@@ -2341,3 +2341,301 @@ async fn suite_7_direct_p2p_security_gate_lockdown_and_human_approve_without_req
     alice.shutdown();
     bob.shutdown();
 }
+
+// ============================================================================
+// Suite 8: Handle Descriptions, Multi-Hub Peer Details & Configured Bridge Targets
+// ============================================================================
+
+#[tokio::test]
+async fn suite_8_handle_descriptions_multihub_peers_and_configured_bridge_targets() {
+    let dir_hub_a = TempDir::new().unwrap();
+    let dir_hub_b = TempDir::new().unwrap();
+    let dir_alice = TempDir::new().unwrap();
+    let dir_bob = TempDir::new().unwrap();
+
+    // 1. Start two Router hubs (`hub-alpha`, `hub-beta`) with Admin-CA keys.
+    let spawn_hub = |node_id: &str, dir: &Path| {
+        let admin_ca = Ed25519KeyPair::generate().unwrap();
+        let admin_jwk = OkpJwk::new(OkpCurve::Ed25519, &admin_ca.public_key_bytes());
+        let mut cfg = NodeConfig::router(NodeId::new(node_id).unwrap(), dir);
+        cfg.secret_backend = Some(SecretBackend::File);
+        cfg.admin_jwk = Some(admin_jwk);
+        let hub = UnifiedNode::open(cfg).unwrap();
+        (hub, admin_ca)
+    };
+    let (hub_a, ca_a) = spawn_hub("hub-alpha", dir_hub_a.path());
+    let (hub_b, ca_b) = spawn_hub("hub-beta", dir_hub_b.path());
+    let (_addr_a, _srv_a) = Arc::clone(&hub_a).serve(loopback_zero()).await.unwrap();
+    let (_addr_b, _srv_b) = Arc::clone(&hub_b).serve(loopback_zero()).await.unwrap();
+
+    let alice = open_local_node("alice@macbook", dir_alice.path());
+    let bob = open_local_node("bob@laptop", dir_bob.path());
+
+    // Pair Alice to BOTH hubs (`hub-alpha` + `hub-beta`), Bob ONLY to `hub-beta`.
+    let scopes = ScopePreset::Member.expand();
+    let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
+    for (hub, ca, client) in [
+        (&hub_a, &ca_a, &alice),
+        (&hub_b, &ca_b, &alice),
+        (&hub_b, &ca_b, &bob),
+    ] {
+        let (am2, _) = hub
+            .create_admin_invite(
+                ca,
+                client.node_id().as_str(),
+                &scope_refs,
+                TrustTier::Org,
+                300_000,
+            )
+            .unwrap();
+        client.accept_am2_invite(&am2).await.unwrap();
+    }
+
+    // Start Alice's LocalDaemon with SecurityGatePipeline + configured bridge targets!
+    let gate_db = Arc::new(Mutex::new(
+        NodeDb::open(dir_alice.path().join("node.sqlite")).unwrap(),
+    ));
+    let gate_pipeline = Arc::new(
+        SecurityGatePipeline::new(SecurityGateConfig::default(), gate_db, None).unwrap(),
+    );
+    let alice_daemon = LocalDaemon::start(
+        Arc::clone(&alice),
+        Some(Arc::clone(&gate_pipeline)),
+        LocalDaemonConfig::default(),
+    )
+    .await
+    .unwrap();
+    let bob_daemon = LocalDaemon::start(Arc::clone(&bob), None, LocalDaemonConfig::default())
+        .await
+        .unwrap();
+
+    // Register a configured bridge poster with pre-configured unlinked targets!
+    struct NoopBridgePoster;
+    impl BridgePoster for NoopBridgePoster {
+        fn post<'a>(
+            &'a self,
+            plugin: &'a str,
+            target: &'a str,
+            text: &'a str,
+            _meta: &'a Map<String, Value>,
+        ) -> BoxFuture<'a, Result<Value, (String, String)>> {
+            let p = plugin.to_string();
+            let t = target.to_string();
+            let len = text.len();
+            Box::pin(async move { Ok(json!({ "ok": true, "plugin": p, "target": t, "len": len })) })
+        }
+    }
+    alice_daemon.register_bridge_poster_with_targets(
+        "telegram",
+        vec!["123456789".to_string(), "ops-alerts".to_string()],
+        Arc::new(NoopBridgePoster),
+    );
+
+    let alice_sock = alice_daemon.socket_path().to_path_buf();
+    let bob_sock = bob_daemon.socket_path().to_path_buf();
+
+    let mut alice_mcp = TestMcpClient::spawn(McpOptions::new(alice_sock.clone()));
+    let mut bob_mcp = TestMcpClient::spawn(McpOptions::new(bob_sock.clone()));
+    alice_mcp.initialize().await;
+    bob_mcp.initialize().await;
+
+    // 2. Bob joins with a multiline/control-char description -> sanitized & synced to `hub-beta`!
+    let (bob_join_txt, bob_join_err) = bob_mcp
+        .call_verified_claude(
+            &bob_sock,
+            "bob-s8",
+            "hyp_mesh",
+            json!({
+                "action": "join",
+                "handle": "bob",
+                "description": "Rust\nrelease\tengineer\x07  specializing in E2EE"
+            }),
+        )
+        .await;
+    assert!(!bob_join_err, "bob join failed: {bob_join_txt}");
+    let bob_join_val: Value = serde_json::from_str(&bob_join_txt).unwrap();
+    assert_eq!(bob_join_val["address"], "bob@laptop/bob");
+    assert_eq!(
+        bob_join_val["description"],
+        "Rust release engineer specializing in E2EE"
+    );
+
+    // Alice joins with description + `include: ["peers"]` -> discovers Bob's sanitized description & `via: "hub-beta"`!
+    let (alice_join_txt, alice_join_err) = alice_mcp
+        .call_verified_claude(
+            &alice_sock,
+            "alice-s8",
+            "hyp_mesh",
+            json!({
+                "action": "join",
+                "handle": "alice",
+                "description": "Coordinator agent",
+                "include": ["peers"]
+            }),
+        )
+        .await;
+    assert!(!alice_join_err, "alice join failed: {alice_join_txt}");
+    let alice_join_val: Value = serde_json::from_str(&alice_join_txt).unwrap();
+    assert_eq!(alice_join_val["description"], "Coordinator agent");
+    assert_eq!(alice_join_val["untrustedMetadata"], true);
+    assert!(alice_join_val["peerDetails"].is_array());
+
+    // Explicit `hyp_mesh({ action: "peers" })` check
+    let (peers_txt, peers_err) = alice_mcp
+        .call_verified_claude(
+            &alice_sock,
+            "alice-s8",
+            "hyp_mesh",
+            json!({ "action": "peers" }),
+        )
+        .await;
+    assert!(!peers_err, "peers failed: {peers_txt}");
+    let peers_val: Value = serde_json::from_str(&peers_txt).unwrap();
+    assert_eq!(peers_val["untrustedMetadata"], true);
+    assert_eq!(
+        peers_val["peers"],
+        json!(["alice@macbook/alice", "bob@laptop/bob"])
+    );
+    let details = peers_val["peerDetails"].as_array().unwrap();
+    let alice_det = details
+        .iter()
+        .find(|d| d["address"] == "alice@macbook/alice")
+        .expect("alice peerDetails entry");
+    assert_eq!(alice_det["nodeId"], "alice@macbook");
+    assert_eq!(alice_det["handle"], "alice");
+    assert_eq!(alice_det["description"], "Coordinator agent");
+    assert!(
+        alice_det.get("via").is_none(),
+        "local handle must omit null via field: {alice_det}"
+    );
+    let bob_det = details
+        .iter()
+        .find(|d| d["address"] == "bob@laptop/bob")
+        .expect("bob peerDetails entry");
+    assert_eq!(bob_det["nodeId"], "bob@laptop");
+    assert_eq!(bob_det["handle"], "bob");
+    assert_eq!(
+        bob_det["description"],
+        "Rust release engineer specializing in E2EE"
+    );
+    assert_eq!(bob_det["via"], "hub-beta");
+
+    // 3. Configured (unlinked) bridge targets MUST appear immediately in `hyp_bridge({ action: "targets" })`!
+    let (t_before_txt, t_before_err) = alice_mcp
+        .call_verified_claude(
+            &alice_sock,
+            "alice-s8",
+            "hyp_bridge",
+            json!({ "action": "targets" }),
+        )
+        .await;
+    assert!(!t_before_err, "targets failed: {t_before_txt}");
+    let t_before: Value = serde_json::from_str(&t_before_txt).unwrap();
+    assert_eq!(t_before["plugins"], json!(["telegram"]));
+    let target_list = t_before["targets"].as_array().unwrap();
+    assert_eq!(target_list.len(), 2, "expected 2 configured targets: {t_before}");
+    let tg_chat = target_list
+        .iter()
+        .find(|t| t["plugin"] == "telegram" && t["target"] == "123456789")
+        .expect("telegram:123456789 must be advertised before linking");
+    assert_eq!(tg_chat["configured"], true);
+    assert_eq!(tg_chat["readers"], json!([]));
+    assert!(tg_chat["primarySession"].is_null());
+    assert_eq!(tg_chat["callerIsPrimary"], false);
+    assert_eq!(tg_chat["callerIsLinked"], false);
+
+    // 4. Link Alice to `telegram:123456789` and verify `deliver_bridge_inbound` wakes Alice's
+    //    live `hyp wait` through Security Gates & §2.5 Delivery Policy!
+    let (link_txt, link_err) = alice_mcp
+        .call_verified_claude(
+            &alice_sock,
+            "alice-s8",
+            "hyp_bridge",
+            json!({ "action": "link", "plugin": "telegram", "target": "123456789" }),
+        )
+        .await;
+    assert!(!link_err, "alice link failed: {link_txt}");
+
+    let (t_after_txt, t_after_err) = alice_mcp
+        .call_verified_claude(
+            &alice_sock,
+            "alice-s8",
+            "hyp_bridge",
+            json!({ "action": "targets" }),
+        )
+        .await;
+    assert!(!t_after_err);
+    let t_after: Value = serde_json::from_str(&t_after_txt).unwrap();
+    let tg_linked = t_after["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["plugin"] == "telegram" && t["target"] == "123456789")
+        .unwrap();
+    assert_eq!(tg_linked["configured"], true);
+    assert_eq!(tg_linked["callerIsLinked"], true);
+    assert_eq!(tg_linked["callerIsPrimary"], false);
+    assert_eq!(tg_linked["readers"], json!(["claude:alice-s8"]));
+
+    // Arm live `run_wait_to_writer` on Alice and deliver inbound bridge message!
+    let wait_sock = alice_sock.clone();
+    let wait_handle = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let code = run_wait_to_writer(
+            WaitOptions {
+                socket_path: wait_sock,
+                mode: WaitMode::Once,
+                session_id: Some("claude:alice-s8".into()),
+                handle: None,
+                timeout_seconds: Some(3.0),
+                json: false,
+            },
+            &mut buf,
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 0);
+        String::from_utf8(buf).unwrap()
+    });
+    wait_for_live_transport(&alice_sock, "claude:alice-s8").await;
+
+    let delivered = alice_daemon
+        .deliver_bridge_inbound(
+            "telegram",
+            "123456789",
+            "tg-msg-101",
+            "[telegram:123456789] alex: Please deploy v0.3.0",
+        )
+        .await
+        .expect("deliver_bridge_inbound succeeds");
+    assert_eq!(delivered, 1);
+
+    let wait_out = tokio::time::timeout(Duration::from_secs(4), wait_handle)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        wait_out.contains("Please deploy v0.3.0"),
+        "live wait must wake with inbound bridge text: {wait_out}"
+    );
+
+    // Also verify Security Gate rejects oversized (>16 KiB) Bridge inbound payload fail-closed!
+    let giant = "X".repeat(20 * 1024);
+    let giant_delivered = alice_daemon
+        .deliver_bridge_inbound("telegram", "123456789", "tg-msg-giant", &giant)
+        .await
+        .expect("deliver_bridge_inbound handles gate decision cleanly");
+    assert_eq!(
+        giant_delivered, 0,
+        "oversized >16 KiB bridge payload must be blocked/quarantined by Security Gate"
+    );
+
+    alice_mcp.close().await;
+    bob_mcp.close().await;
+    alice_daemon.stop().await;
+    bob_daemon.stop().await;
+    alice.shutdown();
+    bob.shutdown();
+    hub_a.shutdown();
+    hub_b.shutdown();
+}

@@ -158,13 +158,16 @@ impl DaemonRpcResult {
     }
 }
 
-/// Resolves the default `connector.sock` path matching `src/cli-fast.ts` and `src/cli-full.ts`:
-/// 1. `HYPHAE_SOCKET` or `AGENTS_MESH_SOCKET`
-/// 2. `HYPHAE_STATE_DIR` -> `<dir>/connector.sock`
-/// 3. `HYPHAE_CONFIG_DIR` -> `<dir>/state/connector.sock`
-/// 4. `$XDG_CONFIG_HOME` (or `$HOME/.config`) -> `hyphae/state/connector.sock`
-///    (falls back to `agents-mesh/state/connector.sock` if `hyphae/connector.json` is absent
-///    and `agents-mesh/connector.json` exists).
+/// Resolves the default `connector.sock` (or `connector.addr` on Windows) path matching
+/// `hyp daemon` (`config_file.rs:resolve_state_dir`) while preserving legacy v1 compatibility:
+/// 1. `HYPHAE_SOCKET` or `AGENTS_MESH_SOCKET` -> exact path
+/// 2. `HYPHAE_STATE_DIR` -> `<dir>/<DEFAULT_SOCKET_FILENAME>`
+/// 3. `HYPHAE_CONFIG_DIR` -> `<dir>/<DEFAULT_SOCKET_FILENAME>` (falls back to
+///    `<dir>/state/<DEFAULT_SOCKET_FILENAME>` only when v2 socket & `node.json` are absent
+///    and the legacy v1 `state/` socket exists)
+/// 4. `$XDG_CONFIG_HOME` (or `$HOME/.config` / `$USERPROFILE/.config`) ->
+///    `hyphae/<DEFAULT_SOCKET_FILENAME>` (with legacy fallbacks for
+///    `hyphae/state/<DEFAULT_SOCKET_FILENAME>` and `agents-mesh/state/<DEFAULT_SOCKET_FILENAME>`).
 pub fn default_socket_path() -> PathBuf {
     resolve_socket_path_with(|k| std::env::var(k).ok(), |p| p.exists())
 }
@@ -184,9 +187,16 @@ where
         return PathBuf::from(state_dir).join(DEFAULT_SOCKET_FILENAME);
     }
     if let Some(config_dir) = non_empty("HYPHAE_CONFIG_DIR") {
-        return PathBuf::from(config_dir)
-            .join("state")
-            .join(DEFAULT_SOCKET_FILENAME);
+        let cfg_dir = PathBuf::from(config_dir);
+        let v2_sock = cfg_dir.join(DEFAULT_SOCKET_FILENAME);
+        let v1_sock = cfg_dir.join("state").join(DEFAULT_SOCKET_FILENAME);
+        if path_exists(&v2_sock) || path_exists(&cfg_dir.join("node.json")) {
+            return v2_sock;
+        }
+        if path_exists(&v1_sock) {
+            return v1_sock;
+        }
+        return v2_sock;
     }
 
     let base = non_empty("XDG_CONFIG_HOME")
@@ -194,11 +204,11 @@ where
         .unwrap_or_else(|| {
             if let Some(home) = non_empty("HOME") {
                 PathBuf::from(home).join(".config")
+            } else if let Some(user_profile) = non_empty("USERPROFILE") {
+                PathBuf::from(user_profile).join(".config")
             } else if cfg!(windows) {
                 if let Some(local_app_data) = non_empty("LOCALAPPDATA") {
                     PathBuf::from(local_app_data)
-                } else if let Some(user_profile) = non_empty("USERPROFILE") {
-                    PathBuf::from(user_profile).join(".config")
                 } else {
                     PathBuf::from(".").join(".config")
                 }
@@ -209,14 +219,22 @@ where
 
     let primary = base.join("hyphae");
     let legacy = base.join("agents-mesh");
-    let dir = if !path_exists(&primary.join("connector.json"))
-        && path_exists(&legacy.join("connector.json"))
+    let primary_v2 = primary.join(DEFAULT_SOCKET_FILENAME);
+    let primary_v1 = primary.join("state").join(DEFAULT_SOCKET_FILENAME);
+    let legacy_v1 = legacy.join("state").join(DEFAULT_SOCKET_FILENAME);
+
+    if path_exists(&primary_v2) || path_exists(&primary.join("node.json")) {
+        return primary_v2;
+    }
+    if path_exists(&primary_v1) {
+        return primary_v1;
+    }
+    if !path_exists(&primary.join("connector.json"))
+        && (path_exists(&legacy_v1) || path_exists(&legacy.join("connector.json")))
     {
-        legacy
-    } else {
-        primary
-    };
-    dir.join("state").join(DEFAULT_SOCKET_FILENAME)
+        return legacy_v1;
+    }
+    primary_v2
 }
 
 /// Convenience helper for testing with an explicit env map.
@@ -551,32 +569,77 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn socket_path_resolution_matches_ts_precedence() {
+    fn socket_path_resolution_matches_v2_default_and_legacy_v1_fallbacks() {
         let mut env = HashMap::new();
         env.insert("HOME".into(), "/home/alice".into());
+
+        // v2 default (matching `hyp daemon` -> `~/.config/hyphae/connector.sock`)
         assert_eq!(
             resolve_socket_path_from_map(&env, |_| false),
+            PathBuf::from("/home/alice/.config/hyphae").join(DEFAULT_SOCKET_FILENAME)
+        );
+
+        // v2 node.json or v2 socket takes precedence even if legacy state/ socket also exists
+        assert_eq!(
+            resolve_socket_path_from_map(&env, |p| {
+                p.ends_with("hyphae/node.json")
+                    || p.ends_with(format!("hyphae/state/{DEFAULT_SOCKET_FILENAME}"))
+            }),
+            PathBuf::from("/home/alice/.config/hyphae").join(DEFAULT_SOCKET_FILENAME)
+        );
+        assert_eq!(
+            resolve_socket_path_from_map(&env, |p| {
+                p.ends_with(format!("hyphae/{DEFAULT_SOCKET_FILENAME}"))
+                    || p.ends_with(format!("hyphae/state/{DEFAULT_SOCKET_FILENAME}"))
+            }),
+            PathBuf::from("/home/alice/.config/hyphae").join(DEFAULT_SOCKET_FILENAME)
+        );
+
+        // Legacy v1 `hyphae/state/connector.sock` fallback when v2 files absent
+        assert_eq!(
+            resolve_socket_path_from_map(&env, |p| {
+                p.ends_with(format!("hyphae/state/{DEFAULT_SOCKET_FILENAME}"))
+            }),
             PathBuf::from("/home/alice/.config/hyphae/state").join(DEFAULT_SOCKET_FILENAME)
         );
 
-        // Legacy agents-mesh fallback when hyphae/connector.json missing & legacy exists
+        // Legacy v1 `agents-mesh/state/connector.sock` fallback when hyphae config absent
         assert_eq!(
             resolve_socket_path_from_map(&env, |p| p.ends_with("agents-mesh/connector.json")),
             PathBuf::from("/home/alice/.config/agents-mesh/state").join(DEFAULT_SOCKET_FILENAME)
         );
+        assert_eq!(
+            resolve_socket_path_from_map(&env, |p| {
+                p.ends_with(format!("agents-mesh/state/{DEFAULT_SOCKET_FILENAME}"))
+            }),
+            PathBuf::from("/home/alice/.config/agents-mesh/state").join(DEFAULT_SOCKET_FILENAME)
+        );
 
-        // XDG_CONFIG_HOME overrides HOME/.config
+        // XDG_CONFIG_HOME overrides HOME/.config (v2 default)
         env.insert("XDG_CONFIG_HOME".into(), "/xdg".into());
         assert_eq!(
             resolve_socket_path_from_map(&env, |_| false),
-            PathBuf::from("/xdg/hyphae/state").join(DEFAULT_SOCKET_FILENAME)
+            PathBuf::from("/xdg/hyphae").join(DEFAULT_SOCKET_FILENAME)
         );
 
-        // HYPHAE_CONFIG_DIR overrides XDG
+        // HYPHAE_CONFIG_DIR overrides XDG (v2 default + legacy state/ fallback)
         env.insert("HYPHAE_CONFIG_DIR".into(), "/cfg".into());
         assert_eq!(
             resolve_socket_path_from_map(&env, |_| false),
+            PathBuf::from("/cfg").join(DEFAULT_SOCKET_FILENAME)
+        );
+        assert_eq!(
+            resolve_socket_path_from_map(&env, |p| {
+                p.ends_with(format!("cfg/state/{DEFAULT_SOCKET_FILENAME}"))
+            }),
             PathBuf::from("/cfg/state").join(DEFAULT_SOCKET_FILENAME)
+        );
+        assert_eq!(
+            resolve_socket_path_from_map(&env, |p| {
+                p.ends_with("cfg/node.json")
+                    || p.ends_with(format!("cfg/state/{DEFAULT_SOCKET_FILENAME}"))
+            }),
+            PathBuf::from("/cfg").join(DEFAULT_SOCKET_FILENAME)
         );
 
         // HYPHAE_STATE_DIR overrides HYPHAE_CONFIG_DIR
@@ -598,6 +661,15 @@ mod tests {
         assert_eq!(
             resolve_socket_path_from_map(&env, |_| false),
             PathBuf::from("/tmp/explicit.sock")
+        );
+
+        // Windows parity: USERPROFILE/.config takes precedence over LOCALAPPDATA when HOME & XDG unset
+        let mut win_env = HashMap::new();
+        win_env.insert("USERPROFILE".into(), "/Users/bob".into());
+        win_env.insert("LOCALAPPDATA".into(), "/Users/bob/AppData/Local".into());
+        assert_eq!(
+            resolve_socket_path_from_map(&win_env, |_| false),
+            PathBuf::from("/Users/bob/.config/hyphae").join(DEFAULT_SOCKET_FILENAME)
         );
     }
 

@@ -19,12 +19,12 @@ use hyp_proto::manifest::{
     CapabilityToken, NodeManifestPayload, ProtocolRange, SignedNodeManifest,
 };
 use hyp_proto::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
-use hyp_store::{NodeDb, PeerRecord, TrustTier, now_ms};
+use hyp_store::{CURRENT_SCHEMA_VERSION, NodeDb, PeerRecord, TrustTier, now_ms};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Args)]
@@ -57,6 +57,35 @@ pub struct DoctorArgs {
     /// Output structured JSON envelope
     #[arg(long)]
     pub json: bool,
+}
+
+/// Pre-migration SQLite backup inventory reported under `data.storage.migrationBackups`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationBackupsReport {
+    pub dir: String,
+    pub count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+}
+
+/// SQLite storage & schema migration status reported under `data.storage`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageStatusReport {
+    pub path: String,
+    pub exists: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub journal_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<i64>,
+    pub supported_schema_version: i64,
+    pub applied_migrations: usize,
+    pub migration_backups: MigrationBackupsReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Single row in the Peer Capabilities & Version Skew table (`docs/architecture-v2.md §3.3`).
@@ -142,43 +171,130 @@ fn run_status_or_doctor(
 
     // Open node.sqlite if it exists (avoid creating empty DB on read-only status when directory doesn't exist)
     let db_path = state_dir.join("node.sqlite");
-    let db: Option<NodeDb> = if db_path.exists() {
+    let backups_dir = state_dir.join("backups");
+    let mut schema_downgrade = false;
+    let (db, storage_status): (Option<NodeDb>, StorageStatusReport) = if db_path.exists() {
         match NodeDb::open(&db_path) {
             Ok(db) => {
                 let wal = db.journal_mode().unwrap_or_else(|_| "unknown".to_string());
                 let schema = db.schema_version().unwrap_or(0);
+                let applied_migrations = db.applied_migrations().map(|v| v.len()).unwrap_or(0);
+                let backups = db.list_migration_backups().unwrap_or_default();
+                let backup_note = format_backup_note(backups.len());
                 checks.push(CliCheck::ok(
                     "store.sqlite",
-                    format!("{} (journal={}, schema=v{})", db_path.display(), wal, schema),
+                    format!("node.sqlite schema v{schema}{backup_note}"),
                 ));
-                Some(db)
+                let backup_files: Vec<String> = backups
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect();
+                let report = StorageStatusReport {
+                    path: db_path.display().to_string(),
+                    exists: true,
+                    journal_mode: Some(wal),
+                    schema_version: Some(schema),
+                    supported_schema_version: CURRENT_SCHEMA_VERSION,
+                    applied_migrations,
+                    migration_backups: MigrationBackupsReport {
+                        dir: backups_dir.display().to_string(),
+                        count: backup_files.len(),
+                        latest: backup_files.first().cloned(),
+                        files: backup_files,
+                    },
+                    error: None,
+                };
+                (Some(db), report)
             }
             Err(e) => {
-                checks.push(CliCheck::fail(
-                    "store.sqlite",
-                    format!("Failed to open {}: {e}", db_path.display()),
-                    None,
-                ));
+                let err_msg = e.to_string();
+                let is_downgrade = err_msg.contains("is newer than supported version");
+                schema_downgrade = is_downgrade;
+                let disk_backups = scan_migration_backups(&backups_dir);
+                let backup_files: Vec<String> = disk_backups
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect();
+                let fix = if is_downgrade {
+                    Some(format!(
+                        "Run `hyp update` to upgrade this binary, or restore a pre-migration backup from {}/.",
+                        backups_dir.display()
+                    ))
+                } else {
+                    Some(format!(
+                        "Verify permissions and integrity of {} (pre-migration backups in {}/).",
+                        db_path.display(),
+                        backups_dir.display()
+                    ))
+                };
+                let detail = if is_downgrade {
+                    format!(
+                        "Schema downgrade blocked for {} (supported v{CURRENT_SCHEMA_VERSION}): {err_msg}",
+                        db_path.display()
+                    )
+                } else {
+                    format!("Failed to open {}: {err_msg}", db_path.display())
+                };
+                checks.push(CliCheck::fail("store.sqlite", detail.clone(), fix.clone()));
                 if !is_doctor {
                     return emit_error(
                         cmd,
                         as_json,
                         EXIT_ERROR,
-                        "DB_ERROR",
-                        format!("Failed to open {}: {e}", db_path.display()),
-                        None,
+                        if is_downgrade {
+                            "SCHEMA_TOO_NEW"
+                        } else {
+                            "DB_ERROR"
+                        },
+                        detail,
+                        fix,
                     );
                 }
-                None
+                let report = StorageStatusReport {
+                    path: db_path.display().to_string(),
+                    exists: true,
+                    journal_mode: None,
+                    schema_version: None,
+                    supported_schema_version: CURRENT_SCHEMA_VERSION,
+                    applied_migrations: 0,
+                    migration_backups: MigrationBackupsReport {
+                        dir: backups_dir.display().to_string(),
+                        count: backup_files.len(),
+                        latest: backup_files.first().cloned(),
+                        files: backup_files,
+                    },
+                    error: Some(err_msg),
+                };
+                (None, report)
             }
         }
     } else {
+        let disk_backups = scan_migration_backups(&backups_dir);
+        let backup_files: Vec<String> = disk_backups
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
         checks.push(CliCheck::warn(
             "store.sqlite",
             format!("Database not initialized yet at {}", db_path.display()),
             Some("Run `hyp onboard` or `hyp node start`.".to_string()),
         ));
-        None
+        let report = StorageStatusReport {
+            path: db_path.display().to_string(),
+            exists: false,
+            journal_mode: None,
+            schema_version: None,
+            supported_schema_version: CURRENT_SCHEMA_VERSION,
+            applied_migrations: 0,
+            migration_backups: MigrationBackupsReport {
+                dir: backups_dir.display().to_string(),
+                count: backup_files.len(),
+                latest: backup_files.first().cloned(),
+                files: backup_files,
+            },
+            error: None,
+        };
+        (None, report)
     };
 
     let node_id = resolve_effective_node_id(loaded_cfg.as_ref(), db.as_ref());
@@ -441,6 +557,7 @@ fn run_status_or_doctor(
             "subscriptions": subs_count,
             "kvNamespaces": kv_namespaces,
         },
+        "storage": storage_status,
         "peers": skew_rows,
         "gate": gate_status,
         "update": update_status,
@@ -455,6 +572,8 @@ fn run_status_or_doctor(
             Some(CliError {
                 code: if gate_status.tampered {
                     "GATE_POLICY_TAMPERED".to_string()
+                } else if schema_downgrade {
+                    "SCHEMA_TOO_NEW".to_string()
                 } else {
                     "DOCTOR_FAILED".to_string()
                 },
@@ -493,6 +612,14 @@ fn run_status_or_doctor(
         }
         if let Some(ref sock) = socket_path {
             println!("  Local IPC: {sock}");
+        }
+        if let Some(v) = storage_status.schema_version {
+            println!(
+                "  Storage:  node.sqlite schema v{v}{}",
+                format_backup_note(storage_status.migration_backups.count)
+            );
+        } else if let Some(ref err) = storage_status.error {
+            println!("  Storage:  FAIL ({err})");
         }
         println!(
             "  Gate:     {} (filters={}, quarantined={})",
@@ -781,4 +908,43 @@ fn parse_cached_manifest(raw: &str) -> Option<NodeManifestPayload> {
         }
     }
     serde_json::from_str::<NodeManifestPayload>(raw).ok()
+}
+
+fn format_backup_note(count: usize) -> String {
+    match count {
+        0 => String::new(),
+        1 => " (1 pre-migration backup in backups/)".to_string(),
+        n => format!(" ({n} pre-migration backups in backups/)"),
+    }
+}
+
+fn scan_migration_backups(backups_dir: &Path) -> Vec<PathBuf> {
+    let Ok(read_dir) = fs::read_dir(backups_dir) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<(u128, String, PathBuf)> = Vec::new();
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("node.sqlite.v") || !name.ends_with(".bak") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        entries.push((mtime, name.to_string(), path));
+    }
+    entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    entries.into_iter().map(|e| e.2).collect()
 }

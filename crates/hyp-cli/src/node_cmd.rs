@@ -15,20 +15,25 @@ use hyp_crypto::CryptoError;
 use hyp_crypto::keystore::{SecretBackend, validate_secret_name};
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
 use hyp_harness::daemon::{LocalDaemon, LocalDaemonConfig};
-use hyp_node::adapters::{GitHubPublicAdapter, GitHubPublicConfig};
+use hyp_node::adapters::{
+    AdapterKind, GitHubPublicAdapter, GitHubPublicConfig, HelloMode, SubprocessConfig,
+};
 use hyp_node::engine::{
     E2eePolicy, EscalationConfig, GuestPairingConfig, NodeConfig, NodeProfile, TopicConfig,
     UnifiedNode,
 };
 use hyp_node::gates::{SecurityGateConfig, SecurityGatePipeline};
-use hyp_proto::address::{LOCAL_NODE_ID, NodeId, is_valid_node_id};
+use hyp_proto::address::{
+    LOCAL_NODE_ID, NodeId, is_valid_handle, is_valid_node_id, is_valid_topic,
+};
 use hyp_proto::scopes::ScopePreset;
 use hyp_store::{NodeDb, PeerStatus};
 use serde_json::{Value, json};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -203,6 +208,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
 
     let mut startup_warnings: Vec<String> = Vec::new();
     let mut github_public_cfg: Option<GitHubPublicConfig> = None;
+    let mut parsed_plugins: Vec<SubprocessConfig> = Vec::new();
 
     if let Some(ref cfg) = loaded {
         node_cfg.require_pairing = cfg.require_pairing;
@@ -246,9 +252,10 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             }
         }
 
+        let secrets = open_secret_store(&state_dir, explicit_state);
+
         // Parse `sources` entries (currently `kind == "github-public"`).
         if let Some(sources_val) = cfg.raw.get("sources") {
-            let secrets = open_secret_store(&state_dir, explicit_state);
             let public_read_only = cfg
                 .raw
                 .get("publicReadOnly")
@@ -288,6 +295,68 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                                 .to_string(),
                         ),
                     );
+                }
+            }
+        }
+
+        // Parse optional `plugins[]` external bridge/source subprocess entries (fail closed on
+        // invalid schema or missing secret references).
+        if let Some(plugins_val) = cfg.raw.get("plugins") {
+            if !plugins_val.is_null() {
+                match parse_plugins_config(plugins_val, cfg.path.parent(), &secrets) {
+                    Ok(plugins) => {
+                        for p in &plugins {
+                            match p.kind {
+                                AdapterKind::Bridge => {
+                                    if !node_cfg.topics.iter().any(|t| t.topic == p.id) {
+                                        node_cfg.topics.push(TopicConfig {
+                                            topic: p.id.clone(),
+                                            kind: Some("bridge".to_string()),
+                                            description: Some(format!(
+                                                "External bridge plugin '{}'",
+                                                p.id
+                                            )),
+                                            metadata: None,
+                                            has_provisioned_publisher: true,
+                                        });
+                                    }
+                                }
+                                AdapterKind::Source => {
+                                    for target in &p.targets {
+                                        if is_valid_topic(target)
+                                            && !node_cfg.topics.iter().any(|t| t.topic == *target)
+                                        {
+                                            node_cfg.topics.push(TopicConfig {
+                                                topic: target.clone(),
+                                                kind: Some("source".to_string()),
+                                                description: Some(format!(
+                                                    "External source plugin '{}'",
+                                                    p.id
+                                                )),
+                                                metadata: None,
+                                                has_provisioned_publisher: true,
+                                            });
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        parsed_plugins = plugins;
+                    }
+                    Err(e) => {
+                        return emit_error(
+                            cmd,
+                            as_json,
+                            EXIT_ERROR,
+                            "CONFIG_ERROR",
+                            format!("Invalid plugins config in {}: {e}", cfg.path.display()),
+                            Some(
+                                "Verify plugins[] in node.json and ensure referenced secrets are set via `hyp secret set <name>`."
+                                    .to_string(),
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -378,9 +447,42 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             let daemon = LocalDaemon::start(Arc::clone(&node), Some(pipeline), local_cfg)
                 .await
                 .map_err(|e| format!("Failed to start local harness IPC daemon: {e}"))?;
-            Some(daemon)
+            Some(Arc::new(daemon))
         } else {
             None
+        };
+
+        // Start configured external fd-3 bridge/source plugins on Unix and wire bridge targets
+        // + outbound BridgePosters into `LocalDaemon`. On non-Unix platforms (e.g. Windows),
+        // warn cleanly without breaking compilation or startup.
+        #[cfg(unix)]
+        let (running_plugins, plugin_statuses) = plugin_runtime::start_plugins(
+            parsed_plugins,
+            &node,
+            local_daemon.as_ref(),
+            &mut startup_warnings,
+        )
+        .await?;
+
+        #[cfg(not(unix))]
+        let plugin_statuses: Vec<Value> = {
+            let mut statuses = Vec::with_capacity(parsed_plugins.len());
+            if !parsed_plugins.is_empty() {
+                let ids: Vec<String> = parsed_plugins.iter().map(|p| p.id.clone()).collect();
+                startup_warnings.push(format!(
+                    "External fd-3 plugins require Unix; skipping configured plugin(s): {}",
+                    ids.join(", ")
+                ));
+                for p in &parsed_plugins {
+                    statuses.push(json!({
+                        "id": p.id,
+                        "kind": plugin_kind_str(p.kind),
+                        "targets": p.targets,
+                        "status": "unsupported_platform",
+                    }));
+                }
+            }
+            statuses
         };
 
         let mut bound_addr: Option<SocketAddr> = None;
@@ -467,6 +569,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             "guestPairingEnabled": guest_pairing_enabled,
             "githubPublicEnabled": github_public_enabled,
             "connectedPeers": connected_peers,
+            "plugins": plugin_statuses,
             "startedAt": started_at,
         });
         write_atomic_json(&status_path, &status_doc, true)?;
@@ -531,6 +634,22 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                     connected_peers.join(", ")
                 );
             }
+            if !plugin_statuses.is_empty() {
+                let labels: Vec<String> = plugin_statuses
+                    .iter()
+                    .filter_map(|p| {
+                        let id = p.get("id")?.as_str()?;
+                        let kind = p.get("kind").and_then(Value::as_str).unwrap_or("bridge");
+                        let status = p.get("status").and_then(Value::as_str).unwrap_or("unknown");
+                        Some(format!("{id}[{kind}:{status}]"))
+                    })
+                    .collect();
+                println!(
+                    "      Plugins:     {} configured ({})",
+                    plugin_statuses.len(),
+                    labels.join(", ")
+                );
+            }
             for w in &warnings {
                 println!("WARN  {w}");
             }
@@ -539,8 +658,14 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
 
         wait_for_shutdown_signal().await;
 
+        #[cfg(unix)]
+        plugin_runtime::stop_plugins(running_plugins).await;
+
         if let Some(daemon) = local_daemon {
-            daemon.stop().await;
+            match Arc::try_unwrap(daemon) {
+                Ok(d) => d.stop().await,
+                Err(arc) => arc.shutdown(),
+            }
         }
         node.shutdown_adapters().await;
         node.shutdown();
@@ -772,4 +897,439 @@ fn parse_github_public_source(
     }
 
     Ok(None)
+}
+
+const fn plugin_kind_str(kind: AdapterKind) -> &'static str {
+    match kind {
+        AdapterKind::Bridge => "bridge",
+        AdapterKind::Source => "source",
+        AdapterKind::Harness => "harness",
+        AdapterKind::PeerLink => "peer_link",
+    }
+}
+
+/// Parses and validates `plugins[]` from `node.json`, resolving any `{ "secret": "<name>" }`
+/// references in `env` via `SecretStore` (failing closed on malformed entries or missing secrets,
+/// and never exposing resolved secret values in error messages).
+fn parse_plugins_config(
+    plugins_val: &Value,
+    config_dir: Option<&Path>,
+    secrets: &hyp_crypto::SecretStore,
+) -> Result<Vec<SubprocessConfig>, String> {
+    let arr = plugins_val
+        .as_array()
+        .ok_or_else(|| "plugins must be a JSON array".to_string())?;
+
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut configs: Vec<SubprocessConfig> = Vec::new();
+
+    for (idx, entry) in arr.iter().enumerate() {
+        let obj = entry
+            .as_object()
+            .ok_or_else(|| format!("plugins[{idx}] must be a JSON object"))?;
+
+        if obj.get("enabled").and_then(Value::as_bool) == Some(false) {
+            continue;
+        }
+
+        let raw_id = obj
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("plugins[{idx}].id must be a non-empty string"))?;
+        let id = raw_id.to_ascii_lowercase();
+        if !is_valid_handle(&id) {
+            return Err(format!(
+                "plugins[{idx}].id '{raw_id}' is not a valid identifier (expected /^[a-z0-9][a-z0-9._-]{{0,63}}$/)"
+            ));
+        }
+        if !seen_ids.insert(id.clone()) {
+            return Err(format!("duplicate plugin id '{id}' in plugins[]"));
+        }
+
+        let kind = match obj.get("kind").and_then(Value::as_str) {
+            None | Some("bridge") => AdapterKind::Bridge,
+            Some("source") => AdapterKind::Source,
+            Some(other) => {
+                return Err(format!(
+                    "plugins[{id}].kind '{other}' is invalid (expected 'bridge' or 'source')"
+                ));
+            }
+        };
+
+        let exec = obj
+            .get("exec")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("plugins[{id}].exec must be a non-empty string"))?
+            .to_string();
+
+        let args = match obj.get("args") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(val) => {
+                let raw_args = val
+                    .as_array()
+                    .ok_or_else(|| format!("plugins[{id}].args must be an array of strings"))?;
+                let mut out = Vec::with_capacity(raw_args.len());
+                for (aidx, item) in raw_args.iter().enumerate() {
+                    let s = item.as_str().ok_or_else(|| {
+                        format!("plugins[{id}].args[{aidx}] must be a string")
+                    })?;
+                    out.push(s.to_string());
+                }
+                out
+            }
+        };
+
+        let cwd = match obj.get("cwd") {
+            None | Some(Value::Null) => None,
+            Some(val) => {
+                let raw_cwd = val
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| format!("plugins[{id}].cwd must be a non-empty string"))?;
+                let path = PathBuf::from(raw_cwd);
+                if path.is_absolute() {
+                    Some(path)
+                } else if let Some(base) = config_dir {
+                    Some(base.join(path))
+                } else {
+                    Some(path)
+                }
+            }
+        };
+
+        let targets = {
+            let raw_targets = obj
+                .get("targets")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    format!("plugins[{id}].targets must be a non-empty array of strings")
+                })?;
+            let mut out = Vec::with_capacity(raw_targets.len());
+            for (tidx, item) in raw_targets.iter().enumerate() {
+                let s = item
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(|| {
+                        format!("plugins[{id}].targets[{tidx}] must be a non-empty string")
+                    })?;
+                if !out.iter().any(|existing: &String| existing == s) {
+                    out.push(s.to_string());
+                }
+            }
+            if out.is_empty() {
+                return Err(format!(
+                    "plugins[{id}].targets must contain at least one target"
+                ));
+            }
+            out
+        };
+
+        let mut env_map: BTreeMap<String, String> = BTreeMap::new();
+        if let Some(env_val) = obj.get("env") {
+            if !env_val.is_null() {
+                let env_obj = env_val
+                    .as_object()
+                    .ok_or_else(|| format!("plugins[{id}].env must be a JSON object"))?;
+                for (env_key, val) in env_obj {
+                    if env_key.trim().is_empty() {
+                        return Err(format!(
+                            "plugins[{id}].env contains an empty variable name"
+                        ));
+                    }
+                    match val {
+                        Value::String(s) => {
+                            env_map.insert(env_key.clone(), s.clone());
+                        }
+                        Value::Object(ref_obj) => {
+                            let secret_name = ref_obj
+                                .get("secret")
+                                .and_then(Value::as_str)
+                                .filter(|_| ref_obj.len() == 1)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "plugins[{id}].env.{env_key} must be a string or {{ \"secret\": \"<name>\" }}"
+                                    )
+                                })?;
+                            validate_secret_name(secret_name).map_err(|e| {
+                                format!(
+                                    "invalid secret name '{secret_name}' in plugins[{id}].env.{env_key}: {e}"
+                                )
+                            })?;
+                            match secrets.get(secret_name) {
+                                Ok(secret) => {
+                                    env_map.insert(env_key.clone(), (*secret).clone());
+                                }
+                                Err(CryptoError::SecretNotFound(_)) => {
+                                    return Err(format!(
+                                        "plugins[{id}].env.{env_key} references missing secret '{secret_name}'; run `hyp secret set {secret_name}`"
+                                    ));
+                                }
+                                Err(e) => {
+                                    return Err(format!(
+                                        "failed to load secret '{secret_name}' for plugins[{id}].env.{env_key}: {e}"
+                                    ));
+                                }
+                            }
+                        }
+                        _ => {
+                            return Err(format!(
+                                "plugins[{id}].env.{env_key} must be a string or {{ \"secret\": \"<name>\" }}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut cfg = SubprocessConfig::new(id, kind, exec, args, targets);
+        cfg.cwd = cwd;
+        cfg.env = env_map;
+        cfg.hello_mode = HelloMode::Auto;
+        configs.push(cfg);
+    }
+
+    Ok(configs)
+}
+
+#[cfg(unix)]
+mod plugin_runtime {
+    use super::plugin_kind_str;
+    use hyp_harness::daemon::{BoxFuture as DaemonBoxFuture, BridgePoster, LocalDaemon};
+    use hyp_node::adapters::{
+        AdapterError, AdapterHealth, AdapterKind, BoxFuture as AdapterBoxFuture, NodeAdapter,
+        NodeAdapterHost, PublishErrorCode, PublishOutcome, PublishStatus, SubprocessConfig,
+        SubprocessSupervisor,
+    };
+    use hyp_node::engine::{NodeError, UnifiedNode};
+    use hyp_proto::address::{LOCAL_NODE_ID, is_valid_topic};
+    use hyp_proto::cloudevent::CloudEvent as ProtoCloudEvent;
+    use hyp_proto::rpc::EventKeyRef;
+    use serde_json::{Map, Value, json};
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Weak};
+    use std::time::Duration;
+
+    const DEFAULT_PLUGIN_POST_TIMEOUT: Duration = Duration::from_secs(15);
+
+    struct NodePluginHost {
+        plugin_id: String,
+        kind: AdapterKind,
+        node: Weak<UnifiedNode>,
+        daemon: Option<Weak<LocalDaemon>>,
+    }
+
+    impl NodeAdapterHost for NodePluginHost {
+        fn publish_event<'a>(
+            &'a self,
+            to: &'a str,
+            event: ProtoCloudEvent,
+        ) -> AdapterBoxFuture<'a, Result<PublishOutcome, AdapterError>> {
+            Box::pin(async move {
+                let Some(node) = self.node.upgrade() else {
+                    return Err(AdapterError::NotRunning("unified-node".to_string()));
+                };
+
+                let topic = match self.kind {
+                    AdapterKind::Bridge => self.plugin_id.as_str(),
+                    _ => {
+                        if is_valid_topic(to) {
+                            to
+                        } else {
+                            self.plugin_id.as_str()
+                        }
+                    }
+                };
+                let qualified = format!("{LOCAL_NODE_ID}.{topic}");
+                let res = node
+                    .publish_event(&qualified, event.clone())
+                    .await
+                    .map_err(|err| {
+                        let code = match &err {
+                            NodeError::PayloadTooLarge(_) => PublishErrorCode::TooLarge,
+                            NodeError::CloudEvent(_) | NodeError::BadRequest(_) => {
+                                PublishErrorCode::InvalidEvent
+                            }
+                            NodeError::Conflict(_) => PublishErrorCode::IdConflict,
+                            _ => PublishErrorCode::Unavailable,
+                        };
+                        AdapterError::PublishFailed {
+                            code,
+                            message: err.to_string(),
+                        }
+                    })?;
+
+                let mut matched = res.matched;
+                if !res.deduplicated && self.kind == AdapterKind::Bridge {
+                    if let Some(daemon) = self.daemon.as_ref().and_then(Weak::upgrade) {
+                        let rendered = render_bridge_cloudevent(&self.plugin_id, to, &event);
+                        if let Ok(delivered) = daemon
+                            .deliver_bridge_inbound(&self.plugin_id, to, &event.id, &rendered)
+                            .await
+                        {
+                            matched = matched.saturating_add(delivered);
+                        }
+                    }
+                }
+
+                let status = if res.deduplicated {
+                    PublishStatus::Duplicate
+                } else {
+                    PublishStatus::Stored
+                };
+                Ok(PublishOutcome { status, matched })
+            })
+        }
+
+        fn update_status<'a>(
+            &'a self,
+            _adapter_id: &'a str,
+            _health: AdapterHealth,
+        ) -> AdapterBoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+
+        fn report_delivery_failed<'a>(
+            &'a self,
+            _adapter_id: &'a str,
+            _target: &'a str,
+            _events: Vec<EventKeyRef>,
+            _reason: &'a str,
+        ) -> AdapterBoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    struct SupervisorBridgePoster {
+        supervisor: Arc<SubprocessSupervisor>,
+    }
+
+    impl BridgePoster for SupervisorBridgePoster {
+        fn post<'a>(
+            &'a self,
+            _plugin: &'a str,
+            target: &'a str,
+            text: &'a str,
+            meta: &'a Map<String, Value>,
+        ) -> DaemonBoxFuture<'a, Result<Value, (String, String)>> {
+            Box::pin(async move {
+                let mut params: BTreeMap<String, Value> = BTreeMap::new();
+                for (k, v) in meta {
+                    if k != "text" {
+                        params.insert(k.clone(), v.clone());
+                    }
+                }
+                params.insert("text".to_string(), Value::String(text.to_string()));
+                self.supervisor
+                    .post(target, params, DEFAULT_PLUGIN_POST_TIMEOUT)
+                    .await
+                    .map_err(|err| match err {
+                        AdapterError::NotRunning(m) => ("plugin_not_running".to_string(), m),
+                        AdapterError::Timeout(m) => ("plugin_timeout".to_string(), m),
+                        AdapterError::RequestFailed(m) => ("plugin_post_failed".to_string(), m),
+                        other => ("plugin_error".to_string(), other.to_string()),
+                    })
+            })
+        }
+    }
+
+    fn render_bridge_cloudevent(plugin_id: &str, target: &str, event: &ProtoCloudEvent) -> String {
+        let mut header = format!("[{plugin_id}:{target}]");
+        if let Some(ref subj) = event.subject {
+            let trimmed = subj.trim();
+            if !trimmed.is_empty() {
+                header.push_str(&format!(" ({trimmed})"));
+            }
+        }
+        if let Some(ref data) = event.data {
+            if let Some(obj) = data.as_object() {
+                if let Some(text) = obj.get("text").and_then(Value::as_str) {
+                    if let Some(sender) = obj
+                        .get("from")
+                        .or_else(|| obj.get("sender"))
+                        .or_else(|| obj.get("author"))
+                        .or_else(|| obj.get("user"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        return format!("{header} {sender}: {text}");
+                    }
+                    return format!("{header} {text}");
+                }
+            }
+            if let Some(s) = data.as_str() {
+                return format!("{header} {s}");
+            }
+            if let Ok(compact) = serde_json::to_string(data) {
+                return format!("{header} {compact}");
+            }
+        }
+        format!("{header} {} ({})", event.event_type, event.source)
+    }
+
+    pub(super) async fn start_plugins(
+        configs: Vec<SubprocessConfig>,
+        node: &Arc<UnifiedNode>,
+        local_daemon: Option<&Arc<LocalDaemon>>,
+        startup_warnings: &mut Vec<String>,
+    ) -> Result<(Vec<Arc<SubprocessSupervisor>>, Vec<Value>), String> {
+        let mut started: Vec<Arc<SubprocessSupervisor>> = Vec::with_capacity(configs.len());
+        let mut statuses: Vec<Value> = Vec::with_capacity(configs.len());
+
+        for cfg in configs {
+            let plugin_id = cfg.id.clone();
+            let kind = cfg.kind;
+            let targets = cfg.targets.clone();
+            let sup = Arc::new(SubprocessSupervisor::new(cfg));
+            let host: Arc<dyn NodeAdapterHost> = Arc::new(NodePluginHost {
+                plugin_id: plugin_id.clone(),
+                kind,
+                node: Arc::downgrade(node),
+                daemon: local_daemon.map(Arc::downgrade),
+            });
+
+            if let Err(err) = sup.start(host).await {
+                stop_plugins(started).await;
+                return Err(format!("Failed to start plugin '{plugin_id}': {err}"));
+            }
+
+            if kind == AdapterKind::Bridge {
+                if let Some(daemon) = local_daemon {
+                    daemon.register_bridge_poster_with_targets(
+                        &plugin_id,
+                        targets.clone(),
+                        Arc::new(SupervisorBridgePoster {
+                            supervisor: Arc::clone(&sup),
+                        }),
+                    );
+                } else {
+                    startup_warnings.push(format!(
+                        "Bridge plugin '{plugin_id}' started without local IPC socket; sessions cannot link bridge targets until local socket is enabled."
+                    ));
+                }
+            }
+
+            statuses.push(json!({
+                "id": plugin_id,
+                "kind": plugin_kind_str(kind),
+                "targets": targets,
+                "status": "running",
+            }));
+            started.push(sup);
+        }
+
+        Ok((started, statuses))
+    }
+
+    pub(super) async fn stop_plugins(plugins: Vec<Arc<SubprocessSupervisor>>) {
+        for sup in plugins {
+            let _ = sup.stop().await;
+        }
+    }
 }

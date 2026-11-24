@@ -156,6 +156,10 @@ pub fn select_tools_for_caps(caps: McpToolCaps) -> Vec<Value> {
                 "properties": {
                     "action": {"type": "string", "enum": ["join", "leave", "peers", "channels", "status"]},
                     "handle": s,
+                    "description": {
+                        "type": "string",
+                        "description": "Optional short role/capability description advertised to peers on join (max 200 chars, untrusted metadata)"
+                    },
                     "channel": s,
                     "include": {"type": "array", "items": {"type": "string", "enum": ["peers", "channels", "topics", "subs", "mutes"]}}
                 },
@@ -371,6 +375,11 @@ pub fn translate_tool_call(
                     out.insert("action".into(), json!(action));
                     if let Some(handle) = args.get("handle") {
                         out.insert("handle".into(), handle.clone());
+                    }
+                    if action == "join" {
+                        if let Some(description) = args.get("description") {
+                            out.insert("description".into(), description.clone());
+                        }
                     }
                     if let Some(include) = args.get("include") {
                         out.insert("include".into(), include.clone());
@@ -1204,6 +1213,9 @@ mod tests {
             json!(["interrupt", "queue", "notify", "mute"])
         );
 
+        let mesh_props = &core[2]["inputSchema"]["properties"];
+        assert_eq!(mesh_props["description"]["type"], json!("string"));
+
         let stream_props = &core[3]["inputSchema"]["properties"];
         assert_eq!(
             stream_props["mode"]["enum"],
@@ -1214,8 +1226,8 @@ mod tests {
         let with_bridge_bytes = serde_json::to_string(&with_bridge).unwrap().len();
         let with_kv_bytes = serde_json::to_string(&with_kv).unwrap().len();
         assert!(
-            core_bytes <= 2150,
-            "Expected lean 4-tool core schema <= 2150 bytes (~450-520 tokens), got {core_bytes} (~{} tokens)",
+            core_bytes <= 2300,
+            "Expected lean 4-tool core schema <= 2300 bytes (~450-575 tokens), got {core_bytes} (~{} tokens)",
             core_bytes / 4
         );
         assert!(with_bridge_bytes > core_bytes);
@@ -1224,19 +1236,29 @@ mod tests {
 
     #[test]
     fn translates_v2_four_plus_one_tools_to_v1_daemon_rpcs() {
-        // hyp_mesh join handle -> hyp_session
+        // hyp_mesh join handle + optional description -> hyp_session
         let join = translate_tool_call(
             "hyp_mesh",
-            json!({"action": "join", "handle": "alice", "include": ["peers", "topics"]})
-                .as_object()
-                .unwrap()
-                .clone(),
+            json!({
+                "action": "join",
+                "handle": "alice",
+                "description": "Rust backend engineer",
+                "include": ["peers", "topics"]
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
         )
         .unwrap();
         assert_eq!(join.name, "hyp_session");
         assert_eq!(
             Value::Object(join.args),
-            json!({"action": "join", "handle": "alice", "include": ["peers", "topics"]})
+            json!({
+                "action": "join",
+                "handle": "alice",
+                "description": "Rust backend engineer",
+                "include": ["peers", "topics"]
+            })
         );
 
         // hyp_mesh join channel -> hyp_channel

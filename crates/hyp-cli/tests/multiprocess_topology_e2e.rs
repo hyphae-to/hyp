@@ -1827,3 +1827,1330 @@ fn hyp_secret_and_hyp_kv_forgotten_inputs_and_adversarial_matrix() {
     assert_eq!(get_json["data"]["version"], 2);
     assert_eq!(get_json["data"]["value"]["sha"], "bbb222");
 }
+
+// ============================================================================
+// 6. Four-Process Two-Hub Topology: Agent Descriptions & Automatic Multi-Hub
+//    E2EE Routing Without `<hub>!` Prefix (Zero Plaintext on Either Hub)
+// ============================================================================
+
+#[test]
+fn two_hub_agent_descriptions_and_auto_routing_without_hub_prefix() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let hub_a_home = tmp.path().join("hub-a-home");
+    let hub_a_state = tmp.path().join("hub-a-state");
+    let hub_b_home = tmp.path().join("hub-b-home");
+    let hub_b_state = tmp.path().join("hub-b-state");
+    let alice_home = tmp.path().join("alice-home");
+    let alice_state = tmp.path().join("alice-state");
+    let bob_home = tmp.path().join("bob-home");
+    let bob_state = tmp.path().join("bob-state");
+    for d in [
+        &hub_a_home,
+        &hub_a_state,
+        &hub_b_home,
+        &hub_b_state,
+        &alice_home,
+        &alice_state,
+        &bob_home,
+        &bob_state,
+    ] {
+        fs::create_dir_all(d).unwrap();
+    }
+
+    // Spawn Process 1 (`hub-alpha`) and Process 2 (`hub-beta`)
+    let spawn_hub = |node_id: &str, home: &Path, state: &Path| {
+        let mut cmd = isolated_cmd(home);
+        cmd.args([
+            "node",
+            "start",
+            "--profile",
+            "router",
+            "--node-id",
+            node_id,
+            "--bind",
+            "127.0.0.1:0",
+            "--no-local-socket",
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::null());
+        let proc = ManagedProcess::spawn(format!("{node_id} hub"), &mut cmd);
+        let startup = proc.read_json_line(STARTUP_TIMEOUT);
+        assert_eq!(startup["ok"], true, "{node_id} startup: {startup}");
+        let endpoint = startup["data"]["endpoint"]
+            .as_str()
+            .expect("hub endpoint")
+            .to_string();
+        (proc, endpoint)
+    };
+    let (mut hub_a_proc, hub_a_ep) = spawn_hub("hub-alpha", &hub_a_home, &hub_a_state);
+    let (mut hub_b_proc, hub_b_ep) = spawn_hub("hub-beta", &hub_b_home, &hub_b_state);
+
+    let pair_node_to_hub = |hub_id: &str,
+                            hub_home: &Path,
+                            hub_state: &Path,
+                            hub_ep: &str,
+                            peer_id: &str,
+                            peer_home: &Path,
+                            peer_state: &Path| {
+        let inv_out = isolated_cmd(hub_home)
+            .args([
+                "pair",
+                "invite",
+                "--mode",
+                "team",
+                "--node-id",
+                hub_id,
+                "--endpoint",
+                hub_ep,
+                "--peer",
+                peer_id,
+                "--preset",
+                "member",
+                "--state-dir",
+                hub_state.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .expect("hyp pair invite");
+        assert_eq!(inv_out.status.code(), Some(0));
+        let am2_token = parse_json_stdout(&inv_out)["data"]["token"]
+            .as_str()
+            .expect("am2 token")
+            .to_string();
+
+        let mut acc_child = isolated_cmd(peer_home)
+            .args([
+                "pair",
+                "accept",
+                "--node-id",
+                peer_id,
+                "--state-dir",
+                peer_state.to_str().unwrap(),
+                "--json",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn hyp pair accept");
+        acc_child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(format!("{am2_token}\n").as_bytes())
+            .unwrap();
+        let acc_out = acc_child.wait_with_output().unwrap();
+        assert_eq!(
+            acc_out.status.code(),
+            Some(0),
+            "pair accept failed for {peer_id} -> {hub_id}: {}",
+            String::from_utf8_lossy(&acc_out.stderr)
+        );
+
+        let peer_keys = SecretStore::new(peer_state, SecretBackend::File)
+            .load_or_create_node_keys(peer_id)
+            .expect("load paired peer keys");
+        register_peer_in_sqlite(
+            &hub_state.join("node.sqlite"),
+            peer_id,
+            &peer_keys,
+            PeerProfile::Local,
+            TrustTier::Org,
+            ScopePreset::Member.expand(),
+        );
+    };
+
+    // Alice connects to BOTH hubs (`hub-alpha` & `hub-beta`); Bob connects ONLY to `hub-beta`.
+    pair_node_to_hub(
+        "hub-alpha",
+        &hub_a_home,
+        &hub_a_state,
+        &hub_a_ep,
+        "alice@macbook",
+        &alice_home,
+        &alice_state,
+    );
+    pair_node_to_hub(
+        "hub-beta",
+        &hub_b_home,
+        &hub_b_state,
+        &hub_b_ep,
+        "alice@macbook",
+        &alice_home,
+        &alice_state,
+    );
+    pair_node_to_hub(
+        "hub-beta",
+        &hub_b_home,
+        &hub_b_state,
+        &hub_b_ep,
+        "bob@laptop",
+        &bob_home,
+        &bob_state,
+    );
+
+    // Process 3: Alice (`alice@macbook`) auto-connects BOTH hubs!
+    let mut alice_cmd = isolated_cmd(&alice_home);
+    alice_cmd
+        .args([
+            "daemon",
+            "--profile",
+            "local",
+            "--node-id",
+            "alice@macbook",
+            "--state-dir",
+            alice_state.to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::null());
+    let mut alice_proc = ManagedProcess::spawn("alice@macbook daemon", &mut alice_cmd);
+    let alice_startup = alice_proc.read_json_line(STARTUP_TIMEOUT);
+    assert_eq!(alice_startup["ok"], true, "alice startup: {alice_startup}");
+    let alice_connected: Vec<String> = alice_startup["data"]["connectedPeers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        alice_connected.contains(&"hub-alpha".to_string())
+            && alice_connected.contains(&"hub-beta".to_string()),
+        "Alice must auto-connect both hubs on boot: {alice_startup}"
+    );
+    let alice_sock = PathBuf::from(alice_startup["data"]["socketPath"].as_str().unwrap());
+
+    // Process 4: Bob (`bob@laptop`) auto-connects ONLY `hub-beta`!
+    let mut bob_cmd = isolated_cmd(&bob_home);
+    bob_cmd
+        .args([
+            "daemon",
+            "--profile",
+            "local",
+            "--node-id",
+            "bob@laptop",
+            "--state-dir",
+            bob_state.to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::null());
+    let mut bob_proc = ManagedProcess::spawn("bob@laptop daemon", &mut bob_cmd);
+    let bob_startup = bob_proc.read_json_line(STARTUP_TIMEOUT);
+    assert_eq!(bob_startup["ok"], true, "bob startup: {bob_startup}");
+    assert_eq!(bob_startup["data"]["connectedPeers"], json!(["hub-beta"]));
+    let bob_sock = PathBuf::from(bob_startup["data"]["socketPath"].as_str().unwrap());
+
+    let mut alice_mcp = McpSubprocess::spawn(&alice_home, &alice_sock);
+    let mut bob_mcp = McpSubprocess::spawn(&bob_home, &bob_sock);
+    alice_mcp.initialize(RPC_TIMEOUT);
+    bob_mcp.initialize(RPC_TIMEOUT);
+
+    // Bob joins `hub-beta` with an explicit role description!
+    let (b_join, b_err) = bob_mcp.call_verified_claude(
+        &bob_home,
+        &bob_sock,
+        "bob-s1",
+        "hyp_mesh",
+        json!({
+            "action": "join",
+            "handle": "bob",
+            "description": "Rust release engineer"
+        }),
+        RPC_TIMEOUT,
+    );
+    assert!(!b_err, "bob join failed: {b_join}");
+    let b_join_val: Value = serde_json::from_str(&b_join).unwrap();
+    assert_eq!(b_join_val["description"], "Rust release engineer");
+
+    let (a_join, a_err) = alice_mcp.call_verified_claude(
+        &alice_home,
+        &alice_sock,
+        "alice-s1",
+        "hyp_mesh",
+        json!({
+            "action": "join",
+            "handle": "alice",
+            "description": "Lead orchestrator"
+        }),
+        RPC_TIMEOUT,
+    );
+    assert!(!a_err, "alice join failed: {a_join}");
+
+    // Alice queries `hyp_mesh({ action: "peers" })` -> discovers Bob's description & `via: "hub-beta"`!
+    let (peers_txt, peers_err) = alice_mcp.call_verified_claude(
+        &alice_home,
+        &alice_sock,
+        "alice-s1",
+        "hyp_mesh",
+        json!({ "action": "peers" }),
+        RPC_TIMEOUT,
+    );
+    assert!(!peers_err, "alice peers failed: {peers_txt}");
+    let peers_val: Value = serde_json::from_str(&peers_txt).unwrap();
+    assert_eq!(peers_val["untrustedMetadata"], true);
+    assert!(
+        peers_val["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p == "bob@laptop/bob"),
+        "expected bob@laptop/bob in peers: {peers_val}"
+    );
+    let bob_detail = peers_val["peerDetails"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["address"] == "bob@laptop/bob")
+        .expect("bob@laptop/bob in peerDetails");
+    assert_eq!(bob_detail["nodeId"], "bob@laptop");
+    assert_eq!(bob_detail["handle"], "bob");
+    assert_eq!(bob_detail["description"], "Rust release engineer");
+    assert_eq!(bob_detail["via"], "hub-beta");
+
+    // Arm Bob's live `hyp wait` and send DM from Alice WITHOUT any `hub-beta!` prefix!
+    let dm_secret = "TWO_HUB_AUTO_ROUTE_E2EE_SECRET_44556677";
+    let mut bob_wait_cmd = isolated_cmd(&bob_home);
+    bob_wait_cmd
+        .args([
+            "wait",
+            "--session",
+            "claude:bob-s1",
+            "--socket",
+            bob_sock.to_str().unwrap(),
+            "--timeout",
+            "15",
+            "--json",
+        ])
+        .stdin(Stdio::null());
+    let mut bob_wait = ManagedProcess::spawn("bob hyp wait (multi-hub DM)", &mut bob_wait_cmd);
+    wait_for_session_live(&bob_sock, "claude:bob-s1", Duration::from_secs(5));
+
+    let (send_txt, send_err) = alice_mcp.call_verified_claude(
+        &alice_home,
+        &alice_sock,
+        "alice-s1",
+        "hyp_send",
+        json!({ "to": "bob@laptop/bob", "text": dm_secret }),
+        RPC_TIMEOUT,
+    );
+    assert!(!send_err, "alice auto-routed send failed: {send_txt}");
+    let send_val: Value = serde_json::from_str(&send_txt).unwrap();
+    assert_eq!(send_val["encrypted"], true, "DM must be E2EE: {send_val}");
+    assert_eq!(
+        send_val["routedVia"], "hub-beta",
+        "DM without hub prefix must auto-route via learned hub-beta route: {send_val}"
+    );
+
+    let (wait_status, wait_json) = bob_wait.wait_json_output(Duration::from_secs(15));
+    assert_eq!(wait_status.code(), Some(0));
+    assert_eq!(wait_json["ok"], true);
+    let items = wait_json["data"]["items"].as_array().unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|i| i["text"].as_str().unwrap_or_default().contains(dm_secret)),
+        "Bob's live hyp wait must receive decrypted E2EE DM: {wait_json}"
+    );
+
+    // Zero-knowledge verification on BOTH hubs (live + post-shutdown)!
+    let scan_both_hubs = |phase: &str| {
+        for (label, dir) in [("hub-alpha", &hub_a_state), ("hub-beta", &hub_b_state)] {
+            for fname in ["node.sqlite", "node.sqlite-wal", "node.sqlite-shm"] {
+                let p = dir.join(fname);
+                if p.exists() {
+                    let raw = fs::read(&p).expect("read hub sqlite");
+                    assert!(
+                        !bytes_contain(&raw, dm_secret.as_bytes()),
+                        "PLAINTEXT LEAK ({phase}) on {label}/{fname}!"
+                    );
+                }
+            }
+        }
+    };
+    scan_both_hubs("live");
+
+    assert_eq!(alice_mcp.close(Duration::from_secs(5)), Some(0));
+    assert_eq!(bob_mcp.close(Duration::from_secs(5)), Some(0));
+    let _ = alice_proc.shutdown_gracefully();
+    let _ = bob_proc.shutdown_gracefully();
+    let _ = hub_a_proc.shutdown_gracefully();
+    let _ = hub_b_proc.shutdown_gracefully();
+
+    scan_both_hubs("post-shutdown");
+}
+
+// ============================================================================
+// 7. `node.json` `plugins[]` Boot Wiring, Secret Resolution & Full Bridge
+//    Inbound/Outbound Roundtrip (Unix fd-3 SubprocessSupervisor)
+// ============================================================================
+
+#[cfg(unix)]
+#[test]
+fn node_json_plugins_boot_wiring_secret_resolution_and_bridge_roundtrip() {
+    struct CapturedCallback {
+        body: String,
+        signature: Option<String>,
+    }
+
+    struct MockCallbackReceiver {
+        addr: SocketAddr,
+        rx: mpsc::Receiver<CapturedCallback>,
+        shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        join: Option<thread::JoinHandle<()>>,
+    }
+
+    impl MockCallbackReceiver {
+        fn start() -> Self {
+            let (addr_tx, addr_rx) = mpsc::channel::<SocketAddr>();
+            let (cb_tx, cb_rx) = mpsc::channel::<CapturedCallback>();
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+            let join = thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("mock callback runtime");
+                rt.block_on(async move {
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let addr = listener.local_addr().unwrap();
+                    let _ = addr_tx.send(addr);
+
+                    loop {
+                        tokio::select! {
+                            _ = &mut shutdown_rx => break,
+                            accepted = listener.accept() => {
+                                let Ok((stream, _)) = accepted else { break };
+                                let tx = cb_tx.clone();
+                                tokio::spawn(async move {
+                                    let io = TokioIo::new(stream);
+                                    let svc = service_fn(move |req: Request<Incoming>| {
+                                        let tx_inner = tx.clone();
+                                        async move {
+                                            let sig = req
+                                                .headers()
+                                                .get("x-webhook-signature-256")
+                                                .and_then(|v| v.to_str().ok())
+                                                .map(ToOwned::to_owned);
+                                            let bytes = req
+                                                .into_body()
+                                                .collect()
+                                                .await
+                                                .map(|b| b.to_bytes())
+                                                .unwrap_or_default();
+                                            let _ = tx_inner.send(CapturedCallback {
+                                                body: String::from_utf8_lossy(&bytes).into_owned(),
+                                                signature: sig,
+                                            });
+                                            Ok::<_, hyper::Error>(
+                                                Response::builder()
+                                                    .status(StatusCode::OK)
+                                                    .header(header::CONTENT_TYPE, "application/json")
+                                                    .body(Full::new(Bytes::from(r#"{"ok":true}"#)))
+                                                    .unwrap(),
+                                            )
+                                        }
+                                    });
+                                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                                });
+                            }
+                        }
+                    }
+                });
+            });
+
+            let addr = addr_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("callback receiver bind");
+            Self {
+                addr,
+                rx: cb_rx,
+                shutdown_tx: Some(shutdown_tx),
+                join: Some(join),
+            }
+        }
+    }
+
+    impl Drop for MockCallbackReceiver {
+        fn drop(&mut self) {
+            if let Some(tx) = self.shutdown_tx.take() {
+                let _ = tx.send(());
+            }
+            if let Some(j) = self.join.take() {
+                let _ = j.join();
+            }
+        }
+    }
+
+    fn hmac_sha256_header(secret: &str, body: &[u8]) -> String {
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+        let tag = ring::hmac::sign(&key, body);
+        format!("sha256={}", hex::encode(tag.as_ref()))
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let webhook_script = repo_root.join("plugins").join("webhook").join("index.mjs");
+    assert!(
+        webhook_script.exists(),
+        "expected webhook plugin at {}",
+        webhook_script.display()
+    );
+
+    // Reserve an ephemeral loopback port for the webhook plugin HTTP listener.
+    let webhook_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+
+    let receiver = MockCallbackReceiver::start();
+    let webhook_secret = "whsec-test-plugin-boot-99112233";
+
+    // Negative fail-closed test: missing secret reference in `plugins[].env` MUST fail startup!
+    let bad_cfg_path = tmp.path().join("bad-node.json");
+    fs::write(
+        &bad_cfg_path,
+        serde_json::to_string_pretty(&json!({
+            "v": 2,
+            "nodeId": "bridge@box",
+            "profile": "local",
+            "stateDir": state_dir.to_str().unwrap(),
+            "plugins": [{
+                "id": "webhook",
+                "kind": "bridge",
+                "exec": "node",
+                "args": [webhook_script.to_str().unwrap()],
+                "targets": ["ops"],
+                "env": {
+                    "WEBHOOK_SECRET": { "secret": "missing-webhook-secret" }
+                }
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let bad_out = isolated_cmd(&home)
+        .args([
+            "daemon",
+            "--config",
+            bad_cfg_path.to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(bad_out.status.code(), Some(1));
+    let bad_json = parse_json_stdout(&bad_out);
+    assert_eq!(bad_json["ok"], false);
+    assert_eq!(bad_json["error"]["code"], "CONFIG_ERROR");
+    assert!(
+        bad_json["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("missing-webhook-secret"),
+        "expected missing secret reference in error: {bad_json}"
+    );
+
+    // Store real secret in `SecretStore` (file backend, 0600) and write valid `node.json`.
+    let secrets = SecretStore::new(&state_dir, SecretBackend::File);
+    secrets
+        .set("webhook-test-secret", webhook_secret)
+        .expect("store webhook-test-secret");
+
+    let node_json_path = state_dir.join("node.json");
+    fs::write(
+        &node_json_path,
+        serde_json::to_string_pretty(&json!({
+            "v": 2,
+            "nodeId": "bridge@box",
+            "profile": "local",
+            "stateDir": state_dir.to_str().unwrap(),
+            "plugins": [{
+                "id": "webhook",
+                "kind": "bridge",
+                "exec": "node",
+                "args": [webhook_script.to_str().unwrap()],
+                "targets": ["ops"],
+                "env": {
+                    "WEBHOOK_HOST": "127.0.0.1",
+                    "WEBHOOK_PORT": webhook_port.to_string(),
+                    "WEBHOOK_PATH": "/webhook",
+                    "WEBHOOK_TARGET": "ops",
+                    "WEBHOOK_SECRET": { "secret": "webhook-test-secret" },
+                    "WEBHOOK_POST_URL": format!("http://{}/callback", receiver.addr)
+                }
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Boot compiled `hyp daemon --config <node.json> --json`!
+    let mut daemon_cmd = isolated_cmd(&home);
+    daemon_cmd
+        .args([
+            "daemon",
+            "--config",
+            node_json_path.to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::null());
+    let mut daemon_proc = ManagedProcess::spawn("bridge@box daemon", &mut daemon_cmd);
+    let startup = daemon_proc.read_json_line(STARTUP_TIMEOUT);
+    assert_eq!(startup["ok"], true, "bridge daemon startup: {startup}");
+    assert!(
+        !startup.to_string().contains(webhook_secret),
+        "secret value MUST NEVER appear in daemon startup JSON"
+    );
+    let status_file_raw = fs::read_to_string(state_dir.join("node.status.json")).unwrap();
+    assert!(
+        !status_file_raw.contains(webhook_secret),
+        "secret value MUST NEVER appear in node.status.json"
+    );
+    assert_eq!(startup["data"]["plugins"][0]["id"], "webhook");
+    assert_eq!(startup["data"]["plugins"][0]["kind"], "bridge");
+    assert_eq!(startup["data"]["plugins"][0]["targets"], json!(["ops"]));
+    assert_eq!(startup["data"]["plugins"][0]["status"], "running");
+    let sock = PathBuf::from(startup["data"]["socketPath"].as_str().unwrap());
+
+    // Spawn real `hyp mcp` and verify `hyp_bridge` tool + unlinked configured target advertising!
+    let mut mcp = McpSubprocess::spawn(&home, &sock);
+    mcp.initialize(RPC_TIMEOUT);
+
+    let list_resp = mcp.rpc(
+        json!({ "jsonrpc": "2.0", "id": 900, "method": "tools/list", "params": {} }),
+        RPC_TIMEOUT,
+    );
+    let tool_names: Vec<String> = list_resp["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        tool_names.contains(&"hyp_bridge".to_string()),
+        "tools/list must include hyp_bridge when plugins[] bridge is booted: {tool_names:?}"
+    );
+
+    // Join two sessions: `primary` and `reader`.
+    for (sess, handle) in [("wh-primary", "primary"), ("wh-reader", "reader")] {
+        let (j_txt, j_err) = mcp.call_verified_claude(
+            &home,
+            &sock,
+            sess,
+            "hyp_mesh",
+            json!({ "action": "join", "handle": handle }),
+            RPC_TIMEOUT,
+        );
+        assert!(!j_err, "join {handle} failed: {j_txt}");
+    }
+
+    // BEFORE linking: `hyp_bridge({ action: "targets" })` immediately advertises `webhook:ops` (`configured: true`)!
+    let (pre_targets_txt, pre_targets_err) = mcp.call_verified_claude(
+        &home,
+        &sock,
+        "wh-primary",
+        "hyp_bridge",
+        json!({ "action": "targets" }),
+        RPC_TIMEOUT,
+    );
+    assert!(!pre_targets_err, "targets failed: {pre_targets_txt}");
+    let pre_targets: Value = serde_json::from_str(&pre_targets_txt).unwrap();
+    assert_eq!(pre_targets["plugins"], json!(["webhook"]));
+    assert_eq!(pre_targets["targets"][0]["plugin"], "webhook");
+    assert_eq!(pre_targets["targets"][0]["target"], "ops");
+    assert_eq!(pre_targets["targets"][0]["configured"], true);
+    assert_eq!(pre_targets["targets"][0]["readers"], json!([]));
+    assert!(pre_targets["targets"][0]["primarySession"].is_null());
+
+    // Claim primary (`handoff`) for `wh-primary`, and `link` (`reader`) for `wh-reader`!
+    let (ho_txt, ho_err) = mcp.call_verified_claude(
+        &home,
+        &sock,
+        "wh-primary",
+        "hyp_bridge",
+        json!({ "action": "handoff", "plugin": "webhook", "target": "ops" }),
+        RPC_TIMEOUT,
+    );
+    assert!(!ho_err, "primary handoff failed: {ho_txt}");
+
+    let (lk_txt, lk_err) = mcp.call_verified_claude(
+        &home,
+        &sock,
+        "wh-reader",
+        "hyp_bridge",
+        json!({ "action": "link", "plugin": "webhook", "target": "ops" }),
+        RPC_TIMEOUT,
+    );
+    assert!(!lk_err, "reader link failed: {lk_txt}");
+    assert_eq!(serde_json::from_str::<Value>(&lk_txt).unwrap()["role"], "reader");
+
+    // Arm BOTH live `hyp wait` subprocesses (`primary` + `reader`)!
+    let spawn_wait = |sess: &str| {
+        let mut cmd = isolated_cmd(&home);
+        cmd.args([
+            "wait",
+            "--session",
+            sess,
+            "--socket",
+            sock.to_str().unwrap(),
+            "--timeout",
+            "15",
+            "--json",
+        ])
+        .stdin(Stdio::null());
+        ManagedProcess::spawn(format!("hyp wait ({sess})"), &mut cmd)
+    };
+    let wait_primary = spawn_wait("claude:wh-primary");
+    let wait_reader = spawn_wait("claude:wh-reader");
+    wait_for_session_live(&sock, "claude:wh-primary", Duration::from_secs(5));
+    wait_for_session_live(&sock, "claude:wh-reader", Duration::from_secs(5));
+
+    // Deliver inbound HTTP POST to the real `plugins/webhook/index.mjs` process!
+    let webhook_url = format!("http://127.0.0.1:{webhook_port}/webhook");
+    let inbound_marker = "WEBHOOK_INBOUND_ROUNDTRIP_SENTINEL_9090";
+    let inbound_body = json!({
+        "id": "wh-delivery-1",
+        "from": "pagerduty",
+        "text": inbound_marker
+    })
+    .to_string();
+    let valid_sig = hmac_sha256_header(webhook_secret, inbound_body.as_bytes());
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+        // Wait for webhook plugin HTTP listener to accept connections (bounded retry).
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let bad_resp = loop {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(&webhook_url)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-webhook-signature-256", "sha256=deadbeef")
+                .body(Full::new(Bytes::from(inbound_body.clone())))
+                .unwrap();
+            match client.request(req).await {
+                Ok(r) => break r,
+                Err(_) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!("webhook plugin never became reachable at {webhook_url}: {e}"),
+            }
+        };
+        assert_eq!(
+            bad_resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "bad HMAC must fail closed 401 (proving WEBHOOK_SECRET was resolved from SecretStore)"
+        );
+
+        let good_req = Request::builder()
+            .method(Method::POST)
+            .uri(&webhook_url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-webhook-signature-256", &valid_sig)
+            .body(Full::new(Bytes::from(inbound_body.clone())))
+            .unwrap();
+        let good_resp = client.request(good_req).await.expect("signed webhook POST");
+        assert_eq!(good_resp.status(), StatusCode::ACCEPTED);
+    });
+
+    // BOTH `primary` and `reader` live `hyp wait` processes MUST wake with the inbound event!
+    for (label, mut waiter) in [("primary", wait_primary), ("reader", wait_reader)] {
+        let (st, out) = waiter.wait_json_output(Duration::from_secs(12));
+        assert_eq!(st.code(), Some(0), "{label} wait status: {out}");
+        assert_eq!(out["ok"], true);
+        let items = out["data"]["items"].as_array().unwrap();
+        assert!(
+            items
+                .iter()
+                .any(|i| i["text"].as_str().unwrap_or_default().contains(inbound_marker)),
+            "{label} must receive inbound webhook event: {out}"
+        );
+    }
+
+    // Outbound: `reader` MUST be rejected `not_target_holder`!
+    let (r_txt, r_err) = mcp.call_verified_claude(
+        &home,
+        &sock,
+        "wh-reader",
+        "hyp_send",
+        json!({ "to": "webhook:ops", "text": "unauthorized reader post" }),
+        RPC_TIMEOUT,
+    );
+    assert!(
+        r_err && r_txt.contains("not_target_holder"),
+        "reader outbound post must fail closed not_target_holder: {r_txt}"
+    );
+
+    // Outbound: Stage 1 Outbound DLP MUST block synthetic AWS secret (`AKIA...`)!
+    let (dlp_txt, dlp_err) = mcp.call_verified_claude(
+        &home,
+        &sock,
+        "wh-primary",
+        "hyp_send",
+        json!({ "to": "webhook:ops", "text": "leak AKIAIOSFODNN7EXAMPLE" }),
+        RPC_TIMEOUT,
+    );
+    assert!(
+        dlp_err && dlp_txt.contains("outbound_dlp_blocked"),
+        "Outbound DLP must block synthetic AWS secret before plugin post: {dlp_txt}"
+    );
+    assert!(
+        receiver.rx.try_recv().is_err(),
+        "no callback may reach receiver for rejected/DLP-blocked posts"
+    );
+
+    // Outbound: `primary` clean reply hits mock HTTP receiver with valid HMAC-SHA256!
+    let outbound_text = "Incident acknowledged by primary on-call agent";
+    let (ok_txt, ok_err) = mcp.call_verified_claude(
+        &home,
+        &sock,
+        "wh-primary",
+        "hyp_send",
+        json!({ "to": "webhook:ops", "text": outbound_text }),
+        RPC_TIMEOUT,
+    );
+    assert!(!ok_err, "primary outbound bridge post failed: {ok_txt}");
+    let ok_val: Value = serde_json::from_str(&ok_txt).unwrap();
+    assert_eq!(ok_val["delivered"], true);
+
+    let captured = receiver
+        .rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("receive outbound webhook callback");
+    let cb_json: Value = serde_json::from_str(&captured.body).expect("callback JSON");
+    assert_eq!(cb_json["target"], "ops");
+    assert_eq!(cb_json["text"], outbound_text);
+    let expected_cb_sig = hmac_sha256_header(webhook_secret, captured.body.as_bytes());
+    assert_eq!(
+        captured.signature.as_deref(),
+        Some(expected_cb_sig.as_str()),
+        "outbound webhook callback MUST carry valid HMAC-SHA256 signature"
+    );
+
+    // Clean daemon shutdown MUST terminate child plugin cleanly (no orphaned listener!).
+    assert_eq!(mcp.close(Duration::from_secs(5)), Some(0));
+    let _ = daemon_proc.shutdown_gracefully();
+
+    let close_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if std::net::TcpStream::connect(("127.0.0.1", webhook_port)).is_err() {
+            break;
+        }
+        assert!(
+            Instant::now() < close_deadline,
+            "child webhook plugin remained listening on port {webhook_port} after daemon shutdown (orphan leak!)"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+// ============================================================================
+// 8. v1 -> v2 SQLite Upgrade via Compiled `hyp doctor` Creates `0600` Backup,
+//    Preserves All v1 Data, and Blocks Newer-Schema Downgrades Fail-Closed
+// ============================================================================
+
+#[test]
+fn v1_to_v2_sqlite_upgrade_via_compiled_hyp_doctor_creates_backup() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("v1-home");
+    let state_dir = home.join(".config").join("hyphae");
+    fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("node.sqlite");
+
+    // 1. Seed a genuine v0.2.0 schema-v1 SQLite DB with sample peer, handle, and mailbox message.
+    {
+        let db = NodeDb::open(&db_path).expect("seed base sqlite");
+        let now = now_ms();
+        db.local().set_metadata("node_id", "v1@workstation").unwrap();
+        db.local()
+            .register_session("claude:v1-sess", r#"{"kind":"claude"}"#, now)
+            .unwrap();
+        db.local()
+            .set_session_handle("claude:v1-sess", Some("legacy-agent"), now)
+            .unwrap();
+        db.messages()
+            .register_handle("v1@workstation", "legacy-agent", Some("claude:v1-sess"), now)
+            .unwrap();
+        db.peers()
+            .upsert_peer(
+                &PeerInput {
+                    peer_id: "acme-team".to_string(),
+                    endpoint: Some("https://acme.example".to_string()),
+                    profile: PeerProfile::Router,
+                    trust_tier: TrustTier::Org,
+                    status: PeerStatus::Active,
+                    scopes: ScopePreset::Member.expand(),
+                    auth_credential_ref: None,
+                },
+                now,
+            )
+            .unwrap();
+        let peer_keys = NodeIdentityKeys::generate().unwrap();
+        let manifest_payload = hyp_proto::manifest::NodeManifestPayload {
+            v: 1,
+            node_id: hyp_proto::address::NodeId::new("acme-team").unwrap(),
+            profile: hyp_proto::manifest::NodeProfile::Router,
+            hyphae_version: "2.2.0".to_string(),
+            protocol_range: hyp_proto::manifest::ProtocolRange { min: 1, max: 2 },
+            manifest_version: 1,
+            issued_at: "2026-11-24T00:00:00Z".to_string(),
+            expires_at: "2027-11-24T00:00:00Z".to_string(),
+            audience: "v1@workstation".to_string(),
+            identity: hyp_proto::manifest::ManifestIdentity {
+                signing_jwk: hyp_proto::manifest::OkpJwk::new(
+                    hyp_proto::manifest::OkpCurve::Ed25519,
+                    &peer_keys.signing.public_key_bytes(),
+                ),
+                encryption_jwk: hyp_proto::manifest::OkpJwk::new(
+                    hyp_proto::manifest::OkpCurve::X25519,
+                    &peer_keys.encryption.public_key_bytes(),
+                ),
+                kid: peer_keys.kid(),
+                admin_jwk: None,
+            },
+            capabilities: vec![
+                hyp_proto::manifest::CapabilityToken::ManifestV1,
+                hyp_proto::manifest::CapabilityToken::DmV1,
+                hyp_proto::manifest::CapabilityToken::DmE2eeV1,
+                hyp_proto::manifest::CapabilityToken::ChannelV1,
+                hyp_proto::manifest::CapabilityToken::ChannelE2eeV1,
+                hyp_proto::manifest::CapabilityToken::EventsV1,
+                hyp_proto::manifest::CapabilityToken::SubPushdownV1,
+                hyp_proto::manifest::CapabilityToken::KvV1,
+                hyp_proto::manifest::CapabilityToken::KvE2eeV1,
+                hyp_proto::manifest::CapabilityToken::TransferStreamV2,
+            ],
+            policy: hyp_proto::manifest::ManifestPolicy {
+                require_pairing: true,
+                require_e2ee: true,
+                max_text_bytes: 32 * 1024,
+                max_transfer_bytes: 50 * 1024 * 1024,
+            },
+            advertised: hyp_proto::manifest::AdvertisedResources::default(),
+            escalation: None,
+        };
+        let caps: Vec<String> = manifest_payload
+            .capabilities
+            .iter()
+            .map(|c| c.as_str().to_string())
+            .collect();
+        db.peers()
+            .cache_manifest(
+                "acme-team",
+                &hyp_store::ManifestCacheUpdate {
+                    manifest_version: 1,
+                    manifest_json: serde_json::to_string(&manifest_payload).unwrap(),
+                    etag: None,
+                    capabilities: caps,
+                    accept_downgrade: false,
+                },
+                now,
+            )
+            .unwrap();
+        db.local()
+            .put_in_mailbox(
+                &hyp_store::MailboxInsert {
+                    session_id: "claude:v1-sess".to_string(),
+                    origin_node: "acme-team".to_string(),
+                    item_id: "v1-msg-001".to_string(),
+                    text: "PRESERVED_V1_MAILBOX_MESSAGE".to_string(),
+                    kind: hyp_store::MailboxKind::Message,
+                    source: "bob@laptop/bob".to_string(),
+                    gate_state: hyp_store::GateState::Pending,
+                    gate_reason: None,
+                    traceparent: None,
+                },
+                now,
+            )
+            .unwrap();
+
+        // Roll schema strictly back to frozen v0.2.0 schema v1 (`0001_initial_v2.sql` shape).
+        db.connection()
+            .execute_batch(
+                "DROP INDEX IF EXISTS peer_routes_via;
+                 DROP TABLE IF EXISTS peer_routes;
+                 ALTER TABLE handles DROP COLUMN description;
+                 DELETE FROM schema_version WHERE version > 1;
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .expect("downgrade seeded DB to exact v1 schema");
+        assert_eq!(db.schema_version().unwrap(), 1);
+    }
+    assert!(
+        !state_dir.join("backups").exists(),
+        "backups/ must not exist before v1->v2 migration"
+    );
+
+    // 2. Run compiled `hyp doctor --home <home> --json` -> upgrades v1 -> v2 & creates backup!
+    let doc_out = isolated_cmd(&home)
+        .args(["doctor", "--home", home.to_str().unwrap(), "--json"])
+        .output()
+        .expect("run hyp doctor --json");
+    assert_eq!(
+        doc_out.status.code(),
+        Some(0),
+        "doctor failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&doc_out.stdout),
+        String::from_utf8_lossy(&doc_out.stderr)
+    );
+    let doc_json = parse_json_stdout(&doc_out);
+    assert_eq!(doc_json["ok"], true, "doctor JSON: {doc_json}");
+
+    let storage = &doc_json["data"]["storage"];
+    assert_eq!(storage["schemaVersion"], 2, "storage report: {storage}");
+    assert_eq!(storage["supportedSchemaVersion"], 2);
+    assert_eq!(storage["appliedMigrations"], 2);
+    assert_eq!(storage["migrationBackups"]["count"], 1);
+    let latest_backup = storage["migrationBackups"]["latest"]
+        .as_str()
+        .expect("latest backup path");
+    let backup_path = Path::new(latest_backup);
+    assert!(
+        backup_path.exists(),
+        "backup file must exist on disk at {}",
+        backup_path.display()
+    );
+    let backup_name = backup_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    assert!(
+        backup_name.starts_with("node.sqlite.v1-to-v2-") && backup_name.ends_with(".bak"),
+        "unexpected backup filename: {backup_name}"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(backup_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "pre-migration backup must enforce strictly 0600 permissions, got {:o}",
+            mode
+        );
+    }
+
+    // Verify `store.sqlite` check line in JSON and TTY presentation.
+    let sqlite_check = doc_json["data"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "store.sqlite")
+        .expect("store.sqlite check");
+    assert_eq!(sqlite_check["status"], "ok");
+    let check_detail = sqlite_check["detail"].as_str().unwrap();
+    assert!(
+        check_detail.contains("node.sqlite schema v2")
+            && check_detail.contains("1 pre-migration backup in backups/"),
+        "unexpected store.sqlite check detail: {check_detail}"
+    );
+
+    let tty_out = isolated_cmd(&home)
+        .args(["doctor", "--home", home.to_str().unwrap()])
+        .output()
+        .expect("run hyp doctor TTY");
+    assert_eq!(tty_out.status.code(), Some(0));
+    let tty_stdout = String::from_utf8_lossy(&tty_out.stdout);
+    assert!(
+        tty_stdout.contains("node.sqlite schema v2 (1 pre-migration backup in backups/)"),
+        "TTY doctor output must display schema version and backup summary:\n{tty_stdout}"
+    );
+
+    // 3. Verify all seeded v1 data survived the v1 -> v2 upgrade intact!
+    {
+        let db = NodeDb::open(&db_path).expect("reopen upgraded v2 DB");
+        assert_eq!(db.schema_version().unwrap(), 2);
+        let peer = db
+            .peers()
+            .get_peer("acme-team")
+            .unwrap()
+            .expect("v1 peer preserved");
+        assert_eq!(peer.endpoint.as_deref(), Some("https://acme.example"));
+        let handles = db.messages().list_handles(Some("v1@workstation")).unwrap();
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].address, "v1@workstation/legacy-agent");
+        assert_eq!(handles[0].description, None);
+        let inbox = db.local().peek_inbox("claude:v1-sess", 10).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].text, "PRESERVED_V1_MAILBOX_MESSAGE");
+    }
+
+    // 4. Verify newer-schema downgrade protection surfaces a FAIL check + actionable next step!
+    let future_home = tmp.path().join("future-home");
+    let future_state = future_home.join(".config").join("hyphae");
+    fs::create_dir_all(&future_state).unwrap();
+    {
+        let db = NodeDb::open(future_state.join("node.sqlite")).unwrap();
+        db.connection()
+            .execute_batch(
+                "INSERT INTO schema_version (version, applied_at) VALUES (99, 1700000000000);",
+            )
+            .unwrap();
+    }
+    let future_out = isolated_cmd(&future_home)
+        .args(["doctor", "--home", future_home.to_str().unwrap(), "--json"])
+        .output()
+        .expect("run hyp doctor on future schema");
+    assert_eq!(future_out.status.code(), Some(1));
+    let future_json = parse_json_stdout(&future_out);
+    assert_eq!(future_json["ok"], false);
+    assert_eq!(future_json["error"]["code"], "SCHEMA_TOO_NEW");
+    let fail_check = future_json["data"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "store.sqlite")
+        .expect("store.sqlite FAIL check");
+    assert_eq!(fail_check["status"], "fail");
+    let fix_str = fail_check["fix"].as_str().unwrap_or_default();
+    assert!(
+        fix_str.contains("hyp update") && fix_str.contains("backups/"),
+        "downgrade FAIL check must include actionable hyp update / backups/ next step: {fail_check}"
+    );
+}
+
+// ============================================================================
+// 9. Zero-Flag Default-HOME E2E Regression (`hyp onboard` -> `hyp daemon` ->
+//    `hyp hook` -> `hyp mcp` -> `hyp wait`, ZERO `--socket` / `--state-dir`!)
+// ============================================================================
+
+#[test]
+fn zero_flag_default_home_onboard_daemon_mcp_hook_wait_roundtrip() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("default-home");
+    fs::create_dir_all(&home).unwrap();
+
+    // 1. `hyp onboard --json` with ZERO `--state-dir` / `--config` / `--home` flags
+    let onboard_out = isolated_cmd(&home)
+        .args(["onboard", "--json"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run hyp onboard --json");
+    assert_eq!(
+        onboard_out.status.code(),
+        Some(0),
+        "hyp onboard failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&onboard_out.stdout),
+        String::from_utf8_lossy(&onboard_out.stderr)
+    );
+    let onboard_json = parse_json_stdout(&onboard_out);
+    assert_eq!(onboard_json["ok"], true, "onboard JSON: {onboard_json}");
+    let expected_cfg_dir = home.join(".config").join("hyphae");
+    assert!(expected_cfg_dir.join("node.json").exists());
+    assert!(expected_cfg_dir.join("node.sqlite").exists());
+
+    // 2. Spawn `hyp daemon --json` with ZERO `--socket` / `--state-dir` / `--config` flags
+    let mut daemon_cmd = isolated_cmd(&home);
+    daemon_cmd.args(["daemon", "--json"]).stdin(Stdio::null());
+    let mut daemon_proc = ManagedProcess::spawn("zero-flag hyp daemon", &mut daemon_cmd);
+    let startup = daemon_proc.read_json_line(STARTUP_TIMEOUT);
+    assert_eq!(startup["ok"], true, "zero-flag daemon startup: {startup}");
+    let node_id = startup["data"]["nodeId"]
+        .as_str()
+        .expect("nodeId")
+        .to_string();
+    let expected_sock = expected_cfg_dir.join(hyp_harness::sock::DEFAULT_SOCKET_FILENAME);
+    let actual_sock = PathBuf::from(startup["data"]["socketPath"].as_str().unwrap());
+    assert_eq!(
+        actual_sock, expected_sock,
+        "hyp daemon default socket must live at ~/.config/hyphae/{}",
+        hyp_harness::sock::DEFAULT_SOCKET_FILENAME
+    );
+    assert!(actual_sock.exists(), "default daemon socket must exist");
+
+    // Helper: invoke `hyp hook claude <event>` with ZERO `--socket` flag!
+    let run_zero_flag_hook = |event: &str, payload: Value| -> Value {
+        let mut proc = isolated_cmd(&home)
+            .args(["hook", "claude", event])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn zero-flag hyp hook");
+        proc.stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let out = proc.wait_with_output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "zero-flag hyp hook claude {event} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        parse_json_stdout(&out)
+    };
+
+    // 3. `hyp hook claude session-start` (ZERO `--socket`)
+    for sess in ["zero-a", "zero-b"] {
+        let ss = run_zero_flag_hook("session-start", json!({ "session_id": sess }));
+        assert_eq!(ss, json!({}));
+    }
+
+    // 4. Spawn `hyp mcp` with ZERO socket argument!
+    let mut mcp_cmd = isolated_cmd(&home);
+    mcp_cmd.args(["mcp"]).stdin(Stdio::piped());
+    let mut mcp_proc = ManagedProcess::spawn("zero-flag hyp mcp", &mut mcp_cmd);
+    let mut mcp_stdin = mcp_proc.take_stdin().expect("mcp stdin");
+    let mut next_rpc_id = 0u64;
+
+    next_rpc_id += 1;
+    writeln!(
+        mcp_stdin,
+        "{}",
+        json!({
+            "jsonrpc": "2.0",
+            "id": next_rpc_id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "zero-flag-e2e", "version": "1" }
+            }
+        })
+    )
+    .expect("write mcp initialize");
+    mcp_stdin.flush().expect("flush mcp stdin");
+    let init_resp = mcp_proc.read_json_line(RPC_TIMEOUT);
+    assert_eq!(init_resp["result"]["protocolVersion"], "2025-06-18");
+    writeln!(
+        mcp_stdin,
+        "{}",
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })
+    )
+    .unwrap();
+    mcp_stdin.flush().unwrap();
+
+    // Helper: zero-flag `hyp hook claude pre-tool-use` + zero-flag `hyp mcp` `tools/call`!
+    let mut call_verified =
+        |session_raw: &str, tool_name: &str, arguments: Value| -> (String, bool) {
+            next_rpc_id += 1;
+            let id = next_rpc_id;
+            let call_id = format!("toolu_zero_{session_raw}_{id}");
+            let pre = run_zero_flag_hook(
+                "pre-tool-use",
+                json!({
+                    "session_id": session_raw,
+                    "tool_use_id": call_id,
+                    "tool_name": format!("mcp__hyphae__{tool_name}"),
+                    "tool_input": arguments
+                }),
+            );
+            assert_eq!(pre, json!({}));
+            writeln!(
+                mcp_stdin,
+                "{}",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "tools/call",
+                    "params": {
+                        "name": tool_name,
+                        "arguments": arguments,
+                        "_meta": { "claudecode/toolUseId": call_id }
+                    }
+                })
+            )
+            .expect("write mcp tools/call");
+            mcp_stdin.flush().expect("flush mcp stdin");
+            let resp = mcp_proc.read_json_line(RPC_TIMEOUT);
+            let result = &resp["result"];
+            let text = result["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let is_error = result["isError"].as_bool() == Some(true);
+            (text, is_error)
+        };
+
+    // Join `alpha` and `beta` via zero-flag `hyp mcp` + zero-flag `hyp hook`!
+    let (ja_txt, ja_err) = call_verified(
+        "zero-a",
+        "hyp_mesh",
+        json!({ "action": "join", "handle": "alpha", "description": "Zero-flag sender" }),
+    );
+    assert!(!ja_err, "zero-flag join alpha failed: {ja_txt}");
+    assert!(ja_txt.contains(&format!("{node_id}/alpha")), "{ja_txt}");
+
+    let (jb_txt, jb_err) = call_verified(
+        "zero-b",
+        "hyp_mesh",
+        json!({ "action": "join", "handle": "beta", "description": "Zero-flag receiver" }),
+    );
+    assert!(!jb_err, "zero-flag join beta failed: {jb_txt}");
+    assert!(jb_txt.contains(&format!("{node_id}/beta")), "{jb_txt}");
+
+    // 5. Send DM #1 (`alpha` -> `beta`) and drain via zero-flag `hyp hook claude post-tool-use`!
+    let dm1 = "ZERO_FLAG_HOOK_DELIVERY_SENTINEL_111";
+    let (s1_txt, s1_err) = call_verified(
+        "zero-a",
+        "hyp_send",
+        json!({ "to": format!("{node_id}/beta"), "text": dm1 }),
+    );
+    assert!(!s1_err, "zero-flag hyp_send #1 failed: {s1_txt}");
+
+    let post_out = run_zero_flag_hook(
+        "post-tool-use",
+        json!({
+            "session_id": "zero-b",
+            "tool_name": "Bash",
+            "tool_use_id": "tu-zero-drain-1"
+        }),
+    );
+    let drained_ctx = post_out["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        drained_ctx.contains(dm1),
+        "zero-flag post-tool-use must drain DM #1 from default daemon socket: {post_out}"
+    );
+
+    // 6. Spawn `hyp wait` with ZERO `--socket` flag and wake it via DM #2!
+    let dm2 = "ZERO_FLAG_WAIT_WAKEUP_SENTINEL_222";
+    let mut wait_cmd = isolated_cmd(&home);
+    wait_cmd
+        .args(["wait", "--session", "claude:zero-b", "--timeout", "15", "--json"])
+        .stdin(Stdio::null());
+    let mut wait_proc = ManagedProcess::spawn("zero-flag hyp wait", &mut wait_cmd);
+    wait_for_session_live(&actual_sock, "claude:zero-b", Duration::from_secs(5));
+
+    let (s2_txt, s2_err) = call_verified(
+        "zero-a",
+        "hyp_send",
+        json!({ "to": format!("{node_id}/beta"), "text": dm2 }),
+    );
+    assert!(!s2_err, "zero-flag hyp_send #2 failed: {s2_txt}");
+
+    let (wait_status, wait_json) = wait_proc.wait_json_output(Duration::from_secs(12));
+    assert_eq!(wait_status.code(), Some(0));
+    assert_eq!(wait_json["ok"], true, "zero-flag hyp wait JSON: {wait_json}");
+    let wait_items = wait_json["data"]["items"].as_array().unwrap();
+    assert!(
+        wait_items
+            .iter()
+            .any(|i| i["text"].as_str().unwrap_or_default().contains(dm2)),
+        "zero-flag hyp wait must receive DM #2 from default daemon socket: {wait_json}"
+    );
+
+    drop(mcp_stdin);
+    assert_eq!(
+        mcp_proc.wait_timeout(Duration::from_secs(5)).and_then(|s| s.code()),
+        Some(0)
+    );
+    let _ = daemon_proc.shutdown_gracefully();
+}

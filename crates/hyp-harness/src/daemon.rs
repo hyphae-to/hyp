@@ -184,6 +184,8 @@ struct LocalDaemonInner {
     dismissed_receipts: Mutex<HashSet<String>>,
     /// Registered pluggable outbound bridge handlers keyed by lowercase plugin slug.
     bridge_posters: Mutex<HashMap<String, Arc<dyn BridgePoster>>>,
+    /// Configured targets per bridge plugin (advertised even before any session links).
+    configured_bridge_targets: Mutex<BTreeMap<String, Vec<String>>>,
     next_id: AtomicU64,
 }
 
@@ -386,8 +388,137 @@ impl LocalDaemon {
         }
     }
 
+    /// Registers a pluggable outbound [`BridgePoster`] together with its configured target list.
+    ///
+    /// Configured targets are immediately advertised by `hyp_bridge({ action: "targets" })` even
+    /// before any session links or claims primary ownership, so agents can discover targets like
+    /// `telegram:123456789` on boot.
+    pub fn register_bridge_poster_with_targets(
+        &self,
+        plugin: impl Into<String>,
+        targets: Vec<String>,
+        poster: Arc<dyn BridgePoster>,
+    ) {
+        let key = plugin.into().trim().to_ascii_lowercase();
+        if key.is_empty() {
+            return;
+        }
+        let mut clean_targets = Vec::new();
+        for raw in targets {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() && !clean_targets.iter().any(|t: &String| t == trimmed) {
+                clean_targets.push(trimmed.to_string());
+            }
+        }
+        self.inner
+            .bridge_posters
+            .lock()
+            .expect("bridge_posters lock poisoned")
+            .insert(key.clone(), poster);
+        let mut cfg_targets = self
+            .inner
+            .configured_bridge_targets
+            .lock()
+            .expect("configured_bridge_targets lock poisoned");
+        if clean_targets.is_empty() {
+            cfg_targets.remove(&key);
+        } else {
+            cfg_targets.insert(key, clean_targets);
+        }
+    }
+
+    /// Fans out an inbound external chat/webhook bridge message to all sessions linked to
+    /// `(plugin, target)` (plus any wildcard `(plugin, "*")` links).
+    ///
+    /// Every delivery runs through [`LocalDaemon::ingest_inbound`] (`GateTrustTier::Bridge`,
+    /// `MailboxKind::Plugin`, `source = "{plugin}:{target}"`) so Local Security Gates and
+    /// §2.5 Delivery Policy apply consistently and wake live sessions immediately.
+    ///
+    /// Returns the number of linked sessions for which ingestion was accepted.
+    pub async fn deliver_bridge_inbound(
+        &self,
+        plugin: &str,
+        target: &str,
+        item_id: &str,
+        text: &str,
+    ) -> Result<usize, String> {
+        let plugin_key = plugin.trim().to_ascii_lowercase();
+        let target_trimmed = target.trim();
+        if plugin_key.is_empty() || target_trimmed.is_empty() {
+            return Err("plugin and target must be non-empty".to_string());
+        }
+
+        let session_ids: Vec<String> = {
+            let db = self.inner.node.db();
+            let mut seen = HashSet::new();
+            let mut out = Vec::new();
+            for link in db
+                .local()
+                .bridge_links(&plugin_key, target_trimmed)
+                .map_err(|e| e.to_string())?
+            {
+                if seen.insert(link.session_id.clone()) {
+                    out.push(link.session_id);
+                }
+            }
+            if target_trimmed != "*" {
+                for link in db
+                    .local()
+                    .bridge_links(&plugin_key, "*")
+                    .map_err(|e| e.to_string())?
+                {
+                    if seen.insert(link.session_id.clone()) {
+                        out.push(link.session_id);
+                    }
+                }
+            }
+            out
+        };
+
+        let origin_node = format!("bridge:{plugin_key}");
+        let source = format!("{plugin_key}:{target_trimmed}");
+        let effective_item_id = if item_id.trim().is_empty() {
+            uuid_v4()
+        } else {
+            item_id.trim().to_string()
+        };
+
+        let mut delivered = 0usize;
+        let mut last_err: Option<String> = None;
+        for session_id in session_ids {
+            match self
+                .ingest_inbound(InboundItem {
+                    session_id,
+                    origin_node: origin_node.clone(),
+                    item_id: effective_item_id.clone(),
+                    source: source.clone(),
+                    text: text.to_string(),
+                    kind: MailboxKind::Plugin,
+                    trust_tier: GateTrustTier::Bridge,
+                })
+                .await
+            {
+                Ok(Some(_)) => delivered += 1,
+                Ok(None) => {}
+                Err(e) => last_err = Some(e),
+            }
+        }
+
+        if delivered == 0 {
+            if let Some(err) = last_err {
+                return Err(err);
+            }
+        }
+        Ok(delivered)
+    }
+
     /// Gracefully stops the daemon listener, background watcher, and removes the local socket/addr file.
     pub async fn stop(self) {
+        self.stop_sync();
+    }
+
+    /// Stops the daemon listener and background tasks via shared reference (useful when wrapped in `Arc`).
+    pub fn shutdown(&self) {
         self.stop_sync();
     }
 
@@ -650,6 +781,7 @@ impl LocalDaemonInner {
             sub_meta: Mutex::new(HashMap::new()),
             dismissed_receipts: Mutex::new(HashSet::new()),
             bridge_posters: Mutex::new(HashMap::new()),
+            configured_bridge_targets: Mutex::new(BTreeMap::new()),
             next_id: AtomicU64::new(1),
         }
     }
@@ -660,6 +792,11 @@ impl LocalDaemonInner {
                 .bridge_posters
                 .lock()
                 .expect("bridge_posters lock poisoned")
+                .is_empty()
+            || !self
+                .configured_bridge_targets
+                .lock()
+                .expect("configured_bridge_targets lock poisoned")
                 .is_empty()
     }
 
@@ -1361,9 +1498,10 @@ impl LocalDaemonInner {
             .get("handle")
             .and_then(Value::as_str)
             .ok_or_else(|| ("invalid_request".into(), "Expected handle".into()))?;
+        let description = args.get("description").and_then(Value::as_str);
         let rec = self
             .node
-            .register_handle(session_id, handle)
+            .register_handle_with_description(session_id, handle, description)
             .await
             .map_err(node_err_tuple)?;
 
@@ -1379,6 +1517,9 @@ impl LocalDaemonInner {
         out.insert("address".into(), json!(rec.address));
         out.insert("nodeId".into(), json!(self.node.node_id().as_str()));
         out.insert("handle".into(), json!(rec.handle));
+        if let Some(ref desc) = rec.description {
+            out.insert("description".into(), json!(desc));
+        }
         out.insert("deliveryMode".into(), json!(policy.default_mode.as_str()));
         out.insert("focusMode".into(), json!(policy.focus_mode));
         out.insert("unread".into(), json!(unread));
@@ -1391,6 +1532,12 @@ impl LocalDaemonInner {
                         if let Ok(v) = self.tool_peers(session_id).await {
                             if let Some(p) = v.get("peers") {
                                 out.insert("peers".into(), p.clone());
+                            }
+                            if let Some(pd) = v.get("peerDetails") {
+                                out.insert("peerDetails".into(), pd.clone());
+                            }
+                            if let Some(um) = v.get("untrustedMetadata") {
+                                out.insert("untrustedMetadata".into(), um.clone());
                             }
                         }
                     }
@@ -1452,49 +1599,39 @@ impl LocalDaemonInner {
     }
 
     async fn tool_peers(&self, session_id: &str) -> Result<Value, (String, String)> {
-        let (self_addr, local_handles, peer_ids) = {
+        let self_addr = {
             let db = self.node.db();
-            let handle = db
-                .local()
+            db.local()
                 .get_session(session_id)
                 .ok()
                 .flatten()
-                .and_then(|s| s.handle);
-            let self_addr = handle.map(|h| format_address(self.node.node_id().as_str(), &h));
-            let local_handles: Vec<String> = db
-                .messages()
-                .list_handles(Some(self.node.node_id().as_str()))
-                .unwrap_or_default()
-                .into_iter()
-                .map(|h| h.address)
-                .collect();
-            let peer_ids: Vec<String> = db
-                .peers()
-                .list_peers(None)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|p| p.status == hyp_store::PeerStatus::Active)
-                .map(|p| p.peer_id)
-                .collect();
-            (self_addr, local_handles, peer_ids)
+                .and_then(|s| s.handle)
+                .map(|h| format_address(self.node.node_id().as_str(), &h))
         };
 
-        let mut peers: Vec<String> = local_handles;
-        for pid in peer_ids {
-            if let Some(link) = self.node.peer_link(&pid).await {
-                if let Ok(resp) = link.get_handles(None).await {
-                    for h in resp.handles {
-                        if !peers.contains(&h.address) {
-                            peers.push(h.address);
-                        }
-                    }
-                }
+        let discovered = self.node.discover_peer_handles().await;
+        let mut peers: Vec<String> = Vec::with_capacity(discovered.len());
+        let mut peer_details: Vec<Value> = Vec::with_capacity(discovered.len());
+        for d in discovered {
+            peers.push(d.address.clone());
+            let mut obj = Map::new();
+            obj.insert("address".into(), json!(d.address));
+            obj.insert("nodeId".into(), json!(d.node_id));
+            obj.insert("handle".into(), json!(d.handle));
+            if let Some(desc) = d.description.filter(|s| !s.is_empty()) {
+                obj.insert("description".into(), json!(desc));
             }
+            if let Some(via) = d.via.filter(|s| !s.is_empty()) {
+                obj.insert("via".into(), json!(via));
+            }
+            peer_details.push(Value::Object(obj));
         }
-        peers.sort();
+
         Ok(json!({
             "self": self_addr,
             "peers": peers,
+            "peerDetails": peer_details,
+            "untrustedMetadata": true,
         }))
     }
 
@@ -2433,6 +2570,12 @@ impl LocalDaemonInner {
     }
 
     async fn tool_bridge_targets(&self, session_id: &str) -> Result<Value, (String, String)> {
+        let configured_snapshot: BTreeMap<String, Vec<String>> = self
+            .configured_bridge_targets
+            .lock()
+            .expect("configured_bridge_targets lock poisoned")
+            .clone();
+
         let mut plugins: Vec<String> = self
             .bridge_posters
             .lock()
@@ -2440,6 +2583,11 @@ impl LocalDaemonInner {
             .keys()
             .cloned()
             .collect();
+        for plugin in configured_snapshot.keys() {
+            if !plugins.contains(plugin) {
+                plugins.push(plugin.clone());
+            }
+        }
         plugins.sort();
 
         let (links, targets) = {
@@ -2455,7 +2603,15 @@ impl LocalDaemonInner {
                 .map(|s| (s.id.clone(), s.handle.clone()))
                 .collect();
 
+            let mut configured_set: HashSet<(String, String)> = HashSet::new();
             let mut target_pairs: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+            for (plugin, targets_for_plugin) in &configured_snapshot {
+                for target in targets_for_plugin {
+                    let pair = (plugin.clone(), target.clone());
+                    configured_set.insert(pair.clone());
+                    target_pairs.entry(pair).or_default();
+                }
+            }
             for s in &sessions {
                 for l in db
                     .local()
@@ -2480,12 +2636,18 @@ impl LocalDaemonInner {
                     .as_deref()
                     .and_then(|sid| handle_by_session.get(sid).cloned().flatten());
                 let is_primary = primary_session.as_deref() == Some(session_id);
+                let is_linked = readers.iter().any(|r| r == session_id);
+                let is_configured = configured_set.contains(&(plugin.clone(), target.clone()));
                 target_views.push(json!({
                     "plugin": plugin,
                     "target": target,
+                    "configured": is_configured,
                     "primarySessionId": primary_session,
+                    "primarySession": primary_session,
                     "primaryHandle": primary_handle,
                     "isPrimary": is_primary,
+                    "callerIsPrimary": is_primary,
+                    "callerIsLinked": is_linked,
                     "readers": readers,
                 }));
             }
