@@ -1,101 +1,197 @@
-//! End-to-end CLI binary tests for `hyp-rs` (`version`, `hook`, `mcp`, `wait`, `watch`).
+//! 100% Pure-Rust end-to-end CLI binary tests for `hyp-rs` (`daemon`, `node start`, `version`,
+//! `hook`, `mcp`, `wait`, `watch`, `status`) — ZERO Node.js!
+//!
+//! Strict isolation invariant: every test runs against ephemeral `tempfile::TempDir`,
+//! `HYPHAE_SECRET_BACKEND=file`, isolated `HOME`/`XDG_CONFIG_HOME`, and loopback `127.0.0.1:0`.
 
 use serde_json::{Value, json};
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
 fn hyp_rs_bin() -> &'static str {
     env!("CARGO_BIN_EXE_hyp-rs")
 }
 
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf()
+fn isolated_cmd(base_dir: &Path) -> Command {
+    let mut cmd = Command::new(hyp_rs_bin());
+    cmd.env("HYPHAE_SECRET_BACKEND", "file")
+        .env("HOME", base_dir)
+        .env("USERPROFILE", base_dir)
+        .env("XDG_CONFIG_HOME", base_dir.join("xdg"))
+        .env_remove("HYPHAE_CONFIG")
+        .env_remove("HYPHAE_STATE_DIR")
+        .env_remove("HYPHAE_CONFIG_DIR")
+        .env_remove("HYPHAE_SOCKET");
+    cmd
 }
 
-struct LiveTsDaemon {
-    _tmp: tempfile::TempDir,
-    child: Child,
-    socket_path: PathBuf,
+struct NativeRustDaemon {
+    tmp: tempfile::TempDir,
+    state_dir: PathBuf,
+    child: Option<Child>,
+    socket_path: Option<PathBuf>,
+    startup_envelope: Value,
 }
 
-impl Drop for LiveTsDaemon {
-    fn drop(&mut self) {
-        let _ = self.child.stdin.take();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+impl NativeRustDaemon {
+    fn shutdown_gracefully(&mut self) -> Option<i32> {
+        let mut child = self.child.take()?;
+        #[cfg(unix)]
+        {
+            let pid = child.id().to_string();
+            let _ = Command::new("kill").args(["-TERM", &pid]).status();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if let Ok(Some(status)) = child.try_wait() {
+                    return status.code();
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+        let _ = child.kill();
+        child.wait().ok().and_then(|s| s.code())
     }
 }
 
-fn start_live_ts_daemon() -> LiveTsDaemon {
+impl Drop for NativeRustDaemon {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            #[cfg(unix)]
+            {
+                let pid = child.id().to_string();
+                let _ = Command::new("kill").args(["-TERM", &pid]).status();
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while std::time::Instant::now() < deadline {
+                    if let Ok(Some(_)) = child.try_wait() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn start_native_rust_daemon_with_args(extra_args: &[&str]) -> NativeRustDaemon {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let root = repo_root();
-    let dir_str = tmp.path().to_str().unwrap();
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
 
-    let bootstrap_js = r#"
-import { mkdirSync } from "node:fs";
-import { join } from "node:path";
-import { RouterCore } from "./src/core/router/core.ts";
-import { serveRouter } from "./src/core/router/server.ts";
-import { startDaemon } from "./src/daemon.ts";
+    let mut cmd = isolated_cmd(tmp.path());
+    cmd.args([
+        "daemon",
+        "--profile",
+        "local",
+        "--node-id",
+        "cli@local",
+        "--state-dir",
+        state_dir.to_str().unwrap(),
+        "--json",
+    ])
+    .args(extra_args)
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
 
-const dir = process.env.HYPHAE_TEST_DIR;
-const routerCore = new RouterCore({ dbPath: join(dir, "router.sqlite") });
-const token = routerCore.addConnector("cli@local");
-const router = await serveRouter({ core: routerCore, host: "127.0.0.1", port: 0 });
-const stateDir = join(dir, "state");
-mkdirSync(stateDir, { mode: 0o700, recursive: true });
-const daemon = await startDaemon({
-  connectorId: "cli@local",
-  directory: stateDir,
-  routers: [{ name: "primary", url: router.url, token }],
-}, { quiet: true });
+    let mut child = cmd.spawn().expect("spawn native Rust hyp-rs daemon");
+    let stdout = child.stdout.take().expect("daemon stdout");
+    let mut line = String::new();
+    BufReader::new(stdout)
+        .read_line(&mut line)
+        .expect("read startup JSON envelope line from native Rust daemon");
 
-process.stdout.write(JSON.stringify({ socketPath: daemon.socketPath }) + "\n");
+    let startup_envelope: Value = match serde_json::from_str(line.trim()) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let stderr = child
+                .stderr
+                .take()
+                .and_then(|mut s| {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut s, &mut buf).ok()?;
+                    Some(buf)
+                })
+                .unwrap_or_default();
+            panic!("invalid startup JSON envelope ({e}): line={line:?}, stderr={stderr}");
+        }
+    };
+    assert_eq!(startup_envelope["ok"], true, "startup failed: {startup_envelope}");
+    assert_eq!(startup_envelope["command"], "node start");
 
-const shutdown = async () => {
-  try { await daemon.stop(); } catch {}
-  try { await router.close(); } catch {}
-  try { routerCore.close(); } catch {}
-  process.exit(0);
-};
-process.stdin.resume();
-process.stdin.on("end", () => { void shutdown(); });
-process.on("SIGTERM", () => { void shutdown(); });
-"#;
+    let socket_path = startup_envelope["data"]["socketPath"]
+        .as_str()
+        .map(PathBuf::from);
 
-    let mut child = Command::new("node")
-        .arg("--experimental-strip-types")
-        .arg("--input-type=module")
-        .arg("-e")
-        .arg(bootstrap_js)
-        .current_dir(&root)
-        .env("HYPHAE_TEST_DIR", dir_str)
-        .env("HYPHAE_SECRET_BACKEND", "file")
-        .env("HOME", dir_str)
-        .env("XDG_CONFIG_HOME", tmp.path().join("xdg"))
+    NativeRustDaemon {
+        tmp,
+        state_dir,
+        child: Some(child),
+        socket_path,
+        startup_envelope,
+    }
+}
+
+fn start_native_rust_daemon() -> NativeRustDaemon {
+    start_native_rust_daemon_with_args(&[])
+}
+
+fn run_claude_pre_tool_use_hook(
+    base_dir: &Path,
+    sock_str: &str,
+    session_id: &str,
+    tool_use_id: &str,
+    tool_name: &str,
+    tool_input: Value,
+) {
+    let mut hook_proc = isolated_cmd(base_dir)
+        .args(["hook", "claude", "pre-tool-use", "--socket", sock_str])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn TS daemon");
+        .expect("spawn hyp-rs hook");
+    hook_proc
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            json!({
+                "session_id": session_id,
+                "tool_use_id": tool_use_id,
+                "tool_name": format!("mcp__hyphae__{tool_name}"),
+                "tool_input": tool_input
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+    let out = hook_proc.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "hook stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
 
-    let stdout = child.stdout.take().expect("stdout");
+fn mcp_rpc(
+    mcp_in: &mut std::process::ChildStdin,
+    mcp_out: &mut BufReader<std::process::ChildStdout>,
+    msg: Value,
+) -> Value {
+    writeln!(mcp_in, "{msg}").unwrap();
+    mcp_in.flush().unwrap();
     let mut line = String::new();
-    BufReader::new(stdout).read_line(&mut line).unwrap();
-    let ready: Value = serde_json::from_str(line.trim()).expect("valid ready JSON");
-    let socket_path = PathBuf::from(ready["socketPath"].as_str().unwrap());
-
-    LiveTsDaemon {
-        _tmp: tmp,
-        child,
-        socket_path,
-    }
+    mcp_out.read_line(&mut line).unwrap();
+    serde_json::from_str(line.trim())
+        .unwrap_or_else(|e| panic!("invalid JSON-RPC response ({e}): line={line:?}"))
 }
 
 #[test]
@@ -184,12 +280,45 @@ fn hook_fast_path_fails_safe_and_validates_usage() {
 }
 
 #[test]
-fn cli_subprocesses_mcp_hook_and_wait_interop_against_live_ts_daemon() {
-    let daemon = start_live_ts_daemon();
-    let sock_str = daemon.socket_path.to_str().unwrap();
+fn cli_subprocesses_mcp_hook_and_wait_interop() {
+    let mut daemon = start_native_rust_daemon();
+    let socket_path = daemon
+        .socket_path
+        .clone()
+        .expect("local profile must start LocalDaemon and report socketPath");
+    assert!(
+        socket_path.exists(),
+        "local daemon socket must exist at {}",
+        socket_path.display()
+    );
+    let sock_str = socket_path.to_str().unwrap();
+
+    // Verify `node.status.json` and `hyp-rs status --json` expose `socketPath`.
+    let status_file: Value = serde_json::from_str(
+        &fs::read_to_string(daemon.state_dir.join("node.status.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status_file["socketPath"], sock_str);
+    assert_eq!(daemon.startup_envelope["data"]["socketPath"], sock_str);
+
+    let status_out = isolated_cmd(daemon.tmp.path())
+        .args([
+            "status",
+            "--state-dir",
+            daemon.state_dir.to_str().unwrap(),
+            "--home",
+            daemon.tmp.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(status_out.status.code(), Some(0));
+    let status_json: Value = serde_json::from_slice(&status_out.stdout).unwrap();
+    assert_eq!(status_json["ok"], true);
+    assert_eq!(status_json["data"]["node"]["socketPath"], sock_str);
 
     // 1. Spawn `hyp-rs mcp <socket>` subprocess
-    let mut mcp = Command::new(hyp_rs_bin())
+    let mut mcp = isolated_cmd(daemon.tmp.path())
         .args(["mcp", sock_str])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -200,19 +329,7 @@ fn cli_subprocesses_mcp_hook_and_wait_interop_against_live_ts_daemon() {
     let mut mcp_in = mcp.stdin.take().unwrap();
     let mut mcp_out = BufReader::new(mcp.stdout.take().unwrap());
 
-    fn rpc(
-        mcp_in: &mut std::process::ChildStdin,
-        mcp_out: &mut BufReader<std::process::ChildStdout>,
-        msg: Value,
-    ) -> Value {
-        writeln!(mcp_in, "{msg}").unwrap();
-        mcp_in.flush().unwrap();
-        let mut line = String::new();
-        mcp_out.read_line(&mut line).unwrap();
-        serde_json::from_str(line.trim()).expect("valid JSON-RPC response")
-    }
-
-    let init = rpc(
+    let init = mcp_rpc(
         &mut mcp_in,
         &mut mcp_out,
         json!({
@@ -232,7 +349,7 @@ fn cli_subprocesses_mcp_hook_and_wait_interop_against_live_ts_daemon() {
     mcp_in.flush().unwrap();
 
     // Verify `tools/list` returns exactly the 4 core tools
-    let list = rpc(
+    let list = mcp_rpc(
         &mut mcp_in,
         &mut mcp_out,
         json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
@@ -245,31 +362,8 @@ fn cli_subprocesses_mcp_hook_and_wait_interop_against_live_ts_daemon() {
         .collect();
     assert_eq!(names, vec!["hyp_send", "hyp_inbox", "hyp_mesh", "hyp_stream"]);
 
-    // 2. Run real `hyp-rs hook claude pre-tool-use` binary to register a join call
-    let mut hook_proc = Command::new(hyp_rs_bin())
-        .args(["hook", "claude", "pre-tool-use", "--socket", sock_str])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    hook_proc
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(
-            json!({
-                "session_id": "cli-s1",
-                "tool_use_id": "toolu_cli_1",
-                "tool_name": "mcp__hyphae__hyp_mesh",
-                "tool_input": {"action": "join", "handle": "alice"}
-            })
-            .to_string()
-            .as_bytes(),
-        )
-        .unwrap();
-    assert_eq!(hook_proc.wait().unwrap().code(), Some(0));
-
-    let joined = rpc(
+    // Verify unverified tool call fails closed with `caller_unverifiable`
+    let unverified = mcp_rpc(
         &mut mcp_in,
         &mut mcp_out,
         json!({
@@ -278,21 +372,52 @@ fn cli_subprocesses_mcp_hook_and_wait_interop_against_live_ts_daemon() {
             "method": "tools/call",
             "params": {
                 "name": "hyp_mesh",
+                "arguments": {"action": "join", "handle": "spoof"}
+            }
+        }),
+    );
+    assert_eq!(unverified["result"]["isError"], true);
+    assert!(
+        unverified["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("caller_unverifiable")
+    );
+
+    // 2. Run real `hyp-rs hook claude pre-tool-use` binary to register Alice's join call
+    run_claude_pre_tool_use_hook(
+        daemon.tmp.path(),
+        sock_str,
+        "cli-s1",
+        "toolu_cli_1",
+        "hyp_mesh",
+        json!({"action": "join", "handle": "alice"}),
+    );
+
+    let joined_alice = mcp_rpc(
+        &mut mcp_in,
+        &mut mcp_out,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "hyp_mesh",
                 "arguments": {"action": "join", "handle": "alice"},
                 "_meta": {"claudecode/toolUseId": "toolu_cli_1"}
             }
         }),
     );
-    assert!(joined["result"].get("isError").is_none());
+    assert!(joined_alice["result"].get("isError").is_none());
     assert!(
-        joined["result"]["content"][0]["text"]
+        joined_alice["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
             .contains("cli@local/alice")
     );
 
-    // 3. Run real `hyp-rs wait --session claude:cli-s1 --timeout 0.1` binary -> exits 0 cleanly on timeout
-    let wait_timeout = Command::new(hyp_rs_bin())
+    // 3. Run real `hyp-rs wait --session claude:cli-s1 --timeout 0.1` -> exits 0 cleanly on timeout
+    let wait_timeout = isolated_cmd(daemon.tmp.path())
         .args([
             "wait",
             "--session",
@@ -306,8 +431,167 @@ fn cli_subprocesses_mcp_hook_and_wait_interop_against_live_ts_daemon() {
         .unwrap();
     assert_eq!(wait_timeout.status.code(), Some(0));
 
-    // 4. Verify piped one-shot stdin EOF drains in-flight `tools/list` cleanly before exiting
-    let mut oneshot = Command::new(hyp_rs_bin())
+    // 4. End-to-end delivery through the compiled Rust daemon: Bob joins, sends DM waking Alice's live `hyp-rs wait`!
+    run_claude_pre_tool_use_hook(
+        daemon.tmp.path(),
+        sock_str,
+        "cli-s2",
+        "toolu_cli_bob_join",
+        "hyp_mesh",
+        json!({"action": "join", "handle": "bob"}),
+    );
+    let joined_bob = mcp_rpc(
+        &mut mcp_in,
+        &mut mcp_out,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "hyp_mesh",
+                "arguments": {"action": "join", "handle": "bob"},
+                "_meta": {"claudecode/toolUseId": "toolu_cli_bob_join"}
+            }
+        }),
+    );
+    assert!(joined_bob["result"].get("isError").is_none());
+    assert!(
+        joined_bob["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("cli@local/bob")
+    );
+
+    // Arm Alice's zero-polling `hyp-rs wait --json` before Bob sends!
+    let wait_live = isolated_cmd(daemon.tmp.path())
+        .args([
+            "wait",
+            "--session",
+            "claude:cli-s1",
+            "--socket",
+            sock_str,
+            "--timeout",
+            "5",
+            "--json",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn live hyp-rs wait");
+
+    std::thread::sleep(Duration::from_millis(120));
+
+    let dm_text = "hello from native rust daemon subprocess";
+    run_claude_pre_tool_use_hook(
+        daemon.tmp.path(),
+        sock_str,
+        "cli-s2",
+        "toolu_cli_bob_dm1",
+        "hyp_send",
+        json!({"to": "cli@local/alice", "text": dm_text}),
+    );
+    let sent1 = mcp_rpc(
+        &mut mcp_in,
+        &mut mcp_out,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "hyp_send",
+                "arguments": {"to": "cli@local/alice", "text": dm_text},
+                "_meta": {"claudecode/toolUseId": "toolu_cli_bob_dm1"}
+            }
+        }),
+    );
+    assert!(
+        sent1["result"].get("isError").is_none(),
+        "hyp_send failed: {sent1}"
+    );
+
+    let wait_out = wait_live.wait_with_output().unwrap();
+    assert_eq!(
+        wait_out.status.code(),
+        Some(0),
+        "wait stderr: {}",
+        String::from_utf8_lossy(&wait_out.stderr)
+    );
+    let wait_json: Value = serde_json::from_slice(&wait_out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "expected valid wait --json output ({e}): stdout={}",
+            String::from_utf8_lossy(&wait_out.stdout)
+        )
+    });
+    assert_eq!(wait_json["ok"], true);
+    assert_eq!(wait_json["command"], "wait");
+    let items = wait_json["data"]["items"].as_array().unwrap();
+    assert!(!items.is_empty(), "expected woken wait items: {wait_json}");
+    assert!(
+        items
+            .iter()
+            .any(|i| i["text"].as_str().unwrap_or_default().contains(dm_text)),
+        "wait output missing DM text: {wait_json}"
+    );
+
+    // 5. Bob sends a second DM; Alice drains it through `hyp_inbox`!
+    let dm_text_2 = "second native inbox message";
+    run_claude_pre_tool_use_hook(
+        daemon.tmp.path(),
+        sock_str,
+        "cli-s2",
+        "toolu_cli_bob_dm2",
+        "hyp_send",
+        json!({"to": "cli@local/alice", "text": dm_text_2}),
+    );
+    let sent2 = mcp_rpc(
+        &mut mcp_in,
+        &mut mcp_out,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "hyp_send",
+                "arguments": {"to": "cli@local/alice", "text": dm_text_2},
+                "_meta": {"claudecode/toolUseId": "toolu_cli_bob_dm2"}
+            }
+        }),
+    );
+    assert!(sent2["result"].get("isError").is_none());
+
+    run_claude_pre_tool_use_hook(
+        daemon.tmp.path(),
+        sock_str,
+        "cli-s1",
+        "toolu_cli_alice_inbox",
+        "hyp_inbox",
+        json!({}),
+    );
+    let inbox = mcp_rpc(
+        &mut mcp_in,
+        &mut mcp_out,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "hyp_inbox",
+                "arguments": {},
+                "_meta": {"claudecode/toolUseId": "toolu_cli_alice_inbox"}
+            }
+        }),
+    );
+    assert!(inbox["result"].get("isError").is_none());
+    assert!(
+        inbox["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(dm_text_2),
+        "hyp_inbox response missing second DM: {inbox}"
+    );
+
+    // 6. Verify piped one-shot stdin EOF drains in-flight `tools/list` cleanly before exiting
+    let mut oneshot = isolated_cmd(daemon.tmp.path())
         .args(["mcp", sock_str])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -321,10 +605,48 @@ fn cli_subprocesses_mcp_hook_and_wait_interop_against_live_ts_daemon() {
         .unwrap();
     let oneshot_out = oneshot.wait_with_output().unwrap();
     assert_eq!(oneshot_out.status.code(), Some(0));
-    let oneshot_json: Value = serde_json::from_slice(&oneshot_out.stdout).expect("piped tools/list JSON");
+    let oneshot_json: Value =
+        serde_json::from_slice(&oneshot_out.stdout).expect("piped tools/list JSON");
     assert_eq!(oneshot_json["id"], 42);
     assert_eq!(oneshot_json["result"]["tools"].as_array().unwrap().len(), 4);
 
     drop(mcp_in);
     assert_eq!(mcp.wait().unwrap().code(), Some(0));
+
+    // 7. Verify graceful shutdown removes socket, node.pid, and node.status.json cleanly on Unix
+    #[cfg(unix)]
+    {
+        let exit_code = daemon.shutdown_gracefully();
+        assert_eq!(exit_code, Some(0));
+        assert!(
+            !socket_path.exists(),
+            "connector.sock must be removed on graceful shutdown"
+        );
+        assert!(
+            !daemon.state_dir.join("node.pid").exists(),
+            "node.pid must be removed on graceful shutdown"
+        );
+        assert!(
+            !daemon.state_dir.join("node.status.json").exists(),
+            "node.status.json must be removed on graceful shutdown"
+        );
+    }
+}
+
+#[test]
+fn daemon_socket_and_no_local_socket_flags() {
+    // 1. Explicit `--socket <custom>` overrides default location
+    let custom_dir = tempfile::tempdir().unwrap();
+    let custom_sock = custom_dir.path().join("custom.sock");
+    let daemon = start_native_rust_daemon_with_args(&["--socket", custom_sock.to_str().unwrap()]);
+    assert_eq!(daemon.socket_path.as_deref(), Some(custom_sock.as_path()));
+    assert!(custom_sock.exists());
+    drop(daemon);
+
+    // 2. `--no-local-socket` disables local IPC listener completely (`socketPath: null`)
+    let headless = start_native_rust_daemon_with_args(&["--no-local-socket"]);
+    assert!(headless.socket_path.is_none());
+    assert!(headless.startup_envelope["data"]["socketPath"].is_null());
+    assert!(!headless.state_dir.join("connector.sock").exists());
+    assert!(!headless.state_dir.join("connector.addr").exists());
 }

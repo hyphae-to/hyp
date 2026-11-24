@@ -210,11 +210,34 @@ fn run_status_or_doctor(
         (None, None)
     };
 
-    // Daemon PID status
+    // Daemon PID & local IPC socket status
     let pid_path = state_dir.join("node.pid");
     let running_pid: Option<u32> = fs::read_to_string(&pid_path)
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok());
+    let status_path = state_dir.join("node.status.json");
+    let socket_path: Option<String> = fs::read_to_string(&status_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| {
+            v.get("socketPath")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        });
+    if let Some(ref sock) = socket_path {
+        if std::path::Path::new(sock).exists() {
+            checks.push(CliCheck::ok(
+                "daemon.socket",
+                format!("Local IPC ready at {sock}"),
+            ));
+        } else if running_pid.is_some() {
+            checks.push(CliCheck::warn(
+                "daemon.socket",
+                format!("Recorded local IPC socket missing: {sock}"),
+                Some("Restart `hyp-rs node start` to recreate the local IPC socket.".to_string()),
+            ));
+        }
+    }
 
     // Local runtime counts from node.sqlite
     let sessions_count = db
@@ -411,6 +434,7 @@ fn run_status_or_doctor(
             "kid": kid,
             "fingerprint": fingerprint,
             "runningPid": running_pid,
+            "socketPath": socket_path,
             "stateDir": state_dir.display().to_string(),
             "configPath": config_path.display().to_string(),
             "sessions": sessions_count,
@@ -466,6 +490,9 @@ fn run_status_or_doctor(
                 "  Identity: kid={k} (fp={})",
                 fingerprint.as_deref().unwrap_or("-")
             );
+        }
+        if let Some(ref sock) = socket_path {
+            println!("  Local IPC: {sock}");
         }
         println!(
             "  Gate:     {} (filters={}, quarantined={})",
