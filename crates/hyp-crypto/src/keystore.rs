@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,6 +23,7 @@ use zeroize::Zeroizing;
 use crate::error::CryptoError;
 use crate::keys::{Ed25519KeyPair, NodeIdentityKeys, X25519KeyPair};
 
+#[cfg(target_os = "macos")]
 const MACOS_SECURITY_BIN: &str = "/usr/bin/security";
 const KEYCHAIN_B64_PREFIX: &str = "hyphae-b64v1:";
 
@@ -138,16 +140,23 @@ fn is_valid_service_name(s: &str) -> bool {
 }
 
 fn is_inside_temp_dir(config_dir: &Path) -> bool {
-    let abs = fs::canonicalize(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
     let sys_tmp = std::env::temp_dir();
+    let canon_tmp = fs::canonicalize(&sys_tmp).unwrap_or_else(|_| sys_tmp.clone());
+    let abs = fs::canonicalize(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
+    #[cfg(unix)]
     let candidates = [
-        fs::canonicalize(&sys_tmp).unwrap_or(sys_tmp),
+        sys_tmp,
+        canon_tmp,
         PathBuf::from("/tmp"),
         PathBuf::from("/private/tmp"),
         PathBuf::from("/var/folders"),
         PathBuf::from("/private/var/folders"),
     ];
-    candidates.iter().any(|base| abs.starts_with(base))
+    #[cfg(not(unix))]
+    let candidates = [sys_tmp, canon_tmp];
+    candidates
+        .iter()
+        .any(|base| abs.starts_with(base) || config_dir.starts_with(base))
 }
 
 /// Pure backend resolution helper matching `detectSecretBackend` in `src/secrets.ts`.
@@ -163,11 +172,17 @@ pub fn detect_backend_with(config_dir: &Path, explicit_override: Option<&str>) -
     if is_inside_temp_dir(config_dir) {
         return SecretBackend::File;
     }
-    if cfg!(target_os = "macos") && Path::new(MACOS_SECURITY_BIN).exists() {
-        return SecretBackend::Keychain;
+    #[cfg(target_os = "macos")]
+    {
+        if Path::new(MACOS_SECURITY_BIN).exists() {
+            return SecretBackend::Keychain;
+        }
     }
-    if cfg!(target_os = "linux") && std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some() {
-        return SecretBackend::SecretService;
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some() {
+            return SecretBackend::SecretService;
+        }
     }
     SecretBackend::File
 }
@@ -356,6 +371,11 @@ impl SecretStore {
             backend,
             service: "hyphae".to_string(),
         }
+    }
+
+    /// Creates a `SecretStore` pinned to the private local file backend (portable across Unix & Windows).
+    pub fn file_only(config_dir: impl Into<PathBuf>) -> Self {
+        Self::new(config_dir, SecretBackend::File)
     }
 
     /// Creates a `SecretStore` resolving backend from `HYPHAE_SECRET_BACKEND`, temp-dir safety guard,
@@ -681,6 +701,7 @@ impl SecretStore {
 
     // ---- macOS Keychain backend (`/usr/bin/security -i` via stdin, zero secrets in argv) ----
 
+    #[cfg(target_os = "macos")]
     fn write_mac_keychain(&self, name: &str, value: &str) -> Result<String, CryptoError> {
         let cmd_line = format_security_add_stdin(&self.service, name, value)?;
         let mut child = Command::new(MACOS_SECURITY_BIN)
@@ -710,6 +731,14 @@ impl SecretStore {
         Ok(format!("keychain:{}/{name}", self.service))
     }
 
+    #[cfg(not(target_os = "macos"))]
+    fn write_mac_keychain(&self, _name: &str, _value: &str) -> Result<String, CryptoError> {
+        Err(CryptoError::Keystore(
+            "macOS Keychain backend is only supported on macOS".into(),
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
     fn read_mac_keychain(
         &self,
         name: &str,
@@ -743,6 +772,18 @@ impl SecretStore {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
+    fn read_mac_keychain(
+        &self,
+        _name: &str,
+        _service: &str,
+    ) -> Result<Option<Zeroizing<String>>, CryptoError> {
+        Err(CryptoError::Keystore(
+            "macOS Keychain backend is only supported on macOS".into(),
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
     fn delete_mac_keychain(&self, name: &str, service: &str) -> bool {
         if !is_valid_service_name(service) {
             return false;
@@ -757,8 +798,14 @@ impl SecretStore {
             .unwrap_or(false)
     }
 
+    #[cfg(not(target_os = "macos"))]
+    fn delete_mac_keychain(&self, _name: &str, _service: &str) -> bool {
+        false
+    }
+
     // ---- Linux Secret Service backend (`secret-tool`, secret over stdin) ----
 
+    #[cfg(target_os = "linux")]
     fn write_linux_secret_service(&self, name: &str, value: &str) -> Result<String, CryptoError> {
         let mut child = Command::new("secret-tool")
             .args([
@@ -789,6 +836,14 @@ impl SecretStore {
         Ok(format!("secret-service:{}/{name}", self.service))
     }
 
+    #[cfg(not(target_os = "linux"))]
+    fn write_linux_secret_service(&self, _name: &str, _value: &str) -> Result<String, CryptoError> {
+        Err(CryptoError::Keystore(
+            "Linux Secret Service backend is only supported on Linux".into(),
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
     fn read_linux_secret_service(
         &self,
         name: &str,
@@ -814,6 +869,18 @@ impl SecretStore {
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
+    fn read_linux_secret_service(
+        &self,
+        _name: &str,
+        _service: &str,
+    ) -> Result<Option<Zeroizing<String>>, CryptoError> {
+        Err(CryptoError::Keystore(
+            "Linux Secret Service backend is only supported on Linux".into(),
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
     fn delete_linux_secret_service(&self, name: &str, service: &str) -> bool {
         Command::new("secret-tool")
             .args(["clear", "service", service, "account", name])
@@ -823,6 +890,11 @@ impl SecretStore {
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn delete_linux_secret_service(&self, _name: &str, _service: &str) -> bool {
+        false
     }
 }
 
@@ -859,11 +931,16 @@ mod tests {
     #[test]
     fn file_backend_atomic_roundtrip_permissions_and_fail_closed_checks() {
         let tmp = TempDir::new().unwrap();
-        // Temp dir automatically resolves to File backend (never touches macOS Keychain!)
+        // Temp dir (and not-yet-created nested subdir) automatically resolves to File backend
+        // across macOS, Linux, and Windows (never touches live OS keyrings!).
         assert_eq!(detect_backend_with(tmp.path(), None), SecretBackend::File);
+        assert_eq!(
+            detect_backend_with(&tmp.path().join("not-created-yet"), None),
+            SecretBackend::File
+        );
         assert_eq!(detect_backend_with(tmp.path(), Some("file")), SecretBackend::File);
 
-        let store = SecretStore::new(tmp.path(), SecretBackend::File);
+        let store = SecretStore::file_only(tmp.path());
         let saved = store.set("api-token", "super-secret-value-123").unwrap();
         assert_eq!(saved.backend, SecretBackend::File);
         assert_eq!(&*store.get("api-token").unwrap(), "super-secret-value-123");

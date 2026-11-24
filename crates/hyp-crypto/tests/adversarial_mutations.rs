@@ -4,6 +4,7 @@
 //! rollback, cross-context swaps, small-order/all-zero keys, symlink/traversal/bomb archives,
 //! blocked executable attachments, and keystore permission violations) to assert fail-closed behavior.
 
+#[cfg(unix)]
 use std::fs;
 use std::io::Write;
 
@@ -26,10 +27,11 @@ use hyp_crypto::hpke;
 use hyp_crypto::keys::{Ed25519KeyPair, Ed25519PublicKey, NodeIdentityKeys, X25519KeyPair, X25519PublicKey};
 use hyp_crypto::keystore::{validate_secret_name, SecretBackend, SecretStore};
 use hyp_crypto::rfc3339::now_unix_ms;
+#[cfg(unix)]
+use hyp_crypto::transfer::{pack_tar_gz, TarInputEntry};
 use hyp_crypto::transfer::{
-    decrypt_stream_v2, default_stage1_attachment_guard, encrypt_stream_v2, pack_tar_gz,
-    pack_tar_gz_bytes, unpack_tar_gz, StreamEncryptParams, TarInputEntry, TarPackOptions,
-    TarUnpackOptions, TRANSFER_CHUNK_SIZE,
+    decrypt_stream_v2, default_stage1_attachment_guard, encrypt_stream_v2, pack_tar_gz_bytes,
+    unpack_tar_gz, StreamEncryptParams, TarPackOptions, TarUnpackOptions, TRANSFER_CHUNK_SIZE,
 };
 use hyp_crypto::CryptoError;
 

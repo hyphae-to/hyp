@@ -1315,7 +1315,7 @@ fn unpack_tar_gz_inner<R: Read>(
                 ));
             }
             let clean_dir = validate_tar_archive_path(&raw_path, true)?;
-            let dir_path = abs_dest.join(&clean_dir);
+            let dir_path = join_posix_rel(&abs_dest, &clean_dir);
             if !dir_path.starts_with(&abs_dest) {
                 return Err(CryptoError::UnsafeArchiveEntry(format!(
                     "directory path escape: '{clean_dir}'"
@@ -1365,7 +1365,7 @@ fn unpack_tar_gz_inner<R: Read>(
             }
         }
 
-        let target_path = abs_dest.join(&clean_path);
+        let target_path = join_posix_rel(&abs_dest, &clean_path);
         if !target_path.starts_with(&abs_dest) {
             return Err(CryptoError::UnsafeArchiveEntry(format!(
                 "file path escape: '{clean_path}'"
@@ -1438,9 +1438,21 @@ fn unpack_tar_gz_inner<R: Read>(
     })
 }
 
+/// Joins a validated POSIX relative path (`a/b/c`) segment-by-segment onto `root`
+/// so Windows verbatim paths (`\\?\C:\...`) always receive native path separators.
+fn join_posix_rel(root: &Path, rel: &str) -> PathBuf {
+    let mut out = root.to_path_buf();
+    for seg in rel.split('/') {
+        if !seg.is_empty() {
+            out.push(seg);
+        }
+    }
+    out
+}
+
 fn create_private_dirs(root: &Path, rel_dir: &str) -> Result<(), CryptoError> {
     let mut cur = root.to_path_buf();
-    for seg in rel_dir.split('/') {
+    for seg in rel_dir.split(['/', '\\']) {
         if seg.is_empty() {
             continue;
         }

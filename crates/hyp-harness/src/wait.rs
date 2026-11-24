@@ -1,7 +1,9 @@
 //! Zero-polling blocking waiter (`hyp-rs wait`) and streaming watcher (`hyp-rs watch`)
 //! on `connector.sock`, matching `src/wait.ts` flags, timeouts, formatting, and signal handling.
 
-use crate::sock::{MAX_SOCKET_LINE_BYTES, read_bounded_line_async, write_ndjson_line_async};
+use crate::sock::{
+    MAX_SOCKET_LINE_BYTES, connect_daemon_async, read_bounded_line_async, write_ndjson_line_async,
+};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -9,8 +11,44 @@ use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::BufReader;
-use tokio::net::UnixStream;
-use tokio::signal::unix::{SignalKind, signal};
+
+#[cfg(unix)]
+struct ShutdownSignal {
+    sigint: tokio::signal::unix::Signal,
+    sigterm: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ShutdownSignal {
+    fn new() -> io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            sigint: signal(SignalKind::interrupt())?,
+            sigterm: signal(SignalKind::terminate())?,
+        })
+    }
+
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.sigint.recv() => {}
+            _ = self.sigterm.recv() => {}
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct ShutdownSignal;
+
+#[cfg(not(unix))]
+impl ShutdownSignal {
+    fn new() -> io::Result<Self> {
+        Ok(Self)
+    }
+
+    async fn recv(&mut self) {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitMode {
@@ -151,13 +189,12 @@ pub async fn run_wait_to_writer<W: Write>(
         return Err(WaitError::MissingSession);
     }
 
-    let stream = UnixStream::connect(&options.socket_path)
+    let (read_half, mut write_half) = connect_daemon_async(&options.socket_path)
         .await
         .map_err(|source| WaitError::Connect {
             path: options.socket_path.display().to_string(),
             source,
         })?;
-    let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
     let mut sub = Map::new();
@@ -173,8 +210,7 @@ pub async fn run_wait_to_writer<W: Write>(
         .await
         .map_err(|e| WaitError::Daemon(e.to_string()))?;
 
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut shutdown = ShutdownSignal::new()?;
 
     let timeout_sleep = options
         .timeout_seconds
@@ -184,8 +220,7 @@ pub async fn run_wait_to_writer<W: Write>(
 
     loop {
         let line_opt = tokio::select! {
-            _ = sigint.recv() => return Ok(0),
-            _ = sigterm.recv() => return Ok(0),
+            _ = shutdown.recv() => return Ok(0),
             _ = async {
                 if let Some(sleep) = timeout_sleep.as_mut().as_pin_mut() {
                     sleep.await;
@@ -300,5 +335,54 @@ mod tests {
             stream_line,
             json!({"router": "primary", "received": 1700000000, "text": "msg 1"})
         );
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn windows_tcp_loopback_wait_once_receives_items() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (r, mut w) = stream.split();
+            let mut reader = BufReader::new(r);
+            let sub_line = read_bounded_line_async(&mut reader, MAX_SOCKET_LINE_BYTES)
+                .await
+                .unwrap()
+                .unwrap();
+            let sub: Value = serde_json::from_str(&sub_line).unwrap();
+            assert_eq!(sub["type"], "wait.subscribe");
+            assert_eq!(sub["mode"], "once");
+            assert_eq!(sub["sessionId"], "claude:win-1");
+
+            write_ndjson_line_async(
+                &mut w,
+                &json!({
+                    "type": "wait.items",
+                    "items": [{"router": "primary", "received": 1, "text": "hello windows"}]
+                }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut buf = Vec::new();
+        let code = run_wait_to_writer(
+            WaitOptions {
+                socket_path: PathBuf::from(addr.to_string()),
+                mode: WaitMode::Once,
+                session_id: Some("claude:win-1".into()),
+                handle: None,
+                timeout_seconds: Some(3.0),
+                json: false,
+            },
+            &mut buf,
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(String::from_utf8(buf).unwrap(), "hello windows\n");
+        server.await.unwrap();
     }
 }
