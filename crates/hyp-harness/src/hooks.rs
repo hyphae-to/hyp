@@ -256,7 +256,7 @@ fn waiter_arm_prompt(
     session_id: &str,
     cli_command: &str,
     explicit_socket: &str,
-) -> String {
+) -> Option<String> {
     let socket_flag = if explicit_socket.is_empty() {
         String::new()
     } else {
@@ -266,19 +266,19 @@ fn waiter_arm_prompt(
         )
     };
     match harness {
-        HarnessKind::Antigravity => format!(
+        HarnessKind::Herdr | HarnessKind::T3 | HarnessKind::Openclaw => None,
+        HarnessKind::Antigravity => Some(format!(
             "hyphae: Enrolled, but no background waiter is running yet. Run `{cli_command} wait --session {session_id}{socket_flag}` in background (WaitMsBeforeAsync: 500, IsDaemon: false), then end turn."
-        ),
+        )),
+        HarnessKind::Claude => Some(format!(
+            "hyphae: Enrolled, but no background waiter is running yet. Start `{cli_command} watch --session {session_id}{socket_flag}` via Monitor (or `{cli_command} wait --session {session_id}{socket_flag}` via background Bash), then end turn."
+        )),
         HarnessKind::Codex
         | HarnessKind::Cursor
         | HarnessKind::Gemini
-        | HarnessKind::Opencode
-        | HarnessKind::Openclaw => format!(
+        | HarnessKind::Opencode => Some(format!(
             "hyphae: Enrolled, but no background waiter is running yet. Run `{cli_command} wait --session {session_id}{socket_flag}` in background, then end turn."
-        ),
-        _ => format!(
-            "hyphae: Enrolled, but no background waiter is running yet. Start `{cli_command} watch --session {session_id}{socket_flag}` via Monitor (or `{cli_command} wait --session {session_id}{socket_flag}` via background Bash), then end turn."
-        ),
+        )),
     }
 }
 
@@ -594,13 +594,14 @@ where
                 == Some(true);
 
             if enrolled && !has_live {
-                let reason = waiter_arm_prompt(
+                if let Some(reason) = waiter_arm_prompt(
                     options.harness,
                     &session_id,
                     options.cli_path.as_deref().unwrap_or("hyp"),
                     options.explicit_socket.as_deref().unwrap_or(""),
-                );
-                return format_stop_continuation(options.harness, reason);
+                ) {
+                    return format_stop_continuation(options.harness, reason);
+                }
             }
 
             json!({})
@@ -987,20 +988,49 @@ mod tests {
             );
 
             match harness {
-                HarnessKind::Antigravity => assert_eq!(stop_res["decision"], "continue"),
-                HarnessKind::Cursor => assert!(stop_res["followup_message"].is_string()),
-                HarnessKind::Gemini => assert_eq!(stop_res["decision"], "deny"),
-                HarnessKind::Opencode => assert!(stop_res["followupMessage"].is_string()),
-                HarnessKind::Codex => {
-                    assert_eq!(stop_res["decision"], "block");
-                    assert!(
-                        stop_res["reason"]
-                            .as_str()
-                            .unwrap()
-                            .contains("hyp wait --session codex:id-1")
+                HarnessKind::Herdr | HarnessKind::T3 | HarnessKind::Openclaw => {
+                    assert_eq!(
+                        stop_res,
+                        json!({}),
+                        "idle Stop for {} must return {{}} (no Monitor/hyp wait prompt)",
+                        harness.as_str()
                     );
                 }
-                _ => assert_eq!(stop_res["decision"], "block"),
+                HarnessKind::Antigravity => {
+                    assert_eq!(stop_res["decision"], "continue");
+                    let reason = stop_res["reason"].as_str().unwrap();
+                    assert!(reason.contains("hyp wait --session antigravity:id-1"));
+                    assert!(reason.contains("WaitMsBeforeAsync: 500, IsDaemon: false"));
+                    assert!(!reason.contains("Monitor"));
+                }
+                HarnessKind::Claude => {
+                    assert_eq!(stop_res["decision"], "block");
+                    let reason = stop_res["reason"].as_str().unwrap();
+                    assert!(reason.contains("hyp watch --session claude:id-1"));
+                    assert!(reason.contains("Monitor"));
+                }
+                HarnessKind::Cursor => {
+                    let reason = stop_res["followup_message"].as_str().unwrap();
+                    assert!(reason.contains("hyp wait --session cursor:id-1"));
+                    assert!(!reason.contains("Monitor"));
+                }
+                HarnessKind::Gemini => {
+                    assert_eq!(stop_res["decision"], "deny");
+                    let reason = stop_res["reason"].as_str().unwrap();
+                    assert!(reason.contains("hyp wait --session gemini:id-1"));
+                    assert!(!reason.contains("Monitor"));
+                }
+                HarnessKind::Opencode => {
+                    let reason = stop_res["followupMessage"].as_str().unwrap();
+                    assert!(reason.contains("hyp wait --session opencode:id-1"));
+                    assert!(!reason.contains("Monitor"));
+                }
+                HarnessKind::Codex => {
+                    assert_eq!(stop_res["decision"], "block");
+                    let reason = stop_res["reason"].as_str().unwrap();
+                    assert!(reason.contains("hyp wait --session codex:id-1"));
+                    assert!(!reason.contains("Monitor"));
+                }
             }
         }
     }

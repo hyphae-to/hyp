@@ -13,6 +13,7 @@ mod pair;
 mod secret_cmd;
 mod service;
 mod setup;
+mod skill_render;
 mod status_doctor;
 mod ui;
 mod update;

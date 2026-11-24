@@ -267,14 +267,54 @@ async fn suite_1_all_nine_harnesses_live_differential_parity() {
         let stop_drain = run_hook(&sock, *harness, HookEvent::Stop, hook_payload.clone()).await;
         let stop_reason = extract_stop_reason(*harness, &stop_drain);
 
-        // 5. Idle Stop hook (no unread, no live transport): ALL harnesses (including Codex!)
-        // prompt to arm a background waiter when no push transport is attached!
+        // 5. Idle Stop hook (no unread, no live transport):
+        //    - Herdr, T3, and OpenClaw rely on native push/ephemeral turn orchestration and
+        //      must return `{}` cleanly instead of prompting for Claude Monitor or `hyp wait`.
+        //    - Claude, Codex, Antigravity, Cursor, OpenCode, and Gemini prompt with their exact
+        //      harness-native background waiter command.
         let stop_idle = run_hook(&sock, *harness, HookEvent::Stop, hook_payload.clone()).await;
-        let idle_reason = extract_stop_reason(*harness, &stop_idle);
-        assert!(
-            idle_reason.contains(&session_id),
-            "idle Stop arm prompt for {raw_id} must mention {session_id}: {idle_reason}"
-        );
+        if matches!(
+            *harness,
+            HarnessKind::Herdr | HarnessKind::T3 | HarnessKind::Openclaw
+        ) {
+            assert_eq!(
+                stop_idle,
+                json!({}),
+                "idle Stop for {raw_id} must stay silent (no waiter-arm prompt)"
+            );
+        } else {
+            let idle_reason = extract_stop_reason(*harness, &stop_idle);
+            assert!(
+                idle_reason.contains(&session_id),
+                "idle Stop arm prompt for {raw_id} must mention {session_id}: {idle_reason}"
+            );
+            if *harness == HarnessKind::Claude {
+                assert!(
+                    idle_reason.contains("Monitor") && idle_reason.contains("hyp watch"),
+                    "Claude idle Stop prompt should offer Monitor + hyp watch: {idle_reason}"
+                );
+            } else {
+                assert!(
+                    !idle_reason.contains("Monitor"),
+                    "non-Claude idle Stop prompt for {raw_id} must never mention Monitor: {idle_reason}"
+                );
+                assert!(
+                    idle_reason.contains("hyp wait"),
+                    "standalone idle Stop prompt for {raw_id} must mention hyp wait: {idle_reason}"
+                );
+            }
+            if *harness == HarnessKind::Antigravity {
+                assert!(
+                    idle_reason.contains("WaitMsBeforeAsync: 500, IsDaemon: false"),
+                    "Antigravity idle Stop prompt must include WaitMsBeforeAsync: {idle_reason}"
+                );
+            } else {
+                assert!(
+                    !idle_reason.contains("WaitMsBeforeAsync"),
+                    "non-Antigravity idle Stop prompt for {raw_id} must not mention WaitMsBeforeAsync: {idle_reason}"
+                );
+            }
+        }
 
         // 6. Harness sends a reply back to `sender` via `hyp_send`!
         let reply_args = json!({
