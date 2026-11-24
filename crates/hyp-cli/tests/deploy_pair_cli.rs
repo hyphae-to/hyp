@@ -6,8 +6,11 @@
 //! - Covers McKeeman differential/mutated-valid-input cases (tampered tokens, leaky manifests,
 //!   plaintext secret configs, unsafe wildcard binds, invalid domains/IDs, expired tokens).
 
+mod common;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use common::{ManagedProcess, isolated_cmd};
 use hyp_crypto::compat_v1::issue_grant_v1;
 use hyp_crypto::keys::{Ed25519KeyPair, NodeIdentityKeys};
 use hyp_crypto::pairing::{AdminInviteV2, create_p2p_offer, encode_am2, encode_hp2p1};
@@ -21,13 +24,24 @@ use hyp_proto::scopes::EscalationConfig;
 use hyp_store::{KeyUse, NodeDb, PeerProfile, PeerStatus, TrustTier};
 use serde_json::{Value, json};
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
 use std::thread;
+use std::time::Duration;
 
-fn hyp_rs_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_hyp")
+fn scrubbed_cmd() -> Command {
+    let mut cmd = Command::new(common::hyp_bin());
+    cmd.env("HYPHAE_SECRET_BACKEND", "file")
+        .env("HYPHAE_NO_OPEN", "1")
+        .env_remove("HYPHAE_CONFIG")
+        .env_remove("HYPHAE_STATE_DIR")
+        .env_remove("HYPHAE_CONFIG_DIR")
+        .env_remove("HYPHAE_SOCKET")
+        .env_remove("AGENTS_MESH_SOCKET")
+        .env_remove("HYPHAE_RELEASE_PUBKEY")
+        .env_remove("HYPHAE_DISABLE_AUTO_UPDATE");
+    cmd
 }
 
 fn spawn_one_shot_http_server(status_line: &str, body: String) -> (String, thread::JoinHandle<()>) {
@@ -107,7 +121,7 @@ fn build_signed_manifest(
 
 #[test]
 fn deploy_providers_json_and_plain_list_all_six() {
-    let out = Command::new(hyp_rs_bin())
+    let out = scrubbed_cmd()
         .args(["deploy", "providers", "--json"])
         .output()
         .expect("run deploy providers --json");
@@ -140,7 +154,7 @@ fn deploy_providers_json_and_plain_list_all_six() {
         assert!(!p["cons"].as_array().unwrap().is_empty());
     }
 
-    let plain = Command::new(hyp_rs_bin())
+    let plain = scrubbed_cmd()
         .args(["deploy", "providers"])
         .output()
         .expect("run deploy providers plain");
@@ -209,7 +223,7 @@ fn deploy_init_all_six_providers_overwrite_guard_and_config_check() {
         let tmp = tempfile::tempdir().unwrap();
         let out_dir = tmp.path().join(provider);
 
-        let out = Command::new(hyp_rs_bin())
+        let out = scrubbed_cmd()
             .args([
                 "deploy",
                 "init",
@@ -278,7 +292,7 @@ fn deploy_init_all_six_providers_overwrite_guard_and_config_check() {
         }
 
         // Every generated node.json MUST pass `deploy check --config` with zero FAIL checks & zero plaintext secrets!
-        let check = Command::new(hyp_rs_bin())
+        let check = scrubbed_cmd()
             .args([
                 "deploy",
                 "check",
@@ -300,7 +314,7 @@ fn deploy_init_all_six_providers_overwrite_guard_and_config_check() {
         // Non-overwrite guard: re-running WITHOUT --force MUST fail closed (exit 1) and keep sentinel intact!
         let sentinel_path = out_dir.join("node.json");
         fs::write(&sentinel_path, "{\"sentinel\":true}\n").unwrap();
-        let refuse = Command::new(hyp_rs_bin())
+        let refuse = scrubbed_cmd()
             .args([
                 "deploy",
                 "init",
@@ -325,7 +339,7 @@ fn deploy_init_all_six_providers_overwrite_guard_and_config_check() {
         );
 
         // Re-running WITH --force succeeds and regenerates cleanly.
-        let forced = Command::new(hyp_rs_bin())
+        let forced = scrubbed_cmd()
             .args([
                 "deploy",
                 "init",
@@ -349,7 +363,7 @@ fn deploy_init_all_six_providers_overwrite_guard_and_config_check() {
 
     // Mutated invalid inputs: reject Caddyfile injection in --domain and reserved 'local' --node-id
     let tmp = tempfile::tempdir().unwrap();
-    let bad_domain = Command::new(hyp_rs_bin())
+    let bad_domain = scrubbed_cmd()
         .args([
             "deploy",
             "init",
@@ -364,7 +378,7 @@ fn deploy_init_all_six_providers_overwrite_guard_and_config_check() {
         .unwrap();
     assert_eq!(bad_domain.status.code(), Some(2));
 
-    let bad_node_id = Command::new(hyp_rs_bin())
+    let bad_node_id = scrubbed_cmd()
         .args([
             "deploy",
             "init",
@@ -399,7 +413,7 @@ fn deploy_check_config_rejects_plaintext_secrets_and_unproxied_wildcard_bind() {
         .unwrap(),
     )
     .unwrap();
-    let out = Command::new(hyp_rs_bin())
+    let out = scrubbed_cmd()
         .args(["deploy", "check", "--config", leaky_cfg.to_str().unwrap(), "--json"])
         .output()
         .unwrap();
@@ -423,7 +437,7 @@ fn deploy_check_config_rejects_plaintext_secrets_and_unproxied_wildcard_bind() {
         .unwrap(),
     )
     .unwrap();
-    let out2 = Command::new(hyp_rs_bin())
+    let out2 = scrubbed_cmd()
         .args(["deploy", "check", "--config", open_bind_cfg.to_str().unwrap(), "--json"])
         .output()
         .unwrap();
@@ -437,7 +451,7 @@ fn deploy_check_config_rejects_plaintext_secrets_and_unproxied_wildcard_bind() {
         .any(|c| c["name"] == "config.bind" && c["status"] == "fail"));
 
     // 3. Remote plaintext http:// URL -> FAIL immediately without network call
-    let bad_url = Command::new(hyp_rs_bin())
+    let bad_url = scrubbed_cmd()
         .args(["deploy", "check", "--url", "http://mesh.example.com", "--json"])
         .output()
         .unwrap();
@@ -461,7 +475,7 @@ fn deploy_check_url_probes_hardened_and_rejects_leaky_or_tampered_manifests() {
         false,
     );
     let (good_url, good_srv) = spawn_one_shot_http_server("200 OK", good_body);
-    let good_out = Command::new(hyp_rs_bin())
+    let good_out = scrubbed_cmd()
         .args(["deploy", "check", "--url", &good_url, "--json"])
         .output()
         .unwrap();
@@ -501,7 +515,7 @@ fn deploy_check_url_probes_hardened_and_rejects_leaky_or_tampered_manifests() {
         false,
     );
     let (leaky_url, leaky_srv) = spawn_one_shot_http_server("200 OK", leaky_body);
-    let leaky_out = Command::new(hyp_rs_bin())
+    let leaky_out = scrubbed_cmd()
         .args(["deploy", "check", "--url", &leaky_url, "--json"])
         .output()
         .unwrap();
@@ -524,7 +538,7 @@ fn deploy_check_url_probes_hardened_and_rejects_leaky_or_tampered_manifests() {
         true,
     );
     let (tampered_url, tampered_srv) = spawn_one_shot_http_server("200 OK", tampered_body);
-    let tampered_out = Command::new(hyp_rs_bin())
+    let tampered_out = scrubbed_cmd()
         .args(["deploy", "check", "--url", &tampered_url, "--json"])
         .output()
         .unwrap();
@@ -541,7 +555,7 @@ fn deploy_check_url_probes_hardened_and_rejects_leaky_or_tampered_manifests() {
 
 #[test]
 fn pair_guide_json_covers_all_topologies_and_presets() {
-    let out = Command::new(hyp_rs_bin())
+    let out = scrubbed_cmd()
         .args(["pair", "guide", "--json"])
         .output()
         .unwrap();
@@ -567,7 +581,7 @@ fn pair_guide_json_covers_all_topologies_and_presets() {
     assert_eq!(presets, vec!["guest-ro", "guest", "observer", "member", "full"]);
 
     // Filtered mode
-    let p2p_only = Command::new(hyp_rs_bin())
+    let p2p_only = scrubbed_cmd()
         .args(["pair", "guide", "--mode", "p2p", "--json"])
         .output()
         .unwrap();
@@ -582,7 +596,7 @@ fn pair_invite_p2p_and_team_roundtrip_via_stdin_and_token_file_and_fail_closed_m
     let state_dir = tempfile::tempdir().unwrap();
 
     // 1. P2P invite with explicit --grant, --request, --escalation
-    let inv = Command::new(hyp_rs_bin())
+    let inv = scrubbed_cmd()
         .args([
             "pair",
             "invite",
@@ -629,7 +643,7 @@ fn pair_invite_p2p_and_team_roundtrip_via_stdin_and_token_file_and_fail_closed_m
         .any(|s| s.as_str().unwrap().contains("<<<")));
 
     // Second invite in same state_dir preserves persistent node keypair `kid`, rotates `offerId`
-    let inv2 = Command::new(hyp_rs_bin())
+    let inv2 = scrubbed_cmd()
         .args([
             "pair",
             "invite",
@@ -651,7 +665,7 @@ fn pair_invite_p2p_and_team_roundtrip_via_stdin_and_token_file_and_fail_closed_m
     assert_ne!(inv2_env["data"]["offerId"].as_str().unwrap(), offer_id);
 
     // 2. Pipe `hp2p1_` token via stdin into `pair inspect --json`
-    let mut inspect_proc = Command::new(hyp_rs_bin())
+    let mut inspect_proc = scrubbed_cmd()
         .args(["pair", "inspect", "--json"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -696,7 +710,7 @@ fn pair_invite_p2p_and_team_roundtrip_via_stdin_and_token_file_and_fail_closed_m
     assert!(insp["data"].get("secret").is_none());
 
     // 3. Team (`am2_`) invite + inspect via `--token-file`
-    let team_inv = Command::new(hyp_rs_bin())
+    let team_inv = scrubbed_cmd()
         .args([
             "pair",
             "invite",
@@ -731,7 +745,7 @@ fn pair_invite_p2p_and_team_roundtrip_via_stdin_and_token_file_and_fail_closed_m
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
     }
-    let am2_insp = Command::new(hyp_rs_bin())
+    let am2_insp = scrubbed_cmd()
         .args([
             "pair",
             "inspect",
@@ -755,7 +769,7 @@ fn pair_invite_p2p_and_team_roundtrip_via_stdin_and_token_file_and_fail_closed_m
     let legacy_admin = Ed25519KeyPair::generate().unwrap();
     let legacy_issued =
         issue_grant_v1(&legacy_admin, "legacy@box", &["*"], 60_000, now_unix_ms()).unwrap();
-    let mut leg_proc = Command::new(hyp_rs_bin())
+    let mut leg_proc = scrubbed_cmd()
         .args(["pair", "inspect", "--json"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -780,7 +794,7 @@ fn pair_invite_p2p_and_team_roundtrip_via_stdin_and_token_file_and_fail_closed_m
     // 5. Mutated / tampered / expired tokens MUST fail closed with exit 1!
     // (a) Truncated/corrupted hp2p1_ token
     let corrupted = format!("{}AAAA_not_valid_json", &token[..12]);
-    let mut bad_proc = Command::new(hyp_rs_bin())
+    let mut bad_proc = scrubbed_cmd()
         .args(["pair", "inspect", "--json"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -811,7 +825,7 @@ fn pair_invite_p2p_and_team_roundtrip_via_stdin_and_token_file_and_fail_closed_m
     )
     .unwrap();
     let expired_token = encode_hp2p1(&expired_offer).unwrap();
-    let mut exp_proc = Command::new(hyp_rs_bin())
+    let mut exp_proc = scrubbed_cmd()
         .args(["pair", "inspect", "--json"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -842,7 +856,7 @@ fn pair_invite_p2p_and_team_roundtrip_via_stdin_and_token_file_and_fail_closed_m
     .unwrap();
     assert!(encode_am2(&serde_json::from_str(&bad_am2_json).unwrap()).is_err());
     let forged_am2 = format!("am2_{}", URL_SAFE_NO_PAD.encode(bad_am2_json.as_bytes()));
-    let mut forged_proc = Command::new(hyp_rs_bin())
+    let mut forged_proc = scrubbed_cmd()
         .args(["pair", "inspect", "--json"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -858,7 +872,7 @@ fn pair_invite_p2p_and_team_roundtrip_via_stdin_and_token_file_and_fail_closed_m
     assert_eq!(forged_out.status.code(), Some(1));
 
     // (d) Reject remote plaintext http:// endpoint in `pair invite`
-    let bad_ep = Command::new(hyp_rs_bin())
+    let bad_ep = scrubbed_cmd()
         .args([
             "pair",
             "invite",
@@ -877,7 +891,7 @@ fn pair_invite_p2p_and_team_roundtrip_via_stdin_and_token_file_and_fail_closed_m
     assert_eq!(bad_ep.status.code(), Some(2));
 
     // (e) Empty stdin and unknown prefix MUST fail closed (exit 1)
-    let mut empty_proc = Command::new(hyp_rs_bin())
+    let mut empty_proc = scrubbed_cmd()
         .args(["pair", "inspect", "--json"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -890,7 +904,7 @@ fn pair_invite_p2p_and_team_roundtrip_via_stdin_and_token_file_and_fail_closed_m
     assert_eq!(empty_env["error"]["code"], "EMPTY_TOKEN");
 
     // (f) Security invariant: `pair inspect` MUST NOT accept `--token <value>` in argv!
-    let argv_token = Command::new(hyp_rs_bin())
+    let argv_token = scrubbed_cmd()
         .args(["pair", "inspect", "--token", token])
         .output()
         .unwrap();
@@ -915,7 +929,7 @@ fn plain_tty_output_and_additional_config_fail_closed_checks() {
         .unwrap(),
     )
     .unwrap();
-    let relay_out = Command::new(hyp_rs_bin())
+    let relay_out = scrubbed_cmd()
         .args(["deploy", "check", "--config", open_relay.to_str().unwrap(), "--json"])
         .output()
         .unwrap();
@@ -928,7 +942,7 @@ fn plain_tty_output_and_additional_config_fail_closed_checks() {
         .any(|c| c["name"] == "config.forwarding" && c["status"] == "fail"));
 
     // 2. Plain text output of `pair guide`, `deploy check`, `pair invite`, `pair inspect`
-    let guide_plain = Command::new(hyp_rs_bin())
+    let guide_plain = scrubbed_cmd()
         .args(["pair", "guide"])
         .output()
         .unwrap();
@@ -939,7 +953,7 @@ fn plain_tty_output_and_additional_config_fail_closed_checks() {
     assert!(guide_txt.contains("public.hyphae.to"));
     assert!(guide_txt.contains("guest-ro"));
 
-    let check_plain = Command::new(hyp_rs_bin())
+    let check_plain = scrubbed_cmd()
         .args(["deploy", "check"])
         .output()
         .unwrap();
@@ -950,7 +964,7 @@ fn plain_tty_output_and_additional_config_fail_closed_checks() {
 
     // 3. `deploy check --url` against HTTP 404 returns FAIL with legacy v1 hint
     let (not_found_url, srv) = spawn_one_shot_http_server("404 Not Found", "{}".to_string());
-    let nf_out = Command::new(hyp_rs_bin())
+    let nf_out = scrubbed_cmd()
         .args(["deploy", "check", "--url", &not_found_url, "--json"])
         .output()
         .unwrap();
@@ -970,7 +984,7 @@ fn pair_accept_p2p_and_team_persists_peers_keys_grants_and_rejects_tampered_or_e
     let accepter_state = tempfile::tempdir().unwrap();
 
     // 1. P2P invite -> pair accept (stdin) with custom counter-grant & untrusted escalationNote
-    let p2p_inv = Command::new(hyp_rs_bin())
+    let p2p_inv = scrubbed_cmd()
         .args([
             "pair",
             "invite",
@@ -1006,7 +1020,7 @@ fn pair_accept_p2p_and_team_persists_peers_keys_grants_and_rejects_tampered_or_e
         "hyp pair accept <<< '<token>'"
     );
 
-    let mut accept_proc = Command::new(hyp_rs_bin())
+    let mut accept_proc = scrubbed_cmd()
         .args([
             "pair",
             "accept",
@@ -1103,7 +1117,7 @@ fn pair_accept_p2p_and_team_persists_peers_keys_grants_and_rejects_tampered_or_e
     }
 
     // 2. Team (`am2_`) invite -> pair accept (stdin) -> verifies Admin-CA grant, admin JWK & peer persisted!
-    let team_inv = Command::new(hyp_rs_bin())
+    let team_inv = scrubbed_cmd()
         .args([
             "pair",
             "invite",
@@ -1133,7 +1147,7 @@ fn pair_accept_p2p_and_team_persists_peers_keys_grants_and_rejects_tampered_or_e
     let grant_id = team_env["data"]["grantId"].as_str().unwrap();
     assert!(am2_token.starts_with("am2_"));
 
-    let mut team_accept = Command::new(hyp_rs_bin())
+    let mut team_accept = scrubbed_cmd()
         .args([
             "pair",
             "accept",
@@ -1208,7 +1222,7 @@ fn pair_accept_p2p_and_team_persists_peers_keys_grants_and_rejects_tampered_or_e
         "hp2p1_{}",
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&hp2p1_obj).unwrap())
     );
-    let mut t1 = Command::new(hyp_rs_bin())
+    let mut t1 = scrubbed_cmd()
         .args([
             "pair",
             "accept",
@@ -1245,7 +1259,7 @@ fn pair_accept_p2p_and_team_persists_peers_keys_grants_and_rejects_tampered_or_e
     )
     .unwrap();
     let expired_tok = encode_hp2p1(&expired_offer).unwrap();
-    let mut t2 = Command::new(hyp_rs_bin())
+    let mut t2 = scrubbed_cmd()
         .args([
             "pair",
             "accept",
@@ -1281,7 +1295,7 @@ fn pair_accept_p2p_and_team_persists_peers_keys_grants_and_rejects_tampered_or_e
         "am2_{}",
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&am2_obj).unwrap())
     );
-    let mut t3 = Command::new(hyp_rs_bin())
+    let mut t3 = scrubbed_cmd()
         .args([
             "pair",
             "accept",
@@ -1305,7 +1319,7 @@ fn pair_accept_p2p_and_team_persists_peers_keys_grants_and_rejects_tampered_or_e
     assert_eq!(t3_env["ok"], false);
 
     // (d) Security invariant: `pair accept` MUST NOT accept `--token <value>` in argv!
-    let argv_tok = Command::new(hyp_rs_bin())
+    let argv_tok = scrubbed_cmd()
         .args(["pair", "accept", "--token", hp2p1_token])
         .output()
         .unwrap();
@@ -1321,7 +1335,8 @@ fn pair_join_verifies_live_rust_node_manifest_rejects_tampered_and_supports_offl
     let client_tmp = tempfile::tempdir().unwrap();
 
     // 1. Start a live native Rust `hyp node start --profile router --bind 127.0.0.1:0` serving `/v1/manifest`
-    let mut hub_child = Command::new(hyp_rs_bin())
+    let mut hub_cmd = isolated_cmd(hub_tmp.path());
+    hub_cmd
         .args([
             "node",
             "start",
@@ -1336,25 +1351,16 @@ fn pair_join_verifies_live_rust_node_manifest_rejects_tampered_and_supports_offl
             hub_tmp.path().to_str().unwrap(),
             "--json",
         ])
-        .env("HYPHAE_SECRET_BACKEND", "file")
-        .env("HOME", hub_tmp.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn live Rust router node");
-
-    let mut hub_line = String::new();
-    BufReader::new(hub_child.stdout.take().unwrap())
-        .read_line(&mut hub_line)
-        .unwrap();
-    let hub_env: Value = serde_json::from_str(hub_line.trim()).expect("valid node start JSON");
+        .stdin(Stdio::null());
+    let mut hub_proc = ManagedProcess::spawn("hyp node start (public.local)", &mut hub_cmd);
+    let hub_env = hub_proc.read_json_line(Duration::from_secs(10));
     assert_eq!(hub_env["ok"], true);
     assert!(hub_env["data"]["socketPath"].is_null());
     let hub_endpoint = hub_env["data"]["endpoint"].as_str().unwrap().to_string();
     let hub_kid = hub_env["data"]["kid"].as_str().unwrap().to_string();
 
     // 2. Run `hyp pair join <hub_endpoint> --state-dir <client_tmp> --json`
-    let join_out = Command::new(hyp_rs_bin())
+    let join_out = isolated_cmd(client_tmp.path())
         .args([
             "pair",
             "join",
@@ -1365,14 +1371,11 @@ fn pair_join_verifies_live_rust_node_manifest_rejects_tampered_and_supports_offl
             "dev@laptop",
             "--json",
         ])
-        .env("HYPHAE_SECRET_BACKEND", "file")
-        .env("HOME", client_tmp.path())
         .output()
         .unwrap();
 
-    // Clean up live router subprocess immediately after join
-    let _ = hub_child.kill();
-    let _ = hub_child.wait();
+    // Clean up live router subprocess immediately after join (also guaranteed by Drop on panic)
+    let _ = hub_proc.shutdown_gracefully();
 
     assert_eq!(
         join_out.status.code(),
@@ -1434,7 +1437,7 @@ fn pair_join_verifies_live_rust_node_manifest_rejects_tampered_and_supports_offl
     );
     let (tampered_url, srv) = spawn_one_shot_http_server("200 OK", tampered_body);
     let bad_state = tempfile::tempdir().unwrap();
-    let bad_join = Command::new(hyp_rs_bin())
+    let bad_join = scrubbed_cmd()
         .args([
             "pair",
             "join",
@@ -1454,7 +1457,7 @@ fn pair_join_verifies_live_rust_node_manifest_rejects_tampered_and_supports_offl
     assert!(!bad_state.path().join("node.sqlite").exists());
 
     // 4. Fail-closed: remote plaintext `http://` URL rejected with exit 2 (`INVALID_ENDPOINT`)
-    let insecure_join = Command::new(hyp_rs_bin())
+    let insecure_join = scrubbed_cmd()
         .args([
             "pair",
             "join",
@@ -1472,7 +1475,7 @@ fn pair_join_verifies_live_rust_node_manifest_rejects_tampered_and_supports_offl
 
     // 5. Offline pre-configuration (`--offline`) derives `public.hyphae.to` and persists peer cleanly
     let offline_state = tempfile::tempdir().unwrap();
-    let offline_join = Command::new(hyp_rs_bin())
+    let offline_join = scrubbed_cmd()
         .args([
             "pair",
             "join",
