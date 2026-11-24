@@ -1,6 +1,5 @@
 [package]
 name = "hyp-node"
-description = "Hyphae v2 unified Node engine: PeerLinks, subscription pushdown, forwarding/loop guard, github-public poller, fd-3 supervisor, Local Security Gates"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +9,31 @@ license.workspace = true
 hyp-proto.workspace = true
 hyp-crypto.workspace = true
 hyp-store.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http = { workspace = true, features = ["limit"] }
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+hyper-rustls.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+anyhow.workspace = true
+regex.workspace = true
+base64.workspace = true
+hex.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+ring.workspace = true
+rand.workspace = true
+semver.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
