@@ -2780,7 +2780,13 @@ fn v1_to_v2_sqlite_upgrade_via_compiled_hyp_doctor_creates_backup() {
         // Roll schema strictly back to frozen v0.2.0 schema v1 (`0001_initial_v2.sql` shape).
         db.connection()
             .execute_batch(
-                "DROP INDEX IF EXISTS mailbox_coalesce_pending;
+                "DROP INDEX IF EXISTS human_authorities_kid;
+                 DROP INDEX IF EXISTS human_claim_nonces_expires;
+                 DROP TABLE IF EXISTS human_authorities;
+                 DROP TABLE IF EXISTS human_claim_nonces;
+                 DROP TABLE IF EXISTS human_node_certs;
+                 ALTER TABLE mailbox DROP COLUMN human_auth_json;
+                 DROP INDEX IF EXISTS mailbox_coalesce_pending;
                  DROP INDEX IF EXISTS mailbox_expires_pending;
                  DROP INDEX IF EXISTS wakeups_next_fire;
                  DROP INDEX IF EXISTS wakeups_owner_active;
