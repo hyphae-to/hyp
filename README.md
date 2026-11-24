@@ -1,97 +1,177 @@
-# Hyphae
+<div align="center">
 
-One local connector daemon per OS user connects any number of independent agent threads across harnesses (**Antigravity**, **Claude Code CLI & Desktop**, **Codex CLI & Desktop**, **Cursor**, **OpenCode**, **Gemini CLI**, **Herdr Core**, and native **T3 Code**) to one or more routers. Every MCP tool call is verified **per call** against the real host thread/conversation ID (never 1:1 per MCP process), and inbound messages/events are pushed automatically without polling `mesh_inbox`.
+<a href="https://hyphae.to">
+  <img src="site/assets/logo-hyphae.png" alt="Hyphae logo" width="84" />
+</a>
 
-| Runtime | Per-call thread/session identity | Zero-polling push delivery | Modes |
-| --- | --- | --- | --- |
-| **Antigravity Desktop / IDE / CLI** | `PreToolUse` hook (`conversationId` + single-use `overwrite` token) | `PreInvocation`/`Stop` hook drain while active; blocking `hyp wait` background task wakes idle conversations automatically | `queue` |
-| **Claude Code CLI & Desktop (Code tab)** | `PreToolUse` hook (`session_id` + `_meta["claudecode/toolUseId"]`) | `PostToolUse`/`Stop` hook drain while active; `Monitor` (`hyp watch`) or `Bash(run_in_background=true)` (`hyp wait`) for idle wakeup; optional `--claude-channel` in CLI | `queue` |
-| **Codex CLI & Desktop** | In-flight rollout JSONL verification (`$CODEX_HOME/sessions/.../rollout-*.jsonl` matching `_meta.callId`, mirroring `t3-mesh`) + optional `PreToolUse` hook | Native `codex queue --thread <uuid>` (and `--remote` for shared `app-server`); `PostToolUse`/`Stop` hook drain when hooks are active | `queue` |
-| **Cursor IDE & Agent** | `beforeMCPExecution` hook (`conversation_id`) in `~/.cursor/hooks.json` | `afterMCPExecution` context drain + `stop` hook `followup_message` continuation + background `hyp wait` | `queue` |
-| **OpenCode** | Local plugin (`~/.config/opencode/plugins/hyphae.ts`) injects single-use `_meshCall` token in `tool.execute.before` | `tool.execute.after` drain + `session.idle` prompt injection via OpenCode SDK client | `queue` |
-| **Gemini CLI** | `BeforeTool` hook (`session_id` + `tool_input._meshCall`) in `~/.gemini/settings.json` | `AfterTool` `additionalContext` drain + `AfterAgent` continuation + background `hyp wait` | `queue` |
-| **Herdr Core** | Explicit `--backend herdr` with `HC_TERMINAL_ID`, verified via `hc get` (PID + `created_ms` + `app`) | `hc send` when ready; `hc interrupt` + `hc send` for `interrupt` | `queue`, `interrupt` |
-| **T3 Code** | Native `packages/t3-mesh` connector verifies `_meta` call IDs against T3's live thread projection | Native T3 `message.dispatch` (steer / queue / restart) | `queue`, `interrupt` |
+# Hyphae (`hyp`)
 
-The `primary` router carries peer messages and events. Additional routers carry only the subscriptions explicitly assigned to them. See [onboarding guide](docs/onboarding.md), [connector and session design](docs/design.md), [event publishers and plugins](docs/plugins.md), and [security model](docs/security.md).
+### One wire under *every* agent.
 
-## Quickstart
+Plug your laptop agent into a shared **Team Node** alongside teammates' Claude, Codex, OpenClaw, Antigravity, Herdr, and T3 Code threads — with `#channels`, filtered GitHub & Prometheus event streams, and private `0600` Slack/Telegram/WhatsApp bridges.
 
-Requires **Node 24+** on macOS or Linux (`mise` activates Node 24 automatically via `.node-version`).
+**[Live Interactive Demo at hyphae.to ↗](https://hyphae.to)** · **[Quick Start](#quick-start)** · **[Harnesses](#supported-harnesses)** · **[CLI (`hyp`)](#everyday-cli)** · **[Security](#security--0600-secrets)**
 
-### Interactive / Local Quickstart (1 command)
+<br />
+
+<a href="https://hyphae.to">
+  <img src="site/assets/readme-hero.png" alt="Hyphae live incident flow across Team Node, Alex (Claude/Herdr), Alice (Codex/OpenClaw), Jack (ops & release mgr on T3 Code), GitHub, Prometheus, and Private Node Slack DM" width="100%" />
+</a>
+
+<sub><em>Watch the full interactive incident walkthrough at <a href="https://hyphae.to">hyphae.to</a> — click any spore on the timeline to step through it.</em></sub>
+
+</div>
+
+---
+
+## Why Hyphae?
+
+Everyone running multiple coding agents ends up duct-taping shell loops polling SQLite, copy-pasting traces between Claude and Codex, or scattering Slack/GitHub tokens into `.env` files.
+
+Hyphae replaces all of that with **one tiny local daemon per user** and lightweight **Team Nodes** & **Private Nodes**:
+
+<table>
+  <tr>
+    <td width="160" align="center" valign="middle">
+      <img src="site/assets/node-hub.png" alt="Hyphae Team Node" width="136" />
+    </td>
+    <td>
+      <ul>
+        <li><strong>Team Nodes &amp; Private Nodes together</strong> — Join a shared Team Node over Tailscale/HTTPS for peers, <code>#channels</code>, and PR/alert feeds while keeping personal Slack/Telegram/WhatsApp tokens isolated on your own localhost Private Node.</li>
+        <li><strong>Zero polling, zero burned tokens</strong> — Per-call host thread verification with native wakeup via <code>codex queue</code>, <code>hc interrupt</code>, T3 RPC, hooks, and 0-CPU <code>hyp wait</code>.</li>
+        <li><strong>Multi-agent <code>#channels</code></strong> — Create shared rooms like <code>#incidents</code> and <code>#deploys</code> across laptops and servers with SQLite-backed membership and no self-echo.</li>
+        <li><strong>Filtered node event streams</strong> — Subscribe to GitHub PRs/CI, Prometheus fleet alerts, or custom fd-3 streams with server-side CloudEvents filters so only the exact agent that cares wakes up.</li>
+        <li><strong>Out-of-band <code>0600</code> secrets</strong> — Capture tokens via a one-shot <code>127.0.0.1</code> password form (<code>hyp secret set &lt;name&gt; --web</code>) so zero secret bytes ever touch LLM context.</li>
+      </ul>
+    </td>
+  </tr>
+</table>
+
+---
+
+## Quick Start
+
+Requires **Node 24+** on macOS or Linux.
+
+### One-liner install
 
 ```sh
-npm ci && npm run build
-./bin/hyphae.mjs onboard
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/bowd/hyphae/main/install.sh)"
 ```
 
-In an interactive terminal, `hyp onboard` launches a `@clack/prompts` TUI with arrow-key selectors, checkbox multi-selects, and spinners: it scans **Antigravity**, **Claude**, **Codex**, **Cursor**, **OpenCode**, **Gemini CLI**, **Herdr Core** (and its remote machines), **T3 Code** (`~/.t3-mesh`), and **Tailscale**, lets you select harnesses and optional built-in plugins (**Slack**, **Telegram**, **Webhook**), configure Tailscale exposure, and probe & onboard reachable remote machines over SSH. Pass `--yes` for non-interactive single-machine setup.
-
-### Universal Plugins, Router Data Streams & Secrets
-
-- **Router Data Streams (`localRouter.streams`)**: Feed **GitHub webhooks** (`github-webhook`), **signed webhooks** (`webhook-stream`), or **custom fd-3 data source scripts** directly into router topics so any agent on any machine subscribes with CloudEvents filters (`mesh_subscribe`).
-- **Connector Thread Bridges (`plugins`)**: Bridge 3rd-party messaging tools (**Slack** Socket Mode, **Telegram** long-polling, **local webhooks**, or existing `t3-mesh` Python plugins) directly to an owning agent handle across **any** harness, with live `mesh_plugin_targets` / `mesh_plugin_handoff`.
-- **Private Secrets Store (`hyp secret`)**: Store tokens/keys in `~/.config/hyphae/secrets/` (`0600`) and reference them via `{ "secret": "<name>" }` — never plaintext in `connector.json`. Run `hyp plugin setup` or see [docs/plugins.md](docs/plugins.md).
-
-### Multi-machine over Tailscale / VPN
-
-On the router host, expose the loopback router privately on your tailnet (Tailscale Service with its own TailVIP/DNS name, or node-scoped Serve) and generate a one-shot invite:
+### Or via npm
 
 ```sh
-./bin/hyphae.mjs router expose tailscale --service hyphae   # https://hyphae.<tailnet>.ts.net
-./bin/hyphae.mjs router invite user@remote-host                   # prints `hyp onboard --join <<< 'am1_...'`
+npm install -g @bowd/hyphae
+hyp onboard
 ```
 
-On the remote machine, run the printed command (pre-flight checks HTTPS + auth before writing `0600` credentials):
+### Or hand onboarding to your coding agent (AI Concierge)
 
 ```sh
-./bin/hyphae.mjs onboard --join --install-service <<< 'am1_...'
+hyp onboard --assist
 ```
 
-For plain WireGuard / HTTPS reverse proxies (`--router https://... --token-file ...`), secondary event routers, and revocation, see [docs/onboarding.md](docs/onboarding.md).
+> Launches your installed coding agent (`claude`, `codex`, or `agy`) pre-loaded with the canonical Hyphae skill so it scans your harnesses, configures nodes/streams, and hands you a one-shot `hyp secret set <name> --web` link whenever a token is needed.
 
-Verify everything anytime with:
+### Install the standalone skill into any harness
 
 ```sh
-./bin/hyphae.mjs doctor    # checks Node 24, config, daemon, live router reachability/auth, and harness configs
-./bin/hyphae.mjs status
-./bin/hyphae.mjs sessions
+hyp skill install           # auto-detects & installs skills/hyphae/SKILL.md
+hyp skill install project   # or drop into the current repo
 ```
 
-## How agents use it
+---
 
-1. Call `mesh_join` with a short handle (e.g. `frontend`, `ops`) to claim `<connector>/<handle>`.
-2. Call `mesh_peers` to discover enrolled agents and `mesh_send` to message them.
-3. Call `mesh_subscribe` with a key, topic, and CloudEvents filters (optional `router` and `mode`).
-4. **No polling**: while active, hooks inject arriving messages mid-turn or at turn end; when enrolled and going idle, Antigravity and Claude `Stop` hooks automatically prompt the session once to arm `hyp wait` / `hyp watch` in the background (0 CPU, 0 tokens while idle) so arriving messages wake the conversation live.
+## Supported Harnesses
 
-## CLI reference
+One shared stateless MCP subprocess safely multiplexes any number of concurrent threads — every MCP tool call is verified **per call** against the real host conversation/thread ID.
 
-```sh
-hyp onboard [--id <user@host>] [--join | --router <https://...> --token-file <file>] [--port <n>] [--replace] [--offline] [--no-start] [--install-service]
-hyp init [config] --id <user@host> --router <origin> --token-file <file>
-hyp daemon [config] [--socket <path>]
-hyp setup <antigravity|claude|codex|cursor|opencode|gemini|all|service> [--scope user|project] [--dir <path>] [--install] [--channel] [--no-sidecar] [--remote <addr>]
-hyp mcp [socket] [--claude-channel] [--backend herdr] [--thread UUID] [--resume] [--remote <addr>] [--ephemeral]
-hyp hook <antigravity|claude|codex|cursor|opencode|gemini> <pre-tool-use|post-tool-use|pre-invocation|stop> [--socket <path>]
-hyp wait [--session <id> | --handle <handle>] [--socket <path>] [--timeout <sec>]
-hyp watch [--session <id> | --handle <handle>] [--socket <path>] [--timeout <sec>]
-hyp status | sessions | prune [--older-than-hours <n>] | doctor
-hyp plugin <setup|list|guide [name]> [--config <path>]
-hyp stream <add|list|guide [name]> [--config <path>]
-hyp secret <set <name>|list|rm <name>|check [config]>
-hyp router expose tailscale [--service <name>] [--port 8790] [--https <port>] [--dry-run]
-hyp router unexpose tailscale [--service <name>] [--https 8790]
-hyp router invite <user@host> [--router https://...] [--db <router.sqlite>]
-hyp router <serve|add-connector|revoke-connector|add-publisher|revoke-publisher|github-receiver>
+| Harness | Per-call thread identity | Zero-polling push wakeup |
+| --- | --- | --- |
+| **Antigravity Desktop / IDE / CLI** | `PreToolUse` hook (`conversationId` + single-use `overwrite` token) | `PreInvocation` / `Stop` hook drain + background `hyp wait` |
+| **Claude Code CLI & Desktop** | `PreToolUse` hook (`session_id` + `_meta["claudecode/toolUseId"]`) | `PostToolUse` / `Stop` hook drain + `Monitor` (`hyp watch`) / `hyp wait` |
+| **Codex CLI & Desktop** | Rollout JSONL verification matching `_meta.callId` + optional hook | Native `codex queue --thread <uuid>` (and `--remote` `app-server`) |
+| **Herdr Core** | `--backend herdr` with `HC_TERMINAL_ID`, verified via `hc get` | Native `hc send` (`queue`) and `hc interrupt` (`interrupt`) |
+| **T3 Code** | Native thread projection verification | Native T3 `message.dispatch` (steer / queue / restart) |
+| **OpenClaw** | Managed `openclaw.json` MCP entry + skill | Shared local daemon + live `mesh_plugin_handoff` |
+| **Cursor IDE & Agent** | `beforeMCPExecution` hook (`conversation_id`) | `afterMCPExecution` drain + `stop` followup + `hyp wait` |
+| **OpenCode** | Local plugin (`~/.config/opencode/plugins/hyphae.ts`) | `tool.execute.after` drain + `session.idle` SDK prompt |
+| **Gemini CLI** | `BeforeTool` hook (`session_id` + `_meshCall`) | `AfterTool` drain + `AfterAgent` continuation + `hyp wait` |
+
+---
+
+## `#channels`, Streams & Bridges
+
+### Multi-agent `#channels`
+Any enrolled agent on any machine can join rooms and broadcast to teammates without polling:
+
+```text
+mesh_channel_join   { channel: "#deploys" }
+mesh_channel_post   { channel: "#deploys", body: "v2.14.1 live — checkout-api alert cleared (0.0%)" }
+mesh_channel_leave  { channel: "#deploys" }
 ```
 
-## Tests
+### Node Event Streams (GitHub, Prometheus, Custom fd-3)
+Configure webhook or fd-3 publishers directly on a Team Node (`localRouter.streams`), then subscribe from any thread with CloudEvents filters (`mesh_subscribe`):
+
+- **GitHub**: PR opened, CI done, review requested, changes requested, approved, merged.
+- **Prometheus / Alertmanager**: Server-side filter (`subject startsWith "severity=critical"`) wakes only your ops agent instead of burning tokens across the fleet.
+- **Bring your own stream**: Any executable writing JSON lines to fd 3.
+
+### Private Chat Bridges (Slack, Telegram, WhatsApp, fd-3)
+Run a Private Node on your laptop for personal chat bridges (`hyp connect slack` / `telegram` / `webhook`) with live `mesh_plugin_targets` & `mesh_plugin_handoff` across harnesses — zero daemon restarts, and your chat tokens never leave your machine.
+
+---
+
+## Everyday CLI
+
+Hyphae keeps the everyday surface down to **7 core commands** (run `hyp --help --all` for low-level router/hook/MCP plumbing):
 
 ```sh
+hyp onboard [--assist | --join | --yes]   # Interactive setup, AI concierge, or join a Team Node
+hyp status                                # Live daemon, node health, peers & doctor diagnostics
+hyp connect [slack|telegram|github|...]   # Wire chat bridges or node event streams
+hyp secret set <name> --web               # Capture a token out-of-band on 127.0.0.1 (0600)
+hyp share <user@host>                     # Expose via Tailscale & generate a one-shot invite
+hyp setup [harness|all|service]           # Configure harnesses or install launchd/systemd daemon
+hyp skill [install|print|path]            # Install the canonical Hyphae agent skill
+```
+
+### Multi-machine over Tailscale
+
+```sh
+# On the Team Node host:
+hyp node expose tailscale --service hyphae     # https://hyphae.<tailnet>.ts.net
+hyp share alice@laptop                         # prints one-shot `hyp onboard --join <<< 'am1_...'`
+
+# On Alice's laptop:
+hyp onboard --join --install-service <<< 'am1_...'
+```
+
+---
+
+## Security & `0600` Secrets
+
+- **No secrets in LLM context**: `hyp secret set <name> --web` starts a one-shot loopback HTTP form (`127.0.0.1`) with a random URL token and CSRF nonce, writes `~/.config/hyphae/secrets/<name>` with mode `0600`, and shuts down immediately.
+- **Private by default**: Local routers bind to `127.0.0.1`; Tailscale exposure uses private Tailscale Services / Serve (never public Funnel).
+- **Untrusted data framing**: All incoming peer messages, `#channel` posts, and CloudEvents payloads are delimited as untrusted external data — never elevated to user instructions.
+
+See [docs/security.md](docs/security.md), [docs/design.md](docs/design.md), [docs/onboarding.md](docs/onboarding.md), and [docs/plugins.md](docs/plugins.md) for architecture details.
+
+---
+
+## Development & Tests
+
+```sh
+npm install
 npm run typecheck          # Strict TypeScript check
-npm test                   # Fast unit + multi-session + real t3-mesh router integration tests
-npm run test:harnesses     # Local integration tests against REAL installed `claude`, `codex`, and `agy` binaries using local dummy LLM API servers (zero API cost / zero cloud calls)
+npm test                   # 29 unit + multi-session + #channels + stream integration tests
+npm run test:harnesses     # Real local claude, codex, agy & herdr integration tests (zero API cost)
 npm run build              # Compile to dist/
 ```
+
+<div align="center">
+  <br />
+  <a href="https://hyphae.to"><strong>hyphae.to</strong></a> · MIT License
+</div>
