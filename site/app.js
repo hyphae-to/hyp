@@ -96,7 +96,7 @@ const CHAPTERS = [
     alertHit: [],
     strands: ["p-alex-node"],
     softStrands: [],
-    bubbles: { "bub-alex": { text: "Calling hyp_join on the Team Node…", alert: false } },
+    bubbles: { "bub-alex": { text: "Calling hyp_mesh(join) on the Team Node…", alert: false } },
     caps: [],
     subs: [],
     promState: "",
@@ -106,7 +106,7 @@ const CHAPTERS = [
     filterTag: false,
     ripples: [],
     packets: [
-      { path: "p-alex-node", reverse: false, cls: "", label: "hyp_join", delay: 150, dur: 900 },
+      { path: "p-alex-node", reverse: false, cls: "", label: "hyp_mesh(join)", delay: 150, dur: 900 },
       { path: "p-node-alice", reverse: false, cls: "amber", label: "alice · Codex online", delay: 1240, dur: 860 },
       { path: "p-node-ops", reverse: false, cls: "", label: "jack · ops online", delay: 2420, dur: 860 },
       { path: "p-node-release", reverse: false, cls: "", label: "sub: approved PRs", delay: 3620, dur: 900 },
@@ -195,8 +195,8 @@ const CHAPTERS = [
   },
   {
     durationMs: 7000,
-    tip: "3 · Ops calls hyp_send -> Alex + Private Slack + #deploys",
-    caption: "<strong>3/7</strong> · Jack's ops sends a <code>hyp_send</code> to <strong>Alex</strong>. Alex joins <code>#deploys</code> with ops and wires a <strong>Private Node -> Slack</strong> to DM Alex.",
+    tip: "3 · Ops calls hyp_send -> Alex + Local Node Slack + #deploys",
+    caption: "<strong>3/7</strong> · Jack's ops sends a <code>hyp_send</code> to <strong>Alex</strong>. Alex joins <code>#deploys</code> with ops and wires a <strong>Local Node · Bridge -> Slack</strong> to DM Alex.",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-prom"],
     dim: ["ent-alice", "ent-release"],
     spotlight: ["ent-ops"],
@@ -261,14 +261,14 @@ const CHAPTERS = [
     ghActive: "amber",
     ghTitle: "GitHub · PR #412",
     ghSub: "open · CI running…",
-    ccAction: "→ opened PR #412 · hyp_subscribe(PR #412)",
+    ccAction: "→ opened PR #412 · hyp_stream(subscribe)",
     promState: "coral",
     promSub: "HighErrorRate · 4.2%!",
     filterTag: false,
     ripples: [],
     packets: [
       { path: "p-alex-gh", reverse: false, cls: "amber", label: "open PR #412", delay: 150, dur: 900 },
-      { path: "p-alex-node", reverse: false, cls: "", label: "hyp_subscribe(PR #412)", delay: 280, dur: 920 },
+      { path: "p-alex-node", reverse: false, cls: "", label: "hyp_stream(subscribe)", delay: 280, dur: 920 },
       { path: "p-gh-node", reverse: false, cls: "", label: "CI Done ✓", delay: 2000, dur: 880 },
       { path: "p-alex-node", reverse: true, cls: "", label: "CI Done ✓", delay: 2940, dur: 940 },
     ],
@@ -1088,7 +1088,7 @@ resetStoryTimer();
     { name: "public.hyphae.to · OSS", sub: "unlinked · click to pair", linkedSub: "anthropics/claude-code · PRs", cls: "amber" },
     { name: "CI Burst (×12)", sub: "acme-team · flaky retries", cls: "amber-muted" },
     { name: "#deploys · chatter", sub: "acme-team · build room", cls: "olive" },
-    { name: "E2EE · diff.patch", sub: "acme-team · X25519 · 42 KB", cls: "moss" },
+    { name: "Direct P2P · diff.patch", sub: "bob@laptop · HPKE · 42 KB", cls: "moss" },
   ];
 
   // Build braided companion hyphae once (tight hugging weave on unified #g-out)
@@ -1350,11 +1350,11 @@ resetStoryTimer();
       packets.push({ path: "g-in-3", cls: "moss", label: "#deploys ok", phase: 0.16, dur: 1180, startT: 0.14, endT: 0.78 });
     }
 
-    // Row 4: E2EE · diff.patch (saved directly to disk outside LLM prompt)
+    // Row 4: Direct P2P · diff.patch (saved directly to disk outside LLM prompt)
     const src4 = { state: "pass", badge: "→ disk", strand: "active" };
     if (st.focus) notifyItems.push("diff.patch");
-    else queuedItems.push("diff");
-    packets.push({ path: "g-in-4", cls: "moss", label: "🔒 diff.patch", phase: 0.04, dur: 1180, startT: 0.14, endT: 0.78 });
+    else queuedItems.push("P2P diff");
+    packets.push({ path: "g-in-4", cls: "moss", label: "🔒 P2P diff.patch", phase: 0.04, dur: 1180, startT: 0.14, endT: 0.78 });
 
     // Compute ONE single unified right-hand strand (#g-out) output reflecting 3-tier urgency!
     const hasInterrupt = interruptItems.length > 0;
@@ -1482,7 +1482,7 @@ resetStoryTimer();
     let savedLabel = "Context saved";
     let barPct = 94;
     let barDanger = false;
-    let foot = "Delivers on idle · E2EE → disk";
+    let foot = "Delivers on idle · P2P diff → disk";
 
     if (leakedInject) {
       deliveredText = st.focus ? "⚠ digest + inject" : "⚠ unguarded inject";
@@ -1526,30 +1526,8 @@ resetStoryTimer();
       foot = hasInterrupt
         ? "Urgent interrupt wakes agent immediately"
         : st.publicLinked
-        ? "2 hubs paired · E2EE → disk · 0 leaked"
-        : "Delivers on idle · E2EE → disk";
-    }
-
-    let caption = "";
-    if (leakedInject) {
-      caption =
-        "<strong>Injection Guard is OFF</strong> — an untrusted <code>public.hyphae.to</code> PR comment (<code>\"ignore prev…\"</code>) slipped straight into your agent. Turn <strong>🛡 Injection Guard</strong> back ON to quarantine attacks via <code>Anthropic</code>, <code>OpenAI-compatible</code>, <code>Llama Prompt Guard 2</code>, <code>Lakera</code>, or BYO plugins.";
-    } else if (st.focus) {
-      caption = hasInterrupt
-        ? "<strong>Focus Mode (* → notify)</strong> is ON — non-VIP feeds sit calmly in your local inbox (<code>hyp_inbox({ filter, cursor })</code>), while VIP <code>interrupt</code> peer <strong>@alice</strong> still wakes your agent immediately."
-        : "<strong>Focus Mode (* → notify)</strong> is ON — every source drops to a calm <code>1-line digest</code> held in your local inbox so your agent finishes uninterrupted, then paginates on demand via <code>hyp_inbox({ mode: \"notify\", filter, cursor })</code>.";
-    } else if (st.aliceMode === "interrupt") {
-      caption =
-        "<strong>3-tier delivery urgency</strong> — <strong>DM @alice</strong> is set to <code>interrupt</code> (wakes thread immediately!), while routine signals <code>queue</code> until idle and noisy bursts step down to <code>notify</code> digests.";
-    } else if (st.publicLinked) {
-      caption =
-        "<strong>Multi-node pairing active</strong> — your Local Node is now paired to both your private <strong>acme-team</strong> hub AND <code>public.hyphae.to</code> (streaming filtered <code>anthropics/claude-code</code> PRs while <strong>🛡 Injection Guard</strong> quarantines untrusted comments).";
-    } else if (st.ciMode === "unsub") {
-      caption =
-        "<strong>Upstream unsubscribed</strong> — <code>CI Burst</code> is cut completely at the source (<code>0 bytes</code> on the wire), while muted <code>#deploys</code> chatter still deflects locally at your gate shield (<code>0 tokens</code>).";
-    } else {
-      caption =
-        "<strong>Paired to private Team Node (<code>acme-team</code>)</strong> — DMs <code>queue</code> cleanly until idle, <strong>CI Burst Cap</strong> steps noisy storms down to <code>notify</code>, and clicking <strong>Public Node</strong> links <code>public.hyphae.to</code> live behind your <strong>Injection Guard</strong>.";
+        ? "3 topologies live · P2P diff → disk"
+        : "Delivers on idle · P2P diff → disk";
     }
 
     return {
@@ -1576,7 +1554,6 @@ resetStoryTimer();
       barPct,
       barDanger,
       foot,
-      caption,
       leakedInject,
       hasInterrupt,
     };
@@ -1681,7 +1658,7 @@ resetStoryTimer();
         <div class="gm-mob-agent-head">
           <img src="./assets/sprite-alex.jpg?v=2" alt="Your agent harness" />
           <div>
-            <strong>Your Agent · Claude / Codex / Agy</strong>
+            <strong>Your Agent · Claude / Codex / Antigravity</strong>
             <small>${esc(sc.foot)}</small>
           </div>
         </div>
@@ -1901,9 +1878,6 @@ resetStoryTimer();
       const modeCls = sc.leakedInject || sc.hasInterrupt ? "mode-guard" : gateState.focus ? "mode-digest" : "mode-coalesce";
       valveEl.className = `gate-valve-ring ${modeCls}`.trim();
     }
-
-    const capEl = document.getElementById("gateCaption");
-    if (capEl) capEl.innerHTML = sc.caption;
 
     // Sync macOS Control Center tiles directly under Local Node
     const pubBtn = document.getElementById("ctlPublicLink");
@@ -2144,18 +2118,40 @@ resetStoryTimer();
 })();
 
 // ============================================================================
-// 4. QUICK START TABS
+// 4. TOPOLOGY CARD COPY BUTTONS (#topologies)
+// ============================================================================
+const TOPO_SNIPPETS = {
+  p2p: `hyp pair invite --mode p2p --grant dm:* files:send=25mb --request kv:read=pair/*
+hyp pair accept <<< "$TOKEN"`,
+  team: `hyp deploy init tailscale --node-id acme-team
+hyp pair invite --mode team --peer alice@macbook --preset member`,
+  public: `hyp pair join https://public.hyphae.to
+hyp_stream(subscribe, repo="anthropics/claude-code")`,
+};
+
+document.querySelectorAll("[data-copy-topo]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const text = TOPO_SNIPPETS[btn.dataset.copyTopo];
+    if (!text) return;
+    navigator.clipboard?.writeText(text).catch(() => {});
+    btn.textContent = "Copied";
+    setTimeout(() => { btn.textContent = "Copy"; }, 1300);
+  });
+});
+
+// ============================================================================
+// 5. QUICK START TABS
 // ============================================================================
 const QS = {
-  unix: `# Install single 1.25 MiB verified Rust binary (SHA-256 checked)
+  unix: `# Install single 1.25 MiB verified Rust binary (SHA-256)
 curl -fsSL https://hyphae.to/install.sh | sh
 
-# Interactive setup: harnesses, Team Hub / P2P, streams & guards
+# Interactive setup: harnesses, Team Hub / P2P & guards
 hyp onboard
 
-# See built-in hub deploy kits & update your entire fleet in one shot
+# Hub deploy kits & fleet updates in one command
 hyp deploy providers
-hyp update --all          # pass --nightly for latest main builds`,
+hyp update --all   # --nightly for latest main builds`,
   win: `# Install single verified Rust binary on Windows (PowerShell)
 irm https://hyphae.to/install.ps1 | iex
 
@@ -2169,7 +2165,7 @@ hyp deploy init tailscale
 
 # Create a zero-hub direct P2P invite (hp2p1_) or inspect any invite's scopes
 hyp pair invite --mode p2p
-hyp pair inspect <invite-token>
+hyp pair inspect <<< "$TOKEN"
 
 # Enable a pluggable prompt-injection guard on your Local Node
 hyp gate init --adapter anthropic`,
