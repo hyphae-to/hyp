@@ -11,16 +11,129 @@ permissions:
   contents: read
 
 concurrency:
-  group: rust-ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: rust-ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   HYPHAE_SECRET_BACKEND: file
 
 jobs:
+  lint-site-and-plugins:
+    name: Lint, Parity & Change Detection
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run_rust: ${{ steps.changes.outputs.run_rust }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Syntax-check site script, external JS/Python plugins, installers, and mirror parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          python3 --version
+
+          node --check site/app.js
+          while IFS= read -r file; do
+            node --check "$file"
+          done < <(find plugins -type f -name '*.mjs' | sort)
+
+          while IFS= read -r file; do
+            python3 -m py_compile "$file"
+          done < <(find plugins -type f -name '*.py' | sort)
+
+          sh -n install.sh scripts/install.sh site/install.sh
+          bash -n scripts/test-installer.sh
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck -s sh scripts/install.sh
+          fi
+
+          cmp -s scripts/install.sh site/install.sh
+          cmp -s scripts/install.sh install.sh
+          cmp -s scripts/install.ps1 site/install.ps1
+
+          if command -v pwsh >/dev/null 2>&1; then
+            pwsh -NoProfile -Command '
+              $ErrorActionPreference = "Stop"
+              foreach ($path in @("scripts/install.ps1", "site/install.ps1")) {
+                $tokens = $null
+                $errors = $null
+                $resolved = (Resolve-Path $path).Path
+                [void][System.Management.Automation.Language.Parser]::ParseFile($resolved, [ref]$tokens, [ref]$errors)
+                if ($errors -and $errors.Count -gt 0) {
+                  $msg = ($errors | ForEach-Object { $_.ToString() }) -join "`n"
+                  throw "PowerShell syntax error(s) in ${path}:`n$msg"
+                }
+              }
+            '
+          fi
+          echo "All site, plugin, shell, PowerShell, and installer mirror checks passed."
+
+      - name: Detect whether Rust workspace CI is required
+        id: changes
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "workflow_dispatch: running full 3-OS Rust workspace CI unconditionally."
+            echo "run_rust=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CHANGED=""
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if git rev-parse --verify HEAD^2 >/dev/null 2>&1; then
+              CHANGED="$(git -c core.quotepath=false diff --name-only HEAD^1 HEAD || true)"
+            elif [ -n "${PR_BASE_SHA:-}" ] && git cat-file -e "${PR_BASE_SHA}^{commit}" 2>/dev/null; then
+              CHANGED="$(git -c core.quotepath=false diff --name-only "${PR_BASE_SHA}" HEAD || true)"
+            fi
+          elif [ "$EVENT_NAME" = "push" ]; then
+            if [ -n "${PUSH_BEFORE_SHA:-}" ] \
+              && [ "$PUSH_BEFORE_SHA" != "0000000000000000000000000000000000000000" ] \
+              && git cat-file -e "${PUSH_BEFORE_SHA}^{commit}" 2>/dev/null; then
+              CHANGED="$(git -c core.quotepath=false diff --name-only "${PUSH_BEFORE_SHA}" "${GITHUB_SHA}" || true)"
+            fi
+          fi
+
+          if [ -z "$CHANGED" ]; then
+            echo "Unable to narrow changed files (initial/force push or empty diff); running Rust CI (fail-safe)."
+            echo "run_rust=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          RUN_RUST="false"
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            case "$path" in
+              *.md|LICENSE|docs/*|skills/*|site/index.html|site/styles.css|site/app.js|site/CNAME|site/assets/*|.github/workflows/pages.yml)
+                ;;
+              *)
+                echo "Code/runtime/plugin/installer/workflow change detected: $path"
+                RUN_RUST="true"
+                break
+                ;;
+            esac
+          done <<< "$CHANGED"
+
+          if [ "$RUN_RUST" = "false" ]; then
+            echo "Only docs/static-site files changed; skipping 3-OS Rust workspace build."
+          fi
+          echo "run_rust=${RUN_RUST}" >> "$GITHUB_OUTPUT"
+
   rust-workspace:
     name: Rust (${{ matrix.os }})
+    needs: lint-site-and-plugins
+    if: needs.lint-site-and-plugins.outputs.run_rust == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     strategy:
@@ -37,19 +150,36 @@ jobs:
       - name: Install Rust 1.87.0
         uses: dtolnay/rust-toolchain@1.87.0
         with:
-          components: clippy, rustfmt
+          components: clippy
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-workspace
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Clippy (zero warnings across workspace & all targets)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Workspace Tests (unit, golden interop, chaos & CLI E2E)
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
+
+      - name: Verify live Node.js & Python external plugin E2E (zero skips)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          python3 --version
+          out="$(cargo test --locked -p hyp-node --test real_plugins_e2e -- --nocapture 2>&1)"
+          printf '%s\n' "$out"
+          if printf '%s\n' "$out" | grep -q 'SKIP '; then
+            echo "ERROR: real_plugins_e2e skipped one or more live plugin tests!" >&2
+            exit 1
+          fi
 
       - name: Build release binary (hyp)
-        run: cargo build --release -p hyp-cli
+        run: cargo build --release --locked -p hyp-cli
 
       - name: Smoke-test compiled binary (Unix)
         if: runner.os != 'Windows'
@@ -59,6 +189,13 @@ jobs:
           out="$(./target/release/hyp version --json)"
           echo "$out"
           python3 -c 'import json, sys; j = json.loads(sys.argv[1]); assert j.get("ok") is True and j.get("command") == "version" and j.get("data", {}).get("version"), j' "$out"
+
+      - name: Run installer E2E verification suite (Unix, reusing built binary)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          HYPHAE_PREBUILT_BIN: ./target/release/hyp
+        run: bash scripts/test-installer.sh
 
       - name: Smoke-test compiled binary (Windows)
         if: runner.os == 'Windows'
@@ -72,7 +209,7 @@ jobs:
             throw "Unexpected hyp.exe version --json output: $out"
           }
 
-      - name: Syntax-check Windows PowerShell installer & mirror parity
+      - name: Verify Windows PowerShell installer (AST, parity & dry-run)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -97,62 +234,9 @@ jobs:
               throw "scripts/install.ps1 and site/install.ps1 differ at byte offset $i."
             }
           }
-          Write-Host "PowerShell AST parse & byte-identical mirror parity verified."
-
-  installer-test:
-    name: Installer Verification (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust 1.87.0
-        uses: dtolnay/rust-toolchain@1.87.0
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Prefetch Cargo dependencies for offline installer test
-        run: cargo fetch --locked
-
-      - name: Run installer end-to-end verification suite
-        shell: bash
-        run: bash scripts/test-installer.sh
-
-  site-and-plugins:
-    name: Site & External Plugins (Syntax + Live E2E)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Syntax-check site script, external JS/Python plugins, and installer mirrors
-        shell: bash
-        run: |
-          set -euo pipefail
-          node --check site/app.js
-          while IFS= read -r file; do
-            node --check "$file"
-          done < <(find plugins -type f -name '*.mjs' | sort)
-          python3 -m py_compile plugins/sdk/client.py
-          sh -n install.sh scripts/install.sh site/install.sh
-          cmp -s scripts/install.sh site/install.sh
-          cmp -s scripts/install.sh install.sh
-          cmp -s scripts/install.ps1 site/install.ps1
-
-      - name: Install Rust 1.87.0
-        uses: dtolnay/rust-toolchain@1.87.0
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Run live Node.js & Python external plugin E2E suite
-        run: cargo test -p hyp-node --test real_plugins_e2e
+          $dryOut = (& .\scripts\install.ps1 -Version v0.2.0-test -BaseUrl "http://127.0.0.1:1/test" -DryRun) | Out-String
+          Write-Output $dryOut
+          if ($dryOut -notmatch "hyp-v0\.2\.0-test-x86_64-pc-windows-msvc\.zip") {
+            throw "Unexpected Windows installer -DryRun output: $dryOut"
+          }
+          Write-Host "PowerShell AST parse, byte-identical mirror parity & dry-run verified."

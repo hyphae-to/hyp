@@ -10,6 +10,43 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="v0.2.0-test"
+PREBUILT_BIN="${HYPHAE_PREBUILT_BIN:-}"
+SKIP_BUILD="${HYPHAE_SKIP_BUILD:-0}"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --prebuilt-bin)
+      if [ "$#" -lt 2 ]; then
+        echo "FAIL: --prebuilt-bin requires a path" >&2
+        exit 2
+      fi
+      PREBUILT_BIN="$2"
+      shift 2
+      ;;
+    --prebuilt-bin=*)
+      PREBUILT_BIN="${1#*=}"
+      shift 1
+      ;;
+    --skip-build)
+      SKIP_BUILD=1
+      shift 1
+      ;;
+    --help|-h)
+      cat <<'EOF'
+Usage: scripts/test-installer.sh [--prebuilt-bin <path>] [--skip-build]
+
+Environment overrides:
+  HYPHAE_PREBUILT_BIN   Path to an already-built `hyp` binary (skips `cargo build`)
+  HYPHAE_SKIP_BUILD=1   Reuse `target/release/hyp` without invoking `cargo build`
+EOF
+      exit 0
+      ;;
+    *)
+      echo "FAIL: unknown option: $1 (use --help for usage)" >&2
+      exit 2
+      ;;
+  esac
+done
 
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/hyphae-installer-test.XXXXXX")"
 SERVER_PID=""
@@ -67,8 +104,25 @@ sha256_file() {
   fi
 }
 
-echo "==> Building release binary (cargo build --release -p hyp-cli --offline)..."
-(cd "$REPO_ROOT" && cargo build --release -p hyp-cli --offline)
+if [ -n "$PREBUILT_BIN" ]; then
+  RELEASE_BIN="$PREBUILT_BIN"
+  if [ ! -f "$RELEASE_BIN" ] || [ ! -x "$RELEASE_BIN" ]; then
+    echo "FAIL: prebuilt binary not found or not executable: ${RELEASE_BIN}" >&2
+    exit 1
+  fi
+  echo "==> Using prebuilt release binary: ${RELEASE_BIN}"
+elif [ "$SKIP_BUILD" = "1" ] || [ "$SKIP_BUILD" = "true" ]; then
+  RELEASE_BIN="${REPO_ROOT}/target/release/hyp"
+  if [ ! -f "$RELEASE_BIN" ] || [ ! -x "$RELEASE_BIN" ]; then
+    echo "FAIL: --skip-build / HYPHAE_SKIP_BUILD set, but ${RELEASE_BIN} does not exist or is not executable" >&2
+    exit 1
+  fi
+  echo "==> Reusing existing release binary (build skipped): ${RELEASE_BIN}"
+else
+  echo "==> Building release binary (cargo build --release -p hyp-cli --offline)..."
+  (cd "$REPO_ROOT" && cargo build --release -p hyp-cli --offline)
+  RELEASE_BIN="${REPO_ROOT}/target/release/hyp"
+fi
 
 TARGET="$(detect_host_target)"
 ARCHIVE_NAME="hyp-${VERSION}-${TARGET}.tar.gz"
@@ -78,7 +132,7 @@ TAMPER_DIR="${SERVE_ROOT}/tampered"
 STAGE_DIR="${TMP_ROOT}/stage"
 mkdir -p "$GOOD_DIR" "$TAMPER_DIR" "$STAGE_DIR"
 
-cp "${REPO_ROOT}/target/release/hyp" "${STAGE_DIR}/hyp"
+cp "$RELEASE_BIN" "${STAGE_DIR}/hyp"
 chmod 0755 "${STAGE_DIR}/hyp"
 tar -C "$STAGE_DIR" -czf "${GOOD_DIR}/${ARCHIVE_NAME}" hyp
 

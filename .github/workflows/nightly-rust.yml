@@ -25,6 +25,7 @@ jobs:
   prepare:
     name: Check Main Commits & Resolve Nightly Metadata
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       should_build: ${{ steps.meta.outputs.should_build }}
       tag: ${{ steps.meta.outputs.tag }}
@@ -37,7 +38,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: main
-          fetch-depth: 20
+          fetch-depth: 1
 
       - name: Check for new commits since last nightly release
         id: meta
@@ -54,9 +55,23 @@ jobs:
           PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
           RAW_VER="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
-          BASE_VER="${RAW_VER%%-*}"
-          BASE_VER="${BASE_VER:-0.2.0}"
-          NIGHTLY_VER="${BASE_VER}-nightly.${DATE_STAMP}.${SHORT_SHA}"
+          RAW_VER="${RAW_VER:-0.2.0}"
+          NO_BUILD="${RAW_VER%%+*}"
+          BASE_VER="${NO_BUILD%%-*}"
+          if ! [[ "$BASE_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid Cargo.toml version: ${RAW_VER} (expected X.Y.Z[-prerelease])" >&2
+            exit 1
+          fi
+          if [ "$NO_BUILD" = "$BASE_VER" ]; then
+            # Cargo.toml is a stable release (e.g. 0.2.0): bump patch so 0.2.1-nightly.*
+            # sorts strictly newer than stable 0.2.0 under SemVer anti-rollback protection
+            # while still sorting older than the eventual stable 0.2.1 release.
+            IFS=. read -r V_MAJOR V_MINOR V_PATCH <<< "$BASE_VER"
+            NIGHTLY_BASE="${V_MAJOR}.${V_MINOR}.$((V_PATCH + 1))"
+          else
+            NIGHTLY_BASE="${BASE_VER}"
+          fi
+          NIGHTLY_VER="${NIGHTLY_BASE}-nightly.${DATE_STAMP}.${SHORT_SHA}"
 
           LAST_SHA=""
           if LAST_TAG_JSON="$(gh api "repos/${REPO}/git/ref/tags/nightly" 2>/dev/null || true)"; then
@@ -131,16 +146,17 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Rust cache
+      - name: Rust cache (shared with release per target)
         uses: Swatinem/rust-cache@v2
         with:
-          key: nightly-${{ matrix.target }}
+          shared-key: release-${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install musl-tools (for x86_64-unknown-linux-musl)
         if: matrix.musl == true
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools
+          sudo apt-get install -y --no-install-recommends musl-tools
 
       - name: Build stripped release binary (Unix)
         if: runner.os != 'Windows'
@@ -180,7 +196,9 @@ jobs:
           chmod 0755 "${STAGE}/hyp"
 
           if [ "$SMOKE_TEST" = "true" ]; then
-            "${STAGE}/hyp" version --json
+            out="$("${STAGE}/hyp" version --json)"
+            echo "$out"
+            python3 -c 'import json, sys; j = json.loads(sys.argv[1]); assert j.get("ok") is True and j.get("command") == "version" and j.get("data", {}).get("version"), j' "$out"
           fi
 
           mkdir -p dist
@@ -202,7 +220,12 @@ jobs:
 
           $bin = Join-Path $stage "hyp.exe"
           Copy-Item -Path "target\$($env:TARGET)\release\hyp.exe" -Destination $bin -Force
-          & $bin version --json
+          $out = & $bin version --json
+          Write-Output $out
+          $json = $out | ConvertFrom-Json
+          if (-not $json.ok -or $json.command -ne "version" -or -not $json.data.version) {
+            throw "Unexpected hyp.exe version --json output: $out"
+          }
 
           Compress-Archive -Path $bin -DestinationPath "dist\$archive" -Force
           Get-Item "dist\$archive" | Format-List Name, Length
@@ -220,6 +243,7 @@ jobs:
     needs: [prepare, build]
     if: needs.prepare.outputs.should_build == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:

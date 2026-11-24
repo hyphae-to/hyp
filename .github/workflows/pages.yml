@@ -18,25 +18,34 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  deploy:
+    name: Validate & Deploy Site
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Pre-deploy site & installer sanity check
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check site/app.js
+          sh -n site/install.sh
+          cmp -s scripts/install.sh site/install.sh
+          cmp -s scripts/install.ps1 site/install.ps1
+
       - name: Setup Pages
         uses: actions/configure-pages@v5
+
       - name: Upload site artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
 
-  deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4

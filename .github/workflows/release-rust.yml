@@ -26,10 +26,15 @@ jobs:
   prepare:
     name: Resolve Release Tag
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
       dry_run: ${{ steps.meta.outputs.dry_run }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
+      git_sha: ${{ steps.meta.outputs.git_sha }}
+      published_at: ${{ steps.meta.outputs.published_at }}
+      changelog_summary: ${{ steps.meta.outputs.changelog_summary }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -67,10 +72,19 @@ jobs:
             PRERELEASE="false"
           fi
 
+          VERSION="${TAG#v}"
+          GIT_SHA="$(git rev-parse HEAD)"
+          PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          SUMMARY="$(git log -1 --pretty=%s | tr '\r\n' ' ' | cut -c1-160)"
+
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "dry_run=$DRY_RUN" >> "$GITHUB_OUTPUT"
           echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
-          echo "Resolved Rust release parameters: tag=$TAG dry_run=$DRY_RUN prerelease=$PRERELEASE"
+          echo "git_sha=$GIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "published_at=$PUBLISHED_AT" >> "$GITHUB_OUTPUT"
+          echo "changelog_summary=$SUMMARY" >> "$GITHUB_OUTPUT"
+          echo "Resolved Rust release parameters: tag=$TAG version=$VERSION dry_run=$DRY_RUN prerelease=$PRERELEASE sha=$GIT_SHA"
 
   build:
     name: Build (${{ matrix.target }})
@@ -115,16 +129,17 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Rust cache
+      - name: Rust cache (shared with nightly per target)
         uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.target }}
+          shared-key: release-${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install musl-tools (for x86_64-unknown-linux-musl)
         if: matrix.musl == true
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools
+          sudo apt-get install -y --no-install-recommends musl-tools
 
       - name: Build stripped release binary (Unix)
         if: runner.os != 'Windows'
@@ -164,7 +179,9 @@ jobs:
           chmod 0755 "${STAGE}/hyp"
 
           if [ "$SMOKE_TEST" = "true" ]; then
-            "${STAGE}/hyp" version --json
+            out="$("${STAGE}/hyp" version --json)"
+            echo "$out"
+            python3 -c 'import json, sys; j = json.loads(sys.argv[1]); assert j.get("ok") is True and j.get("command") == "version" and j.get("data", {}).get("version"), j' "$out"
           fi
 
           mkdir -p dist
@@ -186,7 +203,12 @@ jobs:
 
           $bin = Join-Path $stage "hyp.exe"
           Copy-Item -Path "target\$($env:TARGET)\release\hyp.exe" -Destination $bin -Force
-          & $bin version --json
+          $out = & $bin version --json
+          Write-Output $out
+          $json = $out | ConvertFrom-Json
+          if (-not $json.ok -or $json.command -ne "version" -or -not $json.data.version) {
+            throw "Unexpected hyp.exe version --json output: $out"
+          }
 
           Compress-Archive -Path $bin -DestinationPath "dist\$archive" -Force
           Get-Item "dist\$archive" | Format-List Name, Length
@@ -200,9 +222,10 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: Generate Checksums & Publish GitHub Release
+    name: Generate Checksums, Signed Manifest & Publish GitHub Release
     needs: [prepare, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
@@ -213,10 +236,16 @@ jobs:
           merge-multiple: true
           path: dist
 
-      - name: Generate and verify SHA256SUMS.txt
+      - name: Generate and verify SHA256SUMS.txt & canonical release-manifest.json
         shell: bash
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GIT_SHA: ${{ needs.prepare.outputs.git_sha }}
+          PUBLISHED_AT: ${{ needs.prepare.outputs.published_at }}
+          CHANGELOG_SUMMARY: ${{ needs.prepare.outputs.changelog_summary }}
+          REPO: ${{ github.repository }}
+          HYPHAE_RELEASE_SIGNING_KEY: ${{ secrets.HYPHAE_RELEASE_SIGNING_KEY }}
         run: |
           set -euo pipefail
           cd dist
@@ -243,6 +272,79 @@ jobs:
           echo "=== Verifying checksums ==="
           sha256sum -c SHA256SUMS.txt
 
+          node <<'EOF'
+          const crypto = require("node:crypto");
+          const fs = require("node:fs");
+
+          const tag = process.env.TAG;
+          const repo = process.env.REPO;
+          const targets = [
+            ["aarch64-apple-darwin", "tar.gz"],
+            ["aarch64-unknown-linux-gnu", "tar.gz"],
+            ["x86_64-apple-darwin", "tar.gz"],
+            ["x86_64-pc-windows-msvc", "zip"],
+            ["x86_64-unknown-linux-gnu", "tar.gz"],
+            ["x86_64-unknown-linux-musl", "tar.gz"],
+          ];
+
+          const artifacts = {};
+          for (const [triple, ext] of targets) {
+            const filename = `hyp-${tag}-${triple}.${ext}`;
+            const data = fs.readFileSync(filename);
+            const sha256 = crypto.createHash("sha256").update(data).digest("hex");
+            artifacts[triple] = {
+              sha256,
+              size: data.length,
+              url: `https://github.com/${repo}/releases/download/${tag}/${filename}`,
+            };
+          }
+
+          function canonicalize(value) {
+            if (value === null || typeof value !== "object") {
+              return JSON.stringify(value);
+            }
+            if (Array.isArray(value)) {
+              return "[" + value.map(canonicalize).join(",") + "]";
+            }
+            const keys = Object.keys(value).sort();
+            return "{" + keys.map((k) => JSON.stringify(k) + ":" + canonicalize(value[k])).join(",") + "}";
+          }
+
+          const payloadObj = {
+            artifacts,
+            changelogSummary: process.env.CHANGELOG_SUMMARY || `Hyphae ${tag}`,
+            channel: "stable",
+            gitSha: process.env.GIT_SHA,
+            minProtocol: 1,
+            publishedAt: process.env.PUBLISHED_AT,
+            version: process.env.VERSION,
+          };
+          const canonicalPayload = canonicalize(payloadObj);
+
+          let sig = "";
+          const rawKey = (process.env.HYPHAE_RELEASE_SIGNING_KEY || "").trim();
+          if (rawKey) {
+            const keyObj = rawKey.includes("BEGIN PRIVATE KEY")
+              ? crypto.createPrivateKey(rawKey)
+              : crypto.createPrivateKey({
+                  key: Buffer.from(rawKey, "base64url"),
+                  format: "der",
+                  type: "pkcs8",
+                });
+            const signingInput = Buffer.concat([
+              Buffer.from("hyphae/v2/release\n", "utf8"),
+              Buffer.from(canonicalPayload, "utf8"),
+            ]);
+            sig = crypto.sign(null, signingInput, keyObj).toString("base64url");
+            console.log("Signed release-manifest.json with HYPHAE_RELEASE_SIGNING_KEY.");
+          } else {
+            console.log("HYPHAE_RELEASE_SIGNING_KEY secret not configured; writing unsigned manifest envelope.");
+          }
+
+          const envelope = { payload: canonicalPayload, sig };
+          fs.writeFileSync("release-manifest.json", JSON.stringify(envelope, null, 2) + "\n", "utf8");
+          EOF
+
       - name: Upload dry-run release bundle (workflow_dispatch)
         if: needs.prepare.outputs.dry_run == 'true'
         uses: actions/upload-artifact@v4
@@ -252,7 +354,7 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
-      - name: Upload archives & SHA256SUMS.txt to GitHub Release
+      - name: Upload archives, SHA256SUMS.txt & release-manifest.json to GitHub Release
         if: needs.prepare.outputs.dry_run != 'true' && startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
@@ -263,3 +365,4 @@ jobs:
           files: |
             dist/hyp-*
             dist/SHA256SUMS.txt
+            dist/release-manifest.json
