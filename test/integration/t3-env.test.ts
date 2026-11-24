@@ -692,10 +692,10 @@ test(
       const codexTargetsRes = await callCodexVerified(alexMcp, alexDaemon.socketPath, codexUuid, "hyp_plugin_targets", {}, "3");
       assert.equal(codexTargetsRes.isError, false, codexTargetsRes.text);
       const codexTargets = codexTargetsRes.json() as {
-        targets: Array<{ plugin: string; target: string; sessionId: string | null; handle: string | null }>;
+        targets: Array<{ plugin: string; target: string; sessionId: string | null; handle: string | null; linkedSessions: string[] }>;
       };
       assert.deepEqual(codexTargets.targets, [
-        { plugin: "t3-webhook", target: "t3-ops", sessionId: `codex:${codexUuid}`, handle: "alex-codex" },
+        { plugin: "t3-webhook", target: "t3-ops", sessionId: `codex:${codexUuid}`, handle: "alex-codex", linkedSessions: [] },
       ]);
 
       // Before handoff, Claude does NOT hold the target and cannot steal it
@@ -785,7 +785,7 @@ test(
       const claudeTargetsAfter = await callClaudeVerified(alexMcp, alexDaemon.socketPath, claudeThreadId, "hyp_plugin_targets", {}, "4");
       assert.equal(claudeTargetsAfter.isError, false, claudeTargetsAfter.text);
       assert.deepEqual((claudeTargetsAfter.json() as { targets: unknown[] }).targets, [
-        { plugin: "t3-webhook", target: "t3-ops", sessionId: `claude:${claudeThreadId}`, handle: "alex-claude" },
+        { plugin: "t3-webhook", target: "t3-ops", sessionId: `claude:${claudeThreadId}`, handle: "alex-claude", linkedSessions: [] },
       ]);
 
       // Deliver signed webhook #2 -> lands in `claude:<claudeThreadId>` (and NOT in `codex:<codexUuid>`)!

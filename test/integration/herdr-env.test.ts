@@ -690,7 +690,7 @@ test(
       );
       assert.match(
         doctorRes.stdout,
-        /\[OK\] herdr: Herdr Core detected \(terminal t1a\), remote machines: prod-eu, gpu-box/,
+        /\[OK\]\s+herdr:?\s+Herdr Core detected \(terminal t1a\), remote machines: prod-eu, gpu-box/,
         `Unexpected doctor output:\n${doctorRes.stdout}\n${doctorRes.stderr}`,
       );
     } finally {
