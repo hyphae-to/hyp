@@ -260,13 +260,15 @@ export const CLI_COMMANDS: readonly CliCommandSpec[] = [
     name: "setup",
     group: "core",
     summary: "Wire (or re-wire) MCP, hooks, rules, skills, or OS auto-start service for harnesses",
-    usage: "hyp setup <antigravity|claude|codex|cursor|opencode|gemini|openclaw|all|service> [--scope user|project]",
+    usage: "hyp setup <antigravity|claude|codex|cursor|opencode|gemini|openclaw|t3|all|service> [--scope user|project]",
     flags: [
       { flag: "--scope <user|project>", description: "Target user-wide or project-local harness config (default: user)" },
       { flag: "--dir <path>", description: "Project directory when --scope project is set" },
       { flag: "--install", description: "Write the OS service unit file when target is 'service'" },
       { flag: "--channel", description: "Enable Claude channel mode when setting up claude" },
       { flag: "--no-sidecar", description: "Skip Antigravity daemon sidecar generation" },
+      { flag: "--t3-url <url>", description: "T3 Code server origin for `hyp setup t3` (default: http://127.0.0.1:3773)" },
+      { flag: "--t3-base-dir <dir>", description: "T3 Code base directory (`T3CODE_HOME`) for `hyp setup t3`" },
     ],
     examples: [
       "hyp setup claude",
@@ -337,7 +339,7 @@ export const CLI_COMMANDS: readonly CliCommandSpec[] = [
     name: "mcp",
     group: "advanced",
     summary: "Run the stdio MCP server bound to the local Connector socket",
-    usage: "hyp mcp [socket] [--claude-channel] [--backend <harness>] [--thread <uuid>] [--resume] [--remote <addr>] [--ephemeral]",
+    usage: "hyp mcp [socket] [--claude-channel] [--backend <harness>] [--thread <uuid>] [--resume] [--remote <addr>] [--t3-url <url>] [--t3-base-dir <dir>] [--ephemeral]",
     rawStream: true,
   },
   {

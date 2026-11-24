@@ -5,6 +5,7 @@ import type { Backend } from "./delivery.ts";
 import { connectorPattern, handlePattern, object, sessionIdPattern } from "./protocol.ts";
 import type { RouterConfig } from "./router.ts";
 import { resolveEnvWithSecrets } from "./secrets.ts";
+import { DEFAULT_T3_TOKEN_SECRET, DEFAULT_T3_URL, defaultT3BaseDir, normalizeT3ServerUrl, type T3Config } from "./t3.ts";
 import { isTopic } from "./core/router/cloudevent.ts";
 
 export type BuiltinStreamName = "github-webhook" | "webhook-stream" | "prometheus-webhook";
@@ -60,9 +61,11 @@ export interface AgentPluginConfig {
 export interface Config {
   connectorId: string;
   directory: string;
+  configDir?: string;
   routers: RouterConfig[];
   localRouter?: LocalRouterConfig;
   plugins?: readonly AgentPluginConfig[];
+  t3?: T3Config;
 }
 
 const PLUGIN_NAME = /^[a-z0-9][a-z0-9._-]{0,31}$/;
@@ -310,12 +313,39 @@ export function loadConfig(path: string): Config {
     };
   }
   const plugins = parsePlugins(raw.plugins, base, directory);
+  let t3: T3Config | undefined;
+  if (raw.t3 !== undefined) {
+    if (!object(raw.t3)) throw new Error("t3 config must be an object");
+    const rawUrl = raw.t3.url === undefined ? DEFAULT_T3_URL : raw.t3.url;
+    if (typeof rawUrl !== "string") throw new Error("t3.url must be a string");
+    const url = normalizeT3ServerUrl(rawUrl);
+    const rawBaseDir = raw.t3.baseDir === undefined ? defaultT3BaseDir() : raw.t3.baseDir;
+    if (typeof rawBaseDir !== "string" || rawBaseDir.length === 0 || rawBaseDir.includes("\0")) {
+      throw new Error("t3.baseDir must be a valid directory path");
+    }
+    const tokenSecret = raw.t3.tokenSecret === undefined ? DEFAULT_T3_TOKEN_SECRET : raw.t3.tokenSecret;
+    if (typeof tokenSecret !== "string" || tokenSecret.length === 0) {
+      throw new Error("t3.tokenSecret must be a secret name");
+    }
+    const bin = raw.t3.bin === undefined ? undefined : raw.t3.bin;
+    if (bin !== undefined && (typeof bin !== "string" || !isAbsolute(bin))) {
+      throw new Error("t3.bin must be an absolute path");
+    }
+    t3 = {
+      url,
+      baseDir: resolve(base, rawBaseDir),
+      tokenSecret,
+      ...(bin ? { bin } : {}),
+    };
+  }
   return {
     connectorId: raw.connectorId,
     directory,
+    configDir: base,
     routers,
     ...(localRouter ? { localRouter } : {}),
     ...(plugins.length > 0 ? { plugins } : {}),
+    ...(t3 ? { t3 } : {}),
   };
 }
 
@@ -358,6 +388,37 @@ export function parseBackend(raw: Record<string, unknown>): Backend {
       resume: raw.resume === true,
       ...(remote ? { remote } : {}),
       ...(raw.queue !== undefined ? { queue: raw.queue } : {}),
+    };
+  }
+  if (raw.kind === "t3") {
+    const threadId = raw.threadId;
+    const serverUrl = raw.serverUrl;
+    if (typeof threadId !== "string" || threadId.length === 0 || threadId.length > 200) {
+      throw new Error("Invalid T3 thread ID");
+    }
+    if (typeof serverUrl !== "string") {
+      throw new Error("Invalid T3 server URL");
+    }
+    const normalizedUrl = normalizeT3ServerUrl(serverUrl);
+    const baseDir = raw.baseDir;
+    if (baseDir !== undefined && (typeof baseDir !== "string" || baseDir.length === 0 || baseDir.includes("\0"))) {
+      throw new Error("Invalid T3 base directory");
+    }
+    const tokenSecret = raw.tokenSecret;
+    if (tokenSecret !== undefined && (typeof tokenSecret !== "string" || tokenSecret.length === 0)) {
+      throw new Error("Invalid T3 tokenSecret");
+    }
+    const configDir = raw.configDir;
+    if (configDir !== undefined && (typeof configDir !== "string" || configDir.length === 0 || configDir.includes("\0"))) {
+      throw new Error("Invalid T3 configDir");
+    }
+    return {
+      kind: "t3",
+      threadId,
+      serverUrl: normalizedUrl,
+      ...(baseDir ? { baseDir } : {}),
+      ...(tokenSecret ? { tokenSecret } : {}),
+      ...(configDir ? { configDir } : {}),
     };
   }
   if (raw.kind === "herdr" && typeof raw.terminalId === "string" && /^t[a-z0-9]+$/.test(raw.terminalId) &&

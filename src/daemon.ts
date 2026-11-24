@@ -11,6 +11,16 @@ import { delivered, hold, isHarness, object, reject, sessionIdPattern, type Outc
 import { RouterError } from "./router.ts";
 import { State } from "./state.ts";
 import { buildStreamTopicMap, RouterStreamHost } from "./streams.ts";
+import {
+  DEFAULT_T3_TOKEN_SECRET,
+  DEFAULT_T3_URL,
+  defaultT3BaseDir,
+  normalizeT3ServerUrl,
+  resolveT3CallerByCallId,
+  resolveT3ThreadByProviderSession,
+  verifyT3ThreadExists,
+  type T3Config,
+} from "./t3.ts";
 import { RouterCore } from "./core/router/core.ts";
 import { serveRouter, type RunningRouter } from "./core/router/server.ts";
 
@@ -35,6 +45,8 @@ interface McpSocketContext {
   codexResume?: boolean;
   codexRemote?: string;
   herdrTerminalId?: string;
+  t3Url?: string;
+  t3BaseDir?: string;
 }
 
 const DEFAULT_STALE_SESSION_MS = 7 * 86_400_000;
@@ -464,6 +476,8 @@ export async function startDaemon(config: Config, options: StartDaemonOptions = 
             codexResume: packet.resume === true,
             codexRemote: typeof packet.remote === "string" ? packet.remote : undefined,
             herdrTerminalId: typeof packet.terminalId === "string" ? packet.terminalId : undefined,
+            t3Url: typeof packet.t3Url === "string" ? packet.t3Url : undefined,
+            t3BaseDir: typeof packet.t3BaseDir === "string" ? packet.t3BaseDir : undefined,
           };
           return;
         }
@@ -500,12 +514,61 @@ export async function startDaemon(config: Config, options: StartDaemonOptions = 
           try {
             let resolved: { sessionId: string; backend: Backend } | undefined;
 
+            const activeT3: T3Config | undefined = effectiveConfig.t3
+              ? effectiveConfig.t3
+              : mcpContext?.backend === "t3" || mcpContext?.t3BaseDir || mcpContext?.t3Url
+                ? {
+                    url: normalizeT3ServerUrl(mcpContext.t3Url ?? DEFAULT_T3_URL),
+                    baseDir: mcpContext.t3BaseDir ?? defaultT3BaseDir(),
+                    tokenSecret: DEFAULT_T3_TOKEN_SECRET,
+                  }
+                : undefined;
+
+            const makeT3Backend = (threadId: string, t3Cfg: T3Config): Backend => ({
+              kind: "t3",
+              threadId,
+              serverUrl: t3Cfg.url,
+              baseDir: t3Cfg.baseDir,
+              ...(t3Cfg.tokenSecret ? { tokenSecret: t3Cfg.tokenSecret } : {}),
+              ...(effectiveConfig.configDir ? { configDir: effectiveConfig.configDir } : {}),
+            });
+
+            const maybeUpgradeToT3 = (
+              candidate: { sessionId: string; backend: Backend },
+            ): { ok: true; value: { sessionId: string; backend: Backend } } | { ok: false; code: string; message: string } => {
+              if (!activeT3 || candidate.backend.kind === "t3" || candidate.backend.kind === "herdr") {
+                return { ok: true, value: candidate };
+              }
+              const sepIdx = candidate.sessionId.indexOf(":");
+              if (sepIdx <= 0) return { ok: true, value: candidate };
+              const providerId = candidate.sessionId.slice(sepIdx + 1);
+              const t3Lookup = resolveT3ThreadByProviderSession(providerId, activeT3.baseDir);
+              if (t3Lookup.ok) {
+                return {
+                  ok: true,
+                  value: {
+                    sessionId: `t3:${t3Lookup.threadId}`,
+                    backend: makeT3Backend(t3Lookup.threadId, activeT3),
+                  },
+                };
+              }
+              if (t3Lookup.code === "caller_ambiguous") {
+                return { ok: false, code: t3Lookup.code, message: t3Lookup.message };
+              }
+              return { ok: true, value: candidate };
+            };
+
             // 1. Primary path: authoritative per-call verification from PreToolUse hook,
-            //    with automatic fallback to Codex rollout JSONL verification (for Codex CLI & Desktop).
+            //    with automatic fallback to Codex rollout JSONL verification and T3 Code statev2.sqlite projections.
             if (callId || callToken) {
               const verification = await calls.resolve(toolName, callId, callToken, callToken ? 1_500 : 200);
               if (verification.ok) {
-                resolved = { sessionId: verification.sessionId, backend: verification.backend };
+                const upgraded = maybeUpgradeToT3({ sessionId: verification.sessionId, backend: verification.backend });
+                if (!upgraded.ok) {
+                  send(socket, { id: requestId, error: { code: upgraded.code, message: upgraded.message } });
+                  return;
+                }
+                resolved = upgraded.value;
                 state.register(resolved.sessionId, resolved.backend);
                 if (mcpContext?.channel && resolved.backend.kind === "claude") {
                   bindChannelTransport(resolved.sessionId);
@@ -517,8 +580,25 @@ export async function startDaemon(config: Config, options: StartDaemonOptions = 
                   resume: mcpContext?.codexResume,
                 });
                 if (codexResolved.ok) {
-                  resolved = { sessionId: codexResolved.sessionId, backend: codexResolved.backend };
+                  const upgraded = maybeUpgradeToT3({ sessionId: codexResolved.sessionId, backend: codexResolved.backend });
+                  if (!upgraded.ok) {
+                    send(socket, { id: requestId, error: { code: upgraded.code, message: upgraded.message } });
+                    return;
+                  }
+                  resolved = upgraded.value;
                   state.register(resolved.sessionId, resolved.backend);
+                } else if (activeT3) {
+                  const t3Resolved = await resolveT3CallerByCallId(callId, toolName, activeT3, effectiveConfig.configDir);
+                  if (t3Resolved.ok) {
+                    resolved = { sessionId: t3Resolved.sessionId, backend: t3Resolved.backend };
+                    state.register(resolved.sessionId, resolved.backend);
+                  } else if (t3Resolved.code === "caller_ambiguous") {
+                    send(socket, { id: requestId, error: { code: t3Resolved.code, message: t3Resolved.message } });
+                    return;
+                  } else if (!mcpContext?.herdrTerminalId && !mcpContext?.codexThreadId && !mcpContext?.ephemeralClientId) {
+                    send(socket, { id: requestId, error: { code: verification.code, message: verification.message } });
+                    return;
+                  }
                 } else if (!mcpContext?.herdrTerminalId && !mcpContext?.codexThreadId && !mcpContext?.ephemeralClientId) {
                   send(socket, { id: requestId, error: { code: verification.code, message: verification.message } });
                   return;
@@ -538,8 +618,26 @@ export async function startDaemon(config: Config, options: StartDaemonOptions = 
               }
             }
 
-            // 3. Explicit legacy standalone Codex `--thread <uuid>`
-            if (!resolved && mcpContext?.codexThreadId) {
+            // 3. Explicit T3 Code `--backend t3 --thread <threadId>` (verified fail-closed against statev2.sqlite)
+            if (!resolved && mcpContext?.backend === "t3" && mcpContext.codexThreadId && activeT3) {
+              if (!verifyT3ThreadExists(mcpContext.codexThreadId, activeT3.baseDir)) {
+                send(socket, {
+                  id: requestId,
+                  error: {
+                    code: "caller_not_found",
+                    message: `T3 thread '${mcpContext.codexThreadId}' was not found or is archived/deleted under ${activeT3.baseDir}`,
+                  },
+                });
+                return;
+              }
+              const backend = parseBackend(makeT3Backend(mcpContext.codexThreadId, activeT3) as unknown as Record<string, unknown>);
+              const sessionId = `t3:${mcpContext.codexThreadId}`;
+              state.register(sessionId, backend);
+              resolved = { sessionId, backend };
+            }
+
+            // 4. Explicit standalone Codex `--thread <uuid>`
+            if (!resolved && mcpContext?.codexThreadId && mcpContext.backend !== "t3") {
               const backend = parseBackend({
                 kind: "codex",
                 threadId: mcpContext.codexThreadId,

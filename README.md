@@ -93,8 +93,8 @@ One shared stateless MCP subprocess safely multiplexes any number of concurrent 
 | **Claude Code CLI & Desktop** | `PreToolUse` hook (`session_id` + `_meta["claudecode/toolUseId"]`) | `PostToolUse` / `Stop` hook drain + `Monitor` (`hyp watch`) / `hyp wait` |
 | **Codex CLI & Desktop** | Rollout JSONL verification matching `_meta.callId` + optional hook | Native `codex queue --thread <uuid>` (and `--remote` `app-server`) |
 | **Herdr Core** | `--backend herdr` with `HC_TERMINAL_ID`, verified via `hc get` | Native `hc send` (`queue`) and `hc interrupt` (`interrupt`) |
-| **T3 Code** | Native thread projection verification | Native T3 `message.dispatch` (steer / queue / restart) |
-| **OpenClaw** | Managed `openclaw.json` MCP entry + skill | Shared local daemon + live `hyp_plugin_handoff` |
+| **T3 Code** | `statev2.sqlite` projection verification (`turn_items` call-ID & provider session binding upgrade) via `hyp setup t3` | Native T3 v2 WebSocket RPC (`orchestration.dispatchCommand` `message.dispatch`: start / queue / steer / restart) |
+| **OpenClaw** | Managed `openclaw.json` MCP server (`--backend openclaw --ephemeral`) + skill | Durable SQLite mailbox + `hyp wait` / `hyp_inbox` & live `hyp_plugin_handoff` |
 | **Cursor IDE & Agent** | `beforeMCPExecution` hook (`conversation_id`) | `afterMCPExecution` drain + `stop` followup + `hyp wait` |
 | **OpenCode** | Local plugin (`~/.config/opencode/plugins/hyphae.ts`) | `tool.execute.after` drain + `session.idle` SDK prompt |
 | **Gemini CLI** | `BeforeTool` hook (`session_id` + `_meshCall`) | `AfterTool` drain + `AfterAgent` continuation + `hyp wait` |

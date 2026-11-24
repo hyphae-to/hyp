@@ -43,16 +43,17 @@ const badge = {
 const HARNESS_META: Array<{
   value: ConfigurableHarness;
   label: string;
-  envKey: "antigravity" | "claude" | "codex" | "cursor" | "opencode" | "gemini" | "openclaw";
+  detected: (env: ReturnType<typeof detectLocalEnvironment>) => boolean;
   detail: string;
 }> = [
-  { value: "antigravity", label: "Antigravity", envKey: "antigravity", detail: "Desktop / IDE / CLI plugin + hooks + sidecar" },
-  { value: "claude", label: "Claude Code & Desktop", envKey: "claude", detail: "CLI & Desktop Code tab MCP + PreToolUse/Stop hooks" },
-  { value: "codex", label: "Codex CLI & Desktop", envKey: "codex", detail: "config.toml MCP + rollout verification + hooks" },
-  { value: "cursor", label: "Cursor", envKey: "cursor", detail: "mcp.json + beforeMCPExecution / stop followup hooks" },
-  { value: "opencode", label: "OpenCode", envKey: "opencode", detail: "opencode.json MCP + TypeScript lifecycle plugin" },
-  { value: "gemini", label: "Gemini CLI", envKey: "gemini", detail: "settings.json MCP + BeforeTool / AfterAgent hooks" },
-  { value: "openclaw", label: "OpenClaw Orchestrator", envKey: "openclaw", detail: "openclaw.json MCP gateway + fleet orchestrator skill" },
+  { value: "antigravity", label: "Antigravity", detected: (e) => e.antigravity, detail: "Desktop / IDE / CLI plugin + hooks + sidecar" },
+  { value: "claude", label: "Claude Code & Desktop", detected: (e) => e.claude, detail: "CLI & Desktop Code tab MCP + PreToolUse/Stop hooks" },
+  { value: "codex", label: "Codex CLI & Desktop", detected: (e) => e.codex, detail: "config.toml MCP + rollout verification + hooks" },
+  { value: "cursor", label: "Cursor", detected: (e) => e.cursor, detail: "mcp.json + beforeMCPExecution / stop followup hooks" },
+  { value: "opencode", label: "OpenCode", detected: (e) => e.opencode, detail: "opencode.json MCP + TypeScript lifecycle plugin" },
+  { value: "gemini", label: "Gemini CLI", detected: (e) => e.gemini, detail: "settings.json MCP + BeforeTool / AfterAgent hooks" },
+  { value: "openclaw", label: "OpenClaw Orchestrator", detected: (e) => e.openclaw, detail: "openclaw.json MCP gateway + fleet orchestrator skill" },
+  { value: "t3", label: "T3 Code", detected: (e) => e.t3.installed, detail: "Live WebSocket RPC thread wakeup + statev2.sqlite caller verification" },
 ];
 
 export function formatGuideCard(guide: PluginOrStreamGuide): string {
@@ -483,8 +484,8 @@ export async function runPluginSetupWizard(configPath: string): Promise<void> {
 
 /**
  * Full interactive onboarding wizard powered by `@clack/prompts`:
- * - Environment detection card (6 harnesses + Herdr Core + T3 Code + Tailscale)
- * - Capability cards + multi-select for router roles (Private Router, Public Router, Join Shared Router)
+ * - Environment detection card (8 harnesses + Herdr Core + Tailscale)
+ * - Capability cards + multi-select for node roles (Private Node, Public Node, Join Shared Node)
  * - Checkbox multi-select for agent harnesses, router data streams, and connector thread bridges
  * - OS Keychain / Linux Secret Service secrets store + step-by-step setup guides
  * - Tailscale Service / Serve private exposure + parallel SSH remote host onboarding
@@ -502,7 +503,7 @@ export async function runInteractiveOnboard(options: InteractiveOnboardOptions):
 
   const summaryLines = [
     ...HARNESS_META.map((h) =>
-      env[h.envKey]
+      h.detected(env)
         ? `${badge.ok(h.label.padEnd(22))} ${badge.dim(h.detail)}`
         : `${badge.dim(`○ ${h.label.padEnd(22)} not installed`)}`,
     ),
@@ -558,28 +559,28 @@ export async function runInteractiveOnboard(options: InteractiveOnboardOptions):
     }
   }
 
-  // 1. Router Roles — rich capability cards + select ONE OR MORE!
+  // 1. Node Roles — rich capability cards + select ONE OR MORE!
   const routerCards = [
-    `${badge.tag("PRIVATE ROUTER", "bgGreen")}  ${badge.bold("Local & Tailscale Private Mesh")}`,
+    `${badge.tag("PRIVATE NODE", "bgGreen")}  ${badge.bold("Local & Tailscale Private Mesh")}`,
     `  • Connect all your own agent sessions across harnesses & machines`,
     `  • Subscribe to ${styleText("cyan", "GitHub events")} & ${styleText("cyan", "custom data streams")} with CloudEvents filters`,
-    `  • Bridge threads to ${styleText("cyan", "3rd-party messaging tools")} via plugins (Slack, Telegram, webhooks)`,
+    `  • Bridge threads to ${styleText("cyan", "3rd-party messaging tools")} via bridges (Slack, Telegram, WhatsApp, webhooks)`,
     "",
-    `${badge.tag("PUBLIC ROUTER", "bgMagenta")}  ${badge.bold("Internet-Reachable Webhook & Event Hub")}`,
+    `${badge.tag("PUBLIC NODE", "bgMagenta")}  ${badge.bold("Internet-Reachable Webhook & Event Hub")}`,
     `  • Receive live webhooks from external services (GitHub, Linear, Sentry, CI) & external peers`,
-    `  • Loopback router behind hardened HTTPS (Caddy / nginx / Funnel) with HMAC + per-topic ACLs`,
+    `  • Loopback node behind hardened HTTPS (Caddy / nginx / Funnel) with HMAC + per-topic ACLs`,
     "",
-    `${badge.tag("JOIN SHARED ROUTER", "bgBlue")}  ${badge.bold("Connect to an Existing Team or T3 Mesh Router")}`,
+    `${badge.tag("JOIN TEAM NODE", "bgBlue")}  ${badge.bold("Connect to an Existing Team Node")}`,
     `  • Join via one-shot invite (${styleText("cyan", "am1_...")}) or HTTPS URL + token file${env.t3.routerUrl ? ` (detected: ${env.t3.routerUrl})` : ""}`,
-    `  • Works solo as your primary router, OR alongside your private router as a secondary event router`,
+    `  • Works solo as your primary node, OR alongside your private node as a secondary event node`,
   ].join("\n");
-  p.note(routerCards, "Router capabilities — select one or more");
+  p.note(routerCards, "Node capabilities — select one or more");
 
   const hasExisting = existsSync(absConfig);
   type RouterRole = "private" | "public" | "shared" | "keep";
   const roles = unwrap(
     await p.multiselect({
-      message: "Select one or more router setups (Space to toggle, Enter to confirm)",
+      message: "Select one or more node setups (Space to toggle, Enter to confirm)",
       required: true,
       initialValues: [hasExisting ? "keep" : "private"] as RouterRole[],
       options: [
@@ -588,17 +589,17 @@ export async function runInteractiveOnboard(options: InteractiveOnboardOptions):
           : []),
         {
           value: "private" as const,
-          label: "Setup Private Router",
-          hint: "Connect all your sessions · GitHub/custom streams · Slack/Telegram plugins",
+          label: "Setup Private Node",
+          hint: "Connect all your sessions · GitHub/custom streams · Slack/Telegram/WhatsApp bridges",
         },
         {
           value: "public" as const,
-          label: "Setup Public Router",
+          label: "Setup Public Node",
           hint: "HTTPS webhook & event hub for internet senders & remote collaborators",
         },
         {
           value: "shared" as const,
-          label: "Join a Shared Router",
+          label: "Join a Team Node",
           hint: env.t3.routerUrl ? `Join via invite or ${env.t3.routerUrl}` : "Join via am1_... invite or HTTPS URL + token",
         },
       ],
@@ -705,8 +706,8 @@ export async function runInteractiveOnboard(options: InteractiveOnboardOptions):
     }
   }
 
-  // 2. Harnesses multi-select (all 6 harnesses)
-  const detectedHarnesses = HARNESS_META.filter((h) => env[h.envKey]).map((h) => h.value);
+  // 2. Harnesses multi-select (all 8 harnesses)
+  const detectedHarnesses = HARNESS_META.filter((h) => h.detected(env)).map((h) => h.value);
   const selectedHarnesses = unwrap(
     await p.multiselect({
       message: "Select agent harnesses to configure (Space to toggle, Enter to confirm)",
@@ -715,7 +716,7 @@ export async function runInteractiveOnboard(options: InteractiveOnboardOptions):
       options: HARNESS_META.map((h) => ({
         value: h.value,
         label: h.label,
-        hint: env[h.envKey] ? `detected · ${h.detail}` : `not detected · ${h.detail}`,
+        hint: h.detected(env) ? `detected · ${h.detail}` : `not detected · ${h.detail}`,
       })),
     }),
   );
@@ -805,10 +806,10 @@ export async function runInteractiveOnboard(options: InteractiveOnboardOptions):
         "",
         badge.accent("Option B — Expose ONLY GitHub webhook receiver publicly via Tailscale Funnel:"),
         `  tailscale funnel --bg --https=443 --set-path=/hooks/github http://127.0.0.1:${ghPort}`,
-        "  (Keep the main router private on your tailnet with `hyp router expose tailscale`!)",
+        "  (Keep the main node private on your tailnet with `hyp share tailscale`!)",
         "",
         badge.accent("Invite external machines:"),
-        "  hyp router invite user@remote --router https://mesh.yourdomain.com",
+        "  hyp share invite user@remote --router https://mesh.yourdomain.com",
       ].join("\n"),
       "Public router HTTPS & webhook exposure",
     );
@@ -826,7 +827,7 @@ export async function runInteractiveOnboard(options: InteractiveOnboardOptions):
           options: [
             { value: "service", label: "Tailscale Service (svc:hyphae)", hint: "Recommended · stable https://hyphae.<tailnet>.ts.net" },
             { value: "serve", label: "Node-scoped Tailscale Serve", hint: "Zero tailnet admin setup · https://<node>.<tailnet>.ts.net:8790" },
-            { value: "skip", label: "Keep loopback-only (127.0.0.1)", hint: "Run `hyp router expose tailscale` later" },
+            { value: "skip", label: "Keep loopback-only (127.0.0.1)", hint: "Run `hyp share tailscale` later" },
           ],
           initialValue: "skip",
         }),
@@ -952,7 +953,7 @@ export async function runInteractiveOnboard(options: InteractiveOnboardOptions):
           }
         }
       } else if (reachable.length > 0 && !exposedUrl) {
-        p.log.info(`Tip: run ${styleText("cyan", "hyp router expose tailscale --service hyphae")} to invite those remote machines over your tailnet.`);
+        p.log.info(`Tip: run ${styleText("cyan", "hyp share tailscale --service hyphae")} to invite those remote machines over your tailnet.`);
       }
     }
   }

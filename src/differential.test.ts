@@ -902,7 +902,7 @@ test("differential: stateful ModelOracle matches real RouterCore + Connector + S
 // Test 2: Cross-Harness Parity Differential Matrix (7 durable-mailbox harnesses)
 // ============================================================================
 
-const DURABLE_HARNESSES: readonly Exclude<HarnessKind, "herdr">[] = [
+const DURABLE_HARNESSES: readonly Exclude<HarnessKind, "herdr" | "t3">[] = [
   "antigravity",
   "claude",
   "codex",

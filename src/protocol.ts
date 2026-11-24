@@ -1,7 +1,7 @@
 export type Mode = "queue" | "interrupt";
 export type DeliveryMode = "full" | "notify";
 export type Outcome = { outcome: "delivered" } | { outcome: "hold" | "rejected"; reason: string };
-export type HarnessKind = "antigravity" | "claude" | "codex" | "cursor" | "opencode" | "gemini" | "openclaw" | "herdr";
+export type HarnessKind = "antigravity" | "claude" | "codex" | "cursor" | "opencode" | "gemini" | "openclaw" | "herdr" | "t3";
 
 export interface Subscription {
   id: string;
@@ -117,7 +117,8 @@ export const isHarness = (value: unknown): value is HarnessKind =>
   value === "opencode" ||
   value === "gemini" ||
   value === "openclaw" ||
-  value === "herdr";
+  value === "herdr" ||
+  value === "t3";
 
 /**
  * Normalizes harness-prefixed MCP tool names to the canonical Hyphae tool name:

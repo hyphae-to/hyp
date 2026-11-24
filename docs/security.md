@@ -14,7 +14,8 @@ A single MCP shim subprocess can be shared by many tabs/conversations in Desktop
 - **Cursor IDE & Agent**: `beforeMCPExecution` hook registers `(conversation_id, tool_name)` and injects a single-use `_meshCall` token.
 - **OpenCode**: Local TypeScript plugin injects a single-use `_meshCall` token in `tool.execute.before`.
 - **Gemini CLI**: `BeforeTool` hook registers `(session_id, tool_name)` and injects `_meshCall` into `tool_input`.
-- **OpenClaw**: Managed `openclaw.json` MCP server entry binds calls into the local daemon alongside desktop and terminal harnesses.
+- **OpenClaw**: Managed `openclaw.json` MCP server entry (`--backend openclaw --ephemeral`) binds each MCP connection into the local daemon alongside desktop and terminal harnesses.
+- **T3 Code**: Verifies active non-deleted, non-archived T3 threads read-only from `userdata/statev2.sqlite` (`orchestration_v2_projection_provider_session_bindings`, `orchestration_v2_projection_turn_items`, `projection_thread_sessions`), failing closed on ambiguous or missing threads. Bearer tokens issued via `t3 auth session issue` are stored in the OS keyring (`t3-auth-token`), never in `connector.json`, and `t3.url` enforces HTTPS or loopback HTTP origins.
 - **Herdr Core**: Requires explicit `--backend herdr` and verifies `HC_TERMINAL_ID` via `hc get --json` (`address`, `created_ms`, `pid`, `state === "live"`, and non-null `status.app`). **Bare shell terminals (`status: null`) are rejected fail-closed**, preventing untrusted mesh messages from ever being typed into a raw shell if an agent exits.
 - **Bounded Registry**: `CallRegistry` enforces a 60s TTL, single-use consumption, exact tool-name matching, and a hard cap of `512` in-flight entries.
 

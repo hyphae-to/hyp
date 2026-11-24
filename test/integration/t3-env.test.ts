@@ -1,6 +1,7 @@
+import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -23,7 +24,8 @@ import { startDaemon } from "../../src/daemon.ts";
 import { detectLocalEnvironment } from "../../src/discover.ts";
 import { daemonRpc, handleHookPayload } from "../../src/hooks.ts";
 import { object } from "../../src/protocol.ts";
-import { runDoctor } from "../../src/setup.ts";
+import { runDoctor, setupT3 } from "../../src/setup.ts";
+import { t3StateDbPath } from "../../src/t3.ts";
 import { BINARIES } from "./harness/drivers.ts";
 import { freePort, McpClient, MeshTopology, waitFor } from "./harness/topology.ts";
 import { readAuditEvents, startIsolatedDaemonSubprocess } from "./shims/herdr-env.ts";
@@ -1197,6 +1199,221 @@ test(
       assert.match(inbox3.items[0].text, /SECRET_CHAN_BODY/);
     } finally {
       await topo.cleanup();
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Test 5: Real `t3 serve` Native Hyphae T3 Adapter — Per-Call Thread Identification
+//         (`statev2.sqlite` binding upgrade + `turn_items` callId) & Live WebSocket
+//         RPC Delivery (`orchestration.dispatchCommand` `message.dispatch`)
+// ---------------------------------------------------------------------------
+
+test(
+  "T3 env Test 5: real t3 serve native Hyphae adapter (setupT3, statev2.sqlite identification, and live message.dispatch RPC delivery)",
+  { timeout: 60_000, skip: !BINARIES.t3 ? "t3 binary not installed on PATH" : false },
+  async () => {
+    const topo = new MeshTopology("t3-native");
+    let t3Server: Awaited<ReturnType<typeof startRealT3Server>> | undefined;
+    const t3Root = mkdtempSync(join(tmpdir(), "hi-t3-native-"));
+
+    try {
+      // 1. Boot real isolated `t3 serve` and register a project inside its isolated baseDir
+      t3Server = await startRealT3Server(t3Root);
+      const t3Env = {
+        ...process.env,
+        HOME: t3Server.homeDir,
+        T3CODE_HOME: t3Server.baseDir,
+      };
+      execFileSync(
+        BINARIES.t3!,
+        ["project", "add", "--base-dir", t3Server.baseDir, "--title", "hyphae-t3-demo", t3Server.cwd],
+        { env: t3Env, encoding: "utf8", timeout: 10_000 },
+      );
+
+      const dbPath = t3StateDbPath(t3Server.baseDir);
+      assert.equal(existsSync(dbPath), true, "expected statev2.sqlite in isolated T3 baseDir");
+      let projectId = "";
+      {
+        const db = new DatabaseSync(dbPath, { readOnly: true });
+        try {
+          const row = db.prepare("SELECT project_id FROM projection_projects LIMIT 1").get() as { project_id?: string } | undefined;
+          projectId = row?.project_id ?? "";
+        } finally {
+          db.close();
+        }
+      }
+      assert.ok(projectId.length > 0, "expected project_id after `t3 project add`");
+
+      // 2. Provision Hyphae router + peer connector + T3-enabled connector
+      const router = await topo.addRouter({ name: "team" });
+      const peerConn = await topo.addConnector({
+        connectorId: "alex@laptop",
+        links: [{ name: "primary", router }],
+      });
+
+      // Prepare T3 connector config manually so we can test `setupT3()` + `loadConfig()` + `runDoctor()`
+      const t3CfgDir = join(topo.rootDir, "t3-conn");
+      mkdirSync(t3CfgDir, { recursive: true, mode: 0o700 });
+      const tokFile = join(t3CfgDir, "primary.token");
+      const routerToken = router.core.addConnector("jack@t3-server");
+      writeFileSync(tokFile, routerToken + "\n", { mode: 0o600 });
+      const cfgPath = join(t3CfgDir, "connector.json");
+      writeFileSync(
+        cfgPath,
+        JSON.stringify(
+          {
+            connectorId: "jack@t3-server",
+            stateDir: "state",
+            routers: [{ name: "primary", url: router.url, tokenFile: "primary.token" }],
+          },
+          null,
+          2,
+        ) + "\n",
+        { mode: 0o600 },
+      );
+
+      // `setupT3` writes `t3` config block AND auto-issues a scoped bearer token into Hyphae's secret store!
+      const prevBackend = process.env.HYPHAE_SECRET_BACKEND;
+      process.env.HYPHAE_SECRET_BACKEND = "file";
+      let t3Bearer = "";
+      try {
+        const setupRes = setupT3({
+          scope: "user",
+          homeDir: t3Server.homeDir,
+          configPath: cfgPath,
+          t3Url: t3Server.url,
+          t3BaseDir: t3Server.baseDir,
+        });
+        assert.equal(setupRes.harness, "t3");
+        assert.ok(setupRes.files.includes(cfgPath));
+
+        // Verify token was NOT written plaintext into connector.json
+        const cfgText = JSON.stringify(JSON.parse(readFileSync(cfgPath, "utf8")));
+        t3Bearer = readFileSync(join(t3CfgDir, "secrets", "t3-auth-token.secret"), "utf8").trim();
+        assert.ok(t3Bearer.length > 20, "expected issued T3 bearer token in secret store");
+        assert.equal(cfgText.includes(t3Bearer), false, "T3 bearer token must NEVER be stored plaintext in connector.json");
+
+        // 3. Create a real T3 thread inside `t3 serve` via Effect RPC v4
+        const tickRes = await fetch(`${t3Server.url}/api/auth/websocket-ticket`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${t3Bearer}` },
+        });
+        assert.equal(tickRes.status, 200);
+        const tickBody = (await tickRes.json()) as { ticket: string };
+
+        const wsUrl = `ws://127.0.0.1:${t3Server.port}/ws?wsTicket=${encodeURIComponent(tickBody.ticket)}&orchestrationProtocol=2`;
+        const rpcCall = async (tag: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> => {
+          const ws = new WebSocket(wsUrl);
+          await new Promise<void>((res, rej) => {
+            ws.addEventListener("open", () => res());
+            ws.addEventListener("error", () => rej(new Error("WS connect failed")));
+          });
+          try {
+            const reqId = randomUUID();
+            return await new Promise<Record<string, unknown>>((res, rej) => {
+              const timer = setTimeout(() => rej(new Error(`RPC ${tag} timeout`)), 8_000).unref();
+              ws.addEventListener("message", (ev) => {
+                const msg = JSON.parse(String(ev.data)) as Record<string, unknown>;
+                if (msg.requestId === reqId) {
+                  clearTimeout(timer);
+                  res(msg);
+                }
+              });
+              ws.send(JSON.stringify({ _tag: "Request", id: reqId, tag, payload, headers: [] }));
+            });
+          } finally {
+            ws.close();
+          }
+        };
+
+        const t3ThreadId = randomUUID();
+        const createRes = await rpcCall("orchestration.dispatchCommand", {
+          type: "thread.create",
+          commandId: randomUUID(),
+          createdBy: "user",
+          creationSource: "mcp",
+          threadId: t3ThreadId,
+          projectId,
+          title: "hyphae-ops-thread",
+          modelSelection: { provider: "codex", model: "gpt-5.4" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+        });
+        assert.equal((createRes.exit as { _tag?: string })?._tag, "Success", `thread.create failed: ${JSON.stringify(createRes)}`);
+
+        // Bind a Claude provider session ID to this real T3 thread in `statev2.sqlite` (mirroring what T3 writes when launching a Claude turn)
+        const providerSessionId = `claude-hosted-in-t3-${randomUUID().slice(0, 8)}`;
+        {
+          const db = new DatabaseSync(dbPath);
+          try {
+            db.prepare(
+              "INSERT OR REPLACE INTO orchestration_v2_projection_provider_session_bindings (provider_session_id, thread_id) VALUES (?, ?)",
+            ).run(providerSessionId, t3ThreadId);
+          } finally {
+            db.close();
+          }
+        }
+
+        // 4. Start real Hyphae daemon with `t3` config and verify `runDoctor` reports authenticated live T3 server
+        const loadedCfg = loadConfig(cfgPath);
+        assert.ok(loadedCfg.t3, "expected loadedCfg.t3");
+        const t3Daemon = await startDaemon(loadedCfg, { quiet: true });
+        try {
+          const doctorChecks = await runDoctor(cfgPath, t3Daemon.socketPath, t3Server.homeDir);
+          const t3Doctor = doctorChecks.find((c) => c.name === "t3");
+          assert.ok(t3Doctor, "expected `t3` check in runDoctor");
+          assert.equal(t3Doctor.ok, true, `expected t3 doctor OK, got: ${JSON.stringify(t3Doctor)}`);
+          assert.match(t3Doctor.detail, /authenticated/);
+          assert.match(t3Doctor.detail, /statev2\.sqlite OK/);
+
+          // 5. Claude PreToolUse hook calls `hyp_join` -> Hyphae automatically upgrades caller to `t3:<t3ThreadId>` with `modes: ["queue", "interrupt"]`!
+          const t3Mcp = new McpClient(t3Daemon.socketPath, []);
+          await t3Mcp.initialize();
+          topo.track(() => t3Mcp.close());
+          const peerMcp = await peerConn.openMcp(["--ephemeral"]);
+          assert.equal((await peerMcp.callTool("hyp_join", { handle: "alex" })).isError, false);
+
+          const joinRes = await callClaudeVerified(t3Mcp, t3Daemon.socketPath, providerSessionId, "hyp_join", { handle: "ops" }, "j1");
+          assert.equal(joinRes.isError, false, joinRes.text);
+
+          const capsRes = await callClaudeVerified(t3Mcp, t3Daemon.socketPath, providerSessionId, "hyp_capabilities", {}, "c1");
+          assert.equal(capsRes.isError, false, capsRes.text);
+          const caps = capsRes.json() as { sessionId: string; backend: string; modes: string[] };
+          assert.equal(caps.sessionId, `t3:${t3ThreadId}`);
+          assert.equal(caps.backend, "t3");
+          assert.deepEqual(caps.modes, ["queue", "interrupt"]);
+
+          // 6. Peer sends real `hyp_send` -> Hyphae delivers directly into LIVE `t3 serve` via WebSocket RPC `message.dispatch`!
+          const marker = `LIVE_T3_DISPATCH_${randomUUID().slice(0, 8)}`;
+          const sendRes = await peerMcp.callTool("hyp_send", {
+            to: "jack@t3-server/ops",
+            text: `Checkout error spike detected: ${marker}`,
+          });
+          assert.equal(sendRes.isError, false, sendRes.text);
+
+          // 7. Verify the live T3 Code server actually persisted our dispatched message on `t3ThreadId`!
+          await waitFor(
+            async () => {
+              const proj = await rpcCall("orchestration.getThreadProjection", { threadId: t3ThreadId });
+              const raw = JSON.stringify(proj);
+              return raw.includes(marker) && raw.includes("alex@laptop/alex");
+            },
+            { timeoutMs: 12_000, intervalMs: 150, label: "real t3 serve received message.dispatch payload" },
+          );
+        } finally {
+          await t3Daemon.stop();
+        }
+      } finally {
+        if (prevBackend === undefined) delete process.env.HYPHAE_SECRET_BACKEND;
+        else process.env.HYPHAE_SECRET_BACKEND = prevBackend;
+      }
+    } finally {
+      if (t3Server) await t3Server.stop();
+      await topo.cleanup();
+      rmSync(t3Root, { recursive: true, force: true });
     }
   },
 );

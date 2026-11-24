@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { delivered, hold, object, reject, type Mode, type Outcome } from "./protocol.ts";
+import { deliverToT3Thread } from "./t3.ts";
 
 export interface Delivery {
   readonly modes: readonly Mode[];
@@ -18,6 +19,7 @@ export type Backend =
   | { kind: "openclaw" }
   | { kind: "codex"; threadId?: string; codexHome?: string; bin?: string; resume?: boolean; remote?: string; queue?: boolean }
   | { kind: "herdr"; terminalId: string; createdMs: number; pid: number; app: string; bin: string }
+  | { kind: "t3"; threadId: string; serverUrl: string; baseDir?: string; tokenSecret?: string; configDir?: string }
   | { kind: "claude"; channel?: boolean };
 
 export type Command = (bin: string, args: string[], timeout: number, env?: NodeJS.ProcessEnv) =>
@@ -45,7 +47,7 @@ const parse = (text: string): unknown => {
  * push streams, and harness hooks (`PreInvocation` / `PostToolUse` / `Stop`).
  */
 export function usesDurableMailbox(backend: Backend): boolean {
-  if (backend.kind === "herdr") return false;
+  if (backend.kind === "herdr" || backend.kind === "t3") return false;
   if (backend.kind === "codex" && backend.queue === true && Boolean(backend.threadId)) return false;
   return true;
 }
@@ -69,6 +71,22 @@ export function createDelivery(backend: Backend, channel: () => Channel | undefi
         }
         return reject("codex_queue_outcome_unknown");
       }),
+    };
+  }
+  if (backend.kind === "t3") {
+    return {
+      modes: ["queue", "interrupt"],
+      deliver: (text, mode, submit) =>
+        submit(() =>
+          deliverToT3Thread({
+            serverUrl: backend.serverUrl,
+            threadId: backend.threadId,
+            text,
+            mode,
+            ...(backend.tokenSecret ? { tokenSecret: backend.tokenSecret } : {}),
+            ...(backend.configDir ? { configDir: backend.configDir } : {}),
+          }),
+        ),
     };
   }
   if (backend.kind === "claude") {

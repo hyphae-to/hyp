@@ -43,7 +43,7 @@ An agent can handle the **entire onboarding flow end-to-end** without ever touch
 3. **Run non-secret setup commands**:
    ```bash
    hyp onboard --yes                           # create local private node + start daemon + wire detected harnesses
-   hyp setup <harness|all|service>             # antigravity|claude|codex|cursor|opencode|gemini|openclaw|all|service
+   hyp setup <harness|all|service>             # antigravity|claude|codex|cursor|opencode|gemini|openclaw|t3|all|service
    hyp connect guide <id> --json               # fetch exact setup instructions for github-webhook, prometheus-webhook, slack, telegram, whatsapp, webhook
    hyp share tailscale --service hyphae        # private tailnet exposure (NEVER use tailscale funnel on main router)
    hyp status --discover --probe-ssh           # discover & probe SSH hosts from Herdr / ~/.ssh/config / Tailscale

@@ -54,6 +54,7 @@ import {
   setupOpenClaw,
   setupOpenCode,
   setupService,
+  setupT3,
   type ConfigurableHarness,
   type SetupResult,
   type SkillTarget,
@@ -1260,6 +1261,8 @@ async function runCli(ctx: ExecutionContext): Promise<void> {
         thread: { type: "string" },
         resume: { type: "boolean" },
         remote: { type: "string" },
+        "t3-url": { type: "string" },
+        "t3-base-dir": { type: "string" },
         "claude-channel": { type: "boolean" },
         ephemeral: { type: "boolean" },
       },
@@ -1267,7 +1270,7 @@ async function runCli(ctx: ExecutionContext): Promise<void> {
     const backend = values.backend;
     if (positionals.length > 1 || (backend !== undefined && !isHarness(backend))) {
       throw new CliUsageError("Invalid mcp arguments", {
-        usage: "hyp mcp [socket] [--claude-channel] [--backend <harness>] [--thread <uuid>] [--resume] [--remote <addr>] [--ephemeral]",
+        usage: "hyp mcp [socket] [--claude-channel] [--backend <harness>] [--thread <uuid>] [--resume] [--remote <addr>] [--t3-url <url>] [--t3-base-dir <dir>] [--ephemeral]",
       });
     }
     runMcp(positionals[0] ?? defaultSocketPath(), {
@@ -1276,6 +1279,8 @@ async function runCli(ctx: ExecutionContext): Promise<void> {
       threadId: values.thread,
       resume: values.resume === true,
       remote: values.remote,
+      ...(values["t3-url"] ? { t3Url: values["t3-url"] } : {}),
+      ...(values["t3-base-dir"] ? { t3BaseDir: values["t3-base-dir"] } : {}),
       ephemeral: values.ephemeral === true,
     });
     return;
@@ -1345,6 +1350,8 @@ async function runCli(ctx: ExecutionContext): Promise<void> {
         "no-sidecar": { type: "boolean" },
         channel: { type: "boolean" },
         remote: { type: "string" },
+        "t3-url": { type: "string" },
+        "t3-base-dir": { type: "string" },
         install: { type: "boolean" },
       },
     });
@@ -1352,7 +1359,7 @@ async function runCli(ctx: ExecutionContext): Promise<void> {
     const scope = (values.scope ?? "user") as "user" | "project";
     if (!target || positionals.length > 1) {
       throw new CliUsageError(target ? "Expected a single setup target" : "Missing setup target", {
-        usage: "hyp setup <antigravity|claude|codex|cursor|opencode|gemini|openclaw|all|service> [--scope user|project]",
+        usage: "hyp setup <antigravity|claude|codex|cursor|opencode|gemini|openclaw|t3|all|service> [--scope user|project]",
       });
     }
     if (scope !== "user" && scope !== "project") {
@@ -1406,7 +1413,7 @@ async function runCli(ctx: ExecutionContext): Promise<void> {
 
     if (target !== "all" && !configurableHarnessSet.has(target)) {
       throw new CliUsageError(`Unknown setup target '${target}'`, {
-        usage: "hyp setup <antigravity|claude|codex|cursor|opencode|gemini|openclaw|all|service>",
+        usage: "hyp setup <antigravity|claude|codex|cursor|opencode|gemini|openclaw|t3|all|service>",
         fix: `Valid targets: ${ALL_CONFIGURABLE_HARNESSES.join(", ")}, all, service`,
       });
     }
@@ -1419,6 +1426,8 @@ async function runCli(ctx: ExecutionContext): Promise<void> {
       noSidecar: values["no-sidecar"] === true,
       channel: values.channel === true,
       codexRemote: values.remote,
+      t3Url: values["t3-url"],
+      t3BaseDir: values["t3-base-dir"],
     };
     const targets: ConfigurableHarness[] = target === "all" ? [...ALL_CONFIGURABLE_HARNESSES] : [target as ConfigurableHarness];
     const results: SetupResult[] = targets.map((item) => {
@@ -1428,6 +1437,7 @@ async function runCli(ctx: ExecutionContext): Promise<void> {
       if (item === "cursor") return setupCursor(setupOpts);
       if (item === "opencode") return setupOpenCode(setupOpts);
       if (item === "gemini") return setupGemini(setupOpts);
+      if (item === "t3") return setupT3(setupOpts);
       return setupOpenClaw(setupOpts);
     });
 

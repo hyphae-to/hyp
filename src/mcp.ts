@@ -86,6 +86,10 @@ export interface McpOptions {
   resume?: boolean;
   /** Optional `codex queue --remote <addr>` (ws:// or unix://). */
   remote?: string;
+  /** Optional T3 Code server URL override (e.g. `http://127.0.0.1:3773`) when `--backend t3`. */
+  t3Url?: string;
+  /** Optional T3 Code base directory (`T3CODE_HOME`) when `--backend t3`. */
+  t3BaseDir?: string;
   /** Explicit opt-in ephemeral per-process session ID (for scratch testing without hooks). */
   ephemeral?: boolean;
 }
@@ -143,6 +147,10 @@ export function runMcp(path: string, options: McpOptions = {}): void {
       ...(options.resume && !options.threadId ? { resume: true } : {}),
       ...(process.env.CODEX_HOME ? { codexHome: process.env.CODEX_HOME } : {}),
       ...(options.backend === "herdr" && process.env.HC_TERMINAL_ID ? { terminalId: process.env.HC_TERMINAL_ID } : {}),
+      ...(options.t3Url ? { t3Url: options.t3Url } : {}),
+      ...(options.t3BaseDir || (options.backend === "t3" && process.env.T3CODE_HOME)
+        ? { t3BaseDir: options.t3BaseDir ?? process.env.T3CODE_HOME }
+        : {}),
     }) + "\n");
     sendChannelReady(conn);
     const rl = createInterface({ input: conn });
