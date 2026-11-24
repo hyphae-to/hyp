@@ -1269,28 +1269,28 @@ fn self_update_signed_manifest_atomic_swap_rollback_tamper_and_fleet_all() {
         };
 
         let manifest_ok = Arc::new(make_signed(
-            "0.2.0-nightly.20261124",
+            "99.0.0-nightly.20261124",
             format!("{base}/good.tar.gz"),
             good_sha.clone(),
             good_archive.len() as u64,
             false,
         ));
         let manifest_bad_sig = Arc::new(make_signed(
-            "0.2.0-nightly.20261124",
+            "99.0.0-nightly.20261124",
             format!("{base}/good.tar.gz"),
             good_sha.clone(),
             good_archive.len() as u64,
             true,
         ));
         let manifest_bad_sha = Arc::new(make_signed(
-            "0.2.0-nightly.20261124",
+            "99.0.0-nightly.20261124",
             format!("{base}/tampered.tar.gz"),
             good_sha,
             good_archive.len() as u64,
             false,
         ));
         let manifest_broken = Arc::new(make_signed(
-            "0.2.0-nightly.20261125",
+            "99.0.0-nightly.20261125",
             format!("{base}/broken.tar.gz"),
             broken_sha,
             broken_archive.len() as u64,
@@ -1662,7 +1662,7 @@ fn self_update_signed_manifest_atomic_swap_rollback_tamper_and_fleet_all() {
         .args([
             "update",
             "dismiss",
-            "0.2.0-nightly.20261124",
+            "99.0.0-nightly.20261124",
             "--state-dir",
             state_dir.to_str().unwrap(),
             "--json",
