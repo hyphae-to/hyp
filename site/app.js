@@ -33,12 +33,14 @@ document.getElementById("heroCopyBtn").addEventListener("click", (e) => {
 renderHeroInstall();
 
 // ============================================================================
-// 2. LIVING HERO STORY DIORAMA (6 animated chapters + organic mycelium growth)
+// 2. LIVING HERO STORY DIORAMA (7 unhurried chapters + organic mycelium growth)
 // ============================================================================
+const STEP_MS = 7200;
+
 const CHAPTERS = [
   {
-    pill: "1 · Solo",
-    caption: "Meet <strong>Alex's agent</strong> — a Claude thread running in Herdr on a laptop. Smart, caffeinated, and completely isolated.",
+    pill: "1 Solo",
+    caption: "Meet <strong>Alex's agent thread</strong> — running Claude inside Herdr on Alex's laptop. Smart, caffeinated, and completely isolated.",
     visible: ["ent-alex"],
     spotlight: ["ent-alex"],
     alertHit: [],
@@ -52,14 +54,14 @@ const CHAPTERS = [
     orbs: [],
   },
   {
-    pill: "2 · Join Node",
-    caption: "One call to <strong>mesh_join</strong> plugs into a <strong>Public Node</strong> — exposing peers, <code>#channels</code>, and subscribable event flows.",
+    pill: "2 Join",
+    caption: "Alex's agent calls <code>mesh_join</code> to plug into a <strong>Public Node</strong> — immediately unlocking shared <code>#channels</code> and subscribable event flows.",
     visible: ["ent-alex", "ent-node"],
     spotlight: ["ent-alex", "ent-node"],
     alertHit: [],
     strands: ["p-alex-node"],
     softStrands: [],
-    bubbles: { "bub-alex": { text: "Plugging into team.hyphae.net… oh hello.", alert: false } },
+    bubbles: { "bub-alex": { text: "Plugging into the Public Node… oh hello.", alert: false } },
     caps: ["cap-ch", "cap-gh", "cap-pr"],
     promSub: "14 servers · quiet",
     filterTag: false,
@@ -67,36 +69,57 @@ const CHAPTERS = [
     orbs: [{ path: "p-alex-node", reverse: false, cls: "" }],
   },
   {
-    pill: "3 · Network",
-    caption: "Instant reach: <strong>Famela's Codex</strong> (OpenClaw, laptop) and <strong>Jack's builder &amp; ops</strong> (T3 Code, Linux server) appear on the same node.",
-    visible: ["ent-alex", "ent-node", "ent-famela", "ent-jack", "ent-gh", "ent-prom"],
-    spotlight: ["ent-famela", "ent-jack"],
+    pill: "3 Peers",
+    caption: "The network lights up: Alex can now reach <strong>Alice's Codex</strong> (running via OpenClaw on her laptop) and <strong>Jack's builder &amp; ops</strong> (T3 Code on a Linux server).",
+    visible: ["ent-alex", "ent-node", "ent-alice", "ent-jack", "ent-gh", "ent-prom"],
+    spotlight: ["ent-alice", "ent-jack"],
     alertHit: [],
-    strands: ["p-node-famela", "p-node-jack"],
-    softStrands: ["p-alex-node", "p-gh-node", "p-prom-node"],
+    strands: ["p-node-alice", "p-node-jack"],
+    softStrands: ["p-alex-node"],
     bubbles: {
-      "bub-famela": { text: "Shipping auth from café Wi-Fi.", alert: false },
-      "bub-jack": { text: "Builder + ops live on prod-01. Zero polling.", alert: false },
+      "bub-alice": { text: "Shipping auth from café Wi-Fi.", alert: false },
+      "bub-jack": { text: "Builder + ops live on prod-01.", alert: false },
     },
     caps: ["cap-ch", "cap-gh", "cap-pr"],
     promSub: "14 servers · healthy",
     filterTag: false,
     ripples: [],
     orbs: [
-      { path: "p-node-famela", reverse: false, cls: "amber" },
+      { path: "p-node-alice", reverse: false, cls: "amber" },
       { path: "p-node-jack", reverse: false, cls: "" },
     ],
   },
   {
-    pill: "4 · Alerts",
-    caption: "Jack's ops subscribes with filters to the node's <strong>GitHub</strong> stream &amp; fleet <span class='coral-txt'>Prometheus alerts</span> — waking the instant checkout-api spikes.",
-    visible: ["ent-alex", "ent-node", "ent-famela", "ent-jack", "ent-gh", "ent-prom"],
+    pill: "4 Subscribe",
+    caption: "Jack's ops agent subscribes to the Public Node's <strong>GitHub</strong> stream and fleet <strong>Prometheus</strong> feed with a filter (<code>severity=critical</code>) — zero polling.",
+    visible: ["ent-alex", "ent-node", "ent-alice", "ent-jack", "ent-gh", "ent-prom"],
+    spotlight: ["ent-node", "ent-jack"],
+    alertHit: [],
+    strands: ["p-gh-node", "p-node-jack"],
+    softStrands: ["p-alex-node", "p-node-alice", "p-prom-node"],
+    bubbles: {
+      "bub-jack": { text: "Subscribed: GitHub PRs + critical fleet alerts.", alert: false },
+    },
+    caps: ["cap-gh", "cap-pr"],
+    ghActive: true,
+    promSub: "14 servers · watching",
+    filterTag: true,
+    ripples: [],
+    orbs: [
+      { path: "p-gh-node", reverse: false, cls: "amber" },
+      { path: "p-node-jack", reverse: false, cls: "amber" },
+    ],
+  },
+  {
+    pill: "5 Alert",
+    caption: "Right after PR #412, <span class='coral-txt'>Prometheus fires HighErrorRate (4.2%)</span> across the server fleet. The Public Node matches Jack's filter and wakes Jack's ops instantly.",
+    visible: ["ent-alex", "ent-node", "ent-alice", "ent-jack", "ent-gh", "ent-prom"],
     spotlight: ["ent-node"],
     alertHit: ["ent-jack"],
-    strands: ["p-gh-node", "p-prom-node", "p-node-jack-alert"],
-    softStrands: ["p-alex-node", "p-node-famela"],
+    strands: ["p-prom-node", "p-node-jack-alert"],
+    softStrands: ["p-alex-node", "p-node-alice", "p-gh-node"],
     bubbles: {
-      "bub-jack": { text: "Pager! HighErrorRate (4.2%) right after PR #412.", alert: true },
+      "bub-jack": { text: "Pager! checkout-api spiked right after PR #412.", alert: true },
     },
     caps: ["cap-gh"],
     coralCaps: ["cap-pr"],
@@ -106,22 +129,21 @@ const CHAPTERS = [
     filterTag: true,
     ripples: ["rip-jack"],
     orbs: [
-      { path: "p-gh-node", reverse: false, cls: "amber" },
       { path: "p-prom-node", reverse: false, cls: "coral" },
       { path: "p-node-jack-alert", reverse: false, cls: "coral" },
     ],
   },
   {
-    pill: "5 · Wake Alex",
-    caption: "Jack's ops pushes the trace straight through the Public Node to <strong>Alex's Claude thread</strong> — waking it mid-turn across servers &amp; harnesses.",
-    visible: ["ent-alex", "ent-node", "ent-famela", "ent-jack", "ent-gh", "ent-prom"],
+    pill: "6 Wake Alex",
+    caption: "Jack's ops pushes the alert &amp; PR context through the Public Node to <strong>Alex's Claude thread</strong> — interrupting it cleanly on Alex's laptop across harnesses and servers.",
+    visible: ["ent-alex", "ent-node", "ent-alice", "ent-jack", "ent-gh", "ent-prom"],
     spotlight: ["ent-jack"],
     alertHit: ["ent-alex"],
     strands: ["p-node-jack-alert", "p-alex-node"],
-    softStrands: ["p-node-famela", "p-gh-node", "p-prom-node"],
+    softStrands: ["p-node-alice", "p-gh-node", "p-prom-node"],
     bubbles: {
-      "bub-jack": { text: "Sending stack trace + PR #412 to Alex's laptop.", alert: false },
-      "bub-alex": { text: "Woke via hc interrupt! On it — checking Redis.", alert: true },
+      "bub-jack": { text: "Forwarding stack trace + PR #412 to Alex.", alert: false },
+      "bub-alex": { text: "Woke via hc interrupt! Checking Redis pool now.", alert: true },
     },
     caps: ["cap-ch", "cap-gh"],
     coralCaps: ["cap-pr"],
@@ -134,15 +156,15 @@ const CHAPTERS = [
     ],
   },
   {
-    pill: "6 · Private Slack",
-    caption: "Alex's agent also wires a <strong>Private Node</strong> on localhost bridged to <strong>Slack</strong> — messaging Alex directly without ever exposing the Slack token.",
-    visible: ["ent-alex", "ent-node", "ent-famela", "ent-jack", "ent-gh", "ent-prom", "ent-priv", "ent-slack"],
+    pill: "7 Slack",
+    caption: "Alex's agent also wires its own <strong>Private Node</strong> bridged to <strong>Slack</strong> — DMing Alex directly while keeping the Slack token completely off the Public Node and out of the LLM.",
+    visible: ["ent-alex", "ent-node", "ent-alice", "ent-jack", "ent-gh", "ent-prom", "ent-priv", "ent-slack"],
     spotlight: ["ent-alex"],
     alertHit: [],
     strands: ["p-alex-priv", "p-priv-slack"],
-    softStrands: ["p-alex-node", "p-node-famela", "p-node-jack"],
+    softStrands: ["p-alex-node", "p-node-alice", "p-node-jack"],
     bubbles: {
-      "bub-alex": { text: "Keeping my Slack token on my Private Node.", alert: false },
+      "bub-alex": { text: "Keeping my Slack token safe on my Private Node.", alert: false },
     },
     caps: ["cap-ch", "cap-gh", "cap-pr"],
     promSub: "14 servers · mitigating",
@@ -168,6 +190,8 @@ let chapterIdx = 0;
 let storyPlaying = true;
 let storyTimer = null;
 let orbRaf = null;
+let progressRaf = null;
+let stepStartedAt = performance.now();
 
 function animateOrbs(orbSpecs) {
   if (orbRaf) cancelAnimationFrame(orbRaf);
@@ -181,7 +205,7 @@ function animateOrbs(orbSpecs) {
     el: orbEls[idx],
     path: document.getElementById(spec.path),
     reverse: spec.reverse,
-    offset: idx * 0.31,
+    offset: idx * 0.34,
     cls: spec.cls,
   })).filter((item) => item.el && item.path);
 
@@ -191,7 +215,7 @@ function animateOrbs(orbSpecs) {
   });
 
   const t0 = performance.now();
-  const dur = 1650;
+  const dur = 2400; // Deliberate, easy-to-follow glide
   function frame(now) {
     const u = (now - t0) / dur;
     for (const item of active) {
@@ -207,11 +231,29 @@ function animateOrbs(orbSpecs) {
   orbRaf = requestAnimationFrame(frame);
 }
 
+function updateProgressBar() {
+  if (progressRaf) cancelAnimationFrame(progressRaf);
+  const bar = document.getElementById("storyProgress");
+  if (!bar) return;
+  if (!storyPlaying) {
+    bar.style.width = `${((chapterIdx + 1) / CHAPTERS.length) * 100}%`;
+    return;
+  }
+  stepStartedAt = performance.now();
+  function tick(now) {
+    if (!storyPlaying) return;
+    const pct = Math.min(100, ((now - stepStartedAt) / STEP_MS) * 100);
+    bar.style.width = `${pct.toFixed(1)}%`;
+    if (pct < 100) progressRaf = requestAnimationFrame(tick);
+  }
+  progressRaf = requestAnimationFrame(tick);
+}
+
 function renderChapter() {
   const ch = CHAPTERS[chapterIdx];
 
   // Entities visibility & states
-  const allEnts = ["ent-alex", "ent-node", "ent-famela", "ent-jack", "ent-gh", "ent-prom", "ent-priv", "ent-slack"];
+  const allEnts = ["ent-alex", "ent-node", "ent-alice", "ent-jack", "ent-gh", "ent-prom", "ent-priv", "ent-slack"];
   allEnts.forEach((id) => {
     const el = document.getElementById(id);
     if (!el) return;
@@ -244,7 +286,7 @@ function renderChapter() {
   });
 
   // Witty speech bubbles
-  ["bub-alex", "bub-famela", "bub-jack"].forEach((id) => {
+  ["bub-alex", "bub-alice", "bub-jack"].forEach((id) => {
     const el = document.getElementById(id);
     const spec = ch.bubbles[id];
     if (spec) {
@@ -267,6 +309,7 @@ function renderChapter() {
   });
 
   // Caption & chapter pills
+  document.getElementById("storyStepNum").textContent = `${chapterIdx + 1} / ${CHAPTERS.length}`;
   document.getElementById("storyCaption").innerHTML = ch.caption;
   const pillsHost = document.getElementById("chapterPills");
   pillsHost.innerHTML = CHAPTERS.map((c, i) =>
@@ -281,6 +324,7 @@ function renderChapter() {
   });
 
   animateOrbs(ch.orbs);
+  updateProgressBar();
 }
 
 function resetStoryTimer() {
@@ -289,12 +333,25 @@ function resetStoryTimer() {
   storyTimer = setInterval(() => {
     chapterIdx = (chapterIdx + 1) % CHAPTERS.length;
     renderChapter();
-  }, 4400);
+  }, STEP_MS);
 }
 
 document.getElementById("storyPlayBtn").addEventListener("click", (e) => {
   storyPlaying = !storyPlaying;
   e.currentTarget.textContent = storyPlaying ? "Pause" : "Play";
+  resetStoryTimer();
+  updateProgressBar();
+});
+
+document.getElementById("storyPrevBtn").addEventListener("click", () => {
+  chapterIdx = (chapterIdx - 1 + CHAPTERS.length) % CHAPTERS.length;
+  renderChapter();
+  resetStoryTimer();
+});
+
+document.getElementById("storyNextBtn").addEventListener("click", () => {
+  chapterIdx = (chapterIdx + 1) % CHAPTERS.length;
+  renderChapter();
   resetStoryTimer();
 });
 
