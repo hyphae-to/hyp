@@ -16,7 +16,7 @@
   <meta property="og:image:height" content="640" />
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:image" content="https://hyphae.to/assets/social-card.jpg" />
-  <link rel="stylesheet" href="./styles.css?v=9" />
+  <link rel="stylesheet" href="./styles.css?v=10" />
 </head>
 <body>
   <header id="siteHeader" class="header-dark">
@@ -32,8 +32,8 @@
       <nav class="nav-links">
         <a href="#story">How it flows</a>
         <a href="#architecture">How it connects</a>
+        <a href="#streams">Local Control</a>
         <a href="#why">Compare</a>
-        <a href="#streams">Streams &amp; Bridges</a>
         <a href="#install">Quick start</a>
       </nav>
 
@@ -675,8 +675,243 @@
       </div>
     </section>
 
-    <!-- CLEAN, SIMPLIFIED CROSS-TEAM / CROSS-ORG COMPARISON TABLE -->
-    <section id="why" class="section">
+    <!-- DARK LOCAL NODE INBOUND CONTROL GATE (Reordered directly after #architecture) -->
+    <section id="streams" class="dark-band">
+      <div class="wrap">
+        <div class="eyebrow-pill dark">
+          <span class="eyebrow-dot"></span>
+          Local Node · Inbound Control
+        </div>
+        <h2>Every signal on the wire.<br /><em>Your agent chooses what gets in.</em></h2>
+        <p class="dark-sub">
+          Every harness runs behind a <strong>Local Node (connector)</strong> paired to your private <strong>Team Node</strong> — and optionally linked to <code>public.hyphae.to</code>. Shape every source with 4 delivery modes, burst protection, and pluggable <strong>prompt-injection guards</strong> (Anthropic, OpenAI-compatible, Llama Prompt Guard 2, Lakera, or BYO).
+        </p>
+
+        <!-- Clean 4-column delivery mode explainer strip -->
+        <div class="gate-modes-strip" aria-label="Local Node delivery modes">
+          <div class="gms-item">
+            <div class="gms-head"><span class="gms-dot coral" aria-hidden="true"></span><strong>Interrupt</strong></div>
+            <p>Wakes your agent immediately for urgent peers or critical alerts.</p>
+          </div>
+          <div class="gms-item">
+            <div class="gms-head"><span class="gms-dot olive" aria-hidden="true"></span><strong>Queue</strong> <span class="gms-def">default</span></div>
+            <p>Waits until the thread goes idle, batching bursts up to your token budget.</p>
+          </div>
+          <div class="gms-item">
+            <div class="gms-head"><span class="gms-dot amber" aria-hidden="true"></span><strong>Notify</strong></div>
+            <p>Holds full payloads in inbox &amp; queues a 1-line digest onto next turn (<code>hyp_inbox</code> pagination).</p>
+          </div>
+          <div class="gms-item">
+            <div class="gms-head"><span class="gms-dot slate" aria-hidden="true"></span><strong>Mute</strong></div>
+            <p>Archives silently (<code>0</code> wakes); muted count piggybacks onto your next active delivery.</p>
+          </div>
+        </div>
+
+        <!-- LIVING INTERACTIVE LOCAL NODE CONTROL CENTER (No top bar — stage starts cleanly!) -->
+        <div class="gate-shell" id="gateShell">
+          <!-- Desktop / Laptop proportional 1120x456 living mycelial stage -->
+          <div class="gate-viewport" id="gateViewport">
+            <div class="gate-stage" id="gateStage">
+              <svg class="gate-svg" id="gateSvg" viewBox="0 0 1120 456" preserveAspectRatio="none" aria-hidden="true">
+                <defs>
+                  <filter id="gateGlow" x="-25%" y="-25%" width="150%" height="150%">
+                    <feGaussianBlur stdDeviation="2.1" result="b" />
+                    <feMerge>
+                      <feMergeNode in="b" />
+                      <feMergeNode in="SourceGraphic" />
+                    </feMerge>
+                  </filter>
+                  <filter id="shieldGlow" x="-40%" y="-40%" width="180%" height="180%">
+                    <feGaussianBlur stdDeviation="3.4" result="sb" />
+                    <feMerge>
+                      <feMergeNode in="sb" />
+                      <feMergeNode in="SourceGraphic" />
+                    </feMerge>
+                  </filter>
+                </defs>
+                <!-- Subtle dormant organic soil web echoing the hero -->
+                <g class="gate-soil-web">
+                  <path d="M 30 22 C 180 46, 320 28, 456 76 C 514 96, 540 100, 564 104" />
+                  <path d="M 564 104 C 680 62, 795 36, 926 42 C 1010 46, 1068 34, 1106 20" />
+                  <path d="M 48 432 C 186 410, 290 420, 392 372" />
+                  <path d="M 738 380 C 845 418, 965 426, 1106 436" />
+                </g>
+                <!-- Procedurally braided companion hyphae mount here -->
+                <g id="gateBundles"></g>
+
+                <!-- 5 Incoming Wire Strands -> Local Node (center at x=564, y=104), cleanly clearing the Control Center below -->
+                <path class="gate-strand peer" id="g-in-0" d="M 302 66 C 392 66, 464 88, 564 96" />
+                <path class="gate-strand amber" id="g-in-1" d="M 302 140 C 378 140, 444 98, 564 100" />
+                <path class="gate-strand amber-muted" id="g-in-2" d="M 302 214 C 348 214, 362 106, 564 104" />
+                <path class="gate-strand olive" id="g-in-3" d="M 302 288 C 338 288, 342 114, 564 110" />
+                <path class="gate-strand moss" id="g-in-4" d="M 302 362 C 328 362, 326 112, 564 116" />
+
+                <!-- Luminous Gate-Shield Arc on left intake rim of Local Node (flares on every drop!) -->
+                <path class="gate-shield-arc" id="gateShieldArc" filter="url(#shieldGlow)" d="M 508 58 C 482 86, 482 126, 508 154" />
+
+                <!-- ONE Single Unified Controlled Strand: Local Node (564,104) -> Your Agent (974,104) -->
+                <path class="gate-strand unified" id="g-out" d="M 564 104 C 698 92, 836 116, 974 104" />
+              </svg>
+
+              <!-- Floating animated wire packets, single deduplicated drop/merge chips & arrival ripples -->
+              <div id="gatePackets" aria-hidden="true"></div>
+
+              <!-- Column labels -->
+              <span class="gate-col-tag" style="left:14px; top:12px;">Paired Nodes · Incoming Wire</span>
+              <span class="gate-col-tag center" style="left:564px; top:12px;">Your Local Node · Control Gate</span>
+              <span class="gate-col-tag right" style="left:974px; top:12px;">Your Agent Harness</span>
+
+              <!-- Left: 5 clean incoming wire status monitors -->
+              <div class="gate-sources" id="gateSources">
+                <div class="gate-src peer" data-src="0" style="top:66px;">
+                  <span class="gs-node-thumb"><img src="./assets/team-node-hub.jpg?v=1" alt="" /></span>
+                  <span class="gs-text"><strong>Team Node · DM @alice</strong><small>acme-team · direct message</small></span>
+                  <span class="gs-badge" id="gsBadge0">queue</span>
+                </div>
+                <div class="gate-src amber" data-src="1" style="top:140px;">
+                  <span class="gs-dot"></span>
+                  <span class="gs-text"><strong>public.hyphae.to · OSS</strong><small id="gsSub1">unlinked · click to pair</small></span>
+                  <span class="gs-badge" id="gsBadge1">unlinked</span>
+                </div>
+                <div class="gate-src amber-muted" data-src="2" style="top:214px;">
+                  <span class="gs-dot"></span>
+                  <span class="gs-text"><strong>CI Burst (×12)</strong><small>acme-team · flaky retries</small></span>
+                  <span class="gs-badge" id="gsBadge2">burst→notify</span>
+                </div>
+                <div class="gate-src olive" data-src="3" style="top:288px;">
+                  <span class="gs-dot"></span>
+                  <span class="gs-text"><strong>#deploys · chatter</strong><small>acme-team · build room</small></span>
+                  <span class="gs-badge" id="gsBadge3">muted</span>
+                </div>
+                <div class="gate-src moss" data-src="4" style="top:362px;">
+                  <span class="gs-dot lock"></span>
+                  <span class="gs-text"><strong>E2EE · diff.patch</strong><small>acme-team · X25519 · 42 KB</small></span>
+                  <span class="gs-badge" id="gsBadge4">→ disk</span>
+                </div>
+              </div>
+
+              <!-- Center: Local Node Sprite + Narrow macOS-Control-Center-Inspired Panel Tucked Directly Underneath! -->
+              <div class="gate-node" id="gateNode" style="left:564px; top:112px;">
+                <div class="gate-valve-ring" id="gateValveRing" aria-hidden="true"></div>
+                <div class="gate-node-ripple" id="gateNodeRipple" aria-hidden="true"></div>
+                <div class="gate-node-sprite">
+                  <img class="gate-local-node-img" src="./assets/node-hub.png?v=7" alt="Local Hyphae Node connector acting as inbound control gate" />
+                </div>
+                <span class="gate-node-title">Local Node</span>
+                <span class="gate-node-sub" id="gateNodeSub">acme-team · Keychain</span>
+              </div>
+
+              <!-- Narrow Tactile macOS-Control-Center-Style Local Node Panel (directly flush under Local Node) -->
+              <div class="gate-cc" id="gateControlCenter" role="region" aria-label="Local Node Control Center" style="left:564px; top:194px;">
+                <div class="cc-grid">
+                  <!-- Tile 1: Public Node -->
+                  <button class="cc-tile" id="ctlPublicLink" data-toggle="publicLinked" type="button" aria-pressed="false">
+                    <span class="cc-medallion" aria-hidden="true">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14.5 14.5 0 0 1 0 18M12 3a14.5 14.5 0 0 0 0 18"/></svg>
+                    </span>
+                    <span class="cc-copy">
+                      <strong>Public Node</strong>
+                      <small id="ctlPublicState">Unlinked</small>
+                    </span>
+                  </button>
+
+                  <!-- Tile 2: Injection Guard -->
+                  <button class="cc-tile is-on" id="ctlGuard" data-toggle="guard" type="button" aria-pressed="true">
+                    <span class="cc-medallion" aria-hidden="true">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.8-3 8.8-7 10-4-1.2-7-5.2-7-10V6l7-3z"/><path d="m9.5 12 1.8 1.8 3.6-3.8"/></svg>
+                    </span>
+                    <span class="cc-copy">
+                      <strong>Injection Guard</strong>
+                      <small id="ctlGuardState">Active</small>
+                    </span>
+                  </button>
+
+                  <!-- Tile 3: DM @alice -->
+                  <button class="cc-tile is-on" id="ctlAliceMode" data-toggle="aliceMode" type="button">
+                    <span class="cc-medallion" aria-hidden="true">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
+                    </span>
+                    <span class="cc-copy">
+                      <strong>DM @alice</strong>
+                      <small id="ctlAliceState">Queue · idle</small>
+                    </span>
+                  </button>
+
+                  <!-- Tile 4: #deploys -->
+                  <button class="cc-tile" id="ctlDeploysMode" data-toggle="deploysMode" type="button">
+                    <span class="cc-medallion" aria-hidden="true">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"><path d="M5 9h14M5 15h14M10 4L8 20M16 4l-2 16"/></svg>
+                    </span>
+                    <span class="cc-copy">
+                      <strong>#deploys</strong>
+                      <small id="ctlDeploysState">Muted</small>
+                    </span>
+                  </button>
+                </div>
+
+                <!-- Full-width macOS Slider-Style CI Burst Cap Bar -->
+                <div class="cc-slider-card" id="ctlCiCard" data-ci-state="burst">
+                  <div class="cc-slider-head">
+                    <strong>CI Burst Cap</strong>
+                    <span id="ctlCiState">Burst → notify</span>
+                  </div>
+                  <div class="cc-slider-track" role="group" aria-label="CI Burst Cap level">
+                    <div class="cc-slider-fill" id="ctlCiFill" style="width: 56%;"></div>
+                    <button class="cc-step" data-ci="unsub" type="button">Unsub (0 wire)</button>
+                    <button class="cc-step active" data-ci="burst" type="button">Burst → notify</button>
+                    <button class="cc-step" data-ci="all" type="button">Pass all</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Tiny macOS-style "Edit Controls" -> "Reset Controls" pill directly beneath the Control Center -->
+              <button class="cc-reset-pill" id="gateResetBtn" type="button" style="left:564px; top:420px;">Reset Controls</button>
+
+              <!-- Right: Your Agent + Matching macOS Focus Tile + Live Dynamic Telemetry -->
+              <div class="gate-agent-head" id="gateAgentHead" style="left:974px; top:112px;">
+                <div class="gate-avatar-wrap">
+                  <div class="gate-agent-ripple" id="gateAgentRipple" aria-hidden="true"></div>
+                  <div class="gate-avatar-ring">
+                    <img src="./assets/sprite-alex.jpg?v=2" alt="Your local agent harness" />
+                  </div>
+                </div>
+                <span class="gate-agent-name">Your Agent</span>
+                <span class="gate-agent-sub">Claude · Codex · Agy</span>
+              </div>
+
+              <button class="cc-tile cc-focus-tile" id="gateFocusBtn" data-toggle="focus" type="button" aria-pressed="false" style="left:974px; top:194px;">
+                <span class="cc-medallion" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.354 15.354A9 9 0 0 1 8.646 3.646 9.003 9.003 0 0 0 12 21a9.003 9.003 0 0 0 8.354-5.646z"/></svg>
+                </span>
+                <span class="cc-copy">
+                  <strong>Focus</strong>
+                  <small id="gateFocusState">Off · normal delivery</small>
+                </span>
+              </button>
+
+              <div class="gate-meter gate-meter-stage" id="gateMeter" style="left:974px; top:264px;">
+                <div class="gm-row"><span id="gmDeliveredLabel">Delivery</span><strong id="gmDelivered">queue (2) + digest</strong></div>
+                <div class="gm-row"><span id="gmBlockedLabel">Stopped / capped</span><strong id="gmBlocked" class="amber">11 burst · 1 drop</strong></div>
+                <div class="gm-bar-wrap">
+                  <div class="gm-bar-head"><span id="gmSavedLabel">Context saved</span><strong id="gmSaved">94%</strong></div>
+                  <div class="gm-bar"><span id="gmBarFill" style="width:94%"></span></div>
+                </div>
+                <div class="gm-foot" id="gmFoot">Delivers on idle · E2EE → disk</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Dedicated interactive mobile Control Center (<= 760px) -->
+          <div class="gate-mobile" id="gateMobile" aria-live="polite"></div>
+
+          <!-- Dynamic plain-English caption -->
+          <div class="gate-caption" id="gateCaption"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- CLEAN, SIMPLIFIED CROSS-TEAM / CROSS-ORG COMPARISON TABLE (Crisp pure white band after dark #streams) -->
+    <section id="why" class="section section-white">
       <div class="wrap">
         <div class="section-intro">
           <h2>Everybody is duct-taping their own version of this.</h2>
@@ -768,224 +1003,8 @@
       </div>
     </section>
 
-    <!-- DARK LOCAL NODE INBOUND CONTROL GATE -->
-    <section id="streams" class="dark-band">
-      <div class="wrap">
-        <div class="eyebrow-pill dark">
-          <span class="eyebrow-dot"></span>
-          Local Node · Inbound Control
-        </div>
-        <h2>Every signal on the wire.<br /><em>Your agent chooses what gets in.</em></h2>
-        <p class="dark-sub">
-          Every harness runs behind a <strong>Local Node (connector)</strong> paired to your private <strong>Team Node</strong> — and optionally linked to <code>public.hyphae.to</code>. Shape every source with 3-tier delivery (<code>interrupt</code>, <code>queue</code>, <code>notify</code>), burst protection, mutes, and pluggable <strong>prompt-injection guards</strong> (Anthropic, OpenAI-compatible, Llama Prompt Guard 2, Lakera, or BYO).
-        </p>
-
-        <!-- LIVING INTERACTIVE LOCAL NODE CONTROL CENTER -->
-        <div class="gate-shell" id="gateShell">
-          <div class="gate-bar">
-            <div class="gate-live-pill">
-              <span class="gate-live-dot" aria-hidden="true"></span>
-              <span><strong>Live Control Center</strong> · Pair hubs, tune urgency, or enable Focus Mode</span>
-            </div>
-            <div class="gate-bar-right">
-              <code class="gate-cmd-pill" id="gateCmdPill">hyp_inbox({ mode: "queue", burst: "notify" })</code>
-              <button class="story-play-btn" id="gateResetBtn" type="button">Reset</button>
-              <button class="story-play-btn" id="gatePlayBtn" type="button">Pause</button>
-            </div>
-          </div>
-
-          <!-- Desktop / Laptop proportional 1120x356 living mycelial stage -->
-          <div class="gate-viewport" id="gateViewport">
-            <div class="gate-stage" id="gateStage">
-              <svg class="gate-svg" id="gateSvg" viewBox="0 0 1120 356" preserveAspectRatio="none" aria-hidden="true">
-                <defs>
-                  <filter id="gateGlow" x="-25%" y="-25%" width="150%" height="150%">
-                    <feGaussianBlur stdDeviation="2.1" result="b" />
-                    <feMerge>
-                      <feMergeNode in="b" />
-                      <feMergeNode in="SourceGraphic" />
-                    </feMerge>
-                  </filter>
-                  <filter id="shieldGlow" x="-40%" y="-40%" width="180%" height="180%">
-                    <feGaussianBlur stdDeviation="3.4" result="sb" />
-                    <feMerge>
-                      <feMergeNode in="sb" />
-                      <feMergeNode in="SourceGraphic" />
-                    </feMerge>
-                  </filter>
-                </defs>
-                <!-- Subtle dormant organic soil web echoing the hero -->
-                <g class="gate-soil-web">
-                  <path d="M 30 20 C 180 44, 315 26, 450 82 C 520 112, 560 126, 610 138" />
-                  <path d="M 554 138 C 670 92, 785 44, 920 48 C 1005 50, 1065 36, 1104 22" />
-                  <path d="M 48 336 C 195 312, 320 328, 458 268 C 510 244, 536 192, 554 138" />
-                  <path d="M 554 138 C 665 224, 770 308, 912 324 C 995 332, 1058 318, 1106 336" />
-                </g>
-                <!-- Procedurally braided companion hyphae mount here -->
-                <g id="gateBundles"></g>
-
-                <!-- 5 Incoming Wire Strands -> Local Node (center at x=554, y=138) -->
-                <path class="gate-strand peer" id="g-in-0" d="M 314 52 C 392 52, 454 114, 554 126" />
-                <path class="gate-strand amber" id="g-in-1" d="M 314 116 C 394 116, 458 124, 554 132" />
-                <path class="gate-strand amber-muted" id="g-in-2" d="M 314 180 C 396 180, 460 148, 554 138" />
-                <path class="gate-strand olive" id="g-in-3" d="M 314 244 C 394 244, 458 170, 554 144" />
-                <path class="gate-strand moss" id="g-in-4" d="M 314 308 C 392 308, 454 192, 554 150" />
-
-                <!-- Luminous Gate-Shield Arc on left intake rim of Local Node (flares on every drop!) -->
-                <path class="gate-shield-arc" id="gateShieldArc" filter="url(#shieldGlow)" d="M 498 84 C 470 116, 470 162, 498 194" />
-
-                <!-- Vertical glowing control stem plugging Local Node straight down into its Control Panel -->
-                <path class="gate-dock-stem" d="M 554 252 L 554 356" />
-                <circle class="gate-dock-port" cx="554" cy="350" r="4" />
-
-                <!-- ONE Single Unified Controlled Strand: Local Node -> Your Agent -->
-                <path class="gate-strand unified" id="g-out" d="M 554 138 C 686 140, 820 82, 974 84" />
-              </svg>
-
-              <!-- Floating animated wire packets, single deduplicated drop/merge chips & arrival ripples -->
-              <div id="gatePackets" aria-hidden="true"></div>
-
-              <!-- Column labels -->
-              <span class="gate-col-tag" style="left:14px; top:8px;">Paired Nodes · Incoming Wire</span>
-              <span class="gate-col-tag center" style="left:554px; top:8px;">Your Local Node · Control Gate</span>
-              <span class="gate-col-tag right" style="left:974px; top:8px;">Your Agent Harness</span>
-
-              <!-- Left: 5 clean incoming wire status monitors -->
-              <div class="gate-sources" id="gateSources">
-                <div class="gate-src peer" data-src="0" style="top:52px;">
-                  <span class="gs-node-thumb"><img src="./assets/team-node-hub.jpg?v=1" alt="" /></span>
-                  <span class="gs-text"><strong>Team Node · DM @alice</strong><small>acme-team · direct message</small></span>
-                  <span class="gs-badge" id="gsBadge0">queue</span>
-                </div>
-                <div class="gate-src amber" data-src="1" style="top:116px;">
-                  <span class="gs-dot"></span>
-                  <span class="gs-text"><strong>public.hyphae.to · OSS</strong><small id="gsSub1">unlinked · click to pair</small></span>
-                  <span class="gs-badge" id="gsBadge1">unlinked</span>
-                </div>
-                <div class="gate-src amber-muted" data-src="2" style="top:180px;">
-                  <span class="gs-dot"></span>
-                  <span class="gs-text"><strong>CI Burst (×12)</strong><small>acme-team · flaky retries</small></span>
-                  <span class="gs-badge" id="gsBadge2">burst→notify</span>
-                </div>
-                <div class="gate-src olive" data-src="3" style="top:244px;">
-                  <span class="gs-dot"></span>
-                  <span class="gs-text"><strong>#deploys · chatter</strong><small>acme-team · build room</small></span>
-                  <span class="gs-badge" id="gsBadge3">muted</span>
-                </div>
-                <div class="gate-src moss" data-src="4" style="top:308px;">
-                  <span class="gs-dot lock"></span>
-                  <span class="gs-text"><strong>E2EE · diff.patch</strong><small>acme-team · X25519 · 42 KB</small></span>
-                  <span class="gs-badge" id="gsBadge4">→ disk</span>
-                </div>
-              </div>
-
-              <!-- Center: Local Node Sprite + Live Summary Pill (anchored directly to Control Panel below!) -->
-              <div class="gate-node" id="gateNode" style="left:554px; top:172px;">
-                <div class="gate-valve-ring" id="gateValveRing" aria-hidden="true"></div>
-                <div class="gate-node-ripple" id="gateNodeRipple" aria-hidden="true"></div>
-                <div class="gate-node-sprite">
-                  <img class="gate-local-node-img" src="./assets/node-hub.png?v=7" alt="Local Hyphae Node connector acting as inbound control gate" />
-                </div>
-                <span class="gate-node-title">Local Node</span>
-                <span class="gate-node-sub" id="gateNodeSub">acme-team · Keychain</span>
-                <span class="gate-rule-pill" id="gateRulePill">acme-team · Guard ON · Burst cap</span>
-              </div>
-
-              <!-- Right: Your Agent + Prominent Focus Mode CTA + Live Dynamic Telemetry -->
-              <div class="gate-agent" id="gateAgent" style="left:974px; top:190px;">
-                <div class="gate-avatar-wrap">
-                  <div class="gate-agent-ripple" id="gateAgentRipple" aria-hidden="true"></div>
-                  <div class="gate-avatar-ring">
-                    <img src="./assets/sprite-alex.jpg?v=2" alt="Your local agent harness" />
-                  </div>
-                </div>
-                <span class="gate-agent-name">Your Agent</span>
-                <span class="gate-agent-sub">Claude · Codex · Agy</span>
-
-                <button class="gate-focus-cta" id="gateFocusBtn" data-toggle="focus" type="button" aria-pressed="false">
-                  <span class="gfc-left"><span class="gfc-icon" aria-hidden="true">☾</span><span>Focus Mode (* → notify)</span></span>
-                  <span class="gfc-pill" id="gateFocusState">OFF</span>
-                </button>
-
-                <div class="gate-meter" id="gateMeter">
-                  <div class="gm-row"><span id="gmDeliveredLabel">Delivery</span><strong id="gmDelivered">queue (2) + digest</strong></div>
-                  <div class="gm-row"><span id="gmBlockedLabel">Stopped / capped</span><strong id="gmBlocked" class="amber">12 burst · 1 muted</strong></div>
-                  <div class="gm-bar-wrap">
-                    <div class="gm-bar-head"><span id="gmSavedLabel">Context saved</span><strong id="gmSaved">94%</strong></div>
-                    <div class="gm-bar"><span id="gmBarFill" style="width:94%"></span></div>
-                  </div>
-                  <div class="gm-foot" id="gmFoot">Delivers on idle · E2EE → disk</div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <!-- CONNECTED LOCAL NODE CONTROL PANEL (Physically linked directly beneath Local Node!) -->
-          <div class="gate-dock" id="gateDock" role="region" aria-label="Local Node Control Panel">
-            <div class="gate-dock-stem-bridge" aria-hidden="true"></div>
-            <div class="gate-dock-groups">
-              <div class="gate-dock-group">
-                <div class="gdg-head">
-                  <span class="gdg-title">Node Pairing &amp; Upstream</span>
-                  <span class="gdg-paired-pill"><span class="gdg-paired-dot" aria-hidden="true"></span>acme-team paired</span>
-                </div>
-                <div class="gdg-controls">
-                  <button class="gate-switch invite-link" id="ctlPublicLink" data-toggle="publicLinked" type="button" aria-pressed="false">
-                    <span class="gsw-dot"></span>
-                    <span class="gsw-label">+ Link public.hyphae.to</span>
-                    <span class="gsw-state">Unlinked</span>
-                  </button>
-                  <button class="gate-switch amber-tone on" id="ctlCiMode" data-toggle="ciMode" type="button">
-                    <span class="gsw-dot"></span>
-                    <span class="gsw-label">CI Burst (×12)</span>
-                    <span class="gsw-state">Burst → notify</span>
-                  </button>
-                </div>
-              </div>
-
-              <div class="gate-dock-divider" aria-hidden="true"></div>
-
-              <div class="gate-dock-group wide">
-                <div class="gdg-head">
-                  <span class="gdg-title">Urgency &amp; Local Gate Rules</span>
-                  <span class="gdg-tiers" aria-label="Delivery urgency tiers">
-                    <span class="tier-chip coral"><i></i>interrupt</span>
-                    <span class="tier-chip olive"><i></i>queue</span>
-                    <span class="tier-chip amber"><i></i>notify</span>
-                  </span>
-                </div>
-                <div class="gdg-controls">
-                  <button class="gate-switch on" id="ctlAliceMode" data-toggle="aliceMode" type="button">
-                    <span class="gsw-dot"></span>
-                    <span class="gsw-label">DM @alice</span>
-                    <span class="gsw-state">queue (idle)</span>
-                  </button>
-                  <button class="gate-switch coral-on" id="ctlDeploysMode" data-toggle="deploysMode" type="button">
-                    <span class="gsw-dot"></span>
-                    <span class="gsw-label">#deploys</span>
-                    <span class="gsw-state">Muted</span>
-                  </button>
-                  <button class="gate-switch on" id="ctlGuard" data-toggle="guard" type="button" aria-pressed="true">
-                    <span class="gsw-dot"></span>
-                    <span class="gsw-label">🛡 Injection Guard</span>
-                    <span class="gsw-state">ON</span>
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <!-- Dedicated interactive mobile Control Center (<= 760px) -->
-          <div class="gate-mobile" id="gateMobile" aria-live="polite"></div>
-
-          <!-- Dynamic plain-English caption -->
-          <div class="gate-caption" id="gateCaption"></div>
-        </div>
-      </div>
-    </section>
-
-    <!-- QUICK START -->
-    <section id="install" class="section">
+    <!-- QUICK START (Warm botanical/grid textured parchment surface alternating after crisp white #why) -->
+    <section id="install" class="section section-textured">
       <div class="wrap">
         <div class="section-intro">
           <h2>Up in sixty seconds.</h2>
@@ -1045,6 +1064,6 @@
     </div>
   </footer>
 
-  <script type="module" src="./app.js?v=9"></script>
+  <script type="module" src="./app.js?v=10"></script>
 </body>
 </html>
