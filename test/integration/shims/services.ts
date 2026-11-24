@@ -73,17 +73,29 @@ export interface MockSlackOptions {
   readonly teamId?: string;
 }
 
+export interface MockSlackPostedMessage {
+  readonly channel: string;
+  readonly text: string;
+  readonly thread_ts?: string;
+  readonly ts: string;
+}
+
 export interface MockSlackServer {
   readonly apiBaseUrl: string;
   readonly wsUrl: string;
   readonly authCalls: string[];
   readonly ackedEnvelopes: string[];
+  readonly postedMessages: MockSlackPostedMessage[];
   /** Wait until the Slack plugin completes auth.test + Socket Mode WebSocket handshake. */
   waitForConnected(timeoutMs?: number): Promise<void>;
   /** Push a Slack Socket Mode `events_api` envelope to connected plugin(s) and return its `envelope_id`. */
   pushEvent(event: Record<string, unknown>, envelopeId?: string): string;
   /** Wait until the Slack plugin sends a Socket Mode ack for `envelopeId`. */
   waitForAck(envelopeId: string, timeoutMs?: number): Promise<void>;
+  /** Inject (or clear with `null`) an upstream Slack Web API error for `chat.postMessage`. */
+  setPostError(error: string | null): void;
+  /** Wait until at least `minCount` accepted `chat.postMessage` calls have been recorded. */
+  waitForPost(minCount?: number, timeoutMs?: number): Promise<MockSlackPostedMessage[]>;
   close(): Promise<void>;
 }
 
@@ -96,15 +108,19 @@ export async function startMockSlackServer(options: MockSlackOptions): Promise<M
   const teamId = options.teamId ?? "TTEAM99";
   const authCalls: string[] = [];
   const ackedEnvelopes: string[] = [];
+  const postedMessages: MockSlackPostedMessage[] = [];
   const sockets = new Set<Duplex>();
   const pendingEnvelopes: string[] = [];
   const connectWaiters = new Set<() => void>();
   const ackWaiters = new Map<string, Set<() => void>>();
+  const postWaiters = new Set<() => void>();
+  let postError: string | null = null;
+  let postSeq = 0;
 
   let port = 0;
 
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-    await readBody(req);
+    const raw = await readBody(req);
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
     const auth = req.headers.authorization ?? "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
@@ -129,6 +145,48 @@ export async function startMockSlackServer(options: MockSlackOptions): Promise<M
       }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, url: `ws://127.0.0.1:${port}/ws` }));
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/chat.postMessage") {
+      if (token !== options.botToken) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "invalid_auth" }));
+        return;
+      }
+      if (postError !== null) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: postError }));
+        return;
+      }
+      let parsed: unknown = null;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {}
+      const channel = object(parsed) && typeof parsed.channel === "string" ? parsed.channel : "";
+      const text = object(parsed) && typeof parsed.text === "string" ? parsed.text : "";
+      const threadTs = object(parsed) && typeof parsed.thread_ts === "string" ? parsed.thread_ts : undefined;
+      if (!channel) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "channel_not_found" }));
+        return;
+      }
+      if (!text) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "no_text" }));
+        return;
+      }
+      const ts = `${Math.floor(Date.now() / 1000)}.${String(++postSeq).padStart(6, "0")}`;
+      const record: MockSlackPostedMessage = {
+        channel,
+        text,
+        ...(threadTs !== undefined ? { thread_ts: threadTs } : {}),
+        ts,
+      };
+      postedMessages.push(record);
+      for (const wake of postWaiters) wake();
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, channel, ts }));
       return;
     }
 
@@ -200,6 +258,7 @@ export async function startMockSlackServer(options: MockSlackOptions): Promise<M
     wsUrl: `ws://127.0.0.1:${port}/ws`,
     authCalls,
     ackedEnvelopes,
+    postedMessages,
     async waitForConnected(timeoutMs = 8_000) {
       if (sockets.size > 0) return;
       await new Promise<void>((resolve, reject) => {
@@ -248,6 +307,27 @@ export async function startMockSlackServer(options: MockSlackOptions): Promise<M
         set.add(onAck);
       });
     },
+    setPostError(error) {
+      postError = error;
+    },
+    async waitForPost(minCount = 1, timeoutMs = 8_000) {
+      if (postedMessages.length >= minCount) return postedMessages;
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          postWaiters.delete(onPost);
+          reject(new Error(`Timed out waiting for ${minCount} Slack chat.postMessage call(s) (saw ${postedMessages.length})`));
+        }, timeoutMs).unref();
+        const onPost = () => {
+          if (postedMessages.length >= minCount) {
+            clearTimeout(timer);
+            postWaiters.delete(onPost);
+            resolve();
+          }
+        };
+        postWaiters.add(onPost);
+      });
+      return postedMessages;
+    },
     close: () =>
       new Promise<void>((resolve) => {
         for (const sock of sockets) sock.destroy();
@@ -276,23 +356,39 @@ export interface TelegramUpdate {
   };
 }
 
+export interface MockTelegramSentMessage {
+  readonly chat_id: string;
+  readonly text: string;
+  readonly reply_to_message_id?: number;
+  readonly message_id: number;
+}
+
 export interface MockTelegramServer {
   readonly apiBaseUrl: string;
   readonly pollOffsets: number[];
+  readonly sentMessages: MockTelegramSentMessage[];
   pushUpdate(update: TelegramUpdate): void;
   waitForPoll(minCalls?: number, timeoutMs?: number): Promise<void>;
+  /** Inject (or clear with `null`) an upstream Telegram Bot API error for `sendMessage`. */
+  setSendError(description: string | null, status?: number): void;
+  /** Wait until at least `minCount` accepted `sendMessage` calls have been recorded. */
+  waitForSent(minCount?: number, timeoutMs?: number): Promise<MockTelegramSentMessage[]>;
   close(): Promise<void>;
 }
 
 /**
- * Loopback Telegram Bot API (`POST /bot<token>/getUpdates`) server on `127.0.0.1`
- * for end-to-end testing of the real `plugins/telegram/index.mjs` bridge.
+ * Loopback Telegram Bot API (`POST /bot<token>/getUpdates` & `POST /bot<token>/sendMessage`) server
+ * on `127.0.0.1` for end-to-end testing of the real `plugins/telegram/index.mjs` bridge.
  */
 export async function startMockTelegramServer(botToken: string, pollHoldMs = 120): Promise<MockTelegramServer> {
   const queue: TelegramUpdate[] = [];
   const pollOffsets: number[] = [];
+  const sentMessages: MockTelegramSentMessage[] = [];
   const updateWaiters = new Set<() => void>();
   const pollWaiters = new Set<() => void>();
+  const sendWaiters = new Set<() => void>();
+  let sendError: { readonly description: string; readonly status: number } | null = null;
+  let nextMessageId = 0;
 
   const wakeUpdateWaiters = () => {
     for (const wake of updateWaiters) wake();
@@ -302,8 +398,48 @@ export async function startMockTelegramServer(botToken: string, pollHoldMs = 120
   const server = createServer(async (req, res) => {
     const raw = await readBody(req);
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
-    const expectedPath = `/bot${botToken}/getUpdates`;
-    if (req.method !== "POST" || url.pathname !== expectedPath) {
+    const getUpdatesPath = `/bot${botToken}/getUpdates`;
+    const sendMessagePath = `/bot${botToken}/sendMessage`;
+
+    if (req.method === "POST" && url.pathname === sendMessagePath) {
+      if (sendError !== null) {
+        res.writeHead(sendError.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error_code: sendError.status, description: sendError.description }));
+        return;
+      }
+      let parsed: unknown = null;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {}
+      const chatId =
+        object(parsed) && (typeof parsed.chat_id === "string" || typeof parsed.chat_id === "number")
+          ? String(parsed.chat_id)
+          : "";
+      const text = object(parsed) && typeof parsed.text === "string" ? parsed.text : "";
+      const replyToMessageId =
+        object(parsed) && typeof parsed.reply_to_message_id === "number" && Number.isInteger(parsed.reply_to_message_id)
+          ? parsed.reply_to_message_id
+          : undefined;
+      if (!chatId || !text) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: chat_id and text are required" }));
+        return;
+      }
+      const message_id = ++nextMessageId;
+      const record: MockTelegramSentMessage = {
+        chat_id: chatId,
+        text,
+        ...(replyToMessageId !== undefined ? { reply_to_message_id: replyToMessageId } : {}),
+        message_id,
+      };
+      sentMessages.push(record);
+      for (const wake of sendWaiters) wake();
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, result: { message_id } }));
+      return;
+    }
+
+    if (req.method !== "POST" || url.pathname !== getUpdatesPath) {
       res.writeHead(401, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: false, description: "Unauthorized" }));
       return;
@@ -345,6 +481,7 @@ export async function startMockTelegramServer(botToken: string, pollHoldMs = 120
   return {
     apiBaseUrl: `http://127.0.0.1:${address.port}`,
     pollOffsets,
+    sentMessages,
     pushUpdate(update) {
       queue.push(update);
       wakeUpdateWaiters();
@@ -365,6 +502,27 @@ export async function startMockTelegramServer(botToken: string, pollHoldMs = 120
         };
         pollWaiters.add(onPoll);
       });
+    },
+    setSendError(description, status = 400) {
+      sendError = description === null ? null : { description, status };
+    },
+    async waitForSent(minCount = 1, timeoutMs = 8_000) {
+      if (sentMessages.length >= minCount) return sentMessages;
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          sendWaiters.delete(onSend);
+          reject(new Error(`Timed out waiting for ${minCount} Telegram sendMessage call(s) (saw ${sentMessages.length})`));
+        }, timeoutMs).unref();
+        const onSend = () => {
+          if (sentMessages.length >= minCount) {
+            clearTimeout(timer);
+            sendWaiters.delete(onSend);
+            resolve();
+          }
+        };
+        sendWaiters.add(onSend);
+      });
+      return sentMessages;
     },
     close: () =>
       new Promise<void>((resolve) => {

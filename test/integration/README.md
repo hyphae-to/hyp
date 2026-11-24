@@ -23,6 +23,10 @@ node --test test/integration/muting-and-notify-matrix.test.ts
 node --test test/integration/openclaw-env.test.ts
 node --test test/integration/herdr-env.test.ts
 node --test test/integration/t3-env.test.ts
+node --test test/integration/secrets-backends.test.ts
+node --test test/integration/bidirectional-bridges.test.ts
+node --test test/integration/differential-e2e.test.ts
+node --test test/integration/real-harnesses-v1.test.ts
 ```
 
 ## Architecture & Shims
@@ -37,8 +41,10 @@ Every test spins up an isolated `MeshTopology` ([harness/topology.ts](./harness/
 - **External Service Shims** ([shims/services.ts](./shims/services.ts)):
   - **GitHub Webhooks**: Signed & tampered `X-Hub-Signature-256` payloads delivered to Hyphae's built-in `github-webhook` stream.
   - **Prometheus / Alertmanager**: Signed & tampered `X-Webhook-Signature-256` alerts delivered to `webhook-stream` / `prometheus-webhook`.
-  - **Mock Slack Socket Mode Server**: Zero-dependency `127.0.0.1` HTTP (`auth.test`, `apps.connections.open`) + RFC 6455 WebSocket server driving the real `plugins/slack/index.mjs` bridge via `SLACK_API_BASE` and `0600` `{ "secret": "..." }` tokens.
-  - **Mock Telegram Bot API Server**: Loopback `POST /bot<token>/getUpdates` long-polling server driving the real `plugins/telegram/index.mjs` bridge via `TELEGRAM_API_BASE` and `0600` `{ "secret": "..." }` tokens.
+  - **Mock Slack Socket Mode Server**: Zero-dependency `127.0.0.1` HTTP (`auth.test`, `apps.connections.open`, `chat.postMessage` with fault injection) + RFC 6455 WebSocket server driving the real `plugins/slack/index.mjs` bridge via `SLACK_API_BASE` and `0600` `{ "secret": "..." }` tokens.
+  - **Mock Telegram Bot API Server**: Loopback `POST /bot<token>/getUpdates` long-polling + `POST /bot<token>/sendMessage` server (with fault injection) driving the real `plugins/telegram/index.mjs` bridge via `TELEGRAM_API_BASE` and `0600` `{ "secret": "..." }` tokens.
+- **Virtual Secret Service Shim** ([shims/secret-service.ts](./shims/secret-service.ts)):
+  - `startVirtualSecretService`: cross-platform executable `secret-tool` wrapper backed by atomic temp-dir state + invocation argv log + fault injection, allowing full `HYPHAE_SECRET_BACKEND=secret-service` CLI, daemon, and `{ secretFile }` `.runtime/*.secret` materialization testing on both macOS and Linux without D-Bus.
 - **Multi-Host Emulation Shims** ([shims/multihost.ts](./shims/multihost.ts)):
   - `startTlsReverseProxy`: ephemeral self-signed localhost CA + `node:https` streaming reverse proxy for `https://` origin validation, invites, `probeRouter`, and SSE over TLS (`NODE_EXTRA_CA_CERTS`).
   - `startChaosProxy`: loopback HTTP/SSE proxy with `sever()`, `heal()`, and `setLatencyMs()` to simulate single-host network partitions while the router and other connectors stay live.
@@ -62,6 +68,10 @@ Every test spins up an isolated `MeshTopology` ([harness/topology.ts](./harness/
 | [openclaw-env.test.ts](./openclaw-env.test.ts) | OpenClaw gateway setup, exact-config MCP boot, concurrent sessions, multi-connector fleet orchestration with Prometheus stream & `#incidents`, live delegation to real `opencode`/`claude` binary, and differential post-state equivalence vs Antigravity. |
 | [herdr-env.test.ts](./herdr-env.test.ts) | Stateful virtual `hc` actuation (`idle`/`done`/`working`/`blocked`), `interrupt` subscription preemption, exit `9`/`10` guard recovery, PID/`created_ms`/`app` drift protection, `notify` mode over Herdr, `hc machine ls` discovery, and real `hc` bare-shell fail-closed check. |
 | [t3-env.test.ts](./t3-env.test.ts) | Real `t3 serve` side-by-side boot, isolated `~/.t3-mesh` detection without secret leakage, paired Ed25519 grants + origin-tagged messages + sealed transfers + `byThreadId` handoff, `codex --thread --remote --resume` offline retry & `notify` mode, and `--claude-channel` live push / disconnect buffering / reconnect auto-flush. |
+| [secrets-backends.test.ts](./secrets-backends.test.ts) | Cross-platform virtual Linux Secret Service (`secret-tool`) CLI + daemon + plugin `{ secret }` / `{ secretFile }` `.runtime/` materialization, zero-argv-leakage & fail-closed checks, real CLI `hyp secret set --web --no-open --json` HTTP/1.1 keep-alive & adversarial HTTP security, and real macOS Keychain end-to-end daemon/plugin verification (ephemeral `HYPHAE_KEYCHAIN_SERVICE`). |
+| [bidirectional-bridges.test.ts](./bidirectional-bridges.test.ts) | End-to-end bidirectional `slack`, `telegram`, and `webhook` (`WEBHOOK_POST_URL` + HMAC) bridges over real `hyp mcp`: multi-thread `hyp_bridge_link`/`unlink`, `hyp_plugin_post` auto-reply & explicit targets, allowlists, upstream fault recovery, `plugin:*` muting, and `hyp_plugin_handoff`. |
+| [differential-e2e.test.ts](./differential-e2e.test.ts) | Seeded multi-router / multi-connector / fd-3 bridge stateful differential oracle (`HYPHAE_DIFF_SEED`, McKeeman Levels 5–6), Level 1–2 fd-3 / Unix socket / HTTP framing & boundary perturbation resilience, and real CLI `--json` / `--plain` / `--pretty` / exit-code `0\|1\|2` contract verification. |
+| [real-harnesses-v1.test.ts](./real-harnesses-v1.test.ts) | Real `claude`, `agy`, and `opencode` v2 binaries driving v1 workflows: `hyp_topics` inspection, GitHub `subject`-vs-`repo` dead-subscription self-correction with `strict: true`, signed GitHub PR webhooks, multi-thread `hyp_bridge_link` fan-in, and outbound Slack/Telegram `hyp_plugin_post`. |
 
 ## Strict Isolation Guarantees
 
