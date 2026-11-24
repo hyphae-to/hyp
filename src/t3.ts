@@ -311,10 +311,27 @@ export async function resolveT3CallerByCallId(
   }
 }
 
+/** Resolves the `t3` CLI binary across PATH and common user/Homebrew locations (bare-PATH Electron/CI safe). */
+export function resolveT3Binary(homeDir = homedir()): string | null {
+  try {
+    const out = execFileSync("which", ["t3"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    if (out) return out;
+  } catch {}
+  for (const candidate of [
+    join(homeDir, ".local", "bin", "t3"),
+    "/opt/homebrew/bin/t3",
+    "/usr/local/bin/t3",
+  ]) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
 /** Issues a scoped T3 Code bearer session token via `t3 auth session issue --token-only`. */
-export function issueT3BearerToken(baseDir: string, t3Bin = "t3"): string {
+export function issueT3BearerToken(baseDir: string, t3Bin?: string, homeDir = homedir()): string {
+  const bin = t3Bin ?? resolveT3Binary(homeDir) ?? "t3";
   const out = execFileSync(
-    t3Bin,
+    bin,
     ["auth", "session", "issue", "--base-dir", baseDir, "--token-only", "--label", "hyphae"],
     { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] },
   ).trim();

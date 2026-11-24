@@ -361,8 +361,8 @@ test("security hardening: rejects SSH option injection, remoteBin injection, and
     writeSecret("super-secret-key", "DO_NOT_LEAK_THIS_VALUE", dir);
     const ctx = await gatherOnboardingContext(join(dir, "connector.json"), join(dir, "missing.sock"));
     const prompt = buildAgentOnboardingPrompt(ctx);
-    assert.match(prompt, /Private Router/);
-    assert.match(prompt, /Public Router/);
+    assert.match(prompt, /Private Node/);
+    assert.match(prompt, /Public-Webhook \/ Team Node/);
     assert.match(prompt, /NEVER read, print, log/);
     assert.ok(!prompt.includes("DO_NOT_LEAK_THIS_VALUE"), "Secret value must never appear in agent onboarding prompt!");
   } finally {

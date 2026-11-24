@@ -16,6 +16,7 @@ import {
   issueT3BearerToken,
   normalizeT3ServerUrl,
   probeT3Server,
+  resolveT3Binary,
   t3StateDbPath,
 } from "./t3.ts";
 import { RouterCore } from "./core/router/core.ts";
@@ -61,9 +62,13 @@ function writeJson(path: string, value: unknown): void {
   writeFileSync(path, JSON.stringify(value, null, 2) + "\n", "utf8");
 }
 
+function containsHyphaeHook(content: string): boolean {
+  return content.includes("hyphae") || content.includes("agents-mesh") || /\bhook\s+(?:antigravity|claude|codex|cursor|opencode|gemini)\b/.test(content);
+}
+
 function isHyphaeHook(entry: unknown): boolean {
   if (!object(entry)) return false;
-  if (typeof entry.command === "string" && (entry.command.includes("hyphae") || entry.command.includes("agents-mesh"))) return true;
+  if (typeof entry.command === "string" && containsHyphaeHook(entry.command)) return true;
   if (Array.isArray(entry.hooks)) return entry.hooks.some(isHyphaeHook);
   return false;
 }
@@ -739,9 +744,10 @@ export function setupT3(options: SetupTargetOptions): SetupResult {
     hasToken = false;
   }
 
-  if (!hasToken && dbExists && commandExists("t3")) {
+  const t3Bin = resolveT3Binary(home);
+  if (!hasToken && dbExists && t3Bin) {
     try {
-      const issued = issueT3BearerToken(baseDir);
+      const issued = issueT3BearerToken(baseDir, t3Bin, home);
       const saved = writeSecretDetailed(DEFAULT_T3_TOKEN_SECRET, issued, configDir);
       hasToken = true;
       notes.push(`Issued scoped T3 bearer token and stored it in ${secretBackendLabel(saved.backend)} (${saved.location}).`);
@@ -947,7 +953,7 @@ export async function runDoctor(configPath: string, socketPath: string, homeDir 
   });
 
   const claudeSettings = join(homeDir, ".claude", "settings.json");
-  const claudeConfigured = existsSync(claudeSettings) && readFileSync(claudeSettings, "utf8").includes("hyphae");
+  const claudeConfigured = existsSync(claudeSettings) && containsHyphaeHook(readFileSync(claudeSettings, "utf8"));
   checks.push({
     name: "claude",
     ok: claudeConfigured,
@@ -956,7 +962,7 @@ export async function runDoctor(configPath: string, socketPath: string, homeDir 
   });
 
   const codexHooks = join(homeDir, ".codex", "hooks.json");
-  const codexConfigured = existsSync(codexHooks) && readFileSync(codexHooks, "utf8").includes("hyphae");
+  const codexConfigured = existsSync(codexHooks) && containsHyphaeHook(readFileSync(codexHooks, "utf8"));
   checks.push({
     name: "codex",
     ok: codexConfigured,
@@ -966,7 +972,7 @@ export async function runDoctor(configPath: string, socketPath: string, homeDir 
 
   const env = detectLocalEnvironment(homeDir);
   const cursorHooks = join(homeDir, ".cursor", "hooks.json");
-  const cursorConfigured = existsSync(cursorHooks) && readFileSync(cursorHooks, "utf8").includes("hyphae");
+  const cursorConfigured = existsSync(cursorHooks) && containsHyphaeHook(readFileSync(cursorHooks, "utf8"));
   if (env.cursor || cursorConfigured) {
     checks.push({
       name: "cursor",
@@ -988,7 +994,7 @@ export async function runDoctor(configPath: string, socketPath: string, homeDir 
   }
 
   const geminiSettings = join(homeDir, ".gemini", "settings.json");
-  const geminiConfigured = existsSync(geminiSettings) && readFileSync(geminiSettings, "utf8").includes("hyphae");
+  const geminiConfigured = existsSync(geminiSettings) && containsHyphaeHook(readFileSync(geminiSettings, "utf8"));
   if (env.gemini || geminiConfigured) {
     checks.push({
       name: "gemini",

@@ -28,6 +28,7 @@ import { runMcp } from "./mcp.ts";
 import { ALL_GUIDES, CONNECTOR_BRIDGE_GUIDES, findGuide, ROUTER_STREAM_GUIDES } from "./plugin-catalog.ts";
 import { connectorPattern, isHarness, object } from "./protocol.ts";
 import { detectExposedTailscaleUrl, encodeInvite, exposeTailscale, unexposeTailscale } from "./remote.ts";
+import { defaultT3BaseDir, t3StateDbPath } from "./t3.ts";
 import {
   captureSecretViaWeb,
   collectSecretRefs,
@@ -1429,7 +1430,10 @@ async function runCli(ctx: ExecutionContext): Promise<void> {
       t3Url: values["t3-url"],
       t3BaseDir: values["t3-base-dir"],
     };
-    const targets: ConfigurableHarness[] = target === "all" ? [...ALL_CONFIGURABLE_HARNESSES] : [target as ConfigurableHarness];
+    const t3Initialized = Boolean(values["t3-url"] || values["t3-base-dir"] || existsSync(t3StateDbPath(defaultT3BaseDir())));
+    const targets: ConfigurableHarness[] = target === "all"
+      ? ALL_CONFIGURABLE_HARNESSES.filter((item) => item !== "t3" || t3Initialized)
+      : [target as ConfigurableHarness];
     const results: SetupResult[] = targets.map((item) => {
       if (item === "antigravity") return setupAntigravity(setupOpts);
       if (item === "claude") return setupClaude(setupOpts);
