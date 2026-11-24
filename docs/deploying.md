@@ -1,6 +1,6 @@
 # Deploying & Pairing Hyphae v2 Nodes
 
-Hyphae v2 collapses the legacy *Connector vs. Router* split into **one unified `Node` binary** configured by profile (`local`, `router`, or `p2p`). Use `hyp deploy` to generate hardened internet deployment kits and validate live security posture, and `hyp pair` to issue and inspect permissioned invites without ever leaking tokens into CLI arguments.
+Hyphae v2 collapses the legacy *Connector vs. Router* split into **one unified `Node` binary** (`hyp`) configured by profile (`local`, `router`, or `p2p`). Use `hyp deploy` to generate hardened internet deployment kits and validate live security posture, and `hyp pair` to issue, inspect, accept, and join peers without ever leaking tokens into CLI arguments.
 
 ---
 
@@ -15,7 +15,7 @@ Run `hyp deploy providers` (or `hyp deploy providers --json`) to inspect all six
 | **`docker`** | Caddy sidecar auto-TLS on isolated bridge network | Only Caddy publishes 80/443; `hyphae-node` stays internal | Container-first teams & CI/CD rollouts | `hyp deploy init docker` |
 | **`cloudflare`** | Cloudflare Edge TLS over outbound `cloudflared` tunnel | Zero open inbound ports; works behind CGNAT/homelabs | Homelabs, residential ISPs, and NAT'd devboxes | `hyp deploy init cloudflare` |
 | **`fly`** | Fly Proxy auto-HTTPS (`force_https = true`) | Managed edge; `min_machines_running = 1` keeps SSE warm | Zero-ops always-on cloud hubs in < 3 minutes | `hyp deploy init fly` |
-| **`public-node`** | Caddy auto-TLS + systemd + Docker Compose kit | Public HTTPS 80/443; `guest-ro` confined read-only hub | Hosting `public.hyphae.to` or an OSS GitHub event hub | `hyp deploy init public-node` |
+| **`public-node`** | Caddy auto-TLS + systemd + Docker Compose kit | Public HTTPS 80/443; `guest-ro` confined read-only hub | Hosting a read-only public GitHub event hub (e.g. `public.hyphae.to` or your own community hub) | `hyp deploy init public-node` |
 
 > **Overwrite safety:** `hyp deploy init` refuses to overwrite existing files in `--out` unless you explicitly pass `--force`.
 
@@ -60,7 +60,7 @@ sudo systemctl enable --now hyphae-node caddy
 hyp deploy check --url https://mesh.example.com --config /etc/hyphae/node.json
 ```
 
-Checked-in reference units also live at `deploy/Caddyfile.example` and `deploy/systemd/hyphae-node.service`.
+Checked-in reference units also live at [deploy/Caddyfile.example](../deploy/Caddyfile.example) and [deploy/systemd/hyphae-node.service](../deploy/systemd/hyphae-node.service).
 
 ### 2.3 Docker + Caddy Compose Stack
 
@@ -76,7 +76,7 @@ cd ./deploy-docker && docker compose up -d --build
 hyp deploy check --url https://mesh.example.com --config ./node.json
 ```
 
-Checked-in templates live at `deploy/Dockerfile` and `deploy/docker-compose.yml`.
+Checked-in templates live at [deploy/Dockerfile](../deploy/Dockerfile) and [deploy/docker-compose.yml](../deploy/docker-compose.yml).
 
 ### 2.4 Cloudflare Tunnel (`cloudflared`)
 
@@ -96,7 +96,7 @@ cloudflared tunnel --config ./deploy-cloudflare/cloudflared.yml run
 hyp deploy check --url https://mesh.example.com --config ./deploy-cloudflare/node.json
 ```
 
-Checked-in reference config: `deploy/cloudflared.yml.example`.
+Checked-in reference config: [deploy/cloudflared.yml.example](../deploy/cloudflared.yml.example).
 
 ### 2.5 Fly.io Always-On Machine
 
@@ -115,51 +115,52 @@ flyctl deploy
 hyp deploy check --url https://hyphae-node.fly.dev --config ./node.json
 ```
 
-Checked-in reference config: `deploy/fly.toml.example`.
+Checked-in reference config: [deploy/fly.toml.example](../deploy/fly.toml.example).
 
-### 2.6 Self-Hosting a `public.hyphae.to`-Style Read-Only Public Node
+### 2.6 Self-Hosting a Read-Only Public Node (e.g. `public.hyphae.to` or Your Own Community Hub)
 
-Run a zero-friction public GitHub event hub for open-source repositories without exposing DMs, `#channels`, or KV writes:
+Run a zero-friction read-only public GitHub event hub for open-source repositories without exposing DMs, `#channels`, or KV writes — see [docs/public-node.md](public-node.md) for the complete turnkey runbook:
 
 ```sh
 hyp deploy init public-node \
-  --node-id public.hyphae.to \
-  --domain public.hyphae.to \
+  --node-id mesh.example.org \
+  --domain mesh.example.org \
   --out ./deploy-public
 ```
 
 What this turnkey kit configures:
 - **Guest-RO Confinement (`guest-ro`):** `stream:subscribe=github[require=exact.repo;maxValues=10;maxBatchesPerHour=60]` — zero `dm:send`, `channel:post`, or `kv:write`. Unrestricted subscriptions fail closed with `403 not_granted`.
-- **Demand-Driven `github-public` ETag Poller:** One deduplicated poller per distinct public repository (`If-None-Match` -> `304 Not Modified` costs 0 GitHub API quota), tearing down idle pollers after a 5-minute grace window. Store an optional GitHub PAT via `hyp secret set github-public-token` (referenced as `{ "secret": "github-public-token" }`, never plaintext).
+- **Demand-Driven `github-public` ETag Poller:** One deduplicated poller per distinct public repository (`If-None-Match` -> `304 Not Modified` costs 0 GitHub API quota), tearing down idle pollers after a 5-minute grace window. Store an optional GitHub PAT via stdin (`hyp secret set github-public-token <<< "$GITHUB_PUBLIC_PAT"`, referenced as `{ "secret": "github-public-token" }`, never plaintext).
 - **Strict Rate Limits & Fail-Closed Forwarding:** `forwarding.mode: "deny"`, 1 MB Caddy request cap, and hardened systemd + Docker Compose templates.
-- **One-Command Client Join:** Developer laptops pair read-only with `hyp peer join https://public.hyphae.to`.
+- **One-Command Client Join:** Developer laptops pair read-only with `hyp pair join https://mesh.example.org` (or an example public node such as `hyp pair join https://public.hyphae.to`).
 
 ---
 
 ## 3. Permissioned Pairing Topologies
 
-Run `hyp pair guide` (or `--mode team|p2p|public --json`) at any time for an agent-first reference.
+Run `hyp pair guide` (or `hyp pair guide --mode team|p2p|public --json`) at any time for an agent-first reference.
 
 | Topology | Token Prefix | Trust Model | Invite Command | Peer Accept (Stdin-Safe!) |
 | --- | --- | --- | --- | --- |
-| **Team Hub** | `am2_` | Offline Org Admin-CA signs per-device grants; hub never holds the Admin private key | `hyp pair invite --mode team --node-id acme-team --endpoint https://mesh.example.com --peer alice@laptop --preset member` | `hyp onboard --join <<< '<token>'` |
-| **Direct P2P** | `hp2p1_` | Zero central CA, zero TOFU window: OKP JWKs + 160-bit CSPRNG secret travel out-of-band | `hyp pair invite --mode p2p --node-id alice@macbook --endpoint https://alice.tailnet.ts.net --grant dm:send dm:receive files:send=25mb --request kv:read=pair/*` | `hyp peer accept <<< '<token>'` |
-| **Public Read-Only** | `guest-ro` | Self-service read-only confined guest scopes (`exact.repo`, max 10 repos, 60 wakes/hr) | `hyp deploy init public-node` | `hyp peer join https://public.hyphae.to` |
+| **Team Hub** | `am2_` | Offline Org Admin-CA signs per-device grants; hub never holds the Admin private key | `hyp pair invite --mode team --node-id acme-team --endpoint https://mesh.example.com --peer alice@laptop --preset member` | `hyp pair accept <<< "$TOKEN"` *(or `hyp onboard --join - <<< "$TOKEN"`)* |
+| **Direct P2P** | `hp2p1_` | Zero central CA, zero TOFU window: OKP JWKs + 160-bit CSPRNG secret travel out-of-band | `hyp pair invite --mode p2p --node-id alice@macbook --endpoint https://alice.tailnet.ts.net --grant dm:send dm:receive files:send=25mb --request kv:read=pair/*` | `hyp pair accept <<< "$TOKEN"` |
+| **Public Read-Only** | `guest-ro` | Self-service read-only confined guest scopes (`exact.repo`, max 10 repos, 60 wakes/hr) | `hyp deploy init public-node --node-id mesh.example.org --domain mesh.example.org` | `hyp pair join https://mesh.example.org` *(or `https://public.hyphae.to`)* |
 
-### Stdin-Only Token Inspection (Never Put Tokens in CLI Argv!)
+### Stdin-Only Token Inspection & Acceptance (Never Put Tokens in CLI Argv!)
 
-`hyp pair inspect` deliberately has **no `--token <value>` flag** so secrets never leak to `ps` or shell history. Always pipe via stdin or read from a `0600` file:
+`hyp pair inspect` and `hyp pair accept` deliberately have **no `--token <value>` flag** so secrets never leak to `ps` or shell history. Always pipe via stdin or read from a `0600` file:
 
 ```sh
 # Inspect via stdin (recommended)
 hyp pair inspect <<< "$HYPHAE_TOKEN"
 hyp pair inspect --json <<< "$HYPHAE_TOKEN"
 
-# Or inspect from a 0600 file
+# Or inspect / accept from a 0600 file
 hyp pair inspect --token-file /path/to/invite.token --json
+hyp pair accept --token-file /path/to/invite.token
 ```
 
-`pair inspect` verifies `hp2p1_`, `am2_`, and legacy `t3mp1_` tokens with `hyp-crypto`, checks RFC 7638 JWK `kid` thumbprints, reports expiry (`OK` / `EXPIRED`, failing closed with exit code `1` on expired or tampered tokens), and frames any remote escalation note as untrusted external data (`untrusted: true`).
+`hyp pair inspect` verifies `hp2p1_`, `am2_`, and legacy `t3mp1_` tokens with `hyp-crypto`, checks RFC 7638 JWK `kid` thumbprints, reports expiry (`OK` / `EXPIRED`, failing closed with exit code `1` on expired or tampered tokens), and frames any remote escalation note as untrusted external data (`untrusted: true`).
 
 ### Built-In Scope Presets
 
@@ -183,8 +184,8 @@ Run `hyp deploy check --url https://<your-domain> --config /etc/hyphae/node.json
 
 - [ ] **Loopback bind + TLS proxy:** Bind `127.0.0.1:8790` on VPS/Tailscale/Cloudflare hosts (or an internal non-published Docker bridge network). Never expose plaintext HTTP on `0.0.0.0:8790` directly to the internet.
 - [ ] **Zero-buffering SSE:** Verify Caddy sets `flush_interval -1` (and `read_timeout 0` / `write_timeout 0`) so `/v1/inbox` streams instantaneously.
-- [ ] **Anti-recon unauthenticated `/v1/manifest`:** Confirm `GET /v1/manifest` without credentials returns `audience: "public"`, **empty `advertised` arrays**, no `escalation` text, and a valid Ed25519 signature (`deploy check --url` verifies this automatically!).
-- [ ] **Zero plaintext secrets in `node.json`:** Use only `{ "secret": "<name>" }` references backed by OS Keychain, Linux Secret Service, or `0600` headless secret files (`HYPHAE_SECRET_BACKEND=file`).
+- [ ] **Anti-recon unauthenticated `/v1/manifest`:** Confirm `GET /v1/manifest` without credentials returns `audience: "public"`, **empty `advertised` arrays**, no `escalation` text, and a valid Ed25519 signature (`hyp deploy check --url` verifies this automatically).
+- [ ] **Zero plaintext secrets in `node.json`:** Use only `{ "secret": "<name>" }` references backed by macOS Keychain, Linux Secret Service, or `0600` headless secret files (`HYPHAE_SECRET_BACKEND=file`).
 - [ ] **No open relay:** Keep `forwarding.mode` set to `"deny"` (or an explicit `"allowlist"`).
 - [ ] **Strict filesystem permissions:** State directories `0700`, secret/token files `0600`, config files non-world-writable (`0640`).
 - [ ] **Stdin-only pairing tokens & untrusted escalation notes:** Never pass `hp2p1_` / `am2_` / `t3mp1_` tokens as CLI argv flags, and treat remote escalation text strictly as untrusted human-display hints.

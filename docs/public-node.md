@@ -1,6 +1,8 @@
-# Deploying `public.hyphae.to` (Turnkey Public Read-Only Node Runbook)
+# Hosting a Public Read-Only Node (Turnkey Runbook)
 
-This runbook provides zero-ambiguity steps for an operator or autonomous agent to deploy and verify `public.hyphae.to` (or any self-hosted read-only public GitHub stream hub) in under 5 minutes.
+This runbook provides zero-ambiguity steps for an operator or autonomous agent to deploy and verify a read-only public Hyphae GitHub stream hub — such as the example hosted node `public.hyphae.to` or your own self-hosted community/organization public node — in under 5 minutes.
+
+*(Substitute your own hostname for `public.hyphae.to` below whenever self-hosting your own public node.)*
 
 ## Architecture & Security Guarantees
 
@@ -16,15 +18,15 @@ This runbook provides zero-ambiguity steps for an operator or autonomous agent t
 
 ## Prerequisites
 
-1. **DNS**: Point an `A` (and optional `AAAA`) record for `public.hyphae.to` to the host's public IPv4/IPv6 address.
+1. **DNS**: Point an `A` (and optional `AAAA`) record for your public node domain (e.g. `public.hyphae.to` or `mesh.example.org`) to the host's public IPv4/IPv6 address.
 2. **Firewall**: Allow inbound TCP `80` and `443` (and UDP `443` for HTTP/3) to Caddy / Fly Proxy. Keep Hyphae port `8790` strictly loopback (`127.0.0.1:8790`) or on an internal Docker network.
-3. **Binary**: Install the static `hyp` binary on the server (or build via `deploy/Dockerfile`).
+3. **Binary**: Install the static `hyp` binary (~6 MiB compressed download) on the server via `curl -fsSL https://hyphae.to/install.sh | sh` (or build via [deploy/Dockerfile](../deploy/Dockerfile)).
 
 ---
 
 ## Step 1 — Generate the Hardened Public Node Kit
 
-Run once to generate `node.json`, `Caddyfile`, `hyphae-node.service`, `Dockerfile`, and `docker-compose.yml`:
+Run once to generate `node.json`, `Caddyfile`, `hyphae-node.service`, `Dockerfile`, and `docker-compose.yml` (replace `public.hyphae.to` with your domain when self-hosting):
 
 ```sh
 hyp deploy init public-node \
@@ -34,7 +36,7 @@ hyp deploy init public-node \
   --json
 ```
 
-Verify the generated configuration fails closed on zero checks and contains zero plaintext secrets:
+Verify the generated configuration passes all checks and contains zero plaintext secrets:
 
 ```sh
 hyp deploy check --config ./deploy-public/node.json --json
@@ -82,7 +84,7 @@ sudo systemctl status hyphae-node --no-pager
 
 1. In `./deploy-public/node.json`, change `listen.bind` from `"127.0.0.1:8790"` to `"0.0.0.0:8790"` (safe because `behindReverseProxy: true` and `docker-compose.yml` does **not** publish port `8790` on the host).
 2. In `./deploy-public/Caddyfile`, change `reverse_proxy 127.0.0.1:8790` to `reverse_proxy hyphae-node:8790` (keeping `flush_interval -1`).
-3. Copy `Cargo.toml`, `Cargo.lock`, and `crates/` (or run from repo root with `deploy/Dockerfile` and `deploy/docker-compose.yml`) and launch:
+3. Copy `Cargo.toml`, `Cargo.lock`, and `crates/` (or run from repo root with [deploy/Dockerfile](../deploy/Dockerfile) and [deploy/docker-compose.yml](../deploy/docker-compose.yml)) and launch:
 
 ```sh
 docker compose -f ./deploy-public/docker-compose.yml up -d --build
@@ -100,7 +102,7 @@ docker compose -f ./deploy-public/docker-compose.yml restart hyphae-node
 
 ### Option C: Fly.io Always-On Machine
 
-1. Generate a Fly config (or start from `deploy/fly.toml.example`) and include `./deploy-public/node.json` with `listen.bind = "0.0.0.0:8790"` and `listen.behindReverseProxy = true` mounted/copied to `/etc/hyphae/node.json`.
+1. Generate a Fly config (or start from [deploy/fly.toml.example](../deploy/fly.toml.example)) and include `./deploy-public/node.json` with `listen.bind = "0.0.0.0:8790"` and `listen.behindReverseProxy = true` mounted/copied to `/etc/hyphae/node.json`.
 2. Create the Fly app, persistent `/var/lib/hyphae` volume (retains `node.sqlite`, persistent Ed25519/X25519 keys, and `secrets/`), and TLS certificate:
 
 ```sh
@@ -135,7 +137,7 @@ Run every check below from any developer machine or CI runner:
 hyp deploy check --url https://public.hyphae.to --config ./deploy-public/node.json --json
 ```
 
-Expected: exit code `0`, `ok: true`, `manifest.signature == "ok"`, `manifest.anti_recon == "ok"`, `config.secrets == "ok"`.
+Expected: exit code `0`, `ok: true`, `data.manifest.signatureVerified == true`, `data.manifest.advertisedEmpty == true`, `data.manifest.escalationPresent == false`, and `data.checks` reporting `status == "ok"` for `manifest.signature`, `manifest.anti_recon`, and `config.secrets`.
 
 ### 2. Health & Adapter Readiness Check
 
@@ -181,7 +183,7 @@ Expected: exit code `0`, `ok: true`, `data.enrolled == true`, `data.preset == "g
 
 ## Optional: `<1s` GitHub App Push Upgrade (`POST /v1/webhooks/github-app`)
 
-To receive sub-second push deliveries for repositories that install a "Hyphae Public" GitHub App:
+To receive sub-second push deliveries for repositories that install a GitHub App pointed at your public node:
 
 1. Add `"appWebhookSecret": { "secret": "github-app-webhook-secret" }` to the `github-public` entry in `sources[]` inside `/etc/hyphae/node.json`.
 2. Store the webhook secret via stdin:
@@ -190,4 +192,4 @@ To receive sub-second push deliveries for repositories that install a "Hyphae Pu
      HYPHAE_SECRET_BACKEND=file HYPHAE_STATE_DIR=/var/lib/hyphae \
      /usr/local/bin/hyp secret set github-app-webhook-secret --state-dir /var/lib/hyphae
    ```
-3. Restart `hyphae-node`. GitHub App deliveries to `POST https://public.hyphae.to/v1/webhooks/github-app` are strictly HMAC-SHA256 verified (`X-Hub-Signature-256`; invalid signatures return HTTP `401`) and deduplicated with the ETag poller pool. When `appWebhookSecret` is not configured, the route fails closed with HTTP `404`.
+3. Restart `hyphae-node`. GitHub App deliveries to `POST https://<your-domain>/v1/webhooks/github-app` are strictly HMAC-SHA256 verified (`X-Hub-Signature-256`; invalid signatures return HTTP `401`) and deduplicated with the ETag poller pool. When `appWebhookSecret` is not configured, the route fails closed with HTTP `404`.

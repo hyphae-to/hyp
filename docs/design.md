@@ -1,41 +1,77 @@
-# Connector and session design
+# Local Daemon, Harness Verification & Delivery Design
 
-A connector daemon is the single local authority for a router identity. One shared daemon per OS user multiplexes **any number of agent threads/conversations across harnesses** (`antigravity`, `claude`, `codex`, `cursor`, `opencode`, `gemini`, `openclaw`, `herdr`) over a private user-only Unix socket (`connector.sock`) and SQLite database (`state.sqlite`). T3 Code instances can connect to the same Node using their built-in mesh client with their own connector ID.
+> This document summarizes the local harness runtime (`crates/hyp-harness`) and delivery contract. For the full unified `Node` wire specification, E2EE cryptography, capability negotiation, and Security Gates architecture, see [docs/architecture-v2.md](architecture-v2.md).
 
-## Per-call caller verification (never 1:1 per MCP process)
+---
 
-`hyp mcp` is a **stateless stdio shim** with authoritative per-call caller verification. It does not invent a per-process UUID or assume one MCP subprocess equals one conversation. One shared MCP subprocess (such as Antigravity's Language Server or a pooled desktop MCP host) can safely serve dozens of concurrent threads:
+## 1. Unified Local Node + Harness IPC Daemon
 
-- **Antigravity (Desktop / IDE / CLI)**: `PreToolUse` receives the host-verified `conversationId` and `toolCall.id` on stdin, registers the in-flight call with `connector.sock`, and returns `"overwrite": { "_meshCall": "<single-use-token>" }`. Because `PreToolUse` unconditionally overwrites `_meshCall` before execution, the model cannot forge or replay another conversation's token. The MCP shim strips `_meshCall` and forwards it to the daemon, which consumes the token and binds the call to `antigravity:<conversationId>`.
-- **Claude Code (CLI & Desktop Code tab)**: `PreToolUse` receives host-verified `{ session_id, tool_use_id, tool_name }` and registers the in-flight call in the daemon's `CallRegistry`. The MCP shim forwards `params._meta["claudecode/toolUseId"]`, which the daemon verifies against the exact tool name and consumes on first use → `claude:<session_id>`.
-- **Codex (CLI & Desktop)**: Codex flushes each `function_call` item (`call_id` + tool name) to `$CODEX_HOME/sessions/.../rollout-*.jsonl` before dispatching the MCP tool call, and sends `params._meta.callId` to the MCP shim. Even if `PreToolUse` hooks are not active, the daemon verifies the in-flight `call_id` directly against recent rollout files (matching exact tool name with no `function_call_output` yet) → `codex:<thread_id>`. Zero manual `--thread <UUID>` flags are needed, and N concurrent Codex threads share one static config.
-- **Cursor IDE & Agent**: `beforeMCPExecution` hook receives the host `conversation_id`, registers a single-use call token, and injects `_meshCall`; `afterMCPExecution` and `stop` hooks drain queued items automatically.
-- **OpenCode**: Local TypeScript plugin (`~/.config/opencode/plugins/hyphae.ts`) registers a single-use `_meshCall` token in `tool.execute.before`, drains in `tool.execute.after`, and resumes idle sessions via `session.idle`.
+One local Hyphae `Node` (`hyp node start`, alias `hyp daemon`) runs both the unified `UnifiedNode` engine (`crates/hyp-node`) and the local `LocalDaemon` (`crates/hyp-harness/src/daemon.rs`) over:
+
+- **Single WAL SQLite store**: `~/.config/hyphae/node.sqlite` (bundled `rusqlite`, WAL mode, atomic migrations, exact `next_deadline_ms()` scheduler).
+- **Platform-native private local IPC**:
+  - **macOS & Linux**: Private `0600` Unix domain socket (`connector.sock` inside a `0700` state directory).
+  - **Windows**: Loopback-only TCP (`127.0.0.1:0`) written to `connector.addr`.
+- **One daemon, all 9 harnesses**: Multiplexes any number of concurrent conversations across **Antigravity**, **Claude Code / Desktop**, **Codex / Desktop**, **Cursor**, **OpenCode**, **Gemini CLI**, **OpenClaw**, **Herdr Core**, and **T3 Code**.
+
+---
+
+## 2. Per-Call Caller Verification (`CallRegistry`)
+
+`hyp mcp` (`crates/hyp-harness/src/mcp.rs`) is a **stateless stdio JSON-RPC 2.0 shim** (~2.8 MB idle RSS) with authoritative per-call caller verification (`crates/hyp-harness/src/call_registry.rs`). It never binds a conversation 1:1 to an MCP process, so pooled Desktop MCP hosts can safely serve dozens of concurrent threads through one subprocess:
+
+- **Antigravity (Desktop / IDE / CLI)**: `PreToolUse` hook (`hyp hook antigravity pre-tool-use`) receives host-verified `conversationId`, registers an in-flight call on `connector.sock`, and unconditionally overwrites `_meshCall` with a single-use cryptographic token.
+- **Claude Code (CLI & Desktop)**: `PreToolUse` hook registers `(session_id, tool_name, tool_use_id)` in `CallRegistry`; `hyp mcp` forwards `params._meta["claudecode/toolUseId"]`, consumed atomically on first use -> `claude:<session_id>`.
+- **Codex (CLI & Desktop)**: Verifies `_meta.callId` against in-flight `function_call` records in `$CODEX_HOME/sessions/.../rollout-*.jsonl` (with no `function_call_output` yet) -> `codex:<thread_id>`.
+- **Cursor IDE & Agent**: `beforeMCPExecution` hook registers `(conversation_id, tool_name)` and injects `_meshCall`; `afterMCPExecution` and `stop` drain queued items.
+- **OpenCode**: Local TypeScript plugin (`~/.config/opencode/plugins/hyphae.ts`) injects `_meshCall` in `tool.execute.before`, drains in `tool.execute.after`, and resumes idle sessions via `session.idle`.
 - **Gemini CLI**: `BeforeTool` hook registers `(session_id, tool_name)` and injects `_meshCall` into `tool_input`; `AfterTool` and `AfterAgent` drain queued items.
-- **OpenClaw**: Managed `openclaw.json` MCP server entry (`--backend openclaw --ephemeral`) + bundled `SKILL.md`, connecting OpenClaw sessions into the shared local daemon alongside desktop and terminal harnesses.
-- **T3 Code**: Configured with `hyp setup t3`. Resolves active T3 threads read-only from `userdata/statev2.sqlite` via both provider session/thread bindings (`orchestration_v2_projection_provider_session_bindings` / `orchestration_v2_projection_provider_threads` / `projection_thread_sessions` — upgrading bound Claude/Codex calls automatically to `t3:<threadId>`) and direct in-flight `callId` lookup (`orchestration_v2_projection_turn_items` / `projection_thread_activities`), or explicit `--backend t3 --thread <threadId>` verified fail-closed. Wakes threads natively over T3's orchestration protocol v2 WebSocket RPC (`POST /api/auth/websocket-ticket` -> `/ws?orchestrationProtocol=2` -> `orchestration.getThreadProjection` + `orchestration.dispatchCommand` `message.dispatch` with `start_immediately`, `queue_after_active`, `steer_active`, or `restart_active`).
-- **Herdr Core**: Explicitly configured with `hyp mcp --backend herdr`. Reads `HC_TERMINAL_ID` and verifies the live Core terminal's `address`, `created_ms`, `pid`, `state === "live"`, and non-null `status.app` via `hc get --json`.
-- **Fail closed**: Any MCP call without a verified caller fails closed with `caller_unverifiable` or `caller_not_found` (unless `--ephemeral` is explicitly passed for scratch tests).
+- **OpenClaw**: Managed `openclaw.json` MCP server entry + bundled `SKILL.md` configured via `hyp setup --harness openclaw`.
+- **T3 Code**: Configured via `hyp setup --harness t3`. Verifies active T3 threads read-only against `userdata/statev2.sqlite` projections and wakes threads over T3 v2 WebSocket RPC (`message.dispatch`).
+- **Herdr Core**: Configured via `hyp setup --harness herdr` (`--backend herdr`). Verifies live `HC_TERMINAL_ID` via `hc get --json` (`state === "live"` and non-null `status.app`; bare shells fail closed).
+- **Zero-Tokio Hook Fast Path**: `hyp hook` intercepts `std::env::args()` before initializing `clap` or Tokio, running synchronously over Unix/loopback sockets in **~2.7 ms** cold start.
+- **Fail Closed**: `CallRegistry` enforces a 60s TTL, single-use consumption, exact tool-name matching, and a 512-entry cap. Unverified calls fail closed with `caller_unverifiable` / `caller_not_found` (unless `--ephemeral` is explicitly passed for scratch testing).
 
-## Zero-polling delivery contract
+---
 
-Desktop hosts (Antigravity 2.0, Claude Desktop Code tab, Codex Desktop) own their internal UI state and do not expose an external prompt-injection RPC like T3's WebSocket server. To avoid burning tokens polling `hyp_inbox`, delivery is **durable-first** (committed atomically to SQLite `mailbox` with router ack) and pushed immediately through the best available transport:
+## 3. Compact MCP Surface (4 Core + 2 Conditional Tools)
 
-1. **Live native channel (`--claude-channel`)**: In Claude Code CLI, once a verified `claude:<session_id>` calls through a channel-enabled MCP socket, the daemon binds that socket as the live delivery transport and pushes `notifications/claude/channel`, draining any items queued while offline.
-2. **Streaming watcher (`hyp wait --stream`, alias `hyp watch`)**: Connects to `connector.sock`, blocks silently with 0 CPU / 0 tokens, and flushes one NDJSON line per inbound item—designed for Claude Code's `Monitor` tool.
-3. **One-shot blocking waiter (`hyp wait`)**: Connects to `connector.sock` (auto-inferring `antigravity:<conversationId>` from `ANTIGRAVITY_SOURCE_METADATA`), blocks silently until ≥1 item arrives, prints the formatted payload, and exits `0`—triggering Antigravity's native reactive background-task wakeup (`run_command`, `WaitMsBeforeAsync: 500`, `IsDaemon: false`) or Claude's `Bash(run_in_background=true)`.
-4. **Native Codex queue**: Codex threads resolved from rollout JSONLs dispatch directly via `codex queue --thread <uuid>` (with optional `--remote ws://...` / `unix://...` for a shared `codex app-server`), holding cleanly if the binary or target daemon is temporarily unavailable.
-5. **Mid-turn & turn-boundary hook drain (`PreInvocation` / `PostToolUse` / `Stop`)**: Any item arriving while an agent is mid-turn (before a waiter is re-armed) is drained immediately on the next hook boundary and injected via `injectSteps`, `additionalContext`, or `Stop` continuation (`continue` / `block`).
-6. **Self-healing waiter arming**: On `Stop`, if an Antigravity or Claude session is enrolled (holds a handle or subscription) and has no active push transport attached—and `continuationActive` / `stop_hook_active` is `false` so it never loops—the hook prompts once to start `hyp wait` / `hyp wait --stream` before going idle.
+`hyp mcp` advertises only **4 core tools** by default, plus **2 conditional tools** advertised only when enabled by the daemon's `mcp.caps` response (0 schema tokens otherwise):
 
-## Channels, streams, muting, notify mode & bridges
+| Tool | Actions / Parameters |
+| --- | --- |
+| `hyp_mesh` | `action: "join" \| "leave" \| "peers" \| "channels" \| "status"`, `handle?`, `channel?`, `include?: ["peers"\|"channels"\|"topics"\|"subs"\|"mutes"]` |
+| `hyp_send` | `to` (`<node>/<handle>`, `#channel`, `<bridge>:<target>`), `text?`, `files?`, `replyTo?` |
+| `hyp_stream` | `action: "topics" \| "subscribe" \| "unsubscribe" \| "list"`, `topic?`, `key?`, `filters?`, `mode?: "interrupt"\|"queue"\|"notify"`, `coalesceSeconds?`, `strict?` |
+| `hyp_inbox` | `state?: "unread"\|"muted"\|"delivered"` (plus `"all"`), `filter?`, `cursor?`, `limit?` (`1..=50`), `summary?`, `ack?`, `ids?`, `mode?: "queue"\|"notify"`, `rules?`, `mute?`, `unmute?`, `scope?: "session"\|"connector"` |
+| `hyp_bridge` *(conditional)* | `action: "targets" \| "link" \| "unlink" \| "handoff"`, `plugin?`, `target?`, `handle?`, `all?` |
+| `hyp_kv` *(conditional)* | `action: "get" \| "set" \| "delete" \| "list"`, `namespace`, `key?`, `value?`, `prefix?`, `node?`, `expectedVersion?`, `writeModel?: "owner"\|"shared"\|"allowlist"`, `ttlMs?`, `encrypt?` |
 
-- **Multi-agent `#channels`**: SQLite-backed rooms (`hyp_channel_join`, `hyp_channel_post`, `hyp_channels`, `hyp_channel_leave`) fanned out across all connected machines with no self-echo.
-- **Topic discovery & reachability lint**: Nodes advertise configured streams, declared GitHub scopes (`GITHUB_REPOS`/`GITHUB_ORGS`), observed webhook sources, and CloudEvents filter schemas at `GET /v1/topics` (`hyp_topics`), and `hyp_subscribe` diagnoses unreachable or misconfigured filters immediately (`strict: true` fails closed).
-- **Connector muting & slim `notify` mode**: Mute rules (`hyp_mute` / `hyp mute`) drop noisy peers, `#channels`, `topic:<name>`, or `plugin:<name>` at the connector boundary; `hyp_mode({ mode: "notify" })` pushes only a 1-line unread-count digest until the agent explicitly fetches full payloads with `hyp_inbox`.
-- **Bidirectional bridges & multi-thread fan-in**: Local chat bridges (`slack`, `telegram`, `whatsapp`, `webhook`, custom fd-3) support primary ownership (`hyp_plugin_handoff`), multi-session fan-in (`hyp_bridge_link` / `hyp_bridge_unlink`), and outbound replies (`hyp_plugin_post`) with fail-closed `not_target_holder` authorization.
+---
 
-## Session hygiene & socket lifecycle
+## 4. Zero-Polling Delivery Contract & §2.5 Delivery Engine
 
-- On startup, the daemon probes `connector.sock`: if a live daemon answers, startup fails cleanly; if the socket is stale (`ECONNREFUSED`), it is unlinked and rebound with user-only permissions.
-- Every tool call, hook invocation, and waiter attachment refreshes `sessions.last_seen`. A periodic sweep (and `hyp status --prune` / `hyp prune`) removes stale inactive sessions, their subscriptions, and their handles from the router while never pruning sessions with an active push transport.
+Delivery is **durable-first** (committed atomically to `node.sqlite` before upstream ack) and routed through `DeliveryEngine` (`crates/hyp-node/src/delivery/`) + optional `SecurityGatePipeline` (`crates/hyp-node/src/gates/`):
+
+1. **Four Delivery Tiers**:
+   - `interrupt`: Wakes active or idle threads immediately.
+   - `queue` *(default)*: Coalesced and delivered cleanly at the next turn/idle boundary.
+   - `notify`: Full payload stays `unread` in local inbox while a slim 1-line digest queues for the next turn/idle boundary.
+   - `mute`: Silently archived (`state = "muted"`) — **never** wakes or triggers a standalone digest; piggybacks `· N muted` onto other deliveries and stays readable on demand via `hyp_inbox({ state: "muted" })`.
+2. **Focus Mode & Per-Source Rules**: `hyp_inbox({ mode: "notify", rules: [...] })` demotes `* -> notify` while preserving explicit VIP `interrupt` exceptions (e.g. `@oncall -> interrupt`) and per-source overrides (`@handle`, `<node>/<handle>`, `#channel`, `topic:<name>`, `<plugin>:<target>`).
+3. **Adaptive Burst Protection ("Noisy Mode")**: Exceeding `10` arrivals in a `60s` rolling window per source engages a `300s` cooldown (`min_delivery_interval: 30s`), automatically demoting `interrupt`/`queue` floods to `notify`.
+4. **Token-Budget Hybrid Batch Packer**: Sorts pending items (`interrupt` -> `queue` DM/`#announcement` -> `queue` `#channel`/stream -> `notify`/burst), packs inline items up to `1200` est. tokens / `6` items (truncating single giant payloads at `60%` budget with a `hyp_inbox(ids:[...])` pointer), and spills overflow into a 1-line digest footer with a cursor-paginated `hyp_inbox` hint.
+5. **Zero-Polling Transports**:
+   - **Claude native channel (`hyp mcp --claude-channel`)**: Pushes `notifications/claude/channel` live over MCP stdio.
+   - **Streaming watcher (`hyp watch` / `hyp wait --stream`)**: Blocks at 0 CPU / 0 tokens and emits one NDJSON line per inbound batch (designed for Claude Monitor).
+   - **One-shot blocking waiter (`hyp wait`)**: Blocks silently until an item arrives, prints the batch (supports `--json`), and exits `0` for background-task wakeup.
+   - **Native harness queues**: `codex queue --thread <uuid>`, Herdr `hc send` / `hc interrupt`, and T3 v2 WebSocket RPC (`message.dispatch`).
+   - **Mid-turn & turn-boundary hooks**: `PreInvocation`, `PostToolUse`, and `Stop` drain queued batches automatically and arm `hyp wait` on idle without looping.
+
+---
+
+## 5. Session Hygiene & Daemon Lifecycle
+
+- `hyp node start` writes `node.pid` and `node.status.json` atomically (`0600`) in the state directory and cleans them up on graceful `SIGINT`/`SIGTERM` shutdown.
+- On startup, `LocalDaemon` probes `connector.sock`: if a live daemon answers, startup fails cleanly (`AlreadyRunning`); if the socket is stale, it is unlinked and rebound with `0600` permissions.
+- Every tool call, hook invocation, and waiter attachment refreshes `sessions.last_seen` inside `node.sqlite`, and `hyp status` / `hyp doctor` inspect daemon socket health, session counts, peer manifest skew, and Security Gate integrity in one pass.

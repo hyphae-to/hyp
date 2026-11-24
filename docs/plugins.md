@@ -1,366 +1,167 @@
-# Router Data Streams, Connector Thread Bridges & Secrets
+# Event Sources, External Chat Bridges & Secrets
 
-`hyphae` intentionally separates **Router Data Streams** (1-to-many pub/sub) from **Connector Thread Bridges** (thread-owned bidirectional messaging with multi-thread fan-in), while letting both share the **same fd-3 plugin SDK** (`plugins/sdk/client.{mjs,py}`) and **OS Keychain-first secrets store** (`hyp secret`).
+Hyphae v2 unifies event sources and chat bridges onto the single Rust `Node` CloudEvents v1.0 bus (`node.sqlite`) via `NodeAdapter` (`crates/hyp-node/src/adapters/`), separating **compiled-in pure-Rust event source adapters** from **optional external chat bridge scripts** in `plugins/`.
 
-## Why Both Layers Exist
+> **Zero runtime dependency for core `hyp`:** The static Rust `hyp` binary requires **no** Node.js or Python runtime. Scripts under `plugins/` are **optional external subprocesses** (Node or Python) supervised over duplex Unix fd 3 — you only need Node or Python installed if you opt in to running those specific external bridge scripts.
 
-| Layer | Where it runs | Routing model | Where secrets live | Best for |
+---
+
+## 1. Architecture: Compiled-In Sources vs. External Bridges
+
+| Layer | Implementation | Routing Model | Secrets Location | Best For |
 | --- | --- | --- | --- | --- |
-| **Router Data Streams** (`localRouter.streams`) | Supervised on the **router host** (or external HTTP publisher posting to `POST /v1/events?topic=<name>`) | **1-to-many Pub/Sub** — any agent on any machine subscribes with CloudEvents filters (`hyp_subscribe`) | Router host's OS keyring (or headless `~/.config/hyphae/secrets/` fallback) | **GitHub events** (`github-webhook`), **Prometheus / Alertmanager alerts** (`prometheus-webhook`), **CI / Linear / Sentry / Stripe** webhooks (`webhook-stream`), **custom polling/streaming data source plugins** |
-| **Connector Thread Bridges** (`plugins`) | Supervised on a **local connector daemon** (`hyp daemon`) | **Thread-Owned + Multi-Thread Fan-In + Outbound Replies** — pinned to a primary agent `handle` / `sessionId` with live `hyp_plugin_handoff`, multi-thread `hyp_bridge_link` fan-in, and outbound `hyp_plugin_post` replies | Local machine's OS keyring (or local fallback) — never sent to a shared router | **Personal Slack / Telegram / WhatsApp DM & mention bridges**, machine-local alerts, and **custom fd-3 bridges in any language** |
-
-### Interactive Setup & Built-In Guides
-
-```sh
-hyp connect add                       # Interactive TUI for both Node Streams & Connector Bridges (aliases: `hyp plugin setup`, `hyp stream add`)
-hyp connect list                      # Inspect configured streams and bridges (supports --json)
-hyp connect guide                     # List all built-in streams & bridges
-hyp connect guide slack               # Print step-by-step setup guide + agent usage for Slack
-hyp connect guide whatsapp            # WhatsApp Business Cloud API bridge guide
-hyp connect guide github-webhook      # GitHub webhook stream guide
-hyp connect guide prometheus-webhook  # Prometheus Alertmanager v4 stream guide
-```
+| **Compiled-In Rust Event Sources** (`crates/hyp-node/src/adapters/`) | Pure Rust in-process (`github-public`, `github-webhook`, `prometheus-webhook`, `webhook-stream`) — zero Node/Python needed | **1-to-many Pub/Sub** via `hyp_stream` with server-side CloudEvents filter pushdown | Node's `SecretStore` (`{ "secret": "<name>" }` in `node.json`) | Public or org **GitHub** streams (`github-public` ETag poller + GitHub App webhooks), **Prometheus Alertmanager v4**, and signed **HTTP webhooks** |
+| **External Subprocess Bridges & Custom Sources** (`plugins/`) | Optional self-contained scripts (`plugins/slack`, `plugins/telegram`, `plugins/whatsapp`, `plugins/webhook`, `plugins/prometheus`, or custom executables) supervised by `SubprocessSupervisor` over fd 3 | **Thread-owned + multi-thread fan-in + outbound replies** via `hyp_bridge` and `hyp_send({ to: "<plugin>:<target>", text })` | Local machine's `SecretStore` — scrubbed subprocess env, never sent to remote hubs | Personal **Slack / Telegram / WhatsApp** bridges, local callbacks, and custom scripts in any language |
 
 ---
 
-## 0. Secrets Management (`hyp secret`)
+## 2. Secrets Management (`hyp secret`)
 
-Never put raw API tokens or webhook secrets directly in `connector.json`. `hyp secret set` stores secrets in your OS keyring first, with a private local file fallback on headless hosts:
-- **macOS Keychain** (`security`, service `hyphae`, written over stdin so values never appear in argv/`ps`)
-- **Linux Secret Service** (`secret-tool` — GNOME Keyring, KDE KWallet, KeePassXC — written over stdin when a desktop keyring is available)
-- **Private local file fallback** (`~/.config/hyphae/secrets/<name>.secret` with user-only permissions) on headless servers and containers without a system keyring (overrideable via `HYPHAE_SECRET_BACKEND=keychain|secret-service|file`)
+Never put raw API tokens or webhook secrets directly in `node.json` or CLI argv. `hyp secret set` stores secrets in your OS secret store first, with a private `0600` file fallback on headless hosts and Windows:
+
+- **macOS Keychain** (`/usr/bin/security -i` over stdin, service `hyphae`)
+- **Linux Secret Service** (`secret-tool` over stdin when `DBUS_SESSION_BUS_ADDRESS` is available)
+- **Private local file fallback** (`~/.config/hyphae/secrets/<name>.secret`, `0700` dir / `0600` file, symlink-rejecting; override via `HYPHAE_SECRET_BACKEND=keychain|secret-service|file`)
 
 ```sh
-hyp secret set slack-app-token --web  # one-shot 127.0.0.1 password form (zero secret bytes in LLM context)
-hyp secret set github-webhook-secret  # hidden TTY prompt (or reads stdin)
-hyp secret list                       # lists secret names & backend status (never prints values)
-hyp secret check                      # verifies every secret referenced in connector.json
-hyp secret rm old-token
+# Recommended for agents & interactive laptops (one-shot 127.0.0.1 CSRF-protected form):
+hyp secret set slack-app-token --web
+
+# Headless servers / scripts (stdin only — NEVER CLI argv!):
+printf '%s' "$GITHUB_PUBLIC_PAT" | hyp secret set github-public-token
+
+# Audit stored secret names, backends, and 0600 modes (never prints values):
+hyp secret list
+hyp secret list --json
+
+# Remove an unused secret:
+hyp secret delete old-token
 ```
 
-Reference secrets in any plugin or stream `env` block using:
-- `{ "secret": "<name>" }` — resolves the secret from your OS keyring (or local fallback) and injects it **only** into that plugin/stream child process's environment.
-- `{ "secretFile": "<name>" }` — provides a private user-only file path (for plugins expecting `*_FILE`).
+Reference secrets in `node.json` strictly as `{ "secret": "<name>" }`.
 
 ---
 
-## 1. Router Data Streams (`localRouter.streams`)
+## 3. Compiled-In Rust Event Sources (`sources[]` in `node.json`)
 
-Configure streams directly under `localRouter.streams` in `connector.json` (no manual `add-publisher` / `--topic` flags needed — `hyp daemon` registers topics, supervises each source, and fans out CloudEvents to matching `hyp_subscribe` filters across all connected harnesses and machines):
+### A. `github-public` — Demand-Driven Deduplicated ETag Poller (+ Optional `<1s` GitHub App Push)
+
+Compiled directly into `hyp` (`crates/hyp-node/src/adapters/github_public.rs`). Used both on read-only public nodes (`hyp deploy init public-node`) and locally on developer machines:
 
 ```json
 {
-  "localRouter": {
-    "host": "127.0.0.1",
-    "port": 8790,
-    "db": "router/router.sqlite",
-    "streams": [
-      {
-        "name": "github",
-        "topic": "github",
-        "builtin": "github-webhook",
-        "env": {
-          "GITHUB_WEBHOOK_PORT": "8791",
-          "GITHUB_WEBHOOK_SECRET": { "secret": "github-webhook-secret" },
-          "GITHUB_REPOS": "myorg/myrepo",
-          "GITHUB_ORGS": "myorg"
-        }
-      },
-      {
-        "name": "prometheus",
-        "topic": "alerts",
-        "builtin": "prometheus-webhook",
-        "env": {
-          "PROMETHEUS_PORT": "8793",
-          "PROMETHEUS_TOPIC": "alerts",
-          "PROMETHEUS_BEARER_TOKEN": { "secret": "prometheus-bearer-token" }
-        }
-      },
-      {
-        "name": "ci",
-        "topic": "ci",
-        "builtin": "webhook-stream",
-        "env": {
-          "WEBHOOK_PORT": "8792",
-          "WEBHOOK_SECRET": { "secret": "ci-webhook-secret" }
-        }
-      },
-      {
-        "name": "my-custom-feed",
-        "topic": "my-custom-feed",
-        "exec": "/usr/bin/python3",
-        "args": ["-u", "/path/to/my_source.py"],
-        "env": {
-          "API_KEY": { "secret": "my-feed-api-key" }
-        }
-      }
-    ]
-  }
+  "sources": [
+    {
+      "id": "github-public",
+      "kind": "github-public",
+      "topic": "github",
+      "enabled": true,
+      "minPollIntervalSeconds": 60,
+      "graceWindowSeconds": 300,
+      "githubToken": { "secret": "github-public-token" },
+      "appWebhookSecret": { "secret": "github-app-webhook-secret" }
+    }
+  ]
 }
 ```
 
-### Built-In `github-webhook` Stream & Dead-Subscription Protection
+- **1 poller per distinct `owner/repo`**: Regardless of subscriber count, conditional `If-None-Match` polls returning `304 Not Modified` consume **0** GitHub API quota, adaptively back off on idle repos, and tear down after `graceWindowSeconds` when active subscribers drop to `0`.
+- **Optional GitHub PAT**: Without `github-public-token`, runs in unauthenticated public GitHub mode (60 req/hr); storing a PAT via stdin raises limits to 5,000 req/hr. On non-`publicReadOnly` private/local nodes, setting `"allowPrivateWithToken": true` permits watching private repos with your own token.
+- **Optional `<1s` GitHub App webhooks**: Setting `appWebhookSecret` enables HMAC-verified `POST /v1/webhooks/github-app` (returns `404` when unconfigured, `401` on invalid `X-Hub-Signature-256`).
 
-- Receives signed GitHub webhooks on `POST /hooks/github` (default port `8791`, verifies `X-Hub-Signature-256` against `GITHUB_WEBHOOK_SECRET`).
-- **Option A — Repository / Organization Webhook**: GitHub -> Repo or Org -> Settings -> Webhooks -> Add webhook -> Payload URL `https://<your-public-host>/hooks/github`, Content type `application/json`, Secret from `hyp secret set github-webhook-secret --web`, events: Pull requests, Pull request reviews, Pull request review comments, Issues, Issue comments, Workflow runs, Pushes.
-- **Option B — GitHub App**: Developer settings -> GitHub Apps -> New GitHub App -> Webhook Active + URL `https://<your-public-host>/hooks/github` + Secret -> read-only permissions (Pull requests, Issues, Actions, Contents, Metadata) -> install the App on selected repos or org.
-- **CloudEvents attributes**: `repo` (`"owner/repo"`), `source` (`"github.com/owner/repo"`), `type` (`"com.github.pull_request.opened"`, etc.), `action`, `actor`, and `subject` (`"pull/<n>"`, `"issues/<n>"`, `"actions/runs/<id>"`, `"refs/heads/<branch>"`).
-- **Preventing silent dead subscriptions**:
-  - Set `GITHUB_REPOS` / `GITHUB_ORGS` (or `scope: { repos, orgs }`) in `connector.json` to match where the webhook/App is installed.
-  - Agents should call **`hyp_topics()`** first to inspect available topics, monitored repos/orgs, observed webhook sources, valid filter attributes, and setup instructions.
-  - **`hyp_subscribe(...)`** automatically runs reachability checks and returns `reachable: false` with actionable `diagnostics` (or fails closed when `strict: true`) if a filter references an unmonitored repo, uses `subject` instead of `repo`, or has a malformed `repo`/`source` prefix!
+### B. `github-webhook`, `prometheus-webhook` & `webhook-stream` (`crates/hyp-node/src/adapters/webhooks.rs`)
 
-### Built-In `prometheus-webhook` Stream (`plugins/prometheus/index.mjs`)
+Pure-Rust normalizers verify HMAC-SHA256 / bearer tokens in constant time (`ring::hmac`) and emit normalized CloudEvents v1.0:
+- **GitHub (`com.github.*`)**: Attributes `repo` (`"owner/repo"`), `source` (`"github.com/owner/repo"`), `type` (`"com.github.pull_request.opened"`, etc.), `action`, `actor`, and `subject` (`"pull/<n>"`, `"issues/<n>"`, `"actions/runs/<id>"`, `"refs/heads/<branch>"`).
+- **Prometheus Alertmanager v4**: Emits one CloudEvent per alert (`io.prometheus.alert.firing` / `io.prometheus.alert.resolved`) with `alertname`, `severity`, `service`, and `subject: "severity=<severity>/<alertname>"`.
+- **Generic Webhook**: Optional constant-time HMAC-SHA256 verification and CloudEvents v1.0 pass-through/wrapping.
 
-- Receives **Prometheus Alertmanager v4** webhook payloads on `POST /alerts` (default port `8793`).
-- Optional authentication via `PROMETHEUS_BEARER_TOKEN` (`Authorization: Bearer <token>`) and/or `PROMETHEUS_WEBHOOK_SECRET` (HMAC-SHA256), referenced via `{ "secret": "..." }` or `{ "secretFile": "..." }`.
-- Emits one CloudEvent per alert in the batch:
-  - `type`: `io.prometheus.alert.firing` or `io.prometheus.alert.resolved`
-  - `subject`: `severity=<severity>/<alertname>` (e.g. `severity=critical/CheckoutHighErrorRate`)
+### Subscribing from Any Agent (`hyp_stream`)
 
-Any agent on any connected machine can inspect topics via `hyp_topics()` and subscribe with CloudEvents filters so only the relevant thread wakes up:
+Agents inspect topics and subscribe with CloudEvents Subscriptions API v1.0 filters (pushed down to upstream nodes so non-matching events never cross the wire):
 
 ```json
-hyp_subscribe({
-  "key": "github:repo-prs",
-  "topic": "github",
-  "filters": [{ "exact": { "repo": "myorg/myrepo" } }],
+hyp_stream({ "action": "topics" })
+
+hyp_stream({
+  "action": "subscribe",
+  "key": "gh:checkout",
+  "topic": "public.hyphae.to.github",
+  "filters": [{ "exact": { "repo": "owner/repo" } }],
   "mode": "queue",
+  "coalesceSeconds": 15,
   "strict": true
 })
-```
 
-```json
-hyp_subscribe({
+hyp_stream({
+  "action": "subscribe",
   "key": "prom:critical",
-  "topic": "alerts",
+  "topic": "acme-team.alerts",
   "filters": [{ "prefix": { "subject": "severity=critical" } }],
   "mode": "interrupt"
 })
 ```
 
-Custom router data sources use the **exact same fd-3 SDK** (`plugins/sdk/client.mjs` or `plugins/sdk/client.py`) — emitting `{"type":"event","to":"<topic>","event":<CloudEvent 1.0>}` publishes directly into the router's topic fan-out engine.
+*(For GitHub streams, always filter on `repo` or `source`, **not** `subject`; `strict: true` fails closed on unreachable or misconfigured filters.)*
 
 ---
 
-## 2. Universal Local Connector Bridges (Works Across All Harnesses)
+## 4. Optional External Chat Bridges (`plugins/`)
 
-`hyphae` builds on the battle-tested fd-3 plugin supervisor, SQLite coalescing/retention store (`local.db`), wake caps, backlog status reporting, and CloudEvent validation — while routing targets to **any** harness session on the daemon and adding **multi-thread fan-in** and **bidirectional outbound replies**.
+External scripts under `plugins/` run as optional child processes managed by the unified Rust `SubprocessSupervisor` (`crates/hyp-node/src/adapters/supervisor.rs`) over an anonymous duplex Unix socketpair duped onto **fd 3**:
 
-- **Language-agnostic fd-3 plugins**: Any local executable or script (Node, Python, Go, Rust) speaking the Hyphae fd-3 NDJSON protocol runs cleanly under `hyp daemon`.
-- **Zero credentials shared**: Plugins receive only their explicitly configured secrets (from OS Keychain / Linux Secret Service, local fallback, or `systemd-creds`), never see router tokens, and communicate solely over anonymous duplex fd 3 (`HYPHAE_FD=3`).
-- **Durable buffering & coalescing**: Events are persisted in `state/local.db` (24h retention, 100 pending batches per target, configurable `coalesceSeconds`, `maxWaitSeconds`, `wakesPerHour`). If the target agent hasn't joined yet, batches wait durably and flush automatically once the target session enrolls.
+- **Scrubbed environment**: Inherits only `PATH`, `HOME`, `TMPDIR`, `LANG`, `XDG_RUNTIME_DIR`, and `DBUS_SESSION_BUS_ADDRESS` plus explicitly configured env vars/secrets and protocol headers (`HYPHAE_FD=3`, `HYPHAE_PLUGIN=<id>`, `HYPHAE_PROTOCOL=2`).
+- **Bounded framing & resilience**: Strict 64 KiB `LineSplitter`, exponential restart backoff (`1s -> 60s`), and clean `SIGTERM -> SIGKILL` shutdown.
+- **Dual wire protocol auto-detection**: Speaks **JSON-RPC 2.0 v2** (`hyphae/hello`, `hyphae/publish`, `hyphae/post`, `hyphae/status`, `hyphae/deliveryFailed`) and automatically detects unmodified **legacy fd-3 v1** plugins (`hello`, `event`, `ack`, `nack`, `request`, `response`, `status`, `delivery_failed`).
 
-### Target Addressing
+### Managing Bridges from MCP (`hyp_bridge` + `hyp_send`)
 
-Each plugin target in `~/.config/hyphae/connector.json` accepts one of:
+When local bridges are enabled, the conditional `hyp_bridge` tool is advertised alongside the 4 core tools (0 schema tokens otherwise):
 
-| Field | Example | Behavior |
+- **List linked targets**: `hyp_bridge({ action: "targets" })`
+- **Multi-thread fan-in link/unlink**: `hyp_bridge({ action: "link", plugin: "slack", target: "pm" })` / `hyp_bridge({ action: "unlink", plugin: "slack", target: "pm" })` (also accepts `"target": "slack:pm"` shorthand)
+- **Live primary handoff**: `hyp_bridge({ action: "handoff", plugin: "slack", target: "pm", handle: "codex-pm" })`
+- **Outbound reply**: `hyp_send({ to: "slack:pm", text: "Fix PR #412 is green.", replyTo: "1732435200.000100" })`
+
+### Included Optional External Scripts (`plugins/`)
+
+All included `.mjs` scripts have zero external npm dependencies (using Node standard APIs only when you choose to run them):
+
+| Script | Protocol / Transport | Required Fail-Closed Allowlist / Auth Env Vars |
 | --- | --- | --- |
-| `handle` | `"pm"` | Routes to whichever enrolled session (Antigravity, Claude, Codex, Herdr, T3 Code, OpenClaw, Cursor, OpenCode, Gemini) currently holds handle `pm`. Best for desktop workflows. |
-| `sessionId` | `"antigravity:<uuid>"` / `"claude:<uuid>"` / `"codex:<uuid>"` | Pins delivery to one specific persistent conversation/session ID. |
-| `threadId` | `"30227355-..."` | Matches exact `sessionId` or `<harness>:<threadId>` suffix. |
-
-### Inspecting Targets & Live Handoffs (`hyp_plugin_targets` / `hyp_plugin_handoff`)
-
-- **`hyp_plugin_targets()`** lists every local plugin target routed or linked to the caller, including `linkedSessions` currently fanned into each target.
-- **`hyp_plugin_handoff({ plugin, target, sessionId?, handle?, threadId? })`** transfers primary ownership live to another session (even across different harnesses) with zero daemon restart:
-
-```json
-hyp_plugin_handoff({ "plugin": "slack", "target": "pm", "handle": "codex-pm" })
-```
-
-### Multi-Thread Bridge Fan-In (`hyp_bridge_link` / `hyp_bridge_unlink`)
-
-Multiple agent threads — even across different harnesses — can share a single Slack, Telegram, WhatsApp, or webhook bridge:
-
-- **`hyp_bridge_link({ plugin, target, sessionId?, handle?, threadId? })`** links a session (defaults to the caller) to `(plugin, target)` so it receives fan-in copies of inbound events and is authorized to post replies via `hyp_plugin_post`.
-- **`hyp_bridge_unlink({ plugin, target, sessionId?, handle?, threadId?, all? })`** removes a session's bridge link (defaults to the caller; `all: true` removes every link on the target and requires the primary/configured holder).
-
-```json
-hyp_bridge_link({ "plugin": "slack", "target": "pm" })
-hyp_bridge_link({ "plugin": "slack", "target": "pm", "handle": "claude-ops" })
-hyp_bridge_unlink({ "plugin": "slack", "target": "pm" })
-```
-
-### Outbound Chat Bridge Replies (`hyp_plugin_post`)
-
-Agents can reply directly back into Slack, Telegram, WhatsApp, or an outbound webhook callback over the bidirectional fd-3 protocol (`request` / `response`, SDK `mesh.onPost(handler)`):
-
-```json
-hyp_plugin_post({
-  "plugin": "slack",
-  "target": "pm",
-  "text": "Investigating checkout-api 5xx spike now — fix PR #412 is running CI.",
-  "threadTs": "1732435200.000100"
-})
-```
-
-| Parameter | Required | Description |
-| --- | --- | --- |
-| `plugin` | Yes | Configured plugin name (e.g. `"slack"`, `"telegram"`, `"whatsapp"`, `"alerts"`). |
-| `target` | Yes | Configured target name on that plugin (e.g. `"pm"`, `"assistant"`, `"ops"`). |
-| `text` | Yes | Outbound message body. |
-| `channel` | No | Slack channel override (defaults to `SLACK_DEFAULT_CHANNEL` or last inbound channel). |
-| `threadTs` | No | Slack thread timestamp to reply in-thread. |
-| `chatId` | No | Telegram chat ID override (defaults to `TELEGRAM_DEFAULT_CHAT` or last inbound chat). |
-| `to` | No | WhatsApp recipient phone number override (defaults to `WHATSAPP_DEFAULT_TO` or last inbound sender). |
-| `replyTo` | No | Message ID to quote/reply to on Telegram or WhatsApp. |
-
-**Fail-closed authorization**: the caller must be the target holder (primary handoff owner, configured target, or linked via `hyp_bridge_link`). Calls from unlinked sessions are rejected with `not_target_holder`.
+| [plugins/slack/index.mjs](../plugins/slack/index.mjs) | Slack Socket Mode (WebSocket, no public port needed) + `chat.postMessage` | `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_ALLOWED_USERS` / `SLACK_ALLOWED_CHANNELS` |
+| [plugins/telegram/index.mjs](../plugins/telegram/index.mjs) | Telegram Bot API long polling + `sendMessage` | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS` / `TELEGRAM_ALLOWED_CHATS` |
+| [plugins/whatsapp/index.mjs](../plugins/whatsapp/index.mjs) | Meta WhatsApp Business Cloud API webhook (`X-Hub-Signature-256`) + Graph API | `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_ALLOWED_NUMBERS` |
+| [plugins/webhook/index.mjs](../plugins/webhook/index.mjs) | Local HTTP webhook receiver (`X-Webhook-Signature-256`) + optional `WEBHOOK_POST_URL` | `WEBHOOK_PORT`, `WEBHOOK_SECRET`, optional `WEBHOOK_POST_URL` |
+| [plugins/prometheus/index.mjs](../plugins/prometheus/index.mjs) | Standalone Alertmanager v4 webhook script (when not using compiled-in Rust adapter) | `PROMETHEUS_PORT`, `PROMETHEUS_BEARER_TOKEN` and/or `PROMETHEUS_WEBHOOK_SECRET` |
 
 ---
 
-## 3. Built-In Zero-Dependency Plugins (`plugins/`)
+## 5. Writing a Custom Subprocess Plugin (JSON-RPC 2.0 v2 or fd-3 v1)
 
-`hyphae` ships ready-to-use Node 24 plugins with **zero external npm or Python dependencies**. Configure connector bridges in `connector.json` under `plugins` using `"builtin"`, or router streams under `localRouter.streams`.
+Any language that can read/write newline-delimited JSON (≤ 64 KiB/line) on fd 3 works directly.
 
-### A. Slack (`builtin: "slack"`) — Socket Mode DMs, `@mentions`, Threads & Replies
+### Option A: JSON-RPC 2.0 over fd 3 (`HYPHAE_PROTOCOL=2`, recommended for new plugins)
 
-```json
-{
-  "plugins": [
-    {
-      "name": "slack",
-      "builtin": "slack",
-      "env": {
-        "SLACK_APP_TOKEN": { "secret": "slack-app-token" },
-        "SLACK_BOT_TOKEN": { "secret": "slack-bot-token" },
-        "SLACK_ALLOWED_USERS": "U01234567",
-        "SLACK_DEFAULT_CHANNEL": "C01234567"
-      },
-      "targets": [
-        { "name": "pm", "handle": "pm", "coalesceSeconds": 5, "maxWaitSeconds": 30, "wakesPerHour": 120 }
-      ]
-    }
-  ]
-}
-```
+- Host <-> Plugin notifications & requests on fd 3:
+  - `hyphae/hello` (notification: `{ protocol: 2, plugin, targets }`)
+  - `hyphae/publish` (request from plugin: `{ target, event: <CloudEvent v1.0> }` -> JSON-RPC result `{ status: "stored" | "duplicate" }`)
+  - `hyphae/post` (request from host to plugin: `{ target, params: { text, replyTo?, ... } }` -> JSON-RPC result `{ ... }`)
+  - `hyphae/status` & `hyphae/deliveryFailed` (notifications)
 
-- Uses Slack Socket Mode (`apps.connections.open` + Node 24 native `WebSocket`). No public URL or Funnel required.
-- Outbound `hyp_plugin_post`: calls Slack `chat.postMessage` using explicit `channel`, `SLACK_DEFAULT_CHANNEL`, or the last inbound channel, with optional `threadTs` for threaded replies (requires `chat:write` bot scope).
-- Optional env vars: `SLACK_TARGET`, `SLACK_ALLOWED_USERS` (comma-separated user IDs), `SLACK_ALLOWED_CHANNELS`, `SLACK_DEFAULT_CHANNEL`.
+### Option B: Bundled Zero-Dependency fd-3 v1 SDKs
 
-### B. Telegram (`builtin: "telegram"`) — Bot API Long Polling & Replies
-
-```json
-{
-  "plugins": [
-    {
-      "name": "telegram",
-      "builtin": "telegram",
-      "env": {
-        "TELEGRAM_BOT_TOKEN": { "secret": "telegram-bot-token" },
-        "TELEGRAM_ALLOWED_USERS": "123456789",
-        "TELEGRAM_STATE_FILE": "/Users/you/.config/hyphae/state/telegram-offset.json"
-      },
-      "targets": [
-        { "name": "assistant", "handle": "assistant", "coalesceSeconds": 2, "maxWaitSeconds": 10, "wakesPerHour": 120 }
-      ]
-    }
-  ]
-}
-```
-
-- Persists Telegram `offset` safely only after durable `ack` from the connector's SQLite store.
-- Outbound `hyp_plugin_post`: calls Bot API `sendMessage` using explicit `chatId`, `TELEGRAM_DEFAULT_CHAT`, or the last inbound chat, with optional `replyTo` message ID.
-- Optional env vars: `TELEGRAM_TARGET`, `TELEGRAM_ALLOWED_CHATS`, `TELEGRAM_ALLOWED_USERS`, `TELEGRAM_DEFAULT_CHAT`, `TELEGRAM_STATE_FILE`.
-
-### C. WhatsApp (`builtin: "whatsapp"`) — Meta WhatsApp Business Cloud API
-
-`plugins/whatsapp/index.mjs` receives Meta WhatsApp Business Cloud API webhooks and sends replies back via the Graph API:
-
-```json
-{
-  "plugins": [
-    {
-      "name": "whatsapp",
-      "builtin": "whatsapp",
-      "env": {
-        "WHATSAPP_PORT": "8796",
-        "WHATSAPP_VERIFY_TOKEN": { "secret": "whatsapp-verify-token" },
-        "WHATSAPP_APP_SECRET": { "secret": "whatsapp-app-secret" },
-        "WHATSAPP_ACCESS_TOKEN": { "secret": "whatsapp-access-token" },
-        "WHATSAPP_PHONE_NUMBER_ID": "123456789012345",
-        "WHATSAPP_ALLOWED_NUMBERS": "15551234567"
-      },
-      "targets": [
-        { "name": "assistant", "handle": "assistant", "coalesceSeconds": 2, "maxWaitSeconds": 10, "wakesPerHour": 120 }
-      ]
-    }
-  ]
-}
-```
-
-- **Inbound webhook**: handles Meta `GET` webhook verification challenge (`hub.verify_token` against `WHATSAPP_VERIFY_TOKEN`) and verifies `POST` bodies with constant-time HMAC-SHA256 `X-Hub-Signature-256` against `WHATSAPP_APP_SECRET`.
-- **Fail-closed allowlist**: drops inbound senders unless listed in `WHATSAPP_ALLOWED_NUMBERS` (or explicitly opted out via `WHATSAPP_ALLOW_ALL=1`).
-- **CloudEvents format**: emits `com.whatsapp.message.received` CloudEvents with `subject: "wa/<from>"`.
-- **Outbound `hyp_plugin_post`**: posts via Meta Graph API `/${phoneNumberId}/messages` using `WHATSAPP_ACCESS_TOKEN`, targeting explicit `to`, `WHATSAPP_DEFAULT_TO`, or the last inbound sender, with optional `replyTo` message ID.
-- All three secrets (`WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `WHATSAPP_ACCESS_TOKEN`) can be provided via `{ "secret": "..." }` or `{ "secretFile": "..." }` (`*_FILE`).
-
-### D. Local Webhook (`builtin: "webhook"`) — Loopback / Tailnet HTTP ↔ CloudEvent Bridge
-
-```json
-{
-  "plugins": [
-    {
-      "name": "alerts",
-      "builtin": "webhook",
-      "env": {
-        "WEBHOOK_PORT": "8795",
-        "WEBHOOK_PATH": "/webhook",
-        "WEBHOOK_SECRET": { "secret": "local-webhook-secret" },
-        "WEBHOOK_POST_URL": "http://127.0.0.1:9000/reply",
-        "WEBHOOK_SOURCE": "alerts/local",
-        "WEBHOOK_EVENT_TYPE": "com.ops.alert"
-      },
-      "targets": [
-        { "name": "ops", "handle": "ops", "coalesceSeconds": 30, "maxWaitSeconds": 120, "wakesPerHour": 30 }
-      ]
-    }
-  ]
-}
-```
-
-- Verifies `X-Webhook-Signature-256: sha256=<hex>` with constant-time HMAC when `WEBHOOK_SECRET` / `WEBHOOK_SECRET_FILE` is set.
-- Outbound `hyp_plugin_post`: when `WEBHOOK_POST_URL` is configured, POSTs outbound reply payloads to that callback URL.
-
-### E. Custom Local Plugins (`exec` + `args`)
-
-Any custom Python, Node, or compiled binary plugin speaking the fd-3 NDJSON protocol runs directly:
-
-```json
-{
-  "plugins": [
-    {
-      "name": "ops-alerts",
-      "exec": "/usr/bin/python3",
-      "args": ["-u", "/home/you/.local/share/ops-alerts/alert_plugin.py"],
-      "cwd": "/home/you/.local/share/ops-alerts",
-      "targets": [
-        { "name": "ops", "handle": "ops", "coalesceSeconds": 60, "maxWaitSeconds": 180, "wakesPerHour": 20 }
-      ]
-    }
-  ]
-}
-```
-
----
-
-## 4. Writing Your Own Plugin (fd-3 Protocol v1)
-
-Use the bundled zero-dependency SDK helpers in [plugins/sdk/client.mjs](../plugins/sdk/client.mjs) (Node 24) or [plugins/sdk/client.py](../plugins/sdk/client.py) (Python 3 stdlib):
+Use [plugins/sdk/client.mjs](../plugins/sdk/client.mjs) (Node) or [plugins/sdk/client.py](../plugins/sdk/client.py) (Python 3 stdlib) — `SubprocessSupervisor` auto-detects v1 framing automatically:
 
 ```js
 #!/usr/bin/env node
-import { MeshPluginClient } from "/path/to/hyphae/plugins/sdk/client.mjs";
+import { MeshPluginClient } from "./plugins/sdk/client.mjs";
 
 const mesh = new MeshPluginClient();
 const { targets } = await mesh.ready;
 
-// Handle outbound `hyp_plugin_post` replies from target holders / linked sessions:
-mesh.onPost(async ({ target, text, channel, chatId, threadTs, replyTo, to }) => {
-  // Dispatch to your external service here
+mesh.onPost(async ({ target, text, replyTo }) => {
+  // Dispatch outbound reply to your external service
   return { delivered: true, target };
 });
 
@@ -374,23 +175,4 @@ await mesh.send(targets[0], {
 });
 ```
 
-Protocol summary (Hyphae fd-3 Protocol v1, extended with bidirectional `request`/`response` for outbound replies):
-1. Daemon spawns plugin with duplex pipe on **fd 3** and sets `HYPHAE_FD=3`, `HYPHAE_PLUGIN=<name>`, `HYPHAE_PROTOCOL=1`.
-2. Daemon sends `{"type":"hello","protocol":1,"plugin":"<name>","targets":["<target>",...]}\n`.
-3. Plugin writes newline-delimited JSON (≤ 64 KiB/line): `{"type":"event","to":"<target>","event":<CloudEvent 1.0>}\n` (`data` ≤ 8 KiB, whole event ≤ 12 KiB).
-4. Daemon answers in order with `{"type":"ack","id":"...","source":"...","status":"stored"|"duplicate"}` or `{"type":"nack",...}` (retry only `unavailable`).
-5. Daemon periodically sends `status` (backlog warnings) and `delivery_failed` notices. Plugin should exit cleanly when fd 3 reaches EOF.
-6. For outbound `hyp_plugin_post` calls, the daemon sends `{"type":"request","id":"...","method":"post","target":"<target>","params":{...}}\n` on fd 3; the plugin responds with `{"type":"response","id":"...","ok":true,"result":{...}}\n` (or `ok: false` with `"error"`). In Node, `mesh.onPost(handler)` handles this framing automatically.
-
----
-
-## 5. Router Event Publishers
-
-For external feeds shared across multiple sessions or machines, configure a topic on the router and issue a publisher token restricted to that topic:
-
-```sh
-hyp node add-publisher github-hub --topic github --db router.sqlite --token-out pub.token
-hyp node serve --db router.sqlite --audit audit.log --topic github=github-hub
-```
-
-Publishers post CloudEvents 1.0 to `POST /v1/events?topic=github`. Built-in receivers (`github-webhook`, `prometheus-webhook`, and `webhook-stream`) verify signatures/tokens and publish normalized CloudEvents directly. Sessions subscribe with `hyp_subscribe` filters and choose their own `mode` (`queue` or `interrupt`).
+Exit cleanly when fd 3 reaches EOF.
