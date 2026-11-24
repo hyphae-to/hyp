@@ -19,7 +19,10 @@ pub mod scheduler;
 pub mod transfers;
 pub mod types;
 
-pub use db::{CURRENT_SCHEMA_VERSION, NodeDb, StoreConfig};
+pub use db::{
+    CURRENT_SCHEMA_VERSION, MAX_MIGRATION_BACKUPS, MIGRATIONS, Migration, MigrationKind, NodeDb,
+    StoreConfig, run_migrations_with,
+};
 pub use error::{StoreError, StoreResult};
 pub use events::{
     BatchRecord, BatchState, DueBatch, EventCacheStats, EventLimits, EventStore, EventTickReport,
@@ -37,12 +40,13 @@ pub use local::{
 };
 pub use messages::{
     ChannelDeliveryFailure, ChannelEpoch, ChannelEpochInput, ChannelInfo, ChannelMembership,
-    ChannelStore, EnqueueMessage, EnqueueResult, HandleRecord, MessageLimits, MessageRecord,
-    MessageState, MessageStore, MessageTickReport, PostChannelInput, PostChannelResult,
+    ChannelStore, EnqueueMessage, EnqueueResult, HandleRecord, MAX_HANDLE_DESCRIPTION_CHARS,
+    MessageLimits, MessageRecord, MessageState, MessageStore, MessageTickReport, PostChannelInput,
+    PostChannelResult, sanitize_handle_description,
 };
 pub use peers::{
     DirectoryCheckpoint, DirectoryCheckpointInput, GrantInput, GrantRecord, ManifestCacheUpdate,
-    PeerInput, PeerKeyInput, PeerKeyRecord, PeerRecord, PeerStore, RevocationInput,
+    PeerInput, PeerKeyInput, PeerKeyRecord, PeerRecord, PeerRoute, PeerStore, RevocationInput,
     RevocationRecord,
 };
 pub use scheduler::{DeadlineBreakdown, TickReport};

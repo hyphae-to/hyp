@@ -16,6 +16,49 @@ use crate::types::{
 const HOUR_MS: i64 = 60 * 60 * 1000;
 const DAY_MS: i64 = 24 * HOUR_MS;
 
+/// Maximum Unicode character length of an optional enrolled handle description.
+pub const MAX_HANDLE_DESCRIPTION_CHARS: usize = 200;
+
+/// Sanitizes an optional handle description for safe single-line display and bounded storage.
+///
+/// - Replaces any ASCII/Unicode control character (including `\r`, `\n`, `\t`) and whitespace run
+///   with a single ASCII space.
+/// - Trims leading and trailing whitespace.
+/// - Truncates cleanly at [`MAX_HANDLE_DESCRIPTION_CHARS`] Unicode scalar values (`char`s) without
+///   leaving a trailing space or splitting multibyte UTF-8 sequences.
+/// - Returns `None` if `raw` is `None` or the normalized result is empty.
+pub fn sanitize_handle_description(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    let mut out = String::new();
+    let mut count = 0usize;
+    let mut pending_space = false;
+
+    for ch in raw.chars() {
+        if ch.is_control() || ch.is_whitespace() {
+            if count > 0 {
+                pending_space = true;
+            }
+            continue;
+        }
+        if pending_space {
+            // Only emit the separator space if there is room for both the space and `ch`.
+            if count + 2 > MAX_HANDLE_DESCRIPTION_CHARS {
+                break;
+            }
+            out.push(' ');
+            count += 1;
+            pending_space = false;
+        }
+        if count >= MAX_HANDLE_DESCRIPTION_CHARS {
+            break;
+        }
+        out.push(ch);
+        count += 1;
+    }
+
+    if out.is_empty() { None } else { Some(out) }
+}
+
 /// Operational limits for DM and `#channel` messages.
 #[derive(Debug, Clone)]
 pub struct MessageLimits {
@@ -56,6 +99,8 @@ pub struct HandleRecord {
     pub handle: String,
     pub address: String,
     pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub registered_at: i64,
     pub last_heartbeat_at: i64,
 }
@@ -238,29 +283,67 @@ impl<'a> MessageStore<'a> {
         session_id: Option<&str>,
         now_ms: i64,
     ) -> StoreResult<HandleRecord> {
+        self.register_handle_with_description(node_id, handle, session_id, None, now_ms)
+    }
+
+    /// Registers (or refreshes) an enrolled handle on `node_id` with an optional sanitized
+    /// human-readable description.
+    ///
+    /// Overwrites `description` on conflict (`Some(...)` sets it after sanitization, `None` clears
+    /// it explicitly), while [`Self::heartbeat_handle`] preserves any stored description.
+    pub fn register_handle_with_description(
+        &self,
+        node_id: &str,
+        handle: &str,
+        session_id: Option<&str>,
+        description: Option<&str>,
+        now_ms: i64,
+    ) -> StoreResult<HandleRecord> {
         if !is_node_id(node_id) {
             return Err(StoreError::InvalidInput(format!("invalid node_id '{node_id}'")));
         }
         if !is_handle(handle) {
             return Err(StoreError::InvalidInput(format!("invalid handle '{handle}'")));
         }
+        let sanitized_desc = sanitize_handle_description(description);
         let tx = self.db.immediate_tx()?;
         tx.conn().execute(
-            "INSERT INTO handles (node_id, handle, session_id, registered_at, last_heartbeat_at)
-             VALUES (?1, ?2, ?3, ?4, ?4)
+            "INSERT INTO handles (node_id, handle, session_id, description, registered_at, last_heartbeat_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
              ON CONFLICT(node_id, handle) DO UPDATE SET
                session_id = COALESCE(excluded.session_id, handles.session_id),
+               description = excluded.description,
                last_heartbeat_at = excluded.last_heartbeat_at",
-            params![node_id, handle, session_id, now_ms],
+            params![
+                node_id,
+                handle,
+                session_id,
+                sanitized_desc.as_deref(),
+                now_ms
+            ],
         )?;
         let record = tx.conn().query_row(
-            "SELECT node_id, handle, session_id, registered_at, last_heartbeat_at
+            "SELECT node_id, handle, session_id, description, registered_at, last_heartbeat_at
              FROM handles WHERE node_id = ?1 AND handle = ?2",
             params![node_id, handle],
             decode_handle_row,
         )?;
         tx.commit()?;
         Ok(record)
+    }
+
+    /// Looks up a single enrolled handle record by `(node_id, handle)`.
+    pub fn get_handle(&self, node_id: &str, handle: &str) -> StoreResult<Option<HandleRecord>> {
+        self.db
+            .conn()
+            .query_row(
+                "SELECT node_id, handle, session_id, description, registered_at, last_heartbeat_at
+                 FROM handles WHERE node_id = ?1 AND handle = ?2",
+                params![node_id, handle],
+                decode_handle_row,
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     /// Updates `last_heartbeat_at` for an enrolled handle. Returns `false` if not enrolled.
@@ -294,15 +377,28 @@ impl<'a> MessageStore<'a> {
         handles: &[&str],
         now_ms: i64,
     ) -> StoreResult<Vec<HandleRecord>> {
+        let with_descriptions: Vec<(&str, Option<&str>)> =
+            handles.iter().map(|&h| (h, None)).collect();
+        self.set_handles_with_descriptions(node_id, &with_descriptions, now_ms)
+    }
+
+    /// Atomically replaces the handle set and optional descriptions for `node_id`.
+    /// Removed handles are evicted from `channel_members` and their pending messages rejected.
+    pub fn set_handles_with_descriptions(
+        &self,
+        node_id: &str,
+        handles: &[(&str, Option<&str>)],
+        now_ms: i64,
+    ) -> StoreResult<Vec<HandleRecord>> {
         if !is_node_id(node_id) {
             return Err(StoreError::InvalidInput(format!("invalid node_id '{node_id}'")));
         }
-        let mut next = HashSet::new();
-        for &h in handles {
+        let mut next: BTreeMap<String, Option<String>> = BTreeMap::new();
+        for &(h, desc) in handles {
             if !is_handle(h) {
                 return Err(StoreError::InvalidInput(format!("invalid handle '{h}'")));
             }
-            next.insert(h.to_string());
+            next.insert(h.to_string(), sanitize_handle_description(desc));
         }
 
         let tx = self.db.immediate_tx()?;
@@ -315,27 +411,28 @@ impl<'a> MessageStore<'a> {
         drop(stmt);
 
         for old in &current {
-            if !next.contains(old) {
+            if !next.contains_key(old) {
                 remove_handle_in_tx(tx.conn(), node_id, old, now_ms)?;
             }
         }
-        for h in &next {
+        for (h, desc) in &next {
             if !current.contains(h) {
                 tx.conn().execute(
-                    "INSERT INTO handles (node_id, handle, registered_at, last_heartbeat_at)
-                     VALUES (?1, ?2, ?3, ?3)",
-                    params![node_id, h, now_ms],
+                    "INSERT INTO handles (node_id, handle, description, registered_at, last_heartbeat_at)
+                     VALUES (?1, ?2, ?3, ?4, ?4)",
+                    params![node_id, h, desc.as_deref(), now_ms],
                 )?;
             } else {
                 tx.conn().execute(
-                    "UPDATE handles SET last_heartbeat_at = ?1 WHERE node_id = ?2 AND handle = ?3",
-                    params![now_ms, node_id, h],
+                    "UPDATE handles SET description = ?1, last_heartbeat_at = ?2
+                     WHERE node_id = ?3 AND handle = ?4",
+                    params![desc.as_deref(), now_ms, node_id, h],
                 )?;
             }
         }
 
         let mut list_stmt = tx.conn().prepare(
-            "SELECT node_id, handle, session_id, registered_at, last_heartbeat_at
+            "SELECT node_id, handle, session_id, description, registered_at, last_heartbeat_at
              FROM handles WHERE node_id = ?1 ORDER BY handle ASC",
         )?;
         let records = list_stmt
@@ -350,7 +447,7 @@ impl<'a> MessageStore<'a> {
     pub fn list_handles(&self, node_id: Option<&str>) -> StoreResult<Vec<HandleRecord>> {
         if let Some(nid) = node_id {
             let mut stmt = self.db.conn().prepare(
-                "SELECT node_id, handle, session_id, registered_at, last_heartbeat_at
+                "SELECT node_id, handle, session_id, description, registered_at, last_heartbeat_at
                  FROM handles WHERE node_id = ?1 ORDER BY handle ASC",
             )?;
             let rows = stmt
@@ -359,7 +456,7 @@ impl<'a> MessageStore<'a> {
             Ok(rows)
         } else {
             let mut stmt = self.db.conn().prepare(
-                "SELECT node_id, handle, session_id, registered_at, last_heartbeat_at
+                "SELECT node_id, handle, session_id, description, registered_at, last_heartbeat_at
                  FROM handles ORDER BY node_id ASC, handle ASC",
             )?;
             let rows = stmt
@@ -1159,6 +1256,7 @@ fn decode_handle_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HandleRecord> 
         handle,
         address,
         session_id: row.get("session_id")?,
+        description: row.get("description")?,
         registered_at: row.get("registered_at")?,
         last_heartbeat_at: row.get("last_heartbeat_at")?,
     })
