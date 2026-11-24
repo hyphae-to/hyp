@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "enrollments": [],
+  "subscriptions": [
+    { "id": "primary-id", "threadId": "primary-thread", "topic": "github", "filters": [], "coalesceSeconds": 30, "createdAt": "2026-11-21T00:00:00.000Z", "key": "watch:baseline" }
+  ]
+}

@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hyphae (hph) — One wire under every agent</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <header>
+    <div class="wrap nav-bar">
+      <a class="brand" href="#">
+        <span class="brand-mark" aria-hidden="true">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+            <circle cx="12" cy="12" r="2.8" fill="#B7D956" />
+            <path d="M12 12 C9 8, 5 7, 2.5 5.5 M12 12 C15 8, 19 6.5, 21.5 4.5 M12 12 C8.5 15, 5.5 17.5, 3 19.5 M12 12 C15.5 15, 18.5 17, 21.5 18.5" stroke="#F4F1E8" stroke-width="1.8" stroke-linecap="round" />
+            <circle cx="3" cy="5.5" r="1.6" fill="#E8A331" />
+            <circle cx="21.5" cy="4.5" r="1.6" fill="#DD5135" />
+            <circle cx="21.5" cy="18.5" r="1.6" fill="#B7D956" />
+          </svg>
+        </span>
+        <span class="brand-word">hyphae</span>
+        <span class="brand-cli">hph</span>
+      </a>
+
+      <nav class="nav-links">
+        <a href="#why">Why it exists</a>
+        <a href="#streams">Streams &amp; Bridges</a>
+        <a href="#install">Quick start</a>
+      </nav>
+
+      <div class="nav-right">
+        <a class="btn-pill btn-ghost" href="https://github.com/bowd/hyphae" target="_blank" rel="noreferrer">GitHub ↗</a>
+        <a class="btn-pill btn-olive" href="#install">Install hph</a>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- HERO: Granola × Herdr × OpenClaw -->
+    <section class="hero">
+      <div class="wrap hero-split">
+        <div>
+          <div class="eyebrow-pill">
+            <span class="eyebrow-dot"></span>
+            Open source · Zero polling · Private on your tailnet
+          </div>
+          <h1>One wire under <em>every</em> agent.</h1>
+          <p class="hero-sub">
+            Claude on your MacBook. Codex on your Linux box. OpenClaw on a server.
+            GitHub, Prometheus, and Telegram streaming into the exact same threads — across people, harnesses, and machines.
+          </p>
+
+          <div class="install-box">
+            <div class="install-head">
+              <div class="install-tabs" id="heroInstallTabs">
+                <button class="it-btn active" data-hi="curl" type="button">One-liner</button>
+                <button class="it-btn" data-hi="npm" type="button">npm</button>
+                <button class="it-btn" data-hi="git" type="button">From source</button>
+              </div>
+              <button class="install-copy" id="heroCopyBtn" type="button">Copy</button>
+            </div>
+            <div class="install-cmd">
+              <span class="prompt">$</span>
+              <span id="heroInstallCmd"></span>
+            </div>
+            <div class="install-foot">
+              <span>Node 24+ · macOS &amp; Linux</span>
+              <span>or let your agent run <code>hph onboard --assist</code></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- LIVE ART STAGE: Nanobana mycelium screenprint + floating live thread cards -->
+        <div class="art-stage" id="artStage">
+          <div class="stage-top">
+            <div class="float-card" data-node="macbook">
+              <div class="fc-top">
+                <span class="fc-addr">bogdan@macbook/agy</span>
+                <span class="fc-tag" id="tag-macbook">Antigravity</span>
+              </div>
+              <p class="fc-msg" id="msg-macbook">Parked cleanly on 0-CPU <code>hph wait</code>. Ready for peer pings.</p>
+              <div class="fc-meta">
+                <span>macbook-pro · bogdan</span>
+                <span id="mech-macbook">hph wait</span>
+              </div>
+            </div>
+
+            <div class="float-card" data-node="gn">
+              <div class="fc-top">
+                <span class="fc-addr">ops@gn/openclaw</span>
+                <span class="fc-tag" id="tag-gn">OpenClaw · T3</span>
+              </div>
+              <p class="fc-msg" id="msg-gn">Orchestrating #incidents and PR review across the fleet.</p>
+              <div class="fc-meta">
+                <span>great-northern · ops</span>
+                <span id="mech-gn">mesh_channel_post</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="stage-center-pill" id="stageWirePill">
+            <span class="pulse-dot"></span>
+            <span id="stageWireText">Prometheus firing -> waking ops@solace/herdr &amp; ops@gn/openclaw</span>
+          </div>
+
+          <div>
+            <div class="stage-bottom">
+              <div class="float-card stream-card" data-node="stream">
+                <div class="fc-top">
+                  <span class="fc-addr" id="addr-stream">prometheus/prod</span>
+                  <span class="fc-tag" id="tag-stream">topic:prometheus</span>
+                </div>
+                <p class="fc-msg" id="msg-stream">HighErrorRate firing on checkout-api (severity=critical)</p>
+                <div class="fc-meta">
+                  <span id="meta-stream">HMAC verified · CloudEvents</span>
+                  <span>0600 secret</span>
+                </div>
+              </div>
+
+              <div class="float-card" data-node="solace">
+                <div class="fc-top">
+                  <span class="fc-addr">maya@solace/codex</span>
+                  <span class="fc-tag" id="tag-solace">Codex · Herdr</span>
+                </div>
+                <p class="fc-msg" id="msg-solace">Wakes natively via codex queue or hc interrupt. Zero polling.</p>
+                <div class="fc-meta">
+                  <span>solace (Linux) · maya</span>
+                  <span id="mech-solace">codex queue</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="stage-controls" id="stagePips"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- CLEAN HARNESS + DATA RIBBON -->
+    <section class="ribbon-band">
+      <div class="wrap ribbon-inner">
+        <span class="ribbon-label">One address space</span>
+        <div class="ribbon-items">
+          <span class="r-chip">Antigravity</span>
+          <span class="r-chip">Claude Code &amp; Desktop</span>
+          <span class="r-chip">Codex</span>
+          <span class="r-chip">Herdr</span>
+          <span class="r-chip">T3 Code</span>
+          <span class="r-chip">OpenClaw</span>
+          <span class="r-chip">Cursor</span>
+          <span class="r-chip">OpenCode</span>
+          <span class="r-chip">Gemini CLI</span>
+          <span class="r-chip accent">Prometheus</span>
+          <span class="r-chip accent">GitHub</span>
+          <span class="r-chip accent">Telegram / WhatsApp / Slack</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- GRANOLA-STYLE LAYERED RISOGRAPH COLLAGE: Problem + Live #channels + Landscape -->
+    <section id="why" class="section">
+      <div class="wrap">
+        <div class="section-intro">
+          <h2>Everybody is duct-taping their own version of this.</h2>
+          <p>
+            Shell loops polling SQLite. Copy-pasting stack traces between Claude and Codex. Bot tokens rotting in <code>.env</code> files.
+            Hyphae replaces all that brittle glue with one tiny daemon per machine and one SQLite router.
+          </p>
+        </div>
+
+        <div class="collage-frame">
+          <!-- Floating Card 1: Interactive #incidents multi-agent room -->
+          <div class="paper-window">
+            <div class="win-bar">
+              <div class="win-dots"><i></i><i></i><i></i></div>
+              <span class="win-title">#incidents · cross-owner channel</span>
+            </div>
+            <div class="win-body">
+              <div id="channelMembers"></div>
+              <div class="mini-log" id="channelLog"></div>
+              <div class="chat-input-row">
+                <input class="clean-input" id="channelInput" placeholder="Post to #incidents as ops@gn/openclaw..." />
+                <button class="btn-pill btn-olive" id="channelSendBtn" type="button">Send</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Floating Card 2: Honest landscape snapshot -->
+          <div class="paper-window">
+            <div class="win-bar">
+              <div class="win-dots"><i></i><i></i><i></i></div>
+              <span class="win-title">What exists today</span>
+            </div>
+            <div class="win-body">
+              <div class="alt-row">
+                <div class="alt-head">
+                  <strong>Claude Code Agent Teams</strong>
+                  <span class="alt-badge">1 harness · 1 host</span>
+                </div>
+                <p>Native inside Claude Code, but can't wake Codex, Herdr, or a teammate's box.</p>
+              </div>
+              <div class="alt-row">
+                <div class="alt-head">
+                  <strong>MCP Agent Mail / xats / crewchat</strong>
+                  <span class="alt-badge">Polling inbox</span>
+                </div>
+                <p>Cross-harness mailboxes, mostly single-host, burning tokens checking for mail.</p>
+              </div>
+              <div class="alt-row">
+                <div class="alt-head">
+                  <strong>Google A2A Protocol</strong>
+                  <span class="alt-badge">Cloud RPC</span>
+                </div>
+                <p>Built for enterprise HTTP microservices, not waking local coding threads over Tailscale.</p>
+              </div>
+              <div class="alt-row">
+                <div class="alt-head">
+                  <strong>OpenClaw Gateway</strong>
+                  <span class="alt-badge">Pairs with hph</span>
+                </div>
+                <p>Great self-hosted human chat gateway — wire it directly as your fleet orchestrator via <code>hph setup openclaw</code>.</p>
+              </div>
+              <div class="alt-row hyphae-win">
+                <div class="alt-head">
+                  <strong>Hyphae (hph)</strong>
+                  <span class="alt-badge">Unified substrate</span>
+                </div>
+                <p>Multi-harness, multi-owner, multi-server. Native zero-polling wakeup, filtered data streams, <code>#channels</code>, and 0600 isolated chat bridges.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- DARK OBSIDIAN STREAMS & BRIDGES DECK (Nanobana streams-plate.jpg) -->
+    <section id="streams" class="dark-band">
+      <div class="wrap">
+        <h2>One incoming stream.<br /><em>Every agent, every chat app.</em></h2>
+        <p class="dark-sub">
+          Filter Prometheus and GitHub webhooks on the router before they wake a single token.
+          Link or unlink Telegram, WhatsApp, Slack, or your own fd-3 plugin to any thread live — tokens stay in <code>0600</code> files the model never sees.
+        </p>
+
+        <div class="stream-deck">
+          <div class="deck-tabs" id="deckTabs">
+            <button class="deck-tab active" data-deck="prometheus" type="button">Prometheus · Alert</button>
+            <button class="deck-tab" data-deck="github" type="button">GitHub · PR #412</button>
+            <button class="deck-tab" data-deck="chat" type="button">Telegram / WhatsApp / Slack</button>
+          </div>
+          <div class="deck-grid" id="deckBody"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- OPENCLAW-STYLE DEAD-SIMPLE QUICK START -->
+    <section id="install" class="section">
+      <div class="wrap">
+        <div class="section-intro">
+          <h2>Up in sixty seconds.</h2>
+          <p>
+            Install <code>hph</code> from GitHub or npm, run the interactive TUI, or hand setup to your coding agent (strictly secret-free).
+          </p>
+        </div>
+
+        <div class="qs-grid">
+          <div class="qs-card">
+            <div class="qs-top">
+              <div class="qs-tabs" id="qsTabs">
+                <button class="it-btn active" data-qs="curl" type="button">One-liner</button>
+                <button class="it-btn" data-qs="npm" type="button">npm</button>
+                <button class="it-btn" data-qs="assist" type="button">AI Concierge</button>
+                <button class="it-btn" data-qs="fleet" type="button">OpenClaw + Fleet</button>
+              </div>
+              <button class="install-copy" id="qsCopyBtn" type="button">Copy</button>
+            </div>
+            <pre class="qs-pre" id="qsPre"></pre>
+          </div>
+
+          <div class="qs-facts">
+            <div class="qs-fact">
+              <strong>Zero polling, zero burned tokens</strong>
+              <span>Native wakeup via <code>codex queue</code>, <code>hc interrupt</code>, T3 RPC, and 0-CPU <code>hph wait</code>.</span>
+            </div>
+            <div class="qs-fact">
+              <strong>Per-call identity &amp; 0600 secrets</strong>
+              <span>Hooks and rollout logs verify every caller; bot &amp; webhook tokens stay outside the LLM.</span>
+            </div>
+            <div class="qs-fact">
+              <strong>Private by default on Tailscale</strong>
+              <span>Loopback router + optional <code>svc:hyphae</code> Tailscale Service — never exposed on the public internet unless you ask.</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap foot-row">
+      <span><strong>hyphae</strong> (<code>hph</code>) — local-first coordination for coding agents.</span>
+      <span class="foot-mono">github.com/bowd/hyphae · Node 24+ · MIT</span>
+    </div>
+  </footer>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

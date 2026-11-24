@@ -1,0 +1,118 @@
+#!/usr/bin/env node
+/**
+ * Built-in zero-dependency Telegram Bot long-polling plugin for hyphae / t3-mesh (Node 24+).
+ *
+ * Configuration via env:
+ *   TELEGRAM_BOT_TOKEN_FILE or TELEGRAM_BOT_TOKEN  - Bot token from @BotFather
+ *   TELEGRAM_TARGET                                - Target name (defaults to first target in hello)
+ *   TELEGRAM_ALLOWED_CHATS                         - Optional comma-separated numeric chat IDs allowlist
+ *   TELEGRAM_ALLOWED_USERS                         - Optional comma-separated numeric user IDs allowlist
+ *   TELEGRAM_STATE_FILE                            - Optional path to persist polling offset JSON
+ */
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { MeshPluginClient } from "../sdk/client.mjs";
+
+function readToken() {
+  const file = process.env.TELEGRAM_BOT_TOKEN_FILE;
+  if (file) return readFileSync(file, "utf8").trim();
+  const value = process.env.TELEGRAM_BOT_TOKEN?.trim();
+  if (value) return value;
+  throw new Error("Set TELEGRAM_BOT_TOKEN_FILE (recommended, 0600 file) or TELEGRAM_BOT_TOKEN");
+}
+
+const csvSet = (name) => {
+  const raw = process.env[name]?.trim();
+  return raw ? new Set(raw.split(",").map((v) => v.trim()).filter(Boolean)) : null;
+};
+
+const token = readToken();
+const allowedChats = csvSet("TELEGRAM_ALLOWED_CHATS");
+const allowedUsers = csvSet("TELEGRAM_ALLOWED_USERS");
+const allowAll = process.env.TELEGRAM_ALLOW_ALL === "1";
+const stateFile = process.env.TELEGRAM_STATE_FILE;
+
+if (!allowedChats && !allowedUsers && !allowAll) {
+  throw new Error("Refusing to start Telegram bridge without TELEGRAM_ALLOWED_USERS or TELEGRAM_ALLOWED_CHATS (set TELEGRAM_ALLOW_ALL=1 to explicitly allow any Telegram user)");
+}
+
+const mesh = new MeshPluginClient({
+  onDeliveryFailed: (msg) => console.error(`telegram plugin delivery_failed target=${msg.target} reason=${msg.reason}`),
+});
+const hello = await mesh.ready;
+const target = process.env.TELEGRAM_TARGET ?? hello.targets[0];
+if (!target || !hello.targets.includes(target)) {
+  throw new Error(`Target '${target}' not in configured targets: ${hello.targets.join(", ")}`);
+}
+
+let offset = 0;
+if (stateFile && existsSync(stateFile)) {
+  try {
+    const saved = JSON.parse(readFileSync(stateFile, "utf8"));
+    if (typeof saved.offset === "number" && Number.isInteger(saved.offset)) offset = saved.offset;
+  } catch {}
+}
+
+function saveOffset(next) {
+  offset = next;
+  if (!stateFile) return;
+  mkdirSync(dirname(stateFile), { recursive: true, mode: 0o700 });
+  writeFileSync(stateFile, JSON.stringify({ offset }) + "\n", { mode: 0o600 });
+}
+
+let backoff = 1000;
+while (true) {
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/getUpdates`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ offset, timeout: 30, allowed_updates: ["message", "edited_message"] }),
+      signal: AbortSignal.timeout(40_000),
+    });
+    const body = await res.json();
+    if (!body.ok || !Array.isArray(body.result)) {
+      throw new Error(`Telegram getUpdates failed: ${body.description ?? res.status}`);
+    }
+    backoff = 1000;
+    for (const update of body.result) {
+      const nextOffset = Number(update.update_id) + 1;
+      const msg = update.message ?? update.edited_message;
+      if (msg) {
+        const chatId = String(msg.chat?.id ?? "");
+        const userId = String(msg.from?.id ?? "");
+        if ((!allowedChats || allowedChats.has(chatId)) && (!allowedUsers || allowedUsers.has(userId))) {
+          const text = String(msg.text ?? msg.caption ?? "").slice(0, 4000);
+          const event = {
+            specversion: "1.0",
+            id: String(update.update_id),
+            source: `telegram/${target}`,
+            type: update.edited_message ? "com.telegram.message.edited" : "com.telegram.message",
+            subject: `${chatId}/${msg.message_id}`,
+            time: new Date((msg.date ?? Math.floor(Date.now() / 1000)) * 1000).toISOString(),
+            datacontenttype: "application/json",
+            data: {
+              update_id: update.update_id,
+              message_id: msg.message_id,
+              chat_id: msg.chat?.id ?? null,
+              chat_type: msg.chat?.type ?? null,
+              from_id: msg.from?.id ?? null,
+              from_username: msg.from?.username ?? null,
+              from_name: [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") || null,
+              reply_to_message_id: msg.reply_to_message?.message_id ?? null,
+              text,
+            },
+          };
+          const reply = await mesh.send(target, event);
+          if (reply.type === "nack" && reply.error === "unavailable") {
+            throw new Error("Mesh store temporarily unavailable; retrying update");
+          }
+        }
+      }
+      saveOffset(nextOffset);
+    }
+  } catch (error) {
+    console.error(`telegram poll error: ${error instanceof Error ? error.message : String(error)}`);
+    await new Promise((r) => setTimeout(r, backoff));
+    backoff = Math.min(backoff * 2, 30_000);
+  }
+}

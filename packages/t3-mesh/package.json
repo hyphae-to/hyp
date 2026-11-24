@@ -1,0 +1,27 @@
+{
+  "name": "t3-mesh",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.10.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "t3-mesh": "./src/cli.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --test 'src/**/*.test.ts'",
+    "pin": "scripts/update-t3-pin.sh"
+  },
+  "dependencies": {
+    "@t3tools/client-runtime": "link:vendor/t3code/packages/client-runtime",
+    "@t3tools/contracts": "link:vendor/t3code/packages/contracts",
+    "effect": "link:vendor/t3code/packages/contracts/node_modules/effect"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.4",
+    "typescript": "7.0.2"
+  }
+}

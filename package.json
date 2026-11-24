@@ -1,0 +1,40 @@
+{
+  "name": "@hyphae-sh/cli",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "connector": "node src/cli.ts",
+    "test": "node --test 'src/**/*.test.ts'",
+    "test:harnesses": "node --test 'test/harnesses/**/*.test.ts'",
+    "typecheck": "tsc --noEmit",
+    "router": "node src/cli.ts router",
+    "site": "node -e 'import(\"node:http\").then(({createServer})=>import(\"node:fs\").then(({readFileSync})=>{const t={\".html\":\"text/html\",\".css\":\"text/css\",\".js\":\"text/javascript\",\".jpg\":\"image/jpeg\",\".jpeg\":\"image/jpeg\",\".png\":\"image/png\",\".svg\":\"image/svg+xml\",\".webp\":\"image/webp\",\".sh\":\"text/plain\"};createServer((q,s)=>{const u=(q.url||\"/\").split(\"?\")[0];const f=\"site\"+(u===\"/\"?\"/index.html\":u);try{const b=readFileSync(f);const ext=f.slice(f.lastIndexOf(\".\"));s.writeHead(200,{\"content-type\":t[ext]||\"application/octet-stream\"});s.end(b)}catch{s.writeHead(404).end(\"Not found\")}}).listen(4173,\"127.0.0.1\",()=>console.log(\"Presentation site running at http://127.0.0.1:4173\"))}))'",
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  },
+  "bin": {
+    "hph": "bin/hyphae.mjs",
+    "hyphae": "bin/hyphae.mjs"
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.9.0",
+    "effect": "4.1.5"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "docs",
+    "deploy",
+    "plugins",
+    "skills",
+    "install.sh"
+  ],
+  "version": "0.1.0"
+}
