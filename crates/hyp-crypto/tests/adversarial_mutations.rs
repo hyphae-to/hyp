@@ -11,6 +11,7 @@ use std::io::Write;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 use hyp_crypto::compat_v1::{
@@ -24,9 +25,18 @@ use hyp_crypto::e2ee::{
     EpochScope, KvContext,
 };
 use hyp_crypto::hpke;
-use hyp_crypto::keys::{Ed25519KeyPair, Ed25519PublicKey, NodeIdentityKeys, X25519KeyPair, X25519PublicKey};
+use hyp_crypto::jcs::to_canonical_json;
+use hyp_crypto::keys::{
+    Ed25519KeyPair, Ed25519PublicKey, NodeIdentityKeys, OkpJwk, X25519KeyPair, X25519PublicKey,
+};
 use hyp_crypto::keystore::{validate_secret_name, SecretBackend, SecretStore};
-use hyp_crypto::rfc3339::now_unix_ms;
+use hyp_crypto::pairing::{
+    create_p2p_confirmation, create_p2p_offer, create_p2p_response, decode_am2, decode_hp2p1,
+    encode_am2, encode_hp2p1, sign_revocation_v2, verify_p2p_confirmation, verify_p2p_response,
+    verify_revocation_v2, AdminInviteV2, GrantV2, P2pOfferToken, P2pPairConfirmation,
+    P2pPairResponse, RevocationV2, AM2_PREFIX, HP2P1_PREFIX,
+};
+use hyp_crypto::rfc3339::{now_unix_ms, parse_rfc3339_millis};
 #[cfg(unix)]
 use hyp_crypto::transfer::{pack_tar_gz, TarInputEntry};
 use hyp_crypto::transfer::{
@@ -422,5 +432,474 @@ fn mutation_keystore_symlinks_permissions_and_traversal_in_ephemeral_tempdir() {
             store.get("valid-secret"),
             Err(CryptoError::Keystore(_))
         ));
+    }
+}
+
+/// Deterministic zero-dependency SplitMix64 PRNG for seeded mutation sweeps.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn gen_usize(&mut self, bound: usize) -> usize {
+        (self.next_u64() as usize) % bound
+    }
+}
+
+fn resolve_seed(default: u64) -> u64 {
+    match std::env::var("HYPHAE_TEST_SEED") {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if let Some(hex) = trimmed
+                .strip_prefix("0x")
+                .or_else(|| trimmed.strip_prefix("0X"))
+            {
+                u64::from_str_radix(hex, 16)
+                    .unwrap_or_else(|e| panic!("invalid hex HYPHAE_TEST_SEED={raw:?}: {e}"))
+            } else {
+                trimmed
+                    .parse::<u64>()
+                    .unwrap_or_else(|e| panic!("invalid decimal HYPHAE_TEST_SEED={raw:?}: {e}"))
+            }
+        }
+        Err(_) => default,
+    }
+}
+
+/// Wire-identical v2 self-signed key registration payload (`PUT /v1/keys`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KeyRegPayloadV2 {
+    v: u8,
+    node_id: String,
+    signing_jwk: OkpJwk,
+    encryption_jwk: OkpJwk,
+}
+
+fn flip_ascii_str_bit(s: &str, byte_idx: usize, bit_0_to_6: u8) -> String {
+    let mut bytes = s.as_bytes().to_vec();
+    let mask = 1u8 << (bit_0_to_6 % 7);
+    bytes[byte_idx] ^= mask;
+    String::from_utf8(bytes).expect("flipping bits 0..=6 of ASCII preserves UTF-8")
+}
+
+fn flip_token_ascii_bit(token: &str, byte_idx: usize, bit_0_to_6: u8) -> String {
+    let mut bytes = token.as_bytes().to_vec();
+    bytes[byte_idx] ^= 1u8 << (bit_0_to_6 % 7);
+    String::from_utf8(bytes).expect("token is ASCII")
+}
+
+#[test]
+fn seeded_1bit_mutation_sweep_am2_hp2p1_revocation_and_key_reg() {
+    let seed = resolve_seed(0xC0DE_5EED_2026);
+    let mut rng = SplitMix64::new(seed);
+    let now = parse_rfc3339_millis("2026-11-24T12:00:00Z").unwrap();
+
+    let admin = Ed25519KeyPair::generate().unwrap();
+    let alice = NodeIdentityKeys::generate().unwrap();
+    let bob = NodeIdentityKeys::generate().unwrap();
+
+    // =========================================================================
+    // 1. `am2_` Admin-CA Invite Bundle + `t3mp1_` Pairing Redemption
+    // =========================================================================
+    let issued = issue_grant_v1(&admin, "alice@macbook", &["*"], 60_000, now).unwrap();
+    let invite = AdminInviteV2 {
+        v: 2,
+        router: "https://mesh.acme.internal".into(),
+        admin_jwk: admin.to_jwk(),
+        pairing_code: issued.code.clone(),
+        require_e2ee: Some(true),
+    };
+    let encoded_am2 = encode_am2(&invite).unwrap();
+    assert_eq!(decode_am2(&encoded_am2).unwrap(), invite);
+
+    let redeem_am2 = |candidate_token: &str| -> Result<(), CryptoError> {
+        let decoded = decode_am2(candidate_token)?;
+        let code = parse_pairing_code_v1(&decoded.pairing_code)?;
+        if code.grant_id != issued.grant.id {
+            return Err(CryptoError::InvalidPairing("grant_id mismatch".into()));
+        }
+        let admin_pk = decoded.admin_jwk.to_ed25519()?;
+        let binding = sign_binding_v1(&issued.grant, &code, &alice.signing, &alice.encryption, now)?;
+        let entry = EntryV1 {
+            grant: issued.signed.clone(),
+            binding,
+        };
+        let _ = verify_entry_v1(&entry, &admin_pk)?;
+        Ok(())
+    };
+    redeem_am2(&encoded_am2).expect("baseline am2_ redemption must succeed");
+
+    // 1a. 72 seeded 1-bit flips across `admin_jwk.x` (32B) and `t3mp1_` raw bytes (44B) -> 100% fail closed!
+    let orig_admin_x = URL_SAFE_NO_PAD.decode(&invite.admin_jwk.x).unwrap();
+    let orig_t3mp1_raw = URL_SAFE_NO_PAD
+        .decode(invite.pairing_code.strip_prefix("t3mp1_").unwrap())
+        .unwrap();
+    let am2_crypto_total = orig_admin_x.len() + orig_t3mp1_raw.len();
+    for step in 0..72usize {
+        let pos = rng.gen_usize(am2_crypto_total);
+        let bit = (rng.next_u64() % 8) as u8;
+        let mask = 1u8 << bit;
+        let mut mutated = invite.clone();
+        if pos < orig_admin_x.len() {
+            let mut x = orig_admin_x.clone();
+            x[pos] ^= mask;
+            mutated.admin_jwk.x = URL_SAFE_NO_PAD.encode(x);
+        } else {
+            let mut raw = orig_t3mp1_raw.clone();
+            raw[pos - orig_admin_x.len()] ^= mask;
+            mutated.pairing_code = format!("t3mp1_{}", URL_SAFE_NO_PAD.encode(raw));
+        }
+        let canon = to_canonical_json(&mutated).unwrap();
+        let mutated_token = format!("{AM2_PREFIX}{}", URL_SAFE_NO_PAD.encode(canon.as_bytes()));
+        assert!(
+            redeem_am2(&mutated_token).is_err(),
+            "seed=0x{seed:016x} step={step}: am2_ crypto 1-bit flip (pos={pos}, bit={bit}) was not rejected!"
+        );
+    }
+
+    // 1b. 72 seeded 1-bit flips across raw encoded `am2_<base64url>` bytes -> zero panics & fail-closed!
+    for step in 0..72usize {
+        let pos = rng.gen_usize(encoded_am2.len());
+        let bit = (rng.next_u64() % 7) as u8;
+        let mutated_token = flip_token_ascii_bit(&encoded_am2, pos, bit);
+        if let Ok(decoded) = decode_am2(&mutated_token) {
+            assert_ne!(
+                decoded, invite,
+                "seed=0x{seed:016x} step={step}: mutated am2_ decoded identically at pos={pos}"
+            );
+            // Any mutation touching admin_jwk or pairing_code MUST fail redemption.
+            if decoded.admin_jwk != invite.admin_jwk || decoded.pairing_code != invite.pairing_code {
+                assert!(
+                    redeem_am2(&mutated_token).is_err(),
+                    "seed=0x{seed:016x} step={step}: mutated am2_ key/code passed redemption at pos={pos}"
+                );
+            }
+        }
+    }
+
+    // =========================================================================
+    // 2. `hp2p1_` Direct P2P Offer + `P2pPairResponse` + `P2pPairConfirmation`
+    // =========================================================================
+    let offer = create_p2p_offer(
+        "offer-seed-99",
+        "alice@macbook",
+        "https://alice.tailnet.ts.net",
+        &alice,
+        vec!["dm:send".into(), "dm:receive".into()],
+        vec!["dm:send".into(), "kv:read=pair/*".into()],
+        "2026-11-24T13:00:00Z",
+    )
+    .unwrap();
+    let encoded_hp2p1 = encode_hp2p1(&offer).unwrap();
+    assert_eq!(decode_hp2p1(&encoded_hp2p1).unwrap(), offer);
+
+    let bob_grant = GrantV2 {
+        v: 2,
+        id: "grant-bob-to-alice".into(),
+        node_id: "alice@macbook".into(),
+        scopes: vec!["dm:send".into(), "kv:read=pair/*".into()],
+        trust_tier: Some("peer".into()),
+        pairing_key: None,
+        subject_signing_jwk: Some(offer.signing_jwk.clone()),
+        subject_encryption_jwk: Some(offer.encryption_jwk.clone()),
+        issued_at: "2026-11-24T12:05:00Z".into(),
+        pair_by: None,
+        expires_at: Some("2027-11-24T12:05:00Z".into()),
+    };
+    let p2p_resp = create_p2p_response(
+        &offer,
+        "bob@laptop",
+        Some("https://bob.tailnet.ts.net"),
+        &bob,
+        &bob_grant,
+    )
+    .unwrap();
+    let verified_peer = verify_p2p_response(&offer, &p2p_resp, now).unwrap();
+    assert_eq!(verified_peer.bob_node_id, "bob@laptop");
+
+    let alice_grant = GrantV2 {
+        v: 2,
+        id: "grant-alice-to-bob".into(),
+        node_id: "bob@laptop".into(),
+        scopes: vec!["dm:send".into(), "dm:receive".into()],
+        trust_tier: Some("peer".into()),
+        pairing_key: None,
+        subject_signing_jwk: Some(bob.signing_jwk()),
+        subject_encryption_jwk: Some(bob.encryption_jwk()),
+        issued_at: "2026-11-24T12:05:01Z".into(),
+        pair_by: None,
+        expires_at: None,
+    };
+    let p2p_conf = create_p2p_confirmation(&offer.offer_id, &alice_grant, &alice.signing).unwrap();
+    verify_p2p_confirmation(&offer, &p2p_conf, "bob@laptop").unwrap();
+
+    let run_full_p2p_handshake = |candidate_hp2p1: &str| -> Result<(), CryptoError> {
+        let decoded_offer: P2pOfferToken = decode_hp2p1(candidate_hp2p1)?;
+        let mut grant = bob_grant.clone();
+        grant.node_id = decoded_offer.node_id.clone();
+        grant.subject_signing_jwk = Some(decoded_offer.signing_jwk.clone());
+        grant.subject_encryption_jwk = Some(decoded_offer.encryption_jwk.clone());
+        let resp = create_p2p_response(
+            &decoded_offer,
+            "bob@laptop",
+            Some("https://bob.tailnet.ts.net"),
+            &bob,
+            &grant,
+        )?;
+        // Alice verifies Bob's response against her true offer (checks offerId, nodeId, secret MAC, selfSig).
+        let _ = verify_p2p_response(&offer, &resp, now)?;
+        // Bob verifies Alice's real confirmation against the zero-TOFU signing_jwk from the offer.
+        let _ = verify_p2p_confirmation(&decoded_offer, &p2p_conf, "bob@laptop")?;
+        // Bob encrypts a DM to the zero-TOFU encryption_jwk from the offer; Alice opens it.
+        let alice_enc_from_offer = decoded_offer.encryption_jwk.to_x25519()?;
+        let dm_ctx = DmContext {
+            node_id: "alice@macbook",
+            msg_id: "p2p-check",
+            sender: "bob@laptop/codex",
+            recipient: "alice@macbook/claude",
+        };
+        let env = seal_dm(&dm_ctx, b"p2p-hello", &bob.signing, &alice_enc_from_offer)?;
+        let pt = open_dm(&env, &dm_ctx, &bob.signing.public_key(), &alice.encryption)?;
+        if pt.as_slice() != b"p2p-hello" {
+            return Err(CryptoError::InvalidPairing("dm plaintext mismatch".into()));
+        }
+        Ok(())
+    };
+    run_full_p2p_handshake(&encoded_hp2p1).expect("baseline hp2p1_ handshake must succeed");
+
+    // 2a. 72 seeded 1-bit flips across `hp2p1_` crypto/identity fields (`secret`, `signing_jwk`, `encryption_jwk`, `offer_id`, `node_id`) -> 100% fail closed!
+    let orig_secret = URL_SAFE_NO_PAD.decode(&offer.secret).unwrap();
+    let orig_sign_x = URL_SAFE_NO_PAD.decode(&offer.signing_jwk.x).unwrap();
+    let orig_enc_x = URL_SAFE_NO_PAD.decode(&offer.encryption_jwk.x).unwrap();
+    let total_offer_crypto =
+        orig_secret.len() + orig_sign_x.len() + orig_enc_x.len() + offer.offer_id.len() + offer.node_id.len();
+    for step in 0..72usize {
+        let mut pos = rng.gen_usize(total_offer_crypto);
+        let bit = (rng.next_u64() % 8) as u8;
+        let mut mutated = offer.clone();
+        if pos < orig_secret.len() {
+            let mut s = orig_secret.clone();
+            s[pos] ^= 1u8 << bit;
+            mutated.secret = URL_SAFE_NO_PAD.encode(s);
+        } else {
+            pos -= orig_secret.len();
+            if pos < orig_sign_x.len() {
+                let mut x = orig_sign_x.clone();
+                x[pos] ^= 1u8 << bit;
+                mutated.signing_jwk.x = URL_SAFE_NO_PAD.encode(x);
+            } else {
+                pos -= orig_sign_x.len();
+                if pos < orig_enc_x.len() {
+                    let mut x = orig_enc_x.clone();
+                    x[pos] ^= 1u8 << bit;
+                    mutated.encryption_jwk.x = URL_SAFE_NO_PAD.encode(x);
+                } else {
+                    pos -= orig_enc_x.len();
+                    if pos < offer.offer_id.len() {
+                        mutated.offer_id = flip_ascii_str_bit(&offer.offer_id, pos, bit % 7);
+                    } else {
+                        pos -= offer.offer_id.len();
+                        mutated.node_id = flip_ascii_str_bit(&offer.node_id, pos, bit % 7);
+                    }
+                }
+            }
+        }
+        let canon = to_canonical_json(&mutated).unwrap();
+        let mutated_token = format!("{HP2P1_PREFIX}{}", URL_SAFE_NO_PAD.encode(canon.as_bytes()));
+        assert!(
+            run_full_p2p_handshake(&mutated_token).is_err(),
+            "seed=0x{seed:016x} step={step}: hp2p1_ crypto 1-bit flip was not rejected!"
+        );
+    }
+
+    // 2b. 72 seeded 1-bit flips across raw encoded `hp2p1_<base64url>` bytes -> zero panics & fail-closed!
+    for step in 0..72usize {
+        let pos = rng.gen_usize(encoded_hp2p1.len());
+        let bit = (rng.next_u64() % 7) as u8;
+        let mutated_token = flip_token_ascii_bit(&encoded_hp2p1, pos, bit);
+        if let Ok(decoded) = decode_hp2p1(&mutated_token) {
+            assert_ne!(
+                decoded, offer,
+                "seed=0x{seed:016x} step={step}: mutated hp2p1_ decoded identically at pos={pos}"
+            );
+            if decoded.secret != offer.secret
+                || decoded.signing_jwk != offer.signing_jwk
+                || decoded.encryption_jwk != offer.encryption_jwk
+                || decoded.offer_id != offer.offer_id
+                || decoded.node_id != offer.node_id
+            {
+                assert!(
+                    run_full_p2p_handshake(&mutated_token).is_err(),
+                    "seed=0x{seed:016x} step={step}: mutated hp2p1_ crypto/identity passed handshake at pos={pos}"
+                );
+            }
+        }
+    }
+
+    // 2c. 72 seeded 1-bit flips across `P2pPairResponse` (`payload`, `binding_mac`, `self_sig`) -> 100% rejected!
+    let orig_mac = URL_SAFE_NO_PAD.decode(&p2p_resp.binding_mac).unwrap();
+    let orig_self_sig = URL_SAFE_NO_PAD.decode(&p2p_resp.self_sig).unwrap();
+    let resp_total = p2p_resp.payload.len() + orig_mac.len() + orig_self_sig.len();
+    for step in 0..72usize {
+        let pos = rng.gen_usize(resp_total);
+        let bit = (rng.next_u64() % 8) as u8;
+        let mut mutated: P2pPairResponse = p2p_resp.clone();
+        if pos < p2p_resp.payload.len() {
+            mutated.payload = flip_ascii_str_bit(&p2p_resp.payload, pos, bit % 7);
+        } else if pos < p2p_resp.payload.len() + orig_mac.len() {
+            let mut mac = orig_mac.clone();
+            mac[pos - p2p_resp.payload.len()] ^= 1u8 << bit;
+            mutated.binding_mac = URL_SAFE_NO_PAD.encode(mac);
+        } else {
+            let mut sig = orig_self_sig.clone();
+            sig[pos - p2p_resp.payload.len() - orig_mac.len()] ^= 1u8 << bit;
+            mutated.self_sig = URL_SAFE_NO_PAD.encode(sig);
+        }
+        assert!(
+            verify_p2p_response(&offer, &mutated, now).is_err(),
+            "seed=0x{seed:016x} step={step}: P2pPairResponse 1-bit flip (pos={pos}, bit={bit}) was accepted!"
+        );
+    }
+
+    // 2d. 72 seeded 1-bit flips across `P2pPairConfirmation` (`offer_id`, `payload`, `sig`) -> 100% rejected!
+    let orig_conf_sig = URL_SAFE_NO_PAD
+        .decode(&p2p_conf.alice_grant_to_bob.sig)
+        .unwrap();
+    let conf_total = p2p_conf.offer_id.len()
+        + p2p_conf.alice_grant_to_bob.payload.len()
+        + orig_conf_sig.len();
+    for step in 0..72usize {
+        let pos = rng.gen_usize(conf_total);
+        let bit = (rng.next_u64() % 8) as u8;
+        let mut mutated: P2pPairConfirmation = p2p_conf.clone();
+        if pos < p2p_conf.offer_id.len() {
+            mutated.offer_id = flip_ascii_str_bit(&p2p_conf.offer_id, pos, bit % 7);
+        } else if pos < p2p_conf.offer_id.len() + p2p_conf.alice_grant_to_bob.payload.len() {
+            let p_idx = pos - p2p_conf.offer_id.len();
+            mutated.alice_grant_to_bob.payload =
+                flip_ascii_str_bit(&p2p_conf.alice_grant_to_bob.payload, p_idx, bit % 7);
+        } else {
+            let s_idx = pos - p2p_conf.offer_id.len() - p2p_conf.alice_grant_to_bob.payload.len();
+            let mut sig = orig_conf_sig.clone();
+            sig[s_idx] ^= 1u8 << bit;
+            mutated.alice_grant_to_bob.sig = URL_SAFE_NO_PAD.encode(sig);
+        }
+        assert!(
+            verify_p2p_confirmation(&offer, &mutated, "bob@laptop").is_err(),
+            "seed=0x{seed:016x} step={step}: P2pPairConfirmation 1-bit flip (pos={pos}, bit={bit}) was accepted!"
+        );
+    }
+
+    // =========================================================================
+    // 3. Signed `RevocationV2` (72 seeded 1-bit flips across payload + sig)
+    // =========================================================================
+    let rev = RevocationV2 {
+        v: 2,
+        node_id: "alice@lost-laptop".into(),
+        grant_id: "grant-revoked-777".into(),
+        revoked_at: "2026-11-24T15:00:00Z".into(),
+        reason: Some("device_compromised".into()),
+    };
+    let signed_rev = sign_revocation_v2(&rev, &admin).unwrap();
+    assert_eq!(verify_revocation_v2(&signed_rev, &admin.public_key()).unwrap(), rev);
+
+    let orig_rev_sig = URL_SAFE_NO_PAD.decode(&signed_rev.sig).unwrap();
+    let rev_total = signed_rev.payload.len() + orig_rev_sig.len();
+    for step in 0..72usize {
+        let pos = rng.gen_usize(rev_total);
+        let bit = (rng.next_u64() % 8) as u8;
+        let mut mutated = signed_rev.clone();
+        if pos < signed_rev.payload.len() {
+            mutated.payload = flip_ascii_str_bit(&signed_rev.payload, pos, bit % 7);
+        } else {
+            let mut sig = orig_rev_sig.clone();
+            sig[pos - signed_rev.payload.len()] ^= 1u8 << bit;
+            mutated.sig = URL_SAFE_NO_PAD.encode(sig);
+        }
+        assert!(
+            verify_revocation_v2(&mutated, &admin.public_key()).is_err(),
+            "seed=0x{seed:016x} step={step}: RevocationV2 1-bit flip (pos={pos}, bit={bit}) was accepted!"
+        );
+    }
+
+    // =========================================================================
+    // 4. Signed `KeyRegPayloadV2` (+ `KeyRegistrationV1` parity sweep)
+    // =========================================================================
+    let key_reg_v2 = KeyRegPayloadV2 {
+        v: 2,
+        node_id: "alice@macbook".into(),
+        signing_jwk: alice.signing_jwk(),
+        encryption_jwk: alice.encryption_jwk(),
+    };
+    let signed_kr = alice.signing.sign_jcs("key-reg", &key_reg_v2).unwrap();
+    let verified_kr: KeyRegPayloadV2 = alice
+        .signing
+        .public_key()
+        .verify_signed("key-reg", &signed_kr)
+        .unwrap();
+    assert_eq!(verified_kr, key_reg_v2);
+    // Domain separation check: "key-reg" signature MUST NOT verify under "grant" or "revocation".
+    assert!(
+        alice
+            .signing
+            .public_key()
+            .verify_signed::<KeyRegPayloadV2>("grant", &signed_kr)
+            .is_err()
+    );
+
+    let orig_kr_sig = URL_SAFE_NO_PAD.decode(&signed_kr.sig).unwrap();
+    let kr_total = signed_kr.payload.len() + orig_kr_sig.len();
+    for step in 0..72usize {
+        let pos = rng.gen_usize(kr_total);
+        let bit = (rng.next_u64() % 8) as u8;
+        let mut mutated = signed_kr.clone();
+        if pos < signed_kr.payload.len() {
+            mutated.payload = flip_ascii_str_bit(&signed_kr.payload, pos, bit % 7);
+        } else {
+            let mut sig = orig_kr_sig.clone();
+            sig[pos - signed_kr.payload.len()] ^= 1u8 << bit;
+            mutated.sig = URL_SAFE_NO_PAD.encode(sig);
+        }
+        assert!(
+            alice
+                .signing
+                .public_key()
+                .verify_signed::<KeyRegPayloadV2>("key-reg", &mutated)
+                .is_err(),
+            "seed=0x{seed:016x} step={step}: KeyRegPayloadV2 1-bit flip (pos={pos}, bit={bit}) was accepted!"
+        );
+    }
+
+    // Also sweep 64 seeded 1-bit flips across `KeyRegistrationV1`.
+    let kr_v1 = create_key_registration_v1("alice@macbook", &alice.signing, &alice.encryption).unwrap();
+    assert!(verify_key_registration_v1("alice@macbook", &kr_v1).is_ok());
+    let orig_v1_sig = URL_SAFE_NO_PAD.decode(&kr_v1.proof.sig).unwrap();
+    let kr_v1_total = kr_v1.proof.payload.len() + orig_v1_sig.len();
+    for step in 0..64usize {
+        let pos = rng.gen_usize(kr_v1_total);
+        let bit = (rng.next_u64() % 8) as u8;
+        let mut mutated = kr_v1.clone();
+        if pos < kr_v1.proof.payload.len() {
+            mutated.proof.payload = flip_ascii_str_bit(&kr_v1.proof.payload, pos, bit % 7);
+        } else {
+            let mut sig = orig_v1_sig.clone();
+            sig[pos - kr_v1.proof.payload.len()] ^= 1u8 << bit;
+            mutated.proof.sig = URL_SAFE_NO_PAD.encode(sig);
+        }
+        assert!(
+            verify_key_registration_v1("alice@macbook", &mutated).is_err(),
+            "seed=0x{seed:016x} step={step}: KeyRegistrationV1 1-bit flip (pos={pos}, bit={bit}) was accepted!"
+        );
     }
 }
