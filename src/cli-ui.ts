@@ -307,6 +307,22 @@ export const CLI_COMMANDS: readonly CliCommandSpec[] = [
     ],
   },
   {
+    name: "send-files",
+    group: "core",
+    summary: "Send end-to-end encrypted files (X25519 + AES-256-GCM + Ed25519) directly to a peer handle",
+    usage: "hyp send-files <connector/handle> <file...> [--note <text>] [--from <handle>]",
+    flags: [
+      { flag: "-m, --note <text>", description: "Optional encrypted note delivered alongside the files" },
+      { flag: "--from <handle>", description: "Sender handle metadata inside the encrypted manifest" },
+      { flag: "--config <path>", description: "Path to connector.json (used when daemon is offline or overridden)" },
+      { flag: "--socket <path>", description: "Override local Connector socket path" },
+    ],
+    examples: [
+      "hyp send-files alice@laptop/dev ./report.md ./trace.log --note 'Crash trace'",
+      "hyp send-files alice@laptop/dev ./artifact.tar.gz --json",
+    ],
+  },
+  {
     name: "daemon",
     group: "runtime",
     summary: "Run the local Connector daemon (and embedded Node if configured) in the foreground",

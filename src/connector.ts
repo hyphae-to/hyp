@@ -1,9 +1,28 @@
 import { randomUUID } from "node:crypto";
+import { rmSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import type { Config } from "./config.ts";
+import { parseAddress } from "./core/address.ts";
+import { fingerprint as keyFingerprint, isRawKey, isSmallOrderKey, publicKeyFromRaw } from "./core/identity/keys.ts";
+import { packFiles, unpackFiles, type UnpackedTransfer } from "./core/transfer/pack.ts";
+import {
+  open as openTransfer,
+  OpenError,
+  readHeader,
+  seal as sealTransfer,
+  type TransferHeader,
+} from "./core/transfer/seal.ts";
 import { createDelivery, usesDurableMailbox, type Channel, type Delivery } from "./delivery.ts";
 import {
-  addressPattern, delivered, formatItem, formatUnreadDigest, handlePattern, hold, isDeliveryMode, isMode,
-  normalizeChannelName, normalizeMutePattern, object, reject, type DeliveryMode, type InboxItem, type Mode, type Outcome,
+  createEphemeralConnectorKeys,
+  createKeyRegistration,
+  loadOrCreateConnectorKeys,
+  type ConnectorKeys,
+} from "./identity.ts";
+import {
+  addressPattern, delivered, encodeData, formatItem, formatUnreadDigest, handlePattern, hold, isDeliveryMode, isMode,
+  normalizeChannelName, normalizeMutePattern, object, reject, UNTRUSTED_PROVENANCE,
+  type DeliveryMode, type InboxItem, type Mode, type Outcome,
 } from "./protocol.ts";
 import { RouterError, RouterLink } from "./router.ts";
 import type { MailboxEntry, MuteRule, Session, State } from "./state.ts";
@@ -11,7 +30,19 @@ import type { MailboxEntry, MuteRule, Session, State } from "./state.ts";
 const SUBSCRIPTION_CHANGES = Symbol();
 const MAX_SUBSCRIPTIONS = 20;
 const MAX_TEXT_BYTES = 16_384;
+const MAX_SEND_FILES = 50;
+const TRANSFER_TTL_MS = 24 * 60 * 60 * 1000;
 const invalid = (message: string) => new RouterError("invalid", message);
+
+export interface SendFilesResult {
+  readonly transferId: string;
+  readonly status: "stored";
+  readonly encrypted: true;
+  readonly to: string;
+  readonly files: ReadonlyArray<{ readonly name: string; readonly size: number; readonly sha256: string }>;
+  readonly ciphertextBytes: number;
+  readonly recipientFingerprint: string;
+}
 
 function slimTopicEntry(entry: unknown): unknown {
   if (!object(entry)) return entry;
@@ -73,6 +104,8 @@ export class Connector {
   readonly #mutations = new Map<string | symbol, Promise<unknown>>();
   readonly #dirty = new Set<string>();
   readonly #deliveryTails = new Map<string, Promise<unknown>>();
+  readonly #keysRegistered = new Set<string>();
+  #keys: ConnectorKeys | undefined;
 
   constructor(
     config: Config,
@@ -106,6 +139,36 @@ export class Connector {
     return [...this.#routers.keys()];
   }
 
+  get publicKeys(): { readonly signingPublic: string; readonly encryptionPublic: string; readonly fingerprint: string } {
+    const keys = this.#ensureKeys();
+    return {
+      signingPublic: keys.signingPublic,
+      encryptionPublic: keys.encryptionPublic,
+      fingerprint: keys.fingerprint,
+    };
+  }
+
+  #ensureKeys(): ConnectorKeys {
+    if (this.#keys) return this.#keys;
+    const keyDir = this.#config.configDir ?? this.#config.directory;
+    this.#keys = isAbsolute(keyDir)
+      ? loadOrCreateConnectorKeys(keyDir, this.#config.connectorId)
+      : createEphemeralConnectorKeys();
+    return this.#keys;
+  }
+
+  async #registerKeysIfSupported(name: string, router: RouterLink): Promise<void> {
+    try {
+      await router.registerKeys(createKeyRegistration(this.#config.connectorId, this.#ensureKeys()));
+      this.#keysRegistered.add(name);
+    } catch (error) {
+      if (error instanceof RouterError && (error.code === "not_found" || error.status === 404)) {
+        return;
+      }
+      throw error;
+    }
+  }
+
   #delivery(session: Session): Delivery {
     return createDelivery(session.backend, () => this.#channel(session.id));
   }
@@ -130,10 +193,100 @@ export class Connector {
   #sync(name: string): Promise<void> {
     return this.#change(name, async () => {
       const router = this.#router(name);
+      await this.#registerKeysIfSupported(name, router);
       if (name === "primary") await router.handles(this.#state.handles());
       await router.subscriptions(this.#state.subscriptions().filter((subscription) => subscription.router === name));
       this.#dirty.delete(name);
     });
+  }
+
+  /** Encrypts and uploads one or more regular files end-to-end to a direct peer (`<connector>/<handle>`). */
+  async sendFiles(options: {
+    readonly fromHandle?: string;
+    readonly to: string;
+    readonly files: readonly string[];
+    readonly text?: string;
+  }): Promise<SendFilesResult> {
+    const { to, files, text, fromHandle } = options;
+    if (
+      typeof to !== "string" ||
+      to.startsWith("#") ||
+      (/^[a-z0-9][a-z0-9._-]{0,31}:[a-z0-9][a-z0-9._-]{0,63}$/.test(to) && !to.includes("/"))
+    ) {
+      throw invalid(
+        "Encrypted file transfers require a direct peer address (<connector>/<handle>); #channels and local bridges are not supported",
+      );
+    }
+    const target = parseAddress(to);
+    if (!addressPattern.test(to) || target === null) {
+      throw invalid("Expected a direct peer address (<connector>/<handle>) for file transfer");
+    }
+    if (
+      !Array.isArray(files) ||
+      files.length === 0 ||
+      files.length > MAX_SEND_FILES ||
+      !files.every((entry): entry is string => typeof entry === "string" && isAbsolute(entry))
+    ) {
+      throw invalid(`Expected 'files' to be an array of 1..${MAX_SEND_FILES} absolute file paths`);
+    }
+    if (fromHandle !== undefined && (typeof fromHandle !== "string" || !handlePattern.test(fromHandle))) {
+      throw invalid("Invalid fromHandle");
+    }
+    if (text !== undefined && (typeof text !== "string" || Buffer.byteLength(text) > MAX_TEXT_BYTES)) {
+      throw invalid("Expected optional text note up to 16 KiB");
+    }
+
+    const primary = this.#router("primary");
+    const keys = this.#ensureKeys();
+    if (!this.#keysRegistered.has("primary")) {
+      await this.#registerKeysIfSupported("primary", primary);
+    }
+
+    const peerKeys = await primary.peerKeys();
+    const recipient = peerKeys.find((entry) => entry.connectorId === target.connectorId);
+    if (!recipient || !isRawKey(recipient.encryptionKey)) {
+      throw new RouterError(
+        "recipient_keys_unavailable",
+        `Recipient connector ${target.connectorId} has not registered encryption keys on the router`,
+      );
+    }
+
+    let packed;
+    try {
+      packed = packFiles(files, {
+        ...(fromHandle ? { fromHandle } : {}),
+        ...(text && text.length > 0 ? { note: text } : {}),
+      });
+    } catch (error) {
+      throw invalid(error instanceof Error ? error.message : "Failed to pack files");
+    }
+
+    const transferId = randomUUID();
+    const sealed = sealTransfer(
+      {
+        id: transferId,
+        type: "files",
+        from: this.#config.connectorId,
+        to: target.connectorId,
+        toHandle: target.handle,
+        ttlMs: TRANSFER_TTL_MS,
+      },
+      packed.payload,
+      keys.signingKey,
+      recipient.encryptionKey,
+    );
+
+    await primary.sendTransfer(transferId, sealed.header, sealed.ciphertext);
+
+    return {
+      transferId,
+      status: "stored",
+      encrypted: true,
+      to,
+      files: packed.manifest.files.map(({ name, size, sha256 }) => ({ name, size, sha256 })),
+      ciphertextBytes: sealed.ciphertext.length,
+      recipientFingerprint: keyFingerprint(recipient.encryptionKey),
+    };
   }
 
   async drain(): Promise<void> {
@@ -148,6 +301,27 @@ export class Connector {
 
   async #receive(router: string, item: InboxItem): Promise<Outcome> {
     await this.#mutations.get(router);
+    if (item.kind === "transfer") {
+      if (item.type !== "files") return reject("unsupported_transfer_type");
+      const header = readHeader(item.header);
+      if (header === null || header.id !== item.id || header.from !== item.from || header.type !== "files") {
+        return reject("corrupt");
+      }
+      if (header.to !== this.#config.connectorId) return reject("wrong_recipient");
+      if (header.toHandle === null) return reject("corrupt");
+      const target = this.#state.byHandle(header.toHandle);
+      if (!target) return reject("unknown_recipient");
+      const result = (this.#deliveryTails.get(target.id) ?? Promise.resolve()).then(() =>
+        this.#deliverTransfer(target, router, item, header),
+      );
+      const tail = result.catch(() => {});
+      this.#deliveryTails.set(target.id, tail);
+      try {
+        return await result;
+      } finally {
+        if (this.#deliveryTails.get(target.id) === tail) this.#deliveryTails.delete(target.id);
+      }
+    }
     let session: Session | undefined;
     let mode: Mode = "queue";
     if (item.kind === "message") {
@@ -175,7 +349,124 @@ export class Connector {
     }
   }
 
-  async #deliver(session: Session, router: string, item: InboxItem, mode: Mode): Promise<Outcome> {
+  async #deliverTransfer(
+    session: Session,
+    router: string,
+    item: Extract<InboxItem, { kind: "transfer" }>,
+    header: TransferHeader,
+  ): Promise<Outcome> {
+    const existingReceipt = this.#state.receipt(router, item.id);
+    if (existingReceipt === "submitted" || existingReceipt === "muted") return delivered;
+    if (existingReceipt === "submitting") return reject("previous_submission_outcome_unknown");
+    if (existingReceipt !== undefined && existingReceipt !== "interrupted") return reject(existingReceipt);
+
+    const connectorMute = `${header.from.toLowerCase()}/*`;
+    if (this.#state.isMuted(session.id, [connectorMute])) {
+      this.#state.record(router, item.id, "muted");
+      return delivered;
+    }
+
+    const routerLink = this.#router(router);
+    let peerKeys;
+    try {
+      peerKeys = await routerLink.peerKeys();
+    } catch (error) {
+      if (error instanceof RouterError && error.code === "router_unavailable") {
+        return hold("router_unavailable");
+      }
+      return reject("unknown_sender_key");
+    }
+
+    const sender = peerKeys.find((entry) => entry.connectorId === header.from);
+    if (!sender || !isRawKey(sender.signingKey) || isSmallOrderKey(sender.signingKey)) {
+      return reject("unknown_sender_key");
+    }
+
+    let ciphertext: Buffer;
+    try {
+      ciphertext = await routerLink.fetchTransfer(item.id);
+    } catch (error) {
+      if (error instanceof RouterError && error.code === "router_unavailable") {
+        return hold("router_unavailable");
+      }
+      return reject("transfer_missing");
+    }
+
+    let opened: { readonly header: TransferHeader; readonly plaintext: Buffer };
+    try {
+      opened = openTransfer(
+        item.header,
+        ciphertext,
+        publicKeyFromRaw(sender.signingKey, "ed25519"),
+        this.#ensureKeys().encryptionKey,
+      );
+    } catch (error) {
+      if (error instanceof OpenError) return reject(error.reason);
+      return reject("corrupt");
+    }
+
+    const destDir = join(this.#config.directory, "transfers", "inbox", header.id);
+    let unpacked: UnpackedTransfer;
+    try {
+      unpacked = unpackFiles(opened.plaintext, destDir);
+    } catch {
+      return reject("corrupt_pack");
+    }
+
+    if (unpacked.fromHandle) {
+      const exactMute = `${header.from.toLowerCase()}/${unpacked.fromHandle.toLowerCase()}`;
+      if (this.#state.isMuted(session.id, [exactMute])) {
+        rmSync(destDir, { recursive: true, force: true });
+        this.#state.record(router, item.id, "muted");
+        return delivered;
+      }
+    }
+
+    const totalBytes = unpacked.files.reduce((sum, file) => sum + file.size, 0);
+    const fileWord = unpacked.files.length === 1 ? "file" : "files";
+    const senderLabel = `${header.from}/${unpacked.fromHandle ?? "unknown"}`;
+    const senderSource = unpacked.fromHandle ? `${header.from}/${unpacked.fromHandle}` : header.from;
+
+    const displayed: string[] = [];
+    let summaryLen = 0;
+    let omitted = 0;
+    for (const file of unpacked.files) {
+      const token = `${file.name} (${file.size} B, sha256:${file.sha256.slice(0, 12)})`;
+      if (summaryLen + token.length > 8_000 && displayed.length > 0) {
+        omitted += 1;
+        continue;
+      }
+      displayed.push(token);
+      summaryLen += token.length + 2;
+    }
+    const filesLine = omitted > 0 ? `${displayed.join(", ")} (+${omitted} more)` : displayed.join(", ");
+
+    const lines = [
+      `hyphae files from ${senderLabel} · transfer ${header.id} · ${unpacked.files.length} ${fileWord} (${totalBytes} B) · E2EE verified`,
+      `saved to: ${unpacked.destDir}`,
+      `files: ${filesLine}`,
+    ];
+    if (unpacked.note && unpacked.note.length > 0) {
+      lines.push(UNTRUSTED_PROVENANCE);
+      lines.push(encodeData(unpacked.note));
+    }
+
+    const outcome = await this.#deliverPrepared(session, router, item.id, lines.join("\n"), "queue", {
+      kind: "message",
+      source: senderSource,
+    });
+    if (outcome.outcome !== "delivered") {
+      rmSync(destDir, { recursive: true, force: true });
+    }
+    return outcome;
+  }
+
+  async #deliver(
+    session: Session,
+    router: string,
+    item: Exclude<InboxItem, { kind: "transfer" }>,
+    mode: Mode,
+  ): Promise<Outcome> {
     const muteCandidates = this.#muteCandidates(item);
     if (this.#state.isMuted(session.id, muteCandidates)) {
       this.#state.record(router, item.id, "muted");
@@ -201,6 +492,9 @@ export class Connector {
       const ch = /^\[(#[^\]\s]+)\]\s/.exec(item.text);
       if (ch) list.push(ch[1].toLowerCase());
       return list;
+    }
+    if (item.kind === "transfer") {
+      return [`${item.from.toLowerCase()}/*`];
     }
     return [`topic:${item.topic.toLowerCase()}`];
   }
@@ -534,7 +828,44 @@ export class Connector {
         return { self: this.#address(session.handle), peers: object(value) ? value.peers : [] };
       }
       case "hyp_send": {
-        const { to, text } = args;
+        const { to, text, files } = args;
+        if (files !== undefined) {
+          if (typeof to !== "string") {
+            throw invalid("Expected destination 'to' (<connector>/<handle>) and 'files' (1..50 absolute paths)");
+          }
+          if (
+            to.startsWith("#") ||
+            (/^[a-z0-9][a-z0-9._-]{0,31}:[a-z0-9][a-z0-9._-]{0,63}$/.test(to) && !to.includes("/"))
+          ) {
+            throw invalid(
+              "Encrypted file transfers require a direct peer address (<connector>/<handle>); #channels and local bridges are not supported",
+            );
+          }
+          if (!addressPattern.test(to)) {
+            throw invalid("Expected a direct peer address (<connector>/<handle>) for file transfer");
+          }
+          if (
+            !Array.isArray(files) ||
+            files.length === 0 ||
+            files.length > MAX_SEND_FILES ||
+            !files.every((entry): entry is string => typeof entry === "string" && isAbsolute(entry))
+          ) {
+            throw invalid(`Expected 'files' to be an array of 1..${MAX_SEND_FILES} absolute file paths`);
+          }
+          if (text !== undefined && (typeof text !== "string" || Buffer.byteLength(text) > MAX_TEXT_BYTES)) {
+            throw invalid("Expected optional text note up to 16 KiB");
+          }
+          return this.#change("primary", async () => {
+            const handle = this.#state.session(sessionId)?.handle ?? null;
+            if (handle === null) throw new RouterError("not_enrolled", "Call hyp_join before sending");
+            return this.sendFiles({
+              fromHandle: handle,
+              to,
+              files,
+              ...(typeof text === "string" && text.length > 0 ? { text } : {}),
+            });
+          });
+        }
         if (typeof to !== "string" || typeof text !== "string") {
           throw invalid("Expected destination 'to' (<connector>/<handle>, #channel, or <plugin>:<target>) and text up to 16 KiB");
         }

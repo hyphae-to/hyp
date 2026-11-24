@@ -15,7 +15,16 @@ export interface Subscription {
 
 export type InboxItem =
   | { id: string; kind: "message"; from: string; to: string; text: string }
-  | { id: string; kind: "event"; subscriptionId: string; topic: string; events: Record<string, unknown>[] };
+  | { id: string; kind: "event"; subscriptionId: string; topic: string; events: Record<string, unknown>[] }
+  | {
+      id: string;
+      kind: "transfer";
+      from: string;
+      type: "files" | "fork" | "fork.result";
+      size: number;
+      header: { payload: string; sig: string };
+      sentAt?: string;
+    };
 
 export const CORE_MCP_TOOLS = [
   "hyp_session",
@@ -160,6 +169,28 @@ export function decodeItem(value: Record<string, unknown>): InboxItem | undefine
       typeof value.topic === "string" && Array.isArray(value.events) && value.events.every(object)) {
     return { id: value.id, kind: "event", subscriptionId: value.subscriptionId, topic: value.topic, events: value.events };
   }
+  if (
+    value.kind === "transfer" &&
+    typeof value.from === "string" &&
+    connectorPattern.test(value.from) &&
+    (value.type === "files" || value.type === "fork" || value.type === "fork.result") &&
+    typeof value.size === "number" &&
+    Number.isSafeInteger(value.size) &&
+    value.size > 0 &&
+    object(value.header) &&
+    typeof value.header.payload === "string" &&
+    typeof value.header.sig === "string"
+  ) {
+    return {
+      id: value.id,
+      kind: "transfer",
+      from: value.from,
+      type: value.type,
+      size: value.size,
+      header: { payload: value.header.payload, sig: value.header.sig },
+      ...(typeof value.sentAt === "string" ? { sentAt: value.sentAt } : {}),
+    };
+  }
   if ((value.kind === "message" || value.kind === undefined) && typeof value.from === "string" &&
       typeof value.to === "string" && typeof value.text === "string" && addressPattern.test(value.from) &&
       addressPattern.test(value.to)) {
@@ -167,7 +198,7 @@ export function decodeItem(value: Record<string, unknown>): InboxItem | undefine
   }
 }
 
-const encodeData = (data: unknown): string =>
+export const encodeData = (data: unknown): string =>
   JSON.stringify(data).replace(/[<>`\u007f-\u009f\u2028\u2029]/g, (character) =>
     `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
 
@@ -203,6 +234,9 @@ function compactEventForDisplay(event: Record<string, unknown>): Record<string, 
 export function formatItem(item: InboxItem): string {
   if (item.kind === "message") {
     return `hyphae from ${item.from}\n${UNTRUSTED_PROVENANCE}\n${encodeData(item.text)}`;
+  }
+  if (item.kind === "transfer") {
+    return `hyphae transfer from ${item.from} · ${item.type} · ${item.id} (${item.size} B)`;
   }
   const compactEvents = item.events.map(compactEventForDisplay);
   const lines = compactEvents.map(encodeData);

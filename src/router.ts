@@ -7,12 +7,21 @@ export interface RouterConfig {
   token: string;
 }
 
+export interface PeerKeyEntry {
+  readonly connectorId: string;
+  readonly signingKey: string;
+  readonly encryptionKey: string;
+  readonly source: string;
+}
+
 export class RouterError extends Error {
   readonly code: string;
+  readonly status?: number;
 
-  constructor(code: string, message: string) {
+  constructor(code: string, message: string, status?: number) {
     super(message);
     this.code = code;
+    this.status = status;
   }
 }
 
@@ -21,6 +30,16 @@ export class RouterLink {
 
   constructor(config: RouterConfig) {
     this.config = config;
+  }
+
+  async #parseError(response: Response): Promise<RouterError> {
+    const error: unknown = await response.json().catch(() => null);
+    const fallbackCode = response.status === 404 ? "not_found" : "router_unavailable";
+    return new RouterError(
+      object(error) && typeof error.error === "string" ? error.error : fallbackCode,
+      object(error) && typeof error.message === "string" ? error.message : `${this.config.name} returned HTTP ${response.status}`,
+      response.status,
+    );
   }
 
   async #request(method: string, path: string, body?: unknown, signal = AbortSignal.timeout(15_000)) {
@@ -38,11 +57,78 @@ export class RouterLink {
       throw new RouterError("router_unavailable", `${this.config.name} is unavailable`);
     }
     if (response.ok) return response;
-    const error: unknown = await response.json().catch(() => null);
-    throw new RouterError(
-      object(error) && typeof error.error === "string" ? error.error : "router_unavailable",
-      object(error) && typeof error.message === "string" ? error.message : `${this.config.name} returned HTTP ${response.status}`,
-    );
+    throw await this.#parseError(response);
+  }
+
+  async registerKeys(reg: unknown): Promise<void> {
+    await this.#request("PUT", "/v1/keys", reg);
+  }
+
+  async peerKeys(): Promise<PeerKeyEntry[]> {
+    const payload: unknown = await (await this.#request("GET", "/v1/keys")).json();
+    if (!object(payload) || !Array.isArray(payload.keys)) {
+      throw new RouterError("router_protocol", "Invalid keys response");
+    }
+    const result: PeerKeyEntry[] = [];
+    for (const entry of payload.keys) {
+      if (
+        object(entry) &&
+        typeof entry.connectorId === "string" &&
+        typeof entry.signingKey === "string" &&
+        typeof entry.encryptionKey === "string" &&
+        typeof entry.source === "string"
+      ) {
+        result.push({
+          connectorId: entry.connectorId,
+          signingKey: entry.signingKey,
+          encryptionKey: entry.encryptionKey,
+          source: entry.source,
+        });
+      }
+    }
+    return result;
+  }
+
+  async sendTransfer(
+    id: string,
+    signedHeader: { readonly payload: string; readonly sig: string },
+    ciphertext: Buffer,
+  ): Promise<void> {
+    let response: Response;
+    try {
+      response = await fetch(`${this.config.url}/v1/transfers/${encodeURIComponent(id)}`, {
+        method: "PUT",
+        redirect: "error",
+        signal: AbortSignal.timeout(60_000),
+        headers: {
+          authorization: `Bearer ${this.config.token}`,
+          "hyphae-transfer": Buffer.from(JSON.stringify(signedHeader), "utf8").toString("base64url"),
+          "content-type": "application/octet-stream",
+        },
+        body: new Uint8Array(ciphertext),
+      });
+    } catch {
+      throw new RouterError("router_unavailable", `${this.config.name} is unavailable`);
+    }
+    if (!response.ok) throw await this.#parseError(response);
+  }
+
+  async fetchTransfer(id: string): Promise<Buffer> {
+    let response: Response;
+    try {
+      response = await fetch(`${this.config.url}/v1/transfers/${encodeURIComponent(id)}`, {
+        method: "GET",
+        redirect: "error",
+        signal: AbortSignal.timeout(60_000),
+        headers: {
+          authorization: `Bearer ${this.config.token}`,
+        },
+      });
+    } catch {
+      throw new RouterError("router_unavailable", `${this.config.name} is unavailable`);
+    }
+    if (!response.ok) throw await this.#parseError(response);
+    return Buffer.from(await response.arrayBuffer());
   }
 
   async handles(handles: string[]): Promise<void> {

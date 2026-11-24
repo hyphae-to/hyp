@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -24,11 +25,17 @@ import { loadConfig } from "./config.ts";
 import { startDaemon } from "./daemon.ts";
 import { detectLocalEnvironment, discoverRemoteMachines, onboardRemoteOverSsh, probeRemoteHost } from "./discover.ts";
 import { daemonRpc, runHook, type HookEvent } from "./hooks.ts";
+import { createKeyRegistration, loadOrCreateConnectorKeys } from "./identity.ts";
 import { runMcp } from "./mcp.ts";
 import { ALL_GUIDES, CONNECTOR_BRIDGE_GUIDES, findGuide, ROUTER_STREAM_GUIDES } from "./plugin-catalog.ts";
-import { connectorPattern, isHarness, object } from "./protocol.ts";
+import { addressPattern, connectorPattern, handlePattern, isHarness, object } from "./protocol.ts";
 import { detectExposedTailscaleUrl, encodeInvite, exposeTailscale, unexposeTailscale } from "./remote.ts";
+import { RouterLink } from "./router.ts";
 import { defaultT3BaseDir, t3StateDbPath } from "./t3.ts";
+import { parseAddress } from "./core/address.ts";
+import { fingerprint as keyFingerprint, isRawKey } from "./core/identity/keys.ts";
+import { packFiles } from "./core/transfer/pack.ts";
+import { seal as sealTransfer } from "./core/transfer/seal.ts";
 import {
   captureSecretViaWeb,
   collectSecretRefs,
@@ -1662,6 +1669,188 @@ async function runCli(ctx: ExecutionContext): Promise<void> {
         mode,
       );
     }
+    return;
+  }
+
+  if (action === "send-files") {
+    ctx.command = "send-files";
+    const { values, positionals } = parseArgs({
+      args,
+      allowPositionals: true,
+      options: {
+        note: { type: "string", short: "m" },
+        from: { type: "string" },
+        socket: { type: "string" },
+        config: { type: "string" },
+      },
+    });
+    const [to, ...rawFiles] = positionals;
+    if (!to || !addressPattern.test(to) || rawFiles.length === 0 || rawFiles.length > 50) {
+      throw new CliUsageError(
+        !to
+          ? "Missing destination (<connector/handle>) and file paths"
+          : !addressPattern.test(to)
+            ? `Invalid destination '${to}' (expected direct peer address <connector>/<handle>)`
+            : rawFiles.length === 0
+              ? "Expected at least one file path to send"
+              : "At most 50 files can be sent per transfer",
+        {
+          usage: "hyp send-files <connector/handle> <file...> [--note <text>] [--from <handle>] [--config <path>] [--socket <path>]",
+        },
+      );
+    }
+    if (values.from !== undefined && !handlePattern.test(values.from)) {
+      throw new CliUsageError(`Invalid --from handle '${values.from}'`, {
+        usage: "hyp send-files <connector/handle> <file...> [--note <text>] [--from <handle>]",
+      });
+    }
+    const files = rawFiles.map((file) => resolve(file));
+    const cfgPath = resolve(values.config ?? defaultConfigPath());
+    let socketPath = values.socket;
+    if (!socketPath) {
+      if (values.config && existsSync(cfgPath)) {
+        try {
+          socketPath = join(loadConfig(cfgPath).directory, "connector.sock");
+        } catch {
+          socketPath = defaultSocketPath();
+        }
+      } else {
+        socketPath = defaultSocketPath();
+      }
+    }
+
+    type TransferOut = {
+      transferId: string;
+      status: string;
+      encrypted: boolean;
+      to: string;
+      files: Array<{ name: string; size: number; sha256: string }>;
+      ciphertextBytes: number;
+      recipientFingerprint: string;
+    };
+
+    let via: "daemon" | "standalone" = "daemon";
+    let transferResult: TransferOut;
+
+    const rpcRes = await daemonRpc(
+      socketPath,
+      {
+        type: "transfer.send",
+        to,
+        files,
+        ...(values.note ? { text: values.note } : {}),
+        ...(values.from ? { fromHandle: values.from } : {}),
+      },
+      60_000,
+    );
+
+    if (rpcRes.ok && rpcRes.result) {
+      transferResult = rpcRes.result as unknown as TransferOut;
+    } else if (rpcRes.error !== undefined) {
+      throw new CliOperationalError(rpcRes.error, {
+        code: "TRANSFER_FAILED",
+        fix: "Verify the recipient connector is online and registered on the router, and that all file paths exist",
+      });
+    } else {
+      // Fallback: standalone direct upload using connector.json + connector secret store keys.
+      if (!existsSync(cfgPath)) {
+        throw new CliOperationalError(
+          `Connector daemon not reachable at ${socketPath} and config not found at ${cfgPath}`,
+          {
+            code: "DAEMON_UNREACHABLE",
+            fix: "Run `hyp daemon` or pass `--config <connector.json>`",
+          },
+        );
+      }
+      via = "standalone";
+      const config = loadConfig(cfgPath);
+      const primaryCfg = config.routers.find((r) => r.name === "primary");
+      if (!primaryCfg) {
+        throw new CliOperationalError("No primary router configured in connector.json", { code: "CONFIG_INVALID" });
+      }
+      const target = parseAddress(to);
+      if (!target) {
+        throw new CliUsageError(`Invalid destination '${to}'`);
+      }
+      const keys = loadOrCreateConnectorKeys(config.configDir ?? config.directory, config.connectorId);
+      const router = new RouterLink(primaryCfg);
+      await router.registerKeys(createKeyRegistration(config.connectorId, keys));
+      const peerKeys = await router.peerKeys();
+      const recipient = peerKeys.find((entry) => entry.connectorId === target.connectorId);
+      if (!recipient || !isRawKey(recipient.encryptionKey)) {
+        throw new CliOperationalError(
+          `Recipient connector ${target.connectorId} has not registered encryption keys on the router`,
+          {
+            code: "RECIPIENT_KEYS_UNAVAILABLE",
+            fix: `Ensure ${target.connectorId}'s connector daemon has connected to the router at least once`,
+          },
+        );
+      }
+      const packed = packFiles(files, {
+        ...(values.from ? { fromHandle: values.from } : {}),
+        ...(values.note ? { note: values.note } : {}),
+      });
+      const transferId = randomUUID();
+      const sealed = sealTransfer(
+        {
+          id: transferId,
+          type: "files",
+          from: config.connectorId,
+          to: target.connectorId,
+          toHandle: target.handle,
+          ttlMs: 24 * 60 * 60 * 1000,
+        },
+        packed.payload,
+        keys.signingKey,
+        recipient.encryptionKey,
+      );
+      await router.sendTransfer(transferId, sealed.header, sealed.ciphertext);
+      transferResult = {
+        transferId,
+        status: "stored",
+        encrypted: true,
+        to,
+        files: packed.manifest.files.map(({ name, size, sha256 }) => ({ name, size, sha256 })),
+        ciphertextBytes: sealed.ciphertext.length,
+        recipientFingerprint: keyFingerprint(recipient.encryptionKey),
+      };
+    }
+
+    const fileRows: CliTableRow[] = transferResult.files.map((file) => ({
+      name: file.name,
+      size: `${file.size} B`,
+      sha256: file.sha256.slice(0, 12),
+    }));
+
+    emitResult(
+      {
+        ok: true,
+        command: "send-files",
+        title: "Encrypted Files Sent",
+        summary: `Sent ${transferResult.files.length} E2EE file(s) to ${transferResult.to} (${transferResult.ciphertextBytes} B ciphertext)`,
+        fields: [
+          { label: "Destination", value: transferResult.to },
+          { label: "Transfer ID", value: transferResult.transferId },
+          { label: "Encryption", value: "E2EE (X25519 + AES-256-GCM + Ed25519)" },
+          { label: "Recipient Key", value: transferResult.recipientFingerprint },
+          { label: "Ciphertext", value: `${transferResult.ciphertextBytes} B` },
+          { label: "Via", value: via },
+        ],
+        tables: [
+          {
+            title: "Files",
+            columns: [
+              { key: "name", header: "File" },
+              { key: "size", header: "Size", align: "right" },
+              { key: "sha256", header: "SHA-256" },
+            ],
+            rows: fileRows,
+          },
+        ],
+        data: { ...transferResult, via },
+      },
+      mode,
+    );
     return;
   }
 

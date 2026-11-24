@@ -96,7 +96,7 @@ export interface Signed {
 }
 
 /** `attestation`: a role decision for the bayfold work-record writer (src/attest.ts). */
-export type SignatureKind = "grant" | "binding" | "binding-self" | "revocation" | "transfer" | "attestation";
+export type SignatureKind = "grant" | "binding" | "binding-self" | "revocation" | "transfer" | "attestation" | "key-reg";
 
 const signedBytes = (kind: SignatureKind, payload: string): Buffer => Buffer.from(`t3-mesh/v1/${kind}\n${payload}`, "utf8");
 

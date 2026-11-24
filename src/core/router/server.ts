@@ -228,6 +228,26 @@ export async function serveRouter(options: RouterServerOptions): Promise<Running
         pairingJson(response, core.pairing.directory());
         return;
       }
+      if (route === "PUT /v1/keys") {
+        const result = core.registerKeys(connectorId, await readJson(request, MAX_PAIRING_BODY_BYTES));
+        if (result.ok) {
+          json(response, 200, {
+            connectorId: result.connectorId,
+            signingKey: result.signingKey,
+            encryptionKey: result.encryptionKey,
+          });
+        } else {
+          json(response, result.error === "unauthorized" ? 401 : 400, {
+            error: result.error,
+            message: result.message,
+          });
+        }
+        return;
+      }
+      if (route === "GET /v1/keys") {
+        json(response, 200, { keys: core.connectorKeys() });
+        return;
+      }
       const transferMatch = /^(PUT|GET) \/v1\/transfers\/([0-9a-f-]{36})$/.exec(route);
       if (transferMatch?.[2] !== undefined) {
         const id = transferMatch[2];

@@ -1,13 +1,15 @@
 // Router state and rules (SPEC.md sections 7-8 and 12), on SQLite. Used by the HTTP router (file DB)
 // and the loopback router (in-memory DB). Transport-agnostic: a connector attaches an `offer`
 // callback and answers each offered message or event batch with `ack`.
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, type KeyObject } from "node:crypto";
 import { appendFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import * as Schema from "../validate.ts";
 import { formatAddress, isConnectorId, isHandle, parseAddress } from "../address.ts";
+import { SignedSchema, type Identity } from "../identity/grant.ts";
+import { isRawKey, isSmallOrderKey, publicKeyFromRaw, verifyPayload } from "../identity/keys.ts";
 import { ScopeSet, UNPAIRED_SCOPES } from "../identity/scopes.ts";
 import { DEFAULT_EVENT_LIMITS, EventRouter, type EventLimits } from "./events.ts";
 import { Pairing } from "./pairing.ts";
@@ -70,6 +72,34 @@ const HandleRow = Schema.Struct({ connector_id: Schema.String, handle: Schema.St
 const decodeHandleRows = Schema.decodeUnknownSync(Schema.Array(HandleRow));
 const CountRow = Schema.Struct({ n: Schema.Number });
 const decodeCount = (row: unknown): number => Schema.decodeUnknownSync(CountRow)(row).n;
+const ConnectorKeyRow = Schema.Struct({
+  connector_id: Schema.String,
+  signing_key: Schema.String,
+  encryption_key: Schema.String,
+  registered_at: Schema.Number,
+});
+const decodeConnectorKeyRow = Schema.decodeUnknownSync(ConnectorKeyRow);
+const decodeConnectorKeyRows = Schema.decodeUnknownSync(Schema.Array(ConnectorKeyRow));
+const RegisterKeysBody = Schema.Struct({
+  signingKey: Schema.String,
+  encryptionKey: Schema.String,
+  proof: SignedSchema,
+});
+const decodeRegisterKeysBody = Schema.decodeUnknownOption(RegisterKeysBody);
+const KeyRegPayload = Schema.Struct({
+  v: Schema.Literal(1),
+  connectorId: Schema.String,
+  signingKey: Schema.String,
+  encryptionKey: Schema.String,
+});
+const decodeKeyRegPayload = Schema.decodeUnknownOption(KeyRegPayload);
+const REGISTERED_KEY_SCOPES: readonly string[] = [
+  "messages:send",
+  "messages:receive",
+  "events:subscribe",
+  "files:send",
+  "files:receive",
+];
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS connectors (
@@ -77,6 +107,13 @@ CREATE TABLE IF NOT EXISTS connectors (
   token_hash TEXT NOT NULL UNIQUE,
   created_at INTEGER NOT NULL,
   revoked_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS connector_keys (
+  connector_id TEXT PRIMARY KEY REFERENCES connectors(id) ON DELETE CASCADE,
+  signing_key TEXT NOT NULL,
+  encryption_key TEXT NOT NULL,
+  proof TEXT NOT NULL,
+  registered_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS handles (
   connector_id TEXT NOT NULL REFERENCES connectors(id),
@@ -200,7 +237,8 @@ export class RouterCore {
       limits: options.transferLimits ?? { ...DEFAULT_TRANSFER_LIMITS, holdRetryMs: this.#limits.holdRetryMs },
       now: this.#now,
       audit: (fields) => this.#audit(fields),
-      identity: (connectorId) => this.pairing.identity(connectorId),
+      identity: (connectorId) => this.#transferIdentity(connectorId),
+      onStored: (connectorId) => this.#drain(connectorId),
     });
   }
 
@@ -275,11 +313,152 @@ export class RouterCore {
       .run(this.#now(), id).changes;
     if (Number(changed) === 0) return false;
     this.setHandles(id, []);
+    this.#db.prepare("DELETE FROM connector_keys WHERE connector_id = ?").run(id);
     this.events.removeConnector(id);
     this.transfers.removeConnector(id);
     this.#attached.delete(id);
     this.#audit({ event: "connector.revoked", connector: id });
     return true;
+  }
+
+  /**
+   * Registers a connector's self-signed Ed25519/X25519 public keys (`PUT /v1/keys`).
+   * On strict paired routers (`--admin-key`), `TransferStore` still uses admin-signed pairing grants exclusively.
+   */
+  registerKeys(
+    connectorId: string,
+    body: unknown,
+  ):
+    | { readonly ok: true; readonly connectorId: string; readonly signingKey: string; readonly encryptionKey: string }
+    | { readonly ok: false; readonly error: "invalid" | "unauthorized"; readonly message: string } {
+    const active = this.#db.prepare("SELECT id FROM connectors WHERE id = ? AND revoked_at IS NULL").get(connectorId);
+    if (active === undefined) {
+      return { ok: false, error: "unauthorized", message: `connector ${connectorId} is not active` };
+    }
+    const decoded = decodeRegisterKeysBody(body);
+    if (decoded._tag === "None") {
+      return { ok: false, error: "invalid", message: "expected {signingKey, encryptionKey, proof: {payload, sig}}" };
+    }
+    const { signingKey, encryptionKey, proof } = decoded.value;
+    if (!isRawKey(signingKey) || isSmallOrderKey(signingKey)) {
+      return { ok: false, error: "invalid", message: "invalid Ed25519 signingKey" };
+    }
+    if (!isRawKey(encryptionKey) || Buffer.from(encryptionKey, "base64url").every((byte) => byte === 0)) {
+      return { ok: false, error: "invalid", message: "invalid X25519 encryptionKey" };
+    }
+    let signingPub: KeyObject;
+    try {
+      signingPub = publicKeyFromRaw(signingKey, "ed25519");
+      publicKeyFromRaw(encryptionKey, "x25519");
+    } catch {
+      return { ok: false, error: "invalid", message: "malformed public key material" };
+    }
+    if (!verifyPayload("key-reg", proof.payload, proof.sig, signingPub)) {
+      return { ok: false, error: "unauthorized", message: "key registration proof signature is invalid" };
+    }
+    let parsedPayload: unknown;
+    try {
+      parsedPayload = JSON.parse(proof.payload);
+    } catch {
+      return { ok: false, error: "invalid", message: "key registration payload is not valid JSON" };
+    }
+    const payload = decodeKeyRegPayload(parsedPayload);
+    if (
+      payload._tag === "None" ||
+      payload.value.connectorId !== connectorId ||
+      payload.value.signingKey !== signingKey ||
+      payload.value.encryptionKey !== encryptionKey
+    ) {
+      return { ok: false, error: "invalid", message: "key registration payload does not match connector and keys" };
+    }
+    this.#db
+      .prepare(
+        "INSERT INTO connector_keys (connector_id, signing_key, encryption_key, proof, registered_at) " +
+          "VALUES (?, ?, ?, ?, ?) " +
+          "ON CONFLICT (connector_id) DO UPDATE SET " +
+          "signing_key = excluded.signing_key, encryption_key = excluded.encryption_key, " +
+          "proof = excluded.proof, registered_at = excluded.registered_at",
+      )
+      .run(connectorId, signingKey, encryptionKey, JSON.stringify(proof), this.#now());
+    this.#audit({ event: "connector.keys_registered", connector: connectorId, signingKey, encryptionKey });
+    return { ok: true, connectorId, signingKey, encryptionKey };
+  }
+
+  /** Returns unrevoked connectors' public keys, preferring admin-paired identities whenever pairing is configured. */
+  connectorKeys(): Array<{
+    readonly connectorId: string;
+    readonly signingKey: string;
+    readonly encryptionKey: string;
+    readonly source: "paired" | "registered";
+  }> {
+    const connectors = Schema.decodeUnknownSync(Schema.Array(ConnectorRow))(
+      this.#db.prepare("SELECT id FROM connectors WHERE revoked_at IS NULL ORDER BY id").all(),
+    );
+    const registeredRows = decodeConnectorKeyRows(
+      this.#db
+        .prepare(
+          "SELECT k.connector_id, k.signing_key, k.encryption_key, k.registered_at " +
+            "FROM connector_keys k JOIN connectors c ON c.id = k.connector_id WHERE c.revoked_at IS NULL",
+        )
+        .all(),
+    );
+    const registered = new Map(registeredRows.map((row) => [row.connector_id, row]));
+    const keys: Array<{
+      readonly connectorId: string;
+      readonly signingKey: string;
+      readonly encryptionKey: string;
+      readonly source: "paired" | "registered";
+    }> = [];
+    for (const { id } of connectors) {
+      if (this.pairing.configured) {
+        const paired = this.pairing.identity(id);
+        if (paired !== undefined) {
+          keys.push({
+            connectorId: id,
+            signingKey: paired.signingKey,
+            encryptionKey: paired.encryptionKey,
+            source: "paired",
+          });
+          continue;
+        }
+      }
+      const reg = registered.get(id);
+      if (reg !== undefined) {
+        keys.push({
+          connectorId: id,
+          signingKey: reg.signing_key,
+          encryptionKey: reg.encryption_key,
+          source: "registered",
+        });
+      }
+    }
+    return keys;
+  }
+
+  /** Triggers an immediate inbox drain for `connectorId` when a transfer becomes ready. */
+  notifyTransferReady(connectorId: string): void {
+    this.#drain(connectorId);
+  }
+
+  #transferIdentity(connectorId: string): Identity | undefined {
+    if (this.pairing.configured) return this.pairing.identity(connectorId);
+    const row = this.#db
+      .prepare(
+        "SELECT k.connector_id, k.signing_key, k.encryption_key, k.registered_at " +
+          "FROM connector_keys k JOIN connectors c ON c.id = k.connector_id " +
+          "WHERE k.connector_id = ? AND c.revoked_at IS NULL",
+      )
+      .get(connectorId);
+    if (row === undefined) return undefined;
+    const parsed = decodeConnectorKeyRow(row);
+    return {
+      connectorId: parsed.connector_id,
+      grantId: `registered:${parsed.connector_id}`,
+      issuedAt: new Date(parsed.registered_at).toISOString(),
+      scopes: REGISTERED_KEY_SCOPES,
+      signingKey: parsed.signing_key,
+      encryptionKey: parsed.encryption_key,
+    };
   }
 
   /** Issues a new token for a connector that just paired; any older token of that ID stops working. */

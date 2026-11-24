@@ -452,6 +452,31 @@ export async function startDaemon(config: Config, options: StartDaemonOptions = 
           return;
         }
 
+        if (type === "transfer.send") {
+          try {
+            const to = typeof packet.to === "string" ? packet.to : "";
+            const files = Array.isArray(packet.files) ? packet.files.filter((f): f is string => typeof f === "string") : [];
+            const text = typeof packet.text === "string" ? packet.text : undefined;
+            const fromHandle = typeof packet.fromHandle === "string" && packet.fromHandle.length > 0 ? packet.fromHandle : undefined;
+            const result = await connector.sendFiles({
+              to,
+              files,
+              ...(text !== undefined ? { text } : {}),
+              ...(fromHandle !== undefined ? { fromHandle } : {}),
+            });
+            send(socket, { ok: true, result });
+          } catch (error) {
+            send(socket, {
+              ok: false,
+              error: error instanceof RouterError
+                ? `${error.code}: ${error.message}`
+                : (error instanceof Error ? error.message : "transfer_send_failed"),
+            });
+          }
+          socket.end();
+          return;
+        }
+
         // ---- Blocking waiter / streaming watcher ----
         if (type === "wait.subscribe") {
           const mode = packet.mode === "stream" ? "stream" : "once";
