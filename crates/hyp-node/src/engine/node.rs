@@ -24,6 +24,7 @@ use bytes::Bytes;
 use http::header::AUTHORIZATION;
 use http::{HeaderMap, Method, Request};
 use ring::rand::{SecureRandom, SystemRandom};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, RwLock, broadcast, watch};
 use tokio::task::JoinHandle;
@@ -124,6 +125,20 @@ pub struct PeerLinkInfo {
     pub peer_id: String,
     pub endpoint: String,
     pub negotiated: NegotiatedSession,
+}
+
+/// Structured agent handle entry returned by [`UnifiedNode::discover_peer_handles`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredPeerHandle {
+    pub address: String,
+    pub node_id: String,
+    pub handle: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Connected peer/hub through which this remote handle was discovered (`None` for local handles).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 /// Result of `UnifiedNode::send_dm`.
@@ -696,35 +711,140 @@ impl UnifiedNode {
         session_id: &str,
         handle: &str,
     ) -> Result<HandleRecord, NodeError> {
+        self.register_handle_with_description(session_id, handle, None)
+            .await
+    }
+
+    /// Enrolls (or refreshes) a local handle for `session_id` with an optional human-readable
+    /// description (sanitized and capped at 200 Unicode characters by `hyp-store`) and syncs all
+    /// local handles and their stored descriptions to every active `PeerLink`.
+    pub async fn register_handle_with_description(
+        &self,
+        session_id: &str,
+        handle: &str,
+        description: Option<&str>,
+    ) -> Result<HandleRecord, NodeError> {
         let _ = Handle::new(handle)?;
-        let (record, all_handles) = {
+        let (record, all_handles, descriptions) = {
             let db = self.db();
             let now = now_ms();
             if db.local().get_session(session_id)?.is_none() {
                 db.local().register_session(session_id, "{}", now)?;
             }
             db.local().set_session_handle(session_id, Some(handle), now)?;
-            let rec = db.messages().register_handle(
+            let rec = db.messages().register_handle_with_description(
                 self.config.node_id.as_str(),
                 handle,
                 Some(session_id),
+                description,
                 now,
             )?;
-            let all: Vec<String> = db
-                .messages()
-                .list_handles(Some(self.config.node_id.as_str()))?
-                .into_iter()
-                .map(|h| h.handle)
-                .collect();
-            (rec, all)
+            let (all, descs) =
+                collect_local_handles_and_descriptions(&db, self.config.node_id.as_str())?;
+            (rec, all, descs)
         };
 
         let links: Vec<Arc<PeerLink>> = self.peer_links.read().await.values().cloned().collect();
         for link in links {
-            let _ = link.put_handles(all_handles.clone()).await;
+            let _ = link
+                .put_handles_with_descriptions(&all_handles, &descriptions)
+                .await;
         }
 
         Ok(record)
+    }
+
+    /// Discovers enrolled agent handles across this node and all active connected peers/hubs,
+    /// returning structured entries sorted deterministically by `address` and learning multi-hub
+    /// `peer_routes` in SQLite for hub-relayed remote nodes (never overriding directly paired
+    /// `PeerProfile::P2p` peers).
+    pub async fn discover_peer_handles(&self) -> Vec<DiscoveredPeerHandle> {
+        let self_node = self.config.node_id.as_str();
+        // Keyed by `address` -> (preference_rank, entry)
+        // Rank: 0 = local, 1 = direct peer (`h.node_id == pid`), 2 = hub-relayed.
+        let mut by_addr: BTreeMap<String, (u8, DiscoveredPeerHandle)> = BTreeMap::new();
+
+        let (local_handles, active_peer_ids) = {
+            let db = self.db();
+            let locals = db
+                .messages()
+                .list_handles(Some(self_node))
+                .unwrap_or_default();
+            let mut peer_ids: Vec<String> = db
+                .peers()
+                .list_peers(Some(PeerStatus::Active))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.peer_id)
+                .collect();
+            peer_ids.sort();
+            (locals, peer_ids)
+        };
+
+        for h in local_handles {
+            let entry = DiscoveredPeerHandle {
+                address: h.address.clone(),
+                node_id: h.node_id,
+                handle: h.handle,
+                description: h.description.filter(|d| !d.is_empty()),
+                via: None,
+            };
+            by_addr.insert(h.address, (0, entry));
+        }
+
+        for pid in active_peer_ids {
+            let remote_handles = if let Some(link) = self.peer_link(&pid).await {
+                match link.get_handles(None).await {
+                    Ok(resp) => {
+                        self.learn_routes_from_handles(&pid, &resp.handles);
+                        resp.handles
+                    }
+                    Err(_) => continue,
+                }
+            } else {
+                // Outbound-only P2P peers connected inbound to our server may have already synced
+                // their handles into our local `handles` table via `PUT /v1/handles`.
+                let db = self.db();
+                db.messages().list_handles(Some(&pid)).unwrap_or_default()
+            };
+
+            for h in remote_handles {
+                if h.node_id == self_node {
+                    continue;
+                }
+                let rank = if h.node_id == pid { 1u8 } else { 2u8 };
+                let incoming = DiscoveredPeerHandle {
+                    address: h.address.clone(),
+                    node_id: h.node_id,
+                    handle: h.handle,
+                    description: h.description.filter(|d| !d.is_empty()),
+                    via: Some(pid.clone()),
+                };
+                match by_addr.entry(h.address) {
+                    std::collections::btree_map::Entry::Vacant(v) => {
+                        v.insert((rank, incoming));
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut o) => {
+                        let (cur_rank, cur_entry) = o.get_mut();
+                        if rank < *cur_rank {
+                            let preserved_desc = incoming
+                                .description
+                                .or_else(|| cur_entry.description.take());
+                            *cur_rank = rank;
+                            *cur_entry = DiscoveredPeerHandle {
+                                description: preserved_desc,
+                                ..incoming
+                            };
+                        } else if cur_entry.description.is_none() && incoming.description.is_some()
+                        {
+                            cur_entry.description = incoming.description;
+                        }
+                    }
+                }
+            }
+        }
+
+        by_addr.into_values().map(|(_, entry)| entry).collect()
     }
 
     pub fn drain_local_inbox(
@@ -2175,17 +2295,20 @@ impl UnifiedNode {
             map.insert(peer_id.to_string(), Arc::clone(&link));
         }
 
-        // Sync existing local handles to the newly connected peer.
-        let local_handles: Vec<String> = {
+        // Sync existing local handles and their stored descriptions to the newly connected peer.
+        let (local_handles, local_descriptions) = {
             let db = self.db();
-            db.messages()
-                .list_handles(Some(self.config.node_id.as_str()))?
-                .into_iter()
-                .map(|h| h.handle)
-                .collect()
+            collect_local_handles_and_descriptions(&db, self.config.node_id.as_str())?
         };
         if !local_handles.is_empty() {
-            let _ = link.put_handles(local_handles).await;
+            let _ = link
+                .put_handles_with_descriptions(&local_handles, &local_descriptions)
+                .await;
+        }
+
+        // Best-effort route seeding at connect time (non-fatal if peer is offline or legacy).
+        if let Ok(resp) = link.get_handles(None).await {
+            self.learn_routes_from_handles(peer_id, &resp.handles);
         }
 
         // Spawn (or replace) background SSE `/v1/inbox` worker for this peer.
@@ -2246,21 +2369,185 @@ impl UnifiedNode {
             .ok_or_else(|| NodeError::NotFound(format!("no active PeerLink to '{peer_id}'")))
     }
 
-    /// Finds the default hub (Router-profile peer) if any, else the sole active peer.
+    /// Finds the default hub (active Router-profile peer) if any, else the first active peer.
     async fn default_remote_peer(&self) -> Option<String> {
-        let active_links: Vec<String> = self.peer_links.read().await.keys().cloned().collect();
+        let mut active_links: Vec<String> = self.peer_links.read().await.keys().cloned().collect();
         if active_links.is_empty() {
             return None;
         }
+        active_links.sort();
         let db = self.db();
+        let mut fallback = None;
         for pid in &active_links {
-            if let Ok(Some(rec)) = db.peers().get_peer(pid) {
-                if rec.profile == hyp_store::PeerProfile::Router {
-                    return Some(pid.clone());
+            match db.peers().get_peer(pid) {
+                Ok(Some(rec)) => {
+                    if rec.status != PeerStatus::Active {
+                        continue;
+                    }
+                    if rec.profile == hyp_store::PeerProfile::Router {
+                        return Some(pid.clone());
+                    }
+                    if fallback.is_none() {
+                        fallback = Some(pid.clone());
+                    }
+                }
+                _ => {
+                    if fallback.is_none() {
+                        fallback = Some(pid.clone());
+                    }
                 }
             }
         }
-        active_links.into_iter().next()
+        fallback
+    }
+
+    fn learn_routes_from_handles(&self, via_peer: &str, handles: &[HandleRecord]) {
+        let now = now_ms();
+        let db = self.db();
+        let mut seen_nodes = HashSet::new();
+        for h in handles {
+            if h.node_id == self.config.node_id.as_str() || h.node_id == via_peer {
+                continue;
+            }
+            if !seen_nodes.insert(h.node_id.as_str()) {
+                continue;
+            }
+            let is_direct_p2p = db
+                .peers()
+                .get_peer(&h.node_id)
+                .ok()
+                .flatten()
+                .is_some_and(|p| {
+                    p.profile == hyp_store::PeerProfile::P2p && p.status == PeerStatus::Active
+                });
+            if is_direct_p2p {
+                continue;
+            }
+            let _ = db.peers().upsert_peer_route(&h.node_id, via_peer, now);
+        }
+    }
+
+    async fn refresh_routes_from_connected_peers(&self) {
+        let active_peer_ids: Vec<String> = {
+            let db = self.db();
+            let mut ids: Vec<String> = db
+                .peers()
+                .list_peers(Some(PeerStatus::Active))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.peer_id)
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        for pid in active_peer_ids {
+            if let Some(link) = self.peer_link(&pid).await {
+                if let Ok(resp) = link.get_handles(None).await {
+                    self.learn_routes_from_handles(&pid, &resp.handles);
+                }
+            }
+        }
+    }
+
+    async fn active_peer_link(&self, peer_id: &str) -> Option<Arc<PeerLink>> {
+        let link = self.peer_link(peer_id).await?;
+        let is_inactive = {
+            let db = self.db();
+            db.peers()
+                .get_peer(peer_id)
+                .ok()
+                .flatten()
+                .is_some_and(|p| p.status != PeerStatus::Active)
+        };
+        if is_inactive {
+            return None;
+        }
+        Some(link)
+    }
+
+    async fn active_connected_peer_count(&self) -> usize {
+        let link_ids: Vec<String> = self.peer_links.read().await.keys().cloned().collect();
+        if link_ids.is_empty() {
+            return 0;
+        }
+        let db = self.db();
+        link_ids
+            .into_iter()
+            .filter(|pid| {
+                !db.peers()
+                    .get_peer(pid)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|p| p.status != PeerStatus::Active)
+            })
+            .count()
+    }
+
+    /// Resolves the outbound `PeerLink` for sending a DM or file transfer to `target_node`.
+    ///
+    /// Route precedence:
+    /// 1. Explicit hub (`explicit_hub: Some(hub)` -> `require_peer_link(hub)`).
+    /// 2. Direct active `PeerLink` to `target_node`.
+    /// 3. Directly paired active `PeerProfile::P2p` peer (outbound-only SSE peer -> `Ok(None)`).
+    /// 4. Learned multi-hub route in `peer_routes` (with a single lazy route refresh across
+    ///    connected active peers on miss when >= 2 active peers are connected).
+    /// 5. Fallback to `default_remote_peer()`.
+    async fn resolve_outbound_link_for_target(
+        &self,
+        target_node: &str,
+        explicit_hub: Option<&NodeId>,
+    ) -> Result<Option<Arc<PeerLink>>, NodeError> {
+        if let Some(hub) = explicit_hub {
+            return Ok(Some(self.require_peer_link(hub.as_str()).await?));
+        }
+
+        if let Some(direct) = self.active_peer_link(target_node).await {
+            return Ok(Some(direct));
+        }
+
+        let is_direct_p2p = {
+            let db = self.db();
+            db.peers().get_peer(target_node)?.is_some_and(|p| {
+                p.profile == hyp_store::PeerProfile::P2p && p.status == PeerStatus::Active
+            })
+        };
+        if is_direct_p2p {
+            return Ok(None);
+        }
+
+        let learned_via = {
+            let db = self.db();
+            db.peers()
+                .get_peer_route(target_node)?
+                .map(|r| r.via_peer)
+        };
+        if let Some(via_peer) = learned_via {
+            if let Some(via_link) = self.active_peer_link(&via_peer).await {
+                return Ok(Some(via_link));
+            }
+        }
+
+        if self.active_connected_peer_count().await >= 2 {
+            self.refresh_routes_from_connected_peers().await;
+            let refreshed_via = {
+                let db = self.db();
+                db.peers()
+                    .get_peer_route(target_node)?
+                    .map(|r| r.via_peer)
+            };
+            if let Some(via_peer) = refreshed_via {
+                if let Some(via_link) = self.active_peer_link(&via_peer).await {
+                    return Ok(Some(via_link));
+                }
+            }
+        }
+
+        if let Some(hub_id) = self.default_remote_peer().await {
+            return Ok(self.active_peer_link(&hub_id).await);
+        }
+
+        Ok(None)
     }
 
     // ========================================================================
@@ -2482,27 +2769,11 @@ impl UnifiedNode {
             });
         }
 
-        // Case 2: Resolve outbound link (explicit hub -> direct P2P link -> default hub -> outbound-only local queue).
-        let outbound_link: Option<Arc<PeerLink>> = if let Some(ref hub) = explicit_hub {
-            Some(self.require_peer_link(hub.as_str()).await?)
-        } else if let Some(direct) = self.peer_link(target_node.as_str()).await {
-            Some(direct)
-        } else if let Some(hub_id) = self.default_remote_peer().await {
-            // Check if target_node is a paired outbound-only P2P peer connected to US via SSE.
-            let is_direct_paired = {
-                let db = self.db();
-                db.peers()
-                    .get_peer(target_node.as_str())?
-                    .is_some_and(|p| p.profile == hyp_store::PeerProfile::P2p)
-            };
-            if is_direct_paired {
-                None
-            } else {
-                self.peer_link(&hub_id).await
-            }
-        } else {
-            None
-        };
+        // Case 2: Resolve outbound link (explicit hub -> direct P2P link -> outbound-only P2P ->
+        // learned multi-hub route (+ lazy refresh) -> default hub).
+        let outbound_link = self
+            .resolve_outbound_link_for_target(target_node.as_str(), explicit_hub.as_ref())
+            .await?;
 
         // Determine routing host node (context bound into HPKE info + AEAD AAD + Ed25519 sig)
         // and check E2EE capability requirement fail-closed!
@@ -2528,7 +2799,9 @@ impl UnifiedNode {
             // Outbound-only P2P peer connected to our server via SSE `/v1/inbox`!
             let peer_exists = {
                 let db = self.db();
-                db.peers().get_peer(target_node.as_str())?.is_some()
+                db.peers()
+                    .get_peer(target_node.as_str())?
+                    .is_some_and(|p| p.status == PeerStatus::Active)
             };
             if !peer_exists {
                 return Err(NodeError::NotFound(format!(
@@ -4221,34 +4494,48 @@ impl UnifiedNode {
         via_hub: Option<&str>,
     ) -> Result<TransferSendResult, NodeError> {
         let _ = NodeId::new(target_node)?;
-        let route_peer = match via_hub {
-            Some(h) => h.to_string(),
-            None => {
-                if self.peer_link(target_node).await.is_some() {
-                    target_node.to_string()
-                } else {
-                    self.default_remote_peer().await.ok_or_else(|| {
-                        NodeError::NotFound(format!("no route to transfer target '{target_node}'"))
-                    })?
-                }
-            }
+        let explicit_hub = match via_hub {
+            Some(h) => Some(NodeId::new(h)?),
+            None => None,
         };
-        let link = self.require_peer_link(&route_peer).await?;
-        if !self.peer_supports_cap(&route_peer, &CapabilityToken::TransferStreamV2, Some(&link)) {
-            return Err(NodeError::CapabilityUnsupported(Box::new(
-                ProblemDetails::capability_unsupported(
-                    &CapabilityToken::TransferStreamV2,
-                    &route_peer,
-                    &self.config.hyphae_version,
-                    "unknown",
-                    Some("2.0.0"),
-                    true,
-                    None,
-                ),
-            )));
-        }
+        let outbound_link = self
+            .resolve_outbound_link_for_target(target_node, explicit_hub.as_ref())
+            .await?;
 
-        let (_, recipient_enc_pk) = self.resolve_peer_keys(target_node, Some(&link)).await?;
+        let route_peer = if let Some(ref link) = outbound_link {
+            let pid = link.peer_id().to_string();
+            if !self.peer_supports_cap(&pid, &CapabilityToken::TransferStreamV2, Some(link)) {
+                return Err(NodeError::CapabilityUnsupported(Box::new(
+                    ProblemDetails::capability_unsupported(
+                        &CapabilityToken::TransferStreamV2,
+                        &pid,
+                        &self.config.hyphae_version,
+                        "unknown",
+                        Some("2.0.0"),
+                        true,
+                        None,
+                    ),
+                )));
+            }
+            pid
+        } else {
+            let peer_active = {
+                let db = self.db();
+                db.peers()
+                    .get_peer(target_node)?
+                    .is_some_and(|p| p.status == PeerStatus::Active)
+            };
+            if !peer_active {
+                return Err(NodeError::NotFound(format!(
+                    "no route to transfer target '{target_node}'"
+                )));
+            }
+            self.config.node_id.to_string()
+        };
+
+        let (_, recipient_enc_pk) = self
+            .resolve_peer_keys(target_node, outbound_link.as_ref())
+            .await?;
         let transfer_id = uuid_v4();
         let now = now_ms();
         let created_at = format_rfc3339_millis(now);
@@ -4308,16 +4595,43 @@ impl UnifiedNode {
         let header_json = serde_json::to_string(&signed_header)?;
         let sha = sha256_hex(&enc_bytes);
 
-        link.upload_transfer(
-            &transfer_id,
-            target_node,
-            to_handle,
-            "transfer.stream.v2",
-            &header_json,
-            &sha,
-            Bytes::from(enc_bytes),
-        )
-        .await?;
+        if let Some(ref link) = outbound_link {
+            link.upload_transfer(
+                &transfer_id,
+                target_node,
+                to_handle,
+                "transfer.stream.v2",
+                &header_json,
+                &sha,
+                Bytes::from(enc_bytes),
+            )
+            .await?;
+        } else {
+            let expires_at_ms = now + DEFAULT_TRANSFER_TTL_MS;
+            {
+                let db = self.db();
+                if let Some(h) = to_handle {
+                    let _ = db
+                        .local()
+                        .set_metadata(&format!("transfer_handle:{transfer_id}"), h);
+                }
+                db.transfers().submit(
+                    &TransferSubmit {
+                        id: transfer_id.clone(),
+                        from_node: self.config.node_id.to_string(),
+                        to_node: target_node.to_string(),
+                        transfer_type: "transfer.stream.v2".to_string(),
+                        header_json,
+                        expected_sha256: Some(sha),
+                        expires_at: expires_at_ms,
+                    },
+                    &enc_bytes,
+                    now,
+                )?;
+            }
+            self.notify_peer_inbox(target_node);
+            self.notify_scheduler();
+        }
 
         Ok(TransferSendResult {
             id: transfer_id,
@@ -5317,6 +5631,24 @@ fn peer_may_see_topic(scopes: &ScopeSet, topic: &str) -> bool {
             || s == &format!("stream:subscribe={topic}")
             || s.starts_with(&format!("stream:subscribe={topic}["))
     })
+}
+
+fn collect_local_handles_and_descriptions(
+    db: &NodeDb,
+    node_id: &str,
+) -> Result<(Vec<String>, BTreeMap<String, String>), NodeError> {
+    let records = db.messages().list_handles(Some(node_id))?;
+    let mut handles = Vec::with_capacity(records.len());
+    let mut descriptions = BTreeMap::new();
+    for rec in records {
+        if let Some(desc) = rec.description {
+            if !desc.is_empty() {
+                descriptions.insert(rec.handle.clone(), desc);
+            }
+        }
+        handles.push(rec.handle);
+    }
+    Ok((handles, descriptions))
 }
 
 fn load_channel_policies_from_db(db: &NodeDb) -> BTreeMap<String, ChannelPolicy> {
