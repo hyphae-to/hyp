@@ -2219,6 +2219,111 @@ document.querySelectorAll("[data-copy-topo]").forEach((btn) => {
 });
 
 // ============================================================================
+// 4B. COMPARISON TABLE ACCESSIBLE (i) INFO POPOVERS (#why)
+// ============================================================================
+(() => {
+  const pop = document.getElementById("cmpPopover");
+  const popTitle = document.getElementById("cmpPopTitle");
+  const popBody = document.getElementById("cmpPopBody");
+  if (!pop || !popTitle || !popBody) return;
+
+  let activeBtn = null;
+  let pinnedBtn = null;
+  let hideTimer = null;
+
+  function positionPopover(btn) {
+    const r = btn.getBoundingClientRect();
+    const pw = pop.offsetWidth || 292;
+    const ph = pop.offsetHeight || 96;
+    const margin = 12;
+
+    let leftVp = r.left + r.width / 2 - pw / 2;
+    leftVp = Math.max(margin, Math.min(window.innerWidth - pw - margin, leftVp));
+
+    const placeBelow = r.top < ph + 24;
+    const topDoc = placeBelow
+      ? r.bottom + window.scrollY + 10
+      : r.top + window.scrollY - ph - 10;
+    const leftDoc = leftVp + window.scrollX;
+    const arrowX = Math.max(18, Math.min(pw - 18, r.left + r.width / 2 - leftVp));
+
+    pop.style.left = `${Math.round(leftDoc)}px`;
+    pop.style.top = `${Math.round(topDoc)}px`;
+    pop.style.setProperty("--pop-arrow-x", `${Math.round(arrowX)}px`);
+    pop.classList.toggle("below", placeBelow);
+  }
+
+  function showPopover(btn, pin = false) {
+    clearTimeout(hideTimer);
+    if (activeBtn && activeBtn !== btn) {
+      activeBtn.setAttribute("aria-expanded", "false");
+      activeBtn.classList.remove("is-open");
+    }
+    activeBtn = btn;
+    if (pin) pinnedBtn = btn;
+    popTitle.textContent = btn.dataset.infoTitle || "";
+    popBody.textContent = btn.dataset.infoBody || "";
+    pop.hidden = false;
+    pop.classList.add("show");
+    btn.setAttribute("aria-expanded", "true");
+    btn.classList.add("is-open");
+    positionPopover(btn);
+  }
+
+  function hidePopover(force = false) {
+    if (!force && pinnedBtn) return;
+    clearTimeout(hideTimer);
+    if (activeBtn) {
+      activeBtn.setAttribute("aria-expanded", "false");
+      activeBtn.classList.remove("is-open");
+    }
+    activeBtn = null;
+    pinnedBtn = null;
+    pop.classList.remove("show");
+    pop.hidden = true;
+  }
+
+  document.querySelectorAll(".cmp-info-btn").forEach((btn) => {
+    btn.setAttribute("aria-expanded", "false");
+    btn.addEventListener("mouseenter", () => {
+      if (!pinnedBtn || pinnedBtn === btn) showPopover(btn, false);
+    });
+    btn.addEventListener("mouseleave", () => {
+      if (pinnedBtn === btn) return;
+      hideTimer = setTimeout(() => hidePopover(false), 110);
+    });
+    btn.addEventListener("focus", () => showPopover(btn, false));
+    btn.addEventListener("blur", () => {
+      if (pinnedBtn === btn) return;
+      hideTimer = setTimeout(() => hidePopover(false), 80);
+    });
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (pinnedBtn === btn) hidePopover(true);
+      else showPopover(btn, true);
+    });
+  });
+
+  pop.addEventListener("mouseenter", () => clearTimeout(hideTimer));
+  pop.addEventListener("mouseleave", () => {
+    if (!pinnedBtn) hideTimer = setTimeout(() => hidePopover(false), 110);
+  });
+
+  document.addEventListener("click", (e) => {
+    if (!activeBtn) return;
+    if (e.target.closest(".cmp-info-btn") || e.target.closest("#cmpPopover")) return;
+    hidePopover(true);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && activeBtn) hidePopover(true);
+  });
+  window.addEventListener("resize", () => { if (activeBtn) positionPopover(activeBtn); });
+  document.querySelector(".compare-scroll")?.addEventListener("scroll", () => {
+    if (activeBtn) positionPopover(activeBtn);
+  }, { passive: true });
+})();
+
+// ============================================================================
 // 5. QUICK START TABS
 // ============================================================================
 const QS = {
@@ -2237,7 +2342,7 @@ irm https://hyphae.to/install.ps1 | iex
 # Wire harnesses, Keychain & guard plugins
 hyp onboard
 
-# Join public.hyphae.to or your Team Hub
+# Join any public node or your Team Hub
 hyp pair join public.hyphae.to`,
   deploy: `# Generate a Hub kit (tailscale/docker/fly)
 hyp deploy init tailscale
