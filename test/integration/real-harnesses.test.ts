@@ -7,6 +7,7 @@ import { object } from "../../src/protocol.ts";
 import {
   BINARIES,
   createRealCodexRunner,
+  runRealAgy,
   runRealAgyPluginCheck,
   runRealClaude,
   runRealCursorSetupCheck,
@@ -385,6 +386,88 @@ test(
       assert.equal(opencodeRun.result.code, 0, `opencode failed: ${opencodeRun.result.stderr}`);
       assert.equal(opencodeReceivedPing, true, "Real OpenCode should receive real Claude's message");
       assert.equal(claudeReceivedReply, true, "Real Claude should receive real OpenCode's reply");
+    } finally {
+      await topo.cleanup();
+    }
+  },
+);
+
+test(
+  "REAL Antigravity (agy) binary + scripted Gemini API: lazy call_mcp_tool + PreToolUse _meshCall overwrite + Stop hook push + hyp_send reply",
+  { skip: BINARIES.agy === null ? "agy CLI not installed locally" : false, timeout: 60_000 },
+  async () => {
+    const topo = new MeshTopology("hi-agy-");
+    try {
+      const router = await topo.addRouter({ name: "team" });
+      const alex = await topo.addConnector({ connectorId: "alex@laptop", links: [{ name: "primary", router }] });
+      const jack = await topo.addConnector({ connectorId: "jack@prod", links: [{ name: "primary", router }] });
+
+      jack.daemon.state.register("claude:jack-1", { kind: "claude" });
+      await jack.daemon.connector.call("claude:jack-1", "hyp_join", { handle: "prod-ops" });
+      await jack.daemon.connector.call("claude:jack-1", "hyp_channel_join", { channel: "#deploys" });
+
+      let stage = 0;
+      let sawPushedStopMessage = false;
+
+      const { result, server } = await runRealAgy({
+        baseDir: topo.subDir("agy"),
+        socketPath: alex.socketPath,
+        prompt: "Join hyphae as agy-real, join #deploys, and respond to any incoming message from jack@prod/prod-ops.",
+        handler: async (ctx) => {
+          if (stage === 0) {
+            stage = 1;
+            return ctx.callAgyMcpTool("hyp_join", { handle: "agy-real" });
+          }
+          if (stage === 1) {
+            assert.ok(ctx.hasText("alex@laptop/agy-real"), `Expected hyp_join result in agy context: ${ctx.allText()}`);
+            stage = 2;
+            return ctx.callAgyMcpTool("hyp_channel_join", { channel: "#deploys" });
+          }
+          if (stage === 2) {
+            stage = 3;
+            // Remote peer posts to #deploys -> Antigravity Stop hook drains & continues turn with zero polling!
+            await jack.daemon.connector.call("claude:jack-1", "hyp_channel_post", {
+              channel: "#deploys",
+              text: "push-deploy-ping-to-real-agy",
+            });
+            await waitFor(
+              () => {
+                const s = alex.daemon.state.byHandle("agy-real");
+                return s && alex.daemon.state.pendingCount(s.id) >= 1;
+              },
+              { label: "#deploys post queued for agy-real" },
+            );
+            return ctx.reply("Joined #deploys.");
+          }
+          if (stage === 3 && ctx.hasText("push-deploy-ping-to-real-agy")) {
+            sawPushedStopMessage = true;
+            stage = 4;
+            return ctx.callAgyMcpTool("hyp_send", {
+              to: "jack@prod/prod-ops",
+              text: "ack-from-real-agy-via-stop-hook",
+            });
+          }
+          return ctx.reply("All done.");
+        },
+      });
+
+      assert.equal(
+        result.code,
+        0,
+        `agy exited ${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}\ntranscript:\n${JSON.stringify(server.transcript, null, 2)}`,
+      );
+      assert.equal(sawPushedStopMessage, true, "Real agy should receive pushed #deploys message via Stop hook without polling");
+
+      const agySession = alex.daemon.state.byHandle("agy-real");
+      assert.ok(agySession);
+      assert.match(agySession.id, /^antigravity:[0-9a-f-]+$/i);
+
+      const jackReply = await waitFor(() => {
+        const items = jack.daemon.connector.drainMailbox("claude:jack-1", 5);
+        return items.length > 0 ? items : null;
+      }, { label: "Jack receiving real agy reply across Team Router" });
+      assert.match(jackReply[0].text, /hyphae from alex@laptop\/agy-real/);
+      assert.match(jackReply[0].text, /ack-from-real-agy-via-stop-hook/);
     } finally {
       await topo.cleanup();
     }

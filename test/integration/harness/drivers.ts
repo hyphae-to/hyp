@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { setupAntigravity, setupClaude, setupCodex, setupCursor, setupOpenCode } from "../../../src/setup.ts";
 import {
   startScriptedAnthropicServer,
+  startScriptedGeminiServer,
   startScriptedOpenAIResponsesServer,
   type RunningScriptedServer,
   type TurnHandler,
@@ -272,8 +273,56 @@ export async function runRealOpenCode(opts: RealOpenCodeRunOptions): Promise<Rea
 export async function runRealAgyPluginCheck(baseDir: string, socketPath: string): Promise<ProcessResult> {
   if (!BINARIES.agy) throw new Error("agy CLI binary not installed");
   const env = isolatedEnv(baseDir);
-  setupAntigravity({ scope: "user", homeDir: env.HOME!, socketPath, runtime: devRuntime() });
+  setupAntigravity({ scope: "user", homeDir: env.HOME!, socketPath, noSidecar: true, runtime: devRuntime() });
   return runProcess(BINARIES.agy, ["plugin", "list"], { cwd: baseDir, env, timeoutMs: 20_000 });
+}
+
+export interface RealAgyRunOptions {
+  readonly baseDir: string;
+  readonly socketPath: string;
+  readonly prompt: string;
+  readonly handler: TurnHandler;
+  readonly timeoutMs?: number;
+}
+
+/**
+ * Sets up a real isolated Antigravity plugin (`setupAntigravity` into an ephemeral `HOME`)
+ * and runs the real `agy` CLI against a local loopback Gemini SSE API shim
+ * (`GOOGLE_GEMINI_BASE_URL` + `GEMINI_API_KEY` + `--settings '{"modelProvider":"gemini"}'`).
+ */
+export async function runRealAgy(opts: RealAgyRunOptions): Promise<RealHarnessRunResult> {
+  if (!BINARIES.agy) throw new Error("agy CLI binary not installed");
+  const workspace = initTempWorkspace(opts.baseDir, "agy-workspace");
+  const env = isolatedEnv(opts.baseDir, {
+    GEMINI_API_KEY: "dummy-local-gemini-key",
+    HTTPS_PROXY: "http://127.0.0.1:1",
+    NO_PROXY: "127.0.0.1,localhost",
+    no_proxy: "127.0.0.1,localhost",
+  });
+  setupAntigravity({
+    scope: "user",
+    homeDir: env.HOME!,
+    socketPath: opts.socketPath,
+    noSidecar: true,
+    runtime: devRuntime(),
+  });
+
+  const server = await startScriptedGeminiServer(opts.handler);
+  try {
+    env.GOOGLE_GEMINI_BASE_URL = server.url;
+    const result = await runProcess(
+      BINARIES.agy,
+      [
+        "-p", opts.prompt,
+        "--dangerously-skip-permissions",
+        "--settings", JSON.stringify({ modelProvider: "gemini" }),
+      ],
+      { cwd: workspace, env, timeoutMs: opts.timeoutMs ?? 45_000 },
+    );
+    return { result, server, workspace };
+  } finally {
+    await server.close();
+  }
 }
 
 /** Runs `setupCursor` into an isolated project + HOME and returns generated files and cursor-agent version check. */

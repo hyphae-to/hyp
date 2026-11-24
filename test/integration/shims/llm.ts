@@ -13,12 +13,12 @@ export interface AdvertisedTool {
 }
 
 export interface TurnContext {
-  readonly protocol: "anthropic" | "openai-responses";
+  readonly protocol: "anthropic" | "openai-responses" | "gemini";
   readonly turnIndex: number;
   readonly model: string;
   readonly tools: readonly AdvertisedTool[];
   readonly raw: Record<string, unknown>;
-  /** Serialized full conversation history (messages or Responses input) for easy assertions. */
+  /** Serialized full conversation history (messages, Responses input, or Gemini contents) for easy assertions. */
   allText(): string;
   /** True when the conversation history contains the given substring. */
   hasText(needle: string): boolean;
@@ -28,6 +28,8 @@ export interface TurnContext {
   callTool(nameOrSuffix: string, args: Record<string, unknown>, id?: string): ScriptedAction;
   /** Build an OpenCode v2 Code Mode `execute` call invoking `tools.hyphae.<tool>(args)`. */
   callOpenCodeTool(toolName: string, args?: Record<string, unknown>, id?: string): ScriptedAction;
+  /** Build an Antigravity (`agy`) lazy MCP `call_mcp_tool` invocation for a Hyphae tool. */
+  callAgyMcpTool(toolName: string, args?: Record<string, unknown>, serverName?: string, id?: string): ScriptedAction;
   /** Build a Claude Code `ToolSearch` call to load deferred Hyphae MCP tools. */
   selectClaudeTools(toolNames: readonly string[], id?: string): ScriptedAction;
   /** Build a plain assistant text response action. */
@@ -46,7 +48,7 @@ export interface TurnTranscript {
 
 export interface RunningScriptedServer {
   readonly url: string;
-  readonly protocol: "anthropic" | "openai-responses";
+  readonly protocol: "anthropic" | "openai-responses" | "gemini";
   readonly requests: Record<string, unknown>[];
   readonly transcript: TurnTranscript[];
   /** Reset the turn counter (useful when running a second independent CLI invocation against the same server). */
@@ -65,7 +67,7 @@ function writeSse(res: ServerResponse, event: string, data: unknown): void {
 }
 
 function makeTurnContext(
-  protocol: "anthropic" | "openai-responses",
+  protocol: "anthropic" | "openai-responses" | "gemini",
   turnIndex: number,
   model: string,
   tools: readonly AdvertisedTool[],
@@ -110,6 +112,18 @@ function makeTurnContext(
         id: id ?? `call_oc_${turnIndex}_${toolName}`,
         name: execTool.name,
         arguments: { code: `return await tools.hyphae.${toolName}(${JSON.stringify(args)});` },
+      };
+    },
+    callAgyMcpTool(toolName, args = {}, serverName = "hyphae_hyphae", id) {
+      const mcpTool = findTool("call_mcp_tool");
+      if (!mcpTool) {
+        throw new Error(`Expected Antigravity 'call_mcp_tool' tool; got: ${tools.map((t) => t.name).join(", ")}`);
+      }
+      return {
+        type: "tool_call",
+        id: id ?? `call_agy_${turnIndex}_${toolName}`,
+        name: mcpTool.name,
+        arguments: { ServerName: serverName, ToolName: toolName, Arguments: args },
       };
     },
     selectClaudeTools(toolNames, id) {
@@ -507,6 +521,121 @@ export async function startScriptedOpenAIResponsesServer(
   return {
     url: `http://127.0.0.1:${address.port}`,
     protocol: "openai-responses",
+    requests,
+    transcript,
+    resetTurns: () => { turnIndex = 0; },
+    close: () => new Promise<void>((resolve) => { server.closeAllConnections(); server.close(() => resolve()); }),
+  };
+}
+
+/**
+ * Local deterministic Gemini GenerateContent API server (`/v1beta/models/<model>:streamGenerateContent?alt=sse`
+ * and `:generateContent`) for driving the real `agy` (Antigravity CLI) binary with
+ * `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>`, `GEMINI_API_KEY`, and `--settings '{"modelProvider":"gemini"}'`.
+ */
+export async function startScriptedGeminiServer(
+  handler: TurnHandler,
+  options: { readonly ignoreAuxiliaryNoToolRequests?: boolean } = {},
+): Promise<RunningScriptedServer> {
+  const ignoreAux = options.ignoreAuxiliaryNoToolRequests ?? true;
+  const requests: Record<string, unknown>[] = [];
+  const transcript: TurnTranscript[] = [];
+  let turnIndex = 0;
+
+  const server = createServer(async (req, res) => {
+    try {
+      const rawText = await readBody(req);
+      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      const match = /\/models\/([^/:]+):(streamGenerateContent|generateContent)$/.exec(url.pathname);
+      if (req.method !== "POST" || !match) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      const model = match[1];
+      const isStream = match[2] === "streamGenerateContent" || url.searchParams.get("alt") === "sse";
+
+      let body: Record<string, unknown> = {};
+      try {
+        const parsed: unknown = JSON.parse(rawText);
+        if (object(parsed)) body = parsed;
+      } catch {}
+      requests.push(body);
+
+      const tools: AdvertisedTool[] = [];
+      if (Array.isArray(body.tools)) {
+        for (const group of body.tools) {
+          if (!object(group) || !Array.isArray(group.functionDeclarations)) continue;
+          for (const decl of group.functionDeclarations) {
+            if (object(decl) && typeof decl.name === "string") {
+              tools.push({
+                name: decl.name,
+                description: typeof decl.description === "string" ? decl.description : undefined,
+              });
+            }
+          }
+        }
+      }
+      const contents = Array.isArray(body.contents) ? body.contents : [];
+
+      const sendGeminiPayload = (parts: Record<string, unknown>[]) => {
+        const payload = {
+          candidates: [
+            {
+              content: { role: "model", parts },
+              finishReason: "STOP",
+            },
+          ],
+          usageMetadata: { promptTokenCount: 50, candidatesTokenCount: 15, totalTokenCount: 65 },
+        };
+        if (isStream) {
+          res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+          res.write(`data: ${JSON.stringify(payload)}\n\n`);
+          res.end();
+        } else {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify(payload));
+        }
+      };
+
+      if (ignoreAux && tools.length === 0) {
+        sendGeminiPayload([{ text: "ok" }]);
+        return;
+      }
+
+      const turn = turnIndex++;
+      const ctx = makeTurnContext("gemini", turn, model, tools, contents, body);
+      const action = await handler(ctx);
+      transcript.push({
+        turnIndex: turn,
+        model,
+        toolNames: tools.map((t) => t.name),
+        action,
+        inputSnapshot: ctx.allText().slice(-4000),
+      });
+
+      if (action.type === "tool_call") {
+        sendGeminiPayload([{ functionCall: { name: action.name, args: action.arguments } }]);
+      } else {
+        sendGeminiPayload([{ text: action.text }]);
+      }
+    } catch (error) {
+      if (!res.headersSent) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: error instanceof Error ? error.message : String(error) } }));
+      } else {
+        res.end();
+      }
+    }
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Failed to bind scripted Gemini server");
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    protocol: "gemini",
     requests,
     transcript,
     resetTurns: () => { turnIndex = 0; },
