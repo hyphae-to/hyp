@@ -156,6 +156,8 @@ export class RouterCore {
   readonly #now: () => number;
   readonly #attached = new Map<string, Attachment>();
   readonly #onDeferredError: ((error: unknown) => void) | undefined;
+  #scheduleListener: (() => void) | null = null;
+  #closed = false;
   #lastMessagePruneAt = -Infinity;
   /** Topics, publishers, subscriptions and event batches. */
   readonly events: EventRouter;
@@ -182,6 +184,7 @@ export class RouterCore {
       audit: (fields) => this.#audit(fields),
       ready: (connectorId) => this.#drain(connectorId),
       inFlight: (connectorId, batchId) => this.#attached.get(connectorId)?.inFlight.has(batchId) ?? false,
+      onScheduleChange: () => this.#notifyScheduleChange(),
     });
     this.#requirePairing = options.requirePairing ?? false;
     this.pairing = new Pairing({
@@ -201,6 +204,7 @@ export class RouterCore {
       now: this.#now,
       audit: (fields) => this.#audit(fields),
       identity: (connectorId) => this.pairing.identity(connectorId),
+      onScheduleChange: () => this.#notifyScheduleChange(),
     });
   }
 
@@ -250,7 +254,73 @@ export class RouterCore {
     }
   }
 
+  now(): number {
+    return this.#now();
+  }
+
+  /** Registers (or clears) a listener notified whenever `nextDeadlineMs()` may have moved. */
+  setScheduleListener(fn: (() => void) | null): void {
+    this.#scheduleListener = fn;
+  }
+
+  #notifyScheduleChange(): void {
+    this.#scheduleListener?.();
+  }
+
+  /**
+   * Earliest timestamp (ms) when `tick()` has work to do (event batch close/expiry/hold/wake-cap,
+   * transfer expiry/hold, message expiry/hold, in-flight ack timeout, or retention pruning),
+   * or `null` when completely idle.
+   */
+  nextDeadlineMs(): number | null {
+    const now = this.#now();
+    let earliest: number | null = null;
+    const consider = (t: number | null | undefined) => {
+      if (typeof t === "number" && Number.isFinite(t)) {
+        earliest = earliest === null ? t : Math.min(earliest, t);
+      }
+    };
+
+    consider(this.events.nextDeadlineMs());
+    consider(this.transfers.nextDeadlineMs());
+
+    const oldestPending = this.#db
+      .prepare("SELECT MIN(sent_at) AS t FROM messages WHERE state = 'pending'")
+      .get() as { t?: unknown } | undefined;
+    if (typeof oldestPending?.t === "number") {
+      consider(oldestPending.t + this.#limits.ttlMs);
+    }
+
+    const nextHold = this.#db
+      .prepare("SELECT MIN(hold_until) AS t FROM messages WHERE state = 'pending' AND hold_until > ?")
+      .get(now) as { t?: unknown } | undefined;
+    if (typeof nextHold?.t === "number") consider(nextHold.t);
+
+    for (const attachment of this.#attached.values()) {
+      for (const offeredAt of attachment.inFlight.values()) {
+        consider(offeredAt + this.#limits.ackTimeoutMs);
+      }
+    }
+
+    const oldestSettled = this.#db
+      .prepare("SELECT MIN(settled_at) AS t FROM messages WHERE state != 'pending' AND settled_at IS NOT NULL")
+      .get() as { t?: unknown } | undefined;
+    if (typeof oldestSettled?.t === "number") {
+      const settledRetentionMs = this.#limits.settledRetentionMs ?? DEFAULT_SETTLED_RETENTION_MS;
+      const pruneTarget = oldestSettled.t + settledRetentionMs;
+      const nextPrune = Number.isFinite(this.#lastMessagePruneAt)
+        ? Math.max(pruneTarget, this.#lastMessagePruneAt + MESSAGE_PRUNE_INTERVAL_MS)
+        : pruneTarget;
+      consider(nextPrune);
+    }
+
+    return earliest;
+  }
+
   close(): void {
+    this.#closed = true;
+    this.#scheduleListener = null;
+    this.#attached.clear();
     this.#db.close();
   }
 
@@ -279,6 +349,7 @@ export class RouterCore {
     this.transfers.removeConnector(id);
     this.#attached.delete(id);
     this.#audit({ event: "connector.revoked", connector: id });
+    this.#notifyScheduleChange();
     return true;
   }
 
@@ -343,6 +414,7 @@ export class RouterCore {
       this.#audit({ event: "handle.added", to: formatAddress({ connectorId, handle }) });
     }
     this.#drain(connectorId);
+    this.#notifyScheduleChange();
     return { ok: true, invalid: [] };
   }
 
@@ -512,6 +584,7 @@ export class RouterCore {
     });
     const target = parseAddress(message.to);
     if (target !== null) this.#drain(target.connectorId);
+    this.#notifyScheduleChange();
     return { ok: true, status: "stored" };
   }
 
@@ -550,8 +623,10 @@ export class RouterCore {
     this.#attached.set(connectorId, attachment);
     this.#audit({ event: "connector.online", connector: connectorId });
     queueMicrotask(() => {
+      if (this.#closed || this.#attached.get(connectorId) !== attachment) return;
       try {
         this.#drain(connectorId);
+        this.#notifyScheduleChange();
       } catch (error) {
         if (this.#onDeferredError === undefined) throw error;
         this.#onDeferredError(error);
@@ -561,6 +636,7 @@ export class RouterCore {
       if (this.#attached.get(connectorId) !== attachment) return;
       this.#attached.delete(connectorId);
       this.#audit({ event: "connector.offline", connector: connectorId });
+      this.#notifyScheduleChange();
     };
   }
 
@@ -570,6 +646,7 @@ export class RouterCore {
       if (!this.events.ack(connectorId, id, outcome) && !this.transfers.ack(connectorId, id, outcome)) return false;
       this.#attached.get(connectorId)?.inFlight.delete(id);
       this.#drain(connectorId);
+      this.#notifyScheduleChange();
       return true;
     }
     const message = decodeMessageRow(row);
@@ -599,10 +676,11 @@ export class RouterCore {
       ...(outcome.kind === "delivered" ? {} : { reason: outcome.reason }),
     });
     this.#drain(connectorId);
+    this.#notifyScheduleChange();
     return true;
   }
 
-  /** Periodic housekeeping: expiry, hold and ack-timeout retries, closing event batches. Call every second or so. */
+  /** Periodic housekeeping: expiry, hold and ack-timeout retries, closing event batches. */
   tick(): void {
     this.events.tick();
     this.transfers.tick();
@@ -627,6 +705,7 @@ export class RouterCore {
       }
       this.#drain(connectorId);
     }
+    this.#notifyScheduleChange();
   }
 
   /**

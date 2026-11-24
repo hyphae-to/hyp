@@ -1027,7 +1027,8 @@ test(
 
       teamReadDb = new DatabaseSync(teamDbPath, { readOnly: true });
       privReadDb = new DatabaseSync(privDbPath, { readOnly: true });
-      pluginLocalDb = new DatabaseSync(join(alexStateDir, "local.db"), { readOnly: true });
+      assert.equal(existsSync(join(alexStateDir, "local.db")), false, "PluginHost must host LocalEvents inside state.sqlite without creating local.db");
+      pluginLocalDb = new DatabaseSync(join(alexStateDir, "state.sqlite"), { readOnly: true });
       for (const db of [teamReadDb, privReadDb, pluginLocalDb]) db.exec("PRAGMA busy_timeout = 2000;");
       const allReadDbs = [teamReadDb, privReadDb, pluginLocalDb];
 

@@ -74,6 +74,8 @@ export interface TransferStoreOptions {
   readonly audit: (fields: Readonly<Record<string, unknown>>) => void;
   /** The connector's current paired identity; transfers need both ends paired. */
   readonly identity: (connectorId: string) => Identity | undefined;
+  /** Called whenever a pending transfer's expiry or hold deadline changes. */
+  readonly onScheduleChange?: () => void;
 }
 
 /** Whether `from` may send a `type` transfer to `to`, by both sides' scopes (SPEC.md section 15.2). */
@@ -178,6 +180,7 @@ export class TransferStore {
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
     ).run(header.id, header.from, header.to, header.type, JSON.stringify(signed), upload.size, now(), Date.parse(header.expiresAt));
     audit({ event: "transfer.stored", id: header.id, from: header.from, to: header.to, type: header.type, bytes: upload.size });
+    this.#options.onScheduleChange?.();
     return { ok: true };
   }
 
@@ -240,16 +243,37 @@ export class TransferStore {
       type: transfer.type,
       ...(outcome.kind === "delivered" ? {} : { reason: outcome.reason }),
     });
+    this.#options.onScheduleChange?.();
     return true;
+  }
+
+  /** Earliest timestamp (ms) when a pending transfer expires or comes off hold, or null when idle. */
+  nextDeadlineMs(): number | null {
+    const { db, now } = this.#options;
+    const current = now();
+    let earliest: number | null = null;
+    const exp = db
+      .prepare("SELECT MIN(expires_at) AS t FROM transfers WHERE state = 'pending'")
+      .get() as { t?: unknown } | undefined;
+    if (typeof exp?.t === "number") earliest = exp.t;
+    const hold = db
+      .prepare("SELECT MIN(hold_until) AS t FROM transfers WHERE state = 'pending' AND hold_until > ?")
+      .get(current) as { t?: unknown } | undefined;
+    if (typeof hold?.t === "number") {
+      earliest = earliest === null ? hold.t : Math.min(earliest, hold.t);
+    }
+    return earliest;
   }
 
   tick(): void {
     const { db, now, audit } = this.#options;
-    for (const row of decodeRows(db.prepare("SELECT * FROM transfers WHERE state = 'pending' AND expires_at <= ?").all(now()))) {
+    const expired = decodeRows(db.prepare("SELECT * FROM transfers WHERE state = 'pending' AND expires_at <= ?").all(now()));
+    for (const row of expired) {
       db.prepare("UPDATE transfers SET state = 'expired', settled_at = ? WHERE id = ?").run(now(), row.id);
       rmSync(this.#file(row.id), { force: true });
       audit({ event: "transfer.expired", id: row.id, from: row.from_connector, to: row.to_connector, type: row.type });
     }
+    if (expired.length > 0) this.#options.onScheduleChange?.();
   }
 
   /** Drops a revoked connector's pending transfers, both ways. */
@@ -263,5 +287,6 @@ export class TransferStore {
       rmSync(this.#file(row.id), { force: true });
       audit({ event: "transfer.rejected", id: row.id, from: row.from_connector, to: row.to_connector, reason: "connector_revoked" });
     }
+    if (rows.length > 0) this.#options.onScheduleChange?.();
   }
 }

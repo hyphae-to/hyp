@@ -270,6 +270,8 @@ export interface EventRouterOptions {
   readonly ready: (connectorId: string) => void;
   /** Whether the batch is offered to its connector and not yet answered. */
   readonly inFlight: (connectorId: string, batchId: string) => boolean;
+  /** Called whenever a deadline affecting `nextDeadlineMs()` may have changed. */
+  readonly onScheduleChange?: () => void;
 }
 
 interface Subscription {
@@ -343,6 +345,8 @@ export class EventRouter {
   readonly #options: EventRouterOptions;
   readonly #limits: EventLimits;
   readonly #topicMetadata = new Map<string, TopicMetadata>();
+  readonly #topicSubsCache = new Map<string, readonly Subscription[]>();
+  #cacheDataVersion = -1;
   #lastPrune = Number.NEGATIVE_INFINITY;
   /** Audit lines of the open transaction, written after COMMIT so a rollback leaves none. */
   #auditBuffer: Array<Readonly<Record<string, unknown>>> | null = null;
@@ -751,6 +755,7 @@ export class EventRouter {
       matched,
     });
     for (const connectorId of ready) this.#options.ready(connectorId);
+    this.#options.onScheduleChange?.();
     return { ok: true, status: "stored", matched };
   }
 
@@ -763,10 +768,28 @@ export class EventRouter {
     );
   }
 
-  #subscriptionsOn(topic: string): Subscription[] {
-    return this.#parseSubscriptions(
+  #syncSubscriptionCache(): void {
+    const row = this.#db.prepare("PRAGMA data_version").get() as { data_version?: unknown } | undefined;
+    const version = typeof row?.data_version === "number" ? row.data_version : -1;
+    if (version !== this.#cacheDataVersion) {
+      this.#topicSubsCache.clear();
+      this.#cacheDataVersion = version;
+    }
+  }
+
+  #invalidateSubscriptionCache(): void {
+    this.#topicSubsCache.clear();
+  }
+
+  #subscriptionsOn(topic: string): readonly Subscription[] {
+    this.#syncSubscriptionCache();
+    const cached = this.#topicSubsCache.get(topic);
+    if (cached !== undefined) return cached;
+    const compiled = this.#parseSubscriptions(
       decodeSubscriptionRows(this.#db.prepare("SELECT * FROM subscriptions WHERE topic = ? ORDER BY created_at, id").all(topic)),
     );
+    this.#topicSubsCache.set(topic, compiled);
+    return compiled;
   }
 
   #parseSubscriptions(rows: readonly SubscriptionRow[]): Subscription[] {
@@ -966,7 +989,9 @@ export class EventRouter {
         this.#audit({ event: "subscription.changed", connector: connectorId, subscription: spec.id, topic: spec.topic });
       }
     });
+    this.#invalidateSubscriptionCache();
     this.#options.ready(connectorId);
+    this.#options.onScheduleChange?.();
     const unknownTopics = [...new Set(parsed.map(({ spec }) => spec.topic))].filter(
       (topic) => !this.#options.topics.has(topic),
     );
@@ -983,6 +1008,8 @@ export class EventRouter {
     this.#transaction(() => {
       for (const row of this.#subscriptionsOf(connectorId)) this.#removeSubscription(row, "connector_revoked");
     });
+    this.#invalidateSubscriptionCache();
+    this.#options.onScheduleChange?.();
   }
 
   #subscriptionsOf(connectorId: string): readonly SubscriptionRow[] {
@@ -1101,10 +1128,125 @@ export class EventRouter {
       events: batch.event_count,
       ...(outcome.kind === "delivered" ? {} : { reason: outcome.reason }),
     });
+    this.#options.onScheduleChange?.();
     return true;
   }
 
   // ---- housekeeping ----
+
+  /**
+   * Earliest timestamp (ms) when `tick()` or `dueBatches()` has real work to perform,
+   * or `null` when completely idle (zero open/pending/settled batches and zero events).
+   */
+  nextDeadlineMs(): number | null {
+    const now = this.#now();
+    let earliest: number | null = null;
+    const consider = (t: number | null | undefined) => {
+      if (typeof t === "number" && Number.isFinite(t)) {
+        earliest = earliest === null ? t : Math.min(earliest, t);
+      }
+    };
+
+    // 1. Earliest due close time of any open batch
+    const openDue = this.#db
+      .prepare(
+        "SELECT MIN(" +
+          "CASE " +
+            "WHEN s.id IS NULL THEN ?1 " +
+            "WHEN (b.last_event_at + s.coalesce_seconds * 1000) <= (b.opened_at + COALESCE(s.max_batch_age_ms, ?2)) " +
+              "THEN (b.last_event_at + s.coalesce_seconds * 1000) " +
+            "ELSE (b.opened_at + COALESCE(s.max_batch_age_ms, ?2)) " +
+          "END" +
+        ") AS t " +
+        "FROM batches b LEFT JOIN subscriptions s ON s.id = b.subscription_id " +
+        "WHERE b.state = 'open'",
+      )
+      .get(now, this.#limits.maxBatchAgeMs) as { t?: unknown } | undefined;
+    if (typeof openDue?.t === "number") consider(openDue.t);
+
+    // 2. Earliest expiry of any pending batch
+    const oldestPending = this.#db
+      .prepare("SELECT MIN(opened_at) AS t FROM batches WHERE state = 'pending'")
+      .get() as { t?: unknown } | undefined;
+    if (typeof oldestPending?.t === "number") {
+      consider(oldestPending.t + this.#limits.retentionMs);
+    }
+
+    // 3. Earliest hold_until (> now) of any pending batch
+    const nextHold = this.#db
+      .prepare("SELECT MIN(hold_until) AS t FROM batches WHERE state = 'pending' AND hold_until > ?")
+      .get(now) as { t?: unknown } | undefined;
+    if (typeof nextHold?.t === "number") consider(nextHold.t);
+
+    // 4. Earliest wake-cap unblock time for any subscription with a pending batch at/over its hourly wake cap
+    if (typeof oldestPending?.t === "number") {
+      const pendingSubs = this.#db
+        .prepare(
+          "SELECT DISTINCT b.subscription_id, s.max_batches_per_hour " +
+            "FROM batches b LEFT JOIN subscriptions s ON s.id = b.subscription_id " +
+            "WHERE b.state = 'pending'",
+        )
+        .all() as Array<{ subscription_id?: unknown; max_batches_per_hour?: unknown }>;
+      const wakeStmt = this.#db.prepare(
+        "SELECT settled_at AS t FROM batches " +
+          "WHERE subscription_id = ? AND state = 'delivered' AND settled_at > ? " +
+          "ORDER BY settled_at DESC LIMIT 1 OFFSET ?",
+      );
+      for (const sub of pendingSubs) {
+        const cap =
+          typeof sub.max_batches_per_hour === "number"
+            ? sub.max_batches_per_hour
+            : this.#limits.maxBatchesPerHourPerSubscription;
+        if (cap <= 0) continue;
+        const row = wakeStmt.get(String(sub.subscription_id), now - HOUR_MS, cap - 1) as { t?: unknown } | undefined;
+        if (typeof row?.t === "number") consider(row.t + HOUR_MS);
+      }
+    }
+
+    // 5. Earliest retention prune time ONLY when settled batches or events actually exist
+    let pruneTarget: number | null = null;
+    const considerPrune = (t: number) => {
+      pruneTarget = pruneTarget === null ? t : Math.min(pruneTarget, t);
+    };
+    const oldestSettled = this.#db
+      .prepare(
+        "SELECT MIN(settled_at) AS t FROM batches " +
+          "WHERE state IN ('delivered', 'rejected', 'dropped') AND settled_at IS NOT NULL",
+      )
+      .get() as { t?: unknown } | undefined;
+    if (typeof oldestSettled?.t === "number") {
+      considerPrune(oldestSettled.t + this.#limits.retentionMs);
+    }
+    const oldestEventBody = this.#db
+      .prepare(
+        "SELECT MIN(received_at) AS t FROM events " +
+          "WHERE body IS NOT NULL AND NOT EXISTS (" +
+            "SELECT 1 FROM batch_events be JOIN batches b ON b.id = be.batch_id " +
+            "WHERE be.event_seq = events.seq AND b.state IN ('open', 'pending')" +
+          ")",
+      )
+      .get() as { t?: unknown } | undefined;
+    if (typeof oldestEventBody?.t === "number") {
+      considerPrune(oldestEventBody.t + this.#limits.retentionMs);
+    }
+    const oldestPrunableEvent = this.#db
+      .prepare(
+        "SELECT MIN(received_at) AS t FROM events " +
+          "WHERE NOT EXISTS (SELECT 1 FROM batch_events be WHERE be.event_seq = events.seq)",
+      )
+      .get() as { t?: unknown } | undefined;
+    if (typeof oldestPrunableEvent?.t === "number") {
+      considerPrune(oldestPrunableEvent.t + this.#limits.idempotencyMs);
+    }
+    if (pruneTarget !== null) {
+      const nextPrune = Number.isFinite(this.#lastPrune)
+        ? Math.max(pruneTarget, this.#lastPrune + PRUNE_INTERVAL_MS)
+        : pruneTarget;
+      consider(nextPrune);
+    }
+
+    return earliest;
+  }
 
   /**
    * Closes batches whose window ended, drops expired ones, and prunes old records. Looks first and
@@ -1138,6 +1280,7 @@ export class EventRouter {
         .run(now - this.#limits.idempotencyMs);
     });
     if (prune) this.#lastPrune = now;
+    this.#options.onScheduleChange?.();
   }
 
   #dueOpenBatches(now: number): readonly BatchRow[] {
