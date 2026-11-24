@@ -1,0 +1,1267 @@
+//! `hyp-rs gate` (`init`, `propose`, `lock`, `review`, `log`) & `hyp-rs inbox` (`approve`, `reject`).
+//!
+//! Human-CLI-only Local Security Gate management:
+//! - Never writes plaintext API keys (`{ "secret": "<name>" }` / `api_key_secret` references only!).
+//! - Tamper-evident `gate_policy_sig` signing & verification via `hyp_node::gates::policy`.
+//! - Human-only quarantine review, approval, rejection (+ atomic Stage 1 mute), and immutable
+//!   `gate_audit` log inspection.
+
+use crate::config_file::{
+    default_node_id, ensure_v2_node_json_defaults, open_secret_store, read_json_object_or_empty,
+    resolve_config_path_for_read, resolve_config_path_for_write, resolve_state_dir,
+    write_atomic_json,
+};
+use crate::ui::{
+    EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
+};
+use clap::{Args, Subcommand, ValueEnum};
+use hyp_crypto::keystore::{SecretStore, validate_secret_name};
+use hyp_node::engine::NodeProfile;
+use hyp_node::gates::policy::{
+    DEFAULT_HTTP_CLASSIFIER_THRESHOLD, DEFAULT_STAGE2_BUSY_RETRY_MS, DEFAULT_STAGE2_MAX_CONCURRENT,
+    DEFAULT_STAGE2_MAX_INPUT_CHARS, DEFAULT_STAGE2_MAX_OUTPUT_TOKENS,
+    DEFAULT_STAGE2_MIN_ALLOW_CONFIDENCE, DEFAULT_STAGE2_TIMEOUT_MS, FilterAdapterConfig,
+    FilterPluginConfig, SecurityGateConfig, Stage2ErrorAction, Stage2Matchers, TrustTier,
+    sign_gate_policy, verify_gate_policy_sig,
+};
+use hyp_store::{
+    GateAuditQuery, GateDecision as StoreGateDecision, MuteRuleInput, NodeDb, StoreError, now_ms,
+};
+use serde::Serialize;
+use serde_json::{Value, json};
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CliGateAdapter {
+    Anthropic,
+    #[value(name = "openai-compat")]
+    OpenAiCompat,
+    Google,
+    #[value(name = "lakera-guard")]
+    LakeraGuard,
+    #[value(name = "http-classifier")]
+    HttpClassifier,
+    Subprocess,
+}
+
+impl CliGateAdapter {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAiCompat => "openai-compat",
+            Self::Google => "google",
+            Self::LakeraGuard => "lakera-guard",
+            Self::HttpClassifier => "http-classifier",
+            Self::Subprocess => "subprocess",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CliGateLogDecision {
+    All,
+    Quarantined,
+    Quarantine,
+    Blocked,
+    Block,
+    Allowed,
+    Allow,
+    Error,
+}
+
+impl CliGateLogDecision {
+    pub const fn to_store_filter(self) -> Option<StoreGateDecision> {
+        match self {
+            Self::All => None,
+            Self::Quarantined | Self::Quarantine => Some(StoreGateDecision::Quarantine),
+            Self::Blocked | Self::Block => Some(StoreGateDecision::Block),
+            Self::Allowed | Self::Allow => Some(StoreGateDecision::Allow),
+            Self::Error => Some(StoreGateDecision::Error),
+        }
+    }
+}
+
+#[derive(Args)]
+pub struct GateInitArgs {
+    /// Guardrail / classifier adapter type
+    #[arg(long, value_enum)]
+    pub adapter: CliGateAdapter,
+    /// Optional unique filter ID (defaults to "<adapter>-guard")
+    #[arg(long)]
+    pub id: Option<String>,
+    /// Optional classifier/API base URL (required for http-classifier; defaults to Ollama for openai-compat)
+    #[arg(long)]
+    pub base_url: Option<String>,
+    /// Model identifier (e.g. claude-haiku-4-5, gemini-2.5-flash-lite, qwen2.5:3b)
+    #[arg(long)]
+    pub model: Option<String>,
+    /// SecretStore key name holding the API key (NEVER pass a plaintext key!)
+    #[arg(long)]
+    pub secret: Option<String>,
+    /// Subprocess executable command (required for --adapter subprocess)
+    #[arg(long)]
+    pub command: Option<String>,
+    /// Optional subprocess arguments (repeatable)
+    #[arg(long = "arg")]
+    pub args: Vec<String>,
+    /// Additive operator policy guidance appended after the immutable core rubric
+    #[arg(long)]
+    pub policy_notes: Option<String>,
+    /// Explicit node.json path
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+    /// Explicit state directory for SecretStore and node.json
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
+    /// Immediately sign gate_policy_sig and enable tamper-evident require_signed_policy
+    #[arg(long)]
+    pub lock: bool,
+    /// Output structured JSON envelope
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Subcommand)]
+pub enum GateCommand {
+    /// Configure a Local Security Gate filter adapter in node.json (never plaintext API keys!)
+    Init(GateInitArgs),
+    /// Stage an unsigned gate policy proposal for human inspection before `gate lock`
+    Propose(GateInitArgs),
+    /// Validate gate policy in node.json and sign tamper-evident gate_policy_sig via SecretStore
+    Lock {
+        /// Explicit node.json path
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Explicit state directory for SecretStore
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Output structured JSON envelope
+        #[arg(long)]
+        json: bool,
+    },
+    /// List quarantined mailbox items awaiting human CLI disposition (human CLI only!)
+    Review {
+        /// Optional filter by session ID
+        #[arg(long)]
+        session: Option<String>,
+        /// Maximum quarantined items to display
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Explicit state directory containing node.sqlite
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Output structured JSON envelope
+        #[arg(long)]
+        json: bool,
+    },
+    /// Query the immutable gate_audit trail
+    Log {
+        /// Filter by decision (quarantined, blocked, allowed, error, or all)
+        #[arg(long, value_enum, default_value_t = CliGateLogDecision::All)]
+        decision: CliGateLogDecision,
+        /// Maximum audit rows to return
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Optional filter by session ID
+        #[arg(long)]
+        session: Option<String>,
+        /// Explicit state directory containing node.sqlite
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Output structured JSON envelope
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum InboxCommand {
+    /// Human-CLI-only approval releasing a quarantined mailbox item into the target session inbox
+    Approve {
+        /// Quarantined mailbox receipt ID
+        receipt: String,
+        /// Reviewer identity recorded in immutable gate_audit
+        #[arg(long, default_value = "human-cli")]
+        reviewer: String,
+        /// Explicit state directory containing node.sqlite
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Output structured JSON envelope
+        #[arg(long)]
+        json: bool,
+    },
+    /// Human-CLI-only rejection permanently dropping a quarantined item (optionally installing a global mute rule)
+    Reject {
+        /// Quarantined mailbox receipt ID
+        receipt: String,
+        /// Atomically install a Stage 1 global mute rule for the item's sender
+        #[arg(long)]
+        mute: bool,
+        /// Rejection reason recorded in immutable gate_audit
+        #[arg(long, default_value = "rejected by human reviewer")]
+        reason: String,
+        /// Reviewer identity recorded in immutable gate_audit
+        #[arg(long, default_value = "human-cli")]
+        reviewer: String,
+        /// Explicit state directory containing node.sqlite
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Output structured JSON envelope
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GateFilterSummary {
+    pub id: String,
+    pub adapter_type: String,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_secret: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GateStatusSummary {
+    pub configured: bool,
+    pub require_signed_policy: bool,
+    /// `"OK"`, `"FAIL"`, or `"UNSIGNED"`
+    pub gate_policy_sig: String,
+    pub tampered: bool,
+    pub detail: String,
+    pub filters: Vec<GateFilterSummary>,
+    pub quarantined_count: usize,
+}
+
+/// Evaluates Security Gate configuration, tamper-evident `gate_policy_sig` verification,
+/// active `FilterPlugin` adapters, and quarantined item count for `status` & `doctor`.
+pub fn inspect_gate_status(
+    raw_config: Option<&Value>,
+    secrets: &SecretStore,
+    db: Option<&NodeDb>,
+) -> GateStatusSummary {
+    let quarantined_count = db
+        .and_then(|d| d.local().list_quarantined(None, 10_000).ok())
+        .map(|v| v.len())
+        .unwrap_or(0);
+
+    let Some(gate_val) = raw_config.and_then(|c| c.get("gate")) else {
+        return GateStatusSummary {
+            configured: false,
+            require_signed_policy: false,
+            gate_policy_sig: "UNSIGNED".to_string(),
+            tampered: false,
+            detail: "Stage 1 deterministic defaults active (no custom Stage 2 / filter plugins configured)".to_string(),
+            filters: Vec::new(),
+            quarantined_count,
+        };
+    };
+
+    let gate_cfg: SecurityGateConfig = match serde_json::from_value(gate_val.clone()) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return GateStatusSummary {
+                configured: true,
+                require_signed_policy: true,
+                gate_policy_sig: "FAIL".to_string(),
+                tampered: true,
+                detail: format!("gate_policy_tampered: malformed gate config ({e})"),
+                filters: Vec::new(),
+                quarantined_count,
+            };
+        }
+    };
+
+    let filters: Vec<GateFilterSummary> = gate_cfg
+        .filters
+        .iter()
+        .map(summarize_filter_plugin)
+        .collect();
+
+    if gate_cfg.require_signed_policy || gate_cfg.policy_signature.is_some() {
+        match gate_cfg.policy_signature.as_deref() {
+            Some(sig) => match verify_gate_policy_sig(&gate_cfg, sig, secrets) {
+                Ok(()) => GateStatusSummary {
+                    configured: true,
+                    require_signed_policy: gate_cfg.require_signed_policy,
+                    gate_policy_sig: "OK".to_string(),
+                    tampered: false,
+                    detail: format!(
+                        "Signed gate policy verified ({} filter adapter(s), {} quarantined)",
+                        filters.len(),
+                        quarantined_count
+                    ),
+                    filters,
+                    quarantined_count,
+                },
+                Err(e) => GateStatusSummary {
+                    configured: true,
+                    require_signed_policy: gate_cfg.require_signed_policy,
+                    gate_policy_sig: "FAIL".to_string(),
+                    tampered: true,
+                    detail: format!("gate_policy_tampered: {e}"),
+                    filters,
+                    quarantined_count,
+                },
+            },
+            None => GateStatusSummary {
+                configured: true,
+                require_signed_policy: true,
+                gate_policy_sig: "FAIL".to_string(),
+                tampered: true,
+                detail: "gate_policy_tampered: require_signed_policy is true but policy_signature is missing"
+                    .to_string(),
+                filters,
+                quarantined_count,
+            },
+        }
+    } else {
+        GateStatusSummary {
+            configured: true,
+            require_signed_policy: false,
+            gate_policy_sig: "UNSIGNED".to_string(),
+            tampered: false,
+            detail: format!(
+                "Unsigned gate policy ({} filter adapter(s)); run `hyp-rs gate lock` to enforce tamper-evident signing",
+                filters.len()
+            ),
+            filters,
+            quarantined_count,
+        }
+    }
+}
+
+fn summarize_filter_plugin(cfg: &FilterPluginConfig) -> GateFilterSummary {
+    match &cfg.adapter {
+        FilterAdapterConfig::Anthropic {
+            model,
+            api_key_secret,
+            ..
+        } => GateFilterSummary {
+            id: cfg.id.clone(),
+            adapter_type: "anthropic".to_string(),
+            enabled: cfg.enabled,
+            target: Some(model.clone()),
+            api_key_secret: api_key_secret.clone(),
+        },
+        FilterAdapterConfig::OpenAiCompat {
+            base_url,
+            model,
+            api_key_secret,
+            ..
+        } => GateFilterSummary {
+            id: cfg.id.clone(),
+            adapter_type: "openai-compat".to_string(),
+            enabled: cfg.enabled,
+            target: Some(format!("{model} @ {base_url}")),
+            api_key_secret: api_key_secret.clone(),
+        },
+        FilterAdapterConfig::Google {
+            model,
+            api_key_secret,
+            ..
+        } => GateFilterSummary {
+            id: cfg.id.clone(),
+            adapter_type: "google".to_string(),
+            enabled: cfg.enabled,
+            target: Some(model.clone()),
+            api_key_secret: api_key_secret.clone(),
+        },
+        FilterAdapterConfig::LakeraGuard {
+            base_url,
+            api_key_secret,
+            ..
+        } => GateFilterSummary {
+            id: cfg.id.clone(),
+            adapter_type: "lakera-guard".to_string(),
+            enabled: cfg.enabled,
+            target: Some(base_url.clone()),
+            api_key_secret: api_key_secret.clone(),
+        },
+        FilterAdapterConfig::HttpClassifier {
+            url,
+            api_key_secret,
+            ..
+        } => GateFilterSummary {
+            id: cfg.id.clone(),
+            adapter_type: "http-classifier".to_string(),
+            enabled: cfg.enabled,
+            target: Some(url.clone()),
+            api_key_secret: api_key_secret.clone(),
+        },
+        FilterAdapterConfig::Subprocess { command, .. } => GateFilterSummary {
+            id: cfg.id.clone(),
+            adapter_type: "subprocess".to_string(),
+            enabled: cfg.enabled,
+            target: Some(command.clone()),
+            api_key_secret: None,
+        },
+    }
+}
+
+pub fn run_gate(command: GateCommand) -> ExitCode {
+    match command {
+        GateCommand::Init(args) => run_gate_init_or_propose(args, false),
+        GateCommand::Propose(args) => run_gate_init_or_propose(args, true),
+        GateCommand::Lock {
+            config,
+            state_dir,
+            json,
+        } => run_gate_lock(config, state_dir, json),
+        GateCommand::Review {
+            session,
+            limit,
+            state_dir,
+            json,
+        } => run_gate_review(session, limit, state_dir, json),
+        GateCommand::Log {
+            decision,
+            limit,
+            session,
+            state_dir,
+            json,
+        } => run_gate_log(decision, limit, session, state_dir, json),
+    }
+}
+
+pub fn run_inbox(command: InboxCommand) -> ExitCode {
+    match command {
+        InboxCommand::Approve {
+            receipt,
+            reviewer,
+            state_dir,
+            json,
+        } => run_inbox_approve(receipt, reviewer, state_dir, json),
+        InboxCommand::Reject {
+            receipt,
+            mute,
+            reason,
+            reviewer,
+            state_dir,
+            json,
+        } => run_inbox_reject(receipt, mute, reason, reviewer, state_dir, json),
+    }
+}
+
+fn build_filter_plugin_from_args(args: &GateInitArgs) -> Result<FilterPluginConfig, String> {
+    if let Some(ref secret_name) = args.secret {
+        if looks_like_raw_api_key(secret_name) {
+            return Err(
+                "Refusing plaintext API key in --secret; pass a SecretStore name (e.g. --secret anthropic-api-key) and store the key via `hyp-rs secret set <name>`."
+                    .to_string(),
+            );
+        }
+        validate_secret_name(secret_name)
+            .map_err(|e| format!("Invalid --secret name '{secret_name}': {e}"))?;
+    }
+
+    let id = args
+        .id
+        .clone()
+        .unwrap_or_else(|| format!("{}-guard", args.adapter.as_str()));
+    let policy_notes = args.policy_notes.clone().unwrap_or_default();
+
+    let adapter = match args.adapter {
+        CliGateAdapter::Anthropic => FilterAdapterConfig::Anthropic {
+            model: args
+                .model
+                .clone()
+                .unwrap_or_else(|| "claude-haiku-4-5".to_string()),
+            temperature: 0.0,
+            max_output_tokens: DEFAULT_STAGE2_MAX_OUTPUT_TOKENS,
+            timeout_ms: DEFAULT_STAGE2_TIMEOUT_MS,
+            max_input_chars: DEFAULT_STAGE2_MAX_INPUT_CHARS,
+            min_allow_confidence: DEFAULT_STAGE2_MIN_ALLOW_CONFIDENCE,
+            api_key_secret: Some(
+                args.secret
+                    .clone()
+                    .unwrap_or_else(|| "anthropic-api-key".to_string()),
+            ),
+            base_url: args.base_url.clone(),
+            policy_notes,
+        },
+        CliGateAdapter::OpenAiCompat => FilterAdapterConfig::OpenAiCompat {
+            base_url: args
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "http://127.0.0.1:11434/v1".to_string()),
+            model: args
+                .model
+                .clone()
+                .unwrap_or_else(|| "qwen2.5:3b".to_string()),
+            temperature: 0.0,
+            max_output_tokens: DEFAULT_STAGE2_MAX_OUTPUT_TOKENS,
+            timeout_ms: DEFAULT_STAGE2_TIMEOUT_MS,
+            max_input_chars: DEFAULT_STAGE2_MAX_INPUT_CHARS,
+            min_allow_confidence: DEFAULT_STAGE2_MIN_ALLOW_CONFIDENCE,
+            api_key_secret: args.secret.clone(),
+            policy_notes,
+        },
+        CliGateAdapter::Google => FilterAdapterConfig::Google {
+            model: args
+                .model
+                .clone()
+                .unwrap_or_else(|| "gemini-2.5-flash-lite".to_string()),
+            temperature: 0.0,
+            max_output_tokens: DEFAULT_STAGE2_MAX_OUTPUT_TOKENS,
+            timeout_ms: DEFAULT_STAGE2_TIMEOUT_MS,
+            max_input_chars: DEFAULT_STAGE2_MAX_INPUT_CHARS,
+            min_allow_confidence: DEFAULT_STAGE2_MIN_ALLOW_CONFIDENCE,
+            api_key_secret: Some(
+                args.secret
+                    .clone()
+                    .unwrap_or_else(|| "google-api-key".to_string()),
+            ),
+            base_url: args.base_url.clone(),
+            policy_notes,
+        },
+        CliGateAdapter::LakeraGuard => FilterAdapterConfig::LakeraGuard {
+            base_url: args
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "https://api.lakera.ai".to_string()),
+            api_key_secret: Some(
+                args.secret
+                    .clone()
+                    .unwrap_or_else(|| "lakera-api-key".to_string()),
+            ),
+            project_id: None,
+            timeout_ms: DEFAULT_STAGE2_TIMEOUT_MS,
+            max_input_chars: DEFAULT_STAGE2_MAX_INPUT_CHARS,
+            on_flagged: Stage2ErrorAction::Quarantine,
+        },
+        CliGateAdapter::HttpClassifier => FilterAdapterConfig::HttpClassifier {
+            url: args
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "http://127.0.0.1:8080/classify".to_string()),
+            api_key_secret: args.secret.clone(),
+            auth_header: None,
+            score_field: "score".to_string(),
+            label_field: "label".to_string(),
+            flagged_labels: vec!["INJECTION".to_string(), "JAILBREAK".to_string()],
+            threshold: DEFAULT_HTTP_CLASSIFIER_THRESHOLD,
+            timeout_ms: DEFAULT_STAGE2_TIMEOUT_MS,
+            max_input_chars: DEFAULT_STAGE2_MAX_INPUT_CHARS,
+            on_flagged: Stage2ErrorAction::Quarantine,
+        },
+        CliGateAdapter::Subprocess => {
+            let cmd_bin = args
+                .command
+                .clone()
+                .or_else(|| args.base_url.clone())
+                .ok_or_else(|| {
+                    "--command <executable> is required for --adapter subprocess".to_string()
+                })?;
+            FilterAdapterConfig::Subprocess {
+                command: cmd_bin,
+                args: args.args.clone(),
+                env_allowlist: Vec::new(),
+                timeout_ms: DEFAULT_STAGE2_TIMEOUT_MS,
+                max_input_chars: DEFAULT_STAGE2_MAX_INPUT_CHARS,
+                min_allow_confidence: DEFAULT_STAGE2_MIN_ALLOW_CONFIDENCE,
+            }
+        }
+    };
+
+    let plugin = FilterPluginConfig {
+        id,
+        enabled: true,
+        matchers: Stage2Matchers {
+            peers: Vec::new(),
+            channels: Vec::new(),
+            topics: Vec::new(),
+            bridges: Vec::new(),
+            trust_tiers: vec![
+                TrustTier::Guest,
+                TrustTier::ExternalWebhook,
+                TrustTier::Peer,
+                TrustTier::Bridge,
+            ],
+        },
+        on_error: Stage2ErrorAction::Quarantine,
+        max_concurrent: DEFAULT_STAGE2_MAX_CONCURRENT,
+        busy_retry_after_ms: DEFAULT_STAGE2_BUSY_RETRY_MS,
+        adapter,
+    };
+    plugin.validate().map_err(|e| e.to_string())?;
+    Ok(plugin)
+}
+
+fn looks_like_raw_api_key(s: &str) -> bool {
+    let trimmed = s.trim();
+    ["sk-", "AIza", "ghp_", "gho_", "xoxb-", "xoxp-", "AKIA"]
+        .iter()
+        .any(|p| trimmed.starts_with(p))
+}
+
+fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode {
+    let cmd = if propose_only {
+        "gate propose"
+    } else {
+        "gate init"
+    };
+    let as_json = args.json;
+
+    let plugin = match build_filter_plugin_from_args(&args) {
+        Ok(p) => p,
+        Err(e) => {
+            return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_GATE_CONFIG", e, None);
+        }
+    };
+
+    let state_dir = resolve_state_dir(args.state_dir.as_deref(), args.config.as_deref(), None);
+    let config_path =
+        resolve_config_path_for_write(args.config.as_deref(), args.state_dir.as_deref(), None);
+
+    let mut cfg_map = match read_json_object_or_empty(&config_path) {
+        Ok(m) => m,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None),
+    };
+
+    let mut gate_cfg: SecurityGateConfig = cfg_map
+        .get("gate")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    // Upsert adapter by id so re-running `gate init` is idempotent.
+    if let Some(existing) = gate_cfg.filters.iter_mut().find(|f| f.id == plugin.id) {
+        *existing = plugin.clone();
+    } else {
+        gate_cfg.filters.push(plugin.clone());
+    }
+
+    if propose_only {
+        // Proposal never mutates or locks live signed policy in node.json; writes sibling proposal file.
+        gate_cfg.require_signed_policy = false;
+        gate_cfg.policy_signature = None;
+        let proposal_path = state_dir.join("gate.proposed.json");
+        let proposal_val = match serde_json::to_value(&gate_cfg) {
+            Ok(v) => v,
+            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
+        };
+        if let Err(e) = write_atomic_json(&proposal_path, &proposal_val, true) {
+            return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
+        }
+        let next = vec![
+            format!("Review proposed policy at {}", proposal_path.display()),
+            format!(
+                "Approve & lock as human: hyp-rs gate init --adapter {} --config {} --state-dir {} --lock",
+                args.adapter.as_str(),
+                config_path.display(),
+                state_dir.display()
+            ),
+        ];
+        if as_json {
+            let envelope = JsonEnvelope {
+                ok: true,
+                command: cmd.to_string(),
+                summary: Some(format!(
+                    "Staged unsigned gate policy proposal ({}) at {}",
+                    plugin.id,
+                    proposal_path.display()
+                )),
+                data: Some(json!({
+                    "proposalPath": proposal_path.display().to_string(),
+                    "adapter": args.adapter.as_str(),
+                    "filterId": plugin.id,
+                    "locked": false,
+                    "gate": proposal_val,
+                })),
+                warnings: Vec::new(),
+                next,
+                error: None,
+            };
+            print_json(&envelope);
+        } else {
+            println!("OK    Staged unsigned gate policy proposal '{}'", plugin.id);
+            println!("      Proposal: {}", proposal_path.display());
+            print_next_steps(&next);
+        }
+        return ExitCode::from(EXIT_OK);
+    }
+
+    let mut locked = false;
+    if args.lock {
+        let secrets = open_secret_store(&state_dir, args.state_dir.is_some());
+        gate_cfg.require_signed_policy = true;
+        gate_cfg.policy_signature = None;
+        let sig = match sign_gate_policy(&gate_cfg, &secrets) {
+            Ok(s) => s,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "POLICY_SIGN_FAILED",
+                    format!("Failed to sign gate policy: {e}"),
+                    None,
+                );
+            }
+        };
+        if let Err(e) = verify_gate_policy_sig(&gate_cfg, &sig, &secrets) {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "POLICY_VERIFY_FAILED",
+                format!("Self-verification of signed gate policy failed: {e}"),
+                None,
+            );
+        }
+        gate_cfg.policy_signature = Some(sig);
+        locked = true;
+    } else {
+        // Clear any stale signature because the policy was updated without `--lock`.
+        gate_cfg.policy_signature = None;
+        gate_cfg.require_signed_policy = false;
+    }
+
+    let node_id = cfg_map
+        .get("nodeId")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(default_node_id);
+    ensure_v2_node_json_defaults(&mut cfg_map, &node_id, NodeProfile::Local, &state_dir);
+
+    let gate_val = match serde_json::to_value(&gate_cfg) {
+        Ok(v) => v,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
+    };
+    cfg_map.insert("gate".to_string(), gate_val);
+
+    if let Err(e) = write_atomic_json(&config_path, &Value::Object(cfg_map), true) {
+        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
+    }
+
+    let summary_filter = summarize_filter_plugin(&plugin);
+    let mut next = Vec::new();
+    if let Some(ref secret_ref) = summary_filter.api_key_secret {
+        next.push(format!(
+            "Store API key out-of-band: hyp-rs secret set {secret_ref} --web"
+        ));
+    }
+    if !locked {
+        next.push(format!(
+            "Lock tamper-evident signature: hyp-rs gate lock --config {} --state-dir {}",
+            config_path.display(),
+            state_dir.display()
+        ));
+    }
+    next.push(format!(
+        "hyp-rs doctor --config {} --state-dir {}",
+        config_path.display(),
+        state_dir.display()
+    ));
+
+    if as_json {
+        let envelope = JsonEnvelope {
+            ok: true,
+            command: cmd.to_string(),
+            summary: Some(format!(
+                "Configured gate adapter '{}' ({}) in {}{}",
+                plugin.id,
+                args.adapter.as_str(),
+                config_path.display(),
+                if locked { " [LOCKED]" } else { "" }
+            )),
+            data: Some(json!({
+                "configPath": config_path.display().to_string(),
+                "stateDir": state_dir.display().to_string(),
+                "filter": summary_filter,
+                "locked": locked,
+                "requireSignedPolicy": gate_cfg.require_signed_policy,
+                "gatePolicySig": if locked { "OK" } else { "UNSIGNED" },
+                "policySigningSecret": gate_cfg.policy_signing_secret,
+            })),
+            warnings: Vec::new(),
+            next,
+            error: None,
+        };
+        print_json(&envelope);
+    } else {
+        println!(
+            "OK    Configured Security Gate adapter '{}' ({}){}",
+            plugin.id,
+            args.adapter.as_str(),
+            if locked { " · gate_policy_sig LOCKED" } else { "" }
+        );
+        println!("      Config: {}", config_path.display());
+        if let Some(ref sec) = summary_filter.api_key_secret {
+            println!("      Secret: {{ \"secret\": \"{sec}\" }} (never plaintext)");
+        }
+        print_next_steps(&next);
+    }
+    ExitCode::from(EXIT_OK)
+}
+
+fn run_gate_lock(
+    config: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
+    as_json: bool,
+) -> ExitCode {
+    let cmd = "gate lock";
+    let dir = resolve_state_dir(state_dir.as_deref(), config.as_deref(), None);
+    let config_path = resolve_config_path_for_read(config.as_deref(), state_dir.as_deref(), None);
+    if !config_path.exists() {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "CONFIG_NOT_FOUND",
+            format!("Config file not found: {}", config_path.display()),
+            Some("Run `hyp-rs gate init --adapter ...` or `hyp-rs onboard` first.".to_string()),
+        );
+    }
+
+    let mut cfg_map = match read_json_object_or_empty(&config_path) {
+        Ok(m) => m,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None),
+    };
+
+    let mut gate_cfg: SecurityGateConfig = match cfg_map.get("gate") {
+        Some(v) => match serde_json::from_value(v.clone()) {
+            Ok(g) => g,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "INVALID_GATE_CONFIG",
+                    format!("Malformed gate config in {}: {e}", config_path.display()),
+                    None,
+                );
+            }
+        },
+        None => SecurityGateConfig::default(),
+    };
+
+    if let Err(e) = gate_cfg.stage2.validate() {
+        return emit_error(cmd, as_json, EXIT_ERROR, "INVALID_GATE_CONFIG", e.to_string(), None);
+    }
+    for f in &gate_cfg.filters {
+        if let Err(e) = f.validate() {
+            return emit_error(cmd, as_json, EXIT_ERROR, "INVALID_GATE_CONFIG", e.to_string(), None);
+        }
+    }
+
+    let secrets = open_secret_store(&dir, state_dir.is_some());
+    gate_cfg.require_signed_policy = true;
+    gate_cfg.policy_signature = None;
+    let sig = match sign_gate_policy(&gate_cfg, &secrets) {
+        Ok(s) => s,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "POLICY_SIGN_FAILED",
+                format!("Failed to sign gate policy: {e}"),
+                None,
+            );
+        }
+    };
+    if let Err(e) = verify_gate_policy_sig(&gate_cfg, &sig, &secrets) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "POLICY_VERIFY_FAILED",
+            format!("Failed to verify signed gate policy: {e}"),
+            None,
+        );
+    }
+    gate_cfg.policy_signature = Some(sig);
+
+    let gate_val = match serde_json::to_value(&gate_cfg) {
+        Ok(v) => v,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
+    };
+    cfg_map.insert("gate".to_string(), gate_val);
+    if let Err(e) = write_atomic_json(&config_path, &Value::Object(cfg_map), true) {
+        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
+    }
+
+    let next = vec![format!(
+        "hyp-rs doctor --config {} --state-dir {}",
+        config_path.display(),
+        dir.display()
+    )];
+    if as_json {
+        let envelope = JsonEnvelope {
+            ok: true,
+            command: cmd.to_string(),
+            summary: Some(format!(
+                "Locked and signed gate_policy_sig for {} ({} filter(s))",
+                config_path.display(),
+                gate_cfg.filters.len()
+            )),
+            data: Some(json!({
+                "configPath": config_path.display().to_string(),
+                "stateDir": dir.display().to_string(),
+                "gatePolicySig": "OK",
+                "requireSignedPolicy": true,
+                "filterCount": gate_cfg.filters.len(),
+                "policySigningSecret": gate_cfg.policy_signing_secret,
+            })),
+            warnings: Vec::new(),
+            next,
+            error: None,
+        };
+        print_json(&envelope);
+    } else {
+        println!(
+            "OK    Locked gate policy in {} (gate_policy_sig verified via SecretStore '{}')",
+            config_path.display(),
+            gate_cfg.policy_signing_secret
+        );
+        print_next_steps(&next);
+    }
+    ExitCode::from(EXIT_OK)
+}
+
+fn run_gate_review(
+    session: Option<String>,
+    limit: usize,
+    state_dir: Option<PathBuf>,
+    as_json: bool,
+) -> ExitCode {
+    let cmd = "gate review";
+    let dir = resolve_state_dir(state_dir.as_deref(), None, None);
+    let db_path = dir.join("node.sqlite");
+    let db = match NodeDb::open(&db_path) {
+        Ok(db) => db,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+    };
+
+    let items = match db.local().list_quarantined(session.as_deref(), limit) {
+        Ok(v) => v,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+    };
+
+    let rows: Vec<Value> = items
+        .iter()
+        .map(|entry| {
+            let preview: String = entry.text.chars().take(160).collect();
+            json!({
+                "receipt": entry.receipt,
+                "sessionId": entry.session_id,
+                "originNode": entry.origin_node,
+                "sender": entry.source,
+                "kind": entry.kind.as_str(),
+                "reason": entry.gate_reason,
+                "receivedAt": entry.received_at,
+                "preview": preview,
+                "payloadSha256": entry.payload_sha256,
+            })
+        })
+        .collect();
+
+    let next: Vec<String> = if let Some(first) = items.first() {
+        vec![
+            format!(
+                "Approve: hyp-rs inbox approve {} --state-dir {}",
+                first.receipt,
+                dir.display()
+            ),
+            format!(
+                "Reject & mute sender: hyp-rs inbox reject {} --mute --state-dir {}",
+                first.receipt,
+                dir.display()
+            ),
+        ]
+    } else {
+        Vec::new()
+    };
+
+    if as_json {
+        let envelope = JsonEnvelope {
+            ok: true,
+            command: cmd.to_string(),
+            summary: Some(format!("{} quarantined item(s) awaiting human review", rows.len())),
+            data: Some(json!({
+                "count": rows.len(),
+                "items": rows,
+            })),
+            warnings: Vec::new(),
+            next,
+            error: None,
+        };
+        print_json(&envelope);
+    } else {
+        println!("Hyphae Quarantine Review ({} item(s))", items.len());
+        if items.is_empty() {
+            println!("  (no quarantined items)");
+        } else {
+            println!();
+            for item in &items {
+                let preview: String = item
+                    .text
+                    .chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .take(120)
+                    .collect();
+                println!("Receipt:  {}", item.receipt);
+                println!("  Session:  {}", item.session_id);
+                println!("  From:     {} (origin: {})", item.source, item.origin_node);
+                println!(
+                    "  Reason:   {}",
+                    item.gate_reason.as_deref().unwrap_or("policy_quarantine")
+                );
+                println!("  Preview:  {preview}");
+                println!();
+            }
+            print_next_steps(&next);
+        }
+    }
+    ExitCode::from(EXIT_OK)
+}
+
+fn run_gate_log(
+    decision: CliGateLogDecision,
+    limit: usize,
+    session: Option<String>,
+    state_dir: Option<PathBuf>,
+    as_json: bool,
+) -> ExitCode {
+    let cmd = "gate log";
+    let dir = resolve_state_dir(state_dir.as_deref(), None, None);
+    let db_path = dir.join("node.sqlite");
+    let db = match NodeDb::open(&db_path) {
+        Ok(db) => db,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+    };
+
+    let entries = match db.local().query_gate_audit(&GateAuditQuery {
+        decision: decision.to_store_filter(),
+        direction: None,
+        session_id: session,
+        since_ms: None,
+        until_ms: None,
+        limit: Some(limit),
+    }) {
+        Ok(v) => v,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+    };
+
+    if as_json {
+        let rows: Vec<Value> = entries
+            .iter()
+            .map(|e| {
+                json!({
+                    "seq": e.seq,
+                    "createdAt": e.created_at,
+                    "direction": e.direction.as_str(),
+                    "stage": e.stage,
+                    "decision": e.decision.as_str(),
+                    "originNode": e.origin_node,
+                    "source": e.source,
+                    "sessionId": e.session_id,
+                    "receiptId": e.receipt_id,
+                    "trustTier": e.trust_tier,
+                    "confidence": e.confidence,
+                    "categories": e.categories,
+                    "reason": e.reason,
+                    "payloadSha256": e.payload_sha256,
+                    "reviewer": e.reviewer,
+                })
+            })
+            .collect();
+        let envelope = JsonEnvelope {
+            ok: true,
+            command: cmd.to_string(),
+            summary: Some(format!("{} gate_audit record(s)", rows.len())),
+            data: Some(json!({
+                "count": rows.len(),
+                "entries": rows,
+            })),
+            warnings: Vec::new(),
+            next: Vec::new(),
+            error: None,
+        };
+        print_json(&envelope);
+    } else {
+        println!("Hyphae Security Gate Audit Log ({} record(s))", entries.len());
+        if entries.is_empty() {
+            println!("  (no audit entries)");
+        } else {
+            println!();
+            println!(
+                "{:<6}  {:<10}  {:<16}  {:<10}  {:<22}  Reason",
+                "Seq", "Direction", "Stage", "Decision", "Source"
+            );
+            println!("{}", "-".repeat(92));
+            for e in &entries {
+                println!(
+                    "{:<6}  {:<10}  {:<16}  {:<10}  {:<22}  {}",
+                    e.seq,
+                    e.direction.as_str(),
+                    e.stage,
+                    e.decision.as_str(),
+                    e.source.as_deref().unwrap_or("-"),
+                    e.reason.as_deref().unwrap_or("-")
+                );
+            }
+        }
+    }
+    ExitCode::from(EXIT_OK)
+}
+
+fn run_inbox_approve(
+    receipt: String,
+    reviewer: String,
+    state_dir: Option<PathBuf>,
+    as_json: bool,
+) -> ExitCode {
+    let cmd = "inbox approve";
+    let dir = resolve_state_dir(state_dir.as_deref(), None, None);
+    let db_path = dir.join("node.sqlite");
+    let db = match NodeDb::open(&db_path) {
+        Ok(db) => db,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+    };
+
+    match db.local().approve_quarantined(&receipt, &reviewer, now_ms()) {
+        Ok(entry) => {
+            if as_json {
+                let envelope = JsonEnvelope {
+                    ok: true,
+                    command: cmd.to_string(),
+                    summary: Some(format!(
+                        "Approved quarantined receipt '{}' -> pending for session '{}'",
+                        entry.receipt, entry.session_id
+                    )),
+                    data: Some(json!({
+                        "receipt": entry.receipt,
+                        "sessionId": entry.session_id,
+                        "gateState": entry.gate_state.as_str(),
+                        "reviewer": reviewer,
+                        "reviewedAt": entry.reviewed_at,
+                    })),
+                    warnings: Vec::new(),
+                    next: Vec::new(),
+                    error: None,
+                };
+                print_json(&envelope);
+            } else {
+                println!(
+                    "OK    Approved receipt '{}' -> released to session '{}' (reviewer: {})",
+                    entry.receipt, entry.session_id, reviewer
+                );
+            }
+            ExitCode::from(EXIT_OK)
+        }
+        Err(StoreError::NotFound(m)) => {
+            emit_error(cmd, as_json, EXIT_ERROR, "RECEIPT_NOT_FOUND", m, None)
+        }
+        Err(StoreError::InvalidState(m)) => {
+            emit_error(cmd, as_json, EXIT_ERROR, "INVALID_RECEIPT_STATE", m, None)
+        }
+        Err(e) => emit_error(cmd, as_json, EXIT_ERROR, "APPROVE_FAILED", e.to_string(), None),
+    }
+}
+
+fn run_inbox_reject(
+    receipt: String,
+    mute: bool,
+    reason: String,
+    reviewer: String,
+    state_dir: Option<PathBuf>,
+    as_json: bool,
+) -> ExitCode {
+    let cmd = "inbox reject";
+    let dir = resolve_state_dir(state_dir.as_deref(), None, None);
+    let db_path = dir.join("node.sqlite");
+    let db = match NodeDb::open(&db_path) {
+        Ok(db) => db,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+    };
+
+    let mute_rule = if mute {
+        match db.local().get_mailbox_entry(&receipt) {
+            Ok(Some(entry)) => {
+                let pattern = if !entry.source.trim().is_empty() {
+                    entry.source
+                } else {
+                    entry.origin_node
+                };
+                (!pattern.trim().is_empty()).then_some(MuteRuleInput {
+                    scope: "*".to_string(),
+                    pattern,
+                })
+            }
+            Ok(None) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "RECEIPT_NOT_FOUND",
+                    format!("receipt '{receipt}' not found"),
+                    None,
+                );
+            }
+            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+        }
+    } else {
+        None
+    };
+
+    match db
+        .local()
+        .reject_quarantined(&receipt, &reviewer, &reason, mute_rule.as_ref(), now_ms())
+    {
+        Ok(entry) => {
+            let muted_pattern = mute_rule.as_ref().map(|m| m.pattern.clone());
+            if as_json {
+                let envelope = JsonEnvelope {
+                    ok: true,
+                    command: cmd.to_string(),
+                    summary: Some(format!(
+                        "Rejected quarantined receipt '{}'{}",
+                        entry.receipt,
+                        muted_pattern
+                            .as_deref()
+                            .map(|p| format!(" and muted '{p}'"))
+                            .unwrap_or_default()
+                    )),
+                    data: Some(json!({
+                        "receipt": entry.receipt,
+                        "sessionId": entry.session_id,
+                        "gateState": entry.gate_state.as_str(),
+                        "reason": reason,
+                        "reviewer": reviewer,
+                        "muted": muted_pattern.is_some(),
+                        "mutedPattern": muted_pattern,
+                        "reviewedAt": entry.reviewed_at,
+                    })),
+                    warnings: Vec::new(),
+                    next: Vec::new(),
+                    error: None,
+                };
+                print_json(&envelope);
+            } else {
+                println!(
+                    "OK    Rejected receipt '{}'{}",
+                    entry.receipt,
+                    muted_pattern
+                        .as_deref()
+                        .map(|p| format!(" + installed global mute rule for '{p}'"))
+                        .unwrap_or_default()
+                );
+            }
+            ExitCode::from(EXIT_OK)
+        }
+        Err(StoreError::NotFound(m)) => {
+            emit_error(cmd, as_json, EXIT_ERROR, "RECEIPT_NOT_FOUND", m, None)
+        }
+        Err(StoreError::InvalidState(m)) => {
+            emit_error(cmd, as_json, EXIT_ERROR, "INVALID_RECEIPT_STATE", m, None)
+        }
+        Err(e) => emit_error(cmd, as_json, EXIT_ERROR, "REJECT_FAILED", e.to_string(), None),
+    }
+}

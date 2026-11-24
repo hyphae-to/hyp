@@ -1,11 +1,20 @@
-//! `hyp-rs` — Hyphae v2 native CLI (`hook`, `mcp`, `wait`, `watch`, `deploy`, `pair`, `version`).
+//! `hyp-rs` — Hyphae v2 native CLI (`hook`, `mcp`, `wait`, `watch`, `node`/`daemon`, `onboard`,
+//! `setup`, `status`, `doctor`, `secret`, `gate`, `inbox`, `kv`, `update`, `deploy`, `pair`, `version`).
 //!
 //! Performance note: `hyp-rs hook` intercepts `std::env::args()` BEFORE constructing `clap`
 //! or Tokio so hook invocations pay zero async-runtime startup overhead (1–3 ms cold start).
 
+mod config_file;
 mod deploy;
+mod gate_cmd;
+mod kv_cmd;
+mod node_cmd;
 mod pair;
+mod secret_cmd;
+mod setup;
+mod status_doctor;
 mod ui;
+mod update;
 
 use clap::{Parser, Subcommand};
 use hyp_harness::hooks::{HandleHookOptions, HookEvent, run_hook_sync, shell_quote_cli};
@@ -22,7 +31,7 @@ use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE};
 #[derive(Parser)]
 #[command(
     name = "hyp-rs",
-    about = "Hyphae v2 native CLI (hook, mcp, wait, watch, deploy, pair, version)",
+    about = "Hyphae v2 native CLI (hook, mcp, wait, watch, node, onboard, setup, status, doctor, secret, gate, inbox, kv, update, deploy, pair, version)",
     version
 )]
 struct Cli {
@@ -107,6 +116,43 @@ enum Commands {
         #[arg(long)]
         timeout: Option<f64>,
     },
+    /// Unified Hyphae v2 Node lifecycle commands (`node start`)
+    Node {
+        #[command(subcommand)]
+        command: node_cmd::NodeCommand,
+    },
+    /// Alias for `node start` — runs the unified Hyphae v2 Node daemon
+    Daemon(node_cmd::NodeStartArgs),
+    /// Configure hooks & MCP entries for installed agent harnesses pointing to the static Rust binary
+    Setup(setup::SetupArgs),
+    /// One-command Hyphae v2 onboarding (node.json, persistent keys, optional join token, harness setup)
+    Onboard(setup::OnboardArgs),
+    /// Render Node identity, Peer Capabilities & Version Skew table, Security Gate, and update status
+    Status(status_doctor::StatusArgs),
+    /// Run fail-closed diagnostics across node.sqlite, peer skew, gate_policy_sig, and harness setup
+    Doctor(status_doctor::DoctorArgs),
+    /// Zero-leak OS Keychain / Secret Service / 0600 file secret management (stdin or one-shot --web)
+    Secret {
+        #[command(subcommand)]
+        command: secret_cmd::SecretCommand,
+    },
+    /// Local Security Gate configuration, tamper-evident signing (`lock`), quarantine `review`, and `log`
+    Gate {
+        #[command(subcommand)]
+        command: gate_cmd::GateCommand,
+    },
+    /// Human-CLI-only quarantine inbox disposition (`approve` / `reject`)
+    Inbox {
+        #[command(subcommand)]
+        command: gate_cmd::InboxCommand,
+    },
+    /// Direct CLI access to Shared KV / Blackboard (`get`, `set`, `delete`, `list` with CAS)
+    Kv {
+        #[command(subcommand)]
+        command: kv_cmd::KvCommand,
+    },
+    /// Cryptographically signed self-update, release channels, and `--all` fleet rollout
+    Update(update::UpdateArgs),
     /// Internet deployment provider catalog, hardened kit generator, and fail-closed health checks
     Deploy {
         #[command(subcommand)]
@@ -374,6 +420,17 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Commands::Node { command } => node_cmd::run_node(command),
+        Commands::Daemon(args) => node_cmd::run_node_start(args),
+        Commands::Setup(args) => setup::run_setup(args),
+        Commands::Onboard(args) => setup::run_onboard(args),
+        Commands::Status(args) => status_doctor::run_status(args),
+        Commands::Doctor(args) => status_doctor::run_doctor(args),
+        Commands::Secret { command } => secret_cmd::run_secret(command),
+        Commands::Gate { command } => gate_cmd::run_gate(command),
+        Commands::Inbox { command } => gate_cmd::run_inbox(command),
+        Commands::Kv { command } => kv_cmd::run_kv(command),
+        Commands::Update(args) => update::run_update(args),
         Commands::Deploy { command } => deploy::run_deploy(command),
         Commands::Pair { command } => pair::run_pair(command),
         Commands::Version { json: as_json } => {
