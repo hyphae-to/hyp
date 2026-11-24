@@ -731,7 +731,7 @@ async function main(): Promise<void> {
       options: { socket: { type: "string" }, list: { type: "boolean" } },
     });
     const socketPath = values.socket ?? defaultSocketPath();
-    if (action === "mutes" || values.list === true || (action === "mute" && (!positionals[0] || positionals[0] === "list"))) {
+    if (action === "mutes" || values.list === true || (action === "mute" && (positionals.length === 0 || positionals[0] === "list"))) {
       const res = await daemonRpc(socketPath, { type: "mute.list" });
       if (!res.ok || !res.result) throw new Error(`Daemon not reachable at ${socketPath}`);
       const mutes = Array.isArray(res.result.mutes) ? res.result.mutes : [];
@@ -750,7 +750,7 @@ async function main(): Promise<void> {
     }
     const res = await daemonRpc(socketPath, { type: action === "mute" ? "mute.add" : "mute.remove", target });
     if (!res.ok || !res.result) {
-      throw new Error(`Could not ${action} '${target}' (is daemon running at ${socketPath}?)`);
+      throw new Error(res.error ?? `Could not ${action} '${target}' (is daemon running at ${socketPath}?)`);
     }
     console.log(JSON.stringify(res.result, null, 2));
     return;

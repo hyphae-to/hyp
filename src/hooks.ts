@@ -6,6 +6,7 @@ export type HookEvent = "pre-tool-use" | "post-tool-use" | "pre-invocation" | "s
 interface DaemonRpcResult {
   ok: boolean;
   result?: Record<string, unknown>;
+  error?: string;
 }
 
 /** Fast single-shot local Unix socket RPC for synchronous hooks (fails open when daemon is offline). */
@@ -34,6 +35,10 @@ export function daemonRpc(socketPath: string, packet: Record<string, unknown>, t
         const parsed: unknown = JSON.parse(buffer.slice(0, newline));
         if (object(parsed) && parsed.ok === true && object(parsed.result)) {
           done({ ok: true, result: parsed.result });
+          return;
+        }
+        if (object(parsed) && parsed.ok === false && typeof parsed.error === "string") {
+          done({ ok: false, error: parsed.error });
           return;
         }
       } catch {}
