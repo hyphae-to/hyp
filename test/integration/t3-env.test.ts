@@ -1218,18 +1218,27 @@ test(
     const t3Root = mkdtempSync(join(tmpdir(), "hi-t3-native-"));
 
     try {
-      // 1. Boot real isolated `t3 serve` and register a project inside its isolated baseDir
-      t3Server = await startRealT3Server(t3Root);
+      // 1. Pre-seed a project in the isolated baseDir BEFORE starting `t3 serve`
+      //    (T3 >= 0.1.x enforces a server-owner.sqlite lock on `t3 project add` while `t3 serve` is running),
+      //    then boot the real isolated `t3 serve` on that same baseDir.
+      const preBaseDir = join(t3Root, "t3-base");
+      const preHomeDir = join(t3Root, "t3-home");
+      const preCwd = join(t3Root, "t3-cwd");
+      mkdirSync(preBaseDir, { recursive: true, mode: 0o700 });
+      mkdirSync(join(preHomeDir, ".config"), { recursive: true, mode: 0o700 });
+      mkdirSync(preCwd, { recursive: true, mode: 0o700 });
       const t3Env = {
         ...process.env,
-        HOME: t3Server.homeDir,
-        T3CODE_HOME: t3Server.baseDir,
+        HOME: preHomeDir,
+        T3CODE_HOME: preBaseDir,
       };
       execFileSync(
         BINARIES.t3!,
-        ["project", "add", "--base-dir", t3Server.baseDir, "--title", "hyphae-t3-demo", t3Server.cwd],
+        ["project", "add", "--base-dir", preBaseDir, "--title", "hyphae-t3-demo", preCwd],
         { env: t3Env, encoding: "utf8", timeout: 10_000 },
       );
+
+      t3Server = await startRealT3Server(t3Root);
 
       const dbPath = t3StateDbPath(t3Server.baseDir);
       assert.equal(existsSync(dbPath), true, "expected statev2.sqlite in isolated T3 baseDir");
