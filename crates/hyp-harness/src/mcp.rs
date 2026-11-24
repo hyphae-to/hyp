@@ -121,7 +121,7 @@ pub fn select_tools_for_caps(caps: McpToolCaps) -> Vec<Value> {
         }),
         json!({
             "name": "hyp_inbox",
-            "description": "Query/ack inbox (unread|muted|delivered), set mode (queue|notify), or delivery rules. Never poll.",
+            "description": "Query/ack inbox, set mode (queue|notify), or delivery rules. Never poll.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -152,18 +152,22 @@ pub fn select_tools_for_caps(caps: McpToolCaps) -> Vec<Value> {
         }),
         json!({
             "name": "hyp_mesh",
-            "description": "Join/leave mesh or #channels, and list peers, channels, or session status.",
+            "description": "Join/leave mesh/#channels, list peers/channels/status, or create drop_link.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["join", "leave", "peers", "channels", "status"]},
+                    "action": {"type": "string", "enum": ["join", "leave", "peers", "channels", "status", "drop_link"]},
                     "handle": s,
                     "description": {
                         "type": "string",
-                        "description": "Optional short role/capability description advertised to peers on join (max 200 chars, untrusted metadata)"
+                        "description": "Join role note (<=200c, untrusted)"
                     },
                     "channel": s,
-                    "include": {"type": "array", "items": {"type": "string", "enum": ["peers", "channels", "topics", "subs", "mutes"]}}
+                    "include": {"type": "array", "items": {"type": "string", "enum": ["peers", "channels", "topics", "subs", "mutes"]}},
+                    "kind": {"type": "string", "enum": ["secret", "directive"]},
+                    "secretName": s,
+                    "ttlSeconds": {"type": "integer", "minimum": 60, "maximum": 900},
+                    "relay": s
                 },
                 "required": ["action"]
             }
@@ -364,13 +368,20 @@ pub fn translate_tool_call(
             let action = args
                 .get("action")
                 .and_then(Value::as_str)
-                .ok_or_else(|| "Expected action: join | leave | peers | channels | status".to_string())?;
+                .ok_or_else(|| {
+                    "Expected action: join | leave | peers | channels | status | drop_link"
+                        .to_string()
+                })?;
             let channel = args
                 .get("channel")
                 .and_then(Value::as_str)
                 .filter(|c| !c.is_empty());
 
             match action {
+                "drop_link" => Ok(TranslatedCall {
+                    name: "hyp_mesh".into(),
+                    args,
+                }),
                 "channels" => {
                     let mut out = Map::new();
                     out.insert("action".into(), json!("list"));
@@ -420,7 +431,7 @@ pub fn translate_tool_call(
                     })
                 }
                 other => Err(format!(
-                    "Invalid hyp_mesh action '{other}'. Expected: join | leave | peers | channels | status"
+                    "Invalid hyp_mesh action '{other}'. Expected: join | leave | peers | channels | status | drop_link"
                 )),
             }
         }
@@ -1373,6 +1384,15 @@ mod tests {
 
         let mesh_props = &core[2]["inputSchema"]["properties"];
         assert_eq!(mesh_props["description"]["type"], json!("string"));
+        assert_eq!(
+            mesh_props["action"]["enum"],
+            json!(["join", "leave", "peers", "channels", "status", "drop_link"])
+        );
+        assert_eq!(mesh_props["kind"]["enum"], json!(["secret", "directive"]));
+        assert_eq!(mesh_props["secretName"]["type"], json!("string"));
+        assert_eq!(mesh_props["ttlSeconds"]["minimum"], json!(60));
+        assert_eq!(mesh_props["ttlSeconds"]["maximum"], json!(900));
+        assert_eq!(mesh_props["relay"]["type"], json!("string"));
 
         let stream_props = &core[3]["inputSchema"]["properties"];
         assert_eq!(
@@ -1484,6 +1504,28 @@ mod tests {
         .unwrap();
         assert_eq!(ch_list.name, "hyp_channel");
         assert_eq!(Value::Object(ch_list.args), json!({"action": "list"}));
+
+        // hyp_mesh drop_link -> passes through to hyp_mesh with all drop parameters preserved
+        let drop_call = translate_tool_call(
+            "hyp_mesh",
+            json!({
+                "action": "drop_link",
+                "kind": "secret",
+                "secretName": "prod-api-key",
+                "ttlSeconds": 300,
+                "relay": "https://public.hyphae.to"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        )
+        .unwrap();
+        assert_eq!(drop_call.name, "hyp_mesh");
+        assert_eq!(drop_call.args["action"], "drop_link");
+        assert_eq!(drop_call.args["kind"], "secret");
+        assert_eq!(drop_call.args["secretName"], "prod-api-key");
+        assert_eq!(drop_call.args["ttlSeconds"], 300);
+        assert_eq!(drop_call.args["relay"], "https://public.hyphae.to");
 
         // hyp_inbox mode/mute/unmute -> hyp_session
         let mode = translate_tool_call(

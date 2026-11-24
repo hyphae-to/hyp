@@ -4,28 +4,41 @@
 //! `wakeup.emit`) with coalescing & Security Gate screening, and Tier 4 allowlisted Herdr
 //! cold-spawn security guards.
 
+use std::fs;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hyp_crypto::SecretBackend;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use http::header::CONTENT_TYPE;
+use http::{Method, Request, StatusCode};
+use hyp_crypto::human::{
+    HumanAudience, HumanClaimV1, HumanDropKind, SecretDropSpec, decode_hcert1, encode_hdrop1,
+    seal_human_drop, verify_node_cert,
+};
+use hyp_crypto::jcs::to_canonical_json;
+use hyp_crypto::rfc3339::format_rfc3339_millis;
+use hyp_crypto::{Ed25519KeyPair, SecretBackend};
 use hyp_harness::daemon::{LocalDaemon, LocalDaemonConfig, WakeupDaemonConfig, WakeupMcpToolMode};
 use hyp_harness::hooks::{HandleHookOptions, HookEvent, HookTransportHints, handle_hook_payload};
 use hyp_harness::mcp::{McpOptions, run_mcp_io};
 use hyp_harness::protocol::{HarnessKind, UNTRUSTED_PROVENANCE};
 use hyp_harness::sock::{DaemonRpcResult, daemon_rpc_async};
 use hyp_harness::transport::{PushMode, PushOutcome, PushTransport, TransportFuture};
-use hyp_node::engine::{NodeConfig, UnifiedNode};
+use hyp_node::engine::http_util::{HttpClient, full_body};
+use hyp_node::engine::{DROP_CAP_HEADER, DropRelayConfig, NodeConfig, UnifiedNode};
 use hyp_node::gates::{
     FilterOutcome, FilterPlugin, FilterPluginKind, GateDecision, InboundContext,
     SecurityGateConfig, SecurityGatePipeline, Stage1Config,
 };
 use hyp_proto::address::NodeId;
-use hyp_proto::cloudevent::CloudEvent;
+use hyp_proto::cloudevent::{CloudEvent, TYPE_HUMAN_SECRET_STORED_V1};
 use hyp_store::{
-    DEFAULT_WAKEUP_TTL_MS, FiredWakeup, NodeDb, WakeupInsert, WakeupLimits, WakeupTriggerKind,
-    WakeupUrgency, now_ms,
+    DEFAULT_WAKEUP_TTL_MS, FiredWakeup, GateAuditQuery, HumanAuthorityInput, HumanAuthorityRole,
+    NodeDb, WakeupInsert, WakeupLimits, WakeupTriggerKind, WakeupUrgency, now_ms, uuid_v4,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -1302,4 +1315,484 @@ exit 0
 
         daemon.stop().await;
     }
+}
+
+// =========================================================================
+// Test 6: Live Scheduler Fires Scheduled Wakeup Through LocalDaemon
+// =========================================================================
+
+#[tokio::test]
+async fn test6_live_scheduler_fires_scheduled_wakeup_through_daemon() {
+    let dir = TempDir::new().unwrap();
+    let node = open_local_node("live-sched@box", dir.path());
+
+    let mut cfg = LocalDaemonConfig::default();
+    cfg.wakeup.enabled = true;
+    let daemon = LocalDaemon::start(Arc::clone(&node), None, cfg)
+        .await
+        .expect("start daemon");
+    let sock = daemon.socket_path().to_path_buf();
+
+    let mut client_opts = McpOptions::new(sock.clone());
+    client_opts.backend = Some(HarnessKind::Claude);
+    let mut client = TestMcpClient::spawn(client_opts);
+    client.initialize().await;
+
+    // Enroll a session via `hyp_mesh`.
+    let (_, join_err) = client
+        .call_verified_claude(
+            &sock,
+            "sched-s1",
+            "hyp_mesh",
+            json!({ "action": "join", "handle": "runner" }),
+        )
+        .await;
+    assert!(!join_err);
+    let sid = "claude:sched-s1";
+
+    // Schedule a 1-second one-shot wakeup via `hyp_wakeup` (`at` = now + 1000ms).
+    // `tool_wakeup` must call `self.node.wake_scheduler()` so the zero-polling scheduler
+    // immediately re-arms from idle and fires on time.
+    let fire_at_rfc3339 = format_rfc3339_millis(now_ms() + 1_000);
+    let (set_txt, set_err) = client
+        .call_verified_claude(
+            &sock,
+            "sched-s1",
+            "hyp_wakeup",
+            json!({
+                "action": "set",
+                "at": fire_at_rfc3339,
+                "label": "live-tick",
+                "note": "wake from scheduler"
+            }),
+        )
+        .await;
+    assert!(!set_err, "hyp_wakeup set failed: {set_txt}");
+    let set_val: Value = serde_json::from_str(&set_txt).unwrap();
+    let wk_id = set_val["id"].as_str().unwrap().to_string();
+
+    // Wait (bounded up to 3.5s) for `UnifiedNode::start_scheduler()` -> `spawn_wakeup_watcher`
+    // -> `deliver_fired_wakeup` to deliver automatically to the session mailbox.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(3_500);
+    let delivered_entry = loop {
+        let items = node.db().local().peek_inbox_ex(sid, 10).unwrap();
+        if let Some(first) = items.into_iter().next() {
+            break first;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for live scheduler to fire wakeup '{wk_id}'"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+
+    assert!(
+        delivered_entry.entry.text.starts_with(UNTRUSTED_PROVENANCE),
+        "delivered wakeup must begin with UNTRUSTED_PROVENANCE, got: {}",
+        delivered_entry.entry.text
+    );
+    assert!(delivered_entry.entry.text.contains("live-tick"));
+    assert!(delivered_entry.entry.text.contains("wake from scheduler"));
+
+    // Verify persisted wakeup transitioned to `completed` after firing.
+    let stored = node
+        .db()
+        .wakeups()
+        .get_wakeup(&wk_id)
+        .unwrap()
+        .expect("wakeup record");
+    assert_eq!(stored.state, hyp_store::WakeupState::Completed);
+
+    // Also verify IPC `wakeup.set` (`inSeconds: 1`) + immediate `wakeup.cancel` re-arms scheduler
+    // and never delivers after cancel.
+    let ipc_set = rpc(
+        &sock,
+        &json!({
+            "type": "wakeup.set",
+            "id": "wk-cancel-live",
+            "inSeconds": 1,
+            "sessionId": sid,
+            "label": "cancelled-tick",
+            "note": "must never fire"
+        }),
+    )
+    .await;
+    assert!(ipc_set.ok, "wakeup.set IPC failed: {:?}", ipc_set.error);
+    let ipc_cancel = rpc(
+        &sock,
+        &json!({ "type": "wakeup.cancel", "id": "wk-cancel-live" }),
+    )
+    .await;
+    assert!(ipc_cancel.ok, "wakeup.cancel IPC failed: {:?}", ipc_cancel.error);
+    tokio::time::sleep(Duration::from_millis(1_150)).await;
+    let items_after = node.db().local().peek_inbox_ex(sid, 10).unwrap();
+    assert_eq!(
+        items_after.len(),
+        1,
+        "cancelled wakeup must never fire or enter mailbox"
+    );
+
+    client.close().await;
+    daemon.stop().await;
+    node.shutdown();
+}
+
+// =========================================================================
+// Test 7: `hyp_mesh({ action: "drop_link" })` Roundtrip + Zero-Leak + Burn
+//         + Offline Fallback + IPC `drop.ingest`
+// =========================================================================
+
+fn assert_zero_bytes_in_sqlite_files(state_dir: &Path, needle: &str) {
+    let needle_bytes = needle.as_bytes();
+    for name in ["node.sqlite", "node.sqlite-wal", "node.sqlite-shm"] {
+        let p = state_dir.join(name);
+        if p.exists() {
+            let bytes = fs::read(&p).expect("read sqlite file");
+            assert!(
+                !bytes.windows(needle_bytes.len()).any(|w| w == needle_bytes),
+                "ZERO-LEAK VIOLATION: secret found in {}",
+                p.display()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test7_mesh_drop_link_roundtrip_secret_zero_leak_and_burn() {
+    let dir = TempDir::new().unwrap();
+    let mut node_cfg = NodeConfig::router(NodeId::new("drop-e2e@box").unwrap(), dir.path());
+    node_cfg.secret_backend = Some(SecretBackend::File);
+    node_cfg.drop_relay = DropRelayConfig {
+        enabled: true,
+        ..DropRelayConfig::default()
+    };
+    let node = UnifiedNode::open(node_cfg).expect("open UnifiedNode");
+    let (http_addr, _server_handle) = Arc::clone(&node)
+        .serve("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .expect("bind drop relay HTTP server");
+
+    // Enroll an active human admin authority + sign & persist a NodeCertV1 (`hcert1_`).
+    let human_admin = Ed25519KeyPair::generate().unwrap();
+    let human_id = "bogdan@phone";
+    {
+        let db = node.db();
+        db.human()
+            .upsert_authority(
+                &HumanAuthorityInput {
+                    human_id: human_id.to_string(),
+                    kid: human_admin.kid(),
+                    label: "iPhone Passkey".to_string(),
+                    role: HumanAuthorityRole::Admin,
+                    jwk_json: serde_json::to_string(&human_admin.to_jwk()).unwrap(),
+                    prf_salt: Some("salt-e2e-01".to_string()),
+                    auth_epoch: 1,
+                },
+                now_ms(),
+            )
+            .unwrap();
+    }
+    let (_, expected_hcert1) = node
+        .issue_node_cert(&human_admin, &human_admin.kid(), 30)
+        .expect("issue NodeCertV1");
+
+    let daemon = LocalDaemon::start(Arc::clone(&node), None, LocalDaemonConfig::default())
+        .await
+        .expect("start LocalDaemon");
+    let sock = daemon.socket_path().to_path_buf();
+
+    let mut client_opts = McpOptions::new(sock.clone());
+    client_opts.backend = Some(HarnessKind::Claude);
+    let mut client = TestMcpClient::spawn(client_opts);
+    client.initialize().await;
+
+    let (_, join_err) = client
+        .call_verified_claude(
+            &sock,
+            "ops-s1",
+            "hyp_mesh",
+            json!({ "action": "join", "handle": "ops" }),
+        )
+        .await;
+    assert!(!join_err);
+    let sid = "claude:ops-s1";
+
+    // 1. Fail-closed guards: reserved secret names & insecure remote http:// relay MUST fail!
+    for reserved in ["gate-policy-hmac-key", "node-sign-primary", "human-admin-root"] {
+        let (err_txt, is_err) = client
+            .call_verified_claude(
+                &sock,
+                "ops-s1",
+                "hyp_mesh",
+                json!({
+                    "action": "drop_link",
+                    "kind": "secret",
+                    "secretName": reserved
+                }),
+            )
+            .await;
+        assert!(is_err, "reserved secret '{reserved}' must fail closed: {err_txt}");
+        assert!(
+            err_txt.to_ascii_lowercase().contains("reserved"),
+            "expected reserved error for '{reserved}', got: {err_txt}"
+        );
+    }
+
+    let (bad_relay_txt, bad_relay_err) = client
+        .call_verified_claude(
+            &sock,
+            "ops-s1",
+            "hyp_mesh",
+            json!({
+                "action": "drop_link",
+                "kind": "directive",
+                "relay": "http://evil.example.com"
+            }),
+        )
+        .await;
+    assert!(bad_relay_err, "remote http:// relay must fail closed: {bad_relay_txt}");
+
+    // 2. Request a Verified Secret Drop link via `hyp_mesh({ action: "drop_link" })`.
+    let (link_txt, link_err) = client
+        .call_verified_claude(
+            &sock,
+            "ops-s1",
+            "hyp_mesh",
+            json!({
+                "action": "drop_link",
+                "kind": "secret",
+                "secretName": "prod-api-key"
+            }),
+        )
+        .await;
+    assert!(!link_err, "drop_link failed: {link_txt}");
+    let link_val: Value = serde_json::from_str(&link_txt).unwrap();
+    assert_eq!(link_val["ok"], json!(true));
+    assert_eq!(link_val["offline"], json!(false));
+    assert_eq!(link_val["kind"], "secret");
+    assert_eq!(link_val["secretName"], "prod-api-key");
+    assert_eq!(link_val["handle"], "ops");
+    assert_eq!(link_val["hasNodeCert"], json!(true));
+
+    // Parse the returned `https://hyphae.to/drop#drop=<base64url>` URL matching `site/drop/drop.js`!
+    let url = link_val["url"].as_str().expect("drop URL");
+    let frag_b64 = url
+        .strip_prefix("https://hyphae.to/drop#drop=")
+        .expect("URL must start with https://hyphae.to/drop#drop=");
+    let frag_bytes = URL_SAFE_NO_PAD
+        .decode(frag_b64)
+        .expect("valid base64url fragment");
+    let frag: Value = serde_json::from_slice(&frag_bytes).expect("valid JSON fragment");
+
+    assert_eq!(frag["v"], json!(1));
+    assert_eq!(frag["kind"], "secret");
+    assert_eq!(frag["secretName"], "prod-api-key");
+    assert_eq!(frag["nodeId"], "drop-e2e@box");
+    assert_eq!(frag["handle"], "ops");
+    assert_eq!(frag["encJwk"]["kty"], "OKP");
+    assert_eq!(frag["encJwk"]["crv"], "X25519");
+    assert_eq!(frag["encJwk"]["x"], node.identity().encryption_jwk().x);
+    assert_eq!(frag["relay"], format!("http://{http_addr}"));
+    assert_eq!(frag["humanId"], human_id);
+    assert_eq!(frag["prfSalt"], "salt-e2e-01");
+    assert_eq!(frag["authEpoch"], json!(1));
+    assert!(frag["expiresAt"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(
+        frag.get("proposedText").is_none() && frag.get("body").is_none(),
+        "drop fragment MUST NEVER contain proposedText or body"
+    );
+
+    let frag_cert = frag["nodeCert"].as_str().expect("nodeCert in fragment");
+    assert_eq!(frag_cert, expected_hcert1);
+    let decoded_cert = decode_hcert1(frag_cert).expect("decode hcert1_");
+    let verified_cert = verify_node_cert(&decoded_cert, &human_admin.public_key(), now_ms(), 1)
+        .expect("verify NodeCertV1");
+    assert_eq!(verified_cert.node_id, "drop-e2e@box");
+
+    let relay_url = frag["relay"].as_str().unwrap();
+    let drop_id = frag["dropId"].as_str().unwrap();
+    let post_cap = frag["postCap"].as_str().unwrap();
+    assert!(!drop_id.is_empty());
+    assert!(post_cap.starts_with("hdcap1_"));
+
+    // 3. Seal a secret HumanDropEnvelopeV1 and POST it to `<relay>/v1/drops/<dropId>` with `postCap`.
+    let secret_canary = "sk-live-super-secret-xyz-999";
+    let now = now_ms();
+    let claim = HumanClaimV1 {
+        v: 1,
+        kind: HumanDropKind::Secret,
+        claim_id: format!("clm-{}", uuid_v4()),
+        human_id: human_id.to_string(),
+        human_kid: human_admin.kid(),
+        auth_epoch: 1,
+        issued_at: format_rfc3339_millis(now),
+        expires_at: format_rfc3339_millis(now + 300_000),
+        drop_id: drop_id.to_string(),
+        audience: HumanAudience {
+            node_id: "drop-e2e@box".to_string(),
+            node_enc_kid: node.identity().encryption.kid(),
+            handle: Some("ops".to_string()),
+        },
+        secret_spec: Some(SecretDropSpec {
+            name: "prod-api-key".to_string(),
+            overwrite: false,
+        }),
+        body: secret_canary.to_string(),
+    };
+    let envelope = seal_human_drop(&claim, &human_admin, &node.identity().encryption.public_key())
+        .expect("seal secret drop");
+    let body_json = to_canonical_json(&envelope).unwrap();
+
+    let http_client = HttpClient::new().unwrap();
+    let post_req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("{relay_url}/v1/drops/{drop_id}"))
+        .header(CONTENT_TYPE, "application/json")
+        .header(DROP_CAP_HEADER, post_cap)
+        .body(full_body(body_json.into_bytes()))
+        .unwrap();
+    let (status, _, _) = HttpClient::collect(
+        http_client.request(post_req).await.expect("POST drop"),
+        64 * 1024,
+    )
+    .await
+    .unwrap();
+    assert!(
+        status == StatusCode::OK || status == StatusCode::CREATED || status == StatusCode::ACCEPTED,
+        "unexpected POST /v1/drops status: {status}"
+    );
+
+    // 4. Bounded wait (up to 3s) for background watcher to ingest secret & burn relay RAM.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let secret_ready = node.secret_store().get("prod-api-key").is_ok();
+        let burned = node.drop_relay().health(now_ms()).buffered_bytes == 0;
+        let has_notice = !node.db().local().peek_inbox(sid, 10).unwrap().is_empty();
+        if secret_ready && burned && has_notice {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for drop ingestion & burn (secret_ready={secret_ready}, burned={burned}, has_notice={has_notice})"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // 5. Assert SecretStore value, ZERO leak in SQLite & mailbox, metadata-only notice, and RAM burn!
+    assert_eq!(
+        node.secret_store().get("prod-api-key").unwrap().as_str(),
+        secret_canary
+    );
+    assert_zero_bytes_in_sqlite_files(dir.path(), secret_canary);
+
+    let mailbox = node.db().local().peek_inbox(sid, 10).unwrap();
+    assert_eq!(mailbox.len(), 1);
+    assert!(
+        !mailbox[0].text.contains(secret_canary),
+        "ZERO-LEAK VIOLATION: secret value appeared in session mailbox!"
+    );
+    assert!(
+        mailbox[0].text.contains("prod-api-key"),
+        "expected metadata-only notice referencing prod-api-key, got: {}",
+        mailbox[0].text
+    );
+
+    let audits = node
+        .db()
+        .local()
+        .query_gate_audit(&GateAuditQuery {
+            session_id: Some(sid.to_string()),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        audits
+            .iter()
+            .any(|a| a.event_type.as_deref() == Some(TYPE_HUMAN_SECRET_STORED_V1)),
+        "expected audit record for {TYPE_HUMAN_SECRET_STORED_V1}"
+    );
+
+    assert_eq!(
+        node.drop_relay().health(now_ms()).buffered_bytes,
+        0,
+        "drop relay RAM buffer must be burned immediately on ingest"
+    );
+
+    // 6. Verify IPC `drop.ingest` ingests an offline `hdrop1_` directive cleanly!
+    let now2 = now_ms();
+    let dir_claim = HumanClaimV1 {
+        v: 1,
+        kind: HumanDropKind::Directive,
+        claim_id: format!("clm-{}", uuid_v4()),
+        human_id: human_id.to_string(),
+        human_kid: human_admin.kid(),
+        auth_epoch: 1,
+        issued_at: format_rfc3339_millis(now2),
+        expires_at: format_rfc3339_millis(now2 + 300_000),
+        drop_id: String::new(),
+        audience: HumanAudience {
+            node_id: "drop-e2e@box".to_string(),
+            node_enc_kid: node.identity().encryption.kid(),
+            handle: Some("ops".to_string()),
+        },
+        secret_spec: None,
+        body: "Proceed with production rollout v0.4.0".to_string(),
+    };
+    let dir_env = seal_human_drop(&dir_claim, &human_admin, &node.identity().encryption.public_key())
+        .expect("seal directive");
+    let hdrop1 = encode_hdrop1(&dir_env).unwrap();
+    let ingest_res = rpc(
+        &sock,
+        &json!({
+            "type": "drop.ingest",
+            "token": hdrop1
+        }),
+    )
+    .await;
+    assert!(ingest_res.ok, "drop.ingest IPC failed: {:?}", ingest_res.error);
+    let ingested = ingest_res.result.unwrap();
+    assert_eq!(ingested["kind"], "directive");
+    assert_eq!(ingested["humanId"], human_id);
+
+    client.close().await;
+    daemon.stop().await;
+    node.shutdown();
+
+    // 7. Verify offline fallback when local drop_relay is disabled and no drop_relay_url is set.
+    let dir_off = TempDir::new().unwrap();
+    let node_off = open_local_node("offline-drop@box", dir_off.path());
+    let daemon_off = LocalDaemon::start(Arc::clone(&node_off), None, LocalDaemonConfig::default())
+        .await
+        .expect("start offline daemon");
+    let sock_off = daemon_off.socket_path().to_path_buf();
+    let mut off_opts = McpOptions::new(sock_off.clone());
+    off_opts.backend = Some(HarnessKind::Claude);
+    let mut off_client = TestMcpClient::spawn(off_opts);
+    off_client.initialize().await;
+
+    let (off_txt, off_err) = off_client
+        .call_verified_claude(
+            &sock_off,
+            "off-s1",
+            "hyp_mesh",
+            json!({ "action": "drop_link", "kind": "directive" }),
+        )
+        .await;
+    assert!(!off_err, "offline drop_link failed: {off_txt}");
+    let off_val: Value = serde_json::from_str(&off_txt).unwrap();
+    assert_eq!(off_val["ok"], json!(true));
+    assert_eq!(off_val["offline"], json!(true));
+    let off_url = off_val["url"].as_str().unwrap();
+    let off_b64 = off_url.strip_prefix("https://hyphae.to/drop#drop=").unwrap();
+    let off_frag: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(off_b64).unwrap()).unwrap();
+    assert_eq!(off_frag["v"], json!(1));
+    assert_eq!(off_frag["nodeId"], "offline-drop@box");
+    assert_eq!(off_frag["kind"], "directive");
+    assert!(off_frag.get("relay").is_none());
+    assert!(off_frag.get("proposedText").is_none());
+
+    off_client.close().await;
+    daemon_off.stop().await;
+    node_off.shutdown();
 }
