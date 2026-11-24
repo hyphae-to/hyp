@@ -14,8 +14,8 @@ import { connectorPattern, handlePattern, object } from "./protocol.ts";
 import { detectExposedTailscaleUrl, encodeInvite, exposeTailscale } from "./remote.ts";
 import { writeSecret } from "./secrets.ts";
 import { defaultConnectorId, runOnboard, type AdditionalRouterSpec, type ConfigurableHarness } from "./setup.ts";
-import { isTopic } from "../packages/t3-mesh/src/router/cloudevent.ts";
-import { RouterCore } from "../packages/t3-mesh/src/router/core.ts";
+import { isTopic } from "./core/router/cloudevent.ts";
+import { RouterCore } from "./core/router/core.ts";
 
 export interface InteractiveOnboardOptions {
   readonly configPath: string;

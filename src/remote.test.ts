@@ -15,8 +15,8 @@ import {
   type ExecRunner,
 } from "./remote.ts";
 import { runOnboard } from "./setup.ts";
-import { RouterCore } from "../packages/t3-mesh/src/router/core.ts";
-import { serveRouter } from "../packages/t3-mesh/src/router/server.ts";
+import { RouterCore } from "./core/router/core.ts";
+import { serveRouter } from "./core/router/server.ts";
 
 test("invite encode/decode round-trips and enforces HTTPS/loopback origins", () => {
   const code = encodeInvite({

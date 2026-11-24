@@ -6,8 +6,8 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { startDaemon } from "../../src/daemon.ts";
 import { setupAntigravity, setupClaude, setupCodex } from "../../src/setup.ts";
-import { RouterCore } from "../../packages/t3-mesh/src/router/core.ts";
-import { serveRouter } from "../../packages/t3-mesh/src/router/server.ts";
+import { RouterCore } from "../../src/core/router/core.ts";
+import { serveRouter } from "../../src/core/router/server.ts";
 import { startDummyAnthropicServer, startDummyOpenAIServer } from "./dummy-apis.ts";
 
 function findBinary(name: string): string | null {

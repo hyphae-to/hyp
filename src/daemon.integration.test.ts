@@ -10,8 +10,8 @@ import { startDaemon } from "./daemon.ts";
 import { handleHookPayload } from "./hooks.ts";
 import { object } from "./protocol.ts";
 import { runDoctor, runOnboard, setupAntigravity, setupClaude, setupCodex, setupCursor, setupGemini, setupOpenCode, setupService } from "./setup.ts";
-import { serveRouter } from "../packages/t3-mesh/src/router/server.ts";
-import { RouterCore } from "../packages/t3-mesh/src/router/core.ts";
+import { serveRouter } from "./core/router/server.ts";
+import { RouterCore } from "./core/router/core.ts";
 
 class McpClient {
   readonly #proc: ChildProcessWithoutNullStreams;

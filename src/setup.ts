@@ -9,7 +9,7 @@ import { daemonRpc } from "./hooks.ts";
 import { connectorPattern, object } from "./protocol.ts";
 import { decodeInvite, normalizeRouterOrigin, probeRouter } from "./remote.ts";
 import { collectSecretRefs, readSecret } from "./secrets.ts";
-import { RouterCore } from "../packages/t3-mesh/src/router/core.ts";
+import { RouterCore } from "./core/router/core.ts";
 
 export interface RuntimePaths {
   readonly nodeBin: string;

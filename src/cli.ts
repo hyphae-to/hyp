@@ -31,7 +31,7 @@ import {
   type SkillTarget,
 } from "./setup.ts";
 import { runWait } from "./wait.ts";
-import { RouterCore } from "../packages/t3-mesh/src/router/core.ts";
+import { RouterCore } from "./core/router/core.ts";
 
 const configDir = (() => {
   const base = process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config");
@@ -210,7 +210,7 @@ async function main(): Promise<void> {
       console.log(`  hph router revoke-connector ${connectorId} --db ${dbPath}`);
       return;
     }
-    const { routerUsage, runRouterCommand } = await import("../packages/t3-mesh/src/router/commands.ts");
+    const { routerUsage, runRouterCommand } = await import("./core/router/commands.ts");
     if (args.length === 0 || args[0] === "--help") {
       console.log(
         `  expose tailscale [--service <name>] [--port 8790] [--https <port>] [--dry-run]\n` +

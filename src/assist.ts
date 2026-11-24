@@ -110,7 +110,7 @@ export function launchAgentAssist(agent: AssistAgent, prompt: string): number {
   const invocations: Record<AssistAgent, { bin: string; args: string[] }> = {
     claude: { bin: "claude", args: [prompt] },
     codex: { bin: "codex", args: [prompt] },
-    agy: { bin: "agy", args: [prompt] },
+    agy: { bin: "agy", args: ["-i", prompt] },
     opencode: { bin: "opencode", args: ["--prompt", prompt] },
   };
   const { bin, args } = invocations[agent];

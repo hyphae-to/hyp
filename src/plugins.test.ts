@@ -13,8 +13,8 @@ import { buildAgentOnboardingPrompt, gatherOnboardingContext } from "./assist.ts
 import { encodeInvite } from "./remote.ts";
 import { captureSecretViaWeb, collectSecretRefs, deleteSecret, listSecrets, readSecret, writeSecret } from "./secrets.ts";
 import { installSkill, runDoctor, runOnboard, setupOpenClaw } from "./setup.ts";
-import { RouterCore } from "../packages/t3-mesh/src/router/core.ts";
-import { serveRouter } from "../packages/t3-mesh/src/router/server.ts";
+import { RouterCore } from "./core/router/core.ts";
+import { serveRouter } from "./core/router/server.ts";
 
 function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {

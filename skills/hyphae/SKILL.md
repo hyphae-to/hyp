@@ -24,7 +24,7 @@ If `hph` is not installed yet (requires Node 24+):
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/bowd/hyphae/main/install.sh)"
 
 # Option B: npm
-npm install -g @hyphae-sh/cli
+npm install -g @bowd/hyphae
 ```
 
 ---

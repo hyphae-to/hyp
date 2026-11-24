@@ -3,10 +3,10 @@ import type { Duplex } from "node:stream";
 import { createInterface } from "node:readline";
 import type { RouterStreamConfig } from "./config.ts";
 import { object } from "./protocol.ts";
-import { serveReceiver, type RunningReceiver } from "../packages/t3-mesh/src/github/receiver.ts";
-import { log } from "../packages/t3-mesh/src/log.ts";
-import type { RouterCore } from "../packages/t3-mesh/src/router/core.ts";
-import type { Publisher } from "../packages/t3-mesh/src/router/events.ts";
+import { serveReceiver, type RunningReceiver } from "./core/github/receiver.ts";
+import { log } from "./core/log.ts";
+import type { RouterCore } from "./core/router/core.ts";
+import type { Publisher } from "./core/router/events.ts";
 
 const MAX_FRAME_BYTES = 64 * 1024;
 const MAX_BACKOFF_MS = 30_000;

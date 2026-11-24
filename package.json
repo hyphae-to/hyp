@@ -1,5 +1,5 @@
 {
-  "name": "@hyphae-sh/cli",
+  "name": "@bowd/hyphae",
   "private": true,
   "type": "module",
   "engines": {

@@ -5,7 +5,7 @@ import type { Backend } from "./delivery.ts";
 import { connectorPattern, handlePattern, object, sessionIdPattern } from "./protocol.ts";
 import type { RouterConfig } from "./router.ts";
 import { resolveEnvWithSecrets } from "./secrets.ts";
-import { isTopic } from "../packages/t3-mesh/src/router/cloudevent.ts";
+import { isTopic } from "./core/router/cloudevent.ts";
 
 export type BuiltinStreamName = "github-webhook" | "webhook-stream";
 

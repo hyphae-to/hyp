@@ -3,10 +3,10 @@ import type { AgentPluginConfig, AgentPluginTarget } from "./config.ts";
 import { RouterError } from "./router.ts";
 import type { Session, State } from "./state.ts";
 import type { Outcome } from "./protocol.ts";
-import { Plugins } from "../packages/t3-mesh/src/plugins/plugins.ts";
-import { formatPluginDelivery } from "../packages/t3-mesh/src/plugins/delivery.ts";
-import type { PluginConfig as T3PluginConfig } from "../packages/t3-mesh/src/plugins/types.ts";
-import type { InboundEventBatch, InboundOutcome } from "../packages/t3-mesh/src/router/types.ts";
+import { Plugins } from "./core/plugins/plugins.ts";
+import { formatPluginDelivery } from "./core/plugins/delivery.ts";
+import type { PluginConfig as T3PluginConfig } from "./core/plugins/types.ts";
+import type { InboundEventBatch, InboundOutcome } from "./core/router/types.ts";
 
 export interface PluginDeliverySink {
   deliverPluginText(session: Session, plugin: string, batchId: string, text: string): Promise<Outcome>;

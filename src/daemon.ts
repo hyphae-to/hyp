@@ -11,8 +11,8 @@ import { delivered, hold, isHarness, object, reject, sessionIdPattern, type Outc
 import { RouterError } from "./router.ts";
 import { State } from "./state.ts";
 import { buildStreamTopicMap, RouterStreamHost } from "./streams.ts";
-import { RouterCore } from "../packages/t3-mesh/src/router/core.ts";
-import { serveRouter, type RunningRouter } from "../packages/t3-mesh/src/router/server.ts";
+import { RouterCore } from "./core/router/core.ts";
+import { serveRouter, type RunningRouter } from "./core/router/server.ts";
 
 interface Waiter {
   readonly socket: Socket;

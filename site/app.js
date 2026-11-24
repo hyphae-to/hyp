@@ -7,7 +7,7 @@ function esc(s) {
 // ============================================================================
 const HERO_CMDS = {
   curl: 'bash -c "$(curl -fsSL https://raw.githubusercontent.com/bowd/hyphae/main/install.sh)"',
-  npm: "npm install -g @hyphae-sh/cli && hph onboard",
+  npm: "npm install -g @bowd/hyphae && hph onboard",
   git: "git clone https://github.com/bowd/hyphae && cd hyphae && npm i && npm run build",
 };
 
@@ -361,7 +361,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/bowd/hyphae/main/install
 # Verify Node 24, daemon, live router, 0600 secrets, and harnesses
 hph status`,
   npm: `# Install globally via npm (Node 24+)
-npm install -g @hyphae-sh/cli
+npm install -g @bowd/hyphae
 
 # Pick Private / Public / Shared routers, harnesses, streams & SSH hosts
 hph onboard`,
