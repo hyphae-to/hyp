@@ -31,6 +31,11 @@ pub const DEFAULT_GET_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_INTERRUPT_TIMEOUT: Duration = Duration::from_secs(12);
 /// Default timeout for `hc send --json ... <terminal_id> <text>`.
 pub const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(75);
+/// Default timeout for allowlisted Tier 4 cold revival `hc run <template> <prompt>`.
+pub const DEFAULT_SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum allowed length for a Herdr launch template name.
+pub const MAX_HERDR_TEMPLATE_LEN: usize = 128;
 
 /// Server-side timeout argument passed to `hc interrupt --json --timeout <secs>`.
 const INTERRUPT_CLI_TIMEOUT_SECS: &str = "8";
@@ -313,6 +318,65 @@ pub fn is_valid_terminal_id(terminal_id: &str) -> bool {
             .any(|c| c.is_whitespace() || c.is_control())
 }
 
+/// Validates a Herdr launch template name for allowlisted Tier 4 cold revival:
+/// non-empty, `<= 128` ASCII chars, does not start with `'-'`, and consists solely
+/// of ASCII alphanumeric characters, `'-'`, `'_'`, or `'.'` (zero shell metacharacters).
+pub fn is_valid_herdr_template(template: &str) -> bool {
+    !template.is_empty()
+        && template.len() <= MAX_HERDR_TEMPLATE_LEN
+        && !template.starts_with('-')
+        && template
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// Invokes an operator-allowlisted Herdr launch template directly via
+/// `hc run <template> <prompt>` (zero shell interpolation, `Stdio::null()` stdin,
+/// bounded output drain, `kill_on_drop(true)`, `ExecutableFileBusy` retry loop,
+/// and strict timeout with child kill on timeout).
+///
+/// Fails closed unless `template` is both syntactically valid ([`is_valid_herdr_template`])
+/// and present verbatim in `allowlist`, and `prompt` is non-empty with no NUL bytes.
+pub async fn spawn_herdr_template(
+    bin: &str,
+    template: &str,
+    prompt: &str,
+    allowlist: &[String],
+    timeout: Duration,
+) -> PushOutcome {
+    spawn_herdr_template_with_runner(&ProcessRunner, bin, template, prompt, allowlist, timeout)
+        .await
+}
+
+async fn spawn_herdr_template_with_runner<R: CommandRunner + ?Sized>(
+    runner: &R,
+    bin: &str,
+    template: &str,
+    prompt: &str,
+    allowlist: &[String],
+    timeout: Duration,
+) -> PushOutcome {
+    if !is_valid_herdr_template(template) || !allowlist.iter().any(|t| t == template) {
+        return PushOutcome::reject("herdr_template_not_allowlisted");
+    }
+    if prompt.is_empty() || prompt.contains('\0') {
+        return PushOutcome::reject("herdr_invalid_prompt");
+    }
+    if bin.trim().is_empty() {
+        return PushOutcome::hold("herdr_binary_missing");
+    }
+
+    let args = ["run", template, prompt];
+    match runner.run(bin, &args, timeout).await {
+        CommandOutcome::Completed { code: Some(0), .. } => PushOutcome::delivered(),
+        CommandOutcome::MissingBinary => PushOutcome::hold("herdr_binary_missing"),
+        CommandOutcome::Completed { .. }
+        | CommandOutcome::TimedOut
+        | CommandOutcome::OutputTooLarge
+        | CommandOutcome::IoError => PushOutcome::reject("herdr_spawn_failed"),
+    }
+}
+
 /// Probes a live Herdr terminal via `hc get --json <terminal_id>` (5s timeout)
 /// and returns a pinned [`HerdrTarget`] capturing `created_ms`, `pid`, and `app`.
 ///
@@ -557,15 +621,26 @@ impl CommandRunner for ProcessRunner {
 }
 
 async fn read_bounded<R: AsyncRead + Unpin>(
-    reader: R,
+    mut reader: R,
     limit: usize,
 ) -> std::io::Result<(Vec<u8>, bool)> {
     let mut buf = Vec::new();
-    let mut limited = reader.take((limit + 1) as u64);
-    limited.read_to_end(&mut buf).await?;
-    let truncated = buf.len() > limit;
-    if truncated {
-        buf.truncate(limit);
+    let mut chunk = [0u8; 4096];
+    let mut truncated = false;
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() < limit {
+            let take = (limit - buf.len()).min(n);
+            buf.extend_from_slice(&chunk[..take]);
+            if take < n {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+        }
     }
     Ok((buf, truncated))
 }
@@ -1019,5 +1094,140 @@ mod tests {
             )
         );
         assert_eq!(timeout.calls().len(), 1);
+    }
+
+    #[test]
+    fn validates_herdr_template_names_strictly() {
+        assert!(is_valid_herdr_template("ci-triage"));
+        assert!(is_valid_herdr_template("nightly_audit.v2"));
+        assert!(is_valid_herdr_template(&"a".repeat(MAX_HERDR_TEMPLATE_LEN)));
+
+        let too_long = "a".repeat(MAX_HERDR_TEMPLATE_LEN + 1);
+        for bad in [
+            "",
+            "-flag",
+            "--run",
+            "ci triage",
+            "ci;rm",
+            "ci$(id)",
+            "ci`id`",
+            "ci/triage",
+            "../evil",
+            "ci\ntriage",
+            "ci\0triage",
+            too_long.as_str(),
+        ] {
+            assert!(
+                !is_valid_herdr_template(bad),
+                "expected invalid template name to fail closed: {bad:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_herdr_template_enforces_allowlist_and_prompt_validation() {
+        let allowlist = vec!["ci-triage".to_string(), "--evil".to_string(), "bad;cmd".to_string()];
+
+        // Disallowed or syntactically invalid templates fail closed with ZERO subprocess calls!
+        for bad_tpl in ["unlisted", "--evil", "bad;cmd", "", "ci triage"] {
+            let runner = MockRunner::with_responses(vec![ok_stdout("")]);
+            let out = spawn_herdr_template_with_runner(
+                &runner,
+                "hc",
+                bad_tpl,
+                "Check CI",
+                &allowlist,
+                DEFAULT_SPAWN_TIMEOUT,
+            )
+            .await;
+            assert_eq!(
+                out,
+                PushOutcome::reject("herdr_template_not_allowlisted"),
+                "template {bad_tpl:?} must be rejected"
+            );
+            assert!(runner.calls().is_empty());
+        }
+
+        // Empty or NUL-containing prompts fail closed with ZERO subprocess calls!
+        for bad_prompt in ["", "hello\0world"] {
+            let runner = MockRunner::with_responses(vec![ok_stdout("")]);
+            let out = spawn_herdr_template_with_runner(
+                &runner,
+                "hc",
+                "ci-triage",
+                bad_prompt,
+                &allowlist,
+                DEFAULT_SPAWN_TIMEOUT,
+            )
+            .await;
+            assert_eq!(out, PushOutcome::reject("herdr_invalid_prompt"));
+            assert!(runner.calls().is_empty());
+        }
+
+        // Valid allowlisted template + prompt invokes `hc run ci-triage <prompt>` verbatim.
+        let ok_runner = MockRunner::with_responses(vec![ok_stdout("{}")]);
+        let ok = spawn_herdr_template_with_runner(
+            &ok_runner,
+            "/opt/bin/hc",
+            "ci-triage",
+            "Check PR #1 $(not-interpolated)",
+            &allowlist,
+            DEFAULT_SPAWN_TIMEOUT,
+        )
+        .await;
+        assert_eq!(ok, PushOutcome::delivered());
+        assert_eq!(
+            ok_runner.calls(),
+            vec![(
+                "/opt/bin/hc".to_string(),
+                vec![
+                    "run".to_string(),
+                    "ci-triage".to_string(),
+                    "Check PR #1 $(not-interpolated)".to_string()
+                ]
+            )]
+        );
+
+        // Missing binary -> Hold("herdr_binary_missing")
+        let missing_runner = MockRunner::with_responses(vec![CommandOutcome::MissingBinary]);
+        assert_eq!(
+            spawn_herdr_template_with_runner(
+                &missing_runner,
+                "hc",
+                "ci-triage",
+                "Check CI",
+                &allowlist,
+                DEFAULT_SPAWN_TIMEOUT,
+            )
+            .await,
+            PushOutcome::hold("herdr_binary_missing")
+        );
+
+        // Non-zero exit or timeout -> Reject("herdr_spawn_failed")
+        let fail_runner = MockRunner::with_responses(vec![exit_code(1, "err"), CommandOutcome::TimedOut]);
+        assert_eq!(
+            spawn_herdr_template_with_runner(
+                &fail_runner,
+                "hc",
+                "ci-triage",
+                "Check CI",
+                &allowlist,
+                DEFAULT_SPAWN_TIMEOUT,
+            )
+            .await,
+            PushOutcome::reject("herdr_spawn_failed")
+        );
+        assert_eq!(
+            spawn_herdr_template_with_runner(
+                &fail_runner,
+                "hc",
+                "ci-triage",
+                "Check CI",
+                &allowlist,
+                DEFAULT_SPAWN_TIMEOUT,
+            )
+            .await,
+            PushOutcome::reject("herdr_spawn_failed")
+        );
     }
 }
