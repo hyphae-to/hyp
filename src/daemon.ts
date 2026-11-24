@@ -64,13 +64,18 @@ async function resolveHerdr(terminalId: string): Promise<{ id: string; backend: 
   let terminal: unknown;
   try { terminal = JSON.parse(result.stdout); } catch { return null; }
   if (!object(terminal) || terminal.address !== terminalId || terminal.state !== "live" || !object(terminal.status)) return null;
-  const backend = parseBackend({
-    kind: "herdr",
-    terminalId: terminal.address,
-    createdMs: terminal.created_ms,
-    pid: terminal.pid,
-    app: terminal.status.app,
-  });
+  let backend: Backend;
+  try {
+    backend = parseBackend({
+      kind: "herdr",
+      terminalId: terminal.address,
+      createdMs: terminal.created_ms,
+      pid: terminal.pid,
+      app: terminal.status.app,
+    });
+  } catch {
+    return null;
+  }
   if (backend.kind !== "herdr") return null;
   return { id: `herdr:${backend.terminalId}:${backend.createdMs}:${backend.pid}`, backend };
 }
@@ -246,8 +251,9 @@ export async function startDaemon(config: Config, options: StartDaemonOptions = 
     let attachedWaiter: { sessionId: string; waiter: Waiter } | undefined;
 
     const bindChannelTransport = (sessionId: string) => {
-      if (!mcpContext || !mcpContext.channel || !mcpContext.channelReady || socket.destroyed) return;
+      if (!mcpContext || !mcpContext.channel || socket.destroyed) return;
       mcpContext.channelSessionId = sessionId;
+      if (!mcpContext.channelReady) return;
       channels.set(sessionId, {
         socket,
         deliver: (text) => {
@@ -537,6 +543,7 @@ export async function startDaemon(config: Config, options: StartDaemonOptions = 
               const backend = parseBackend({
                 kind: "codex",
                 threadId: mcpContext.codexThreadId,
+                ...(mcpContext.codexHome ? { codexHome: mcpContext.codexHome } : {}),
                 resume: mcpContext.codexResume,
                 ...(mcpContext.codexRemote ? { remote: mcpContext.codexRemote } : {}),
                 queue: true,

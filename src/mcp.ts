@@ -104,17 +104,28 @@ export function runMcp(path: string, options: McpOptions = {}): void {
   const channel = options.channel === true;
   const ephemeralClientId = options.ephemeral ? randomUUID() : undefined;
   let socket: Socket | undefined;
+  let channelReadySent = false;
   let initialized = false;
   let nextId = 0;
   const pending = new Map<number, { reply: (result: unknown, isError?: boolean) => void; timer: NodeJS.Timeout }>();
+
+  const sendChannelReady = (conn: Socket): void => {
+    if (!channel || !initialized || channelReadySent || conn.destroyed) return;
+    channelReadySent = true;
+    conn.write(JSON.stringify({ type: "channel.ready" }) + "\n");
+  };
 
   const connect = (): Socket => {
     if (socket && !socket.destroyed) return socket;
     const conn = createConnection(path);
     socket = conn;
+    channelReadySent = false;
     conn.on("error", () => {});
     conn.on("close", () => {
-      if (socket === conn) socket = undefined;
+      if (socket === conn) {
+        socket = undefined;
+        channelReadySent = false;
+      }
       for (const [id, request] of pending) {
         clearTimeout(request.timer);
         request.reply("Local hyp daemon is not running. Run `hyp onboard` (or `hyp daemon`).", true);
@@ -133,9 +144,7 @@ export function runMcp(path: string, options: McpOptions = {}): void {
       ...(process.env.CODEX_HOME ? { codexHome: process.env.CODEX_HOME } : {}),
       ...(options.backend === "herdr" && process.env.HC_TERMINAL_ID ? { terminalId: process.env.HC_TERMINAL_ID } : {}),
     }) + "\n");
-    conn.once("connect", () => {
-      if (channel && initialized) conn.write(JSON.stringify({ type: "channel.ready" }) + "\n");
-    });
+    sendChannelReady(conn);
     const rl = createInterface({ input: conn });
     rl.on("error", () => {});
     rl.on("line", (line) => {
@@ -175,8 +184,7 @@ export function runMcp(path: string, options: McpOptions = {}): void {
     if (request.method === "notifications/initialized") {
       initialized = true;
       if (channel) {
-        if (socket && !socket.connecting && !socket.destroyed) socket.write(JSON.stringify({ type: "channel.ready" }) + "\n");
-        else connect();
+        sendChannelReady(connect());
       }
       return;
     }

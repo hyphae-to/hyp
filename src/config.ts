@@ -336,6 +336,10 @@ export function parseBackend(raw: Record<string, unknown>): Backend {
     if (threadId !== undefined && (typeof threadId !== "string" || threadId.length === 0 || threadId.length > 128)) {
       throw new Error("Invalid Codex thread ID");
     }
+    const codexHome = raw.codexHome;
+    if (codexHome !== undefined && (typeof codexHome !== "string" || codexHome.length === 0 || codexHome.includes("\0"))) {
+      throw new Error("Invalid Codex home directory");
+    }
     const remote = raw.remote;
     if (remote !== undefined && (typeof remote !== "string" || !codexRemotePattern.test(remote))) {
       throw new Error("Codex remote must be ws://, wss://, or unix://");
@@ -349,6 +353,7 @@ export function parseBackend(raw: Record<string, unknown>): Backend {
     return {
       kind: "codex",
       ...(threadId ? { threadId } : {}),
+      ...(codexHome ? { codexHome } : {}),
       bin: raw.bin ?? "codex",
       resume: raw.resume === true,
       ...(remote ? { remote } : {}),
