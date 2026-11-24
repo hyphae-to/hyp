@@ -337,14 +337,14 @@ export async function promptConnectorPlugins(configDir: string): Promise<Record<
   return plugins;
 }
 
-/** Standalone interactive `hph plugin setup` command. */
+/** Standalone interactive `hyp plugin setup` command. */
 export async function runPluginSetupWizard(configPath: string): Promise<void> {
   const absConfig = resolve(configPath);
   const configDir = dirname(absConfig);
   p.intro(`${badge.tag("hyphae")} ${badge.dim("plugin & stream setup")}`);
 
   if (!existsSync(absConfig)) {
-    p.log.error(`No config found at ${absConfig}. Run \`hph onboard\` first.`);
+    p.log.error(`No config found at ${absConfig}. Run \`hyp onboard\` first.`);
     process.exitCode = 1;
     return;
   }
@@ -381,7 +381,7 @@ export async function runPluginSetupWizard(configPath: string): Promise<void> {
     );
     const guide = ALL_GUIDES.find((g) => g.id === pick)!;
     p.note(formatGuideCard(guide), guide.label);
-    p.outro("Run `hph plugin setup` anytime to configure it interactively.");
+    p.outro("Run `hyp plugin setup` anytime to configure it interactively.");
     return;
   }
 
@@ -399,7 +399,7 @@ export async function runPluginSetupWizard(configPath: string): Promise<void> {
   } else {
     if (!object(rawCfg.localRouter)) {
       p.log.warn("This machine does not run a localRouter in connector.json. Router streams run on the router host.");
-      p.outro("Run `hph stream add` on your router host.");
+      p.outro("Run `hyp stream add` on your router host.");
       return;
     }
     const added = await promptRouterStreams(configDir);
@@ -416,7 +416,7 @@ export async function runPluginSetupWizard(configPath: string): Promise<void> {
     }
   }
 
-  p.outro(`Restart ${styleText("cyan", "hph daemon")} to activate the new configuration, then verify with ${styleText("cyan", "hph secret check")}.`);
+  p.outro(`Restart ${styleText("cyan", "hyp daemon")} to activate the new configuration, then verify with ${styleText("cyan", "hyp secret check")}.`);
 }
 
 /**
@@ -660,7 +660,7 @@ export async function runInteractiveOnboard(options: InteractiveOnboardOptions):
 
   if (env.herdr.installed) {
     p.log.info(
-      `Herdr Core detected: agents inside Herdr can also attach via ${styleText("cyan", "hph mcp --backend herdr")} for native ${styleText("cyan", "hc interrupt")} + ${styleText("cyan", "hc send")}.`,
+      `Herdr Core detected: agents inside Herdr can also attach via ${styleText("cyan", "hyp mcp --backend herdr")} for native ${styleText("cyan", "hc interrupt")} + ${styleText("cyan", "hc send")}.`,
     );
   }
 
@@ -743,10 +743,10 @@ export async function runInteractiveOnboard(options: InteractiveOnboardOptions):
         "",
         badge.accent("Option B — Expose ONLY GitHub webhook receiver publicly via Tailscale Funnel:"),
         `  tailscale funnel --bg --https=443 --set-path=/hooks/github http://127.0.0.1:${ghPort}`,
-        "  (Keep the main router private on your tailnet with `hph router expose tailscale`!)",
+        "  (Keep the main router private on your tailnet with `hyp router expose tailscale`!)",
         "",
         badge.accent("Invite external machines:"),
-        "  hph router invite user@remote --router https://mesh.yourdomain.com",
+        "  hyp router invite user@remote --router https://mesh.yourdomain.com",
       ].join("\n"),
       "Public router HTTPS & webhook exposure",
     );
@@ -764,7 +764,7 @@ export async function runInteractiveOnboard(options: InteractiveOnboardOptions):
           options: [
             { value: "service", label: "Tailscale Service (svc:hyphae)", hint: "Recommended · stable https://hyphae.<tailnet>.ts.net" },
             { value: "serve", label: "Node-scoped Tailscale Serve", hint: "Zero tailnet admin setup · https://<node>.<tailnet>.ts.net:8790" },
-            { value: "skip", label: "Keep loopback-only (127.0.0.1)", hint: "Run `hph router expose tailscale` later" },
+            { value: "skip", label: "Keep loopback-only (127.0.0.1)", hint: "Run `hyp router expose tailscale` later" },
           ],
           initialValue: "skip",
         }),
@@ -875,7 +875,7 @@ export async function runInteractiveOnboard(options: InteractiveOnboardOptions):
             } else {
               sshSpin.stop(`Remote onboard failed on ${hostName}`);
               p.log.warn(sshRes.stderr.trim() || sshRes.stdout.trim());
-              p.note(`ssh ${sshTarget} 'hph onboard --join' <<< '${code}'`, `Manual invite for ${hostName}`);
+              p.note(`ssh ${sshTarget} 'hyp onboard --join' <<< '${code}'`, `Manual invite for ${hostName}`);
             }
           } else {
             p.note(
@@ -883,19 +883,19 @@ export async function runInteractiveOnboard(options: InteractiveOnboardOptions):
                 `hyphae is not installed on ${hostName} yet.`,
                 `After installing Node 24 + hyphae on ${sshTarget}, run:`,
                 "",
-                `  hph onboard --join --install-service <<< '${code}'`,
+                `  hyp onboard --join --install-service <<< '${code}'`,
               ].join("\n"),
               `Invite created for ${remoteId}`,
             );
           }
         }
       } else if (reachable.length > 0 && !exposedUrl) {
-        p.log.info(`Tip: run ${styleText("cyan", "hph router expose tailscale --service hyphae")} to invite those remote machines over your tailnet.`);
+        p.log.info(`Tip: run ${styleText("cyan", "hyp router expose tailscale --service hyphae")} to invite those remote machines over your tailnet.`);
       }
     }
   }
 
   p.outro(
-    `${badge.ok("Ready!")} Run ${styleText("cyan", "hph doctor")}, ${styleText("cyan", "hph plugin setup")}, or ${styleText("cyan", "hph secret list")} anytime.`,
+    `${badge.ok("Ready!")} Run ${styleText("cyan", "hyp doctor")}, ${styleText("cyan", "hyp plugin setup")}, or ${styleText("cyan", "hyp secret list")} anytime.`,
   );
 }

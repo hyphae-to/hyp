@@ -141,13 +141,13 @@ test("Antigravity PreToolUse overwrites _meshCall, PreInvocation injects queued 
   );
   assert.ok(Array.isArray(preInv.injectSteps) && preInv.injectSteps.length === 1);
 
-  // Stop with empty mailbox and no waiter prompts once to arm `hph wait`
+  // Stop with empty mailbox and no waiter prompts once to arm `hyp wait`
   const stop1 = await handleHookPayload(
     { conversationId: "conv-42", continuationActive: false, terminationReason: "NO_TOOL_CALL" },
-    { harness: "antigravity", event: "stop", socketPath: "/tmp/unused.sock", cliPath: "hph", rpc },
+    { harness: "antigravity", event: "stop", socketPath: "/tmp/unused.sock", cliPath: "hyp", rpc },
   );
   assert.equal(stop1.decision, "continue");
-  assert.match(String(stop1.reason), /hph wait --session antigravity:conv-42/);
+  assert.match(String(stop1.reason), /hyp wait --session antigravity:conv-42/);
 
   // Stop with continuationActive=true never loops
   const stopLoop = await handleHookPayload(
@@ -219,9 +219,9 @@ test("Cursor, OpenCode, and Gemini CLI hook payloads map cleanly to each harness
   assert.deepEqual(ocPre, { callToken: "tok_xyz", sessionId: "opencode:oc-9" });
   const ocStop = await handleHookPayload(
     { session_id: "oc-9" },
-    { harness: "opencode", event: "stop", socketPath: "/tmp/u.sock", cliPath: "hph", rpc },
+    { harness: "opencode", event: "stop", socketPath: "/tmp/u.sock", cliPath: "hyp", rpc },
   );
-  assert.match(String(ocStop.followupMessage), /hph wait --session opencode:oc-9/);
+  assert.match(String(ocStop.followupMessage), /hyp wait --session opencode:oc-9/);
 
   // Gemini CLI: BeforeTool -> tool_input._meshCall, AfterTool -> additionalContext, AfterAgent -> decision:deny
   const gemPre = await handleHookPayload(
@@ -243,8 +243,8 @@ test("Cursor, OpenCode, and Gemini CLI hook payloads map cleanly to each harness
   );
   const gemStop = await handleHookPayload(
     { session_id: "gem-7" },
-    { harness: "gemini", event: "stop", socketPath: "/tmp/u.sock", cliPath: "hph", rpc },
+    { harness: "gemini", event: "stop", socketPath: "/tmp/u.sock", cliPath: "hyp", rpc },
   );
   assert.equal(gemStop.decision, "deny");
-  assert.match(String(gemStop.reason), /hph wait --session gemini:gem-7/);
+  assert.match(String(gemStop.reason), /hyp wait --session gemini:gem-7/);
 });

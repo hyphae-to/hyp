@@ -36,9 +36,9 @@ export function inferSessionIdFromEnv(env: NodeJS.ProcessEnv = process.env): str
 
 /**
  * Blocking zero-CPU, zero-polling event waiter/watcher on `connector.sock`:
- * - `mode: "once"` (`hph wait`): blocks until ≥1 item arrives, prints formatted payload, exits 0.
+ * - `mode: "once"` (`hyp wait`): blocks until ≥1 item arrives, prints formatted payload, exits 0.
  *   Ideal for Antigravity `run_command` (WaitMsBeforeAsync: 500) and Claude `Bash(run_in_background=true)`.
- * - `mode: "stream"` (`hph watch`): stays open and writes one flushed line per event/message.
+ * - `mode: "stream"` (`hyp watch`): stays open and writes one flushed line per event/message.
  *   Ideal for Claude Code's `Monitor` tool.
  */
 export function runWait(options: WaitOptions): Promise<number> {
@@ -72,7 +72,7 @@ export function runWait(options: WaitOptions): Promise<number> {
     socket.on("error", (error) => {
       process.off("SIGINT", onSignal);
       process.off("SIGTERM", onSignal);
-      finish(1, new Error(`Could not connect to hph daemon at ${options.socketPath}: ${error.message}`));
+      finish(1, new Error(`Could not connect to hyp daemon at ${options.socketPath}: ${error.message}`));
     });
 
     socket.on("close", () => {

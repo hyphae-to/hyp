@@ -259,7 +259,7 @@ export async function handleHookPayload(
     const reason = waiterArmPrompt(
       options.harness,
       sessionId,
-      options.cliPath ?? "hph",
+      options.cliPath ?? "hyp",
       options.explicitSocket ?? "",
     );
     return formatStopContinuation(reason);

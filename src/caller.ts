@@ -146,7 +146,7 @@ export class CallRegistry {
     return {
       ok: false,
       code: "caller_unverifiable",
-      message: "No verified tool-call ID or hook token present. Run 'hph setup <antigravity|claude|codex>' to install hooks.",
+      message: "No verified tool-call ID or hook token present. Run 'hyp setup <antigravity|claude|codex>' to install hooks.",
     };
   }
 
@@ -160,7 +160,7 @@ export class CallRegistry {
       return {
         ok: false,
         code: "caller_unverifiable",
-        message: "No verified tool-call ID or hook token present. Run 'hph setup <antigravity|claude|codex>' to install hooks.",
+        message: "No verified tool-call ID or hook token present. Run 'hyp setup <antigravity|claude|codex>' to install hooks.",
       };
     }
     const immediate = this.#tryResolve(tool, callId, callToken, Date.now());
@@ -169,7 +169,7 @@ export class CallRegistry {
       return {
         ok: false,
         code: "caller_not_found",
-        message: `No verified PreToolUse hook registration found for ${tool}. Ensure hooks are installed ('hph setup <harness>').`,
+        message: `No verified PreToolUse hook registration found for ${tool}. Ensure hooks are installed ('hyp setup <harness>').`,
       };
     }
 
@@ -197,7 +197,7 @@ export class CallRegistry {
     return {
       ok: false,
       code: "caller_not_found",
-      message: `No verified PreToolUse hook registration found for ${tool}. Ensure hooks are installed ('hph setup <harness>').`,
+      message: `No verified PreToolUse hook registration found for ${tool}. Ensure hooks are installed ('hyp setup <harness>').`,
     };
   }
 }

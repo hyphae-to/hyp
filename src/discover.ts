@@ -244,7 +244,7 @@ const REMOTE_PROBE_SCRIPT = [
   'echo "USER=$(whoami)"',
   'echo "HOST=$(hostname -s 2>/dev/null || hostname)"',
   'echo "NODE=$(node -v 2>/dev/null || true)"',
-  'echo "MESH=$(command -v hph 2>/dev/null || command -v hyphae 2>/dev/null || true)"',
+  'echo "MESH=$(command -v hyp 2>/dev/null || command -v hyphae 2>/dev/null || true)"',
   'echo "T3MESH=$(test -f ~/.t3-mesh/config.json && echo yes || echo no)"',
   'H=""',
   '(test -d ~/.gemini/config || command -v agy >/dev/null 2>&1) && H="$H antigravity"',
@@ -333,7 +333,7 @@ export function onboardRemoteOverSsh(options: {
   readonly installService?: boolean;
   readonly remoteBin?: string;
 }): Promise<{ ok: boolean; stdout: string; stderr: string }> {
-  const bin = options.remoteBin ?? "hph";
+  const bin = options.remoteBin ?? "hyp";
   if (!SAFE_SSH_TARGET.test(options.host)) {
     return Promise.resolve({ ok: false, stdout: "", stderr: `Unsafe SSH host: ${options.host}` });
   }
@@ -341,7 +341,7 @@ export function onboardRemoteOverSsh(options: {
     return Promise.resolve({ ok: false, stdout: "", stderr: `Unsafe remote binary path: ${bin}` });
   }
   const flags = ["--join", "--replace", ...(options.installService ? ["--install-service"] : [])].join(" ");
-  const inner = `if command -v ${bin} >/dev/null 2>&1; then ${bin} onboard ${flags}; elif command -v hyphae >/dev/null 2>&1; then hyphae onboard ${flags}; elif [ -x "$HOME/.local/bin/hph" ]; then "$HOME/.local/bin/hph" onboard ${flags}; else echo "hph (hyphae) not found in PATH on $(hostname)" >&2; exit 127; fi`;
+  const inner = `if command -v ${bin} >/dev/null 2>&1; then ${bin} onboard ${flags}; elif command -v hyphae >/dev/null 2>&1; then hyphae onboard ${flags}; elif [ -x "$HOME/.local/bin/hyp" ]; then "$HOME/.local/bin/hyp" onboard ${flags}; else echo "hyp (hyphae) not found in PATH on $(hostname)" >&2; exit 127; fi`;
   const remoteCmd = `sh -c '${inner.replace(/'/g, "'\\''")}'`;
 
   return new Promise((resolve) => {

@@ -330,7 +330,7 @@ test(
         env: { ...process.env, HOME: fakeHome },
       });
       assert.equal(res.code, 0, `agy plugin list exited ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
-      assert.match(res.stdout, /hyphae/, `Expected agy plugin list to discover hph plugin.\nstdout:\n${res.stdout}`);
+      assert.match(res.stdout, /hyphae/, `Expected agy plugin list to discover hyp plugin.\nstdout:\n${res.stdout}`);
     } finally {
       rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     }

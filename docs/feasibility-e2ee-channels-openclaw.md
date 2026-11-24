@@ -71,4 +71,4 @@ Two clean options fit the exact same fd-3 plugin model:
 Pairing **OpenClaw** with `hyphae` creates a clean separation of concerns:
 - **OpenClaw** acts as the **high-level orchestrator & human-facing multi-channel gateway** (receiving user requests from WhatsApp/Telegram/Discord or Prometheus/GitHub escalations).
 - **`hyphae`** acts as the **authenticated, zero-polling cross-machine execution bus** connecting OpenClaw to live coding threads running on your MacBook (**Antigravity**, **Claude Desktop**, **Cursor**), Linux boxes (**Codex**, **Herdr Core**, **OpenCode**), and **T3 Code** servers.
-- **Configuration**: Add `hph mcp` under OpenClaw's `mcp.servers` config + install our bundled `SKILL.md`, and OpenClaw immediately gains `mesh_join`, `mesh_peers`, `mesh_send`, `mesh_subscribe`, and `mesh_plugin_handoff` across your entire fleet.
+- **Configuration**: Add `hyp mcp` under OpenClaw's `mcp.servers` config + install our bundled `SKILL.md`, and OpenClaw immediately gains `mesh_join`, `mesh_peers`, `mesh_send`, `mesh_subscribe`, and `mesh_plugin_handoff` across your entire fleet.

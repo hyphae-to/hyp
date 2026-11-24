@@ -24,8 +24,8 @@ A single MCP shim subprocess can be shared by many tabs/conversations in Desktop
 - **Strict filesystem permissions**:
   - `~/.config/hyphae/secrets/` must be a real `0700` directory (not a symlink) owned by the current UID.
   - Every `<name>.secret` and router `tokenFile` is verified with `lstatSync` (never following symlinks), strict `0600` mode, and matching UID.
-  - `hph secret set <name>` reads from a hidden TTY prompt or stdin — never CLI argv (keeping secrets out of `ps` and shell history).
-  - `hph secret check` and `hph doctor` verify all referenced secrets without ever printing secret values.
+  - `hyp secret set <name>` reads from a hidden TTY prompt or stdin — never CLI argv (keeping secrets out of `ps` and shell history).
+  - `hyp secret check` and `hyp doctor` verify all referenced secrets without ever printing secret values.
 - **Subprocess environment scrubbing**: Both connector plugins (`PluginProcess`) and router data stream plugins (`RouterStreamHost`) spawn with a **minimal baseline environment** (`HOME`, `PATH`, `LANG`, `TMPDIR`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`) plus **only** the env vars/secrets explicitly configured for that plugin. Unrelated host variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `AWS_*`, `GH_TOKEN`, router tokens) are never inherited.
 
 ---
@@ -48,4 +48,4 @@ A single MCP shim subprocess can be shared by many tabs/conversations in Desktop
 - **Remote SSH Onboarding**:
   - Validates SSH host targets (`/^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/`) and remote binary paths, and always passes `--` before the hostname to block SSH `-o` option injection.
   - Pipes one-shot `am1_...` invites over **SSH stdin**, keeping tokens out of remote argv and shell history.
-- **Instant revocation**: Revoke any lost machine or compromised publisher immediately with `hph router revoke-connector <id>` or `hph router revoke-publisher <id>`.
+- **Instant revocation**: Revoke any lost machine or compromised publisher immediately with `hyp router revoke-connector <id>` or `hyp router revoke-publisher <id>`.

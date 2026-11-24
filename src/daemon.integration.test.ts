@@ -137,7 +137,7 @@ test("ONE shared MCP subprocess multiplexes Antigravity, Claude, and Codex threa
       ["antigravity:ag-conv-1=ag-peer", "claude:claude-sess-2=claude-peer", "codex:codex-thr-3=codex-peer"],
     );
 
-    // 4. Antigravity arms blocking `hph wait` (inferring session from ANTIGRAVITY_SOURCE_METADATA!)
+    // 4. Antigravity arms blocking `hyp wait` (inferring session from ANTIGRAVITY_SOURCE_METADATA!)
     const agWaitProc = spawn(process.execPath, [join(process.cwd(), "src", "cli.ts"), "wait", "--socket", daemon.socketPath], {
       env: { ...process.env, ANTIGRAVITY_SOURCE_METADATA: JSON.stringify({ tool: { conversationId: "ag-conv-1" } }) },
       stdio: ["ignore", "pipe", "pipe"],
@@ -183,7 +183,7 @@ test("ONE shared MCP subprocess multiplexes Antigravity, Claude, and Codex threa
     assert.match(agReceived, /mesh from bogdan@local\/claude-peer/);
     assert.match(agReceived, /wake up antigravity!/);
 
-    // 6. Claude starts streaming `hph watch` (Monitor mode) and receives Antigravity's reply!
+    // 6. Claude starts streaming `hyp watch` (Monitor mode) and receives Antigravity's reply!
     const claudeWatchProc = spawn(
       process.execPath,
       [join(process.cwd(), "src", "cli.ts"), "watch", "--session", "claude:claude-sess-2", "--socket", daemon.socketPath],

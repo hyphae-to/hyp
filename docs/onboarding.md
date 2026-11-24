@@ -16,7 +16,7 @@ npm ci && npm run build
 ./bin/hyphae.mjs onboard
 ```
 
-When run in an interactive terminal without `--yes`, `hph onboard` launches a `@clack/prompts` terminal UI with capability cards, arrow-key selectors, checkbox multi-selects, spinners, and masked secret prompts:
+When run in an interactive terminal without `--yes`, `hyp onboard` launches a `@clack/prompts` terminal UI with capability cards, arrow-key selectors, checkbox multi-selects, spinners, and masked secret prompts:
 - Scans installed harnesses (**Antigravity**, **Claude Code / Desktop**, **Codex / Desktop**, **Cursor**, **OpenCode**, **Gemini CLI**), **Herdr Core** (`hc` / `HC_TERMINAL_ID` + Herdr remote machines), **T3 Code** (`~/.t3` / `~/.t3-mesh/config.json`), and **Tailscale** (`tailscale status`).
 - Displays capability cards and lets you select **one or more** router roles together:
   - **Setup Private Router** — connect all your sessions across harnesses & machines, subscribe to GitHub events & custom router data streams with filters, and bridge threads to 3rd-party messaging tools (Slack, Telegram).
@@ -42,12 +42,12 @@ Prefer a conversational setup where your coding agent inspects your environment,
 ./bin/hyphae.mjs onboard --prompt             # print secret-free concierge prompt for Claude Desktop / Cursor
 ```
 
-You can also choose **"Guided by an AI agent"** right at the start of `./bin/hyphae.mjs onboard`. The concierge receives a strictly **secret-free** snapshot and guides you to store tokens via `hph secret set <name>` without ever handling raw secrets.
+You can also choose **"Guided by an AI agent"** right at the start of `./bin/hyphae.mjs onboard`. The concierge receives a strictly **secret-free** snapshot and guides you to store tokens via `hyp secret set <name>` without ever handling raw secrets.
 
 What local `onboard` (alias `up`) configures:
 - Creates `~/.config/hyphae/connector.json` (`0600`) with an **embedded local router** (`127.0.0.1:8790`, SQLite DB at `~/.config/hyphae/router/router.sqlite`) and a private connector token (`0600`).
 - Auto-detects installed harnesses (**Antigravity**, **Claude Code / Desktop**, **Codex / Desktop**) and merges MCP + hook configs non-destructively using your exact Node 24 binary path.
-- Starts `hph daemon` (running both the embedded router and connector in one process). Pass `--install-service` to also install a macOS LaunchAgent or Linux `systemd --user` unit.
+- Starts `hyp daemon` (running both the embedded router and connector in one process). Pass `--install-service` to also install a macOS LaunchAgent or Linux `systemd --user` unit.
 
 Restart any open Desktop app once so it loads the new MCP server and hooks, then run:
 
@@ -113,7 +113,7 @@ Pass `--dry-run` to preview the exact `tailscale serve` command and URL first. T
 This creates a connector token in `~/.config/hyphae/router/router.sqlite` and prints a single command with an `am1_...` invite bundle passed over **stdin** (never in CLI argv / `ps`):
 
 ```sh
-hph onboard --join <<< 'am1_...'
+hyp onboard --join <<< 'am1_...'
 ```
 
 ### Step C — On each remote machine: join in 1 command
@@ -128,7 +128,7 @@ What `onboard --join` does automatically:
 1. Decodes `{ connectorId, router, token }` from stdin and enforces an `https://` origin.
 2. Runs a **live pre-flight check** (`GET <router>/v1/peers` with the bearer token) so VPN, Tailscale DNS, TLS, or auth errors are caught immediately before writing config (pass `--offline` to skip during image/Ansible provisioning).
 3. Saves the token to `~/.config/hyphae/tokens/primary.token` (`0600`) and writes `~/.config/hyphae/connector.json` (`0600`, remote mode with no embedded local router).
-4. Configures local harnesses (Antigravity, Claude, Codex), installs the OS background service if requested, and starts `hph daemon`.
+4. Configures local harnesses (Antigravity, Claude, Codex), installs the OS background service if requested, and starts `hyp daemon`.
 
 > **Migrating an already-onboarded machine from local to remote**: pass `--replace` (or `--join` / `--router` automatically replaces `connector.json`), then restart the daemon so it connects to the remote router instead of its local embedded one.
 
@@ -140,25 +140,25 @@ If your router runs behind any private HTTPS reverse proxy on a VPN:
 
 1. On the router host, issue a token file:
    ```sh
-   hph router add-connector bogdan@worker --db /path/to/router.sqlite --token-out connector.token
+   hyp router add-connector bogdan@worker --db /path/to/router.sqlite --token-out connector.token
    ```
 2. Copy `connector.token` securely (`0600`) to the remote machine and onboard:
    ```sh
-   hph onboard --id bogdan@worker --router https://mesh.internal.example --token-file /path/to/connector.token --install-service
+   hyp onboard --id bogdan@worker --router https://mesh.internal.example --token-file /path/to/connector.token --install-service
    ```
    Or generate an invite bundle on the router host:
    ```sh
-   hph router invite bogdan@worker --router https://mesh.internal.example --db /path/to/router.sqlite
+   hyp router invite bogdan@worker --router https://mesh.internal.example --db /path/to/router.sqlite
    ```
 
 ---
 
 ## 4. Verifying & Troubleshooting
 
-- **`hph doctor`**: checks Node ≥ 24, `connector.json` permissions, live daemon socket, **live HTTPS reachability + auth for every configured router**, and installed harness configs.
-- **`hph status`** / **`hph sessions`**: shows connected routers, active sessions across all harnesses, handles, pending mailbox counts, and live push transports.
-- **`hph prune --older-than-hours 24`**: removes stale inactive sessions and frees their handles/subscriptions on the router (never prunes sessions with an active `wait`/`watch`/`channel`).
+- **`hyp doctor`**: checks Node ≥ 24, `connector.json` permissions, live daemon socket, **live HTTPS reachability + auth for every configured router**, and installed harness configs.
+- **`hyp status`** / **`hyp sessions`**: shows connected routers, active sessions across all harnesses, handles, pending mailbox counts, and live push transports.
+- **`hyp prune --older-than-hours 24`**: removes stale inactive sessions and frees their handles/subscriptions on the router (never prunes sessions with an active `wait`/`watch`/`channel`).
 - **Revoking a remote machine**:
   ```sh
-  hph router revoke-connector bogdan@solace --db ~/.config/hyphae/router/router.sqlite
+  hyp router revoke-connector bogdan@solace --db ~/.config/hyphae/router/router.sqlite
   ```

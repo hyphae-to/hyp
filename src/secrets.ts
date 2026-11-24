@@ -50,7 +50,7 @@ export function writeSecret(name: string, value: string, configDir = defaultConf
 export function readSecret(name: string, configDir = defaultConfigDir()): string {
   const dir = secretsDir(configDir);
   if (!existsSync(dir)) {
-    throw new Error(`Missing secret "${name}" (${secretFilePath(name, configDir)}). Set it with: hph secret set ${name}`);
+    throw new Error(`Missing secret "${name}" (${secretFilePath(name, configDir)}). Set it with: hyp secret set ${name}`);
   }
   const dirSt = lstatSync(dir);
   if (!dirSt.isDirectory() || dirSt.isSymbolicLink() || (dirSt.mode & 0o077) !== 0 ||
@@ -62,7 +62,7 @@ export function readSecret(name: string, configDir = defaultConfigDir()): string
     throw new Error(`Secret path escapes secrets directory`);
   }
   if (!existsSync(path)) {
-    throw new Error(`Missing secret "${name}" (${path}). Set it with: hph secret set ${name}`);
+    throw new Error(`Missing secret "${name}" (${path}). Set it with: hyp secret set ${name}`);
   }
   const st = lstatSync(path);
   if (!st.isFile() || st.isSymbolicLink()) {

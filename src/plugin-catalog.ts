@@ -85,7 +85,7 @@ export const ROUTER_STREAM_GUIDES: readonly PluginOrStreamGuide[] = [
     instructions: [
       "1. Write an executable script importing plugins/sdk/client.mjs (Node 24) or plugins/sdk/client.py (Python 3).",
       "2. Call `await mesh.send(targets[0], cloudEvent)` whenever new data arrives.",
-      "3. Store any API keys safely with `hph secret set <name>` and reference them in `env` as `{ \"secret\": \"<name>\" }`.",
+      "3. Store any API keys safely with `hyp secret set <name>` and reference them in `env` as `{ \"secret\": \"<name>\" }`.",
     ],
     agentUsage: [
       'mesh_subscribe({ key: "custom:feed", topic: "custom-feed", filters: [{ prefix: { type: "com.custom." } }] })',
@@ -190,7 +190,7 @@ export const CONNECTOR_BRIDGE_GUIDES: readonly PluginOrStreamGuide[] = [
     secrets: [],
     instructions: [
       "1. Provide an absolute executable path (`exec`) and optional arguments (`args`).",
-      "2. Store any secrets with `hph secret set <name>` and reference them in `env` as `{ \"secret\": \"<name>\" }` or `{ \"secretFile\": \"<name>\" }`.",
+      "2. Store any secrets with `hyp secret set <name>` and reference them in `env` as `{ \"secret\": \"<name>\" }` or `{ \"secretFile\": \"<name>\" }`.",
     ],
     agentUsage: [
       'Claim target handle: mesh_join({ handle: "ops" })',

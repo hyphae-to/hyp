@@ -20,7 +20,7 @@
     "typescript": "^5.9.3"
   },
   "bin": {
-    "hph": "bin/hyphae.mjs",
+    "hyp": "bin/hyphae.mjs",
     "hyphae": "bin/hyphae.mjs"
   },
   "dependencies": {

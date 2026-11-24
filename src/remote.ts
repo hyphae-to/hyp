@@ -132,7 +132,7 @@ export function normalizeTailscaleServiceName(raw: string): { readonly serviceFl
 }
 
 export interface ExposeTailscaleOptions {
-  /** Local loopback port where hph router listens (default 8790). */
+  /** Local loopback port where hyp router listens (default 8790). */
   readonly localPort?: number;
   /** Expose as a Tailscale Service (`--service=svc:<name>`) with its own tailnet DNS name & VIP. */
   readonly service?: string;
@@ -218,7 +218,7 @@ export function unexposeTailscale(options: { service?: string; httpsPort?: numbe
 
 /**
  * Best-effort detection of an already-exposed Tailscale HTTPS URL for a local router port
- * (used by `hph router invite` when `--router` is omitted).
+ * (used by `hyp router invite` when `--router` is omitted).
  */
 export function detectExposedTailscaleUrl(localPort = 8790, exec: ExecRunner = defaultExec): string | null {
   try {

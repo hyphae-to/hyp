@@ -52,7 +52,7 @@ function esc(s) {
 // ============================================================================
 const HERO_CMDS = {
   curl: 'bash -c "$(curl -fsSL https://raw.githubusercontent.com/bowd/hyphae/main/install.sh)"',
-  npm: "npm install -g @bowd/hyphae && hph onboard",
+  npm: "npm install -g @bowd/hyphae && hyp onboard",
   git: "git clone https://github.com/bowd/hyphae && cd hyphae && npm i && npm run build",
 };
 
@@ -1245,7 +1245,7 @@ function renderDeck() {
       <pre class="payload-pre">${esc(JSON.stringify({
         node: "Private Node (localhost — never shared with Team Node)",
         bridge: `${chatApp}/dm-alex`,
-        secrets: "0600 local store · captured via hph secret set --web",
+        secrets: "0600 local store · captured via hyp secret set --web",
         linkedThreads: linkedList,
         liveHandoff: "mesh_plugin_handoff (zero daemon restart)",
       }, null, 2))}</pre>
@@ -1288,30 +1288,30 @@ renderDeck();
 // 5. QUICK START TABS
 // ============================================================================
 const QS = {
-  curl: `# Install hph from GitHub and launch interactive onboarding
+  curl: `# Install hyp from GitHub and launch interactive onboarding
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/bowd/hyphae/main/install.sh)"
 
 # Verify Node 24, daemon, live nodes, 0600 secrets, and harnesses
-hph status`,
+hyp status`,
   npm: `# Install globally via npm (Node 24+)
 npm install -g @bowd/hyphae
 
 # Pick Private / Public / Shared nodes, harnesses, streams & SSH hosts
-hph onboard`,
+hyp onboard`,
   assist: `# Install the standalone Hyphae skill across harnesses (agent starting point)
-hph skill install all
+hyp skill install all
 
 # Or let your coding agent run full onboarding end-to-end (secrets captured out-of-band via --web)
-hph onboard --assist`,
+hyp onboard --assist`,
   fleet: `# Wire OpenClaw as your fleet orchestrator
-hph setup openclaw
+hyp setup openclaw
 
 # Share your private node on Tailscale & onboard remote Linux hosts over SSH
-hph share tailscale --service hyphae
-hph onboard --remote-ssh bogdan@solace --install-service
+hyp share tailscale --service hyphae
+hyp onboard --remote-ssh bogdan@solace --install-service
 
 # Store Slack/Telegram/webhook tokens out-of-band (0600, never enters LLM context)
-hph secret set slack-bot-token --web`,
+hyp secret set slack-bot-token --web`,
 };
 
 let activeQs = "curl";

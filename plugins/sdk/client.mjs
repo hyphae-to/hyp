@@ -3,7 +3,7 @@ import { createInterface } from "node:readline";
 
 /**
  * Minimal Node 24 client for the hyphae / t3-mesh local plugin channel (fd 3, protocol v1).
- * Works identically under both `hph daemon` and `t3-mesh daemon`.
+ * Works identically under both `hyp daemon` and `t3-mesh daemon`.
  */
 export class MeshPluginClient {
   plugin;

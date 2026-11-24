@@ -93,7 +93,7 @@ test("built-in webhook plugin delivers signed CloudEvents to Antigravity wait an
     daemon.state.register("claude:cl-2", { kind: "claude" });
     await daemon.connector.call("claude:cl-2", "mesh_join", { handle: "ops-claude" });
 
-    // Arm zero-polling `hph wait` for Antigravity
+    // Arm zero-polling `hyp wait` for Antigravity
     const waitProc = spawn(
       process.execPath,
       [join(process.cwd(), "src", "cli.ts"), "wait", "--session", "antigravity:ag-1", "--socket", daemon.socketPath],
@@ -538,7 +538,7 @@ test("installSkill installs canonical skills/hyphae/SKILL.md across harnesses an
     for (const f of res.files) {
       assert.ok(existsSync(f), `Expected skill installed at ${f}`);
       const txt = readFileSync(f, "utf8");
-      assert.match(txt, /hph secret set <name> --web/);
+      assert.match(txt, /hyp secret set <name> --web/);
       assert.match(txt, /mesh_channel_join/);
     }
     const projRes = installSkill("project", { projectDir: proj });

@@ -45,38 +45,38 @@ const configDir = (() => {
 const defaultConfigPath = () => join(configDir, "connector.json");
 const defaultSocketPath = () => process.env.HYPHAE_SOCKET ?? process.env.AGENTS_MESH_SOCKET ?? join(configDir, "state", "connector.sock");
 
-const usage = `Hyphae (hph) — cross-harness agent mesh & event node
+const usage = `Hyphae (hyp) — cross-harness agent mesh & event node
 
 Core commands:
-  hph onboard [--assist | --prompt | --join | --remote-ssh <host>]
+  hyp onboard [--assist | --prompt | --join | --remote-ssh <host>]
       Set up private/public nodes, harnesses, streams, bridges & SSH hosts
-  hph status [--sessions | --discover | --probe-ssh | --prune]
+  hyp status [--sessions | --discover | --probe-ssh | --prune]
       Health check (Node 24, daemon, nodes, 0600 secrets, harnesses & live peers)
-  hph connect [add | list | guide [name]]
+  hyp connect [add | list | guide [name]]
       Configure or inspect node event streams (GitHub, Prometheus) & chat bridges (Slack, Telegram)
-  hph secret <set <name> [--web] | list | rm <name> | check>
+  hyp secret <set <name> [--web] | list | rm <name> | check>
       Manage 0600 secrets privately (hidden TTY prompt or --web out-of-band browser form)
-  hph share <tailscale | invite <user@host> | stop>
+  hyp share <tailscale | invite <user@host> | stop>
       Expose your node on Tailscale Services and generate remote invite codes
-  hph setup <antigravity|claude|codex|cursor|opencode|gemini|openclaw|all|service>
+  hyp setup <antigravity|claude|codex|cursor|opencode|gemini|openclaw|all|service>
       Wire (or re-wire) MCP, hooks, rules, skills, or OS auto-start service
-  hph skill [install [antigravity|claude|codex|cursor|openclaw|project|all] | print | path]
+  hyp skill [install [antigravity|claude|codex|cursor|openclaw|project|all] | print | path]
       Install or print the standalone Hyphae agent skill (starting point for any agent)
 
 Runtime:
-  hph daemon | hph wait [--stream]
+  hyp daemon | hyp wait [--stream]
 
-Run \`hph --help --all\` for advanced & plumbing commands (node, mcp, hook, init).`;
+Run \`hyp --help --all\` for advanced & plumbing commands (node, mcp, hook, init).`;
 
 const fullUsage = `${usage}
 
 Advanced & plumbing commands (aliases kept for hooks/scripts):
-  hph init [config] --id <user@host> --router <origin> --token-file <file>
-  hph mcp [socket] [--claude-channel] [--backend herdr|openclaw] [--thread UUID] [--resume] [--remote <addr>] [--ephemeral]
-  hph hook <antigravity|claude|codex|cursor|opencode|gemini|openclaw> <pre-tool-use|post-tool-use|pre-invocation|stop>
-  hph watch [--session <id> | --handle <handle>] [--timeout <sec>]   (alias: hph wait --stream)
-  hph doctor | sessions | prune | discover | plugin | stream         (aliases under status / connect)
-  hph node <expose|unexpose|invite|serve|add-connector|revoke-connector|add-publisher|revoke-publisher|github-receiver>`;
+  hyp init [config] --id <user@host> --router <origin> --token-file <file>
+  hyp mcp [socket] [--claude-channel] [--backend herdr|openclaw] [--thread UUID] [--resume] [--remote <addr>] [--ephemeral]
+  hyp hook <antigravity|claude|codex|cursor|opencode|gemini|openclaw> <pre-tool-use|post-tool-use|pre-invocation|stop>
+  hyp watch [--session <id> | --handle <handle>] [--timeout <sec>]   (alias: hyp wait --stream)
+  hyp doctor | sessions | prune | discover | plugin | stream         (aliases under status / connect)
+  hyp node <expose|unexpose|invite|serve|add-connector|revoke-connector|add-publisher|revoke-publisher|github-receiver>`;
 
 function readStdinLine(): Promise<string> {
   return new Promise((resolve) => {
@@ -94,14 +94,14 @@ async function main(): Promise<void> {
   let action = rawAction;
   let args = rawArgs;
 
-  // Map clean `hph share <tailscale|invite|stop>` onto `router <expose|invite|unexpose>`
+  // Map clean `hyp share <tailscale|invite|stop>` onto `router <expose|invite|unexpose>`
   if (action === "share") {
     const [sub, ...rest] = args;
     if (sub === "tailscale") { action = "router"; args = ["expose", "tailscale", ...rest]; }
     else if (sub === "stop" || sub === "unexpose") { action = "router"; args = ["unexpose", "tailscale", ...rest]; }
     else if (sub === "invite") { action = "router"; args = ["invite", ...rest]; }
     else {
-      throw new Error("Usage: hph share <tailscale [--service hyphae] | invite <user@host> | stop>");
+      throw new Error("Usage: hyp share <tailscale [--service hyphae] | invite <user@host> | stop>");
     }
   }
 
@@ -123,14 +123,14 @@ async function main(): Promise<void> {
     if (sub === "install") {
       const valid = new Set<SkillTarget>(["antigravity", "claude", "codex", "cursor", "openclaw", "project", "all"]);
       if (!valid.has(target as SkillTarget)) {
-        throw new Error("Usage: hph skill install [antigravity|claude|codex|cursor|openclaw|project|all] [--dir <path>]");
+        throw new Error("Usage: hyp skill install [antigravity|claude|codex|cursor|openclaw|project|all] [--dir <path>]");
       }
       const res = installSkill(target as SkillTarget, { projectDir: values.dir });
       console.log("Installed Hyphae skill:");
       for (const f of res.files) console.log(`  - ${f}`);
       return;
     }
-    throw new Error("Usage: hph skill [install [harness|project|all] | print | path]");
+    throw new Error("Usage: hyp skill [install [harness|project|all] | print | path]");
   }
 
   if (action === "node" || action === "router") {
@@ -147,7 +147,7 @@ async function main(): Promise<void> {
         },
       });
       if (positionals[0] !== "tailscale") {
-        throw new Error("Usage: hph router expose tailscale [--service <name>] [--port 8790] [--https <port>] [--dry-run]");
+        throw new Error("Usage: hyp router expose tailscale [--service <name>] [--port 8790] [--https <port>] [--dry-run]");
       }
       const res = exposeTailscale({
         localPort: values.port ? Number(values.port) : 8790,
@@ -157,7 +157,7 @@ async function main(): Promise<void> {
       });
       console.log(`${res.applied ? "Exposed" : "Dry run"} (${res.mode}): ${res.url}`);
       console.log(`  Command : ${res.command.join(" ")}`);
-      console.log(`\nTo invite another machine on your tailnet:\n  hph router invite <user@host> --router ${res.url}`);
+      console.log(`\nTo invite another machine on your tailnet:\n  hyp router invite <user@host> --router ${res.url}`);
       return;
     }
     if (sub === "unexpose") {
@@ -167,7 +167,7 @@ async function main(): Promise<void> {
         options: { service: { type: "string" }, https: { type: "string" } },
       });
       if (positionals[0] !== "tailscale") {
-        throw new Error("Usage: hph router unexpose tailscale [--service <name>] [--https 8790]");
+        throw new Error("Usage: hyp router unexpose tailscale [--service <name>] [--https 8790]");
       }
       const cmd = unexposeTailscale({
         service: values.service,
@@ -188,12 +188,12 @@ async function main(): Promise<void> {
       });
       const connectorId = positionals[0];
       if (!connectorId || !connectorPattern.test(connectorId)) {
-        throw new Error("Usage: hph router invite <user@host> [--router https://...] [--db <router.sqlite>]");
+        throw new Error("Usage: hyp router invite <user@host> [--router https://...] [--db <router.sqlite>]");
       }
       const dbPath = resolve(values.db ?? join(configDir, "router", "router.sqlite"));
       const routerUrl = values.router ?? detectExposedTailscaleUrl(values.port ? Number(values.port) : 8790);
       if (!routerUrl) {
-        throw new Error("Could not detect an exposed Tailscale router URL. Pass --router https://<host> or run `hph router expose tailscale` first.");
+        throw new Error("Could not detect an exposed Tailscale router URL. Pass --router https://<host> or run `hyp router expose tailscale` first.");
       }
       const core = new RouterCore({ dbPath });
       let token: string;
@@ -205,9 +205,9 @@ async function main(): Promise<void> {
       const code = encodeInvite({ connectorId, router: routerUrl, token });
       console.log(`Created connector '${connectorId}' on ${dbPath} for ${routerUrl}\n`);
       console.log("Run this on the remote machine (keeps the token out of CLI argv/ps):");
-      console.log(`  hph onboard --join <<< '${code}'`);
+      console.log(`  hyp onboard --join <<< '${code}'`);
       console.log("\nTreat this invite string like a private password; revoke anytime with:");
-      console.log(`  hph router revoke-connector ${connectorId} --db ${dbPath}`);
+      console.log(`  hyp router revoke-connector ${connectorId} --db ${dbPath}`);
       return;
     }
     const { routerUsage, runRouterCommand } = await import("./core/router/commands.ts");
@@ -237,7 +237,7 @@ async function main(): Promise<void> {
     const [sub, target] = positionals;
     const dir = resolve(values["config-dir"] ?? configDir);
     if (sub === "set") {
-      if (!target) throw new Error("Usage: hph secret set <name> [--web] (reads from hidden TTY prompt, browser form, or stdin)");
+      if (!target) throw new Error("Usage: hyp secret set <name> [--web] (reads from hidden TTY prompt, browser form, or stdin)");
       if (values.web === true) {
         const res = await captureSecretViaWeb(target, {
           configDir: dir,
@@ -260,7 +260,7 @@ async function main(): Promise<void> {
       } else {
         value = await readStdinLine();
         if (!value) {
-          throw new Error(`No secret received on stdin. In non-TTY / agent sessions, use: hph secret set ${target} --web`);
+          throw new Error(`No secret received on stdin. In non-TTY / agent sessions, use: hyp secret set ${target} --web`);
         }
       }
       const path = writeSecret(target, value, dir);
@@ -279,7 +279,7 @@ async function main(): Promise<void> {
       return;
     }
     if (sub === "rm" || sub === "delete") {
-      if (!target) throw new Error("Usage: hph secret rm <name>");
+      if (!target) throw new Error("Usage: hyp secret rm <name>");
       const removed = deleteSecret(target, dir);
       console.log(removed ? `Removed secret '${target}'` : `Secret '${target}' not found`);
       return;
@@ -306,7 +306,7 @@ async function main(): Promise<void> {
       if (!ok) process.exitCode = 1;
       return;
     }
-    throw new Error("Usage: hph secret <set <name>|list|rm <name>|check [config]>");
+    throw new Error("Usage: hyp secret <set <name>|list|rm <name>|check [config]>");
   }
 
   if (action === "connect" || action === "plugin" || action === "stream") {
@@ -333,12 +333,12 @@ async function main(): Promise<void> {
       for (const g of ALL_GUIDES) {
         console.log(`${g.id.padEnd(18)} [${g.kind}] ${g.label} — ${g.tagline}`);
       }
-      console.log("\nRun `hph plugin guide <id>` for full setup instructions, or `hph plugin setup` for interactive setup.");
+      console.log("\nRun `hyp plugin guide <id>` for full setup instructions, or `hyp plugin setup` for interactive setup.");
       return;
     }
     if (sub === "list") {
       if (!existsSync(cfgPath)) {
-        console.log(`No config at ${cfgPath}. Run \`hph onboard\` first.`);
+        console.log(`No config at ${cfgPath}. Run \`hyp onboard\` first.`);
         return;
       }
       const raw = JSON.parse(readFileSync(cfgPath, "utf8")) as Record<string, unknown>;
@@ -409,7 +409,7 @@ async function main(): Promise<void> {
       const available = detectAvailableAssistAgents(ctx.local);
       const chosen = (values.agent || available[0]) as "agy" | "claude" | "codex" | "opencode" | undefined;
       if (!chosen || !["agy", "claude", "codex", "opencode"].includes(chosen)) {
-        throw new Error(`No supported CLI agent found (${available.join(", ") || "none"}). Run \`hph onboard --prompt\` to paste into Claude Desktop or Cursor.`);
+        throw new Error(`No supported CLI agent found (${available.join(", ") || "none"}). Run \`hyp onboard --prompt\` to paste into Claude Desktop or Cursor.`);
       }
       process.exitCode = launchAgentAssist(chosen, prompt);
       return;
@@ -426,7 +426,7 @@ async function main(): Promise<void> {
       if (!probe.sshReachable) throw new Error(`Cannot reach ${host} over SSH: ${probe.error ?? "failed"}`);
       const remoteRouter = values.router ?? detectExposedTailscaleUrl(port ?? 8790);
       if (!remoteRouter) {
-        throw new Error("No exposed router URL detected. Run `hph router expose tailscale` first or pass --router https://...");
+        throw new Error("No exposed router URL detected. Run `hyp router expose tailscale` first or pass --router https://...");
       }
       const remoteId = values.id ?? `${probe.user ?? "user"}@${probe.hostname ?? host}`;
       const dbPath = join(dirname(resolve(values.config ?? defaultConfigPath())), "router", "router.sqlite");
@@ -440,7 +440,7 @@ async function main(): Promise<void> {
       const code = encodeInvite({ connectorId: remoteId, router: remoteRouter, token: remoteToken });
       const sshRes = await onboardRemoteOverSsh({ host, inviteCode: code, installService: values["install-service"] === true });
       if (!sshRes.ok) {
-        throw new Error(`Remote onboarding on ${host} failed:\n${sshRes.stderr || sshRes.stdout}\nManual command: hph onboard --join <<< '${code}'`);
+        throw new Error(`Remote onboarding on ${host} failed:\n${sshRes.stderr || sshRes.stdout}\nManual command: hyp onboard --join <<< '${code}'`);
       }
       console.log(sshRes.stdout.trim());
       return;
@@ -473,15 +473,15 @@ async function main(): Promise<void> {
       startDaemon: values["no-start"] !== true,
       installService: values["install-service"] === true,
     });
-    console.log(`hph onboard complete!`);
+    console.log(`hyp onboard complete!`);
     console.log(`  Connector ID : ${result.connectorId}`);
     console.log(`  Config       : ${result.configPath}${result.configCreated ? " (written)" : " (existing)"}`);
     console.log(`  Router       : ${result.routerUrl}${result.localRouter ? " (embedded local router)" : result.remoteVerified ? " (remote verified)" : " (remote)"}`);
-    console.log(`  Daemon       : ${result.daemonRunning ? `running at ${result.socketPath}` : "stopped (run `hph daemon`)"}`);
+    console.log(`  Daemon       : ${result.daemonRunning ? `running at ${result.socketPath}` : "stopped (run `hyp daemon`)"}`);
     if (result.configuredHarnesses.length > 0) {
       console.log(`  Harnesses    : ${result.configuredHarnesses.map((h) => h.harness).join(", ")}`);
     } else {
-      console.log("  Harnesses    : none detected (run `hph setup <antigravity|claude|codex>`)");
+      console.log("  Harnesses    : none detected (run `hyp setup <antigravity|claude|codex>`)");
     }
     if (result.servicePath) {
       console.log(`  Service      : ${result.servicePath}`);

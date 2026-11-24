@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Hyphae (hph) one-line installer
+# Hyphae (hyp) one-line installer
 # Usage: bash -c "$(curl -fsSL https://raw.githubusercontent.com/bowd/hyphae/main/install.sh)"
 
 REPO="${HYPHAE_REPO:-https://github.com/bowd/hyphae.git}"
 INSTALL_DIR="${HYPHAE_HOME:-$HOME/.local/share/hyphae}"
 BIN_DIR="${HYPHAE_BIN_DIR:-$HOME/.local/bin}"
 
-echo "Installing Hyphae (hph)..."
+echo "Installing Hyphae (hyp)..."
 
 if ! command -v node >/dev/null 2>&1; then
   echo "Error: Node.js 24+ is required. Install Node 24+ (https://nodejs.org or mise/nvm) and re-run." >&2
@@ -34,18 +34,18 @@ fi
 (cd "$INSTALL_DIR" && npm install --no-audit --no-fund && npm run build)
 
 chmod +x "$INSTALL_DIR/bin/hyphae.mjs"
-ln -sf "$INSTALL_DIR/bin/hyphae.mjs" "$BIN_DIR/hph"
+ln -sf "$INSTALL_DIR/bin/hyphae.mjs" "$BIN_DIR/hyp"
 ln -sf "$INSTALL_DIR/bin/hyphae.mjs" "$BIN_DIR/hyphae"
 
 echo ""
-echo "Installed hph -> $BIN_DIR/hph"
+echo "Installed hyp -> $BIN_DIR/hyp"
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) echo "Add $BIN_DIR to your PATH:  export PATH=\"$BIN_DIR:\$PATH\"" ;;
 esac
 
 if [ -t 0 ] && [ -t 1 ]; then
-  exec "$BIN_DIR/hph" onboard
+  exec "$BIN_DIR/hyp" onboard
 else
-  echo "Next: run 'hph onboard' to wire your harnesses, router, and streams."
+  echo "Next: run 'hyp onboard' to wire your harnesses, router, and streams."
 fi

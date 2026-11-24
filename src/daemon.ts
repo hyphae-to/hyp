@@ -98,11 +98,11 @@ export async function startDaemon(config: Config, options: StartDaemonOptions = 
   }
   const socketPath = options.socketPath ?? join(config.directory, "connector.sock");
   if (await probeSocketAlive(socketPath)) {
-    throw new Error(`hph daemon is already running at ${socketPath}`);
+    throw new Error(`hyp daemon is already running at ${socketPath}`);
   }
   rmSync(socketPath, { force: true });
 
-  // Optional embedded local router (configured by `hph onboard`) so a single daemon
+  // Optional embedded local router (configured by `hyp onboard`) so a single daemon
   // process provides a complete working local mesh with zero extra services to supervise.
   let embeddedCore: RouterCore | undefined;
   let embeddedRouter: RunningRouter | undefined;
@@ -206,7 +206,7 @@ export async function startDaemon(config: Config, options: StartDaemonOptions = 
         const set = waiters.get(sessionId);
         if (!set || set.size === 0) break;
 
-        // Priority 2: Streaming watcher (`hph watch` / Claude Monitor)
+        // Priority 2: Streaming watcher (`hyp watch` / Claude Monitor)
         const streamWaiter = [...set].find((entry) => entry.mode === "stream" && !entry.socket.destroyed);
         if (streamWaiter) {
           const items = connector.drainMailbox(sessionId, 10);
@@ -215,7 +215,7 @@ export async function startDaemon(config: Config, options: StartDaemonOptions = 
           continue;
         }
 
-        // Priority 3: One-shot blocking waiter (`hph wait` / Antigravity run_command)
+        // Priority 3: One-shot blocking waiter (`hyp wait` / Antigravity run_command)
         const onceWaiter = [...set].find((entry) => entry.mode === "once" && !entry.socket.destroyed);
         if (onceWaiter) {
           const items = connector.drainMailbox(sessionId, 10);
@@ -531,7 +531,7 @@ export async function startDaemon(config: Config, options: StartDaemonOptions = 
                 id: requestId,
                 error: {
                   code: "caller_unverifiable",
-                  message: "Could not verify calling thread/conversation. Run 'hph setup <antigravity|claude|codex>' to install PreToolUse hooks (or pass --ephemeral for scratch testing).",
+                  message: "Could not verify calling thread/conversation. Run 'hyp setup <antigravity|claude|codex>' to install PreToolUse hooks (or pass --ephemeral for scratch testing).",
                 },
               });
               return;

@@ -7,30 +7,30 @@
 | Layer | Where it runs | Routing model | Where secrets live | Best for |
 | --- | --- | --- | --- | --- |
 | **Router Data Streams** (`localRouter.streams`) | Supervised on the **router host** (or external HTTP publisher posting to `POST /v1/events?topic=<name>`) | **1-to-many Pub/Sub** — any agent on any machine subscribes with CloudEvents filters (`mesh_subscribe`) | Router host's `~/.config/hyphae/secrets/` (`0600`) | **GitHub events** (`github-webhook`), **CI / Linear / Sentry / Stripe** webhooks (`webhook-stream`), **custom polling/streaming data source plugins** |
-| **Connector Thread Bridges** (`plugins`) | Supervised on a **local connector daemon** (`hph daemon`) | **1-to-1 Thread-Owned** — pinned to one local agent `handle` / `sessionId` with live `mesh_plugin_handoff` | Local machine's `~/.config/hyphae/secrets/` (`0600`) — never sent to a shared router | **Personal Slack / Telegram DM & mention bridges**, machine-local alerts, and **100% drop-in compatibility with existing `t3-mesh` plugins** |
+| **Connector Thread Bridges** (`plugins`) | Supervised on a **local connector daemon** (`hyp daemon`) | **1-to-1 Thread-Owned** — pinned to one local agent `handle` / `sessionId` with live `mesh_plugin_handoff` | Local machine's `~/.config/hyphae/secrets/` (`0600`) — never sent to a shared router | **Personal Slack / Telegram DM & mention bridges**, machine-local alerts, and **100% drop-in compatibility with existing `t3-mesh` plugins** |
 
 ### Interactive Setup & Built-In Guides
 
 ```sh
-hph plugin setup           # Interactive TUI for both Router Data Streams & Connector Bridges
-hph plugin list            # Inspect configured streams and bridges
-hph plugin guide           # List all built-in plugins & streams
-hph plugin guide slack     # Print step-by-step setup guide + agent usage for Slack
-hph plugin guide github-webhook
+hyp plugin setup           # Interactive TUI for both Router Data Streams & Connector Bridges
+hyp plugin list            # Inspect configured streams and bridges
+hyp plugin guide           # List all built-in plugins & streams
+hyp plugin guide slack     # Print step-by-step setup guide + agent usage for Slack
+hyp plugin guide github-webhook
 ```
 
 ---
 
-## 0. Private Secrets Management (`hph secret`)
+## 0. Private Secrets Management (`hyp secret`)
 
 Never put raw API tokens or webhook secrets directly in `connector.json`. Store them in `~/.config/hyphae/secrets/<name>.secret` (strict `0600` inside `0700` directory):
 
 ```sh
-hph secret set slack-app-token      # hidden TTY prompt (or reads stdin)
-hph secret set github-webhook-secret
-hph secret list                     # lists names & 0600 status (never prints values)
-hph secret check                    # verifies every secret referenced in connector.json
-hph secret rm old-token
+hyp secret set slack-app-token      # hidden TTY prompt (or reads stdin)
+hyp secret set github-webhook-secret
+hyp secret list                     # lists names & 0600 status (never prints values)
+hyp secret check                    # verifies every secret referenced in connector.json
+hyp secret rm old-token
 ```
 
 Reference secrets in any plugin or stream `env` block using:
@@ -41,7 +41,7 @@ Reference secrets in any plugin or stream `env` block using:
 
 ## 1. Router Data Streams (`localRouter.streams`)
 
-Configure streams directly under `localRouter.streams` in `connector.json` (no manual `add-publisher` / `--topic` flags needed — `hph daemon` registers topics, supervises each source, and fans out CloudEvents to matching `mesh_subscribe` filters across all connected harnesses and machines):
+Configure streams directly under `localRouter.streams` in `connector.json` (no manual `add-publisher` / `--topic` flags needed — `hyp daemon` registers topics, supervises each source, and fans out CloudEvents to matching `mesh_subscribe` filters across all connected harnesses and machines):
 
 ```json
 {
@@ -100,7 +100,7 @@ Custom router data sources use the **exact same fd-3 SDK** (`plugins/sdk/client.
 
 `hyphae` reuses `t3-mesh`'s battle-tested fd-3 plugin supervisor, SQLite coalescing/retention store (`local.db`), wake caps, backlog status reporting, and CloudEvent validation—while routing targets to **any** harness session on the daemon.
 
-- **100% drop-in compatible with existing `t3-mesh` plugins**: Any plugin built for `t3-mesh` (such as Python Slack Socket Mode bridges, Telegram long-polling connectors, `bf-ops-alerts`, or `scalable`) runs unmodified under `hph daemon`.
+- **100% drop-in compatible with existing `t3-mesh` plugins**: Any plugin built for `t3-mesh` (such as Python Slack Socket Mode bridges, Telegram long-polling connectors, `bf-ops-alerts`, or `scalable`) runs unmodified under `hyp daemon`.
 - **Zero credentials shared**: Plugins hold their own secrets (e.g. `0600` files or `systemd-creds`), never see router tokens, and communicate solely over anonymous duplex fd 3 (`T3_MESH_FD=3` / `AGENTS_MESH_FD=3`).
 - **Durable buffering & coalescing**: Events are persisted in `state/local.db` (24h retention, 100 pending batches per target, configurable `coalesceSeconds`, `maxWaitSeconds`, `wakesPerHour`). If the target agent hasn't joined yet, batches wait durably and flush automatically once the target session enrolls!
 
@@ -256,8 +256,8 @@ Protocol summary (full wire spec in [packages/t3-mesh/SPEC.md §13](../packages/
 For external feeds shared across multiple sessions or machines, configure a topic on the router and issue a publisher token restricted to that topic:
 
 ```sh
-hph router add-publisher github-hub --topic github --db router.sqlite --token-out pub.token
-hph router serve --db router.sqlite --audit audit.log --topic github=github-hub
+hyp router add-publisher github-hub --topic github --db router.sqlite --token-out pub.token
+hyp router serve --db router.sqlite --audit audit.log --topic github=github-hub
 ```
 
-Publishers post CloudEvents 1.0 to `POST /v1/events?topic=github`. The built-in GitHub webhook receiver (`hph router github-receiver ...`) verifies `X-Hub-Signature-256` and publishes normalized GitHub events directly. Sessions subscribe with `mesh_subscribe` filters and choose their own `mode` (`queue` or `interrupt`).
+Publishers post CloudEvents 1.0 to `POST /v1/events?topic=github`. The built-in GitHub webhook receiver (`hyp router github-receiver ...`) verifies `X-Hub-Signature-256` and publishes normalized GitHub events directly. Sessions subscribe with `mesh_subscribe` filters and choose their own `mode` (`queue` or `interrupt`).
