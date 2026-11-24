@@ -51,9 +51,9 @@ function esc(s) {
 // 1. HERO INSTALL SWITCHER
 // ============================================================================
 const HERO_CMDS = {
-  curl: 'bash -c "$(curl -fsSL https://raw.githubusercontent.com/bowd/hyphae/main/install.sh)"',
+  curl: 'bash -c "$(curl -fsSL https://raw.githubusercontent.com/hyphae-to/hyp/main/install.sh)"',
   npm: "npm install -g @bowd/hyphae && hyp onboard",
-  git: "git clone https://github.com/bowd/hyphae && cd hyphae && npm i && npm run build",
+  git: "git clone https://github.com/hyphae-to/hyp && cd hyp && npm i && npm run build",
 };
 
 let activeHeroInstall = "curl";
@@ -1289,7 +1289,7 @@ renderDeck();
 // ============================================================================
 const QS = {
   curl: `# Install hyp from GitHub and launch interactive onboarding
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/bowd/hyphae/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/hyphae-to/hyp/main/install.sh)"
 
 # Verify Node 24, daemon, live nodes, 0600 secrets, and harnesses
 hyp status`,
