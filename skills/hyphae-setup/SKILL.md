@@ -2,8 +2,9 @@
 name: hyphae-setup
 description: >-
   Interactive setup, first-time onboarding, and ongoing configuration concierge for Hyphae (`hyp`) —
-  local node, 9 coding harnesses, Direct P2P (`hp2p1_`), Team Hubs (`am2_`), Public Nodes,
-  GitHub/Prometheus/webhook streams, Slack/Telegram bridges, and Local Security Gates.
+  local node, 9 coding harnesses, native wakeup transports (Herdr `hc`, Codex Queue,
+  `--claude-channel`, T3 Code, OpenClaw), Direct P2P (`hp2p1_`), Team Hubs (`am2_`),
+  Public Nodes, GitHub/Prometheus/webhook streams, Slack/Telegram bridges, and Local Security Gates.
 ---
 
 # Hyphae (`hyp`) — Setup & Configuration Concierge
@@ -14,17 +15,18 @@ You are guiding the user through first-time onboarding **or** ongoing configurat
 
 ## 0. First Step (Always): Inspect Current State (Secret-Free)
 
-Before asking questions or modifying files, inspect the machine with structured `--json` probes:
+Before asking questions or modifying files, inspect the machine with structured `--json` probes (and check whether orchestrators like Herdr `hc` are present):
 
 ```sh
 hyp version --json
 hyp status --json
 hyp doctor --json
+command -v hc >/dev/null && hc templates --json || true
 ```
 
 Use the results to pick the right mode automatically:
 - **Mode 1 — First-Time Onboarding**: no `~/.config/hyphae/node.json` (or legacy `connector.json`) exists yet, or identity keys / harnesses have not been configured.
-- **Mode 2 — Ongoing Configuration Changes**: a node already exists (`nodeId`, keys, and `node.sqlite` present) and the user wants to add/remove harnesses, pair a laptop/server, deploy a Team Hub or Public Node, wire streams/bridges, configure a Security Gate, or fix `hyp doctor` warnings.
+- **Mode 2 — Ongoing Configuration Changes**: a node already exists (`nodeId`, keys, and `node.sqlite` present) and the user wants to add/remove harnesses, configure native wakeup transports (Herdr, Codex Queue, `--claude-channel`, T3 Code, OpenClaw), pair a laptop/server, deploy a Team Hub or Public Node, wire streams/bridges, configure a Security Gate, or fix `hyp doctor` warnings.
 
 ---
 
@@ -73,6 +75,17 @@ Preview or adjust harness wiring with `hyp setup`:
 hyp setup --harness claude,codex,antigravity --dry-run --json
 hyp setup --harness claude,codex,antigravity --json
 ```
+
+### Native Wakeup Transports & Orchestrators
+
+Check which orchestrators and native push transports are present on this machine and wire them cleanly so idle agents wake automatically without polling:
+
+- **Herdr (`hc`)**: Terminal orchestrator with reusable launch templates (`hc templates --json`, `hc run <template> <task>`). When agents run inside Herdr tabs, Hyphae verifies terminal identity and pushes wakeups (both queued and urgent interrupts) directly into live tabs. Wire with `hyp setup --harness herdr --json`.
+- **Codex Queue**: Native push transport for Codex CLI sessions (`hyp mcp --backend codex`, plus `--thread <uuid>`, `--resume`, or `--remote <addr>` for standalone threads). Delivers mesh messages directly into idle Codex threads via `codex queue` alongside hooks (`hyp setup --harness codex --json`).
+- **Claude Native Push Channel (`--claude-channel`)**: Opt-in MCP push channel for Claude Code (`hyp mcp --claude-channel`) emitting `notifications/claude/channel` directly into live sessions in addition to `PreToolUse`/`PostToolUse`/`Stop` hooks (`hyp setup --harness claude --json`).
+- **T3 Code (`t3`)**: Desktop/web orchestrator that spawns Claude and Codex threads. Hyphae resolves active threads via read-only `statev2.sqlite` and pushes wakeups over authenticated WebSocket RPC. Wire with `hyp setup --harness t3 --json`, store any T3 session token out-of-band via `hyp secret set t3-session-token --web` (never plaintext), and install `hyphae-setup` via `hyp onboard --assist t3` so T3-spawned Claude/Codex threads discover it.
+- **OpenClaw (`openclaw`)**: Daemon/GUI orchestrator configured in `~/.openclaw/openclaw.json` (`hyp mcp --backend openclaw --ephemeral`) with its orchestrator skill at `~/.openclaw/skills/hyphae/SKILL.md`. Wire with `hyp setup --harness openclaw --json`; for guided onboarding inside OpenClaw, run `hyp onboard --assist openclaw` to install `hyphae-setup` and paste the printed prompt in a new thread.
+- **Desktop & IDE Apps (`claude-desktop`, `codex-desktop`, `cursor`)**: GUI apps without a direct CLI session launcher use the guide-only handoff (`hyp onboard --assist claude-desktop`, `--assist codex-desktop`, `--assist cursor`) to install `hyphae-setup` into their skill directory (`~/.claude/skills`, `~/.codex/skills`, `~/.cursor/skills`) and provide the `claude_desktop_config.json` MCP snippet or copy-paste prompt.
 
 ### Step 1.2 — Connect Chosen Topology (If Beyond Local-Only)
 

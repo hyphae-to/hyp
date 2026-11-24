@@ -562,3 +562,326 @@ fn service_status_json_reports_cleanly_in_isolated_home() {
     assert_eq!(payload["data"]["installed"], false);
     assert_eq!(payload["data"]["daemon"]["alive"], false);
 }
+
+#[cfg(unix)]
+#[test]
+fn assist_herdr_template_installs_skill_and_invokes_hc_run() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let canonical = fs::read_to_string(repo_setup_skill_path()).expect("read repo SKILL.md");
+
+    let cases: &[(&str, &str, Option<&str>, i32)] = &[
+        (
+            "claude-gateway",
+            ".claude/skills/hyphae-setup/SKILL.md",
+            None,
+            0,
+        ),
+        (
+            "codex-gateway",
+            ".codex/skills/hyphae-setup/SKILL.md",
+            Some(".agents/skills/hyphae-setup/SKILL.md"),
+            5,
+        ),
+    ];
+
+    for &(template_name, primary_skill_rel, extra_skill_rel, shim_exit) in cases {
+        let tmp = TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        let bin_dir = tmp.path().join("bin");
+        let capture = tmp.path().join("hc_capture.txt");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+
+        let primary_skill = home.join(primary_skill_rel);
+        let hc_script = bin_dir.join("hc");
+        let script = format!(
+            "#!/bin/sh\n\
+             set -eu\n\
+             if [ \"$1\" = 'templates' ]; then\n\
+               printf '%s\\n' '{{\"templates\":[{{\"name\":\"claude-gateway\",\"description\":\"Claude (Gateway)\",\"command\":\"claude-gateway\"}},{{\"name\":\"codex-gateway\",\"description\":\"Codex (Gateway)\",\"command\":\"codex-gateway --no-daemon\"}}]}}'\n\
+               exit 0\n\
+             fi\n\
+             if [ -f '{skill}' ]; then\n\
+               echo 'SKILL_PREEXISTED=1' > '{cap}'\n\
+             else\n\
+               echo 'SKILL_PREEXISTED=0' > '{cap}'\n\
+             fi\n\
+             echo \"ARGC=$#\" >> '{cap}'\n\
+             for arg in \"$@\"; do\n\
+               printf 'ARG=%s\\n' \"$arg\" >> '{cap}'\n\
+             done\n\
+             exit {shim_exit}\n",
+            skill = primary_skill.display(),
+            cap = capture.display(),
+        );
+        fs::write(&hc_script, script).expect("write fake hc");
+        fs::set_permissions(&hc_script, fs::Permissions::from_mode(0o755)).expect("chmod hc");
+
+        let isolated_path = format!("{}:/usr/bin:/bin", bin_dir.display());
+        let assist_arg = format!("herdr:{template_name}");
+        let out = isolated_cmd(&home)
+            .env("PATH", &isolated_path)
+            .args([
+                "onboard",
+                "--assist",
+                &assist_arg,
+                "--home",
+                home.to_str().unwrap(),
+                "--no-anim",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .expect("run onboard --assist herdr:<template>");
+
+        assert_eq!(
+            out.status.code(),
+            Some(shim_exit),
+            "template {template_name}: stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&primary_skill).expect("primary skill installed"),
+            canonical
+        );
+        if let Some(extra_rel) = extra_skill_rel {
+            let extra_path = home.join(extra_rel);
+            assert!(extra_path.is_file(), "missing extra skill {}", extra_path.display());
+            assert_eq!(fs::read_to_string(&extra_path).unwrap(), canonical);
+        }
+
+        let captured = fs::read_to_string(&capture).expect("read fake hc capture");
+        let lines: Vec<&str> = captured.lines().collect();
+        assert_eq!(
+            lines.first().copied(),
+            Some("SKILL_PREEXISTED=1"),
+            "hyphae-setup/SKILL.md must be installed BEFORE `hc run` executes"
+        );
+        assert_eq!(lines.get(1).copied(), Some("ARGC=3"), "captured:\n{captured}");
+        assert_eq!(lines.get(2).copied(), Some("ARG=run"), "captured:\n{captured}");
+        assert_eq!(
+            lines.get(3).copied(),
+            Some(format!("ARG={template_name}").as_str()),
+            "captured:\n{captured}"
+        );
+        let prompt_line = lines.get(4).copied().unwrap_or("");
+        assert!(
+            prompt_line.contains("hyphae-setup")
+                && prompt_line.contains(&primary_skill.display().to_string()),
+            "prompt missing skill reference: {prompt_line}"
+        );
+    }
+}
+
+#[test]
+fn assist_openclaw_and_t3_install_skill_and_emit_structured_manual_guide() {
+    let canonical = fs::read_to_string(repo_setup_skill_path()).expect("read repo SKILL.md");
+
+    // 1. OpenClaw `--json` manual guide flow.
+    let tmp_oc = TempDir::new().expect("tempdir");
+    let home_oc = tmp_oc.path();
+    let oc_out = isolated_cmd(home_oc)
+        .args([
+            "onboard",
+            "--assist",
+            "openclaw",
+            "--home",
+            home_oc.to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run onboard --assist openclaw --json");
+    assert_eq!(
+        oc_out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&oc_out.stderr)
+    );
+    let oc_json = parse_json_stdout(&oc_out);
+    assert_eq!(oc_json["ok"], true);
+    assert_eq!(oc_json["command"], "onboard");
+    assert_eq!(oc_json["data"]["mode"], "manual_guide");
+    assert_eq!(oc_json["data"]["harness"], "openclaw");
+    assert_eq!(oc_json["data"]["displayName"], "OpenClaw");
+    assert!(
+        oc_json["data"]["prompt"]
+            .as_str()
+            .is_some_and(|p| p.contains("hyphae-setup")),
+        "missing prompt in JSON: {oc_json}"
+    );
+    let oc_skill = home_oc.join(".openclaw/skills/hyphae-setup/SKILL.md");
+    assert!(oc_skill.is_file(), "expected OpenClaw skill at {}", oc_skill.display());
+    assert_eq!(fs::read_to_string(&oc_skill).unwrap(), canonical);
+
+    // 1b. OpenClaw plain non-TTY flow also exits 0 and prints the 2-step guide.
+    let oc_plain = isolated_cmd(home_oc)
+        .args([
+            "onboard",
+            "--assist",
+            "openclaw",
+            "--home",
+            home_oc.to_str().unwrap(),
+            "--no-anim",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run onboard --assist openclaw plain");
+    assert_eq!(oc_plain.status.code(), Some(0));
+    let oc_stdout = String::from_utf8_lossy(&oc_plain.stdout);
+    assert!(oc_stdout.contains("Open OpenClaw"), "stdout={oc_stdout}");
+    assert!(oc_stdout.contains("hyphae-setup"), "stdout={oc_stdout}");
+
+    // 2. T3 Code `--json` manual guide flow (installs into .agents, .claude, and .codex!).
+    let tmp_t3 = TempDir::new().expect("tempdir");
+    let home_t3 = tmp_t3.path();
+    let t3_out = isolated_cmd(home_t3)
+        .args([
+            "onboard",
+            "--assist",
+            "t3",
+            "--home",
+            home_t3.to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run onboard --assist t3 --json");
+    assert_eq!(
+        t3_out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&t3_out.stderr)
+    );
+    let t3_json = parse_json_stdout(&t3_out);
+    assert_eq!(t3_json["ok"], true);
+    assert_eq!(t3_json["command"], "onboard");
+    assert_eq!(t3_json["data"]["mode"], "manual_guide");
+    assert_eq!(t3_json["data"]["harness"], "t3");
+    assert_eq!(t3_json["data"]["displayName"], "T3 Code");
+    assert!(
+        t3_json["data"]["prompt"]
+            .as_str()
+            .is_some_and(|p| p.contains("hyphae-setup")),
+        "missing prompt in JSON: {t3_json}"
+    );
+
+    for rel in [
+        ".agents/skills/hyphae-setup/SKILL.md",
+        ".claude/skills/hyphae-setup/SKILL.md",
+        ".codex/skills/hyphae-setup/SKILL.md",
+    ] {
+        let path = home_t3.join(rel);
+        assert!(path.is_file(), "expected T3 skill at {}", path.display());
+        assert_eq!(fs::read_to_string(&path).unwrap(), canonical);
+    }
+}
+
+#[test]
+fn assist_claude_desktop_codex_desktop_and_cursor_ide_emit_manual_guides() {
+    let canonical = fs::read_to_string(repo_setup_skill_path()).expect("read repo SKILL.md");
+
+    // 1. Claude Desktop (`--assist claude-desktop --json`): installs ~/.claude/skills + emits MCP snippet.
+    let tmp_cd = TempDir::new().expect("tempdir");
+    let home_cd = tmp_cd.path();
+    let cd_out = isolated_cmd(home_cd)
+        .args([
+            "onboard",
+            "--assist",
+            "claude-desktop",
+            "--home",
+            home_cd.to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run onboard --assist claude-desktop --json");
+    assert_eq!(
+        cd_out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&cd_out.stderr)
+    );
+    let cd_json = parse_json_stdout(&cd_out);
+    assert_eq!(cd_json["ok"], true);
+    assert_eq!(cd_json["data"]["mode"], "manual_guide");
+    assert_eq!(cd_json["data"]["harness"], "claude-desktop");
+    assert_eq!(cd_json["data"]["displayName"], "Claude Desktop");
+    assert_eq!(
+        cd_json["data"]["prompt"],
+        "Set up Hyphae on this machine using the hyphae-setup skill"
+    );
+    assert!(
+        cd_json["data"]["mcpSnippet"]
+            .as_str()
+            .is_some_and(|s| s.contains("mcpServers") && s.contains("hyphae")),
+        "expected claude_desktop_config.json MCP snippet: {cd_json}"
+    );
+    let cd_skill = home_cd.join(".claude/skills/hyphae-setup/SKILL.md");
+    assert!(cd_skill.is_file());
+    assert_eq!(fs::read_to_string(&cd_skill).unwrap(), canonical);
+
+    // 2. Codex Desktop (`--assist codex-desktop --json`): installs ~/.codex/skills + ~/.agents/skills.
+    let tmp_cx = TempDir::new().expect("tempdir");
+    let home_cx = tmp_cx.path();
+    let cx_out = isolated_cmd(home_cx)
+        .args([
+            "onboard",
+            "--assist",
+            "codex-desktop",
+            "--home",
+            home_cx.to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run onboard --assist codex-desktop --json");
+    assert_eq!(cx_out.status.code(), Some(0));
+    let cx_json = parse_json_stdout(&cx_out);
+    assert_eq!(cx_json["ok"], true);
+    assert_eq!(cx_json["data"]["mode"], "manual_guide");
+    assert_eq!(cx_json["data"]["harness"], "codex-desktop");
+    assert_eq!(cx_json["data"]["displayName"], "Codex Desktop");
+    assert_eq!(
+        cx_json["data"]["prompt"],
+        "Set up Hyphae on this machine using the hyphae-setup skill"
+    );
+    for rel in [
+        ".codex/skills/hyphae-setup/SKILL.md",
+        ".agents/skills/hyphae-setup/SKILL.md",
+    ] {
+        let p = home_cx.join(rel);
+        assert!(p.is_file(), "missing {}", p.display());
+        assert_eq!(fs::read_to_string(&p).unwrap(), canonical);
+    }
+
+    // 3. Cursor IDE fallback when `cursor-agent` CLI is NOT on PATH (`--assist cursor --json`).
+    let tmp_cu = TempDir::new().expect("tempdir");
+    let home_cu = tmp_cu.path();
+    let cu_out = isolated_cmd(home_cu)
+        .env("PATH", "")
+        .args([
+            "onboard",
+            "--assist",
+            "cursor",
+            "--home",
+            home_cu.to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run onboard --assist cursor without cursor-agent on PATH");
+    assert_eq!(cu_out.status.code(), Some(0));
+    let cu_json = parse_json_stdout(&cu_out);
+    assert_eq!(cu_json["ok"], true);
+    assert_eq!(cu_json["data"]["mode"], "manual_guide");
+    assert_eq!(cu_json["data"]["harness"], "cursor");
+    assert_eq!(cu_json["data"]["displayName"], "Cursor (IDE)");
+    assert_eq!(
+        cu_json["data"]["prompt"],
+        "Set up Hyphae on this machine using the hyphae-setup skill"
+    );
+    let cu_skill = home_cu.join(".cursor/skills/hyphae-setup/SKILL.md");
+    assert!(cu_skill.is_file());
+    assert_eq!(fs::read_to_string(&cu_skill).unwrap(), canonical);
+}
