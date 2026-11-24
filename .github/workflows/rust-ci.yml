@@ -39,6 +39,9 @@ jobs:
           python3 --version
 
           node --check site/app.js
+          node --check site/drop/crypto.js
+          node --check site/drop/drop.js
+          node scripts/test-drop-crypto.mjs
           while IFS= read -r file; do
             node --check "$file"
           done < <(find plugins -type f -name '*.mjs' | sort)

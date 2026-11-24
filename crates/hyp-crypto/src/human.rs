@@ -76,6 +76,15 @@ const RESERVED_SECRET_PREFIXES: &[&str] = &[
     "auth-token-",
 ];
 
+const RESERVED_SECRET_EXACT: &[&str] = &[
+    "admin-ca",
+    "gate-policy",
+    "gate-policy-hmac-key",
+    "human-admin",
+    "human-authority",
+    "auth-token",
+];
+
 /// Supported MVP sealed drop kinds (`directive` or `secret`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -284,9 +293,10 @@ pub fn derive_prf_ed25519_keypair(
 /// `gate-policy-*`, `human-admin-*`, `human-authority-*`, `auth-token-*`.
 pub fn is_reserved_secret_name(name: &str) -> bool {
     let lower = name.trim().to_ascii_lowercase();
-    RESERVED_SECRET_PREFIXES
-        .iter()
-        .any(|prefix| lower.starts_with(prefix))
+    RESERVED_SECRET_EXACT.contains(&lower.as_str())
+        || RESERVED_SECRET_PREFIXES
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
 }
 
 // ============================================================================

@@ -31,6 +31,9 @@ jobs:
         run: |
           set -euo pipefail
           node --check site/app.js
+          node --check site/drop/crypto.js
+          node --check site/drop/drop.js
+          node scripts/test-drop-crypto.mjs
           sh -n site/install.sh
           cmp -s scripts/install.sh site/install.sh
           cmp -s scripts/install.ps1 site/install.ps1
