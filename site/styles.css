@@ -1174,11 +1174,12 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   z-index: 15;
   margin: 0 auto 12px;
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   justify-content: center;
   gap: 10px;
-  max-width: min(100%, 880px);
+  max-width: min(100%, 960px);
+  min-height: 60px;
 }
 
 .scene-subtitle {
@@ -4853,6 +4854,7 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
   .hero-stage-center { padding: 8px 0; }
   .hero-controls-dock { padding-bottom: 16px; }
   .hero-cta-strip { padding: 28px 0 40px; }
+  .scene-subtitle-wrap { flex-wrap: wrap; min-height: 102px; }
   .scene-subtitle { font-size: 0.8rem; padding: 8px 12px; border-radius: 12px; max-width: 100%; }
   .myc-timeline { gap: 8px; margin-top: 8px; flex-wrap: wrap; height: auto; justify-content: center; }
   .tl-track-wrap { min-width: 100%; }
