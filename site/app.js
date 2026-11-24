@@ -56,12 +56,12 @@ function esc(s) {
 // 1. HERO INSTALL SWITCHER
 // ============================================================================
 const HERO_CMDS = {
-  curl: 'bash -c "$(curl -fsSL https://raw.githubusercontent.com/hyphae-to/hyp/main/install.sh)"',
-  npm: "npm install -g @hyphae-to/hyp && hyp onboard",
-  git: "git clone https://github.com/hyphae-to/hyp && cd hyp && npm i && npm run build",
+  unix: "curl -fsSL https://hyphae.to/install.sh | sh",
+  win: "irm https://hyphae.to/install.ps1 | iex",
+  git: "git clone https://github.com/hyphae-to/hyp && cd hyp && cargo install --path crates/hyp-cli",
 };
 
-let activeHeroInstall = "curl";
+let activeHeroInstall = "unix";
 function renderHeroInstall() {
   document.getElementById("heroInstallCmd").textContent = HERO_CMDS[activeHeroInstall];
   document.querySelectorAll("#heroInstallTabs .it-btn").forEach((b) =>
@@ -1054,7 +1054,7 @@ renderChapter();
 resetStoryTimer();
 
 // ============================================================================
-// 3. LOCAL NODE INBOUND CONTROL-GATE LIVING ANIMATION (#streams)
+// 3. INTERACTIVE LOCAL NODE CONTROL CENTER (#streams)
 // ============================================================================
 (function initControlGate() {
   const viewport = document.getElementById("gateViewport");
@@ -1065,13 +1065,13 @@ resetStoryTimer();
   if (!viewport || !stage) return;
 
   const LOGICAL_W = 1120;
-  const LOGICAL_H = 336;
+  const LOGICAL_H = 356;
   const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
   function fitGateStage() {
     if (window.innerWidth <= 760) return;
     const availW = viewport.clientWidth || LOGICAL_W;
-    const scale = Math.min(1.08, availW / LOGICAL_W);
+    const scale = Math.min(1.06, availW / LOGICAL_W);
     const offsetX = Math.max(0, (availW - LOGICAL_W * scale) / 2);
     stage.style.transform = `translateX(${offsetX.toFixed(1)}px) scale(${scale.toFixed(4)})`;
     viewport.style.height = `${Math.round(LOGICAL_H * scale)}px`;
@@ -1084,243 +1084,14 @@ resetStoryTimer();
   window.addEventListener("resize", fitGateStage, { passive: true });
 
   const GATE_SOURCES = [
-    { name: "Team Hyp Node · DM @alice", sub: "peer node · direct message", cls: "peer", thumb: "./assets/team-node-hub.jpg?v=1" },
-    { name: "GitHub · PR #412", sub: "review: approved", cls: "amber" },
-    { name: "CI · noisy flake ×8", sub: "retry chatter", cls: "amber-muted" },
-    { name: "#deploys · chatter", sub: "build room noise", cls: "olive" },
-    { name: "E2EE · diff.patch", sub: "X25519 · 42 KB", cls: "moss" },
+    { name: "Team Node · DM @alice", sub: "acme-team · direct message", cls: "peer", thumb: "./assets/team-node-hub.jpg?v=1" },
+    { name: "public.hyphae.to · OSS", sub: "unlinked · click to pair", linkedSub: "anthropics/claude-code · PRs", cls: "amber" },
+    { name: "CI Burst (×12)", sub: "acme-team · flaky retries", cls: "amber-muted" },
+    { name: "#deploys · chatter", sub: "acme-team · build room", cls: "olive" },
+    { name: "E2EE · diff.patch", sub: "acme-team · X25519 · 42 KB", cls: "moss" },
   ];
 
-  const GATE_MODES = {
-    filter: {
-      cmd: 'hyp_stream({ action: "subscribe", coalesceSeconds: 15 })',
-      ruleText: "CloudEvents filter · 15s batch",
-      ruleCls: "",
-      deflectText: "✕ flakes dropped · 3 merged → 1",
-      delivered: "1 batch (3)",
-      blocked: "8 CI flakes",
-      blockedCls: "amber",
-      saved: "94%",
-      barPct: 94,
-      foot: "1 wake turn · E2EE saved to disk",
-      caption:
-        "Your <strong>Local Node</strong> drops noisy CI flakes at the gate shield (<code>0 tokens</code>), while coalescing simultaneous arrivals (Team Node DM, PR #412, E2EE diff) into <strong>one batched delivery</strong> down a single wire.",
-      sources: [
-        { state: "pass", badge: "batch" },
-        { state: "pass", badge: "batch" },
-        { state: "blocked", badge: "dropped" },
-        { state: "idle", badge: "idle" },
-        { state: "pass", badge: "-> disk" },
-      ],
-      strands: {
-        "g-in-0": "active",
-        "g-in-1": "active",
-        "g-in-2": "blocked",
-        "g-in-3": "dim",
-        "g-in-4": "active",
-        "g-out": "active",
-      },
-      packets: [
-        // 3 simultaneous passing arrivals converging into Local Node
-        { path: "g-in-0", cls: "", label: "DM @alice", phase: 0.02, dur: 1200, startT: 0.14, endT: 0.78, rippleNode: "green" },
-        { path: "g-in-1", cls: "amber", label: "PR #412", phase: 0.02, dur: 1200, startT: 0.14, endT: 0.78 },
-        { path: "g-in-4", cls: "moss", label: "🔒 diff.patch", phase: 0.03, dur: 1200, startT: 0.14, endT: 0.74, mergeTag: "3 → 1 batch" },
-        // ONE unified batched packet gliding down the single right-hand strand
-        { path: "g-out", cls: "", label: "batch (3) · DM + PR #412 + diff", phase: 0.36, dur: 1900, startT: 0.34, endT: 0.78, rippleAgent: true },
-        // 2 noisy CI flakes racing in and getting deflected hard at the left gate shield
-        { path: "g-in-2", cls: "blocked", label: "CI flake #3", phase: 0.16, dur: 1750, startT: 0.14, endT: 0.67, deflect: "amber", dropTag: "✕ dropped · 0 tokens" },
-        { path: "g-in-2", cls: "blocked", label: "CI flake #4", phase: 0.62, dur: 1750, startT: 0.14, endT: 0.67, deflect: "amber", dropTag: "✕ dropped · 0 tokens" },
-      ],
-    },
-    coalesce: {
-      cmd: "hyp_stream({ coalesceSeconds: 15, maxWaitSeconds: 30 })",
-      ruleText: "Coalescing window · 15s",
-      ruleCls: "amber",
-      deflectText: "3 simultaneous arrivals → 1 batch",
-      delivered: "1 batched wake",
-      blockedLabel: "Merged",
-      blocked: "3 merged → 1",
-      blockedCls: "amber",
-      saved: "89%",
-      barPct: 89,
-      foot: "1 turn instead of 3 · E2EE -> disk",
-      caption:
-        "When a <strong>DM from a Team Hyp Node</strong>, a <strong>GitHub review</strong>, and an <strong>E2EE file</strong> arrive together, your <strong>Local Node</strong> merges them in a 15s coalescing window and wakes your agent <strong>once</strong>.",
-      sources: [
-        { state: "batched", badge: "merged" },
-        { state: "batched", badge: "merged" },
-        { state: "blocked", badge: "dropped" },
-        { state: "idle", badge: "quiet" },
-        { state: "batched", badge: "merged" },
-      ],
-      strands: {
-        "g-in-0": "active",
-        "g-in-1": "active",
-        "g-in-2": "blocked",
-        "g-in-3": "dim",
-        "g-in-4": "active",
-        "g-out": "active",
-      },
-      packets: [
-        { path: "g-in-0", cls: "", label: "DM @alice", phase: 0.02, dur: 1240, startT: 0.14, endT: 0.78, rippleNode: "amber" },
-        { path: "g-in-1", cls: "amber", label: "PR #412", phase: 0.02, dur: 1240, startT: 0.14, endT: 0.78 },
-        { path: "g-in-4", cls: "moss", label: "🔒 diff.patch", phase: 0.02, dur: 1240, startT: 0.14, endT: 0.74, mergeTag: "3 arrivals → 1 batch" },
-        { path: "g-out", cls: "", label: "batch ×3 · 1 wake", phase: 0.38, dur: 1900, startT: 0.32, endT: 0.78, rippleAgent: true },
-        { path: "g-in-2", cls: "blocked", label: "CI flake #7", phase: 0.24, dur: 1700, startT: 0.14, endT: 0.67, deflect: "amber", dropTag: "✕ dropped · 0 tokens" },
-      ],
-    },
-    guard: {
-      cmd: "hyp gate init --adapter anthropic|openai|plugin",
-      ruleText: "Guard plugin · injection shield",
-      ruleCls: "coral",
-      deflectText: "✕ 1 prompt injection quarantined",
-      delivered: "2 clean (1 batch)",
-      blockedLabel: "Quarantined",
-      blocked: "1 injection · 0 leaked",
-      blockedCls: "coral",
-      savedLabel: "Prompt safety",
-      saved: "100%",
-      barPct: 100,
-      foot: "Anthropic · OpenAI · Llama Guard · BYO",
-      src1Sub: 'comment · "ignore prev…"',
-      caption:
-        "Run pluggable <strong>prompt-injection guard &amp; filter plugins</strong> on your Local Node — out-of-the-box <code>Anthropic</code> / <code>OpenAI-compatible</code> adapters (Keychain token + sane default prompt), <code>Llama Prompt Guard 2</code> / <code>Lakera</code>, or your own custom filter — quarantining attacks before they ever touch your agent.",
-      sources: [
-        { state: "pass", badge: "clean" },
-        { state: "muted", badge: "quarantined" },
-        { state: "idle", badge: "quiet" },
-        { state: "idle", badge: "quiet" },
-        { state: "pass", badge: "-> disk" },
-      ],
-      strands: {
-        "g-in-0": "active",
-        "g-in-1": "blocked",
-        "g-in-2": "dim",
-        "g-in-3": "dim",
-        "g-in-4": "active",
-        "g-out": "active",
-      },
-      packets: [
-        { path: "g-in-1", cls: "coral", label: "PR #412: ignore prev…", phase: 0.14, dur: 1800, startT: 0.14, endT: 0.66, deflect: "coral", dropTag: "✕ quarantined · guard plugin" },
-        { path: "g-in-1", cls: "coral", label: "prompt inject ⚠", phase: 0.6, dur: 1750, startT: 0.14, endT: 0.66, deflect: "coral", dropTag: "✕ quarantined · guard plugin" },
-        { path: "g-in-0", cls: "", label: "DM @alice", phase: 0.03, dur: 1200, startT: 0.14, endT: 0.78, rippleNode: "green" },
-        { path: "g-in-4", cls: "moss", label: "🔒 diff.patch", phase: 0.03, dur: 1200, startT: 0.14, endT: 0.74 },
-        { path: "g-out", cls: "", label: "DM @alice + diff.patch", phase: 0.38, dur: 1880, startT: 0.32, endT: 0.78, rippleAgent: true },
-      ],
-    },
-    mute: {
-      cmd: 'hyp_inbox({ mute: "#deploys", ttl: "2h" })',
-      ruleText: "Muted: #deploys (local)",
-      ruleCls: "coral",
-      deflectText: "✕ #deploys deflected at shield",
-      delivered: "1 batch (2)",
-      blockedLabel: "Dropped",
-      blocked: "#deploys muted",
-      blockedCls: "coral",
-      saved: "96%",
-      barPct: 96,
-      foot: "Mute rules run on your Local Node",
-      caption:
-        "Mute noisy rooms or peers locally — your <strong>Local Node</strong> stops matching <code>#deploys</code> chatter right at the gate shield while peer DMs and encrypted files continue cleanly down your single wire.",
-      sources: [
-        { state: "pass", badge: "pass" },
-        { state: "idle", badge: "quiet" },
-        { state: "idle", badge: "quiet" },
-        { state: "muted", badge: "muted" },
-        { state: "pass", badge: "-> disk" },
-      ],
-      strands: {
-        "g-in-0": "active",
-        "g-in-1": "dim",
-        "g-in-2": "dim",
-        "g-in-3": "blocked",
-        "g-in-4": "active",
-        "g-out": "active",
-      },
-      packets: [
-        { path: "g-in-3", cls: "coral", label: "#deploys: build ok", phase: 0.12, dur: 1750, startT: 0.14, endT: 0.67, deflect: "coral", dropTag: "✕ muted" },
-        { path: "g-in-3", cls: "coral", label: "#deploys: cache hit", phase: 0.58, dur: 1750, startT: 0.14, endT: 0.67, deflect: "coral", dropTag: "✕ muted" },
-        { path: "g-in-0", cls: "", label: "DM @alice", phase: 0.04, dur: 1200, startT: 0.14, endT: 0.78, rippleNode: "green" },
-        { path: "g-in-4", cls: "moss", label: "🔒 diff.patch", phase: 0.04, dur: 1200, startT: 0.14, endT: 0.74 },
-        { path: "g-out", cls: "", label: "DM @alice + diff.patch", phase: 0.38, dur: 1880, startT: 0.32, endT: 0.78, rippleAgent: true },
-      ],
-    },
-    digest: {
-      cmd: 'hyp_inbox({ mode: "notify" })',
-      ruleText: "Digest-only · local queue",
-      ruleCls: "amber",
-      deflectText: "4 bursts → 1 calm digest line",
-      delivered: "1 digest line",
-      blockedLabel: "Queued",
-      blocked: "4 buffered locally",
-      blockedCls: "amber",
-      saved: "91%",
-      barPct: 91,
-      foot: "Full msgs wait in local inbox",
-      caption:
-        "Switch to <code>notify</code> (digest-only) mode during deep focus — your <strong>Local Node</strong> queues bursts locally and sends your agent one calm <code>1-line digest</code> instead of flooding prompts.",
-      sources: [
-        { state: "batched", badge: "batched" },
-        { state: "batched", badge: "batched" },
-        { state: "batched", badge: "batched" },
-        { state: "batched", badge: "batched" },
-        { state: "pass", badge: "-> disk" },
-      ],
-      strands: {
-        "g-in-0": "active",
-        "g-in-1": "active",
-        "g-in-2": "active",
-        "g-in-3": "active",
-        "g-in-4": "active",
-        "g-out": "active",
-      },
-      packets: [
-        { path: "g-in-0", cls: "", label: "DM @alice", phase: 0.03, dur: 1260, startT: 0.14, endT: 0.78, rippleNode: "amber" },
-        { path: "g-in-1", cls: "amber", label: "PR #412", phase: 0.09, dur: 1260, startT: 0.14, endT: 0.78 },
-        { path: "g-in-2", cls: "amber", label: "CI flake", phase: 0.15, dur: 1260, startT: 0.14, endT: 0.76 },
-        { path: "g-in-3", cls: "moss", label: "#deploys", phase: 0.21, dur: 1260, startT: 0.14, endT: 0.74, mergeTag: "4 queued · 1-line digest" },
-        { path: "g-out", cls: "", label: "digest: 4 unread (1 line)", phase: 0.42, dur: 1900, startT: 0.34, endT: 0.78, rippleAgent: true },
-      ],
-    },
-    unsub: {
-      cmd: 'hyp_stream({ action: "unsubscribe", key: "ci-flakes" })',
-      ruleText: "2 streams unsub · 0 wakes",
-      ruleCls: "moss",
-      deflectText: "✕ unsubscribed · cut at connector",
-      delivered: "2 subscribed",
-      blocked: "2 streams off",
-      blockedCls: "coral",
-      saved: "100%",
-      barPct: 100,
-      foot: "Zero wakes for unsubscribed streams",
-      caption:
-        "Unsubscribe from any stream or leave any <code>#channel</code> in one call — your <strong>Local Node</strong> severs the strand immediately so stray traffic drops before reaching your agent.",
-      sources: [
-        { state: "pass", badge: "subscribed" },
-        { state: "idle", badge: "paused" },
-        { state: "detached", badge: "unsub" },
-        { state: "detached", badge: "left room" },
-        { state: "pass", badge: "-> disk" },
-      ],
-      strands: {
-        "g-in-0": "active",
-        "g-in-1": "dim",
-        "g-in-2": "detached",
-        "g-in-3": "detached",
-        "g-in-4": "active",
-        "g-out": "active",
-      },
-      packets: [
-        { path: "g-in-2", cls: "coral", label: "CI flake ×8", phase: 0.16, dur: 1700, startT: 0.12, endT: 0.54, deflect: "coral", dropTag: "✕ unsub · 0 wakes" },
-        { path: "g-in-3", cls: "coral", label: "#deploys", phase: 0.6, dur: 1700, startT: 0.12, endT: 0.54, deflect: "coral", dropTag: "✕ unsub · 0 wakes" },
-        { path: "g-in-0", cls: "", label: "DM @alice", phase: 0.04, dur: 1220, startT: 0.14, endT: 0.78, rippleNode: "green" },
-        { path: "g-in-4", cls: "moss", label: "🔒 diff.patch", phase: 0.04, dur: 1220, startT: 0.14, endT: 0.74 },
-        { path: "g-out", cls: "", label: "DM @alice + diff.patch", phase: 0.4, dur: 1880, startT: 0.32, endT: 0.78, rippleAgent: true },
-      ],
-    },
-  };
-
-  // Build braided companion hyphae for every gate strand (tight hugging weave on unified #g-out)
+  // Build braided companion hyphae once (tight hugging weave on unified #g-out)
   const gateBundles = new Map();
   const gateHost = document.getElementById("gateBundles");
   document.querySelectorAll(".gate-strand").forEach((path, idx) => {
@@ -1332,7 +1103,7 @@ resetStoryTimer();
     g.setAttribute("class", `gate-bundle ${cls}`.trim());
 
     const steps = Math.max(10, Math.min(24, Math.round(len / 18)));
-    const amp = isUnified ? 2.9 : Math.min(6.8, Math.max(3.8, len * 0.024));
+    const amp = isUnified ? 2.8 : Math.min(6.4, Math.max(3.6, len * 0.022));
     const seed = (idx + 2) * 1.43;
     const ptsA = [];
     const ptsB = [];
@@ -1390,14 +1161,29 @@ resetStoryTimer();
     gateBundles.set(path.id, g);
   });
 
-  const MODE_ORDER = ["filter", "coalesce", "guard", "mute", "digest", "unsub"];
+  const DEFAULT_STATE = {
+    publicLinked: false, // Multi-node pairing: Private Team Node (acme-team) active by default; click to link public.hyphae.to!
+    ciMode: "burst",     // "burst" (Burst cap: noisy -> notify) -> "unsub" (0 wire!) -> "all" (unthrottled flood)
+    aliceMode: "queue",  // 3-tier delivery urgency: "queue" (idle) -> "interrupt" (urgent VIP) -> "notify" (inbox) -> "mute"
+    deploysMode: "mute", // "mute" (deflect at shield) -> "notify" (inbox) -> "queue" (idle)
+    guard: true,         // Pluggable prompt-injection guard ON <-> OFF
+    focus: false,        // Focus Mode (* -> notify): holds all non-VIP sources in local inbox
+  };
+
   const params = new URLSearchParams(window.location.search);
-  const urlGate = params.get("gate");
   const urlPhaseRaw = params.get("t");
   const fixedPhase = urlPhaseRaw !== null && !Number.isNaN(Number(urlPhaseRaw)) ? Number(urlPhaseRaw) : null;
-  let activeGate = GATE_MODES[urlGate] ? urlGate : "filter";
-  let gatePlaying = !GATE_MODES[urlGate] && fixedPhase === null && !reducedMotion;
-  let gateCycleTimer = null;
+
+  let gateState = { ...DEFAULT_STATE };
+  if (params.get("public") === "1") gateState.publicLinked = true;
+  if (params.get("focus") === "1") gateState.focus = true;
+  if (params.get("ci") && ["burst", "unsub", "all"].includes(params.get("ci"))) gateState.ciMode = params.get("ci");
+  if (params.get("alice") && ["queue", "interrupt", "notify", "mute"].includes(params.get("alice"))) gateState.aliceMode = params.get("alice");
+  if (params.get("deploys") && ["mute", "notify", "queue"].includes(params.get("deploys"))) gateState.deploysMode = params.get("deploys");
+  if (params.get("guard") === "0") gateState.guard = false;
+
+  let lastCmd = 'hyp_inbox({ mode: "queue", burst: "notify" })';
+  let gatePlaying = fixedPhase === null && !reducedMotion;
   let gateRaf = null;
   let shieldTimer = null;
 
@@ -1419,13 +1205,397 @@ resetStoryTimer();
     }, 440);
   }
 
-  function renderGateMobile(mode) {
+  function buildScenario(st) {
+    const packets = [];
+    const queuedItems = [];
+    const notifyItems = [];
+    const interruptItems = [];
+    let droppedCount = 0;
+    let burstCapped = 0;
+    let unsubOrUnlinked = 0;
+    let leakedInject = false;
+    let noisyFlood = false;
+
+    // Row 0: Team Node (acme) · DM @alice (queue | interrupt | notify | mute)
+    const aliceEff = st.aliceMode === "mute"
+      ? "mute"
+      : st.aliceMode === "interrupt"
+      ? "interrupt" // VIP interrupt breaks through Focus Mode!
+      : st.focus
+      ? "notify"
+      : st.aliceMode;
+
+    let src0;
+    if (aliceEff === "mute") {
+      droppedCount += 1;
+      src0 = { state: "muted", badge: "muted", strand: "blocked" };
+      packets.push({
+        path: "g-in-0",
+        cls: "coral",
+        label: "DM @alice",
+        phase: 0.78,
+        dur: 1680,
+        startT: 0.14,
+        endT: 0.67,
+        deflect: "coral",
+        dropTag: "✕ muted · @alice",
+      });
+    } else if (aliceEff === "interrupt") {
+      interruptItems.push("DM @alice");
+      src0 = { state: "urgent", badge: "interrupt!", strand: "active" };
+      packets.push({ path: "g-in-0", cls: "coral", label: "⚡ DM @alice", phase: 0.02, dur: 980, startT: 0.14, endT: 0.78, rippleNode: "coral" });
+    } else if (aliceEff === "notify") {
+      notifyItems.push("DM @alice");
+      src0 = { state: "notify", badge: "notify", strand: "active" };
+      packets.push({ path: "g-in-0", cls: "amber", label: "DM @alice", phase: 0.03, dur: 1180, startT: 0.14, endT: 0.78, rippleNode: "amber" });
+    } else {
+      queuedItems.push("DM");
+      src0 = { state: "pass", badge: "queue", strand: "active" };
+      packets.push({ path: "g-in-0", cls: "", label: "DM @alice", phase: 0.02, dur: 1160, startT: 0.14, endT: 0.78, rippleNode: "green" });
+    }
+
+    // Row 1: public.hyphae.to · GitHub OSS (starts UNLINKED -> 0 wire! Click "+ Link public.hyphae.to" to light up!)
+    let src1;
+    if (!st.publicLinked) {
+      unsubOrUnlinked += 1;
+      src1 = { state: "detached", badge: "unlinked", strand: "detached", sub: GATE_SOURCES[1].sub };
+    } else {
+      const ossEff = st.focus ? "notify" : "queue";
+      if (ossEff === "notify") notifyItems.push("claude-code PR");
+      else queuedItems.push("OSS PR");
+
+      src1 = {
+        state: !st.guard ? "warn" : ossEff === "notify" ? "notify" : "pass",
+        badge: !st.guard ? "⚠ guard off" : ossEff,
+        strand: "active",
+        sub: GATE_SOURCES[1].linkedSub,
+      };
+      packets.push({ path: "g-in-1", cls: "amber", label: "claude-code PR", phase: 0.05, dur: 1180, startT: 0.14, endT: 0.78 });
+
+      if (st.guard) {
+        droppedCount += 1;
+        packets.push({
+          path: "g-in-1",
+          cls: "coral",
+          label: "ignore prev…",
+          phase: 0.36,
+          dur: 1700,
+          startT: 0.14,
+          endT: 0.66,
+          deflect: "coral",
+          dropTag: "✕ quarantined · guard",
+        });
+      } else {
+        leakedInject = true;
+        packets.push({ path: "g-in-1", cls: "coral", label: "⚠ ignore prev…", phase: 0.42, dur: 1160, startT: 0.14, endT: 0.78, rippleNode: "coral" });
+      }
+    }
+
+    // Row 2: CI Burst (x12) ("burst" = Burst cap: noisy -> notify | "unsub" = 0 wire! | "all" = flood)
+    let src2;
+    if (st.ciMode === "unsub") {
+      unsubOrUnlinked += 1;
+      src2 = { state: "detached", badge: "unsub · 0 wire", strand: "detached" };
+    } else if (st.ciMode === "burst") {
+      burstCapped = 11;
+      notifyItems.push("CI ×12");
+      src2 = { state: "notify", badge: "burst→notify", strand: "blocked" };
+      packets.push({
+        path: "g-in-2",
+        cls: "blocked",
+        label: "CI burst ×12",
+        phase: 0.12,
+        dur: 1680,
+        startT: 0.14,
+        endT: 0.67,
+        deflect: "amber",
+        dropTag: "✕ burst cap → notify",
+      });
+    } else {
+      noisyFlood = true;
+      if (st.focus) {
+        notifyItems.push("CI ×12");
+        src2 = { state: "notify", badge: "notify", strand: "active" };
+      } else {
+        queuedItems.push("CI ×12");
+        src2 = { state: "warn", badge: "flood!", strand: "active" };
+      }
+      packets.push({ path: "g-in-2", cls: "amber", label: "CI burst ×12", phase: 0.08, dur: 1120, startT: 0.14, endT: 0.76 });
+    }
+
+    // Row 3: #deploys · chatter ("mute" | "notify" | "queue")
+    const deploysEff = st.deploysMode === "mute" ? "mute" : st.focus ? "notify" : st.deploysMode;
+    let src3;
+    if (deploysEff === "mute") {
+      droppedCount += 1;
+      src3 = { state: "muted", badge: "muted", strand: "blocked" };
+      packets.push({
+        path: "g-in-3",
+        cls: "coral",
+        label: "#deploys noise",
+        phase: 0.58,
+        dur: 1680,
+        startT: 0.14,
+        endT: 0.58,
+        deflect: "coral",
+        dropTag: "✕ muted · 0 tokens",
+      });
+    } else if (deploysEff === "notify") {
+      notifyItems.push("#deploys");
+      src3 = { state: "notify", badge: "notify", strand: "active" };
+      packets.push({ path: "g-in-3", cls: "amber", label: "#deploys ok", phase: 0.16, dur: 1180, startT: 0.14, endT: 0.74 });
+    } else {
+      queuedItems.push("#deploys");
+      src3 = { state: "pass", badge: "queue", strand: "active" };
+      packets.push({ path: "g-in-3", cls: "moss", label: "#deploys ok", phase: 0.16, dur: 1180, startT: 0.14, endT: 0.74 });
+    }
+
+    // Row 4: E2EE · diff.patch (saved directly to disk outside LLM prompt)
+    const src4 = { state: "pass", badge: "→ disk", strand: "active" };
+    if (st.focus) notifyItems.push("diff.patch");
+    else queuedItems.push("diff");
+    packets.push({ path: "g-in-4", cls: "moss", label: "🔒 diff.patch", phase: 0.04, dur: 1180, startT: 0.14, endT: 0.74 });
+
+    // Compute ONE single unified right-hand strand (#g-out) output reflecting 3-tier urgency!
+    const hasInterrupt = interruptItems.length > 0;
+    const hasQueued = queuedItems.length > 0;
+    const hasNotify = notifyItems.length > 0;
+    const outActive = hasInterrupt || hasQueued || hasNotify || leakedInject;
+
+    let outTone = "";
+    if (hasInterrupt || leakedInject) outTone = "urgent";
+    else if (st.focus || (!hasQueued && hasNotify)) outTone = "notify-mode";
+
+    // Merge chip above Local Node
+    const firstPassIn = packets.find((p) => !p.deflect);
+    if (firstPassIn) {
+      if (st.focus && hasInterrupt) {
+        firstPassIn.mergeTag = `VIP interrupt · ${notifyItems.length} in inbox`;
+      } else if (st.focus) {
+        firstPassIn.mergeTag = `${notifyItems.length} queued · 1-line digest`;
+      } else if (hasInterrupt) {
+        firstPassIn.mergeTag = "⚡ interrupt · wake now";
+      } else if (queuedItems.length >= 2) {
+        firstPassIn.mergeTag = `${queuedItems.length} queued · idle wake`;
+      }
+    }
+
+    if (hasInterrupt) {
+      packets.push({
+        path: "g-out",
+        cls: "coral",
+        label: "⚡ interrupt: DM @alice",
+        phase: 0.24,
+        dur: 1240,
+        startT: 0.34,
+        endT: 0.78,
+        rippleAgent: true,
+      });
+    }
+
+    if (st.focus && hasNotify) {
+      packets.push({
+        path: "g-out",
+        cls: leakedInject ? "coral" : "amber",
+        label: leakedInject
+          ? `⚠ digest (${notifyItems.length} + inject)`
+          : `notify: ${notifyItems.length} in inbox (1 line)`,
+        phase: hasInterrupt ? 0.64 : 0.38,
+        dur: 1900,
+        startT: 0.34,
+        endT: 0.78,
+        rippleAgent: true,
+      });
+    } else {
+      if (hasQueued) {
+        const qLabel = queuedItems.slice(0, 3).join(" + ") + (queuedItems.length > 3 ? "…" : "");
+        packets.push({
+          path: "g-out",
+          cls: "",
+          label: `queue (idle): ${qLabel}`,
+          phase: hasInterrupt ? 0.6 : 0.36,
+          dur: 1840,
+          startT: 0.34,
+          endT: 0.78,
+          rippleAgent: true,
+        });
+      }
+      if (hasNotify && !hasInterrupt) {
+        packets.push({
+          path: "g-out",
+          cls: "amber",
+          label: `notify: ${notifyItems.length} digest (inbox)`,
+          phase: hasQueued ? 0.74 : 0.38,
+          dur: 1860,
+          startT: 0.34,
+          endT: 0.78,
+          rippleAgent: !hasQueued,
+        });
+      }
+      if (leakedInject) {
+        packets.push({
+          path: "g-out",
+          cls: "coral",
+          label: "⚠ prompt inject leaked!",
+          phase: 0.76,
+          dur: 1460,
+          startT: 0.34,
+          endT: 0.78,
+          rippleAgent: true,
+        });
+      }
+    }
+
+    // Center Local Node subtitle & rule pill
+    const nodeSubText = st.publicLinked
+      ? "acme-team + public.hyphae.to"
+      : "acme-team · Keychain";
+
+    let rulePillText = `${st.publicLinked ? "2 nodes" : "acme-team"} · ${st.guard ? "Guard ON" : "Guard OFF"} · ${st.ciMode === "burst" ? "Burst cap" : st.ciMode === "unsub" ? "CI unsub" : "CI open"}`;
+    let rulePillCls = "";
+    if (leakedInject) {
+      rulePillText = "⚠ Injection Guard OFF";
+      rulePillCls = "coral";
+    } else if (st.focus && hasInterrupt) {
+      rulePillText = "Focus · VIP interrupt active";
+      rulePillCls = "coral";
+    } else if (st.focus) {
+      rulePillText = "Focus (* → notify) · local inbox";
+      rulePillCls = "amber";
+    } else if (hasInterrupt) {
+      rulePillText = "⚡ interrupt active · wake now";
+      rulePillCls = "coral";
+    } else if (!st.guard) {
+      rulePillCls = "amber";
+    }
+
+    // Dynamic telemetry calculations
+    let deliveredLabel = "Delivery";
+    let deliveredText = "quiet · 0 wakes";
+    let blockedLabel = "Stopped / capped";
+    const stopParts = [];
+    if (burstCapped > 0) stopParts.push(`${burstCapped} burst`);
+    if (droppedCount > 0) stopParts.push(`${droppedCount} drop`);
+    if (unsubOrUnlinked > 0 && stopParts.length < 2) stopParts.push(`${unsubOrUnlinked} off`);
+    let blockedText = stopParts.length ? stopParts.join(" · ") : "0 stopped";
+    let blockedCls = burstCapped > 0 || droppedCount > 0 ? "amber" : "";
+    let savedLabel = "Context saved";
+    let barPct = 94;
+    let barDanger = false;
+    let foot = "Delivers on idle · E2EE → disk";
+
+    if (leakedInject) {
+      deliveredText = st.focus ? "⚠ digest + inject" : "⚠ unguarded inject";
+      blockedLabel = "Guard status";
+      blockedText = "1 injection leaked!";
+      blockedCls = "coral";
+      savedLabel = "Prompt safety";
+      barPct = 26;
+      barDanger = true;
+      foot = "Enable 🛡 Injection Guard to quarantine attacks";
+    } else if (st.focus) {
+      deliveredText = hasInterrupt ? "⚡ 1 VIP + 1 digest" : `1-line digest (${notifyItems.length})`;
+      blockedLabel = "Held in inbox";
+      blockedText = `${notifyItems.length} notify · ${burstCapped + droppedCount} stopped`;
+      barPct = Math.min(99, 95 + (st.ciMode !== "all" ? 2 : 0) + (st.deploysMode === "mute" ? 1 : 0));
+      foot = hasInterrupt
+        ? "VIP interrupt (@alice) breaks through Focus"
+        : "Held in local inbox · paginate via cursor";
+    } else {
+      if (hasInterrupt) {
+        deliveredText = `⚡ interrupt + ${queuedItems.length} queue`;
+      } else if (hasQueued && hasNotify) {
+        deliveredText = `queue (${queuedItems.length}) + digest`;
+      } else if (hasQueued) {
+        deliveredText = `queue (${queuedItems.length}) on idle`;
+      } else if (hasNotify) {
+        deliveredText = `notify (${notifyItems.length} digest)`;
+      }
+
+      let score = 50;
+      if (st.ciMode === "burst") score += 26;
+      if (st.ciMode === "unsub") score += 29;
+      if (st.deploysMode === "mute") score += 11;
+      if (st.deploysMode === "notify") score += 8;
+      if (st.aliceMode === "notify" || st.aliceMode === "mute") score += 4;
+      if (st.guard) score += 4;
+      if (!st.publicLinked) score += 3;
+      if (noisyFlood) score = Math.min(score, 40);
+      barPct = Math.max(24, Math.min(99, score));
+
+      foot = hasInterrupt
+        ? "Urgent interrupt wakes agent immediately"
+        : st.publicLinked
+        ? "2 hubs paired · E2EE → disk · 0 leaked"
+        : "Delivers on idle · E2EE → disk";
+    }
+
+    let caption = "";
+    if (leakedInject) {
+      caption =
+        "<strong>Injection Guard is OFF</strong> — an untrusted <code>public.hyphae.to</code> PR comment (<code>\"ignore prev…\"</code>) slipped straight into your agent. Turn <strong>🛡 Injection Guard</strong> back ON to quarantine attacks via <code>Anthropic</code>, <code>OpenAI-compatible</code>, <code>Llama Prompt Guard 2</code>, <code>Lakera</code>, or BYO plugins.";
+    } else if (st.focus) {
+      caption = hasInterrupt
+        ? "<strong>Focus Mode (* → notify)</strong> is ON — non-VIP feeds sit calmly in your local inbox (<code>hyp_inbox({ filter, cursor })</code>), while VIP <code>interrupt</code> peer <strong>@alice</strong> still wakes your agent immediately."
+        : "<strong>Focus Mode (* → notify)</strong> is ON — every source drops to a calm <code>1-line digest</code> held in your local inbox so your agent finishes uninterrupted, then paginates on demand via <code>hyp_inbox({ mode: \"notify\", filter, cursor })</code>.";
+    } else if (st.aliceMode === "interrupt") {
+      caption =
+        "<strong>3-tier delivery urgency</strong> — <strong>DM @alice</strong> is set to <code>interrupt</code> (wakes thread immediately!), while routine signals <code>queue</code> until idle and noisy bursts step down to <code>notify</code> digests.";
+    } else if (st.publicLinked) {
+      caption =
+        "<strong>Multi-node pairing active</strong> — your Local Node is now paired to both your private <strong>acme-team</strong> hub AND <code>public.hyphae.to</code> (streaming filtered <code>anthropics/claude-code</code> PRs while <strong>🛡 Injection Guard</strong> quarantines untrusted comments).";
+    } else if (st.ciMode === "unsub") {
+      caption =
+        "<strong>Upstream unsubscribed</strong> — <code>CI Burst</code> is cut completely at the source (<code>0 bytes</code> on the wire), while muted <code>#deploys</code> chatter still deflects locally at your gate shield (<code>0 tokens</code>).";
+    } else {
+      caption =
+        "<strong>Paired to private Team Node (<code>acme-team</code>)</strong> — DMs <code>queue</code> cleanly until idle, <strong>CI Burst protection</strong> steps noisy storms down to <code>notify</code>, and clicking <strong>+ Link public.hyphae.to</strong> pairs public OSS streams live behind your <strong>🛡 Injection Guard</strong>.";
+    }
+
+    return {
+      sources: [src0, src1, src2, src3, src4],
+      strands: {
+        "g-in-0": src0.strand,
+        "g-in-1": src1.strand,
+        "g-in-2": src2.strand,
+        "g-in-3": src3.strand,
+        "g-in-4": src4.strand,
+        "g-out": outActive ? "active" : "dim",
+      },
+      outTone,
+      packets,
+      nodeSubText,
+      rulePillText,
+      rulePillCls,
+      deliveredLabel,
+      deliveredText,
+      blockedLabel,
+      blockedText,
+      blockedCls,
+      savedLabel,
+      barPct,
+      barDanger,
+      foot,
+      caption,
+      leakedInject,
+      hasInterrupt,
+    };
+  }
+
+  function renderGateMobile(sc) {
     if (!mobileHost) return;
+    const ciLabel = gateState.ciMode === "burst" ? "Burst→notify" : gateState.ciMode === "unsub" ? "Unsub" : "All";
+    const ciCls = gateState.ciMode === "burst" ? "amber-tone on" : gateState.ciMode === "unsub" ? "off" : "danger-off";
+    const aliceLabel = gateState.aliceMode === "queue" ? "queue" : gateState.aliceMode === "interrupt" ? "interrupt!" : gateState.aliceMode === "notify" ? "notify" : "mute";
+    const aliceCls = gateState.aliceMode === "interrupt" ? "urgent-on" : gateState.aliceMode === "notify" ? "amber-tone on" : gateState.aliceMode === "mute" ? "coral-on" : "on";
+    const depLabel = gateState.deploysMode === "mute" ? "Muted" : gateState.deploysMode === "notify" ? "Notify" : "Queue";
+    const depCls = gateState.deploysMode === "mute" ? "coral-on" : gateState.deploysMode === "notify" ? "amber-tone on" : "on";
+
     mobileHost.innerHTML = `
       <div class="gm-mob-list">
         ${GATE_SOURCES.map((src, i) => {
-          const st = mode.sources[i];
-          const subText = i === 1 && mode.src1Sub ? mode.src1Sub : src.sub;
+          const st = sc.sources[i];
+          const subTxt = st.sub || src.sub;
           const iconHtml = src.thumb
             ? `<span class="gs-node-thumb"><img src="${esc(src.thumb)}" alt="" /></span>`
             : `<span class="gs-dot"></span>`;
@@ -1435,7 +1605,7 @@ resetStoryTimer();
                 ${iconHtml}
                 <div>
                   <strong>${esc(src.name)}</strong>
-                  <small>${esc(subText)}</small>
+                  <small>${esc(subTxt)}</small>
                 </div>
               </div>
               <span class="gs-badge">${esc(st.badge)}</span>
@@ -1450,17 +1620,37 @@ resetStoryTimer();
           <path stroke="rgba(127,201,123,0.45)" stroke-width="1.2" d="M 42 0 C 40 8, 36 14, 34 22" />
         </svg>
       </div>
-      <div class="gm-mob-node">
-        <img class="gate-local-node-img" src="./assets/node-hub.png?v=7" alt="Local Hyphae Node" />
-        <div class="gm-mob-node-body">
-          <strong>Your Local Node (Connector)</strong>
-          <span>${esc(mode.ruleText)}</span>
-          <small>${esc(mode.deflectText)} · localhost · filter plugins</small>
+      <div class="gm-mob-node" style="flex-direction:column; align-items:stretch;">
+        <div style="display:flex; align-items:center; gap:11px;">
+          <img class="gate-local-node-img" src="./assets/node-hub.png?v=7" alt="Local Hyphae Node" />
+          <div class="gm-mob-node-body">
+            <strong>Your Local Node (Control Gate)</strong>
+            <span>${esc(sc.rulePillText)}</span>
+            <small>${esc(sc.nodeSubText)}</small>
+          </div>
+        </div>
+        <div class="gm-mob-switches">
+          <button class="gate-switch ${gateState.publicLinked ? "amber-tone on" : "invite-link"}" data-toggle="publicLinked" type="button" style="grid-column: 1 / -1; justify-content: space-between;">
+            <span style="display:inline-flex;align-items:center;gap:6px;"><span class="gsw-dot"></span><span class="gsw-label">${gateState.publicLinked ? "Public Node (public.hyphae.to)" : "+ Link public.hyphae.to"}</span></span>
+            <span class="gsw-state">${gateState.publicLinked ? "Linked" : "Unlinked"}</span>
+          </button>
+          <button class="gate-switch ${aliceCls}" data-toggle="aliceMode" type="button">
+            <span class="gsw-dot"></span><span class="gsw-label">@alice</span><span class="gsw-state">${aliceLabel}</span>
+          </button>
+          <button class="gate-switch ${ciCls}" data-toggle="ciMode" type="button">
+            <span class="gsw-dot"></span><span class="gsw-label">CI ×12</span><span class="gsw-state">${ciLabel}</span>
+          </button>
+          <button class="gate-switch ${depCls}" data-toggle="deploysMode" type="button">
+            <span class="gsw-dot"></span><span class="gsw-label">#deploys</span><span class="gsw-state">${depLabel}</span>
+          </button>
+          <button class="gate-switch ${gateState.guard ? "on" : "danger-off"}" data-toggle="guard" type="button">
+            <span class="gsw-dot"></span><span class="gsw-label">🛡 Guard</span><span class="gsw-state">${gateState.guard ? "ON" : "OFF"}</span>
+          </button>
         </div>
       </div>
       <div class="gm-mob-stem" aria-hidden="true">
         <svg viewBox="0 0 64 22" fill="none">
-          <path stroke="rgba(183,217,86,0.85)" stroke-width="2.4" d="M 32 0 C 33 8, 31 14, 32 22" />
+          <path stroke="${sc.hasInterrupt ? "rgba(255,122,92,0.9)" : "rgba(183,217,86,0.85)"}" stroke-width="2.4" d="M 32 0 C 33 8, 31 14, 32 22" />
         </svg>
       </div>
       <div class="gm-mob-agent">
@@ -1468,58 +1658,63 @@ resetStoryTimer();
           <img src="./assets/sprite-alex.jpg?v=2" alt="Your agent harness" />
           <div>
             <strong>Your Agent · Claude / Codex / Agy</strong>
-            <small>${esc(mode.foot)}</small>
+            <small>${esc(sc.foot)}</small>
           </div>
         </div>
-        <div class="gm-row"><span>Delivered</span><strong>${esc(mode.delivered)}</strong></div>
-        <div class="gm-row"><span>${esc(mode.blockedLabel || "Dropped")}</span><strong class="${esc(mode.blockedCls)}">${esc(mode.blocked)}</strong></div>
+        <button class="gate-focus-cta ${gateState.focus ? "active" : ""}" data-toggle="focus" type="button">
+          <span class="gfc-left"><span class="gfc-icon" aria-hidden="true">☾</span><span>Focus Mode (* → notify)</span></span>
+          <span class="gfc-pill">${gateState.focus ? "ON" : "OFF"}</span>
+        </button>
+        <div class="gm-row"><span>${esc(sc.deliveredLabel)}</span><strong class="${sc.leakedInject || sc.hasInterrupt ? "coral" : ""}">${esc(sc.deliveredText)}</strong></div>
+        <div class="gm-row"><span>${esc(sc.blockedLabel)}</span><strong class="${esc(sc.blockedCls)}">${esc(sc.blockedText)}</strong></div>
         <div class="gm-bar-wrap">
-          <div class="gm-bar-head"><span>${esc(mode.savedLabel || "Context saved")}</span><strong>${esc(mode.saved)}</strong></div>
-          <div class="gm-bar"><span style="width:${mode.barPct}%"></span></div>
+          <div class="gm-bar-head"><span>${esc(sc.savedLabel)}</span><strong>${sc.barPct}%</strong></div>
+          <div class="gm-bar"><span class="${sc.barDanger ? "danger" : ""}" style="width:${sc.barPct}%"></span></div>
         </div>
       </div>
     `;
   }
 
-  function startGatePackets(mode) {
+  let pausedElapsed = 0;
+  let cycleStart = performance.now();
+
+  function startGatePackets(sc) {
     if (gateRaf) cancelAnimationFrame(gateRaf);
     if (!packetsHost) return;
     packetsHost.innerHTML = "";
     shieldArc?.classList.remove("hit-amber", "hit-coral");
 
-    const items = mode.packets.map((spec) => {
+    const items = sc.packets.map((spec) => {
       const path = document.getElementById(spec.path);
       if (!path) return null;
       const el = document.createElement("div");
       el.className = `gate-pkt ${spec.cls || ""}`.trim();
       el.innerHTML = `<span class="gp-dot"></span><span class="gp-label">${esc(spec.label)}</span>`;
       packetsHost.appendChild(el);
-
-      let tagEl = null;
-      if (spec.dropTag) {
-        tagEl = document.createElement("div");
-        tagEl.className = `gate-drop-tag ${spec.deflect === "amber" ? "amber" : ""}`.trim();
-        tagEl.textContent = spec.dropTag;
-        tagEl.style.opacity = "0";
-        packetsHost.appendChild(tagEl);
-      } else if (spec.mergeTag) {
-        tagEl = document.createElement("div");
-        tagEl.className = "gate-merge-tag";
-        tagEl.textContent = spec.mergeTag;
-        tagEl.style.opacity = "0";
-        packetsHost.appendChild(tagEl);
-      }
-
-      return { ...spec, el, tagEl, path, len: path.getTotalLength(), lastCycle: -1 };
+      return { ...spec, el, path, len: path.getTotalLength(), lastCycle: -1 };
     }).filter(Boolean);
 
+    // Strictly ONE reusable drop chip & ONE merge chip — prevents ghost/overlapping double text!
+    const dropTagEl = document.createElement("div");
+    dropTagEl.className = "gate-drop-tag";
+    dropTagEl.style.opacity = "0";
+    packetsHost.appendChild(dropTagEl);
+
+    const mergeTagEl = document.createElement("div");
+    mergeTagEl.className = "gate-merge-tag";
+    mergeTagEl.style.opacity = "0";
+    packetsHost.appendChild(mergeTagEl);
+
     const CYCLE_MS = 3400;
-    const t0 = performance.now();
+    cycleStart = performance.now() - pausedElapsed;
     const agentRipple = document.getElementById("gateAgentRipple");
     const nodeRipple = document.getElementById("gateNodeRipple");
 
     function renderFrame(elapsed) {
       let shieldHitKind = "";
+      let bestDrop = null;
+      let bestMerge = null;
+
       for (const item of items) {
         const rawPos = (elapsed / CYCLE_MS) - item.phase;
         const cyclePos = ((rawPos % 1) + 1) % 1;
@@ -1527,22 +1722,20 @@ resetStoryTimer();
         const span = Math.min(0.84, item.dur / CYCLE_MS);
         const raw = cyclePos / span;
 
-        // Manage floating dropTag / mergeTag visibility (lingers briefly right after hit!)
-        if (item.tagEl) {
-          const hitAt = item.deflect ? 0.62 : 0.88;
-          const tagWindow = item.deflect ? 0.56 : 0.42;
+        if (item.dropTag) {
+          const hitAt = 0.62;
+          const tagWindow = 0.24;
           const post = (cyclePos - span * hitAt + 1) % 1;
-          if (post >= 0 && post < tagWindow) {
-            const pNorm = post / tagWindow;
-            const anchorPt = item.path.getPointAtLength(item.len * (item.endT ?? 0.67));
-            const tx = item.deflect ? anchorPt.x - 58 : 554;
-            const ty = item.deflect ? anchorPt.y + 34 + pNorm * 8 : 52 - pNorm * 5;
-            const tOp = pNorm < 0.14 ? pNorm / 0.14 : pNorm > 0.74 ? (1 - pNorm) / 0.26 : 1;
-            item.tagEl.style.left = `${(tx / LOGICAL_W) * 100}%`;
-            item.tagEl.style.top = `${(ty / LOGICAL_H) * 100}%`;
-            item.tagEl.style.opacity = Math.max(0, Math.min(1, tOp)).toFixed(2);
-          } else {
-            item.tagEl.style.opacity = "0";
+          if (post >= 0 && post < tagWindow && (!bestDrop || post < bestDrop.post)) {
+            bestDrop = { item, post, tagWindow };
+          }
+        }
+        if (item.mergeTag) {
+          const hitAt = 0.88;
+          const tagWindow = 0.4;
+          const post = (cyclePos - span * hitAt + 1) % 1;
+          if (post >= 0 && post < tagWindow && (!bestMerge || post < bestMerge.post)) {
+            bestMerge = { item, post, tagWindow };
           }
         }
 
@@ -1556,7 +1749,6 @@ resetStoryTimer();
         const endT = item.endT ?? 0.84;
 
         if (item.deflect) {
-          // 0..0.62: race straight toward left gate-shield; 0.62..1.0: hard stop, flash coral/amber, shake & drop down!
           const hitFrac = 0.62;
           if (raw < hitFrac) {
             const moveFrac = raw / hitFrac;
@@ -1585,7 +1777,7 @@ resetStoryTimer();
 
             if (dropFrac < 0.55) shieldHitKind = item.deflect;
 
-            if (item.lastCycle !== cycleNum && fixedPhase === null) {
+            if (item.lastCycle !== cycleNum && fixedPhase === null && gatePlaying) {
               item.lastCycle = cycleNum;
               flashShield(item.deflect);
               const burst = document.createElement("div");
@@ -1616,7 +1808,7 @@ resetStoryTimer();
           scale = 1 - 0.18 * tail;
         }
 
-        if (raw >= 0.86 && item.lastCycle !== cycleNum && fixedPhase === null) {
+        if (raw >= 0.86 && item.lastCycle !== cycleNum && fixedPhase === null && gatePlaying) {
           item.lastCycle = cycleNum;
           if (item.rippleAgent) fireRipple(agentRipple);
           if (item.rippleNode) fireRipple(nodeRipple, item.rippleNode === "green" ? "" : item.rippleNode);
@@ -1626,50 +1818,135 @@ resetStoryTimer();
         item.el.style.transform = `translate(-50%, -50%) scale(${scale.toFixed(3)})`;
       }
 
+      if (bestDrop) {
+        const { item, post, tagWindow } = bestDrop;
+        const pNorm = post / tagWindow;
+        const anchorPt = item.path.getPointAtLength(item.len * (item.endT ?? 0.67));
+        const tx = Math.max(384, anchorPt.x - 56);
+        const ty = anchorPt.y + 34 + pNorm * 7;
+        const tOp = pNorm < 0.14 ? pNorm / 0.14 : pNorm > 0.72 ? (1 - pNorm) / 0.28 : 1;
+        dropTagEl.className = `gate-drop-tag ${item.deflect === "amber" ? "amber" : ""}`.trim();
+        dropTagEl.textContent = item.dropTag;
+        dropTagEl.style.left = `${(tx / LOGICAL_W) * 100}%`;
+        dropTagEl.style.top = `${(ty / LOGICAL_H) * 100}%`;
+        dropTagEl.style.opacity = Math.max(0, Math.min(1, tOp)).toFixed(2);
+      } else {
+        dropTagEl.style.opacity = "0";
+      }
+
+      if (bestMerge) {
+        const { item, post, tagWindow } = bestMerge;
+        const pNorm = post / tagWindow;
+        const ty = 64 - pNorm * 5;
+        const tOp = pNorm < 0.14 ? pNorm / 0.14 : pNorm > 0.74 ? (1 - pNorm) / 0.26 : 1;
+        mergeTagEl.textContent = item.mergeTag;
+        mergeTagEl.style.left = `${(554 / LOGICAL_W) * 100}%`;
+        mergeTagEl.style.top = `${(ty / LOGICAL_H) * 100}%`;
+        mergeTagEl.style.opacity = Math.max(0, Math.min(1, tOp)).toFixed(2);
+      } else {
+        mergeTagEl.style.opacity = "0";
+      }
+
       if (fixedPhase !== null && shieldArc) {
         shieldArc.classList.toggle("hit-amber", shieldHitKind === "amber");
         shieldArc.classList.toggle("hit-coral", shieldHitKind === "coral");
       }
     }
 
-    if (fixedPhase !== null || reducedMotion) {
-      renderFrame((fixedPhase ?? 0.56) * CYCLE_MS);
+    if (fixedPhase !== null || !gatePlaying) {
+      renderFrame(fixedPhase !== null ? fixedPhase * CYCLE_MS : pausedElapsed || 0.48 * CYCLE_MS);
       return;
     }
 
     function tick(now) {
-      renderFrame(now - t0);
+      pausedElapsed = now - cycleStart;
+      renderFrame(pausedElapsed);
       gateRaf = requestAnimationFrame(tick);
     }
     gateRaf = requestAnimationFrame(tick);
   }
 
-  function renderGateMode() {
-    const mode = GATE_MODES[activeGate];
-    document.querySelectorAll("#gateTabs .gate-tab").forEach((b) => {
-      const on = b.dataset.gate === activeGate;
-      b.classList.toggle("active", on);
-      b.setAttribute("aria-selected", on ? "true" : "false");
-    });
+  function renderControlCenter() {
+    const sc = buildScenario(gateState);
 
     const cmdEl = document.getElementById("gateCmdPill");
-    if (cmdEl) cmdEl.textContent = mode.cmd;
+    if (cmdEl) cmdEl.textContent = lastCmd;
+
+    const nodeSubEl = document.getElementById("gateNodeSub");
+    if (nodeSubEl) nodeSubEl.textContent = sc.nodeSubText;
 
     const ruleEl = document.getElementById("gateRulePill");
     if (ruleEl) {
-      ruleEl.textContent = mode.ruleText;
-      ruleEl.className = `gate-rule-pill ${mode.ruleCls}`.trim();
+      ruleEl.textContent = sc.rulePillText;
+      ruleEl.className = `gate-rule-pill ${sc.rulePillCls}`.trim();
     }
 
-    const deflectEl = document.getElementById("gateDeflectPill");
-    if (deflectEl) deflectEl.textContent = mode.deflectText;
-
     const valveEl = document.getElementById("gateValveRing");
-    if (valveEl) valveEl.className = `gate-valve-ring mode-${activeGate}`;
+    if (valveEl) {
+      const modeCls = sc.leakedInject || sc.hasInterrupt ? "mode-guard" : gateState.focus ? "mode-digest" : "mode-coalesce";
+      valveEl.className = `gate-valve-ring ${modeCls}`.trim();
+    }
 
     const capEl = document.getElementById("gateCaption");
-    if (capEl) capEl.innerHTML = mode.caption;
+    if (capEl) capEl.innerHTML = sc.caption;
 
+    // Sync Connected Local Node Control Panel buttons
+    const pubBtn = document.getElementById("ctlPublicLink");
+    if (pubBtn) {
+      pubBtn.className = `gate-switch ${gateState.publicLinked ? "amber-tone on" : "invite-link"}`;
+      pubBtn.setAttribute("aria-pressed", gateState.publicLinked ? "true" : "false");
+      pubBtn.querySelector(".gsw-label").textContent = gateState.publicLinked ? "public.hyphae.to" : "+ Link public.hyphae.to";
+      pubBtn.querySelector(".gsw-state").textContent = gateState.publicLinked ? "Linked" : "Unlinked";
+    }
+    const ciBtn = document.getElementById("ctlCiMode");
+    if (ciBtn) {
+      const ciCls = gateState.ciMode === "burst" ? "amber-tone on" : gateState.ciMode === "unsub" ? "off" : "danger-off";
+      const ciTxt = gateState.ciMode === "burst" ? "Burst → notify" : gateState.ciMode === "unsub" ? "Unsub (0 wire)" : "All (flood)";
+      ciBtn.className = `gate-switch ${ciCls}`;
+      ciBtn.querySelector(".gsw-state").textContent = ciTxt;
+    }
+    const aliceBtn = document.getElementById("ctlAliceMode");
+    if (aliceBtn) {
+      const aMap = {
+        queue: { cls: "on", txt: "queue (idle)" },
+        interrupt: { cls: "urgent-on", txt: "interrupt (now)" },
+        notify: { cls: "amber-tone on", txt: "notify (inbox)" },
+        mute: { cls: "coral-on", txt: "muted" },
+      };
+      const cur = aMap[gateState.aliceMode] || aMap.queue;
+      aliceBtn.className = `gate-switch ${cur.cls}`;
+      aliceBtn.querySelector(".gsw-state").textContent = cur.txt;
+    }
+    const depBtn = document.getElementById("ctlDeploysMode");
+    if (depBtn) {
+      const dMap = {
+        mute: { cls: "coral-on", txt: "Muted" },
+        notify: { cls: "amber-tone on", txt: "Notify" },
+        queue: { cls: "on", txt: "Queue" },
+      };
+      const cur = dMap[gateState.deploysMode] || dMap.mute;
+      depBtn.className = `gate-switch ${cur.cls}`;
+      depBtn.querySelector(".gsw-state").textContent = cur.txt;
+    }
+    const guardBtn = document.getElementById("ctlGuard");
+    if (guardBtn) {
+      guardBtn.className = `gate-switch ${gateState.guard ? "on" : "danger-off"}`;
+      guardBtn.setAttribute("aria-pressed", gateState.guard ? "true" : "false");
+      guardBtn.querySelector(".gsw-label").textContent = gateState.guard ? "🛡 Injection Guard" : "⚠ Injection Guard";
+      guardBtn.querySelector(".gsw-state").textContent = gateState.guard ? "ON" : "OFF";
+    }
+
+    // Sync Right Focus Mode CTA
+    const focusBtn = document.getElementById("gateFocusBtn");
+    const focusState = document.getElementById("gateFocusState");
+    if (focusBtn) {
+      focusBtn.classList.toggle("active", gateState.focus);
+      focusBtn.setAttribute("aria-pressed", gateState.focus ? "true" : "false");
+    }
+    if (focusState) focusState.textContent = gateState.focus ? "ON" : "OFF";
+
+    // Sync Right Telemetry Meter
+    const gmDelLbl = document.getElementById("gmDeliveredLabel");
     const gmDel = document.getElementById("gmDelivered");
     const gmBlkLbl = document.getElementById("gmBlockedLabel");
     const gmBlk = document.getElementById("gmBlocked");
@@ -1677,37 +1954,52 @@ resetStoryTimer();
     const gmSav = document.getElementById("gmSaved");
     const gmBar = document.getElementById("gmBarFill");
     const gmFt = document.getElementById("gmFoot");
-    const gsSub1 = document.getElementById("gsSub1");
-    if (gmDel) gmDel.textContent = mode.delivered;
-    if (gmBlkLbl) gmBlkLbl.textContent = mode.blockedLabel || "Dropped";
-    if (gmBlk) {
-      gmBlk.textContent = mode.blocked;
-      gmBlk.className = mode.blockedCls || "";
+    if (gmDelLbl) gmDelLbl.textContent = sc.deliveredLabel;
+    if (gmDel) {
+      gmDel.textContent = sc.deliveredText;
+      gmDel.className = sc.leakedInject || sc.hasInterrupt ? "coral" : "";
     }
-    if (gmSavLbl) gmSavLbl.textContent = mode.savedLabel || "Context saved";
-    if (gmSav) gmSav.textContent = mode.saved;
-    if (gmBar) gmBar.style.width = `${mode.barPct}%`;
-    if (gmFt) gmFt.textContent = mode.foot;
-    if (gsSub1) gsSub1.textContent = mode.src1Sub || GATE_SOURCES[1].sub;
+    if (gmBlkLbl) gmBlkLbl.textContent = sc.blockedLabel;
+    if (gmBlk) {
+      gmBlk.textContent = sc.blockedText;
+      gmBlk.className = sc.blockedCls || "";
+    }
+    if (gmSavLbl) gmSavLbl.textContent = sc.savedLabel;
+    if (gmSav) gmSav.textContent = `${sc.barPct}%`;
+    if (gmBar) {
+      gmBar.style.width = `${sc.barPct}%`;
+      gmBar.classList.toggle("danger", sc.barDanger);
+    }
+    if (gmFt) gmFt.textContent = sc.foot;
 
+    // Sync Left 5 Incoming Wire Status Monitors
     document.querySelectorAll("#gateSources .gate-src").forEach((el, idx) => {
-      const st = mode.sources[idx];
+      const st = sc.sources[idx];
       if (!st) return;
-      el.classList.remove("state-pass", "state-blocked", "state-muted", "state-batched", "state-detached", "state-idle");
+      el.classList.remove("state-pass", "state-blocked", "state-muted", "state-batched", "state-detached", "state-idle", "state-warn", "state-urgent", "state-notify");
       el.classList.add(`state-${st.state}`);
       const badge = document.getElementById(`gsBadge${idx}`);
       if (badge) badge.textContent = st.badge;
+      if (idx === 1) {
+        const subEl = document.getElementById("gsSub1");
+        if (subEl && st.sub) subEl.textContent = st.sub;
+      }
     });
 
-    Object.entries(mode.strands).forEach(([id, state]) => {
+    // Sync SVG strands & companion weaves
+    Object.entries(sc.strands).forEach(([id, state]) => {
       const p = document.getElementById(id);
       if (p) {
         p.classList.toggle("dim", state === "dim");
         p.classList.toggle("blocked", state === "blocked");
         p.classList.toggle("detached", state === "detached");
+        if (id === "g-out") {
+          p.classList.toggle("urgent", sc.outTone === "urgent");
+          p.classList.toggle("notify-mode", sc.outTone === "notify-mode");
+        }
         if (state === "detached") {
           const l = p.getTotalLength();
-          p.style.strokeDasharray = `${(l * 0.56).toFixed(1)} ${l.toFixed(1)}`;
+          p.style.strokeDasharray = `${(l * 0.44).toFixed(1)} ${l.toFixed(1)}`;
         } else {
           p.style.strokeDasharray = "";
         }
@@ -1720,78 +2012,133 @@ resetStoryTimer();
       }
     });
 
-    renderGateMobile(mode);
-    startGatePackets(mode);
+    renderGateMobile(sc);
+    startGatePackets(sc);
   }
 
-  function resetGateCycle() {
-    clearInterval(gateCycleTimer);
-    if (!gatePlaying) return;
-    gateCycleTimer = setInterval(() => {
-      const i = MODE_ORDER.indexOf(activeGate);
-      activeGate = MODE_ORDER[(i + 1) % MODE_ORDER.length];
-      renderGateMode();
-    }, 6400);
+  function handleToggle(key) {
+    if (key === "ciMode") {
+      const order = ["burst", "unsub", "all"];
+      gateState.ciMode = order[(order.indexOf(gateState.ciMode) + 1) % order.length];
+      lastCmd =
+        gateState.ciMode === "burst"
+          ? 'hyp_stream({ topic: "ci", burstCap: "notify" })'
+          : gateState.ciMode === "unsub"
+          ? 'hyp_stream({ action: "unsubscribe", key: "ci" })'
+          : 'hyp_stream({ topic: "ci", burstCap: "off" })';
+      renderControlCenter();
+      return;
+    }
+    if (key === "aliceMode") {
+      const order = ["queue", "interrupt", "notify", "mute"];
+      gateState.aliceMode = order[(order.indexOf(gateState.aliceMode) + 1) % order.length];
+      lastCmd =
+        gateState.aliceMode === "mute"
+          ? 'hyp_inbox({ mute: "@alice" })'
+          : `hyp_inbox({ from: "@alice", mode: "${gateState.aliceMode}" })`;
+      renderControlCenter();
+      return;
+    }
+    if (key === "deploysMode") {
+      const order = ["mute", "notify", "queue"];
+      gateState.deploysMode = order[(order.indexOf(gateState.deploysMode) + 1) % order.length];
+      lastCmd =
+        gateState.deploysMode === "mute"
+          ? 'hyp_inbox({ mute: "#deploys" })'
+          : `hyp_inbox({ from: "#deploys", mode: "${gateState.deploysMode}" })`;
+      renderControlCenter();
+      return;
+    }
+    if (!(key in gateState)) return;
+    gateState[key] = !gateState[key];
+    switch (key) {
+      case "publicLinked":
+        lastCmd = gateState.publicLinked
+          ? "hyp pair join public.hyphae.to"
+          : "hyp pair leave public.hyphae.to";
+        break;
+      case "guard":
+        lastCmd = gateState.guard
+          ? "hyp gate init --adapter anthropic|openai|plugin"
+          : "hyp gate disable injection-guard";
+        break;
+      case "focus":
+        lastCmd = gateState.focus
+          ? 'hyp_inbox({ mode: "notify", filter: {...}, cursor })'
+          : 'hyp_inbox({ mode: "queue" })';
+        break;
+    }
+    renderControlCenter();
   }
+
+  document.getElementById("gateShell")?.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-toggle]");
+    if (!btn) return;
+    handleToggle(btn.dataset.toggle);
+  });
+
+  document.getElementById("gateResetBtn")?.addEventListener("click", () => {
+    gateState = { ...DEFAULT_STATE };
+    lastCmd = 'hyp_inbox({ mode: "queue", burst: "notify" })';
+    renderControlCenter();
+  });
 
   const playBtn = document.getElementById("gatePlayBtn");
   function syncPlayBtn() {
-    if (playBtn) playBtn.textContent = gatePlaying ? "Pause" : "Auto";
+    if (playBtn) playBtn.textContent = gatePlaying ? "Pause" : "Play";
   }
-
-  document.querySelectorAll("#gateTabs .gate-tab").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      activeGate = btn.dataset.gate;
-      gatePlaying = false;
-      clearInterval(gateCycleTimer);
-      syncPlayBtn();
-      renderGateMode();
-    });
-  });
-
   playBtn?.addEventListener("click", () => {
     gatePlaying = !gatePlaying;
     syncPlayBtn();
-    if (gatePlaying) resetGateCycle();
-    else clearInterval(gateCycleTimer);
+    renderControlCenter();
   });
 
   syncPlayBtn();
-  renderGateMode();
-  resetGateCycle();
+  renderControlCenter();
 })();
 
 // ============================================================================
 // 4. QUICK START TABS
 // ============================================================================
 const QS = {
-  curl: `# Install hyp from GitHub and launch interactive onboarding
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/hyphae-to/hyp/main/install.sh)"
+  unix: `# Install single 1.25 MiB verified Rust binary (SHA-256 checked)
+curl -fsSL https://hyphae.to/install.sh | sh
 
-# Verify Node 24, daemon, live nodes, secrets, and harnesses
-hyp status`,
-  npm: `# Install globally via npm (Node 24+)
-npm install -g @hyphae-to/hyp
+# Interactive setup: harnesses, Team Hub / P2P, streams & guards
+hyp onboard
 
-# Pick Private / Public / Shared nodes, harnesses, streams & SSH hosts
-hyp onboard`,
-  assist: `# Install the standalone Hyphae skill across harnesses (agent starting point)
-hyp skill install all
+# See built-in hub deploy kits & update your entire fleet in one shot
+hyp deploy providers
+hyp update --all          # pass --nightly for latest main builds`,
+  win: `# Install single verified Rust binary on Windows (PowerShell)
+irm https://hyphae.to/install.ps1 | iex
 
-# Or let your coding agent run full onboarding end-to-end (secrets captured out-of-band via --web)
-hyp onboard --assist`,
-  fleet: `# Wire OpenClaw as your fleet orchestrator
-hyp setup openclaw
+# Wire local harnesses, Keychain credentials & guard plugins
+hyp onboard
 
-# Share your private node on Tailscale & onboard remote Linux hosts over SSH
-hyp share tailscale --service hyphae
-hyp onboard --remote-ssh bogdan@solace --install-service
+# Join the public community hub or your own Team Hub
+hyp pair join public.hyphae.to`,
+  deploy: `# Generate a ready-to-run Hub kit (tailscale | vps | docker | cloudflare | fly)
+hyp deploy init tailscale
 
-# Store Slack/Telegram/webhook tokens in OS Keychain / Secret Service (never enters LLM context)
-hyp secret set slack-bot-token --web`,
+# Create a zero-hub direct P2P invite (hp2p1_) or inspect any invite's scopes
+hyp pair invite --mode p2p
+hyp pair inspect <invite-token>
+
+# Enable a pluggable prompt-injection guard on your Local Node
+hyp gate init --adapter anthropic`,
+  assist: `# Hand full onboarding (harnesses, hubs & streams) to your coding agent
+hyp onboard --assist
+
+# Capture tokens out-of-band in OS Keychain (zero bytes enter LLM context)
+hyp secret set slack-bot-token --web
+
+# Lock human-approved guard policy & keep every node current
+hyp gate lock
+hyp update --all`,
 };
 
-let activeQs = "curl";
+let activeQs = "unix";
 function renderQs() {
   document.getElementById("qsPre").textContent = QS[activeQs];
   document.querySelectorAll("#qsTabs .it-btn").forEach((b) =>
