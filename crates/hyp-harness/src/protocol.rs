@@ -175,6 +175,7 @@ pub fn resolve_v1_daemon_tool<'a>(
             match action {
                 Some("channels") => "hyp_channel",
                 Some("join" | "leave") if has_channel => "hyp_channel",
+                Some("drop_link") => "hyp_mesh",
                 _ => "hyp_session",
             }
         }
@@ -297,6 +298,14 @@ mod tests {
         assert_eq!(
             resolve_v1_daemon_tool("hyp_mesh", json!({"action": "channels"}).as_object()),
             "hyp_channel"
+        );
+        assert_eq!(
+            resolve_v1_daemon_tool(
+                "hyp_mesh",
+                json!({"action": "drop_link", "kind": "secret", "secretName": "prod-key"})
+                    .as_object()
+            ),
+            "hyp_mesh"
         );
         assert_eq!(
             resolve_v1_daemon_tool("hyp_inbox", json!({"ack": true}).as_object()),
