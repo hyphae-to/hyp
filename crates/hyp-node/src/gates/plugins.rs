@@ -754,11 +754,15 @@ impl SubprocessFilterPlugin {
 
         let mut child = cmd.spawn().map_err(|_| "gate_subprocess_spawn_failed")?;
         if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(request_line.as_bytes())
-                .await
-                .map_err(|_| "gate_subprocess_io_error")?;
-            stdin.flush().await.map_err(|_| "gate_subprocess_io_error")?;
+            if let Err(err) = stdin.write_all(request_line.as_bytes()).await {
+                if err.kind() != std::io::ErrorKind::BrokenPipe {
+                    return Err("gate_subprocess_io_error");
+                }
+            } else if let Err(err) = stdin.flush().await {
+                if err.kind() != std::io::ErrorKind::BrokenPipe {
+                    return Err("gate_subprocess_io_error");
+                }
+            }
             // Close stdin to signal EOF for single-shot filter scripts.
             drop(stdin);
         } else {

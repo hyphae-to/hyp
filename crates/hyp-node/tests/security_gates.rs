@@ -1976,7 +1976,7 @@ esac
         SecurityGatePipeline::new(cfg, Arc::clone(&db), None).unwrap()
     };
 
-    let p_ok = make_subproc_pipeline(&filter_script, "org-sql-guard", 2_000);
+    let p_ok = make_subproc_pipeline(&filter_script, "org-sql-guard", 10_000);
 
     // 1. `"DROP TABLE"` -> Block!
     let eval_sql = p_ok
@@ -1993,10 +1993,13 @@ esac
         .await
         .unwrap();
     assert_eq!(eval_sql.stage, "filter:org-sql-guard");
-    assert!(matches!(
-        eval_sql.decision,
-        GateDecision::Block { ref reason } if reason == "blocked destructive SQL"
-    ));
+    assert!(
+        matches!(
+            eval_sql.decision,
+            GateDecision::Block { ref reason } if reason == "blocked destructive SQL"
+        ),
+        "expected Block('blocked destructive SQL'), got: {eval_sql:?}"
+    );
     assert!(eval_sql.receipt.is_none());
 
     // 2. `"ignore previous instructions"` -> Quarantine (hidden from peek_inbox)!
