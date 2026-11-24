@@ -1065,7 +1065,7 @@ resetStoryTimer();
   if (!viewport || !stage) return;
 
   const LOGICAL_W = 1120;
-  const LOGICAL_H = 456;
+  const LOGICAL_H = 488;
   const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
   function fitGateStage() {
@@ -1084,11 +1084,11 @@ resetStoryTimer();
   window.addEventListener("resize", fitGateStage, { passive: true });
 
   const GATE_SOURCES = [
-    { name: "Team Node · DM @alice", sub: "acme-team · direct message", cls: "peer", thumb: "./assets/team-node-hub.jpg?v=1" },
-    { name: "public.hyphae.to · OSS", sub: "unlinked · click to pair", linkedSub: "anthropics/claude-code · PRs", cls: "amber" },
-    { name: "CI Burst (×12)", sub: "acme-team · flaky retries", cls: "amber-muted" },
-    { name: "#deploys · chatter", sub: "acme-team · build room", cls: "olive" },
-    { name: "Direct P2P · diff.patch", sub: "bob@laptop · HPKE · 42 KB", cls: "moss" },
+    { name: "DM @alice", sub: "direct message", cls: "peer" },
+    { name: "OSS PRs", sub: "anthropics/claude-code", linkedSub: "anthropics/claude-code", cls: "amber" },
+    { name: "CI Burst (×12)", sub: "flaky retries", cls: "amber-muted" },
+    { name: "#deploys", sub: "build room", cls: "olive" },
+    { name: "Direct P2P · bob@laptop", sub: "HPKE · diff.patch", cls: "moss" },
   ];
 
   // Build braided companion hyphae once (tight hugging weave on unified #g-out)
@@ -1333,7 +1333,7 @@ resetStoryTimer();
         path: "g-in-3",
         cls: "coral",
         label: "#deploys noise",
-        phase: 0.58,
+        phase: 0.72,
         dur: 1680,
         startT: 0.14,
         endT: 0.74,
@@ -1350,11 +1350,14 @@ resetStoryTimer();
       packets.push({ path: "g-in-3", cls: "moss", label: "#deploys ok", phase: 0.16, dur: 1180, startT: 0.14, endT: 0.78 });
     }
 
-    // Row 4: Direct P2P · diff.patch (saved directly to disk outside LLM prompt)
+    // Row 4: Direct P2P · bob@laptop (saved directly to disk outside LLM prompt)
     const src4 = { state: "pass", badge: "→ disk", strand: "active" };
     if (st.focus) notifyItems.push("diff.patch");
     else queuedItems.push("P2P diff");
     packets.push({ path: "g-in-4", cls: "moss", label: "🔒 P2P diff.patch", phase: 0.04, dur: 1180, startT: 0.14, endT: 0.78 });
+
+    // Subtle personal Slack/Telegram bridge pulse on #g-in-5
+    packets.push({ path: "g-in-5", cls: "moss", label: "Slack · writer", phase: 0.48, dur: 1320, startT: 0.16, endT: 0.76 });
 
     // Compute ONE single unified right-hand strand (#g-out) output reflecting 3-tier urgency!
     const hasInterrupt = interruptItems.length > 0;
@@ -1538,6 +1541,7 @@ resetStoryTimer();
         "g-in-2": src2.strand,
         "g-in-3": src3.strand,
         "g-in-4": src4.strand,
+        "g-in-5": "active",
         "g-out": outActive ? "active" : "dim",
       },
       outTone,
@@ -1577,27 +1581,80 @@ resetStoryTimer();
     };
     const dCur = depMap[gateState.deploysMode] || depMap.mute;
 
+    const renderMobRow = (idx) => {
+      const src = GATE_SOURCES[idx];
+      const st = sc.sources[idx];
+      const subTxt = st.sub || src.sub;
+      return `
+        <div class="gm-mob-row ${src.cls} state-${st.state}">
+          <div class="gm-mob-left">
+            <span class="gs-dot"></span>
+            <div>
+              <strong>${esc(src.name)}</strong>
+              <small>${esc(subTxt)}</small>
+            </div>
+          </div>
+          <span class="gs-badge">${esc(st.badge)}</span>
+        </div>
+      `;
+    };
+
+    const relState = gateState.publicLinked ? "notify" : "detached";
+    const relBadge = gateState.publicLinked ? "notify" : "unlinked";
+
     mobileHost.innerHTML = `
       <div class="gm-mob-list">
-        ${GATE_SOURCES.map((src, i) => {
-          const st = sc.sources[i];
-          const subTxt = st.sub || src.sub;
-          const iconHtml = src.thumb
-            ? `<span class="gs-node-thumb"><img src="${esc(src.thumb)}" alt="" /></span>`
-            : `<span class="gs-dot"></span>`;
-          return `
-            <div class="gm-mob-row ${src.cls} state-${st.state}">
-              <div class="gm-mob-left">
-                ${iconHtml}
-                <div>
-                  <strong>${esc(src.name)}</strong>
-                  <small>${esc(subTxt)}</small>
-                </div>
+        <div class="gm-mob-group team">
+          <div class="gg-head">
+            <span class="gg-thumb"><img src="./assets/team-node-hub.jpg?v=1" alt="" /></span>
+            <strong class="gg-title">Team Node · acme-team</strong>
+            <span class="gg-status paired"><i></i>paired</span>
+          </div>
+          ${renderMobRow(0)}
+          ${renderMobRow(2)}
+          ${renderMobRow(3)}
+        </div>
+
+        <div class="gm-mob-group public ${gateState.publicLinked ? "" : "is-unlinked"}" data-toggle="publicLinked" role="button" tabindex="0">
+          <div class="gg-head">
+            <span class="gg-dot amber" aria-hidden="true"></span>
+            <strong class="gg-title">Public · public.hyphae.to</strong>
+            <span class="gg-status ${gateState.publicLinked ? "linked" : ""}">${gateState.publicLinked ? "linked" : "unlinked"}</span>
+          </div>
+          ${renderMobRow(1)}
+          <div class="gm-mob-row amber-soft state-${relState}">
+            <div class="gm-mob-left">
+              <span class="gs-dot"></span>
+              <div>
+                <strong>#hyp-releases</strong>
+                <small>read-only feed</small>
               </div>
-              <span class="gs-badge">${esc(st.badge)}</span>
             </div>
-          `;
-        }).join("")}
+            <span class="gs-badge">${relBadge}</span>
+          </div>
+        </div>
+
+        <div class="gm-mob-group private">
+          <div class="gg-head">
+            <span class="gg-dot moss" aria-hidden="true"></span>
+            <strong class="gg-title">Private · Keychain &amp; P2P</strong>
+            <span class="gg-status moss">local</span>
+          </div>
+          <div class="gm-mob-row moss state-pass">
+            <div class="gm-mob-left">
+              <span class="gs-bridge-icos" aria-hidden="true">
+                <span><img src="./assets/icons/slack.svg" alt="" /></span>
+                <span><img src="./assets/icons/telegram.svg" alt="" /></span>
+              </span>
+              <div>
+                <strong>Slack · Telegram</strong>
+                <small>all read · 1 writer + handoff</small>
+              </div>
+            </div>
+            <span class="gs-badge">bridge</span>
+          </div>
+          ${renderMobRow(4)}
+        </div>
       </div>
       <div class="gm-mob-stem" aria-hidden="true">
         <svg viewBox="0 0 64 22" fill="none">
@@ -1823,8 +1880,8 @@ resetStoryTimer();
         const { item, post, tagWindow } = bestDrop;
         const pNorm = post / tagWindow;
         const anchorPt = item.path.getPointAtLength(item.len * (item.endT ?? 0.72));
-        const tx = Math.min(448, Math.max(384, anchorPt.x - 42));
-        const ty = Math.min(168, anchorPt.y + 30 + pNorm * 5);
+        const tx = Math.min(458, Math.max(396, anchorPt.x - 42));
+        const ty = Math.min(176, anchorPt.y + 30 + pNorm * 5);
         const tOp = pNorm < 0.14 ? pNorm / 0.14 : pNorm > 0.72 ? (1 - pNorm) / 0.28 : 1;
         dropTagEl.className = `gate-drop-tag ${item.deflect === "amber" ? "amber" : ""}`.trim();
         dropTagEl.textContent = item.dropTag;
@@ -1838,10 +1895,10 @@ resetStoryTimer();
       if (bestMerge) {
         const { item, post, tagWindow } = bestMerge;
         const pNorm = post / tagWindow;
-        const ty = 42 - pNorm * 4;
+        const ty = 44 - pNorm * 4;
         const tOp = pNorm < 0.14 ? pNorm / 0.14 : pNorm > 0.74 ? (1 - pNorm) / 0.26 : 1;
         mergeTagEl.textContent = item.mergeTag;
-        mergeTagEl.style.left = `${(564 / LOGICAL_W) * 100}%`;
+        mergeTagEl.style.left = `${(576 / LOGICAL_W) * 100}%`;
         mergeTagEl.style.top = `${(ty / LOGICAL_H) * 100}%`;
         mergeTagEl.style.opacity = Math.max(0, Math.min(1, tOp)).toFixed(2);
       } else {
@@ -1981,8 +2038,9 @@ resetStoryTimer();
     }
     if (gmFt) gmFt.textContent = sc.foot;
 
-    // Sync Left 5 Incoming Wire Status Monitors
-    document.querySelectorAll("#gateSources .gate-src").forEach((el, idx) => {
+    // Sync Left Nested Parent-Node Groups & Status Monitors (by data-src index!)
+    document.querySelectorAll("#gateSources .gate-src[data-src]").forEach((el) => {
+      const idx = Number(el.dataset.src);
       const st = sc.sources[idx];
       if (!st) return;
       el.classList.remove("state-pass", "state-blocked", "state-muted", "state-batched", "state-detached", "state-idle", "state-warn", "state-urgent", "state-notify");
@@ -1994,6 +2052,22 @@ resetStoryTimer();
         if (subEl && st.sub) subEl.textContent = st.sub;
       }
     });
+
+    // Sync Public Node nested group shell + #hyp-releases read-only feed row
+    const pubGroup = document.getElementById("gatePublicGroup");
+    const pubGroupStatus = document.getElementById("ggPubStatus");
+    const relRow = document.getElementById("gateRelRow");
+    const relBadge = document.getElementById("gsBadgeRel");
+    if (pubGroup) pubGroup.classList.toggle("is-unlinked", !gateState.publicLinked);
+    if (pubGroupStatus) {
+      pubGroupStatus.textContent = gateState.publicLinked ? "linked" : "unlinked";
+      pubGroupStatus.className = `gg-status ${gateState.publicLinked ? "linked" : ""}`.trim();
+    }
+    if (relRow) {
+      relRow.classList.remove("state-notify", "state-detached");
+      relRow.classList.add(gateState.publicLinked ? "state-notify" : "state-detached");
+    }
+    if (relBadge) relBadge.textContent = gateState.publicLinked ? "notify" : "unlinked";
 
     // Sync SVG strands & companion weaves
     Object.entries(sc.strands).forEach(([id, state]) => {
@@ -2108,6 +2182,14 @@ resetStoryTimer();
     handleToggle(btn.dataset.toggle);
   });
 
+  document.getElementById("gateShell")?.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    const roleBtn = e.target.closest('[data-toggle][role="button"]');
+    if (!roleBtn) return;
+    e.preventDefault();
+    handleToggle(roleBtn.dataset.toggle);
+  });
+
   document.getElementById("gateResetBtn")?.addEventListener("click", () => {
     gateState = { ...DEFAULT_STATE };
     lastCmd = 'hyp_inbox({ mode: "queue", burst: "notify" })';
@@ -2121,12 +2203,9 @@ resetStoryTimer();
 // 4. TOPOLOGY CARD COPY BUTTONS (#topologies)
 // ============================================================================
 const TOPO_SNIPPETS = {
-  p2p: `hyp pair invite --mode p2p --grant dm:* files:send=25mb --request kv:read=pair/*
-hyp pair accept <<< "$TOKEN"`,
-  team: `hyp deploy init tailscale --node-id acme-team
-hyp pair invite --mode team --peer alice@macbook --preset member`,
-  public: `hyp pair join https://public.hyphae.to
-hyp_stream(subscribe, repo="anthropics/claude-code")`,
+  p2p: "hyp pair invite --mode p2p",
+  team: "hyp deploy init tailscale",
+  public: "hyp pair join https://public.hyphae.to",
 };
 
 document.querySelectorAll("[data-copy-topo]").forEach((btn) => {
@@ -2143,46 +2222,62 @@ document.querySelectorAll("[data-copy-topo]").forEach((btn) => {
 // 5. QUICK START TABS
 // ============================================================================
 const QS = {
-  unix: `# Install single 1.25 MiB verified Rust binary (SHA-256)
+  unix: `# Install ~6 MiB verified Rust binary
 curl -fsSL https://hyphae.to/install.sh | sh
 
-# Interactive setup: harnesses, Team Hub / P2P & guards
+# Wire harnesses, Team Hub / P2P & guards
 hyp onboard
 
-# Hub deploy kits & fleet updates in one command
+# Hub deploy kits & fleet-wide updates
 hyp deploy providers
-hyp update --all   # --nightly for latest main builds`,
-  win: `# Install single verified Rust binary on Windows (PowerShell)
+hyp update --all  # --nightly for main`,
+  win: `# Install ~6 MiB Rust binary (PowerShell)
 irm https://hyphae.to/install.ps1 | iex
 
-# Wire local harnesses, Keychain credentials & guard plugins
+# Wire harnesses, Keychain & guard plugins
 hyp onboard
 
-# Join the public community hub or your own Team Hub
+# Join public.hyphae.to or your Team Hub
 hyp pair join public.hyphae.to`,
-  deploy: `# Generate a ready-to-run Hub kit (tailscale | vps | docker | cloudflare | fly)
+  deploy: `# Generate a Hub kit (tailscale/docker/fly)
 hyp deploy init tailscale
 
-# Create a zero-hub direct P2P invite (hp2p1_) or inspect any invite's scopes
+# Create a P2P invite or inspect scopes
 hyp pair invite --mode p2p
 hyp pair inspect <<< "$TOKEN"
 
-# Enable a pluggable prompt-injection guard on your Local Node
+# Enable a prompt-injection guard
 hyp gate init --adapter anthropic`,
-  assist: `# Hand full onboarding (harnesses, hubs & streams) to your coding agent
+  assist: `# Let your coding agent handle full setup
 hyp onboard --assist
 
-# Capture tokens out-of-band in OS Keychain (zero bytes enter LLM context)
+# Capture tokens safely (zero LLM context)
 hyp secret set slack-bot-token --web
 
-# Lock human-approved guard policy & keep every node current
+# Lock guard policy & update every node
 hyp gate lock
 hyp update --all`,
 };
 
+function formatQsHtml(raw) {
+  return raw
+    .split("\n")
+    .map((line) => {
+      if (line.trimStart().startsWith("#")) {
+        return `<span class="qs-comment">${esc(line)}</span>`;
+      }
+      const inlineIdx = line.indexOf("  # ");
+      if (inlineIdx !== -1) {
+        return `${esc(line.slice(0, inlineIdx))}<span class="qs-comment">${esc(line.slice(inlineIdx))}</span>`;
+      }
+      return esc(line);
+    })
+    .join("\n");
+}
+
 let activeQs = "unix";
 function renderQs() {
-  document.getElementById("qsPre").textContent = QS[activeQs];
+  document.getElementById("qsPre").innerHTML = formatQsHtml(QS[activeQs]);
   document.querySelectorAll("#qsTabs .it-btn").forEach((b) =>
     b.classList.toggle("active", b.dataset.qs === activeQs)
   );
