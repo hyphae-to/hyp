@@ -1091,6 +1091,536 @@ function ceMatchesFilters(filters, event) {
 }
 
 // ============================================================================
+// 3B. LOCAL NODE INBOUND CONTROL-GATE LIVING ANIMATION (#streams)
+// ============================================================================
+(function initControlGate() {
+  const viewport = document.getElementById("gateViewport");
+  const stage = document.getElementById("gateStage");
+  const packetsHost = document.getElementById("gatePackets");
+  const mobileHost = document.getElementById("gateMobile");
+  if (!viewport || !stage) return;
+
+  const LOGICAL_W = 1120;
+  const LOGICAL_H = 336;
+  const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+
+  function fitGateStage() {
+    if (window.innerWidth <= 760) return;
+    const availW = viewport.clientWidth || LOGICAL_W;
+    const scale = Math.min(1.08, availW / LOGICAL_W);
+    const offsetX = Math.max(0, (availW - LOGICAL_W * scale) / 2);
+    stage.style.transform = `translateX(${offsetX.toFixed(1)}px) scale(${scale.toFixed(4)})`;
+    viewport.style.height = `${Math.round(LOGICAL_H * scale)}px`;
+  }
+
+  fitGateStage();
+  if (typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(fitGateStage).observe(viewport);
+  }
+  window.addEventListener("resize", fitGateStage, { passive: true });
+
+  const GATE_SOURCES = [
+    { name: "GitHub · PR #412", sub: "review: approved", cls: "amber" },
+    { name: "Prometheus · p99", sub: "severity=critical", cls: "coral" },
+    { name: "CI · noisy flake ×8", sub: "retry chatter", cls: "amber-muted" },
+    { name: "#deploys · chatter", sub: "build room noise", cls: "olive" },
+    { name: "E2EE · diff.patch", sub: "X25519 · 42 KB", cls: "moss" },
+  ];
+
+  const GATE_MODES = {
+    filter: {
+      cmd: 'hyp_subscribe({ topic: "ci", filters: [{ not: ... }] })',
+      ruleText: "CloudEvents filter active",
+      ruleCls: "",
+      deflectText: "✕ 8 CI flakes dropped · 0 tokens",
+      delivered: "3 signals",
+      blocked: "8 flakes dropped",
+      blockedCls: "amber",
+      saved: "94%",
+      barPct: 94,
+      foot: "E2EE saved to disk · path-only ref",
+      caption:
+        "Your <strong>Local Node</strong> evaluates CloudEvents v1.0 filters before touching the LLM — passing <code>PR #412</code>, critical alerts, and E2EE file paths while dropping noisy CI flakes at zero token cost.",
+      sources: [
+        { state: "pass", badge: "pass" },
+        { state: "pass", badge: "pass" },
+        { state: "blocked", badge: "filtered" },
+        { state: "idle", badge: "idle" },
+        { state: "pass", badge: "-> disk" },
+      ],
+      strands: {
+        "g-in-0": "active",
+        "g-in-1": "active",
+        "g-in-2": "blocked",
+        "g-in-3": "dim",
+        "g-in-4": "active",
+        "g-out-0": "active",
+        "g-out-1": "active",
+        "g-out-2": "active",
+      },
+      packets: [
+        { path: "g-in-0", cls: "amber", label: "PR #412", phase: 0.04, dur: 1700, startT: 0.2, endT: 0.8 },
+        { path: "g-out-1", cls: "amber", label: "PR #412 approved", phase: 0.44, dur: 1750, startT: 0.2, endT: 0.8, rippleAgent: true },
+        { path: "g-in-1", cls: "coral", label: "p99 critical", phase: 0.22, dur: 1600, startT: 0.2, endT: 0.8 },
+        { path: "g-out-0", cls: "coral", label: "p99 critical", phase: 0.62, dur: 1650, startT: 0.2, endT: 0.8, rippleAgent: true },
+        { path: "g-in-2", cls: "blocked", label: "flake ×8 ✕", phase: 0.14, dur: 1550, startT: 0.2, endT: 0.68, deflect: "amber" },
+        { path: "g-in-4", cls: "moss", label: "🔒 diff.patch", phase: 0.36, dur: 1750, startT: 0.2, endT: 0.8 },
+        { path: "g-out-2", cls: "moss", label: "saved -> disk", phase: 0.76, dur: 1700, startT: 0.2, endT: 0.8, rippleAgent: true },
+      ],
+    },
+    mute: {
+      cmd: 'hyp_mute({ channel: "#deploys", ttl: "2h" })',
+      ruleText: "Muted: #deploys (local)",
+      ruleCls: "coral",
+      deflectText: "✕ #deploys muted at node",
+      delivered: "2 urgent",
+      blocked: "#deploys muted",
+      blockedCls: "coral",
+      saved: "96%",
+      barPct: 96,
+      foot: "Mute rules run on your Local Node",
+      caption:
+        "Call <code>hyp_mute()</code> on noisy rooms, peers, or senders — your <strong>Local Node</strong> drops matching chatter before it ever enters context, while urgent alerts and E2EE files keep flowing.",
+      sources: [
+        { state: "idle", badge: "quiet" },
+        { state: "pass", badge: "pass" },
+        { state: "idle", badge: "quiet" },
+        { state: "muted", badge: "muted" },
+        { state: "pass", badge: "-> disk" },
+      ],
+      strands: {
+        "g-in-0": "dim",
+        "g-in-1": "active",
+        "g-in-2": "dim",
+        "g-in-3": "blocked",
+        "g-in-4": "active",
+        "g-out-0": "active",
+        "g-out-1": "dim",
+        "g-out-2": "active",
+      },
+      packets: [
+        { path: "g-in-3", cls: "coral", label: "#deploys ✕ muted", phase: 0.06, dur: 1650, startT: 0.2, endT: 0.68, deflect: "coral" },
+        { path: "g-in-3", cls: "coral", label: "build log ✕", phase: 0.56, dur: 1650, startT: 0.2, endT: 0.68, deflect: "coral" },
+        { path: "g-in-1", cls: "coral", label: "p99 critical", phase: 0.18, dur: 1600, startT: 0.2, endT: 0.8 },
+        { path: "g-out-0", cls: "coral", label: "p99 critical", phase: 0.58, dur: 1650, startT: 0.2, endT: 0.8, rippleAgent: true },
+        { path: "g-in-4", cls: "moss", label: "🔒 diff.patch", phase: 0.34, dur: 1750, startT: 0.2, endT: 0.8 },
+        { path: "g-out-2", cls: "moss", label: "saved -> disk", phase: 0.74, dur: 1700, startT: 0.2, endT: 0.8, rippleAgent: true },
+      ],
+    },
+    digest: {
+      cmd: 'hyp_mode("notify") // 1-line SQLite digest',
+      ruleText: "Digest-only · SQLite batch",
+      ruleCls: "amber",
+      deflectText: "4 bursts -> 1 calm digest line",
+      delivered: "1 digest line",
+      blocked: "4 batched locally",
+      blockedCls: "amber",
+      saved: "91%",
+      barPct: 91,
+      foot: "Full msgs wait in local SQLite",
+      caption:
+        "Switch to <code>notify</code> (digest-only) mode during deep work — your <strong>Local Node</strong> buffers bursts in SQLite and sends your agent one calm <code>1-line digest</code> instead of flooding prompts.",
+      sources: [
+        { state: "batched", badge: "batched" },
+        { state: "batched", badge: "batched" },
+        { state: "batched", badge: "batched" },
+        { state: "batched", badge: "batched" },
+        { state: "pass", badge: "-> disk" },
+      ],
+      strands: {
+        "g-in-0": "active",
+        "g-in-1": "active",
+        "g-in-2": "active",
+        "g-in-3": "active",
+        "g-in-4": "active",
+        "g-out-0": "dim",
+        "g-out-1": "active",
+        "g-out-2": "dim",
+      },
+      packets: [
+        { path: "g-in-0", cls: "amber", label: "PR #412", phase: 0.04, dur: 1650, startT: 0.2, endT: 0.78, rippleNode: "amber" },
+        { path: "g-in-1", cls: "coral", label: "p99 spike", phase: 0.14, dur: 1650, startT: 0.2, endT: 0.78 },
+        { path: "g-in-2", cls: "amber", label: "CI flake", phase: 0.24, dur: 1650, startT: 0.2, endT: 0.78 },
+        { path: "g-in-3", cls: "moss", label: "#deploys", phase: 0.34, dur: 1650, startT: 0.2, endT: 0.78, rippleNode: "amber" },
+        { path: "g-out-1", cls: "", label: "digest: 4 unread (1 line)", phase: 0.56, dur: 2000, startT: 0.22, endT: 0.8, rippleAgent: true },
+      ],
+    },
+    unsub: {
+      cmd: 'hyp_unsubscribe("ci-flakes") && hyp_channel_leave("#deploys")',
+      ruleText: "2 streams detached · 0 wakes",
+      ruleCls: "moss",
+      deflectText: "Cut at connector · 0 background polling",
+      delivered: "2 subscribed",
+      blocked: "2 streams off",
+      blockedCls: "",
+      saved: "100%",
+      barPct: 100,
+      foot: "Zero wakes for detached streams",
+      caption:
+        "Call <code>hyp_unsubscribe()</code> or <code>hyp_channel_leave()</code> anytime — your <strong>Local Node</strong> cuts the strand immediately with zero wakes, zero retries, and zero polling.",
+      sources: [
+        { state: "pass", badge: "subscribed" },
+        { state: "idle", badge: "paused" },
+        { state: "detached", badge: "detached" },
+        { state: "detached", badge: "left room" },
+        { state: "pass", badge: "-> disk" },
+      ],
+      strands: {
+        "g-in-0": "active",
+        "g-in-1": "dim",
+        "g-in-2": "detached",
+        "g-in-3": "detached",
+        "g-in-4": "active",
+        "g-out-0": "dim",
+        "g-out-1": "active",
+        "g-out-2": "active",
+      },
+      packets: [
+        { path: "g-in-0", cls: "amber", label: "PR #412", phase: 0.08, dur: 1800, startT: 0.2, endT: 0.8 },
+        { path: "g-out-1", cls: "amber", label: "PR #412 approved", phase: 0.5, dur: 1850, startT: 0.2, endT: 0.8, rippleAgent: true },
+        { path: "g-in-4", cls: "moss", label: "🔒 diff.patch", phase: 0.28, dur: 1800, startT: 0.2, endT: 0.8 },
+        { path: "g-out-2", cls: "moss", label: "saved -> disk", phase: 0.7, dur: 1850, startT: 0.2, endT: 0.8, rippleAgent: true },
+      ],
+    },
+  };
+
+  // Build braided companion hyphae for every gate strand (mirrors hero organic style)
+  const gateBundles = new Map();
+  const gateHost = document.getElementById("gateBundles");
+  document.querySelectorAll(".gate-strand").forEach((path, idx) => {
+    if (!gateHost) return;
+    const len = path.getTotalLength();
+    const g = document.createElementNS(SVG_NS, "g");
+    const cls = ["amber-muted", "amber", "coral", "olive", "moss"].find((c) => path.classList.contains(c)) || "";
+    g.setAttribute("class", `gate-bundle ${cls}`.trim());
+
+    const steps = Math.max(10, Math.min(20, Math.round(len / 18)));
+    const amp = Math.min(7.5, Math.max(4, len * 0.025));
+    const seed = (idx + 2) * 1.43;
+    const ptsA = [];
+    const ptsB = [];
+    for (let i = 0; i <= steps; i++) {
+      const f = i / steps;
+      const d = f * len;
+      const p = path.getPointAtLength(d);
+      const pN = path.getPointAtLength(Math.min(len, d + 2));
+      const pP = path.getPointAtLength(Math.max(0, d - 2));
+      const dx = pN.x - pP.x;
+      const dy = pN.y - pP.y;
+      const mag = Math.hypot(dx, dy) || 1;
+      const nx = -dy / mag;
+      const ny = dx / mag;
+      const env = Math.sin(f * Math.PI);
+      const offA = env * Math.sin(f * Math.PI * 3 + seed) * amp;
+      const offB = env * Math.cos(f * Math.PI * 4.1 - seed) * (amp * 0.62);
+      ptsA.push(`${(p.x + nx * offA).toFixed(1)} ${(p.y + ny * offA).toFixed(1)}`);
+      ptsB.push(`${(p.x + nx * offB).toFixed(1)} ${(p.y + ny * offB).toFixed(1)}`);
+    }
+
+    for (const [pts, wcls] of [[ptsA, "gb-weave"], [ptsB, "gb-weave fine"]]) {
+      const w = document.createElementNS(SVG_NS, "path");
+      w.setAttribute("class", wcls);
+      w.setAttribute("d", `M ${pts[0]} L ${pts.slice(1).join(" L ")}`);
+      g.appendChild(w);
+    }
+
+    [0.34, 0.68].forEach((f, ti) => {
+      const d = f * len;
+      const p = path.getPointAtLength(d);
+      const pN = path.getPointAtLength(Math.min(len, d + 3));
+      const dx = pN.x - p.x;
+      const dy = pN.y - p.y;
+      const mag = Math.hypot(dx, dy) || 1;
+      const tx = dx / mag;
+      const ty = dy / mag;
+      const side = (ti + idx) % 2 === 0 ? 1 : -1;
+      const nx = -ty * side;
+      const ny = tx * side;
+      const reach = 15;
+      const c1x = p.x + tx * 7 + nx * 8;
+      const c1y = p.y + ty * 7 + ny * 8;
+      const ex = p.x + tx * 12 + nx * reach;
+      const ey = p.y + ty * 12 + ny * reach;
+      const twig = document.createElementNS(SVG_NS, "path");
+      twig.setAttribute("class", "gb-twig");
+      twig.setAttribute("d", `M ${p.x.toFixed(1)} ${p.y.toFixed(1)} Q ${c1x.toFixed(1)} ${c1y.toFixed(1)}, ${ex.toFixed(1)} ${ey.toFixed(1)}`);
+      g.appendChild(twig);
+    });
+
+    gateHost.appendChild(g);
+    gateBundles.set(path.id, g);
+  });
+
+  const MODE_ORDER = ["filter", "mute", "digest", "unsub"];
+  const urlGate = new URLSearchParams(window.location.search).get("gate");
+  let activeGate = GATE_MODES[urlGate] ? urlGate : "filter";
+  let gatePlaying = !GATE_MODES[urlGate] && !reducedMotion;
+  let gateCycleTimer = null;
+  let gateRaf = null;
+
+  function fireRipple(el, extraCls) {
+    if (!el || reducedMotion) return;
+    el.classList.remove("fire", "amber", "coral");
+    if (extraCls) el.classList.add(extraCls);
+    void el.offsetWidth;
+    el.classList.add("fire");
+  }
+
+  function renderGateMobile(mode) {
+    if (!mobileHost) return;
+    mobileHost.innerHTML = `
+      <div class="gm-mob-list">
+        ${GATE_SOURCES.map((src, i) => {
+          const st = mode.sources[i];
+          return `
+            <div class="gm-mob-row ${src.cls} state-${st.state}">
+              <div class="gm-mob-left">
+                <span class="gs-dot"></span>
+                <div>
+                  <strong>${esc(src.name)}</strong>
+                  <small>${esc(src.sub)}</small>
+                </div>
+              </div>
+              <span class="gs-badge">${esc(st.badge)}</span>
+            </div>
+          `;
+        }).join("")}
+      </div>
+      <div class="gm-mob-stem" aria-hidden="true">
+        <svg viewBox="0 0 64 22" fill="none">
+          <path stroke="rgba(183,217,86,0.65)" stroke-width="1.8" d="M 32 0 C 30 8, 34 14, 32 22" />
+          <path stroke="rgba(232,163,49,0.45)" stroke-width="1.2" d="M 22 0 C 24 8, 28 14, 30 22" />
+          <path stroke="rgba(127,201,123,0.45)" stroke-width="1.2" d="M 42 0 C 40 8, 36 14, 34 22" />
+        </svg>
+      </div>
+      <div class="gm-mob-node">
+        <img src="./assets/node-hub.png?v=6" alt="Local Hyphae Node" />
+        <div class="gm-mob-node-body">
+          <strong>Your Local Node (Connector)</strong>
+          <span>${esc(mode.ruleText)}</span>
+          <small>${esc(mode.deflectText)} · localhost SQLite WAL</small>
+        </div>
+      </div>
+      <div class="gm-mob-stem" aria-hidden="true">
+        <svg viewBox="0 0 64 22" fill="none">
+          <path stroke="rgba(183,217,86,0.75)" stroke-width="2" d="M 32 0 C 34 8, 30 14, 32 22" />
+        </svg>
+      </div>
+      <div class="gm-mob-agent">
+        <div class="gm-mob-agent-head">
+          <img src="./assets/sprite-alex.jpg?v=2" alt="Your agent harness" />
+          <div>
+            <strong>Your Agent · Claude / Codex / Agy</strong>
+            <small>${esc(mode.foot)}</small>
+          </div>
+        </div>
+        <div class="gm-row"><span>Delivered</span><strong>${esc(mode.delivered)}</strong></div>
+        <div class="gm-row"><span>At gate</span><strong class="${esc(mode.blockedCls)}">${esc(mode.blocked)}</strong></div>
+        <div class="gm-bar-wrap">
+          <div class="gm-bar-head"><span>Context saved</span><strong>${esc(mode.saved)}</strong></div>
+          <div class="gm-bar"><span style="width:${mode.barPct}%"></span></div>
+        </div>
+      </div>
+    `;
+  }
+
+  function startGatePackets(mode) {
+    if (gateRaf) cancelAnimationFrame(gateRaf);
+    if (!packetsHost) return;
+    packetsHost.innerHTML = "";
+
+    const items = mode.packets.map((spec) => {
+      const path = document.getElementById(spec.path);
+      if (!path) return null;
+      const el = document.createElement("div");
+      el.className = `gate-pkt ${spec.cls || ""}`.trim();
+      el.innerHTML = `<span class="gp-dot"></span><span>${esc(spec.label)}</span>`;
+      packetsHost.appendChild(el);
+      return { ...spec, el, path, len: path.getTotalLength(), lastCycle: -1 };
+    }).filter(Boolean);
+
+    // Position static snapshot neatly when reduced-motion is enabled
+    if (reducedMotion) {
+      items.forEach((item) => {
+        const pt = item.path.getPointAtLength(item.len * (0.46));
+        item.el.style.left = `${(pt.x / LOGICAL_W) * 100}%`;
+        item.el.style.top = `${(pt.y / LOGICAL_H) * 100}%`;
+        item.el.style.opacity = "0.95";
+        item.el.style.transform = "translate(-50%, -50%) scale(1)";
+      });
+      return;
+    }
+
+    const CYCLE_MS = 3200;
+    const t0 = performance.now();
+    const agentRipple = document.getElementById("gateAgentRipple");
+    const nodeRipple = document.getElementById("gateNodeRipple");
+
+    function tick(now) {
+      const elapsed = now - t0;
+      for (const item of items) {
+        const cyclePos = ((elapsed / CYCLE_MS) + item.phase) % 1;
+        const cycleNum = Math.floor((elapsed / CYCLE_MS) + item.phase);
+        const span = Math.min(0.82, item.dur / CYCLE_MS);
+        const raw = cyclePos / span;
+
+        if (raw > 1) {
+          item.el.style.opacity = "0";
+          continue;
+        }
+
+        const startT = item.startT ?? 0.18;
+        const endT = item.endT ?? 0.8;
+        const travel = startT + easeInOutQuad(raw) * (endT - startT);
+        const pt = item.path.getPointAtLength(item.len * travel);
+        item.el.style.left = `${(pt.x / LOGICAL_W) * 100}%`;
+        item.el.style.top = `${(pt.y / LOGICAL_H) * 100}%`;
+
+        let opacity = 1;
+        let scale = 1;
+        if (raw < 0.1) {
+          opacity = raw / 0.1;
+          scale = 0.86 + 0.14 * (raw / 0.1);
+        } else if (raw > 0.88) {
+          const tail = (raw - 0.88) / 0.12;
+          opacity = Math.max(0, 1 - tail);
+          scale = 1 - 0.18 * tail;
+        }
+
+        if (raw >= 0.86 && item.lastCycle !== cycleNum) {
+          item.lastCycle = cycleNum;
+          if (item.deflect) {
+            const burst = document.createElement("div");
+            burst.className = `gate-deflect-burst ${item.deflect}`;
+            burst.style.left = `${(pt.x / LOGICAL_W) * 100}%`;
+            burst.style.top = `${(pt.y / LOGICAL_H) * 100}%`;
+            packetsHost.appendChild(burst);
+            setTimeout(() => burst.remove(), 520);
+          }
+          if (item.rippleAgent) fireRipple(agentRipple);
+          if (item.rippleNode) fireRipple(nodeRipple, item.rippleNode);
+        }
+
+        item.el.style.opacity = opacity.toFixed(2);
+        item.el.style.transform = `translate(-50%, -50%) scale(${scale.toFixed(3)})`;
+      }
+      gateRaf = requestAnimationFrame(tick);
+    }
+    gateRaf = requestAnimationFrame(tick);
+  }
+
+  function renderGateMode() {
+    const mode = GATE_MODES[activeGate];
+    document.querySelectorAll("#gateTabs .gate-tab").forEach((b) => {
+      const on = b.dataset.gate === activeGate;
+      b.classList.toggle("active", on);
+      b.setAttribute("aria-selected", on ? "true" : "false");
+    });
+
+    const cmdEl = document.getElementById("gateCmdPill");
+    if (cmdEl) cmdEl.textContent = mode.cmd;
+
+    const ruleEl = document.getElementById("gateRulePill");
+    if (ruleEl) {
+      ruleEl.textContent = mode.ruleText;
+      ruleEl.className = `gate-rule-pill ${mode.ruleCls}`.trim();
+    }
+
+    const deflectEl = document.getElementById("gateDeflectPill");
+    if (deflectEl) deflectEl.textContent = mode.deflectText;
+
+    const valveEl = document.getElementById("gateValveRing");
+    if (valveEl) valveEl.className = `gate-valve-ring mode-${activeGate}`;
+
+    const capEl = document.getElementById("gateCaption");
+    if (capEl) capEl.innerHTML = mode.caption;
+
+    const gmDel = document.getElementById("gmDelivered");
+    const gmBlk = document.getElementById("gmBlocked");
+    const gmSav = document.getElementById("gmSaved");
+    const gmBar = document.getElementById("gmBarFill");
+    const gmFt = document.getElementById("gmFoot");
+    if (gmDel) gmDel.textContent = mode.delivered;
+    if (gmBlk) {
+      gmBlk.textContent = mode.blocked;
+      gmBlk.className = mode.blockedCls || "";
+    }
+    if (gmSav) gmSav.textContent = mode.saved;
+    if (gmBar) gmBar.style.width = `${mode.barPct}%`;
+    if (gmFt) gmFt.textContent = mode.foot;
+
+    document.querySelectorAll("#gateSources .gate-src").forEach((el, idx) => {
+      const st = mode.sources[idx];
+      if (!st) return;
+      el.classList.remove("state-pass", "state-blocked", "state-muted", "state-batched", "state-detached", "state-idle");
+      el.classList.add(`state-${st.state}`);
+      const badge = document.getElementById(`gsBadge${idx}`);
+      if (badge) badge.textContent = st.badge;
+    });
+
+    Object.entries(mode.strands).forEach(([id, state]) => {
+      const p = document.getElementById(id);
+      if (p) {
+        p.classList.toggle("dim", state === "dim");
+        p.classList.toggle("blocked", state === "blocked");
+        p.classList.toggle("detached", state === "detached");
+        if (state === "detached") {
+          const l = p.getTotalLength();
+          p.style.strokeDasharray = `${(l * 0.42).toFixed(1)} ${l.toFixed(1)}`;
+        } else {
+          p.style.strokeDasharray = "";
+        }
+      }
+      const b = gateBundles.get(id);
+      if (b) {
+        b.classList.toggle("dim", state === "dim");
+        b.classList.toggle("blocked", state === "blocked");
+        b.classList.toggle("detached", state === "detached");
+      }
+    });
+
+    renderGateMobile(mode);
+    startGatePackets(mode);
+  }
+
+  function resetGateCycle() {
+    clearInterval(gateCycleTimer);
+    if (!gatePlaying) return;
+    gateCycleTimer = setInterval(() => {
+      const i = MODE_ORDER.indexOf(activeGate);
+      activeGate = MODE_ORDER[(i + 1) % MODE_ORDER.length];
+      renderGateMode();
+    }, 6400);
+  }
+
+  const playBtn = document.getElementById("gatePlayBtn");
+  function syncPlayBtn() {
+    if (playBtn) playBtn.textContent = gatePlaying ? "Pause" : "Auto";
+  }
+
+  document.querySelectorAll("#gateTabs .gate-tab").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      activeGate = btn.dataset.gate;
+      gatePlaying = false;
+      clearInterval(gateCycleTimer);
+      syncPlayBtn();
+      renderGateMode();
+    });
+  });
+
+  playBtn?.addEventListener("click", () => {
+    gatePlaying = !gatePlaying;
+    syncPlayBtn();
+    if (gatePlaying) resetGateCycle();
+    else clearInterval(gateCycleTimer);
+  });
+
+  syncPlayBtn();
+  renderGateMode();
+  resetGateCycle();
+})();
+
+// ============================================================================
 // 4. DARK STREAMS, REAL CLOUDEVENTS FILTER DECK, #CHANNELS & PRIVATE BRIDGES
 // ============================================================================
 let activeDeck = "prometheus";
