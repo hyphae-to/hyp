@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use hyp_crypto::{Ed25519KeyPair, SecretBackend};
 use hyp_harness::daemon::{LocalDaemon, LocalDaemonConfig};
-use hyp_harness::hooks::{HandleHookOptions, HookEvent, handle_hook_payload};
+use hyp_harness::hooks::{HandleHookOptions, HookEvent, HookTransportHints, handle_hook_payload};
 use hyp_harness::mcp::{McpOptions, run_mcp_io};
 use hyp_harness::protocol::HarnessKind;
 use hyp_harness::sock::{
@@ -50,6 +50,7 @@ fn hook_opts(harness: HarnessKind, event: HookEvent, sock: &Path) -> HandleHookO
         socket_path: sock.to_path_buf(),
         cli_path: Some("hyp".into()),
         explicit_socket: None,
+        transport_hints: HookTransportHints::default(),
     }
 }
 

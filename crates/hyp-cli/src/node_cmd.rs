@@ -442,6 +442,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             }
             let local_cfg = LocalDaemonConfig {
                 socket_path: explicit_socket,
+                auto_detect_transports: true,
                 ..Default::default()
             };
             let daemon = LocalDaemon::start(Arc::clone(&node), Some(pipeline), local_cfg)

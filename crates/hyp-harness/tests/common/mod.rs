@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-use hyp_harness::hooks::{HandleHookOptions, HookEvent, handle_hook_payload};
+use hyp_harness::hooks::{HandleHookOptions, HookEvent, HookTransportHints, handle_hook_payload};
 use hyp_harness::mcp::{McpOptions, run_mcp_io};
 use hyp_harness::protocol::HarnessKind;
 use hyp_harness::sock::daemon_rpc_async;
@@ -23,6 +23,7 @@ pub fn hook_opts(harness: HarnessKind, event: HookEvent, sock: &Path) -> HandleH
         socket_path: sock.to_path_buf(),
         cli_path: Some("hyp".into()),
         explicit_socket: None,
+        transport_hints: HookTransportHints::default(),
     }
 }
 
@@ -33,12 +34,25 @@ pub async fn run_hook(
     event: HookEvent,
     payload: Value,
 ) -> Value {
+    run_hook_with_hints(sock, harness, event, payload, HookTransportHints::default()).await
+}
+
+/// Runs synchronous `handle_hook_payload` with explicit [`HookTransportHints`].
+pub async fn run_hook_with_hints(
+    sock: &Path,
+    harness: HarnessKind,
+    event: HookEvent,
+    payload: Value,
+    transport_hints: HookTransportHints,
+) -> Value {
     let sock_owned = sock.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let map = payload
             .as_object()
             .expect("hook payload must be a JSON object");
-        handle_hook_payload(map, &hook_opts(harness, event, &sock_owned))
+        let mut opts = hook_opts(harness, event, &sock_owned);
+        opts.transport_hints = transport_hints;
+        handle_hook_payload(map, &opts)
     })
     .await
     .expect("hook blocking task panicked")

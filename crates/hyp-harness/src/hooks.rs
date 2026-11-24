@@ -53,6 +53,45 @@ impl FromStr for HookEvent {
     }
 }
 
+/// Optional transport environment hints captured by `hyp hook` inside the
+/// agent's child process and forwarded to `LocalDaemon` for zero-config
+/// push transport auto-detection (Herdr, T3 Code, Codex Queue).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HookTransportHints {
+    pub herdr_terminal_id: Option<String>,
+    pub codex_home: Option<String>,
+    pub codex_remote: Option<String>,
+    pub t3_base_dir: Option<String>,
+    pub t3_url: Option<String>,
+}
+
+impl HookTransportHints {
+    /// Captures transport environment variables from the current hook process.
+    pub fn from_env() -> Self {
+        let non_empty = |key: &str| {
+            std::env::var(key)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        Self {
+            herdr_terminal_id: crate::transport::herdr::detect_env_terminal_id(),
+            codex_home: non_empty("CODEX_HOME"),
+            codex_remote: non_empty("CODEX_REMOTE"),
+            t3_base_dir: non_empty("T3CODE_HOME"),
+            t3_url: non_empty("T3CODE_URL").or_else(|| non_empty("T3_URL")),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.herdr_terminal_id.is_none()
+            && self.codex_home.is_none()
+            && self.codex_remote.is_none()
+            && self.t3_base_dir.is_none()
+            && self.t3_url.is_none()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HandleHookOptions {
     pub harness: HarnessKind,
@@ -60,6 +99,7 @@ pub struct HandleHookOptions {
     pub socket_path: PathBuf,
     pub cli_path: Option<String>,
     pub explicit_socket: Option<String>,
+    pub transport_hints: HookTransportHints,
 }
 
 fn qualify_session_id(harness: HarnessKind, raw: Option<&Value>) -> Option<String> {
@@ -229,7 +269,8 @@ fn waiter_arm_prompt(
         HarnessKind::Antigravity => format!(
             "hyphae: Enrolled, but no background waiter is running yet. Run `{cli_command} wait --session {session_id}{socket_flag}` in background (WaitMsBeforeAsync: 500, IsDaemon: false), then end turn."
         ),
-        HarnessKind::Cursor
+        HarnessKind::Codex
+        | HarnessKind::Cursor
         | HarnessKind::Gemini
         | HarnessKind::Opencode
         | HarnessKind::Openclaw => format!(
@@ -262,6 +303,64 @@ fn format_stop_continuation(harness: HarnessKind, reason: String) -> Value {
     }
 }
 
+fn insert_transport_hints(
+    pkt: &mut Map<String, Value>,
+    harness: HarnessKind,
+    payload: &Map<String, Value>,
+    hints: &HookTransportHints,
+) -> bool {
+    let mut added = false;
+    let herdr_tid = hints
+        .herdr_terminal_id
+        .as_deref()
+        .or_else(|| {
+            payload
+                .get("herdr_terminal_id")
+                .or_else(|| payload.get("terminal_id"))
+                .or_else(|| payload.get("terminalId"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| crate::transport::herdr::is_valid_terminal_id(s))
+        });
+    if let Some(tid) = herdr_tid {
+        pkt.insert("herdrTerminalId".into(), json!(tid));
+        added = true;
+    }
+
+    if harness == HarnessKind::Codex {
+        let raw_tid = payload
+            .get("thread_id")
+            .or_else(|| payload.get("threadId"))
+            .or_else(|| payload.get("session_id"))
+            .or_else(|| payload.get("sessionId"))
+            .and_then(Value::as_str)
+            .map(|s| s.strip_prefix("codex:").unwrap_or(s).trim())
+            .filter(|s| !s.is_empty());
+        if let Some(tid) = raw_tid {
+            pkt.insert("codexThreadId".into(), json!(tid));
+            added = true;
+        }
+    }
+
+    if let Some(ref home) = hints.codex_home {
+        pkt.insert("codexHome".into(), json!(home));
+        added = true;
+    }
+    if let Some(ref remote) = hints.codex_remote {
+        pkt.insert("codexRemote".into(), json!(remote));
+        added = true;
+    }
+    if let Some(ref t3_dir) = hints.t3_base_dir {
+        pkt.insert("t3BaseDir".into(), json!(t3_dir));
+        added = true;
+    }
+    if let Some(ref t3_url) = hints.t3_url {
+        pkt.insert("t3Url".into(), json!(t3_url));
+        added = true;
+    }
+    added
+}
+
 /// Pure hook decision engine with injectable RPC callback (easily unit-tested without sockets).
 pub fn handle_hook_payload_with<F>(
     payload: &Map<String, Value>,
@@ -271,13 +370,20 @@ pub fn handle_hook_payload_with<F>(
 where
     F: FnMut(&Path, &Value) -> DaemonRpcResult,
 {
-    if options.event == HookEvent::SessionStart {
-        return json!({});
-    }
-
     let Some(session_id) = extract_session_id(options.harness, payload) else {
         return default_pre_response(options.harness, options.event);
     };
+
+    if options.event == HookEvent::SessionStart {
+        let mut pkt = Map::new();
+        pkt.insert("type".into(), json!("session.hint"));
+        pkt.insert("harness".into(), json!(options.harness.as_str()));
+        pkt.insert("sessionId".into(), json!(session_id));
+        if insert_transport_hints(&mut pkt, options.harness, payload, &options.transport_hints) {
+            let _ = rpc(&options.socket_path, &Value::Object(pkt));
+        }
+        return json!({});
+    }
 
     match options.event {
         HookEvent::PreToolUse => {
@@ -302,6 +408,12 @@ where
             if let Some(call_id) = info.call_id {
                 pkt.insert("callId".into(), json!(call_id));
             }
+            let _ = insert_transport_hints(
+                &mut pkt,
+                options.harness,
+                payload,
+                &options.transport_hints,
+            );
             let res = rpc(&options.socket_path, &Value::Object(pkt));
             let token = res
                 .ok
@@ -447,10 +559,6 @@ where
                 );
             }
 
-            if options.harness == HarnessKind::Codex {
-                return json!({});
-            }
-
             let already_continued =
                 payload.get("continuationActive").and_then(Value::as_bool) == Some(true)
                     || payload.get("stop_hook_active").and_then(Value::as_bool) == Some(true)
@@ -554,6 +662,7 @@ mod tests {
             socket_path: PathBuf::from("/tmp/unused.sock"),
             cli_path: Some("hyp".into()),
             explicit_socket: None,
+            transport_hints: HookTransportHints::default(),
         }
     }
 
@@ -878,14 +987,77 @@ mod tests {
             );
 
             match harness {
-                HarnessKind::Codex => assert_eq!(stop_res, json!({})),
                 HarnessKind::Antigravity => assert_eq!(stop_res["decision"], "continue"),
                 HarnessKind::Cursor => assert!(stop_res["followup_message"].is_string()),
                 HarnessKind::Gemini => assert_eq!(stop_res["decision"], "deny"),
                 HarnessKind::Opencode => assert!(stop_res["followupMessage"].is_string()),
+                HarnessKind::Codex => {
+                    assert_eq!(stop_res["decision"], "block");
+                    assert!(
+                        stop_res["reason"]
+                            .as_str()
+                            .unwrap()
+                            .contains("hyp wait --session codex:id-1")
+                    );
+                }
                 _ => assert_eq!(stop_res["decision"], "block"),
             }
         }
+    }
+
+    #[test]
+    fn forwards_transport_hints_on_pre_tool_use_and_session_start() {
+        let recorded = RefCell::new(Vec::<Value>::new());
+        let mut pre_opts = opts(HarnessKind::Codex, HookEvent::PreToolUse);
+        pre_opts.transport_hints = HookTransportHints {
+            herdr_terminal_id: Some("t1h".into()),
+            codex_home: Some("/tmp/codex-home".into()),
+            codex_remote: Some("ws://127.0.0.1:4242".into()),
+            t3_base_dir: Some("/tmp/t3".into()),
+            t3_url: Some("http://127.0.0.1:3773".into()),
+        };
+
+        let _ = handle_hook_payload_with(
+            json!({
+                "thread_id": "thr-42",
+                "tool_name": "mcp__hyphae__hyp_mesh",
+                "tool_use_id": "c-hint",
+                "tool_input": {"action": "join", "handle": "worker"}
+            })
+            .as_object()
+            .unwrap(),
+            &pre_opts,
+            |_sock, pkt| {
+                recorded.borrow_mut().push(pkt.clone());
+                DaemonRpcResult::ok(json!({"callToken": "tok_h"}).as_object().unwrap().clone())
+            },
+        );
+
+        let mut ss_opts = pre_opts.clone();
+        ss_opts.event = HookEvent::SessionStart;
+        let ss_res = handle_hook_payload_with(
+            json!({"thread_id": "thr-42"}).as_object().unwrap(),
+            &ss_opts,
+            |_sock, pkt| {
+                recorded.borrow_mut().push(pkt.clone());
+                DaemonRpcResult::ok(Map::new())
+            },
+        );
+        assert_eq!(ss_res, json!({}));
+
+        let pkts = recorded.borrow();
+        assert_eq!(pkts.len(), 2);
+        assert_eq!(pkts[0]["type"], "call.start");
+        assert_eq!(pkts[0]["herdrTerminalId"], "t1h");
+        assert_eq!(pkts[0]["codexThreadId"], "thr-42");
+        assert_eq!(pkts[0]["codexHome"], "/tmp/codex-home");
+        assert_eq!(pkts[0]["codexRemote"], "ws://127.0.0.1:4242");
+        assert_eq!(pkts[0]["t3BaseDir"], "/tmp/t3");
+        assert_eq!(pkts[0]["t3Url"], "http://127.0.0.1:3773");
+
+        assert_eq!(pkts[1]["type"], "session.hint");
+        assert_eq!(pkts[1]["sessionId"], "codex:thr-42");
+        assert_eq!(pkts[1]["herdrTerminalId"], "t1h");
     }
 
     #[test]

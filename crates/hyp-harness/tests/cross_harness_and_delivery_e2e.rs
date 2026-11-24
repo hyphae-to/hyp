@@ -31,6 +31,7 @@ use hyp_harness::sock::{
     MAX_SOCKET_LINE_BYTES, connect_daemon_async, daemon_rpc_async, read_bounded_line_async,
     write_ndjson_line_async,
 };
+use hyp_harness::transport::{PushMode, PushOutcome, PushTransport, TransportFuture};
 use hyp_harness::wait::{WaitMode, WaitOptions, run_wait_to_writer};
 use hyp_node::engine::{NodeConfig, UnifiedNode};
 use hyp_node::gates::{
@@ -266,17 +267,14 @@ async fn suite_1_all_nine_harnesses_live_differential_parity() {
         let stop_drain = run_hook(&sock, *harness, HookEvent::Stop, hook_payload.clone()).await;
         let stop_reason = extract_stop_reason(*harness, &stop_drain);
 
-        // 5. Idle Stop hook (no unread, no live transport): Codex returns `{}`, others prompt to arm wait!
+        // 5. Idle Stop hook (no unread, no live transport): ALL harnesses (including Codex!)
+        // prompt to arm a background waiter when no push transport is attached!
         let stop_idle = run_hook(&sock, *harness, HookEvent::Stop, hook_payload.clone()).await;
-        if *harness == HarnessKind::Codex {
-            assert_eq!(stop_idle, json!({}), "Codex Stop when idle must return {{}}");
-        } else {
-            let idle_reason = extract_stop_reason(*harness, &stop_idle);
-            assert!(
-                idle_reason.contains(&session_id),
-                "idle Stop arm prompt for {raw_id} must mention {session_id}: {idle_reason}"
-            );
-        }
+        let idle_reason = extract_stop_reason(*harness, &stop_idle);
+        assert!(
+            idle_reason.contains(&session_id),
+            "idle Stop arm prompt for {raw_id} must mention {session_id}: {idle_reason}"
+        );
 
         // 6. Harness sends a reply back to `sender` via `hyp_send`!
         let reply_args = json!({
@@ -2638,4 +2636,342 @@ async fn suite_8_handle_descriptions_multihub_peers_and_configured_bridge_target
     bob.shutdown();
     hub_a.shutdown();
     hub_b.shutdown();
+}
+
+// ============================================================================
+// Suite 9: Native PushTransport Routing, Auto-Detection & Safe Hook Fallback
+// ============================================================================
+
+struct RecordingPushTransport {
+    kind_name: &'static str,
+    interruptible: bool,
+    next_outcome: Mutex<PushOutcome>,
+    delivered: Mutex<Vec<(PushMode, String)>>,
+}
+
+impl RecordingPushTransport {
+    fn new(kind_name: &'static str, interruptible: bool) -> Self {
+        Self {
+            kind_name,
+            interruptible,
+            next_outcome: Mutex::new(PushOutcome::delivered()),
+            delivered: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn set_outcome(&self, outcome: PushOutcome) {
+        *self.next_outcome.lock().unwrap() = outcome;
+    }
+
+    fn take_delivered(&self) -> Vec<(PushMode, String)> {
+        std::mem::take(&mut *self.delivered.lock().unwrap())
+    }
+}
+
+impl PushTransport for RecordingPushTransport {
+    fn kind(&self) -> &'static str {
+        self.kind_name
+    }
+
+    fn supports_interrupt(&self) -> bool {
+        self.interruptible
+    }
+
+    fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
+        let outcome = self.next_outcome.lock().unwrap().clone();
+        self.delivered
+            .lock()
+            .unwrap()
+            .push((mode, text.to_string()));
+        Box::pin(async move { outcome })
+    }
+}
+
+#[tokio::test]
+async fn suite_9_push_transport_queue_interrupt_stop_silencing_and_hold_fallback() {
+    let dir = TempDir::new().unwrap();
+    let node = open_local_node("push@box", dir.path());
+    let daemon = LocalDaemon::start(Arc::clone(&node), None, LocalDaemonConfig::default())
+        .await
+        .unwrap();
+    let sock = daemon.socket_path().to_path_buf();
+
+    let mut sender_mcp = TestMcpClient::spawn(McpOptions::new(sock.clone()));
+    sender_mcp.initialize().await;
+    let (_, s_err) = sender_mcp
+        .call_verified_claude(
+            &sock,
+            "sender-p9",
+            "hyp_mesh",
+            json!({ "action": "join", "handle": "sender" }),
+        )
+        .await;
+    assert!(!s_err);
+
+    let mut codex_mcp = TestMcpClient::spawn(McpOptions::new(sock.clone()));
+    codex_mcp.initialize().await;
+    let (join_txt, join_err) = codex_mcp
+        .call_verified_for_harness(
+            &sock,
+            HarnessKind::Codex,
+            "thr-p9",
+            "hyp_mesh",
+            json!({ "action": "join", "handle": "codex" }),
+        )
+        .await;
+    assert!(!join_err, "codex join failed: {join_txt}");
+    let join_val: Value = serde_json::from_str(&join_txt).unwrap();
+    assert_eq!(join_val["hasLiveTransport"], false);
+    assert_eq!(join_val["transport"]["kind"], "none");
+
+    // Without a push transport, Codex Stop hook prompts to arm `hyp wait`.
+    let codex_payload = json!({ "thread_id": "thr-p9" });
+    let stop_before = run_hook(&sock, HarnessKind::Codex, HookEvent::Stop, codex_payload.clone()).await;
+    assert_eq!(stop_before["decision"], "block");
+    assert!(
+        stop_before["reason"]
+            .as_str()
+            .unwrap()
+            .contains("hyp wait --session codex:thr-p9")
+    );
+
+    // Attach a live interrupt-capable PushTransport -> Stop hook becomes silent!
+    let mock_transport = Arc::new(RecordingPushTransport::new("mock_push", true));
+    daemon.register_session_transport("codex:thr-p9", Arc::clone(&mock_transport) as Arc<dyn PushTransport>);
+    assert_eq!(daemon.session_transport_kind("codex:thr-p9"), Some("mock_push"));
+
+    let st_live = session_status(&sock, "codex:thr-p9").await;
+    assert_eq!(st_live["hasLiveTransport"], true);
+    assert_eq!(st_live["transportKind"], "mock_push");
+
+    let stop_with_push = run_hook(&sock, HarnessKind::Codex, HookEvent::Stop, codex_payload.clone()).await;
+    assert_eq!(stop_with_push, json!({}), "Stop hook must stay silent when live PushTransport is attached");
+
+    // 1. Standard DM -> pushed in Queue mode and marked delivered (pending == 0).
+    let (_, dm1_err) = sender_mcp
+        .call_verified_claude(
+            &sock,
+            "sender-p9",
+            "hyp_send",
+            json!({ "to": "push@box/codex", "text": "hello-via-queue-push" }),
+        )
+        .await;
+    assert!(!dm1_err);
+
+    for _ in 0..100 {
+        if !mock_transport.delivered.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    let batch1 = mock_transport.take_delivered();
+    assert_eq!(batch1.len(), 1);
+    assert_eq!(batch1[0].0, PushMode::Queue);
+    assert!(batch1[0].1.contains("hello-via-queue-push"));
+    assert_eq!(session_status(&sock, "codex:thr-p9").await["pending"], 0);
+
+    // 2. VIP interrupt rule -> pushed in Interrupt mode!
+    let (_, rule_err) = codex_mcp
+        .call_verified_for_harness(
+            &sock,
+            HarnessKind::Codex,
+            "thr-p9",
+            "hyp_inbox",
+            json!({ "rules": [{ "target": "push@box/sender", "delivery": "interrupt" }] }),
+        )
+        .await;
+    assert!(!rule_err);
+
+    let (_, dm2_err) = sender_mcp
+        .call_verified_claude(
+            &sock,
+            "sender-p9",
+            "hyp_send",
+            json!({ "to": "push@box/codex", "text": "urgent-interrupt-msg" }),
+        )
+        .await;
+    assert!(!dm2_err);
+
+    for _ in 0..100 {
+        if !mock_transport.delivered.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    let batch2 = mock_transport.take_delivered();
+    assert_eq!(batch2.len(), 1);
+    assert_eq!(batch2[0].0, PushMode::Interrupt);
+    assert!(batch2[0].1.contains("urgent-interrupt-msg"));
+
+    // 3. Transport returns Hold("herdr_working") -> message preserved unread in durable SQLite
+    //    and drained cleanly via PostToolUse hook!
+    mock_transport.set_outcome(PushOutcome::hold("herdr_working"));
+    let (_, dm3_err) = sender_mcp
+        .call_verified_claude(
+            &sock,
+            "sender-p9",
+            "hyp_send",
+            json!({ "to": "push@box/codex", "text": "preserve-on-hold-fallback" }),
+        )
+        .await;
+    assert!(!dm3_err);
+
+    for _ in 0..100 {
+        if !mock_transport.delivered.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    let _ = mock_transport.take_delivered();
+    assert_eq!(
+        session_status(&sock, "codex:thr-p9").await["pending"],
+        1,
+        "Hold outcome must preserve message unread in durable SQLite"
+    );
+
+    let post_drain = run_hook(&sock, HarnessKind::Codex, HookEvent::PostToolUse, codex_payload).await;
+    let drained_txt = extract_drain_text(HarnessKind::Codex, &post_drain);
+    assert!(
+        drained_txt.contains("preserve-on-hold-fallback"),
+        "PostToolUse fallback must deliver held message: {drained_txt}"
+    );
+    assert_eq!(session_status(&sock, "codex:thr-p9").await["pending"], 0);
+
+    codex_mcp.close().await;
+    sender_mcp.close().await;
+    daemon.stop().await;
+    node.shutdown();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn suite_9b_auto_detect_herdr_transport_from_pre_tool_use_hook_and_push_live() {
+    use common::run_hook_with_hints;
+    use hyp_harness::hooks::HookTransportHints;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let log_path = dir.path().join("hc-invocations.log");
+    let fake_hc = dir.path().join("fake-hc");
+
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "{log}"
+case "$1" in
+  get)
+    printf '%s\n' '{{"address":"t9h","state":"live","created_ms":1700000000,"pid":4242,"status":{{"app":"codex","state":"idle"}}}}'
+    exit 0
+    ;;
+  send)
+    printf '%s\n' '{{"ok":true}}'
+    exit 0
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#,
+        log = log_path.display()
+    );
+    std::fs::write(&fake_hc, script).unwrap();
+    std::fs::set_permissions(&fake_hc, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let node = open_local_node("herdr-auto@box", dir.path());
+    let daemon_cfg = LocalDaemonConfig {
+        auto_detect_transports: true,
+        herdr_bin: Some(fake_hc.display().to_string()),
+        t3_default_base_dir: Some(dir.path().join("no-t3")),
+        ..Default::default()
+    };
+    let daemon = LocalDaemon::start(Arc::clone(&node), None, daemon_cfg)
+        .await
+        .unwrap();
+    let sock = daemon.socket_path().to_path_buf();
+
+    let mut sender_mcp = TestMcpClient::spawn(McpOptions::new(sock.clone()));
+    sender_mcp.initialize().await;
+    let (_, s_err) = sender_mcp
+        .call_verified_claude(
+            &sock,
+            "sender-h9",
+            "hyp_mesh",
+            json!({ "action": "join", "handle": "sender" }),
+        )
+        .await;
+    assert!(!s_err);
+
+    // Codex PreToolUse carries `HC_TERMINAL_ID = t9h` -> daemon probes fake-hc and auto-attaches HerdrTransport!
+    let mut codex_mcp = TestMcpClient::spawn(McpOptions::new(sock.clone()));
+    codex_mcp.initialize().await;
+    let call_id = "call-codex-herdr-1";
+    let pre = run_hook_with_hints(
+        &sock,
+        HarnessKind::Codex,
+        HookEvent::PreToolUse,
+        json!({
+            "thread_id": "thr-herdr-1",
+            "tool_name": "mcp__hyphae__hyp_mesh",
+            "tool_use_id": call_id,
+            "tool_input": { "action": "join", "handle": "codex-in-herdr" }
+        }),
+        HookTransportHints {
+            herdr_terminal_id: Some("t9h".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(pre, json!({}));
+
+    let (join_txt, join_err) = codex_mcp
+        .call_tool(
+            "hyp_mesh",
+            json!({ "action": "join", "handle": "codex-in-herdr" }),
+            Some(json!({ "callId": call_id })),
+        )
+        .await;
+    assert!(!join_err, "codex-in-herdr join failed: {join_txt}");
+    let join_val: Value = serde_json::from_str(&join_txt).unwrap();
+    assert_eq!(join_val["hasLiveTransport"], true);
+    assert_eq!(join_val["transport"]["kind"], "herdr");
+
+    // Codex Stop hook stays completely silent because Herdr transport is live!
+    let stop_out = run_hook(
+        &sock,
+        HarnessKind::Codex,
+        HookEvent::Stop,
+        json!({ "thread_id": "thr-herdr-1" }),
+    )
+    .await;
+    assert_eq!(stop_out, json!({}));
+
+    // Send a DM from sender -> Herdr auto-pushes via `fake-hc send --json --if idle t9h <text>`!
+    let (_, dm_err) = sender_mcp
+        .call_verified_claude(
+            &sock,
+            "sender-h9",
+            "hyp_send",
+            json!({ "to": "herdr-auto@box/codex-in-herdr", "text": "wake-up-codex-via-herdr" }),
+        )
+        .await;
+    assert!(!dm_err);
+
+    let mut log_contents = String::new();
+    for _ in 0..100 {
+        log_contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if log_contents.contains("wake-up-codex-via-herdr") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        log_contents.contains("send --json --if idle t9h")
+            && log_contents.contains("wake-up-codex-via-herdr"),
+        "expected fake-hc to receive guarded send with DM payload, got:\n{log_contents}"
+    );
+    assert_eq!(session_status(&sock, "codex:thr-herdr-1").await["pending"], 0);
+
+    codex_mcp.close().await;
+    sender_mcp.close().await;
+    daemon.stop().await;
+    node.shutdown();
 }

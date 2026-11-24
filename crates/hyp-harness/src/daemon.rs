@@ -49,6 +49,23 @@ use crate::sock::{
     DEFAULT_SOCKET_FILENAME, MAX_SOCKET_LINE_BYTES, read_bounded_line_async,
     write_ndjson_line_async,
 };
+use crate::transport::codex::{
+    CodexQueueTarget, CodexQueueTransport, DEFAULT_CODEX_BIN, build_codex_queue_args,
+};
+use crate::transport::herdr::{
+    DEFAULT_HERDR_BIN, HerdrTransport, is_valid_terminal_id, probe_herdr_terminal,
+};
+use crate::transport::t3::{
+    DEFAULT_PROBE_TIMEOUT, DEFAULT_T3_TOKEN_SECRET, DEFAULT_T3_URL, FALLBACK_T3_TOKEN_SECRET,
+    T3Target, T3Transport, default_t3_base_dir, normalize_t3_server_url, probe_t3_server,
+    resolve_t3_thread_by_provider_session, t3_state_db_path, verify_t3_thread_exists,
+};
+use crate::transport::{PushMode, PushOutcome, PushTransport};
+
+const PRIORITY_EXPLICIT: u8 = 100;
+const PRIORITY_HERDR: u8 = 30;
+const PRIORITY_T3: u8 = 25;
+const PRIORITY_CODEX_QUEUE: u8 = 20;
 
 /// Default timeout waiting for a live `--claude-channel` `channel.ack`.
 pub const DEFAULT_CHANNEL_DELIVER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -110,6 +127,19 @@ pub struct LocalDaemonConfig {
     /// Maximum time to wait for a `--claude-channel` `channel.ack` before preserving the batch
     /// as unread for hook/`hyp_inbox` fallback. Defaults to 10 seconds.
     pub channel_deliver_timeout: Duration,
+    /// Enable automatic detection & attachment of native external push transports
+    /// (`Herdr`, `T3 Code`, `Codex Queue`) from hook/MCP metadata.
+    /// Defaults to `false` in `LocalDaemonConfig::default()` so hermetic unit/E2E tests
+    /// never probe host binaries unexpectedly; `hyp node start` / `hyp daemon` enables it.
+    pub auto_detect_transports: bool,
+    /// Optional override for the Herdr (`hc`) binary path during auto-detection.
+    pub herdr_bin: Option<String>,
+    /// Optional override for the Codex (`codex`) binary path during auto-detection.
+    pub codex_bin: Option<String>,
+    /// Optional override for the default T3 Code base directory during auto-detection.
+    pub t3_default_base_dir: Option<PathBuf>,
+    /// Optional override for the default T3 Code server URL during auto-detection.
+    pub t3_default_url: Option<String>,
 }
 
 impl Default for LocalDaemonConfig {
@@ -120,7 +150,82 @@ impl Default for LocalDaemonConfig {
             enable_kv: None,
             enable_plugins: false,
             channel_deliver_timeout: DEFAULT_CHANNEL_DELIVER_TIMEOUT,
+            auto_detect_transports: false,
+            herdr_bin: None,
+            codex_bin: None,
+            t3_default_base_dir: None,
+            t3_default_url: None,
         }
+    }
+}
+
+#[derive(Clone)]
+struct AttachedPushTransport {
+    transport: Arc<dyn PushTransport>,
+    priority: u8,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TransportHints {
+    harness: Option<HarnessKind>,
+    herdr_terminal_id: Option<String>,
+    codex_thread_id: Option<String>,
+    codex_home: Option<PathBuf>,
+    codex_remote: Option<String>,
+    codex_resume: bool,
+    explicit_codex_queue: bool,
+    t3_base_dir: Option<PathBuf>,
+    t3_url: Option<String>,
+}
+
+impl TransportHints {
+    fn from_packet(packet: &Map<String, Value>, default_harness: Option<HarnessKind>) -> Self {
+        let non_empty_str = |key: &str| {
+            packet
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+        };
+        let harness = non_empty_str("harness")
+            .or_else(|| non_empty_str("backend"))
+            .and_then(|s| s.parse::<HarnessKind>().ok())
+            .or(default_harness);
+        let herdr_terminal_id = non_empty_str("herdrTerminalId")
+            .or_else(|| non_empty_str("terminalId"))
+            .filter(|tid| is_valid_terminal_id(tid));
+        let explicit_thread = non_empty_str("threadId");
+        let codex_thread_id = explicit_thread
+            .clone()
+            .or_else(|| non_empty_str("codexThreadId"));
+        let codex_home = non_empty_str("codexHome").map(PathBuf::from);
+        let codex_remote = non_empty_str("codexRemote").or_else(|| non_empty_str("remote"));
+        let codex_resume = packet.get("resume").and_then(Value::as_bool) == Some(true);
+        let explicit_codex_queue =
+            explicit_thread.is_some() || codex_remote.is_some() || codex_resume;
+        let t3_base_dir = non_empty_str("t3BaseDir").map(PathBuf::from);
+        let t3_url = non_empty_str("t3Url");
+
+        Self {
+            harness,
+            herdr_terminal_id,
+            codex_thread_id,
+            codex_home,
+            codex_remote,
+            codex_resume,
+            explicit_codex_queue,
+            t3_base_dir,
+            t3_url,
+        }
+    }
+
+    fn has_any_hint(&self) -> bool {
+        self.herdr_terminal_id.is_some()
+            || self.t3_base_dir.is_some()
+            || self.t3_url.is_some()
+            || self.harness == Some(HarnessKind::T3)
+            || (self.explicit_codex_queue && self.codex_thread_id.is_some())
     }
 }
 
@@ -175,6 +280,10 @@ struct LocalDaemonInner {
     socket_path: PathBuf,
     waiters: Mutex<HashMap<String, Vec<LiveWaiter>>>,
     channels: Mutex<HashMap<String, LiveChannel>>,
+    /// Attached native external push transports (`Herdr`, `T3`, `CodexQueue`, or test doubles).
+    session_transports: Mutex<HashMap<String, AttachedPushTransport>>,
+    /// Active background auto-detection probe watchers keyed by `session_id`.
+    pending_probes: Mutex<HashMap<String, watch::Receiver<bool>>>,
     flushing: Mutex<HashSet<String>>,
     /// Per-session classified metadata for `Pending` receipts (`receipt -> meta`).
     item_meta: Mutex<HashMap<String, HashMap<String, ClassifiedItemMeta>>>,
@@ -369,6 +478,42 @@ impl LocalDaemon {
 
     pub fn calls(&self) -> &Arc<CallRegistry> {
         &self.inner.calls
+    }
+
+    /// Registers an explicit native [`PushTransport`] (e.g. `HerdrTransport`, `T3Transport`,
+    /// `CodexQueueTransport`, or test double) for `session_id` and immediately flushes any
+    /// pending unread mailbox items through it.
+    pub fn register_session_transport(
+        &self,
+        session_id: impl Into<String>,
+        transport: Arc<dyn PushTransport>,
+    ) {
+        let sid = session_id.into();
+        if sid.is_empty() {
+            return;
+        }
+        self.inner
+            .attach_transport_if_higher_priority(&sid, transport, PRIORITY_EXPLICIT);
+        let flush_inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            flush_inner.flush_session(&sid).await;
+        });
+    }
+
+    /// Removes any attached native [`PushTransport`] for `session_id`.
+    pub fn unregister_session_transport(&self, session_id: &str) -> bool {
+        self.inner
+            .session_transports
+            .lock()
+            .expect("session_transports lock poisoned")
+            .remove(session_id)
+            .is_some()
+    }
+
+    /// Returns the active live wakeup transport kind for `session_id`, if any
+    /// (`"claude_channel"`, `"herdr"`, `"t3"`, `"codex_queue"`, `"watch"`, `"wait"`, etc.).
+    pub fn session_transport_kind(&self, session_id: &str) -> Option<&'static str> {
+        self.inner.active_transport_kind(session_id)
     }
 
     /// Registers a pluggable outbound [`BridgePoster`] for `plugin` (case-insensitive slug).
@@ -776,6 +921,8 @@ impl LocalDaemonInner {
             socket_path,
             waiters: Mutex::new(HashMap::new()),
             channels: Mutex::new(HashMap::new()),
+            session_transports: Mutex::new(HashMap::new()),
+            pending_probes: Mutex::new(HashMap::new()),
             flushing: Mutex::new(HashSet::new()),
             item_meta: Mutex::new(HashMap::new()),
             sub_meta: Mutex::new(HashMap::new()),
@@ -804,20 +951,94 @@ impl LocalDaemonInner {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn has_live_transport(&self, session_id: &str) -> bool {
+    fn attach_transport_if_higher_priority(
+        &self,
+        session_id: &str,
+        transport: Arc<dyn PushTransport>,
+        priority: u8,
+    ) -> bool {
+        let mut map = self
+            .session_transports
+            .lock()
+            .expect("session_transports lock poisoned");
+        if let Some(existing) = map.get(session_id) {
+            if existing.priority > priority {
+                return false;
+            }
+        }
+        map.insert(
+            session_id.to_string(),
+            AttachedPushTransport {
+                transport,
+                priority,
+            },
+        );
+        true
+    }
+
+    fn current_transport_priority(&self, session_id: &str) -> u8 {
+        self.session_transports
+            .lock()
+            .expect("session_transports lock poisoned")
+            .get(session_id)
+            .map(|t| t.priority)
+            .unwrap_or(0)
+    }
+
+    fn active_transport_kind(&self, session_id: &str) -> Option<&'static str> {
         if self
             .channels
             .lock()
             .expect("channels lock poisoned")
             .contains_key(session_id)
         {
-            return true;
+            return Some("claude_channel");
         }
-        self.waiters
+        if let Some(attached) = self
+            .session_transports
             .lock()
-            .expect("waiters lock poisoned")
+            .expect("session_transports lock poisoned")
             .get(session_id)
-            .is_some_and(|w| !w.is_empty())
+        {
+            return Some(attached.transport.kind());
+        }
+        let waiters = self.waiters.lock().expect("waiters lock poisoned");
+        if let Some(list) = waiters.get(session_id) {
+            if list.iter().any(|w| w.mode == WaiterKind::Stream) {
+                return Some("watch");
+            }
+            if !list.is_empty() {
+                return Some("wait");
+            }
+        }
+        None
+    }
+
+    fn has_live_transport(&self, session_id: &str) -> bool {
+        self.active_transport_kind(session_id).is_some()
+    }
+
+    fn transport_summary_json(&self, session_id: &str) -> Value {
+        match self.active_transport_kind(session_id) {
+            Some(kind) => json!({ "live": true, "kind": kind }),
+            None => json!({ "live": false, "kind": "none" }),
+        }
+    }
+
+    async fn wait_for_pending_probe(&self, session_id: &str) {
+        let rx_opt = self
+            .pending_probes
+            .lock()
+            .expect("pending_probes lock poisoned")
+            .get(session_id)
+            .cloned();
+        if let Some(mut rx) = rx_opt {
+            let _ = tokio::time::timeout(
+                Duration::from_millis(1_500),
+                rx.wait_for(|done| *done),
+            )
+            .await;
+        }
     }
 
     fn has_kv_capability(&self) -> bool {
@@ -1315,7 +1536,44 @@ impl LocalDaemonInner {
                 }
             }
 
-            // Priority 2: Streaming watcher (`hyp watch` / `inbox.watch`)
+            // Priority 2: Attached native external PushTransport (Herdr > T3 Code > Codex Queue)
+            let push_transport = self
+                .session_transports
+                .lock()
+                .expect("session_transports lock poisoned")
+                .get(session_id)
+                .map(|a| Arc::clone(&a.transport));
+            if let Some(transport) = push_transport {
+                let push_mode = if batch.max_urgency == DeliveryUrgency::Interrupt
+                    && transport.supports_interrupt()
+                {
+                    PushMode::Interrupt
+                } else {
+                    PushMode::Queue
+                };
+                match transport.deliver(&batch.rendered, push_mode).await {
+                    PushOutcome::Delivered => {
+                        self.commit_delivered_batch(session_id, &batch);
+                        continue;
+                    }
+                    PushOutcome::Hold { ref reason, .. }
+                        if matches!(
+                            reason.as_str(),
+                            "herdr_working" | "herdr_send_guard_refused" | "herdr_agent_not_ready"
+                        ) =>
+                    {
+                        // Target is actively working or has an in-progress user draft;
+                        // preserve unread in durable SQLite for hook/`hyp_inbox` delivery.
+                        break;
+                    }
+                    PushOutcome::Hold { .. } | PushOutcome::Reject { .. } => {
+                        // Preserve unread in durable SQLite; fall through to any live
+                        // `watch`/`wait` waiter if one is attached, else exit flush loop.
+                    }
+                }
+            }
+
+            // Priority 3: Streaming watcher (`hyp watch` / `inbox.watch`)
             let stream_tx = self
                 .waiters
                 .lock()
@@ -1513,6 +1771,10 @@ impl LocalDaemonInner {
             (p, u, m)
         };
 
+        self.wait_for_pending_probe(session_id).await;
+        let has_live = self.has_live_transport(session_id);
+        let transport_summary = self.transport_summary_json(session_id);
+
         let mut out = Map::new();
         out.insert("address".into(), json!(rec.address));
         out.insert("nodeId".into(), json!(self.node.node_id().as_str()));
@@ -1524,6 +1786,8 @@ impl LocalDaemonInner {
         out.insert("focusMode".into(), json!(policy.focus_mode));
         out.insert("unread".into(), json!(unread));
         out.insert("muted".into(), json!(muted));
+        out.insert("hasLiveTransport".into(), json!(has_live));
+        out.insert("transport".into(), transport_summary);
 
         if let Some(include) = args.get("include").and_then(Value::as_array) {
             for item in include {
@@ -1657,6 +1921,7 @@ impl LocalDaemonInner {
                 .collect();
             (sess, policy, unread, muted, mutes_len, peers)
         };
+        self.wait_for_pending_probe(session_id).await;
         Ok(json!({
             "sessionId": session_id,
             "nodeId": self.node.node_id().as_str(),
@@ -1670,6 +1935,7 @@ impl LocalDaemonInner {
             "rules": policy.overrides,
             "peers": peers,
             "hasLiveTransport": self.has_live_transport(session_id),
+            "transport": self.transport_summary_json(session_id),
             "hasKv": self.has_kv_capability(),
         }))
     }
@@ -2986,6 +3252,7 @@ struct McpSocketContext {
     channel_ready: bool,
     channel_session_id: Option<String>,
     ephemeral_client_id: Option<String>,
+    hints: TransportHints,
 }
 
 async fn handle_connection<R, W>(
@@ -3083,6 +3350,21 @@ async fn handle_connection<R, W>(
                     // ---- Single-shot hook / CLI RPCs ----
                     "call.start" => {
                         let resp = handle_call_start(&daemon, &packet);
+                        if resp.get("ok").and_then(Value::as_bool) == Some(true) {
+                            if let Some(sid) = resp
+                                .get("result")
+                                .and_then(|r| r.get("sessionId"))
+                                .and_then(Value::as_str)
+                            {
+                                let hints = TransportHints::from_packet(&packet, None);
+                                maybe_spawn_transport_probe(&daemon, sid, hints);
+                            }
+                        }
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
+                    "session.hint" => {
+                        let resp = handle_session_hint(&daemon, &packet);
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
                         break;
                     }
@@ -3237,12 +3519,14 @@ async fn handle_connection<R, W>(
                             .and_then(Value::as_str)
                             .filter(|s| !s.is_empty() && s.len() <= 64)
                             .map(ToString::to_string);
+                        let hints = TransportHints::from_packet(&packet, backend);
                         mcp_ctx = Some(McpSocketContext {
                             backend,
                             channel,
                             channel_ready: false,
                             channel_session_id: None,
                             ephemeral_client_id,
+                            hints,
                         });
                     }
                     "channel.ready" => {
@@ -3429,6 +3713,11 @@ async fn resolve_tool_caller(
                             bind_channel(daemon, conn_id, &session_id, chan_tx);
                         }
                     }
+                    let mut hints = ctx.hints.clone();
+                    if hints.harness.is_none() {
+                        hints.harness = Some(harness);
+                    }
+                    maybe_spawn_transport_probe(daemon, &session_id, hints);
                 }
                 return Ok(session_id);
             }
@@ -3459,6 +3748,11 @@ async fn resolve_tool_caller(
                     bind_channel(daemon, conn_id, &session_id, chan_tx);
                 }
             }
+            let mut hints = ctx.hints.clone();
+            if hints.harness.is_none() {
+                hints.harness = Some(harness);
+            }
+            maybe_spawn_transport_probe(daemon, &session_id, hints);
             return Ok(session_id);
         }
     }
@@ -3474,6 +3768,211 @@ async fn resolve_tool_caller(
         "caller_unverifiable".into(),
         "Could not verify calling thread/conversation. Run 'hyp setup <harness>' to install PreToolUse hooks (or pass --ephemeral for scratch testing).".into(),
     ))
+}
+
+fn handle_session_hint(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Value>) -> Value {
+    let Some(session_id) = packet
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|s| is_valid_session_id(s))
+    else {
+        return json!({ "ok": false, "error": "invalid_session" });
+    };
+    let harness = packet
+        .get("harness")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<HarnessKind>().ok());
+    if let Some(h) = harness {
+        let backend_json = format!("{{\"kind\":\"{}\"}}", h.as_str());
+        let _ = daemon.node.register_session(session_id, &backend_json);
+    }
+    let hints = TransportHints::from_packet(packet, harness);
+    maybe_spawn_transport_probe(daemon, session_id, hints);
+    json!({ "ok": true, "result": {} })
+}
+
+fn read_t3_secret_for_node(node: &UnifiedNode) -> Option<String> {
+    let cfg = node.config();
+    let store = match cfg.secret_backend {
+        Some(backend) => hyp_crypto::SecretStore::new(cfg.state_dir.clone(), backend),
+        None => hyp_crypto::SecretStore::from_env(cfg.state_dir.clone()),
+    };
+    if let Ok(val) = store.get(DEFAULT_T3_TOKEN_SECRET) {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Ok(val) = store.get(FALLBACK_T3_TOKEN_SECRET) {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+fn maybe_spawn_transport_probe(
+    daemon: &Arc<LocalDaemonInner>,
+    session_id: &str,
+    hints: TransportHints,
+) {
+    if !daemon.config.auto_detect_transports {
+        return;
+    }
+    if daemon.current_transport_priority(session_id) >= PRIORITY_HERDR {
+        return;
+    }
+
+    // Check whether we have any plausible transport signal worth probing:
+    // - explicit Herdr terminal ID, T3 dir/url/harness, or explicit Codex Queue args
+    // - OR default T3 statev2.sqlite exists on disk (Claude/Codex running inside T3 Code)
+    let default_t3_base = daemon
+        .config
+        .t3_default_base_dir
+        .clone()
+        .unwrap_or_else(default_t3_base_dir);
+    let t3_base_candidate = hints.t3_base_dir.clone().unwrap_or(default_t3_base);
+    let has_t3_db = t3_state_db_path(&t3_base_candidate).is_file();
+
+    if !hints.has_any_hint() && !has_t3_db {
+        return;
+    }
+
+    let (tx, rx) = watch::channel(false);
+    {
+        let mut probes = daemon
+            .pending_probes
+            .lock()
+            .expect("pending_probes lock poisoned");
+        if probes.contains_key(session_id) {
+            return;
+        }
+        probes.insert(session_id.to_string(), rx);
+    }
+
+    let daemon_arc = Arc::clone(daemon);
+    let sid = session_id.to_string();
+    tokio::spawn(async move {
+        struct ProbeGuard {
+            daemon: Arc<LocalDaemonInner>,
+            session_id: String,
+            tx: watch::Sender<bool>,
+        }
+        impl Drop for ProbeGuard {
+            fn drop(&mut self) {
+                let _ = self.tx.send(true);
+                let mut probes = self
+                    .daemon
+                    .pending_probes
+                    .lock()
+                    .expect("pending_probes lock poisoned");
+                probes.remove(&self.session_id);
+            }
+        }
+        let _guard = ProbeGuard {
+            daemon: Arc::clone(&daemon_arc),
+            session_id: sid.clone(),
+            tx,
+        };
+
+        let mut attached = false;
+
+        // Priority 1: Herdr (`HC_TERMINAL_ID` verified live via `hc get --json`)
+        if let Some(ref tid) = hints.herdr_terminal_id {
+            let hc_bin = daemon_arc
+                .config
+                .herdr_bin
+                .as_deref()
+                .unwrap_or(DEFAULT_HERDR_BIN);
+            if let Some(target) = probe_herdr_terminal(hc_bin, tid).await {
+                if daemon_arc.attach_transport_if_higher_priority(
+                    &sid,
+                    Arc::new(HerdrTransport::new(target)),
+                    PRIORITY_HERDR,
+                ) {
+                    attached = true;
+                }
+            }
+        }
+
+        // Priority 2: T3 Code (read-only `statev2.sqlite` match + reachable T3 server)
+        if !attached && daemon_arc.current_transport_priority(&sid) < PRIORITY_T3 && has_t3_db {
+            let raw_id = hints
+                .codex_thread_id
+                .as_deref()
+                .unwrap_or_else(|| sid.split_once(':').map(|(_, r)| r).unwrap_or(sid.as_str()));
+            let resolved_t3_thread = if hints.harness == Some(HarnessKind::T3)
+                && verify_t3_thread_exists(raw_id, &t3_base_candidate)
+            {
+                Some(raw_id.to_string())
+            } else {
+                resolve_t3_thread_by_provider_session(raw_id, &t3_base_candidate).ok()
+            };
+
+            if let Some(thread_id) = resolved_t3_thread {
+                let raw_url = hints
+                    .t3_url
+                    .as_deref()
+                    .or(daemon_arc.config.t3_default_url.as_deref())
+                    .unwrap_or(DEFAULT_T3_URL);
+                if let Ok(origin) = normalize_t3_server_url(raw_url) {
+                    let token = read_t3_secret_for_node(&daemon_arc.node);
+                    let probe =
+                        probe_t3_server(&origin, token.as_deref(), DEFAULT_PROBE_TIMEOUT).await;
+                    if probe.ok {
+                        let mut target = T3Target::new(thread_id, origin);
+                        target.base_dir = Some(t3_base_candidate.clone());
+                        target.state_dir = Some(daemon_arc.node.config().state_dir.clone());
+                        target.secret_backend = daemon_arc.node.config().secret_backend;
+                        if daemon_arc.attach_transport_if_higher_priority(
+                            &sid,
+                            Arc::new(T3Transport::new(target)),
+                            PRIORITY_T3,
+                        ) {
+                            attached = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Priority 3: Codex Queue (explicit `--thread` / `--remote` / `--resume` / `CODEX_REMOTE`)
+        if !attached
+            && daemon_arc.current_transport_priority(&sid) < PRIORITY_CODEX_QUEUE
+            && hints.explicit_codex_queue
+        {
+            if let Some(ref thread_id) = hints.codex_thread_id {
+                let codex_bin = daemon_arc
+                    .config
+                    .codex_bin
+                    .as_deref()
+                    .unwrap_or(DEFAULT_CODEX_BIN);
+                let mut target = CodexQueueTarget::new(thread_id.clone())
+                    .with_bin(codex_bin.to_string())
+                    .with_resume(hints.codex_resume);
+                if let Some(ref home) = hints.codex_home {
+                    target = target.with_codex_home(home.clone());
+                }
+                if let Some(ref remote) = hints.codex_remote {
+                    target = target.with_remote(remote.clone());
+                }
+                if build_codex_queue_args(&target, "probe").is_ok()
+                    && daemon_arc.attach_transport_if_higher_priority(
+                        &sid,
+                        Arc::new(CodexQueueTransport::new(target)),
+                        PRIORITY_CODEX_QUEUE,
+                    )
+                {
+                    attached = true;
+                }
+            }
+        }
+
+        if attached {
+            daemon_arc.flush_session(&sid).await;
+        }
+    });
 }
 
 fn handle_call_start(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> Value {
@@ -3573,6 +4072,7 @@ async fn handle_session_status(daemon: &LocalDaemonInner, packet: &Map<String, V
     let Some(session_id) = packet.get("sessionId").and_then(Value::as_str) else {
         return json!({ "ok": false, "error": "invalid_session" });
     };
+    daemon.wait_for_pending_probe(session_id).await;
     daemon.reconcile_session_inbox(session_id).await;
     let (sess, pending, muted, policy) = {
         let db = daemon.node.db();
@@ -3583,6 +4083,7 @@ async fn handle_session_status(daemon: &LocalDaemonInner, packet: &Map<String, V
         (sess, pending, muted, policy)
     };
     let enrolled = sess.as_ref().and_then(|s| s.handle.as_ref()).is_some();
+    let transport_kind = daemon.active_transport_kind(session_id);
     json!({
         "ok": true,
         "result": {
@@ -3593,7 +4094,8 @@ async fn handle_session_status(daemon: &LocalDaemonInner, packet: &Map<String, V
             "muted": muted,
             "deliveryMode": policy.default_mode.as_str(),
             "focusMode": policy.focus_mode,
-            "hasLiveTransport": daemon.has_live_transport(session_id),
+            "hasLiveTransport": transport_kind.is_some(),
+            "transportKind": transport_kind,
         }
     })
 }
@@ -3621,12 +4123,14 @@ async fn handle_daemon_status(daemon: &LocalDaemonInner) -> Value {
             let m = muted_count(&db, &s.id).unwrap_or(0);
             let p = db.local().pending_count(&s.id).unwrap_or(0);
             muted_sum += m;
+            let transport_kind = daemon.active_transport_kind(&s.id);
             sess_arr.push(json!({
                 "id": s.id,
                 "handle": s.handle,
                 "pending": p,
                 "muted": m,
-                "hasLiveTransport": daemon.has_live_transport(&s.id),
+                "hasLiveTransport": transport_kind.is_some(),
+                "transportKind": transport_kind,
             }));
         }
         let peers: Vec<Value> = db

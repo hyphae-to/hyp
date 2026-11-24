@@ -19,7 +19,9 @@ mod update;
 mod wizard;
 
 use clap::{Parser, Subcommand};
-use hyp_harness::hooks::{HandleHookOptions, HookEvent, run_hook_sync, shell_quote_cli};
+use hyp_harness::hooks::{
+    HandleHookOptions, HookEvent, HookTransportHints, run_hook_sync, shell_quote_cli,
+};
 use hyp_harness::mcp::{McpOptions, run_mcp};
 use hyp_harness::protocol::HarnessKind;
 use hyp_harness::sock::default_socket_path;
@@ -252,6 +254,7 @@ fn try_hook_fast_path() -> Option<ExitCode> {
         socket_path,
         cli_path: Some(current_cli_command()),
         explicit_socket,
+        transport_hints: HookTransportHints::from_env(),
     };
     run_hook_sync(&options);
     Some(ExitCode::from(EXIT_OK))
@@ -292,6 +295,7 @@ fn main() -> ExitCode {
                 socket_path,
                 cli_path: Some(current_cli_command()),
                 explicit_socket,
+                transport_hints: HookTransportHints::from_env(),
             });
             ExitCode::from(EXIT_OK)
         }
