@@ -16,8 +16,14 @@ use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::pin::Pin;
+#[cfg(unix)]
+use std::task::{Context, Poll};
 use std::time::Duration;
 use thiserror::Error;
+#[cfg(unix)]
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::UnixStream as TokioUnixStream;
@@ -28,12 +34,63 @@ pub const DEFAULT_SOCKET_FILENAME: &str = "connector.sock";
 #[cfg(not(unix))]
 pub const DEFAULT_SOCKET_FILENAME: &str = "connector.addr";
 
-/// Platform-native async read half for local daemon NDJSON streams.
+/// Platform-native async read half for local daemon NDJSON streams
+/// (supports both Unix domain sockets and loopback TCP `connector.addr` on Unix).
 #[cfg(unix)]
-pub type DaemonReadHalf = tokio::net::unix::OwnedReadHalf;
-/// Platform-native async write half for local daemon NDJSON streams.
+pub enum DaemonReadHalf {
+    Unix(tokio::net::unix::OwnedReadHalf),
+    Tcp(tokio::net::tcp::OwnedReadHalf),
+}
+
+/// Platform-native async write half for local daemon NDJSON streams
+/// (supports both Unix domain sockets and loopback TCP `connector.addr` on Unix).
 #[cfg(unix)]
-pub type DaemonWriteHalf = tokio::net::unix::OwnedWriteHalf;
+pub enum DaemonWriteHalf {
+    Unix(tokio::net::unix::OwnedWriteHalf),
+    Tcp(tokio::net::tcp::OwnedWriteHalf),
+}
+
+#[cfg(unix)]
+impl AsyncRead for DaemonReadHalf {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Unix(u) => Pin::new(u).poll_read(cx, buf),
+            Self::Tcp(t) => Pin::new(t).poll_read(cx, buf),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl AsyncWrite for DaemonWriteHalf {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Unix(u) => Pin::new(u).poll_write(cx, buf),
+            Self::Tcp(t) => Pin::new(t).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Unix(u) => Pin::new(u).poll_flush(cx),
+            Self::Tcp(t) => Pin::new(t).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Unix(u) => Pin::new(u).poll_shutdown(cx),
+            Self::Tcp(t) => Pin::new(t).poll_shutdown(cx),
+        }
+    }
+}
 
 /// Platform-native async read half for local daemon NDJSON streams (Windows TCP loopback).
 #[cfg(not(unix))]
@@ -310,7 +367,7 @@ pub fn resolve_loopback_addr(socket_path: &Path) -> io::Result<SocketAddr> {
     if let Some(raw) = socket_path.to_str() {
         let trimmed = raw.trim();
         let stripped = trimmed.strip_prefix("tcp://").unwrap_or(trimmed);
-        if stripped.parse::<SocketAddr>().is_ok() {
+        if trimmed.starts_with("tcp://") || stripped.parse::<SocketAddr>().is_ok() {
             return parse_loopback_addr(trimmed);
         }
     }
@@ -336,13 +393,64 @@ pub fn resolve_loopback_addr(socket_path: &Path) -> io::Result<SocketAddr> {
     ))
 }
 
-/// Connects asynchronously to the local daemon (Unix domain socket on Unix, loopback TCP on Windows).
+/// Auto-detects whether `socket_path` on Unix targets a loopback TCP endpoint
+/// (`127.0.0.1:<port>`, `[::1]:<port>`, `tcp://...`, `connector.addr` / `*.addr`,
+/// regular addr file, or sibling `connector.addr` when `connector.sock` is absent).
+///
+/// Strictly fails closed (`PermissionDenied` / `InvalidInput`) on any non-loopback IP.
+#[cfg(unix)]
+fn detect_loopback_tcp_target(socket_path: &Path) -> io::Result<Option<SocketAddr>> {
+    if let Some(raw) = socket_path.to_str() {
+        let trimmed = raw.trim();
+        if trimmed.starts_with("tcp://") || trimmed.parse::<SocketAddr>().is_ok() {
+            return parse_loopback_addr(trimmed).map(Some);
+        }
+    }
+
+    let is_addr_name = socket_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "connector.addr")
+        || socket_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("addr"));
+    if is_addr_name {
+        let contents = read_small_addr_file(socket_path)?;
+        return parse_loopback_addr(&contents).map(Some);
+    }
+
+    if let Ok(meta) = std::fs::metadata(socket_path) {
+        if meta.is_file() {
+            let contents = read_small_addr_file(socket_path)?;
+            return parse_loopback_addr(&contents).map(Some);
+        }
+        return Ok(None);
+    }
+
+    let sibling = socket_path.with_file_name("connector.addr");
+    if sibling != socket_path && sibling.is_file() {
+        let contents = read_small_addr_file(&sibling)?;
+        return parse_loopback_addr(&contents).map(Some);
+    }
+
+    Ok(None)
+}
+
+/// Connects asynchronously to the local daemon (auto-detecting Unix domain socket vs loopback TCP
+/// on Unix; loopback TCP on Windows). Strictly fails closed on any non-loopback IP.
 #[cfg(unix)]
 pub async fn connect_daemon_async(
     socket_path: &Path,
 ) -> io::Result<(DaemonReadHalf, DaemonWriteHalf)> {
+    if let Some(addr) = detect_loopback_tcp_target(socket_path)? {
+        let stream = tokio::net::TcpStream::connect(addr).await?;
+        let (r, w) = stream.into_split();
+        return Ok((DaemonReadHalf::Tcp(r), DaemonWriteHalf::Tcp(w)));
+    }
     let stream = TokioUnixStream::connect(socket_path).await?;
-    Ok(stream.into_split())
+    let (r, w) = stream.into_split();
+    Ok((DaemonReadHalf::Unix(r), DaemonWriteHalf::Unix(w)))
 }
 
 /// Connects asynchronously to the local daemon over loopback TCP on Windows.
@@ -372,17 +480,31 @@ fn daemon_rpc_sync_on_stream<S: Read + Write>(mut stream: S, packet: &Value) -> 
 }
 
 /// Ultra-fast synchronous single-shot daemon RPC for hooks (zero Tokio overhead!).
-/// Uses `std::os::unix::net::UnixStream` on Unix and loopback `std::net::TcpStream` on Windows.
-/// Always fails open (returns `DaemonRpcResult { ok: false, .. }`) when daemon is offline,
+/// Uses `std::os::unix::net::UnixStream` or loopback `std::net::TcpStream` (`connector.addr` /
+/// `tcp://127.0.0.1:<port>`) on Unix, and loopback `std::net::TcpStream` on Windows.
+/// Always fails closed on non-loopback IPs and fails open (`ok: false`) when daemon is offline,
 /// timed out, or returns malformed data.
 #[cfg(unix)]
 pub fn daemon_rpc_sync(socket_path: &Path, packet: &Value, timeout: Duration) -> DaemonRpcResult {
-    let Ok(stream) = StdUnixStream::connect(socket_path) else {
-        return DaemonRpcResult::fail();
-    };
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
-    daemon_rpc_sync_on_stream(stream, packet)
+    match detect_loopback_tcp_target(socket_path) {
+        Ok(Some(addr)) => {
+            let Ok(stream) = std::net::TcpStream::connect_timeout(&addr, timeout) else {
+                return DaemonRpcResult::fail();
+            };
+            let _ = stream.set_read_timeout(Some(timeout));
+            let _ = stream.set_write_timeout(Some(timeout));
+            daemon_rpc_sync_on_stream(stream, packet)
+        }
+        Ok(None) => {
+            let Ok(stream) = StdUnixStream::connect(socket_path) else {
+                return DaemonRpcResult::fail();
+            };
+            let _ = stream.set_read_timeout(Some(timeout));
+            let _ = stream.set_write_timeout(Some(timeout));
+            daemon_rpc_sync_on_stream(stream, packet)
+        }
+        Err(_) => DaemonRpcResult::fail(),
+    }
 }
 
 /// Ultra-fast synchronous single-shot loopback TCP RPC for hooks on Windows (zero Tokio overhead!).
@@ -559,9 +681,8 @@ mod tests {
         assert!(!res.ok);
     }
 
-    #[cfg(not(unix))]
     #[tokio::test]
-    async fn windows_tcp_loopback_sync_and_async_rpc_roundtrip() {
+    async fn tcp_loopback_sync_and_async_rpc_roundtrip_and_non_loopback_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -569,7 +690,7 @@ mod tests {
         std::fs::write(&addr_file, format!("{addr}\n")).unwrap();
 
         let server = tokio::spawn(async move {
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let (r, mut w) = stream.split();
                 let mut reader = tokio::io::BufReader::new(r);
@@ -609,6 +730,51 @@ mod tests {
         .unwrap();
         assert!(sync_res.ok);
         assert_eq!(sync_res.result.unwrap()["echoType"], "sync.ping");
+
+        // 3. Async RPC via tcp://127.0.0.1:<port> string
+        let tcp_url_path = PathBuf::from(format!("tcp://{addr}"));
+        let tcp_url_res = daemon_rpc_async(
+            &tcp_url_path,
+            &serde_json::json!({"type": "tcp_url.ping"}),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(tcp_url_res.ok);
+        assert_eq!(tcp_url_res.result.unwrap()["echoType"], "tcp_url.ping");
+
+        // 4. Non-loopback IPs MUST strictly fail closed on ALL platforms!
+        assert_eq!(
+            connect_daemon_async(Path::new("192.168.1.5:41234"))
+                .await
+                .err()
+                .expect("non-loopback direct IP must fail closed")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            connect_daemon_async(Path::new("tcp://10.0.0.1:41234"))
+                .await
+                .err()
+                .expect("non-loopback tcp:// URL must fail closed")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let bad_addr_file = dir.path().join("bad.addr");
+        std::fs::write(&bad_addr_file, "10.0.0.1:41234\n").unwrap();
+        assert_eq!(
+            connect_daemon_async(&bad_addr_file)
+                .await
+                .err()
+                .expect("non-loopback .addr file must fail closed")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let bad_sync = daemon_rpc_sync(
+            &bad_addr_file,
+            &serde_json::json!({"type": "bad.ping"}),
+            Duration::from_millis(200),
+        );
+        assert!(!bad_sync.ok);
 
         server.await.unwrap();
     }

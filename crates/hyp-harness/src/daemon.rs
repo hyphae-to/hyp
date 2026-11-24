@@ -10,9 +10,11 @@
 //! - live zero-polling transports (`wait`, `watch`, and `--claude-channel` push).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -48,7 +50,26 @@ use crate::sock::{
     write_ndjson_line_async,
 };
 
-const CHANNEL_DELIVER_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default timeout waiting for a live `--claude-channel` `channel.ack`.
+pub const DEFAULT_CHANNEL_DELIVER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Boxed `Send` future alias used by [`BridgePoster`].
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Pluggable async outbound handler for local chat/webhook bridges (`<plugin>:<target>`).
+///
+/// Implemented by real external chat bridge supervisors as well as deterministic in-process
+/// test bridges. Outbound DLP (`SecurityGatePipeline`) and primary target ownership
+/// (`plugin_targets`) are ALWAYS enforced by [`LocalDaemon`] BEFORE invoking [`BridgePoster::post`].
+pub trait BridgePoster: Send + Sync {
+    fn post<'a>(
+        &'a self,
+        plugin: &'a str,
+        target: &'a str,
+        text: &'a str,
+        meta: &'a Map<String, Value>,
+    ) -> BoxFuture<'a, Result<Value, (String, String)>>;
+}
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
@@ -86,6 +107,9 @@ pub struct LocalDaemonConfig {
     pub enable_kv: Option<bool>,
     /// Optional explicit override for advertising `hyp_bridge` in `mcp.caps`.
     pub enable_plugins: bool,
+    /// Maximum time to wait for a `--claude-channel` `channel.ack` before preserving the batch
+    /// as unread for hook/`hyp_inbox` fallback. Defaults to 10 seconds.
+    pub channel_deliver_timeout: Duration,
 }
 
 impl Default for LocalDaemonConfig {
@@ -95,6 +119,7 @@ impl Default for LocalDaemonConfig {
             require_verified_caller: true,
             enable_kv: None,
             enable_plugins: false,
+            channel_deliver_timeout: DEFAULT_CHANNEL_DELIVER_TIMEOUT,
         }
     }
 }
@@ -157,6 +182,8 @@ struct LocalDaemonInner {
     sub_meta: Mutex<HashMap<String, Vec<SubscriptionRecordMeta>>>,
     /// Receipts dismissed by Security Gate (`Block` or `Quarantine` in pipeline) so they never surface.
     dismissed_receipts: Mutex<HashSet<String>>,
+    /// Registered pluggable outbound bridge handlers keyed by lowercase plugin slug.
+    bridge_posters: Mutex<HashMap<String, Arc<dyn BridgePoster>>>,
     next_id: AtomicU64,
 }
 
@@ -340,6 +367,23 @@ impl LocalDaemon {
 
     pub fn calls(&self) -> &Arc<CallRegistry> {
         &self.inner.calls
+    }
+
+    /// Registers a pluggable outbound [`BridgePoster`] for `plugin` (case-insensitive slug).
+    /// Also causes `mcp.caps` to advertise `hasPlugins: true` so `hyp_bridge` is surfaced in `tools/list`.
+    pub fn register_bridge_poster(
+        &self,
+        plugin: impl Into<String>,
+        poster: Arc<dyn BridgePoster>,
+    ) {
+        let key = plugin.into().trim().to_ascii_lowercase();
+        if !key.is_empty() {
+            self.inner
+                .bridge_posters
+                .lock()
+                .expect("bridge_posters lock poisoned")
+                .insert(key, poster);
+        }
     }
 
     /// Gracefully stops the daemon listener, background watcher, and removes the local socket/addr file.
@@ -605,8 +649,18 @@ impl LocalDaemonInner {
             item_meta: Mutex::new(HashMap::new()),
             sub_meta: Mutex::new(HashMap::new()),
             dismissed_receipts: Mutex::new(HashSet::new()),
+            bridge_posters: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         }
+    }
+
+    fn has_plugins_capability(&self) -> bool {
+        self.config.enable_plugins
+            || !self
+                .bridge_posters
+                .lock()
+                .expect("bridge_posters lock poisoned")
+                .is_empty()
     }
 
     fn next_seq(&self) -> u64 {
@@ -728,7 +782,7 @@ impl LocalDaemonInner {
                 .get(session_id)
                 .and_then(|m| m.get(&entry.receipt).cloned());
             if let Some(meta) = existing_meta {
-                if meta.urgency.triggers_delivery_or_digest() && (!meta.notified || !matches!(meta.urgency, DeliveryUrgency::Notify)) {
+                if meta.urgency.triggers_delivery_or_digest() && !meta.notified {
                     wake_needed = true;
                 }
                 continue;
@@ -918,7 +972,7 @@ impl LocalDaemonInner {
             .unwrap_or_default();
 
         let mut packable: Vec<PackableItem> = Vec::with_capacity(pending.len());
-        let mut any_deliverable_or_unnotified = false;
+        let mut any_unnotified = false;
 
         for entry in pending {
             let meta = meta_snapshot.get(&entry.receipt);
@@ -931,9 +985,18 @@ impl LocalDaemonInner {
             let burst_demoted = meta.is_some_and(|m| m.burst_demoted);
             let already_notified = entry.notified || meta.is_some_and(|m| m.notified);
 
-            if !(urgency == DeliveryUrgency::Notify || burst_demoted) || !already_notified {
-                any_deliverable_or_unnotified = true;
+            if !already_notified {
+                any_unnotified = true;
             }
+
+            // Items already notified in an earlier digest or truncated preview stay in the unread
+            // footer band (Notify) when a newer unnotified item arrives so they are never re-dumped
+            // or re-truncated in a loop.
+            let effective_urgency = if already_notified {
+                DeliveryUrgency::Notify
+            } else {
+                urgency
+            };
 
             let parsed = hyp_node::delivery::ParsedMailboxSource::from_entry(&entry);
             let channel = meta
@@ -945,7 +1008,7 @@ impl LocalDaemonInner {
 
             packable.push(PackableItem {
                 id: entry.receipt,
-                urgency,
+                urgency: effective_urgency,
                 kind: entry.kind,
                 source: entry.source,
                 channel,
@@ -956,7 +1019,7 @@ impl LocalDaemonInner {
             });
         }
 
-        if packable.is_empty() || !any_deliverable_or_unnotified {
+        if packable.is_empty() || !any_unnotified {
             return None;
         }
 
@@ -1034,13 +1097,13 @@ impl LocalDaemonInner {
             };
 
             // Priority 1: Live Claude native channel (`--claude-channel`)
-            let channel_tx = self
+            let channel_entry = self
                 .channels
                 .lock()
                 .expect("channels lock poisoned")
                 .get(session_id)
-                .map(|c| c.tx.clone());
-            if let Some(tx) = channel_tx {
+                .map(|c| (c.conn_id, c.tx.clone()));
+            if let Some((channel_conn_id, tx)) = channel_entry {
                 let delivery_id = self.next_seq();
                 let (ack_tx, ack_rx) = oneshot::channel();
                 if tx
@@ -1051,18 +1114,31 @@ impl LocalDaemonInner {
                     })
                     .is_ok()
                 {
-                    let submitted = tokio::time::timeout(CHANNEL_DELIVER_TIMEOUT, ack_rx)
-                        .await
-                        .ok()
-                        .and_then(Result::ok)
-                        .unwrap_or(false);
+                    let submitted =
+                        tokio::time::timeout(self.config.channel_deliver_timeout, ack_rx)
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .unwrap_or(false);
                     if submitted {
                         self.commit_delivered_batch(session_id, &batch);
                         // Stop loop if notify-only (already marked notified so next iteration would break).
                         continue;
                     }
                 }
-                break;
+                // If the same channel connection is still attached (explicit nack or timeout),
+                // keep the batch preserved as unread for hook/`hyp_inbox` fallback instead of
+                // spinning on the stalled channel. If the channel disconnected, fall through to
+                // any live `watch`/`wait` transport!
+                let still_attached = self
+                    .channels
+                    .lock()
+                    .expect("channels lock poisoned")
+                    .get(session_id)
+                    .is_some_and(|c| c.conn_id == channel_conn_id);
+                if still_attached {
+                    break;
+                }
             }
 
             // Priority 2: Streaming watcher (`hyp watch` / `inbox.watch`)
@@ -1183,6 +1259,7 @@ impl LocalDaemonInner {
             "hyp_bridge_link" => self.tool_bridge_link(session_id, args).await,
             "hyp_bridge_unlink" => self.tool_bridge_unlink(session_id, args).await,
             "hyp_plugin_handoff" => self.tool_bridge_handoff(session_id, args).await,
+            "hyp_plugin_post" => self.tool_plugin_post(session_id, args).await,
             other => Err(("unknown_tool".into(), format!("Unknown tool {other}"))),
         }
     }
@@ -1741,10 +1818,15 @@ impl LocalDaemonInner {
 
         // Local bridge `<plugin>:<target>`
         if is_bridge_destination(to) {
-            return Err((
-                "no_plugins".into(),
-                format!("No local bridge plugin configured for '{to}'"),
-            ));
+            let (raw_plugin, raw_target) = to.split_once(':').ok_or_else(|| {
+                (
+                    "invalid_request".into(),
+                    format!("Invalid bridge destination '{to}'"),
+                )
+            })?;
+            return self
+                .send_to_bridge(session_id, &handle, raw_plugin, raw_target, text, args)
+                .await;
         }
 
         // Direct DM `<node>/<handle>`
@@ -2314,13 +2396,71 @@ impl LocalDaemonInner {
     }
 
     async fn tool_bridge_targets(&self, session_id: &str) -> Result<Value, (String, String)> {
-        let links = {
+        let mut plugins: Vec<String> = self
+            .bridge_posters
+            .lock()
+            .expect("bridge_posters lock poisoned")
+            .keys()
+            .cloned()
+            .collect();
+        plugins.sort();
+
+        let (links, targets) = {
             let db = self.node.db();
-            db.local()
+            let caller_links = db
+                .local()
                 .bridge_links_for_session(session_id)
-                .map_err(store_err_tuple)?
+                .map_err(store_err_tuple)?;
+
+            let sessions = db.local().list_sessions().map_err(store_err_tuple)?;
+            let handle_by_session: HashMap<String, Option<String>> = sessions
+                .iter()
+                .map(|s| (s.id.clone(), s.handle.clone()))
+                .collect();
+
+            let mut target_pairs: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+            for s in &sessions {
+                for l in db
+                    .local()
+                    .bridge_links_for_session(&s.id)
+                    .unwrap_or_default()
+                {
+                    let readers = target_pairs.entry((l.plugin, l.target)).or_default();
+                    if !readers.contains(&l.session_id) {
+                        readers.push(l.session_id);
+                    }
+                }
+            }
+
+            let mut target_views = Vec::with_capacity(target_pairs.len());
+            for ((plugin, target), readers) in target_pairs {
+                let holder = db
+                    .local()
+                    .get_plugin_target(&plugin, &target)
+                    .map_err(store_err_tuple)?;
+                let primary_session = holder.as_ref().map(|h| h.session_id.clone());
+                let primary_handle = primary_session
+                    .as_deref()
+                    .and_then(|sid| handle_by_session.get(sid).cloned().flatten());
+                let is_primary = primary_session.as_deref() == Some(session_id);
+                target_views.push(json!({
+                    "plugin": plugin,
+                    "target": target,
+                    "primarySessionId": primary_session,
+                    "primaryHandle": primary_handle,
+                    "isPrimary": is_primary,
+                    "readers": readers,
+                }));
+            }
+
+            (caller_links, target_views)
         };
-        Ok(json!({ "links": links }))
+
+        Ok(json!({
+            "plugins": plugins,
+            "links": links,
+            "targets": targets,
+        }))
     }
 
     async fn tool_bridge_link(
@@ -2328,27 +2468,34 @@ impl LocalDaemonInner {
         session_id: &str,
         args: &Map<String, Value>,
     ) -> Result<Value, (String, String)> {
-        let plugin = args
-            .get("plugin")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ("invalid_request".into(), "Expected plugin".into()))?;
-        let target = args
-            .get("target")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ("invalid_request".into(), "Expected target".into()))?;
+        let (plugin, target) = parse_bridge_plugin_target(args)?;
         let link = BridgeLink {
-            plugin: plugin.to_string(),
-            target: target.to_string(),
+            plugin: plugin.clone(),
+            target: target.clone(),
             session_id: session_id.to_string(),
             linked_at: now_ms(),
             linked_by: session_id.to_string(),
         };
-        self.node
-            .db()
-            .local()
-            .add_bridge_link(&link)
-            .map_err(store_err_tuple)?;
-        Ok(json!({ "linked": true, "plugin": plugin, "target": target }))
+        let primary_session = {
+            let db = self.node.db();
+            db.local().add_bridge_link(&link).map_err(store_err_tuple)?;
+            db.local()
+                .get_plugin_target(&plugin, &target)
+                .map_err(store_err_tuple)?
+                .map(|h| h.session_id)
+        };
+        let role = if primary_session.as_deref() == Some(session_id) {
+            "primary"
+        } else {
+            "reader"
+        };
+        Ok(json!({
+            "linked": true,
+            "plugin": plugin,
+            "target": target,
+            "role": role,
+            "primarySessionId": primary_session,
+        }))
     }
 
     async fn tool_bridge_unlink(
@@ -2356,21 +2503,61 @@ impl LocalDaemonInner {
         session_id: &str,
         args: &Map<String, Value>,
     ) -> Result<Value, (String, String)> {
-        let plugin = args
-            .get("plugin")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ("invalid_request".into(), "Expected plugin".into()))?;
-        let target = args
-            .get("target")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ("invalid_request".into(), "Expected target".into()))?;
-        let removed = self
-            .node
-            .db()
-            .local()
-            .remove_bridge_link(plugin, target, Some(session_id))
-            .map_err(store_err_tuple)?;
-        Ok(json!({ "removed": removed > 0 }))
+        let (plugin, target) = parse_bridge_plugin_target(args)?;
+        let all = args.get("all").and_then(Value::as_bool) == Some(true);
+
+        let removed = {
+            let db = self.node.db();
+            let holder = db
+                .local()
+                .get_plugin_target(&plugin, &target)
+                .map_err(store_err_tuple)?;
+            if all {
+                match holder {
+                    Some(ref h) if h.session_id == session_id => {}
+                    Some(ref h) => {
+                        return Err((
+                            "not_target_holder".into(),
+                            format!(
+                                "Session '{session_id}' is not the primary holder of '{plugin}:{target}' (held by '{}')",
+                                h.session_id
+                            ),
+                        ));
+                    }
+                    None => {
+                        return Err((
+                            "not_target_holder".into(),
+                            format!(
+                                "No primary holder assigned for '{plugin}:{target}'; cannot unlink all"
+                            ),
+                        ));
+                    }
+                }
+                let count = db
+                    .local()
+                    .remove_bridge_link(&plugin, &target, None)
+                    .map_err(store_err_tuple)?;
+                let _ = db.local().remove_plugin_target(&plugin, &target);
+                count
+            } else {
+                let count = db
+                    .local()
+                    .remove_bridge_link(&plugin, &target, Some(session_id))
+                    .map_err(store_err_tuple)?;
+                if holder.as_ref().is_some_and(|h| h.session_id == session_id) {
+                    let _ = db.local().remove_plugin_target(&plugin, &target);
+                }
+                count
+            }
+        };
+
+        Ok(json!({
+            "removed": removed > 0,
+            "removedCount": removed,
+            "all": all,
+            "plugin": plugin,
+            "target": target,
+        }))
     }
 
     async fn tool_bridge_handoff(
@@ -2378,38 +2565,167 @@ impl LocalDaemonInner {
         session_id: &str,
         args: &Map<String, Value>,
     ) -> Result<Value, (String, String)> {
-        let plugin = args
-            .get("plugin")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ("invalid_request".into(), "Expected plugin".into()))?;
-        let target = args
-            .get("target")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ("invalid_request".into(), "Expected target".into()))?;
-        let target_session = if let Some(h) = args.get("handle").and_then(Value::as_str) {
-            self.node
-                .db()
+        let (plugin, target) = parse_bridge_plugin_target(args)?;
+        let now = now_ms();
+
+        let (target_session, previous_session) = {
+            let db = self.node.db();
+            let current = db
                 .local()
-                .session_by_handle(h)
-                .map_err(store_err_tuple)?
-                .ok_or_else(|| ("not_found".into(), format!("Unknown handle '{h}'")))?
-                .id
-        } else {
-            session_id.to_string()
+                .get_plugin_target(&plugin, &target)
+                .map_err(store_err_tuple)?;
+
+            if let Some(ref holder) = current {
+                if holder.session_id != session_id {
+                    return Err((
+                        "not_target_holder".into(),
+                        format!(
+                            "Session '{session_id}' is not the primary holder of '{plugin}:{target}' (held by '{}')",
+                            holder.session_id
+                        ),
+                    ));
+                }
+            }
+
+            let target_session = if let Some(raw_handle) = args
+                .get("handle")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let h = raw_handle.strip_prefix('@').unwrap_or(raw_handle);
+                let lookup = parse_address(h).map(|(_, h_part)| h_part).unwrap_or(h);
+                db.local()
+                    .session_by_handle(lookup)
+                    .map_err(store_err_tuple)?
+                    .ok_or_else(|| ("not_found".into(), format!("Unknown handle '{raw_handle}'")))?
+                    .id
+            } else {
+                session_id.to_string()
+            };
+
+            let handoff = PluginTargetHandoff {
+                plugin: plugin.clone(),
+                target: target.clone(),
+                session_id: target_session.clone(),
+                set_at: now,
+                set_by: session_id.to_string(),
+            };
+            db.local()
+                .set_plugin_target(&handoff)
+                .map_err(store_err_tuple)?;
+
+            // Ensure the new primary writer is always also linked for inbound reads.
+            let link = BridgeLink {
+                plugin: plugin.clone(),
+                target: target.clone(),
+                session_id: target_session.clone(),
+                linked_at: now,
+                linked_by: session_id.to_string(),
+            };
+            db.local().add_bridge_link(&link).map_err(store_err_tuple)?;
+
+            (target_session, current.map(|h| h.session_id))
         };
-        let handoff = PluginTargetHandoff {
-            plugin: plugin.to_string(),
-            target: target.to_string(),
-            session_id: target_session.clone(),
-            set_at: now_ms(),
-            set_by: session_id.to_string(),
-        };
-        self.node
+
+        Ok(json!({
+            "handoff": true,
+            "plugin": plugin,
+            "target": target,
+            "sessionId": target_session,
+            "previousSessionId": previous_session,
+        }))
+    }
+
+    async fn tool_plugin_post(
+        &self,
+        session_id: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value, (String, String)> {
+        let (plugin, target) = parse_bridge_plugin_target(args)?;
+        let text = args
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ("invalid_request".into(), "Expected 'text'".into()))?;
+        let handle = self.require_session_handle(session_id)?;
+        self.send_to_bridge(session_id, &handle, &plugin, &target, text, args)
+            .await
+    }
+
+    async fn send_to_bridge(
+        &self,
+        session_id: &str,
+        handle: &str,
+        raw_plugin: &str,
+        raw_target: &str,
+        text: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value, (String, String)> {
+        let plugin = raw_plugin.trim().to_ascii_lowercase();
+        let target = raw_target.trim();
+        let full_dest = format!("{plugin}:{target}");
+
+        let poster = self
+            .bridge_posters
+            .lock()
+            .expect("bridge_posters lock poisoned")
+            .get(&plugin)
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    "no_plugins".into(),
+                    format!("No local bridge plugin configured for '{full_dest}'"),
+                )
+            })?;
+
+        let holder = self
+            .node
             .db()
             .local()
-            .set_plugin_target(&handoff)
+            .get_plugin_target(&plugin, target)
             .map_err(store_err_tuple)?;
-        Ok(json!({ "handoff": true, "sessionId": target_session }))
+        match holder {
+            Some(ref h) if h.session_id == session_id => {}
+            Some(ref h) => {
+                return Err((
+                    "not_target_holder".into(),
+                    format!(
+                        "Session '{session_id}' is not the primary holder of '{full_dest}' (held by '{}')",
+                        h.session_id
+                    ),
+                ));
+            }
+            None => {
+                return Err((
+                    "not_target_holder".into(),
+                    format!(
+                        "No primary holder assigned for '{full_dest}'; claim ownership via hyp_bridge(action:'handoff')"
+                    ),
+                ));
+            }
+        }
+
+        // Enforce Stage 1 Outbound DLP BEFORE invoking any external chat bridge!
+        self.check_outbound_gate(session_id, &full_dest, "to.hyphae.bridge.v1", text)?;
+
+        let mut meta = Map::new();
+        meta.insert("sessionId".into(), json!(session_id));
+        meta.insert("handle".into(), json!(handle));
+        if let Some(reply_to) = args.get("replyTo") {
+            meta.insert("replyTo".into(), reply_to.clone());
+        }
+        if let Some(thread_ts) = args.get("threadTs") {
+            meta.insert("threadTs".into(), thread_ts.clone());
+        }
+
+        let response = poster.post(&plugin, target, text, &meta).await?;
+        Ok(json!({
+            "delivered": true,
+            "plugin": plugin,
+            "target": target,
+            "to": full_dest,
+            "response": response,
+        }))
     }
 
     fn require_session_handle(&self, session_id: &str) -> Result<String, (String, String)> {
@@ -2762,7 +3078,7 @@ async fn handle_connection<R, W>(
                             let resp = json!({
                                 "id": req_id,
                                 "result": {
-                                    "hasPlugins": daemon.config.enable_plugins,
+                                    "hasPlugins": daemon.has_plugins_capability(),
                                     "hasKv": daemon.has_kv_capability(),
                                 }
                             });
@@ -3204,6 +3520,40 @@ fn parse_inbox_filter_arg(raw: Option<&Value>) -> Result<InboxFilter, (String, S
         kind,
         ce_filters,
     })
+}
+
+fn parse_bridge_plugin_target(
+    args: &Map<String, Value>,
+) -> Result<(String, String), (String, String)> {
+    let plugin_opt = args
+        .get("plugin")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let target_raw = args
+        .get("target")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ("invalid_request".into(), "Expected target".into()))?;
+
+    let (plugin, target) = if let Some(p) = plugin_opt {
+        (p.to_ascii_lowercase(), target_raw.to_string())
+    } else if let Some((p, t)) = target_raw.split_once(':') {
+        let p_trim = p.trim().to_ascii_lowercase();
+        let t_trim = t.trim();
+        if p_trim.is_empty() || t_trim.is_empty() {
+            return Err((
+                "invalid_request".into(),
+                "Expected valid plugin and target".into(),
+            ));
+        }
+        (p_trim, t_trim.to_string())
+    } else {
+        return Err(("invalid_request".into(), "Expected plugin".into()));
+    };
+
+    Ok((plugin, target))
 }
 
 fn node_err_tuple(err: hyp_node::engine::NodeError) -> (String, String) {
