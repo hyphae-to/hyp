@@ -2339,7 +2339,7 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
 .gate-tabs {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 5px;
 }
 
 .gate-tab {
@@ -2347,8 +2347,8 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   background: rgba(255, 255, 255, 0.04);
   color: #ccc7ba;
   font-family: var(--mono);
-  font-size: 0.71rem;
-  padding: 5px 11px;
+  font-size: 0.7rem;
+  padding: 5px 10px;
   border-radius: 999px;
   cursor: pointer;
   transition: all 0.16s ease;
@@ -2561,7 +2561,7 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
 .gate-src {
   position: absolute;
   left: 14px;
-  width: 278px;
+  width: 288px;
   height: 46px;
   transform: translateY(-50%);
   display: flex;
@@ -2674,26 +2674,31 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   color: var(--chartreuse);
 }
 
-.gate-src.state-blocked .gs-badge {
+.gate-src.state-blocked .gs-badge,
+.gm-mob-row.state-blocked .gs-badge {
   background: rgba(232, 163, 49, 0.16);
   border-color: rgba(232, 163, 49, 0.55);
   color: var(--amber);
 }
 
-.gate-src.state-muted .gs-badge {
+.gate-src.state-muted .gs-badge,
+.gm-mob-row.state-muted .gs-badge {
   background: rgba(221, 81, 53, 0.18);
   border-color: rgba(221, 81, 53, 0.58);
   color: #ff9c87;
 }
 
-.gate-src.state-batched .gs-badge {
+.gate-src.state-batched .gs-badge,
+.gm-mob-row.state-batched .gs-badge {
   background: rgba(232, 163, 49, 0.16);
   border-color: rgba(232, 163, 49, 0.48);
   color: #f0be63;
 }
 
 .gate-src.state-detached .gs-badge,
-.gate-src.state-idle .gs-badge {
+.gate-src.state-idle .gs-badge,
+.gm-mob-row.state-detached .gs-badge,
+.gm-mob-row.state-idle .gs-badge {
   background: rgba(244, 241, 232, 0.06);
   border-color: rgba(244, 241, 232, 0.18);
   color: #9e9a8d;
@@ -2730,9 +2735,10 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   box-shadow: 0 0 34px rgba(232, 163, 49, 0.22);
 }
 
+.gate-valve-ring.mode-guard,
 .gate-valve-ring.mode-mute {
-  border-color: rgba(221, 81, 53, 0.5);
-  box-shadow: 0 0 34px rgba(221, 81, 53, 0.18);
+  border-color: rgba(221, 81, 53, 0.54);
+  box-shadow: 0 0 36px rgba(221, 81, 53, 0.22);
 }
 
 .gate-valve-ring.mode-digest {

@@ -1138,6 +1138,7 @@ resetStoryTimer();
       ruleCls: "amber",
       deflectText: "3 simultaneous arrivals → 1 batch",
       delivered: "1 batched wake",
+      blockedLabel: "Merged",
       blocked: "3 merged → 1",
       blockedCls: "amber",
       saved: "89%",
@@ -1168,12 +1169,52 @@ resetStoryTimer();
         { path: "g-in-2", cls: "blocked", label: "CI flake #7", phase: 0.24, dur: 1700, startT: 0.14, endT: 0.67, deflect: "amber", dropTag: "✕ dropped · 0 tokens" },
       ],
     },
+    guard: {
+      cmd: "hyp gate init --adapter anthropic|openai|plugin",
+      ruleText: "Guard plugin · injection shield",
+      ruleCls: "coral",
+      deflectText: "✕ 1 prompt injection quarantined",
+      delivered: "2 clean (1 batch)",
+      blockedLabel: "Quarantined",
+      blocked: "1 injection · 0 leaked",
+      blockedCls: "coral",
+      savedLabel: "Prompt safety",
+      saved: "100%",
+      barPct: 100,
+      foot: "Anthropic · OpenAI · Llama Guard · BYO",
+      src1Sub: 'comment · "ignore prev…"',
+      caption:
+        "Run pluggable <strong>prompt-injection guard &amp; filter plugins</strong> on your Local Node — out-of-the-box <code>Anthropic</code> / <code>OpenAI-compatible</code> adapters (Keychain token + sane default prompt), <code>Llama Prompt Guard 2</code> / <code>Lakera</code>, or your own custom filter — quarantining attacks before they ever touch your agent.",
+      sources: [
+        { state: "pass", badge: "clean" },
+        { state: "muted", badge: "quarantined" },
+        { state: "idle", badge: "quiet" },
+        { state: "idle", badge: "quiet" },
+        { state: "pass", badge: "-> disk" },
+      ],
+      strands: {
+        "g-in-0": "active",
+        "g-in-1": "blocked",
+        "g-in-2": "dim",
+        "g-in-3": "dim",
+        "g-in-4": "active",
+        "g-out": "active",
+      },
+      packets: [
+        { path: "g-in-1", cls: "coral", label: "PR #412: ignore prev…", phase: 0.14, dur: 1800, startT: 0.14, endT: 0.66, deflect: "coral", dropTag: "✕ quarantined · guard plugin" },
+        { path: "g-in-1", cls: "coral", label: "prompt inject ⚠", phase: 0.6, dur: 1750, startT: 0.14, endT: 0.66, deflect: "coral", dropTag: "✕ quarantined · guard plugin" },
+        { path: "g-in-0", cls: "", label: "DM @alice", phase: 0.03, dur: 1200, startT: 0.14, endT: 0.78, rippleNode: "green" },
+        { path: "g-in-4", cls: "moss", label: "🔒 diff.patch", phase: 0.03, dur: 1200, startT: 0.14, endT: 0.74 },
+        { path: "g-out", cls: "", label: "DM @alice + diff.patch", phase: 0.38, dur: 1880, startT: 0.32, endT: 0.78, rippleAgent: true },
+      ],
+    },
     mute: {
       cmd: 'hyp_inbox({ mute: "#deploys", ttl: "2h" })',
       ruleText: "Muted: #deploys (local)",
       ruleCls: "coral",
       deflectText: "✕ #deploys deflected at shield",
       delivered: "1 batch (2)",
+      blockedLabel: "Dropped",
       blocked: "#deploys muted",
       blockedCls: "coral",
       saved: "96%",
@@ -1206,17 +1247,18 @@ resetStoryTimer();
     },
     digest: {
       cmd: 'hyp_inbox({ mode: "notify" })',
-      ruleText: "Digest-only · SQLite batch",
+      ruleText: "Digest-only · local queue",
       ruleCls: "amber",
       deflectText: "4 bursts → 1 calm digest line",
       delivered: "1 digest line",
+      blockedLabel: "Queued",
       blocked: "4 buffered locally",
       blockedCls: "amber",
       saved: "91%",
       barPct: 91,
-      foot: "Full msgs wait in local SQLite",
+      foot: "Full msgs wait in local inbox",
       caption:
-        "Switch to <code>notify</code> (digest-only) mode during deep focus — your <strong>Local Node</strong> buffers bursts in SQLite and sends your agent one calm <code>1-line digest</code> instead of flooding prompts.",
+        "Switch to <code>notify</code> (digest-only) mode during deep focus — your <strong>Local Node</strong> queues bursts locally and sends your agent one calm <code>1-line digest</code> instead of flooding prompts.",
       sources: [
         { state: "batched", badge: "batched" },
         { state: "batched", badge: "batched" },
@@ -1236,7 +1278,7 @@ resetStoryTimer();
         { path: "g-in-0", cls: "", label: "DM @alice", phase: 0.03, dur: 1260, startT: 0.14, endT: 0.78, rippleNode: "amber" },
         { path: "g-in-1", cls: "amber", label: "PR #412", phase: 0.09, dur: 1260, startT: 0.14, endT: 0.78 },
         { path: "g-in-2", cls: "amber", label: "CI flake", phase: 0.15, dur: 1260, startT: 0.14, endT: 0.76 },
-        { path: "g-in-3", cls: "moss", label: "#deploys", phase: 0.21, dur: 1260, startT: 0.14, endT: 0.74, mergeTag: "SQLite digest (4)" },
+        { path: "g-in-3", cls: "moss", label: "#deploys", phase: 0.21, dur: 1260, startT: 0.14, endT: 0.74, mergeTag: "4 queued · 1-line digest" },
         { path: "g-out", cls: "", label: "digest: 4 unread (1 line)", phase: 0.42, dur: 1900, startT: 0.34, endT: 0.78, rippleAgent: true },
       ],
     },
@@ -1348,7 +1390,7 @@ resetStoryTimer();
     gateBundles.set(path.id, g);
   });
 
-  const MODE_ORDER = ["filter", "coalesce", "mute", "digest", "unsub"];
+  const MODE_ORDER = ["filter", "coalesce", "guard", "mute", "digest", "unsub"];
   const params = new URLSearchParams(window.location.search);
   const urlGate = params.get("gate");
   const urlPhaseRaw = params.get("t");
@@ -1383,6 +1425,7 @@ resetStoryTimer();
       <div class="gm-mob-list">
         ${GATE_SOURCES.map((src, i) => {
           const st = mode.sources[i];
+          const subText = i === 1 && mode.src1Sub ? mode.src1Sub : src.sub;
           const iconHtml = src.thumb
             ? `<span class="gs-node-thumb"><img src="${esc(src.thumb)}" alt="" /></span>`
             : `<span class="gs-dot"></span>`;
@@ -1392,7 +1435,7 @@ resetStoryTimer();
                 ${iconHtml}
                 <div>
                   <strong>${esc(src.name)}</strong>
-                  <small>${esc(src.sub)}</small>
+                  <small>${esc(subText)}</small>
                 </div>
               </div>
               <span class="gs-badge">${esc(st.badge)}</span>
@@ -1412,7 +1455,7 @@ resetStoryTimer();
         <div class="gm-mob-node-body">
           <strong>Your Local Node (Connector)</strong>
           <span>${esc(mode.ruleText)}</span>
-          <small>${esc(mode.deflectText)} · localhost SQLite WAL</small>
+          <small>${esc(mode.deflectText)} · localhost · filter plugins</small>
         </div>
       </div>
       <div class="gm-mob-stem" aria-hidden="true">
@@ -1429,9 +1472,9 @@ resetStoryTimer();
           </div>
         </div>
         <div class="gm-row"><span>Delivered</span><strong>${esc(mode.delivered)}</strong></div>
-        <div class="gm-row"><span>Dropped / Gate</span><strong class="${esc(mode.blockedCls)}">${esc(mode.blocked)}</strong></div>
+        <div class="gm-row"><span>${esc(mode.blockedLabel || "Dropped")}</span><strong class="${esc(mode.blockedCls)}">${esc(mode.blocked)}</strong></div>
         <div class="gm-bar-wrap">
-          <div class="gm-bar-head"><span>Context saved</span><strong>${esc(mode.saved)}</strong></div>
+          <div class="gm-bar-head"><span>${esc(mode.savedLabel || "Context saved")}</span><strong>${esc(mode.saved)}</strong></div>
           <div class="gm-bar"><span style="width:${mode.barPct}%"></span></div>
         </div>
       </div>
@@ -1628,18 +1671,24 @@ resetStoryTimer();
     if (capEl) capEl.innerHTML = mode.caption;
 
     const gmDel = document.getElementById("gmDelivered");
+    const gmBlkLbl = document.getElementById("gmBlockedLabel");
     const gmBlk = document.getElementById("gmBlocked");
+    const gmSavLbl = document.getElementById("gmSavedLabel");
     const gmSav = document.getElementById("gmSaved");
     const gmBar = document.getElementById("gmBarFill");
     const gmFt = document.getElementById("gmFoot");
+    const gsSub1 = document.getElementById("gsSub1");
     if (gmDel) gmDel.textContent = mode.delivered;
+    if (gmBlkLbl) gmBlkLbl.textContent = mode.blockedLabel || "Dropped";
     if (gmBlk) {
       gmBlk.textContent = mode.blocked;
       gmBlk.className = mode.blockedCls || "";
     }
+    if (gmSavLbl) gmSavLbl.textContent = mode.savedLabel || "Context saved";
     if (gmSav) gmSav.textContent = mode.saved;
     if (gmBar) gmBar.style.width = `${mode.barPct}%`;
     if (gmFt) gmFt.textContent = mode.foot;
+    if (gsSub1) gsSub1.textContent = mode.src1Sub || GATE_SOURCES[1].sub;
 
     document.querySelectorAll("#gateSources .gate-src").forEach((el, idx) => {
       const st = mode.sources[idx];
