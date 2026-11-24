@@ -4699,7 +4699,8 @@ mod tests {
 
     #[test]
     fn embedded_skill_matches_frontmatter_and_security_invariants() {
-        assert!(HYPHAE_SETUP_SKILL_MD.starts_with("---\nname: hyphae-setup\n"));
+        let normalized = HYPHAE_SETUP_SKILL_MD.replace("\r\n", "\n");
+        assert!(normalized.starts_with("---\nname: hyphae-setup\n"));
         assert!(!HYPHAE_SETUP_SKILL_MD.contains("hyp share"));
         assert!(!HYPHAE_SETUP_SKILL_MD.contains("hyp connect"));
         assert!(!HYPHAE_SETUP_SKILL_MD.contains("npm install"));

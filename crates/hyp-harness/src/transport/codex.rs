@@ -170,26 +170,37 @@ impl CodexQueueTransport {
             return PushOutcome::hold(REASON_BINARY_MISSING);
         }
 
-        let mut cmd = Command::new(&self.target.bin);
-        cmd.args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        let mut child = {
+            let mut attempts = 0u32;
+            loop {
+                let mut cmd = Command::new(&self.target.bin);
+                cmd.args(&args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true);
 
-        if let Some(ref codex_home) = self.target.codex_home {
-            if !codex_home.as_os_str().is_empty() {
-                cmd.env("CODEX_HOME", codex_home);
-            }
-        }
+                if let Some(ref codex_home) = self.target.codex_home {
+                    if !codex_home.as_os_str().is_empty() {
+                        cmd.env("CODEX_HOME", codex_home);
+                    }
+                }
 
-        let mut child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return PushOutcome::hold(REASON_BINARY_MISSING);
-            }
-            Err(_) => {
-                return PushOutcome::reject(REASON_QUEUE_OUTCOME_UNKNOWN);
+                match cmd.spawn() {
+                    Ok(child) => break child,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        return PushOutcome::hold(REASON_BINARY_MISSING);
+                    }
+                    Err(err)
+                        if err.kind() == io::ErrorKind::ExecutableFileBusy && attempts < 5 =>
+                    {
+                        attempts += 1;
+                        tokio::time::sleep(Duration::from_millis(10 * u64::from(attempts))).await;
+                    }
+                    Err(_) => {
+                        return PushOutcome::reject(REASON_QUEUE_OUTCOME_UNKNOWN);
+                    }
+                }
             }
         };
 

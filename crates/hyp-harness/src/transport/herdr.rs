@@ -486,19 +486,31 @@ impl CommandRunner for ProcessRunner {
         timeout: Duration,
     ) -> TransportFuture<'a, CommandOutcome> {
         Box::pin(async move {
-            let mut cmd = Command::new(bin);
-            cmd.args(args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
-
-            let mut child = match cmd.spawn() {
-                Ok(child) => child,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    return CommandOutcome::MissingBinary;
+            let mut child = {
+                let mut attempts = 0u32;
+                loop {
+                    let mut cmd = Command::new(bin);
+                    cmd.args(args)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .kill_on_drop(true);
+                    match cmd.spawn() {
+                        Ok(child) => break child,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                            return CommandOutcome::MissingBinary;
+                        }
+                        Err(err)
+                            if err.kind() == std::io::ErrorKind::ExecutableFileBusy
+                                && attempts < 5 =>
+                        {
+                            attempts += 1;
+                            tokio::time::sleep(Duration::from_millis(10 * u64::from(attempts)))
+                                .await;
+                        }
+                        Err(_) => return CommandOutcome::IoError,
+                    }
                 }
-                Err(_) => return CommandOutcome::IoError,
             };
 
             let stdout = child.stdout.take();
