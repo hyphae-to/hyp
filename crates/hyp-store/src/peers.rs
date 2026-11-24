@@ -1,0 +1,888 @@
+//! Federation, pairing, keys & manifest trust store (`peers`, `grants`, `revocations`,
+//! `peer_keys`, `directory_checkpoints`) with strict monotonic `manifest_version` anti-rollback,
+//! E2EE capability anti-downgrade ratcheting, single-use pairing grant claims, and directory
+//! checkpoint anti-rollback protection.
+
+use std::collections::BTreeSet;
+
+use rusqlite::{OptionalExtension, params};
+use serde::{Deserialize, Serialize};
+
+use crate::db::NodeDb;
+use crate::error::{StoreError, StoreResult};
+use crate::types::{
+    GrantDirection, KeyStatus, KeyUse, PeerProfile, PeerStatus, TrustTier, is_node_id,
+};
+
+/// Input to register or update a paired peer node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerInput {
+    pub peer_id: String,
+    pub endpoint: Option<String>,
+    pub profile: PeerProfile,
+    pub trust_tier: TrustTier,
+    pub status: PeerStatus,
+    pub scopes: Vec<String>,
+    /// Keychain / secret reference name (never plaintext secrets).
+    pub auth_credential_ref: Option<String>,
+}
+
+/// Persisted paired peer record including verified manifest cache & E2EE downgrade ratchet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerRecord {
+    pub peer_id: String,
+    pub endpoint: Option<String>,
+    pub profile: PeerProfile,
+    pub trust_tier: TrustTier,
+    pub status: PeerStatus,
+    pub scopes: Vec<String>,
+    pub auth_credential_ref: Option<String>,
+    pub manifest_json: Option<String>,
+    pub manifest_version: i64,
+    pub manifest_etag: Option<String>,
+    pub manifest_fetched_at: Option<i64>,
+    pub observed_e2ee_caps: Vec<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Update applied to a peer's verified signed capability manifest cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestCacheUpdate {
+    pub manifest_version: i64,
+    pub manifest_json: String,
+    pub etag: Option<String>,
+    /// All capability tokens advertised in the verified manifest.
+    pub capabilities: Vec<String>,
+    /// Explicit operator override (`hyp peer trust --accept-downgrade <peer>`) permitting
+    /// previously observed E2EE capability tokens to disappear.
+    pub accept_downgrade: bool,
+}
+
+/// Input to store a signed pairing grant (`am2_` / `hp2p1_` / legacy `t3mp1_`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantInput {
+    pub id: String,
+    pub peer_id: String,
+    pub direction: GrantDirection,
+    pub signed_json: String,
+    pub scopes: Vec<String>,
+    pub trust_tier: TrustTier,
+    pub issued_at: i64,
+    pub pair_by: Option<i64>,
+    pub expires_at: Option<i64>,
+}
+
+/// Persisted grant record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantRecord {
+    pub id: String,
+    pub peer_id: String,
+    pub direction: GrantDirection,
+    pub signed_json: String,
+    pub scopes: Vec<String>,
+    pub trust_tier: TrustTier,
+    pub issued_at: i64,
+    pub pair_by: Option<i64>,
+    pub expires_at: Option<i64>,
+    pub entry_json: Option<String>,
+    pub paired_at: Option<i64>,
+}
+
+/// Input to record a signed grant revocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevocationInput {
+    pub grant_id: String,
+    pub peer_id: String,
+    pub signed_json: String,
+}
+
+/// Persisted revocation record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevocationRecord {
+    pub grant_id: String,
+    pub peer_id: String,
+    pub signed_json: String,
+    pub revoked_at: i64,
+}
+
+/// Input to store a peer's RFC 7517 OKP JWK keyed by `(peer_id, kid)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerKeyInput {
+    pub peer_id: String,
+    pub kid: String,
+    pub key_use: KeyUse,
+    pub jwk_json: String,
+    pub status: KeyStatus,
+    pub expires_at: Option<i64>,
+}
+
+/// Persisted peer JWK record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerKeyRecord {
+    pub peer_id: String,
+    pub kid: String,
+    pub key_use: KeyUse,
+    pub jwk_json: String,
+    pub status: KeyStatus,
+    pub registered_at: i64,
+    pub expires_at: Option<i64>,
+}
+
+/// Input to record an admin-signed directory anti-rollback checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryCheckpointInput {
+    pub authority_id: String,
+    pub version: i64,
+    pub root_hash: String,
+    pub signed_json: String,
+    pub issued_at: i64,
+}
+
+/// Persisted directory checkpoint record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryCheckpoint {
+    pub authority_id: String,
+    pub version: i64,
+    pub root_hash: String,
+    pub signed_json: String,
+    pub issued_at: i64,
+    pub recorded_at: i64,
+}
+
+/// Federation, pairing & manifest trust store view borrowed from [`NodeDb`].
+pub struct PeerStore<'a> {
+    db: &'a NodeDb,
+}
+
+impl<'a> PeerStore<'a> {
+    pub(crate) fn new(db: &'a NodeDb) -> Self {
+        Self { db }
+    }
+
+    // ---- Peers & Manifest Cache ----
+
+    /// Registers or updates a paired peer record (preserving existing manifest cache & E2EE ratchet).
+    pub fn upsert_peer(&self, input: &PeerInput, now_ms: i64) -> StoreResult<PeerRecord> {
+        if !is_node_id(&input.peer_id) || input.peer_id == "local" {
+            return Err(StoreError::InvalidInput(format!(
+                "invalid peer_id '{}' ('local' is reserved)",
+                input.peer_id
+            )));
+        }
+        let scopes_json = serde_json::to_string(&input.scopes)?;
+        let tx = self.db.immediate_tx()?;
+        tx.conn().execute(
+            "INSERT INTO peers
+             (peer_id, endpoint, profile, trust_tier, status, scopes_json, auth_credential_ref,
+              created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+             ON CONFLICT(peer_id) DO UPDATE SET
+               endpoint = excluded.endpoint,
+               profile = excluded.profile,
+               trust_tier = excluded.trust_tier,
+               status = excluded.status,
+               scopes_json = excluded.scopes_json,
+               auth_credential_ref = excluded.auth_credential_ref,
+               updated_at = excluded.updated_at",
+            params![
+                &input.peer_id,
+                input.endpoint.as_deref(),
+                input.profile.as_str(),
+                input.trust_tier.as_str(),
+                input.status.as_str(),
+                &scopes_json,
+                input.auth_credential_ref.as_deref(),
+                now_ms
+            ],
+        )?;
+        let record = tx.conn().query_row(
+            "SELECT * FROM peers WHERE peer_id = ?1",
+            params![&input.peer_id],
+            decode_peer_row,
+        )??;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn get_peer(&self, peer_id: &str) -> StoreResult<Option<PeerRecord>> {
+        self.db
+            .conn()
+            .query_row(
+                "SELECT * FROM peers WHERE peer_id = ?1",
+                params![peer_id],
+                decode_peer_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    pub fn list_peers(&self, status: Option<PeerStatus>) -> StoreResult<Vec<PeerRecord>> {
+        if let Some(st) = status {
+            let mut stmt = self
+                .db
+                .conn()
+                .prepare("SELECT * FROM peers WHERE status = ?1 ORDER BY peer_id ASC")?;
+            let rows = stmt
+                .query_map(params![st.as_str()], decode_peer_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter().collect()
+        } else {
+            let mut stmt = self
+                .db
+                .conn()
+                .prepare("SELECT * FROM peers ORDER BY peer_id ASC")?;
+            let rows = stmt
+                .query_map([], decode_peer_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter().collect()
+        }
+    }
+
+    pub fn set_peer_status(
+        &self,
+        peer_id: &str,
+        status: PeerStatus,
+        now_ms: i64,
+    ) -> StoreResult<bool> {
+        let changed = self.db.conn().execute(
+            "UPDATE peers SET status = ?1, updated_at = ?2 WHERE peer_id = ?3",
+            params![status.as_str(), now_ms, peer_id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn delete_peer(&self, peer_id: &str) -> StoreResult<bool> {
+        let changed = self
+            .db
+            .conn()
+            .execute("DELETE FROM peers WHERE peer_id = ?1", params![peer_id])?;
+        Ok(changed > 0)
+    }
+
+    /// Caches a verified signed Node Capability Manifest for `peer_id`.
+    ///
+    /// **Fail-closed security invariants:**
+    /// 1. **Monotonic `manifest_version` anti-rollback:** Rejects any `manifest_version < current`
+    ///    and rejects equivocation (`manifest_version == current` with differing `manifest_json`)
+    ///    with [`StoreError::ManifestRollback`].
+    /// 2. **E2EE capability anti-downgrade:** Any previously observed `.e2ee.` capability token
+    ///    (e.g. `dm.e2ee.v1`, `channel.e2ee.v1`, `kv.e2ee.v1`, `events.e2ee.v1`) disappearing from
+    ///    `capabilities` fails closed with [`StoreError::CapabilityDowngrade`] unless
+    ///    `update.accept_downgrade == true`.
+    pub fn cache_manifest(
+        &self,
+        peer_id: &str,
+        update: &ManifestCacheUpdate,
+        now_ms: i64,
+    ) -> StoreResult<PeerRecord> {
+        if update.manifest_version <= 0 {
+            return Err(StoreError::InvalidInput(
+                "manifest_version must be positive".to_string(),
+            ));
+        }
+
+        let tx = self.db.immediate_tx()?;
+        let current: PeerRecord = tx
+            .conn()
+            .query_row(
+                "SELECT * FROM peers WHERE peer_id = ?1",
+                params![peer_id],
+                decode_peer_row,
+            )
+            .optional()?
+            .transpose()?
+            .ok_or_else(|| StoreError::NotFound(format!("peer '{peer_id}' not found")))?;
+
+        // 1. Monotonic anti-rollback & same-version equivocation guard.
+        if update.manifest_version < current.manifest_version {
+            return Err(StoreError::ManifestRollback {
+                peer_id: peer_id.to_string(),
+                expected_min: current.manifest_version,
+                received: update.manifest_version,
+            });
+        }
+        if update.manifest_version == current.manifest_version {
+            if let Some(prev_json) = &current.manifest_json {
+                if prev_json != &update.manifest_json {
+                    return Err(StoreError::ManifestRollback {
+                        peer_id: peer_id.to_string(),
+                        expected_min: current.manifest_version + 1,
+                        received: update.manifest_version,
+                    });
+                }
+            }
+        }
+
+        // 2. E2EE capability anti-downgrade check & forward ratchet.
+        let prev_e2ee: BTreeSet<String> = current.observed_e2ee_caps.iter().cloned().collect();
+        let new_e2ee: BTreeSet<String> = update
+            .capabilities
+            .iter()
+            .filter(|cap| is_e2ee_capability(cap))
+            .cloned()
+            .collect();
+
+        let missing: Vec<String> = prev_e2ee.difference(&new_e2ee).cloned().collect();
+        if !missing.is_empty() && !update.accept_downgrade {
+            return Err(StoreError::CapabilityDowngrade {
+                peer_id: peer_id.to_string(),
+                missing_capabilities: missing,
+            });
+        }
+
+        let next_e2ee: Vec<String> = if update.accept_downgrade {
+            new_e2ee.into_iter().collect()
+        } else {
+            prev_e2ee.union(&new_e2ee).cloned().collect()
+        };
+        let next_e2ee_json = serde_json::to_string(&next_e2ee)?;
+
+        tx.conn().execute(
+            "UPDATE peers
+             SET manifest_json = ?1,
+                 manifest_version = ?2,
+                 manifest_etag = ?3,
+                 manifest_fetched_at = ?4,
+                 observed_e2ee_caps_json = ?5,
+                 updated_at = ?4
+             WHERE peer_id = ?6",
+            params![
+                &update.manifest_json,
+                update.manifest_version,
+                update.etag.as_deref(),
+                now_ms,
+                &next_e2ee_json,
+                peer_id
+            ],
+        )?;
+
+        let updated = tx.conn().query_row(
+            "SELECT * FROM peers WHERE peer_id = ?1",
+            params![peer_id],
+            decode_peer_row,
+        )??;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    // ---- Grants ----
+
+    /// Stores a signed pairing grant (idempotent for identical `signed_json`, fails closed on
+    /// conflicting content or already-expired `pair_by`).
+    pub fn add_grant(&self, input: &GrantInput, now_ms: i64) -> StoreResult<GrantRecord> {
+        if input.id.is_empty() {
+            return Err(StoreError::InvalidInput("grant id must be non-empty".to_string()));
+        }
+        if !is_node_id(&input.peer_id) {
+            return Err(StoreError::InvalidInput(format!(
+                "invalid peer_id '{}'",
+                input.peer_id
+            )));
+        }
+        let scopes_json = serde_json::to_string(&input.scopes)?;
+
+        let tx = self.db.immediate_tx()?;
+        let existing: Option<GrantRecord> = tx
+            .conn()
+            .query_row(
+                "SELECT * FROM grants WHERE id = ?1",
+                params![&input.id],
+                decode_grant_row,
+            )
+            .optional()?
+            .transpose()?;
+        if let Some(prev) = existing {
+            if prev.signed_json == input.signed_json {
+                tx.commit()?;
+                return Ok(prev);
+            }
+            return Err(StoreError::IdConflict(format!(
+                "grant '{}' already exists with different content",
+                input.id
+            )));
+        }
+
+        if let Some(pair_by) = input.pair_by {
+            if pair_by <= now_ms {
+                return Err(StoreError::Expired(format!(
+                    "grant '{}' pairing window has already ended",
+                    input.id
+                )));
+            }
+        }
+
+        tx.conn().execute(
+            "INSERT INTO grants
+             (id, peer_id, direction, signed_json, scopes_json, trust_tier, issued_at, pair_by, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                &input.id,
+                &input.peer_id,
+                input.direction.as_str(),
+                &input.signed_json,
+                &scopes_json,
+                input.trust_tier.as_str(),
+                input.issued_at,
+                input.pair_by,
+                input.expires_at
+            ],
+        )?;
+        let saved = tx.conn().query_row(
+            "SELECT * FROM grants WHERE id = ?1",
+            params![&input.id],
+            decode_grant_row,
+        )??;
+        tx.commit()?;
+        Ok(saved)
+    }
+
+    pub fn get_grant(&self, id: &str) -> StoreResult<Option<GrantRecord>> {
+        self.db
+            .conn()
+            .query_row("SELECT * FROM grants WHERE id = ?1", params![id], decode_grant_row)
+            .optional()?
+            .transpose()
+    }
+
+    pub fn list_grants(&self, peer_id: Option<&str>) -> StoreResult<Vec<GrantRecord>> {
+        if let Some(pid) = peer_id {
+            let mut stmt = self.db.conn().prepare(
+                "SELECT * FROM grants WHERE peer_id = ?1 ORDER BY issued_at ASC, id ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![pid], decode_grant_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter().collect()
+        } else {
+            let mut stmt = self
+                .db
+                .conn()
+                .prepare("SELECT * FROM grants ORDER BY issued_at ASC, id ASC")?;
+            let rows = stmt
+                .query_map([], decode_grant_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter().collect()
+        }
+    }
+
+    /// Atomically claims a single-use pairing grant inside `BEGIN IMMEDIATE` so two concurrent
+    /// pairing attempts racing for the same grant cannot both succeed.
+    pub fn claim_grant(
+        &self,
+        id: &str,
+        entry_json: &str,
+        now_ms: i64,
+    ) -> StoreResult<GrantRecord> {
+        let tx = self.db.immediate_tx()?;
+        let grant: GrantRecord = tx
+            .conn()
+            .query_row("SELECT * FROM grants WHERE id = ?1", params![id], decode_grant_row)
+            .optional()?
+            .transpose()?
+            .ok_or_else(|| StoreError::NotFound(format!("grant '{id}' not found")))?;
+
+        if grant.entry_json.is_some() {
+            return Err(StoreError::AlreadyPaired(format!(
+                "grant '{id}' has already been used"
+            )));
+        }
+        if let Some(pair_by) = grant.pair_by {
+            if pair_by <= now_ms {
+                return Err(StoreError::Expired(format!(
+                    "grant '{id}' pairing window has ended"
+                )));
+            }
+        }
+        let changed = tx.conn().execute(
+            "UPDATE grants SET entry_json = ?1, paired_at = ?2 WHERE id = ?3 AND entry_json IS NULL",
+            params![entry_json, now_ms, id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::AlreadyPaired(format!(
+                "grant '{id}' has already been used"
+            )));
+        }
+        let updated = tx.conn().query_row(
+            "SELECT * FROM grants WHERE id = ?1",
+            params![id],
+            decode_grant_row,
+        )??;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    // ---- Revocations ----
+
+    pub fn add_revocation(
+        &self,
+        input: &RevocationInput,
+        now_ms: i64,
+    ) -> StoreResult<RevocationRecord> {
+        if input.grant_id.is_empty() || !is_node_id(&input.peer_id) {
+            return Err(StoreError::InvalidInput(
+                "invalid revocation grant_id or peer_id".to_string(),
+            ));
+        }
+        let tx = self.db.immediate_tx()?;
+        tx.conn().execute(
+            "INSERT OR IGNORE INTO revocations (grant_id, peer_id, signed_json, revoked_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![&input.grant_id, &input.peer_id, &input.signed_json, now_ms],
+        )?;
+        let rec = tx.conn().query_row(
+            "SELECT grant_id, peer_id, signed_json, revoked_at FROM revocations WHERE grant_id = ?1",
+            params![&input.grant_id],
+            decode_revocation_row,
+        )?;
+        tx.commit()?;
+        Ok(rec)
+    }
+
+    pub fn is_grant_revoked(&self, grant_id: &str) -> StoreResult<bool> {
+        let found: Option<i64> = self
+            .db
+            .conn()
+            .query_row(
+                "SELECT 1 FROM revocations WHERE grant_id = ?1",
+                params![grant_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    pub fn list_revocations(&self, peer_id: Option<&str>) -> StoreResult<Vec<RevocationRecord>> {
+        if let Some(pid) = peer_id {
+            let mut stmt = self.db.conn().prepare(
+                "SELECT grant_id, peer_id, signed_json, revoked_at FROM revocations
+                 WHERE peer_id = ?1 ORDER BY revoked_at ASC, grant_id ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![pid], decode_revocation_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        } else {
+            let mut stmt = self.db.conn().prepare(
+                "SELECT grant_id, peer_id, signed_json, revoked_at FROM revocations
+                 ORDER BY revoked_at ASC, grant_id ASC",
+            )?;
+            let rows = stmt
+                .query_map([], decode_revocation_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        }
+    }
+
+    // ---- Peer Keys (RFC 7517 OKP JWKs + RFC 7638 kid) ----
+
+    pub fn upsert_peer_key(
+        &self,
+        input: &PeerKeyInput,
+        now_ms: i64,
+    ) -> StoreResult<PeerKeyRecord> {
+        if !is_node_id(&input.peer_id) || input.kid.is_empty() {
+            return Err(StoreError::InvalidInput(
+                "invalid peer_id or kid".to_string(),
+            ));
+        }
+        let tx = self.db.immediate_tx()?;
+        tx.conn().execute(
+            "INSERT INTO peer_keys
+             (peer_id, kid, key_use, jwk_json, status, registered_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(peer_id, kid) DO UPDATE SET
+               key_use = excluded.key_use,
+               jwk_json = excluded.jwk_json,
+               status = excluded.status,
+               expires_at = excluded.expires_at",
+            params![
+                &input.peer_id,
+                &input.kid,
+                input.key_use.as_str(),
+                &input.jwk_json,
+                input.status.as_str(),
+                now_ms,
+                input.expires_at
+            ],
+        )?;
+        let rec = tx.conn().query_row(
+            "SELECT * FROM peer_keys WHERE peer_id = ?1 AND kid = ?2",
+            params![&input.peer_id, &input.kid],
+            decode_peer_key_row,
+        )??;
+        tx.commit()?;
+        Ok(rec)
+    }
+
+    pub fn get_peer_key(&self, peer_id: &str, kid: &str) -> StoreResult<Option<PeerKeyRecord>> {
+        self.db
+            .conn()
+            .query_row(
+                "SELECT * FROM peer_keys WHERE peer_id = ?1 AND kid = ?2",
+                params![peer_id, kid],
+                decode_peer_key_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    pub fn list_peer_keys(
+        &self,
+        peer_id: &str,
+        key_use: Option<KeyUse>,
+        active_only: bool,
+    ) -> StoreResult<Vec<PeerKeyRecord>> {
+        let mut stmt = self.db.conn().prepare(
+            "SELECT * FROM peer_keys WHERE peer_id = ?1 ORDER BY registered_at ASC, kid ASC",
+        )?;
+        let all = stmt
+            .query_map(params![peer_id], decode_peer_key_row)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect::<StoreResult<Vec<_>>>()?;
+        Ok(all
+            .into_iter()
+            .filter(|k| key_use.is_none_or(|u| k.key_use == u))
+            .filter(|k| !active_only || k.status == KeyStatus::Active)
+            .collect())
+    }
+
+    pub fn set_peer_key_status(
+        &self,
+        peer_id: &str,
+        kid: &str,
+        status: KeyStatus,
+    ) -> StoreResult<bool> {
+        let changed = self.db.conn().execute(
+            "UPDATE peer_keys SET status = ?1 WHERE peer_id = ?2 AND kid = ?3",
+            params![status.as_str(), peer_id, kid],
+        )?;
+        Ok(changed > 0)
+    }
+
+    // ---- Directory Checkpoints (Anti-Rollback) ----
+
+    /// Records an admin-signed directory checkpoint with strict monotonic `version` anti-rollback
+    /// and equivocation detection (`root_hash` mismatch at an existing version).
+    pub fn record_checkpoint(
+        &self,
+        input: &DirectoryCheckpointInput,
+        now_ms: i64,
+    ) -> StoreResult<DirectoryCheckpoint> {
+        if input.authority_id.is_empty() || input.root_hash.is_empty() {
+            return Err(StoreError::InvalidInput(
+                "authority_id and root_hash must be non-empty".to_string(),
+            ));
+        }
+        if input.version <= 0 {
+            return Err(StoreError::InvalidInput(
+                "checkpoint version must be positive".to_string(),
+            ));
+        }
+
+        let tx = self.db.immediate_tx()?;
+        let latest: Option<DirectoryCheckpoint> = tx
+            .conn()
+            .query_row(
+                "SELECT * FROM directory_checkpoints
+                 WHERE authority_id = ?1
+                 ORDER BY version DESC LIMIT 1",
+                params![&input.authority_id],
+                decode_checkpoint_row,
+            )
+            .optional()?;
+
+        if let Some(prev) = latest {
+            if input.version < prev.version {
+                return Err(StoreError::CheckpointRollback {
+                    authority_id: input.authority_id.clone(),
+                    expected_min: prev.version,
+                    received: input.version,
+                });
+            }
+            if input.version == prev.version {
+                if prev.root_hash == input.root_hash && prev.signed_json == input.signed_json {
+                    tx.commit()?;
+                    return Ok(prev);
+                }
+                return Err(StoreError::CheckpointRollback {
+                    authority_id: input.authority_id.clone(),
+                    expected_min: prev.version + 1,
+                    received: input.version,
+                });
+            }
+        }
+
+        tx.conn().execute(
+            "INSERT INTO directory_checkpoints
+             (authority_id, version, root_hash, signed_json, issued_at, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                &input.authority_id,
+                input.version,
+                &input.root_hash,
+                &input.signed_json,
+                input.issued_at,
+                now_ms
+            ],
+        )?;
+        let saved = tx.conn().query_row(
+            "SELECT * FROM directory_checkpoints WHERE authority_id = ?1 AND version = ?2",
+            params![&input.authority_id, input.version],
+            decode_checkpoint_row,
+        )?;
+        tx.commit()?;
+        Ok(saved)
+    }
+
+    pub fn latest_checkpoint(&self, authority_id: &str) -> StoreResult<Option<DirectoryCheckpoint>> {
+        self.db
+            .conn()
+            .query_row(
+                "SELECT * FROM directory_checkpoints
+                 WHERE authority_id = ?1
+                 ORDER BY version DESC LIMIT 1",
+                params![authority_id],
+                decode_checkpoint_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_checkpoints(&self, authority_id: &str) -> StoreResult<Vec<DirectoryCheckpoint>> {
+        let mut stmt = self.db.conn().prepare(
+            "SELECT * FROM directory_checkpoints
+             WHERE authority_id = ?1
+             ORDER BY version ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![authority_id], decode_checkpoint_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+}
+
+/// Identifies E2EE capability tokens protected by the permanent anti-downgrade ratchet
+/// (e.g. `dm.e2ee.v1`, `channel.e2ee.v1`, `kv.e2ee.v1`, `events.e2ee.v1`).
+fn is_e2ee_capability(cap: &str) -> bool {
+    cap.contains(".e2ee.") || cap.ends_with(".e2ee")
+}
+
+fn decode_peer_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<PeerRecord>> {
+    let peer_id: String = row.get("peer_id")?;
+    let endpoint: Option<String> = row.get("endpoint")?;
+    let profile_str: String = row.get("profile")?;
+    let trust_str: String = row.get("trust_tier")?;
+    let status_str: String = row.get("status")?;
+    let scopes_json: String = row.get("scopes_json")?;
+    let auth_credential_ref: Option<String> = row.get("auth_credential_ref")?;
+    let manifest_json: Option<String> = row.get("manifest_json")?;
+    let manifest_version: i64 = row.get("manifest_version")?;
+    let manifest_etag: Option<String> = row.get("manifest_etag")?;
+    let manifest_fetched_at: Option<i64> = row.get("manifest_fetched_at")?;
+    let observed_e2ee_caps_json: String = row.get("observed_e2ee_caps_json")?;
+    let created_at: i64 = row.get("created_at")?;
+    let updated_at: i64 = row.get("updated_at")?;
+
+    Ok((|| {
+        let profile = PeerProfile::parse(&profile_str)?;
+        let trust_tier = TrustTier::parse(&trust_str)?;
+        let status = PeerStatus::parse(&status_str)?;
+        let scopes: Vec<String> = serde_json::from_str(&scopes_json)?;
+        let observed_e2ee_caps: Vec<String> = serde_json::from_str(&observed_e2ee_caps_json)?;
+        Ok(PeerRecord {
+            peer_id,
+            endpoint,
+            profile,
+            trust_tier,
+            status,
+            scopes,
+            auth_credential_ref,
+            manifest_json,
+            manifest_version,
+            manifest_etag,
+            manifest_fetched_at,
+            observed_e2ee_caps,
+            created_at,
+            updated_at,
+        })
+    })())
+}
+
+fn decode_grant_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<GrantRecord>> {
+    let id: String = row.get("id")?;
+    let peer_id: String = row.get("peer_id")?;
+    let direction_str: String = row.get("direction")?;
+    let signed_json: String = row.get("signed_json")?;
+    let scopes_json: String = row.get("scopes_json")?;
+    let trust_str: String = row.get("trust_tier")?;
+    let issued_at: i64 = row.get("issued_at")?;
+    let pair_by: Option<i64> = row.get("pair_by")?;
+    let expires_at: Option<i64> = row.get("expires_at")?;
+    let entry_json: Option<String> = row.get("entry_json")?;
+    let paired_at: Option<i64> = row.get("paired_at")?;
+
+    Ok((|| {
+        let direction = GrantDirection::parse(&direction_str)?;
+        let trust_tier = TrustTier::parse(&trust_str)?;
+        let scopes: Vec<String> = serde_json::from_str(&scopes_json)?;
+        Ok(GrantRecord {
+            id,
+            peer_id,
+            direction,
+            signed_json,
+            scopes,
+            trust_tier,
+            issued_at,
+            pair_by,
+            expires_at,
+            entry_json,
+            paired_at,
+        })
+    })())
+}
+
+fn decode_revocation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RevocationRecord> {
+    Ok(RevocationRecord {
+        grant_id: row.get(0)?,
+        peer_id: row.get(1)?,
+        signed_json: row.get(2)?,
+        revoked_at: row.get(3)?,
+    })
+}
+
+fn decode_peer_key_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<PeerKeyRecord>> {
+    let peer_id: String = row.get("peer_id")?;
+    let kid: String = row.get("kid")?;
+    let key_use_str: String = row.get("key_use")?;
+    let jwk_json: String = row.get("jwk_json")?;
+    let status_str: String = row.get("status")?;
+    let registered_at: i64 = row.get("registered_at")?;
+    let expires_at: Option<i64> = row.get("expires_at")?;
+
+    Ok((|| {
+        let key_use = KeyUse::parse(&key_use_str)?;
+        let status = KeyStatus::parse(&status_str)?;
+        Ok(PeerKeyRecord {
+            peer_id,
+            kid,
+            key_use,
+            jwk_json,
+            status,
+            registered_at,
+            expires_at,
+        })
+    })())
+}
+
+fn decode_checkpoint_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DirectoryCheckpoint> {
+    Ok(DirectoryCheckpoint {
+        authority_id: row.get("authority_id")?,
+        version: row.get("version")?,
+        root_hash: row.get("root_hash")?,
+        signed_json: row.get("signed_json")?,
+        issued_at: row.get("issued_at")?,
+        recorded_at: row.get("recorded_at")?,
+    })
+}
