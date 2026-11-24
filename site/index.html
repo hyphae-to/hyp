@@ -7,17 +7,11 @@
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
-  <header>
+  <header id="siteHeader" class="header-dark">
     <div class="wrap nav-bar">
       <a class="brand" href="#">
         <span class="brand-mark" aria-hidden="true">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-            <circle cx="12" cy="12" r="2.8" fill="#B7D956" />
-            <path d="M12 12 C9 8, 5 7, 2.5 5.5 M12 12 C15 8, 19 6.5, 21.5 4.5 M12 12 C8.5 15, 5.5 17.5, 3 19.5 M12 12 C15.5 15, 18.5 17, 21.5 18.5" stroke="#F4F1E8" stroke-width="1.8" stroke-linecap="round" />
-            <circle cx="3" cy="5.5" r="1.6" fill="#E8A331" />
-            <circle cx="21.5" cy="4.5" r="1.6" fill="#DD5135" />
-            <circle cx="21.5" cy="18.5" r="1.6" fill="#B7D956" />
-          </svg>
+          <img class="brand-logo" src="./assets/logo-hyphae.png" alt="" />
         </span>
         <span class="brand-word">hyphae</span>
         <span class="brand-cli">hph</span>
@@ -32,50 +26,14 @@
 
       <div class="nav-right">
         <a class="btn-pill btn-ghost" href="https://github.com/bowd/hyphae" target="_blank" rel="noreferrer">GitHub ↗</a>
-        <a class="btn-pill btn-olive" href="#install">Install hph</a>
+        <a class="btn-pill btn-cta" href="#cta-install">Install hph</a>
       </div>
     </div>
   </header>
 
   <main>
-    <!-- HERO TOP: Editorial headline + real GitHub / npm install -->
-    <section class="hero-top">
-      <div class="wrap hero-top-grid">
-        <div>
-          <div class="eyebrow-pill">
-            <span class="eyebrow-dot"></span>
-            Open source · Team &amp; Private Nodes · Zero polling
-          </div>
-          <h1>One wire under <em>every</em> agent.</h1>
-          <p class="hero-sub">
-            Plug your laptop agent into a shared node alongside teammates' Codex, Claude, OpenClaw, and T3 Code threads —
-            with <code>#channels</code>, filtered GitHub &amp; Prometheus streams, and private Slack/Telegram bridges.
-          </p>
-        </div>
-
-        <div class="install-box">
-          <div class="install-head">
-            <div class="install-tabs" id="heroInstallTabs">
-              <button class="it-btn active" data-hi="curl" type="button">One-liner</button>
-              <button class="it-btn" data-hi="npm" type="button">npm</button>
-              <button class="it-btn" data-hi="git" type="button">From source</button>
-            </div>
-            <button class="install-copy" id="heroCopyBtn" type="button">Copy</button>
-          </div>
-          <div class="install-cmd">
-            <span class="prompt">$</span>
-            <span id="heroInstallCmd"></span>
-          </div>
-          <div class="install-foot">
-            <span>Node 24+ · macOS &amp; Linux</span>
-            <span>or let your agent run <code>hph onboard --assist</code></span>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- FULL-BLEED DARK CINEMATIC STORY BAND (Large crisp sprites, 9 slow deliberate chapters) -->
-    <section id="story" class="story-band">
+    <!-- MAIN HERO: Full-bleed dark organic mycelium canvas from top edge behind transparent header -->
+    <section id="story" class="story-band hero-cinema">
       <div class="story-bg" aria-hidden="true"></div>
       <canvas class="story-canvas" id="sporeCanvas" aria-hidden="true"></canvas>
 
@@ -264,6 +222,39 @@
             <button class="story-play-btn" id="storyPrevBtn" type="button" aria-label="Previous step">←</button>
             <button class="story-play-btn" id="storyPlayBtn" type="button">Pause</button>
             <button class="story-play-btn" id="storyNextBtn" type="button" aria-label="Next step">→</button>
+          </div>
+        </div>
+
+        <!-- Subtle editorial title + concise summary + immediate install CTA right below the animated show -->
+        <div id="cta-install" class="hero-cta-strip">
+          <div class="hero-cta-copy">
+            <div class="eyebrow-pill dark">
+              <span class="eyebrow-dot"></span>
+              Open source · Team &amp; Private Nodes · Zero polling
+            </div>
+            <h1>One wire under <em>every</em> agent.</h1>
+            <p class="hero-sub">
+              Connect Claude, Codex, OpenClaw, and T3 Code across laptops and servers — with <code>#channels</code>, filtered GitHub &amp; Prometheus streams, and private chat bridges.
+            </p>
+          </div>
+
+          <div class="install-box">
+            <div class="install-head">
+              <div class="install-tabs" id="heroInstallTabs">
+                <button class="it-btn active" data-hi="curl" type="button">One-liner</button>
+                <button class="it-btn" data-hi="npm" type="button">npm</button>
+                <button class="it-btn" data-hi="git" type="button">From source</button>
+              </div>
+              <button class="install-copy" id="heroCopyBtn" type="button">Copy</button>
+            </div>
+            <div class="install-cmd">
+              <span class="prompt">$</span>
+              <span id="heroInstallCmd"></span>
+            </div>
+            <div class="install-foot">
+              <span>Node 24+ · macOS &amp; Linux</span>
+              <span>or let your agent run <code>hph onboard --assist</code></span>
+            </div>
           </div>
         </div>
       </div>

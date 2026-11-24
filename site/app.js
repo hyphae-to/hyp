@@ -3,6 +3,28 @@ function esc(s) {
 }
 
 // ============================================================================
+// 0. SMART SCROLL-AWARE HEADER (Transparent over dark hero -> frosted white below)
+// ============================================================================
+(function initSmartHeader() {
+  const header = document.getElementById("siteHeader");
+  const heroBand = document.getElementById("story");
+  if (!header || !heroBand) return;
+
+  function syncHeaderTheme() {
+    const heroBottom = heroBand.getBoundingClientRect().bottom;
+    const headerH = header.offsetHeight || 68;
+    const pastHero = heroBottom <= headerH + 6;
+    header.classList.toggle("header-light", pastHero);
+    header.classList.toggle("header-dark", !pastHero);
+    header.classList.toggle("dark-frosted", !pastHero && window.scrollY > 18);
+  }
+
+  syncHeaderTheme();
+  window.addEventListener("scroll", syncHeaderTheme, { passive: true });
+  window.addEventListener("resize", syncHeaderTheme, { passive: true });
+})();
+
+// ============================================================================
 // 1. HERO INSTALL SWITCHER
 // ============================================================================
 const HERO_CMDS = {
