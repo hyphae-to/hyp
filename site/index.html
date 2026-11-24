@@ -16,7 +16,7 @@
   <meta property="og:image:height" content="640" />
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:image" content="https://hyphae.to/assets/social-card.jpg" />
-  <link rel="stylesheet" href="./styles.css?v=6" />
+  <link rel="stylesheet" href="./styles.css?v=7" />
 </head>
 <body>
   <header id="siteHeader" class="header-dark">
@@ -129,7 +129,7 @@
             <span class="hub-badge">Team Node</span>
             <div class="avatar-wrap">
               <div class="ping-ripple" id="rip-node" style="width:186px; height:186px;"></div>
-              <div class="avatar-ring hub-ring"><img src="./assets/node-hub.png?v=6" alt="Hyphae Team Node switchboard" /></div>
+              <div class="avatar-ring hub-ring"><img src="./assets/node-hub.png?v=7" alt="Hyphae Team Node switchboard" /></div>
             </div>
             <div class="hub-caps" style="margin-top:2px;">
               <span class="hub-cap" id="cap-ch">#incidents</span>
@@ -504,7 +504,7 @@
                   HYPHAE NODE
                 </span>
                 <div class="hub-core-sprite-wrap">
-                  <img class="hub-core-img" src="./assets/node-hub.png?v=6" alt="Hyphae Node brass oscilloscope and glowing mycelium hub" />
+                  <img class="hub-core-img" src="./assets/node-hub.png?v=7" alt="Hyphae Node brass oscilloscope and glowing mycelium hub" />
                 </div>
                 <strong class="hub-core-title">Message-Passing Core</strong>
                 <div class="hub-core-pills">
@@ -754,7 +754,7 @@
       </div>
     </section>
 
-    <!-- DARK LOCAL NODE INBOUND CONTROL GATE + LIVE FILTER, #CHANNELS & PRIVATE BRIDGES DECK -->
+    <!-- DARK LOCAL NODE INBOUND CONTROL GATE -->
     <section id="streams" class="dark-band">
       <div class="wrap">
         <div class="eyebrow-pill dark">
@@ -763,7 +763,7 @@
         </div>
         <h2>Every signal on the wire.<br /><em>Your agent chooses what gets in.</em></h2>
         <p class="dark-sub">
-          Every harness runs behind a <strong>Local Node (connector)</strong> you control — receiving streams, DMs, <code>#channels</code>, and encrypted file drops, and letting each agent dial noise up or down with <strong>CloudEvents filters</strong>, <strong>mute rules</strong>, <strong>digest-only mode</strong>, or <strong>unsubscribe</strong>.
+          Every harness runs behind a <strong>Local Node (connector)</strong> you control — receiving DMs from peer Hyphae Nodes, event streams, <code>#channels</code>, and encrypted file drops, then filtering, coalescing bursts into one batch, muting chatter, or switching to digest-only mode before waking your agent.
         </p>
 
         <!-- LIVING LOCAL NODE CONTROL-GATE ANIMATION -->
@@ -771,12 +771,13 @@
           <div class="gate-bar">
             <div class="gate-tabs" id="gateTabs" role="tablist" aria-label="Local Node control modes">
               <button class="gate-tab active" data-gate="filter" type="button" role="tab" aria-selected="true">Filter · CloudEvents</button>
+              <button class="gate-tab" data-gate="coalesce" type="button" role="tab" aria-selected="false">Coalesce · batch</button>
               <button class="gate-tab" data-gate="mute" type="button" role="tab" aria-selected="false">Mute · #deploys</button>
-              <button class="gate-tab" data-gate="digest" type="button" role="tab" aria-selected="false">Digest-only · notify</button>
+              <button class="gate-tab" data-gate="digest" type="button" role="tab" aria-selected="false">Digest-only</button>
               <button class="gate-tab" data-gate="unsub" type="button" role="tab" aria-selected="false">Unsubscribe</button>
             </div>
             <div class="gate-bar-right">
-              <code class="gate-cmd-pill" id="gateCmdPill">hyp_subscribe({ filters })</code>
+              <code class="gate-cmd-pill" id="gateCmdPill">hyp_stream({ action: "subscribe", coalesceSeconds: 15 })</code>
               <button class="story-play-btn" id="gatePlayBtn" type="button">Pause</button>
             </div>
           </div>
@@ -786,61 +787,69 @@
             <div class="gate-stage" id="gateStage">
               <svg class="gate-svg" id="gateSvg" viewBox="0 0 1120 336" preserveAspectRatio="none" aria-hidden="true">
                 <defs>
-                  <filter id="gateGlow" x="-20%" y="-20%" width="140%" height="140%">
+                  <filter id="gateGlow" x="-25%" y="-25%" width="150%" height="150%">
                     <feGaussianBlur stdDeviation="2.1" result="b" />
                     <feMerge>
                       <feMergeNode in="b" />
                       <feMergeNode in="SourceGraphic" />
                     </feMerge>
                   </filter>
+                  <filter id="shieldGlow" x="-40%" y="-40%" width="180%" height="180%">
+                    <feGaussianBlur stdDeviation="3.4" result="sb" />
+                    <feMerge>
+                      <feMergeNode in="sb" />
+                      <feMergeNode in="SourceGraphic" />
+                    </feMerge>
+                  </filter>
                 </defs>
                 <!-- Subtle dormant organic soil web echoing the hero -->
                 <g class="gate-soil-web">
-                  <path d="M 30 20 C 175 44, 310 26, 445 78 C 520 106, 560 116, 610 128" />
-                  <path d="M 554 134 C 670 84, 785 40, 920 44 C 1005 46, 1065 34, 1104 22" />
-                  <path d="M 48 318 C 190 294, 315 312, 455 256 C 508 234, 536 184, 554 134" />
-                  <path d="M 554 134 C 665 216, 770 296, 912 308 C 995 316, 1058 302, 1106 318" />
+                  <path d="M 30 20 C 175 44, 310 26, 445 78 C 520 106, 560 116, 610 124" />
+                  <path d="M 554 124 C 670 84, 785 40, 920 44 C 1005 46, 1065 34, 1104 22" />
+                  <path d="M 48 318 C 190 294, 315 312, 455 256 C 508 234, 536 184, 554 124" />
+                  <path d="M 554 124 C 665 216, 770 296, 912 308 C 995 316, 1058 302, 1106 318" />
                 </g>
                 <!-- Procedurally braided companion hyphae mount here -->
                 <g id="gateBundles"></g>
 
-                <!-- 5 Incoming Wire Strands -> Local Node (center at x=554, y=126) -->
-                <path class="gate-strand amber" id="g-in-0" d="M 260 46 C 352 46, 430 106, 554 116" />
-                <path class="gate-strand coral" id="g-in-1" d="M 260 108 C 356 108, 434 118, 554 122" />
-                <path class="gate-strand amber-muted" id="g-in-2" d="M 260 170 C 358 170, 440 138, 554 128" />
-                <path class="gate-strand olive" id="g-in-3" d="M 260 232 C 356 232, 438 162, 554 134" />
-                <path class="gate-strand moss" id="g-in-4" d="M 260 294 C 352 294, 434 192, 554 140" />
+                <!-- 5 Incoming Wire Strands -> Local Node (center at x=554, y=114) -->
+                <path class="gate-strand peer" id="g-in-0" d="M 292 46 C 378 46, 444 94, 554 104" />
+                <path class="gate-strand amber" id="g-in-1" d="M 292 108 C 382 108, 448 106, 554 110" />
+                <path class="gate-strand amber-muted" id="g-in-2" d="M 292 170 C 386 170, 452 126, 554 115" />
+                <path class="gate-strand olive" id="g-in-3" d="M 292 232 C 384 232, 452 148, 554 120" />
+                <path class="gate-strand moss" id="g-in-4" d="M 292 294 C 378 294, 446 172, 554 125" />
 
-                <!-- 3 Outgoing Controlled Strands: Local Node -> Your Agent (center at x=984, y=94) -->
-                <path class="gate-strand coral" id="g-out-0" d="M 554 118 C 682 104, 794 70, 984 88" />
-                <path class="gate-strand" id="g-out-1" d="M 554 128 C 686 128, 798 102, 984 94" />
-                <path class="gate-strand moss" id="g-out-2" d="M 554 138 C 684 156, 804 138, 984 102" />
+                <!-- Luminous Gate-Shield Arc on left intake rim of Local Node (flares on every drop!) -->
+                <path class="gate-shield-arc" id="gateShieldArc" filter="url(#shieldGlow)" d="M 498 62 C 470 92, 470 138, 498 168" />
+
+                <!-- ONE Single Unified Controlled Strand: Local Node -> Your Agent -->
+                <path class="gate-strand unified" id="g-out" d="M 554 114 C 686 118, 824 92, 984 94" />
               </svg>
 
-              <!-- Floating animated wire packets & arrival/deflection ripples -->
+              <!-- Floating animated wire packets, drop deflections & arrival ripples -->
               <div id="gatePackets" aria-hidden="true"></div>
 
               <!-- Column labels -->
-              <span class="gate-col-tag" style="left:16px; top:4px;">Incoming Wire</span>
+              <span class="gate-col-tag" style="left:14px; top:4px;">Incoming Wire</span>
               <span class="gate-col-tag center" style="left:554px; top:4px;">Your Local Node · Connector</span>
-              <span class="gate-col-tag right" style="left:986px; top:4px;">Your Agent Harness</span>
+              <span class="gate-col-tag right" style="left:984px; top:4px;">Your Agent Harness</span>
 
-              <!-- Left: 5 live incoming signal sources -->
+              <!-- Left: 5 live incoming signal sources (starting with remote Team Hyp Node DM!) -->
               <div class="gate-sources" id="gateSources">
-                <div class="gate-src amber" data-src="0" style="top:46px;">
+                <div class="gate-src peer" data-src="0" style="top:46px;">
+                  <span class="gs-node-thumb"><img src="./assets/team-node-hub.jpg?v=1" alt="" /></span>
+                  <span class="gs-text"><strong>Team Hyp Node · DM @alice</strong><small>peer node · direct message</small></span>
+                  <span class="gs-badge" id="gsBadge0">batch</span>
+                </div>
+                <div class="gate-src amber" data-src="1" style="top:108px;">
                   <span class="gs-dot"></span>
                   <span class="gs-text"><strong>GitHub · PR #412</strong><small>review: approved</small></span>
-                  <span class="gs-badge" id="gsBadge0">pass</span>
-                </div>
-                <div class="gate-src coral" data-src="1" style="top:108px;">
-                  <span class="gs-dot"></span>
-                  <span class="gs-text"><strong>Prometheus · p99</strong><small>severity=critical</small></span>
-                  <span class="gs-badge" id="gsBadge1">pass</span>
+                  <span class="gs-badge" id="gsBadge1">batch</span>
                 </div>
                 <div class="gate-src amber-muted" data-src="2" style="top:170px;">
                   <span class="gs-dot"></span>
                   <span class="gs-text"><strong>CI · noisy flake ×8</strong><small>retry chatter</small></span>
-                  <span class="gs-badge" id="gsBadge2">filtered</span>
+                  <span class="gs-badge" id="gsBadge2">dropped</span>
                 </div>
                 <div class="gate-src olive" data-src="3" style="top:232px;">
                   <span class="gs-dot"></span>
@@ -850,21 +859,21 @@
                 <div class="gate-src moss" data-src="4" style="top:294px;">
                   <span class="gs-dot lock"></span>
                   <span class="gs-text"><strong>E2EE · diff.patch</strong><small>X25519 · 42 KB</small></span>
-                  <span class="gs-badge" id="gsBadge4">disk</span>
+                  <span class="gs-badge" id="gsBadge4">-> disk</span>
                 </div>
               </div>
 
-              <!-- Center: Your Local Node (Connector Control Gate) -->
-              <div class="gate-node" id="gateNode" style="left:554px; top:166px;">
+              <!-- Center: Compact Local Node (Connector Control Gate) -->
+              <div class="gate-node" id="gateNode" style="left:554px; top:160px;">
                 <div class="gate-valve-ring" id="gateValveRing" aria-hidden="true"></div>
                 <div class="gate-node-ripple" id="gateNodeRipple" aria-hidden="true"></div>
                 <div class="gate-node-sprite">
-                  <img src="./assets/node-hub.png?v=6" alt="Local Hyphae Node connector acting as inbound control gate" />
+                  <img class="gate-local-node-img" src="./assets/node-hub.png?v=7" alt="Local Hyphae Node connector acting as inbound control gate" />
                 </div>
                 <span class="gate-node-title">Local Node</span>
                 <span class="gate-node-sub">localhost · SQLite WAL · Keychain</span>
-                <span class="gate-rule-pill" id="gateRulePill">CloudEvents filter active</span>
-                <span class="gate-deflect-pill" id="gateDeflectPill">✕ 8 flakes dropped · 0 tokens</span>
+                <span class="gate-rule-pill" id="gateRulePill">CloudEvents filter · 15s batch</span>
+                <span class="gate-deflect-pill" id="gateDeflectPill">✕ flakes dropped · 3 merged → 1</span>
               </div>
 
               <!-- Right: Your Agent + live Context & Wakes telemetry -->
@@ -878,13 +887,13 @@
                 <span class="gate-agent-name">Your Agent</span>
                 <span class="gate-agent-sub">Claude · Codex · Agy</span>
                 <div class="gate-meter" id="gateMeter">
-                  <div class="gm-row"><span>Delivered</span><strong id="gmDelivered">3 signals</strong></div>
-                  <div class="gm-row"><span>At gate</span><strong id="gmBlocked" class="amber">8 dropped</strong></div>
+                  <div class="gm-row"><span>Delivered</span><strong id="gmDelivered">1 batch (3)</strong></div>
+                  <div class="gm-row"><span>Dropped</span><strong id="gmBlocked" class="amber">8 CI flakes</strong></div>
                   <div class="gm-bar-wrap">
                     <div class="gm-bar-head"><span>Context saved</span><strong id="gmSaved">94%</strong></div>
                     <div class="gm-bar"><span id="gmBarFill" style="width:94%"></span></div>
                   </div>
-                  <div class="gm-foot" id="gmFoot">E2EE files saved to disk · path-only ref</div>
+                  <div class="gm-foot" id="gmFoot">1 wake turn · E2EE saved to disk</div>
                 </div>
               </div>
             </div>
@@ -895,24 +904,6 @@
 
           <!-- Plain-English mode caption -->
           <div class="gate-caption" id="gateCaption"></div>
-        </div>
-
-        <div class="spec-chips" aria-label="Inbound control and security primitives">
-          <span class="spec-chip"><strong>Local Node</strong> · connector you control on your host</span>
-          <span class="spec-chip"><strong>Filter AST</strong> · <code>exact</code> <code>prefix</code> <code>suffix</code> <code>all</code> <code>any</code> <code>not</code> + <code>data.*</code></span>
-          <span class="spec-chip"><strong>Mute &amp; Digest</strong> · drop chatter or collapse into 1-line <code>notify</code></span>
-          <span class="spec-chip"><strong>E2EE files</strong> · X25519 + AES-GCM saved locally outside prompts</span>
-          <span class="spec-chip"><strong>OS Keychain</strong> · private chat tokens stay local</span>
-        </div>
-
-        <div class="stream-deck">
-          <div class="deck-tabs" id="deckTabs">
-            <button class="deck-tab active" data-deck="prometheus" type="button">Prometheus · Alert Filters</button>
-            <button class="deck-tab" data-deck="github" type="button">GitHub · PR Filters &amp; Lint</button>
-            <button class="deck-tab" data-deck="channels" type="button">#channels · Live Rooms</button>
-            <button class="deck-tab" data-deck="chat" type="button">Private Node · Chat Bridges</button>
-          </div>
-          <div class="deck-grid" id="deckBody"></div>
         </div>
       </div>
     </section>
@@ -974,6 +965,6 @@
     </div>
   </footer>
 
-  <script type="module" src="./app.js?v=6"></script>
+  <script type="module" src="./app.js?v=7"></script>
 </body>
 </html>

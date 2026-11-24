@@ -1054,50 +1054,14 @@ renderChapter();
 resetStoryTimer();
 
 // ============================================================================
-// 3. REAL CLOUDEVENTS SUBSCRIPTIONS API v1.0 EVALUATOR (mirrors src/core/router/filter.ts)
-// ============================================================================
-function ceTexts(value) {
-  if (typeof value === "string") return [value];
-  if (typeof value === "number" || typeof value === "boolean") return [JSON.stringify(value)];
-  if (Array.isArray(value)) return value.flatMap((item) => (Array.isArray(item) ? [] : ceTexts(item)));
-  return [];
-}
-
-function ceLookup(event, key) {
-  if (key.startsWith("data.")) {
-    const field = key.slice(5);
-    return event.data && Object.prototype.hasOwnProperty.call(event.data, field) ? ceTexts(event.data[field]) : [];
-  }
-  if (key === "data" || !Object.prototype.hasOwnProperty.call(event, key)) return [];
-  return ceTexts(event[key]);
-}
-
-function ceCompare(pairs, event, fn) {
-  return Object.entries(pairs).every(([k, expected]) => ceLookup(event, k).some((actual) => fn(actual, expected)));
-}
-
-function ceMatchesFilter(filter, event) {
-  if ("exact" in filter) return ceCompare(filter.exact, event, (a, e) => a === e);
-  if ("prefix" in filter) return ceCompare(filter.prefix, event, (a, e) => a.startsWith(e));
-  if ("suffix" in filter) return ceCompare(filter.suffix, event, (a, e) => a.endsWith(e));
-  if ("all" in filter) return filter.all.every((inner) => ceMatchesFilter(inner, event));
-  if ("any" in filter) return filter.any.some((inner) => ceMatchesFilter(inner, event));
-  if ("not" in filter) return !ceMatchesFilter(filter.not, event);
-  return false;
-}
-
-function ceMatchesFilters(filters, event) {
-  return filters.every((f) => ceMatchesFilter(f, event));
-}
-
-// ============================================================================
-// 3B. LOCAL NODE INBOUND CONTROL-GATE LIVING ANIMATION (#streams)
+// 3. LOCAL NODE INBOUND CONTROL-GATE LIVING ANIMATION (#streams)
 // ============================================================================
 (function initControlGate() {
   const viewport = document.getElementById("gateViewport");
   const stage = document.getElementById("gateStage");
   const packetsHost = document.getElementById("gatePackets");
   const mobileHost = document.getElementById("gateMobile");
+  const shieldArc = document.getElementById("gateShieldArc");
   if (!viewport || !stage) return;
 
   const LOGICAL_W = 1120;
@@ -1120,8 +1084,8 @@ function ceMatchesFilters(filters, event) {
   window.addEventListener("resize", fitGateStage, { passive: true });
 
   const GATE_SOURCES = [
+    { name: "Team Hyp Node · DM @alice", sub: "peer node · direct message", cls: "peer", thumb: "./assets/team-node-hub.jpg?v=1" },
     { name: "GitHub · PR #412", sub: "review: approved", cls: "amber" },
-    { name: "Prometheus · p99", sub: "severity=critical", cls: "coral" },
     { name: "CI · noisy flake ×8", sub: "retry chatter", cls: "amber-muted" },
     { name: "#deploys · chatter", sub: "build room noise", cls: "olive" },
     { name: "E2EE · diff.patch", sub: "X25519 · 42 KB", cls: "moss" },
@@ -1129,22 +1093,22 @@ function ceMatchesFilters(filters, event) {
 
   const GATE_MODES = {
     filter: {
-      cmd: 'hyp_subscribe({ topic: "ci", filters: [{ not: ... }] })',
-      ruleText: "CloudEvents filter active",
+      cmd: 'hyp_stream({ action: "subscribe", coalesceSeconds: 15 })',
+      ruleText: "CloudEvents filter · 15s batch",
       ruleCls: "",
-      deflectText: "✕ 8 CI flakes dropped · 0 tokens",
-      delivered: "3 signals",
-      blocked: "8 flakes dropped",
+      deflectText: "✕ flakes dropped · 3 merged → 1",
+      delivered: "1 batch (3)",
+      blocked: "8 CI flakes",
       blockedCls: "amber",
       saved: "94%",
       barPct: 94,
-      foot: "E2EE saved to disk · path-only ref",
+      foot: "1 wake turn · E2EE saved to disk",
       caption:
-        "Your <strong>Local Node</strong> evaluates CloudEvents v1.0 filters before touching the LLM — passing <code>PR #412</code>, critical alerts, and E2EE file paths while dropping noisy CI flakes at zero token cost.",
+        "Your <strong>Local Node</strong> drops noisy CI flakes at the gate shield (<code>0 tokens</code>), while coalescing simultaneous arrivals (Team Node DM, PR #412, E2EE diff) into <strong>one batched delivery</strong> down a single wire.",
       sources: [
-        { state: "pass", badge: "pass" },
-        { state: "pass", badge: "pass" },
-        { state: "blocked", badge: "filtered" },
+        { state: "pass", badge: "batch" },
+        { state: "pass", badge: "batch" },
+        { state: "blocked", badge: "dropped" },
         { state: "idle", badge: "idle" },
         { state: "pass", badge: "-> disk" },
       ],
@@ -1154,72 +1118,105 @@ function ceMatchesFilters(filters, event) {
         "g-in-2": "blocked",
         "g-in-3": "dim",
         "g-in-4": "active",
-        "g-out-0": "active",
-        "g-out-1": "active",
-        "g-out-2": "active",
+        "g-out": "active",
       },
       packets: [
-        { path: "g-in-0", cls: "amber", label: "PR #412", phase: 0.04, dur: 1700, startT: 0.2, endT: 0.8 },
-        { path: "g-out-1", cls: "amber", label: "PR #412 approved", phase: 0.44, dur: 1750, startT: 0.2, endT: 0.8, rippleAgent: true },
-        { path: "g-in-1", cls: "coral", label: "p99 critical", phase: 0.22, dur: 1600, startT: 0.2, endT: 0.8 },
-        { path: "g-out-0", cls: "coral", label: "p99 critical", phase: 0.62, dur: 1650, startT: 0.2, endT: 0.8, rippleAgent: true },
-        { path: "g-in-2", cls: "blocked", label: "flake ×8 ✕", phase: 0.14, dur: 1550, startT: 0.2, endT: 0.68, deflect: "amber" },
-        { path: "g-in-4", cls: "moss", label: "🔒 diff.patch", phase: 0.36, dur: 1750, startT: 0.2, endT: 0.8 },
-        { path: "g-out-2", cls: "moss", label: "saved -> disk", phase: 0.76, dur: 1700, startT: 0.2, endT: 0.8, rippleAgent: true },
+        // 3 simultaneous passing arrivals converging into Local Node
+        { path: "g-in-0", cls: "", label: "DM @alice", phase: 0.02, dur: 1200, startT: 0.14, endT: 0.78, rippleNode: "green" },
+        { path: "g-in-1", cls: "amber", label: "PR #412", phase: 0.02, dur: 1200, startT: 0.14, endT: 0.78 },
+        { path: "g-in-4", cls: "moss", label: "🔒 diff.patch", phase: 0.03, dur: 1200, startT: 0.14, endT: 0.74, mergeTag: "3 → 1 batch" },
+        // ONE unified batched packet gliding down the single right-hand strand
+        { path: "g-out", cls: "", label: "batch (3) · DM + PR #412 + diff", phase: 0.36, dur: 1900, startT: 0.34, endT: 0.78, rippleAgent: true },
+        // 2 noisy CI flakes racing in and getting deflected hard at the left gate shield
+        { path: "g-in-2", cls: "blocked", label: "CI flake #3", phase: 0.16, dur: 1750, startT: 0.14, endT: 0.67, deflect: "amber", dropTag: "✕ dropped · 0 tokens" },
+        { path: "g-in-2", cls: "blocked", label: "CI flake #4", phase: 0.62, dur: 1750, startT: 0.14, endT: 0.67, deflect: "amber", dropTag: "✕ dropped · 0 tokens" },
+      ],
+    },
+    coalesce: {
+      cmd: "hyp_stream({ coalesceSeconds: 15, maxWaitSeconds: 30 })",
+      ruleText: "Coalescing window · 15s",
+      ruleCls: "amber",
+      deflectText: "3 simultaneous arrivals → 1 batch",
+      delivered: "1 batched wake",
+      blocked: "3 merged → 1",
+      blockedCls: "amber",
+      saved: "89%",
+      barPct: 89,
+      foot: "1 turn instead of 3 · E2EE -> disk",
+      caption:
+        "When a <strong>DM from a Team Hyp Node</strong>, a <strong>GitHub review</strong>, and an <strong>E2EE file</strong> arrive together, your <strong>Local Node</strong> merges them in a 15s coalescing window and wakes your agent <strong>once</strong>.",
+      sources: [
+        { state: "batched", badge: "merged" },
+        { state: "batched", badge: "merged" },
+        { state: "blocked", badge: "dropped" },
+        { state: "idle", badge: "quiet" },
+        { state: "batched", badge: "merged" },
+      ],
+      strands: {
+        "g-in-0": "active",
+        "g-in-1": "active",
+        "g-in-2": "blocked",
+        "g-in-3": "dim",
+        "g-in-4": "active",
+        "g-out": "active",
+      },
+      packets: [
+        { path: "g-in-0", cls: "", label: "DM @alice", phase: 0.02, dur: 1240, startT: 0.14, endT: 0.78, rippleNode: "amber" },
+        { path: "g-in-1", cls: "amber", label: "PR #412", phase: 0.02, dur: 1240, startT: 0.14, endT: 0.78 },
+        { path: "g-in-4", cls: "moss", label: "🔒 diff.patch", phase: 0.02, dur: 1240, startT: 0.14, endT: 0.74, mergeTag: "3 arrivals → 1 batch" },
+        { path: "g-out", cls: "", label: "batch ×3 · 1 wake", phase: 0.38, dur: 1900, startT: 0.32, endT: 0.78, rippleAgent: true },
+        { path: "g-in-2", cls: "blocked", label: "CI flake #7", phase: 0.24, dur: 1700, startT: 0.14, endT: 0.67, deflect: "amber", dropTag: "✕ dropped · 0 tokens" },
       ],
     },
     mute: {
-      cmd: 'hyp_mute({ channel: "#deploys", ttl: "2h" })',
+      cmd: 'hyp_inbox({ mute: "#deploys", ttl: "2h" })',
       ruleText: "Muted: #deploys (local)",
       ruleCls: "coral",
-      deflectText: "✕ #deploys muted at node",
-      delivered: "2 urgent",
+      deflectText: "✕ #deploys deflected at shield",
+      delivered: "1 batch (2)",
       blocked: "#deploys muted",
       blockedCls: "coral",
       saved: "96%",
       barPct: 96,
       foot: "Mute rules run on your Local Node",
       caption:
-        "Call <code>hyp_mute()</code> on noisy rooms, peers, or senders — your <strong>Local Node</strong> drops matching chatter before it ever enters context, while urgent alerts and E2EE files keep flowing.",
+        "Mute noisy rooms or peers locally — your <strong>Local Node</strong> stops matching <code>#deploys</code> chatter right at the gate shield while peer DMs and encrypted files continue cleanly down your single wire.",
       sources: [
-        { state: "idle", badge: "quiet" },
         { state: "pass", badge: "pass" },
+        { state: "idle", badge: "quiet" },
         { state: "idle", badge: "quiet" },
         { state: "muted", badge: "muted" },
         { state: "pass", badge: "-> disk" },
       ],
       strands: {
-        "g-in-0": "dim",
-        "g-in-1": "active",
+        "g-in-0": "active",
+        "g-in-1": "dim",
         "g-in-2": "dim",
         "g-in-3": "blocked",
         "g-in-4": "active",
-        "g-out-0": "active",
-        "g-out-1": "dim",
-        "g-out-2": "active",
+        "g-out": "active",
       },
       packets: [
-        { path: "g-in-3", cls: "coral", label: "#deploys ✕ muted", phase: 0.06, dur: 1650, startT: 0.2, endT: 0.68, deflect: "coral" },
-        { path: "g-in-3", cls: "coral", label: "build log ✕", phase: 0.56, dur: 1650, startT: 0.2, endT: 0.68, deflect: "coral" },
-        { path: "g-in-1", cls: "coral", label: "p99 critical", phase: 0.18, dur: 1600, startT: 0.2, endT: 0.8 },
-        { path: "g-out-0", cls: "coral", label: "p99 critical", phase: 0.58, dur: 1650, startT: 0.2, endT: 0.8, rippleAgent: true },
-        { path: "g-in-4", cls: "moss", label: "🔒 diff.patch", phase: 0.34, dur: 1750, startT: 0.2, endT: 0.8 },
-        { path: "g-out-2", cls: "moss", label: "saved -> disk", phase: 0.74, dur: 1700, startT: 0.2, endT: 0.8, rippleAgent: true },
+        { path: "g-in-3", cls: "coral", label: "#deploys: build ok", phase: 0.12, dur: 1750, startT: 0.14, endT: 0.67, deflect: "coral", dropTag: "✕ muted" },
+        { path: "g-in-3", cls: "coral", label: "#deploys: cache hit", phase: 0.58, dur: 1750, startT: 0.14, endT: 0.67, deflect: "coral", dropTag: "✕ muted" },
+        { path: "g-in-0", cls: "", label: "DM @alice", phase: 0.04, dur: 1200, startT: 0.14, endT: 0.78, rippleNode: "green" },
+        { path: "g-in-4", cls: "moss", label: "🔒 diff.patch", phase: 0.04, dur: 1200, startT: 0.14, endT: 0.74 },
+        { path: "g-out", cls: "", label: "DM @alice + diff.patch", phase: 0.38, dur: 1880, startT: 0.32, endT: 0.78, rippleAgent: true },
       ],
     },
     digest: {
-      cmd: 'hyp_mode("notify") // 1-line SQLite digest',
+      cmd: 'hyp_inbox({ mode: "notify" })',
       ruleText: "Digest-only · SQLite batch",
       ruleCls: "amber",
-      deflectText: "4 bursts -> 1 calm digest line",
+      deflectText: "4 bursts → 1 calm digest line",
       delivered: "1 digest line",
-      blocked: "4 batched locally",
+      blocked: "4 buffered locally",
       blockedCls: "amber",
       saved: "91%",
       barPct: 91,
       foot: "Full msgs wait in local SQLite",
       caption:
-        "Switch to <code>notify</code> (digest-only) mode during deep work — your <strong>Local Node</strong> buffers bursts in SQLite and sends your agent one calm <code>1-line digest</code> instead of flooding prompts.",
+        "Switch to <code>notify</code> (digest-only) mode during deep focus — your <strong>Local Node</strong> buffers bursts in SQLite and sends your agent one calm <code>1-line digest</code> instead of flooding prompts.",
       sources: [
         { state: "batched", badge: "batched" },
         { state: "batched", badge: "batched" },
@@ -1233,35 +1230,33 @@ function ceMatchesFilters(filters, event) {
         "g-in-2": "active",
         "g-in-3": "active",
         "g-in-4": "active",
-        "g-out-0": "dim",
-        "g-out-1": "active",
-        "g-out-2": "dim",
+        "g-out": "active",
       },
       packets: [
-        { path: "g-in-0", cls: "amber", label: "PR #412", phase: 0.04, dur: 1650, startT: 0.2, endT: 0.78, rippleNode: "amber" },
-        { path: "g-in-1", cls: "coral", label: "p99 spike", phase: 0.14, dur: 1650, startT: 0.2, endT: 0.78 },
-        { path: "g-in-2", cls: "amber", label: "CI flake", phase: 0.24, dur: 1650, startT: 0.2, endT: 0.78 },
-        { path: "g-in-3", cls: "moss", label: "#deploys", phase: 0.34, dur: 1650, startT: 0.2, endT: 0.78, rippleNode: "amber" },
-        { path: "g-out-1", cls: "", label: "digest: 4 unread (1 line)", phase: 0.56, dur: 2000, startT: 0.22, endT: 0.8, rippleAgent: true },
+        { path: "g-in-0", cls: "", label: "DM @alice", phase: 0.03, dur: 1260, startT: 0.14, endT: 0.78, rippleNode: "amber" },
+        { path: "g-in-1", cls: "amber", label: "PR #412", phase: 0.09, dur: 1260, startT: 0.14, endT: 0.78 },
+        { path: "g-in-2", cls: "amber", label: "CI flake", phase: 0.15, dur: 1260, startT: 0.14, endT: 0.76 },
+        { path: "g-in-3", cls: "moss", label: "#deploys", phase: 0.21, dur: 1260, startT: 0.14, endT: 0.74, mergeTag: "SQLite digest (4)" },
+        { path: "g-out", cls: "", label: "digest: 4 unread (1 line)", phase: 0.42, dur: 1900, startT: 0.34, endT: 0.78, rippleAgent: true },
       ],
     },
     unsub: {
-      cmd: 'hyp_unsubscribe("ci-flakes") && hyp_channel_leave("#deploys")',
-      ruleText: "2 streams detached · 0 wakes",
+      cmd: 'hyp_stream({ action: "unsubscribe", key: "ci-flakes" })',
+      ruleText: "2 streams unsub · 0 wakes",
       ruleCls: "moss",
-      deflectText: "Cut at connector · 0 background polling",
+      deflectText: "✕ unsubscribed · cut at connector",
       delivered: "2 subscribed",
       blocked: "2 streams off",
-      blockedCls: "",
+      blockedCls: "coral",
       saved: "100%",
       barPct: 100,
-      foot: "Zero wakes for detached streams",
+      foot: "Zero wakes for unsubscribed streams",
       caption:
-        "Call <code>hyp_unsubscribe()</code> or <code>hyp_channel_leave()</code> anytime — your <strong>Local Node</strong> cuts the strand immediately with zero wakes, zero retries, and zero polling.",
+        "Unsubscribe from any stream or leave any <code>#channel</code> in one call — your <strong>Local Node</strong> severs the strand immediately so stray traffic drops before reaching your agent.",
       sources: [
         { state: "pass", badge: "subscribed" },
         { state: "idle", badge: "paused" },
-        { state: "detached", badge: "detached" },
+        { state: "detached", badge: "unsub" },
         { state: "detached", badge: "left room" },
         { state: "pass", badge: "-> disk" },
       ],
@@ -1271,31 +1266,31 @@ function ceMatchesFilters(filters, event) {
         "g-in-2": "detached",
         "g-in-3": "detached",
         "g-in-4": "active",
-        "g-out-0": "dim",
-        "g-out-1": "active",
-        "g-out-2": "active",
+        "g-out": "active",
       },
       packets: [
-        { path: "g-in-0", cls: "amber", label: "PR #412", phase: 0.08, dur: 1800, startT: 0.2, endT: 0.8 },
-        { path: "g-out-1", cls: "amber", label: "PR #412 approved", phase: 0.5, dur: 1850, startT: 0.2, endT: 0.8, rippleAgent: true },
-        { path: "g-in-4", cls: "moss", label: "🔒 diff.patch", phase: 0.28, dur: 1800, startT: 0.2, endT: 0.8 },
-        { path: "g-out-2", cls: "moss", label: "saved -> disk", phase: 0.7, dur: 1850, startT: 0.2, endT: 0.8, rippleAgent: true },
+        { path: "g-in-2", cls: "coral", label: "CI flake ×8", phase: 0.16, dur: 1700, startT: 0.12, endT: 0.54, deflect: "coral", dropTag: "✕ unsub · 0 wakes" },
+        { path: "g-in-3", cls: "coral", label: "#deploys", phase: 0.6, dur: 1700, startT: 0.12, endT: 0.54, deflect: "coral", dropTag: "✕ unsub · 0 wakes" },
+        { path: "g-in-0", cls: "", label: "DM @alice", phase: 0.04, dur: 1220, startT: 0.14, endT: 0.78, rippleNode: "green" },
+        { path: "g-in-4", cls: "moss", label: "🔒 diff.patch", phase: 0.04, dur: 1220, startT: 0.14, endT: 0.74 },
+        { path: "g-out", cls: "", label: "DM @alice + diff.patch", phase: 0.4, dur: 1880, startT: 0.32, endT: 0.78, rippleAgent: true },
       ],
     },
   };
 
-  // Build braided companion hyphae for every gate strand (mirrors hero organic style)
+  // Build braided companion hyphae for every gate strand (tight hugging weave on unified #g-out)
   const gateBundles = new Map();
   const gateHost = document.getElementById("gateBundles");
   document.querySelectorAll(".gate-strand").forEach((path, idx) => {
     if (!gateHost) return;
+    const isUnified = path.id === "g-out";
     const len = path.getTotalLength();
     const g = document.createElementNS(SVG_NS, "g");
-    const cls = ["amber-muted", "amber", "coral", "olive", "moss"].find((c) => path.classList.contains(c)) || "";
+    const cls = ["amber-muted", "amber", "coral", "olive", "moss", "peer"].find((c) => path.classList.contains(c)) || "";
     g.setAttribute("class", `gate-bundle ${cls}`.trim());
 
-    const steps = Math.max(10, Math.min(20, Math.round(len / 18)));
-    const amp = Math.min(7.5, Math.max(4, len * 0.025));
+    const steps = Math.max(10, Math.min(24, Math.round(len / 18)));
+    const amp = isUnified ? 2.9 : Math.min(6.8, Math.max(3.8, len * 0.024));
     const seed = (idx + 2) * 1.43;
     const ptsA = [];
     const ptsB = [];
@@ -1311,8 +1306,8 @@ function ceMatchesFilters(filters, event) {
       const nx = -dy / mag;
       const ny = dx / mag;
       const env = Math.sin(f * Math.PI);
-      const offA = env * Math.sin(f * Math.PI * 3 + seed) * amp;
-      const offB = env * Math.cos(f * Math.PI * 4.1 - seed) * (amp * 0.62);
+      const offA = env * Math.sin(f * Math.PI * (isUnified ? 4.2 : 3) + seed) * amp;
+      const offB = env * Math.cos(f * Math.PI * (isUnified ? 5.2 : 4.1) - seed) * (amp * 0.58);
       ptsA.push(`${(p.x + nx * offA).toFixed(1)} ${(p.y + ny * offA).toFixed(1)}`);
       ptsB.push(`${(p.x + nx * offB).toFixed(1)} ${(p.y + ny * offB).toFixed(1)}`);
     }
@@ -1324,39 +1319,45 @@ function ceMatchesFilters(filters, event) {
       g.appendChild(w);
     }
 
-    [0.34, 0.68].forEach((f, ti) => {
-      const d = f * len;
-      const p = path.getPointAtLength(d);
-      const pN = path.getPointAtLength(Math.min(len, d + 3));
-      const dx = pN.x - p.x;
-      const dy = pN.y - p.y;
-      const mag = Math.hypot(dx, dy) || 1;
-      const tx = dx / mag;
-      const ty = dy / mag;
-      const side = (ti + idx) % 2 === 0 ? 1 : -1;
-      const nx = -ty * side;
-      const ny = tx * side;
-      const reach = 15;
-      const c1x = p.x + tx * 7 + nx * 8;
-      const c1y = p.y + ty * 7 + ny * 8;
-      const ex = p.x + tx * 12 + nx * reach;
-      const ey = p.y + ty * 12 + ny * reach;
-      const twig = document.createElementNS(SVG_NS, "path");
-      twig.setAttribute("class", "gb-twig");
-      twig.setAttribute("d", `M ${p.x.toFixed(1)} ${p.y.toFixed(1)} Q ${c1x.toFixed(1)} ${c1y.toFixed(1)}, ${ex.toFixed(1)} ${ey.toFixed(1)}`);
-      g.appendChild(twig);
-    });
+    if (!isUnified) {
+      [0.34, 0.68].forEach((f, ti) => {
+        const d = f * len;
+        const p = path.getPointAtLength(d);
+        const pN = path.getPointAtLength(Math.min(len, d + 3));
+        const dx = pN.x - p.x;
+        const dy = pN.y - p.y;
+        const mag = Math.hypot(dx, dy) || 1;
+        const tx = dx / mag;
+        const ty = dy / mag;
+        const side = (ti + idx) % 2 === 0 ? 1 : -1;
+        const nx = -ty * side;
+        const ny = tx * side;
+        const reach = 14;
+        const c1x = p.x + tx * 6 + nx * 7;
+        const c1y = p.y + ty * 6 + ny * 7;
+        const ex = p.x + tx * 11 + nx * reach;
+        const ey = p.y + ty * 11 + ny * reach;
+        const twig = document.createElementNS(SVG_NS, "path");
+        twig.setAttribute("class", "gb-twig");
+        twig.setAttribute("d", `M ${p.x.toFixed(1)} ${p.y.toFixed(1)} Q ${c1x.toFixed(1)} ${c1y.toFixed(1)}, ${ex.toFixed(1)} ${ey.toFixed(1)}`);
+        g.appendChild(twig);
+      });
+    }
 
     gateHost.appendChild(g);
     gateBundles.set(path.id, g);
   });
 
-  const MODE_ORDER = ["filter", "mute", "digest", "unsub"];
-  const urlGate = new URLSearchParams(window.location.search).get("gate");
+  const MODE_ORDER = ["filter", "coalesce", "mute", "digest", "unsub"];
+  const params = new URLSearchParams(window.location.search);
+  const urlGate = params.get("gate");
+  const urlPhaseRaw = params.get("t");
+  const fixedPhase = urlPhaseRaw !== null && !Number.isNaN(Number(urlPhaseRaw)) ? Number(urlPhaseRaw) : null;
   let activeGate = GATE_MODES[urlGate] ? urlGate : "filter";
-  let gatePlaying = !GATE_MODES[urlGate] && !reducedMotion;
+  let gatePlaying = !GATE_MODES[urlGate] && fixedPhase === null && !reducedMotion;
   let gateCycleTimer = null;
   let gateRaf = null;
+  let shieldTimer = null;
 
   function fireRipple(el, extraCls) {
     if (!el || reducedMotion) return;
@@ -1366,16 +1367,29 @@ function ceMatchesFilters(filters, event) {
     el.classList.add("fire");
   }
 
+  function flashShield(kind) {
+    if (!shieldArc) return;
+    shieldArc.classList.remove("hit-amber", "hit-coral");
+    shieldArc.classList.add(kind === "coral" ? "hit-coral" : "hit-amber");
+    clearTimeout(shieldTimer);
+    shieldTimer = setTimeout(() => {
+      shieldArc.classList.remove("hit-amber", "hit-coral");
+    }, 440);
+  }
+
   function renderGateMobile(mode) {
     if (!mobileHost) return;
     mobileHost.innerHTML = `
       <div class="gm-mob-list">
         ${GATE_SOURCES.map((src, i) => {
           const st = mode.sources[i];
+          const iconHtml = src.thumb
+            ? `<span class="gs-node-thumb"><img src="${esc(src.thumb)}" alt="" /></span>`
+            : `<span class="gs-dot"></span>`;
           return `
             <div class="gm-mob-row ${src.cls} state-${st.state}">
               <div class="gm-mob-left">
-                <span class="gs-dot"></span>
+                ${iconHtml}
                 <div>
                   <strong>${esc(src.name)}</strong>
                   <small>${esc(src.sub)}</small>
@@ -1394,7 +1408,7 @@ function ceMatchesFilters(filters, event) {
         </svg>
       </div>
       <div class="gm-mob-node">
-        <img src="./assets/node-hub.png?v=6" alt="Local Hyphae Node" />
+        <img class="gate-local-node-img" src="./assets/node-hub.png?v=7" alt="Local Hyphae Node" />
         <div class="gm-mob-node-body">
           <strong>Your Local Node (Connector)</strong>
           <span>${esc(mode.ruleText)}</span>
@@ -1403,7 +1417,7 @@ function ceMatchesFilters(filters, event) {
       </div>
       <div class="gm-mob-stem" aria-hidden="true">
         <svg viewBox="0 0 64 22" fill="none">
-          <path stroke="rgba(183,217,86,0.75)" stroke-width="2" d="M 32 0 C 34 8, 30 14, 32 22" />
+          <path stroke="rgba(183,217,86,0.85)" stroke-width="2.4" d="M 32 0 C 33 8, 31 14, 32 22" />
         </svg>
       </div>
       <div class="gm-mob-agent">
@@ -1415,7 +1429,7 @@ function ceMatchesFilters(filters, event) {
           </div>
         </div>
         <div class="gm-row"><span>Delivered</span><strong>${esc(mode.delivered)}</strong></div>
-        <div class="gm-row"><span>At gate</span><strong class="${esc(mode.blockedCls)}">${esc(mode.blocked)}</strong></div>
+        <div class="gm-row"><span>Dropped / Gate</span><strong class="${esc(mode.blockedCls)}">${esc(mode.blocked)}</strong></div>
         <div class="gm-bar-wrap">
           <div class="gm-bar-head"><span>Context saved</span><strong>${esc(mode.saved)}</strong></div>
           <div class="gm-bar"><span style="width:${mode.barPct}%"></span></div>
@@ -1428,51 +1442,123 @@ function ceMatchesFilters(filters, event) {
     if (gateRaf) cancelAnimationFrame(gateRaf);
     if (!packetsHost) return;
     packetsHost.innerHTML = "";
+    shieldArc?.classList.remove("hit-amber", "hit-coral");
 
     const items = mode.packets.map((spec) => {
       const path = document.getElementById(spec.path);
       if (!path) return null;
       const el = document.createElement("div");
       el.className = `gate-pkt ${spec.cls || ""}`.trim();
-      el.innerHTML = `<span class="gp-dot"></span><span>${esc(spec.label)}</span>`;
+      el.innerHTML = `<span class="gp-dot"></span><span class="gp-label">${esc(spec.label)}</span>`;
       packetsHost.appendChild(el);
-      return { ...spec, el, path, len: path.getTotalLength(), lastCycle: -1 };
+
+      let tagEl = null;
+      if (spec.dropTag) {
+        tagEl = document.createElement("div");
+        tagEl.className = `gate-drop-tag ${spec.deflect === "amber" ? "amber" : ""}`.trim();
+        tagEl.textContent = spec.dropTag;
+        tagEl.style.opacity = "0";
+        packetsHost.appendChild(tagEl);
+      } else if (spec.mergeTag) {
+        tagEl = document.createElement("div");
+        tagEl.className = "gate-merge-tag";
+        tagEl.textContent = spec.mergeTag;
+        tagEl.style.opacity = "0";
+        packetsHost.appendChild(tagEl);
+      }
+
+      return { ...spec, el, tagEl, path, len: path.getTotalLength(), lastCycle: -1 };
     }).filter(Boolean);
 
-    // Position static snapshot neatly when reduced-motion is enabled
-    if (reducedMotion) {
-      items.forEach((item) => {
-        const pt = item.path.getPointAtLength(item.len * (0.46));
-        item.el.style.left = `${(pt.x / LOGICAL_W) * 100}%`;
-        item.el.style.top = `${(pt.y / LOGICAL_H) * 100}%`;
-        item.el.style.opacity = "0.95";
-        item.el.style.transform = "translate(-50%, -50%) scale(1)";
-      });
-      return;
-    }
-
-    const CYCLE_MS = 3200;
+    const CYCLE_MS = 3400;
     const t0 = performance.now();
     const agentRipple = document.getElementById("gateAgentRipple");
     const nodeRipple = document.getElementById("gateNodeRipple");
 
-    function tick(now) {
-      const elapsed = now - t0;
+    function renderFrame(elapsed) {
+      let shieldHitKind = "";
       for (const item of items) {
-        const cyclePos = ((elapsed / CYCLE_MS) + item.phase) % 1;
-        const cycleNum = Math.floor((elapsed / CYCLE_MS) + item.phase);
-        const span = Math.min(0.82, item.dur / CYCLE_MS);
+        const rawPos = (elapsed / CYCLE_MS) - item.phase;
+        const cyclePos = ((rawPos % 1) + 1) % 1;
+        const cycleNum = Math.floor(rawPos);
+        const span = Math.min(0.84, item.dur / CYCLE_MS);
         const raw = cyclePos / span;
+
+        // Manage floating dropTag / mergeTag visibility (lingers briefly right after hit!)
+        if (item.tagEl) {
+          const hitAt = item.deflect ? 0.62 : 0.88;
+          const tagWindow = item.deflect ? 0.56 : 0.42;
+          const post = (cyclePos - span * hitAt + 1) % 1;
+          if (post >= 0 && post < tagWindow) {
+            const pNorm = post / tagWindow;
+            const anchorPt = item.path.getPointAtLength(item.len * (item.endT ?? 0.67));
+            const tx = item.deflect ? anchorPt.x - 58 : 554;
+            const ty = item.deflect ? anchorPt.y + 34 + pNorm * 8 : 52 - pNorm * 5;
+            const tOp = pNorm < 0.14 ? pNorm / 0.14 : pNorm > 0.74 ? (1 - pNorm) / 0.26 : 1;
+            item.tagEl.style.left = `${(tx / LOGICAL_W) * 100}%`;
+            item.tagEl.style.top = `${(ty / LOGICAL_H) * 100}%`;
+            item.tagEl.style.opacity = Math.max(0, Math.min(1, tOp)).toFixed(2);
+          } else {
+            item.tagEl.style.opacity = "0";
+          }
+        }
 
         if (raw > 1) {
           item.el.style.opacity = "0";
+          item.el.classList.remove("hit-drop");
           continue;
         }
 
-        const startT = item.startT ?? 0.18;
-        const endT = item.endT ?? 0.8;
+        const startT = item.startT ?? 0.14;
+        const endT = item.endT ?? 0.84;
+
+        if (item.deflect) {
+          // 0..0.62: race straight toward left gate-shield; 0.62..1.0: hard stop, flash coral/amber, shake & drop down!
+          const hitFrac = 0.62;
+          if (raw < hitFrac) {
+            const moveFrac = raw / hitFrac;
+            const travel = startT + easeInOutQuad(moveFrac) * (endT - startT);
+            const pt = item.path.getPointAtLength(item.len * travel);
+            const op = moveFrac < 0.12 ? moveFrac / 0.12 : 1;
+            item.el.classList.remove("hit-drop");
+            item.el.style.left = `${(pt.x / LOGICAL_W) * 100}%`;
+            item.el.style.top = `${(pt.y / LOGICAL_H) * 100}%`;
+            item.el.style.opacity = op.toFixed(2);
+            item.el.style.transform = "translate(-50%, -50%) scale(1)";
+          } else {
+            const dropFrac = (raw - hitFrac) / (1 - hitFrac);
+            const pt = item.path.getPointAtLength(item.len * endT);
+            const shakeX = Math.sin(dropFrac * Math.PI * 3) * (1 - dropFrac) * 4;
+            const bounceX = -10 * dropFrac + shakeX;
+            const dropY = 18 * dropFrac * dropFrac + 6 * dropFrac;
+            const tilt = -6 * dropFrac;
+            const op = dropFrac > 0.62 ? Math.max(0, 1 - (dropFrac - 0.62) / 0.38) : 1;
+
+            item.el.classList.add("hit-drop");
+            item.el.style.left = `${(pt.x / LOGICAL_W) * 100}%`;
+            item.el.style.top = `${(pt.y / LOGICAL_H) * 100}%`;
+            item.el.style.opacity = op.toFixed(2);
+            item.el.style.transform = `translate(-50%, -50%) translate(${bounceX.toFixed(1)}px, ${dropY.toFixed(1)}px) rotate(${tilt.toFixed(1)}deg) scale(${(1 - 0.08 * dropFrac).toFixed(3)})`;
+
+            if (dropFrac < 0.55) shieldHitKind = item.deflect;
+
+            if (item.lastCycle !== cycleNum && fixedPhase === null) {
+              item.lastCycle = cycleNum;
+              flashShield(item.deflect);
+              const burst = document.createElement("div");
+              burst.className = `gate-deflect-burst ${item.deflect}`;
+              burst.style.left = `${(pt.x / LOGICAL_W) * 100}%`;
+              burst.style.top = `${(pt.y / LOGICAL_H) * 100}%`;
+              packetsHost.appendChild(burst);
+              setTimeout(() => burst.remove(), 540);
+            }
+          }
+          continue;
+        }
+
         const travel = startT + easeInOutQuad(raw) * (endT - startT);
         const pt = item.path.getPointAtLength(item.len * travel);
+        item.el.classList.remove("hit-drop");
         item.el.style.left = `${(pt.x / LOGICAL_W) * 100}%`;
         item.el.style.top = `${(pt.y / LOGICAL_H) * 100}%`;
 
@@ -1487,23 +1573,29 @@ function ceMatchesFilters(filters, event) {
           scale = 1 - 0.18 * tail;
         }
 
-        if (raw >= 0.86 && item.lastCycle !== cycleNum) {
+        if (raw >= 0.86 && item.lastCycle !== cycleNum && fixedPhase === null) {
           item.lastCycle = cycleNum;
-          if (item.deflect) {
-            const burst = document.createElement("div");
-            burst.className = `gate-deflect-burst ${item.deflect}`;
-            burst.style.left = `${(pt.x / LOGICAL_W) * 100}%`;
-            burst.style.top = `${(pt.y / LOGICAL_H) * 100}%`;
-            packetsHost.appendChild(burst);
-            setTimeout(() => burst.remove(), 520);
-          }
           if (item.rippleAgent) fireRipple(agentRipple);
-          if (item.rippleNode) fireRipple(nodeRipple, item.rippleNode);
+          if (item.rippleNode) fireRipple(nodeRipple, item.rippleNode === "green" ? "" : item.rippleNode);
         }
 
         item.el.style.opacity = opacity.toFixed(2);
         item.el.style.transform = `translate(-50%, -50%) scale(${scale.toFixed(3)})`;
       }
+
+      if (fixedPhase !== null && shieldArc) {
+        shieldArc.classList.toggle("hit-amber", shieldHitKind === "amber");
+        shieldArc.classList.toggle("hit-coral", shieldHitKind === "coral");
+      }
+    }
+
+    if (fixedPhase !== null || reducedMotion) {
+      renderFrame((fixedPhase ?? 0.56) * CYCLE_MS);
+      return;
+    }
+
+    function tick(now) {
+      renderFrame(now - t0);
       gateRaf = requestAnimationFrame(tick);
     }
     gateRaf = requestAnimationFrame(tick);
@@ -1566,7 +1658,7 @@ function ceMatchesFilters(filters, event) {
         p.classList.toggle("detached", state === "detached");
         if (state === "detached") {
           const l = p.getTotalLength();
-          p.style.strokeDasharray = `${(l * 0.42).toFixed(1)} ${l.toFixed(1)}`;
+          p.style.strokeDasharray = `${(l * 0.56).toFixed(1)} ${l.toFixed(1)}`;
         } else {
           p.style.strokeDasharray = "";
         }
@@ -1621,508 +1713,7 @@ function ceMatchesFilters(filters, event) {
 })();
 
 // ============================================================================
-// 4. DARK STREAMS, REAL CLOUDEVENTS FILTER DECK, #CHANNELS & PRIVATE BRIDGES
-// ============================================================================
-let activeDeck = "prometheus";
-let activePromCase = "critical-firing";
-let activeGhCase = "pr-approved";
-let activeRoom = "#incidents";
-const chatLinked = new Set(["alex@laptop/claude"]);
-let chatApp = "slack";
-
-const PROM_CASES = {
-  "critical-firing": {
-    label: "Critical · checkout-api (firing)",
-    event: {
-      specversion: "1.0",
-      id: "8f3c1a9b:firing:2026-11-24T12:00:00Z",
-      type: "io.prometheus.alert.firing",
-      source: "prometheus/alertmanager",
-      subject: "severity=critical/HighErrorRate",
-      time: "2026-11-24T12:00:00Z",
-      datacontenttype: "application/json",
-      data: {
-        status: "firing",
-        alertname: "HighErrorRate",
-        severity: "critical",
-        service: "checkout-api",
-        summary: "5xx error rate at 4.2% across 14 prod nodes",
-      },
-    },
-  },
-  "warning-firing": {
-    label: "Warning · billing-db (firing)",
-    event: {
-      specversion: "1.0",
-      id: "4d9a22e1:firing:2026-11-24T12:03:10Z",
-      type: "io.prometheus.alert.firing",
-      source: "prometheus/alertmanager",
-      subject: "severity=warning/ReplicationLag",
-      time: "2026-11-24T12:03:10Z",
-      datacontenttype: "application/json",
-      data: {
-        status: "firing",
-        alertname: "ReplicationLag",
-        severity: "warning",
-        service: "billing-db",
-        summary: "Read replica lag 4.1s (threshold 3s)",
-      },
-    },
-  },
-  "critical-resolved": {
-    label: "Critical · checkout-api (resolved)",
-    event: {
-      specversion: "1.0",
-      id: "8f3c1a9b:resolved:2026-11-24T12:14:22Z",
-      type: "io.prometheus.alert.resolved",
-      source: "prometheus/alertmanager",
-      subject: "severity=critical/HighErrorRate",
-      time: "2026-11-24T12:14:22Z",
-      datacontenttype: "application/json",
-      data: {
-        status: "resolved",
-        alertname: "HighErrorRate",
-        severity: "critical",
-        service: "checkout-api",
-        summary: "5xx error rate back to 0.0%",
-      },
-    },
-  },
-};
-
-const PROM_SUBS = [
-  {
-    addr: "jack@prod/ops",
-    harness: "T3 Code · mode: interrupt · coalesce: 10s",
-    mode: "interrupt",
-    filters: [
-      { exact: { type: "io.prometheus.alert.firing", "data.severity": "critical" } },
-      { prefix: { subject: "severity=critical/" } },
-    ],
-  },
-  {
-    addr: "alex@laptop/claude",
-    harness: "Claude in Herdr · mode: queue · coalesce: 15s",
-    mode: "queue",
-    filters: [
-      { exact: { "data.service": "checkout-api" } },
-      { any: [
-        { exact: { type: "io.prometheus.alert.firing" } },
-        { exact: { type: "io.prometheus.alert.resolved" } },
-      ]},
-    ],
-  },
-  {
-    addr: "alice@laptop/codex",
-    harness: "Codex via OpenClaw · mode: queue · coalesce: 60s",
-    mode: "queue",
-    filters: [
-      { exact: { type: "io.prometheus.alert.firing" } },
-      { not: { exact: { "data.severity": "critical" } } },
-    ],
-  },
-];
-
-const GH_CASES = {
-  "pr-approved": {
-    label: "PR #412 Approved",
-    event: {
-      specversion: "1.0",
-      id: "72d91b40-9a12-11ef-8120-0242ac120003",
-      source: "github.com/acme/checkout-api",
-      type: "com.github.pull_request_review.submitted",
-      time: "2026-11-24T12:05:12Z",
-      datacontenttype: "application/json",
-      subject: "pull/412",
-      repo: "acme/checkout-api",
-      action: "submitted",
-      actor: "alice-bot",
-      data: {
-        number: 412,
-        pr_numbers: [412],
-        title: "Bound Redis pool queueLimit",
-        state: "approved",
-        labels: ["release-ready"],
-        author: "alice-bot",
-      },
-    },
-  },
-  "ci-failed": {
-    label: "PR #412 CI Failed",
-    event: {
-      specversion: "1.0",
-      id: "91e04c12-9a12-11ef-8120-0242ac120003",
-      source: "github.com/acme/checkout-api",
-      type: "com.github.workflow_run.completed",
-      time: "2026-11-24T12:02:01Z",
-      datacontenttype: "application/json",
-      subject: "actions/runs/982144",
-      repo: "acme/checkout-api",
-      action: "completed",
-      actor: "alex",
-      data: {
-        pr_numbers: [412],
-        conclusion: "failure",
-        workflow_path: ".github/workflows/ci.yml",
-        branch: "fix/redis-pool",
-      },
-    },
-  },
-  "dependabot-pr": {
-    label: "Dependabot PR #419",
-    event: {
-      specversion: "1.0",
-      id: "11c8a9f0-9a12-11ef-8120-0242ac120003",
-      source: "github.com/acme/checkout-api",
-      type: "com.github.pull_request.opened",
-      time: "2026-11-24T12:08:40Z",
-      datacontenttype: "application/json",
-      subject: "pull/419",
-      repo: "acme/checkout-api",
-      action: "opened",
-      actor: "dependabot[bot]",
-      data: {
-        number: 419,
-        pr_numbers: [419],
-        title: "Bump eslint from 9.10 to 9.11",
-        labels: ["dependencies"],
-      },
-    },
-  },
-  "strict-lint": {
-    label: "Reachability Lint (strict: true)",
-    lintDemo: true,
-    call: {
-      tool: "hyp_subscribe",
-      key: "gh:broken-typo",
-      topic: "github",
-      strict: true,
-      filters: [
-        { exact: { subject: "acme/checkout-api" } },
-      ],
-    },
-    response: {
-      ok: false,
-      code: "unreachable_subscription",
-      rolledBack: true,
-      diagnostics: [
-        {
-          code: "invalid_github_subject_filter",
-          message: "GitHub `subject` is `pull/<n>`, `issues/<n>`, or `actions/runs/<id>` — use the `repo` extension attribute for `owner/repo`.",
-          suggestedFilter: { exact: { repo: "acme/checkout-api" } },
-        },
-      ],
-    },
-  },
-};
-
-const GH_SUBS = [
-  {
-    addr: "jack@prod/release",
-    harness: "T3 Code · mode: queue · coalesce: 15s · strict: true",
-    mode: "queue",
-    filters: [
-      { exact: { repo: "acme/checkout-api", type: "com.github.pull_request_review.submitted" } },
-      { exact: { "data.state": "approved", "data.labels": "release-ready" } },
-    ],
-  },
-  {
-    addr: "alex@laptop/claude",
-    harness: "Claude in Herdr · mode: queue · array match on data.pr_numbers",
-    mode: "queue",
-    filters: [
-      { exact: { repo: "acme/checkout-api", "data.pr_numbers": "412" } },
-      { not: { exact: { actor: "dependabot[bot]" } } },
-    ],
-  },
-  {
-    addr: "alice@laptop/codex",
-    harness: "Codex via OpenClaw · suffix + not bot exclusion",
-    mode: "queue",
-    filters: [
-      { exact: { repo: "acme/checkout-api" } },
-      { suffix: { type: ".opened" } },
-      { not: { exact: { actor: "dependabot[bot]" } } },
-    ],
-  },
-];
-
-const chMembers = [
-  { id: "jack@prod/ops", sub: "T3 Code · Linux server · Prometheus subscriber" },
-  { id: "alex@laptop/claude", sub: "Claude in Herdr · laptop · checkout-api owner" },
-  { id: "alice@laptop/codex", sub: "Codex via OpenClaw · laptop · PR reviewer" },
-  { id: "jack@prod/release", sub: "T3 Code · Linux server · Release Manager" },
-];
-
-const ROOM_STATE = {
-  "#incidents": {
-    joined: new Set(["jack@prod/ops", "alex@laptop/claude"]),
-    sender: "jack@prod/ops",
-    log: [
-      "#incidents · Team Node SQLite room (2 enrolled · no sender echo)",
-      "jack@prod/ops: checkout-api HighErrorRate (4.2%) — CODEOWNERS -> alex",
-      "alex@laptop/claude: Fixed Redis pool leak; handed PR #412 to Alice",
-    ],
-  },
-  "#deploys": {
-    joined: new Set(["alex@laptop/claude", "alice@laptop/codex", "jack@prod/ops", "jack@prod/release"]),
-    sender: "jack@prod/release",
-    log: [
-      "#deploys · release fan-out room (4 enrolled · no sender echo)",
-      "jack@prod/release: Merged PR #412 (approved by Alice) -> v2.14.1 live ✓ · alert resolved (0.0%)",
-    ],
-  },
-};
-
-const CHAT_THREADS = [
-  { id: "alex@laptop/claude", sub: "Claude in Herdr · Alex's Private Node" },
-  { id: "alice@laptop/codex", sub: "Codex via OpenClaw · Alice's laptop" },
-  { id: "jack@prod/ops", sub: "T3 Code · Jack's server" },
-  { id: "jack@prod/release", sub: "T3 Code · Jack's Release Manager" },
-];
-
-const BRIDGE_SECRET_ENV = {
-  slack: {
-    SLACK_APP_TOKEN: { secret: "slack-app-token" },
-    SLACK_BOT_TOKEN: { secret: "slack-bot-token" },
-    SLACK_ALLOWED_USERS: "U01234567",
-  },
-  telegram: {
-    TELEGRAM_BOT_TOKEN: { secret: "telegram-bot-token" },
-    TELEGRAM_ALLOWED_USERS: "981234567",
-  },
-  whatsapp: {
-    WHATSAPP_ACCESS_TOKEN: { secret: "whatsapp-access-token" },
-    WHATSAPP_APP_SECRET: { secret: "whatsapp-app-secret" },
-    WHATSAPP_ALLOWED_NUMBERS: "15551234567",
-  },
-  "byo-fd3": {
-    exec: "/usr/local/bin/my-bridge.py",
-    protocol: "NDJSON over fd 3 (plugins/sdk/client.{mjs,py})",
-    BRIDGE_API_KEY: { secret: "my-bridge-key" },
-  },
-};
-
-function renderEventEvaluator(topic, cases, activeKey, setKey, subs) {
-  const current = cases[activeKey];
-  const chips = Object.entries(cases)
-    .map(([k, c]) => `<button class="sub-chip ${c.lintDemo ? "lint" : ""} ${activeKey === k ? "active" : ""}" data-case="${k}" type="button">${esc(c.label)}</button>`)
-    .join("");
-
-  if (current.lintDemo) {
-    return `
-      <div>
-        <div class="deck-col-label"><span>Subscribe Call</span><code>strict: true</code></div>
-        <div class="deck-subtabs">${chips}</div>
-        <pre class="payload-pre">${esc(JSON.stringify(current.call, null, 2))}</pre>
-      </div>
-      <div>
-        <div class="deck-col-label"><span>Router Reachability Lint</span><code>fail-closed rollback</code></div>
-        <div class="route-item lint-warn">
-          <div class="route-top">
-            <div>
-              <span class="ri-addr">invalid_github_subject_filter</span>
-              <span class="ri-sub">Caught before saving — never silently waits forever on an unreachable filter.</span>
-            </div>
-            <span class="ri-pill">rejected</span>
-          </div>
-          <pre class="ri-filter">${esc(JSON.stringify(current.response, null, 2))}</pre>
-        </div>
-        <div class="route-item matched">
-          <div class="route-top">
-            <div>
-              <span class="ri-addr">Also linted at subscribe time</span>
-              <span class="ri-sub"><code>unknown_topic</code> · <code>unmonitored_repo</code> (checks <code>GITHUB_REPOS</code> / <code>GITHUB_ORGS</code>) · <code>unknown_filter_attribute</code> · <code>unprovisioned_publisher</code></span>
-            </div>
-            <span class="ri-pill">hyp_topics</span>
-          </div>
-        </div>
-      </div>
-    `;
-  }
-
-  const ev = current.event;
-  return `
-    <div>
-      <div class="deck-col-label"><span>Incoming CloudEvent v1.0</span><code>topic: "${topic}"</code></div>
-      <div class="deck-subtabs">${chips}</div>
-      <pre class="payload-pre">${esc(JSON.stringify(ev, null, 2))}</pre>
-    </div>
-    <div>
-      <div class="deck-col-label"><span>Live Subscriptions API v1.0 Evaluation</span><code>filter.ts</code></div>
-      ${subs.map((s) => {
-        const matched = ceMatchesFilters(s.filters, ev);
-        const cls = matched ? (s.mode === "interrupt" ? "interrupt" : "matched") : "dim";
-        const pill = matched ? (s.mode === "interrupt" ? "interrupt" : "woken") : "filtered";
-        return `
-          <div class="route-item ${cls}">
-            <div class="route-top">
-              <div>
-                <span class="ri-addr">${esc(s.addr)}</span>
-                <span class="ri-sub">${esc(s.harness)}</span>
-              </div>
-              <span class="ri-pill">${pill}</span>
-            </div>
-            <pre class="ri-filter">filters: ${esc(JSON.stringify(s.filters))}</pre>
-          </div>
-        `;
-      }).join("")}
-    </div>
-  `;
-}
-
-function renderDeck() {
-  document.querySelectorAll("#deckTabs .deck-tab").forEach((b) =>
-    b.classList.toggle("active", b.dataset.deck === activeDeck)
-  );
-  const body = document.getElementById("deckBody");
-  if (!body) return;
-
-  if (activeDeck === "prometheus") {
-    body.innerHTML = renderEventEvaluator("alerts", PROM_CASES, activePromCase, (k) => { activePromCase = k; }, PROM_SUBS);
-    body.querySelectorAll("[data-case]").forEach((btn) => {
-      btn.addEventListener("click", () => { activePromCase = btn.dataset.case; renderDeck(); });
-    });
-    return;
-  }
-
-  if (activeDeck === "github") {
-    body.innerHTML = renderEventEvaluator("github", GH_CASES, activeGhCase, (k) => { activeGhCase = k; }, GH_SUBS);
-    body.querySelectorAll("[data-case]").forEach((btn) => {
-      btn.addEventListener("click", () => { activeGhCase = btn.dataset.case; renderDeck(); });
-    });
-    return;
-  }
-
-  if (activeDeck === "channels") {
-    const room = ROOM_STATE[activeRoom];
-    body.innerHTML = `
-      <div>
-        <div class="deck-col-label"><span>Multi-Agent Room Log</span><code>hyp_channel_post</code></div>
-        <div class="deck-subtabs">
-          <button class="sub-chip ${activeRoom === "#incidents" ? "active" : ""}" data-room="#incidents" type="button">#incidents</button>
-          <button class="sub-chip ${activeRoom === "#deploys" ? "active" : ""}" data-room="#deploys" type="button">#deploys</button>
-        </div>
-        <div class="deck-log" id="deckChannelLog">
-          ${room.log.map((line, i) => `<div class="${i === room.log.length - 1 ? "hl" : ""}">${esc(line)}</div>`).join("")}
-        </div>
-        <div class="deck-input-row">
-          <input class="deck-input" id="deckChannelInput" placeholder="Post to ${esc(activeRoom)} as ${esc(room.sender)}..." />
-          <button class="deck-send-btn" id="deckChannelSendBtn" type="button">Post</button>
-        </div>
-      </div>
-      <div>
-        <div class="deck-col-label"><span>Room Membership</span><code>toggle join / leave</code></div>
-        ${chMembers.map((m) => {
-          const on = room.joined.has(m.id);
-          return `
-            <div class="route-item inline ${on ? "matched" : "dim"}">
-              <div>
-                <span class="ri-addr">${esc(m.id)}</span>
-                <span class="ri-sub">${esc(m.sub)}</span>
-              </div>
-              <button class="ri-pill" data-cm="${esc(m.id)}" type="button">${on ? "joined · leave" : "join room"}</button>
-            </div>
-          `;
-        }).join("")}
-      </div>
-    `;
-    const logEl = document.getElementById("deckChannelLog");
-    if (logEl) logEl.scrollTop = logEl.scrollHeight;
-    const postMsg = () => {
-      const input = document.getElementById("deckChannelInput");
-      const text = (input?.value || "").trim() || (activeRoom === "#incidents"
-        ? "PR #412 merged — checkout-api errors back to 0.0%."
-        : "Shipping checkout-api v2.14.1 to prod.");
-      if (input) input.value = "";
-      const recips = [...room.joined].filter((x) => x !== room.sender);
-      room.log.push(`${room.sender}: ${text}`);
-      room.log.push(`-> pushed natively to [${recips.join(", ") || "nobody"}] (no self-echo)`);
-      renderDeck();
-    };
-    body.querySelectorAll("[data-room]").forEach((btn) => {
-      btn.addEventListener("click", () => { activeRoom = btn.dataset.room; renderDeck(); });
-    });
-    body.querySelectorAll("[data-cm]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const id = btn.dataset.cm;
-        if (room.joined.has(id)) {
-          room.joined.delete(id);
-          room.log.push(`hyp_channel_leave('${activeRoom}') -> ${id}`);
-        } else {
-          room.joined.add(id);
-          room.log.push(`hyp_channel_join('${activeRoom}') -> ${id}`);
-        }
-        renderDeck();
-      });
-    });
-    document.getElementById("deckChannelSendBtn")?.addEventListener("click", postMsg);
-    document.getElementById("deckChannelInput")?.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") postMsg();
-    });
-    return;
-  }
-
-  const linkedList = [...chatLinked];
-  body.innerHTML = `
-    <div>
-      <div class="deck-col-label"><span>Private Node Bridge Config</span><code>connector.json</code></div>
-      <div class="deck-subtabs">
-        ${["slack", "telegram", "whatsapp", "byo-fd3"].map((app) =>
-          `<button class="sub-chip ${chatApp === app ? "active" : ""}" data-capp="${app}" type="button">${app}</button>`
-        ).join("")}
-      </div>
-      <pre class="payload-pre">${esc(JSON.stringify({
-        node: "Private Node (127.0.0.1 — never shared with Team Node)",
-        plugin: chatApp,
-        env: BRIDGE_SECRET_ENV[chatApp],
-        target: {
-          name: "dm-alex",
-          coalesceSeconds: 5,
-          maxWaitSeconds: 30,
-          wakesPerHour: 120,
-          linkedThreads: linkedList,
-        },
-        outboundReply: 'hyp_plugin_post({ plugin: "' + chatApp + '", target: "dm-alex", text: "..." })',
-      }, null, 2))}</pre>
-    </div>
-    <div>
-      <div class="deck-col-label"><span>Live Multi-Thread Fan-In</span><code>hyp_bridge_link / unlink</code></div>
-      ${CHAT_THREADS.map((t) => {
-        const on = chatLinked.has(t.id);
-        return `
-          <div class="route-item inline ${on ? "matched" : "dim"}">
-            <div>
-              <span class="ri-addr">${esc(t.id)}</span>
-              <span class="ri-sub">${esc(t.sub)}</span>
-            </div>
-            <button class="ri-pill" data-ct="${esc(t.id)}" type="button">${on ? "linked · unlink" : "link thread"}</button>
-          </div>
-        `;
-      }).join("")}
-    </div>
-  `;
-
-  body.querySelectorAll("[data-capp]").forEach((btn) => {
-    btn.addEventListener("click", () => { chatApp = btn.dataset.capp; renderDeck(); });
-  });
-  body.querySelectorAll("[data-ct]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const id = btn.dataset.ct;
-      if (chatLinked.has(id)) chatLinked.delete(id);
-      else chatLinked.add(id);
-      renderDeck();
-    });
-  });
-}
-
-document.querySelectorAll("#deckTabs .deck-tab").forEach((b) => {
-  b.addEventListener("click", () => { activeDeck = b.dataset.deck; renderDeck(); });
-});
-renderDeck();
-
-// ============================================================================
-// 5. QUICK START TABS
+// 4. QUICK START TABS
 // ============================================================================
 const QS = {
   curl: `# Install hyp from GitHub and launch interactive onboarding
