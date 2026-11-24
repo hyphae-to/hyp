@@ -43,7 +43,7 @@ const agyBin = findBinary("agy");
 const hcBin = findBinary("hc");
 
 test(
-  "REAL Claude Code binary + dummy Anthropic API: per-call PreToolUse identity + zero-polling Stop hook push + mesh_send reply",
+  "REAL Claude Code binary + dummy Anthropic API: per-call PreToolUse identity + zero-polling Stop hook push + hyp_send reply",
   { skip: claudeBin === null ? "claude CLI not installed locally" : false, timeout: 60_000 },
   async () => {
     assert.ok(claudeBin);
@@ -63,7 +63,7 @@ test(
 
     // Enroll a virtual peer on the same daemon so real Claude can exchange messages with it!
     daemon.state.register("antigravity:peer-conv", { kind: "antigravity" });
-    await daemon.connector.call("antigravity:peer-conv", "mesh_join", { handle: "peer-bot" });
+    await daemon.connector.call("antigravity:peer-conv", "hyp_join", { handle: "peer-bot" });
 
     // Generate real project setup via `setupClaude`!
     const runtime = { nodeBin: process.execPath, cliScript: join(process.cwd(), "src", "cli.ts") };
@@ -75,8 +75,8 @@ test(
     let didSearch = false;
 
     const dummyApi = await startDummyAnthropicServer(async (req) => {
-      const joinTool = req.tools.find((t) => t.name.endsWith("mesh_join"))?.name;
-      const sendTool = req.tools.find((t) => t.name.endsWith("mesh_send"))?.name;
+      const joinTool = req.tools.find((t) => t.name.endsWith("hyp_join"))?.name;
+      const sendTool = req.tools.find((t) => t.name.endsWith("hyp_send"))?.name;
       const toolSearch = req.tools.find((t) => t.name === "ToolSearch")?.name;
       const allText = JSON.stringify(req.messages);
 
@@ -87,20 +87,20 @@ test(
           type: "tool_use",
           id: "toolu_search_0",
           name: toolSearch,
-          input: { query: "select:mcp__hyphae__mesh_join,mcp__hyphae__mesh_send" },
+          input: { query: "select:mcp__hyphae__hyp_join,mcp__hyphae__hyp_send" },
         };
       }
 
       if (!didJoin) {
         didJoin = true;
-        assert.ok(joinTool, `Expected Claude to advertise mesh_join; got: ${req.tools.map((t) => t.name).join(", ")}`);
+        assert.ok(joinTool, `Expected Claude to advertise hyp_join; got: ${req.tools.map((t) => t.name).join(", ")}`);
         return { type: "tool_use", id: "toolu_real_join_1", name: joinTool, input: { handle: "claude-real" } };
       }
 
       if (!pushedToClaude) {
-        assert.match(allText, /bogdan@local\/claude-real/, `Expected mesh_join result in messages, got: ${allText}`);
+        assert.match(allText, /bogdan@local\/claude-real/, `Expected hyp_join result in messages, got: ${allText}`);
         pushedToClaude = true;
-        await daemon.connector.call("antigravity:peer-conv", "mesh_send", {
+        await daemon.connector.call("antigravity:peer-conv", "hyp_send", {
           to: "bogdan@local/claude-real",
           text: "push-hello-to-real-claude",
         });
@@ -111,7 +111,7 @@ test(
 
       if (allText.includes("push-hello-to-real-claude") && !sawPushedMessage) {
         sawPushedMessage = true;
-        assert.ok(sendTool, "Expected mesh_send tool");
+        assert.ok(sendTool, "Expected hyp_send tool");
         return {
           type: "tool_use",
           id: "toolu_real_send_2",
@@ -148,7 +148,7 @@ test(
       );
 
       assert.equal(res.code, 0, `claude exited ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
-      assert.equal(sawPushedMessage, true, "Real Claude should have received peer message via Stop/PostToolUse hook without polling mesh_inbox");
+      assert.equal(sawPushedMessage, true, "Real Claude should have received peer message via Stop/PostToolUse hook without polling hyp_inbox");
 
       // Verify identity was bound to real `claude:<session_id>`, NOT a random MCP UUID
       const claudeSession = daemon.state.byHandle("claude-real");
@@ -159,7 +159,7 @@ test(
       await new Promise((r) => setTimeout(r, 250));
       const peerInbox = daemon.connector.drainMailbox("antigravity:peer-conv", 5);
       assert.equal(peerInbox.length, 1, `Expected 1 reply in peer-bot mailbox, got ${peerInbox.length}`);
-      assert.match(peerInbox[0].text, /mesh from bogdan@local\/claude-real/);
+      assert.match(peerInbox[0].text, /hyphae from bogdan@local\/claude-real/);
       assert.match(peerInbox[0].text, /ack-from-real-claude-without-polling/);
     } finally {
       await dummyApi.close();
@@ -191,7 +191,7 @@ test(
     }, { quiet: true });
 
     daemon.state.register("antigravity:peer-conv", { kind: "antigravity" });
-    await daemon.connector.call("antigravity:peer-conv", "mesh_join", { handle: "peer-bot" });
+    await daemon.connector.call("antigravity:peer-conv", "hyp_join", { handle: "peer-bot" });
 
     // Generate real Codex config + hooks via `setupCodex` into isolated CODEX_HOME!
     const runtime = { nodeBin: process.execPath, cliScript: join(process.cwd(), "src", "cli.ts") };
@@ -202,13 +202,13 @@ test(
     let didReply = false;
 
     const dummyApi = await startDummyOpenAIServer(async (req) => {
-      const joinTool = req.tools.find((t) => t.name.endsWith("mesh_join"));
-      const sendTool = req.tools.find((t) => t.name.endsWith("mesh_send"));
+      const joinTool = req.tools.find((t) => t.name.endsWith("hyp_join"));
+      const sendTool = req.tools.find((t) => t.name.endsWith("hyp_send"));
       const allText = JSON.stringify(req.input);
 
       if (!didJoin) {
         didJoin = true;
-        assert.ok(joinTool, `Expected Codex to advertise mesh_join; got: ${JSON.stringify(req.tools)}`);
+        assert.ok(joinTool, `Expected Codex to advertise hyp_join; got: ${JSON.stringify(req.tools)}`);
         return {
           type: "function_call",
           callId: "call_real_codex_join_1",
@@ -220,7 +220,7 @@ test(
 
       if (allText.includes("push-hello-to-real-codex") && !didReply) {
         didReply = true;
-        assert.ok(sendTool, "Expected mesh_send tool");
+        assert.ok(sendTool, "Expected hyp_send tool");
         return {
           type: "function_call",
           callId: "call_real_codex_send_2",
@@ -266,7 +266,7 @@ test(
       const threadId = codexSession.id.slice("codex:".length);
 
       // Step 2: Peer sends a real mesh message → daemon pushes it natively via `codex queue --thread <id>`!
-      await daemon.connector.call("antigravity:peer-conv", "mesh_send", {
+      await daemon.connector.call("antigravity:peer-conv", "hyp_send", {
         to: "bogdan@local/codex-real",
         text: "push-hello-to-real-codex",
       });
@@ -405,7 +405,7 @@ test(
       assert.equal(info.status, null);
 
       // Must fail closed on a non-agent shell terminal (prevents injecting mesh text into a raw shell)
-      const [denied] = await callHerdrMcp(termId, [{ name: "mesh_capabilities", arguments: {} }]);
+      const [denied] = await callHerdrMcp(termId, [{ name: "hyp_capabilities", arguments: {} }]);
       assert.equal((denied.result as { isError?: boolean }).isError, true);
       const deniedText = ((denied.result as { content: Array<{ text: string }> }).content[0]).text;
       assert.match(deniedText, /caller_unverifiable|Could not verify/i);
@@ -419,8 +419,8 @@ test(
         };
         if (liveInfo.state === "live" && liveInfo.status?.app) {
           const [capRes, joinRes] = await callHerdrMcp(liveAgentTerm, [
-            { name: "mesh_capabilities", arguments: {} },
-            { name: "mesh_join", arguments: { handle: "hc-agent" } },
+            { name: "hyp_capabilities", arguments: {} },
+            { name: "hyp_join", arguments: { handle: "hc-agent" } },
           ]);
           const caps = JSON.parse(((capRes.result as { content: Array<{ text: string }> }).content[0]).text) as {
             sessionId: string; backend: string; modes: string[];

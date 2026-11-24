@@ -69,7 +69,7 @@ interface SupervisedStream {
 /**
  * Supervises router-level data source plugins ("streams") feeding CloudEvents directly into
  * `RouterCore.events.publish(...)` so any enrolled agent across any harness or machine can
- * subscribe with CloudEvents filters (`mesh_subscribe`).
+ * subscribe with CloudEvents filters (`hyp_subscribe`).
  *
  * Supports:
  * - `builtin: "github-webhook"` — runs t3-mesh's hardened GitHub HMAC webhook receiver

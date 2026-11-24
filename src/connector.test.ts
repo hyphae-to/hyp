@@ -40,13 +40,13 @@ test("sessions share router enrollment but keep handles and inbox acknowledgemen
   const loop = connector.run(lifecycle.signal);
   try {
     const stream = await inbox;
-    assert.deepEqual(await connector.call("a", "mesh_join", { handle: "me" }), { address: "receiver/me" });
-    assert.deepEqual(await connector.call("b", "mesh_join", { handle: "other" }), { address: "receiver/other" });
-    await assert.rejects(connector.call("b", "mesh_join", { handle: "me" }), /belongs to another session/);
+    assert.deepEqual(await connector.call("a", "hyp_join", { handle: "me" }), { address: "receiver/me" });
+    assert.deepEqual(await connector.call("b", "hyp_join", { handle: "other" }), { address: "receiver/other" });
+    await assert.rejects(connector.call("b", "hyp_join", { handle: "me" }), /belongs to another session/);
     assert.deepEqual(handleSets, [[], ["me"], ["me", "other"]]);
     const args = { key: "watch:ci", topic: "github", filters: [] };
-    await connector.call("a", "mesh_subscribe", args);
-    await connector.call("b", "mesh_subscribe", args);
+    await connector.call("a", "hyp_subscribe", args);
+    await connector.call("b", "hyp_subscribe", args);
     assert.equal(state.subscriptions().length, 2);
     const item = { id: "item", kind: "message", from: "sender/peer", to: "receiver/me", text: "hello" };
     const frame = `data: ${JSON.stringify(item)}\n\n`;
@@ -63,13 +63,13 @@ test("sessions share router enrollment but keep handles and inbox acknowledgemen
         }, 10);
       });
     }
-    const mailbox = await connector.call("a", "mesh_inbox", {}) as { items: { receipt: string }[] };
+    const mailbox = await connector.call("a", "hyp_inbox", {}) as { items: { receipt: string }[] };
     assert.equal(mailbox.items.length, 1);
     const [itemReceipt] = mailbox.items;
     assert.ok(itemReceipt);
-    assert.deepEqual(await connector.call("b", "mesh_inbox", { acknowledge: [itemReceipt.receipt] }), { items: [] });
-    assert.deepEqual(await connector.call("a", "mesh_inbox", {}), mailbox);
-    assert.deepEqual(await connector.call("a", "mesh_inbox", { acknowledge: [itemReceipt.receipt] }), { items: [] });
+    assert.deepEqual(await connector.call("b", "hyp_inbox", { acknowledge: [itemReceipt.receipt] }), { items: [] });
+    assert.deepEqual(await connector.call("a", "hyp_inbox", {}), mailbox);
+    assert.deepEqual(await connector.call("a", "hyp_inbox", { acknowledge: [itemReceipt.receipt] }), { items: [] });
     assert.deepEqual(acked, [delivered, delivered]);
   } finally {
     lifecycle.abort();

@@ -88,7 +88,7 @@ export function buildAgentOnboardingPrompt(ctx: OnboardingContext): string {
     "3. Ask which harnesses to enable (`antigravity`, `claude`, `codex`, `cursor`, `opencode`, `gemini`, `openclaw`, plus Herdr `--backend herdr`), which Router Data Streams (`github-webhook`, `webhook-stream`, custom fd-3 source), and which Connector Thread Bridges (`slack`, `telegram`, `webhook`, custom) they want.",
     "4. Execute the setup commands using `" + ctx.cli + "` (`onboard --yes`, `setup <harness>`, `share tailscale`, `status --discover --probe-ssh`, `connect guide <id>`, `secret set <name> --web`, `secret check`, `status`).",
     "5. If remote SSH machines are discovered (Herdr / `~/.ssh/config` / Tailscale), offer to probe them with `hyp status --discover --probe-ssh` and walk through inviting reachable ones with `hyp onboard --remote-ssh <host>`.",
-    "6. Finish by running `" + ctx.cli + " status` and giving the user a 2-line test they can run right now (`mesh_join` + `mesh_channel_join('#incidents')` + `mesh_peers`).",
+    "6. Finish by running `" + ctx.cli + " status` and giving the user a 2-line test they can run right now (`hyp_join` + `hyp_channel_join('#incidents')` + `hyp_peers`).",
     "",
     "Start by greeting the user concisely with the detected snapshot and asking your first question.",
   ].join("\n");

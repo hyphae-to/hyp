@@ -73,8 +73,8 @@ export const eventLine = (type: string | null, second: string | null, subject: s
 
 export function formatEventDelivery(batch: InboundEventBatch): string {
   const header =
-    `mesh event ${safe(PATTERNS.topic, batch.topic) ?? "?"} · ${eventCount(batch.events.length)} · ` +
-    `sub ${safe(PATTERNS.id, batch.subscriptionId) ?? "?"} · stop with mesh_unsubscribe`;
+    `hyphae event ${safe(PATTERNS.topic, batch.topic) ?? "?"} · ${eventCount(batch.events.length)} · ` +
+    `sub ${safe(PATTERNS.id, batch.subscriptionId) ?? "?"} · stop with hyp_unsubscribe`;
   const lines = batch.events.map((event) =>
     eventLine(safe(PATTERNS.type, event.type), safe(PATTERNS.repo, event["repo"]), safe(PATTERNS.subject, event.subject)),
   );

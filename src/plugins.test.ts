@@ -89,9 +89,9 @@ test("built-in webhook plugin delivers signed CloudEvents to Antigravity wait an
   try {
     // Enroll Antigravity session under handle `ops-ag` and Claude session under `ops-claude`
     daemon.state.register("antigravity:ag-1", { kind: "antigravity" });
-    await daemon.connector.call("antigravity:ag-1", "mesh_join", { handle: "ops-ag" });
+    await daemon.connector.call("antigravity:ag-1", "hyp_join", { handle: "ops-ag" });
     daemon.state.register("claude:cl-2", { kind: "claude" });
-    await daemon.connector.call("claude:cl-2", "mesh_join", { handle: "ops-claude" });
+    await daemon.connector.call("claude:cl-2", "hyp_join", { handle: "ops-claude" });
 
     // Arm zero-polling `hyp wait` for Antigravity
     const waitProc = spawn(
@@ -140,15 +140,15 @@ test("built-in webhook plugin delivers signed CloudEvents to Antigravity wait an
 
     // Antigravity waiter wakes automatically with the plugin batch!
     const received = await waitOutput;
-    assert.match(received, /mesh event plugin:alerts/);
+    assert.match(received, /hyphae event plugin:alerts/);
     assert.match(received, /disk-full/);
 
-    // 2. Verify mesh_plugin_targets and hand off `alerts/ops` from Antigravity -> Claude!
-    const targets = await daemon.connector.call("antigravity:ag-1", "mesh_plugin_targets", {}) as { targets: Array<{ plugin: string; target: string }> };
+    // 2. Verify hyp_plugin_targets and hand off `alerts/ops` from Antigravity -> Claude!
+    const targets = await daemon.connector.call("antigravity:ag-1", "hyp_plugin_targets", {}) as { targets: Array<{ plugin: string; target: string }> };
     assert.equal(targets.targets.length, 1);
     assert.equal(targets.targets[0].plugin, "alerts");
 
-    const handoff = await daemon.connector.call("antigravity:ag-1", "mesh_plugin_handoff", {
+    const handoff = await daemon.connector.call("antigravity:ag-1", "hyp_plugin_handoff", {
       plugin: "alerts",
       target: "ops",
       handle: "ops-claude",
@@ -205,7 +205,7 @@ test("secrets store enforces 0600 permissions, tracks refs, and never leaks valu
   }
 });
 
-test("router data stream resolves {secret} from store and fans out CloudEvents to agents by mesh_subscribe filters", { timeout: 15_000 }, async () => {
+test("router data stream resolves {secret} from store and fans out CloudEvents to agents by hyp_subscribe filters", { timeout: 15_000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "am-str-"));
   const webhookPort = await freePort();
   const routerPort = await freePort();
@@ -244,8 +244,8 @@ test("router data stream resolves {secret} from store and fans out CloudEvents t
     try {
       // Register two agents across different harnesses with DIFFERENT CloudEvents filters on topic `ci`
       daemon.state.register("antigravity:ag-ci", { kind: "antigravity" });
-      await daemon.connector.call("antigravity:ag-ci", "mesh_join", { handle: "ag-ci" });
-      await daemon.connector.call("antigravity:ag-ci", "mesh_subscribe", {
+      await daemon.connector.call("antigravity:ag-ci", "hyp_join", { handle: "ag-ci" });
+      await daemon.connector.call("antigravity:ag-ci", "hyp_subscribe", {
         key: "ci:fail",
         topic: "ci",
         filters: [{ exact: { type: "com.ci.failed" } }],
@@ -253,8 +253,8 @@ test("router data stream resolves {secret} from store and fans out CloudEvents t
       });
 
       daemon.state.register("claude:cl-ci", { kind: "claude" });
-      await daemon.connector.call("claude:cl-ci", "mesh_join", { handle: "cl-ci" });
-      await daemon.connector.call("claude:cl-ci", "mesh_subscribe", {
+      await daemon.connector.call("claude:cl-ci", "hyp_join", { handle: "cl-ci" });
+      await daemon.connector.call("claude:cl-ci", "hyp_subscribe", {
         key: "ci:pass",
         topic: "ci",
         filters: [{ exact: { type: "com.ci.passed" } }],
@@ -392,7 +392,7 @@ test("setupOpenClaw configures openclaw.json + SKILL.md idempotently without clo
     assert.equal(parsed.mcp.servers.hyphae.command, "/opt/node24/bin/node");
     assert.ok(parsed.mcp.servers.hyphae.args.includes("openclaw"));
     const skillText = fs.readFileSync(join(ocDir, "skills", "hyphae", "SKILL.md"), "utf8");
-    assert.match(skillText, /mesh_channel_join/);
+    assert.match(skillText, /hyp_channel_join/);
 
     const checks = await runDoctor(join(dir, "missing.json"), join(dir, "missing.sock"), home);
     assert.equal(checks.find((c) => c.name === "openclaw")?.ok, true);
@@ -418,28 +418,28 @@ test("multi-agent #channels fan out posts to all other members across harnesses 
     daemon.state.register("antigravity:ag-1", { kind: "antigravity" });
     daemon.state.register("codex:cx-1", { kind: "codex" });
 
-    await daemon.connector.call("openclaw:oc-1", "mesh_join", { handle: "orchestrator" });
-    await daemon.connector.call("antigravity:ag-1", "mesh_join", { handle: "agy" });
-    await daemon.connector.call("codex:cx-1", "mesh_join", { handle: "backend" });
+    await daemon.connector.call("openclaw:oc-1", "hyp_join", { handle: "orchestrator" });
+    await daemon.connector.call("antigravity:ag-1", "hyp_join", { handle: "agy" });
+    await daemon.connector.call("codex:cx-1", "hyp_join", { handle: "backend" });
 
     // Posting before joining fails closed
     await assert.rejects(
-      () => daemon.connector.call("openclaw:oc-1", "mesh_channel_post", { channel: "#incidents", text: "nope" }),
+      () => daemon.connector.call("openclaw:oc-1", "hyp_channel_post", { channel: "#incidents", text: "nope" }),
       /join #incidents before posting/i,
     );
 
     // Join `#incidents` (accepts with or without leading `#`)
-    await daemon.connector.call("openclaw:oc-1", "mesh_channel_join", { channel: "incidents" });
-    await daemon.connector.call("antigravity:ag-1", "mesh_channel_join", { channel: "#incidents" });
-    const join3 = await daemon.connector.call("codex:cx-1", "mesh_channel_join", { channel: "#incidents" }) as { members: string[] };
+    await daemon.connector.call("openclaw:oc-1", "hyp_channel_join", { channel: "incidents" });
+    await daemon.connector.call("antigravity:ag-1", "hyp_channel_join", { channel: "#incidents" });
+    const join3 = await daemon.connector.call("codex:cx-1", "hyp_channel_join", { channel: "#incidents" }) as { members: string[] };
     assert.deepEqual(join3.members, ["bogdan@fleet/agy", "bogdan@fleet/backend", "bogdan@fleet/orchestrator"]);
 
-    const listed = await daemon.connector.call("openclaw:oc-1", "mesh_channels", {}) as { channels: Array<{ channel: string; members: string[] }> };
+    const listed = await daemon.connector.call("openclaw:oc-1", "hyp_channels", {}) as { channels: Array<{ channel: string; members: string[] }> };
     assert.equal(listed.channels.length, 1);
     assert.equal(listed.channels[0].channel, "#incidents");
 
     // OpenClaw posts to #incidents -> delivered to agy & backend, NOT echoed back to orchestrator!
-    const posted = await daemon.connector.call("openclaw:oc-1", "mesh_channel_post", {
+    const posted = await daemon.connector.call("openclaw:oc-1", "hyp_channel_post", {
       channel: "#incidents",
       text: "Prometheus HighErrorRate on checkout-api!",
     }) as { deliveredTo: string[] };
@@ -460,9 +460,9 @@ test("multi-agent #channels fan out posts to all other members across harnesses 
     assert.equal(daemon.connector.drainMailbox("openclaw:oc-1", 5).length, 0);
 
     // Codex leaves #incidents -> subsequent post only delivers to agy
-    const left = await daemon.connector.call("codex:cx-1", "mesh_channel_leave", { channel: "#incidents" }) as { left: boolean };
+    const left = await daemon.connector.call("codex:cx-1", "hyp_channel_leave", { channel: "#incidents" }) as { left: boolean };
     assert.equal(left.left, true);
-    const posted2 = await daemon.connector.call("openclaw:oc-1", "mesh_channel_post", {
+    const posted2 = await daemon.connector.call("openclaw:oc-1", "hyp_channel_post", {
       channel: "#incidents",
       text: "Alert resolved.",
     }) as { deliveredTo: string[] };
@@ -539,7 +539,7 @@ test("installSkill installs canonical skills/hyphae/SKILL.md across harnesses an
       assert.ok(existsSync(f), `Expected skill installed at ${f}`);
       const txt = readFileSync(f, "utf8");
       assert.match(txt, /hyp secret set <name> --web/);
-      assert.match(txt, /mesh_channel_join/);
+      assert.match(txt, /hyp_channel_join/);
     }
     const projRes = installSkill("project", { projectDir: proj });
     assert.equal(projRes.files.length, 1);

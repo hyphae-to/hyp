@@ -487,7 +487,7 @@ async function main(): Promise<void> {
       console.log(`  Service      : ${result.servicePath}`);
       for (const cmd of result.serviceInstructions ?? []) console.log(`                 ${cmd}`);
     }
-    console.log("\nRestart any open Desktop apps/sessions once so they pick up the updated MCP & hooks, then have agents call `mesh_join`.");
+    console.log("\nRestart any open Desktop apps/sessions once so they pick up the updated MCP & hooks, then have agents call `hyp_join`.");
     return;
   }
 

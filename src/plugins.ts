@@ -122,7 +122,7 @@ export class PluginHost {
     }
     const { plugin, target, sessionId, handle, threadId } = args;
     if (typeof plugin !== "string" || typeof target !== "string") {
-      throw new RouterError("invalid", "mesh_plugin_handoff needs {plugin, target} plus one of {sessionId, handle, threadId}");
+      throw new RouterError("invalid", "hyp_plugin_handoff needs {plugin, target} plus one of {sessionId, handle, threadId}");
     }
     const config = this.#findTarget(plugin, target);
     if (!config) throw new RouterError("unknown_target", `No target ${target} of plugin ${plugin}`);

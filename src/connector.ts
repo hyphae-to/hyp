@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Config } from "./config.ts";
-import { createDelivery, type Channel, type Delivery } from "./delivery.ts";
+import { createDelivery, usesDurableMailbox, type Channel, type Delivery } from "./delivery.ts";
 import { addressPattern, delivered, formatItem, handlePattern, hold, isMode, normalizeChannelName, object, reject, type InboxItem, type Mode, type Outcome } from "./protocol.ts";
 import { RouterError, RouterLink } from "./router.ts";
 import type { MailboxEntry, Session, State } from "./state.ts";
@@ -77,10 +77,7 @@ export class Connector {
   }
 
   #usesDurableMailbox(session: Session): boolean {
-    if (session.backend.kind === "antigravity") return true;
-    if (session.backend.kind === "claude") return true;
-    if (session.backend.kind === "codex" && session.backend.queue !== true) return true;
-    return false;
+    return usesDurableMailbox(session.backend);
   }
 
   async run(signal: AbortSignal): Promise<void> {
@@ -267,7 +264,7 @@ export class Connector {
     if (!session) throw new RouterError("unbound_session", "No registered client session");
     this.#state.touch(sessionId);
     switch (name) {
-      case "mesh_capabilities":
+      case "hyp_capabilities":
         return {
           sessionId: session.id,
           backend: session.backend.kind,
@@ -275,7 +272,7 @@ export class Connector {
           routers: [...this.#routers.keys()],
           inbound: this.#inboundMode(session),
         };
-      case "mesh_inbox": {
+      case "hyp_inbox": {
         const acknowledge = args.acknowledge ?? [];
         if (!Array.isArray(acknowledge) || acknowledge.length > 100 ||
             !acknowledge.every((id): id is string => typeof id === "string" && id.length <= 80)) {
@@ -283,7 +280,7 @@ export class Connector {
         }
         return { items: this.#state.inbox(session.id, acknowledge) };
       }
-      case "mesh_join": {
+      case "hyp_join": {
         const { handle } = args;
         if (typeof handle !== "string" || !handlePattern.test(handle)) throw invalid("Invalid handle");
         return this.#change("primary", async () => {
@@ -301,7 +298,7 @@ export class Connector {
           return { address: this.#address(handle) };
         });
       }
-      case "mesh_leave":
+      case "hyp_leave":
         return this.#change("primary", async () => {
           const left = this.#state.session(sessionId)?.handle != null;
           if (left) {
@@ -315,44 +312,44 @@ export class Connector {
           }
           return { left };
         });
-      case "mesh_peers": {
+      case "hyp_peers": {
         const value = await this.#router("primary").query("/v1/peers");
         return { self: this.#address(session.handle), peers: object(value) ? value.peers : [] };
       }
-      case "mesh_send": {
+      case "hyp_send": {
         const { to, text } = args;
         if (typeof to !== "string" || !addressPattern.test(to) || typeof text !== "string" || Buffer.byteLength(text) > MAX_TEXT_BYTES) {
           throw invalid("Expected a connector/handle address and text up to 16 KiB");
         }
         return this.#change("primary", async () => {
           const handle = this.#state.session(sessionId)?.handle ?? null;
-          if (handle === null) throw new RouterError("not_enrolled", "Call mesh_join before sending");
+          if (handle === null) throw new RouterError("not_enrolled", "Call hyp_join before sending");
           const messageId = randomUUID();
           await this.#router("primary").send(messageId, handle, to, text);
           return { messageId, status: "stored" };
         });
       }
-      case "mesh_channel_join": {
+      case "hyp_channel_join": {
         const rawChannel = args.channel;
         const channel = typeof rawChannel === "string" ? normalizeChannelName(rawChannel) : null;
         if (!channel) throw invalid("Expected channel name like '#incidents' or 'incidents'");
         return this.#change("primary", async () => {
           const handle = this.#state.session(sessionId)?.handle ?? null;
-          if (handle === null) throw new RouterError("not_enrolled", "Call mesh_join before joining a channel");
+          if (handle === null) throw new RouterError("not_enrolled", "Call hyp_join before joining a channel");
           return this.#router("primary").joinChannel(handle, channel);
         });
       }
-      case "mesh_channel_leave": {
+      case "hyp_channel_leave": {
         const rawChannel = args.channel;
         const channel = typeof rawChannel === "string" ? normalizeChannelName(rawChannel) : null;
         if (!channel) throw invalid("Expected channel name like '#incidents'");
         return this.#change("primary", async () => {
           const handle = this.#state.session(sessionId)?.handle ?? null;
-          if (handle === null) throw new RouterError("not_enrolled", "Call mesh_join first");
+          if (handle === null) throw new RouterError("not_enrolled", "Call hyp_join first");
           return this.#router("primary").leaveChannel(handle, channel);
         });
       }
-      case "mesh_channel_post": {
+      case "hyp_channel_post": {
         const { text } = args;
         const rawChannel = args.channel;
         const channel = typeof rawChannel === "string" ? normalizeChannelName(rawChannel) : null;
@@ -361,21 +358,21 @@ export class Connector {
         }
         return this.#change("primary", async () => {
           const handle = this.#state.session(sessionId)?.handle ?? null;
-          if (handle === null) throw new RouterError("not_enrolled", "Call mesh_join before posting to a channel");
+          if (handle === null) throw new RouterError("not_enrolled", "Call hyp_join before posting to a channel");
           const messageId = randomUUID();
           return this.#router("primary").postChannel(messageId, handle, channel, text);
         });
       }
-      case "mesh_channels": {
+      case "hyp_channels": {
         const rawChannel = args.channel;
         const channel = typeof rawChannel === "string" ? normalizeChannelName(rawChannel) ?? undefined : undefined;
         return this.#router("primary").channels(channel);
       }
-      case "mesh_subscribe":
+      case "hyp_subscribe":
         return this.#subscribe(session, args);
-      case "mesh_unsubscribe":
+      case "hyp_unsubscribe":
         return this.#unsubscribe(sessionId, args);
-      case "mesh_subscriptions": {
+      case "hyp_subscriptions": {
         const subscriptions = this.#state.subscriptions().filter((entry) => entry.sessionId === sessionId);
         const statuses = new Map(await Promise.all([...new Set(subscriptions.map(({ router }) => router))].map(async (routerName) => {
           const value = await this.#router(routerName).query("/v1/subscriptions/status").catch(() => null);
@@ -385,11 +382,11 @@ export class Connector {
           ...item, delivery: statuses.get(item.router)?.find(({ id }) => id === item.id) ?? null,
         })) };
       }
-      case "mesh_plugin_targets": {
+      case "hyp_plugin_targets": {
         if (!this.#listPluginTargets) throw new RouterError("no_plugins", "This connector has no local plugins configured");
         return this.#listPluginTargets(sessionId);
       }
-      case "mesh_plugin_handoff": {
+      case "hyp_plugin_handoff": {
         if (!this.#handoffPluginTarget) throw new RouterError("no_plugins", "This connector has no local plugins configured");
         return this.#handoffPluginTarget(sessionId, args);
       }

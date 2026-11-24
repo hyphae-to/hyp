@@ -6,8 +6,8 @@
 
 | Layer | Where it runs | Routing model | Where secrets live | Best for |
 | --- | --- | --- | --- | --- |
-| **Router Data Streams** (`localRouter.streams`) | Supervised on the **router host** (or external HTTP publisher posting to `POST /v1/events?topic=<name>`) | **1-to-many Pub/Sub** — any agent on any machine subscribes with CloudEvents filters (`mesh_subscribe`) | Router host's `~/.config/hyphae/secrets/` (`0600`) | **GitHub events** (`github-webhook`), **CI / Linear / Sentry / Stripe** webhooks (`webhook-stream`), **custom polling/streaming data source plugins** |
-| **Connector Thread Bridges** (`plugins`) | Supervised on a **local connector daemon** (`hyp daemon`) | **1-to-1 Thread-Owned** — pinned to one local agent `handle` / `sessionId` with live `mesh_plugin_handoff` | Local machine's `~/.config/hyphae/secrets/` (`0600`) — never sent to a shared router | **Personal Slack / Telegram DM & mention bridges**, machine-local alerts, and **100% drop-in compatibility with existing `t3-mesh` plugins** |
+| **Router Data Streams** (`localRouter.streams`) | Supervised on the **router host** (or external HTTP publisher posting to `POST /v1/events?topic=<name>`) | **1-to-many Pub/Sub** — any agent on any machine subscribes with CloudEvents filters (`hyp_subscribe`) | Router host's `~/.config/hyphae/secrets/` (`0600`) | **GitHub events** (`github-webhook`), **CI / Linear / Sentry / Stripe** webhooks (`webhook-stream`), **custom polling/streaming data source plugins** |
+| **Connector Thread Bridges** (`plugins`) | Supervised on a **local connector daemon** (`hyp daemon`) | **1-to-1 Thread-Owned** — pinned to one local agent `handle` / `sessionId` with live `hyp_plugin_handoff` | Local machine's `~/.config/hyphae/secrets/` (`0600`) — never sent to a shared router | **Personal Slack / Telegram DM & mention bridges**, machine-local alerts, and **100% drop-in compatibility with existing `t3-mesh` plugins** |
 
 ### Interactive Setup & Built-In Guides
 
@@ -41,7 +41,7 @@ Reference secrets in any plugin or stream `env` block using:
 
 ## 1. Router Data Streams (`localRouter.streams`)
 
-Configure streams directly under `localRouter.streams` in `connector.json` (no manual `add-publisher` / `--topic` flags needed — `hyp daemon` registers topics, supervises each source, and fans out CloudEvents to matching `mesh_subscribe` filters across all connected harnesses and machines):
+Configure streams directly under `localRouter.streams` in `connector.json` (no manual `add-publisher` / `--topic` flags needed — `hyp daemon` registers topics, supervises each source, and fans out CloudEvents to matching `hyp_subscribe` filters across all connected harnesses and machines):
 
 ```json
 {
@@ -85,7 +85,7 @@ Configure streams directly under `localRouter.streams` in `connector.json` (no m
 Any agent on any connected machine can then subscribe with CloudEvents filters:
 
 ```json
-mesh_subscribe({
+hyp_subscribe({
   "key": "github:repo-prs",
   "topic": "github",
   "filters": [{ "prefix": { "subject": "myorg/myrepo" } }]
@@ -114,7 +114,7 @@ Each plugin target in `~/.config/hyphae/connector.json` accepts one of:
 | `sessionId` | `"antigravity:<uuid>"` / `"claude:<uuid>"` / `"codex:<uuid>"` | Pins delivery to one specific persistent conversation/session ID. |
 | `threadId` | `"30227355-..."` | Matches exact `sessionId` or `<harness>:<threadId>` suffix (drop-in compatibility with `t3-mesh` configs). |
 
-Agents can inspect targets they hold with **`mesh_plugin_targets`** and transfer ownership live to another session (even on a different harness!) with **`mesh_plugin_handoff`**:
+Agents can inspect targets they hold with **`hyp_plugin_targets`** and transfer ownership live to another session (even on a different harness!) with **`hyp_plugin_handoff`**:
 
 ```json
 { "plugin": "slack", "target": "pm", "handle": "codex-pm" }
@@ -260,4 +260,4 @@ hyp router add-publisher github-hub --topic github --db router.sqlite --token-ou
 hyp router serve --db router.sqlite --audit audit.log --topic github=github-hub
 ```
 
-Publishers post CloudEvents 1.0 to `POST /v1/events?topic=github`. The built-in GitHub webhook receiver (`hyp router github-receiver ...`) verifies `X-Hub-Signature-256` and publishes normalized GitHub events directly. Sessions subscribe with `mesh_subscribe` filters and choose their own `mode` (`queue` or `interrupt`).
+Publishers post CloudEvents 1.0 to `POST /v1/events?topic=github`. The built-in GitHub webhook receiver (`hyp router github-receiver ...`) verifies `X-Hub-Signature-256` and publishes normalized GitHub events directly. Sessions subscribe with `hyp_subscribe` filters and choose their own `mode` (`queue` or `interrupt`).

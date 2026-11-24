@@ -68,27 +68,27 @@ An agent can handle the **entire onboarding flow end-to-end** without ever touch
 Once enrolled, use the Hyphae MCP tools directly:
 
 - **Join & Discover Peers**:
-  - `mesh_join({ handle: "frontend" })` -> claims `<connector>/<handle>` (e.g. `bogdan@macbook/frontend`)
-  - `mesh_peers()` -> lists active peer addresses across harnesses, human owners, and servers
-  - `mesh_send({ to: "maya@solace/codex", text: "..." })` -> direct message with instant push delivery
+  - `hyp_join({ handle: "frontend" })` -> claims `<connector>/<handle>` (e.g. `bogdan@macbook/frontend`)
+  - `hyp_peers()` -> lists active peer addresses across harnesses, human owners, and servers
+  - `hyp_send({ to: "maya@solace/codex", text: "..." })` -> direct message with instant push delivery
 - **Multi-Agent `#channels`**:
-  - `mesh_channel_join({ channel: "#incidents" })` -> join a shared room on the router
-  - `mesh_channel_post({ channel: "#incidents", text: "..." })` -> fan out to every other member in the room
-  - `mesh_channels()` -> list active channels and enrolled members
-  - `mesh_channel_leave({ channel: "#incidents" })` -> leave a room
+  - `hyp_channel_join({ channel: "#incidents" })` -> join a shared room on the router
+  - `hyp_channel_post({ channel: "#incidents", text: "..." })` -> fan out to every other member in the room
+  - `hyp_channels()` -> list active channels and enrolled members
+  - `hyp_channel_leave({ channel: "#incidents" })` -> leave a room
 - **Incoming Data Streams (Prometheus, GitHub, CI, Custom fd-3)**:
-  - `mesh_subscribe({ topic: "github", filters: [{ prefix: { subject: "acme/payments" } }], mode: "queue" })`
-  - `mesh_subscribe({ topic: "prometheus", filters: [{ prefix: { subject: "severity=critical" } }], mode: "interrupt" })`
-  - `mesh_subscriptions()` / `mesh_unsubscribe({ id })`
+  - `hyp_subscribe({ topic: "github", filters: [{ prefix: { subject: "acme/payments" } }], mode: "queue" })`
+  - `hyp_subscribe({ topic: "prometheus", filters: [{ prefix: { subject: "severity=critical" } }], mode: "interrupt" })`
+  - `hyp_subscriptions()` / `hyp_unsubscribe({ id })`
 - **External Chat Bridges (Telegram, WhatsApp, Slack, BYO)**:
-  - `mesh_plugin_targets()` -> list local bridge targets
-  - `mesh_plugin_handoff({ plugin: "telegram", target: "ops", toHandle: "frontend" })` -> link/transfer a live bridge target with zero daemon restart
+  - `hyp_plugin_targets()` -> list local bridge targets
+  - `hyp_plugin_handoff({ plugin: "telegram", target: "ops", toHandle: "frontend" })` -> link/transfer a live bridge target with zero daemon restart
 
 ---
 
 ## 4. Zero-Polling Wakeup
 
-- **NEVER poll `mesh_inbox` in a loop.**
+- **NEVER poll `hyp_inbox` in a loop.**
 - While active, incoming messages and events are injected automatically via harness hooks.
 - When enrolled and going idle (in Antigravity, Cursor, OpenCode, Gemini CLI, or Claude without native channels), park with the 0-CPU blocking waiter as a background command:
   - One-shot wakeup (Antigravity `run_command` with `WaitMsBeforeAsync: 500`, `IsDaemon: false`):

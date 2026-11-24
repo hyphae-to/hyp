@@ -98,34 +98,34 @@ test("ONE shared MCP subprocess multiplexes Antigravity, Claude, and Codex threa
 
   try {
     // 0. Calling a tool without PreToolUse hook verification fails closed!
-    const unverified = await sharedMcp.callTool("mesh_join", { handle: "spoof" });
+    const unverified = await sharedMcp.callTool("hyp_join", { handle: "spoof" });
     assert.equal(unverified.isError, true);
     assert.match(unverified.text, /caller_unverifiable/);
 
     // 1. Antigravity conversation joins via PreToolUse `overwrite` token on the shared MCP process
     const agPre = await handleHookPayload(
-      { conversationId: "ag-conv-1", toolCall: { id: "ag-call-1", name: "mesh_join", args: { handle: "ag-peer" } } },
+      { conversationId: "ag-conv-1", toolCall: { id: "ag-call-1", name: "hyp_join", args: { handle: "ag-peer" } } },
       { harness: "antigravity", event: "pre-tool-use", socketPath: daemon.socketPath },
     );
-    const agJoin = await sharedMcp.callTool("mesh_join", { handle: "ag-peer", ...(object(agPre.overwrite) ? agPre.overwrite : {}) });
+    const agJoin = await sharedMcp.callTool("hyp_join", { handle: "ag-peer", ...(object(agPre.overwrite) ? agPre.overwrite : {}) });
     assert.equal(agJoin.isError, false);
     assert.deepEqual(JSON.parse(agJoin.text), { address: "bogdan@local/ag-peer" });
 
     // 2. Claude session joins via PreToolUse + `_meta["claudecode/toolUseId"]` on the SAME shared MCP process
     await handleHookPayload(
-      { session_id: "claude-sess-2", tool_use_id: "toolu_join_2", tool_name: "mcp__hyphae__mesh_join" },
+      { session_id: "claude-sess-2", tool_use_id: "toolu_join_2", tool_name: "mcp__hyphae__hyp_join" },
       { harness: "claude", event: "pre-tool-use", socketPath: daemon.socketPath },
     );
-    const claudeJoin = await sharedMcp.callTool("mesh_join", { handle: "claude-peer" }, { "claudecode/toolUseId": "toolu_join_2" });
+    const claudeJoin = await sharedMcp.callTool("hyp_join", { handle: "claude-peer" }, { "claudecode/toolUseId": "toolu_join_2" });
     assert.equal(claudeJoin.isError, false);
     assert.deepEqual(JSON.parse(claudeJoin.text), { address: "bogdan@local/claude-peer" });
 
     // 3. Codex thread joins via PreToolUse + `_meta.callId` on the SAME shared MCP process
     await handleHookPayload(
-      { session_id: "codex-thr-3", tool_use_id: "call_join_3", tool_name: "hyphae.mesh_join" },
+      { session_id: "codex-thr-3", tool_use_id: "call_join_3", tool_name: "hyphae.hyp_join" },
       { harness: "codex", event: "pre-tool-use", socketPath: daemon.socketPath },
     );
-    const codexJoin = await sharedMcp.callTool("mesh_join", { handle: "codex-peer" }, { callId: "call_join_3" });
+    const codexJoin = await sharedMcp.callTool("hyp_join", { handle: "codex-peer" }, { callId: "call_join_3" });
     assert.equal(codexJoin.isError, false);
     assert.deepEqual(JSON.parse(codexJoin.text), { address: "bogdan@local/codex-peer" });
 
@@ -168,11 +168,11 @@ test("ONE shared MCP subprocess multiplexes Antigravity, Claude, and Codex threa
 
     // 5. Claude sends a real mesh message to Antigravity through the real t3-mesh router!
     await handleHookPayload(
-      { session_id: "claude-sess-2", tool_use_id: "toolu_send_1", tool_name: "mcp__hyphae__mesh_send" },
+      { session_id: "claude-sess-2", tool_use_id: "toolu_send_1", tool_name: "mcp__hyphae__hyp_send" },
       { harness: "claude", event: "pre-tool-use", socketPath: daemon.socketPath },
     );
     const sendToAg = await sharedMcp.callTool(
-      "mesh_send",
+      "hyp_send",
       { to: "bogdan@local/ag-peer", text: "wake up antigravity!" },
       { "claudecode/toolUseId": "toolu_send_1" },
     );
@@ -180,7 +180,7 @@ test("ONE shared MCP subprocess multiplexes Antigravity, Claude, and Codex threa
 
     // Antigravity's blocking `wait` exits 0 immediately with the payload (zero polling!)
     const agReceived = await agWaitOut;
-    assert.match(agReceived, /mesh from bogdan@local\/claude-peer/);
+    assert.match(agReceived, /hyphae from bogdan@local\/claude-peer/);
     assert.match(agReceived, /wake up antigravity!/);
 
     // 6. Claude starts streaming `hyp watch` (Monitor mode) and receives Antigravity's reply!
@@ -195,10 +195,10 @@ test("ONE shared MCP subprocess multiplexes Antigravity, Claude, and Codex threa
     await new Promise((r) => setTimeout(r, 150));
 
     const agSendPre = await handleHookPayload(
-      { conversationId: "ag-conv-1", toolCall: { id: "ag-call-2", name: "mesh_send", args: {} } },
+      { conversationId: "ag-conv-1", toolCall: { id: "ag-call-2", name: "hyp_send", args: {} } },
       { harness: "antigravity", event: "pre-tool-use", socketPath: daemon.socketPath },
     );
-    const replyToClaude = await sharedMcp.callTool("mesh_send", {
+    const replyToClaude = await sharedMcp.callTool("hyp_send", {
       to: "bogdan@local/claude-peer",
       text: "pong from antigravity!",
       ...(object(agSendPre.overwrite) ? agSendPre.overwrite : {}),
@@ -206,16 +206,16 @@ test("ONE shared MCP subprocess multiplexes Antigravity, Claude, and Codex threa
     assert.equal(replyToClaude.isError, false);
 
     const watchEvent = JSON.parse(await firstWatchLine) as { text: string };
-    assert.match(watchEvent.text, /mesh from bogdan@local\/ag-peer/);
+    assert.match(watchEvent.text, /hyphae from bogdan@local\/ag-peer/);
     assert.match(watchEvent.text, /pong from antigravity!/);
     claudeWatchProc.kill("SIGTERM");
 
     // 7. Codex receives a message while mid-turn and drains it immediately on Stop hook (zero polling!)
     const agSendCodexPre = await handleHookPayload(
-      { conversationId: "ag-conv-1", toolCall: { id: "ag-call-3", name: "mesh_send", args: {} } },
+      { conversationId: "ag-conv-1", toolCall: { id: "ag-call-3", name: "hyp_send", args: {} } },
       { harness: "antigravity", event: "pre-tool-use", socketPath: daemon.socketPath },
     );
-    await sharedMcp.callTool("mesh_send", {
+    await sharedMcp.callTool("hyp_send", {
       to: "bogdan@local/codex-peer",
       text: "hey codex desktop!",
       ...(object(agSendCodexPre.overwrite) ? agSendCodexPre.overwrite : {}),
@@ -386,7 +386,7 @@ test("MCP shim stays alive and returns a clean error when daemon socket is missi
   const client = new McpClient(join(dir, "missing.sock"));
   try {
     await client.initialize();
-    const res = await client.callTool("mesh_capabilities", {});
+    const res = await client.callTool("hyp_capabilities", {});
     assert.equal(res.isError, true);
     assert.match(res.text, /daemon is not running/i);
     // Process must still be alive for subsequent ping
@@ -424,7 +424,7 @@ test("onboard creates embedded local router config, configures harnesses, and da
     try {
       assert.ok(daemon.localRouterUrl?.startsWith("http://127.0.0.1:"));
       daemon.state.register("antigravity:test-1", { kind: "antigravity" });
-      const joined = await daemon.connector.call("antigravity:test-1", "mesh_join", { handle: "solo" });
+      const joined = await daemon.connector.call("antigravity:test-1", "hyp_join", { handle: "solo" });
       assert.deepEqual(joined, { address: "dev@local/solo" });
     } finally {
       await daemon.stop();

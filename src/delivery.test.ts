@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createDelivery, type AttemptOutcome, type Command } from "./delivery.ts";
+import { createDelivery, usesDurableMailbox, type AttemptOutcome, type Command } from "./delivery.ts";
 import { delivered, formatItem } from "./protocol.ts";
 
 test("Herdr holds queue delivery while working and only interrupts the pinned agent", async () => {
@@ -66,4 +66,20 @@ test("untrusted message bytes cannot emit terminal sequences or close a Claude c
   const payload = text.slice(text.lastIndexOf("\n") + 1);
   assert.doesNotMatch(payload, /[<>`\u001b\u009b]/);
   assert.equal(JSON.parse(payload), malicious);
+});
+
+test("durable-mailbox backends route via SQLite mailbox and never silently no-op in createDelivery", async () => {
+  for (const kind of ["antigravity", "cursor", "opencode", "gemini", "openclaw"] as const) {
+    assert.equal(usesDurableMailbox({ kind }), true, `${kind} should use durable mailbox`);
+    const delivery = createDelivery({ kind }, () => undefined);
+    assert.deepEqual(delivery.modes, ["queue"]);
+    assert.deepEqual(
+      await delivery.deliver("hello", "queue", () => Promise.resolve(delivered)),
+      { outcome: "rejected", reason: "durable_mailbox_required" },
+    );
+  }
+  assert.equal(usesDurableMailbox({ kind: "claude" }), true);
+  assert.equal(usesDurableMailbox({ kind: "codex" }), true);
+  assert.equal(usesDurableMailbox({ kind: "codex", threadId: "t1", queue: true }), false);
+  assert.equal(usesDurableMailbox({ kind: "herdr", terminalId: "t1", createdMs: 1, pid: 1, app: "claude", bin: "hc" }), false);
 });

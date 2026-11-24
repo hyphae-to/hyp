@@ -6,7 +6,7 @@ import type { InboundEventBatch } from "../router/types.ts";
 
 /** `plugin` is a configured name, already checked against PLUGIN_NAME. */
 export function formatPluginDelivery(plugin: string, batch: InboundEventBatch): string {
-  const header = `mesh event plugin:${plugin} · ${eventCount(batch.events.length)}`;
+  const header = `hyphae event plugin:${plugin} · ${eventCount(batch.events.length)}`;
   const lines = batch.events.map((event) =>
     eventLine(safe(PATTERNS.type, event.type), safe(PATTERNS.source, event.source), safe(PATTERNS.subject, event.subject)),
   );

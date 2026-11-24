@@ -131,7 +131,7 @@ test("remote onboard via --join invite verifies live router auth, writes 0600 to
     const daemon = await startDaemon(loadConfig(configPath), { quiet: true });
     try {
       daemon.state.register("claude:remote-1", { kind: "claude" });
-      const res = await daemon.connector.call("claude:remote-1", "mesh_join", { handle: "worker" });
+      const res = await daemon.connector.call("claude:remote-1", "hyp_join", { handle: "worker" });
       assert.deepEqual(res, { address: "bogdan@remote-box/worker" });
     } finally {
       await daemon.stop();

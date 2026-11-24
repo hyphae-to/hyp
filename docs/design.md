@@ -14,7 +14,7 @@ Inspired directly by [t3-mesh's caller verification](../packages/t3-mesh/SPEC.md
 
 ## Zero-polling delivery contract
 
-Desktop hosts (Antigravity 2.0, Claude Desktop Code tab, Codex Desktop) own their internal UI state and do not expose an external prompt-injection RPC like T3's WebSocket server. To avoid burning tokens polling `mesh_inbox`, delivery is **durable-first** (committed atomically to SQLite `mailbox` with router ack) and pushed immediately through the best available transport:
+Desktop hosts (Antigravity 2.0, Claude Desktop Code tab, Codex Desktop) own their internal UI state and do not expose an external prompt-injection RPC like T3's WebSocket server. To avoid burning tokens polling `hyp_inbox`, delivery is **durable-first** (committed atomically to SQLite `mailbox` with router ack) and pushed immediately through the best available transport:
 
 1. **Live native channel (`--claude-channel`)**: In Claude Code CLI, once a verified `claude:<session_id>` calls through a channel-enabled MCP socket, the daemon binds that socket as the live delivery transport and pushes `notifications/claude/channel`, draining any items queued while offline.
 2. **Streaming watcher (`hyp watch`)**: Connects to `connector.sock`, blocks silently with 0 CPU / 0 tokens, and flushes one NDJSON line per inbound item—designed for Claude Code's `Monitor` tool.

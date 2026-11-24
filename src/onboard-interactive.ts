@@ -126,7 +126,7 @@ export async function promptRouterStreams(configDir: string): Promise<Record<str
     );
     const topic = unwrap(
       await p.text({
-        message: `Router topic agents will subscribe to (mesh_subscribe({ topic: "..." }))`,
+        message: `Router topic agents will subscribe to (hyp_subscribe({ topic: "..." }))`,
         initialValue: guide.defaultTopicOrTarget,
         validate: (v) => (v && isTopic(v) ? undefined : "Use lowercase topic name (e.g. github, ci, linear)"),
       }),
@@ -254,7 +254,7 @@ export async function promptConnectorPlugins(configDir: string): Promise<Record<
     );
     const targetHandle = unwrap(
       await p.text({
-        message: "Target agent handle (whichever agent runs `mesh_join({ handle })` receives messages)",
+        message: "Target agent handle (whichever agent runs `hyp_join({ handle })` receives messages)",
         initialValue: guide.defaultTopicOrTarget,
         validate: (v) => (v && handlePattern.test(v) ? undefined : "Use lowercase handle (e.g. pm, assistant, ops)"),
       }),
@@ -572,7 +572,7 @@ export async function runInteractiveOnboard(options: InteractiveOnboardOptions):
     const sharedName = asSecondary
       ? unwrap(
           await p.text({
-            message: "Name for this shared router (agents pass `router: \"<name>\"` in mesh_subscribe)",
+            message: "Name for this shared router (agents pass `router: \"<name>\"` in hyp_subscribe)",
             initialValue: env.t3.routerUrl ? "t3" : "shared",
             validate: (v) => (v && /^[a-z][a-z0-9-]{0,31}$/.test(v) && v !== "primary" ? undefined : "Lowercase name (not 'primary')"),
           }),

@@ -44,7 +44,7 @@ export const ROUTER_STREAM_GUIDES: readonly PluginOrStreamGuide[] = [
       "5. Select individual events (Pull requests, Issues, Issue comments, Check runs, Pushes).",
     ],
     agentUsage: [
-      'mesh_subscribe({ key: "github:my-prs", topic: "github", filters: [{ prefix: { subject: "org/repo" } }] })',
+      'hyp_subscribe({ key: "github:my-prs", topic: "github", filters: [{ prefix: { subject: "org/repo" } }] })',
     ],
   },
   {
@@ -70,7 +70,7 @@ export const ROUTER_STREAM_GUIDES: readonly PluginOrStreamGuide[] = [
       '   curl -X POST http://127.0.0.1:8792/webhook -H "content-type: application/json" -d \'{"type":"com.ci.failed","source":"ci/main","data":{"repo":"app"}}\'',
     ],
     agentUsage: [
-      'mesh_subscribe({ key: "ci:failures", topic: "webhooks", filters: [{ exact: { type: "com.ci.failed" } }] })',
+      'hyp_subscribe({ key: "ci:failures", topic: "webhooks", filters: [{ exact: { type: "com.ci.failed" } }] })',
     ],
   },
   {
@@ -88,7 +88,7 @@ export const ROUTER_STREAM_GUIDES: readonly PluginOrStreamGuide[] = [
       "3. Store any API keys safely with `hyp secret set <name>` and reference them in `env` as `{ \"secret\": \"<name>\" }`.",
     ],
     agentUsage: [
-      'mesh_subscribe({ key: "custom:feed", topic: "custom-feed", filters: [{ prefix: { type: "com.custom." } }] })',
+      'hyp_subscribe({ key: "custom:feed", topic: "custom-feed", filters: [{ prefix: { type: "com.custom." } }] })',
     ],
   },
 ];
@@ -99,7 +99,7 @@ export const CONNECTOR_BRIDGE_GUIDES: readonly PluginOrStreamGuide[] = [
     kind: "connector-bridge",
     label: "Slack Thread Bridge (Socket Mode)",
     tagline: "Connect Slack DMs, @mentions & threads directly to a local agent handle",
-    summary: "Outbound WebSocket via Slack Socket Mode (no public URL required). Tokens stay on your local machine; events route to one owning agent handle with live `mesh_plugin_handoff`.",
+    summary: "Outbound WebSocket via Slack Socket Mode (no public URL required). Tokens stay on your local machine; events route to one owning agent handle with live `hyp_plugin_handoff`.",
     defaultName: "slack",
     defaultTopicOrTarget: "pm",
     secrets: [
@@ -124,8 +124,8 @@ export const CONNECTOR_BRIDGE_GUIDES: readonly PluginOrStreamGuide[] = [
       "5. Restrict who can trigger your agent by setting `SLACK_ALLOWED_USERS` (comma-separated Slack member IDs, e.g. U01234567).",
     ],
     agentUsage: [
-      'Claim target handle: mesh_join({ handle: "pm" })',
-      'Inspect or hand off live: mesh_plugin_targets() / mesh_plugin_handoff({ plugin: "slack", target: "pm", handle: "other" })',
+      'Claim target handle: hyp_join({ handle: "pm" })',
+      'Inspect or hand off live: hyp_plugin_targets() / hyp_plugin_handoff({ plugin: "slack", target: "pm", handle: "other" })',
     ],
   },
   {
@@ -151,8 +151,8 @@ export const CONNECTOR_BRIDGE_GUIDES: readonly PluginOrStreamGuide[] = [
       "4. Send a message to your bot — it wakes your enrolled agent handle automatically!",
     ],
     agentUsage: [
-      'Claim target handle: mesh_join({ handle: "assistant" })',
-      'Hand off to another session/harness: mesh_plugin_handoff({ plugin: "telegram", target: "assistant", handle: "claude-ops" })',
+      'Claim target handle: hyp_join({ handle: "assistant" })',
+      'Hand off to another session/harness: hyp_plugin_handoff({ plugin: "telegram", target: "assistant", handle: "claude-ops" })',
     ],
   },
   {
@@ -176,7 +176,7 @@ export const CONNECTOR_BRIDGE_GUIDES: readonly PluginOrStreamGuide[] = [
       "2. If a secret is configured, sign raw body with header `X-Webhook-Signature-256: sha256=<hex>`.",
     ],
     agentUsage: [
-      'Claim target handle: mesh_join({ handle: "ops" })',
+      'Claim target handle: hyp_join({ handle: "ops" })',
     ],
   },
   {
@@ -193,7 +193,7 @@ export const CONNECTOR_BRIDGE_GUIDES: readonly PluginOrStreamGuide[] = [
       "2. Store any secrets with `hyp secret set <name>` and reference them in `env` as `{ \"secret\": \"<name>\" }` or `{ \"secretFile\": \"<name>\" }`.",
     ],
     agentUsage: [
-      'Claim target handle: mesh_join({ handle: "ops" })',
+      'Claim target handle: hyp_join({ handle: "ops" })',
     ],
   },
 ];

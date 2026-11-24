@@ -91,7 +91,7 @@ const CHAPTERS = [
     alertHit: [],
     strands: ["p-alex-node"],
     softStrands: [],
-    bubbles: { "bub-alex": { text: "Calling mesh_join on the Team Node…", alert: false } },
+    bubbles: { "bub-alex": { text: "Calling hyp_join on the Team Node…", alert: false } },
     caps: [],
     subs: [],
     promState: "",
@@ -101,7 +101,7 @@ const CHAPTERS = [
     filterTag: false,
     ripples: [],
     packets: [
-      { path: "p-alex-node", reverse: false, cls: "", label: "mesh_join", delay: 150, dur: 900 },
+      { path: "p-alex-node", reverse: false, cls: "", label: "hyp_join", delay: 150, dur: 900 },
       { path: "p-node-alice", reverse: false, cls: "amber", label: "alice · Codex online", delay: 1240, dur: 860 },
       { path: "p-node-ops", reverse: false, cls: "", label: "jack · ops online", delay: 2420, dur: 860 },
       { path: "p-node-release", reverse: false, cls: "", label: "sub: approved PRs", delay: 3620, dur: 900 },
@@ -190,8 +190,8 @@ const CHAPTERS = [
   },
   {
     durationMs: 7000,
-    tip: "3 · Ops calls mesh_send -> Alex + Private Slack + #deploys",
-    caption: "<strong>3/7</strong> · Jack's ops sends a <code>mesh_send</code> to <strong>Alex</strong>. Alex joins <code>#deploys</code> with ops and wires a <strong>Private Node -> Slack</strong> to DM Alex.",
+    tip: "3 · Ops calls hyp_send -> Alex + Private Slack + #deploys",
+    caption: "<strong>3/7</strong> · Jack's ops sends a <code>hyp_send</code> to <strong>Alex</strong>. Alex joins <code>#deploys</code> with ops and wires a <strong>Private Node -> Slack</strong> to DM Alex.",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-prom"],
     dim: ["ent-alice", "ent-release"],
     spotlight: ["ent-ops"],
@@ -199,7 +199,7 @@ const CHAPTERS = [
     strands: ["p-node-ops-alert", "p-alex-node"],
     softStrands: ["p-prom-node"],
     bubbles: {
-      "bub-ops": { text: "mesh_send -> alex: trace attached. Joining #deploys.", alert: false },
+      "bub-ops": { text: "hyp_send -> alex: trace attached. Joining #deploys.", alert: false },
     },
     caps: ["cap-ch", "cap-dep"],
     coralCaps: ["cap-pr"],
@@ -212,8 +212,8 @@ const CHAPTERS = [
     filterTag: false,
     ripples: [],
     packets: [
-      { path: "p-node-ops-alert", reverse: true, cls: "coral", label: "mesh_send(trace)", delay: 150, dur: 940 },
-      { path: "p-alex-node", reverse: true, cls: "coral", label: "mesh_send -> alex", delay: 1150, dur: 1000 },
+      { path: "p-node-ops-alert", reverse: true, cls: "coral", label: "hyp_send(trace)", delay: 150, dur: 940 },
+      { path: "p-alex-node", reverse: true, cls: "coral", label: "hyp_send -> alex", delay: 1150, dur: 1000 },
       { path: "p-priv-slack", reverse: false, cls: "moss", label: "DM: 4.2% error", delay: 2700, dur: 880 },
     ],
     stages: [
@@ -256,14 +256,14 @@ const CHAPTERS = [
     ghActive: "amber",
     ghTitle: "GitHub · PR #412",
     ghSub: "open · CI running…",
-    ccAction: "→ opened PR #412 · mesh_subscribe(PR #412)",
+    ccAction: "→ opened PR #412 · hyp_subscribe(PR #412)",
     promState: "coral",
     promSub: "HighErrorRate · 4.2%!",
     filterTag: false,
     ripples: [],
     packets: [
       { path: "p-alex-gh", reverse: false, cls: "amber", label: "open PR #412", delay: 150, dur: 900 },
-      { path: "p-alex-node", reverse: false, cls: "", label: "mesh_subscribe(PR #412)", delay: 280, dur: 920 },
+      { path: "p-alex-node", reverse: false, cls: "", label: "hyp_subscribe(PR #412)", delay: 280, dur: 920 },
       { path: "p-gh-node", reverse: false, cls: "", label: "CI Done ✓", delay: 2000, dur: 880 },
       { path: "p-alex-node", reverse: true, cls: "", label: "CI Done ✓", delay: 2940, dur: 940 },
     ],
@@ -1106,10 +1106,10 @@ function renderChannel() {
       const id = btn.dataset.cm;
       if (room.joined.has(id)) {
         room.joined.delete(id);
-        room.log.push(`mesh_channel_leave('${activeRoom}') -> ${id}`);
+        room.log.push(`hyp_channel_leave('${activeRoom}') -> ${id}`);
       } else {
         room.joined.add(id);
-        room.log.push(`mesh_channel_join('${activeRoom}') -> ${id}`);
+        room.log.push(`hyp_channel_join('${activeRoom}') -> ${id}`);
       }
       renderChannel();
     });
@@ -1162,7 +1162,7 @@ const DECK_VIEWS = {
     },
     routes: [
       { addr: "jack@prod/ops", sub: "filter: subject startsWith 'severity=critical' · T3 dispatch", match: true, interrupt: true },
-      { addr: "alex@laptop/claude", sub: "notified by jack/ops via mesh_send after CODEOWNERS check", match: true, interrupt: false },
+      { addr: "alex@laptop/claude", sub: "notified by jack/ops via hyp_send after CODEOWNERS check", match: true, interrupt: false },
       { addr: "alice@laptop/codex", sub: "filter: PR reviews only · stays quiet", match: false, interrupt: false },
       { addr: "jack@prod/release", sub: "filter: approved PRs only · stays quiet", match: false, interrupt: false },
     ],
@@ -1184,7 +1184,7 @@ const DECK_VIEWS = {
   },
   channels: {
     payload: {
-      tool: "mesh_channel_post",
+      tool: "hyp_channel_post",
       node: "team-node (SQLite channel_members)",
       channel: "#deploys",
       from: "jack@prod/release",
@@ -1247,7 +1247,7 @@ function renderDeck() {
         bridge: `${chatApp}/dm-alex`,
         secrets: "0600 local store · captured via hyp secret set --web",
         linkedThreads: linkedList,
-        liveHandoff: "mesh_plugin_handoff (zero daemon restart)",
+        liveHandoff: "hyp_plugin_handoff (zero daemon restart)",
       }, null, 2))}</pre>
     </div>
     <div>

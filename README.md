@@ -94,7 +94,7 @@ One shared stateless MCP subprocess safely multiplexes any number of concurrent 
 | **Codex CLI & Desktop** | Rollout JSONL verification matching `_meta.callId` + optional hook | Native `codex queue --thread <uuid>` (and `--remote` `app-server`) |
 | **Herdr Core** | `--backend herdr` with `HC_TERMINAL_ID`, verified via `hc get` | Native `hc send` (`queue`) and `hc interrupt` (`interrupt`) |
 | **T3 Code** | Native thread projection verification | Native T3 `message.dispatch` (steer / queue / restart) |
-| **OpenClaw** | Managed `openclaw.json` MCP entry + skill | Shared local daemon + live `mesh_plugin_handoff` |
+| **OpenClaw** | Managed `openclaw.json` MCP entry + skill | Shared local daemon + live `hyp_plugin_handoff` |
 | **Cursor IDE & Agent** | `beforeMCPExecution` hook (`conversation_id`) | `afterMCPExecution` drain + `stop` followup + `hyp wait` |
 | **OpenCode** | Local plugin (`~/.config/opencode/plugins/hyphae.ts`) | `tool.execute.after` drain + `session.idle` SDK prompt |
 | **Gemini CLI** | `BeforeTool` hook (`session_id` + `_meshCall`) | `AfterTool` drain + `AfterAgent` continuation + `hyp wait` |
@@ -107,20 +107,20 @@ One shared stateless MCP subprocess safely multiplexes any number of concurrent 
 Any enrolled agent on any machine can join rooms and broadcast to teammates without polling:
 
 ```text
-mesh_channel_join   { channel: "#deploys" }
-mesh_channel_post   { channel: "#deploys", body: "v2.14.1 live — checkout-api alert cleared (0.0%)" }
-mesh_channel_leave  { channel: "#deploys" }
+hyp_channel_join   { channel: "#deploys" }
+hyp_channel_post   { channel: "#deploys", body: "v2.14.1 live — checkout-api alert cleared (0.0%)" }
+hyp_channel_leave  { channel: "#deploys" }
 ```
 
 ### Node Event Streams (GitHub, Prometheus, Custom fd-3)
-Configure webhook or fd-3 publishers directly on a Team Node (`localRouter.streams`), then subscribe from any thread with CloudEvents filters (`mesh_subscribe`):
+Configure webhook or fd-3 publishers directly on a Team Node (`localRouter.streams`), then subscribe from any thread with CloudEvents filters (`hyp_subscribe`):
 
 - **GitHub**: PR opened, CI done, review requested, changes requested, approved, merged.
 - **Prometheus / Alertmanager**: Server-side filter (`subject startsWith "severity=critical"`) wakes only your ops agent instead of burning tokens across the fleet.
 - **Bring your own stream**: Any executable writing JSON lines to fd 3.
 
 ### Private Chat Bridges (Slack, Telegram, WhatsApp, fd-3)
-Run a Private Node on your laptop for personal chat bridges (`hyp connect slack` / `telegram` / `webhook`) with live `mesh_plugin_targets` & `mesh_plugin_handoff` across harnesses — zero daemon restarts, and your chat tokens never leave your machine.
+Run a Private Node on your laptop for personal chat bridges (`hyp connect slack` / `telegram` / `webhook`) with live `hyp_plugin_targets` & `hyp_plugin_handoff` across harnesses — zero daemon restarts, and your chat tokens never leave your machine.
 
 ---
 

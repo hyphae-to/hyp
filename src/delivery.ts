@@ -38,6 +38,18 @@ const parse = (text: string): unknown => {
   try { return JSON.parse(text); } catch { return null; }
 };
 
+/**
+ * Backends without an external push CLI/RPC (`herdr` or `codex queue`) deliver
+ * through the connector's durable SQLite mailbox (`Connector.#deliverPrepared`),
+ * which immediately wakes live `hyp wait` / `hyp watch` waiters, `--claude-channel`
+ * push streams, and harness hooks (`PreInvocation` / `PostToolUse` / `Stop`).
+ */
+export function usesDurableMailbox(backend: Backend): boolean {
+  if (backend.kind === "herdr") return false;
+  if (backend.kind === "codex" && backend.queue === true && Boolean(backend.threadId)) return false;
+  return true;
+}
+
 export function createDelivery(backend: Backend, channel: () => Channel | undefined, run = command): Delivery {
   if (backend.kind === "codex" && backend.queue !== false && backend.threadId) {
     const threadId = backend.threadId;
@@ -59,19 +71,6 @@ export function createDelivery(backend: Backend, channel: () => Channel | undefi
       }),
     };
   }
-  if (
-    backend.kind === "antigravity" ||
-    backend.kind === "codex" ||
-    backend.kind === "cursor" ||
-    backend.kind === "opencode" ||
-    backend.kind === "gemini" ||
-    backend.kind === "openclaw"
-  ) {
-    return {
-      modes: ["queue"],
-      deliver: () => Promise.resolve(delivered),
-    };
-  }
   if (backend.kind === "claude") {
     return {
       modes: ["queue"],
@@ -79,6 +78,14 @@ export function createDelivery(backend: Backend, channel: () => Channel | undefi
         const active = channel();
         return active === undefined ? Promise.resolve(hold("claude_channel_offline")) : submit(() => active(text));
       },
+    };
+  }
+  if (backend.kind !== "herdr") {
+    // Durable-mailbox backends (antigravity, cursor, opencode, gemini, openclaw, hook-only codex)
+    // must be persisted by Connector.#deliverPrepared; never silently no-op `delivered`.
+    return {
+      modes: ["queue"],
+      deliver: () => Promise.resolve(reject("durable_mailbox_required")),
     };
   }
   const get = async () => {

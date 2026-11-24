@@ -1,7 +1,7 @@
 /** A thread a plugin may deliver into (SPEC.md section 13.2). */
 export interface PluginTarget {
   readonly name: string;
-  /** The configured ("bootstrap") thread; mesh_plugin_handoff can move delivery elsewhere. */
+  /** The configured ("bootstrap") thread; hyp_plugin_handoff can move delivery elsewhere. */
   readonly threadId: string;
   readonly coalesceSeconds: number;
   readonly maxWaitSeconds: number;

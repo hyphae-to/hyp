@@ -7,12 +7,12 @@ import { normalizeMeshToolName } from "./protocol.ts";
 import { inferSessionIdFromEnv } from "./wait.ts";
 
 test("normalizeMeshToolName handles plain and harness-prefixed MCP names", () => {
-  assert.equal(normalizeMeshToolName("mesh_join"), "mesh_join");
-  assert.equal(normalizeMeshToolName("mcp__hyphae__mesh_send"), "mesh_send");
-  assert.equal(normalizeMeshToolName("mcp_hyphae_mesh_join"), "mesh_join");
-  assert.equal(normalizeMeshToolName("hyphae_mesh_peers"), "mesh_peers");
-  assert.equal(normalizeMeshToolName("hyphae.mesh_subscribe"), "mesh_subscribe");
-  assert.equal(normalizeMeshToolName("hyphae/mesh_peers"), "mesh_peers");
+  assert.equal(normalizeMeshToolName("hyp_join"), "hyp_join");
+  assert.equal(normalizeMeshToolName("mcp__hyphae__hyp_send"), "hyp_send");
+  assert.equal(normalizeMeshToolName("mcp_hyphae_hyp_join"), "hyp_join");
+  assert.equal(normalizeMeshToolName("hyphae_hyp_peers"), "hyp_peers");
+  assert.equal(normalizeMeshToolName("hyphae.hyp_subscribe"), "hyp_subscribe");
+  assert.equal(normalizeMeshToolName("hyphae/hyp_peers"), "hyp_peers");
   assert.equal(normalizeMeshToolName("run_command"), null);
   assert.equal(normalizeMeshToolName("mcp__other__foo"), null);
 });
@@ -23,17 +23,17 @@ test("CallRegistry resolves per-call identity, enforces tool match, single-use, 
     harness: "claude",
     sessionId: "claude:sess-1",
     backend: { kind: "claude" },
-    tool: "mcp__hyphae__mesh_join",
+    tool: "mcp__hyphae__hyp_join",
     callId: "toolu_abc",
   });
 
   // Wrong tool name must not match
-  const wrongTool = await registry.resolve("mesh_send", "toolu_abc", undefined, 0);
+  const wrongTool = await registry.resolve("hyp_send", "toolu_abc", undefined, 0);
   assert.equal(wrongTool.ok, false);
   if (!wrongTool.ok) assert.equal(wrongTool.code, "caller_not_found");
 
   // Matching callId + tool resolves and consumes single-use entry
-  const resolved = await registry.resolve("mesh_join", "toolu_abc", undefined, 0);
+  const resolved = await registry.resolve("hyp_join", "toolu_abc", undefined, 0);
   assert.equal(resolved.ok, true);
   if (resolved.ok) {
     assert.equal(resolved.sessionId, "claude:sess-1");
@@ -41,13 +41,13 @@ test("CallRegistry resolves per-call identity, enforces tool match, single-use, 
   }
 
   // Replaying either callId or token after consumption fails closed
-  const replayId = await registry.resolve("mesh_join", "toolu_abc", undefined, 0);
+  const replayId = await registry.resolve("hyp_join", "toolu_abc", undefined, 0);
   assert.equal(replayId.ok, false);
-  const replayToken = await registry.resolve("mesh_join", undefined, reg.token, 0);
+  const replayToken = await registry.resolve("hyp_join", undefined, reg.token, 0);
   assert.equal(replayToken.ok, false);
 
   // Missing both callId and token fails closed with caller_unverifiable
-  const unverified = await registry.resolve("mesh_join", undefined, undefined, 0);
+  const unverified = await registry.resolve("hyp_join", undefined, undefined, 0);
   assert.equal(unverified.ok, false);
   if (!unverified.ok) assert.equal(unverified.code, "caller_unverifiable");
 });
@@ -58,32 +58,32 @@ test("CallRegistry resolves Antigravity PreToolUse overwrite tokens and blocks c
     harness: "antigravity",
     sessionId: "antigravity:conv-a",
     backend: { kind: "antigravity" },
-    tool: "mesh_send",
+    tool: "hyp_send",
     callId: "call_1",
   });
   const convB = registry.register({
     harness: "antigravity",
     sessionId: "antigravity:conv-b",
     backend: { kind: "antigravity" },
-    tool: "mesh_send",
+    tool: "hyp_send",
     callId: "call_2",
   });
 
-  const forged = await registry.resolve("mesh_send", undefined, "forged-token", 0);
+  const forged = await registry.resolve("hyp_send", undefined, "forged-token", 0);
   assert.equal(forged.ok, false);
 
-  const resB = await registry.resolve("mesh_send", undefined, convB.token, 0);
+  const resB = await registry.resolve("hyp_send", undefined, convB.token, 0);
   assert.equal(resB.ok, true);
   if (resB.ok) assert.equal(resB.sessionId, "antigravity:conv-b");
 
-  const resA = await registry.resolve("mesh_send", undefined, convA.token, 0);
+  const resA = await registry.resolve("hyp_send", undefined, convA.token, 0);
   assert.equal(resA.ok, true);
   if (resA.ok) assert.equal(resA.sessionId, "antigravity:conv-a");
 });
 
 test("Antigravity PreToolUse overwrites _meshCall, PreInvocation injects queued items, Stop auto-arms once", async () => {
   const calls: Record<string, unknown>[] = [];
-  let queued = [{ text: "mesh from bob/ops · reply with mesh_send\n\nhello" }];
+  let queued = [{ text: "hyphae from bob/ops · reply with hyp_send\n\nhello" }];
   let hasLiveTransport = false;
 
   const rpc = async (_socket: string, packet: Record<string, unknown>) => {
@@ -102,7 +102,7 @@ test("Antigravity PreToolUse overwrites _meshCall, PreInvocation injects queued 
 
   // PreToolUse returns allow + overwrite _meshCall for direct MCP tool calls
   const pre = await handleHookPayload(
-    { conversationId: "conv-42", toolCall: { id: "tc-1", name: "mesh_join", args: { handle: "a", _meshCall: "spoof" } } },
+    { conversationId: "conv-42", toolCall: { id: "tc-1", name: "hyp_join", args: { handle: "a", _meshCall: "spoof" } } },
     { harness: "antigravity", event: "pre-tool-use", socketPath: "/tmp/unused.sock", rpc },
   );
   assert.deepEqual(pre, { decision: "allow", overwrite: { _meshCall: "tok_123" } });
@@ -114,7 +114,7 @@ test("Antigravity PreToolUse overwrites _meshCall, PreInvocation injects queued 
       toolCall: {
         id: "tc-2",
         name: "call_mcp_tool",
-        args: { ServerName: "hyphae_hyphae", ToolName: "mesh_join", Arguments: { handle: "a" } },
+        args: { ServerName: "hyphae_hyphae", ToolName: "hyp_join", Arguments: { handle: "a" } },
       },
     },
     { harness: "antigravity", event: "pre-tool-use", socketPath: "/tmp/unused.sock", rpc },
@@ -196,7 +196,7 @@ test("Cursor, OpenCode, and Gemini CLI hook payloads map cleanly to each harness
 
   // Cursor: beforeMCPExecution -> permission:allow, stop -> followup_message (loop_count guarded)
   const curPre = await handleHookPayload(
-    { conversation_id: "c-1", tool_name: "mesh_join" },
+    { conversation_id: "c-1", tool_name: "hyp_join" },
     { harness: "cursor", event: "pre-tool-use", socketPath: "/tmp/u.sock", rpc },
   );
   assert.deepEqual(curPre, { permission: "allow" });
@@ -213,7 +213,7 @@ test("Cursor, OpenCode, and Gemini CLI hook payloads map cleanly to each harness
 
   // OpenCode: pre-tool-use -> callToken, stop -> followupMessage
   const ocPre = await handleHookPayload(
-    { session_id: "oc-9", tool_name: "hyphae_mesh_join", call_id: "call-1" },
+    { session_id: "oc-9", tool_name: "hyphae_hyp_join", call_id: "call-1" },
     { harness: "opencode", event: "pre-tool-use", socketPath: "/tmp/u.sock", rpc },
   );
   assert.deepEqual(ocPre, { callToken: "tok_xyz", sessionId: "opencode:oc-9" });
@@ -225,7 +225,7 @@ test("Cursor, OpenCode, and Gemini CLI hook payloads map cleanly to each harness
 
   // Gemini CLI: BeforeTool -> tool_input._meshCall, AfterTool -> additionalContext, AfterAgent -> decision:deny
   const gemPre = await handleHookPayload(
-    { session_id: "gem-7", tool_name: "mcp_hyphae_mesh_join", tool_input: { handle: "g" } },
+    { session_id: "gem-7", tool_name: "mcp_hyphae_hyp_join", tool_input: { handle: "g" } },
     { harness: "gemini", event: "pre-tool-use", socketPath: "/tmp/u.sock", rpc },
   );
   assert.deepEqual(gemPre, {
