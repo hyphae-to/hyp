@@ -150,6 +150,14 @@ pub struct DirectoryCheckpoint {
     pub recorded_at: i64,
 }
 
+/// Persisted multi-hub route directing traffic for `target_node` through `via_peer`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerRoute {
+    pub target_node: String,
+    pub via_peer: String,
+    pub updated_at: i64,
+}
+
 /// Federation, pairing & manifest trust store view borrowed from [`NodeDb`].
 pub struct PeerStore<'a> {
     db: &'a NodeDb,
@@ -196,6 +204,12 @@ impl<'a> PeerStore<'a> {
                 now_ms
             ],
         )?;
+        if input.status == PeerStatus::Revoked {
+            tx.conn().execute(
+                "DELETE FROM peer_routes WHERE via_peer = ?1",
+                params![&input.peer_id],
+            )?;
+        }
         let record = tx.conn().query_row(
             "SELECT * FROM peers WHERE peer_id = ?1",
             params![&input.peer_id],
@@ -245,18 +259,31 @@ impl<'a> PeerStore<'a> {
         status: PeerStatus,
         now_ms: i64,
     ) -> StoreResult<bool> {
-        let changed = self.db.conn().execute(
+        let tx = self.db.immediate_tx()?;
+        let changed = tx.conn().execute(
             "UPDATE peers SET status = ?1, updated_at = ?2 WHERE peer_id = ?3",
             params![status.as_str(), now_ms, peer_id],
         )?;
+        if status == PeerStatus::Revoked {
+            tx.conn().execute(
+                "DELETE FROM peer_routes WHERE via_peer = ?1",
+                params![peer_id],
+            )?;
+        }
+        tx.commit()?;
         Ok(changed > 0)
     }
 
     pub fn delete_peer(&self, peer_id: &str) -> StoreResult<bool> {
-        let changed = self
-            .db
+        let tx = self.db.immediate_tx()?;
+        tx.conn().execute(
+            "DELETE FROM peer_routes WHERE via_peer = ?1",
+            params![peer_id],
+        )?;
+        let changed = tx
             .conn()
             .execute("DELETE FROM peers WHERE peer_id = ?1", params![peer_id])?;
+        tx.commit()?;
         Ok(changed > 0)
     }
 
@@ -761,6 +788,92 @@ impl<'a> PeerStore<'a> {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+
+    // ---- Persisted Multi-Hub Peer Routes ----
+
+    /// Persists or updates a multi-hub route directing `target_node` via `via_peer`.
+    ///
+    /// Rejects invalid node IDs and self-loops (`target_node == via_peer`).
+    pub fn upsert_peer_route(
+        &self,
+        target_node: &str,
+        via_peer: &str,
+        now_ms: i64,
+    ) -> StoreResult<PeerRoute> {
+        if !is_node_id(target_node) {
+            return Err(StoreError::InvalidInput(format!(
+                "invalid target_node '{target_node}'"
+            )));
+        }
+        if !is_node_id(via_peer) {
+            return Err(StoreError::InvalidInput(format!(
+                "invalid via_peer '{via_peer}'"
+            )));
+        }
+        if target_node == via_peer {
+            return Err(StoreError::InvalidInput(format!(
+                "peer route cannot be a self-loop ('{target_node}')"
+            )));
+        }
+        let tx = self.db.immediate_tx()?;
+        tx.conn().execute(
+            "INSERT INTO peer_routes (target_node, via_peer, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(target_node) DO UPDATE SET
+               via_peer = excluded.via_peer,
+               updated_at = excluded.updated_at",
+            params![target_node, via_peer, now_ms],
+        )?;
+        let route = tx.conn().query_row(
+            "SELECT target_node, via_peer, updated_at FROM peer_routes WHERE target_node = ?1",
+            params![target_node],
+            decode_peer_route_row,
+        )?;
+        tx.commit()?;
+        Ok(route)
+    }
+
+    /// Looks up the persisted route for `target_node`.
+    pub fn get_peer_route(&self, target_node: &str) -> StoreResult<Option<PeerRoute>> {
+        self.db
+            .conn()
+            .query_row(
+                "SELECT target_node, via_peer, updated_at FROM peer_routes WHERE target_node = ?1",
+                params![target_node],
+                decode_peer_route_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Lists all persisted multi-hub peer routes ordered by `target_node ASC`.
+    pub fn list_peer_routes(&self) -> StoreResult<Vec<PeerRoute>> {
+        let mut stmt = self.db.conn().prepare(
+            "SELECT target_node, via_peer, updated_at FROM peer_routes ORDER BY target_node ASC",
+        )?;
+        let rows = stmt
+            .query_map([], decode_peer_route_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Deletes all routes forwarded through `via_peer`. Returns the count of deleted routes.
+    pub fn delete_peer_routes_via(&self, via_peer: &str) -> StoreResult<usize> {
+        let changed = self.db.conn().execute(
+            "DELETE FROM peer_routes WHERE via_peer = ?1",
+            params![via_peer],
+        )?;
+        Ok(changed)
+    }
+
+    /// Deletes the route for `target_node`. Returns `true` if a route was removed.
+    pub fn delete_peer_route(&self, target_node: &str) -> StoreResult<bool> {
+        let changed = self.db.conn().execute(
+            "DELETE FROM peer_routes WHERE target_node = ?1",
+            params![target_node],
+        )?;
+        Ok(changed > 0)
+    }
 }
 
 /// Identifies E2EE capability tokens protected by the permanent anti-downgrade ratchet
@@ -884,5 +997,13 @@ fn decode_checkpoint_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DirectoryC
         signed_json: row.get("signed_json")?,
         issued_at: row.get("issued_at")?,
         recorded_at: row.get("recorded_at")?,
+    })
+}
+
+fn decode_peer_route_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PeerRoute> {
+    Ok(PeerRoute {
+        target_node: row.get("target_node")?,
+        via_peer: row.get("via_peer")?,
+        updated_at: row.get("updated_at")?,
     })
 }

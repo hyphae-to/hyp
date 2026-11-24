@@ -95,6 +95,7 @@ fn db_open_pragmas_permissions_and_all_tables() {
         "kv_entries",
         "kv_epochs",
         "peers",
+        "peer_routes",
         "grants",
         "revocations",
         "peer_keys",

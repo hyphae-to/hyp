@@ -1,14 +1,16 @@
-//! Unified `node.sqlite` WAL connection, Unix permission enforcement, atomic `BEGIN IMMEDIATE`
-//! schema migrations, and RAII transaction helper.
+//! Unified `node.sqlite` WAL connection, Unix permission enforcement, declarative atomic
+//! `BEGIN IMMEDIATE` schema migrations with automatic pre-migration `VACUUM INTO` backups,
+//! and RAII transaction helper.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use rusqlite::{Connection, ErrorCode, OpenFlags};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension};
 
 use crate::error::{StoreError, StoreResult};
 use crate::events::{CompiledSubscription, EventLimits, EventStore};
@@ -19,9 +21,88 @@ use crate::peers::PeerStore;
 use crate::transfers::{TransferLimits, TransferStore};
 use crate::types::now_ms;
 
-/// Current unified v2 schema version stored in `schema_version`.
-pub const CURRENT_SCHEMA_VERSION: i64 = 1;
+/// Current unified schema version stored in `schema_version`.
+pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+/// Maximum number of pre-migration `node.sqlite.v*.bak` backups retained per database directory.
+pub const MAX_MIGRATION_BACKUPS: usize = 3;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
+const BACKUP_FILE_PREFIX: &str = "node.sqlite.v";
+const BACKUP_FILE_SUFFIX: &str = ".bak";
+const SCHEMA_VERSION_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER PRIMARY KEY,
+            applied_at INTEGER NOT NULL
+        );";
+
+/// Executable body of a schema migration step.
+#[derive(Debug, Clone, Copy)]
+pub enum MigrationKind {
+    Sql(&'static str),
+    Fn(fn(&Connection) -> StoreResult<()>),
+}
+
+/// Declarative, immutable forward-only schema migration entry.
+#[derive(Debug, Clone, Copy)]
+pub struct Migration {
+    pub version: i64,
+    pub name: &'static str,
+    pub disable_foreign_keys: bool,
+    pub kind: MigrationKind,
+}
+
+/// Immutable registry of all Hyphae `node.sqlite` schema migrations.
+///
+/// Existing entries must never be mutated once shipped; append new migrations with
+/// monotonically increasing versions.
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "0001_initial_v2",
+        disable_foreign_keys: false,
+        kind: MigrationKind::Sql(include_str!("../migrations/0001_initial_v2.sql")),
+    },
+    Migration {
+        version: 2,
+        name: "0002_discovery_and_routes",
+        disable_foreign_keys: false,
+        kind: MigrationKind::Sql(include_str!("../migrations/0002_discovery_and_routes.sql")),
+    },
+];
+
+const _: () = {
+    assert!(!MIGRATIONS.is_empty(), "MIGRATIONS must not be empty");
+    assert!(
+        MIGRATIONS.len() as i64 == CURRENT_SCHEMA_VERSION,
+        "CURRENT_SCHEMA_VERSION must match MIGRATIONS.len()"
+    );
+    let mut i = 0;
+    while i < MIGRATIONS.len() {
+        let m = &MIGRATIONS[i];
+        assert!(
+            m.version == (i as i64) + 1,
+            "MIGRATIONS versions must be contiguous 1..=CURRENT_SCHEMA_VERSION"
+        );
+        assert!(!m.name.is_empty(), "migration name must not be empty");
+        let a = m.name.as_bytes();
+        let mut j = 0;
+        while j < i {
+            let b = MIGRATIONS[j].name.as_bytes();
+            let mut same = a.len() == b.len();
+            if same {
+                let mut k = 0;
+                while k < a.len() {
+                    if a[k] != b[k] {
+                        same = false;
+                        break;
+                    }
+                    k += 1;
+                }
+            }
+            assert!(!same, "migration names must be unique");
+            j += 1;
+        }
+        i += 1;
+    }
+};
 
 /// Configuration knobs for all subsystems backed by `NodeDb`.
 #[derive(Debug, Clone)]
@@ -95,6 +176,41 @@ impl Drop for ImmediateTx<'_> {
     }
 }
 
+/// RAII guard that temporarily disables `PRAGMA foreign_keys` outside a transaction
+/// (as required by SQLite for table rebuilds) and unconditionally restores it to `ON` on drop.
+struct ForeignKeysGuard<'a> {
+    conn: &'a Connection,
+    active: bool,
+}
+
+impl<'a> ForeignKeysGuard<'a> {
+    fn disable_if(conn: &'a Connection, disable: bool) -> StoreResult<Self> {
+        if disable {
+            conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        }
+        Ok(Self {
+            conn,
+            active: disable,
+        })
+    }
+
+    fn restore(mut self) -> StoreResult<()> {
+        if self.active {
+            self.active = false;
+            self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ForeignKeysGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
+        }
+    }
+}
+
 /// Unified Hyphae v2 SQLite WAL database handle (`node.sqlite`).
 ///
 /// Owns one `rusqlite::Connection` configured for WAL concurrency and exposes scoped store views
@@ -132,10 +248,7 @@ impl NodeDb {
     /// Opens (or creates) a WAL-mode `node.sqlite` at `path` with custom [`StoreConfig`].
     pub fn open_with_config(path: impl AsRef<Path>, config: StoreConfig) -> StoreResult<Self> {
         let path = path.as_ref().to_path_buf();
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
+        let parent = db_parent(&path);
         ensure_dir_0700(parent)?;
 
         let transfers_dir = config
@@ -149,7 +262,7 @@ impl NodeDb {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(&path, flags)?;
         configure_connection(&conn, true)?;
-        migrate(&conn)?;
+        migrate(&conn, Some(&path))?;
 
         // Enforce user-only 0600 permissions on DB file and WAL sidecars.
         ensure_file_0600(&path)?;
@@ -176,7 +289,7 @@ impl NodeDb {
     pub fn open_in_memory_with_config(config: StoreConfig) -> StoreResult<Self> {
         let conn = Connection::open_in_memory()?;
         configure_connection(&conn, false)?;
-        migrate(&conn)?;
+        migrate(&conn, None)?;
 
         let (transfers_dir, ephemeral_transfers_dir) = if let Some(dir) = &config.transfers_dir {
             ensure_dir_0700(dir)?;
@@ -206,6 +319,27 @@ impl NodeDb {
                 row.get(0)
             })?;
         Ok(version.unwrap_or(0))
+    }
+
+    /// Returns all applied migrations as `(version, applied_at)` pairs ordered ascending.
+    pub fn applied_migrations(&self) -> StoreResult<Vec<(i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT version, applied_at FROM schema_version ORDER BY version ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Lists pre-migration backup files (`<db_parent>/backups/node.sqlite.v*.bak`) sorted newest-first.
+    ///
+    /// Returns an empty vector for in-memory databases or when no backups exist.
+    pub fn list_migration_backups(&self) -> StoreResult<Vec<PathBuf>> {
+        let Some(db_path) = &self.db_path else {
+            return Ok(Vec::new());
+        };
+        list_migration_backups_for_db(db_path)
     }
 
     /// Returns SQLite's `PRAGMA data_version` for this connection.
@@ -329,34 +463,393 @@ fn is_locked_error(err: &rusqlite::Error) -> bool {
     )
 }
 
-/// Runs atomic `BEGIN IMMEDIATE` schema migrations guarded by `schema_version`.
-fn migrate(conn: &Connection) -> StoreResult<()> {
-    let tx = ImmediateTx::begin(conn)?;
-    tx.conn().execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_version (
-            version INTEGER PRIMARY KEY,
-            applied_at INTEGER NOT NULL
-        );",
-    )?;
-    let current: Option<i64> =
-        tx.conn()
-            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
-                row.get(0)
-            })?;
-    let current = current.unwrap_or(0);
-    if current > CURRENT_SCHEMA_VERSION {
-        return Err(StoreError::InvalidState(format!(
-            "database schema version {current} is newer than supported version {CURRENT_SCHEMA_VERSION}"
-        )));
+fn retry_on_locked<T, F>(mut op: F) -> StoreResult<T>
+where
+    F: FnMut() -> StoreResult<T>,
+{
+    let deadline = Instant::now() + Duration::from_millis(BUSY_TIMEOUT_MS);
+    loop {
+        match op() {
+            Ok(val) => return Ok(val),
+            Err(StoreError::Sqlite(ref err)) if is_locked_error(err) && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => return Err(err),
+        }
     }
-    if current < 1 {
-        tx.conn().execute_batch(SCHEMA_V1)?;
-        tx.conn().execute(
-            "INSERT INTO schema_version (version, applied_at) VALUES (?1, ?2)",
-            rusqlite::params![1i64, now_ms()],
-        )?;
+}
+
+fn db_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn backup_dir_for_db(db_path: &Path) -> PathBuf {
+    db_parent(db_path).join("backups")
+}
+
+/// Runs the production [`MIGRATIONS`] registry against `conn`.
+fn migrate(conn: &Connection, db_path: Option<&Path>) -> StoreResult<()> {
+    run_migrations_with(conn, db_path, MIGRATIONS)
+}
+
+/// Runs an explicit slice of declarative [`Migration`] steps against `conn`.
+///
+/// Guarantees:
+/// - **Zero write lock fast-path** when `schema_version` already equals the target version.
+/// - **Fail-closed downgrade protection** when the database schema version is newer than supported.
+/// - **Automatic atomic pre-migration `VACUUM INTO` backup** (`0600` perms, retaining newest
+///   [`MAX_MIGRATION_BACKUPS`]) whenever upgrading an existing file-backed database.
+/// - **Per-step atomic `BEGIN IMMEDIATE` execution** with double-checked version guards,
+///   safe `PRAGMA foreign_keys = OFF` table-rebuild restoration, and `PRAGMA foreign_key_check`
+///   verification before commit.
+pub fn run_migrations_with(
+    conn: &Connection,
+    db_path: Option<&Path>,
+    migrations: &[Migration],
+) -> StoreResult<()> {
+    let target_version = validate_migration_registry(migrations)?;
+
+    // 1. Fast-path read-only check (no write lock when already up to date).
+    let initial_current = retry_on_locked(|| read_current_schema_version(conn))?;
+    if initial_current == target_version {
+        return Ok(());
     }
-    tx.commit()?;
+    if initial_current > target_version {
+        return Err(newer_schema_error(initial_current, target_version, db_path));
+    }
+
+    // Serialize intra-process upgrade storms on the same DB path so concurrent threads do not
+    // create duplicate redundant pre-migration backups or contend on `VACUUM INTO`.
+    let _process_guard = db_path.map(migration_lock_for);
+    let _locked = _process_guard
+        .as_ref()
+        .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+
+    let mut current = retry_on_locked(|| read_current_schema_version(conn))?;
+    if current == target_version {
+        return Ok(());
+    }
+    if current > target_version {
+        return Err(newer_schema_error(current, target_version, db_path));
+    }
+
+    // 2. Automatic atomic pre-migration backup for existing file-backed databases.
+    if let Some(path) = db_path {
+        if current > 0 && current < target_version {
+            create_pre_migration_backup(conn, path, current, target_version)?;
+        }
+    }
+
+    // 3. Per-step atomic migration execution.
+    for m in migrations {
+        if m.version <= current {
+            continue;
+        }
+
+        // `PRAGMA foreign_keys` changes must happen outside an active transaction in SQLite.
+        // Declaring `fk_guard` before the inner `tx` scope guarantees `tx` rolls back or commits
+        // BEFORE `fk_guard` restores `PRAGMA foreign_keys = ON`.
+        let fk_guard = ForeignKeysGuard::disable_if(conn, m.disable_foreign_keys)?;
+        {
+            let tx = retry_on_locked(|| ImmediateTx::begin(conn))?;
+            tx.conn().execute_batch(SCHEMA_VERSION_TABLE_SQL)?;
+            let locked_current: i64 = tx
+                .conn()
+                .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                    row.get::<_, Option<i64>>(0)
+                })?
+                .unwrap_or(0);
+
+            if locked_current > target_version {
+                return Err(newer_schema_error(locked_current, target_version, db_path));
+            }
+            if m.version <= locked_current {
+                tx.commit()?;
+                current = locked_current;
+            } else {
+                match m.kind {
+                    MigrationKind::Sql(sql) => tx.conn().execute_batch(sql)?,
+                    MigrationKind::Fn(func) => func(tx.conn())?,
+                }
+
+                if m.disable_foreign_keys {
+                    let violations = collect_foreign_key_violations(tx.conn())?;
+                    if !violations.is_empty() {
+                        return Err(StoreError::InvalidState(format!(
+                            "migration {} ('{}') failed foreign_key_check: {}",
+                            m.version,
+                            m.name,
+                            violations.join("; ")
+                        )));
+                    }
+                }
+
+                tx.conn().execute(
+                    "INSERT INTO schema_version (version, applied_at) VALUES (?1, ?2)",
+                    rusqlite::params![m.version, now_ms()],
+                )?;
+                tx.commit()?;
+                current = m.version;
+            }
+        }
+        fk_guard.restore()?;
+    }
+
+    Ok(())
+}
+
+fn validate_migration_registry(migrations: &[Migration]) -> StoreResult<i64> {
+    let mut prev_version = 0i64;
+    let mut seen_names = HashSet::with_capacity(migrations.len());
+    for m in migrations {
+        if m.version <= prev_version {
+            return Err(StoreError::InvalidInput(format!(
+                "migration versions must be strictly ascending positive integers (saw {} after {})",
+                m.version, prev_version
+            )));
+        }
+        if m.name.is_empty() {
+            return Err(StoreError::InvalidInput(format!(
+                "migration {} has an empty name",
+                m.version
+            )));
+        }
+        if !seen_names.insert(m.name) {
+            return Err(StoreError::InvalidInput(format!(
+                "duplicate migration name '{}'",
+                m.name
+            )));
+        }
+        prev_version = m.version;
+    }
+    Ok(prev_version)
+}
+
+fn read_current_schema_version(conn: &Connection) -> StoreResult<i64> {
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if exists.is_none() {
+        return Ok(0);
+    }
+    let version: Option<i64> =
+        conn.query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+            row.get(0)
+        })?;
+    Ok(version.unwrap_or(0))
+}
+
+fn newer_schema_error(current: i64, supported: i64, db_path: Option<&Path>) -> StoreError {
+    let hint = db_path
+        .map(|p| {
+            format!(
+                "; upgrade `hyp` or restore a pre-migration backup from '{}'",
+                backup_dir_for_db(p).display()
+            )
+        })
+        .unwrap_or_else(|| "; upgrade `hyp` to open this database".to_string());
+    StoreError::InvalidState(format!(
+        "database schema version {current} is newer than supported version {supported}{hint}"
+    ))
+}
+
+fn collect_foreign_key_violations(conn: &Connection) -> StoreResult<Vec<String>> {
+    let mut stmt = conn.prepare("PRAGMA foreign_key_check;")?;
+    let rows = stmt
+        .query_map([], |row| {
+            let table: String = row.get(0)?;
+            let rowid: Option<i64> = row.get(1)?;
+            let parent: String = row.get(2)?;
+            let fkid: i64 = row.get(3)?;
+            Ok(format!("table={table} rowid={rowid:?} parent={parent} fkid={fkid}"))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn migration_lock_for(db_path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    let canonical_key = db_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .and_then(|p| fs::canonicalize(p).ok())
+        .map(|p| match db_path.file_name() {
+            Some(name) => p.join(name),
+            None => p,
+        })
+        .unwrap_or_else(|| db_path.to_path_buf());
+
+    let map_mutex = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = map_mutex.lock().unwrap_or_else(|e| e.into_inner());
+    map.retain(|_, weak| weak.strong_count() > 0);
+    if let Some(existing) = map.get(&canonical_key).and_then(Weak::upgrade) {
+        return existing;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    map.insert(canonical_key, Arc::downgrade(&lock));
+    lock
+}
+
+fn create_pre_migration_backup(
+    conn: &Connection,
+    db_path: &Path,
+    from_version: i64,
+    target_version: i64,
+) -> StoreResult<()> {
+    let backups_dir = backup_dir_for_db(db_path);
+    ensure_dir_0700(&backups_dir)?;
+
+    let ts = now_ms();
+    let pid = std::process::id();
+    let mut seq = 0u32;
+    let backup_path = loop {
+        let name = if seq == 0 {
+            format!(
+                "{BACKUP_FILE_PREFIX}{from_version}-to-v{target_version}-{ts}-{pid}{BACKUP_FILE_SUFFIX}"
+            )
+        } else {
+            format!(
+                "{BACKUP_FILE_PREFIX}{from_version}-to-v{target_version}-{ts}-{pid}-{seq}{BACKUP_FILE_SUFFIX}"
+            )
+        };
+        let candidate = backups_dir.join(name);
+        if !candidate.exists() {
+            break candidate;
+        }
+        seq = seq.saturating_add(1);
+    };
+
+    let tmp_name = format!(
+        ".{}.tmp",
+        backup_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("backup")
+    );
+    let tmp_path = backups_dir.join(tmp_name);
+    let tmp_str = tmp_path.to_str().ok_or_else(|| {
+        StoreError::InvalidInput("migration backup path is not valid UTF-8".to_string())
+    })?;
+    let escaped = tmp_str.replace('\'', "''");
+    let vacuum_sql = format!("VACUUM INTO '{escaped}';");
+
+    let deadline = Instant::now() + Duration::from_millis(BUSY_TIMEOUT_MS);
+    loop {
+        let _ = fs::remove_file(&tmp_path);
+        match conn.execute_batch(&vacuum_sql) {
+            Ok(()) => break,
+            Err(err) if is_locked_error(&err) && Instant::now() < deadline => {
+                // If another process already finished migrating while we waited, skip backup cleanly.
+                if let Ok(latest) = read_current_schema_version(conn) {
+                    if latest >= target_version {
+                        let _ = fs::remove_file(&tmp_path);
+                        return Ok(());
+                    }
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => {
+                let _ = fs::remove_file(&tmp_path);
+                if is_locked_error(&err) {
+                    if let Ok(latest) = read_current_schema_version(conn) {
+                        if latest >= target_version {
+                            return Ok(());
+                        }
+                    }
+                }
+                return Err(err.into());
+            }
+        }
+    }
+
+    ensure_file_0600(&tmp_path)?;
+    fs::rename(&tmp_path, &backup_path)?;
+    ensure_file_0600(&backup_path)?;
+    prune_migration_backups(&backups_dir, MAX_MIGRATION_BACKUPS)?;
+    Ok(())
+}
+
+fn parse_backup_timestamp_ms(file_name: &str) -> Option<i64> {
+    let stem = file_name
+        .strip_prefix(BACKUP_FILE_PREFIX)?
+        .strip_suffix(BACKUP_FILE_SUFFIX)?;
+    let (_, after_to) = stem.split_once("-to-v")?;
+    let (_, after_target) = after_to.split_once('-')?;
+    let ts_part = after_target.split('-').next()?;
+    ts_part.parse::<i64>().ok()
+}
+
+fn list_migration_backups_in_dir(backups_dir: &Path) -> StoreResult<Vec<PathBuf>> {
+    if !backups_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut entries: Vec<(i64, u128, bool, String, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(backups_dir)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(BACKUP_FILE_PREFIX) || !name.ends_with(BACKUP_FILE_SUFFIX) {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let mtime_dur = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .unwrap_or_default();
+        let parsed_ts = parse_backup_timestamp_ms(name);
+        let sort_ts = parsed_ts
+            .unwrap_or_else(|| i64::try_from(mtime_dur.as_millis()).unwrap_or(i64::MAX));
+        entries.push((
+            sort_ts,
+            mtime_dur.as_nanos(),
+            parsed_ts.is_some(),
+            name.to_string(),
+            path,
+        ));
+    }
+    // Sort newest-first.
+    entries.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| b.3.cmp(&a.3))
+    });
+    Ok(entries.into_iter().map(|e| e.4).collect())
+}
+
+fn list_migration_backups_for_db(db_path: &Path) -> StoreResult<Vec<PathBuf>> {
+    list_migration_backups_in_dir(&backup_dir_for_db(db_path))
+}
+
+fn prune_migration_backups(backups_dir: &Path, keep: usize) -> StoreResult<()> {
+    let backups = list_migration_backups_in_dir(backups_dir)?;
+    for stale in backups.into_iter().skip(keep) {
+        if let Err(err) = fs::remove_file(&stale) {
+            if err.kind() != io::ErrorKind::NotFound {
+                return Err(err.into());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -377,7 +870,11 @@ pub(crate) fn ensure_file_0600(file: &Path) -> StoreResult<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         if file.exists() {
-            fs::set_permissions(file, fs::Permissions::from_mode(0o600))?;
+            if let Err(err) = fs::set_permissions(file, fs::Permissions::from_mode(0o600)) {
+                if err.kind() != io::ErrorKind::NotFound {
+                    return Err(err.into());
+                }
+            }
         }
     }
     #[cfg(not(unix))]
@@ -396,396 +893,3 @@ fn ensure_sidecar_0600(db_path: &Path, suffix: &str) -> StoreResult<()> {
     }
     Ok(())
 }
-
-/// Complete unified v2 `node.sqlite` schema (v1).
-const SCHEMA_V1: &str = r#"
--- =========================================================================
--- 1. Messaging & Channels
--- =========================================================================
-
-CREATE TABLE IF NOT EXISTS handles (
-    node_id TEXT NOT NULL,
-    handle TEXT NOT NULL,
-    session_id TEXT,
-    registered_at INTEGER NOT NULL,
-    last_heartbeat_at INTEGER NOT NULL,
-    PRIMARY KEY (node_id, handle)
-);
-CREATE INDEX IF NOT EXISTS handles_heartbeat ON handles (last_heartbeat_at);
-
-CREATE TABLE IF NOT EXISTS messages (
-    id TEXT PRIMARY KEY,
-    from_addr TEXT NOT NULL,
-    to_addr TEXT NOT NULL,
-    channel TEXT,
-    text TEXT NOT NULL,
-    digest TEXT NOT NULL,
-    sent_at INTEGER NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('pending', 'delivered', 'rejected', 'expired')),
-    reason TEXT,
-    hold_until INTEGER NOT NULL DEFAULT 0,
-    settled_at INTEGER,
-    origin_environment_id TEXT,
-    origin_thread_id TEXT,
-    e2ee_epoch INTEGER
-);
-CREATE INDEX IF NOT EXISTS messages_pending ON messages (to_addr, sent_at) WHERE state = 'pending';
-CREATE INDEX IF NOT EXISTS messages_recent ON messages (to_addr, sent_at);
-CREATE INDEX IF NOT EXISTS messages_settled ON messages (settled_at) WHERE state != 'pending' AND settled_at IS NOT NULL;
-CREATE INDEX IF NOT EXISTS messages_hold ON messages (hold_until) WHERE state = 'pending' AND hold_until > 0;
-
-CREATE TABLE IF NOT EXISTS channel_members (
-    host_node TEXT NOT NULL DEFAULT 'local',
-    channel TEXT NOT NULL,
-    address TEXT NOT NULL,
-    joined_at INTEGER NOT NULL,
-    PRIMARY KEY (host_node, channel, address)
-);
-CREATE INDEX IF NOT EXISTS channel_members_address ON channel_members (address);
-
-CREATE TABLE IF NOT EXISTS channel_epochs (
-    host_node TEXT NOT NULL DEFAULT 'local',
-    channel TEXT NOT NULL,
-    epoch INTEGER NOT NULL,
-    creator_node_id TEXT NOT NULL,
-    key_envelope_json TEXT NOT NULL,
-    members_json TEXT NOT NULL,
-    signature TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    PRIMARY KEY (host_node, channel, epoch)
-);
-CREATE INDEX IF NOT EXISTS channel_epochs_latest ON channel_epochs (host_node, channel, epoch DESC);
-
--- =========================================================================
--- 2. Universal CloudEvents Bus & Pushdown Subscriptions
--- =========================================================================
-
-CREATE TABLE IF NOT EXISTS publishers (
-    id TEXT PRIMARY KEY,
-    token_hash TEXT NOT NULL UNIQUE,
-    created_at INTEGER NOT NULL,
-    revoked_at INTEGER
-);
-
-CREATE TABLE IF NOT EXISTS publisher_grants (
-    publisher_id TEXT NOT NULL REFERENCES publishers(id) ON DELETE CASCADE,
-    topic TEXT NOT NULL,
-    PRIMARY KEY (publisher_id, topic)
-);
-
-CREATE TABLE IF NOT EXISTS events (
-    seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    origin_node TEXT NOT NULL DEFAULT 'local',
-    topic TEXT NOT NULL,
-    publisher TEXT NOT NULL,
-    source TEXT NOT NULL,
-    event_id TEXT NOT NULL,
-    digest TEXT NOT NULL,
-    body TEXT,
-    bytes INTEGER NOT NULL,
-    matched INTEGER NOT NULL DEFAULT 0,
-    received_at INTEGER NOT NULL,
-    UNIQUE (origin_node, topic, publisher, source, event_id)
-);
-CREATE INDEX IF NOT EXISTS events_received ON events (received_at);
-CREATE INDEX IF NOT EXISTS events_with_body ON events (received_at) WHERE body IS NOT NULL;
-CREATE INDEX IF NOT EXISTS events_origin_topic ON events (origin_node, topic, received_at);
-
-CREATE TABLE IF NOT EXISTS subscriptions (
-    id TEXT PRIMARY KEY,
-    origin_node TEXT NOT NULL DEFAULT 'local',
-    topic TEXT NOT NULL,
-    subscriber TEXT NOT NULL,
-    filters_json TEXT NOT NULL,
-    coalesce_seconds INTEGER NOT NULL DEFAULT 0,
-    max_batch_age_ms INTEGER,
-    max_wakes_per_hour INTEGER,
-    mode TEXT NOT NULL DEFAULT 'full' CHECK (mode IN ('full', 'notify')),
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS subscriptions_origin_topic ON subscriptions (origin_node, topic);
-CREATE INDEX IF NOT EXISTS subscriptions_subscriber ON subscriptions (subscriber);
-
-CREATE TABLE IF NOT EXISTS batches (
-    id TEXT PRIMARY KEY,
-    subscription_id TEXT NOT NULL,
-    origin_node TEXT NOT NULL DEFAULT 'local',
-    subscriber TEXT NOT NULL,
-    topic TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('open', 'pending', 'delivered', 'rejected', 'dropped')),
-    event_count INTEGER NOT NULL DEFAULT 0,
-    opened_at INTEGER NOT NULL,
-    last_event_at INTEGER NOT NULL,
-    flush_at INTEGER NOT NULL,
-    closed_at INTEGER,
-    hold_until INTEGER NOT NULL DEFAULT 0,
-    reason TEXT,
-    settled_at INTEGER
-);
-CREATE INDEX IF NOT EXISTS batches_subscription ON batches (subscription_id, state, closed_at);
-CREATE INDEX IF NOT EXISTS batches_state ON batches (state);
-CREATE INDEX IF NOT EXISTS batches_open_flush ON batches (flush_at) WHERE state = 'open';
-CREATE INDEX IF NOT EXISTS batches_subscriber_pending ON batches (subscriber, state, closed_at);
-
-CREATE TABLE IF NOT EXISTS batch_events (
-    batch_id TEXT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
-    position INTEGER NOT NULL,
-    event_seq INTEGER NOT NULL,
-    PRIMARY KEY (batch_id, position)
-);
-CREATE INDEX IF NOT EXISTS batch_events_event ON batch_events (event_seq);
-
-CREATE TABLE IF NOT EXISTS upstream_pushdowns (
-    id TEXT PRIMARY KEY,
-    peer_id TEXT NOT NULL,
-    topic TEXT NOT NULL,
-    shard_index INTEGER NOT NULL DEFAULT 0,
-    filters_json TEXT NOT NULL,
-    coalesce_seconds INTEGER NOT NULL,
-    local_sub_count INTEGER NOT NULL DEFAULT 0,
-    digest TEXT NOT NULL,
-    synced_at INTEGER,
-    last_error TEXT,
-    updated_at INTEGER NOT NULL,
-    UNIQUE (peer_id, topic, shard_index)
-);
-CREATE INDEX IF NOT EXISTS upstream_pushdowns_peer ON upstream_pushdowns (peer_id, topic);
-
--- =========================================================================
--- 3. Encrypted File Transfers
--- =========================================================================
-
-CREATE TABLE IF NOT EXISTS transfers (
-    id TEXT PRIMARY KEY,
-    from_node TEXT NOT NULL,
-    to_node TEXT NOT NULL,
-    transfer_type TEXT NOT NULL,
-    header_json TEXT NOT NULL,
-    sha256 TEXT NOT NULL,
-    size INTEGER NOT NULL,
-    sent_at INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('pending', 'delivered', 'rejected', 'expired')),
-    reason TEXT,
-    hold_until INTEGER NOT NULL DEFAULT 0,
-    settled_at INTEGER
-);
-CREATE INDEX IF NOT EXISTS transfers_pending ON transfers (to_node, sent_at) WHERE state = 'pending';
-CREATE INDEX IF NOT EXISTS transfers_expires ON transfers (expires_at) WHERE state = 'pending';
-CREATE INDEX IF NOT EXISTS transfers_hold ON transfers (hold_until) WHERE state = 'pending' AND hold_until > 0;
-
--- =========================================================================
--- 4. Shared KV / Blackboard
--- =========================================================================
-
-CREATE TABLE IF NOT EXISTS kv_entries (
-    host_node TEXT NOT NULL DEFAULT 'local',
-    namespace TEXT NOT NULL,
-    key TEXT NOT NULL,
-    value_json TEXT NOT NULL,
-    content_type TEXT NOT NULL DEFAULT 'application/json',
-    version INTEGER NOT NULL,
-    write_model TEXT NOT NULL DEFAULT 'owner' CHECK (write_model IN ('owner', 'shared', 'allowlist')),
-    owner_id TEXT,
-    allowlist_json TEXT,
-    writer_id TEXT NOT NULL,
-    e2ee_epoch INTEGER,
-    signature TEXT,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    expires_at INTEGER,
-    PRIMARY KEY (host_node, namespace, key)
-);
-CREATE INDEX IF NOT EXISTS kv_entries_expires ON kv_entries (expires_at) WHERE expires_at IS NOT NULL;
-
-CREATE TABLE IF NOT EXISTS kv_epochs (
-    host_node TEXT NOT NULL DEFAULT 'local',
-    namespace TEXT NOT NULL,
-    epoch INTEGER NOT NULL,
-    creator_node_id TEXT NOT NULL,
-    key_envelope_json TEXT NOT NULL,
-    members_json TEXT NOT NULL,
-    signature TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    PRIMARY KEY (host_node, namespace, epoch)
-);
-CREATE INDEX IF NOT EXISTS kv_epochs_latest ON kv_epochs (host_node, namespace, epoch DESC);
-
--- =========================================================================
--- 5. Federation, Pairing, Keys & Directory Trust
--- =========================================================================
-
-CREATE TABLE IF NOT EXISTS peers (
-    peer_id TEXT PRIMARY KEY,
-    endpoint TEXT,
-    profile TEXT NOT NULL DEFAULT 'router' CHECK (profile IN ('local', 'router', 'p2p')),
-    trust_tier TEXT NOT NULL DEFAULT 'peer' CHECK (trust_tier IN ('self', 'org', 'peer', 'guest')),
-    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('pending', 'active', 'paused', 'revoked')),
-    scopes_json TEXT NOT NULL DEFAULT '[]',
-    auth_credential_ref TEXT,
-    manifest_json TEXT,
-    manifest_version INTEGER NOT NULL DEFAULT 0,
-    manifest_etag TEXT,
-    manifest_fetched_at INTEGER,
-    observed_e2ee_caps_json TEXT NOT NULL DEFAULT '[]',
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS peers_status ON peers (status);
-
-CREATE TABLE IF NOT EXISTS grants (
-    id TEXT PRIMARY KEY,
-    peer_id TEXT NOT NULL,
-    direction TEXT NOT NULL DEFAULT 'inbound' CHECK (direction IN ('inbound', 'outbound')),
-    signed_json TEXT NOT NULL,
-    scopes_json TEXT NOT NULL DEFAULT '[]',
-    trust_tier TEXT NOT NULL DEFAULT 'peer' CHECK (trust_tier IN ('self', 'org', 'peer', 'guest')),
-    issued_at INTEGER NOT NULL,
-    pair_by INTEGER,
-    expires_at INTEGER,
-    entry_json TEXT,
-    paired_at INTEGER
-);
-CREATE INDEX IF NOT EXISTS grants_peer ON grants (peer_id, issued_at);
-
-CREATE TABLE IF NOT EXISTS revocations (
-    grant_id TEXT PRIMARY KEY,
-    peer_id TEXT NOT NULL,
-    signed_json TEXT NOT NULL,
-    revoked_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS revocations_peer ON revocations (peer_id, revoked_at);
-
-CREATE TABLE IF NOT EXISTS peer_keys (
-    peer_id TEXT NOT NULL,
-    kid TEXT NOT NULL,
-    key_use TEXT NOT NULL CHECK (key_use IN ('signing', 'encryption', 'prekey', 'admin')),
-    jwk_json TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'retired', 'revoked')),
-    registered_at INTEGER NOT NULL,
-    expires_at INTEGER,
-    PRIMARY KEY (peer_id, kid)
-);
-CREATE INDEX IF NOT EXISTS peer_keys_peer_use ON peer_keys (peer_id, key_use, status);
-
-CREATE TABLE IF NOT EXISTS directory_checkpoints (
-    authority_id TEXT NOT NULL,
-    version INTEGER NOT NULL,
-    root_hash TEXT NOT NULL,
-    signed_json TEXT NOT NULL,
-    issued_at INTEGER NOT NULL,
-    recorded_at INTEGER NOT NULL,
-    PRIMARY KEY (authority_id, version)
-);
-CREATE INDEX IF NOT EXISTS directory_checkpoints_latest ON directory_checkpoints (authority_id, version DESC);
-
--- =========================================================================
--- 6. Local Runtime, Mailbox, Mutes, Bridges & Immutable Security Gate Audit
--- =========================================================================
-
-CREATE TABLE IF NOT EXISTS metadata (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
-    backend_json TEXT NOT NULL,
-    handle TEXT UNIQUE,
-    last_seen INTEGER NOT NULL DEFAULT 0,
-    delivery_mode TEXT NOT NULL DEFAULT 'full' CHECK (delivery_mode IN ('full', 'notify')),
-    created_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS sessions_last_seen ON sessions (last_seen);
-
-CREATE TABLE IF NOT EXISTS mailbox (
-    receipt TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    origin_node TEXT NOT NULL,
-    item_id TEXT NOT NULL,
-    text TEXT NOT NULL,
-    received_at INTEGER NOT NULL,
-    kind TEXT NOT NULL DEFAULT 'message' CHECK (kind IN ('message', 'event', 'plugin', 'transfer', 'kv')),
-    source TEXT NOT NULL DEFAULT '',
-    notified INTEGER NOT NULL DEFAULT 0,
-    gate_state TEXT NOT NULL DEFAULT 'pending' CHECK (gate_state IN ('pending', 'delivered', 'quarantined', 'rejected')),
-    gate_reason TEXT,
-    traceparent TEXT,
-    payload_sha256 TEXT,
-    reviewed_at INTEGER,
-    UNIQUE (origin_node, item_id, session_id)
-);
-CREATE INDEX IF NOT EXISTS mailbox_session_state ON mailbox (session_id, gate_state, received_at);
-CREATE INDEX IF NOT EXISTS mailbox_quarantined ON mailbox (gate_state, received_at) WHERE gate_state = 'quarantined';
-
-CREATE TABLE IF NOT EXISTS deliveries (
-    origin_node TEXT NOT NULL,
-    item_id TEXT NOT NULL,
-    state TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    PRIMARY KEY (origin_node, item_id)
-);
-CREATE INDEX IF NOT EXISTS deliveries_created ON deliveries (created_at);
-
-CREATE TABLE IF NOT EXISTS muted_sources (
-    scope TEXT NOT NULL,
-    pattern TEXT NOT NULL,
-    muted_at INTEGER NOT NULL,
-    muted_by TEXT NOT NULL,
-    PRIMARY KEY (scope, pattern)
-);
-
-CREATE TABLE IF NOT EXISTS plugin_targets (
-    plugin TEXT NOT NULL,
-    target TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    set_at INTEGER NOT NULL,
-    set_by TEXT NOT NULL,
-    PRIMARY KEY (plugin, target)
-);
-
-CREATE TABLE IF NOT EXISTS bridge_links (
-    plugin TEXT NOT NULL,
-    target TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    linked_at INTEGER NOT NULL,
-    linked_by TEXT NOT NULL,
-    PRIMARY KEY (plugin, target, session_id)
-);
-CREATE INDEX IF NOT EXISTS bridge_links_session ON bridge_links (session_id);
-
-CREATE TABLE IF NOT EXISTS gate_audit (
-    seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    created_at INTEGER NOT NULL,
-    direction TEXT NOT NULL CHECK (direction IN ('inbound', 'outbound', 'review')),
-    stage TEXT NOT NULL,
-    decision TEXT NOT NULL CHECK (decision IN ('allow', 'quarantine', 'block', 'error')),
-    origin_node TEXT,
-    source TEXT,
-    session_id TEXT,
-    receipt_id TEXT,
-    event_type TEXT,
-    trust_tier TEXT,
-    confidence REAL,
-    categories_json TEXT,
-    reason TEXT,
-    traceparent TEXT,
-    payload_sha256 TEXT NOT NULL,
-    reviewer TEXT
-);
-CREATE INDEX IF NOT EXISTS gate_audit_created ON gate_audit (created_at);
-CREATE INDEX IF NOT EXISTS gate_audit_decision_created ON gate_audit (decision, created_at);
-
-CREATE TRIGGER IF NOT EXISTS gate_audit_no_update
-BEFORE UPDATE ON gate_audit
-BEGIN
-    SELECT RAISE(ABORT, 'gate_audit is immutable');
-END;
-
-CREATE TRIGGER IF NOT EXISTS gate_audit_no_delete
-BEFORE DELETE ON gate_audit
-BEGIN
-    SELECT RAISE(ABORT, 'gate_audit is immutable');
-END;
-"#;
