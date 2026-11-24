@@ -1,0 +1,24 @@
+# Cloudflare Tunnel (cloudflared) example for Hyphae v2 Node
+# Exposes a loopback-bound Hyphae node over HTTPS with zero open inbound ports
+# (ideal behind CGNAT, homelabs, or laptops).
+#
+# Quick start:
+#   1. cloudflared tunnel login
+#   2. cloudflared tunnel create hyphae-node
+#   3. cloudflared tunnel route dns hyphae-node mesh.example.com
+#   4. Copy this file to /etc/cloudflared/config.yml, replace <TUNNEL_UUID> & hostname
+#   5. cloudflared tunnel --config /etc/cloudflared/config.yml run
+#   6. Verify with: hyp-rs deploy check --url https://mesh.example.com
+
+tunnel: <TUNNEL_UUID>
+credentials-file: /etc/cloudflared/<TUNNEL_UUID>.json
+
+ingress:
+  - hostname: mesh.example.com
+    service: http://127.0.0.1:8790
+    originRequest:
+      connectTimeout: 10s
+      keepAliveTimeout: 90s
+      keepAliveConnections: 100
+      noHappyEyeballs: true
+  - service: http_status:404
