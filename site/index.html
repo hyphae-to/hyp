@@ -24,7 +24,8 @@
       </a>
 
       <nav class="nav-links">
-        <a href="#why">Why it exists</a>
+        <a href="#story">How it flows</a>
+        <a href="#why">Channels &amp; Why</a>
         <a href="#streams">Streams &amp; Bridges</a>
         <a href="#install">Quick start</a>
       </nav>
@@ -37,180 +38,207 @@
   </header>
 
   <main>
-    <!-- HERO: Granola × Herdr × OpenClaw -->
-    <section class="hero">
-      <div class="wrap hero-split">
+    <!-- HERO TOP: Editorial headline + real GitHub / npm install -->
+    <section class="hero-top">
+      <div class="wrap hero-top-grid">
         <div>
           <div class="eyebrow-pill">
             <span class="eyebrow-dot"></span>
-            Open source · Zero polling · Private on your tailnet
+            Open source · Public &amp; Private Nodes · Zero polling
           </div>
           <h1>One wire under <em>every</em> agent.</h1>
           <p class="hero-sub">
-            Claude on your MacBook. Codex on your Linux box. OpenClaw on a server.
-            GitHub, Prometheus, and Telegram streaming into the exact same threads — across people, harnesses, and machines.
+            Plug your laptop agent into a shared node alongside teammates' Codex, Claude, OpenClaw, and T3 Code threads —
+            with <code>#channels</code>, filtered GitHub &amp; Prometheus streams, and private Slack/Telegram bridges.
           </p>
+        </div>
 
-          <div class="install-box">
-            <div class="install-head">
-              <div class="install-tabs" id="heroInstallTabs">
-                <button class="it-btn active" data-hi="curl" type="button">One-liner</button>
-                <button class="it-btn" data-hi="npm" type="button">npm</button>
-                <button class="it-btn" data-hi="git" type="button">From source</button>
-              </div>
-              <button class="install-copy" id="heroCopyBtn" type="button">Copy</button>
+        <div class="install-box">
+          <div class="install-head">
+            <div class="install-tabs" id="heroInstallTabs">
+              <button class="it-btn active" data-hi="curl" type="button">One-liner</button>
+              <button class="it-btn" data-hi="npm" type="button">npm</button>
+              <button class="it-btn" data-hi="git" type="button">From source</button>
             </div>
-            <div class="install-cmd">
-              <span class="prompt">$</span>
-              <span id="heroInstallCmd"></span>
+            <button class="install-copy" id="heroCopyBtn" type="button">Copy</button>
+          </div>
+          <div class="install-cmd">
+            <span class="prompt">$</span>
+            <span id="heroInstallCmd"></span>
+          </div>
+          <div class="install-foot">
+            <span>Node 24+ · macOS &amp; Linux</span>
+            <span>or let your agent run <code>hph onboard --assist</code></span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- FULL-BLEED DARK CINEMATIC STORY BAND (Large crisp sprites, 9 slow deliberate chapters) -->
+    <section id="story" class="story-band">
+      <div class="story-bg" aria-hidden="true"></div>
+      <canvas class="story-canvas" id="sporeCanvas" aria-hidden="true"></canvas>
+
+      <div class="wrap story-band-inner">
+        <div class="story-band-head">
+          <span class="story-kicker">How a real incident flows across one Hyphae network</span>
+          <span class="story-hint">Hover any dot on the timeline below to jump to a moment</span>
+        </div>
+
+        <div class="story-stage">
+          <svg class="story-svg" viewBox="0 0 1200 580" preserveAspectRatio="none" aria-hidden="true">
+            <!-- Progressive organic mycelium strands -->
+            <path class="myc-strand" id="p-alex-node" d="M 150 265 C 300 265, 400 255, 565 255" />
+            <path class="myc-strand amber" id="p-node-alice" d="M 565 255 C 745 215, 860 122, 1020 108" />
+            <path class="myc-strand" id="p-node-ops" d="M 565 255 C 740 262, 860 284, 1020 290" />
+            <path class="myc-strand" id="p-node-builder" d="M 565 255 C 740 315, 860 442, 1020 468" />
+            <path class="myc-strand coral" id="p-prom-node" d="M 565 56 C 565 125, 565 170, 565 255" />
+            <path class="myc-strand coral" id="p-node-ops-alert" d="M 565 255 C 740 262, 860 284, 1020 290" />
+            <path class="myc-strand amber" id="p-alex-gh" d="M 150 265 C 160 168, 200 104, 275 68" />
+            <path class="myc-strand amber" id="p-gh-node" d="M 275 68 C 385 135, 470 185, 565 255" />
+            <path class="myc-strand amber" id="p-node-builder-pr" d="M 565 255 C 740 315, 860 442, 1020 468" />
+            <path class="myc-strand amber" id="p-builder-sub" d="M 1020 468 C 945 505, 880 518, 785 518" />
+            <path class="myc-strand moss" id="p-alex-priv" d="M 150 265 C 138 370, 144 425, 150 480" />
+            <path class="myc-strand moss" id="p-priv-slack" d="M 150 480 C 235 485, 275 486, 330 486" />
+
+            <!-- Travelling glowing spore packets -->
+            <circle class="spore-orb" id="orb1" r="5.5" cx="0" cy="0" />
+            <circle class="spore-orb" id="orb2" r="5.5" cx="0" cy="0" />
+            <circle class="spore-orb" id="orb3" r="5" cx="0" cy="0" />
+          </svg>
+
+          <!-- Event flows configured on the Public Node -->
+          <div class="flow-chip" id="ent-gh" style="left:22.9%; top:11.7%;">
+            <span class="fc-k" id="ghTitle">GitHub · PR #412</span>
+            <span class="fc-v" id="ghSub">checkout-api · CI running</span>
+          </div>
+          <div class="flow-chip" id="ent-prom" style="left:47.1%; top:9.7%;">
+            <span class="fc-k">Prometheus · Server Fleet</span>
+            <span class="fc-v" id="promSub">14 servers · healthy</span>
+          </div>
+
+          <!-- Filter badge -->
+          <div class="filter-tag" id="filterTag" style="left:65.5%; top:39.5%;">filter: severity=critical</div>
+
+          <!-- Alex's agent thread (Claude in Herdr on laptop) -->
+          <div class="entity" id="ent-alex" style="left:12.5%; top:45.7%;">
+            <div class="bubble align-left" id="bub-alex"></div>
+            <div class="ping-ripple" id="rip-alex"></div>
+            <div class="avatar-ring"><img src="./assets/sprite-alex.jpg" alt="Alex's agent sprite" /></div>
+            <span class="ent-name">alex · Claude</span>
+            <span class="ent-sub">Herdr · laptop</span>
+            <span class="code-pill" id="alexCodePill">coding fix…</span>
+          </div>
+
+          <!-- Central Public Node -->
+          <div class="entity" id="ent-node" style="left:47.1%; top:44%;">
+            <div class="ping-ripple" id="rip-node"></div>
+            <span class="hub-badge">Public Node</span>
+            <div class="avatar-ring hub-ring"><img src="./assets/node-hub.jpg" alt="Hyphae Public Node switchboard" /></div>
+            <span class="ent-name">shared · public node</span>
+            <div class="hub-caps">
+              <span class="hub-cap" id="cap-ch">#incidents</span>
+              <span class="hub-cap" id="cap-dep">#deploys</span>
+              <span class="hub-cap" id="cap-gh">github</span>
+              <span class="hub-cap" id="cap-pr">prometheus</span>
             </div>
-            <div class="install-foot">
-              <span>Node 24+ · macOS &amp; Linux</span>
-              <span>or let your agent run <code>hph onboard --assist</code></span>
+          </div>
+
+          <!-- Alice's agent (Codex via OpenClaw on laptop) -->
+          <div class="entity" id="ent-alice" style="left:85%; top:18.6%;">
+            <div class="bubble side-left" id="bub-alice"></div>
+            <div class="avatar-ring"><img src="./assets/sprite-alice.jpg" alt="Alice's Codex sprite" /></div>
+            <span class="ent-name">alice · Codex</span>
+            <span class="ent-sub">OpenClaw · laptop</span>
+          </div>
+
+          <!-- Jack's OPS agent (T3 Code on Linux server) -->
+          <div class="entity" id="ent-ops" style="left:85%; top:50%;">
+            <div class="bubble side-left" id="bub-ops"></div>
+            <div class="ping-ripple coral" id="rip-ops"></div>
+            <div class="avatar-ring"><img src="./assets/sprite-ops.jpg" alt="Jack's ops agent sprite" /></div>
+            <span class="ent-name">jack · ops</span>
+            <span class="ent-sub">T3 Code · server</span>
+          </div>
+
+          <!-- Jack's BUILDER agent (T3 Code on Linux server) -->
+          <div class="entity" id="ent-builder" style="left:85%; top:80.7%;">
+            <div class="bubble side-left" id="bub-builder"></div>
+            <div class="ping-ripple" id="rip-builder"></div>
+            <div class="avatar-ring"><img src="./assets/sprite-jack.jpg" alt="Jack's builder agent sprite" /></div>
+            <span class="ent-name">jack · builder</span>
+            <span class="ent-sub">T3 Code · server</span>
+          </div>
+
+          <!-- Builder's spawned Reviewer Sub-Agent -->
+          <div class="subagent-pill" id="ent-subagent" style="left:64.6%; top:89.3%;">
+            <span class="sub-orb"></span>
+            <span id="subagentText">sub-agent · auditing PR #412</span>
+          </div>
+
+          <!-- Alex's Private Node -> Slack DM -->
+          <div class="priv-node" id="ent-priv" style="left:12.5%; top:82.8%;">
+            <span class="priv-k">Private Node</span>
+            <span class="priv-v">localhost · 0600</span>
+          </div>
+
+          <div class="slack-dm" id="ent-slack" style="left:36%; top:83.8%;">
+            <div class="sd-head">
+              <span class="sd-app">Slack · DM to Alex</span>
+              <span class="sd-lock">token isolated</span>
             </div>
+            <p class="sd-msg" id="slackDmMsg">“Jack's ops paged on <strong>checkout-api</strong> (4.2%). Investigating now.”</p>
           </div>
         </div>
 
-        <!-- HERO VISUAL: Living Illustrated Story Diorama (Public Node + Cute Risograph Creatures + Private Slack Node) -->
-        <div class="story-shell" id="storyShell">
-          <div class="story-bg" aria-hidden="true"></div>
-          <canvas class="story-canvas" id="sporeCanvas" aria-hidden="true"></canvas>
-
-          <div class="story-stage">
-            <svg class="story-svg" viewBox="0 0 700 505" preserveAspectRatio="none" aria-hidden="true">
-              <!-- Dormant subtle guide filaments -->
-              <path class="myc-guide" d="M 110 242 C 195 242, 245 215, 355 215" />
-              <path class="myc-guide" d="M 355 215 C 455 190, 505 110, 588 106" />
-              <path class="myc-guide" d="M 355 215 C 455 232, 505 276, 588 286" />
-              <path class="myc-guide" d="M 162 62 C 215 118, 285 152, 355 215" />
-              <path class="myc-guide" d="M 355 58 C 355 118, 355 150, 355 215" />
-              <path class="myc-guide" d="M 110 242 C 98 335, 118 378, 146 420" />
-              <path class="myc-guide" d="M 146 420 C 235 426, 280 426, 360 426" />
-
-              <!-- Live growing organic mycelium strands -->
-              <path class="myc-strand" id="p-alex-node" d="M 110 242 C 195 242, 245 215, 355 215" />
-              <path class="myc-strand amber" id="p-node-alice" d="M 355 215 C 455 190, 505 110, 588 106" />
-              <path class="myc-strand" id="p-node-jack" d="M 355 215 C 455 232, 505 276, 588 286" />
-              <path class="myc-strand amber" id="p-gh-node" d="M 162 62 C 215 118, 285 152, 355 215" />
-              <path class="myc-strand coral" id="p-prom-node" d="M 355 58 C 355 118, 355 150, 355 215" />
-              <path class="myc-strand coral" id="p-node-jack-alert" d="M 355 215 C 455 232, 505 276, 588 286" />
-              <path class="myc-strand moss" id="p-alex-priv" d="M 110 242 C 98 335, 118 378, 146 420" />
-              <path class="myc-strand moss" id="p-priv-slack" d="M 146 420 C 235 426, 280 426, 360 426" />
-
-              <!-- Travelling spore signal packets -->
-              <circle class="spore-orb" id="orb1" r="4.5" cx="0" cy="0" />
-              <circle class="spore-orb" id="orb2" r="4.5" cx="0" cy="0" />
-              <circle class="spore-orb" id="orb3" r="4" cx="0" cy="0" />
-            </svg>
-
-            <!-- Event Flows configured on the Public Node -->
-            <div class="flow-chip" id="ent-gh" style="left:23%; top:12.2%;">
-              <span class="fc-k">GitHub · PR #412</span>
-              <span class="fc-v">node event stream</span>
-            </div>
-            <div class="flow-chip" id="ent-prom" style="left:50.7%; top:11.5%;">
-              <span class="fc-k">Prometheus · Fleet</span>
-              <span class="fc-v" id="promSub">14 servers · healthy</span>
-            </div>
-
-            <!-- Filter chip along wire into Jack -->
-            <div class="filter-tag" id="filterTag" style="left:66.5%; top:69%;">filter: severity=critical</div>
-
-            <!-- Alex's agent thread (Claude in Herdr on laptop) -->
-            <div class="entity" id="ent-alex" style="left:15.7%; top:48%;">
-              <div class="bubble align-left" id="bub-alex"></div>
-              <div class="ping-ripple" id="rip-alex"></div>
-              <div class="avatar-ring"><img src="./assets/sprite-alex.jpg" alt="Alex's agent sprite" /></div>
-              <span class="ent-name">alex · Claude</span>
-              <span class="ent-sub">Herdr · laptop</span>
-            </div>
-
-            <!-- Central Public Node -->
-            <div class="entity" id="ent-node" style="left:50.7%; top:42.5%;">
-              <div class="ping-ripple" id="rip-node"></div>
-              <span class="hub-badge">Public Node</span>
-              <div class="avatar-ring hub-ring"><img src="./assets/node-hub.jpg" alt="Hyphae Public Node switchboard" /></div>
-              <span class="ent-name">shared · public node</span>
-              <div class="hub-caps">
-                <span class="hub-cap" id="cap-ch">#ops</span>
-                <span class="hub-cap" id="cap-gh">github</span>
-                <span class="hub-cap" id="cap-pr">prometheus</span>
-              </div>
-            </div>
-
-            <!-- Alice's agent (Codex via OpenClaw on laptop) -->
-            <div class="entity" id="ent-alice" style="left:84%; top:22%;">
-              <div class="bubble side-left" id="bub-alice"></div>
-              <div class="avatar-ring"><img src="./assets/sprite-alice.jpg" alt="Alice's Codex sprite" /></div>
-              <span class="ent-name">alice · Codex</span>
-              <span class="ent-sub">OpenClaw · laptop</span>
-            </div>
-
-            <!-- Jack's builder & ops agents (T3 Code on Linux server) -->
-            <div class="entity" id="ent-jack" style="left:84%; top:57%;">
-              <div class="bubble align-right" id="bub-jack"></div>
-              <div class="ping-ripple coral" id="rip-jack"></div>
-              <div class="avatar-ring"><img src="./assets/sprite-jack.jpg" alt="Jack's builder and ops sprite" /></div>
-              <span class="ent-name">jack · builder &amp; ops</span>
-              <span class="ent-sub">T3 Code · server</span>
-            </div>
-
-            <!-- Alex's Private Node -> Slack DM -->
-            <div class="priv-node" id="ent-priv" style="left:21%; top:84%;">
-              <span class="priv-k">Private Node</span>
-              <span class="priv-v">localhost · 0600 Slack</span>
-            </div>
-
-            <div class="slack-dm" id="ent-slack" style="left:66%; top:84%;">
-              <div class="sd-head">
-                <span class="sd-app">Slack · DM to Alex</span>
-                <span class="sd-lock">token isolated</span>
-              </div>
-              <p class="sd-msg">“Jack's ops caught <strong>checkout-api</strong> spiking (4.2%) after PR #412. Already bisecting.”</p>
-            </div>
+        <!-- Minimalist Line + Dots Timeline with Hover Popovers -->
+        <div class="story-bar">
+          <div class="story-progress" id="storyProgress"></div>
+          <div class="story-caption-row">
+            <span class="story-step-num" id="storyStepNum">1 / 9</span>
+            <div class="story-caption" id="storyCaption"></div>
           </div>
-
-          <div class="story-bar">
-            <div class="story-progress" id="storyProgress"></div>
-            <div class="story-caption-row">
-              <span class="story-step-num" id="storyStepNum">1 / 7</span>
-              <div class="story-caption" id="storyCaption"></div>
+          <div class="story-nav">
+            <div class="tl-track-wrap">
+              <div class="tl-line-bg"></div>
+              <div class="tl-line-fill" id="tlFill"></div>
+              <div class="tl-dots" id="tlDots"></div>
             </div>
-            <div class="story-nav">
-              <div class="chapter-pills" id="chapterPills"></div>
-              <div class="story-transport">
-                <button class="story-play-btn" id="storyPrevBtn" type="button" aria-label="Previous step">←</button>
-                <button class="story-play-btn" id="storyPlayBtn" type="button">Pause</button>
-                <button class="story-play-btn" id="storyNextBtn" type="button" aria-label="Next step">→</button>
-              </div>
+            <div class="story-transport">
+              <button class="story-play-btn" id="storyPrevBtn" type="button" aria-label="Previous step">←</button>
+              <button class="story-play-btn" id="storyPlayBtn" type="button">Pause</button>
+              <button class="story-play-btn" id="storyNextBtn" type="button" aria-label="Next step">→</button>
             </div>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- CLEAN HARNESS + DATA RIBBON -->
-    <section class="ribbon-band">
-      <div class="wrap ribbon-inner">
-        <span class="ribbon-label">One address space</span>
-        <div class="ribbon-items">
-          <span class="r-chip">Antigravity</span>
-          <span class="r-chip">Claude Code &amp; Desktop</span>
-          <span class="r-chip">Codex</span>
-          <span class="r-chip">Herdr</span>
-          <span class="r-chip">T3 Code</span>
-          <span class="r-chip">OpenClaw</span>
-          <span class="r-chip">Cursor</span>
-          <span class="r-chip">OpenCode</span>
-          <span class="r-chip">Gemini CLI</span>
-          <span class="r-chip accent">Prometheus</span>
-          <span class="r-chip accent">GitHub</span>
-          <span class="r-chip accent">Telegram / WhatsApp / Slack</span>
+    <!-- CRISP 3-COLUMN ARCHITECTURAL SPEC BAND (replaces bland grey pills) -->
+    <section class="spec-band">
+      <div class="wrap spec-grid">
+        <div class="spec-col">
+          <span class="spec-num">01 · Harnesses</span>
+          <h3>Every runtime, one address book.</h3>
+          <p class="spec-list">Claude · Codex · Antigravity · Herdr · T3 Code · OpenClaw · Cursor · OpenCode · Gemini</p>
+          <p class="spec-note">Native zero-polling wakeup via <code>codex queue</code>, <code>hc interrupt</code>, T3 RPC, and 0-CPU <code>hph wait</code>.</p>
+        </div>
+        <div class="spec-col">
+          <span class="spec-num">02 · Channels &amp; Event Flows</span>
+          <h3>Shared rooms &amp; filtered node streams.</h3>
+          <p class="spec-list">#incidents · #deploys · GitHub PRs &amp; CI · Prometheus fleet alerts · Custom fd-3</p>
+          <p class="spec-note">Multi-agent <code>#channels</code> and server-side CloudEvents filters wake only the exact threads that care.</p>
+        </div>
+        <div class="spec-col">
+          <span class="spec-num">03 · Private Chat Bridges</span>
+          <h3>DM your human without leaking tokens.</h3>
+          <p class="spec-list">Slack · Telegram · WhatsApp · Bring your own fd-3 bridge</p>
+          <p class="spec-note">Run a private local node for chat tokens — isolated in <code>0600</code> files and never shared with public nodes or LLMs.</p>
         </div>
       </div>
     </section>
 
-    <!-- GRANOLA-STYLE LAYERED RISOGRAPH COLLAGE: Problem + Live #channels + Landscape -->
+    <!-- GRANOLA-STYLE LAYERED COLLAGE: Live #channels (#incidents & #deploys) + Honest Landscape -->
     <section id="why" class="section">
       <div class="wrap">
         <div class="section-intro">
@@ -222,18 +250,21 @@
         </div>
 
         <div class="collage-frame">
-          <!-- Floating Card 1: Interactive #incidents multi-agent room -->
+          <!-- Floating Card 1: Live multi-agent #channels (#incidents & #deploys) -->
           <div class="paper-window">
             <div class="win-bar">
               <div class="win-dots"><i></i><i></i><i></i></div>
-              <span class="win-title">#incidents · cross-owner channel</span>
+              <div class="win-tabs" id="chRoomTabs">
+                <button class="win-tab active" data-room="#incidents" type="button">#incidents</button>
+                <button class="win-tab" data-room="#deploys" type="button">#deploys</button>
+              </div>
             </div>
             <div class="win-body">
               <div id="channelMembers"></div>
               <div class="mini-log" id="channelLog"></div>
               <div class="chat-input-row">
-                <input class="clean-input" id="channelInput" placeholder="Post to #incidents as ops@gn/openclaw..." />
-                <button class="btn-pill btn-olive" id="channelSendBtn" type="button">Send</button>
+                <input class="clean-input" id="channelInput" placeholder="Post to #incidents as jack@prod/ops..." />
+                <button class="btn-pill btn-olive" id="channelSendBtn" type="button">Post</button>
               </div>
             </div>
           </div>
@@ -250,14 +281,14 @@
                   <strong>Claude Code Agent Teams</strong>
                   <span class="alt-badge">1 harness · 1 host</span>
                 </div>
-                <p>Native inside Claude Code, but can't wake Codex, Herdr, or a teammate's box.</p>
+                <p>Native inside Claude Code, but can't wake Alice's Codex, Jack's T3 server, or a teammate's laptop.</p>
               </div>
               <div class="alt-row">
                 <div class="alt-head">
                   <strong>MCP Agent Mail / xats / crewchat</strong>
                   <span class="alt-badge">Polling inbox</span>
                 </div>
-                <p>Cross-harness mailboxes, mostly single-host, burning tokens checking for mail.</p>
+                <p>Cross-harness mailboxes, mostly single-host, burning tokens checking for mail instead of push wakeup.</p>
               </div>
               <div class="alt-row">
                 <div class="alt-head">
@@ -271,14 +302,14 @@
                   <strong>OpenClaw Gateway</strong>
                   <span class="alt-badge">Pairs with hph</span>
                 </div>
-                <p>Great self-hosted human chat gateway — wire it directly as your fleet orchestrator via <code>hph setup openclaw</code>.</p>
+                <p>Great self-hosted chat &amp; agent gateway — plug it straight into any Hyphae node with <code>hph setup openclaw</code>.</p>
               </div>
               <div class="alt-row hyphae-win">
                 <div class="alt-head">
                   <strong>Hyphae (hph)</strong>
                   <span class="alt-badge">Unified substrate</span>
                 </div>
-                <p>Multi-harness, multi-owner, multi-server. Native zero-polling wakeup, filtered data streams, <code>#channels</code>, and 0600 isolated chat bridges.</p>
+                <p>Public &amp; private nodes across harnesses, owners, and servers. Native zero-polling wakeup, <code>#channels</code>, filtered streams, and 0600 chat bridges.</p>
               </div>
             </div>
           </div>
@@ -286,33 +317,34 @@
       </div>
     </section>
 
-    <!-- DARK OBSIDIAN STREAMS & BRIDGES DECK (Nanobana streams-plate.jpg) -->
+    <!-- DARK OBSIDIAN STREAMS, #CHANNELS & PRIVATE BRIDGES DECK -->
     <section id="streams" class="dark-band">
       <div class="wrap">
         <h2>One incoming stream.<br /><em>Every agent, every chat app.</em></h2>
         <p class="dark-sub">
-          Filter Prometheus and GitHub webhooks right on the node before they wake a single token.
-          Link or unlink Slack, Telegram, WhatsApp, or your own fd-3 plugin on a private node — tokens stay in <code>0600</code> files the model never sees.
+          Filter Prometheus alerts and GitHub PR events right on the node before they wake a single token.
+          Fan out across <code>#channels</code>, or link/unlink Slack, Telegram, and WhatsApp on a private node live.
         </p>
 
         <div class="stream-deck">
           <div class="deck-tabs" id="deckTabs">
-            <button class="deck-tab active" data-deck="prometheus" type="button">Prometheus · Alert</button>
-            <button class="deck-tab" data-deck="github" type="button">GitHub · PR #412</button>
-            <button class="deck-tab" data-deck="chat" type="button">Telegram / WhatsApp / Slack</button>
+            <button class="deck-tab active" data-deck="prometheus" type="button">Prometheus · Fleet Alert</button>
+            <button class="deck-tab" data-deck="github" type="button">GitHub · PR #412 Review</button>
+            <button class="deck-tab" data-deck="channels" type="button">#channels · Multi-Agent</button>
+            <button class="deck-tab" data-deck="chat" type="button">Private Node · Slack / Telegram / WhatsApp</button>
           </div>
           <div class="deck-grid" id="deckBody"></div>
         </div>
       </div>
     </section>
 
-    <!-- OPENCLAW-STYLE DEAD-SIMPLE QUICK START -->
+    <!-- QUICK START -->
     <section id="install" class="section">
       <div class="wrap">
         <div class="section-intro">
           <h2>Up in sixty seconds.</h2>
           <p>
-            Install <code>hph</code> from GitHub or npm, run the interactive TUI, or hand setup to your coding agent (strictly secret-free).
+            Install <code>hph</code> from GitHub or npm, run the interactive TUI, or hand full onboarding to your coding agent (secrets captured out-of-band via <code>--web</code>).
           </p>
         </div>
 
@@ -336,12 +368,12 @@
               <span>Native wakeup via <code>codex queue</code>, <code>hc interrupt</code>, T3 RPC, and 0-CPU <code>hph wait</code>.</span>
             </div>
             <div class="qs-fact">
-              <strong>Per-call identity &amp; 0600 secrets</strong>
-              <span>Hooks and rollout logs verify every caller; bot &amp; webhook tokens stay outside the LLM.</span>
+              <strong>Out-of-band 0600 secrets</strong>
+              <span><code>hph secret set &lt;name&gt; --web</code> captures tokens via a one-shot localhost password form — zero bytes enter LLM context.</span>
             </div>
             <div class="qs-fact">
-              <strong>Private or public nodes on Tailscale</strong>
-              <span>Run a private local node for Slack/Telegram, share over <code>svc:hyphae</code>, or join a team's public node — all at once.</span>
+              <strong>Public &amp; Private Nodes together</strong>
+              <span>Join a shared team node for peers, <code>#channels</code>, and PR/Prometheus feeds while keeping Slack/Telegram on your own Private Node.</span>
             </div>
           </div>
         </div>
