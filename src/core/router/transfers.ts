@@ -72,8 +72,10 @@ export interface TransferStoreOptions {
   readonly limits: TransferLimits;
   readonly now: () => number;
   readonly audit: (fields: Readonly<Record<string, unknown>>) => void;
-  /** The connector's current paired identity; transfers need both ends paired. */
+  /** The connector's current identity (paired or registered); transfers need both ends identified. */
   readonly identity: (connectorId: string) => Identity | undefined;
+  /** Called immediately after a transfer is persisted so an online recipient receives its SSE offer without waiting for tick(). */
+  readonly onStored?: (connectorId: string) => void;
 }
 
 /** Whether `from` may send a `type` transfer to `to`, by both sides' scopes (SPEC.md section 15.2). */
@@ -178,6 +180,7 @@ export class TransferStore {
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
     ).run(header.id, header.from, header.to, header.type, JSON.stringify(signed), upload.size, now(), Date.parse(header.expiresAt));
     audit({ event: "transfer.stored", id: header.id, from: header.from, to: header.to, type: header.type, bytes: upload.size });
+    this.#options.onStored?.(header.to);
     return { ok: true };
   }
 

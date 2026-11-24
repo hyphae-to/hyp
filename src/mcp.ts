@@ -30,16 +30,17 @@ export const CONSOLIDATED_CORE_TOOLS = [
   ),
   tool(
     "hyp_send",
-    "Send to peer (<connector>/<handle>), #channel, or local bridge (<plugin>:<target>).",
+    "Send to peer (<connector>/<handle>), #channel, or bridge (<plugin>:<target>). Pass files[] (abs paths) for E2EE peer transfer.",
     {
       to: str,
       text: str,
+      files: { type: "array", items: str },
       channel: str,
       chatId: str,
       threadTs: str,
       replyTo: str,
     },
-    ["to", "text"],
+    ["to"],
   ),
   tool(
     "hyp_channel",
@@ -108,7 +109,7 @@ export const LEGACY_MCP_CORE_TOOLS = [
   tool("hyp_join", "Enroll this thread/conversation under a handle on the primary router.", { handle: str }, ["handle"]),
   tool("hyp_leave", "Remove this thread/conversation's enrolled handle from the primary router."),
   tool("hyp_peers", "List enrolled peers on the primary router."),
-  tool("hyp_send", "Send a message to a peer (<connector>/<handle>), #channel, or <plugin>:<target>.", { to: str, text: str }, ["to", "text"]),
+  tool("hyp_send", "Send a message or E2EE files[] to a peer (<connector>/<handle>), #channel, or <plugin>:<target>.", { to: str, text: str, files: { type: "array", items: str } }, ["to"]),
   tool("hyp_subscribe", "Subscribe this thread/conversation to matching events. Call hyp_topics first to verify available topics, monitored repos/scope, and filter schema.", {
     key: str,
     topic: str,
