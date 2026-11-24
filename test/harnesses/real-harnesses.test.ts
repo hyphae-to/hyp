@@ -75,26 +75,26 @@ test(
     let didSearch = false;
 
     const dummyApi = await startDummyAnthropicServer(async (req) => {
-      const joinTool = req.tools.find((t) => t.name.endsWith("hyp_join"))?.name;
+      const sessionTool = req.tools.find((t) => t.name.endsWith("hyp_session"))?.name;
       const sendTool = req.tools.find((t) => t.name.endsWith("hyp_send"))?.name;
       const toolSearch = req.tools.find((t) => t.name === "ToolSearch")?.name;
       const allText = JSON.stringify(req.messages);
 
       // Claude Code defers MCP tools behind ToolSearch by default: load them first!
-      if (!joinTool && toolSearch && !didSearch) {
+      if (!sessionTool && toolSearch && !didSearch) {
         didSearch = true;
         return {
           type: "tool_use",
           id: "toolu_search_0",
           name: toolSearch,
-          input: { query: "select:mcp__hyphae__hyp_join,mcp__hyphae__hyp_send" },
+          input: { query: "select:mcp__hyphae__hyp_session,mcp__hyphae__hyp_send" },
         };
       }
 
       if (!didJoin) {
         didJoin = true;
-        assert.ok(joinTool, `Expected Claude to advertise hyp_join; got: ${req.tools.map((t) => t.name).join(", ")}`);
-        return { type: "tool_use", id: "toolu_real_join_1", name: joinTool, input: { handle: "claude-real" } };
+        assert.ok(sessionTool, `Expected Claude to advertise hyp_session; got: ${req.tools.map((t) => t.name).join(", ")}`);
+        return { type: "tool_use", id: "toolu_real_join_1", name: sessionTool, input: { action: "join", handle: "claude-real" } };
       }
 
       if (!pushedToClaude) {
@@ -202,19 +202,19 @@ test(
     let didReply = false;
 
     const dummyApi = await startDummyOpenAIServer(async (req) => {
-      const joinTool = req.tools.find((t) => t.name.endsWith("hyp_join"));
+      const sessionTool = req.tools.find((t) => t.name.endsWith("hyp_session"));
       const sendTool = req.tools.find((t) => t.name.endsWith("hyp_send"));
       const allText = JSON.stringify(req.input);
 
       if (!didJoin) {
         didJoin = true;
-        assert.ok(joinTool, `Expected Codex to advertise hyp_join; got: ${JSON.stringify(req.tools)}`);
+        assert.ok(sessionTool, `Expected Codex to advertise hyp_session; got: ${JSON.stringify(req.tools)}`);
         return {
           type: "function_call",
           callId: "call_real_codex_join_1",
-          name: joinTool.name,
-          ...(joinTool.namespace ? { namespace: joinTool.namespace } : {}),
-          arguments: { handle: "codex-real" },
+          name: sessionTool.name,
+          ...(sessionTool.namespace ? { namespace: sessionTool.namespace } : {}),
+          arguments: { action: "join", handle: "codex-real" },
         };
       }
 

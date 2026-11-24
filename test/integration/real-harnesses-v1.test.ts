@@ -160,34 +160,32 @@ test(
           "Join hyphae as claude-v1, inspect hyp_topics, test GitHub subscription reachability lint and fix it with strict mode, link reviewer to slack/slack-v1, wait for GitHub PR and Slack mention events, and reply to Slack via hyp_plugin_post.",
         handler: async (ctx) => {
           // Stage 0: Load deferred MCP tools via Claude's ToolSearch when deferred loading is active
-          if (stage === 0 && !ctx.findTool("hyp_join") && ctx.findTool("ToolSearch")) {
+          if (stage === 0 && !ctx.findTool("hyp_session") && ctx.findTool("ToolSearch")) {
             return ctx.selectClaudeTools([
-              "hyp_join",
-              "hyp_topics",
-              "hyp_subscribe",
-              "hyp_unsubscribe",
-              "hyp_bridge_link",
-              "hyp_plugin_post",
+              "hyp_session",
+              "hyp_stream",
+              "hyp_bridge",
             ]);
           }
 
           if (stage === 0) {
             stage = 1;
-            return ctx.callTool("hyp_join", { handle: "claude-v1" });
+            return ctx.callTool("hyp_session", { action: "join", handle: "claude-v1" });
           }
 
           if (stage === 1) {
-            assert.ok(ctx.hasText("alex@laptop/claude-v1"), `Expected hyp_join address in context: ${ctx.allText()}`);
+            assert.ok(ctx.hasText("alex@laptop/claude-v1"), `Expected hyp_session join address in context: ${ctx.allText()}`);
             stage = 2;
-            return ctx.callTool("hyp_topics", {});
+            return ctx.callTool("hyp_stream", { action: "topics" });
           }
 
           if (stage === 2) {
-            assert.ok(ctx.hasText("github"), `Expected github topic in hyp_topics output: ${ctx.allText()}`);
-            assert.ok(ctx.hasText("hyphae-to/hyp"), `Expected monitored repo scope in hyp_topics output: ${ctx.allText()}`);
+            assert.ok(ctx.hasText("github"), `Expected github topic in hyp_stream topics output: ${ctx.allText()}`);
+            assert.ok(ctx.hasText("hyphae-to/hyp"), `Expected monitored repo scope in hyp_stream topics output: ${ctx.allText()}`);
             stage = 3;
             // Deliberately subscribe with the wrong GitHub `subject` attribute to trigger dead-subscription reachability lint
-            return ctx.callTool("hyp_subscribe", {
+            return ctx.callTool("hyp_stream", {
+              action: "subscribe",
               key: "gh:bad-subject",
               topic: "github",
               filters: [{ exact: { subject: "hyphae-to/hyp" } }],
@@ -204,14 +202,15 @@ test(
             );
             stage = 4;
             // Clean up the dead subscription before creating the corrected strict subscription
-            return ctx.callTool("hyp_unsubscribe", { key: "gh:bad-subject" });
+            return ctx.callTool("hyp_stream", { action: "unsubscribe", key: "gh:bad-subject" });
           }
 
           if (stage === 4) {
             assert.match(ctx.allText(), /removed\\?":\s*true/, `Expected dead subscription removal: ${ctx.allText()}`);
             stage = 5;
             // Self-correct using the suggested `repo` attribute with strict: true
-            return ctx.callTool("hyp_subscribe", {
+            return ctx.callTool("hyp_stream", {
+              action: "subscribe",
               key: "gh:hyp-prs",
               topic: "github",
               filters: [{ exact: { repo: "hyphae-to/hyp" } }],
@@ -225,7 +224,8 @@ test(
             assert.match(text, /reachable\\?":\s*true/, `Expected strict subscription reachable: true in context: ${text}`);
             assert.equal(ctx.hasText("unreachable_subscription"), false, `Unexpected strict failure in context: ${text}`);
             stage = 6;
-            return ctx.callTool("hyp_bridge_link", {
+            return ctx.callTool("hyp_bridge", {
+              action: "link",
               plugin: "slack",
               target: "slack-v1",
               handle: "reviewer",
@@ -275,7 +275,8 @@ test(
             sawGithubEvent = true;
             sawSlackMention = true;
             stage = 8;
-            return ctx.callTool("hyp_plugin_post", {
+            return ctx.callTool("hyp_bridge", {
+              action: "post",
               plugin: "slack",
               target: "slack-v1",
               threadTs: "1700077.0001",
@@ -392,7 +393,7 @@ test(
         handler: async (ctx) => {
           if (agyStage === 0) {
             agyStage = 1;
-            return ctx.callAgyMcpTool("hyp_join", { handle: "agy-lead" }, "hyphae_hyphae");
+            return ctx.callAgyMcpTool("hyp_session", { action: "join", handle: "agy-lead" }, "hyphae_hyphae");
           }
 
           if (agyStage === 1) {
@@ -400,8 +401,8 @@ test(
             await awaitWithTimeout(ocJoined.promise, 30_000, "opencode enrolling as oc-responder");
             agyStage = 2;
             return ctx.callAgyMcpTool(
-              "hyp_bridge_link",
-              { plugin: "telegram", target: "tg-team", handle: "oc-responder" },
+              "hyp_bridge",
+              { action: "link", plugin: "telegram", target: "tg-team", handle: "oc-responder" },
               "hyphae_hyphae",
             );
           }
@@ -429,8 +430,8 @@ test(
             );
 
             agyStage = 3;
-            // Call hyp_peers so Antigravity's PreInvocation/Stop hooks push the queued Telegram update into agy's turn
-            return ctx.callAgyMcpTool("hyp_peers", {}, "hyphae_hyphae");
+            // Call hyp_session peers so Antigravity's PreInvocation/Stop hooks push the queued Telegram update into agy's turn
+            return ctx.callAgyMcpTool("hyp_session", { action: "peers" }, "hyphae_hyphae");
           }
 
           if (agyStage === 3) {
@@ -466,7 +467,7 @@ test(
         handler: async (ctx) => {
           if (ocStage === 0) {
             ocStage = 1;
-            return ctx.callOpenCodeTool("hyp_join", { handle: "oc-responder" });
+            return ctx.callOpenCodeTool("hyp_session", { action: "join", handle: "oc-responder" });
           }
 
           if (ocStage === 1) {
@@ -484,14 +485,15 @@ test(
 
             ocStage = 2;
             // OpenCode's v2 `execute.after` hook drains and injects the fanned-in Telegram message into the next turn!
-            return ctx.callOpenCodeTool("hyp_peers", {});
+            return ctx.callOpenCodeTool("hyp_session", { action: "peers" });
           }
 
           if (ocStage === 2) {
             assert.ok(ctx.hasText("DEPLOY_CHECK_99"), `Expected DEPLOY_CHECK_99 pushed into OpenCode context: ${ctx.allText()}`);
             ocSawTelegram = true;
             ocStage = 3;
-            return ctx.callOpenCodeTool("hyp_plugin_post", {
+            return ctx.callOpenCodeTool("hyp_bridge", {
+              action: "post",
               plugin: "telegram",
               target: "tg-team",
               replyTo: "99",

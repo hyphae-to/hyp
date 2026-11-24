@@ -40,31 +40,29 @@ test(
         prompt: "Join hyphae as claude-dev, join #deploys, switch to notify mode, read inbox on notice, and reply to alice@laptop/ops.",
         handler: async (ctx) => {
           // Stage 0: Load deferred MCP tools via Claude's ToolSearch if needed
-          if (!ctx.findTool("hyp_join") && ctx.findTool("ToolSearch") && stage === 0) {
+          if (!ctx.findTool("hyp_session") && ctx.findTool("ToolSearch") && stage === 0) {
             return ctx.selectClaudeTools([
-              "hyp_join",
-              "hyp_channel_join",
-              "hyp_mode",
+              "hyp_session",
+              "hyp_channel",
               "hyp_inbox",
-              "hyp_mute",
               "hyp_send",
             ]);
           }
 
           if (stage === 0) {
             stage = 1;
-            return ctx.callTool("hyp_join", { handle: "claude-dev" });
+            return ctx.callTool("hyp_session", { action: "join", handle: "claude-dev" });
           }
 
           if (stage === 1) {
-            assert.ok(ctx.hasText("alex@laptop/claude-dev"), `Expected hyp_join result in context: ${ctx.allText()}`);
+            assert.ok(ctx.hasText("alex@laptop/claude-dev"), `Expected hyp_session join result in context: ${ctx.allText()}`);
             stage = 2;
-            return ctx.callTool("hyp_channel_join", { channel: "#deploys" });
+            return ctx.callTool("hyp_channel", { action: "join", channel: "#deploys" });
           }
 
           if (stage === 2) {
             stage = 3;
-            return ctx.callTool("hyp_mode", { mode: "notify" });
+            return ctx.callTool("hyp_session", { action: "mode", mode: "notify" });
           }
 
           if (stage === 3) {
@@ -94,13 +92,13 @@ test(
             // Verify notify mode did NOT leak the full payload before hyp_inbox was called
             assert.equal(ctx.hasText("SECRET_DIRECT_NOTE_FOR_CLAUDE"), false, "Notify mode must not push full body before hyp_inbox");
             stage = 5;
-            return ctx.callTool("hyp_inbox", { acknowledgeAll: true });
+            return ctx.callTool("hyp_inbox", { ack: true });
           }
 
           if (stage === 5 && ctx.hasText("SECRET_DIRECT_NOTE_FOR_CLAUDE")) {
             sawFullPayloadInInbox = true;
             stage = 6;
-            return ctx.callTool("hyp_mute", { target: "noisy@prod/*" });
+            return ctx.callTool("hyp_session", { action: "mute", target: "noisy@prod/*" });
           }
 
           if (stage === 6) {
@@ -161,7 +159,7 @@ test(
         socketPath: alex.socketPath,
         handler: async (ctx) => {
           if (ctx.turnIndex === 0) {
-            return ctx.callTool("hyp_join", { handle: desiredHandle });
+            return ctx.callTool("hyp_session", { action: "join", handle: desiredHandle });
           }
           if (ctx.turnIndex === 1 && shouldSend) {
             return ctx.callTool("hyp_send", {
@@ -244,7 +242,7 @@ test(
         prompt: "Enroll in hyphae as oc-dev, check peers, and respond to any incoming message from jack@prod/jack-ops.",
         handler: async (ctx) => {
           if (ctx.turnIndex === 0) {
-            return ctx.callOpenCodeTool("hyp_join", { handle: "oc-dev" });
+            return ctx.callOpenCodeTool("hyp_session", { action: "join", handle: "oc-dev" });
           }
           if (ctx.turnIndex === 1) {
             assert.ok(ctx.hasText("alice@laptop/oc-dev"), `Expected oc-dev address in turn 1: ${ctx.allText()}`);
@@ -261,7 +259,7 @@ test(
               },
               { label: "message queued for oc-dev" },
             );
-            return ctx.callOpenCodeTool("hyp_peers", {});
+            return ctx.callOpenCodeTool("hyp_session", { action: "peers" });
           }
           if (ctx.turnIndex === 2) {
             if (ctx.hasText("incident-handoff-to-real-opencode")) {
@@ -324,11 +322,11 @@ test(
         socketPath: alex.socketPath,
         prompt: "Join as claude-lead, ping alice@laptop/oc-worker, and confirm receipt of reply.",
         handler: async (ctx) => {
-          if (!ctx.findTool("hyp_join") && ctx.findTool("ToolSearch")) {
-            return ctx.selectClaudeTools(["hyp_join", "hyp_send"]);
+          if (!ctx.findTool("hyp_session") && ctx.findTool("ToolSearch")) {
+            return ctx.selectClaudeTools(["hyp_session", "hyp_send"]);
           }
           if (!alex.daemon.state.byHandle("claude-lead")) {
-            return ctx.callTool("hyp_join", { handle: "claude-lead" });
+            return ctx.callTool("hyp_session", { action: "join", handle: "claude-lead" });
           }
           if (!ctx.hasText("pong-from-real-opencode") && !ctx.hasText("messageId")) {
             // Wait until real OpenCode has enrolled on alice@laptop before sending!
@@ -360,15 +358,15 @@ test(
         prompt: "Join as oc-worker, receive ping from alex@laptop/claude-lead, and reply.",
         handler: async (ctx) => {
           if (ctx.turnIndex === 0) {
-            return ctx.callOpenCodeTool("hyp_join", { handle: "oc-worker" });
+            return ctx.callOpenCodeTool("hyp_session", { action: "join", handle: "oc-worker" });
           }
           if (ctx.turnIndex === 1) {
-            // Wait for real Claude's ping to arrive in OpenCode's mailbox before running hyp_peers -> execute.after injects it!
+            // Wait for real Claude's ping to arrive in OpenCode's mailbox before running hyp_session peers -> execute.after injects it!
             await waitFor(() => {
               const s = alice.daemon.state.byHandle("oc-worker");
               return s && alice.daemon.state.pendingCount(s.id) >= 1;
             }, { timeoutMs: 20_000, label: "Claude ping landing in OpenCode mailbox" });
-            return ctx.callOpenCodeTool("hyp_peers", {});
+            return ctx.callOpenCodeTool("hyp_session", { action: "peers" });
           }
           if (ctx.turnIndex === 2) {
             if (ctx.hasText("ping-from-real-claude")) opencodeReceivedPing = true;
@@ -416,12 +414,12 @@ test(
         handler: async (ctx) => {
           if (stage === 0) {
             stage = 1;
-            return ctx.callAgyMcpTool("hyp_join", { handle: "agy-real" });
+            return ctx.callAgyMcpTool("hyp_session", { action: "join", handle: "agy-real" });
           }
           if (stage === 1) {
-            assert.ok(ctx.hasText("alex@laptop/agy-real"), `Expected hyp_join result in agy context: ${ctx.allText()}`);
+            assert.ok(ctx.hasText("alex@laptop/agy-real"), `Expected hyp_session join result in agy context: ${ctx.allText()}`);
             stage = 2;
-            return ctx.callAgyMcpTool("hyp_channel_join", { channel: "#deploys" });
+            return ctx.callAgyMcpTool("hyp_channel", { action: "join", channel: "#deploys" });
           }
           if (stage === 2) {
             stage = 3;

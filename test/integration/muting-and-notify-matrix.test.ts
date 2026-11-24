@@ -1047,17 +1047,17 @@ test(
         socketPath: alex.socketPath,
         prompt: "Join hyphae as agy-quiet, switch to notify mode, read inbox on slim notice, and reply to jack@prod/prod-ops.",
         handler: async (ctx) => {
-          // Turn 1: hyp_join
+          // Turn 1: hyp_session join
           if (stage === 0) {
             stage = 1;
-            return ctx.callAgyMcpTool("hyp_join", { handle: "agy-quiet" });
+            return ctx.callAgyMcpTool("hyp_session", { action: "join", handle: "agy-quiet" });
           }
 
-          // Turn 2: hyp_mode({ mode: "notify" })
+          // Turn 2: hyp_session mode notify
           if (stage === 1) {
-            assert.ok(ctx.hasText("alex@laptop/agy-quiet"), `Expected hyp_join result in agy context: ${ctx.allText()}`);
+            assert.ok(ctx.hasText("alex@laptop/agy-quiet"), `Expected hyp_session join result in agy context: ${ctx.allText()}`);
             stage = 2;
-            return ctx.callAgyMcpTool("hyp_mode", { mode: "notify" });
+            return ctx.callAgyMcpTool("hyp_session", { action: "mode", mode: "notify" });
           }
 
           // Turn 3: Remote peer sends secret payload; agy ends turn -> Stop hook wakes agy with ONLY slim notice

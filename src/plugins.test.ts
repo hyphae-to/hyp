@@ -393,7 +393,7 @@ test("setupOpenClaw configures openclaw.json + SKILL.md idempotently without clo
     assert.equal(parsed.mcp.servers.hyphae.command, "/opt/node24/bin/node");
     assert.ok(parsed.mcp.servers.hyphae.args.includes("openclaw"));
     const skillText = fs.readFileSync(join(ocDir, "skills", "hyphae", "SKILL.md"), "utf8");
-    assert.match(skillText, /hyp_channel_join/);
+    assert.match(skillText, /hyp_channel/);
 
     const checks = await runDoctor(join(dir, "missing.json"), join(dir, "missing.sock"), home);
     assert.equal(checks.find((c) => c.name === "openclaw")?.ok, true);
@@ -540,7 +540,7 @@ test("installSkill installs canonical skills/hyphae/SKILL.md across harnesses an
       assert.ok(existsSync(f), `Expected skill installed at ${f}`);
       const txt = readFileSync(f, "utf8");
       assert.match(txt, /hyp secret set <name> --web/);
-      assert.match(txt, /hyp_channel_join/);
+      assert.match(txt, /hyp_channel/);
     }
     const projRes = installSkill("project", { projectDir: proj });
     assert.equal(projRes.files.length, 1);

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { test } from "node:test";
 import { daemonRpc } from "../../src/hooks.ts";
-import { MESH_TOOLS, object } from "../../src/protocol.ts";
+import { CORE_MCP_TOOLS, object } from "../../src/protocol.ts";
 import {
   setupAntigravity,
   setupClaude,
@@ -368,14 +368,14 @@ test(
         if (ctx.hasText("desktop-a")) {
           if (!joinedA) {
             joinedA = true;
-            return ctx.callTool("hyp_join", { handle: "desktop-a" });
+            return ctx.callTool("hyp_session", { action: "join", handle: "desktop-a" });
           }
           return ctx.reply("Joined as desktop-a.");
         }
         if (ctx.hasText("desktop-b")) {
           if (!joinedB) {
             joinedB = true;
-            return ctx.callTool("hyp_join", { handle: "desktop-b" });
+            return ctx.callTool("hyp_session", { action: "join", handle: "desktop-b" });
           }
           return ctx.reply("Joined as desktop-b.");
         }
@@ -592,7 +592,7 @@ test(
         if (ctx.hasText("JOIN_MESH_AS_HERDR_CODEX")) {
           if (!joinedHerdr) {
             joinedHerdr = true;
-            return ctx.callTool("hyp_join", { handle: "herdr-codex" });
+            return ctx.callTool("hyp_session", { action: "join", handle: "herdr-codex" });
           }
           return ctx.reply("Joined as herdr-codex.");
         }
@@ -802,7 +802,7 @@ test(
         },
       ];
 
-      // Spawn every generated MCP entry concurrently under stripped Electron PATH and verify tools/list === MESH_TOOLS.size
+      // Spawn every generated MCP entry concurrently under stripped Electron PATH and verify consolidated CORE_MCP_TOOLS
       const mcpResults = await Promise.all(
         mcpEntries.map(async (entry) => ({
           harness: entry.harness,
@@ -810,14 +810,15 @@ test(
         })),
       );
 
+      const coreToolSet = new Set<string>(CORE_MCP_TOOLS);
       for (const { harness, tools } of mcpResults) {
         assert.equal(
           tools.length,
-          MESH_TOOLS.size,
-          `Expected ${MESH_TOOLS.size} tools for ${harness} under stripped PATH, got ${tools.length}: ${tools.join(", ")}`,
+          CORE_MCP_TOOLS.length,
+          `Expected ${CORE_MCP_TOOLS.length} core tools for ${harness} under stripped PATH, got ${tools.length}: ${tools.join(", ")}`,
         );
         for (const name of tools) {
-          assert.ok(MESH_TOOLS.has(name), `Unexpected tool '${name}' from ${harness}`);
+          assert.ok(coreToolSet.has(name), `Unexpected tool '${name}' from ${harness}`);
         }
       }
 

@@ -13,6 +13,26 @@ const MAX_SUBSCRIPTIONS = 20;
 const MAX_TEXT_BYTES = 16_384;
 const invalid = (message: string) => new RouterError("invalid", message);
 
+function slimTopicEntry(entry: unknown): unknown {
+  if (!object(entry)) return entry;
+  const out: Record<string, unknown> = { topic: entry.topic };
+  const meta = object(entry.metadata) ? entry.metadata : undefined;
+  if (meta && typeof meta.kind === "string") out.kind = meta.kind;
+  if (Array.isArray(entry.publishers)) out.publishers = entry.publishers;
+  if (meta && object(meta.scope)) out.scope = meta.scope;
+  if (meta && object(meta.schema) && Array.isArray(meta.schema.attributes)) {
+    out.attributes = meta.schema.attributes;
+  }
+  if (object(entry.observed)) {
+    const obs: Record<string, unknown> = {};
+    if (typeof entry.observed.eventCount === "number") obs.eventCount = entry.observed.eventCount;
+    if (Array.isArray(entry.observed.repos) && entry.observed.repos.length > 0) obs.repos = entry.observed.repos;
+    if (entry.observed.lastEventAt) obs.lastEventAt = entry.observed.lastEventAt;
+    if (Object.keys(obs).length > 0) out.observed = obs;
+  }
+  return out;
+}
+
 export interface ConnectorHooks {
   readonly channel?: (sessionId: string) => Channel | undefined;
   readonly hasLiveTransport?: (sessionId: string) => boolean;
@@ -390,6 +410,14 @@ export class Connector {
     if (!session) throw new RouterError("unbound_session", "No registered client session");
     this.#state.touch(sessionId);
     switch (name) {
+      case "hyp_session":
+        return this.#sessionTool(session, args);
+      case "hyp_channel":
+        return this.#channelTool(sessionId, args);
+      case "hyp_stream":
+        return this.#streamTool(session, args);
+      case "hyp_bridge":
+        return this.#bridgeTool(sessionId, args);
       case "hyp_capabilities":
         return {
           sessionId: session.id,
@@ -445,14 +473,24 @@ export class Connector {
       }
       case "hyp_inbox": {
         const acknowledge = args.acknowledge ?? [];
-        const acknowledgeAll = args.acknowledgeAll === true;
+        const acknowledgeAll = args.acknowledgeAll === true || (args.acknowledgeAll === undefined && args.ack === true);
+        const summaryOnly = args.summaryOnly === true;
         const limit = typeof args.limit === "number" && Number.isInteger(args.limit) && args.limit > 0 && args.limit <= 50
           ? args.limit : 20;
         if (!Array.isArray(acknowledge) || acknowledge.length > 100 ||
             !acknowledge.every((id): id is string => typeof id === "string" && id.length <= 80)) {
           throw invalid("Expected at most 100 receipt IDs");
         }
-        const items = this.#state.inbox(session.id, acknowledge, { limit, acknowledgeAll });
+        const rawItems = this.#state.inbox(session.id, acknowledge, { limit, acknowledgeAll });
+        const items = summaryOnly
+          ? rawItems.map((it) => ({
+              receipt: it.receipt,
+              kind: it.kind,
+              source: it.source,
+              received: it.received,
+              preview: it.text.split("\n").find((l) => l.trim().length > 0 && !l.startsWith("External data"))?.slice(0, 140) ?? "",
+            }))
+          : rawItems;
         return {
           deliveryMode: session.deliveryMode,
           unread: this.#state.pendingCount(session.id),
@@ -497,7 +535,23 @@ export class Connector {
       }
       case "hyp_send": {
         const { to, text } = args;
-        if (typeof to !== "string" || !addressPattern.test(to) || typeof text !== "string" || Buffer.byteLength(text) > MAX_TEXT_BYTES) {
+        if (typeof to !== "string" || typeof text !== "string") {
+          throw invalid("Expected destination 'to' (<connector>/<handle>, #channel, or <plugin>:<target>) and text up to 16 KiB");
+        }
+        if (to.startsWith("#")) {
+          return this.call(sessionId, "hyp_channel_post", { channel: to, text });
+        }
+        const bridgeMatch = /^([a-z0-9][a-z0-9._-]{0,31}):([a-z0-9][a-z0-9._-]{0,63})$/.exec(to);
+        if (bridgeMatch && !to.includes("/")) {
+          return this.call(sessionId, "hyp_plugin_post", {
+            ...args,
+            plugin: bridgeMatch[1],
+            target: bridgeMatch[2],
+            to: typeof args.replyTo === "string" ? undefined : undefined,
+            text,
+          });
+        }
+        if (!addressPattern.test(to) || Buffer.byteLength(text) > MAX_TEXT_BYTES) {
           throw invalid("Expected a connector/handle address and text up to 16 KiB");
         }
         return this.#change("primary", async () => {
@@ -563,12 +617,14 @@ export class Connector {
       }
       case "hyp_topics": {
         const routerFilter = typeof args.router === "string" && args.router.length > 0 ? args.router : undefined;
+        const slim = args.verbose === false;
         const names = routerFilter ? [routerFilter] : [...this.#routers.keys()];
         const routers = await Promise.all(names.map(async (routerName) => {
           const link = this.#router(routerName);
           try {
             const value = await link.query("/v1/topics");
-            const topics = object(value) && Array.isArray(value.topics) ? value.topics : [];
+            const rawTopics = object(value) && Array.isArray(value.topics) ? value.topics : [];
+            const topics = slim ? rawTopics.map(slimTopicEntry) : rawTopics;
             return { router: routerName, supported: true, topics };
           } catch (error) {
             if (error instanceof RouterError && error.code === "not_found") {
@@ -601,6 +657,120 @@ export class Connector {
       }
       default:
         throw new RouterError("unknown_tool", `Unknown tool ${name}`);
+    }
+  }
+
+  async #sessionTool(session: Session, args: Record<string, unknown>): Promise<unknown> {
+    const action = args.action;
+    switch (action) {
+      case "status":
+        return this.call(session.id, "hyp_capabilities", {});
+      case "leave":
+        return this.call(session.id, "hyp_leave", {});
+      case "peers":
+        return this.call(session.id, "hyp_peers", {});
+      case "mode":
+        return this.call(session.id, "hyp_mode", args);
+      case "mute":
+        return this.call(session.id, "hyp_mute", args);
+      case "unmute":
+        return this.call(session.id, "hyp_unmute", args);
+      case "mutes":
+        return this.call(session.id, "hyp_mutes", {});
+      case "join": {
+        const joined = (await this.call(session.id, "hyp_join", args)) as Record<string, unknown>;
+        const out: Record<string, unknown> = {
+          ...joined,
+          deliveryMode: session.deliveryMode,
+          unread: this.#state.pendingCount(session.id),
+        };
+        const include = Array.isArray(args.include) ? args.include.filter((x): x is string => typeof x === "string") : [];
+        if (include.length > 0) {
+          await Promise.all(include.map(async (part) => {
+            if (part === "peers") {
+              const p = (await this.call(session.id, "hyp_peers", {})) as Record<string, unknown>;
+              out.peers = p.peers;
+            } else if (part === "channels") {
+              const c = (await this.call(session.id, "hyp_channels", {})) as Record<string, unknown>;
+              out.channels = c.channels;
+            } else if (part === "topics") {
+              const t = (await this.call(session.id, "hyp_topics", { verbose: false })) as Record<string, unknown>;
+              out.topics = t.routers;
+            } else if (part === "subs") {
+              const s = (await this.#streamTool(session, { action: "list" })) as Record<string, unknown>;
+              out.subs = s.subscriptions;
+            } else if (part === "mutes") {
+              const m = (await this.call(session.id, "hyp_mutes", {})) as Record<string, unknown>;
+              out.mutes = m.mutes;
+            } else if (part === "bridges" && this.#listPluginTargets) {
+              out.bridges = await this.#listPluginTargets(session.id);
+            }
+          }));
+        }
+        return out;
+      }
+      default:
+        throw invalid("Expected action: join | leave | status | peers | mode | mute | unmute | mutes");
+    }
+  }
+
+  async #channelTool(sessionId: string, args: Record<string, unknown>): Promise<unknown> {
+    switch (args.action) {
+      case "join":
+        return this.call(sessionId, "hyp_channel_join", args);
+      case "leave":
+        return this.call(sessionId, "hyp_channel_leave", args);
+      case "list":
+        return this.call(sessionId, "hyp_channels", args);
+      default:
+        throw invalid("Expected action: join | leave | list");
+    }
+  }
+
+  async #streamTool(session: Session, args: Record<string, unknown>): Promise<unknown> {
+    switch (args.action) {
+      case "topics":
+        return this.call(session.id, "hyp_topics", { ...args, verbose: args.verbose === true });
+      case "subscribe":
+        return this.#subscribe(session, args);
+      case "unsubscribe":
+        return this.#unsubscribe(session.id, args);
+      case "list": {
+        const res = (await this.call(session.id, "hyp_subscriptions", {})) as { subscriptions: Array<Record<string, unknown>> };
+        return {
+          subscriptions: res.subscriptions.map((sub) => {
+            if (!object(sub.delivery)) return sub;
+            const d = sub.delivery;
+            const trimmed: Record<string, unknown> = {};
+            if (typeof d.pending === "number" && d.pending > 0) trimmed.pending = d.pending;
+            if (typeof d.delivered === "number" && d.delivered > 0) trimmed.delivered = d.delivered;
+            if (d.heldReason !== null && d.heldReason !== undefined) trimmed.heldReason = d.heldReason;
+            if (d.oldestPendingAt !== null && d.oldestPendingAt !== undefined) trimmed.oldestPendingAt = d.oldestPendingAt;
+            if (object(d.rejected) && Object.keys(d.rejected).length > 0) trimmed.rejected = d.rejected;
+            if (object(d.dropped) && Object.keys(d.dropped).length > 0) trimmed.dropped = d.dropped;
+            return { ...sub, delivery: Object.keys(trimmed).length > 0 ? trimmed : "ok" };
+          }),
+        };
+      }
+      default:
+        throw invalid("Expected action: topics | subscribe | unsubscribe | list");
+    }
+  }
+
+  async #bridgeTool(sessionId: string, args: Record<string, unknown>): Promise<unknown> {
+    switch (args.action) {
+      case "targets":
+        return this.call(sessionId, "hyp_plugin_targets", args);
+      case "link":
+        return this.call(sessionId, "hyp_bridge_link", args);
+      case "unlink":
+        return this.call(sessionId, "hyp_bridge_unlink", args);
+      case "handoff":
+        return this.call(sessionId, "hyp_plugin_handoff", args);
+      case "post":
+        return this.call(sessionId, "hyp_plugin_post", args);
+      default:
+        throw invalid("Expected action: targets | link | unlink | handoff | post");
     }
   }
 

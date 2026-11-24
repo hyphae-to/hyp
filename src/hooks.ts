@@ -1,5 +1,5 @@
 import { createConnection } from "node:net";
-import { normalizeMeshToolName, object, type HarnessKind } from "./protocol.ts";
+import { normalizeMeshToolName, object, UNTRUSTED_PROVENANCE, type HarnessKind } from "./protocol.ts";
 
 export type HookEvent = "pre-tool-use" | "post-tool-use" | "pre-invocation" | "stop";
 
@@ -98,30 +98,31 @@ function extractToolInfo(
 }
 
 function formatDrainedMessages(items: Array<{ text?: unknown }>): string {
-  return items
+  const texts = items
     .map((item) => (typeof item.text === "string" ? item.text : ""))
-    .filter((text) => text.length > 0)
-    .join("\n\n---\n\n");
+    .filter((text) => text.length > 0);
+  if (texts.length <= 1) return texts.join("\n\n---\n\n");
+  // Deduplicate repeated untrusted-data provenance lines across multi-item hook drains.
+  const hasProv = texts.some((t) => t.includes(UNTRUSTED_PROVENANCE));
+  if (!hasProv) return texts.join("\n\n---\n\n");
+  const stripped = texts.map((t) =>
+    t
+      .replaceAll(`\n\n${UNTRUSTED_PROVENANCE}\n`, "\n")
+      .replaceAll(`\n${UNTRUSTED_PROVENANCE}\n`, "\n")
+      .replaceAll(`${UNTRUSTED_PROVENANCE}\n`, ""),
+  );
+  return `${UNTRUSTED_PROVENANCE}\n\n${stripped.join("\n---\n")}`;
 }
 
 function waiterArmPrompt(harness: HarnessKind, sessionId: string, cliCommand: string, socketPath: string): string {
   const socketFlag = socketPath ? ` --socket ${JSON.stringify(socketPath)}` : "";
   if (harness === "antigravity") {
-    return [
-      "hyphae: This conversation is enrolled on the mesh, but no background waiter is running yet.",
-      `Run \`${cliCommand} wait --session ${sessionId}${socketFlag}\` in the background (WaitMsBeforeAsync: 500, IsDaemon: false) so incoming mesh messages wake this conversation automatically without polling, then end your turn.`,
-    ].join(" ");
+    return `hyphae: Enrolled, but no background waiter is running yet. Run \`${cliCommand} wait --session ${sessionId}${socketFlag}\` in background (WaitMsBeforeAsync: 500, IsDaemon: false), then end turn.`;
   }
   if (harness === "cursor" || harness === "gemini" || harness === "opencode" || harness === "openclaw") {
-    return [
-      "hyphae: This session is enrolled on the mesh, but no background waiter is running yet.",
-      `Run \`${cliCommand} wait --session ${sessionId}${socketFlag}\` as a background shell command so incoming mesh messages wake this session automatically without polling, then end your turn.`,
-    ].join(" ");
+    return `hyphae: Enrolled, but no background waiter is running yet. Run \`${cliCommand} wait --session ${sessionId}${socketFlag}\` in background, then end turn.`;
   }
-  return [
-    "hyphae: This session is enrolled on the mesh, but no background watcher is running yet.",
-    `Start \`${cliCommand} watch --session ${sessionId}${socketFlag}\` with the Monitor tool (or \`${cliCommand} wait --session ${sessionId}${socketFlag}\` via Bash with run_in_background=true) so incoming mesh messages wake this session automatically without polling, then end your turn.`,
-  ].join(" ");
+  return `hyphae: Enrolled, but no background waiter is running yet. Start \`${cliCommand} watch --session ${sessionId}${socketFlag}\` via Monitor (or \`${cliCommand} wait --session ${sessionId}${socketFlag}\` via background Bash), then end turn.`;
 }
 
 export interface HandleHookOptions {

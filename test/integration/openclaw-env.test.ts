@@ -7,7 +7,7 @@ import { RouterCore } from "../../src/core/router/core.ts";
 import { startDaemon } from "../../src/daemon.ts";
 import { detectLocalEnvironment } from "../../src/discover.ts";
 import { handleHookPayload } from "../../src/hooks.ts";
-import { MESH_TOOLS, object } from "../../src/protocol.ts";
+import { CORE_MCP_TOOLS, object } from "../../src/protocol.ts";
 import { writeSecret } from "../../src/secrets.ts";
 import { runDoctor, runOnboard, setupOpenClaw } from "../../src/setup.ts";
 import { BINARIES, devRuntime, runRealClaude, runRealOpenCode } from "./harness/drivers.ts";
@@ -149,9 +149,9 @@ test(
       assert.ok(hyphaeSpec.args.includes("--ephemeral"));
 
       assert.match(skillAfter1, /name: hyphae/);
-      assert.match(skillAfter1, /hyp_join/);
+      assert.match(skillAfter1, /hyp_session/);
       assert.match(skillAfter1, /#incidents/);
-      assert.match(skillAfter1, /hyp_subscribe/);
+      assert.match(skillAfter1, /hyp_stream/);
       assert.match(skillAfter1, /untrusted external data/i);
 
       // Verify `detectLocalEnvironment` & `runDoctor` now pass cleanly for OpenClaw + core daemon/router
@@ -208,14 +208,14 @@ test(
       assert.deepEqual(repaired.gateway, { port: 18799 });
       assert.equal(repairEnv.readHyphaeServerConfig().command, process.execPath);
 
-      // 4. Boot Session 1 strictly from generated `openclaw.json` -> verify all tools, capabilities & boundary errors
+      // 4. Boot Session 1 strictly from generated `openclaw.json` -> verify consolidated 5-tool core (bridge omitted when 0 plugins)
       const s1 = await ocEnv.openSession();
       const listedTools = await s1.listTools();
-      assert.equal(listedTools.length, MESH_TOOLS.size, `Expected all ${MESH_TOOLS.size} Hyphae tools, got ${listedTools.length}`);
+      assert.equal(listedTools.length, CORE_MCP_TOOLS.length, `Expected ${CORE_MCP_TOOLS.length} core Hyphae tools, got ${listedTools.length}`);
       assert.deepEqual(
         new Set(listedTools.map((t) => t.name)),
-        MESH_TOOLS,
-        "Advertised MCP tool set must exactly match MESH_TOOLS",
+        new Set<string>(CORE_MCP_TOOLS),
+        "Advertised MCP tool set must match CORE_MCP_TOOLS when no plugins are configured",
       );
 
       assert.ok(s1.capabilities);
@@ -691,15 +691,15 @@ test(
             prompt: "Enroll as live-worker, receive task from gw@openclaw/orchestrator, and reply with audit result.",
             handler: async (ctx) => {
               if (ctx.turnIndex === 0) {
-                return ctx.callOpenCodeTool("hyp_join", { handle: "live-worker" });
+                return ctx.callOpenCodeTool("hyp_session", { action: "join", handle: "live-worker" });
               }
               if (ctx.turnIndex === 1) {
                 await waitFor(() => {
                   const s = alex.daemon.state.byHandle("live-worker");
                   return s && alex.daemon.state.pendingCount(s.id) >= 1;
                 }, { timeoutMs: 25_000, label: "OpenClaw delegation landing in real OpenCode mailbox" });
-                // Calling hyp_peers triggers OpenCode v2's `execute.after` hook which drains & injects OpenClaw's task!
-                return ctx.callOpenCodeTool("hyp_peers", {});
+                // Calling hyp_session peers triggers OpenCode v2's `execute.after` hook which drains & injects OpenClaw's task!
+                return ctx.callOpenCodeTool("hyp_session", { action: "peers" });
               }
               if (ctx.turnIndex === 2) {
                 if (ctx.hasText(delegatedPayload)) workerSawDelegatedTask = true;
@@ -716,11 +716,11 @@ test(
             socketPath: alex.socketPath,
             prompt: "Enroll as live-worker, receive task from gw@openclaw/orchestrator, and reply with audit result.",
             handler: async (ctx) => {
-              if (!ctx.findTool("hyp_join") && ctx.findTool("ToolSearch")) {
-                return ctx.selectClaudeTools(["hyp_join", "hyp_send"]);
+              if (!ctx.findTool("hyp_session") && ctx.findTool("ToolSearch")) {
+                return ctx.selectClaudeTools(["hyp_session", "hyp_send"]);
               }
               if (!alex.daemon.state.byHandle("live-worker")) {
-                return ctx.callTool("hyp_join", { handle: "live-worker" });
+                return ctx.callTool("hyp_session", { action: "join", handle: "live-worker" });
               }
               if (ctx.hasText(delegatedPayload)) {
                 workerSawDelegatedTask = true;

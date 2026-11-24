@@ -518,6 +518,16 @@ export async function startDaemon(config: Config, options: StartDaemonOptions = 
           return;
         }
 
+        if (type === "mcp.caps" && typeof packet.id === "number") {
+          send(socket, {
+            id: packet.id,
+            result: {
+              hasPlugins: Boolean(pluginHost && pluginHost.names.length > 0),
+            },
+          });
+          return;
+        }
+
         if (type === "tool.call" && typeof packet.id === "number" && typeof packet.name === "string" && object(packet.args)) {
           const requestId = packet.id;
           const toolName = packet.name;
