@@ -131,7 +131,7 @@ fn deploy_providers_json_and_plain_list_all_six() {
     assert_eq!(env["ok"], true);
     assert_eq!(env["command"], "deploy providers");
     let providers = env["data"]["providers"].as_array().unwrap();
-    assert_eq!(providers.len(), 6);
+    assert_eq!(providers.len(), 7);
     let ids: Vec<&str> = providers
         .iter()
         .map(|p| p["id"].as_str().unwrap())
@@ -144,7 +144,8 @@ fn deploy_providers_json_and_plain_list_all_six() {
             "docker",
             "cloudflare",
             "fly",
-            "public-node"
+            "public-node",
+            "drop-relay"
         ]
     );
     for p in providers {

@@ -6,6 +6,7 @@ use crate::config_file::{
     LoadedNodeFile, load_node_or_legacy_config, open_secret_store, profile_as_str,
     resolve_config_path_for_read, resolve_effective_node_id, resolve_home_dir, resolve_state_dir,
 };
+use crate::drop_cmd::validate_relay_url;
 use crate::gate_cmd::inspect_gate_status;
 use crate::setup::{HarnessDiagnostic, detect_harness_statuses};
 use crate::ui::{
@@ -14,14 +15,14 @@ use crate::ui::{
 };
 use crate::update::read_cached_update_status;
 use clap::Args;
-use hyp_node::engine::{DEFAULT_HYPHAE_VERSION, NodeProfile};
+use hyp_node::engine::{DEFAULT_HYPHAE_VERSION, DropRelayConfig, NodeProfile};
 use hyp_proto::manifest::{
     CapabilityToken, NodeManifestPayload, ProtocolRange, SignedNodeManifest,
 };
 use hyp_proto::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
-use hyp_store::{CURRENT_SCHEMA_VERSION, NodeDb, PeerRecord, TrustTier, now_ms};
+use hyp_store::{CURRENT_SCHEMA_VERSION, NodeDb, PeerRecord, TrustTier, WakeupState, now_ms};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -457,7 +458,122 @@ fn run_status_or_doctor(
         ));
     }
 
-    // 3. Update channel & cached available update notice
+    // 3. Wakeup scheduler summary
+    let (wakeup_enabled, wakeup_mcp_tool) = loaded_cfg
+        .as_ref()
+        .and_then(|c| c.raw.get("sources"))
+        .and_then(Value::as_array)
+        .and_then(|arr| {
+            arr.iter().find_map(|entry| {
+                let obj = entry.as_object()?;
+                if obj.get("kind").and_then(Value::as_str) != Some("wakeup") {
+                    return None;
+                }
+                let en = obj.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+                let tool = obj
+                    .get("mcpTool")
+                    .and_then(Value::as_str)
+                    .unwrap_or("auto")
+                    .to_string();
+                Some((en, tool))
+            })
+        })
+        .unwrap_or_else(|| (false, "auto".to_string()));
+    let active_wakeups = db
+        .as_ref()
+        .and_then(|d| d.wakeups().list_wakeups(None, Some(WakeupState::Active)).ok())
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let paused_wakeups = db
+        .as_ref()
+        .and_then(|d| d.wakeups().list_wakeups(None, Some(WakeupState::Paused)).ok())
+        .map(|v| v.len())
+        .unwrap_or(0);
+    if paused_wakeups > 0 {
+        checks.push(CliCheck::warn(
+            "wakeup.paused",
+            format!("{paused_wakeups} wakeup(s) auto-paused after repeated delivery failures"),
+            Some(format!("hyp wakeup list --all --state-dir {}", state_dir.display())),
+        ));
+    } else if wakeup_enabled {
+        checks.push(CliCheck::ok(
+            "wakeup",
+            format!("enabled (mcpTool={wakeup_mcp_tool}, active={active_wakeups}, paused={paused_wakeups})"),
+        ));
+    }
+    let wakeup_summary = json!({
+        "enabled": wakeup_enabled,
+        "mcpTool": wakeup_mcp_tool,
+        "active": active_wakeups,
+        "paused": paused_wakeups,
+    });
+
+    // 4. Verified Human Drops & Drop Relay summary
+    let active_authorities = db
+        .as_ref()
+        .and_then(|d| d.human().list_authorities(false).ok())
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let min_auth_epoch = db
+        .as_ref()
+        .and_then(|d| d.human().min_auth_epoch().ok())
+        .unwrap_or(1);
+    let has_node_cert = db
+        .as_ref()
+        .and_then(|d| d.human().get_latest_node_cert(&node_id).ok().flatten())
+        .is_some();
+    let drop_relay_cfg: DropRelayConfig = loaded_cfg
+        .as_ref()
+        .and_then(|c| c.raw.get("dropRelay"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let drop_relay_url = loaded_cfg
+        .as_ref()
+        .and_then(|c| c.raw.get("dropRelayUrl"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    if let Some(ref url) = drop_relay_url {
+        if let Err(e) = validate_relay_url(url) {
+            checks.push(CliCheck::fail(
+                "drops.relayUrl",
+                format!("Invalid dropRelayUrl '{url}': {e}"),
+                Some("Run `hyp relay set https://<your-drop-relay>`.".to_string()),
+            ));
+        }
+    }
+    if drop_relay_cfg
+        .allowed_origins
+        .iter()
+        .any(|o| o.trim() == "*" || o.trim().eq_ignore_ascii_case("null"))
+    {
+        checks.push(CliCheck::fail(
+            "drops.dropRelay",
+            "dropRelay.allowedOrigins must not contain wildcard '*' or 'null'",
+            Some("Set dropRelay.allowedOrigins to [\"https://hyphae.to\"].".to_string()),
+        ));
+    } else if active_authorities > 0 || drop_relay_cfg.enabled || drop_relay_url.is_some() {
+        checks.push(CliCheck::ok(
+            "drops",
+            format!(
+                "authorities={active_authorities}, minAuthEpoch={min_auth_epoch}, nodeCert={}, dropRelay={}, url={}",
+                if has_node_cert { "yes" } else { "no" },
+                if drop_relay_cfg.enabled { "enabled" } else { "disabled" },
+                drop_relay_url.as_deref().unwrap_or("-")
+            ),
+        ));
+    }
+    let human_drops_summary = json!({
+        "activeAuthorities": active_authorities,
+        "minAuthEpoch": min_auth_epoch,
+        "hasNodeCert": has_node_cert,
+        "dropRelayEnabled": drop_relay_cfg.enabled,
+        "dropRelayMaxMemoryMb": drop_relay_cfg.max_memory_mb,
+        "dropRelayUrl": drop_relay_url,
+    });
+
+    // 5. Update channel & cached available update notice
     let update_status = read_cached_update_status(
         loaded_cfg.as_ref().and_then(|c| c.update_channel.as_deref()),
         db.as_ref(),
@@ -560,6 +676,8 @@ fn run_status_or_doctor(
         "storage": storage_status,
         "peers": skew_rows,
         "gate": gate_status,
+        "wakeup": wakeup_summary,
+        "humanDrops": human_drops_summary,
         "update": update_status,
         "harnesses": harnesses,
         "checks": checks,
@@ -626,6 +744,24 @@ fn run_status_or_doctor(
             gate_status.gate_policy_sig,
             gate_status.filters.len(),
             gate_status.quarantined_count
+        );
+        println!(
+            "  Wakeup:   {} (mcpTool={}, active={}, paused={})",
+            if wakeup_enabled { "enabled" } else { "disabled" },
+            wakeup_mcp_tool,
+            active_wakeups,
+            paused_wakeups
+        );
+        println!(
+            "  Drops:    authorities={} (minEpoch={}, cert={}, relay={}{})",
+            active_authorities,
+            min_auth_epoch,
+            if has_node_cert { "yes" } else { "no" },
+            if drop_relay_cfg.enabled { "enabled" } else { "disabled" },
+            drop_relay_url
+                .as_deref()
+                .map(|u| format!(", url={u}"))
+                .unwrap_or_default()
         );
         println!(
             "  Update:   channel={}{}",
