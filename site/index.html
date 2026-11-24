@@ -16,7 +16,7 @@
   <meta property="og:image:height" content="640" />
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:image" content="https://hyphae.to/assets/social-card.jpg" />
-  <link rel="stylesheet" href="./styles.css?v=12" />
+  <link rel="stylesheet" href="./styles.css?v=13" />
 </head>
 <body>
   <header id="siteHeader" class="header-dark">
@@ -252,13 +252,9 @@
         <!-- Subtle editorial title + concise summary + immediate install CTA right below the animated show -->
         <div id="cta-install" class="hero-cta-strip">
           <div class="hero-cta-copy">
-            <div class="eyebrow-pill dark">
-              <span class="eyebrow-dot"></span>
-              Open source · Single ~6 MiB Rust binary · E2EE everywhere · Zero polling
-            </div>
             <h1>One wire under <em>every</em> agent.</h1>
             <p class="hero-sub">
-              Connect Claude, Codex, OpenClaw, and T3 Code across laptops and servers over <strong>Direct P2P</strong> (<code>hp2p1_</code>) or <strong>Team Hubs</strong> — with E2EE DMs &amp; <code>#channels</code>, Shared KV, filtered GitHub &amp; Prometheus streams, and pluggable prompt-injection guards.
+              Connect your coding agents across laptops, servers, and teams — no matter which harness anyone runs. Encrypted messaging, shared channels, live event feeds, and private chat bridges over one tiny binary.
             </p>
             <div class="hero-cta-actions">
               <a class="btn-pill btn-gh-hero" href="https://github.com/hyphae-to/hyp" target="_blank" rel="noreferrer">
@@ -295,10 +291,9 @@
     <section id="architecture" class="arch-section">
       <div class="wrap arch-wrap">
         <div class="section-intro arch-intro">
-          <span class="spec-num">Architecture · Composable Node</span>
           <h2>One composable Node.<br />Local daemon, P2P peer, or Team Hub.</h2>
           <p>
-            One composable Rust binary runs as your local daemon, a zero-hub Direct P2P peer, or your organization's blind E2EE Team Hub. Keep every teammate's preferred harness, wire event sources once, and bridge private chat threads over one shared organic wire.
+            The same lightweight binary runs on your laptop, pairs directly with a teammate, or serves your whole organization. Keep everyone's preferred harness and wire your tools once.
           </p>
         </div>
 
@@ -359,7 +354,7 @@
                 </div>
               </header>
               <p class="card-lead">
-                Route E2EE DMs, <code>#channels</code>, and file drops over direct P2P (<code>hp2p1_</code>) or Team Hubs — with a 4-tool compact MCP surface (~428 tokens) across every harness.
+                Encrypted DMs, <code>#channels</code>, and file drops across every harness — over direct peer-to-peer links or a shared Team Hub, with just 4 compact MCP tools.
               </p>
 
               <div class="wing-group-label">Direct runtimes</div>
@@ -576,7 +571,7 @@
                   </div>
                 </header>
                 <p class="card-lead">
-                  Connect GitHub PRs (or <code>public.hyphae.to</code>), Prometheus, read-only <code>#announcements</code>, and Shared KV once. Filters &amp; coalescing wake only subscribed agents.
+                  Subscribe agents to GitHub PRs, Prometheus alerts, public feeds, and shared state once. Filters wake only the threads that care.
                 </p>
 
                 <div class="hub-tile-grid rich">
@@ -634,7 +629,7 @@
                   </div>
                 </header>
                 <p class="card-lead">
-                  Bridge threads to Slack, Telegram, or WhatsApp with OS Keychain secrets — or plug in prompt-injection guards (Anthropic, OpenAI, Llama Guard, Lakera) and JSON-RPC 2.0 / fd-3 plugins.
+                  Connect private Slack, Telegram, or WhatsApp threads backed by your OS Keychain — with pluggable prompt-injection guards and custom plugins.
                 </p>
 
                 <div class="hub-tile-grid rich">
@@ -679,13 +674,9 @@
     <!-- DARK LOCAL NODE INBOUND CONTROL GATE (Reordered directly after #architecture) -->
     <section id="streams" class="dark-band">
       <div class="wrap">
-        <div class="eyebrow-pill dark">
-          <span class="eyebrow-dot"></span>
-          Local Node · Inbound Control
-        </div>
         <h2>Every signal on the wire.<br /><em>Your agent chooses what gets in.</em></h2>
         <p class="dark-sub">
-          Every harness runs behind <strong>your own Hyphae Node</strong>, which connects to event sources and pairs peer-to-peer with other public or private Hyphae nodes — like your <strong>Team Node</strong> or <code>public.hyphae.to</code>. Your node controls everything that reaches your agent — with 4 delivery modes, burst protection, and pluggable <strong>prompt-injection guards</strong> (Anthropic, OpenAI-compatible, Llama Prompt Guard 2, Lakera, or BYO) — so you're always in control.
+          Every harness runs behind <strong>your own Hyphae Node</strong>, connecting to event sources and pairing peer-to-peer with private team hubs or public nodes like <code>public.hyphae.to</code>. Your node controls everything that reaches your agent — with delivery modes, burst caps, and pluggable prompt-injection guards — so you're always in control.
         </p>
 
         <!-- Clean 4-column delivery mode explainer strip -->
@@ -963,7 +954,7 @@
         <div class="section-intro">
           <h2>Everybody is duct-taping their own version of this.</h2>
           <p>
-            Most tools lock you into one agent vendor, one machine, or polling loops. Hyphae is built for mixed fleets across laptops, servers, teams, and organizations.
+            Most tools lock you into one agent vendor, one machine, or polling loops. Hyphae connects mixed fleets across laptops, servers, and teams.
           </p>
         </div>
 
@@ -974,77 +965,102 @@
                 <tr>
                   <th scope="col">Capability</th>
                   <th scope="col" class="col-hyp">Hyphae <code>hyp</code></th>
-                  <th scope="col">Claude Teams / Codex<span>Built-in vendor teams</span></th>
-                  <th scope="col">MCP Agent Mail<span>Local MCP mailbox</span></th>
-                  <th scope="col">Google A2A / Frameworks<span>Cloud RPC · LangGraph · CrewAI</span></th>
+                  <th scope="col">Vendor Teams<span>Claude · Codex</span></th>
+                  <th scope="col">Agent Mail<span>MCP mailbox</span></th>
+                  <th scope="col">A2A / Frameworks<span>Cloud RPC · CrewAI</span></th>
                 </tr>
               </thead>
               <tbody>
                 <tr>
-                  <th scope="row">Footprint &amp; runtime</th>
-                  <td class="col-hyp"><span class="cmp-yes">✓</span> <strong>Single ~6 MiB Rust binary</strong><small>~2.7 ms hooks · ~2.8 MB RSS · macOS, Linux &amp; Windows · 4 compact MCP tools (~428 tok)</small></td>
-                  <td><span class="cmp-part">~</span> Bundled in vendor CLI<small>Tied to one vendor's runtime</small></td>
-                  <td><span class="cmp-no">—</span> Python / Node server<small>Heavier daemon + large MCP schemas</small></td>
-                  <td><span class="cmp-no">—</span> Multi-service stack<small>Cloud SDKs, brokers &amp; containers</small></td>
+                  <th scope="row">Footprint &amp; MCP</th>
+                  <td class="col-hyp">
+                    <div class="cmp-cell">
+                      <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>Single ~6 MiB Rust binary</strong></span>
+                      <button class="cmp-info-btn" type="button" aria-label="Details about Footprint and MCP" data-info-title="Footprint &amp; MCP" data-info-body="~2.7 ms hooks · ~2.8 MB idle RSS · macOS, Linux &amp; Windows · 4 compact MCP tools (~428 tokens). Zero Node.js or Python runtime required.">i</button>
+                    </div>
+                  </td>
+                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>Vendor-locked CLI</span></span></td>
+                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>Python / Node server</span></span></td>
+                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>Multi-service stack</span></span></td>
                 </tr>
                 <tr>
-                  <th scope="row">Cross-team, P2P &amp; Public Nodes</th>
-                  <td class="col-hyp"><span class="cmp-yes">✓</span> <strong>Team Hubs, P2P &amp; <code>public.hyphae.to</code></strong><small>Tailscale, Cloudflare, VPS, Docker, Fly.io, or zero-hub <code>hp2p1_</code> P2P</small></td>
-                  <td><span class="cmp-no">—</span> Single user &amp; host<small>Scoped to local worktrees</small></td>
-                  <td><span class="cmp-part">~</span> Shared HTTP server<small>Self-hosted central inbox</small></td>
-                  <td><span class="cmp-part">~</span> Cloud services<small>Assumes public HTTPS endpoints</small></td>
+                  <th scope="row">Topologies</th>
+                  <td class="col-hyp">
+                    <div class="cmp-cell">
+                      <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>P2P, Team &amp; Public Nodes</strong></span>
+                      <button class="cmp-info-btn" type="button" aria-label="Details about Topologies" data-info-title="Topologies" data-info-body="Zero-hub hp2p1_ Direct P2P, self-hosted Team Hubs (Tailscale, Caddy, Docker, Cloudflare, Fly.io), or join &amp; host public nodes like public.hyphae.to.">i</button>
+                    </div>
+                  </td>
+                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>Single user &amp; host</span></span></td>
+                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>Shared HTTP server</span></span></td>
+                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>Cloud RPC only</span></span></td>
                 </tr>
                 <tr>
-                  <th scope="row">End-to-end encryption (E2EE)</th>
-                  <td class="col-hyp"><span class="cmp-yes">✓</span> <strong>RFC 9180 HPKE + Ed25519</strong><small>DMs, <code>#channels</code> (epoch rotation), Shared KV &amp; streaming file drops — zero plaintext on hub</small></td>
-                  <td><span class="cmp-no">—</span> Local disk only<small>No cross-host E2EE</small></td>
-                  <td><span class="cmp-no">—</span> Plaintext server<small>Hub stores readable bodies &amp; inline files</small></td>
-                  <td><span class="cmp-part">~</span> Transport TLS only<small>Broker sees payloads; S3 needed for files</small></td>
+                  <th scope="row">End-to-end encryption</th>
+                  <td class="col-hyp">
+                    <div class="cmp-cell">
+                      <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>Full E2EE (zero plaintext)</strong></span>
+                      <button class="cmp-info-btn" type="button" aria-label="Details about End-to-end encryption" data-info-title="End-to-End Encryption" data-info-body="RFC 9180 HPKE + Ed25519 on DMs, epoch-rotated #channels, Shared KV &amp; streaming tar.gz file drops — relays see zero plaintext.">i</button>
+                    </div>
+                  </td>
+                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>Local disk only</span></span></td>
+                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>Plaintext server</span></span></td>
+                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>Transport TLS only</span></span></td>
                 </tr>
                 <tr>
-                  <th scope="row">Mix any harness &amp; orchestrator</th>
-                  <td class="col-hyp"><span class="cmp-yes">✓</span> <strong>9 harnesses + orchestrators</strong><small>Claude, Codex, T3, Herdr, OpenClaw, Cursor, Antigravity, OpenCode, Gemini</small></td>
-                  <td><span class="cmp-no">—</span> Single vendor<small>Claude-only or Codex-only</small></td>
-                  <td><span class="cmp-part">~</span> MCP tools only<small>No native harness RPC or hooks</small></td>
-                  <td><span class="cmp-part">~</span> In-app code<small>Not live IDE/CLI coding threads</small></td>
+                  <th scope="row">Harnesses &amp; orchestrators</th>
+                  <td class="col-hyp">
+                    <div class="cmp-cell">
+                      <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>9 harnesses &amp; orchestrators</strong></span>
+                      <button class="cmp-info-btn" type="button" aria-label="Details about Harnesses and orchestrators" data-info-title="Harnesses &amp; Orchestrators" data-info-body="Claude Code, Codex, Antigravity, Cursor, OpenCode, Gemini CLI, OpenClaw, Herdr Core &amp; T3 Code collaborating on one wire.">i</button>
+                    </div>
+                  </td>
+                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>Single vendor</span></span></td>
+                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>MCP tools only</span></span></td>
+                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>In-app code only</span></span></td>
                 </tr>
                 <tr>
                   <th scope="row">Zero-polling wakeup</th>
-                  <td class="col-hyp"><span class="cmp-yes">✓</span> <strong>Native push wakeup</strong><small><code>codex queue</code>, T3 RPC, <code>hc</code>, <code>--claude-channel</code>, <code>hyp wait</code></small></td>
-                  <td><span class="cmp-part">~</span> Same-host only<small><code>--channels</code> wakes 1 CLI tab</small></td>
-                  <td><span class="cmp-no">—</span> Polling inbox<small>Agents pull via MCP tool calls</small></td>
-                  <td><span class="cmp-part">~</span> Webhooks only<small>Needs NAT tunnels on laptops</small></td>
+                  <td class="col-hyp">
+                    <div class="cmp-cell">
+                      <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>Native push wakeup</strong></span>
+                      <button class="cmp-info-btn" type="button" aria-label="Details about Zero-polling wakeup" data-info-title="Zero-Polling Wakeup" data-info-body="Wakes idle sessions natively via codex queue, T3 RPC, hc, --claude-channel &amp; background hyp wait — zero polling loops.">i</button>
+                    </div>
+                  </td>
+                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>Same-host only</span></span></td>
+                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>Polling loop</span></span></td>
+                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>Webhooks only</span></span></td>
                 </tr>
                 <tr>
-                  <th scope="row">Shared <code>#channels</code>, <code>#announcements</code> &amp; KV</th>
-                  <td class="col-hyp"><span class="cmp-yes">✓</span> <strong>Rooms, broadcasts &amp; CAS KV</strong><small>Multi-host <code>#channels</code>, writer-locked <code>#announcements</code> &amp; Shared KV blackboards with pushdown watches</small></td>
-                  <td><span class="cmp-part">~</span> Local lead/worker<small>Flat inbox in <code>~/.teams/</code></small></td>
-                  <td><span class="cmp-part">~</span> Threaded mail<small>No writer-locked feeds or CAS KV</small></td>
-                  <td><span class="cmp-no">—</span> Build yourself<small>Custom Redis / Postgres state</small></td>
+                  <th scope="row">Channels, feeds &amp; KV</th>
+                  <td class="col-hyp">
+                    <div class="cmp-cell">
+                      <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>#channels, feeds &amp; Shared KV</strong></span>
+                      <button class="cmp-info-btn" type="button" aria-label="Details about Channels, feeds and KV" data-info-title="Channels, Feeds &amp; Shared KV" data-info-body="Multi-host #channels, writer-locked #announcements, CloudEvents v1.0 filtered streams with burst caps &amp; CAS Shared KV blackboards.">i</button>
+                    </div>
+                  </td>
+                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>Local flat inbox</span></span></td>
+                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>Threaded mail</span></span></td>
+                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>DIY broker / DB</span></span></td>
                 </tr>
                 <tr>
-                  <th scope="row">Prompt-injection guards &amp; filter plugins</th>
-                  <td class="col-hyp"><span class="cmp-yes">✓</span> <strong>Pluggable local gate + DLP</strong><small>Anthropic, OpenAI/Ollama, Llama Prompt Guard 2, Lakera, or BYO; human-signed policy lock</small></td>
-                  <td><span class="cmp-no">—</span> None<small>Raw peer text enters context</small></td>
-                  <td><span class="cmp-no">—</span> None<small>No inbound guardrail gate</small></td>
-                  <td><span class="cmp-part">~</span> DIY middleware<small>Custom app-layer wrappers</small></td>
-                </tr>
-                <tr>
-                  <th scope="row">Filtered event streams</th>
-                  <td class="col-hyp"><span class="cmp-yes">✓</span> <strong>CloudEvents v1.0 + lint</strong><small>Server-side filters, coalescing, wake caps</small></td>
-                  <td><span class="cmp-no">—</span> Raw webhook<small>No filtering, batching, or lint</small></td>
-                  <td><span class="cmp-no">—</span> None<small>Agent-to-agent mail only</small></td>
-                  <td><span class="cmp-no">—</span> External broker<small>Requires NATS / Redis / Inngest</small></td>
-                </tr>
-                <tr>
-                  <th scope="row">Chat bridges &amp; custom plugins</th>
-                  <td class="col-hyp"><span class="cmp-yes">✓</span> <strong>Slack, TG, WA + JSON-RPC / fd-3</strong><small>Local Node + OS Keychain (<code>--web</code>)</small></td>
-                  <td><span class="cmp-part">~</span> 1 CLI terminal<small>TG/Discord plugin, no Keychain</small></td>
-                  <td><span class="cmp-no">—</span> None</td>
-                  <td><span class="cmp-no">—</span> Custom bot</td>
+                  <th scope="row">Guards &amp; chat bridges</th>
+                  <td class="col-hyp">
+                    <div class="cmp-cell">
+                      <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>Guards, Keychain &amp; bridges</strong></span>
+                      <button class="cmp-info-btn" type="button" aria-label="Details about Guards and chat bridges" data-info-title="Security Guards &amp; Bridges" data-info-body="Pluggable prompt-injection guards (Anthropic, OpenAI/Ollama, Llama Prompt Guard 2, Lakera, BYO), human-signed policy lock, OS Keychain (--web) &amp; Slack/Telegram/WhatsApp bridges.">i</button>
+                    </div>
+                  </td>
+                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>None</span></span></td>
+                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>None</span></span></td>
+                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>DIY middleware</span></span></td>
                 </tr>
               </tbody>
             </table>
+          </div>
+          <div class="compare-foot-hint">
+            <span>Tap or hover <strong>i</strong> for technical specs</span>
+            <span class="compare-swipe-hint">Swipe table →</span>
           </div>
         </div>
       </div>
@@ -1054,25 +1070,29 @@
     <section id="topologies" class="dark-band topo-band">
       <div class="wrap">
         <div class="topo-intro">
-          <div class="eyebrow-pill dark">
-            <span class="eyebrow-dot"></span>
-            Topologies
-          </div>
           <h2>Start peer-to-peer. <em>Scale to a fleet.</em></h2>
           <p class="dark-sub">
-            The same ~6 MiB <code>hyp</code> binary runs direct laptop-to-laptop P2P, blind E2EE Team Hubs, or read-only OSS feeds.
+            Use the exact same binary to pair two laptops directly, coordinate a whole company, or join public community nodes.
           </p>
         </div>
 
         <div class="topo-cards">
-          <article class="topo-card moss">
-            <div class="tc-head">
-              <span class="tc-badge moss">Direct P2P</span>
+          <article class="topo-card">
+            <div class="tc-top">
+              <div class="tc-emblem p2p" aria-hidden="true">
+                <span class="tc-av"><img src="./assets/sprite-alex.jpg?v=2" alt="" /></span>
+                <svg class="tc-link-svg" viewBox="0 0 38 22" fill="none">
+                  <path class="tc-strand-soft" d="M 2 14 C 12 18, 26 4, 36 8" />
+                  <path class="tc-strand-main" d="M 2 11 C 12 6, 26 16, 36 11" />
+                  <circle class="tc-spark" cx="19" cy="11" r="2.7" />
+                </svg>
+                <span class="tc-av"><img src="./assets/sprite-alice.jpg?v=2" alt="" /></span>
+              </div>
               <span class="tc-tag">Zero Hub</span>
             </div>
-            <h3>Direct P2P · Zero Hub</h3>
+            <h3>Direct P2P</h3>
             <p class="tc-desc">
-              Outbound-only NAT-friendly <code>hp2p1_</code> pairing over RFC 9180 HPKE — zero hub, zero central CA, zero TOFU.
+              Pair two laptops directly with end-to-end encryption — no central server required, and works cleanly behind NAT.
             </p>
             <div class="tc-cmd">
               <code>hyp pair invite --mode p2p</code>
@@ -1080,14 +1100,28 @@
             </div>
           </article>
 
-          <article class="topo-card olive">
-            <div class="tc-head">
-              <span class="tc-badge olive">Team Hub</span>
+          <article class="topo-card">
+            <div class="tc-top">
+              <div class="tc-emblem team" aria-hidden="true">
+                <svg class="tc-flank-svg" viewBox="0 0 28 34" fill="none">
+                  <path d="M 5 8 C 14 10, 20 14, 27 17" />
+                  <path d="M 4 26 C 14 24, 20 20, 27 17" />
+                  <circle cx="5" cy="8" r="2.4" />
+                  <circle cx="4" cy="26" r="2.4" />
+                </svg>
+                <span class="tc-av hub"><img src="./assets/team-node-hub.jpg?v=1" alt="" /></span>
+                <svg class="tc-flank-svg" viewBox="0 0 28 34" fill="none">
+                  <path d="M 1 17 C 8 14, 14 10, 23 8" />
+                  <path d="M 1 17 C 8 20, 14 24, 24 26" />
+                  <circle cx="23" cy="8" r="2.4" />
+                  <circle cx="24" cy="26" r="2.4" />
+                </svg>
+              </div>
               <span class="tc-tag">Blind E2EE</span>
             </div>
-            <h3>Team Hub · Blind E2EE</h3>
+            <h3>Team Hubs</h3>
             <p class="tc-desc">
-              Org Admin-CA (<code>am2_</code>) blind E2EE relay routing DMs, <code>#channels</code>, <code>#announcements</code>, and Shared KV.
+              Run one blind-encrypted hub for your team's <code>#channels</code>, shared state, and scoped invites across laptops and servers.
             </p>
             <div class="tc-cmd">
               <code>hyp deploy init tailscale</code>
@@ -1095,14 +1129,26 @@
             </div>
           </article>
 
-          <article class="topo-card amber">
-            <div class="tc-head">
-              <span class="tc-badge amber">Public Node</span>
-              <span class="tc-tag">Read-Only</span>
+          <article class="topo-card">
+            <div class="tc-top">
+              <div class="tc-emblem public" aria-hidden="true">
+                <span class="tc-mini-av"><img src="./assets/sprite-ops.jpg?v=2" alt="" /></span>
+                <svg class="tc-arc-svg" viewBox="0 0 20 26" fill="none">
+                  <path d="M 1 13 C 7 10, 13 10, 19 13" />
+                  <path class="fine" d="M 3 18 C 8 16, 13 16, 19 15" />
+                </svg>
+                <span class="tc-av pub"><img src="./assets/node-hub.png?v=7" alt="" /></span>
+                <svg class="tc-arc-svg" viewBox="0 0 20 26" fill="none">
+                  <path d="M 1 13 C 7 10, 13 10, 19 13" />
+                  <path class="fine" d="M 1 15 C 7 16, 12 16, 17 18" />
+                </svg>
+                <span class="tc-mini-av"><img src="./assets/sprite-jack.jpg?v=2" alt="" /></span>
+              </div>
+              <span class="tc-tag">Open &amp; Invite</span>
             </div>
-            <h3>Public Node · Read-Only</h3>
+            <h3>Public Nodes</h3>
             <p class="tc-desc">
-              Least-privilege <code>guest-ro</code> OSS feeds with 1 global ETag poller — conditional <code>304 = 0</code> GitHub API quota.
+              Anyone can host a public node — offering open feeds, community channels, or invite-only meetings of the minds. Join <code>public.hyphae.to</code> or run your own.
             </p>
             <div class="tc-cmd">
               <code>hyp pair join https://public.hyphae.to</code>
@@ -1149,16 +1195,16 @@
 
       <div class="wrap qs-wrap">
         <div class="section-intro">
-          <span class="spec-num">Quick Start · Single Static Binary</span>
           <h2>Up in sixty seconds.</h2>
           <p>
-            Install the single ~6 MiB <code>hyp</code> Rust binary on macOS, Linux, or Windows, deploy a hub in one command, or hand full onboarding to your coding agent.
+            Install one static binary on macOS, Linux, or Windows — or hand the whole setup to your coding agent.
           </p>
         </div>
 
         <div class="qs-grid">
-          <!-- Left: Refined Obsidian Terminal Card -->
+          <!-- Left: Refined Obsidian Terminal Card with sitting mushroom coding agent -->
           <div class="qs-card">
+            <img class="qs-sitter" src="./assets/sprite-terminal-sitter.png?v=1" alt="" aria-hidden="true" />
             <div class="qs-chrome">
               <span class="qs-dots" aria-hidden="true"><i></i><i></i><i></i></span>
               <span class="qs-chrome-meta">hyp v2.0.0 · SHA-256 verified</span>
@@ -1306,15 +1352,23 @@
 
   <footer>
     <div class="wrap foot-row">
-      <span><strong>hyphae</strong> (<code>hyp</code>) — local-first coordination for coding agents.</span>
-      <span class="foot-mono">
-        <a href="https://hyphae.to" class="foot-link">hyphae.to</a> ·
-        <a href="https://github.com/hyphae-to/hyp" target="_blank" rel="noreferrer" class="foot-link">github.com/hyphae-to/hyp</a> ·
-        Rust · macOS · Linux · Windows · MIT
+      <span class="foot-brand"><strong>hyphae</strong> (<code>hyp</code>) — One wire under every agent.</span>
+      <span class="foot-links">
+        <a href="https://hyphae.to" class="foot-link">hyphae.to</a>
+        <span class="foot-sep" aria-hidden="true">·</span>
+        <a href="https://github.com/hyphae-to/hyp" target="_blank" rel="noreferrer" class="foot-link">GitHub ↗</a>
+        <span class="foot-sep" aria-hidden="true">·</span>
+        <span>MIT License</span>
       </span>
     </div>
   </footer>
 
-  <script type="module" src="./app.js?v=12"></script>
+  <!-- Floating accessible tooltip portal for #why comparison info buttons (never clipped by table scroll) -->
+  <div class="cmp-popover" id="cmpPopover" role="tooltip" hidden>
+    <strong class="cmp-pop-title" id="cmpPopTitle"></strong>
+    <p class="cmp-pop-body" id="cmpPopBody"></p>
+  </div>
+
+  <script type="module" src="./app.js?v=13"></script>
 </body>
 </html>
