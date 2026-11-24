@@ -248,8 +248,9 @@ export async function startDaemon(config: Config, options: StartDaemonOptions = 
     let attachedWaiter: { sessionId: string; waiter: Waiter } | undefined;
 
     const bindChannelTransport = (sessionId: string) => {
-      if (!mcpContext || !mcpContext.channel || !mcpContext.channelReady || socket.destroyed) return;
+      if (!mcpContext || !mcpContext.channel || socket.destroyed) return;
       mcpContext.channelSessionId = sessionId;
+      if (!mcpContext.channelReady) return;
       channels.set(sessionId, {
         socket,
         deliver: (text) => {
@@ -539,6 +540,7 @@ export async function startDaemon(config: Config, options: StartDaemonOptions = 
               const backend = parseBackend({
                 kind: "codex",
                 threadId: mcpContext.codexThreadId,
+                ...(mcpContext.codexHome ? { codexHome: mcpContext.codexHome } : {}),
                 resume: mcpContext.codexResume,
                 ...(mcpContext.codexRemote ? { remote: mcpContext.codexRemote } : {}),
                 queue: true,
