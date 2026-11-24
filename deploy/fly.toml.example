@@ -40,7 +40,7 @@ primary_region = "iad"
     interval = "30s"
     method = "GET"
     timeout = "5s"
-    path = "/v1/manifest"
+    path = "/v1/health"
 
 [[mounts]]
   source = "hyphae_data"

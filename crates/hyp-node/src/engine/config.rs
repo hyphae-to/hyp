@@ -9,12 +9,13 @@ use http::StatusCode;
 use hyp_crypto::{CryptoError, SecretBackend};
 use hyp_proto::address::{AddressError, NodeId};
 use hyp_proto::cloudevent::{CloudEventError, DEFAULT_MAX_HOPS, HARD_MAX_HOPS};
-use hyp_proto::filter::{FilterError, TopicMetadata};
+use hyp_proto::filter::{FilterError, SubscriptionDiagnostic, TopicMetadata};
 use hyp_proto::manifest::{
     CapabilityToken, KvMode, KvWriteModel, ManifestError, NegotiationError, OkpCurve,
     OkpJwk as ProtoOkpJwk, ProtocolRange,
 };
 use hyp_proto::problem::ProblemDetails;
+use hyp_proto::scopes::ScopePreset;
 use hyp_store::{PeerProfile, StoreConfig, StoreError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -229,6 +230,53 @@ impl ChannelPolicy {
     }
 }
 
+/// Opt-in self-service read-only guest pairing policy (`POST /v1/guest/pair`),
+/// powering public stream hubs such as `public.hyphae.to`.
+///
+/// **Hard security invariant:** `enabled` defaults strictly to `false` (opt-in only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestPairingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_guest_scopes")]
+    pub scopes: Vec<String>,
+    #[serde(default = "default_max_repos_per_guest")]
+    pub max_repos_per_guest: usize,
+    #[serde(default = "default_max_batches_per_hour")]
+    pub max_batches_per_hour: u32,
+    #[serde(default = "default_max_joins_per_minute")]
+    pub max_joins_per_minute: u32,
+}
+
+fn default_guest_scopes() -> Vec<String> {
+    ScopePreset::GuestRo.expand()
+}
+
+const fn default_max_repos_per_guest() -> usize {
+    10
+}
+
+const fn default_max_batches_per_hour() -> u32 {
+    60
+}
+
+const fn default_max_joins_per_minute() -> u32 {
+    20
+}
+
+impl Default for GuestPairingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            scopes: default_guest_scopes(),
+            max_repos_per_guest: default_max_repos_per_guest(),
+            max_batches_per_hour: default_max_batches_per_hour(),
+            max_joins_per_minute: default_max_joins_per_minute(),
+        }
+    }
+}
+
 /// Complete configuration for a Hyphae v2 Unified `Node` (§1.3).
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -242,6 +290,8 @@ pub struct NodeConfig {
     pub e2ee_policy: E2eePolicy,
     pub forwarding: ForwardingPolicy,
     pub escalation: EscalationConfig,
+    /// Opt-in self-service `guest-ro` pairing policy (`POST /v1/guest/pair`; default disabled).
+    pub guest_pairing: GuestPairingConfig,
     pub peers: Vec<PeerConfig>,
     pub topics: Vec<TopicConfig>,
     pub kv_namespaces: Vec<KvNamespaceConfig>,
@@ -277,6 +327,7 @@ impl NodeConfig {
             e2ee_policy: E2eePolicy::Required,
             forwarding: ForwardingPolicy::default(),
             escalation: EscalationConfig::default(),
+            guest_pairing: GuestPairingConfig::default(),
             peers: Vec::new(),
             topics: Vec::new(),
             kv_namespaces: Vec::new(),
@@ -386,6 +437,21 @@ pub enum NodeError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    #[error("peer key mismatch: {0}")]
+    PeerKeyMismatch(String),
+
+    #[error("rate limited: {detail}")]
+    RateLimited {
+        detail: String,
+        retry_after_secs: Option<u64>,
+    },
+
+    #[error("subscription rejected: {detail}")]
+    SubscriptionRejected {
+        detail: String,
+        diagnostics: Vec<SubscriptionDiagnostic>,
+    },
+
     #[error("bad request: {0}")]
     BadRequest(String),
 
@@ -452,6 +518,41 @@ impl NodeError {
             }
             Self::Conflict(msg) => {
                 ProblemDetails::new("conflict", "conflict", "Conflict", 409, msg.clone())
+            }
+            Self::PeerKeyMismatch(msg) => ProblemDetails::new(
+                "peer_key_mismatch",
+                "peer-key-mismatch",
+                "Peer Key Mismatch",
+                409,
+                msg.clone(),
+            )
+            .with_extension("code", serde_json::json!("peer_key_mismatch")),
+            Self::RateLimited { detail, .. } => ProblemDetails::new(
+                "rate_limited",
+                "rate-limited",
+                "Rate Limited",
+                429,
+                detail.clone(),
+            )
+            .with_extension("code", serde_json::json!("rate_limited")),
+            Self::SubscriptionRejected {
+                detail,
+                diagnostics,
+            } => {
+                let mut p = ProblemDetails::new(
+                    "subscription_rejected",
+                    "subscription-rejected",
+                    "Subscription Rejected",
+                    422,
+                    detail.clone(),
+                )
+                .with_extension("code", serde_json::json!("subscription_rejected"))
+                .with_extension(
+                    "diagnostics",
+                    serde_json::to_value(diagnostics).unwrap_or_else(|_| serde_json::json!([])),
+                );
+                p.problem_type = "https://hyphae.to/problems/subscription-rejected".to_string();
+                p
             }
             Self::BadRequest(msg) => ProblemDetails::new(
                 "bad_request",

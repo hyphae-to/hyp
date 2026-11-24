@@ -11,20 +11,27 @@ use crate::config_file::{
 };
 use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error};
 use clap::{Args, Subcommand, ValueEnum};
-use hyp_crypto::keystore::SecretBackend;
+use hyp_crypto::CryptoError;
+use hyp_crypto::keystore::{SecretBackend, validate_secret_name};
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
 use hyp_harness::daemon::{LocalDaemon, LocalDaemonConfig};
-use hyp_node::engine::{E2eePolicy, NodeConfig, NodeProfile, UnifiedNode};
+use hyp_node::adapters::{GitHubPublicAdapter, GitHubPublicConfig};
+use hyp_node::engine::{
+    E2eePolicy, EscalationConfig, GuestPairingConfig, NodeConfig, NodeProfile, TopicConfig,
+    UnifiedNode,
+};
 use hyp_node::gates::{SecurityGateConfig, SecurityGatePipeline};
 use hyp_proto::address::{LOCAL_NODE_ID, NodeId, is_valid_node_id};
+use hyp_proto::scopes::ScopePreset;
 use hyp_store::NodeDb;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::fs;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CliNodeProfile {
@@ -189,6 +196,14 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
     let mut node_cfg = NodeConfig::new(node_id, profile, &state_dir);
     node_cfg.bind_addr = bind_addr;
     node_cfg.public_endpoint = loaded.as_ref().and_then(|c| c.public_url.clone());
+    let explicit_state = args.state_dir.is_some();
+    if explicit_state && std::env::var_os("HYPHAE_SECRET_BACKEND").is_none() {
+        node_cfg.secret_backend = Some(SecretBackend::File);
+    }
+
+    let mut startup_warnings: Vec<String> = Vec::new();
+    let mut github_public_cfg: Option<GitHubPublicConfig> = None;
+
     if let Some(ref cfg) = loaded {
         node_cfg.require_pairing = cfg.require_pairing;
         node_cfg.e2ee_policy = if cfg.require_e2ee {
@@ -196,10 +211,86 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         } else {
             E2eePolicy::Prefer
         };
-    }
-    let explicit_state = args.state_dir.is_some();
-    if explicit_state && std::env::var_os("HYPHAE_SECRET_BACKEND").is_none() {
-        node_cfg.secret_backend = Some(SecretBackend::File);
+
+        // Parse optional `escalation` hints (default + byScope).
+        if let Some(esc_val) = cfg.raw.get("escalation") {
+            match serde_json::from_value::<EscalationConfig>(esc_val.clone()) {
+                Ok(esc) => node_cfg.escalation = esc,
+                Err(e) => {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "CONFIG_ERROR",
+                        format!("Invalid escalation config in {}: {e}", cfg.path.display()),
+                        None,
+                    );
+                }
+            }
+        }
+
+        // Parse opt-in `guestPairing` policy (matching `hyp deploy init public-node`).
+        if let Some(gp_val) = cfg.raw.get("guestPairing") {
+            match parse_guest_pairing_config(gp_val, cfg.raw.get("rateLimits")) {
+                Ok(gp) => node_cfg.guest_pairing = gp,
+                Err(e) => {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "CONFIG_ERROR",
+                        format!("Invalid guestPairing config in {}: {e}", cfg.path.display()),
+                        None,
+                    );
+                }
+            }
+        }
+
+        // Parse `sources` entries (currently `kind == "github-public"`).
+        if let Some(sources_val) = cfg.raw.get("sources") {
+            let secrets = open_secret_store(&state_dir, explicit_state);
+            let public_read_only = cfg
+                .raw
+                .get("publicReadOnly")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            match parse_github_public_source(
+                sources_val,
+                &secrets,
+                public_read_only,
+                &mut startup_warnings,
+            ) {
+                Ok(Some(gh_cfg)) => {
+                    if !node_cfg.topics.iter().any(|t| t.topic == gh_cfg.topic) {
+                        node_cfg.topics.push(TopicConfig {
+                            topic: gh_cfg.topic.clone(),
+                            kind: Some("github-public".to_string()),
+                            description: Some(
+                                "Public GitHub repository events (demand-driven ETag polling)"
+                                    .to_string(),
+                            ),
+                            metadata: None,
+                            has_provisioned_publisher: true,
+                        });
+                    }
+                    github_public_cfg = Some(gh_cfg);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "CONFIG_ERROR",
+                        format!("Invalid github-public source in {}: {e}", cfg.path.display()),
+                        Some(
+                            "Verify sources[] in node.json uses { \"secret\": \"<name>\" } references, never plaintext tokens."
+                                .to_string(),
+                        ),
+                    );
+                }
+            }
+        }
     }
 
     let start_local_daemon = !args.no_local_socket
@@ -242,6 +333,21 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                 .local()
                 .set_metadata("node_version", env!("CARGO_PKG_VERSION"));
         }
+
+        // Attach and start demand-driven `github-public` adapter BEFORE serving HTTP!
+        let github_public_enabled = if let Some(gh_cfg) = github_public_cfg {
+            let adapter = Arc::new(
+                GitHubPublicAdapter::new(gh_cfg)
+                    .map_err(|e| format!("Failed to initialize github-public adapter: {e}"))?,
+            );
+            node.attach_github_public(adapter)
+                .await
+                .map_err(|e| format!("Failed to attach github-public adapter: {e}"))?;
+            true
+        } else {
+            false
+        };
+        let guest_pairing_enabled = node.config().guest_pairing.enabled;
 
         let local_daemon = if start_local_daemon {
             let gate_cfg: SecurityGateConfig = match loaded.as_ref().and_then(|c| c.raw.get("gate"))
@@ -308,11 +414,13 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             "socketPath": socket_path_str,
             "stateDir": state_dir.display().to_string(),
             "configPath": loaded.as_ref().map(|c| c.path.display().to_string()),
+            "guestPairingEnabled": guest_pairing_enabled,
+            "githubPublicEnabled": github_public_enabled,
             "startedAt": started_at,
         });
         write_atomic_json(&status_path, &status_doc, true)?;
 
-        let mut warnings = Vec::new();
+        let mut warnings = startup_warnings;
         if let Some(w) = legacy_warning {
             warnings.push(w);
         }
@@ -355,9 +463,15 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                 println!("      Local IPC:   disabled");
             }
             if let Some(addr) = bound_addr {
-                println!("      Peer HTTP:   http://{addr} (GET /v1/manifest)");
+                println!("      Peer HTTP:   http://{addr} (GET /v1/manifest, GET /v1/health)");
             } else {
                 println!("      Peer HTTP:   disabled (local profile)");
+            }
+            if guest_pairing_enabled {
+                println!("      Guest Pair:  enabled (POST /v1/guest/pair -> guest-ro)");
+            }
+            if github_public_enabled {
+                println!("      GitHub Pub:  enabled (demand-driven ETag poller)");
             }
             for w in &warnings {
                 println!("WARN  {w}");
@@ -370,6 +484,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         if let Some(daemon) = local_daemon {
             daemon.stop().await;
         }
+        node.shutdown_adapters().await;
         node.shutdown();
         if let Some(handle) = server_handle {
             handle.abort();
@@ -415,4 +530,188 @@ async fn wait_for_shutdown_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+fn parse_guest_pairing_config(
+    gp_val: &Value,
+    rate_limits_val: Option<&Value>,
+) -> Result<GuestPairingConfig, String> {
+    let obj = gp_val
+        .as_object()
+        .ok_or_else(|| "guestPairing must be a JSON object".to_string())?;
+    let mut cfg = GuestPairingConfig::default();
+
+    if let Some(enabled) = obj.get("enabled").and_then(Value::as_bool) {
+        cfg.enabled = enabled;
+    }
+    if let Some(max_repos) = obj.get("maxReposPerGuest").and_then(Value::as_u64) {
+        if max_repos == 0 {
+            return Err("guestPairing.maxReposPerGuest must be > 0".to_string());
+        }
+        cfg.max_repos_per_guest = max_repos as usize;
+    }
+    if let Some(max_batches) = obj.get("maxBatchesPerHour").and_then(Value::as_u64) {
+        if max_batches == 0 {
+            return Err("guestPairing.maxBatchesPerHour must be > 0".to_string());
+        }
+        cfg.max_batches_per_hour = max_batches.min(u32::MAX as u64) as u32;
+    }
+    if let Some(max_joins) = obj
+        .get("maxJoinsPerMinute")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            rate_limits_val
+                .and_then(|rl| rl.get("guestJoinRequestsPerMinute"))
+                .and_then(Value::as_u64)
+        })
+    {
+        cfg.max_joins_per_minute = max_joins.min(u32::MAX as u64) as u32;
+    }
+    if let Some(scopes_val) = obj.get("scopes") {
+        let arr = scopes_val
+            .as_array()
+            .ok_or_else(|| "guestPairing.scopes must be an array of scope strings".to_string())?;
+        let mut parsed = Vec::with_capacity(arr.len());
+        for item in arr {
+            let s = item
+                .as_str()
+                .ok_or_else(|| "guestPairing.scopes entries must be strings".to_string())?;
+            parsed.push(s.to_string());
+        }
+        if !parsed.is_empty() {
+            cfg.scopes = parsed;
+        }
+    } else {
+        cfg.scopes = if cfg.max_repos_per_guest == 10 && cfg.max_batches_per_hour == 60 {
+            ScopePreset::GuestRo.expand()
+        } else {
+            vec![format!(
+                "stream:subscribe=github[require=exact.repo;maxValues={};maxBatchesPerHour={}]",
+                cfg.max_repos_per_guest, cfg.max_batches_per_hour
+            )]
+        };
+    }
+
+    Ok(cfg)
+}
+
+fn parse_secret_ref_name(val: &Value, field_name: &str) -> Result<Option<String>, String> {
+    if val.is_null() {
+        return Ok(None);
+    }
+    if val.is_string() {
+        return Err(format!(
+            "'{field_name}' must use {{ \"secret\": \"<name>\" }} (plaintext credentials are forbidden in node.json)"
+        ));
+    }
+    let obj = val
+        .as_object()
+        .ok_or_else(|| format!("'{field_name}' must be an object {{ \"secret\": \"<name>\" }}"))?;
+    let name = obj
+        .get("secret")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("'{field_name}' missing string 'secret' reference"))?;
+    validate_secret_name(name)
+        .map_err(|e| format!("invalid secret name '{name}' in '{field_name}': {e}"))?;
+    Ok(Some(name.to_string()))
+}
+
+fn parse_github_public_source(
+    sources_val: &Value,
+    secrets: &hyp_crypto::SecretStore,
+    public_read_only: bool,
+    warnings: &mut Vec<String>,
+) -> Result<Option<GitHubPublicConfig>, String> {
+    let arr = sources_val
+        .as_array()
+        .ok_or_else(|| "sources must be a JSON array".to_string())?;
+
+    for entry in arr {
+        let Some(obj) = entry.as_object() else {
+            continue;
+        };
+        if obj.get("kind").and_then(Value::as_str) != Some("github-public") {
+            continue;
+        }
+        if obj.get("enabled").and_then(Value::as_bool) == Some(false) {
+            continue;
+        }
+
+        let mut cfg = GitHubPublicConfig::default();
+        if let Some(id) = obj.get("id").and_then(Value::as_str) {
+            if !id.trim().is_empty() {
+                cfg.id = id.trim().to_string();
+            }
+        }
+        if let Some(topic) = obj.get("topic").and_then(Value::as_str) {
+            if !topic.trim().is_empty() {
+                cfg.topic = topic.trim().to_string();
+            }
+        }
+        if let Some(api_base) = obj.get("apiBaseUrl").and_then(Value::as_str) {
+            if !api_base.trim().is_empty() {
+                cfg.api_base_url = api_base.trim().to_string();
+            }
+        }
+        if let Some(min_poll) = obj.get("minPollIntervalSeconds").and_then(Value::as_u64) {
+            let dur = Duration::from_secs(min_poll);
+            cfg.min_poll_interval = dur;
+            if cfg.base_poll_interval > dur {
+                cfg.base_poll_interval = dur;
+            }
+        }
+        if let Some(base_poll) = obj.get("basePollIntervalSeconds").and_then(Value::as_u64) {
+            cfg.base_poll_interval = Duration::from_secs(base_poll);
+        }
+        if let Some(grace) = obj.get("graceWindowSeconds").and_then(Value::as_u64) {
+            cfg.teardown_grace = Duration::from_secs(grace);
+        }
+        if !public_read_only {
+            if let Some(allow_priv) = obj.get("allowPrivateWithToken").and_then(Value::as_bool) {
+                cfg.allow_private_with_token = allow_priv;
+            }
+        }
+
+        if let Some(tok_val) = obj.get("githubToken") {
+            if let Some(secret_name) = parse_secret_ref_name(tok_val, "sources[].githubToken")? {
+                match secrets.get(&secret_name) {
+                    Ok(secret) => cfg.github_token = Some(secret),
+                    Err(CryptoError::SecretNotFound(_)) => {
+                        warnings.push(format!(
+                            "Secret '{secret_name}' is not set; starting github-public in unauthenticated public GitHub mode (60 req/hr). Run `hyp secret set {secret_name}` for 5,000 req/hr."
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "failed to load GitHub token secret '{secret_name}': {e}"
+                        ));
+                    }
+                }
+            }
+        }
+
+        if let Some(app_sec_val) = obj.get("appWebhookSecret") {
+            if let Some(secret_name) =
+                parse_secret_ref_name(app_sec_val, "sources[].appWebhookSecret")?
+            {
+                match secrets.get(&secret_name) {
+                    Ok(secret) => cfg.app_webhook_secret = Some(secret),
+                    Err(CryptoError::SecretNotFound(_)) => {
+                        warnings.push(format!(
+                            "Secret '{secret_name}' is not set; POST /v1/webhooks/github-app disabled until `hyp secret set {secret_name}` is configured."
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "failed to load GitHub App webhook secret '{secret_name}': {e}"
+                        ));
+                    }
+                }
+            }
+        }
+
+        return Ok(Some(cfg));
+    }
+
+    Ok(None)
 }

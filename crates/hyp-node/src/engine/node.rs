@@ -10,12 +10,12 @@
 //!   permanent E2EE anti-downgrade ratcheting)
 //! - Direct P2P mutual pairing (`hp2p1_`) and Org Admin-CA pairing (`am2_`).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -62,8 +62,8 @@ use hyp_proto::cloudevent::{
     CONTENT_TYPE_E2EE_JSON, CONTENT_TYPE_JSON, CloudEvent as ProtoCloudEvent, ProvenanceError,
 };
 use hyp_proto::filter::{
-    Filter as ProtoFilter, LocalSubscription, ObservedTopicStats, SubscriptionDiagnostic,
-    TopicCatalogEntry, compile_upstream_pushdown, diagnose_subscription,
+    DiagnosticSeverity, Filter as ProtoFilter, LocalSubscription, ObservedTopicStats,
+    SubscriptionDiagnostic, TopicCatalogEntry, compile_upstream_pushdown, diagnose_subscription,
 };
 use hyp_proto::manifest::{
     AdvertisedKvNamespace, AdvertisedResources, AdvertisedTopic, CapabilityToken, E2eePolicy,
@@ -71,7 +71,7 @@ use hyp_proto::manifest::{
     PeerCapabilitiesView, PeerTrustHistory, SignedNodeManifest, negotiate_capabilities,
 };
 use hyp_proto::problem::ProblemDetails;
-use hyp_proto::scopes::{ScopeSet, expand_v2_scopes};
+use hyp_proto::scopes::{ScopePreset, ScopeSet, expand_v2_scopes, extract_confined_values};
 use hyp_store::{
     AckOutcome, ChannelEpoch, ChannelEpochInput, DeliveryMode, DueBatch,
     EnqueueMessage, GateState, GrantDirection, GrantInput, GrantRecord, HandleRecord, IngestResult,
@@ -82,6 +82,11 @@ use hyp_store::{
     UpstreamPushdownInput, WriteModel, format_address, now_ms, parse_address, sha256_hex, uuid_v4,
 };
 
+use crate::adapters::github_public::canonicalize_repo;
+use crate::adapters::{
+    AdapterError, AdapterHealth, BoxFuture, CompiledSubscription, GitHubPublicAdapter, NodeAdapter,
+    NodeAdapterHost, PublishErrorCode, PublishOutcome, PublishStatus,
+};
 use crate::engine::config::{
     ChannelMode, ChannelPolicy, NodeConfig, NodeError, crypto_jwk_to_proto, profile_to_store,
     proto_ce_to_store, proto_filter_to_store, proto_jwk_to_crypto, store_ce_to_proto,
@@ -91,11 +96,12 @@ use crate::engine::http_util::{
     HttpClient, compute_etag, full_body,
 };
 use crate::engine::peer_link::{
-    ChannelDirectoryEntry, ChannelJoinResponse, ChannelPostRequest, KeyRegPayloadV2, KvSetBody,
-    MAX_JSON_RESPONSE_BYTES, ManifestFetchOutcome, P2pPairServerReply, PairBindingV2,
-    PairRequestV2, PairServerReply, PeerAuth, PeerKeyDirectoryEntry, PeerLink, PostMessageRequest,
-    PublishEventRequest, PutChannelEpochRequest, PutKeyRequest, PutKvEpochRequest,
-    PutSubscriptionsRequest, SubscriptionInputWire, http_auth_signing_input, spawn_sse_worker,
+    ChannelDirectoryEntry, ChannelJoinResponse, ChannelPostRequest, GuestPairReply,
+    GuestPairRequest, KeyRegPayloadV2, KvSetBody, MAX_JSON_RESPONSE_BYTES, ManifestFetchOutcome,
+    P2pPairServerReply, PairBindingV2, PairRequestV2, PairServerReply, PeerAuth,
+    PeerKeyDirectoryEntry, PeerLink, PostMessageRequest, PublishEventRequest,
+    PutChannelEpochRequest, PutKeyRequest, PutKvEpochRequest, PutSubscriptionsRequest,
+    SubscriptionInputWire, guest_pair_proof_canonical, http_auth_signing_input, spawn_sse_worker,
 };
 
 const MANIFEST_TTL_MS: i64 = 24 * 60 * 60 * 1000;
@@ -200,6 +206,8 @@ pub struct UnifiedNode {
     kv_max_seen_version: Mutex<HashMap<(String, String, String), u64>>,
     remote_channel_policies: Mutex<HashMap<(String, String), ChannelPolicy>>,
     pending_p2p_offers: Mutex<HashMap<String, P2pOfferToken>>,
+    guest_join_timestamps: Mutex<VecDeque<i64>>,
+    github_public: Mutex<Option<Arc<GitHubPublicAdapter>>>,
     peer_links: RwLock<HashMap<String, Arc<PeerLink>>>,
     sse_tasks: Mutex<HashMap<String, JoinHandle<()>>>,
     inbox_tx: broadcast::Sender<String>,
@@ -287,6 +295,8 @@ impl UnifiedNode {
             kv_max_seen_version: Mutex::new(HashMap::new()),
             remote_channel_policies: Mutex::new(HashMap::new()),
             pending_p2p_offers: Mutex::new(HashMap::new()),
+            guest_join_timestamps: Mutex::new(VecDeque::new()),
+            github_public: Mutex::new(None),
             peer_links: RwLock::new(HashMap::new()),
             sse_tasks: Mutex::new(HashMap::new()),
             inbox_tx,
@@ -363,10 +373,63 @@ impl UnifiedNode {
             .expect("scheduler_handle lock poisoned") = Some(handle);
     }
 
-    /// Gracefully stops the scheduler and all background SSE peer links.
+    /// Attaches and starts a live demand-driven [`GitHubPublicAdapter`] on this `UnifiedNode`,
+    /// routing published CloudEvents straight into [`UnifiedNode::publish_event`], advertising its
+    /// topic in authenticated manifests, and syncing any already-persisted subscriptions.
+    pub async fn attach_github_public(
+        self: &Arc<Self>,
+        adapter: Arc<GitHubPublicAdapter>,
+    ) -> Result<(), NodeError> {
+        let host: Arc<dyn NodeAdapterHost> = Arc::new(UnifiedNodeAdapterHost {
+            node: Arc::downgrade(self),
+        });
+        adapter.start(host).await.map_err(|e| {
+            NodeError::BadRequest(format!("failed to start github-public adapter: {e}"))
+        })?;
+        *self
+            .github_public
+            .lock()
+            .expect("github_public lock poisoned") = Some(Arc::clone(&adapter));
+        self.sync_github_public_subscriptions(&adapter).await?;
+        Ok(())
+    }
+
+    /// Returns the currently attached [`GitHubPublicAdapter`], if any.
+    pub fn github_public_adapter(&self) -> Option<Arc<GitHubPublicAdapter>> {
+        self.github_public
+            .lock()
+            .expect("github_public lock poisoned")
+            .clone()
+    }
+
+    /// Gracefully stops any attached live source adapters (e.g. `GitHubPublicAdapter`).
+    pub async fn shutdown_adapters(&self) {
+        let adapter = self
+            .github_public
+            .lock()
+            .expect("github_public lock poisoned")
+            .take();
+        if let Some(gh) = adapter {
+            let _ = gh.stop().await;
+        }
+    }
+
+    /// Gracefully stops the scheduler, attached source adapters, and all background SSE peer links.
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
         self.scheduler_notify.notify_waiters();
+        if let Some(gh) = self
+            .github_public
+            .lock()
+            .expect("github_public lock poisoned")
+            .take()
+        {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = gh.stop().await;
+                });
+            }
+        }
         if let Some(h) = self
             .scheduler_handle
             .lock()
@@ -749,6 +812,21 @@ impl UnifiedNode {
                             topic: t.topic.clone(),
                             kind: t.kind.clone(),
                             description: t.description.clone(),
+                        });
+                    }
+                }
+                if let Some(gh) = self.github_public_adapter() {
+                    let gh_topic = gh.topic();
+                    if !topics.iter().any(|t| t.topic == gh_topic)
+                        && peer_may_see_topic(&peer.scopes, gh_topic)
+                    {
+                        topics.push(AdvertisedTopic {
+                            topic: gh_topic.to_string(),
+                            kind: Some("github-public".to_string()),
+                            description: Some(
+                                "Public GitHub repository events (demand-driven ETag polling)"
+                                    .to_string(),
+                            ),
                         });
                     }
                 }
@@ -1382,6 +1460,191 @@ impl UnifiedNode {
             grant: signed_grant,
             auth_credential,
             signed_manifest,
+        })
+    }
+
+    /// Server-side handler for opt-in self-service `POST /v1/guest/pair` (`guest-ro` confinement).
+    ///
+    /// Security invariants:
+    /// - Returns `404` when `!config.guest_pairing.enabled`.
+    /// - Enforces sliding-window `max_joins_per_minute` (`429 rate_limited`).
+    /// - Verifies Ed25519 possession proof under domain `"guest-pair"` over canonical RFC 8785 JCS
+    ///   with a ±5 minute RFC 3339 timestamp skew bound.
+    /// - Anti-hijack fail-closed: refuses (`409 peer_key_mismatch`) to overwrite any already
+    ///   registered peer with a different Ed25519 signing key or non-Guest trust tier; re-enrolling
+    ///   with the SAME Ed25519 key is idempotent.
+    pub fn handle_guest_pair_request(
+        &self,
+        req: &GuestPairRequest,
+    ) -> Result<GuestPairReply, NodeError> {
+        if !self.config.guest_pairing.enabled {
+            return Err(NodeError::NotFound(
+                "guest pairing is disabled on this node".into(),
+            ));
+        }
+
+        let now = now_ms();
+        {
+            let mut window = self
+                .guest_join_timestamps
+                .lock()
+                .expect("guest_join_timestamps lock poisoned");
+            let cutoff = now.saturating_sub(60_000);
+            while window.front().is_some_and(|&ts| ts < cutoff) {
+                window.pop_front();
+            }
+            let limit = self.config.guest_pairing.max_joins_per_minute as usize;
+            if limit == 0 || window.len() >= limit {
+                return Err(NodeError::RateLimited {
+                    detail: format!("guest pairing rate limit exceeded ({limit} requests/minute)"),
+                    retry_after_secs: Some(60),
+                });
+            }
+            window.push_back(now);
+        }
+
+        if req.node_id == LOCAL_NODE_ID {
+            return Err(NodeError::BadRequest(
+                "guest nodeId cannot be reserved 'local'".into(),
+            ));
+        }
+        let _ = NodeId::new(&req.node_id)?;
+        if req.node_id == self.config.node_id.as_str() {
+            return Err(NodeError::BadRequest(
+                "guest nodeId cannot equal this hub's own nodeId".into(),
+            ));
+        }
+
+        let signing_pk = req.ed25519_jwk.to_ed25519()?;
+        let enc_pk = req.x25519_jwk.to_x25519()?;
+
+        let ts_ms = parse_rfc3339_millis(&req.timestamp)?;
+        if (now - ts_ms).abs() > HTTP_AUTH_SKEW_MS {
+            return Err(NodeError::Unauthorized(
+                "guest pairing timestamp outside allowed ±5 minute skew window".into(),
+            ));
+        }
+
+        let canonical = guest_pair_proof_canonical(
+            self.config.node_id.as_str(),
+            &req.node_id,
+            &req.ed25519_jwk,
+            &req.x25519_jwk,
+            &req.timestamp,
+        )?;
+        signing_pk
+            .verify_domain_b64("guest-pair", canonical.as_bytes(), &req.proof_sig)
+            .map_err(|_| NodeError::Unauthorized("invalid guest-pair proofSig".into()))?;
+
+        let raw_scopes = if self.config.guest_pairing.scopes.is_empty() {
+            ScopePreset::GuestRo.expand()
+        } else {
+            self.config.guest_pairing.scopes.clone()
+        };
+        let guest_scopes = expand_v2_scopes(&raw_scopes)
+            .map_err(|e| NodeError::BadRequest(format!("invalid guest pairing scopes: {e}")))?;
+
+        let signing_kid = signing_pk.kid();
+        let enc_kid = enc_pk.kid();
+        let sign_jwk_json = serde_json::to_string(&req.ed25519_jwk)?;
+        let enc_jwk_json = serde_json::to_string(&req.x25519_jwk)?;
+
+        // Anti-hijack check + atomic registration under the NodeDb mutex.
+        {
+            let db = self.db();
+            let existing_peer = db.peers().get_peer(&req.node_id)?;
+            let existing_sign_keys =
+                db.peers()
+                    .list_peer_keys(&req.node_id, Some(KeyUse::Signing), true)?;
+
+            if let Some(peer) = existing_peer {
+                if peer.status != PeerStatus::Active {
+                    return Err(NodeError::Unauthorized(format!(
+                        "peer '{}' is not active (status: {})",
+                        req.node_id,
+                        peer.status.as_str()
+                    )));
+                }
+                if peer.trust_tier != TrustTier::Guest {
+                    return Err(NodeError::PeerKeyMismatch(format!(
+                        "peer '{}' is already registered as a non-guest peer",
+                        req.node_id
+                    )));
+                }
+                if existing_sign_keys.is_empty() {
+                    return Err(NodeError::PeerKeyMismatch(format!(
+                        "peer '{}' is already registered without a matching signing key",
+                        req.node_id
+                    )));
+                }
+            }
+
+            if !existing_sign_keys.is_empty() {
+                let all_match = existing_sign_keys.iter().all(|k| {
+                    k.kid == signing_kid
+                        && serde_json::from_str::<CryptoOkpJwk>(&k.jwk_json)
+                            .ok()
+                            .and_then(|j| j.to_ed25519().ok())
+                            == Some(signing_pk)
+                });
+                if !all_match {
+                    return Err(NodeError::PeerKeyMismatch(format!(
+                        "peer '{}' is already registered with a different Ed25519 signing key",
+                        req.node_id
+                    )));
+                }
+            }
+
+            db.peers().upsert_peer(
+                &PeerInput {
+                    peer_id: req.node_id.clone(),
+                    endpoint: None,
+                    profile: hyp_store::PeerProfile::Local,
+                    trust_tier: TrustTier::Guest,
+                    status: PeerStatus::Active,
+                    scopes: guest_scopes.clone(),
+                    auth_credential_ref: None,
+                },
+                now,
+            )?;
+            db.peers().upsert_peer_key(
+                &PeerKeyInput {
+                    peer_id: req.node_id.clone(),
+                    kid: signing_kid,
+                    key_use: KeyUse::Signing,
+                    jwk_json: sign_jwk_json,
+                    status: KeyStatus::Active,
+                    expires_at: None,
+                },
+                now,
+            )?;
+            db.peers().upsert_peer_key(
+                &PeerKeyInput {
+                    peer_id: req.node_id.clone(),
+                    kid: enc_kid,
+                    key_use: KeyUse::Encryption,
+                    jwk_json: enc_jwk_json,
+                    status: KeyStatus::Active,
+                    expires_at: None,
+                },
+                now,
+            )?;
+        }
+
+        let caller = AuthenticatedPeer {
+            peer_id: req.node_id.clone(),
+            scopes: ScopeSet::from_strings(&guest_scopes),
+            trust_tier: TrustTier::Guest,
+        };
+        let (manifest, _, _) = self.build_signed_manifest(Some(&caller))?;
+
+        Ok(GuestPairReply {
+            ok: true,
+            node_id: self.config.node_id.to_string(),
+            peer_id: req.node_id.clone(),
+            preset: "guest-ro".to_string(),
+            scopes: guest_scopes,
+            manifest,
         })
     }
 
@@ -4252,6 +4515,28 @@ impl UnifiedNode {
         let sub_id = req.id.unwrap_or_else(uuid_v4);
         let now = now_ms();
 
+        // Fail-closed subscribe-time validation against attached `github-public` adapter for local topic.
+        let local_gh_adapter = if resolved.node == NodeScope::Local {
+            self.github_public_adapter()
+                .filter(|a| a.topic() == topic_str)
+        } else {
+            None
+        };
+        let mut local_adapter_diags = Vec::new();
+        if let Some(ref adapter) = local_gh_adapter {
+            let diags = adapter.validate_subscription(&topic_str, &req.filters).await;
+            if let Some(first_err) = diags
+                .iter()
+                .find(|d| d.severity == DiagnosticSeverity::Error)
+            {
+                return Err(NodeError::SubscriptionRejected {
+                    detail: first_err.message.clone(),
+                    diagnostics: diags,
+                });
+            }
+            local_adapter_diags = diags;
+        }
+
         let subscription = {
             let db = self.db();
             db.events().upsert_subscription(
@@ -4271,8 +4556,12 @@ impl UnifiedNode {
         };
 
         if resolved.node == NodeScope::Local {
+            if let Some(ref adapter) = local_gh_adapter {
+                self.sync_github_public_subscriptions(adapter).await?;
+            }
             let catalog = self.local_topic_catalog();
-            let diagnostics = diagnose_subscription(&topic_str, &req.filters, &catalog);
+            let mut diagnostics = diagnose_subscription(&topic_str, &req.filters, &catalog);
+            diagnostics.extend(local_adapter_diags);
             return Ok(SubscribeResult {
                 subscription,
                 origin_node: origin_node_str,
@@ -4389,6 +4678,17 @@ impl UnifiedNode {
             })
             .collect();
 
+        if let Some(gh) = self.github_public_adapter() {
+            let gh_topic = gh.topic();
+            if !catalog.iter().any(|c| c.topic == gh_topic) {
+                catalog.push(TopicCatalogEntry {
+                    topic: gh_topic.to_string(),
+                    has_provisioned_publisher: true,
+                    metadata: None,
+                    observed: ObservedTopicStats::default(),
+                });
+            }
+        }
         if !catalog.iter().any(|c| c.topic == "kv") {
             catalog.push(TopicCatalogEntry {
                 topic: "kv".to_string(),
@@ -4400,33 +4700,118 @@ impl UnifiedNode {
         catalog
     }
 
+    /// Recomputes all active compiled subscriptions for `adapter.topic()` from `EventStore`
+    /// across all peers and notifies the demand-driven `GitHubPublicAdapter`.
+    async fn sync_github_public_subscriptions(
+        &self,
+        adapter: &Arc<GitHubPublicAdapter>,
+    ) -> Result<(), NodeError> {
+        let target_topic = adapter.topic().to_string();
+        let compiled: Vec<CompiledSubscription> = {
+            let db = self.db();
+            db.events()
+                .list_subscriptions(None)?
+                .into_iter()
+                .filter(|s| s.topic == target_topic)
+                .map(|s| CompiledSubscription {
+                    id: s.id,
+                    subscriber: s.subscriber,
+                    topic: s.topic,
+                    filters: s.filters.iter().map(store_filter_to_proto).collect(),
+                    coalesce_seconds: s.coalesce_seconds.max(0) as u32,
+                })
+                .collect()
+        };
+        adapter
+            .on_subscriptions_changed(&target_topic, &compiled)
+            .await;
+        Ok(())
+    }
+
     /// Server-side handler for `PUT /v1/subscriptions`: checks `stream:subscribe` scope &
-    /// dynamic constraints, runs `diagnose_subscription`, namespaces remote subscriber IDs so
-    /// multiple peers' `pd:<hash>:0` shards never collide, and persists in `EventStore`.
-    pub fn handle_server_put_subscriptions(
+    /// dynamic `guest-ro` constraints, runs fail-closed `GitHubPublicAdapter::validate_subscription`
+    /// BEFORE saving, persists in `EventStore`, and immediately syncs active subscriptions into
+    /// `GitHubPublicAdapter::on_subscriptions_changed`.
+    pub async fn handle_server_put_subscriptions(
         &self,
         caller: &AuthenticatedPeer,
         req: PutSubscriptionsRequest,
     ) -> Result<(Vec<Subscription>, Vec<SubscriptionDiagnostic>), NodeError> {
         let catalog = self.local_topic_catalog();
+        let gh_adapter = self.github_public_adapter();
         let mut all_diagnostics = Vec::new();
         let mut specs = Vec::with_capacity(req.subscriptions.len());
+        let mut incoming_guest_repos: BTreeSet<String> = BTreeSet::new();
+        let incoming_namespaced_ids: HashSet<String> = req
+            .subscriptions
+            .iter()
+            .map(|s| format!("{}::{}", caller.peer_id, s.id))
+            .collect();
 
         for sub in &req.subscriptions {
             match caller.scopes.check_stream_subscribe(&sub.topic, &sub.filters) {
                 Ok(approval) => {
+                    if caller.trust_tier == TrustTier::Guest {
+                        let Some(confined_repos) =
+                            extract_confined_values(&sub.filters, "exact", "repo")
+                        else {
+                            self.require_scope(
+                                caller,
+                                false,
+                                &format!("stream:subscribe={}[require=exact.repo]", sub.topic),
+                            )?;
+                            unreachable!();
+                        };
+                        if confined_repos.is_empty() {
+                            self.require_scope(
+                                caller,
+                                false,
+                                &format!("stream:subscribe={}[require=exact.repo]", sub.topic),
+                            )?;
+                        }
+                        for raw_repo in confined_repos {
+                            let canonical = canonicalize_repo(&raw_repo)
+                                .unwrap_or_else(|| raw_repo.to_ascii_lowercase());
+                            incoming_guest_repos.insert(canonical);
+                        }
+                    }
+
+                    // Fail-closed subscribe-time validation against attached `github-public` adapter
+                    // BEFORE writing anything to SQLite!
+                    if let Some(ref adapter) = gh_adapter {
+                        if sub.topic == adapter.topic() {
+                            let adapter_diags = adapter
+                                .validate_subscription(&sub.topic, &sub.filters)
+                                .await;
+                            if let Some(first_err) = adapter_diags
+                                .iter()
+                                .find(|d| d.severity == DiagnosticSeverity::Error)
+                            {
+                                return Err(NodeError::SubscriptionRejected {
+                                    detail: first_err.message.clone(),
+                                    diagnostics: adapter_diags,
+                                });
+                            }
+                            all_diagnostics.extend(adapter_diags);
+                        }
+                    }
+
                     let diags = diagnose_subscription(&sub.topic, &sub.filters, &catalog);
                     all_diagnostics.extend(diags);
                     let store_filters: Vec<hyp_store::Filter> =
                         sub.filters.iter().map(proto_filter_to_store).collect();
                     let namespaced_id = format!("{}::{}", caller.peer_id, sub.id);
-                    let effective_wakes = match (sub.max_wakes_per_hour, approval.max_batches_per_hour)
-                    {
-                        (Some(a), Some(b)) => Some(a.min(b as usize)),
-                        (Some(a), None) => Some(a),
-                        (None, Some(b)) => Some(b as usize),
-                        (None, None) => None,
-                    };
+                    let mut effective_wakes =
+                        match (sub.max_wakes_per_hour, approval.max_batches_per_hour) {
+                            (Some(a), Some(b)) => Some(a.min(b as usize)),
+                            (Some(a), None) => Some(a),
+                            (None, Some(b)) => Some(b as usize),
+                            (None, None) => None,
+                        };
+                    if caller.trust_tier == TrustTier::Guest {
+                        let cap = self.config.guest_pairing.max_batches_per_hour as usize;
+                        effective_wakes = Some(effective_wakes.map_or(cap, |w| w.min(cap)));
+                    }
                     specs.push(SubscriptionSpec {
                         id: namespaced_id,
                         origin_node: self.config.node_id.to_string(),
@@ -4442,6 +4827,41 @@ impl UnifiedNode {
                 Err(hyp_proto::scopes::ScopeDenial::Denied { missing_scope, .. }) => {
                     self.require_scope(caller, false, &missing_scope)?;
                 }
+            }
+        }
+
+        // Cumulative per-guest repo cap across ALL active subscriptions for this guest peer!
+        if caller.trust_tier == TrustTier::Guest {
+            let max_repos = self.config.guest_pairing.max_repos_per_guest;
+            let mut total_repos = incoming_guest_repos;
+            {
+                let db = self.db();
+                for existing in db.events().list_subscriptions(Some(&caller.peer_id))? {
+                    if incoming_namespaced_ids.contains(&existing.id) {
+                        continue;
+                    }
+                    if req.replace_topic.as_deref() == Some(existing.topic.as_str()) {
+                        continue;
+                    }
+                    let proto_filters: Vec<ProtoFilter> =
+                        existing.filters.iter().map(store_filter_to_proto).collect();
+                    if let Some(existing_repos) =
+                        extract_confined_values(&proto_filters, "exact", "repo")
+                    {
+                        for raw_repo in existing_repos {
+                            let canonical = canonicalize_repo(&raw_repo)
+                                .unwrap_or_else(|| raw_repo.to_ascii_lowercase());
+                            total_repos.insert(canonical);
+                        }
+                    }
+                }
+            }
+            if total_repos.len() > max_repos {
+                self.require_scope(
+                    caller,
+                    false,
+                    &format!("stream:subscribe=github[maxValues={max_repos}]"),
+                )?;
             }
         }
 
@@ -4469,7 +4889,50 @@ impl UnifiedNode {
             out
         };
 
+        if let Some(ref adapter) = gh_adapter {
+            let gh_topic = adapter.topic();
+            let touches_gh = req.replace_topic.as_deref() == Some(gh_topic)
+                || req.subscriptions.iter().any(|s| s.topic == gh_topic);
+            if touches_gh {
+                self.sync_github_public_subscriptions(adapter).await?;
+            }
+        }
+
         Ok((saved, all_diagnostics))
+    }
+
+    /// Server-side handler for `DELETE /v1/subscriptions?id=...`: deletes only caller-owned
+    /// subscriptions and notifies `GitHubPublicAdapter::on_subscriptions_changed` so pollers tear
+    /// down cleanly when refcount drops to `0`.
+    pub async fn handle_server_delete_subscription(
+        &self,
+        caller: &AuthenticatedPeer,
+        id: &str,
+    ) -> Result<bool, NodeError> {
+        let namespaced = format!("{}::{id}", caller.peer_id);
+        let deleted = {
+            let db = self.db();
+            let owned_ids: HashSet<String> = db
+                .events()
+                .list_subscriptions(Some(&caller.peer_id))?
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
+            if owned_ids.contains(&namespaced) {
+                db.events().delete_subscription(&namespaced)?
+            } else if owned_ids.contains(id) {
+                db.events().delete_subscription(id)?
+            } else {
+                false
+            }
+        };
+
+        if deleted {
+            if let Some(adapter) = self.github_public_adapter() {
+                self.sync_github_public_subscriptions(&adapter).await?;
+            }
+        }
+        Ok(deleted)
     }
 
     /// Publishes an event onto a local or remote topic, stamping provenance hop headers.
@@ -4705,8 +5168,68 @@ impl UnifiedNode {
 }
 
 // ============================================================================
-// Internal helpers
+// Internal helpers & NodeAdapterHost bridge
 // ============================================================================
+
+struct UnifiedNodeAdapterHost {
+    node: Weak<UnifiedNode>,
+}
+
+impl NodeAdapterHost for UnifiedNodeAdapterHost {
+    fn publish_event<'a>(
+        &'a self,
+        topic: &'a str,
+        event: ProtoCloudEvent,
+    ) -> BoxFuture<'a, Result<PublishOutcome, AdapterError>> {
+        Box::pin(async move {
+            let Some(node) = self.node.upgrade() else {
+                return Err(AdapterError::NotRunning("unified-node".into()));
+            };
+            let qualified = format!("{LOCAL_NODE_ID}.{topic}");
+            let res = node.publish_event(&qualified, event).await.map_err(|err| {
+                let code = match &err {
+                    NodeError::PayloadTooLarge(_) => PublishErrorCode::TooLarge,
+                    NodeError::CloudEvent(_) | NodeError::BadRequest(_) => {
+                        PublishErrorCode::InvalidEvent
+                    }
+                    NodeError::Conflict(_) => PublishErrorCode::IdConflict,
+                    _ => PublishErrorCode::Unavailable,
+                };
+                AdapterError::PublishFailed {
+                    code,
+                    message: err.to_string(),
+                }
+            })?;
+            let status = if res.deduplicated {
+                PublishStatus::Duplicate
+            } else {
+                PublishStatus::Stored
+            };
+            Ok(PublishOutcome {
+                status,
+                matched: res.matched,
+            })
+        })
+    }
+
+    fn update_status<'a>(
+        &'a self,
+        _adapter_id: &'a str,
+        _health: AdapterHealth,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn report_delivery_failed<'a>(
+        &'a self,
+        _adapter_id: &'a str,
+        _target: &'a str,
+        _events: Vec<hyp_proto::rpc::EventKeyRef>,
+        _reason: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+}
 
 fn map_provenance_err(err: ProvenanceError) -> NodeError {
     match err {

@@ -12,15 +12,16 @@ pub mod server;
 
 pub use config::{
     ChannelMode, ChannelPolicy, DEFAULT_HYPHAE_VERSION, E2eePolicy, EscalationConfig,
-    ForwardingMode, ForwardingPolicy, ForwardingRule, KvNamespaceConfig, NodeConfig, NodeError,
-    NodeProfile, PeerConfig, TopicConfig,
+    ForwardingMode, ForwardingPolicy, ForwardingRule, GuestPairingConfig, KvNamespaceConfig,
+    NodeConfig, NodeError, NodeProfile, PeerConfig, TopicConfig,
 };
 pub use node::{
     AuthenticatedPeer, KvWriteRequest, PeerLinkInfo, SendDmResult, SubscribeRequest,
     SubscribeResult, TransferSendResult, UnifiedNode,
 };
 pub use peer_link::{
-    ChannelDirectoryEntry, ChannelJoinResponse, ChannelsResponse, HandlesResponse,
-    ManifestFetchOutcome, P2pPairServerReply, PairServerReply, PeerAuth, PeerKeyDirectoryEntry,
-    PeerKeysResponse, PeerLink,
+    ChannelDirectoryEntry, ChannelJoinResponse, ChannelsResponse, GuestPairProofPayload,
+    GuestPairReply, GuestPairRequest, HandlesResponse, ManifestFetchOutcome, P2pPairServerReply,
+    PairServerReply, PeerAuth, PeerKeyDirectoryEntry, PeerKeysResponse, PeerLink,
+    guest_pair_proof_canonical,
 };
