@@ -71,67 +71,35 @@
           </div>
         </div>
 
-        <!-- LIVE ART STAGE: Nanobana mycelium screenprint + floating live thread cards -->
-        <div class="art-stage" id="artStage">
-          <div class="stage-top">
-            <div class="float-card" data-node="macbook">
-              <div class="fc-top">
-                <span class="fc-addr">bogdan@macbook/agy</span>
-                <span class="fc-tag" id="tag-macbook">Antigravity</span>
-              </div>
-              <p class="fc-msg" id="msg-macbook">Parked cleanly on 0-CPU <code>hph wait</code>. Ready for peer pings.</p>
-              <div class="fc-meta">
-                <span>macbook-pro · bogdan</span>
-                <span id="mech-macbook">hph wait</span>
-              </div>
+        <!-- HERO VISUAL: Layered nanobana art plates + ONE crisp foreground live terminal + corner toast -->
+        <div class="hero-visual">
+          <div class="art-swatch-back" aria-hidden="true"></div>
+          <div class="art-plate-main" aria-hidden="true"></div>
+
+          <div class="live-term">
+            <div class="lt-bar">
+              <div class="lt-dots"><i></i><i></i><i></i></div>
+              <span class="lt-title">hph watch · 3 servers · 5 harnesses</span>
+              <span class="lt-status"><span class="pulse-dot"></span>live · 0 poll</span>
             </div>
 
-            <div class="float-card" data-node="gn">
-              <div class="fc-top">
-                <span class="fc-addr">ops@gn/openclaw</span>
-                <span class="fc-tag" id="tag-gn">OpenClaw · T3</span>
+            <div class="lt-body" id="heroTermLines"></div>
+
+            <div class="lt-foot">
+              <div class="lt-actions">
+                <button class="lt-btn" id="heroNextBtn" type="button">Next event →</button>
               </div>
-              <p class="fc-msg" id="msg-gn">Orchestrating #incidents and PR review across the fleet.</p>
-              <div class="fc-meta">
-                <span>great-northern · ops</span>
-                <span id="mech-gn">mesh_channel_post</span>
-              </div>
+              <span id="heroTermMeta">3 owners · 3 hosts · 0 poll</span>
             </div>
           </div>
 
-          <div class="stage-center-pill" id="stageWirePill">
-            <span class="pulse-dot"></span>
-            <span id="stageWireText">Prometheus firing -> waking ops@solace/herdr &amp; ops@gn/openclaw</span>
-          </div>
-
-          <div>
-            <div class="stage-bottom">
-              <div class="float-card stream-card" data-node="stream">
-                <div class="fc-top">
-                  <span class="fc-addr" id="addr-stream">prometheus/prod</span>
-                  <span class="fc-tag" id="tag-stream">topic:prometheus</span>
-                </div>
-                <p class="fc-msg" id="msg-stream">HighErrorRate firing on checkout-api (severity=critical)</p>
-                <div class="fc-meta">
-                  <span id="meta-stream">HMAC verified · CloudEvents</span>
-                  <span>0600 secret</span>
-                </div>
-              </div>
-
-              <div class="float-card" data-node="solace">
-                <div class="fc-top">
-                  <span class="fc-addr">maya@solace/codex</span>
-                  <span class="fc-tag" id="tag-solace">Codex · Herdr</span>
-                </div>
-                <p class="fc-msg" id="msg-solace">Wakes natively via codex queue or hc interrupt. Zero polling.</p>
-                <div class="fc-meta">
-                  <span>solace (Linux) · maya</span>
-                  <span id="mech-solace">codex queue</span>
-                </div>
-              </div>
+          <div class="corner-toast" id="heroToast">
+            <div class="ct-head">
+              <span class="ct-label"><span class="ct-dot"></span><span id="ctLabel">Telegram · @OpsBot</span></span>
+              <span class="ct-pill" id="ctPill">0600 isolated</span>
             </div>
-
-            <div class="stage-controls" id="stagePips"></div>
+            <p class="ct-body" id="ctBody"></p>
+            <div class="ct-meta" id="ctMeta"></div>
           </div>
         </div>
       </div>

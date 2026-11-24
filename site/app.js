@@ -33,104 +33,127 @@ document.getElementById("heroCopyBtn").addEventListener("click", (e) => {
 renderHeroInstall();
 
 // ============================================================================
-// 2. HERO ART STAGE — LIVE CROSS-OWNER / CROSS-HARNESS / STREAM ANIMATION
+// 2. HERO LIVE TERMINAL + FLOATING CORNER TOAST
 // ============================================================================
-const STAGE_SCENES = [
+const HERO_EVENTS = [
   {
+    ts: "09:14:02",
+    src: "prometheus/prod",
+    srcCls: "alert",
     alert: true,
-    active: ["stream", "gn", "solace"],
-    wire: "Prometheus HighErrorRate -> hc interrupt (solace) + queue (openclaw)",
-    stream: { addr: "prometheus/prod", tag: "topic:prometheus", msg: "HighErrorRate firing on checkout-api (severity=critical)", meta: "HMAC verified · CloudEvents" },
-    macbook: { tag: "Antigravity", msg: "Parked on 0-CPU hph wait. Not woken by noise.", mech: "hph wait (idle)" },
-    gn: { tag: "OpenClaw · woke", msg: "Received critical alert -> gathering logs & posting to #incidents.", mech: "queue wakeup" },
-    solace: { tag: "Herdr · interrupted", msg: "ops@solace/herdr interrupted mid-turn to inspect checkout-api.", mech: "hc interrupt" },
+    msg: "HighErrorRate firing · checkout-api (4.2%)",
+    via: "hc interrupt",
+    toast: {
+      label: "ops@solace/herdr",
+      pill: "interrupted",
+      body: "Woke mid-turn via hc interrupt on Linux box solace — inspecting Redis pool.",
+      meta: "HMAC verified · topic:prometheus",
+    },
   },
   {
+    ts: "09:14:04",
+    src: "ops@gn/openclaw",
+    srcCls: "",
     alert: false,
-    active: ["gn", "macbook", "solace"],
-    wire: "ops@gn/openclaw -> #incidents -> bogdan@macbook/agy + maya@solace/codex",
-    stream: { addr: "#incidents", tag: "channel fan-out", msg: "3 owners, 3 servers, 3 harnesses synced in one SQLite room.", meta: "mesh_channel_post" },
-    macbook: { tag: "Antigravity · woke", msg: "Woke via hph wait! Running regression suite on MacBook Pro.", mech: "0-CPU hph wait" },
-    gn: { tag: "OpenClaw · posted", msg: "\"Checkout pool exhausted at 4.2% error rate — Maya check Redis.\"", mech: "mesh_channel_post" },
-    solace: { tag: "Codex · woke", msg: "Woke natively via codex queue. Reproducing Redis timeout locally.", mech: "codex queue" },
+    msg: "#incidents -> fanned out to bogdan@macbook + maya@solace",
+    via: "channel_post",
+    toast: {
+      label: "#incidents · 3 owners",
+      pill: "fan-out",
+      body: "OpenClaw synced Antigravity (MacBook) & Codex (solace) in one SQLite room.",
+      meta: "mesh_channel_post · 0 echo",
+    },
   },
   {
+    ts: "09:14:07",
+    src: "maya@solace/codex",
+    srcCls: "",
     alert: false,
-    active: ["stream", "gn", "solace"],
-    wire: "GitHub pull_request.opened (#412) -> T3 Code pr-bot (maya@gn)",
-    stream: { addr: "github/acme/payments", tag: "topic:github", msg: "PR #412 opened by maya@solace/codex: Cap Redis wait queue", meta: "X-Hub-Signature-256 ok" },
-    macbook: { tag: "Antigravity", msg: "Tests green on checkout-api (42/42 passed).", mech: "mesh_send" },
-    gn: { tag: "T3 Code · woke", msg: "maya@gn/pr-bot dispatched via T3 RPC to review PR #412.", mech: "T3 dispatch" },
-    solace: { tag: "Codex · pushed", msg: "Pushed fix & notified bogdan@macbook/agy directly.", mech: "rollout verified" },
+    msg: "Reproduced pool timeout & opened PR #412",
+    via: "codex queue",
+    toast: {
+      label: "maya@solace/codex",
+      pill: "rollout verified",
+      body: "Woke natively via codex queue with zero polling; messaged bogdan@macbook/agy.",
+      meta: "callId verified · codex CLI",
+    },
   },
   {
+    ts: "09:14:09",
+    src: "github/payments",
+    srcCls: "amber",
     alert: false,
-    active: ["macbook", "stream"],
-    wire: "bogdan@macbook/agy -> fd-3 bridge -> Telegram @OpsBot (0600 token)",
-    stream: { addr: "telegram/@OpsBot", tag: "fd-3 bridge", msg: "Posted to #ops: \"PR #412 verified & merged — p99 38ms, 0 errors.\"", meta: "0600 secret isolated" },
-    macbook: { tag: "Antigravity · replied", msg: "Sent summary through local fd-3 pipe without touching bot token.", mech: "fd-3 post" },
-    gn: { tag: "OpenClaw", msg: "Incident #412 marked resolved across #incidents.", mech: "idle" },
-    solace: { tag: "Codex · Herdr", msg: "Cleanly back to work on solace.", mech: "idle" },
+    msg: "PR #412 opened -> dispatched review to maya@gn/t3",
+    via: "T3 dispatch",
+    toast: {
+      label: "maya@gn/t3",
+      pill: "T3 Code",
+      body: "Matched CloudEvents filter subject:'acme/payments' and started automated review.",
+      meta: "X-Hub-Signature-256 ok",
+    },
+  },
+  {
+    ts: "09:14:11",
+    src: "bogdan@mac/agy",
+    srcCls: "",
+    alert: false,
+    msg: "42/42 tests green -> posted summary to Telegram",
+    via: "hph wait + fd3",
+    toast: {
+      label: "Telegram · @OpsBot",
+      pill: "0600 isolated",
+      body: "\"PR #412 verified & merged — p99 38ms, 0 errors.\"",
+      meta: "bogdan@macbook/agy -> local fd-3 bridge",
+    },
   },
 ];
 
-let sceneIdx = 0;
-let sceneTimer = null;
+let heroIdx = 4; // Start on the full resolved story (shows all 5 lines + Telegram toast immediately!)
+let heroTimer = null;
 
-function renderStage() {
-  const s = STAGE_SCENES[sceneIdx];
-  const pill = document.getElementById("stageWirePill");
-  pill.classList.toggle("alert", s.alert);
-  document.getElementById("stageWireText").textContent = s.wire;
+function renderHeroTerm() {
+  const container = document.getElementById("heroTermLines");
+  container.innerHTML = HERO_EVENTS.map((ev, i) => `
+    <div class="lt-line ${i === heroIdx ? "current" : i < heroIdx ? "seen" : ""} ${ev.alert ? "is-alert" : ""}" data-hi-ev="${i}">
+      <span class="lt-ts">${ev.ts}</span>
+      <span class="lt-src ${ev.srcCls}">${ev.src}</span>
+      <span class="lt-msg">${esc(ev.msg)}<span class="lt-via">${ev.via}</span></span>
+    </div>
+  `).join("");
 
-  document.getElementById("addr-stream").textContent = s.stream.addr;
-  document.getElementById("tag-stream").textContent = s.stream.tag;
-  document.getElementById("msg-stream").textContent = s.stream.msg;
-  document.getElementById("meta-stream").textContent = s.stream.meta;
-
-  for (const k of ["macbook", "gn", "solace"]) {
-    document.getElementById(`tag-${k}`).textContent = s[k].tag;
-    document.getElementById(`msg-${k}`).textContent = s[k].msg;
-    document.getElementById(`mech-${k}`).textContent = s[k].mech;
-  }
-
-  document.querySelectorAll("#artStage .float-card").forEach((card) => {
-    const on = s.active.includes(card.dataset.node);
-    card.classList.toggle("active", on);
-    card.classList.toggle("alert", s.alert && on);
-  });
-
-  const pips = document.getElementById("stagePips");
-  pips.innerHTML = STAGE_SCENES.map((_, i) =>
-    `<button class="step-pip ${i === sceneIdx ? "active" : ""}" data-pip="${i}" aria-label="Step ${i + 1}" type="button"></button>`
-  ).join("");
-  pips.querySelectorAll("[data-pip]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      sceneIdx = Number(btn.dataset.pip);
-      renderStage();
-      resetSceneTimer();
+  container.querySelectorAll("[data-hi-ev]").forEach((row) => {
+    row.addEventListener("click", () => {
+      heroIdx = Number(row.dataset.hiEv);
+      renderHeroTerm();
+      resetHeroTimer();
     });
   });
+
+  const cur = HERO_EVENTS[heroIdx];
+  const toast = document.getElementById("heroToast");
+  toast.classList.toggle("is-alert", cur.alert);
+  document.getElementById("ctLabel").textContent = cur.toast.label;
+  document.getElementById("ctPill").textContent = cur.toast.pill;
+  document.getElementById("ctBody").textContent = cur.toast.body;
+  document.getElementById("ctMeta").textContent = cur.toast.meta;
 }
 
-function resetSceneTimer() {
-  if (sceneTimer) clearInterval(sceneTimer);
-  sceneTimer = setInterval(() => {
-    sceneIdx = (sceneIdx + 1) % STAGE_SCENES.length;
-    renderStage();
-  }, 3800);
+function resetHeroTimer() {
+  if (heroTimer) clearInterval(heroTimer);
+  heroTimer = setInterval(() => {
+    heroIdx = (heroIdx + 1) % HERO_EVENTS.length;
+    renderHeroTerm();
+  }, 3400);
 }
 
-document.querySelectorAll("#artStage .float-card").forEach((card) => {
-  card.addEventListener("click", () => {
-    sceneIdx = (sceneIdx + 1) % STAGE_SCENES.length;
-    renderStage();
-    resetSceneTimer();
-  });
+document.getElementById("heroNextBtn").addEventListener("click", () => {
+  heroIdx = (heroIdx + 1) % HERO_EVENTS.length;
+  renderHeroTerm();
+  resetHeroTimer();
 });
 
-renderStage();
-resetSceneTimer();
+renderHeroTerm();
+resetHeroTimer();
 
 // ============================================================================
 // 3. INTERACTIVE #INCIDENTS CHANNEL CARD (Inside Granola-style collage)
