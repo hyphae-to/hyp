@@ -449,9 +449,9 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   position: absolute;
   inset: 0;
   background-image: url("./assets/hero-mycelium.jpg");
-  background-size: max(1380px, 78vw) auto;
-  background-position: center top;
-  background-repeat: repeat;
+  background-size: cover;
+  background-position: center center;
+  background-repeat: no-repeat;
   opacity: 0.62;
   filter: saturate(0.95) contrast(1.04);
   pointer-events: none;
@@ -1436,6 +1436,7 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   background-image: url("./assets/collage-canvas.jpg");
   background-size: cover;
   background-position: center;
+  background-repeat: no-repeat;
   border: 1px solid var(--border-strong);
   box-shadow: var(--shadow-card);
   display: grid;
@@ -1566,6 +1567,7 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   background-image: url("./assets/streams-plate.jpg");
   background-size: cover;
   background-position: center;
+  background-repeat: no-repeat;
   color: var(--cream);
   padding: 92px 0;
   border-top: 1px solid rgba(255, 255, 255, 0.08);
@@ -1742,7 +1744,6 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
   .nav-right .btn-ghost { display: none; }
   .btn-pill { padding: 7px 14px; font-size: 0.8rem; }
   .story-band { padding: 66px 0 42px; }
-  .story-bg { background-size: 860px auto; }
   .scene-subtitle { font-size: 0.78rem; padding: 8px 12px; border-radius: 12px; max-width: 100%; }
   .myc-timeline { gap: 8px; margin-top: 8px; flex-wrap: wrap; height: auto; justify-content: center; }
   .tl-track-wrap { min-width: 100%; }
