@@ -1065,7 +1065,7 @@ resetStoryTimer();
   if (!viewport || !stage) return;
 
   const LOGICAL_W = 1120;
-  const LOGICAL_H = 356;
+  const LOGICAL_H = 456;
   const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
   function fitGateStage() {
@@ -1236,7 +1236,7 @@ resetStoryTimer();
         phase: 0.78,
         dur: 1680,
         startT: 0.14,
-        endT: 0.67,
+        endT: 0.72,
         deflect: "coral",
         dropTag: "✕ muted · @alice",
       });
@@ -1254,7 +1254,7 @@ resetStoryTimer();
       packets.push({ path: "g-in-0", cls: "", label: "DM @alice", phase: 0.02, dur: 1160, startT: 0.14, endT: 0.78, rippleNode: "green" });
     }
 
-    // Row 1: public.hyphae.to · GitHub OSS (starts UNLINKED -> 0 wire! Click "+ Link public.hyphae.to" to light up!)
+    // Row 1: public.hyphae.to · GitHub OSS (starts UNLINKED -> 0 wire! Click "Public Node" to light up!)
     let src1;
     if (!st.publicLinked) {
       unsubOrUnlinked += 1;
@@ -1281,7 +1281,7 @@ resetStoryTimer();
           phase: 0.36,
           dur: 1700,
           startT: 0.14,
-          endT: 0.66,
+          endT: 0.72,
           deflect: "coral",
           dropTag: "✕ quarantined · guard",
         });
@@ -1307,7 +1307,7 @@ resetStoryTimer();
         phase: 0.12,
         dur: 1680,
         startT: 0.14,
-        endT: 0.67,
+        endT: 0.74,
         deflect: "amber",
         dropTag: "✕ burst cap → notify",
       });
@@ -1320,7 +1320,7 @@ resetStoryTimer();
         queuedItems.push("CI ×12");
         src2 = { state: "warn", badge: "flood!", strand: "active" };
       }
-      packets.push({ path: "g-in-2", cls: "amber", label: "CI burst ×12", phase: 0.08, dur: 1120, startT: 0.14, endT: 0.76 });
+      packets.push({ path: "g-in-2", cls: "amber", label: "CI burst ×12", phase: 0.08, dur: 1120, startT: 0.14, endT: 0.78 });
     }
 
     // Row 3: #deploys · chatter ("mute" | "notify" | "queue")
@@ -1336,25 +1336,25 @@ resetStoryTimer();
         phase: 0.58,
         dur: 1680,
         startT: 0.14,
-        endT: 0.58,
+        endT: 0.74,
         deflect: "coral",
         dropTag: "✕ muted · 0 tokens",
       });
     } else if (deploysEff === "notify") {
       notifyItems.push("#deploys");
       src3 = { state: "notify", badge: "notify", strand: "active" };
-      packets.push({ path: "g-in-3", cls: "amber", label: "#deploys ok", phase: 0.16, dur: 1180, startT: 0.14, endT: 0.74 });
+      packets.push({ path: "g-in-3", cls: "amber", label: "#deploys ok", phase: 0.16, dur: 1180, startT: 0.14, endT: 0.78 });
     } else {
       queuedItems.push("#deploys");
       src3 = { state: "pass", badge: "queue", strand: "active" };
-      packets.push({ path: "g-in-3", cls: "moss", label: "#deploys ok", phase: 0.16, dur: 1180, startT: 0.14, endT: 0.74 });
+      packets.push({ path: "g-in-3", cls: "moss", label: "#deploys ok", phase: 0.16, dur: 1180, startT: 0.14, endT: 0.78 });
     }
 
     // Row 4: E2EE · diff.patch (saved directly to disk outside LLM prompt)
     const src4 = { state: "pass", badge: "→ disk", strand: "active" };
     if (st.focus) notifyItems.push("diff.patch");
     else queuedItems.push("diff");
-    packets.push({ path: "g-in-4", cls: "moss", label: "🔒 diff.patch", phase: 0.04, dur: 1180, startT: 0.14, endT: 0.74 });
+    packets.push({ path: "g-in-4", cls: "moss", label: "🔒 diff.patch", phase: 0.04, dur: 1180, startT: 0.14, endT: 0.78 });
 
     // Compute ONE single unified right-hand strand (#g-out) output reflecting 3-tier urgency!
     const hasInterrupt = interruptItems.length > 0;
@@ -1387,7 +1387,7 @@ resetStoryTimer();
         label: "⚡ interrupt: DM @alice",
         phase: 0.24,
         dur: 1240,
-        startT: 0.34,
+        startT: 0.25,
         endT: 0.78,
         rippleAgent: true,
       });
@@ -1402,7 +1402,7 @@ resetStoryTimer();
           : `notify: ${notifyItems.length} in inbox (1 line)`,
         phase: hasInterrupt ? 0.64 : 0.38,
         dur: 1900,
-        startT: 0.34,
+        startT: 0.25,
         endT: 0.78,
         rippleAgent: true,
       });
@@ -1415,7 +1415,7 @@ resetStoryTimer();
           label: `queue (idle): ${qLabel}`,
           phase: hasInterrupt ? 0.6 : 0.36,
           dur: 1840,
-          startT: 0.34,
+          startT: 0.25,
           endT: 0.78,
           rippleAgent: true,
         });
@@ -1427,7 +1427,7 @@ resetStoryTimer();
           label: `notify: ${notifyItems.length} digest (inbox)`,
           phase: hasQueued ? 0.74 : 0.38,
           dur: 1860,
-          startT: 0.34,
+          startT: 0.25,
           endT: 0.78,
           rippleAgent: !hasQueued,
         });
@@ -1439,7 +1439,7 @@ resetStoryTimer();
           label: "⚠ prompt inject leaked!",
           phase: 0.76,
           dur: 1460,
-          startT: 0.34,
+          startT: 0.25,
           endT: 0.78,
           rippleAgent: true,
         });
@@ -1549,7 +1549,7 @@ resetStoryTimer();
         "<strong>Upstream unsubscribed</strong> — <code>CI Burst</code> is cut completely at the source (<code>0 bytes</code> on the wire), while muted <code>#deploys</code> chatter still deflects locally at your gate shield (<code>0 tokens</code>).";
     } else {
       caption =
-        "<strong>Paired to private Team Node (<code>acme-team</code>)</strong> — DMs <code>queue</code> cleanly until idle, <strong>CI Burst protection</strong> steps noisy storms down to <code>notify</code>, and clicking <strong>+ Link public.hyphae.to</strong> pairs public OSS streams live behind your <strong>🛡 Injection Guard</strong>.";
+        "<strong>Paired to private Team Node (<code>acme-team</code>)</strong> — DMs <code>queue</code> cleanly until idle, <strong>CI Burst Cap</strong> steps noisy storms down to <code>notify</code>, and clicking <strong>Public Node</strong> links <code>public.hyphae.to</code> live behind your <strong>Injection Guard</strong>.";
     }
 
     return {
@@ -1584,12 +1584,21 @@ resetStoryTimer();
 
   function renderGateMobile(sc) {
     if (!mobileHost) return;
-    const ciLabel = gateState.ciMode === "burst" ? "Burst→notify" : gateState.ciMode === "unsub" ? "Unsub" : "All";
-    const ciCls = gateState.ciMode === "burst" ? "amber-tone on" : gateState.ciMode === "unsub" ? "off" : "danger-off";
-    const aliceLabel = gateState.aliceMode === "queue" ? "queue" : gateState.aliceMode === "interrupt" ? "interrupt!" : gateState.aliceMode === "notify" ? "notify" : "mute";
-    const aliceCls = gateState.aliceMode === "interrupt" ? "urgent-on" : gateState.aliceMode === "notify" ? "amber-tone on" : gateState.aliceMode === "mute" ? "coral-on" : "on";
-    const depLabel = gateState.deploysMode === "mute" ? "Muted" : gateState.deploysMode === "notify" ? "Notify" : "Queue";
-    const depCls = gateState.deploysMode === "mute" ? "coral-on" : gateState.deploysMode === "notify" ? "amber-tone on" : "on";
+    const ciFill = gateState.ciMode === "unsub" ? 34 : gateState.ciMode === "burst" ? 66 : 100;
+    const ciStateTxt = gateState.ciMode === "burst" ? "Burst → notify" : gateState.ciMode === "unsub" ? "Unsub · 0 wire" : "Pass all";
+    const aliceMap = {
+      queue: { cls: "is-on", txt: "Queue · idle" },
+      interrupt: { cls: "is-urgent", txt: "Interrupt" },
+      notify: { cls: "is-amber", txt: "Notify" },
+      mute: { cls: "", txt: "Muted" },
+    };
+    const aCur = aliceMap[gateState.aliceMode] || aliceMap.queue;
+    const depMap = {
+      mute: { cls: "", txt: "Muted" },
+      notify: { cls: "is-amber", txt: "Notify" },
+      queue: { cls: "is-on", txt: "Queue · idle" },
+    };
+    const dCur = depMap[gateState.deploysMode] || depMap.mute;
 
     mobileHost.innerHTML = `
       <div class="gm-mob-list">
@@ -1624,28 +1633,43 @@ resetStoryTimer();
         <div style="display:flex; align-items:center; gap:11px;">
           <img class="gate-local-node-img" src="./assets/node-hub.png?v=7" alt="Local Hyphae Node" />
           <div class="gm-mob-node-body">
-            <strong>Your Local Node (Control Gate)</strong>
+            <strong>Your Local Node</strong>
             <span>${esc(sc.rulePillText)}</span>
             <small>${esc(sc.nodeSubText)}</small>
           </div>
         </div>
-        <div class="gm-mob-switches">
-          <button class="gate-switch ${gateState.publicLinked ? "amber-tone on" : "invite-link"}" data-toggle="publicLinked" type="button" style="grid-column: 1 / -1; justify-content: space-between;">
-            <span style="display:inline-flex;align-items:center;gap:6px;"><span class="gsw-dot"></span><span class="gsw-label">${gateState.publicLinked ? "Public Node (public.hyphae.to)" : "+ Link public.hyphae.to"}</span></span>
-            <span class="gsw-state">${gateState.publicLinked ? "Linked" : "Unlinked"}</span>
-          </button>
-          <button class="gate-switch ${aliceCls}" data-toggle="aliceMode" type="button">
-            <span class="gsw-dot"></span><span class="gsw-label">@alice</span><span class="gsw-state">${aliceLabel}</span>
-          </button>
-          <button class="gate-switch ${ciCls}" data-toggle="ciMode" type="button">
-            <span class="gsw-dot"></span><span class="gsw-label">CI ×12</span><span class="gsw-state">${ciLabel}</span>
-          </button>
-          <button class="gate-switch ${depCls}" data-toggle="deploysMode" type="button">
-            <span class="gsw-dot"></span><span class="gsw-label">#deploys</span><span class="gsw-state">${depLabel}</span>
-          </button>
-          <button class="gate-switch ${gateState.guard ? "on" : "danger-off"}" data-toggle="guard" type="button">
-            <span class="gsw-dot"></span><span class="gsw-label">🛡 Guard</span><span class="gsw-state">${gateState.guard ? "ON" : "OFF"}</span>
-          </button>
+        <div class="gm-mob-cc">
+          <div class="cc-grid">
+            <button class="cc-tile ${gateState.publicLinked ? "is-amber" : ""}" data-toggle="publicLinked" type="button">
+              <span class="cc-medallion" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14.5 14.5 0 0 1 0 18M12 3a14.5 14.5 0 0 0 0 18"/></svg></span>
+              <span class="cc-copy"><strong>Public Node</strong><small>${gateState.publicLinked ? "Linked" : "Unlinked"}</small></span>
+            </button>
+            <button class="cc-tile ${gateState.guard ? "is-on" : "is-danger"}" data-toggle="guard" type="button">
+              <span class="cc-medallion" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.8-3 8.8-7 10-4-1.2-7-5.2-7-10V6l7-3z"/><path d="m9.5 12 1.8 1.8 3.6-3.8"/></svg></span>
+              <span class="cc-copy"><strong>Guard</strong><small>${gateState.guard ? "Active" : "Off"}</small></span>
+            </button>
+            <button class="cc-tile ${aCur.cls}" data-toggle="aliceMode" type="button">
+              <span class="cc-medallion" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg></span>
+              <span class="cc-copy"><strong>DM @alice</strong><small>${aCur.txt}</small></span>
+            </button>
+            <button class="cc-tile ${dCur.cls}" data-toggle="deploysMode" type="button">
+              <span class="cc-medallion" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"><path d="M5 9h14M5 15h14M10 4L8 20M16 4l-2 16"/></svg></span>
+              <span class="cc-copy"><strong>#deploys</strong><small>${dCur.txt}</small></span>
+            </button>
+          </div>
+          <div class="cc-slider-card" data-ci-state="${gateState.ciMode}">
+            <div class="cc-slider-head">
+              <strong>CI Burst Cap</strong>
+              <span>${ciStateTxt}</span>
+            </div>
+            <div class="cc-slider-track">
+              <div class="cc-slider-fill" style="width:${ciFill}%;"></div>
+              <button class="cc-step ${gateState.ciMode === "unsub" ? "active" : "covered"}" data-ci="unsub" type="button">Unsub</button>
+              <button class="cc-step ${gateState.ciMode === "burst" ? "active" : gateState.ciMode === "all" ? "covered" : ""}" data-ci="burst" type="button">Burst→notify</button>
+              <button class="cc-step ${gateState.ciMode === "all" ? "active" : ""}" data-ci="all" type="button">Pass all</button>
+            </div>
+          </div>
+          <button class="cc-reset-pill gm-mob-reset" data-reset-gate="1" type="button">Reset Controls</button>
         </div>
       </div>
       <div class="gm-mob-stem" aria-hidden="true">
@@ -1661,9 +1685,9 @@ resetStoryTimer();
             <small>${esc(sc.foot)}</small>
           </div>
         </div>
-        <button class="gate-focus-cta ${gateState.focus ? "active" : ""}" data-toggle="focus" type="button">
-          <span class="gfc-left"><span class="gfc-icon" aria-hidden="true">☾</span><span>Focus Mode (* → notify)</span></span>
-          <span class="gfc-pill">${gateState.focus ? "ON" : "OFF"}</span>
+        <button class="cc-tile cc-focus-tile ${gateState.focus ? "is-on" : ""}" data-toggle="focus" type="button">
+          <span class="cc-medallion" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.354 15.354A9 9 0 0 1 8.646 3.646 9.003 9.003 0 0 0 12 21a9.003 9.003 0 0 0 8.354-5.646z"/></svg></span>
+          <span class="cc-copy"><strong>Focus</strong><small>${gateState.focus ? "All → notify" : "Off · normal delivery"}</small></span>
         </button>
         <div class="gm-row"><span>${esc(sc.deliveredLabel)}</span><strong class="${sc.leakedInject || sc.hasInterrupt ? "coral" : ""}">${esc(sc.deliveredText)}</strong></div>
         <div class="gm-row"><span>${esc(sc.blockedLabel)}</span><strong class="${esc(sc.blockedCls)}">${esc(sc.blockedText)}</strong></div>
@@ -1821,9 +1845,9 @@ resetStoryTimer();
       if (bestDrop) {
         const { item, post, tagWindow } = bestDrop;
         const pNorm = post / tagWindow;
-        const anchorPt = item.path.getPointAtLength(item.len * (item.endT ?? 0.67));
-        const tx = Math.max(384, anchorPt.x - 56);
-        const ty = anchorPt.y + 34 + pNorm * 7;
+        const anchorPt = item.path.getPointAtLength(item.len * (item.endT ?? 0.72));
+        const tx = Math.min(448, Math.max(384, anchorPt.x - 42));
+        const ty = Math.min(168, anchorPt.y + 30 + pNorm * 5);
         const tOp = pNorm < 0.14 ? pNorm / 0.14 : pNorm > 0.72 ? (1 - pNorm) / 0.28 : 1;
         dropTagEl.className = `gate-drop-tag ${item.deflect === "amber" ? "amber" : ""}`.trim();
         dropTagEl.textContent = item.dropTag;
@@ -1837,10 +1861,10 @@ resetStoryTimer();
       if (bestMerge) {
         const { item, post, tagWindow } = bestMerge;
         const pNorm = post / tagWindow;
-        const ty = 64 - pNorm * 5;
+        const ty = 42 - pNorm * 4;
         const tOp = pNorm < 0.14 ? pNorm / 0.14 : pNorm > 0.74 ? (1 - pNorm) / 0.26 : 1;
         mergeTagEl.textContent = item.mergeTag;
-        mergeTagEl.style.left = `${(554 / LOGICAL_W) * 100}%`;
+        mergeTagEl.style.left = `${(564 / LOGICAL_W) * 100}%`;
         mergeTagEl.style.top = `${(ty / LOGICAL_H) * 100}%`;
         mergeTagEl.style.opacity = Math.max(0, Math.min(1, tOp)).toFixed(2);
       } else {
@@ -1869,17 +1893,8 @@ resetStoryTimer();
   function renderControlCenter() {
     const sc = buildScenario(gateState);
 
-    const cmdEl = document.getElementById("gateCmdPill");
-    if (cmdEl) cmdEl.textContent = lastCmd;
-
     const nodeSubEl = document.getElementById("gateNodeSub");
     if (nodeSubEl) nodeSubEl.textContent = sc.nodeSubText;
-
-    const ruleEl = document.getElementById("gateRulePill");
-    if (ruleEl) {
-      ruleEl.textContent = sc.rulePillText;
-      ruleEl.className = `gate-rule-pill ${sc.rulePillCls}`.trim();
-    }
 
     const valveEl = document.getElementById("gateValveRing");
     if (valveEl) {
@@ -1890,60 +1905,80 @@ resetStoryTimer();
     const capEl = document.getElementById("gateCaption");
     if (capEl) capEl.innerHTML = sc.caption;
 
-    // Sync Connected Local Node Control Panel buttons
+    // Sync macOS Control Center tiles directly under Local Node
     const pubBtn = document.getElementById("ctlPublicLink");
+    const pubState = document.getElementById("ctlPublicState");
     if (pubBtn) {
-      pubBtn.className = `gate-switch ${gateState.publicLinked ? "amber-tone on" : "invite-link"}`;
+      pubBtn.className = `cc-tile ${gateState.publicLinked ? "is-amber" : ""}`.trim();
       pubBtn.setAttribute("aria-pressed", gateState.publicLinked ? "true" : "false");
-      pubBtn.querySelector(".gsw-label").textContent = gateState.publicLinked ? "public.hyphae.to" : "+ Link public.hyphae.to";
-      pubBtn.querySelector(".gsw-state").textContent = gateState.publicLinked ? "Linked" : "Unlinked";
     }
-    const ciBtn = document.getElementById("ctlCiMode");
-    if (ciBtn) {
-      const ciCls = gateState.ciMode === "burst" ? "amber-tone on" : gateState.ciMode === "unsub" ? "off" : "danger-off";
-      const ciTxt = gateState.ciMode === "burst" ? "Burst → notify" : gateState.ciMode === "unsub" ? "Unsub (0 wire)" : "All (flood)";
-      ciBtn.className = `gate-switch ${ciCls}`;
-      ciBtn.querySelector(".gsw-state").textContent = ciTxt;
+    if (pubState) pubState.textContent = gateState.publicLinked ? "Linked · OSS" : "Unlinked";
+
+    const guardBtn = document.getElementById("ctlGuard");
+    const guardState = document.getElementById("ctlGuardState");
+    if (guardBtn) {
+      guardBtn.className = `cc-tile ${gateState.guard ? "is-on" : "is-danger"}`.trim();
+      guardBtn.setAttribute("aria-pressed", gateState.guard ? "true" : "false");
     }
+    if (guardState) guardState.textContent = gateState.guard ? "Active" : "Off";
+
     const aliceBtn = document.getElementById("ctlAliceMode");
+    const aliceState = document.getElementById("ctlAliceState");
     if (aliceBtn) {
       const aMap = {
-        queue: { cls: "on", txt: "queue (idle)" },
-        interrupt: { cls: "urgent-on", txt: "interrupt (now)" },
-        notify: { cls: "amber-tone on", txt: "notify (inbox)" },
-        mute: { cls: "coral-on", txt: "muted" },
+        queue: { cls: "is-on", txt: "Queue · idle" },
+        interrupt: { cls: "is-urgent", txt: "Interrupt" },
+        notify: { cls: "is-amber", txt: "Notify" },
+        mute: { cls: "", txt: "Muted" },
       };
       const cur = aMap[gateState.aliceMode] || aMap.queue;
-      aliceBtn.className = `gate-switch ${cur.cls}`;
-      aliceBtn.querySelector(".gsw-state").textContent = cur.txt;
-    }
-    const depBtn = document.getElementById("ctlDeploysMode");
-    if (depBtn) {
-      const dMap = {
-        mute: { cls: "coral-on", txt: "Muted" },
-        notify: { cls: "amber-tone on", txt: "Notify" },
-        queue: { cls: "on", txt: "Queue" },
-      };
-      const cur = dMap[gateState.deploysMode] || dMap.mute;
-      depBtn.className = `gate-switch ${cur.cls}`;
-      depBtn.querySelector(".gsw-state").textContent = cur.txt;
-    }
-    const guardBtn = document.getElementById("ctlGuard");
-    if (guardBtn) {
-      guardBtn.className = `gate-switch ${gateState.guard ? "on" : "danger-off"}`;
-      guardBtn.setAttribute("aria-pressed", gateState.guard ? "true" : "false");
-      guardBtn.querySelector(".gsw-label").textContent = gateState.guard ? "🛡 Injection Guard" : "⚠ Injection Guard";
-      guardBtn.querySelector(".gsw-state").textContent = gateState.guard ? "ON" : "OFF";
+      aliceBtn.className = `cc-tile ${cur.cls}`.trim();
+      if (aliceState) aliceState.textContent = cur.txt;
     }
 
-    // Sync Right Focus Mode CTA
+    const depBtn = document.getElementById("ctlDeploysMode");
+    const depState = document.getElementById("ctlDeploysState");
+    if (depBtn) {
+      const dMap = {
+        mute: { cls: "", txt: "Muted" },
+        notify: { cls: "is-amber", txt: "Notify" },
+        queue: { cls: "is-on", txt: "Queue · idle" },
+      };
+      const cur = dMap[gateState.deploysMode] || dMap.mute;
+      depBtn.className = `cc-tile ${cur.cls}`.trim();
+      if (depState) depState.textContent = cur.txt;
+    }
+
+    // Sync macOS Slider-Style CI Burst Cap Bar
+    const ciCard = document.getElementById("ctlCiCard");
+    const ciState = document.getElementById("ctlCiState");
+    const ciFill = document.getElementById("ctlCiFill");
+    if (ciCard) {
+      ciCard.dataset.ciState = gateState.ciMode;
+      const fillPct = gateState.ciMode === "unsub" ? 34 : gateState.ciMode === "burst" ? 66 : 100;
+      const ciTxt = gateState.ciMode === "burst" ? "Burst → notify" : gateState.ciMode === "unsub" ? "Unsub · 0 wire" : "Pass all";
+      if (ciState) ciState.textContent = ciTxt;
+      if (ciFill) ciFill.style.width = `${fillPct}%`;
+      ciCard.querySelectorAll(".cc-step").forEach((btn) => {
+        const v = btn.dataset.ci;
+        const isActive = v === gateState.ciMode;
+        const isCovered =
+          (gateState.ciMode === "burst" && v === "unsub") ||
+          (gateState.ciMode === "all" && (v === "unsub" || v === "burst"));
+        btn.classList.toggle("active", isActive);
+        btn.classList.toggle("covered", !isActive && isCovered);
+        btn.setAttribute("aria-pressed", isActive ? "true" : "false");
+      });
+    }
+
+    // Sync Right macOS Focus Tile
     const focusBtn = document.getElementById("gateFocusBtn");
     const focusState = document.getElementById("gateFocusState");
     if (focusBtn) {
-      focusBtn.classList.toggle("active", gateState.focus);
+      focusBtn.className = `cc-tile cc-focus-tile ${gateState.focus ? "is-on" : ""}`.trim();
       focusBtn.setAttribute("aria-pressed", gateState.focus ? "true" : "false");
     }
-    if (focusState) focusState.textContent = gateState.focus ? "ON" : "OFF";
+    if (focusState) focusState.textContent = gateState.focus ? "All → notify" : "Off · normal delivery";
 
     // Sync Right Telemetry Meter
     const gmDelLbl = document.getElementById("gmDeliveredLabel");
@@ -2072,6 +2107,28 @@ resetStoryTimer();
   }
 
   document.getElementById("gateShell")?.addEventListener("click", (e) => {
+    const ciStep = e.target.closest("[data-ci]");
+    if (ciStep) {
+      const val = ciStep.dataset.ci;
+      if (["unsub", "burst", "all"].includes(val)) {
+        gateState.ciMode = val;
+        lastCmd =
+          val === "burst"
+            ? 'hyp_stream({ topic: "ci", burstCap: "notify" })'
+            : val === "unsub"
+            ? 'hyp_stream({ action: "unsubscribe", key: "ci" })'
+            : 'hyp_stream({ topic: "ci", burstCap: "off" })';
+        renderControlCenter();
+      }
+      return;
+    }
+    const resetEl = e.target.closest("[data-reset-gate]");
+    if (resetEl) {
+      gateState = { ...DEFAULT_STATE };
+      lastCmd = 'hyp_inbox({ mode: "queue", burst: "notify" })';
+      renderControlCenter();
+      return;
+    }
     const btn = e.target.closest("[data-toggle]");
     if (!btn) return;
     handleToggle(btn.dataset.toggle);
@@ -2083,17 +2140,6 @@ resetStoryTimer();
     renderControlCenter();
   });
 
-  const playBtn = document.getElementById("gatePlayBtn");
-  function syncPlayBtn() {
-    if (playBtn) playBtn.textContent = gatePlaying ? "Pause" : "Play";
-  }
-  playBtn?.addEventListener("click", () => {
-    gatePlaying = !gatePlaying;
-    syncPlayBtn();
-    renderControlCenter();
-  });
-
-  syncPlayBtn();
   renderControlCenter();
 })();
 
