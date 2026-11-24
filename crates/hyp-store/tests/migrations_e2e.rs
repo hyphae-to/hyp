@@ -311,7 +311,7 @@ fn create_seeded_v1_db(path: &Path, enable_wal: bool) {
 
 #[test]
 fn registry_invariants_and_invalid_registry_rejection() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, 2);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 3);
     assert_eq!(MIGRATIONS.len() as i64, CURRENT_SCHEMA_VERSION);
     let mut names = HashSet::new();
     for (idx, m) in MIGRATIONS.iter().enumerate() {
@@ -387,10 +387,11 @@ fn differential_schema_and_data_parity_v1_migrated_equals_fresh_v2() {
     let applied_migrated = migrated.applied_migrations().unwrap();
     assert_eq!(
         applied_migrated.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
-        vec![1, 2]
+        vec![1, 2, 3]
     );
     assert_eq!(applied_migrated[0].1, T0);
     assert!(applied_migrated[1].1 >= T0);
+    assert!(applied_migrated[2].1 >= T0);
 
     // 3. All seeded v1 rows survive untouched; handles default to `description: None`.
     let peer = migrated.peers().get_peer("acme-team").unwrap().unwrap();
@@ -482,7 +483,8 @@ fn differential_schema_and_data_parity_v1_migrated_equals_fresh_v2() {
     assert!(backup_path.exists());
     let backup_name = backup_path.file_name().unwrap().to_str().unwrap();
     assert!(
-        backup_name.starts_with("node.sqlite.v1-to-v2-") && backup_name.ends_with(".bak"),
+        backup_name.starts_with(&format!("node.sqlite.v1-to-v{CURRENT_SCHEMA_VERSION}-"))
+            && backup_name.ends_with(".bak"),
         "unexpected backup filename: {backup_name}"
     );
 
@@ -508,6 +510,7 @@ fn differential_schema_and_data_parity_v1_migrated_equals_fresh_v2() {
     assert_eq!(bak_ver, 1);
     let bak_schema = snapshot_canonical_schema(&bak_conn);
     assert!(!bak_schema.table_sql.contains_key("peer_routes"));
+    assert!(!bak_schema.table_sql.contains_key("wakeups"));
     assert!(
         !bak_schema.table_columns["handles"]
             .iter()
@@ -629,20 +632,22 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("node.sqlite");
     let db = NodeDb::open(&db_path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 2);
+    assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    let next_ver = CURRENT_SCHEMA_VERSION + 1;
 
     // Seed a publisher + publisher_grants row (FK child -> parent).
     db.events()
         .add_publisher("pub-1", "tok-secret-1", &["github"], T0)
         .unwrap();
 
-    // 1. Failing SQL v3 migration must roll back partial DDL atomically.
+    // 1. Failing SQL next-version migration must roll back partial DDL atomically.
     let failing_sql_migrations = [
         MIGRATIONS[0],
         MIGRATIONS[1],
+        MIGRATIONS[2],
         Migration {
-            version: 3,
-            name: "0003_broken_sql",
+            version: next_ver,
+            name: "0004_broken_sql",
             disable_foreign_keys: false,
             kind: MigrationKind::Sql(
                 "CREATE TABLE partial_should_rollback (id INTEGER PRIMARY KEY);
@@ -654,7 +659,7 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
     let err = run_migrations_with(db.connection(), Some(&db_path), &failing_sql_migrations)
         .unwrap_err();
     assert!(matches!(err, StoreError::Sqlite(_)));
-    assert_eq!(db.schema_version().unwrap(), 2);
+    assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     let partial_exists: Option<i64> = db
         .connection()
         .query_row(
@@ -664,10 +669,10 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
         )
         .ok();
     assert_eq!(partial_exists, None, "partial DDL must be rolled back");
-    // Pre-migration v2 backup should have been captured before v3 ran.
+    // Pre-migration backup should have been captured before the next migration ran.
     assert_eq!(db.list_migration_backups().unwrap().len(), 1);
 
-    // 2. Failing Fn v3 migration must also roll back atomically.
+    // 2. Failing Fn next-version migration must also roll back atomically.
     fn failing_fn(conn: &Connection) -> hyp_store::StoreResult<()> {
         conn.execute_batch("CREATE TABLE fn_partial (id INTEGER PRIMARY KEY);")?;
         Err(StoreError::InvalidState("simulated fn error".to_string()))
@@ -675,9 +680,10 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
     let failing_fn_migrations = [
         MIGRATIONS[0],
         MIGRATIONS[1],
+        MIGRATIONS[2],
         Migration {
-            version: 3,
-            name: "0003_broken_fn",
+            version: next_ver,
+            name: "0004_broken_fn",
             disable_foreign_keys: false,
             kind: MigrationKind::Fn(failing_fn),
         },
@@ -685,7 +691,7 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
     let err =
         run_migrations_with(db.connection(), Some(&db_path), &failing_fn_migrations).unwrap_err();
     assert!(matches!(err, StoreError::InvalidState(_)));
-    assert_eq!(db.schema_version().unwrap(), 2);
+    assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     let fn_partial_exists: Option<i64> = db
         .connection()
         .query_row(
@@ -701,9 +707,10 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
     let fk_violation_migrations = [
         MIGRATIONS[0],
         MIGRATIONS[1],
+        MIGRATIONS[2],
         Migration {
-            version: 3,
-            name: "0003_fk_orphan",
+            version: next_ver,
+            name: "0004_fk_orphan",
             disable_foreign_keys: true,
             kind: MigrationKind::Sql(
                 "INSERT INTO publisher_grants (publisher_id, topic) VALUES ('ghost-pub', 'alerts');",
@@ -716,7 +723,7 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
         matches!(err, StoreError::InvalidState(ref msg) if msg.contains("foreign_key_check")),
         "expected foreign_key_check InvalidState, got: {err:?}"
     );
-    assert_eq!(db.schema_version().unwrap(), 2);
+    assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     let orphan_count: i64 = db
         .connection()
         .query_row(
@@ -736,9 +743,10 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
     let fk_rebuild_ok = [
         MIGRATIONS[0],
         MIGRATIONS[1],
+        MIGRATIONS[2],
         Migration {
-            version: 3,
-            name: "0003_rebuild_publishers_ok",
+            version: next_ver,
+            name: "0004_rebuild_publishers_ok",
             disable_foreign_keys: true,
             kind: MigrationKind::Sql(
                 "CREATE TABLE publishers_new (
@@ -756,7 +764,7 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
         },
     ];
     run_migrations_with(db.connection(), Some(&db_path), &fk_rebuild_ok).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 3);
+    assert_eq!(db.schema_version().unwrap(), next_ver);
     let fk_enabled_after: i64 = db
         .connection()
         .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
