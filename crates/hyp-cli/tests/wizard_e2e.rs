@@ -150,7 +150,8 @@ fn install_skill_detects_fake_harnesses_and_writes_exact_skill_files() {
     assert_eq!(payload["data"]["installedCount"], 6);
 
     let canonical = fs::read_to_string(repo_setup_skill_path()).expect("read repo SKILL.md");
-    assert!(canonical.starts_with("---\nname: hyphae-setup\n"));
+    let canonical_lf = canonical.replace("\r\n", "\n");
+    assert!(canonical_lf.starts_with("---\nname: hyphae-setup\n"));
     assert!(!canonical.contains("hyp share"));
     assert!(!canonical.contains("hyp connect"));
     assert!(!canonical.contains("npm install"));
