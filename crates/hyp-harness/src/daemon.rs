@@ -1,0 +1,3220 @@
+//! Standalone async native Rust `LocalDaemon` (`connector.sock` on Unix / `127.0.0.1:0` ->
+//! `connector.addr` on Windows).
+//!
+//! Replaces the Node.js `hyp daemon` cleanly in pure Rust by wrapping:
+//! - [`UnifiedNode`] (single WAL `node.sqlite`, E2EE DMs/`#channels`/KV/transfers, pushdown streams)
+//! - optional [`SecurityGatePipeline`] (post-decrypt inbound screening & pre-encrypt outbound DLP)
+//! - [`DeliveryEngine`] (§2.5 3-tier urgency + silent `mute` archive, Focus Mode, Burst Protection,
+//!   Token-Budget Hybrid Batch Packer, and filtered cursor-paginated `query_inbox`)
+//! - [`CallRegistry`] (fail-closed host-verified caller resolution for hooks & MCP)
+//! - live zero-polling transports (`wait`, `watch`, and `--claude-channel` push).
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use hyp_node::delivery::{
+    DeliveryEngine, DeliveryRule, DeliveryUrgency, InboxFilter, InboxQuery, InboxStateFilter,
+    PackableItem, PackedDeliveryBatch, archive_muted_entry, move_pending_to_muted, muted_count,
+    pack_delivery_batch, query_inbox, record_delivered_receipts,
+};
+use hyp_node::engine::{ChannelMode, KvWriteRequest, SubscribeRequest, UnifiedNode};
+use hyp_node::gates::{
+    GateDecision, InboundContext, OutboundContext, SecurityGatePipeline, TrustTier as GateTrustTier,
+};
+use hyp_proto::cloudevent::{CONTENT_TYPE_JSON, CloudEvent as ProtoCloudEvent};
+use hyp_proto::filter::Filter as ProtoFilter;
+use hyp_store::{
+    BridgeLink, DeliveryMode, GateState, MailboxEntry, MailboxInsert, MailboxKind,
+    MailboxPutResult, PluginTargetHandoff, WriteModel, format_address, now_ms, parse_address,
+    uuid_v4,
+};
+use serde_json::{Map, Value, json};
+use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+
+use crate::call_registry::{
+    CallRegistry, CallerResolution, DEFAULT_RESOLVE_WAIT, StartCallInput, is_valid_session_id,
+};
+use crate::protocol::{HarnessKind, is_bridge_destination, normalize_mesh_tool_name};
+use crate::sock::{
+    DEFAULT_SOCKET_FILENAME, MAX_SOCKET_LINE_BYTES, read_bounded_line_async,
+    write_ndjson_line_async,
+};
+
+const CHANNEL_DELIVER_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Error)]
+pub enum DaemonError {
+    #[error("daemon already running at {0}")]
+    AlreadyRunning(PathBuf),
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    #[error("node error: {0}")]
+    Node(#[from] hyp_node::engine::NodeError),
+}
+
+/// Input payload for [`LocalDaemon::ingest_inbound`].
+#[derive(Debug, Clone)]
+pub struct InboundItem {
+    pub session_id: String,
+    pub origin_node: String,
+    pub item_id: String,
+    pub source: String,
+    pub text: String,
+    pub kind: MailboxKind,
+    pub trust_tier: GateTrustTier,
+}
+
+/// Configuration for [`LocalDaemon`].
+#[derive(Debug, Clone)]
+pub struct LocalDaemonConfig {
+    /// Explicit socket (`connector.sock`) or address (`connector.addr`) path.
+    /// Defaults to `<node.state_dir>/<DEFAULT_SOCKET_FILENAME>`.
+    pub socket_path: Option<PathBuf>,
+    /// Require host-verified `PreToolUse` `callId`/`callToken` (or explicit `--ephemeral`) for `tool.call`.
+    /// Defaults to `true` (fail-closed!).
+    pub require_verified_caller: bool,
+    /// Optional explicit override for advertising `hyp_kv` in `mcp.caps`.
+    /// When `None`, auto-detects from local `kv_namespaces` or paired peer manifests.
+    pub enable_kv: Option<bool>,
+    /// Optional explicit override for advertising `hyp_bridge` in `mcp.caps`.
+    pub enable_plugins: bool,
+}
+
+impl Default for LocalDaemonConfig {
+    fn default() -> Self {
+        Self {
+            socket_path: None,
+            require_verified_caller: true,
+            enable_kv: None,
+            enable_plugins: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaiterKind {
+    Once,
+    Stream,
+}
+
+struct LiveWaiter {
+    id: u64,
+    mode: WaiterKind,
+    tx: mpsc::UnboundedSender<Value>,
+}
+
+struct LiveChannel {
+    conn_id: u64,
+    tx: mpsc::UnboundedSender<ChannelDeliverCommand>,
+}
+
+struct ChannelDeliverCommand {
+    delivery_id: u64,
+    text: String,
+    ack_tx: oneshot::Sender<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct ClassifiedItemMeta {
+    urgency: DeliveryUrgency,
+    burst_demoted: bool,
+    burst_source_key: String,
+    channel: Option<String>,
+    is_announcement: bool,
+    notified: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SubscriptionRecordMeta {
+    id: String,
+    key: Option<String>,
+    origin_node: String,
+    topic: String,
+    urgency: DeliveryUrgency,
+}
+
+struct LocalDaemonInner {
+    node: Arc<UnifiedNode>,
+    gate: Option<Arc<SecurityGatePipeline>>,
+    delivery: Arc<DeliveryEngine>,
+    calls: Arc<CallRegistry>,
+    config: LocalDaemonConfig,
+    socket_path: PathBuf,
+    waiters: Mutex<HashMap<String, Vec<LiveWaiter>>>,
+    channels: Mutex<HashMap<String, LiveChannel>>,
+    flushing: Mutex<HashSet<String>>,
+    /// Per-session classified metadata for `Pending` receipts (`receipt -> meta`).
+    item_meta: Mutex<HashMap<String, HashMap<String, ClassifiedItemMeta>>>,
+    /// Per-session subscription urgency & key mappings.
+    sub_meta: Mutex<HashMap<String, Vec<SubscriptionRecordMeta>>>,
+    /// Receipts dismissed by Security Gate (`Block` or `Quarantine` in pipeline) so they never surface.
+    dismissed_receipts: Mutex<HashSet<String>>,
+    next_id: AtomicU64,
+}
+
+/// Native async Rust Hyphae `LocalDaemon` handle.
+pub struct LocalDaemon {
+    inner: Arc<LocalDaemonInner>,
+    tcp_addr: Option<SocketAddr>,
+    shutdown_tx: watch::Sender<bool>,
+    accept_task: Mutex<Option<JoinHandle<()>>>,
+    inbox_task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for LocalDaemon {
+    fn drop(&mut self) {
+        self.stop_sync();
+    }
+}
+
+impl LocalDaemon {
+    /// Starts the native Rust `LocalDaemon` on the platform-native local transport:
+    /// - Unix: Unix domain socket (`connector.sock`, `0600` permissions, stale-socket cleanup).
+    /// - Windows (`#[cfg(not(unix))]`): loopback TCP (`127.0.0.1:0` -> writes `connector.addr`).
+    #[cfg(unix)]
+    pub async fn start(
+        node: Arc<UnifiedNode>,
+        gate: Option<Arc<SecurityGatePipeline>>,
+        config: LocalDaemonConfig,
+    ) -> Result<Self, DaemonError> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let socket_path = config
+            .socket_path
+            .clone()
+            .unwrap_or_else(|| node.config().state_dir.join(DEFAULT_SOCKET_FILENAME));
+
+        if let Some(parent) = socket_path.parent() {
+            std::fs::create_dir_all(parent)?;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+
+        if socket_path.exists() {
+            // Probe whether an active daemon is already listening on this socket.
+            if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+                return Err(DaemonError::AlreadyRunning(socket_path));
+            }
+            let _ = std::fs::remove_file(&socket_path);
+        }
+
+        let listener = tokio::net::UnixListener::bind(&socket_path)?;
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
+
+        let inner = Arc::new(LocalDaemonInner::new(node, gate, config, socket_path));
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let accept_inner = Arc::clone(&inner);
+        let accept_task = tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    res = listener.accept() => res,
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let Ok((stream, _)) = accepted else {
+                    continue;
+                };
+                let conn_inner = Arc::clone(&accept_inner);
+                let conn_shutdown = shutdown_rx.clone();
+                tokio::spawn(async move {
+                    let (r, w) = stream.into_split();
+                    handle_connection(conn_inner, r, w, conn_shutdown).await;
+                });
+            }
+        });
+
+        let inbox_task = spawn_inbox_watcher(Arc::clone(&inner), shutdown_tx.subscribe());
+
+        Ok(Self {
+            inner,
+            tcp_addr: None,
+            shutdown_tx,
+            accept_task: Mutex::new(Some(accept_task)),
+            inbox_task: Mutex::new(Some(inbox_task)),
+        })
+    }
+
+    /// Starts the native Rust `LocalDaemon` on loopback TCP (`127.0.0.1:0` -> `connector.addr`) on Windows.
+    #[cfg(not(unix))]
+    pub async fn start(
+        node: Arc<UnifiedNode>,
+        gate: Option<Arc<SecurityGatePipeline>>,
+        config: LocalDaemonConfig,
+    ) -> Result<Self, DaemonError> {
+        let addr_path = config
+            .socket_path
+            .clone()
+            .unwrap_or_else(|| node.config().state_dir.join(DEFAULT_SOCKET_FILENAME));
+        Self::start_tcp(node, gate, config, addr_path).await
+    }
+
+    /// Starts the native Rust `LocalDaemon` bound strictly to loopback TCP `127.0.0.1:0`,
+    /// writing `<addr>\n` to `addr_file_path` (`connector.addr`).
+    ///
+    /// Available on ALL platforms (used by default on Windows and callable on Unix for
+    /// cross-platform transport testing).
+    pub async fn start_tcp(
+        node: Arc<UnifiedNode>,
+        gate: Option<Arc<SecurityGatePipeline>>,
+        config: LocalDaemonConfig,
+        addr_file_path: PathBuf,
+    ) -> Result<Self, DaemonError> {
+        if let Some(parent) = addr_file_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let local_addr = listener.local_addr()?;
+        std::fs::write(&addr_file_path, format!("{local_addr}\n"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&addr_file_path, std::fs::Permissions::from_mode(0o600));
+        }
+
+        let inner = Arc::new(LocalDaemonInner::new(node, gate, config, addr_file_path));
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let accept_inner = Arc::clone(&inner);
+        let accept_task = tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    res = listener.accept() => res,
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let Ok((stream, _)) = accepted else {
+                    continue;
+                };
+                let conn_inner = Arc::clone(&accept_inner);
+                let conn_shutdown = shutdown_rx.clone();
+                tokio::spawn(async move {
+                    let (r, w) = stream.into_split();
+                    handle_connection(conn_inner, r, w, conn_shutdown).await;
+                });
+            }
+        });
+
+        let inbox_task = spawn_inbox_watcher(Arc::clone(&inner), shutdown_tx.subscribe());
+
+        Ok(Self {
+            inner,
+            tcp_addr: Some(local_addr),
+            shutdown_tx,
+            accept_task: Mutex::new(Some(accept_task)),
+            inbox_task: Mutex::new(Some(inbox_task)),
+        })
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.inner.socket_path
+    }
+
+    pub fn tcp_addr(&self) -> Option<SocketAddr> {
+        self.tcp_addr
+    }
+
+    pub fn node(&self) -> &Arc<UnifiedNode> {
+        &self.inner.node
+    }
+
+    pub fn delivery(&self) -> &Arc<DeliveryEngine> {
+        &self.inner.delivery
+    }
+
+    pub fn calls(&self) -> &Arc<CallRegistry> {
+        &self.inner.calls
+    }
+
+    /// Gracefully stops the daemon listener, background watcher, and removes the local socket/addr file.
+    pub async fn stop(self) {
+        self.stop_sync();
+    }
+
+    fn stop_sync(&self) {
+        let _ = self.shutdown_tx.send(true);
+        if let Some(h) = self
+            .accept_task
+            .lock()
+            .expect("accept_task lock poisoned")
+            .take()
+        {
+            h.abort();
+        }
+        if let Some(h) = self
+            .inbox_task
+            .lock()
+            .expect("inbox_task lock poisoned")
+            .take()
+        {
+            h.abort();
+        }
+        let _ = std::fs::remove_file(&self.inner.socket_path);
+    }
+
+    /// Directly ingests an inbound item through `SecurityGatePipeline` (if configured) ->
+    /// `DeliveryEngine` -> `NodeDb` mailbox, waking live transports ONLY for non-`Mute` items.
+    pub async fn ingest_inbound(
+        &self,
+        item: InboundItem,
+    ) -> Result<Option<DeliveryUrgency>, String> {
+        let InboundItem {
+            session_id,
+            origin_node,
+            item_id,
+            source,
+            text,
+            kind,
+            trust_tier,
+        } = item;
+        let now = now_ms();
+        let mut gate_downgraded = false;
+
+        if let Some(ref pipeline) = self.inner.gate {
+            let parsed =
+                hyp_node::delivery::ParsedMailboxSource::parse(&origin_node, &source, kind);
+            let ce = ProtoCloudEvent {
+                specversion: "1.0".into(),
+                id: item_id.clone(),
+                source: source.clone(),
+                event_type: format!("to.hyphae.mailbox.{}", kind.as_str()),
+                datacontenttype: Some(CONTENT_TYPE_JSON.into()),
+                dataschema: None,
+                subject: parsed.channel.clone().or(parsed.topic.clone()),
+                time: None,
+                data: Some(json!({ "text": text })),
+                data_base64: None,
+                extensions: BTreeMap::new(),
+            };
+            let ctx = InboundContext {
+                session_id: session_id.clone(),
+                origin_node: origin_node.clone(),
+                sender: source.clone(),
+                trust_tier,
+                e2ee_verified: true,
+                identity_verified: true,
+                kind,
+                channel: parsed.channel,
+                topic: parsed.topic,
+                bridge: parsed.bridge,
+                event: ce,
+                transfer_paths: Vec::new(),
+                rendered_text: Some(text.clone()),
+            };
+            let eval = pipeline
+                .evaluate_inbound(&ctx, now)
+                .await
+                .map_err(|e| e.to_string())?;
+            match eval.decision {
+                GateDecision::Allow {
+                    downgraded_to_notify,
+                } => {
+                    gate_downgraded = downgraded_to_notify;
+                    if let Some(receipt) = eval.receipt {
+                        // Pipeline already inserted into DB if sharing same DB; check if present in node DB.
+                        let exists = self
+                            .inner
+                            .node
+                            .db()
+                            .local()
+                            .get_mailbox_entry(&receipt)
+                            .ok()
+                            .flatten()
+                            .is_some();
+                        if exists {
+                            let urgency = self
+                                .inner
+                                .classify_and_route_pending_entry(
+                                    &session_id,
+                                    &receipt,
+                                    gate_downgraded,
+                                    now,
+                                )
+                                .await;
+                            if urgency.is_some_and(DeliveryUrgency::triggers_delivery_or_digest) {
+                                self.inner.flush_session(&session_id).await;
+                            }
+                            return Ok(urgency);
+                        }
+                    }
+                }
+                GateDecision::Quarantine { .. }
+                | GateDecision::Block { .. }
+                | GateDecision::Hold { .. } => {
+                    return Ok(None);
+                }
+            }
+        }
+
+        let insert = MailboxInsert {
+            session_id: session_id.clone(),
+            origin_node: origin_node.clone(),
+            item_id: item_id.clone(),
+            text: text.clone(),
+            kind,
+            source: source.clone(),
+            gate_state: GateState::Pending,
+            gate_reason: None,
+            traceparent: None,
+        };
+
+        let temp_entry = MailboxEntry {
+            receipt: String::new(),
+            session_id: session_id.clone(),
+            origin_node: origin_node.clone(),
+            item_id,
+            text,
+            received_at: now,
+            kind,
+            source: source.clone(),
+            notified: false,
+            gate_state: GateState::Pending,
+            gate_reason: None,
+            traceparent: None,
+            payload_sha256: None,
+            reviewed_at: None,
+        };
+
+        let sub_mode = self
+            .inner
+            .lookup_subscription_urgency(&session_id, &origin_node, &source);
+        let classification = {
+            let db = self.inner.node.db();
+            self.inner
+                .delivery
+                .classify_entry(&db, &session_id, &temp_entry, sub_mode, gate_downgraded, now)
+                .map_err(|e| e.to_string())?
+        };
+
+        if classification.effective_urgency == DeliveryUrgency::Mute {
+            let db = self.inner.node.db();
+            archive_muted_entry(&db, &insert, now).map_err(|e| e.to_string())?;
+            return Ok(Some(DeliveryUrgency::Mute));
+        }
+
+        let receipt = {
+            let db = self.inner.node.db();
+            match db
+                .local()
+                .put_in_mailbox(&insert, now)
+                .map_err(|e| e.to_string())?
+            {
+                MailboxPutResult::Stored { receipt } => receipt,
+                MailboxPutResult::Duplicate => return Ok(Some(classification.effective_urgency)),
+                MailboxPutResult::QueueFull => return Err("local_inbox_full".to_string()),
+            }
+        };
+
+        let is_announcement = self
+            .inner
+            .is_announcement_channel(classification.parsed.channel.as_deref());
+        self.inner.record_item_meta(
+            &session_id,
+            receipt,
+            ClassifiedItemMeta {
+                urgency: classification.effective_urgency,
+                burst_demoted: classification.burst.demoted,
+                burst_source_key: classification.burst_source_key,
+                channel: classification.parsed.channel,
+                is_announcement,
+                notified: false,
+            },
+        );
+        self.inner.flush_session(&session_id).await;
+        Ok(Some(classification.effective_urgency))
+    }
+}
+
+fn spawn_inbox_watcher(
+    inner: Arc<LocalDaemonInner>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    let mut rx = inner.node.subscribe_local_inbox();
+    tokio::spawn(async move {
+        loop {
+            let session_id = tokio::select! {
+                res = rx.recv() => match res {
+                    Ok(sid) => sid,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Reconcile all known sessions on lag.
+                        let sessions: Vec<String> = {
+                            let db = inner.node.db();
+                            db.local()
+                                .list_sessions()
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|s| s.id)
+                                .collect()
+                        };
+                        for sid in sessions {
+                            if inner.reconcile_session_inbox(&sid).await {
+                                inner.flush_session(&sid).await;
+                            }
+                        }
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            if inner.reconcile_session_inbox(&session_id).await {
+                inner.flush_session(&session_id).await;
+            }
+        }
+    })
+}
+
+impl LocalDaemonInner {
+    fn new(
+        node: Arc<UnifiedNode>,
+        gate: Option<Arc<SecurityGatePipeline>>,
+        config: LocalDaemonConfig,
+        socket_path: PathBuf,
+    ) -> Self {
+        Self {
+            node,
+            gate,
+            delivery: Arc::new(DeliveryEngine::new()),
+            calls: Arc::new(CallRegistry::new()),
+            config,
+            socket_path,
+            waiters: Mutex::new(HashMap::new()),
+            channels: Mutex::new(HashMap::new()),
+            flushing: Mutex::new(HashSet::new()),
+            item_meta: Mutex::new(HashMap::new()),
+            sub_meta: Mutex::new(HashMap::new()),
+            dismissed_receipts: Mutex::new(HashSet::new()),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    fn next_seq(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn has_live_transport(&self, session_id: &str) -> bool {
+        if self
+            .channels
+            .lock()
+            .expect("channels lock poisoned")
+            .contains_key(session_id)
+        {
+            return true;
+        }
+        self.waiters
+            .lock()
+            .expect("waiters lock poisoned")
+            .get(session_id)
+            .is_some_and(|w| !w.is_empty())
+    }
+
+    fn has_kv_capability(&self) -> bool {
+        if let Some(explicit) = self.config.enable_kv {
+            return explicit;
+        }
+        if !self.node.config().kv_namespaces.is_empty() {
+            return true;
+        }
+        let db = self.node.db();
+        if let Ok(peers) = db.peers().list_peers(None) {
+            for p in peers {
+                if let Some(ref raw) = p.manifest_json {
+                    if let Ok(signed) =
+                        serde_json::from_str::<hyp_proto::manifest::SignedNodeManifest>(raw)
+                    {
+                        if let Ok(payload) = signed.decode_payload() {
+                            if !payload.advertised.kv_namespaces.is_empty() {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn is_announcement_channel(&self, channel: Option<&str>) -> bool {
+        let Some(ch) = channel else {
+            return false;
+        };
+        self.node.get_channel_policy(ch).mode == ChannelMode::Announcement
+    }
+
+    fn lookup_subscription_urgency(
+        &self,
+        session_id: &str,
+        origin_node: &str,
+        source: &str,
+    ) -> Option<DeliveryUrgency> {
+        let guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
+        let list = guard.get(session_id)?;
+        let src_low = source.to_ascii_lowercase();
+        let origin_low = origin_node.to_ascii_lowercase();
+        list.iter()
+            .find(|s| {
+                let expected = format!("{}.{}", s.origin_node.to_ascii_lowercase(), s.topic.to_ascii_lowercase());
+                src_low == expected || (origin_low == s.origin_node.to_ascii_lowercase() && src_low.ends_with(&format!(".{}", s.topic.to_ascii_lowercase())))
+            })
+            .map(|s| s.urgency)
+    }
+
+    fn record_item_meta(&self, session_id: &str, receipt: String, meta: ClassifiedItemMeta) {
+        let mut guard = self.item_meta.lock().expect("item_meta lock poisoned");
+        guard
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(receipt, meta);
+    }
+
+    /// Reconciles any newly arrived raw `Pending` entries in `NodeDb` for `session_id` through
+    /// optional `SecurityGatePipeline` + `DeliveryEngine`:
+    /// - `Quarantine`/`Block` items are removed from `Pending` (never leak to agent).
+    /// - `Mute` items are silently archived (`move_pending_to_muted`) and NEVER trigger a wake.
+    /// - `Interrupt`/`Queue`/`Notify` items are tagged with their resolved urgency & burst metadata.
+    ///
+    /// Returns `true` if at least one non-muted item is eligible for delivery/digest wake.
+    async fn reconcile_session_inbox(&self, session_id: &str) -> bool {
+        let pending = {
+            let db = self.node.db();
+            db.local().peek_inbox(session_id, 500).unwrap_or_default()
+        };
+        if pending.is_empty() {
+            return false;
+        }
+
+        let mut wake_needed = false;
+        let now = now_ms();
+
+        for entry in pending {
+            let already_dismissed = self
+                .dismissed_receipts
+                .lock()
+                .expect("dismissed lock poisoned")
+                .contains(&entry.receipt);
+            if already_dismissed {
+                let db = self.node.db();
+                let _ = db
+                    .local()
+                    .acknowledge_inbox(session_id, &[entry.receipt.as_str()], now);
+                continue;
+            }
+
+            let existing_meta = self
+                .item_meta
+                .lock()
+                .expect("item_meta lock poisoned")
+                .get(session_id)
+                .and_then(|m| m.get(&entry.receipt).cloned());
+            if let Some(meta) = existing_meta {
+                if meta.urgency.triggers_delivery_or_digest() && (!meta.notified || !matches!(meta.urgency, DeliveryUrgency::Notify)) {
+                    wake_needed = true;
+                }
+                continue;
+            }
+
+            // Newly arrived raw item from `UnifiedNode`!
+            let mut gate_downgraded = false;
+            if let Some(ref pipeline) = self.gate {
+                let parsed = hyp_node::delivery::ParsedMailboxSource::from_entry(&entry);
+                let trust_tier = self.resolve_peer_trust_tier(&entry.origin_node);
+                let ce = ProtoCloudEvent {
+                    specversion: "1.0".into(),
+                    id: format!("gate:{}", entry.item_id),
+                    source: entry.source.clone(),
+                    event_type: format!("to.hyphae.mailbox.{}", entry.kind.as_str()),
+                    datacontenttype: Some(CONTENT_TYPE_JSON.into()),
+                    dataschema: None,
+                    subject: parsed.channel.clone().or(parsed.topic.clone()),
+                    time: None,
+                    data: Some(json!({ "text": entry.text })),
+                    data_base64: None,
+                    extensions: BTreeMap::new(),
+                };
+                let ctx = InboundContext {
+                    session_id: session_id.to_string(),
+                    origin_node: entry.origin_node.clone(),
+                    sender: entry.source.clone(),
+                    trust_tier,
+                    e2ee_verified: true,
+                    identity_verified: true,
+                    kind: entry.kind,
+                    channel: parsed.channel,
+                    topic: parsed.topic,
+                    bridge: parsed.bridge,
+                    event: ce,
+                    transfer_paths: Vec::new(),
+                    rendered_text: Some(entry.text.clone()),
+                };
+                match pipeline.evaluate_inbound(&ctx, now).await {
+                    Ok(eval) => match eval.decision {
+                        GateDecision::Allow {
+                            downgraded_to_notify,
+                        } => {
+                            gate_downgraded = downgraded_to_notify;
+                            // If pipeline shares the same SQLite DB and inserted a duplicate `gate:` row,
+                            // dismiss the duplicate so we keep exactly one row (`entry.receipt`).
+                            if let Some(dup_receipt) = eval.receipt {
+                                if dup_receipt != entry.receipt {
+                                    self.dismissed_receipts
+                                        .lock()
+                                        .expect("dismissed lock poisoned")
+                                        .insert(dup_receipt.clone());
+                                    let db = self.node.db();
+                                    let _ = db.local().acknowledge_inbox(
+                                        session_id,
+                                        &[dup_receipt.as_str()],
+                                        now,
+                                    );
+                                }
+                            }
+                        }
+                        GateDecision::Quarantine { .. }
+                        | GateDecision::Block { .. }
+                        | GateDecision::Hold { .. } => {
+                            self.dismissed_receipts
+                                .lock()
+                                .expect("dismissed lock poisoned")
+                                .insert(entry.receipt.clone());
+                            let db = self.node.db();
+                            let _ = db
+                                .local()
+                                .acknowledge_inbox(session_id, &[entry.receipt.as_str()], now);
+                            continue;
+                        }
+                    },
+                    Err(_) => {
+                        // Fail closed on gate error: suppress delivery.
+                        self.dismissed_receipts
+                            .lock()
+                            .expect("dismissed lock poisoned")
+                            .insert(entry.receipt.clone());
+                        let db = self.node.db();
+                        let _ = db
+                            .local()
+                            .acknowledge_inbox(session_id, &[entry.receipt.as_str()], now);
+                        continue;
+                    }
+                }
+            }
+
+            if let Some(u) = self
+                .classify_and_route_pending_entry(session_id, &entry.receipt, gate_downgraded, now)
+                .await
+            {
+                if u.triggers_delivery_or_digest() {
+                    wake_needed = true;
+                }
+            }
+        }
+
+        wake_needed
+    }
+
+    async fn classify_and_route_pending_entry(
+        &self,
+        session_id: &str,
+        receipt: &str,
+        gate_downgraded: bool,
+        now: i64,
+    ) -> Option<DeliveryUrgency> {
+        let entry = {
+            let db = self.node.db();
+            db.local().get_mailbox_entry(receipt).ok().flatten()?
+        };
+        if entry.gate_state != GateState::Pending {
+            return None;
+        }
+        let sub_mode =
+            self.lookup_subscription_urgency(session_id, &entry.origin_node, &entry.source);
+        let classification = {
+            let db = self.node.db();
+            self.delivery
+                .classify_entry(&db, session_id, &entry, sub_mode, gate_downgraded, now)
+                .ok()?
+        };
+
+        if classification.effective_urgency == DeliveryUrgency::Mute {
+            let db = self.node.db();
+            let _ = move_pending_to_muted(&db, session_id, &entry, now);
+            return Some(DeliveryUrgency::Mute);
+        }
+
+        let is_announcement =
+            self.is_announcement_channel(classification.parsed.channel.as_deref());
+        self.record_item_meta(
+            session_id,
+            entry.receipt,
+            ClassifiedItemMeta {
+                urgency: classification.effective_urgency,
+                burst_demoted: classification.burst.demoted,
+                burst_source_key: classification.burst_source_key,
+                channel: classification.parsed.channel,
+                is_announcement,
+                notified: entry.notified,
+            },
+        );
+        Some(classification.effective_urgency)
+    }
+
+    fn resolve_peer_trust_tier(&self, origin_node: &str) -> GateTrustTier {
+        if origin_node == "local" || origin_node == self.node.node_id().as_str() {
+            return GateTrustTier::SelfHost;
+        }
+        let db = self.node.db();
+        if let Ok(Some(peer)) = db.peers().get_peer(origin_node) {
+            return GateTrustTier::from(peer.trust_tier);
+        }
+        GateTrustTier::Peer
+    }
+
+    /// Builds a token-budgeted [`PackedDeliveryBatch`] for `session_id` from pending unread items.
+    ///
+    /// - Excludes already-notified `Notify`-tier items when there are NO unnotified items and NO
+    ///   `Interrupt`/`Queue` items (prevents re-emitting identical `notify` digests in a loop).
+    /// - Strictly returns `None` when zero eligible unread items exist (even if `muted_count > 0`!).
+    async fn build_batch_for_session(&self, session_id: &str) -> Option<PackedDeliveryBatch> {
+        self.reconcile_session_inbox(session_id).await;
+
+        let (policy, pending, muted) = {
+            let db = self.node.db();
+            let policy = self.delivery.policy(&db, session_id).ok()?;
+            let pending = db.local().peek_inbox(session_id, 500).ok()?;
+            let muted = muted_count(&db, session_id).unwrap_or(0);
+            (policy, pending, muted)
+        };
+
+        if pending.is_empty() {
+            return None;
+        }
+
+        let meta_snapshot: HashMap<String, ClassifiedItemMeta> = self
+            .item_meta
+            .lock()
+            .expect("item_meta lock poisoned")
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut packable: Vec<PackableItem> = Vec::with_capacity(pending.len());
+        let mut any_deliverable_or_unnotified = false;
+
+        for entry in pending {
+            let meta = meta_snapshot.get(&entry.receipt);
+            let urgency = meta
+                .map(|m| m.urgency)
+                .unwrap_or(policy.default_mode);
+            if urgency == DeliveryUrgency::Mute {
+                continue;
+            }
+            let burst_demoted = meta.is_some_and(|m| m.burst_demoted);
+            let already_notified = entry.notified || meta.is_some_and(|m| m.notified);
+
+            if !(urgency == DeliveryUrgency::Notify || burst_demoted) || !already_notified {
+                any_deliverable_or_unnotified = true;
+            }
+
+            let parsed = hyp_node::delivery::ParsedMailboxSource::from_entry(&entry);
+            let channel = meta
+                .and_then(|m| m.channel.clone())
+                .or(parsed.channel);
+            let is_announcement = meta
+                .map(|m| m.is_announcement)
+                .unwrap_or_else(|| self.is_announcement_channel(channel.as_deref()));
+
+            packable.push(PackableItem {
+                id: entry.receipt,
+                urgency,
+                kind: entry.kind,
+                source: entry.source,
+                channel,
+                is_announcement,
+                text: entry.text,
+                created_at_ms: entry.received_at,
+                burst_demoted,
+            });
+        }
+
+        if packable.is_empty() || !any_deliverable_or_unnotified {
+            return None;
+        }
+
+        pack_delivery_batch(&packable, muted, &policy)
+    }
+
+    /// Commits a delivered [`PackedDeliveryBatch`]:
+    /// - Inline full items -> transitioned `pending -> delivered` + recorded in delivered archive.
+    /// - Spilled & truncated items -> kept `unread` (`Pending`) in `NodeDb` and marked `notified = 1`.
+    fn commit_delivered_batch(&self, session_id: &str, batch: &PackedDeliveryBatch) {
+        let now = now_ms();
+        {
+            let db = self.node.db();
+            if !batch.inline_ids.is_empty() {
+                let refs: Vec<&str> = batch.inline_ids.iter().map(String::as_str).collect();
+                let _ = db.local().acknowledge_inbox(session_id, &refs, now);
+                let _ = record_delivered_receipts(&db, session_id, &batch.inline_ids);
+            }
+            if !batch.spilled_ids.is_empty() || !batch.truncated_ids.is_empty() {
+                let _ = db.local().mark_mailbox_notified(session_id);
+            }
+        }
+
+        let mut sources_delivered: HashSet<String> = HashSet::new();
+        {
+            let mut guard = self.item_meta.lock().expect("item_meta lock poisoned");
+            if let Some(map) = guard.get_mut(session_id) {
+                for id in &batch.inline_ids {
+                    if let Some(m) = map.remove(id) {
+                        sources_delivered.insert(m.burst_source_key);
+                    }
+                }
+                for id in batch.spilled_ids.iter().chain(batch.truncated_ids.iter()) {
+                    if let Some(m) = map.get_mut(id) {
+                        m.notified = true;
+                        sources_delivered.insert(m.burst_source_key.clone());
+                    }
+                }
+            }
+        }
+        for src in sources_delivered {
+            self.delivery.record_delivery(session_id, &src, now);
+        }
+    }
+
+    /// Flushes eligible batches to live transports (`claude-channel` > `watch` stream > `wait` once).
+    async fn flush_session(&self, session_id: &str) {
+        {
+            let mut f = self.flushing.lock().expect("flushing lock poisoned");
+            if !f.insert(session_id.to_string()) {
+                return;
+            }
+        }
+
+        struct FlushGuard<'a> {
+            flushing: &'a Mutex<HashSet<String>>,
+            session_id: String,
+        }
+        impl Drop for FlushGuard<'_> {
+            fn drop(&mut self) {
+                self.flushing
+                    .lock()
+                    .expect("flushing lock poisoned")
+                    .remove(&self.session_id);
+            }
+        }
+        let _guard = FlushGuard {
+            flushing: &self.flushing,
+            session_id: session_id.to_string(),
+        };
+
+        loop {
+            let Some(batch) = self.build_batch_for_session(session_id).await else {
+                break;
+            };
+
+            // Priority 1: Live Claude native channel (`--claude-channel`)
+            let channel_tx = self
+                .channels
+                .lock()
+                .expect("channels lock poisoned")
+                .get(session_id)
+                .map(|c| c.tx.clone());
+            if let Some(tx) = channel_tx {
+                let delivery_id = self.next_seq();
+                let (ack_tx, ack_rx) = oneshot::channel();
+                if tx
+                    .send(ChannelDeliverCommand {
+                        delivery_id,
+                        text: batch.rendered.clone(),
+                        ack_tx,
+                    })
+                    .is_ok()
+                {
+                    let submitted = tokio::time::timeout(CHANNEL_DELIVER_TIMEOUT, ack_rx)
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or(false);
+                    if submitted {
+                        self.commit_delivered_batch(session_id, &batch);
+                        // Stop loop if notify-only (already marked notified so next iteration would break).
+                        continue;
+                    }
+                }
+                break;
+            }
+
+            // Priority 2: Streaming watcher (`hyp watch` / `inbox.watch`)
+            let stream_tx = self
+                .waiters
+                .lock()
+                .expect("waiters lock poisoned")
+                .get(session_id)
+                .and_then(|list| {
+                    list.iter()
+                        .find(|w| w.mode == WaiterKind::Stream)
+                        .map(|w| w.tx.clone())
+                });
+            if let Some(tx) = stream_tx {
+                let pkt = json!({
+                    "type": "wait.items",
+                    "items": [{
+                        "router": self.node.node_id().as_str(),
+                        "received": now_ms() / 1000,
+                        "text": batch.rendered,
+                        "notifyOnly": batch.notify_only,
+                        "mutedCount": batch.muted_count,
+                    }]
+                });
+                if tx.send(pkt).is_ok() {
+                    self.commit_delivered_batch(session_id, &batch);
+                    continue;
+                }
+            }
+
+            // Priority 3: One-shot blocking waiter (`hyp wait` / `inbox.wait`)
+            let once_waiter = {
+                let mut map = self.waiters.lock().expect("waiters lock poisoned");
+                let extracted = map.get_mut(session_id).and_then(|list| {
+                    list.iter()
+                        .position(|w| w.mode == WaiterKind::Once)
+                        .map(|idx| list.remove(idx))
+                });
+                if map.get(session_id).is_some_and(Vec::is_empty) {
+                    map.remove(session_id);
+                }
+                extracted
+            };
+            if let Some(waiter) = once_waiter {
+                let pkt = json!({
+                    "type": "wait.items",
+                    "items": [{
+                        "router": self.node.node_id().as_str(),
+                        "received": now_ms() / 1000,
+                        "text": batch.rendered,
+                        "notifyOnly": batch.notify_only,
+                        "mutedCount": batch.muted_count,
+                    }]
+                });
+                if waiter.tx.send(pkt).is_ok() {
+                    self.commit_delivered_batch(session_id, &batch);
+                    continue;
+                }
+            }
+
+            break;
+        }
+    }
+
+    async fn default_peer_id(&self) -> Option<String> {
+        let db = self.node.db();
+        db.peers()
+            .list_peers(None)
+            .ok()?
+            .into_iter()
+            .find(|p| p.status == hyp_store::PeerStatus::Active)
+            .map(|p| p.peer_id)
+    }
+
+    async fn dispatch_tool(
+        &self,
+        session_id: &str,
+        raw_name: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value, (String, String)> {
+        let name = normalize_mesh_tool_name(raw_name).unwrap_or(raw_name);
+        {
+            let db = self.node.db();
+            let now = now_ms();
+            if db.local().get_session(session_id).ok().flatten().is_none() {
+                let _ = db.local().register_session(session_id, "{}", now);
+            } else {
+                let _ = db.local().touch_session(session_id, now);
+            }
+        }
+
+        match name {
+            "hyp_mesh" => self.tool_mesh(session_id, args).await,
+            "hyp_session" => self.tool_session(session_id, args).await,
+            "hyp_join" => self.tool_join(session_id, args).await,
+            "hyp_leave" => self.tool_leave(session_id).await,
+            "hyp_peers" => self.tool_peers(session_id).await,
+            "hyp_capabilities" => self.tool_capabilities(session_id).await,
+            "hyp_mode" => self.tool_mode(session_id, args).await,
+            "hyp_mute" => self.tool_mute(session_id, args).await,
+            "hyp_unmute" => self.tool_unmute(session_id, args).await,
+            "hyp_mutes" => self.tool_mutes(session_id).await,
+            "hyp_channel" => self.tool_channel(session_id, args).await,
+            "hyp_channel_join" => self.tool_channel_join(session_id, args).await,
+            "hyp_channel_leave" => self.tool_channel_leave(session_id, args).await,
+            "hyp_channel_post" => self.tool_channel_post(session_id, args).await,
+            "hyp_channels" => self.tool_channels(args).await,
+            "hyp_send" => self.tool_send(session_id, args).await,
+            "hyp_inbox" => self.tool_inbox(session_id, args).await,
+            "hyp_stream" => self.tool_stream(session_id, args).await,
+            "hyp_subscribe" => self.tool_subscribe(session_id, args).await,
+            "hyp_unsubscribe" => self.tool_unsubscribe(session_id, args).await,
+            "hyp_subscriptions" => self.tool_subscriptions(session_id).await,
+            "hyp_topics" => self.tool_topics(args).await,
+            "hyp_kv" => self.tool_kv(args).await,
+            "hyp_bridge" => self.tool_bridge(session_id, args).await,
+            "hyp_plugin_targets" => self.tool_bridge_targets(session_id).await,
+            "hyp_bridge_link" => self.tool_bridge_link(session_id, args).await,
+            "hyp_bridge_unlink" => self.tool_bridge_unlink(session_id, args).await,
+            "hyp_plugin_handoff" => self.tool_bridge_handoff(session_id, args).await,
+            other => Err(("unknown_tool".into(), format!("Unknown tool {other}"))),
+        }
+    }
+
+    async fn tool_mesh(
+        &self,
+        session_id: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value, (String, String)> {
+        let action = args
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                (
+                    "invalid_request".into(),
+                    "Expected action: join | leave | peers | channels | status".into(),
+                )
+            })?;
+        let has_channel = args
+            .get("channel")
+            .and_then(Value::as_str)
+            .is_some_and(|c| !c.is_empty());
+        match action {
+            "channels" => self.tool_channels(args).await,
+            "join" if has_channel => self.tool_channel_join(session_id, args).await,
+            "leave" if has_channel => self.tool_channel_leave(session_id, args).await,
+            _ => self.tool_session(session_id, args).await,
+        }
+    }
+
+    async fn tool_session(
+        &self,
+        session_id: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value, (String, String)> {
+        let action = args
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ("invalid_request".into(), "Expected session action".into()))?;
+        match action {
+            "join" => self.tool_join(session_id, args).await,
+            "leave" => self.tool_leave(session_id).await,
+            "peers" => self.tool_peers(session_id).await,
+            "status" => self.tool_capabilities(session_id).await,
+            "mode" => self.tool_mode(session_id, args).await,
+            "mute" => self.tool_mute(session_id, args).await,
+            "unmute" => self.tool_unmute(session_id, args).await,
+            "mutes" => self.tool_mutes(session_id).await,
+            other => Err((
+                "invalid_request".into(),
+                format!("Unsupported session action '{other}'"),
+            )),
+        }
+    }
+
+    async fn tool_join(
+        &self,
+        session_id: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value, (String, String)> {
+        let handle = args
+            .get("handle")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ("invalid_request".into(), "Expected handle".into()))?;
+        let rec = self
+            .node
+            .register_handle(session_id, handle)
+            .await
+            .map_err(node_err_tuple)?;
+
+        let (policy, unread, muted) = {
+            let db = self.node.db();
+            let p = self.delivery.policy(&db, session_id).unwrap_or_default();
+            let u = db.local().pending_count(session_id).unwrap_or(0);
+            let m = muted_count(&db, session_id).unwrap_or(0);
+            (p, u, m)
+        };
+
+        let mut out = Map::new();
+        out.insert("address".into(), json!(rec.address));
+        out.insert("nodeId".into(), json!(self.node.node_id().as_str()));
+        out.insert("handle".into(), json!(rec.handle));
+        out.insert("deliveryMode".into(), json!(policy.default_mode.as_str()));
+        out.insert("focusMode".into(), json!(policy.focus_mode));
+        out.insert("unread".into(), json!(unread));
+        out.insert("muted".into(), json!(muted));
+
+        if let Some(include) = args.get("include").and_then(Value::as_array) {
+            for item in include {
+                match item.as_str() {
+                    Some("peers") => {
+                        if let Ok(v) = self.tool_peers(session_id).await {
+                            if let Some(p) = v.get("peers") {
+                                out.insert("peers".into(), p.clone());
+                            }
+                        }
+                    }
+                    Some("channels") => {
+                        if let Ok(v) = self.tool_channels(&Map::new()).await {
+                            if let Some(c) = v.get("channels") {
+                                out.insert("channels".into(), c.clone());
+                            }
+                        }
+                    }
+                    Some("topics") => {
+                        if let Ok(v) = self.tool_topics(&Map::new()).await {
+                            if let Some(r) = v.get("routers") {
+                                out.insert("topics".into(), r.clone());
+                            }
+                        }
+                    }
+                    Some("subs") => {
+                        if let Ok(v) = self.tool_subscriptions(session_id).await {
+                            if let Some(s) = v.get("subscriptions") {
+                                out.insert("subs".into(), s.clone());
+                            }
+                        }
+                    }
+                    Some("mutes") => {
+                        if let Ok(v) = self.tool_mutes(session_id).await {
+                            if let Some(m) = v.get("mutes") {
+                                out.insert("mutes".into(), m.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(Value::Object(out))
+    }
+
+    async fn tool_leave(&self, session_id: &str) -> Result<Value, (String, String)> {
+        let now = now_ms();
+        let left = {
+            let db = self.node.db();
+            let prev = db
+                .local()
+                .get_session(session_id)
+                .map_err(store_err_tuple)?
+                .and_then(|s| s.handle);
+            if let Some(handle) = prev {
+                let _ = db.local().set_session_handle(session_id, None, now);
+                let _ = db
+                    .messages()
+                    .remove_handle(self.node.node_id().as_str(), &handle, now);
+                true
+            } else {
+                false
+            }
+        };
+        Ok(json!({ "left": left }))
+    }
+
+    async fn tool_peers(&self, session_id: &str) -> Result<Value, (String, String)> {
+        let (self_addr, local_handles, peer_ids) = {
+            let db = self.node.db();
+            let handle = db
+                .local()
+                .get_session(session_id)
+                .ok()
+                .flatten()
+                .and_then(|s| s.handle);
+            let self_addr = handle.map(|h| format_address(self.node.node_id().as_str(), &h));
+            let local_handles: Vec<String> = db
+                .messages()
+                .list_handles(Some(self.node.node_id().as_str()))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|h| h.address)
+                .collect();
+            let peer_ids: Vec<String> = db
+                .peers()
+                .list_peers(None)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|p| p.status == hyp_store::PeerStatus::Active)
+                .map(|p| p.peer_id)
+                .collect();
+            (self_addr, local_handles, peer_ids)
+        };
+
+        let mut peers: Vec<String> = local_handles;
+        for pid in peer_ids {
+            if let Some(link) = self.node.peer_link(&pid).await {
+                if let Ok(resp) = link.get_handles(None).await {
+                    for h in resp.handles {
+                        if !peers.contains(&h.address) {
+                            peers.push(h.address);
+                        }
+                    }
+                }
+            }
+        }
+        peers.sort();
+        Ok(json!({
+            "self": self_addr,
+            "peers": peers,
+        }))
+    }
+
+    async fn tool_capabilities(&self, session_id: &str) -> Result<Value, (String, String)> {
+        self.reconcile_session_inbox(session_id).await;
+        let (sess, policy, unread, muted, mutes_len, peers) = {
+            let db = self.node.db();
+            let sess = db.local().get_session(session_id).ok().flatten();
+            let policy = self.delivery.policy(&db, session_id).unwrap_or_default();
+            let unread = db.local().pending_count(session_id).unwrap_or(0);
+            let muted = muted_count(&db, session_id).unwrap_or(0);
+            let mutes_len = db
+                .local()
+                .list_mutes(Some(session_id))
+                .map(|v| v.len())
+                .unwrap_or(0);
+            let peers: Vec<String> = db
+                .peers()
+                .list_peers(None)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.peer_id)
+                .collect();
+            (sess, policy, unread, muted, mutes_len, peers)
+        };
+        Ok(json!({
+            "sessionId": session_id,
+            "nodeId": self.node.node_id().as_str(),
+            "handle": sess.and_then(|s| s.handle),
+            "deliveryMode": policy.default_mode.as_str(),
+            "focusMode": policy.focus_mode,
+            "focusAllowInterruptVips": policy.focus_allow_interrupt_vips,
+            "unread": unread,
+            "muted": muted,
+            "mutes": mutes_len,
+            "rules": policy.overrides,
+            "peers": peers,
+            "hasLiveTransport": self.has_live_transport(session_id),
+            "hasKv": self.has_kv_capability(),
+        }))
+    }
+
+    async fn tool_mode(
+        &self,
+        session_id: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value, (String, String)> {
+        let mode_raw = args
+            .get("mode")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ("invalid_request".into(), "Expected mode: 'queue' | 'notify'".into()))?;
+        let allow_vips = args
+            .get("focusAllowInterruptVips")
+            .and_then(Value::as_bool);
+        let extra_rules = parse_rules_arg(args)?;
+
+        let (focus_mode, default_urgency, store_mode) = match mode_raw.trim().to_ascii_lowercase().as_str() {
+            "notify" => (true, DeliveryUrgency::Notify, DeliveryMode::Notify),
+            "queue" | "full" => (false, DeliveryUrgency::Queue, DeliveryMode::Full),
+            other => {
+                return Err((
+                    "invalid_request".into(),
+                    format!("Expected mode 'queue' | 'full' | 'notify', got '{other}'"),
+                ));
+            }
+        };
+
+        let now = now_ms();
+        let (policy, unread, muted) = {
+            let db = self.node.db();
+            let _ = db.local().set_delivery_mode(session_id, store_mode, now);
+            let policy = self
+                .delivery
+                .update_policy(&db, session_id, |p| {
+                    p.focus_mode = focus_mode;
+                    p.default_mode = default_urgency;
+                    if let Some(v) = allow_vips {
+                        p.focus_allow_interrupt_vips = v;
+                    }
+                    for rule in &extra_rules {
+                        p.upsert_rule(rule.clone());
+                    }
+                })
+                .map_err(delivery_err_tuple)?;
+            for rule in &extra_rules {
+                if rule.delivery == DeliveryUrgency::Mute {
+                    let _ = db.local().add_mute(session_id, &rule.target, session_id, now);
+                }
+            }
+            let unread = db.local().pending_count(session_id).unwrap_or(0);
+            let muted = muted_count(&db, session_id).unwrap_or(0);
+            (policy, unread, muted)
+        };
+
+        if !focus_mode && unread > 0 {
+            self.flush_session(session_id).await;
+        }
+
+        Ok(json!({
+            "deliveryMode": policy.default_mode.as_str(),
+            "focusMode": policy.focus_mode,
+            "focusAllowInterruptVips": policy.focus_allow_interrupt_vips,
+            "rules": policy.overrides,
+            "unread": unread,
+            "muted": muted,
+        }))
+    }
+
+    async fn tool_mute(
+        &self,
+        session_id: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value, (String, String)> {
+        let target = args
+            .get("target")
+            .or_else(|| args.get("mute"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ("invalid_request".into(), "Expected mute target".into()))?;
+        let scope_arg = args.get("scope").and_then(Value::as_str).unwrap_or("session");
+        let db_scope = if scope_arg == "connector" { "*" } else { session_id };
+        let now = now_ms();
+
+        let rule = {
+            let db = self.node.db();
+            let added = db
+                .local()
+                .add_mute(db_scope, target, session_id, now)
+                .map_err(store_err_tuple)?;
+            let _ = self.delivery.update_policy(&db, session_id, |p| {
+                p.upsert_rule(DeliveryRule::new(target, DeliveryUrgency::Mute));
+            });
+            added
+        };
+
+        Ok(json!({
+            "muted": rule.pattern,
+            "scope": if db_scope == "*" { "connector" } else { "session" },
+        }))
+    }
+
+    async fn tool_unmute(
+        &self,
+        session_id: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value, (String, String)> {
+        let target = args
+            .get("target")
+            .or_else(|| args.get("unmute"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ("invalid_request".into(), "Expected unmute target".into()))?;
+        let scope_arg = args.get("scope").and_then(Value::as_str).unwrap_or("session");
+        let db_scope = if scope_arg == "connector" { "*" } else { session_id };
+
+        let removed = {
+            let db = self.node.db();
+            let db_removed = db
+                .local()
+                .remove_mute(db_scope, target)
+                .map_err(store_err_tuple)?;
+            let mut policy_removed = false;
+            let _ = self.delivery.update_policy(&db, session_id, |p| {
+                policy_removed = p.remove_rule(target);
+            });
+            db_removed || policy_removed
+        };
+
+        Ok(json!({
+            "pattern": target.to_ascii_lowercase(),
+            "scope": if db_scope == "*" { "connector" } else { "session" },
+            "removed": removed,
+        }))
+    }
+
+    async fn tool_mutes(&self, session_id: &str) -> Result<Value, (String, String)> {
+        let rules = {
+            let db = self.node.db();
+            db.local()
+                .list_mutes(Some(session_id))
+                .map_err(store_err_tuple)?
+        };
+        let list: Vec<Value> = rules
+            .into_iter()
+            .map(|r| {
+                json!({
+                    "pattern": r.pattern,
+                    "scope": if r.scope == "*" { "connector" } else { "session" },
+                    "mutedAt": r.muted_at,
+                    "mutedBy": r.muted_by,
+                })
+            })
+            .collect();
+        Ok(json!({ "mutes": list }))
+    }
+
+    async fn tool_channel(
+        &self,
+        session_id: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value, (String, String)> {
+        match args.get("action").and_then(Value::as_str) {
+            Some("join") => self.tool_channel_join(session_id, args).await,
+            Some("leave") => self.tool_channel_leave(session_id, args).await,
+            Some("list") => self.tool_channels(args).await,
+            _ => Err((
+                "invalid_request".into(),
+                "Expected channel action: join | leave | list".into(),
+            )),
+        }
+    }
+
+    async fn tool_channel_join(
+        &self,
+        session_id: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value, (String, String)> {
+        let ch = args
+            .get("channel")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ("invalid_request".into(), "Expected channel name".into()))?;
+        let handle = self.require_session_handle(session_id)?;
+        let resp = self
+            .node
+            .join_channel(ch, &handle)
+            .await
+            .map_err(node_err_tuple)?;
+        Ok(serde_json::to_value(resp).unwrap_or_else(|_| json!({})))
+    }
+
+    async fn tool_channel_leave(
+        &self,
+        session_id: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value, (String, String)> {
+        let ch = args
+            .get("channel")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ("invalid_request".into(), "Expected channel name".into()))?;
+        let handle = self.require_session_handle(session_id)?;
+        let left = self
+            .node
+            .leave_channel(ch, &handle)
+            .await
+            .map_err(node_err_tuple)?;
+        Ok(json!({ "left": left }))
+    }
+
+    async fn tool_channel_post(
+        &self,
+        session_id: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value, (String, String)> {
+        let ch = args
+            .get("channel")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ("invalid_request".into(), "Expected channel name".into()))?;
+        let text = args
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ("invalid_request".into(), "Expected non-empty text".into()))?;
+        let handle = self.require_session_handle(session_id)?;
+        self.check_outbound_gate(session_id, ch, "to.hyphae.channel.v1", text)?;
+        let res = self
+            .node
+            .post_channel(ch, &handle, text)
+            .await
+            .map_err(node_err_tuple)?;
+        Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({})))
+    }
+
+    async fn tool_channels(&self, args: &Map<String, Value>) -> Result<Value, (String, String)> {
+        let filter = args.get("channel").and_then(Value::as_str);
+        let host = self
+            .default_peer_id()
+            .await
+            .unwrap_or_else(|| "local".to_string());
+        let list = self
+            .node
+            .list_channels(&host, filter)
+            .await
+            .map_err(node_err_tuple)?;
+        Ok(json!({ "channels": list }))
+    }
+
+    async fn tool_send(
+        &self,
+        session_id: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value, (String, String)> {
+        let to = args
+            .get("to")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ("invalid_request".into(), "Expected destination 'to'".into()))?;
+        let handle = self.require_session_handle(session_id)?;
+
+        // File transfer path
+        if let Some(files_val) = args.get("files").and_then(Value::as_array) {
+            let paths: Vec<PathBuf> = files_val
+                .iter()
+                .filter_map(Value::as_str)
+                .map(PathBuf::from)
+                .collect();
+            if paths.is_empty() {
+                return Err(("invalid_request".into(), "Expected non-empty files array".into()));
+            }
+            let (target_node, to_handle) = parse_address(to).ok_or_else(|| {
+                (
+                    "invalid_request".into(),
+                    "File transfers require <node>/<handle> destination".into(),
+                )
+            })?;
+            let note = args.get("text").and_then(Value::as_str);
+            if let Some(n) = note {
+                self.check_outbound_gate(session_id, to, "to.hyphae.transfer.v1", n)?;
+            }
+            let mut entries = Vec::with_capacity(paths.len());
+            for path in &paths {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file.bin")
+                    .to_string();
+                entries.push(hyp_crypto::transfer::TarInputEntry {
+                    archive_path: name,
+                    source_path: path.clone(),
+                });
+            }
+            let res = self
+                .node
+                .send_files(target_node, Some(to_handle), &entries, None)
+                .await
+                .map_err(node_err_tuple)?;
+            return Ok(json!({
+                "transferId": res.id,
+                "to": to,
+                "routedVia": res.routed_via,
+                "encrypted": true,
+                "ciphertextBytes": res.ciphertext_bytes,
+            }));
+        }
+
+        let text = args
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ("invalid_request".into(), "Expected 'text'".into()))?;
+
+        // `#channel` or `<node>/#channel`
+        if to.starts_with('#') || to.contains("/#") {
+            let mut ch_args = Map::new();
+            ch_args.insert("channel".into(), json!(to));
+            ch_args.insert("text".into(), json!(text));
+            return self.tool_channel_post(session_id, &ch_args).await;
+        }
+
+        // Local bridge `<plugin>:<target>`
+        if is_bridge_destination(to) {
+            return Err((
+                "no_plugins".into(),
+                format!("No local bridge plugin configured for '{to}'"),
+            ));
+        }
+
+        // Direct DM `<node>/<handle>`
+        self.check_outbound_gate(session_id, to, "to.hyphae.dm.v1", text)?;
+        let res = self
+            .node
+            .send_dm(&handle, to, text)
+            .await
+            .map_err(node_err_tuple)?;
+        Ok(json!({
+            "messageId": res.id,
+            "to": res.to,
+            "routedVia": res.routed_via,
+            "encrypted": res.encrypted,
+            "status": "stored",
+        }))
+    }
+
+    async fn tool_inbox(
+        &self,
+        session_id: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value, (String, String)> {
+        // Policy controls if present (`mode`, `mute`, `unmute`, `rules`, `focusMode`).
+        if args.get("mode").and_then(Value::as_str).is_some() {
+            return self.tool_mode(session_id, args).await;
+        }
+        if args.get("mute").and_then(Value::as_str).is_some() {
+            return self.tool_mute(session_id, args).await;
+        }
+        if args.get("unmute").and_then(Value::as_str).is_some() {
+            return self.tool_unmute(session_id, args).await;
+        }
+
+        let rules = parse_rules_arg(args)?;
+        let focus_mode_opt = args.get("focusMode").and_then(Value::as_bool);
+        let allow_vips_opt = args
+            .get("focusAllowInterruptVips")
+            .and_then(Value::as_bool);
+
+        if !rules.is_empty() || focus_mode_opt.is_some() || allow_vips_opt.is_some() {
+            let now = now_ms();
+            let policy = {
+                let db = self.node.db();
+                let p = self
+                    .delivery
+                    .update_policy(&db, session_id, |pol| {
+                        if let Some(fm) = focus_mode_opt {
+                            pol.focus_mode = fm;
+                            pol.default_mode = if fm {
+                                DeliveryUrgency::Notify
+                            } else {
+                                DeliveryUrgency::Queue
+                            };
+                        }
+                        if let Some(v) = allow_vips_opt {
+                            pol.focus_allow_interrupt_vips = v;
+                        }
+                        for r in &rules {
+                            pol.upsert_rule(r.clone());
+                        }
+                    })
+                    .map_err(delivery_err_tuple)?;
+                for r in &rules {
+                    if r.delivery == DeliveryUrgency::Mute {
+                        let _ = db.local().add_mute(session_id, &r.target, session_id, now);
+                    }
+                }
+                p
+            };
+
+            // If ONLY policy updates were provided (no read/query flags), return updated policy directly.
+            let is_query = args.contains_key("state")
+                || args.contains_key("filter")
+                || args.contains_key("cursor")
+                || args.contains_key("ack")
+                || args.contains_key("acknowledge")
+                || args.contains_key("ids")
+                || args.contains_key("summary")
+                || args.contains_key("summaryOnly")
+                || args.contains_key("limit");
+            if !is_query {
+                let (unread, muted) = {
+                    let db = self.node.db();
+                    (
+                        db.local().pending_count(session_id).unwrap_or(0),
+                        muted_count(&db, session_id).unwrap_or(0),
+                    )
+                };
+                return Ok(json!({
+                    "deliveryMode": policy.default_mode.as_str(),
+                    "focusMode": policy.focus_mode,
+                    "focusAllowInterruptVips": policy.focus_allow_interrupt_vips,
+                    "rules": policy.overrides,
+                    "unread": unread,
+                    "muted": muted,
+                }));
+            }
+        }
+
+        // Reconcile any newly arrived entries before querying!
+        self.reconcile_session_inbox(session_id).await;
+
+        let state = match args.get("state").and_then(Value::as_str) {
+            Some(raw) => InboxStateFilter::parse(raw).map_err(delivery_err_tuple)?,
+            None => InboxStateFilter::Unread,
+        };
+        let filter = parse_inbox_filter_arg(args.get("filter"))?;
+        let cursor = args
+            .get("cursor")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .unwrap_or(20);
+        let summary_only = args
+            .get("summaryOnly")
+            .or_else(|| args.get("summary"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let ack = args
+            .get("acknowledgeAll")
+            .or_else(|| args.get("ack"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let ids: Vec<String> = args
+            .get("acknowledge")
+            .or_else(|| args.get("ids"))
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let query = InboxQuery {
+            state,
+            filter,
+            cursor,
+            limit,
+            summary_only,
+            ack,
+            ids,
+        };
+
+        let (result, policy) = {
+            let db = self.node.db();
+            let res = query_inbox(&db, session_id, &query, now_ms()).map_err(delivery_err_tuple)?;
+            let pol = self.delivery.policy(&db, session_id).unwrap_or_default();
+            (res, pol)
+        };
+
+        // Clean up in-memory item_meta for acknowledged receipts.
+        if result.acked_count > 0 {
+            let mut guard = self.item_meta.lock().expect("item_meta lock poisoned");
+            if let Some(map) = guard.get_mut(session_id) {
+                for item in &result.items {
+                    map.remove(&item.receipt);
+                }
+            }
+        }
+
+        Ok(json!({
+            "deliveryMode": policy.default_mode.as_str(),
+            "focusMode": policy.focus_mode,
+            "state": result.state.as_str(),
+            "unread": result.unread_count,
+            "muted": result.muted_count,
+            "acked": result.acked_count,
+            "totalMatched": result.total_matched,
+            "hasMore": result.has_more,
+            "nextCursor": result.next_cursor,
+            "items": result.items,
+        }))
+    }
+
+    async fn tool_stream(
+        &self,
+        session_id: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value, (String, String)> {
+        match args.get("action").and_then(Value::as_str) {
+            Some("topics") => self.tool_topics(args).await,
+            Some("subscribe") => self.tool_subscribe(session_id, args).await,
+            Some("unsubscribe") => self.tool_unsubscribe(session_id, args).await,
+            Some("list") => self.tool_subscriptions(session_id).await,
+            _ => Err((
+                "invalid_request".into(),
+                "Expected hyp_stream action: topics | subscribe | unsubscribe | list".into(),
+            )),
+        }
+    }
+
+    async fn tool_topics(&self, args: &Map<String, Value>) -> Result<Value, (String, String)> {
+        let router_filter = args.get("router").and_then(Value::as_str);
+        let mut routers = Vec::new();
+
+        if router_filter.is_none() || router_filter == Some("local") {
+            let local_topics: Vec<Value> = self
+                .node
+                .local_topic_catalog()
+                .into_iter()
+                .map(|t| {
+                    json!({
+                        "topic": t.topic,
+                        "provisioned": t.has_provisioned_publisher,
+                    })
+                })
+                .collect();
+            routers.push(json!({
+                "router": "local",
+                "nodeId": self.node.node_id().as_str(),
+                "supported": true,
+                "topics": local_topics,
+            }));
+        }
+
+        let peers = {
+            let db = self.node.db();
+            db.peers().list_peers(None).unwrap_or_default()
+        };
+        for p in peers {
+            if let Some(rf) = router_filter {
+                if rf != "primary" && rf != p.peer_id {
+                    continue;
+                }
+            }
+            let mut peer_topics = Vec::new();
+            if let Some(ref raw) = p.manifest_json {
+                if let Ok(signed) =
+                    serde_json::from_str::<hyp_proto::manifest::SignedNodeManifest>(raw)
+                {
+                    if let Ok(payload) = signed.decode_payload() {
+                        for t in payload.advertised.topics {
+                            peer_topics.push(json!({
+                                "topic": t.topic,
+                                "kind": t.kind,
+                                "description": t.description,
+                            }));
+                        }
+                    }
+                }
+            }
+            routers.push(json!({
+                "router": p.peer_id,
+                "supported": true,
+                "topics": peer_topics,
+            }));
+        }
+
+        Ok(json!({ "routers": routers }))
+    }
+
+    async fn tool_subscribe(
+        &self,
+        session_id: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value, (String, String)> {
+        let raw_topic = args
+            .get("topic")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ("invalid_request".into(), "Expected topic".into()))?;
+        let router = args.get("router").and_then(Value::as_str);
+        let qualified_topic = match router {
+            Some("primary") | None => raw_topic.to_string(),
+            Some(r) => format!("{r}.{raw_topic}"),
+        };
+
+        let filters: Vec<ProtoFilter> = match args.get("filters") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(val) => hyp_proto::filter::validate_filters(val)
+                .map_err(|e| ("invalid_filter".into(), e.to_string()))?,
+        };
+        let coalesce_seconds = args
+            .get("coalesceSeconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(600) as u32;
+        let urgency = match args.get("mode").and_then(Value::as_str) {
+            Some(raw) => DeliveryUrgency::parse(raw).map_err(delivery_err_tuple)?,
+            None => DeliveryUrgency::Queue,
+        };
+        let key = args
+            .get("key")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+
+        // Reuse existing subscription ID if caller supplied matching `key`.
+        let existing_id = key.as_deref().and_then(|k| {
+            let guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
+            guard
+                .get(session_id)?
+                .iter()
+                .find(|s| s.key.as_deref() == Some(k))
+                .map(|s| s.id.clone())
+        });
+
+        let res = self
+            .node
+            .subscribe_local_or_remote(SubscribeRequest {
+                id: existing_id.clone(),
+                subscriber_session: session_id.to_string(),
+                qualified_topic,
+                filters: filters.clone(),
+                coalesce_seconds,
+                mode: urgency.to_store_mode(),
+            })
+            .await
+            .map_err(node_err_tuple)?;
+
+        let strict = args.get("strict").and_then(Value::as_bool) == Some(true);
+        let has_error = res
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == hyp_proto::filter::DiagnosticSeverity::Error);
+        if strict && has_error {
+            let msg = res
+                .diagnostics
+                .iter()
+                .find(|d| d.severity == hyp_proto::filter::DiagnosticSeverity::Error)
+                .map(|d| d.message.clone())
+                .unwrap_or_else(|| "Unreachable subscription".into());
+            let _ = self
+                .node
+                .db()
+                .events()
+                .delete_subscription(&res.subscription.id);
+            return Err(("unreachable_subscription".into(), msg));
+        }
+
+        {
+            let mut guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
+            let list = guard.entry(session_id.to_string()).or_default();
+            list.retain(|s| s.id != res.subscription.id);
+            list.push(SubscriptionRecordMeta {
+                id: res.subscription.id.clone(),
+                key,
+                origin_node: res.origin_node.clone(),
+                topic: res.topic.clone(),
+                urgency,
+            });
+        }
+
+        let outcome = if existing_id.is_some() {
+            "updated"
+        } else {
+            "created"
+        };
+        Ok(json!({
+            "id": res.subscription.id,
+            "originNode": res.origin_node,
+            "topic": res.topic,
+            "mode": urgency.as_str(),
+            "outcome": outcome,
+            "filters": filters,
+            "reachable": !has_error,
+            "pushdownShards": res.pushdown_shards,
+            "diagnostics": res.diagnostics,
+        }))
+    }
+
+    async fn tool_unsubscribe(
+        &self,
+        session_id: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value, (String, String)> {
+        let id_arg = args.get("id").and_then(Value::as_str);
+        let key_arg = args.get("key").and_then(Value::as_str);
+        let target_id = if let Some(id) = id_arg {
+            Some(id.to_string())
+        } else if let Some(key) = key_arg {
+            let guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
+            guard
+                .get(session_id)
+                .and_then(|list| {
+                    list.iter()
+                        .find(|s| s.key.as_deref() == Some(key) || s.id == key)
+                        .map(|s| s.id.clone())
+                })
+                .or_else(|| Some(key.to_string()))
+        } else {
+            return Err(("invalid_request".into(), "Expected id or key".into()));
+        };
+
+        let removed = if let Some(sub_id) = target_id {
+            let db_removed = {
+                let db = self.node.db();
+                db.events()
+                    .delete_subscription(&sub_id)
+                    .map_err(store_err_tuple)?
+            };
+            let mut guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
+            if let Some(list) = guard.get_mut(session_id) {
+                list.retain(|s| s.id != sub_id);
+            }
+            db_removed
+        } else {
+            false
+        };
+
+        Ok(json!({ "removed": removed }))
+    }
+
+    async fn tool_subscriptions(&self, session_id: &str) -> Result<Value, (String, String)> {
+        let subs = {
+            let db = self.node.db();
+            db.events()
+                .list_subscriptions(Some(session_id))
+                .map_err(store_err_tuple)?
+        };
+        let meta_map: HashMap<String, SubscriptionRecordMeta> = self
+            .sub_meta
+            .lock()
+            .expect("sub_meta lock poisoned")
+            .get(session_id)
+            .map(|l| l.iter().map(|m| (m.id.clone(), m.clone())).collect())
+            .unwrap_or_default();
+
+        let list: Vec<Value> = subs
+            .into_iter()
+            .map(|s| {
+                let meta = meta_map.get(&s.id);
+                let mode_str = meta
+                    .map(|m| m.urgency.as_str())
+                    .unwrap_or_else(|| s.mode.as_str());
+                json!({
+                    "id": s.id,
+                    "key": meta.and_then(|m| m.key.clone()),
+                    "originNode": s.origin_node,
+                    "topic": s.topic,
+                    "filters": s.filters,
+                    "coalesceSeconds": s.coalesce_seconds,
+                    "mode": mode_str,
+                })
+            })
+            .collect();
+        Ok(json!({ "subscriptions": list }))
+    }
+
+    async fn tool_kv(&self, args: &Map<String, Value>) -> Result<Value, (String, String)> {
+        let action = args
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ("invalid_request".into(), "Expected hyp_kv action".into()))?;
+        let namespace = args
+            .get("namespace")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ("invalid_request".into(), "Expected namespace".into()))?;
+
+        let host_node = match args.get("node").and_then(Value::as_str) {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => self
+                .default_peer_id()
+                .await
+                .unwrap_or_else(|| "local".to_string()),
+        };
+
+        match action {
+            "get" => {
+                let key = args
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ("invalid_request".into(), "Expected key".into()))?;
+                let entry = self
+                    .node
+                    .kv_get(&host_node, namespace, key)
+                    .await
+                    .map_err(node_err_tuple)?;
+                Ok(json!({ "entry": entry }))
+            }
+            "set" => {
+                let key = args
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ("invalid_request".into(), "Expected key".into()))?;
+                let value = args
+                    .get("value")
+                    .cloned()
+                    .ok_or_else(|| ("invalid_request".into(), "Expected value".into()))?;
+                let write_model = match args.get("writeModel").and_then(Value::as_str) {
+                    Some("shared") => WriteModel::Shared,
+                    Some("allowlist") => WriteModel::Allowlist,
+                    _ => WriteModel::Owner,
+                };
+                let expected_version = args.get("expectedVersion").and_then(Value::as_u64);
+                let ttl_ms = args.get("ttlMs").and_then(Value::as_i64);
+                let encrypt = args.get("encrypt").and_then(Value::as_bool).unwrap_or(false);
+                let e2ee_members = args
+                    .get("e2eeMembers")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(ToString::to_string)
+                            .collect()
+                    });
+
+                let entry = self
+                    .node
+                    .kv_set(KvWriteRequest {
+                        host_node,
+                        namespace: namespace.to_string(),
+                        key: key.to_string(),
+                        value,
+                        write_model,
+                        owner_id: None,
+                        allowlist: None,
+                        expected_version,
+                        ttl_ms,
+                        encrypt,
+                        e2ee_members,
+                    })
+                    .await
+                    .map_err(node_err_tuple)?;
+                Ok(json!({ "entry": entry }))
+            }
+            "delete" => {
+                let key = args
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ("invalid_request".into(), "Expected key".into()))?;
+                let expected_version = args.get("expectedVersion").and_then(Value::as_u64);
+                let res = self
+                    .node
+                    .kv_delete(&host_node, namespace, key, expected_version)
+                    .await
+                    .map_err(node_err_tuple)?;
+                Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({})))
+            }
+            "list" => {
+                let prefix = args.get("prefix").and_then(Value::as_str);
+                let entries = self
+                    .node
+                    .kv_list(&host_node, namespace, prefix)
+                    .await
+                    .map_err(node_err_tuple)?;
+                Ok(json!({ "entries": entries }))
+            }
+            other => Err((
+                "invalid_request".into(),
+                format!("Unsupported hyp_kv action '{other}'"),
+            )),
+        }
+    }
+
+    async fn tool_bridge(
+        &self,
+        session_id: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value, (String, String)> {
+        match args.get("action").and_then(Value::as_str) {
+            Some("targets") => self.tool_bridge_targets(session_id).await,
+            Some("link") => self.tool_bridge_link(session_id, args).await,
+            Some("unlink") => self.tool_bridge_unlink(session_id, args).await,
+            Some("handoff") => self.tool_bridge_handoff(session_id, args).await,
+            _ => Err((
+                "invalid_request".into(),
+                "Expected hyp_bridge action: targets | link | unlink | handoff".into(),
+            )),
+        }
+    }
+
+    async fn tool_bridge_targets(&self, session_id: &str) -> Result<Value, (String, String)> {
+        let links = {
+            let db = self.node.db();
+            db.local()
+                .bridge_links_for_session(session_id)
+                .map_err(store_err_tuple)?
+        };
+        Ok(json!({ "links": links }))
+    }
+
+    async fn tool_bridge_link(
+        &self,
+        session_id: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value, (String, String)> {
+        let plugin = args
+            .get("plugin")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ("invalid_request".into(), "Expected plugin".into()))?;
+        let target = args
+            .get("target")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ("invalid_request".into(), "Expected target".into()))?;
+        let link = BridgeLink {
+            plugin: plugin.to_string(),
+            target: target.to_string(),
+            session_id: session_id.to_string(),
+            linked_at: now_ms(),
+            linked_by: session_id.to_string(),
+        };
+        self.node
+            .db()
+            .local()
+            .add_bridge_link(&link)
+            .map_err(store_err_tuple)?;
+        Ok(json!({ "linked": true, "plugin": plugin, "target": target }))
+    }
+
+    async fn tool_bridge_unlink(
+        &self,
+        session_id: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value, (String, String)> {
+        let plugin = args
+            .get("plugin")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ("invalid_request".into(), "Expected plugin".into()))?;
+        let target = args
+            .get("target")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ("invalid_request".into(), "Expected target".into()))?;
+        let removed = self
+            .node
+            .db()
+            .local()
+            .remove_bridge_link(plugin, target, Some(session_id))
+            .map_err(store_err_tuple)?;
+        Ok(json!({ "removed": removed > 0 }))
+    }
+
+    async fn tool_bridge_handoff(
+        &self,
+        session_id: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value, (String, String)> {
+        let plugin = args
+            .get("plugin")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ("invalid_request".into(), "Expected plugin".into()))?;
+        let target = args
+            .get("target")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ("invalid_request".into(), "Expected target".into()))?;
+        let target_session = if let Some(h) = args.get("handle").and_then(Value::as_str) {
+            self.node
+                .db()
+                .local()
+                .session_by_handle(h)
+                .map_err(store_err_tuple)?
+                .ok_or_else(|| ("not_found".into(), format!("Unknown handle '{h}'")))?
+                .id
+        } else {
+            session_id.to_string()
+        };
+        let handoff = PluginTargetHandoff {
+            plugin: plugin.to_string(),
+            target: target.to_string(),
+            session_id: target_session.clone(),
+            set_at: now_ms(),
+            set_by: session_id.to_string(),
+        };
+        self.node
+            .db()
+            .local()
+            .set_plugin_target(&handoff)
+            .map_err(store_err_tuple)?;
+        Ok(json!({ "handoff": true, "sessionId": target_session }))
+    }
+
+    fn require_session_handle(&self, session_id: &str) -> Result<String, (String, String)> {
+        let db = self.node.db();
+        db.local()
+            .get_session(session_id)
+            .map_err(store_err_tuple)?
+            .and_then(|s| s.handle)
+            .ok_or_else(|| {
+                (
+                    "not_enrolled".into(),
+                    "Call hyp_mesh(action:'join', handle:'...') before sending".into(),
+                )
+            })
+    }
+
+    fn check_outbound_gate(
+        &self,
+        session_id: &str,
+        destination: &str,
+        event_type: &str,
+        payload: &str,
+    ) -> Result<(), (String, String)> {
+        let Some(ref pipeline) = self.gate else {
+            return Ok(());
+        };
+        let dest_node = parse_address(destination).map(|(n, _)| n.to_string());
+        let trust_tier = dest_node
+            .as_deref()
+            .map(|n| self.resolve_peer_trust_tier(n))
+            .unwrap_or(GateTrustTier::Peer);
+        let eval = pipeline
+            .evaluate_outbound(
+                &OutboundContext {
+                    session_id: Some(session_id.to_string()),
+                    destination_node: dest_node,
+                    destination: destination.to_string(),
+                    event_type: event_type.to_string(),
+                    trust_tier,
+                    traceparent: None,
+                    payload: payload.to_string(),
+                },
+                now_ms(),
+            )
+            .map_err(|e| ("gate_error".into(), e.to_string()))?;
+        match eval.decision {
+            GateDecision::Allow { .. } => Ok(()),
+            GateDecision::Block { reason }
+            | GateDecision::Quarantine { reason, .. }
+            | GateDecision::Hold { reason, .. } => Err(("outbound_dlp_blocked".into(), reason)),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct McpSocketContext {
+    backend: Option<HarnessKind>,
+    channel: bool,
+    channel_ready: bool,
+    channel_session_id: Option<String>,
+    ephemeral_client_id: Option<String>,
+}
+
+async fn handle_connection<R, W>(
+    daemon: Arc<LocalDaemonInner>,
+    read_half: R,
+    mut write_half: W,
+    mut shutdown_rx: watch::Receiver<bool>,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let conn_id = daemon.next_seq();
+    let mut reader = BufReader::new(read_half);
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
+    let (chan_tx, mut chan_rx) = mpsc::unbounded_channel::<ChannelDeliverCommand>();
+
+    let mut mcp_ctx: Option<McpSocketContext> = None;
+    let mut attached_waiter: Option<(String, u64)> = None;
+    let mut pending_channel_acks: HashMap<u64, oneshot::Sender<bool>> = HashMap::new();
+
+    // Writer loop merged into select! so both request replies and async pushes serialize cleanly.
+    loop {
+        enum Ev {
+            Line(Result<Option<String>, crate::sock::SockError>),
+            Push(Option<Value>),
+            ChannelCmd(Option<ChannelDeliverCommand>),
+            Shutdown,
+        }
+
+        let ev = tokio::select! {
+            res = read_bounded_line_async(&mut reader, MAX_SOCKET_LINE_BYTES) => Ev::Line(res),
+            msg = out_rx.recv() => Ev::Push(msg),
+            cmd = chan_rx.recv() => Ev::ChannelCmd(cmd),
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    Ev::Shutdown
+                } else {
+                    continue;
+                }
+            }
+        };
+
+        match ev {
+            Ev::Shutdown => break,
+            Ev::Push(Some(pkt)) => {
+                let is_once_done = attached_waiter.as_ref().is_some_and(|(sid, wid)| {
+                    let map = daemon.waiters.lock().expect("waiters lock poisoned");
+                    !map.get(sid)
+                        .is_some_and(|list| list.iter().any(|w| w.id == *wid))
+                }) && pkt.get("type").and_then(Value::as_str) == Some("wait.items");
+
+                if write_ndjson_line_async(&mut write_half, &pkt).await.is_err() {
+                    break;
+                }
+                if is_once_done {
+                    let _ = write_half.shutdown().await;
+                    break;
+                }
+            }
+            Ev::Push(None) => break,
+            Ev::ChannelCmd(Some(cmd)) => {
+                let pkt = json!({
+                    "type": "channel.deliver",
+                    "delivery": cmd.delivery_id,
+                    "text": cmd.text,
+                });
+                if write_ndjson_line_async(&mut write_half, &pkt).await.is_ok() {
+                    pending_channel_acks.insert(cmd.delivery_id, cmd.ack_tx);
+                } else {
+                    let _ = cmd.ack_tx.send(false);
+                    break;
+                }
+            }
+            Ev::ChannelCmd(None) => break,
+            Ev::Line(Ok(None)) | Ev::Line(Err(_)) => break,
+            Ev::Line(Ok(Some(line))) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let Ok(Value::Object(packet)) = serde_json::from_str::<Value>(&line) else {
+                    let _ = write_ndjson_line_async(
+                        &mut write_half,
+                        &json!({ "ok": false, "error": "invalid_json" }),
+                    )
+                    .await;
+                    break;
+                };
+
+                let pkt_type = packet
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+
+                match pkt_type {
+                    // ---- Single-shot hook / CLI RPCs ----
+                    "call.start" => {
+                        let resp = handle_call_start(&daemon, &packet);
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
+                    "call.end" | "call.finish" => {
+                        let cid = packet.get("callId").and_then(Value::as_str);
+                        let tok = packet.get("callToken").and_then(Value::as_str);
+                        daemon.calls.finish_call(cid, tok);
+                        let _ = write_ndjson_line_async(
+                            &mut write_half,
+                            &json!({ "ok": true, "result": {} }),
+                        )
+                        .await;
+                        break;
+                    }
+                    "mailbox.drain" => {
+                        let resp = handle_mailbox_drain(&daemon, &packet).await;
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
+                    "session.status" => {
+                        let resp = handle_session_status(&daemon, &packet).await;
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
+                    "daemon.status" => {
+                        let resp = handle_daemon_status(&daemon).await;
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
+                    "mute.add" => {
+                        let target = packet
+                            .get("target")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let resp = match daemon.node.db().local().add_mute("*", target, "cli", now_ms()) {
+                            Ok(rule) => json!({ "ok": true, "result": { "rule": rule } }),
+                            Err(e) => json!({ "ok": false, "error": e.to_string() }),
+                        };
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
+                    "mute.remove" => {
+                        let target = packet
+                            .get("target")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let resp = match daemon.node.db().local().remove_mute("*", target) {
+                            Ok(removed) => json!({ "ok": true, "result": { "removed": removed } }),
+                            Err(e) => json!({ "ok": false, "error": e.to_string() }),
+                        };
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
+                    "mute.list" => {
+                        let mutes = daemon
+                            .node
+                            .db()
+                            .local()
+                            .list_mutes(None)
+                            .unwrap_or_default();
+                        let _ = write_ndjson_line_async(
+                            &mut write_half,
+                            &json!({ "ok": true, "result": { "mutes": mutes } }),
+                        )
+                        .await;
+                        break;
+                    }
+
+                    // ---- Blocking waiter / streaming watcher ----
+                    "wait.subscribe" | "inbox.wait" | "inbox.watch" => {
+                        let mode = match pkt_type {
+                            "inbox.wait" => WaiterKind::Once,
+                            "inbox.watch" => WaiterKind::Stream,
+                            _ => match packet.get("mode").and_then(Value::as_str) {
+                                Some("stream") => WaiterKind::Stream,
+                                _ => WaiterKind::Once,
+                            },
+                        };
+
+                        let mut sid = packet
+                            .get("sessionId")
+                            .and_then(Value::as_str)
+                            .filter(|s| is_valid_session_id(s))
+                            .map(ToString::to_string);
+                        if sid.is_none() {
+                            if let Some(h) = packet.get("handle").and_then(Value::as_str) {
+                                sid = daemon
+                                    .node
+                                    .db()
+                                    .local()
+                                    .session_by_handle(h)
+                                    .ok()
+                                    .flatten()
+                                    .map(|s| s.id);
+                            }
+                        }
+                        let Some(session_id) = sid else {
+                            let _ = write_ndjson_line_async(
+                                &mut write_half,
+                                &json!({
+                                    "type": "wait.error",
+                                    "message": "Unknown session or handle. Join the mesh first or pass --session <id>."
+                                }),
+                            )
+                            .await;
+                            break;
+                        };
+
+                        let waiter_id = daemon.next_seq();
+                        {
+                            let mut map = daemon.waiters.lock().expect("waiters lock poisoned");
+                            map.entry(session_id.clone()).or_default().push(LiveWaiter {
+                                id: waiter_id,
+                                mode,
+                                tx: out_tx.clone(),
+                            });
+                        }
+                        attached_waiter = Some((session_id.clone(), waiter_id));
+                        let _ = daemon.node.db().local().touch_session(&session_id, now_ms());
+
+                        let mode_str = match mode {
+                            WaiterKind::Once => "once",
+                            WaiterKind::Stream => "stream",
+                        };
+                        if write_ndjson_line_async(
+                            &mut write_half,
+                            &json!({ "type": "wait.ready", "sessionId": session_id, "mode": mode_str }),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+
+                        // Spawn flush so `out_rx` in this select loop receives pushed items immediately!
+                        let flush_daemon = Arc::clone(&daemon);
+                        let flush_sid = session_id;
+                        tokio::spawn(async move {
+                            flush_daemon.flush_session(&flush_sid).await;
+                        });
+                    }
+
+                    // ---- Persistent MCP shim protocol ----
+                    "mcp.hello" => {
+                        let backend = packet
+                            .get("backend")
+                            .and_then(Value::as_str)
+                            .and_then(|s| s.parse::<HarnessKind>().ok());
+                        let channel = packet.get("channel").and_then(Value::as_bool) == Some(true);
+                        let ephemeral_client_id = packet
+                            .get("clientId")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty() && s.len() <= 64)
+                            .map(ToString::to_string);
+                        mcp_ctx = Some(McpSocketContext {
+                            backend,
+                            channel,
+                            channel_ready: false,
+                            channel_session_id: None,
+                            ephemeral_client_id,
+                        });
+                    }
+                    "channel.ready" => {
+                        if let Some(ref mut ctx) = mcp_ctx {
+                            if ctx.channel {
+                                ctx.channel_ready = true;
+                                if let Some(ref sid) = ctx.channel_session_id.clone() {
+                                    bind_channel(&daemon, conn_id, sid, &chan_tx);
+                                } else if let Some(ref cid) = ctx.ephemeral_client_id.clone() {
+                                    let sid = format!("claude:{cid}");
+                                    let _ = daemon.node.register_session(
+                                        &sid,
+                                        "{\"kind\":\"claude\",\"channel\":true}",
+                                    );
+                                    ctx.channel_session_id = Some(sid.clone());
+                                    bind_channel(&daemon, conn_id, &sid, &chan_tx);
+                                }
+                            }
+                        }
+                    }
+                    "channel.ack" => {
+                        if let Some(delivery_id) = packet.get("delivery").and_then(Value::as_u64) {
+                            let submitted =
+                                packet.get("submitted").and_then(Value::as_bool) == Some(true);
+                            if let Some(tx) = pending_channel_acks.remove(&delivery_id) {
+                                let _ = tx.send(submitted);
+                            }
+                        }
+                    }
+                    "mcp.caps" => {
+                        if let Some(req_id) = packet.get("id").and_then(Value::as_u64) {
+                            let resp = json!({
+                                "id": req_id,
+                                "result": {
+                                    "hasPlugins": daemon.config.enable_plugins,
+                                    "hasKv": daemon.has_kv_capability(),
+                                }
+                            });
+                            if write_ndjson_line_async(&mut write_half, &resp).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    "tool.call" => {
+                        let Some(req_id) = packet.get("id").and_then(Value::as_u64) else {
+                            continue;
+                        };
+                        let Some(tool_name) = packet.get("name").and_then(Value::as_str) else {
+                            let _ = write_ndjson_line_async(
+                                &mut write_half,
+                                &json!({
+                                    "id": req_id,
+                                    "error": { "code": "invalid_request", "message": "Missing tool name" }
+                                }),
+                            )
+                            .await;
+                            continue;
+                        };
+                        let args = packet
+                            .get("args")
+                            .and_then(Value::as_object)
+                            .cloned()
+                            .unwrap_or_default();
+                        let call_id = packet.get("callId").and_then(Value::as_str);
+                        let call_token = packet.get("callToken").and_then(Value::as_str);
+
+                        let resolved_session = resolve_tool_caller(
+                            &daemon,
+                            mcp_ctx.as_mut(),
+                            conn_id,
+                            &chan_tx,
+                            tool_name,
+                            call_id,
+                            call_token,
+                        )
+                        .await;
+
+                        let resp = match resolved_session {
+                            Ok(session_id) => match daemon
+                                .dispatch_tool(&session_id, tool_name, &args)
+                                .await
+                            {
+                                Ok(result) => json!({ "id": req_id, "result": result }),
+                                Err((code, message)) => json!({
+                                    "id": req_id,
+                                    "error": { "code": code, "message": message }
+                                }),
+                            },
+                            Err((code, message)) => json!({
+                                "id": req_id,
+                                "error": { "code": code, "message": message }
+                            }),
+                        };
+                        if write_ndjson_line_async(&mut write_half, &resp).await.is_err() {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Cleanup registered live waiter / channel transport on disconnect.
+    if let Some((sid, wid)) = attached_waiter {
+        let mut map = daemon.waiters.lock().expect("waiters lock poisoned");
+        if let Some(list) = map.get_mut(&sid) {
+            list.retain(|w| w.id != wid);
+            if list.is_empty() {
+                map.remove(&sid);
+            }
+        }
+    }
+    if let Some(ref ctx) = mcp_ctx {
+        if let Some(ref sid) = ctx.channel_session_id {
+            let mut map = daemon.channels.lock().expect("channels lock poisoned");
+            if map.get(sid).is_some_and(|c| c.conn_id == conn_id) {
+                map.remove(sid);
+            }
+        }
+    }
+    for (_, tx) in pending_channel_acks.drain() {
+        let _ = tx.send(false);
+    }
+}
+
+fn bind_channel(
+    daemon: &Arc<LocalDaemonInner>,
+    conn_id: u64,
+    session_id: &str,
+    chan_tx: &mpsc::UnboundedSender<ChannelDeliverCommand>,
+) {
+    {
+        let mut map = daemon.channels.lock().expect("channels lock poisoned");
+        map.insert(
+            session_id.to_string(),
+            LiveChannel {
+                conn_id,
+                tx: chan_tx.clone(),
+            },
+        );
+    }
+    let flush_daemon = Arc::clone(daemon);
+    let sid = session_id.to_string();
+    tokio::spawn(async move {
+        flush_daemon.flush_session(&sid).await;
+    });
+}
+
+async fn resolve_tool_caller(
+    daemon: &Arc<LocalDaemonInner>,
+    mut mcp_ctx: Option<&mut McpSocketContext>,
+    conn_id: u64,
+    chan_tx: &mpsc::UnboundedSender<ChannelDeliverCommand>,
+    tool_name: &str,
+    call_id: Option<&str>,
+    call_token: Option<&str>,
+) -> Result<String, (String, String)> {
+    // 1. Primary path: host-verified PreToolUse registration (`callToken` or `_meta` `callId`).
+    if call_id.is_some_and(|s| !s.is_empty()) || call_token.is_some_and(|s| !s.is_empty()) {
+        let wait = if call_token.is_some() {
+            DEFAULT_RESOLVE_WAIT
+        } else {
+            Duration::from_millis(250)
+        };
+        match daemon
+            .calls
+            .resolve_call(tool_name, call_id, call_token, wait)
+            .await
+        {
+            CallerResolution::Verified {
+                session_id,
+                harness,
+                ..
+            } => {
+                let _ = daemon.node.register_session(
+                    &session_id,
+                    &format!("{{\"kind\":\"{}\"}}", harness.as_str()),
+                );
+                if let Some(ctx) = mcp_ctx.as_deref_mut() {
+                    if ctx.channel && harness == HarnessKind::Claude {
+                        ctx.channel_session_id = Some(session_id.clone());
+                        if ctx.channel_ready {
+                            bind_channel(daemon, conn_id, &session_id, chan_tx);
+                        }
+                    }
+                }
+                return Ok(session_id);
+            }
+            CallerResolution::Failed { code, message } => {
+                if mcp_ctx
+                    .as_deref()
+                    .and_then(|c| c.ephemeral_client_id.as_ref())
+                    .is_none()
+                {
+                    return Err((code.as_str().to_string(), message));
+                }
+            }
+        }
+    }
+
+    // 2. Explicit opt-in `--ephemeral` scratch mode
+    if let Some(ctx) = mcp_ctx {
+        if let Some(ref cid) = ctx.ephemeral_client_id {
+            let harness = ctx.backend.unwrap_or(HarnessKind::Claude);
+            let session_id = format!("{}:{cid}", harness.as_str());
+            let _ = daemon.node.register_session(
+                &session_id,
+                &format!("{{\"kind\":\"{}\"}}", harness.as_str()),
+            );
+            if ctx.channel && harness == HarnessKind::Claude {
+                ctx.channel_session_id = Some(session_id.clone());
+                if ctx.channel_ready {
+                    bind_channel(daemon, conn_id, &session_id, chan_tx);
+                }
+            }
+            return Ok(session_id);
+        }
+    }
+
+    // 3. Optional test-only bypass when `require_verified_caller == false`
+    if !daemon.config.require_verified_caller {
+        let sid = format!("ephemeral:{}", uuid_v4());
+        let _ = daemon.node.register_session(&sid, "{\"kind\":\"claude\"}");
+        return Ok(sid);
+    }
+
+    Err((
+        "caller_unverifiable".into(),
+        "Could not verify calling thread/conversation. Run 'hyp setup <harness>' to install PreToolUse hooks (or pass --ephemeral for scratch testing).".into(),
+    ))
+}
+
+fn handle_call_start(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> Value {
+    let harness_str = packet
+        .get("harness")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let Ok(harness) = harness_str.parse::<HarnessKind>() else {
+        return json!({ "ok": false, "error": "invalid_call_start" });
+    };
+    let Some(session_id) = packet
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|s| is_valid_session_id(s))
+    else {
+        return json!({ "ok": false, "error": "invalid_call_start" });
+    };
+    let Some(tool) = packet.get("tool").and_then(Value::as_str) else {
+        return json!({ "ok": false, "error": "invalid_call_start" });
+    };
+    let call_id = packet
+        .get("callId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+
+    let backend_json = format!("{{\"kind\":\"{}\"}}", harness.as_str());
+    if let Err(e) = daemon.node.register_session(session_id, &backend_json) {
+        return json!({ "ok": false, "error": e.to_string() });
+    }
+
+    match daemon.calls.start_call(
+        StartCallInput {
+            harness,
+            session_id: session_id.to_string(),
+            tool: tool.to_string(),
+            call_id,
+            backend_json: Some(backend_json),
+            ttl_ms: None,
+        },
+        now_ms(),
+    ) {
+        Ok(reg) => json!({
+            "ok": true,
+            "result": {
+                "callToken": reg.token,
+                "sessionId": reg.session_id,
+            }
+        }),
+        Err(msg) => json!({ "ok": false, "error": msg }),
+    }
+}
+
+async fn handle_mailbox_drain(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> Value {
+    let Some(session_id) = packet
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|s| is_valid_session_id(s))
+    else {
+        return json!({ "ok": false, "error": "invalid_session" });
+    };
+
+    let session_exists = daemon
+        .node
+        .db()
+        .local()
+        .get_session(session_id)
+        .ok()
+        .flatten()
+        .is_some();
+    if !session_exists {
+        return json!({ "ok": true, "result": { "items": [] } });
+    }
+
+    match daemon.build_batch_for_session(session_id).await {
+        None => json!({ "ok": true, "result": { "items": [] } }),
+        Some(batch) => {
+            daemon.commit_delivered_batch(session_id, &batch);
+            json!({
+                "ok": true,
+                "result": {
+                    "items": [{
+                        "text": batch.rendered,
+                        "notifyOnly": batch.notify_only,
+                        "mutedCount": batch.muted_count,
+                        "inlineIds": batch.inline_ids,
+                        "spilledIds": batch.spilled_ids,
+                        "truncatedIds": batch.truncated_ids,
+                    }]
+                }
+            })
+        }
+    }
+}
+
+async fn handle_session_status(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> Value {
+    let Some(session_id) = packet.get("sessionId").and_then(Value::as_str) else {
+        return json!({ "ok": false, "error": "invalid_session" });
+    };
+    daemon.reconcile_session_inbox(session_id).await;
+    let (sess, pending, muted, policy) = {
+        let db = daemon.node.db();
+        let sess = db.local().get_session(session_id).ok().flatten();
+        let pending = db.local().pending_count(session_id).unwrap_or(0);
+        let muted = muted_count(&db, session_id).unwrap_or(0);
+        let policy = daemon.delivery.policy(&db, session_id).unwrap_or_default();
+        (sess, pending, muted, policy)
+    };
+    let enrolled = sess.as_ref().and_then(|s| s.handle.as_ref()).is_some();
+    json!({
+        "ok": true,
+        "result": {
+            "id": session_id,
+            "enrolled": enrolled,
+            "handle": sess.and_then(|s| s.handle),
+            "pending": pending,
+            "muted": muted,
+            "deliveryMode": policy.default_mode.as_str(),
+            "focusMode": policy.focus_mode,
+            "hasLiveTransport": daemon.has_live_transport(session_id),
+        }
+    })
+}
+
+async fn handle_daemon_status(daemon: &LocalDaemonInner) -> Value {
+    let session_ids: Vec<String> = {
+        let db = daemon.node.db();
+        db.local()
+            .list_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.id)
+            .collect()
+    };
+    for sid in &session_ids {
+        daemon.reconcile_session_inbox(sid).await;
+    }
+
+    let (sessions_json, peers_json, total_muted, total_quarantined) = {
+        let db = daemon.node.db();
+        let sessions = db.local().list_sessions().unwrap_or_default();
+        let mut muted_sum = 0usize;
+        let mut sess_arr = Vec::with_capacity(sessions.len());
+        for s in sessions {
+            let m = muted_count(&db, &s.id).unwrap_or(0);
+            let p = db.local().pending_count(&s.id).unwrap_or(0);
+            muted_sum += m;
+            sess_arr.push(json!({
+                "id": s.id,
+                "handle": s.handle,
+                "pending": p,
+                "muted": m,
+                "hasLiveTransport": daemon.has_live_transport(&s.id),
+            }));
+        }
+        let peers: Vec<Value> = db
+            .peers()
+            .list_peers(None)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| {
+                json!({
+                    "peerId": p.peer_id,
+                    "profile": p.profile.as_str(),
+                    "status": p.status.as_str(),
+                })
+            })
+            .collect();
+        let quarantined = db
+            .local()
+            .list_quarantined(None, 10_000)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        (sess_arr, peers, muted_sum, quarantined)
+    };
+
+    json!({
+        "ok": true,
+        "result": {
+            "nodeId": daemon.node.node_id().as_str(),
+            "version": daemon.node.config().hyphae_version,
+            "profile": daemon.node.config().profile,
+            "socketPath": daemon.socket_path.display().to_string(),
+            "sessions": sessions_json,
+            "peers": peers_json,
+            "mutedCount": total_muted,
+            "quarantinedCount": total_quarantined,
+        }
+    })
+}
+
+fn parse_rules_arg(args: &Map<String, Value>) -> Result<Vec<DeliveryRule>, (String, String)> {
+    let Some(raw) = args.get("rules") else {
+        return Ok(Vec::new());
+    };
+    let Value::Array(items) = raw else {
+        return Err((
+            "invalid_request".into(),
+            "Expected 'rules' to be an array of { target, delivery }".into(),
+        ));
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let rule: DeliveryRule = serde_json::from_value(item.clone())
+            .map_err(|e| ("invalid_request".into(), format!("Invalid delivery rule: {e}")))?;
+        rule.validate().map_err(delivery_err_tuple)?;
+        out.push(rule);
+    }
+    Ok(out)
+}
+
+fn parse_inbox_filter_arg(raw: Option<&Value>) -> Result<InboxFilter, (String, String)> {
+    let Some(val) = raw else {
+        return Ok(InboxFilter::default());
+    };
+    if val.is_null() {
+        return Ok(InboxFilter::default());
+    }
+    let Value::Object(map) = val else {
+        return Err(("invalid_filter".into(), "Expected filter object".into()));
+    };
+    let from = map.get("from").and_then(Value::as_str).map(ToString::to_string);
+    let node = map.get("node").and_then(Value::as_str).map(ToString::to_string);
+    let topic = map.get("topic").and_then(Value::as_str).map(ToString::to_string);
+    let channel = map
+        .get("channel")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let kind = match map.get("kind").and_then(Value::as_str) {
+        Some(k) => Some(MailboxKind::parse(k).map_err(store_err_tuple)?),
+        None => None,
+    };
+    let ce_filters = match map.get("ceFilters").or_else(|| map.get("filters")) {
+        None | Some(Value::Null) => Vec::new(),
+        Some(fval) => hyp_proto::filter::validate_filters(fval)
+            .map_err(|e| ("invalid_filter".into(), e.to_string()))?,
+    };
+    Ok(InboxFilter {
+        from,
+        node,
+        topic,
+        channel,
+        kind,
+        ce_filters,
+    })
+}
+
+fn node_err_tuple(err: hyp_node::engine::NodeError) -> (String, String) {
+    let problem = err.to_problem_details();
+    (problem.error, problem.detail.unwrap_or(problem.title))
+}
+
+fn store_err_tuple(err: hyp_store::StoreError) -> (String, String) {
+    ("store_error".into(), err.to_string())
+}
+
+fn delivery_err_tuple(err: hyp_node::delivery::DeliveryError) -> (String, String) {
+    ("delivery_error".into(), err.to_string())
+}
