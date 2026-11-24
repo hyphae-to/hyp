@@ -58,15 +58,15 @@ const CHAPTERS = [
     orbs: [],
   },
   {
-    tip: "2 · Joins the Public Node",
-    caption: "Alex's agent calls <code>mesh_join</code> on a <strong>Public Node</strong> — exposing shared <code>#channels</code> and subscribable event streams.",
+    tip: "2 · Joins the Team Node",
+    caption: "Alex's agent calls <code>mesh_join</code> on a <strong>Team Node</strong> — exposing shared <code>#channels</code> and subscribable event streams.",
     visible: ["ent-alex", "ent-node"],
     dim: [],
     spotlight: ["ent-alex", "ent-node"],
     alertHit: [],
     strands: ["p-alex-node"],
     softStrands: [],
-    bubbles: { "bub-alex": { text: "Joining the Public Node… oh hello.", alert: false } },
+    bubbles: { "bub-alex": { text: "Joining the Team Node… oh hello.", alert: false } },
     caps: ["cap-ch", "cap-dep", "cap-gh", "cap-pr"],
     promSub: "14 servers · quiet",
     ghTitle: "GitHub · stream",
@@ -160,7 +160,7 @@ const CHAPTERS = [
   },
   {
     tip: "6 · Alex codes fix & opens PR #412",
-    caption: "Alex's agent reproduces the Redis pool bug, writes the fix, opens <strong>PR #412</strong>, and subscribes to it on the Public Node for reviews &amp; CI status.",
+    caption: "Alex's agent reproduces the Redis pool bug, writes the fix, opens <strong>PR #412</strong>, and subscribes to it on the Team Node for reviews &amp; CI status.",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-builder", "ent-prom", "ent-gh"],
     dim: ["ent-alice", "ent-ops", "ent-builder"],
     spotlight: ["ent-alex"],
@@ -185,7 +185,7 @@ const CHAPTERS = [
   },
   {
     tip: "7 · Builder assigned -> spawns sub-agent",
-    caption: "GitHub assigns <strong>Jack's builder</strong> as reviewer on PR #412. The Public Node wakes builder instantly, who spawns a <strong>reviewer sub-agent</strong> to audit the diff.",
+    caption: "GitHub assigns <strong>Jack's builder</strong> as reviewer on PR #412. The Team Node wakes builder instantly, who spawns a <strong>reviewer sub-agent</strong> to audit the diff.",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-builder", "ent-gh", "ent-subagent"],
     dim: ["ent-alice", "ent-ops"],
     spotlight: ["ent-builder"],
@@ -239,7 +239,7 @@ const CHAPTERS = [
   },
   {
     tip: "9 · PR Ready -> Alex notified on Slack",
-    caption: "The Public Node notifies Alex's subscribed thread that <strong>PR #412 is ready to merge</strong> — Alex's Private Node sends the all-clear DM to Alex on Slack.",
+    caption: "The Team Node notifies Alex's subscribed thread that <strong>PR #412 is ready to merge</strong> — Alex's Private Node sends the all-clear DM to Alex on Slack.",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-builder", "ent-gh", "ent-priv", "ent-slack"],
     dim: ["ent-alice", "ent-ops"],
     spotlight: ["ent-alex"],
@@ -645,7 +645,7 @@ const DECK_VIEWS = {
   channels: {
     payload: {
       tool: "mesh_channel_post",
-      node: "public-node (SQLite channel_members)",
+      node: "team-node (SQLite channel_members)",
       channel: "#incidents",
       from: "jack@prod/ops",
       text: "checkout-api spiking (4.2%). Alex opening PR #412; builder queued for review.",
@@ -703,7 +703,7 @@ function renderDeck() {
         ).join("")}
       </div>
       <pre class="payload-pre">${esc(JSON.stringify({
-        node: "Private Node (localhost — never shared with Public Node)",
+        node: "Private Node (localhost — never shared with Team Node)",
         bridge: `${chatApp}/dm-alex`,
         secrets: "0600 local store · captured via hph secret set --web",
         linkedThreads: linkedList,

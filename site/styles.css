@@ -476,10 +476,32 @@ header {
 }
 
 .avatar-ring.hub-ring {
-  width: 126px;
-  height: 126px;
-  border-color: rgba(232, 163, 49, 0.55);
+  width: 196px;
+  height: 196px;
+  border-radius: 0;
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  overflow: visible;
   animation-duration: 5.8s;
+}
+
+.avatar-ring.hub-ring img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  mix-blend-mode: lighten;
+  -webkit-mask-image: radial-gradient(circle at 50% 50%, #000 58%, transparent 95%);
+  mask-image: radial-gradient(circle at 50% 50%, #000 58%, transparent 95%);
+  filter: drop-shadow(0 0 28px rgba(232, 163, 49, 0.28));
+}
+
+.entity.spotlight .avatar-ring.hub-ring {
+  box-shadow: none;
+}
+
+.entity.spotlight .avatar-ring.hub-ring img {
+  filter: drop-shadow(0 0 34px rgba(183, 217, 86, 0.48)) drop-shadow(0 0 18px rgba(232, 163, 49, 0.35));
 }
 
 .avatar-ring img {
@@ -1276,7 +1298,7 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
   .spec-col { border-right: none; border-bottom: 1px solid var(--border); padding: 22px 0; }
   .spec-col:last-child { border-bottom: none; }
   .avatar-ring { width: 64px; height: 64px; }
-  .avatar-ring.hub-ring { width: 82px; height: 82px; }
+  .avatar-ring.hub-ring { width: 120px; height: 120px; }
   .story-stage { min-height: 430px; }
   .slack-dm { width: 215px; }
   .nav-links { display: none; }
