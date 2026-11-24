@@ -1,4 +1,4 @@
-"""Minimal Python 3 stdlib client for the hyphae / t3-mesh fd-3 plugin channel (protocol v1)."""
+"""Minimal Python 3 stdlib client for the Hyphae fd-3 plugin channel (protocol v1)."""
 from __future__ import annotations
 
 import json
@@ -18,8 +18,8 @@ class MeshPluginClient:
         on_status: Callable[[dict[str, Any]], None] | None = None,
         on_delivery_failed: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
-        raw_fd = fd if fd is not None else int(os.environ.get("T3_MESH_FD") or os.environ.get("AGENTS_MESH_FD") or "3")
-        self.plugin = os.environ.get("T3_MESH_PLUGIN") or os.environ.get("AGENTS_MESH_PLUGIN") or "plugin"
+        raw_fd = fd if fd is not None else int(os.environ.get("HYPHAE_FD") or os.environ.get("AGENTS_MESH_FD") or os.environ.get("T3_MESH_FD") or "3")
+        self.plugin = os.environ.get("HYPHAE_PLUGIN") or os.environ.get("AGENTS_MESH_PLUGIN") or os.environ.get("T3_MESH_PLUGIN") or "plugin"
         self.sock = socket.socket(fileno=raw_fd)
         self.reader = self.sock.makefile("rb")
         self._replies: queue.Queue[dict[str, Any]] = queue.Queue()

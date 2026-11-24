@@ -24,11 +24,16 @@ function buildIsolatedStreamEnv(cfg: RouterStreamConfig): NodeJS.ProcessEnv {
   return {
     ...base,
     ...cfg.env,
-    T3_MESH_FD: "3",
+    HYPHAE_FD: "3",
+    HYPHAE_PLUGIN: cfg.name,
+    HYPHAE_STREAM: cfg.name,
+    HYPHAE_TOPIC: cfg.topic,
+    HYPHAE_PROTOCOL: "1",
     AGENTS_MESH_FD: "3",
-    T3_MESH_PLUGIN: cfg.name,
     AGENTS_MESH_STREAM: cfg.name,
     AGENTS_MESH_TOPIC: cfg.topic,
+    T3_MESH_FD: "3",
+    T3_MESH_PLUGIN: cfg.name,
     T3_MESH_PROTOCOL: "1",
   };
 }
@@ -72,7 +77,7 @@ interface SupervisedStream {
  * subscribe with CloudEvents filters (`hyp_subscribe`).
  *
  * Supports:
- * - `builtin: "github-webhook"` — runs t3-mesh's hardened GitHub HMAC webhook receiver
+ * - `builtin: "github-webhook"` — runs the built-in hardened GitHub HMAC webhook receiver
  * - `builtin: "webhook-stream"` — runs the built-in signed HTTP webhook source over fd 3
  * - custom `exec` + `args` — any executable speaking the standard fd-3 NDJSON protocol v1
  */

@@ -1,5 +1,5 @@
-// `t3-mesh router ...` subcommands. Imports only router modules, effect and node builtins, so the
-// router can be deployed without the vendored T3 packages (see src/router/main.ts).
+// `hyp router ...` subcommands. Imports only router modules, effect and node builtins so the
+// router can run standalone with zero extra harness dependencies.
 import { writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { isConnectorId } from "../address.ts";

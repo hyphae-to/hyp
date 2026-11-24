@@ -189,7 +189,7 @@ export class RouterCore {
       db: this.#db,
       dir:
         options.transferDir ??
-        (options.dbPath === ":memory:" ? mkdtempSync(join(tmpdir(), "t3-mesh-transfers-")) : join(dirname(options.dbPath), "transfers")),
+        (options.dbPath === ":memory:" ? mkdtempSync(join(tmpdir(), "hyphae-transfers-")) : join(dirname(options.dbPath), "transfers")),
       limits: options.transferLimits ?? { ...DEFAULT_TRANSFER_LIMITS, holdRetryMs: this.#limits.holdRetryMs },
       now: this.#now,
       audit: (fields) => this.#audit(fields),

@@ -1,17 +1,24 @@
-# Feasibility & Design: End-to-End Encryption, Chat Channels, Bidirectional Bridges & OpenClaw
+# Architecture & Roadmap: E2EE, `#channels`, Bidirectional Bridges & OpenClaw
 
-This document evaluates the engineering feasibility and concrete wire designs for four next-stage capabilities on top of `hyphae` (working brand name: **Patchbay**).
+This document tracks the wire architecture and implementation status for four major capabilities built on `hyphae` (`hyp`):
+
+| Capability | Status | Notes |
+| --- | --- | --- |
+| **1. End-to-End Encryption (E2EE)** | Planned (post-v1) | Zero-dependency `node:crypto` X25519 + AES-256-GCM envelope design below |
+| **2. Multi-Agent `#channels`** | **Shipped in v1** | `hyp_channel_join`, `hyp_channel_post`, `hyp_channels`, `hyp_channel_leave` |
+| **3. Bidirectional Bridges & Multi-Thread Fan-In** | **Shipped in v1** | `hyp_plugin_post`, `hyp_bridge_link`/`unlink`, `slack`, `telegram`, `whatsapp`, `webhook` |
+| **4. OpenClaw Gateway Integration** | **Shipped in v1** | `hyp setup openclaw`, managed `openclaw.json` MCP server + bundled `SKILL.md` |
 
 ---
 
-## 1. End-to-End Encryption (E2EE) — **High Feasibility (Zero External Deps)**
+## 1. End-to-End Encryption (E2EE) — **Planned (Zero External Deps)**
 
-Node 24's built-in `node:crypto` natively supports **Ed25519**, **X25519** (Curve25519 ECDH), **HKDF-SHA256**, and **AES-256-GCM / ChaCha20-Poly1305**, and `packages/t3-mesh/src/identity/keys.ts` already implements Ed25519 connector identity keys.
+Node 24's built-in `node:crypto` natively supports **Ed25519**, **X25519** (Curve25519 ECDH), **HKDF-SHA256**, and **AES-256-GCM / ChaCha20-Poly1305**, and [src/core/identity/keys.ts](../src/core/identity/keys.ts) already implements Ed25519 connector identity keys.
 
-### A. Direct Peer Messages (`hyp_send`) — ~1–2 days
+### A. Direct Peer Messages (`hyp_send`)
 - **Key advertisement**: Each connector generates a static X25519 encryption keypair (`encPub`, `encPriv` stored in the OS keyring or private `state/` fallback), signs `encPub` with its Ed25519 identity key, and publishes it to the router. `GET /v1/peers` returns `{ address, identityPub, encPub, encSig }`.
 - **Sealed envelope**: Before calling `POST /v1/messages`, the sender generates an ephemeral X25519 keypair, derives a per-message AEAD key via `HKDF-SHA256(X25519(ephPriv, recipientEncPub), salt, info="hyphae-dm-v1|" + from + "|" + to + "|" + msgId)`, and encrypts `text` with `AES-256-GCM` using the envelope metadata as AAD.
-- **Router blindness**: Even on a **public or shared team router**, the router sees only routing metadata (`from`, `to`, `id`, timestamp) and opaque ciphertext — never prompts, code snippets, or tool outputs.
+- **Router blindness**: Even on a **shared team Node**, the router sees only routing metadata (`from`, `to`, `id`, timestamp) and opaque ciphertext — never prompts, code snippets, or tool outputs.
 - **Compatibility**: Pure additive field (`ciphertext` / `enc: "x25519-aes256gcm-v1"`); plaintext peers continue working unless `requireE2EE: true` is set on the connector.
 
 ### B. Event Streams (GitHub / Prometheus) — Hybrid Payload E2EE
@@ -20,55 +27,43 @@ Node 24's built-in `node:crypto` natively supports **Ed25519**, **X25519** (Curv
 
 ---
 
-## 2. Multi-Agent Chat Channels (`#incidents`, `#frontend`) — **High Feasibility (~2–3 days)**
+## 2. Multi-Agent Chat Channels (`#incidents`, `#deploys`) — **Shipped in v1**
 
-Agents often need shared rooms where multiple sessions across machines collaborate (e.g. `#incidents` with `herdr/oncall`, `t3/backend`, `macbook/agy`, and `gn/openclaw`) without knowing every peer handle in advance.
+Agents collaborate in shared rooms across machines without knowing every peer handle in advance:
 
-- **New MCP tools**:
+- **Shipped MCP tools**:
   - `hyp_channel_join({ channel: "#incidents", mode?: "queue" | "interrupt" })`
   - `hyp_channel_leave({ channel: "#incidents" })`
   - `hyp_channel_post({ channel: "#incidents", text })`
-  - `hyp_channel_members({ channel: "#incidents" })`
-- **Router model**: Reuses the existing `EventRouter` SQLite batch/fan-out engine! Each channel `#name` maps to a router room topic `chan:<name>` with dynamic member-publish ACLs (only joined connectors may publish, plus optional admin/invite-only rooms).
-- **E2EE for Channels (Sender Keys / Epoch Keys)**:
-  - Each room maintains an `epoch` counter and a random 256-bit room key (or per-sender chain key, Signal/WhatsApp Sender-Keys style).
-  - When a member joins, an existing member (or room creator) wraps the current epoch key to the new member's verified X25519 `encPub`.
-  - When a member leaves or is revoked, the next sender increments `epoch`, generates a fresh room key, and wraps it only to remaining members (forward/post-compromise secrecy).
+  - `hyp_channels()` — lists active channels and enrolled members
+- **SQLite-backed fan-out**: Membership and delivery live in `RouterCore`, fanning messages out to every other member in the room with no self-echo.
+- **Future E2EE extension (Sender Keys / Epoch Keys)**:
+  - Each room can add an `epoch` counter and a random 256-bit room key wrapped to each member's verified X25519 `encPub`, rotating the epoch whenever a member leaves or is revoked for forward/post-compromise secrecy.
 
 ---
 
-## 3. Bidirectional Communication Bridges (Telegram, WhatsApp, Slack, BYO Plugin) + Multi-Thread Link/Unlink
+## 3. Bidirectional Bridges & Multi-Thread Fan-In — **Shipped in v1**
 
-Currently connector plugins support inbound fd-3 events + 1:1 `hyp_plugin_handoff`. Extending the fd-3 protocol v1 → v2 adds two lightweight capabilities while remaining 100% backward compatible with existing `t3-mesh` plugins:
+See [docs/plugins.md](./plugins.md) for full configuration and protocol details. The shipped v1 implementation extends the fd-3 NDJSON protocol with backward-compatible bidirectional `request`/`response` frames and multi-thread bridge linking:
 
-### A. Link / Unlink One or More Threads to Any Channel
-Replace the single-owner `PRIMARY KEY (plugin, target)` table with a many-to-many `plugin_links (plugin, target, session_id, role, linked_at)` table:
-- `hyp_bridge_link({ plugin: "telegram", target: "ops", sessionId? })` — attaches this (or another) thread to receive events from `telegram/ops`. Multiple threads across harnesses (e.g. a Claude researcher + a Codex fixer) can listen simultaneously!
-- `hyp_bridge_unlink({ plugin: "telegram", target: "ops", sessionId? })` — detaches one or all threads cleanly at runtime without editing `connector.json` or restarting the daemon.
+### A. Multi-Thread Link / Unlink (`bridge_links`)
+- `hyp_bridge_link({ plugin, target, sessionId?, handle?, threadId? })` — attaches one or more threads (even across different harnesses) to receive fan-in copies of inbound bridge events and post replies.
+- `hyp_bridge_unlink({ plugin, target, sessionId?, handle?, threadId?, all? })` — detaches a session (or all linked sessions when called by the primary/configured holder) with zero daemon restarts.
+- `hyp_plugin_targets()` — inspects targets routed or linked to the caller, including `linkedSessions`.
 
-### B. Outbound Posting (`hyp_plugin_post`) Over fd 3
-Add a symmetric daemon → plugin frame on fd 3:
-```json
-{ "type": "post", "id": "req-1", "target": "ops", "replyTo": "chat:12345", "text": "Fix deployed — p99 latency back to 42ms." }
-```
-Plugin executes the native API call (Telegram `sendMessage`, WhatsApp Cloud API / Baileys `sendMessage`, Slack `chat.postMessage`, or custom webhook) and replies:
-```json
-{ "type": "post_ack", "id": "req-1", "ok": true, "externalId": "msg-998" }
-```
-**Security win**: Agents NEVER see Telegram/WhatsApp/Slack bot tokens — the plugin resolves its credentials from the OS keyring (or headless fallback) inside an isolated subprocess, enforces per-target channel/user allowlists, and rate-limits outbound posts!
+### B. Outbound Replies (`hyp_plugin_post`) Over fd 3
+- The daemon sends `{"type":"request","id":"...","method":"post","target":"<target>","params":{...}}\n` over fd 3 and awaits `{"type":"response","id":"...","ok":true,"result":{...}}\n` (handled automatically in Node via `mesh.onPost(handler)`).
+- Fail-closed authorization rejects unlinked callers with `not_target_holder`.
+- Agents never see Slack, Telegram, WhatsApp, or webhook credentials—plugins resolve secrets inside an isolated subprocess from the OS keyring (or headless fallback) and enforce per-target allowlists.
 
-### C. WhatsApp Support
-Two clean options fit the exact same fd-3 plugin model:
-1. **WhatsApp Cloud API (`builtin: "whatsapp-cloud"`)**: Official Meta webhook + Graph API (`WEBHOOK_SECRET` + `WHATSAPP_TOKEN` via `hyp secret`), zero third-party deps.
-2. **OpenClaw Gateway Bridge**: Delegate WhatsApp/Telegram/Discord/Signal session management to an **OpenClaw** Gateway and connect it to the mesh via `openclaw mcp serve` or a tiny fd-3 bridge!
+### C. Built-In WhatsApp Bridge (`builtin: "whatsapp"`)
+- Implemented in [plugins/whatsapp/index.mjs](../plugins/whatsapp/index.mjs) with zero external dependencies: Meta `GET` webhook verification, constant-time `X-Hub-Signature-256` verification, fail-closed `WHATSAPP_ALLOWED_NUMBERS` allowlist, `com.whatsapp.message.received` CloudEvents, and outbound Graph API replies via `hyp_plugin_post`.
 
 ---
 
-## 4. OpenClaw as a Mesh Orchestrator
+## 4. OpenClaw as a Mesh Orchestrator — **Shipped in v1**
 
-**OpenClaw** is an open-source self-hosted AI agent gateway supporting multi-channel chat routing (WhatsApp, Telegram, Discord, Slack), `SKILL.md` skills, and bidirectional MCP (`mcp.servers` client + `openclaw mcp serve`).
+**OpenClaw** is an open-source self-hosted AI agent gateway supporting multi-channel chat routing (WhatsApp, Telegram, Discord, Slack), `SKILL.md` skills, and bidirectional MCP.
 
-Pairing **OpenClaw** with `hyphae` creates a clean separation of concerns:
-- **OpenClaw** acts as the **high-level orchestrator & human-facing multi-channel gateway** (receiving user requests from WhatsApp/Telegram/Discord or Prometheus/GitHub escalations).
-- **`hyphae`** acts as the **authenticated, zero-polling cross-machine execution bus** connecting OpenClaw to live coding threads running on your MacBook (**Antigravity**, **Claude Desktop**, **Cursor**), Linux boxes (**Codex**, **Herdr Core**, **OpenCode**), and **T3 Code** servers.
-- **Configuration**: Add `hyp mcp` under OpenClaw's `mcp.servers` config + install our bundled `SKILL.md`, and OpenClaw immediately gains `hyp_join`, `hyp_peers`, `hyp_send`, `hyp_subscribe`, and `hyp_plugin_handoff` across your entire fleet.
+- **One-command wiring**: `hyp setup openclaw` configures OpenClaw's `openclaw.json` MCP server entry (`hyp mcp`) and installs the bundled `skills/hyphae/SKILL.md`.
+- **Clean separation of concerns**: OpenClaw acts as a human-facing multi-channel orchestrator while `hyphae` acts as the authenticated, zero-polling cross-machine execution bus connecting OpenClaw to live coding threads across **Antigravity**, **Claude Code / Desktop**, **Codex**, **Cursor**, **OpenCode**, **Gemini CLI**, **Herdr Core**, and **T3 Code**.

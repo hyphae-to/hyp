@@ -1,7 +1,6 @@
-// GitHub webhook delivery -> CloudEvent on the `github` topic, as specified in bayfold/infra
-// hub/README.md (summary in SPEC.md section 12.7). `data` is a fixed-shape summary, never GitHub's
-// raw body: every field is present (null or [] when it does not apply), text is cut, and the whole
-// object fits the router's 8 KiB limit. All of it is untrusted user content.
+// GitHub webhook delivery -> CloudEvent on the `github` topic. `data` is a fixed-shape summary,
+// never GitHub's raw body: every field is present (null or [] when it does not apply), text is cut,
+// and the whole object fits the router's 8 KiB limit. All of it is untrusted user content.
 import { MAX_ATTRIBUTE_CHARS, MAX_DATA_BYTES, type CloudEvent } from "../router/cloudevent.ts";
 import { emptyRecordKeys, recordKeys, type RecordKeys } from "./records.ts";
 

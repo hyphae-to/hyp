@@ -122,7 +122,7 @@ test(
       const t3Check = checksBeforeDaemon.find((c) => c.name === "t3");
       assert.ok(t3Check, "runDoctor must include a `t3` check");
       assert.equal(t3Check.ok, true);
-      assert.match(t3Check.detail, /t3-mesh active/);
+      assert.match(t3Check.detail, /T3 Code mesh active/);
       assert.match(t3Check.detail, /t3@studio/);
       assert.match(t3Check.detail, /https:\/\/mesh\.studio\.ts\.net/);
       assert.match(t3Check.detail, /slack-bridge, ops-webhook/);
@@ -148,7 +148,7 @@ test(
       assert.equal(envNoMesh.t3.connectorId, undefined);
       assert.deepEqual(envNoMesh.t3.plugins, []);
       const doctorNoMesh = await runDoctor(join(rootDir, "missing.json"), join(rootDir, "missing.sock"), homeNoMesh);
-      assert.match(doctorNoMesh.find((c) => c.name === "t3")?.detail ?? "", /no ~\/\.t3-mesh\/config\.json/i);
+      assert.match(doctorNoMesh.find((c) => c.name === "t3")?.detail ?? "", /mesh not configured/i);
 
       const homeCorrupt = join(rootDir, "h3");
       seedVirtualT3MeshHome(homeCorrupt, {

@@ -90,7 +90,7 @@ export interface McpOptions {
   ephemeral?: boolean;
 }
 
-/** Extract provider-supplied unforgeable tool-call ID from MCP `_meta` (same pattern as t3-mesh). */
+/** Extract provider-supplied unforgeable tool-call ID from MCP `_meta`. */
 export function extractMetaCallId(meta: Record<string, unknown> | undefined): string | undefined {
   if (!meta) return undefined;
   for (const key of ["claudecode/toolUseId", "callId", "toolUseId", "antigravity/toolCallId", "toolCallId"]) {

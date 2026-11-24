@@ -29,7 +29,7 @@ Our testing approach is grounded in William M. McKeeman's [*Differential Testing
    - In Hyphae, our primary comparable systems are:
      - **Cross-harness parity**: Running the same messaging, `#channel`, CloudEvent subscription, muting, `notify`-mode, and bridge-link scenarios across all harnesses (`antigravity`, `claude`, `codex`, `cursor`, `opencode`, `gemini`, `openclaw`, `herdr`) and asserting identical observable outcomes. (Cross-harness differential comparison catches silent harness-specific drops immediately.)
      - **Reference model vs. real daemon/router**: Running seeded sequences of protocol operations against a tiny pure in-memory specification oracle *and* against real SQLite-backed `RouterCore` + `Connector` + `PluginHost` + HTTP/Unix-socket servers, comparing post-state after every step.
-     - **Protocol & backward compatibility**: Comparing `hyphae` behavior against `t3-mesh` wire contracts (fd-3 NDJSON plugin framing, router HTTP/SSE endpoints, CloudEvents Subscriptions API filters).
+     - **Protocol & backward compatibility**: Verifying Hyphae wire contracts (fd-3 NDJSON plugin framing, router HTTP/SSE endpoints, CloudEvents Subscriptions API filters, and T3 Code interoperability).
      - **Old vs. new implementations**: Whenever refactoring a delivery path, CLI renderer, or filter engine, differentially compare old and new across generated inputs before retiring the old path.
 
 2. **Climb the Seven Levels of Test Case Quality**
@@ -72,6 +72,7 @@ All `hyp` CLI commands follow an **agent-first, consistent output contract** (`s
 ```bash
 npm run typecheck
 npm test
-npm run test:integration   # once merged from feat/integration-test-harness
+npm run test:harnesses
+npm run test:integration
 npm run build
 ```

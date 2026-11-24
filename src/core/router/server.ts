@@ -1,5 +1,5 @@
-// `t3-mesh router serve`: the HTTP router (SPEC.md sections 7 and 12). Listens on loopback; Tailscale
-// Serve terminates TLS in front of it. Connectors and publishers authenticate with their bearer token.
+// `hyp router serve`: the HTTP router. Listens on loopback; Tailscale Serve or a reverse proxy
+// terminates TLS in front of it. Connectors and publishers authenticate with their bearer token.
 import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream, rmSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -238,10 +238,10 @@ export async function serveRouter(options: RouterServerOptions): Promise<Running
           await pipeline(createReadStream(stored.path), response);
           return;
         }
-        const headerText = request.headers["t3-mesh-transfer"];
-        if (typeof headerText !== "string") throw new HttpError(400, "invalid", "missing T3-Mesh-Transfer header");
+        const headerText = request.headers["hyphae-transfer"] ?? request.headers["t3-mesh-transfer"];
+        if (typeof headerText !== "string") throw new HttpError(400, "invalid", "missing transfer signature header");
         const decoded = Schema.decodeUnknownOption(SignedHeader)(Buffer.from(headerText, "base64url").toString("utf8"));
-        if (decoded._tag === "None") throw new HttpError(400, "invalid", "T3-Mesh-Transfer is not a signed header");
+        if (decoded._tag === "None") throw new HttpError(400, "invalid", "invalid transfer signature header");
         // Refused or already stored transfers are answered before the body is read.
         const checked = core.transfers.check(connectorId, id, decoded.value);
         if (!checked.ok) {

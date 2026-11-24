@@ -86,7 +86,7 @@ export function buildAgentOnboardingPrompt(ctx: OnboardingContext): string {
     "2. Ask the user which router role(s) they want (they can pick ONE OR MORE):",
     "   - **Private Router** (local + optional Tailscale tailnet): connect all your sessions across harnesses/machines, subscribe to GitHub/Prometheus events & custom data streams with filters, and bridge threads to Slack/Telegram/WhatsApp.",
     "   - **Public Router**: hardened HTTPS webhook/event hub for internet senders (GitHub, Linear, Sentry, CI) & external peers.",
-    "   - **Join a Shared Router**: connect to an existing team or `t3-mesh` router (as primary or secondary event router).",
+    "   - **Join a Shared Router**: connect to an existing shared Team Node (as primary or secondary event router).",
     "3. Ask which harnesses to enable (`antigravity`, `claude`, `codex`, `cursor`, `opencode`, `gemini`, `openclaw`, plus Herdr `--backend herdr`), which Router Data Streams (`github-webhook`, `prometheus-webhook`, `webhook-stream`, custom fd-3 source), and which Connector Thread Bridges (`slack`, `telegram`, `whatsapp`, `webhook`, custom) they want.",
     "4. For any selected stream or bridge, run `hyp connect guide <id> --json` to retrieve the exact step-by-step setup instructions and walk the user through them (e.g. GitHub App vs Repo Webhook `/hooks/github` + `GITHUB_REPOS`/`GITHUB_ORGS`, then verifying `ping` delivery with `hyp_topics`).",
     "5. Execute the setup commands using `" + ctx.cli + "` (`onboard --yes`, `setup <harness>`, `share tailscale`, `status --discover --probe-ssh`, `connect guide <id>`, `secret set <name> --web`, `secret check`, `status`).",

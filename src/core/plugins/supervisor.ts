@@ -53,6 +53,11 @@ export function pluginEnv(plugin: PluginConfig, parentEnv: NodeJS.ProcessEnv): N
   return {
     ...env,
     ...plugin.env,
+    HYPHAE_FD: "3",
+    HYPHAE_PLUGIN: plugin.name,
+    HYPHAE_PROTOCOL: String(PROTOCOL_VERSION),
+    AGENTS_MESH_FD: "3",
+    AGENTS_MESH_PLUGIN: plugin.name,
     T3_MESH_FD: "3",
     T3_MESH_PLUGIN: plugin.name,
     T3_MESH_PROTOCOL: String(PROTOCOL_VERSION),

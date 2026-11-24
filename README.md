@@ -113,9 +113,9 @@ hyp_channel_leave  { channel: "#deploys" }
 ```
 
 ### Node Event Streams (GitHub, Prometheus, Custom fd-3)
-Configure webhook or fd-3 publishers directly on a Team Node (`localRouter.streams`), then subscribe from any thread with CloudEvents filters (`hyp_subscribe`):
+Configure webhook or fd-3 publishers directly on a Team Node (`localRouter.streams`), call `hyp_topics()` to inspect monitored repos/orgs and filter schemas, then subscribe from any thread with CloudEvents filters (`hyp_subscribe`):
 
-- **GitHub (`github-webhook`)**: PR opened, CI done, review requested, changes requested, approved, merged.
+- **GitHub (`github-webhook`)**: PR opened, CI done, review requested, changes requested, approved, merged — with built-in dead-subscription reachability diagnostics (`GITHUB_REPOS`/`GITHUB_ORGS` scope checking and `strict: true` fail-closed mode).
 - **Prometheus / Alertmanager (`prometheus-webhook`)**: Built-in Alertmanager v4 receiver (`POST /alerts`, default port `8793`) emitting `io.prometheus.alert.firing` / `io.prometheus.alert.resolved` with `subject: "severity=<severity>/<alertname>"` — filter server-side (`prefix: { subject: "severity=critical" }`) so only your ops agent wakes up.
 - **Signed webhooks & custom fd-3 streams (`webhook-stream`)**: Any HTTP publisher or executable writing CloudEvents JSON lines to fd 3.
 
@@ -140,24 +140,25 @@ Run a Private Node on your laptop for personal chat bridges whose tokens stay in
 
 ## Everyday CLI
 
-Hyphae keeps the everyday surface down to **7 core commands** (run `hyp --help --all` for low-level router/hook/MCP plumbing):
+Hyphae keeps the everyday surface down to **8 core commands** — all supporting agent-first `--json` / `--plain` / `--pretty` output modes with deterministic exit codes (`0` ok, `1` operational/check failure, `2` usage error). Run `hyp --help --all` (or `hyp --help --json`) for full plumbing commands:
 
 ```sh
 hyp onboard [--assist | --join | --yes]            # Interactive setup, AI concierge, or join a Team Node
-hyp status                                         # Live daemon, node health, peers & doctor diagnostics
-hyp connect [slack|telegram|whatsapp|github|...]   # Wire chat bridges or node event streams
+hyp status [--json | --sessions | --discover]      # Live daemon, node health, peers & doctor diagnostics
+hyp connect [add | list | guide [id]]              # Wire chat bridges or node event streams & read guides
 hyp secret set <name> --web                        # Save a token out-of-band to OS Keychain / Secret Service
-hyp share <user@host>                              # Expose via Tailscale & generate a one-shot invite
+hyp share <tailscale | invite <user@host> | stop>  # Expose via Tailscale & generate a one-shot invite
 hyp setup [harness|all|service]                    # Configure harnesses or install launchd/systemd daemon
 hyp skill [install|print|path]                     # Install the canonical Hyphae agent skill
+hyp mute <target> | hyp unmute <target> | hyp mutes # Manage connector mute rules (#channel, topic:, plugin:, peer)
 ```
 
 ### Multi-machine over Tailscale
 
 ```sh
 # On the Team Node host:
-hyp node expose tailscale --service hyphae     # https://hyphae.<tailnet>.ts.net
-hyp share alice@laptop                         # prints one-shot `hyp onboard --join <<< 'am1_...'`
+hyp share tailscale --service hyphae           # https://hyphae.<tailnet>.ts.net
+hyp share invite alice@laptop                  # prints one-shot `hyp onboard --join <<< 'am1_...'`
 
 # On Alice's laptop:
 hyp onboard --join --install-service <<< 'am1_...'
@@ -180,8 +181,9 @@ See [docs/security.md](docs/security.md), [docs/design.md](docs/design.md), [doc
 ```sh
 npm install
 npm run typecheck          # Strict TypeScript check
-npm test                   # Unit, multi-session, #channels, stream & bridge integration tests
-npm run test:harnesses     # Real local claude, codex, agy & herdr integration tests (zero API cost)
+npm test                   # Unit, differential oracle, #channels, stream, bridge & secret store tests
+npm run test:harnesses     # Real local claude, codex, agy & herdr smoke tests (zero API cost)
+npm run test:integration   # End-to-end multi-host, TLS, webhook, bridge & virtual harness suites (10 suites)
 npm run build              # Compile to dist/
 ```
 

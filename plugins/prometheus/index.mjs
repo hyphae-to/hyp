@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Built-in zero-dependency Prometheus Alertmanager v4 webhook stream plugin for hyphae / t3-mesh (Node 24+).
+ * Built-in zero-dependency Prometheus Alertmanager v4 webhook stream plugin for Hyphae (Node 24+).
  * Turns Alertmanager webhook POST payloads into filterable CloudEvents 1.0 on fd 3.
  *
  * Configuration via env:

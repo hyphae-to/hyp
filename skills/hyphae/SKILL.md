@@ -44,6 +44,7 @@ An agent can handle the **entire onboarding flow end-to-end** without ever touch
    ```bash
    hyp onboard --yes                           # create local private node + start daemon + wire detected harnesses
    hyp setup <harness|all|service>             # antigravity|claude|codex|cursor|opencode|gemini|openclaw|all|service
+   hyp connect guide <id> --json               # fetch exact setup instructions for github-webhook, prometheus-webhook, slack, telegram, whatsapp, webhook
    hyp share tailscale --service hyphae        # private tailnet exposure (NEVER use tailscale funnel on main router)
    hyp status --discover --probe-ssh           # discover & probe SSH hosts from Herdr / ~/.ssh/config / Tailscale
    hyp onboard --remote-ssh <host>             # invite & configure a reachable remote machine over SSH
@@ -55,10 +56,10 @@ An agent can handle the **entire onboarding flow end-to-end** without ever touch
      ```
    - Or if the user prefers their own terminal, have them run `hyp secret set <name>` directly (override backend via `HYPHAE_SECRET_BACKEND=keychain|secret-service|file` if needed).
    - Reference secrets in `~/.config/hyphae/connector.json` ONLY as `{ "secret": "<name>" }` or `{ "secretFile": "<name>" }`.
-5. **Verify everything**:
+5. **Verify everything** (all `hyp` commands support `--json` for structured output):
    ```bash
-   hyp secret check
-   hyp status
+   hyp secret check --json
+   hyp status --json
    ```
 
 ---

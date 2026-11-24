@@ -246,7 +246,7 @@ export async function promptRouterStreams(configDir: string): Promise<Record<str
 
 /**
  * Interactive wizard to configure connector-level messaging & bridge plugins (`slack`, `telegram`,
- * `webhook`, or custom / existing `t3-mesh` plugins). Stores secrets in the OS keyring (or private local fallback).
+ * `webhook`, or custom fd-3 plugins). Stores secrets in the OS keyring (or private local fallback).
  */
 export async function promptConnectorPlugins(configDir: string): Promise<Record<string, unknown>[]> {
   const cardLines = CONNECTOR_BRIDGE_GUIDES.flatMap((g) => [
@@ -417,7 +417,7 @@ export async function runPluginSetupWizard(configPath: string): Promise<void> {
       options: [
         {
           value: "bridge",
-          label: "Connector Thread Bridge (Slack, Telegram, Webhook, custom t3-mesh plugin)",
+          label: "Connector Bridge (Slack, Telegram, WhatsApp, Webhook, custom plugin)",
           hint: "1-to-1 local bridge pinned to an agent handle · secrets stay on this machine",
         },
         {
@@ -515,9 +515,9 @@ export async function runInteractiveOnboard(options: InteractiveOnboardOptions):
         )}`
       : `${badge.dim("○ Herdr Core             not installed")}`,
     env.t3.meshConfigured
-      ? `${badge.ok("T3 Code / t3-mesh".padEnd(22))} ${badge.dim(`${env.t3.connectorId ?? "?"} -> ${env.t3.routerUrl ?? "?"}`)}`
+      ? `${badge.ok("T3 Code".padEnd(22))} ${badge.dim(`mesh active · ${env.t3.connectorId ?? "?"} -> ${env.t3.routerUrl ?? "?"}`)}`
       : env.t3.installed
-        ? `${badge.ok("T3 Code".padEnd(22))} ${badge.dim("installed (no ~/.t3-mesh/config.json)")}`
+        ? `${badge.ok("T3 Code".padEnd(22))} ${badge.dim("installed (mesh not configured)")}`
         : `${badge.dim("○ T3 Code                not installed")}`,
     env.tailscale
       ? `${badge.ok("Tailscale".padEnd(22))} ${badge.dim("available for private tailnet router exposure")}`
@@ -882,7 +882,7 @@ export async function runInteractiveOnboard(options: InteractiveOnboardOptions):
           const extra = [
             pr.nodeVersion || "node?",
             pr.hasHyphae ? "hyphae:yes" : "hyphae:no",
-            pr.hasT3Mesh ? "t3-mesh:yes" : "",
+            pr.hasT3Mesh ? "t3-code:mesh" : "",
             pr.harnesses.length > 0 ? `[${pr.harnesses.join(",")}]` : "",
           ].filter(Boolean).join(" · ");
           return `${badge.ok(pr.host.padEnd(20))} ${styleText("cyan", `${pr.user ?? "?"}@${pr.hostname ?? pr.host}`)} ${badge.dim(extra)}`;

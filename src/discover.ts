@@ -107,7 +107,7 @@ export function detectLocalEnvironment(home = homedir(), env: NodeJS.ProcessEnv 
     }
   }
 
-  // T3 Code + t3-mesh detection (never reads tokens/secrets)
+  // T3 Code mesh detection (never reads tokens/secrets)
   const t3Home = join(home, ".t3");
   const t3Installed = existsSync(t3Home) || hasBin("t3");
   const t3MeshCfgPath = join(home, ".t3-mesh", "config.json");

@@ -13,9 +13,9 @@ export interface PluginDeliverySink {
 }
 
 /**
- * Universal local plugin host for `hyphae`: reuses `t3-mesh`'s battle-tested fd-3 process
- * supervisor, SQLite coalescing/retention store (`local.db`), and safe CloudEvent formatting,
- * while routing targets dynamically to ANY enrolled harness session (Antigravity, Claude, Codex, Herdr).
+ * Universal local plugin host for `hyphae`: runs the fd-3 process supervisor,
+ * SQLite coalescing/retention store (`local.db`), and safe CloudEvent formatting,
+ * routing targets dynamically to ANY enrolled harness session (Antigravity, Claude, Codex, Herdr).
  */
 export class PluginHost {
   readonly #configs: readonly AgentPluginConfig[];

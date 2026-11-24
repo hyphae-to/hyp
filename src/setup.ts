@@ -939,8 +939,8 @@ export async function runDoctor(configPath: string, socketPath: string, homeDir 
       name: "t3",
       ok: true,
       detail: env.t3.meshConfigured
-        ? `t3-mesh active (${env.t3.connectorId ?? "?"} -> ${env.t3.routerUrl ?? "?"}${env.t3.plugins.length > 0 ? `, plugins: ${env.t3.plugins.join(", ")}` : ""})`
-        : "T3 Code detected (no ~/.t3-mesh/config.json)",
+        ? `T3 Code mesh active (${env.t3.connectorId ?? "?"} -> ${env.t3.routerUrl ?? "?"}${env.t3.plugins.length > 0 ? `, plugins: ${env.t3.plugins.join(", ")}` : ""})`
+        : "T3 Code detected (mesh not configured)",
     });
   }
 

@@ -77,7 +77,7 @@ class McpClient {
   }
 }
 
-test("ONE shared MCP subprocess multiplexes Antigravity, Claude, and Codex threads with zero-polling push wakeup over real t3-mesh router", { timeout: 15_000 }, async () => {
+test("ONE shared MCP subprocess multiplexes Antigravity, Claude, and Codex threads with zero-polling push wakeup over real Hyphae router", { timeout: 15_000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hyphae-e2e-"));
   const routerStore = new RouterCore({ dbPath: join(dir, "router.sqlite") });
   const token = routerStore.addConnector("bogdan@local");
@@ -166,7 +166,7 @@ test("ONE shared MCP subprocess multiplexes Antigravity, Claude, and Codex threa
     );
     assert.deepEqual(agStopWhileArmed, {});
 
-    // 5. Claude sends a real mesh message to Antigravity through the real t3-mesh router!
+    // 5. Claude sends a real mesh message to Antigravity through the real Hyphae router!
     await handleHookPayload(
       { session_id: "claude-sess-2", tool_use_id: "toolu_send_1", tool_name: "mcp__hyphae__hyp_send" },
       { harness: "claude", event: "pre-tool-use", socketPath: daemon.socketPath },

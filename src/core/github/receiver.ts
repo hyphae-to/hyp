@@ -1,7 +1,6 @@
-// `t3-mesh-router github-receiver`: the GitHub org webhook endpoint (bayfold/infra hub/README.md,
-// SPEC.md section 12.7). Internet-facing through Tailscale Funnel, so it runs as its own process
-// and user: it holds only the webhook secret and a publisher token, never opens the router's
-// database, never calls GitHub, and talks only to the router.
+// `hyp router github-receiver`: the GitHub webhook endpoint. Internet-facing through Tailscale
+// Funnel or reverse proxy, so it runs isolated: it holds only the webhook secret and a publisher
+// token, never opens the router's database, never calls GitHub, and talks only to the router.
 //
 // POST /hooks/github: verify X-Hub-Signature-256 over the raw body (401 if bad or missing),
 // normalize, publish to the router, and answer GitHub 202 once the router has stored the event,

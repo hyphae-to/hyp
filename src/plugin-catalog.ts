@@ -262,9 +262,9 @@ export const CONNECTOR_BRIDGE_GUIDES: readonly PluginOrStreamGuide[] = [
   {
     id: "custom-plugin",
     kind: "connector-bridge",
-    label: "Custom / Existing t3-mesh Plugin",
-    tagline: "Run any local executable or existing t3-mesh Python bridge on fd 3",
-    summary: "100% drop-in compatible with existing t3-mesh connector plugins (e.g. Python Slack/Telegram/ops bridges) and custom scripts using plugins/sdk/client.{mjs,py}.",
+    label: "Custom fd-3 Plugin",
+    tagline: "Run any local executable or Python/Node bridge on fd 3",
+    summary: "Run any custom local bridge or script (Node, Python, Go, Rust) over the Hyphae fd-3 NDJSON protocol using plugins/sdk/client.{mjs,py}.",
     defaultName: "custom-bridge",
     defaultTopicOrTarget: "ops",
     secrets: [],

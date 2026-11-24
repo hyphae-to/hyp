@@ -37,8 +37,8 @@ Every test spins up an isolated `MeshTopology` ([harness/topology.ts](./harness/
 - **External Service Shims** ([shims/services.ts](./shims/services.ts)):
   - **GitHub Webhooks**: Signed & tampered `X-Hub-Signature-256` payloads delivered to Hyphae's built-in `github-webhook` stream.
   - **Prometheus / Alertmanager**: Signed & tampered `X-Webhook-Signature-256` alerts delivered to `webhook-stream` / `prometheus-webhook`.
-  - **Mock Slack Socket Mode Server**: Zero-dependency `127.0.0.1` HTTP (`auth.test`, `apps.connections.open`) + RFC 6455 WebSocket server driving the real `plugins/slack/index.mjs` bridge via `SLACK_API_BASE` and `0600` `{ "secret": "..." }` tokens.
-  - **Mock Telegram Bot API Server**: Loopback `POST /bot<token>/getUpdates` long-polling server driving the real `plugins/telegram/index.mjs` bridge via `TELEGRAM_API_BASE` and `0600` `{ "secret": "..." }` tokens.
+  - **Mock Slack Socket Mode Server**: Zero-dependency `127.0.0.1` HTTP (`auth.test`, `apps.connections.open`) + RFC 6455 WebSocket server driving the real `plugins/slack/index.mjs` bridge via `SLACK_API_BASE` and `{ "secret": "..." }` tokens.
+  - **Mock Telegram Bot API Server**: Loopback `POST /bot<token>/getUpdates` long-polling server driving the real `plugins/telegram/index.mjs` bridge via `TELEGRAM_API_BASE` and `{ "secret": "..." }` tokens.
 - **Multi-Host Emulation Shims** ([shims/multihost.ts](./shims/multihost.ts)):
   - `startTlsReverseProxy`: ephemeral self-signed localhost CA + `node:https` streaming reverse proxy for `https://` origin validation, invites, `probeRouter`, and SSE over TLS (`NODE_EXTRA_CA_CERTS`).
   - `startChaosProxy`: loopback HTTP/SSE proxy with `sever()`, `heal()`, and `setLatencyMs()` to simulate single-host network partitions while the router and other connectors stay live.
@@ -53,7 +53,7 @@ Every test spins up an isolated `MeshTopology` ([harness/topology.ts](./harness/
 | File | Coverage |
 | --- | --- |
 | [network-topology.test.ts](./network-topology.test.ts) | Multi-router Team + Private isolation, cross-connector `hyp_send` & `#channels`, connector & session muting, slim `notify` mode with real `hyp wait` / `hyp watch` & `hyp_inbox`. |
-| [webhooks-and-bridges.test.ts](./webhooks-and-bridges.test.ts) | Built-in `github-webhook` & Prometheus `webhook-stream` (`0600` secrets, 401 bad signature rejection), real built-in Slack Socket Mode & Telegram bridges (allowlists, offset checkpointing, `plugin:*` muting, live `hyp_plugin_handoff`). |
+| [webhooks-and-bridges.test.ts](./webhooks-and-bridges.test.ts) | Built-in `github-webhook` & Prometheus `webhook-stream` (`{ "secret": "..." }` resolution, 401 bad signature rejection), real built-in Slack Socket Mode & Telegram bridges (allowlists, offset checkpointing, `plugin:*` muting, live `hyp_plugin_handoff`). |
 | [v1-bridges-and-reachability.test.ts](./v1-bridges-and-reachability.test.ts) | Bidirectional `hyp_plugin_post`, multi-thread `hyp_bridge_link`/`unlink`, `whatsapp` & `prometheus-webhook` streams, `hyp_topics` & GitHub dead-subscription reachability lint. |
 | [real-harnesses.test.ts](./real-harnesses.test.ts) | Real `claude`, `codex`, `opencode` v2, and `agy` CLI binaries driven via local LLM shims (including a live cross-connector `claude <-> opencode` conversation), plus `agy` plugin discovery, `cursor-agent` setup/hooks, and `hc` fail-closed check. Missing binaries auto-skip cleanly. |
 | [incident-and-resilience.test.ts](./incident-and-resilience.test.ts) | Full multi-owner incident workflow (Prometheus -> `#deploys` -> GitHub PR -> private Slack bridge + live handoff), 6-harness concurrent multiplexing over one shared `hyp mcp` subprocess, router restart/reconnect, stale socket recovery, forged/replayed/cross-tool token rejection, and `0644` secret rejection. |

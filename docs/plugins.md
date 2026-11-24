@@ -7,18 +7,18 @@
 | Layer | Where it runs | Routing model | Where secrets live | Best for |
 | --- | --- | --- | --- | --- |
 | **Router Data Streams** (`localRouter.streams`) | Supervised on the **router host** (or external HTTP publisher posting to `POST /v1/events?topic=<name>`) | **1-to-many Pub/Sub** — any agent on any machine subscribes with CloudEvents filters (`hyp_subscribe`) | Router host's OS keyring (or headless `~/.config/hyphae/secrets/` fallback) | **GitHub events** (`github-webhook`), **Prometheus / Alertmanager alerts** (`prometheus-webhook`), **CI / Linear / Sentry / Stripe** webhooks (`webhook-stream`), **custom polling/streaming data source plugins** |
-| **Connector Thread Bridges** (`plugins`) | Supervised on a **local connector daemon** (`hyp daemon`) | **Thread-Owned + Multi-Thread Fan-In + Outbound Replies** — pinned to a primary agent `handle` / `sessionId` with live `hyp_plugin_handoff`, multi-thread `hyp_bridge_link` fan-in, and outbound `hyp_plugin_post` replies | Local machine's OS keyring (or local fallback) — never sent to a shared router | **Personal Slack / Telegram / WhatsApp DM & mention bridges**, machine-local alerts, and **100% drop-in compatibility with existing `t3-mesh` plugins** |
+| **Connector Thread Bridges** (`plugins`) | Supervised on a **local connector daemon** (`hyp daemon`) | **Thread-Owned + Multi-Thread Fan-In + Outbound Replies** — pinned to a primary agent `handle` / `sessionId` with live `hyp_plugin_handoff`, multi-thread `hyp_bridge_link` fan-in, and outbound `hyp_plugin_post` replies | Local machine's OS keyring (or local fallback) — never sent to a shared router | **Personal Slack / Telegram / WhatsApp DM & mention bridges**, machine-local alerts, and **custom fd-3 bridges in any language** |
 
 ### Interactive Setup & Built-In Guides
 
 ```sh
-hyp plugin setup                      # Interactive TUI for both Router Data Streams & Connector Bridges
-hyp plugin list                       # Inspect configured streams and bridges
-hyp plugin guide                      # List all built-in plugins & streams
-hyp plugin guide slack                # Print step-by-step setup guide + agent usage for Slack
-hyp plugin guide whatsapp             # WhatsApp Business Cloud API bridge guide
-hyp plugin guide github-webhook       # GitHub webhook stream guide
-hyp plugin guide prometheus-webhook   # Prometheus Alertmanager v4 stream guide
+hyp connect add                       # Interactive TUI for both Node Streams & Connector Bridges (aliases: `hyp plugin setup`, `hyp stream add`)
+hyp connect list                      # Inspect configured streams and bridges (supports --json)
+hyp connect guide                     # List all built-in streams & bridges
+hyp connect guide slack               # Print step-by-step setup guide + agent usage for Slack
+hyp connect guide whatsapp            # WhatsApp Business Cloud API bridge guide
+hyp connect guide github-webhook      # GitHub webhook stream guide
+hyp connect guide prometheus-webhook  # Prometheus Alertmanager v4 stream guide
 ```
 
 ---
@@ -147,8 +147,8 @@ Custom router data sources use the **exact same fd-3 SDK** (`plugins/sdk/client.
 
 `hyphae` builds on the battle-tested fd-3 plugin supervisor, SQLite coalescing/retention store (`local.db`), wake caps, backlog status reporting, and CloudEvent validation — while routing targets to **any** harness session on the daemon and adding **multi-thread fan-in** and **bidirectional outbound replies**.
 
-- **100% drop-in compatible with existing `t3-mesh` plugins**: Any plugin built for `t3-mesh` (such as Python Slack Socket Mode bridges, Telegram long-polling connectors, `bf-ops-alerts`, or `scalable`) runs unmodified under `hyp daemon`.
-- **Zero credentials shared**: Plugins receive only their explicitly configured secrets (from OS Keychain / Linux Secret Service, local fallback, or `systemd-creds`), never see router tokens, and communicate solely over anonymous duplex fd 3 (`T3_MESH_FD=3` / `AGENTS_MESH_FD=3`).
+- **Language-agnostic fd-3 plugins**: Any local executable or script (Node, Python, Go, Rust) speaking the Hyphae fd-3 NDJSON protocol runs cleanly under `hyp daemon`.
+- **Zero credentials shared**: Plugins receive only their explicitly configured secrets (from OS Keychain / Linux Secret Service, local fallback, or `systemd-creds`), never see router tokens, and communicate solely over anonymous duplex fd 3 (`HYPHAE_FD=3`).
 - **Durable buffering & coalescing**: Events are persisted in `state/local.db` (24h retention, 100 pending batches per target, configurable `coalesceSeconds`, `maxWaitSeconds`, `wakesPerHour`). If the target agent hasn't joined yet, batches wait durably and flush automatically once the target session enrolls.
 
 ### Target Addressing
@@ -159,7 +159,7 @@ Each plugin target in `~/.config/hyphae/connector.json` accepts one of:
 | --- | --- | --- |
 | `handle` | `"pm"` | Routes to whichever enrolled session (Antigravity, Claude, Codex, Herdr, T3 Code, OpenClaw, Cursor, OpenCode, Gemini) currently holds handle `pm`. Best for desktop workflows. |
 | `sessionId` | `"antigravity:<uuid>"` / `"claude:<uuid>"` / `"codex:<uuid>"` | Pins delivery to one specific persistent conversation/session ID. |
-| `threadId` | `"30227355-..."` | Matches exact `sessionId` or `<harness>:<threadId>` suffix (drop-in compatibility with `t3-mesh` configs). |
+| `threadId` | `"30227355-..."` | Matches exact `sessionId` or `<harness>:<threadId>` suffix. |
 
 ### Inspecting Targets & Live Handoffs (`hyp_plugin_targets` / `hyp_plugin_handoff`)
 
@@ -224,8 +224,8 @@ hyp_plugin_post({
       "name": "slack",
       "builtin": "slack",
       "env": {
-        "SLACK_APP_TOKEN_FILE": { "secretFile": "slack-app-token" },
-        "SLACK_BOT_TOKEN_FILE": { "secretFile": "slack-bot-token" },
+        "SLACK_APP_TOKEN": { "secret": "slack-app-token" },
+        "SLACK_BOT_TOKEN": { "secret": "slack-bot-token" },
         "SLACK_ALLOWED_USERS": "U01234567",
         "SLACK_DEFAULT_CHANNEL": "C01234567"
       },
@@ -250,7 +250,7 @@ hyp_plugin_post({
       "name": "telegram",
       "builtin": "telegram",
       "env": {
-        "TELEGRAM_BOT_TOKEN_FILE": { "secretFile": "telegram-bot-token" },
+        "TELEGRAM_BOT_TOKEN": { "secret": "telegram-bot-token" },
         "TELEGRAM_ALLOWED_USERS": "123456789",
         "TELEGRAM_STATE_FILE": "/Users/you/.config/hyphae/state/telegram-offset.json"
       },
@@ -309,7 +309,7 @@ hyp_plugin_post({
       "env": {
         "WEBHOOK_PORT": "8795",
         "WEBHOOK_PATH": "/webhook",
-        "WEBHOOK_SECRET_FILE": { "secretFile": "local-webhook-secret" },
+        "WEBHOOK_SECRET": { "secret": "local-webhook-secret" },
         "WEBHOOK_POST_URL": "http://127.0.0.1:9000/reply",
         "WEBHOOK_SOURCE": "alerts/local",
         "WEBHOOK_EVENT_TYPE": "com.ops.alert"
@@ -325,18 +325,18 @@ hyp_plugin_post({
 - Verifies `X-Webhook-Signature-256: sha256=<hex>` with constant-time HMAC when `WEBHOOK_SECRET` / `WEBHOOK_SECRET_FILE` is set.
 - Outbound `hyp_plugin_post`: when `WEBHOOK_POST_URL` is configured, POSTs outbound reply payloads to that callback URL.
 
-### E. Custom / Existing `t3-mesh` Plugins (`exec` + `args`)
+### E. Custom Local Plugins (`exec` + `args`)
 
-Existing Python or binary plugins from `t3-mesh` (e.g. `bridge.py`, `alert_plugin.py`, `connector.py`) run unchanged:
+Any custom Python, Node, or compiled binary plugin speaking the fd-3 NDJSON protocol runs directly:
 
 ```json
 {
   "plugins": [
     {
-      "name": "bf-ops-alerts",
+      "name": "ops-alerts",
       "exec": "/usr/bin/python3",
-      "args": ["-u", "/home/you/.local/share/bf-ops/alert_plugin.py"],
-      "cwd": "/home/you/.local/share/bf-ops",
+      "args": ["-u", "/home/you/.local/share/ops-alerts/alert_plugin.py"],
+      "cwd": "/home/you/.local/share/ops-alerts",
       "targets": [
         { "name": "ops", "handle": "ops", "coalesceSeconds": 60, "maxWaitSeconds": 180, "wakesPerHour": 20 }
       ]
@@ -374,8 +374,8 @@ await mesh.send(targets[0], {
 });
 ```
 
-Protocol summary (compatible with `t3-mesh` fd-3 Protocol v1, extended with bidirectional `request`/`response` for outbound replies):
-1. Daemon spawns plugin with duplex pipe on **fd 3** and sets `T3_MESH_FD=3`, `AGENTS_MESH_FD=3`, `T3_MESH_PLUGIN=<name>`, `T3_MESH_PROTOCOL=1`.
+Protocol summary (Hyphae fd-3 Protocol v1, extended with bidirectional `request`/`response` for outbound replies):
+1. Daemon spawns plugin with duplex pipe on **fd 3** and sets `HYPHAE_FD=3`, `HYPHAE_PLUGIN=<name>`, `HYPHAE_PROTOCOL=1`.
 2. Daemon sends `{"type":"hello","protocol":1,"plugin":"<name>","targets":["<target>",...]}\n`.
 3. Plugin writes newline-delimited JSON (≤ 64 KiB/line): `{"type":"event","to":"<target>","event":<CloudEvent 1.0>}\n` (`data` ≤ 8 KiB, whole event ≤ 12 KiB).
 4. Daemon answers in order with `{"type":"ack","id":"...","source":"...","status":"stored"|"duplicate"}` or `{"type":"nack",...}` (retry only `unavailable`).
@@ -389,8 +389,8 @@ Protocol summary (compatible with `t3-mesh` fd-3 Protocol v1, extended with bidi
 For external feeds shared across multiple sessions or machines, configure a topic on the router and issue a publisher token restricted to that topic:
 
 ```sh
-hyp router add-publisher github-hub --topic github --db router.sqlite --token-out pub.token
-hyp router serve --db router.sqlite --audit audit.log --topic github=github-hub
+hyp node add-publisher github-hub --topic github --db router.sqlite --token-out pub.token
+hyp node serve --db router.sqlite --audit audit.log --topic github=github-hub
 ```
 
 Publishers post CloudEvents 1.0 to `POST /v1/events?topic=github`. Built-in receivers (`github-webhook`, `prometheus-webhook`, and `webhook-stream`) verify signatures/tokens and publish normalized CloudEvents directly. Sessions subscribe with `hyp_subscribe` filters and choose their own `mode` (`queue` or `interrupt`).

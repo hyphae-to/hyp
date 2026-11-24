@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Built-in zero-dependency Telegram Bot long-polling plugin for hyphae / t3-mesh (Node 24+).
+ * Built-in zero-dependency Telegram Bot long-polling plugin for Hyphae (Node 24+).
  *
  * Configuration via env:
  *   TELEGRAM_BOT_TOKEN_FILE or TELEGRAM_BOT_TOKEN  - Bot token from @BotFather

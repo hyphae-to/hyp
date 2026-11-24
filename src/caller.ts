@@ -32,7 +32,7 @@ const RESOLVE_WAIT_MS = 1_500;
 const MAX_PENDING_CALLS = 512;
 
 /**
- * Authoritative per-call caller verification modeled on t3-mesh's `resolveCaller`:
+ * Authoritative per-call caller verification:
  * PreToolUse hooks register the host-verified `(sessionId, tool, callId)` immediately before
  * the tool executes and receive a single-use `callToken` (for harnesses like Antigravity whose
  * PreToolUse hook can inject arguments via `overwrite`). Every MCP `tools/call` must present
@@ -269,8 +269,7 @@ function inspectCodexRollout(filePath: string, callId: string, normalizedTool: s
 }
 
 /**
- * Authoritative Codex caller verification directly from `$CODEX_HOME/sessions/.../rollout-*.jsonl`
- * (mirroring t3-mesh's `resolveCaller` against T3 projections):
+ * Authoritative Codex caller verification directly from `$CODEX_HOME/sessions/.../rollout-*.jsonl`:
  * Codex flushes the `function_call` record with `call_id` before dispatching the MCP tool call,
  * and sends the same `callId` in MCP `params._meta.callId`. Works for both Codex CLI and Codex
  * Desktop across shared MCP servers with zero manual `--thread` flags or hook trust prompts.

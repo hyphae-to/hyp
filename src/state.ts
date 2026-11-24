@@ -131,7 +131,7 @@ export class State {
     return row === undefined ? undefined : this.#decodeSession(row);
   }
 
-  /** Matches either exact sessionId or `<harness>:<threadId>` suffix (for t3-mesh drop-in compatibility). */
+  /** Matches either exact sessionId or `<harness>:<threadId>` suffix. */
   byThreadId(threadId: string): Session | undefined {
     const exact = this.session(threadId);
     if (exact) return exact;

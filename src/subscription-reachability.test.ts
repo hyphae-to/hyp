@@ -140,7 +140,7 @@ test("hyp_topics & hyp_subscribe detect unmonitored GitHub repos, wrong attribut
         /NOT in the configured 'github' stream scope/i,
       );
 
-      // 4. Generalized filter mistake family (t3-mesh subject vs repo, URL prefix, source without github.com/, unknown attr)
+      // 4. Generalized filter mistake family (subject vs repo, URL prefix, source without github.com/, unknown attr)
       const wrongSubject = await daemon.connector.call("antigravity:ag-1", "hyp_subscribe", {
         key: "gh:wrong-subj",
         topic: "github",

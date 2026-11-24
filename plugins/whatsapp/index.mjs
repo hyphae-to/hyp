@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Built-in zero-dependency WhatsApp Business Cloud API plugin for hyphae / t3-mesh (Node 24+).
+ * Built-in zero-dependency WhatsApp Business Cloud API plugin for Hyphae (Node 24+).
  * Receives Meta Cloud API webhooks (GET verification + signed POST messages) and supports
  * outbound replies via `mesh.onPost` (`hyp_plugin_post`).
  *

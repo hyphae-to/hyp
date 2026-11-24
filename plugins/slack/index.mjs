@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Built-in zero-dependency Slack Socket Mode plugin for hyphae / t3-mesh (Node 24+).
+ * Built-in zero-dependency Slack Socket Mode plugin for Hyphae (Node 24+).
  *
  * Configuration via env:
  *   SLACK_APP_TOKEN_FILE or SLACK_APP_TOKEN  - xapp-... Socket Mode token

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Built-in zero-dependency local HTTP webhook plugin for hyphae / t3-mesh (Node 24+).
+ * Built-in zero-dependency local HTTP webhook plugin for Hyphae (Node 24+).
  * Turns any loopback/tailnet webhook POST into a validated CloudEvent on fd 3.
  *
  * Configuration via env:

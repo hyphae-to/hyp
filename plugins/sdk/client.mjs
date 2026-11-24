@@ -2,8 +2,7 @@ import { createReadStream, createWriteStream } from "node:fs";
 import { createInterface } from "node:readline";
 
 /**
- * Minimal Node 24 client for the hyphae / t3-mesh local plugin channel (fd 3, protocol v1).
- * Works identically under both `hyp daemon` and `t3-mesh daemon`.
+ * Minimal Node 24 client for the Hyphae local plugin channel (fd 3, protocol v1).
  */
 export class MeshPluginClient {
   plugin;
@@ -13,8 +12,8 @@ export class MeshPluginClient {
   #closed = false;
   #onPost;
 
-  constructor({ fd = Number(process.env.T3_MESH_FD ?? process.env.AGENTS_MESH_FD ?? 3), onStatus, onDeliveryFailed, onPost } = {}) {
-    this.plugin = process.env.T3_MESH_PLUGIN ?? process.env.AGENTS_MESH_PLUGIN ?? "plugin";
+  constructor({ fd = Number(process.env.HYPHAE_FD ?? process.env.AGENTS_MESH_FD ?? process.env.T3_MESH_FD ?? 3), onStatus, onDeliveryFailed, onPost } = {}) {
+    this.plugin = process.env.HYPHAE_PLUGIN ?? process.env.AGENTS_MESH_PLUGIN ?? process.env.T3_MESH_PLUGIN ?? "plugin";
     this.#onPost = onPost;
     this.#out = createWriteStream("", { fd, autoClose: false });
     const input = createReadStream("", { fd, autoClose: false });
