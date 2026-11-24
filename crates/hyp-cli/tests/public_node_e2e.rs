@@ -931,6 +931,11 @@ async fn public_node_turnkey_deploy_join_live_github_stream_and_confinement() {
         assert!(kill_status.success());
         let exit_status = child.wait().expect("wait for graceful exit");
         assert_eq!(exit_status.code(), Some(0), "expected clean exit code 0 on SIGTERM");
+        assert!(!hub_state.join("node.pid").exists(), "node.pid should be cleaned up");
+        assert!(
+            !hub_state.join("node.status.json").exists(),
+            "node.status.json should be cleaned up"
+        );
     }
     #[cfg(not(unix))]
     {
@@ -938,12 +943,6 @@ async fn public_node_turnkey_deploy_join_live_github_stream_and_confinement() {
         let _ = child.kill();
         let _ = child.wait();
     }
-
-    assert!(!hub_state.join("node.pid").exists(), "node.pid should be cleaned up");
-    assert!(
-        !hub_state.join("node.status.json").exists(),
-        "node.status.json should be cleaned up"
-    );
 }
 
 // ============================================================================

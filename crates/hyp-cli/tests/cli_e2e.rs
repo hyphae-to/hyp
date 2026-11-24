@@ -37,6 +37,7 @@ struct NativeRustDaemon {
 }
 
 impl NativeRustDaemon {
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn shutdown_gracefully(&mut self) -> Option<i32> {
         let mut child = self.child.take()?;
         #[cfg(unix)]
@@ -281,6 +282,7 @@ fn hook_fast_path_fails_safe_and_validates_usage() {
 
 #[test]
 fn cli_subprocesses_mcp_hook_and_wait_interop() {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut daemon = start_native_rust_daemon();
     let socket_path = daemon
         .socket_path

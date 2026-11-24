@@ -1117,6 +1117,7 @@ fn encode_am2_with_metadata(
 // `pair inspect` (stdin or --token-file ONLY)
 // ============================================================================
 
+#[cfg_attr(not(unix), allow(unused_variables, clippy::ptr_arg))]
 fn read_bounded_token(token_file: Option<&Path>, warnings: &mut Vec<String>) -> Result<String, (u8, &'static str, String)> {
     let mut raw = String::new();
     match token_file {
