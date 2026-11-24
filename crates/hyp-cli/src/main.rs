@@ -1,11 +1,14 @@
 //! `hyp` — Hyphae v2 native CLI (`hook`, `mcp`, `wait`, `watch`, `node`/`daemon`, `onboard`,
-//! `setup`, `status`, `doctor`, `secret`, `gate`, `inbox`, `kv`, `update`, `deploy`, `pair`, `version`).
+//! `setup`, `status`, `doctor`, `secret`, `gate`, `inbox`, `kv`, `wakeup`, `auth`, `drop`,
+//! `relay`, `update`, `deploy`, `pair`, `version`).
 //!
 //! Performance note: `hyp hook` intercepts `std::env::args()` BEFORE constructing `clap`
 //! or Tokio so hook invocations pay zero async-runtime startup overhead (1–3 ms cold start).
 
+mod auth_cmd;
 mod config_file;
 mod deploy;
+mod drop_cmd;
 mod gate_cmd;
 mod kv_cmd;
 mod node_cmd;
@@ -17,6 +20,7 @@ mod skill_render;
 mod status_doctor;
 mod ui;
 mod update;
+mod wakeup_cmd;
 mod wizard;
 
 use clap::{Parser, Subcommand};
@@ -36,7 +40,7 @@ use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE};
 #[derive(Parser)]
 #[command(
     name = "hyp",
-    about = "Hyphae v2 native CLI (hook, mcp, wait, watch, node, onboard, setup, status, doctor, secret, gate, inbox, kv, update, deploy, pair, version)",
+    about = "Hyphae v2 native CLI (hook, mcp, wait, watch, node, onboard, setup, status, doctor, secret, gate, inbox, kv, wakeup, auth, drop, relay, update, deploy, pair, version)",
     version
 )]
 struct Cli {
@@ -160,6 +164,26 @@ enum Commands {
     Kv {
         #[command(subcommand)]
         command: kv_cmd::KvCommand,
+    },
+    /// Durable local wakeup scheduler & OS trigger commands (`enable`, `disable`, `set`, `list`, `cancel`, `fire`, `emit`)
+    Wakeup {
+        #[command(subcommand)]
+        command: wakeup_cmd::WakeupCommand,
+    },
+    /// Tier 1 Ed25519 Human Authority management, node certification (`hcert1_`), and drop signing (`hdrop1_`)
+    Auth {
+        #[command(subcommand)]
+        command: auth_cmd::AuthCommand,
+    },
+    /// Verified Human Drops (`create`, `wait`, `ingest` — zero-leak secret & directive drops)
+    Drop {
+        #[command(subcommand)]
+        command: drop_cmd::DropCommand,
+    },
+    /// Blind Ephemeral Drop Relay configuration and health inspection (`set`, `status`)
+    Relay {
+        #[command(subcommand)]
+        command: drop_cmd::RelayCommand,
     },
     /// Cryptographically signed self-update, release channels, and `--all` fleet rollout
     Update(update::UpdateArgs),
@@ -443,6 +467,10 @@ fn main() -> ExitCode {
         Commands::Gate { command } => gate_cmd::run_gate(command),
         Commands::Inbox { command } => gate_cmd::run_inbox(command),
         Commands::Kv { command } => kv_cmd::run_kv(command),
+        Commands::Wakeup { command } => wakeup_cmd::run_wakeup(command),
+        Commands::Auth { command } => auth_cmd::run_auth(command),
+        Commands::Drop { command } => drop_cmd::run_drop(command),
+        Commands::Relay { command } => drop_cmd::run_relay(command),
         Commands::Update(args) => update::run_update(args),
         Commands::Deploy { command } => deploy::run_deploy(command),
         Commands::Pair { command } => pair::run_pair(command),

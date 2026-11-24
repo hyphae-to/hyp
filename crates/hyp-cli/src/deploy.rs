@@ -1,6 +1,7 @@
 //! `hyp deploy` — Internet deployment provider catalog, hardened kit generator,
 //! and fail-closed config + live manifest health checker.
 
+use crate::drop_cmd::validate_relay_url;
 use crate::ui::{
     CheckStatus, CliCheck, CliError, EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error,
     print_checks, print_json, print_next_steps, print_warnings,
@@ -10,6 +11,7 @@ use http_body_util::{BodyExt, Empty};
 use hyp_crypto::keys::OkpJwk as CryptoOkpJwk;
 use hyp_crypto::pairing::validate_endpoint_origin;
 use hyp_crypto::rfc3339::{now_unix_ms, parse_rfc3339_millis};
+use hyp_node::engine::DropRelayConfig;
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
 use hyp_proto::manifest::{NodeManifestPayload, SignedNodeManifest};
 use hyp_proto::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
@@ -27,6 +29,8 @@ use std::time::Duration;
 const MAX_MANIFEST_RESPONSE_BYTES: usize = 512 * 1024;
 const PROBE_TIMEOUT_SECS: u64 = 10;
 
+const DEFAULT_DROP_RELAY_MEMORY_MB: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DeployProvider {
@@ -36,6 +40,7 @@ pub enum DeployProvider {
     Cloudflare,
     Fly,
     PublicNode,
+    DropRelay,
 }
 
 impl DeployProvider {
@@ -47,15 +52,19 @@ impl DeployProvider {
             Self::Cloudflare => "cloudflare",
             Self::Fly => "fly",
             Self::PublicNode => "public-node",
+            Self::DropRelay => "drop-relay",
         }
     }
 
     pub const fn default_profile(self) -> DeployProfile {
         match self {
             Self::PublicNode => DeployProfile::Public,
-            Self::Tailscale | Self::Vps | Self::Docker | Self::Cloudflare | Self::Fly => {
-                DeployProfile::Router
-            }
+            Self::Tailscale
+            | Self::Vps
+            | Self::Docker
+            | Self::Cloudflare
+            | Self::Fly
+            | Self::DropRelay => DeployProfile::Router,
         }
     }
 
@@ -67,6 +76,7 @@ impl DeployProvider {
             Self::Cloudflare => "homelab-node",
             Self::Fly => "fly-node",
             Self::PublicNode => "public.hyphae.to",
+            Self::DropRelay => "drop-relay",
         }
     }
 
@@ -78,13 +88,16 @@ impl DeployProvider {
             Self::Cloudflare => "mesh.example.com",
             Self::Fly => "hyphae-node.fly.dev",
             Self::PublicNode => "public.hyphae.to",
+            Self::DropRelay => "drop.example.com",
         }
     }
 
     pub const fn default_bind(self) -> &'static str {
         match self {
             Self::Docker | Self::Fly => "0.0.0.0:8790",
-            Self::Tailscale | Self::Vps | Self::Cloudflare | Self::PublicNode => "127.0.0.1:8790",
+            Self::Tailscale | Self::Vps | Self::Cloudflare | Self::PublicNode | Self::DropRelay => {
+                "127.0.0.1:8790"
+            }
         }
     }
 
@@ -121,7 +134,7 @@ impl DeployProfile {
 
 #[derive(Subcommand)]
 pub enum DeployCommand {
-    /// List all 6 supported internet deployment providers with TLS, NAT, and pros/cons
+    /// List all 7 supported internet deployment providers with TLS, NAT, and pros/cons
     Providers {
         /// Output structured JSON envelope
         #[arg(long)]
@@ -132,7 +145,7 @@ pub enum DeployCommand {
         /// Target deployment provider
         #[arg(value_enum)]
         provider: DeployProvider,
-        /// Canonical Hyphae nodeId (e.g. acme-team, public.hyphae.to)
+        /// Canonical Hyphae nodeId (e.g. acme-team, public.hyphae.to, drop-relay)
         #[arg(long)]
         node_id: Option<String>,
         /// Public or tailnet HTTPS hostname (without scheme, e.g. mesh.example.com)
@@ -144,6 +157,12 @@ pub enum DeployCommand {
         /// Node profile (router, p2p, or public)
         #[arg(long, value_enum)]
         profile: Option<DeployProfile>,
+        /// Enable the opt-in RAM-only Blind Drop Relay block in generated node.json
+        #[arg(long)]
+        enable_drop_relay: bool,
+        /// Drop Relay maximum RAM budget in MiB (default: 256)
+        #[arg(long = "drop-max-memory-mb", alias = "max-memory-mb")]
+        drop_max_memory_mb: Option<usize>,
         /// Output directory for generated deployment artifacts
         #[arg(long)]
         out: Option<PathBuf>,
@@ -203,10 +222,23 @@ pub fn run_deploy(command: DeployCommand) -> ExitCode {
             domain,
             bind,
             profile,
+            enable_drop_relay,
+            drop_max_memory_mb,
             out,
             force,
             json,
-        } => run_init(provider, node_id, domain, bind, profile, out, force, json),
+        } => run_init(
+            provider,
+            node_id,
+            domain,
+            bind,
+            profile,
+            enable_drop_relay,
+            drop_max_memory_mb,
+            out,
+            force,
+            json,
+        ),
         DeployCommand::Check { url, config, json } => run_check(url, config, json),
     }
 }
@@ -402,6 +434,28 @@ fn build_provider_catalog(tools: &[DetectedTool]) -> Vec<ProviderInfo> {
             detected: has_tool("caddy") || has_tool("docker"),
             init_command: "hyp deploy init public-node --node-id public.hyphae.to --domain public.hyphae.to",
         },
+        ProviderInfo {
+            id: "drop-relay",
+            name: "Self-Hosted Blind Drop Relay (Zero-Disk RAM)",
+            summary: "60-second privacy-hardened RAM-only blind Drop Relay for Verified Human Drops (https://hyphae.to/drop).",
+            default_profile: "router",
+            tls_method: "Caddy automatic HTTPS (zero /v1/drops access logs, flush_interval -1) + Fly.io & Docker Compose",
+            nat_firewall: "Public HTTPS 80/443 via Caddy/Fly; hyphae binds loopback 127.0.0.1:8790 with zero disk persistence for drops",
+            best_for: "Self-hosting a zero-knowledge, RAM-only blind Drop Relay for your own phone-to-agent secret & directive drops",
+            pros: &[
+                "100% RAM-only opaque HPKE ciphertexts — zero disk or SQLite persistence for drops",
+                "Privacy-hardened Caddyfile discards access logs on /v1/drops*",
+                "Strict CORS allowlist (https://hyphae.to) with Chrome Private Network Access support",
+                "Includes Caddyfile, read-only docker-compose.yml, fly.toml, and hardened systemd unit",
+            ],
+            cons: &[
+                "Requires an HTTPS domain reachable from your mobile browser",
+                "In-flight drops are strictly ephemeral and vanish on restart by design",
+            ],
+            required_tools: &["caddy", "docker", "flyctl", "systemctl"],
+            detected: has_tool("caddy") || has_tool("docker") || has_tool("flyctl"),
+            init_command: "hyp deploy init drop-relay --domain drop.example.com --drop-max-memory-mb 256",
+        },
     ]
 }
 
@@ -564,12 +618,29 @@ fn run_init(
     domain_arg: Option<String>,
     bind_arg: Option<String>,
     profile_arg: Option<DeployProfile>,
+    enable_drop_relay_flag: bool,
+    drop_max_memory_mb_arg: Option<usize>,
     out_arg: Option<PathBuf>,
     force: bool,
     as_json: bool,
 ) -> ExitCode {
     let cmd = "deploy init";
     let profile = profile_arg.unwrap_or_else(|| provider.default_profile());
+    let enable_drop_relay = enable_drop_relay_flag || provider == DeployProvider::DropRelay;
+    let drop_max_memory_mb = match drop_max_memory_mb_arg {
+        Some(0) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "INVALID_DROP_MEMORY",
+                "--drop-max-memory-mb must be >= 1",
+                Some("Example: --drop-max-memory-mb 256".to_string()),
+            );
+        }
+        Some(mb) => mb,
+        None => DEFAULT_DROP_RELAY_MEMORY_MB,
+    };
     let domain_raw = domain_arg.unwrap_or_else(|| provider.default_domain().to_string());
     let domain = match validate_domain_hostname(&domain_raw) {
         Ok(d) => d,
@@ -621,7 +692,15 @@ fn run_init(
     };
 
     let out_dir = out_arg.unwrap_or_else(|| PathBuf::from(format!("hyphae-deploy-{}", provider.as_str())));
-    let artifacts = build_provider_artifacts(provider, profile, &node_id, &domain, &bind);
+    let artifacts = build_provider_artifacts(
+        provider,
+        profile,
+        &node_id,
+        &domain,
+        &bind,
+        enable_drop_relay,
+        drop_max_memory_mb,
+    );
 
     // Pre-flight overwrite guard: fail closed BEFORE creating or mutating any file.
     if !force {
@@ -717,6 +796,8 @@ fn run_init(
                 "domain": domain,
                 "endpoint": format!("https://{domain}"),
                 "bind": bind,
+                "dropRelayEnabled": enable_drop_relay,
+                "dropMaxMemoryMb": if enable_drop_relay { Some(drop_max_memory_mb) } else { None },
                 "outDir": out_dir.display().to_string(),
                 "files": written_files,
             })),
@@ -769,17 +850,54 @@ fn write_artifact_file(path: &Path, content: &[u8], executable: bool) -> std::io
     Ok(())
 }
 
+fn build_drop_relay_json(max_memory_mb: usize) -> Value {
+    json!({
+        "enabled": true,
+        "maxMemoryMb": max_memory_mb,
+        "defaultTtlSeconds": 600,
+        "maxTtlSeconds": 900,
+        "allowedOrigins": ["https://hyphae.to"],
+        "allowPrivateNetwork": true
+    })
+}
+
 fn build_node_json(
     provider: DeployProvider,
     profile: DeployProfile,
     node_id: &str,
     domain: &str,
     bind: &str,
+    enable_drop_relay: bool,
+    drop_max_memory_mb: usize,
 ) -> String {
     let behind_reverse_proxy = true;
     let state_dir = "/var/lib/hyphae";
 
-    let config = if profile == DeployProfile::Public || provider == DeployProvider::PublicNode {
+    let mut config = if provider == DeployProvider::DropRelay {
+        json!({
+            "v": 2,
+            "nodeId": node_id,
+            "profile": "router",
+            "deploymentProvider": provider.as_str(),
+            "stateDir": state_dir,
+            "listen": {
+                "bind": bind,
+                "behindReverseProxy": behind_reverse_proxy,
+                "publicUrl": format!("https://{domain}")
+            },
+            "policy": {
+                "requirePairing": true,
+                "requireE2ee": true,
+                "maxTextBytes": 32768,
+                "maxTransferBytes": 0
+            },
+            "dropRelay": build_drop_relay_json(drop_max_memory_mb),
+            "forwarding": {
+                "mode": "deny",
+                "rules": []
+            }
+        })
+    } else if profile == DeployProfile::Public || provider == DeployProvider::PublicNode {
         json!({
             "v": 2,
             "nodeId": node_id,
@@ -911,6 +1029,15 @@ fn build_node_json(
             }
         })
     };
+
+    if enable_drop_relay && provider != DeployProvider::DropRelay {
+        if let Some(obj) = config.as_object_mut() {
+            obj.insert(
+                "dropRelay".to_string(),
+                build_drop_relay_json(drop_max_memory_mb),
+            );
+        }
+    }
 
     let mut out = serde_json::to_string_pretty(&config).expect("valid node.json");
     out.push('\n');
@@ -1215,14 +1342,242 @@ fn render_kit_readme(
     out
 }
 
+fn render_drop_relay_caddyfile(domain: &str, upstream: &str) -> String {
+    format!(
+        r#"# Hyphae v2 Blind Drop Relay Caddyfile (auto-HTTPS, zero /v1/drops access logging, unbuffered SSE)
+# Generated by `hyp deploy init drop-relay`
+
+{domain} {{
+    # Privacy hardening: discard HTTP access logs so dropIds and client IPs never hit disk.
+    log {{
+        output discard
+    }}
+
+    encode zstd gzip
+
+    request_body {{
+        max_size 1MB
+    }}
+
+    header {{
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
+        -Server
+    }}
+
+    handle /v1/drops* {{
+        reverse_proxy {upstream} {{
+            flush_interval -1
+            header_up X-Forwarded-Proto https
+            transport http {{
+                read_timeout 0
+                write_timeout 0
+                dial_timeout 10s
+            }}
+        }}
+    }}
+
+    handle {{
+        reverse_proxy {upstream} {{
+            flush_interval -1
+            header_up X-Forwarded-Proto https
+            transport http {{
+                read_timeout 0
+                write_timeout 0
+                dial_timeout 10s
+            }}
+        }}
+    }}
+}}
+"#
+    )
+}
+
+fn render_drop_relay_docker_compose(node_id: &str, max_memory_mb: usize) -> String {
+    let mem_limit_mb = max_memory_mb.saturating_add(128);
+    format!(
+        r#"# Hyphae v2 Blind Drop Relay Docker Compose stack ({node_id})
+# Zero disk volumes for drops: opaque HPKE ciphertexts live strictly in RAM and zeroize on burn/TTL.
+
+services:
+  hyphae-drop-relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hyphae-drop-relay
+    restart: unless-stopped
+    read_only: true
+    mem_limit: {mem_limit_mb}m
+    tmpfs:
+      - /tmp:size=32M,noexec,nosuid
+      - /var/lib/hyphae:size=64M,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      HYPHAE_SECRET_BACKEND: file
+      HYPHAE_STATE_DIR: /var/lib/hyphae
+      HYPHAE_CONFIG: /etc/hyphae/node.json
+    command:
+      - node
+      - start
+      - --config
+      - /etc/hyphae/node.json
+      - --bind
+      - 0.0.0.0:8790
+      - --no-local-socket
+      - --enable-drop-relay
+      - --drop-max-memory-mb
+      - "{max_memory_mb}"
+    volumes:
+      - ./node.json:/etc/hyphae/node.json:ro
+    networks:
+      - hyphae_drop_internal
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: hyphae-drop-caddy
+    restart: unless-stopped
+    depends_on:
+      - hyphae-drop-relay
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - hyphae_drop_internal
+
+networks:
+  hyphae_drop_internal:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:
+"#
+    )
+}
+
+fn render_drop_relay_fly_toml(app_name: &str, node_id: &str, port: u16, max_memory_mb: usize) -> String {
+    let vm_memory_mb = max_memory_mb.saturating_add(256).max(512);
+    format!(
+        r#"# Fly.io configuration for Hyphae v2 Blind Drop Relay ({node_id})
+# Zero disk persistence for drops; auto-HTTPS + always-on SSE streaming.
+
+app = "{app_name}"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  HYPHAE_SECRET_BACKEND = "file"
+  HYPHAE_STATE_DIR = "/var/lib/hyphae"
+  HYPHAE_CONFIG = "/etc/hyphae/node.json"
+
+[http_service]
+  internal_port = {port}
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 1000
+    soft_limit = 800
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    timeout = "5s"
+    path = "/v1/health"
+
+[[vm]]
+  memory = "{vm_memory_mb}mb"
+  cpu_kind = "shared"
+  cpus = 1
+"#
+    )
+}
+
+fn render_drop_relay_systemd_unit(node_id: &str, bind: &str, max_memory_mb: usize) -> String {
+    let memory_max_mb = max_memory_mb.saturating_add(128);
+    format!(
+        r#"[Unit]
+Description=Hyphae v2 Blind Drop Relay ({node_id})
+Documentation=https://hyphae.to
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hyphae
+Group=hyphae
+StateDirectory=hyphae
+StateDirectoryMode=0700
+ConfigurationDirectory=hyphae
+ConfigurationDirectoryMode=0750
+WorkingDirectory=/var/lib/hyphae
+Environment=HYPHAE_SECRET_BACKEND=file
+Environment=HYPHAE_STATE_DIR=/var/lib/hyphae
+Environment=HYPHAE_CONFIG=/etc/hyphae/node.json
+Environment=HYPHAE_BIND={bind}
+ExecStart=/usr/local/bin/hyp node start --config /etc/hyphae/node.json --no-local-socket --enable-drop-relay --drop-max-memory-mb {max_memory_mb}
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=15s
+MemoryMax={memory_max_mb}M
+
+# Hardened sandboxing
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target
+"#
+    )
+}
+
 fn build_provider_artifacts(
     provider: DeployProvider,
     profile: DeployProfile,
     node_id: &str,
     domain: &str,
     bind: &str,
+    enable_drop_relay: bool,
+    drop_max_memory_mb: usize,
 ) -> Vec<GeneratedArtifact> {
-    let node_json = build_node_json(provider, profile, node_id, domain, bind);
+    let node_json = build_node_json(
+        provider,
+        profile,
+        node_id,
+        domain,
+        bind,
+        enable_drop_relay,
+        drop_max_memory_mb,
+    );
     let dummy_out = PathBuf::from(".");
     let next_for_readme = build_init_next_steps(provider, profile, node_id, domain, bind, &dummy_out);
     let readme = render_kit_readme(provider, profile, node_id, domain, bind, &next_for_readme);
@@ -1419,6 +1774,54 @@ fn build_provider_artifacts(
                 },
             ]
         }
+        DeployProvider::DropRelay => {
+            let app_name = sanitize_fly_app_name(node_id, domain);
+            let port = bind_port(bind);
+            vec![
+                GeneratedArtifact {
+                    rel_path: "node.json",
+                    description: "Hardened Blind Drop Relay node.json (RAM-only drops, strict https://hyphae.to CORS)",
+                    content: node_json,
+                    executable: false,
+                },
+                GeneratedArtifact {
+                    rel_path: "Caddyfile",
+                    description: "Privacy-hardened Caddy auto-TLS reverse proxy (zero /v1/drops logs, flush_interval -1)",
+                    content: render_drop_relay_caddyfile(domain, bind),
+                    executable: false,
+                },
+                GeneratedArtifact {
+                    rel_path: "Dockerfile",
+                    description: "Multi-stage static Rust build (non-root UID 10001)",
+                    content: render_dockerfile(),
+                    executable: false,
+                },
+                GeneratedArtifact {
+                    rel_path: "docker-compose.yml",
+                    description: "Read-only Docker Compose stack with zero disk volumes for drops",
+                    content: render_drop_relay_docker_compose(node_id, drop_max_memory_mb),
+                    executable: false,
+                },
+                GeneratedArtifact {
+                    rel_path: "fly.toml",
+                    description: "Fly.io zero-disk Drop Relay config (auto-HTTPS, always-on SSE)",
+                    content: render_drop_relay_fly_toml(&app_name, node_id, port, drop_max_memory_mb),
+                    executable: false,
+                },
+                GeneratedArtifact {
+                    rel_path: "hyphae-drop-relay.service",
+                    description: "Hardened systemd unit (ProtectSystem=strict, NoNewPrivileges, MemoryMax)",
+                    content: render_drop_relay_systemd_unit(node_id, bind, drop_max_memory_mb),
+                    executable: false,
+                },
+                GeneratedArtifact {
+                    rel_path: "README.md",
+                    description: "60-second Blind Drop Relay launch & verification instructions",
+                    content: readme,
+                    executable: false,
+                },
+            ]
+        }
     }
 }
 
@@ -1483,6 +1886,13 @@ fn build_init_next_steps(
             format!("Deploy with Caddy + systemd ({dir}/hyphae-node.service + {dir}/Caddyfile) or Docker Compose ({dir}/docker-compose.yml)"),
             format!("hyp deploy check --url https://{domain} --config {dir}/node.json"),
             pair_cmd,
+        ],
+        DeployProvider::DropRelay => vec![
+            format!("hyp deploy check --config {dir}/node.json"),
+            format!("Launch via systemd ({dir}/hyphae-drop-relay.service + {dir}/Caddyfile), Docker Compose ({dir}/docker-compose.yml), or Fly.io ({dir}/fly.toml)"),
+            format!("hyp relay set https://{domain}"),
+            format!("hyp relay status --url https://{domain}"),
+            format!("hyp drop create --kind secret --secret-name example-api-key --relay https://{domain}"),
         ],
     }
 }
@@ -1811,6 +2221,84 @@ fn validate_config_file(path: &Path, checks: &mut Vec<CliCheck>) -> Option<Value
                 format!("Unsafe forwarding.mode '{mode}' (only 'deny' or 'allowlist' permitted)"),
                 Some("Set forwarding.mode to \"deny\" (or \"allowlist\" with explicit rules).".to_string()),
             ));
+        }
+    }
+
+    // 7. Blind Drop Relay (`dropRelay` & `dropRelayUrl`) fail-closed validation
+    if let Some(dr_val) = parsed.get("dropRelay") {
+        match serde_json::from_value::<DropRelayConfig>(dr_val.clone()) {
+            Ok(dr) => {
+                let bad_origin = dr.allowed_origins.iter().find(|o| {
+                    let t = o.trim();
+                    t.is_empty() || t == "*" || t.eq_ignore_ascii_case("null")
+                });
+                if let Some(bad) = bad_origin {
+                    checks.push(CliCheck::fail(
+                        "config.dropRelay",
+                        format!("Unsafe dropRelay.allowedOrigins entry '{bad}' (wildcards and null origins are forbidden)"),
+                        Some("Set dropRelay.allowedOrigins to explicit HTTPS origins such as [\"https://hyphae.to\"].".to_string()),
+                    ));
+                } else if dr.max_memory_mb == 0 {
+                    checks.push(CliCheck::fail(
+                        "config.dropRelay",
+                        "dropRelay.maxMemoryMb must be >= 1",
+                        Some("Set dropRelay.maxMemoryMb to 256.".to_string()),
+                    ));
+                } else if dr.max_ttl_seconds == 0 || dr.max_ttl_seconds > 900 {
+                    checks.push(CliCheck::fail(
+                        "config.dropRelay",
+                        format!("dropRelay.maxTtlSeconds ({}) must be in 1..=900", dr.max_ttl_seconds),
+                        Some("Set dropRelay.maxTtlSeconds <= 900 (15 minutes).".to_string()),
+                    ));
+                } else if dr.default_ttl_seconds == 0 || dr.default_ttl_seconds > dr.max_ttl_seconds {
+                    checks.push(CliCheck::fail(
+                        "config.dropRelay",
+                        format!(
+                            "dropRelay.defaultTtlSeconds ({}) must be in 1..={}",
+                            dr.default_ttl_seconds, dr.max_ttl_seconds
+                        ),
+                        None,
+                    ));
+                } else {
+                    checks.push(CliCheck::ok(
+                        "config.dropRelay",
+                        format!(
+                            "Drop Relay {} (maxMemoryMb={}, ttl={}..={}s, origins={})",
+                            if dr.enabled { "enabled" } else { "disabled" },
+                            dr.max_memory_mb,
+                            dr.default_ttl_seconds,
+                            dr.max_ttl_seconds,
+                            dr.allowed_origins.join(", ")
+                        ),
+                    ));
+                }
+            }
+            Err(e) => {
+                checks.push(CliCheck::fail(
+                    "config.dropRelay",
+                    format!("Malformed dropRelay block: {e}"),
+                    None,
+                ));
+            }
+        }
+    }
+
+    if let Some(raw_relay_url) = parsed
+        .get("dropRelayUrl")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        match validate_relay_url(raw_relay_url) {
+            Ok(url) => checks.push(CliCheck::ok(
+                "config.dropRelayUrl",
+                format!("Valid Drop Relay URL '{url}'"),
+            )),
+            Err(e) => checks.push(CliCheck::fail(
+                "config.dropRelayUrl",
+                format!("Invalid dropRelayUrl '{raw_relay_url}': {e}"),
+                Some("Run `hyp relay set https://<your-drop-relay>`.".to_string()),
+            )),
         }
     }
 

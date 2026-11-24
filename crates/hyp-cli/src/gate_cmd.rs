@@ -286,19 +286,36 @@ pub fn inspect_gate_status(
     if gate_cfg.require_signed_policy || gate_cfg.policy_signature.is_some() {
         match gate_cfg.policy_signature.as_deref() {
             Some(sig) => match verify_gate_policy_sig(&gate_cfg, sig, secrets) {
-                Ok(()) => GateStatusSummary {
-                    configured: true,
-                    require_signed_policy: gate_cfg.require_signed_policy,
-                    gate_policy_sig: "OK".to_string(),
-                    tampered: false,
-                    detail: format!(
-                        "Signed gate policy verified ({} filter adapter(s), {} quarantined)",
-                        filters.len(),
-                        quarantined_count
-                    ),
-                    filters,
-                    quarantined_count,
-                },
+                Ok(()) => {
+                    if let Some(ref expected_digest) = gate_cfg.human_authorities_digest {
+                        let actual_digest = db.and_then(|d| d.human().authorities_digest().ok());
+                        if actual_digest.as_deref() != Some(expected_digest.as_str()) {
+                            return GateStatusSummary {
+                                configured: true,
+                                require_signed_policy: gate_cfg.require_signed_policy,
+                                gate_policy_sig: "FAIL".to_string(),
+                                tampered: true,
+                                detail: "gate_policy_tampered: human_authorities_digest mismatch with node.sqlite"
+                                    .to_string(),
+                                filters,
+                                quarantined_count,
+                            };
+                        }
+                    }
+                    GateStatusSummary {
+                        configured: true,
+                        require_signed_policy: gate_cfg.require_signed_policy,
+                        gate_policy_sig: "OK".to_string(),
+                        tampered: false,
+                        detail: format!(
+                            "Signed gate policy verified ({} filter adapter(s), {} quarantined)",
+                            filters.len(),
+                            quarantined_count
+                        ),
+                        filters,
+                        quarantined_count,
+                    }
+                }
                 Err(e) => GateStatusSummary {
                     configured: true,
                     require_signed_policy: gate_cfg.require_signed_policy,
@@ -689,6 +706,9 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
     let mut locked = false;
     if args.lock {
         let secrets = open_secret_store(&state_dir, args.state_dir.is_some());
+        if let Err(e) = bind_human_authorities_digest_if_present(&state_dir, &mut gate_cfg) {
+            return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None);
+        }
         gate_cfg.require_signed_policy = true;
         gate_cfg.policy_signature = None;
         let sig = match sign_gate_policy(&gate_cfg, &secrets) {
@@ -800,6 +820,30 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
     ExitCode::from(EXIT_OK)
 }
 
+fn bind_human_authorities_digest_if_present(
+    state_dir: &std::path::Path,
+    gate_cfg: &mut SecurityGateConfig,
+) -> Result<(), String> {
+    let db_path = state_dir.join("node.sqlite");
+    if !db_path.exists() {
+        return Ok(());
+    }
+    let db = NodeDb::open(&db_path)
+        .map_err(|e| format!("failed to open {}: {e}", db_path.display()))?;
+    let active = db
+        .human()
+        .list_authorities(false)
+        .map_err(|e| format!("failed to query human_authorities: {e}"))?;
+    if !active.is_empty() || gate_cfg.human_authorities_digest.is_some() {
+        let digest = db
+            .human()
+            .authorities_digest()
+            .map_err(|e| format!("failed to compute human_authorities_digest: {e}"))?;
+        gate_cfg.human_authorities_digest = Some(digest);
+    }
+    Ok(())
+}
+
 fn run_gate_lock(
     config: Option<PathBuf>,
     state_dir: Option<PathBuf>,
@@ -851,6 +895,9 @@ fn run_gate_lock(
     }
 
     let secrets = open_secret_store(&dir, state_dir.is_some());
+    if let Err(e) = bind_human_authorities_digest_if_present(&dir, &mut gate_cfg) {
+        return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None);
+    }
     gate_cfg.require_signed_policy = true;
     gate_cfg.policy_signature = None;
     let sig = match sign_gate_policy(&gate_cfg, &secrets) {
@@ -908,6 +955,7 @@ fn run_gate_lock(
                 "requireSignedPolicy": true,
                 "filterCount": gate_cfg.filters.len(),
                 "policySigningSecret": gate_cfg.policy_signing_secret,
+                "humanAuthoritiesDigest": gate_cfg.human_authorities_digest,
             })),
             warnings: Vec::new(),
             next,

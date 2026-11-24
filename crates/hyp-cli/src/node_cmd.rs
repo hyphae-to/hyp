@@ -9,18 +9,20 @@ use crate::config_file::{
     default_node_id, ensure_dir, load_node_or_legacy_config, open_secret_store, profile_as_str,
     resolve_config_path_for_read, resolve_state_dir, write_atomic_file, write_atomic_json,
 };
+use crate::drop_cmd::validate_relay_url;
 use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error};
 use clap::{Args, Subcommand, ValueEnum};
 use hyp_crypto::CryptoError;
 use hyp_crypto::keystore::{SecretBackend, validate_secret_name};
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
-use hyp_harness::daemon::{LocalDaemon, LocalDaemonConfig};
+use hyp_harness::daemon::{LocalDaemon, LocalDaemonConfig, WakeupDaemonConfig, WakeupMcpToolMode};
+use hyp_harness::protocol::HarnessKind;
 use hyp_node::adapters::{
     AdapterKind, GitHubPublicAdapter, GitHubPublicConfig, HelloMode, SubprocessConfig,
 };
 use hyp_node::engine::{
-    E2eePolicy, EscalationConfig, GuestPairingConfig, NodeConfig, NodeProfile, TopicConfig,
-    UnifiedNode,
+    DropRelayConfig, E2eePolicy, EscalationConfig, GuestPairingConfig, NodeConfig, NodeProfile,
+    TopicConfig, UnifiedNode,
 };
 use hyp_node::gates::{SecurityGateConfig, SecurityGatePipeline};
 use hyp_proto::address::{
@@ -86,6 +88,12 @@ pub struct NodeStartArgs {
     /// Disable local harness IPC listener (e.g. for pure headless router containers)
     #[arg(long)]
     pub no_local_socket: bool,
+    /// Enable the opt-in RAM-only Blind Drop Relay (/v1/drops) on this node
+    #[arg(long)]
+    pub enable_drop_relay: bool,
+    /// Override Drop Relay maximum RAM budget in MiB (default: 256)
+    #[arg(long = "drop-max-memory-mb", alias = "max-memory-mb")]
+    pub drop_max_memory_mb: Option<usize>,
     /// Output structured JSON envelope on startup
     #[arg(long)]
     pub json: bool,
@@ -208,6 +216,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
 
     let mut startup_warnings: Vec<String> = Vec::new();
     let mut github_public_cfg: Option<GitHubPublicConfig> = None;
+    let mut wakeup_cfg = WakeupDaemonConfig::default();
     let mut parsed_plugins: Vec<SubprocessConfig> = Vec::new();
 
     if let Some(ref cfg) = loaded {
@@ -217,6 +226,69 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         } else {
             E2eePolicy::Prefer
         };
+
+        // Parse optional `dropRelay` (RAM-only Blind Drop Relay) and `dropRelayUrl`.
+        if let Some(dr_val) = cfg.raw.get("dropRelay") {
+            match serde_json::from_value::<DropRelayConfig>(dr_val.clone()) {
+                Ok(dr) => {
+                    if dr.max_memory_mb == 0 {
+                        return emit_error(
+                            cmd,
+                            as_json,
+                            EXIT_ERROR,
+                            "CONFIG_ERROR",
+                            format!("dropRelay.maxMemoryMb in {} must be >= 1", cfg.path.display()),
+                            None,
+                        );
+                    }
+                    if dr.allowed_origins.iter().any(|o| o.trim() == "*" || o.trim().eq_ignore_ascii_case("null")) {
+                        return emit_error(
+                            cmd,
+                            as_json,
+                            EXIT_ERROR,
+                            "CONFIG_ERROR",
+                            format!(
+                                "dropRelay.allowedOrigins in {} must not contain wildcard '*' or 'null'",
+                                cfg.path.display()
+                            ),
+                            Some("Set allowedOrigins to [\"https://hyphae.to\"].".to_string()),
+                        );
+                    }
+                    node_cfg.drop_relay = dr;
+                }
+                Err(e) => {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "CONFIG_ERROR",
+                        format!("Invalid dropRelay config in {}: {e}", cfg.path.display()),
+                        None,
+                    );
+                }
+            }
+        }
+        if let Some(raw_url) = cfg
+            .raw
+            .get("dropRelayUrl")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            match validate_relay_url(raw_url) {
+                Ok(valid_url) => node_cfg.drop_relay_url = Some(valid_url),
+                Err(e) => {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "CONFIG_ERROR",
+                        format!("Invalid dropRelayUrl in {}: {e}", cfg.path.display()),
+                        None,
+                    );
+                }
+            }
+        }
 
         // Parse optional `escalation` hints (default + byScope).
         if let Some(esc_val) = cfg.raw.get("escalation") {
@@ -297,6 +369,22 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                     );
                 }
             }
+
+            // Parse optional `kind == "wakeup"` source entry into `WakeupDaemonConfig`.
+            match parse_wakeup_source(sources_val) {
+                Ok(Some(w_cfg)) => wakeup_cfg = w_cfg,
+                Ok(None) => {}
+                Err(e) => {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "CONFIG_ERROR",
+                        format!("Invalid wakeup source in {}: {e}", cfg.path.display()),
+                        Some("Verify sources[] entry with kind == \"wakeup\" in node.json.".to_string()),
+                    );
+                }
+            }
         }
 
         // Parse optional `plugins[]` external bridge/source subprocess entries (fail closed on
@@ -361,6 +449,27 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             }
         }
     }
+
+    if args.enable_drop_relay {
+        node_cfg.drop_relay.enabled = true;
+    }
+    if let Some(max_mb) = args.drop_max_memory_mb {
+        if max_mb == 0 {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "INVALID_DROP_MEMORY",
+                "--drop-max-memory-mb must be >= 1",
+                None,
+            );
+        }
+        node_cfg.drop_relay.max_memory_mb = max_mb;
+    }
+
+    let wakeup_enabled = wakeup_cfg.enabled;
+    let drop_relay_enabled = node_cfg.drop_relay.enabled;
+    let drop_relay_url = node_cfg.drop_relay_url.clone();
 
     let start_local_daemon = !args.no_local_socket
         && (matches!(profile, NodeProfile::Local | NodeProfile::P2p) || args.socket.is_some());
@@ -443,6 +552,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             let local_cfg = LocalDaemonConfig {
                 socket_path: explicit_socket,
                 auto_detect_transports: true,
+                wakeup: wakeup_cfg,
                 ..Default::default()
             };
             let daemon = LocalDaemon::start(Arc::clone(&node), Some(pipeline), local_cfg)
@@ -569,6 +679,9 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             "configPath": loaded.as_ref().map(|c| c.path.display().to_string()),
             "guestPairingEnabled": guest_pairing_enabled,
             "githubPublicEnabled": github_public_enabled,
+            "wakeupEnabled": wakeup_enabled,
+            "dropRelayEnabled": drop_relay_enabled,
+            "dropRelayUrl": drop_relay_url,
             "connectedPeers": connected_peers,
             "plugins": plugin_statuses,
             "startedAt": started_at,
@@ -627,6 +740,15 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             }
             if github_public_enabled {
                 println!("      GitHub Pub:  enabled (demand-driven ETag poller)");
+            }
+            if wakeup_enabled {
+                println!("      Wakeup:      enabled");
+            }
+            if drop_relay_enabled {
+                println!(
+                    "      Drop Relay:  enabled (RAM cap {} MiB)",
+                    node.config().drop_relay.max_memory_mb
+                );
             }
             if !connected_peers.is_empty() {
                 println!(
@@ -894,6 +1016,87 @@ fn parse_github_public_source(
             }
         }
 
+        return Ok(Some(cfg));
+    }
+
+    Ok(None)
+}
+
+fn parse_wakeup_source(sources_val: &Value) -> Result<Option<WakeupDaemonConfig>, String> {
+    let arr = sources_val
+        .as_array()
+        .ok_or_else(|| "sources must be a JSON array".to_string())?;
+
+    for entry in arr {
+        let Some(obj) = entry.as_object() else {
+            continue;
+        };
+        if obj.get("kind").and_then(Value::as_str) != Some("wakeup") {
+            continue;
+        }
+        let mut cfg = WakeupDaemonConfig {
+            enabled: obj.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+            ..WakeupDaemonConfig::default()
+        };
+        if let Some(mode) = obj.get("mcpTool").and_then(Value::as_str) {
+            cfg.mcp_tool_mode = match mode {
+                "auto" => WakeupMcpToolMode::Auto,
+                "always" => WakeupMcpToolMode::Always,
+                "never" => WakeupMcpToolMode::Never,
+                other => {
+                    return Err(format!(
+                        "invalid wakeup mcpTool '{other}' (expected auto, always, or never)"
+                    ));
+                }
+            };
+        }
+        if let Some(arr) = obj.get("denyBackends").and_then(Value::as_array) {
+            let mut denied = Vec::with_capacity(arr.len());
+            for item in arr {
+                let s = item
+                    .as_str()
+                    .ok_or_else(|| "wakeup.denyBackends entries must be strings".to_string())?;
+                let kind = s
+                    .parse::<HarnessKind>()
+                    .map_err(|e| format!("invalid harness '{s}' in wakeup.denyBackends: {e}"))?;
+                denied.push(kind);
+            }
+            cfg.deny_backends = denied;
+        }
+        if let Some(arr) = obj.get("holdRetryBackoffMs").and_then(Value::as_array) {
+            let mut backoff = Vec::with_capacity(arr.len());
+            for item in arr {
+                let ms = item
+                    .as_u64()
+                    .ok_or_else(|| "wakeup.holdRetryBackoffMs entries must be positive integers".to_string())?;
+                backoff.push(ms);
+            }
+            if !backoff.is_empty() {
+                cfg.hold_retry_backoff_ms = backoff;
+            }
+        }
+        if let Some(max_att) = obj.get("holdRetryMaxAttempts").and_then(Value::as_u64) {
+            cfg.hold_retry_max_attempts = max_att.min(u32::MAX as u64) as u32;
+        }
+        if let Some(resume) = obj.get("codexResume").and_then(Value::as_bool) {
+            cfg.codex_resume = resume;
+        }
+        if let Some(arr) = obj.get("herdrSpawnAllowlist").and_then(Value::as_array) {
+            let mut allow = Vec::with_capacity(arr.len());
+            for item in arr {
+                let s = item
+                    .as_str()
+                    .ok_or_else(|| "wakeup.herdrSpawnAllowlist entries must be strings".to_string())?;
+                allow.push(s.to_string());
+            }
+            cfg.herdr_spawn_allowlist = allow;
+        }
+        if let Some(screen_ext) = obj.get("screenExternalNotes").and_then(Value::as_bool) {
+            cfg.screen_external_notes = screen_ext;
+        }
+        if let Some(screen_agent) = obj.get("screenAgentNotes").and_then(Value::as_bool) {
+            cfg.screen_agent_notes = screen_agent;
+        }
         return Ok(Some(cfg));
     }
 
