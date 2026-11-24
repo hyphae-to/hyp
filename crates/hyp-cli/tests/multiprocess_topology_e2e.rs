@@ -2780,7 +2780,16 @@ fn v1_to_v2_sqlite_upgrade_via_compiled_hyp_doctor_creates_backup() {
         // Roll schema strictly back to frozen v0.2.0 schema v1 (`0001_initial_v2.sql` shape).
         db.connection()
             .execute_batch(
-                "DROP INDEX IF EXISTS peer_routes_via;
+                "DROP INDEX IF EXISTS mailbox_coalesce_pending;
+                 DROP INDEX IF EXISTS mailbox_expires_pending;
+                 DROP INDEX IF EXISTS wakeups_next_fire;
+                 DROP INDEX IF EXISTS wakeups_owner_active;
+                 DROP INDEX IF EXISTS wakeups_target_session;
+                 DROP TABLE IF EXISTS wakeups;
+                 ALTER TABLE mailbox DROP COLUMN coalesce_key;
+                 ALTER TABLE mailbox DROP COLUMN expires_at;
+                 ALTER TABLE mailbox DROP COLUMN missed_count;
+                 DROP INDEX IF EXISTS peer_routes_via;
                  DROP TABLE IF EXISTS peer_routes;
                  ALTER TABLE handles DROP COLUMN description;
                  DELETE FROM schema_version WHERE version > 1;
@@ -2791,10 +2800,12 @@ fn v1_to_v2_sqlite_upgrade_via_compiled_hyp_doctor_creates_backup() {
     }
     assert!(
         !state_dir.join("backups").exists(),
-        "backups/ must not exist before v1->v2 migration"
+        "backups/ must not exist before v1->vN migration"
     );
 
-    // 2. Run compiled `hyp doctor --home <home> --json` -> upgrades v1 -> v2 & creates backup!
+    let expected_ver = hyp_store::CURRENT_SCHEMA_VERSION;
+
+    // 2. Run compiled `hyp doctor --home <home> --json` -> upgrades v1 -> latest & creates backup!
     let doc_out = isolated_cmd(&home)
         .args(["doctor", "--home", home.to_str().unwrap(), "--json"])
         .output()
@@ -2810,9 +2821,9 @@ fn v1_to_v2_sqlite_upgrade_via_compiled_hyp_doctor_creates_backup() {
     assert_eq!(doc_json["ok"], true, "doctor JSON: {doc_json}");
 
     let storage = &doc_json["data"]["storage"];
-    assert_eq!(storage["schemaVersion"], 2, "storage report: {storage}");
-    assert_eq!(storage["supportedSchemaVersion"], 2);
-    assert_eq!(storage["appliedMigrations"], 2);
+    assert_eq!(storage["schemaVersion"], expected_ver, "storage report: {storage}");
+    assert_eq!(storage["supportedSchemaVersion"], expected_ver);
+    assert_eq!(storage["appliedMigrations"], expected_ver);
     assert_eq!(storage["migrationBackups"]["count"], 1);
     let latest_backup = storage["migrationBackups"]["latest"]
         .as_str()
@@ -2827,9 +2838,10 @@ fn v1_to_v2_sqlite_upgrade_via_compiled_hyp_doctor_creates_backup() {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
+    let expected_backup_prefix = format!("node.sqlite.v1-to-v{expected_ver}-");
     assert!(
-        backup_name.starts_with("node.sqlite.v1-to-v2-") && backup_name.ends_with(".bak"),
-        "unexpected backup filename: {backup_name}"
+        backup_name.starts_with(&expected_backup_prefix) && backup_name.ends_with(".bak"),
+        "unexpected backup filename: {backup_name} (expected prefix {expected_backup_prefix})"
     );
 
     #[cfg(unix)]
@@ -2852,8 +2864,9 @@ fn v1_to_v2_sqlite_upgrade_via_compiled_hyp_doctor_creates_backup() {
         .expect("store.sqlite check");
     assert_eq!(sqlite_check["status"], "ok");
     let check_detail = sqlite_check["detail"].as_str().unwrap();
+    let expected_schema_tag = format!("node.sqlite schema v{expected_ver}");
     assert!(
-        check_detail.contains("node.sqlite schema v2")
+        check_detail.contains(&expected_schema_tag)
             && check_detail.contains("1 pre-migration backup in backups/"),
         "unexpected store.sqlite check detail: {check_detail}"
     );
@@ -2864,15 +2877,17 @@ fn v1_to_v2_sqlite_upgrade_via_compiled_hyp_doctor_creates_backup() {
         .expect("run hyp doctor TTY");
     assert_eq!(tty_out.status.code(), Some(0));
     let tty_stdout = String::from_utf8_lossy(&tty_out.stdout);
+    let expected_tty_line =
+        format!("node.sqlite schema v{expected_ver} (1 pre-migration backup in backups/)");
     assert!(
-        tty_stdout.contains("node.sqlite schema v2 (1 pre-migration backup in backups/)"),
+        tty_stdout.contains(&expected_tty_line),
         "TTY doctor output must display schema version and backup summary:\n{tty_stdout}"
     );
 
-    // 3. Verify all seeded v1 data survived the v1 -> v2 upgrade intact!
+    // 3. Verify all seeded v1 data survived the v1 -> latest upgrade intact!
     {
-        let db = NodeDb::open(&db_path).expect("reopen upgraded v2 DB");
-        assert_eq!(db.schema_version().unwrap(), 2);
+        let db = NodeDb::open(&db_path).expect("reopen upgraded DB");
+        assert_eq!(db.schema_version().unwrap(), expected_ver);
         let peer = db
             .peers()
             .get_peer("acme-team")
