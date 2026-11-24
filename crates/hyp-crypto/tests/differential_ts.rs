@@ -535,7 +535,7 @@ console.log(JSON.stringify({
 }
 
 /// Differential check: verify our pure-Rust POSIX USTAR/PAX + gzip archive is cleanly
-/// readable by the host OS `/usr/bin/tar -tzf` tool!
+/// readable by the host OS `tar -tzf` tool!
 #[test]
 fn differential_pure_rust_tar_gz_interop_with_system_tar() {
     let tmp = TempDir::new().unwrap();
@@ -555,18 +555,50 @@ fn differential_pure_rust_tar_gz_interop_with_system_tar() {
     .unwrap();
     fs::write(&archive_path, &buf).unwrap();
 
-    let output = Command::new("/usr/bin/tar")
-        .args(["-tzf", archive_path.to_str().unwrap()])
+    #[cfg(unix)]
+    let tar_bin = if Path::new("/usr/bin/tar").exists() {
+        "/usr/bin/tar"
+    } else {
+        "tar"
+    };
+    #[cfg(not(unix))]
+    let tar_bin = "tar";
+
+    let output = match Command::new(tar_bin)
+        .current_dir(tmp.path())
+        .args(["-tzf", "bundle.tar.gz"])
         .output()
-        .expect("failed to execute /usr/bin/tar");
+    {
+        Ok(out) => out,
+        #[cfg(not(unix))]
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => panic!("failed to execute {tar_bin}: {e}"),
+    };
     assert!(
         output.status.success(),
         "system tar failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let listing: Vec<&str> = std::str::from_utf8(&output.stdout)
+    let listing: Vec<String> = std::str::from_utf8(&output.stdout)
         .unwrap()
         .lines()
+        .map(|l| {
+            #[cfg(unix)]
+            {
+                l.to_string()
+            }
+            #[cfg(not(unix))]
+            {
+                l.trim().replace('\\', "/")
+            }
+        })
         .collect();
-    assert_eq!(listing, vec!["hello.txt", "nested/data.json", long_name.as_str()]);
+    assert_eq!(
+        listing,
+        vec![
+            "hello.txt".to_string(),
+            "nested/data.json".to_string(),
+            long_name,
+        ]
+    );
 }

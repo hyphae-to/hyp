@@ -1,6 +1,7 @@
 //! Ultra-fast synchronous hook shim (`hyp-rs hook <harness> <event>`).
 //!
-//! Runs completely synchronously on `std::os::unix::net::UnixStream` (no Tokio runtime boot)
+//! Runs completely synchronously on a Unix domain socket (`connector.sock`) on Unix or
+//! loopback TCP (`connector.addr` / `127.0.0.1:<port>`) on Windows (zero Tokio runtime boot)
 //! so cold-start hook execution stays within ~1–3 ms while matching `src/hooks.ts` byte-for-byte
 //! across all 9 harnesses (`antigravity`, `claude`, `codex`, `cursor`, `opencode`, `gemini`,
 //! `openclaw`, `herdr`, `t3`).

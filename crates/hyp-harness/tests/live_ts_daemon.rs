@@ -1,25 +1,37 @@
 //! Live end-to-end interoperability tests between the Rust `hyp-harness` shims
 //! (`hooks`, `mcp`, `wait`/`watch`, `sock`) and our actual TypeScript v1 `hyp daemon`
-//! launched via `node --experimental-strip-types` in an isolated TempDir.
+//! launched via `node --experimental-strip-types` in an isolated TempDir (Unix), plus
+//! loopback TCP end-to-end shim verification on Windows.
+
+#![cfg_attr(not(unix), allow(dead_code))]
 
 use hyp_harness::hooks::{HandleHookOptions, HookEvent, handle_hook_payload};
-use hyp_harness::mcp::{McpOptions, run_mcp_io, select_tools_for_list};
+#[cfg(unix)]
+use hyp_harness::mcp::select_tools_for_list;
+use hyp_harness::mcp::{McpOptions, run_mcp_io};
 use hyp_harness::protocol::HarnessKind;
 use hyp_harness::wait::{WaitMode, WaitOptions, run_wait_to_writer};
 use serde_json::{Value, json};
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+#[cfg(unix)]
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, DuplexStream};
 
+#[cfg(unix)]
 struct LiveTsDaemon {
     _tmp: TempDir,
     child: Child,
     socket_path: PathBuf,
 }
 
+#[cfg(unix)]
 impl Drop for LiveTsDaemon {
     fn drop(&mut self) {
         let _ = self.child.stdin.take();
@@ -28,6 +40,7 @@ impl Drop for LiveTsDaemon {
     }
 }
 
+#[cfg(unix)]
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -37,6 +50,7 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+#[cfg(unix)]
 fn start_live_ts_daemon() -> LiveTsDaemon {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let root = repo_root();
@@ -233,6 +247,7 @@ fn hook_opts(harness: HarnessKind, event: HookEvent, sock: &Path) -> HandleHookO
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn live_ts_daemon_end_to_end_rust_shims() {
     let daemon = start_live_ts_daemon();
@@ -861,4 +876,136 @@ async fn live_ts_daemon_end_to_end_rust_shims() {
         bridge_bytes,
         bridge_bytes / 4
     );
+}
+
+#[cfg(not(unix))]
+#[tokio::test]
+async fn windows_tcp_loopback_end_to_end_hook_mcp_and_wait() {
+    use hyp_harness::sock::{MAX_SOCKET_LINE_BYTES, read_bounded_line_async, write_ndjson_line_async};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let addr_file = tmp.path().join("connector.addr");
+    std::fs::write(&addr_file, format!("{addr}\n")).unwrap();
+
+    // Minimal mock daemon over 127.0.0.1 handling hook `call.start`, MCP `mcp.caps`/`tool.call`,
+    // and `wait.subscribe`.
+    let server = tokio::spawn(async move {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let (r, mut w) = stream.split();
+                let mut reader = tokio::io::BufReader::new(r);
+                while let Ok(Some(line)) =
+                    read_bounded_line_async(&mut reader, MAX_SOCKET_LINE_BYTES).await
+                {
+                    let Ok(pkt) = serde_json::from_str::<Value>(&line) else {
+                        break;
+                    };
+                    match pkt.get("type").and_then(Value::as_str) {
+                        Some("call.start") => {
+                            let _ = write_ndjson_line_async(
+                                &mut w,
+                                &json!({"ok": true, "result": {"callToken": "win_tok_1"}}),
+                            )
+                            .await;
+                            break;
+                        }
+                        Some("mcp.hello") => {}
+                        Some("mcp.caps") => {
+                            let _ = write_ndjson_line_async(
+                                &mut w,
+                                &json!({"id": pkt["id"], "result": {"hasPlugins": false}}),
+                            )
+                            .await;
+                        }
+                        Some("tool.call") => {
+                            let _ = write_ndjson_line_async(
+                                &mut w,
+                                &json!({
+                                    "id": pkt["id"],
+                                    "result": {
+                                        "address": "win@local/alice",
+                                        "callToken": pkt["callToken"]
+                                    }
+                                }),
+                            )
+                            .await;
+                        }
+                        Some("wait.subscribe") => {
+                            let _ = write_ndjson_line_async(
+                                &mut w,
+                                &json!({
+                                    "type": "wait.items",
+                                    "items": [{"router": "primary", "received": 1, "text": "windows wakeup!"}]
+                                }),
+                            )
+                            .await;
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+            });
+        }
+    });
+
+    // 1. Synchronous hook over connector.addr
+    let hook_addr = addr_file.clone();
+    let pre = tokio::task::spawn_blocking(move || {
+        handle_hook_payload(
+            json!({
+                "conversationId": "win-conv-1",
+                "toolCall": {
+                    "id": "tc-1",
+                    "name": "hyp_mesh",
+                    "args": {"action": "join", "handle": "alice"}
+                }
+            })
+            .as_object()
+            .unwrap(),
+            &hook_opts(HarnessKind::Antigravity, HookEvent::PreToolUse, &hook_addr),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(pre["decision"], "allow");
+    assert_eq!(pre["overwrite"]["_meshCall"], "win_tok_1");
+
+    // 2. Async MCP over connector.addr
+    let mut mcp = TestMcpClient::spawn(McpOptions::new(addr_file.clone()));
+    let _ = mcp.initialize().await;
+    let list = mcp.request("tools/list", json!({})).await;
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 4);
+    let (txt, is_err) = mcp
+        .call_tool(
+            "hyp_mesh",
+            json!({"action": "join", "handle": "alice", "_meshCall": "win_tok_1"}),
+            None,
+        )
+        .await;
+    assert!(!is_err, "mcp join failed: {txt}");
+    assert!(txt.contains("win@local/alice"));
+    mcp.close().await;
+
+    // 3. Async wait over connector.addr
+    let mut out = Vec::new();
+    let code = run_wait_to_writer(
+        WaitOptions {
+            socket_path: addr_file,
+            mode: WaitMode::Once,
+            session_id: Some("antigravity:win-conv-1".into()),
+            handle: None,
+            timeout_seconds: Some(3.0),
+            json: false,
+        },
+        &mut out,
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8(out).unwrap(), "windows wakeup!\n");
+
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
 }

@@ -1,0 +1,265 @@
+name: Release Rust Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        type: string
+        required: false
+        default: ""
+        description: "Optional version tag for dry-run build (e.g. v0.2.0-dryrun); never publishes a GitHub Release on workflow_dispatch"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-rust-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Resolve Release Tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      dry_run: ${{ steps.meta.outputs.dry_run }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve tag & mode
+        id: meta
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            DRY_RUN="true"
+            if [ -n "$INPUT_TAG" ]; then
+              TAG="$INPUT_TAG"
+            else
+              VER="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+              TAG="v${VER:-0.2.0-dryrun}"
+            fi
+          else
+            DRY_RUN="false"
+            TAG="$REF_NAME"
+          fi
+
+          if ! [[ "$TAG" =~ ^v[0-9A-Za-z._+-]+$ ]]; then
+            echo "Invalid release tag: $TAG (expected vX.Y.Z...)" >&2
+            exit 1
+          fi
+
+          if [[ "$TAG" == *-* ]]; then
+            PRERELEASE="true"
+          else
+            PRERELEASE="false"
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$DRY_RUN" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "Resolved Rust release parameters: tag=$TAG dry_run=$DRY_RUN prerelease=$PRERELEASE"
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive_ext: tar.gz
+            smoke_test: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive_ext: tar.gz
+            smoke_test: false
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive_ext: tar.gz
+            smoke_test: true
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive_ext: tar.gz
+            musl: true
+            smoke_test: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            archive_ext: tar.gz
+            smoke_test: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive_ext: zip
+            smoke_test: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.87.0 (${{ matrix.target }})
+        uses: dtolnay/rust-toolchain@1.87.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install musl-tools (for x86_64-unknown-linux-musl)
+        if: matrix.musl == true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build stripped release binary (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "$TARGET" -p hyp-cli
+
+      - name: Build stripped release binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo build --release --locked --target $env:TARGET -p hyp-cli
+
+      - name: Package archive (Unix tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          SMOKE_TEST: ${{ matrix.smoke_test }}
+        run: |
+          set -euo pipefail
+          ARCHIVE="hyp-${TAG}-${TARGET}.tar.gz"
+          STAGE="$(mktemp -d)"
+          trap 'rm -rf "$STAGE"' EXIT
+
+          cp "target/${TARGET}/release/hyp-rs" "${STAGE}/hyp"
+          chmod 0755 "${STAGE}/hyp"
+
+          if [ "$SMOKE_TEST" = "true" ]; then
+            "${STAGE}/hyp" version --json
+          fi
+
+          mkdir -p dist
+          tar -C "$STAGE" -czf "dist/${ARCHIVE}" hyp
+          ls -lh "dist/${ARCHIVE}"
+
+      - name: Package archive (Windows zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archive = "hyp-$($env:TAG)-$($env:TARGET).zip"
+          $stage = Join-Path $env:RUNNER_TEMP "hyp-stage"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          $bin = Join-Path $stage "hyp.exe"
+          Copy-Item -Path "target\$($env:TARGET)\release\hyp-rs.exe" -Destination $bin -Force
+          & $bin version --json
+
+          Compress-Archive -Path $bin -DestinationPath "dist\$archive" -Force
+          Get-Item "dist\$archive" | Format-List Name, Length
+
+      - name: Upload target archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/hyp-*
+          retention-days: 7
+          if-no-files-found: error
+
+  release:
+    name: Generate Checksums & Publish GitHub Release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all target archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate and verify SHA256SUMS.txt
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cd dist
+
+          expected=(
+            "hyp-${TAG}-aarch64-apple-darwin.tar.gz"
+            "hyp-${TAG}-x86_64-apple-darwin.tar.gz"
+            "hyp-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+            "hyp-${TAG}-x86_64-unknown-linux-musl.tar.gz"
+            "hyp-${TAG}-aarch64-unknown-linux-gnu.tar.gz"
+            "hyp-${TAG}-x86_64-pc-windows-msvc.zip"
+          )
+
+          for file in "${expected[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "Missing expected release archive: $file" >&2
+              exit 1
+            fi
+          done
+
+          sha256sum "${expected[@]}" | LC_ALL=C sort -k2 > SHA256SUMS.txt
+          echo "=== SHA256SUMS.txt ==="
+          cat SHA256SUMS.txt
+          echo "=== Verifying checksums ==="
+          sha256sum -c SHA256SUMS.txt
+
+      - name: Upload dry-run release bundle (workflow_dispatch)
+        if: needs.prepare.outputs.dry_run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hyphae-rust-release-${{ needs.prepare.outputs.tag }}
+          path: dist/*
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload archives & SHA256SUMS.txt to GitHub Release
+        if: needs.prepare.outputs.dry_run != 'true' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: Hyphae ${{ needs.prepare.outputs.tag }}
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          files: |
+            dist/hyp-*
+            dist/SHA256SUMS.txt

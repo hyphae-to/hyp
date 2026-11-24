@@ -1,20 +1,46 @@
-//! Unix domain socket NDJSON client for `connector.sock`.
+//! Local daemon NDJSON client for `connector.sock` (Unix domain sockets) and
+//! `connector.addr` / loopback TCP (`127.0.0.1:<port>`) on Windows.
 //!
 //! Provides BOTH:
-//! - A **zero-Tokio synchronous fast-path** (`std::os::unix::net::UnixStream`) for `hyp-rs hook`,
-//!   keeping cold-start latency at 1–3 ms.
-//! - An **async Tokio client** (`tokio::net::UnixStream`) with bounded NDJSON line reading for
+//! - A **zero-Tokio synchronous fast-path** (`std::os::unix::net::UnixStream` on Unix,
+//!   loopback `std::net::TcpStream` on Windows) for `hyp-rs hook`, keeping cold-start
+//!   latency at 1–3 ms.
+//! - An **async Tokio client** (`tokio::net::UnixStream` on Unix, loopback
+//!   `tokio::net::TcpStream` on Windows) with bounded NDJSON line reading for
 //!   `hyp-rs mcp`, `hyp-rs wait`, and `hyp-rs watch`.
 
 use serde_json::{Map, Value};
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::SocketAddr;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(unix)]
 use tokio::net::UnixStream as TokioUnixStream;
+
+/// Platform-native default daemon socket/address filename inside `<state_dir>`.
+#[cfg(unix)]
+pub const DEFAULT_SOCKET_FILENAME: &str = "connector.sock";
+#[cfg(not(unix))]
+pub const DEFAULT_SOCKET_FILENAME: &str = "connector.addr";
+
+/// Platform-native async read half for local daemon NDJSON streams.
+#[cfg(unix)]
+pub type DaemonReadHalf = tokio::net::unix::OwnedReadHalf;
+/// Platform-native async write half for local daemon NDJSON streams.
+#[cfg(unix)]
+pub type DaemonWriteHalf = tokio::net::unix::OwnedWriteHalf;
+
+/// Platform-native async read half for local daemon NDJSON streams (Windows TCP loopback).
+#[cfg(not(unix))]
+pub type DaemonReadHalf = tokio::net::tcp::OwnedReadHalf;
+/// Platform-native async write half for local daemon NDJSON streams (Windows TCP loopback).
+#[cfg(not(unix))]
+pub type DaemonWriteHalf = tokio::net::tcp::OwnedWriteHalf;
 
 /// Maximum NDJSON line size on `connector.sock` (matches `MAX_SOCKET_LINE_BYTES` in `src/daemon.ts`).
 pub const MAX_SOCKET_LINE_BYTES: usize = 1024 * 1024;
@@ -96,19 +122,30 @@ where
         return PathBuf::from(sock);
     }
     if let Some(state_dir) = non_empty("HYPHAE_STATE_DIR") {
-        return PathBuf::from(state_dir).join("connector.sock");
+        return PathBuf::from(state_dir).join(DEFAULT_SOCKET_FILENAME);
     }
     if let Some(config_dir) = non_empty("HYPHAE_CONFIG_DIR") {
         return PathBuf::from(config_dir)
             .join("state")
-            .join("connector.sock");
+            .join(DEFAULT_SOCKET_FILENAME);
     }
 
     let base = non_empty("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            let home = non_empty("HOME").unwrap_or_else(|| ".".to_string());
-            PathBuf::from(home).join(".config")
+            if let Some(home) = non_empty("HOME") {
+                PathBuf::from(home).join(".config")
+            } else if cfg!(windows) {
+                if let Some(local_app_data) = non_empty("LOCALAPPDATA") {
+                    PathBuf::from(local_app_data)
+                } else if let Some(user_profile) = non_empty("USERPROFILE") {
+                    PathBuf::from(user_profile).join(".config")
+                } else {
+                    PathBuf::from(".").join(".config")
+                }
+            } else {
+                PathBuf::from(".").join(".config")
+            }
         });
 
     let primary = base.join("hyphae");
@@ -120,7 +157,7 @@ where
     } else {
         primary
     };
-    dir.join("state").join("connector.sock")
+    dir.join("state").join(DEFAULT_SOCKET_FILENAME)
 }
 
 /// Convenience helper for testing with an explicit env map.
@@ -237,16 +274,88 @@ pub fn parse_rpc_response_line(line: &str) -> DaemonRpcResult {
     }
 }
 
-/// Ultra-fast synchronous single-shot Unix socket RPC for hooks (zero Tokio overhead!).
-/// Always fails open (returns `DaemonRpcResult { ok: false, .. }`) when daemon is offline,
-/// timed out, or returns malformed data.
-pub fn daemon_rpc_sync(socket_path: &Path, packet: &Value, timeout: Duration) -> DaemonRpcResult {
-    let Ok(mut stream) = StdUnixStream::connect(socket_path) else {
-        return DaemonRpcResult::fail();
-    };
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
+fn parse_loopback_addr(raw: &str) -> io::Result<SocketAddr> {
+    let trimmed = raw.trim();
+    let stripped = trimmed.strip_prefix("tcp://").unwrap_or(trimmed);
+    let addr: SocketAddr = stripped.parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid daemon loopback address: {trimmed:?}"),
+        )
+    })?;
+    if !addr.ip().is_loopback() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("refusing non-loopback daemon address: {addr}"),
+        ));
+    }
+    Ok(addr)
+}
 
+fn read_small_addr_file(path: &Path) -> io::Result<String> {
+    let file = std::fs::File::open(path)?;
+    let mut buf = String::new();
+    file.take(256).read_to_string(&mut buf)?;
+    Ok(buf)
+}
+
+/// Resolves a loopback TCP `SocketAddr` (`127.0.0.1:<port>` or `[::1]:<port>`) for Windows
+/// local daemon transport from:
+/// 1. Direct address string in `socket_path` (e.g. `HYPHAE_SOCKET=127.0.0.1:41234`)
+/// 2. Contents of `socket_path` (e.g. `.../state/connector.addr`)
+/// 3. Sibling `connector.addr` alongside `socket_path` (e.g. when `.../state/connector.sock` is passed)
+///
+/// Fails closed if the parsed IP is not loopback.
+pub fn resolve_loopback_addr(socket_path: &Path) -> io::Result<SocketAddr> {
+    if let Some(raw) = socket_path.to_str() {
+        let trimmed = raw.trim();
+        let stripped = trimmed.strip_prefix("tcp://").unwrap_or(trimmed);
+        if stripped.parse::<SocketAddr>().is_ok() {
+            return parse_loopback_addr(trimmed);
+        }
+    }
+
+    if let Ok(contents) = read_small_addr_file(socket_path) {
+        return parse_loopback_addr(&contents);
+    }
+
+    let sibling = socket_path.with_file_name("connector.addr");
+    if sibling != socket_path {
+        if let Ok(contents) = read_small_addr_file(&sibling) {
+            return parse_loopback_addr(&contents);
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "no loopback daemon address found at {} or {}",
+            socket_path.display(),
+            sibling.display()
+        ),
+    ))
+}
+
+/// Connects asynchronously to the local daemon (Unix domain socket on Unix, loopback TCP on Windows).
+#[cfg(unix)]
+pub async fn connect_daemon_async(
+    socket_path: &Path,
+) -> io::Result<(DaemonReadHalf, DaemonWriteHalf)> {
+    let stream = TokioUnixStream::connect(socket_path).await?;
+    Ok(stream.into_split())
+}
+
+/// Connects asynchronously to the local daemon over loopback TCP on Windows.
+#[cfg(not(unix))]
+pub async fn connect_daemon_async(
+    socket_path: &Path,
+) -> io::Result<(DaemonReadHalf, DaemonWriteHalf)> {
+    let addr = resolve_loopback_addr(socket_path)?;
+    let stream = tokio::net::TcpStream::connect(addr).await?;
+    Ok(stream.into_split())
+}
+
+fn daemon_rpc_sync_on_stream<S: Read + Write>(mut stream: S, packet: &Value) -> DaemonRpcResult {
     let Ok(mut payload) = serde_json::to_vec(packet) else {
         return DaemonRpcResult::fail();
     };
@@ -262,16 +371,44 @@ pub fn daemon_rpc_sync(socket_path: &Path, packet: &Value, timeout: Duration) ->
     }
 }
 
-/// Async single-shot Unix socket RPC over `tokio::net::UnixStream`.
+/// Ultra-fast synchronous single-shot daemon RPC for hooks (zero Tokio overhead!).
+/// Uses `std::os::unix::net::UnixStream` on Unix and loopback `std::net::TcpStream` on Windows.
+/// Always fails open (returns `DaemonRpcResult { ok: false, .. }`) when daemon is offline,
+/// timed out, or returns malformed data.
+#[cfg(unix)]
+pub fn daemon_rpc_sync(socket_path: &Path, packet: &Value, timeout: Duration) -> DaemonRpcResult {
+    let Ok(stream) = StdUnixStream::connect(socket_path) else {
+        return DaemonRpcResult::fail();
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    daemon_rpc_sync_on_stream(stream, packet)
+}
+
+/// Ultra-fast synchronous single-shot loopback TCP RPC for hooks on Windows (zero Tokio overhead!).
+#[cfg(not(unix))]
+pub fn daemon_rpc_sync(socket_path: &Path, packet: &Value, timeout: Duration) -> DaemonRpcResult {
+    let Ok(addr) = resolve_loopback_addr(socket_path) else {
+        return DaemonRpcResult::fail();
+    };
+    let Ok(stream) = std::net::TcpStream::connect_timeout(&addr, timeout) else {
+        return DaemonRpcResult::fail();
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    daemon_rpc_sync_on_stream(stream, packet)
+}
+
+/// Async single-shot daemon RPC (Unix domain socket on Unix, loopback TCP on Windows).
 pub async fn daemon_rpc_async(
     socket_path: &Path,
     packet: &Value,
     timeout: Duration,
 ) -> DaemonRpcResult {
     let fut = async {
-        let mut stream = TokioUnixStream::connect(socket_path).await.ok()?;
-        write_ndjson_line_async(&mut stream, packet).await.ok()?;
-        let mut reader = tokio::io::BufReader::new(stream);
+        let (read_half, mut write_half) = connect_daemon_async(socket_path).await.ok()?;
+        write_ndjson_line_async(&mut write_half, packet).await.ok()?;
+        let mut reader = tokio::io::BufReader::new(read_half);
         let line = read_bounded_line_async(&mut reader, MAX_SOCKET_LINE_BYTES)
             .await
             .ok()??;
@@ -295,34 +432,34 @@ mod tests {
         env.insert("HOME".into(), "/home/alice".into());
         assert_eq!(
             resolve_socket_path_from_map(&env, |_| false),
-            PathBuf::from("/home/alice/.config/hyphae/state/connector.sock")
+            PathBuf::from("/home/alice/.config/hyphae/state").join(DEFAULT_SOCKET_FILENAME)
         );
 
         // Legacy agents-mesh fallback when hyphae/connector.json missing & legacy exists
         assert_eq!(
             resolve_socket_path_from_map(&env, |p| p.ends_with("agents-mesh/connector.json")),
-            PathBuf::from("/home/alice/.config/agents-mesh/state/connector.sock")
+            PathBuf::from("/home/alice/.config/agents-mesh/state").join(DEFAULT_SOCKET_FILENAME)
         );
 
         // XDG_CONFIG_HOME overrides HOME/.config
         env.insert("XDG_CONFIG_HOME".into(), "/xdg".into());
         assert_eq!(
             resolve_socket_path_from_map(&env, |_| false),
-            PathBuf::from("/xdg/hyphae/state/connector.sock")
+            PathBuf::from("/xdg/hyphae/state").join(DEFAULT_SOCKET_FILENAME)
         );
 
         // HYPHAE_CONFIG_DIR overrides XDG
         env.insert("HYPHAE_CONFIG_DIR".into(), "/cfg".into());
         assert_eq!(
             resolve_socket_path_from_map(&env, |_| false),
-            PathBuf::from("/cfg/state/connector.sock")
+            PathBuf::from("/cfg/state").join(DEFAULT_SOCKET_FILENAME)
         );
 
         // HYPHAE_STATE_DIR overrides HYPHAE_CONFIG_DIR
         env.insert("HYPHAE_STATE_DIR".into(), "/state".into());
         assert_eq!(
             resolve_socket_path_from_map(&env, |_| false),
-            PathBuf::from("/state/connector.sock")
+            PathBuf::from("/state").join(DEFAULT_SOCKET_FILENAME)
         );
 
         // AGENTS_MESH_SOCKET overrides state dir
@@ -337,6 +474,59 @@ mod tests {
         assert_eq!(
             resolve_socket_path_from_map(&env, |_| false),
             PathBuf::from("/tmp/explicit.sock")
+        );
+    }
+
+    #[test]
+    fn resolve_loopback_addr_supports_direct_file_sibling_and_rejects_non_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Direct loopback addresses (IPv4, IPv6, tcp:// prefix)
+        assert_eq!(
+            resolve_loopback_addr(Path::new("127.0.0.1:41234")).unwrap(),
+            "127.0.0.1:41234".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            resolve_loopback_addr(Path::new("tcp://127.0.0.1:41235")).unwrap(),
+            "127.0.0.1:41235".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            resolve_loopback_addr(Path::new("[::1]:41236")).unwrap(),
+            "[::1]:41236".parse::<SocketAddr>().unwrap()
+        );
+
+        // Non-loopback IP rejected fail-closed!
+        assert_eq!(
+            resolve_loopback_addr(Path::new("192.168.1.5:41234"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            resolve_loopback_addr(Path::new("0.0.0.0:41234"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        // Direct connector.addr file and sibling lookup from connector.sock
+        let addr_file = dir.path().join("connector.addr");
+        std::fs::write(&addr_file, "127.0.0.1:52345\n").unwrap();
+        assert_eq!(
+            resolve_loopback_addr(&addr_file).unwrap(),
+            "127.0.0.1:52345".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            resolve_loopback_addr(&dir.path().join("connector.sock")).unwrap(),
+            "127.0.0.1:52345".parse::<SocketAddr>().unwrap()
+        );
+
+        // File containing non-loopback IP fails closed
+        let bad_file = dir.path().join("bad.addr");
+        std::fs::write(&bad_file, "10.0.0.1:52345\n").unwrap();
+        assert_eq!(
+            resolve_loopback_addr(&bad_file).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
         );
     }
 
@@ -367,5 +557,59 @@ mod tests {
             Duration::from_millis(100),
         );
         assert!(!res.ok);
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn windows_tcp_loopback_sync_and_async_rpc_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let addr_file = dir.path().join("connector.addr");
+        std::fs::write(&addr_file, format!("{addr}\n")).unwrap();
+
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (r, mut w) = stream.split();
+                let mut reader = tokio::io::BufReader::new(r);
+                let line = read_bounded_line_async(&mut reader, MAX_SOCKET_LINE_BYTES)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let resp = serde_json::json!({
+                    "ok": true,
+                    "result": { "echoType": req["type"] }
+                });
+                write_ndjson_line_async(&mut w, &resp).await.unwrap();
+            }
+        });
+
+        // 1. Async RPC via connector.addr file
+        let async_res = daemon_rpc_async(
+            &addr_file,
+            &serde_json::json!({"type": "async.ping"}),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(async_res.ok);
+        assert_eq!(async_res.result.unwrap()["echoType"], "async.ping");
+
+        // 2. Sync RPC via direct HYPHAE_SOCKET=127.0.0.1:<port> string
+        let direct_path = PathBuf::from(addr.to_string());
+        let sync_res = tokio::task::spawn_blocking(move || {
+            daemon_rpc_sync(
+                &direct_path,
+                &serde_json::json!({"type": "sync.ping"}),
+                Duration::from_secs(2),
+            )
+        })
+        .await
+        .unwrap();
+        assert!(sync_res.ok);
+        assert_eq!(sync_res.result.unwrap()["echoType"], "sync.ping");
+
+        server.await.unwrap();
     }
 }

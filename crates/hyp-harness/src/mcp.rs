@@ -13,15 +13,17 @@
 use crate::protocol::{
     HarnessKind, is_bridge_destination, is_valid_router_name, normalize_mesh_tool_name,
 };
-use crate::sock::{MAX_SOCKET_LINE_BYTES, read_bounded_line_async, write_ndjson_line_async};
+use crate::sock::{
+    DaemonReadHalf, DaemonWriteHalf, MAX_SOCKET_LINE_BYTES, connect_daemon_async,
+    read_bounded_line_async, write_ndjson_line_async,
+};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::Instant;
 
 pub const ERR_METHOD_NOT_FOUND: i64 = -32601;
@@ -405,19 +407,30 @@ pub fn translate_tool_call(
     }
 }
 
+#[cfg(unix)]
+fn fill_os_random(bytes: &mut [u8; 16]) -> bool {
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, bytes))
+        .is_ok()
+}
+
+#[cfg(not(unix))]
+fn fill_os_random(_bytes: &mut [u8; 16]) -> bool {
+    false
+}
+
 /// Generates a lowercase UUID v4 string (36 chars) using OS randomness without external crates.
 fn generate_uuid_v4() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
     let mut bytes = [0u8; 16];
-    let ok = std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes))
-        .is_ok();
-    if !ok {
+    if !fill_os_random(&mut bytes) {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let pid = std::process::id() as u128;
-        let mixed = nanos ^ (pid << 64) ^ 0x9e37_79b9_7f4a_7c15_u128;
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
+        let mixed = nanos ^ (pid << 64) ^ (seq.wrapping_mul(0x9e37_79b9_7f4a_7c15_u128));
         bytes = mixed.to_le_bytes();
     }
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -551,8 +564,8 @@ struct PendingReq {
 }
 
 struct DaemonConn {
-    reader: BufReader<OwnedReadHalf>,
-    writer: OwnedWriteHalf,
+    reader: BufReader<DaemonReadHalf>,
+    writer: DaemonWriteHalf,
 }
 
 async fn write_stdout_json<W: AsyncWrite + Unpin>(writer: &mut W, msg: &Value) -> io::Result<()> {
@@ -590,8 +603,7 @@ where
         initialized: bool,
         channel_ready_sent: &mut bool,
     ) -> Option<DaemonConn> {
-        let stream = UnixStream::connect(&options.socket_path).await.ok()?;
-        let (r, mut w) = stream.into_split();
+        let (r, mut w) = connect_daemon_async(&options.socket_path).await.ok()?;
         let hello = build_mcp_hello(options, ephemeral_client_id);
         if write_ndjson_line_async(&mut w, &hello).await.is_err() {
             return None;
@@ -1064,8 +1076,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-    use tokio::net::UnixListener;
+    use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt};
 
     #[test]
     fn catalog_is_four_core_tools_plus_conditional_bridge() {
@@ -1278,71 +1289,95 @@ mod tests {
         assert_eq!(extract_meta_call_id(json!({}).as_object()), None);
     }
 
+    async fn run_mock_mcp_server<R, W>(r: R, mut w: W)
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let mut lines = BufReader::new(r).lines();
+
+        // 1. Expect mcp.hello with channel: true
+        let hello: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(hello["type"], "mcp.hello");
+        assert_eq!(hello["channel"], true);
+
+        // 2. Expect channel.ready
+        let ready: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(ready["type"], "channel.ready");
+
+        // Push a channel.deliver notification to the MCP shim!
+        write_ndjson_line_async(
+            &mut w,
+            &json!({"type": "channel.deliver", "delivery": 7, "text": "push-from-daemon"}),
+        )
+        .await
+        .unwrap();
+
+        // 3. Expect channel.ack for delivery 7
+        let ack: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(ack["type"], "channel.ack");
+        assert_eq!(ack["delivery"], 7);
+        assert_eq!(ack["submitted"], true);
+
+        // 4. Handle mcp.caps -> hasPlugins: true
+        let caps: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(caps["type"], "mcp.caps");
+        write_ndjson_line_async(
+            &mut w,
+            &json!({"id": caps["id"], "result": {"hasPlugins": true}}),
+        )
+        .await
+        .unwrap();
+
+        // 5. Handle tool.call -> assert callId + callToken + translated name
+        let call: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(call["type"], "tool.call");
+        assert_eq!(call["name"], "hyp_session");
+        assert_eq!(call["callId"], "toolu_99");
+        assert_eq!(call["callToken"], "tok_xyz");
+        assert_eq!(call["args"]["action"], "join");
+        assert_eq!(call["args"]["handle"], "alice");
+        assert!(call["args"].get("_meshCall").is_none());
+        write_ndjson_line_async(
+            &mut w,
+            &json!({"id": call["id"], "result": {"address": "me@local/alice"}}),
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn mcp_handles_jsonrpc_errors_meta_call_id_and_claude_channel_push() {
         let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("mock.sock");
-        let listener = UnixListener::bind(&sock_path).unwrap();
-
-        let server_task = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (r, mut w) = stream.into_split();
-            let mut lines = BufReader::new(r).lines();
-
-            // 1. Expect mcp.hello with channel: true
-            let hello: Value =
-                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-            assert_eq!(hello["type"], "mcp.hello");
-            assert_eq!(hello["channel"], true);
-
-            // 2. Expect channel.ready
-            let ready: Value =
-                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-            assert_eq!(ready["type"], "channel.ready");
-
-            // Push a channel.deliver notification to the MCP shim!
-            write_ndjson_line_async(
-                &mut w,
-                &json!({"type": "channel.deliver", "delivery": 7, "text": "push-from-daemon"}),
-            )
-            .await
-            .unwrap();
-
-            // 3. Expect channel.ack for delivery 7
-            let ack: Value =
-                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-            assert_eq!(ack["type"], "channel.ack");
-            assert_eq!(ack["delivery"], 7);
-            assert_eq!(ack["submitted"], true);
-
-            // 4. Handle mcp.caps -> hasPlugins: true
-            let caps: Value =
-                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-            assert_eq!(caps["type"], "mcp.caps");
-            write_ndjson_line_async(
-                &mut w,
-                &json!({"id": caps["id"], "result": {"hasPlugins": true}}),
-            )
-            .await
-            .unwrap();
-
-            // 5. Handle tool.call -> assert callId + callToken + translated name
-            let call: Value =
-                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-            assert_eq!(call["type"], "tool.call");
-            assert_eq!(call["name"], "hyp_session");
-            assert_eq!(call["callId"], "toolu_99");
-            assert_eq!(call["callToken"], "tok_xyz");
-            assert_eq!(call["args"]["action"], "join");
-            assert_eq!(call["args"]["handle"], "alice");
-            assert!(call["args"].get("_meshCall").is_none());
-            write_ndjson_line_async(
-                &mut w,
-                &json!({"id": call["id"], "result": {"address": "me@local/alice"}}),
-            )
-            .await
-            .unwrap();
-        });
+        #[cfg(unix)]
+        let (sock_path, server_task) = {
+            let sock_path = dir.path().join("mock.sock");
+            let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+            let task = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (r, w) = stream.into_split();
+                run_mock_mcp_server(r, w).await;
+            });
+            (sock_path, task)
+        };
+        #[cfg(not(unix))]
+        let (sock_path, server_task) = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let addr_file = dir.path().join("connector.addr");
+            std::fs::write(&addr_file, format!("{addr}\n")).unwrap();
+            let task = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (r, w) = stream.into_split();
+                run_mock_mcp_server(r, w).await;
+            });
+            (addr_file, task)
+        };
 
         let (mut client_w, server_r) = tokio::io::duplex(8192);
         let (server_w, client_r) = tokio::io::duplex(8192);
