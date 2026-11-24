@@ -32,17 +32,12 @@
   </header>
 
   <main>
-    <!-- MAIN HERO: Full-bleed dark organic mycelium canvas from top edge behind transparent header -->
+    <!-- MAIN HERO: Full-bleed dark organic mycelium canvas from top edge -->
     <section id="story" class="story-band hero-cinema">
       <div class="story-bg" aria-hidden="true"></div>
       <canvas class="story-canvas" id="sporeCanvas" aria-hidden="true"></canvas>
 
       <div class="wrap story-band-inner">
-        <div class="story-band-head">
-          <span class="story-kicker">How a real incident flows across one Hyphae network</span>
-          <span class="story-hint">Hover any dot on the timeline below to jump to a moment</span>
-        </div>
-
         <div class="story-stage">
           <svg class="story-svg" id="storySvg" viewBox="0 0 1200 580" preserveAspectRatio="none" aria-hidden="true">
             <defs>
@@ -194,8 +189,11 @@
             <p class="sd-msg" id="slackDmMsg">“Jack's ops paged on <strong>checkout-api</strong> (4.2%). Investigating now.”</p>
           </div>
 
-          <!-- In-scene narrative subtitle (story lives right inside the stage) -->
-          <div class="scene-subtitle" id="storyCaption"></div>
+          <!-- In-scene narrative subtitle + end-of-story Replay CTA -->
+          <div class="scene-subtitle-wrap">
+            <div class="scene-subtitle" id="storyCaption"></div>
+            <button class="replay-cta" id="storyReplayBtn" type="button">↻ Play again</button>
+          </div>
         </div>
 
         <!-- Single-line Organic Mycelial Timeline (intertwining growing vine + glowing spore dots + popovers) -->

@@ -3,7 +3,7 @@ function esc(s) {
 }
 
 // ============================================================================
-// 0. SMART SCROLL-AWARE HEADER (Transparent over dark hero -> frosted white below)
+// 0. SMART SCROLL-AWARE HEADER (Frosted dark over hero -> frosted white below)
 // ============================================================================
 (function initSmartHeader() {
   const header = document.getElementById("siteHeader");
@@ -16,7 +16,6 @@ function esc(s) {
     const pastHero = heroBottom <= headerH + 6;
     header.classList.toggle("header-light", pastHero);
     header.classList.toggle("header-dark", !pastHero);
-    header.classList.toggle("dark-frosted", !pastHero && window.scrollY > 18);
   }
 
   syncHeaderTheme();
@@ -398,9 +397,9 @@ const CHAPTERS = [
     ],
   },
   {
-    durationMs: 7600,
-    tip: "7 · Release Mgr ships -> Alert fixed -> #deploys fan-out",
-    caption: "<strong>7/7</strong> · <strong>Jack's release mgr</strong> merges &amp; ships <code>v2.14.1</code> -> <span style='color:var(--chartreuse);font-weight:600;'>alert fixed (0.0%)</span> -> <code>#deploys</code> notifies Alex, Alice &amp; Jack's ops (+ Slack DM).",
+    durationMs: 8200,
+    tip: "7 · Release Mgr ships -> Alert fixed -> #deploys fan-out & banter",
+    caption: "<strong>7/7</strong> · <strong>Jack's release mgr</strong> ships <code>v2.14.1</code> -> <span style='color:var(--chartreuse);font-weight:600;'>alert fixed (0.0%)</span> -> <code>#deploys</code> notifies everyone (+ Slack DM).",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-gh", "ent-prom"],
     dim: [],
     spotlight: ["ent-release"],
@@ -459,6 +458,26 @@ const CHAPTERS = [
       {
         at: 3620,
         addVisible: ["ent-slack"],
+      },
+      {
+        at: 4450,
+        bubbles: {
+          "bub-ops": { text: "0.0% errors across all 14 servers. Nice save, team.", alert: false },
+        },
+      },
+      {
+        at: 5350,
+        bubbles: {
+          "bub-alice": { text: "Glad my sub-agent caught that timeout. Coffee's on Alex.", alert: false },
+        },
+      },
+      {
+        at: 6300,
+        bubbles: {
+          "bub-alex": { text: "Deal. Next outage is Jack's turn.", alert: false },
+          "bub-release": { text: "Please don't jinx v2.14.1.", alert: false },
+        },
+        showReplay: true,
       },
     ],
   },
@@ -778,6 +797,9 @@ function applyStage(st) {
       el.classList.add("fire");
     });
   }
+  if (st.showReplay) {
+    document.getElementById("storyReplayBtn")?.classList.add("show");
+  }
 }
 
 function updateVineProgress() {
@@ -790,6 +812,7 @@ let forceSettled = new URLSearchParams(window.location.search).get("settled") ==
 
 function renderChapter() {
   clearStagedTimers();
+  document.getElementById("storyReplayBtn")?.classList.remove("show");
   const ch = CHAPTERS[chapterIdx];
 
   const allEnts = ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-gh", "ent-prom", "ent-priv", "ent-slack", "ent-subagent", "ent-code"];
@@ -901,15 +924,40 @@ function renderChapter() {
 function resetStoryTimer() {
   if (storyTimer) clearTimeout(storyTimer);
   if (!storyPlaying) return;
-  const delay = CHAPTERS[chapterIdx]?.durationMs ?? 8000;
+  const isLast = chapterIdx >= CHAPTERS.length - 1;
+  if (isLast) {
+    // Stop cleanly at the end instead of auto-looping; show Play again CTA
+    storyTimer = setTimeout(() => {
+      storyPlaying = false;
+      const playBtn = document.getElementById("storyPlayBtn");
+      if (playBtn) playBtn.textContent = "Replay";
+      document.getElementById("storyReplayBtn")?.classList.add("show");
+    }, CHAPTERS[chapterIdx]?.durationMs ?? 8000);
+    return;
+  }
+  const delay = CHAPTERS[chapterIdx]?.durationMs ?? 7200;
   storyTimer = setTimeout(() => {
-    chapterIdx = (chapterIdx + 1) % CHAPTERS.length;
+    chapterIdx += 1;
     renderChapter();
     resetStoryTimer();
   }, delay);
 }
 
+function replayStory() {
+  chapterIdx = 0;
+  storyPlaying = true;
+  document.getElementById("storyPlayBtn").textContent = "Pause";
+  renderChapter();
+  resetStoryTimer();
+}
+
+document.getElementById("storyReplayBtn")?.addEventListener("click", replayStory);
+
 document.getElementById("storyPlayBtn").addEventListener("click", (e) => {
+  if (!storyPlaying && chapterIdx === CHAPTERS.length - 1) {
+    replayStory();
+    return;
+  }
   storyPlaying = !storyPlaying;
   e.currentTarget.textContent = storyPlaying ? "Pause" : "Play";
   resetStoryTimer();
