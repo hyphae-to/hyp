@@ -1,0 +1,34 @@
+# Hyphae v2 Caddy reverse proxy example (automatic HTTPS + zero-buffering SSE)
+#
+# Copy to /etc/caddy/Caddyfile (VPS) or deploy/Caddyfile (Docker Compose) and
+# replace `mesh.example.com` with your DNS name.
+#
+# For Docker Compose, change `127.0.0.1:8790` to `hyphae-node:8790`.
+
+mesh.example.com {
+    encode zstd gzip
+
+    request_body {
+        # Cap inbound transfer/event payloads (reduce to 1MB for public read-only nodes).
+        max_size 64MB
+    }
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
+        -Server
+    }
+
+    # Critical for Hyphae SSE (/v1/inbox): `flush_interval -1` disables response buffering
+    # and disables read/write idle disconnects so long-lived peer links stream immediately.
+    reverse_proxy 127.0.0.1:8790 {
+        flush_interval -1
+        header_up X-Forwarded-Proto https
+        transport http {
+            read_timeout 0
+            write_timeout 0
+            dial_timeout 10s
+        }
+    }
+}

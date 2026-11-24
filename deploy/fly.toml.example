@@ -1,0 +1,53 @@
+# Fly.io configuration example for a Hyphae v2 Node
+#
+# Quick start:
+#   1. Copy to fly.toml (or run `hyp-rs deploy init fly --node-id my-hub --domain my-hub.fly.dev`)
+#   2. Create app & persistent state volume:
+#        flyctl apps create hyphae-node
+#        flyctl volumes create hyphae_data --size 1 --region iad
+#   3. Deploy:
+#        flyctl deploy
+#   4. Verify manifest & anti-recon posture:
+#        hyp-rs deploy check --url https://hyphae-node.fly.dev
+
+app = "hyphae-node"
+primary_region = "iad"
+
+[build]
+  dockerfile = "deploy/Dockerfile"
+
+[env]
+  HYPHAE_SECRET_BACKEND = "file"
+  HYPHAE_STATE_DIR = "/var/lib/hyphae"
+  HYPHAE_CONFIG = "/etc/hyphae/node.json"
+
+[http_service]
+  internal_port = 8790
+  force_https = true
+  # Keep at least 1 machine warm so long-lived SSE (/v1/inbox) connections never drop.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 500
+    soft_limit = 400
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    timeout = "5s"
+    path = "/v1/manifest"
+
+[[mounts]]
+  source = "hyphae_data"
+  destination = "/var/lib/hyphae"
+  initial_size = "1gb"
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1

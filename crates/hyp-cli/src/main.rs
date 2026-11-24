@@ -1,7 +1,11 @@
-//! `hyp-rs` — Hyphae v2 native hot-path CLI shim (`hook`, `mcp`, `wait`, `watch`, `version`).
+//! `hyp-rs` — Hyphae v2 native CLI (`hook`, `mcp`, `wait`, `watch`, `deploy`, `pair`, `version`).
 //!
 //! Performance note: `hyp-rs hook` intercepts `std::env::args()` BEFORE constructing `clap`
 //! or Tokio so hook invocations pay zero async-runtime startup overhead (1–3 ms cold start).
+
+mod deploy;
+mod pair;
+mod ui;
 
 use clap::{Parser, Subcommand};
 use hyp_harness::hooks::{HandleHookOptions, HookEvent, run_hook_sync, shell_quote_cli};
@@ -13,14 +17,12 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const EXIT_OK: u8 = 0;
-const EXIT_ERROR: u8 = 1;
-const EXIT_USAGE: u8 = 2;
+use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE};
 
 #[derive(Parser)]
 #[command(
     name = "hyp-rs",
-    about = "Hyphae v2 native hot-path shim (hook, mcp, wait, watch)",
+    about = "Hyphae v2 native CLI (hook, mcp, wait, watch, deploy, pair, version)",
     version
 )]
 struct Cli {
@@ -104,6 +106,16 @@ enum Commands {
         /// Optional timeout in seconds (0 = watch indefinitely)
         #[arg(long)]
         timeout: Option<f64>,
+    },
+    /// Internet deployment provider catalog, hardened kit generator, and fail-closed health checks
+    Deploy {
+        #[command(subcommand)]
+        command: deploy::DeployCommand,
+    },
+    /// Permissioned pairing guide, hp2p1_/am2_ invite generation, and stdin-safe token inspection
+    Pair {
+        #[command(subcommand)]
+        command: pair::PairCommand,
     },
     /// Print version info (supports --json agent-first envelope)
     Version {
@@ -362,6 +374,8 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Commands::Deploy { command } => deploy::run_deploy(command),
+        Commands::Pair { command } => pair::run_pair(command),
         Commands::Version { json: as_json } => {
             let version = env!("CARGO_PKG_VERSION");
             if as_json {

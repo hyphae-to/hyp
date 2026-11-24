@@ -1,0 +1,43 @@
+[Unit]
+Description=Hyphae v2 Unified Node
+Documentation=https://hyphae.to
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hyphae
+Group=hyphae
+StateDirectory=hyphae
+StateDirectoryMode=0700
+ConfigurationDirectory=hyphae
+ConfigurationDirectoryMode=0750
+WorkingDirectory=/var/lib/hyphae
+Environment=HYPHAE_SECRET_BACKEND=file
+Environment=HYPHAE_STATE_DIR=/var/lib/hyphae
+Environment=HYPHAE_CONFIG=/etc/hyphae/node.json
+Environment=HYPHAE_BIND=127.0.0.1:8790
+ExecStart=/usr/local/bin/hyp node start --config /etc/hyphae/node.json
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=15s
+
+# Hardened sandboxing
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target
