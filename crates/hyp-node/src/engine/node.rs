@@ -107,6 +107,7 @@ use crate::engine::peer_link::{
 const MANIFEST_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 const MANIFEST_WINDOW_REFRESH_MS: i64 = 60 * 60 * 1000;
 const HTTP_AUTH_SKEW_MS: i64 = 5 * 60 * 1000;
+const MAX_HTTP_AUTH_NONCES: usize = 16_384;
 const DEFAULT_TRANSFER_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// Authenticated remote peer context attached to incoming HTTP requests.
@@ -206,6 +207,7 @@ pub struct UnifiedNode {
     kv_max_seen_version: Mutex<HashMap<(String, String, String), u64>>,
     remote_channel_policies: Mutex<HashMap<(String, String), ChannelPolicy>>,
     pending_p2p_offers: Mutex<HashMap<String, P2pOfferToken>>,
+    seen_http_nonces: Mutex<HashMap<(String, String), i64>>,
     guest_join_timestamps: Mutex<VecDeque<i64>>,
     github_public: Mutex<Option<Arc<GitHubPublicAdapter>>>,
     peer_links: RwLock<HashMap<String, Arc<PeerLink>>>,
@@ -295,6 +297,7 @@ impl UnifiedNode {
             kv_max_seen_version: Mutex::new(HashMap::new()),
             remote_channel_policies: Mutex::new(HashMap::new()),
             pending_p2p_offers: Mutex::new(HashMap::new()),
+            seen_http_nonces: Mutex::new(HashMap::new()),
             guest_join_timestamps: Mutex::new(VecDeque::new()),
             github_public: Mutex::new(None),
             peer_links: RwLock::new(HashMap::new()),
@@ -1190,6 +1193,11 @@ impl UnifiedNode {
             let nonce = params
                 .get("nonce")
                 .ok_or_else(|| NodeError::Unauthorized("missing nonce in Ed25519 auth".into()))?;
+            if nonce.is_empty() {
+                return Err(NodeError::Unauthorized(
+                    "empty nonce in Ed25519 auth".into(),
+                ));
+            }
             let sig = params
                 .get("sig")
                 .ok_or_else(|| NodeError::Unauthorized("missing sig in Ed25519 auth".into()))?;
@@ -1197,22 +1205,56 @@ impl UnifiedNode {
             let ts: i64 = ts_str
                 .parse()
                 .map_err(|_| NodeError::Unauthorized("invalid ts in Ed25519 auth".into()))?;
-            if (now_ms() - ts).abs() > HTTP_AUTH_SKEW_MS {
+            let now = now_ms();
+            if (now - ts).abs() > HTTP_AUTH_SKEW_MS {
                 return Err(NodeError::Unauthorized(
                     "Ed25519 auth timestamp outside allowed skew window".into(),
                 ));
             }
 
-            let db = self.db();
-            let peer = load_active_authenticated_peer(&db, peer_id)?;
-            let signing_pk = lookup_peer_signing_key_in_db(&db, peer_id)?.ok_or_else(|| {
-                NodeError::Unauthorized(format!("no pinned signing key for peer '{peer_id}'"))
-            })?;
-            let signing_input =
-                http_auth_signing_input(method, path_and_query, ts, nonce, body_sha256);
-            signing_pk
-                .verify_domain_b64("http-auth", &signing_input, sig)
-                .map_err(|_| NodeError::Unauthorized("Ed25519 auth signature invalid".into()))?;
+            let peer = {
+                let db = self.db();
+                let peer = load_active_authenticated_peer(&db, peer_id)?;
+                let signing_pk = lookup_peer_signing_key_in_db(&db, peer_id)?.ok_or_else(|| {
+                    NodeError::Unauthorized(format!("no pinned signing key for peer '{peer_id}'"))
+                })?;
+                let signing_input =
+                    http_auth_signing_input(method, path_and_query, ts, nonce, body_sha256);
+                signing_pk
+                    .verify_domain_b64("http-auth", &signing_input, sig)
+                    .map_err(|_| {
+                        NodeError::Unauthorized("Ed25519 auth signature invalid".into())
+                    })?;
+                peer
+            };
+
+            // Bounded in-memory replay guard: reject any (peer_id, nonce) reuse while the
+            // signed request could still be valid within the skew window.
+            let expires_at = ts.saturating_add(HTTP_AUTH_SKEW_MS);
+            let mut nonces = self
+                .seen_http_nonces
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let key = (peer_id.clone(), nonce.clone());
+            if let Some(&existing_exp) = nonces.get(&key) {
+                if existing_exp >= now {
+                    return Err(NodeError::Unauthorized("replayed request nonce".into()));
+                }
+            }
+            if nonces.len() >= MAX_HTTP_AUTH_NONCES {
+                nonces.retain(|_, &mut exp| exp >= now);
+                if nonces.len() >= MAX_HTTP_AUTH_NONCES {
+                    let evict_count = (MAX_HTTP_AUTH_NONCES / 8).max(1);
+                    let mut oldest: Vec<((String, String), i64)> =
+                        nonces.iter().map(|(k, &v)| (k.clone(), v)).collect();
+                    oldest.sort_by_key(|(_, exp)| *exp);
+                    for (k, _) in oldest.into_iter().take(evict_count) {
+                        nonces.remove(&k);
+                    }
+                }
+            }
+            nonces.insert(key, expires_at);
+
             return Ok(Some(peer));
         }
 

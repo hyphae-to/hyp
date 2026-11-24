@@ -2104,14 +2104,16 @@ async fn chaos_oversized_and_malformed_wire_mutation_fuzz() {
         }
     };
 
+    let nonce_seq = AtomicU64::new(1);
     let sign_alice = |method: &str, path: &str, body: &[u8]| {
+        let seq = nonce_seq.fetch_add(1, Ordering::Relaxed);
         build_ed25519_auth_header(
             "alice@macbook",
             &alice.identity().signing,
             method,
             path,
             now_ms(),
-            "fuzz-nonce-1",
+            &format!("fuzz-nonce-{seq}"),
             body,
         )
     };

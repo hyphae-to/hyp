@@ -133,6 +133,7 @@ async fn handle_http_request(
                 NodeError::RateLimited {
                     retry_after_secs, ..
                 } => *retry_after_secs,
+                NodeError::Store(StoreError::RateLimited(_)) => Some(60),
                 _ => None,
             };
             let resp = problem_response(&err.to_problem_details());
