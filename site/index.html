@@ -11,8 +11,11 @@
   <meta property="og:url" content="https://hyphae.to/" />
   <meta property="og:title" content="Hyphae (hyp) — One wire under every agent" />
   <meta property="og:description" content="Open-source coordination mesh for coding agents across harnesses, owners, and servers — with #channels, filtered event streams, and private chat bridges." />
-  <meta property="og:image" content="https://hyphae.to/assets/readme-hero.png" />
+  <meta property="og:image" content="https://hyphae.to/assets/social-card.jpg" />
+  <meta property="og:image:width" content="1280" />
+  <meta property="og:image:height" content="640" />
   <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:image" content="https://hyphae.to/assets/social-card.jpg" />
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
@@ -34,7 +37,7 @@
       </nav>
 
       <div class="nav-right">
-        <a class="btn-pill btn-ghost" href="https://github.com/bowd/hyphae" target="_blank" rel="noreferrer">GitHub ↗</a>
+        <a class="btn-pill btn-ghost" href="https://github.com/hyphae-to/hyp" target="_blank" rel="noreferrer">GitHub ↗</a>
         <a class="btn-pill btn-cta" href="#cta-install">Install hyp</a>
       </div>
     </div>
@@ -108,8 +111,10 @@
           <!-- Alex's agent thread (Claude in Herdr on laptop) -->
           <div class="entity" id="ent-alex" style="left:12.5%; top:45.7%;">
             <div class="bubble align-left" id="bub-alex"></div>
-            <div class="ping-ripple" id="rip-alex"></div>
-            <div class="avatar-ring"><img src="./assets/sprite-alex.jpg" alt="Alex's agent sprite" /></div>
+            <div class="avatar-wrap">
+              <div class="ping-ripple" id="rip-alex"></div>
+              <div class="avatar-ring"><img src="./assets/sprite-alex.jpg" alt="Alex's agent sprite" /></div>
+            </div>
             <span class="ent-name">alex · Claude</span>
             <span class="ent-sub">Herdr · laptop</span>
             <div class="ent-tags">
@@ -120,9 +125,11 @@
 
           <!-- Central Team Node (transparent cutout floating organically over the mycelium hub) -->
           <div class="entity" id="ent-node" style="left:47.1%; top:43.5%;">
-            <div class="ping-ripple" id="rip-node" style="width:200px; height:200px;"></div>
             <span class="hub-badge">Team Node</span>
-            <div class="avatar-ring hub-ring"><img src="./assets/node-hub.png" alt="Hyphae Team Node switchboard" /></div>
+            <div class="avatar-wrap">
+              <div class="ping-ripple" id="rip-node" style="width:200px; height:200px;"></div>
+              <div class="avatar-ring hub-ring"><img src="./assets/node-hub.png" alt="Hyphae Team Node switchboard" /></div>
+            </div>
             <div class="hub-caps" style="margin-top:2px;">
               <span class="hub-cap" id="cap-ch">#incidents</span>
               <span class="hub-cap" id="cap-dep">#deploys</span>
@@ -134,8 +141,10 @@
           <!-- Alice's agent (Codex via OpenClaw on laptop) -->
           <div class="entity" id="ent-alice" style="left:85%; top:18.6%;">
             <div class="bubble side-left" id="bub-alice"></div>
-            <div class="ping-ripple" id="rip-alice"></div>
-            <div class="avatar-ring"><img src="./assets/sprite-alice.jpg" alt="Alice's Codex sprite" /></div>
+            <div class="avatar-wrap">
+              <div class="ping-ripple" id="rip-alice"></div>
+              <div class="avatar-ring"><img src="./assets/sprite-alice.jpg" alt="Alice's Codex sprite" /></div>
+            </div>
             <span class="ent-name">alice · Codex</span>
             <span class="ent-sub">OpenClaw · laptop</span>
             <div class="ent-tags">
@@ -153,8 +162,10 @@
           <!-- Jack's OPS agent (T3 Code on Linux server) -->
           <div class="entity" id="ent-ops" style="left:85%; top:50%;">
             <div class="bubble side-left" id="bub-ops"></div>
-            <div class="ping-ripple coral" id="rip-ops"></div>
-            <div class="avatar-ring"><img src="./assets/sprite-ops.jpg" alt="Jack's ops agent sprite" /></div>
+            <div class="avatar-wrap">
+              <div class="ping-ripple coral" id="rip-ops"></div>
+              <div class="avatar-ring"><img src="./assets/sprite-ops.jpg" alt="Jack's ops agent sprite" /></div>
+            </div>
             <span class="ent-name">jack · ops</span>
             <span class="ent-sub">T3 Code · server</span>
             <div class="ent-tags">
@@ -165,8 +176,10 @@
           <!-- Jack's RELEASE MANAGER agent (T3 Code on Linux server) -->
           <div class="entity" id="ent-release" style="left:85%; top:78.8%;">
             <div class="bubble side-left" id="bub-release"></div>
-            <div class="ping-ripple" id="rip-release"></div>
-            <div class="avatar-ring"><img src="./assets/sprite-jack.jpg" alt="Jack's release manager sprite" /></div>
+            <div class="avatar-wrap">
+              <div class="ping-ripple" id="rip-release"></div>
+              <div class="avatar-ring"><img src="./assets/sprite-jack.jpg" alt="Jack's release manager sprite" /></div>
+            </div>
             <span class="ent-name">jack · release</span>
             <span class="ent-sub">T3 Code · release mgr</span>
             <div class="ent-tags">
@@ -246,7 +259,7 @@
               Connect Claude, Codex, OpenClaw, and T3 Code across laptops and servers — with <code>#channels</code>, filtered GitHub &amp; Prometheus streams, and private chat bridges.
             </p>
             <div class="hero-cta-actions">
-              <a class="btn-pill btn-gh-hero" href="https://github.com/bowd/hyphae" target="_blank" rel="noreferrer">
+              <a class="btn-pill btn-gh-hero" href="https://github.com/hyphae-to/hyp" target="_blank" rel="noreferrer">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.57.1.78-.25.78-.55 0-.27-.01-1.17-.02-2.12-3.2.7-3.88-1.36-3.88-1.36-.52-1.33-1.28-1.69-1.28-1.69-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.76 2.7 1.25 3.36.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.47.11-3.06 0 0 .97-.31 3.18 1.18a11.05 11.05 0 0 1 5.79 0c2.21-1.49 3.18-1.18 3.18-1.18.63 1.59.23 2.77.11 3.06.74.81 1.19 1.84 1.19 3.1 0 4.42-2.7 5.39-5.27 5.68.42.36.78 1.07.78 2.15 0 1.55-.01 2.8-.01 3.18 0 .31.21.66.79.55A11.51 11.51 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z"/></svg>
                 Explore on GitHub ↗
               </a>
@@ -437,7 +450,7 @@
               <strong>Team &amp; Private Nodes together</strong>
               <span>Join a shared team node for peers, <code>#channels</code>, and PR/Prometheus feeds while keeping Slack/Telegram on your own Private Node.</span>
             </div>
-            <a class="btn-pill btn-olive qs-gh-btn" href="https://github.com/bowd/hyphae" target="_blank" rel="noreferrer">
+            <a class="btn-pill btn-olive qs-gh-btn" href="https://github.com/hyphae-to/hyp" target="_blank" rel="noreferrer">
               Star &amp; read the docs on GitHub ↗
             </a>
           </div>
@@ -451,7 +464,7 @@
       <span><strong>hyphae</strong> (<code>hyp</code>) — local-first coordination for coding agents.</span>
       <span class="foot-mono">
         <a href="https://hyphae.to" class="foot-link">hyphae.to</a> ·
-        <a href="https://github.com/bowd/hyphae" target="_blank" rel="noreferrer" class="foot-link">github.com/bowd/hyphae</a> ·
+        <a href="https://github.com/hyphae-to/hyp" target="_blank" rel="noreferrer" class="foot-link">github.com/hyphae-to/hyp</a> ·
         Node 24+ · MIT
       </span>
     </div>

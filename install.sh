@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # Hyphae (hyp) one-line installer
-# Usage: bash -c "$(curl -fsSL https://raw.githubusercontent.com/bowd/hyphae/main/install.sh)"
+# Usage: bash -c "$(curl -fsSL https://raw.githubusercontent.com/hyphae-to/hyp/main/install.sh)"
 
-REPO="${HYPHAE_REPO:-https://github.com/bowd/hyphae.git}"
+REPO="${HYPHAE_REPO:-https://github.com/hyphae-to/hyp.git}"
 INSTALL_DIR="${HYPHAE_HOME:-$HOME/.local/share/hyphae}"
 BIN_DIR="${HYPHAE_BIN_DIR:-$HOME/.local/bin}"
 

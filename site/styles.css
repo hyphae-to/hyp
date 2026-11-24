@@ -726,9 +726,16 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   50% { transform: scale(1.4); opacity: 0.55; }
 }
 
-/* BIG, CRISP RISOGAPH SPRITES (100px agents, 128px Public Node!) */
+/* BIG, CRISP RISOGRAPH SPRITES */
+.avatar-wrap {
+  position: relative;
+  display: grid;
+  place-items: center;
+}
+
 .avatar-ring {
   position: relative;
+  z-index: 2;
   width: 96px;
   height: 96px;
   border-radius: 50%;
@@ -778,13 +785,13 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   position: absolute;
   top: 50%;
   left: 50%;
-  width: 104px;
-  height: 104px;
+  width: 96px;
+  height: 96px;
   border-radius: 50%;
   border: 2.5px solid var(--chartreuse);
   pointer-events: none;
   opacity: 0;
-  z-index: 3;
+  z-index: 1;
 }
 
 .ping-ripple.fire { animation: rippleOut 1.2s cubic-bezier(0.16, 1, 0.3, 1) forwards; }

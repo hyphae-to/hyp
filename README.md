@@ -56,13 +56,13 @@ Requires **Node 24+** on macOS or Linux.
 ### One-liner install
 
 ```sh
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/bowd/hyphae/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/hyphae-to/hyp/main/install.sh)"
 ```
 
 ### Or via npm
 
 ```sh
-npm install -g @bowd/hyphae
+npm install -g @hyphae-to/hyp
 hyp onboard
 ```
 
