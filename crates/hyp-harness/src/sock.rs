@@ -37,6 +37,7 @@ pub const DEFAULT_SOCKET_FILENAME: &str = "connector.addr";
 /// Platform-native async read half for local daemon NDJSON streams
 /// (supports both Unix domain sockets and loopback TCP `connector.addr` on Unix).
 #[cfg(unix)]
+#[derive(Debug)]
 pub enum DaemonReadHalf {
     Unix(tokio::net::unix::OwnedReadHalf),
     Tcp(tokio::net::tcp::OwnedReadHalf),
@@ -45,6 +46,7 @@ pub enum DaemonReadHalf {
 /// Platform-native async write half for local daemon NDJSON streams
 /// (supports both Unix domain sockets and loopback TCP `connector.addr` on Unix).
 #[cfg(unix)]
+#[derive(Debug)]
 pub enum DaemonWriteHalf {
     Unix(tokio::net::unix::OwnedWriteHalf),
     Tcp(tokio::net::tcp::OwnedWriteHalf),
@@ -746,16 +748,14 @@ mod tests {
         assert_eq!(
             connect_daemon_async(Path::new("192.168.1.5:41234"))
                 .await
-                .err()
-                .expect("non-loopback direct IP must fail closed")
+                .expect_err("non-loopback direct IP must fail closed")
                 .kind(),
             io::ErrorKind::PermissionDenied
         );
         assert_eq!(
             connect_daemon_async(Path::new("tcp://10.0.0.1:41234"))
                 .await
-                .err()
-                .expect("non-loopback tcp:// URL must fail closed")
+                .expect_err("non-loopback tcp:// URL must fail closed")
                 .kind(),
             io::ErrorKind::PermissionDenied
         );
@@ -764,8 +764,7 @@ mod tests {
         assert_eq!(
             connect_daemon_async(&bad_addr_file)
                 .await
-                .err()
-                .expect("non-loopback .addr file must fail closed")
+                .expect_err("non-loopback .addr file must fail closed")
                 .kind(),
             io::ErrorKind::PermissionDenied
         );
