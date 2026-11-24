@@ -23,7 +23,7 @@ use hyp_node::engine::{
 use hyp_node::gates::{SecurityGateConfig, SecurityGatePipeline};
 use hyp_proto::address::{LOCAL_NODE_ID, NodeId, is_valid_node_id};
 use hyp_proto::scopes::ScopePreset;
-use hyp_store::NodeDb;
+use hyp_store::{NodeDb, PeerStatus};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::Write as _;
@@ -365,6 +365,12 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                 SecurityGatePipeline::new(gate_cfg, gate_db, Some(gate_secrets))
                     .map_err(|e| format!("Failed to initialize SecurityGatePipeline: {e}"))?,
             );
+            if pipeline.is_policy_tampered() {
+                startup_warnings.push(
+                    "gate_policy_tampered: gate policy signature verification failed; all non-self-host inbound items will fail closed to quarantine until re-locked via `hyp gate lock`."
+                        .to_string(),
+                );
+            }
             let local_cfg = LocalDaemonConfig {
                 socket_path: explicit_socket,
                 ..Default::default()
@@ -386,6 +392,50 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                 .map_err(|e| format!("Failed to bind HTTP/SSE peer server on {addr}: {e}"))?;
             bound_addr = Some(actual);
             server_handle = Some(handle);
+        }
+
+        // Auto-connect persisted active peers with a configured endpoint so restarted
+        // daemons immediately restore PeerLinks and background SSE `/v1/inbox` streams.
+        // Never fail startup if a remote peer is temporarily offline — record a warning instead.
+        let active_peers = {
+            let db = node.db();
+            db.peers()
+                .list_peers(Some(PeerStatus::Active))
+                .unwrap_or_default()
+        };
+        let mut connected_peers: Vec<String> = Vec::new();
+        for peer in active_peers {
+            if peer.peer_id == node.node_id().as_str() {
+                continue;
+            }
+            let Some(ep) = peer
+                .endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                node.connect_peer(&peer.peer_id, ep),
+            )
+            .await
+            {
+                Ok(Ok(_)) => connected_peers.push(peer.peer_id),
+                Ok(Err(e)) => {
+                    startup_warnings.push(format!(
+                        "Peer '{}' ({ep}) could not be auto-connected on startup: {e}",
+                        peer.peer_id
+                    ));
+                }
+                Err(_) => {
+                    startup_warnings.push(format!(
+                        "Peer '{}' ({ep}) timed out during startup auto-connect",
+                        peer.peer_id
+                    ));
+                }
+            }
         }
 
         let pid = std::process::id();
@@ -416,6 +466,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             "configPath": loaded.as_ref().map(|c| c.path.display().to_string()),
             "guestPairingEnabled": guest_pairing_enabled,
             "githubPublicEnabled": github_public_enabled,
+            "connectedPeers": connected_peers,
             "startedAt": started_at,
         });
         write_atomic_json(&status_path, &status_doc, true)?;
@@ -472,6 +523,13 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             }
             if github_public_enabled {
                 println!("      GitHub Pub:  enabled (demand-driven ETag poller)");
+            }
+            if !connected_peers.is_empty() {
+                println!(
+                    "      Peers:       {} connected ({})",
+                    connected_peers.len(),
+                    connected_peers.join(", ")
+                );
             }
             for w in &warnings {
                 println!("WARN  {w}");

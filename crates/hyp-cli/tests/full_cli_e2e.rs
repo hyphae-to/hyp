@@ -11,6 +11,9 @@
 //! `HOME` / `--home` / `--state-dir`, and `HYPHAE_SECRET_BACKEND=file` — zero live user
 //! config or OS Keychain mutations!
 
+mod common;
+
+use common::{ManagedProcess, hyp_bin as hyp_rs_bin, isolated_cmd, parse_json_stdout};
 use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full};
 use hyp_crypto::keys::Ed25519KeyPair;
@@ -37,40 +40,13 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::fs;
-use std::io::{BufRead, BufReader, Write as _};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::net::TcpListener;
-
-fn hyp_rs_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_hyp")
-}
-
-fn isolated_cmd(home: &Path) -> Command {
-    let mut cmd = Command::new(hyp_rs_bin());
-    cmd.env("HOME", home)
-        .env("USERPROFILE", home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("HYPHAE_SECRET_BACKEND", "file")
-        .env("HYPHAE_NO_OPEN", "1")
-        .env_remove("HYPHAE_CONFIG")
-        .env_remove("HYPHAE_STATE_DIR")
-        .env_remove("HYPHAE_CONFIG_DIR");
-    cmd
-}
-
-fn parse_json_stdout(out: &Output) -> Value {
-    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
-        panic!(
-            "expected valid JSON stdout ({e}):\nstatus={:?}\nstdout={}\nstderr={}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        )
-    })
-}
 
 fn current_target_triple() -> &'static str {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -446,7 +422,8 @@ fn secret_stdin_and_web_out_of_band_capture() {
     assert_eq!(del_json["data"]["deleted"], true);
 
     // 2. Out-of-band `--web` capture: scrape URL from stderr -> GET CSRF -> test bad CSRF -> POST secret
-    let mut web_child = isolated_cmd(&home)
+    let mut web_cmd = isolated_cmd(&home);
+    web_cmd
         .args([
             "secret",
             "set",
@@ -459,15 +436,12 @@ fn secret_stdin_and_web_out_of_band_capture() {
             state_dir.to_str().unwrap(),
             "--json",
         ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stdin(Stdio::null());
+    let mut web_child = ManagedProcess::spawn("hyp secret set --web", &mut web_cmd);
 
-    let mut stderr_reader = BufReader::new(web_child.stderr.take().unwrap());
-    let mut line = String::new();
-    stderr_reader.read_line(&mut line).unwrap();
+    let line = web_child
+        .try_read_stderr_line(Duration::from_secs(10))
+        .expect("read loopback capture URL from stderr");
     let url = line
         .split_whitespace()
         .find(|w| w.starts_with("http://127.0.0.1:"))
@@ -524,13 +498,12 @@ fn secret_stdin_and_web_out_of_band_capture() {
         assert_eq!(good_resp.status(), StatusCode::OK);
     });
 
-    let web_out = web_child.wait_with_output().unwrap();
-    assert_eq!(web_out.status.code(), Some(0));
+    let (web_status, web_json) = web_child.wait_json_output(Duration::from_secs(10));
+    assert_eq!(web_status.code(), Some(0));
     assert!(
-        !String::from_utf8_lossy(&web_out.stdout).contains(web_secret),
+        !web_json.to_string().contains(web_secret),
         "web-captured secret must NEVER appear in stdout JSON!"
     );
-    let web_json = parse_json_stdout(&web_out);
     assert_eq!(web_json["ok"], true);
     assert_eq!(web_json["data"]["name"], "api-key");
     assert_eq!(web_json["data"]["captureMode"], "web");
@@ -1779,7 +1752,8 @@ fn node_start_legacy_v1_and_http_manifest_probe() {
     )
     .unwrap();
 
-    let mut child = isolated_cmd(&home)
+    let mut node_cmd = isolated_cmd(&home);
+    node_cmd
         .args([
             "node",
             "start",
@@ -1791,17 +1765,12 @@ fn node_start_legacy_v1_and_http_manifest_probe() {
             state_dir.to_str().unwrap(),
             "--json",
         ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stdin(Stdio::null());
+    let mut child = ManagedProcess::spawn("hyp node start (legacy v1)", &mut node_cmd);
+    let startup_env = child.read_json_line(Duration::from_secs(10));
+    assert_eq!(startup_env["ok"], true);
 
-    // Wait for `node.status.json` to appear (written right after bind)
     let status_file = state_dir.join("node.status.json");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !status_file.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
     assert!(status_file.exists(), "node.status.json must be written on start");
     assert!(state_dir.join("node.pid").exists(), "node.pid must be written on start");
 
@@ -1820,7 +1789,6 @@ fn node_start_legacy_v1_and_http_manifest_probe() {
     assert_eq!(check_json["data"]["manifest"]["signatureVerified"], true);
     assert_eq!(check_json["data"]["manifest"]["advertisedEmpty"], true);
 
-    // Graceful shutdown
-    let _ = child.kill();
-    let _ = child.wait();
+    // Graceful shutdown (also guaranteed via ManagedProcess::drop on panic)
+    let _ = child.shutdown_gracefully();
 }
