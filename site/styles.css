@@ -33,6 +33,7 @@
   --type-body: 0.875rem;
   --type-eyebrow: 0.74rem;
   --type-code: 0.81rem;
+  --header-h: clamp(64px, 6.2vh, 80px);
 
   --shadow-card: 0 22px 50px -18px rgba(18, 19, 16, 0.34), 0 2px 6px rgba(18, 19, 16, 0.08);
 }
@@ -92,6 +93,12 @@ header.header-dark {
   background: transparent;
   backdrop-filter: none;
   border-bottom: 1px solid transparent;
+}
+
+header.header-dark.is-scrolled {
+  background: rgba(17, 20, 15, 0.82);
+  backdrop-filter: blur(14px);
+  border-bottom-color: rgba(244, 241, 232, 0.08);
 }
 
 header.header-light {
@@ -250,11 +257,11 @@ header.header-light .btn-cta {
 }
 header.header-light .btn-cta:hover { background: var(--olive-hover); }
 
-/* ================= HERO CTA STRIP (Right below the animated show) ================= */
+/* ================= HERO #2 CTA STRIP (Cleanly below Hero #1's bottom divider) ================= */
 .hero-cta-strip {
-  margin-top: clamp(36px, 4.8vh, 72px);
-  padding-top: clamp(28px, 3.8vh, 52px);
-  border-top: 1px solid rgba(244, 241, 232, 0.1);
+  margin-top: 0;
+  padding: 44px 0 56px;
+  border-top: none;
   display: grid;
   grid-template-columns: 1.08fr 0.92fr;
   gap: clamp(28px, 4vw, 68px);
@@ -437,23 +444,14 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
 
 .install-foot code { font-family: var(--mono); color: var(--chartreuse); font-size: 0.72rem; }
 
-/* ================= FULL-BLEED DARK CINEMATIC STORY BAND (Starts right at top) ================= */
+/* ================= FULL-BLEED DARK CINEMATIC STORY BAND (Two-Block Viewport-Adaptive Hero) ================= */
 .story-band {
   position: relative;
   background: #11140f;
   color: var(--cream);
   border-bottom: 1px solid rgba(244, 241, 232, 0.1);
   overflow: hidden;
-  padding: clamp(92px, 9.5vh, 148px) 0 clamp(56px, 6.8vh, 104px);
-}
-
-@media (min-width: 1440px) and (min-height: 960px) {
-  .story-band {
-    min-height: min(94vh, 1180px);
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-  }
+  padding: 0;
 }
 
 .story-bg {
@@ -490,6 +488,70 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   position: relative;
   z-index: 2;
   width: 100%;
+}
+
+/* HERO #1: Diorama Stage + Controls Dock ending on the horizontal divider line */
+.hero-block-stage {
+  display: flex;
+  flex-direction: column;
+  padding-top: var(--header-h, 68px);
+  border-bottom: 1px solid rgba(183, 217, 86, 0.14);
+}
+
+.hero-stage-center {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px 0;
+}
+
+.hero-controls-dock {
+  flex: 0 0 auto;
+  width: 100%;
+  padding-bottom: 18px;
+}
+
+/* Mode A — Laptop / Standard Desktop: Header + Hero #1 = exact 100svh (divider flush at viewport bottom) */
+@media (min-width: 761px) {
+  .hero-block-stage {
+    height: 100vh;
+    height: 100svh;
+    min-height: 100vh;
+    min-height: 100svh;
+  }
+}
+
+/* Mode B — Big / Tall Desktop Screens: Header + Hero #1 + Divider + Hero #2 = exact 100svh */
+@media (min-width: 1100px) and (min-height: 990px) {
+  .story-band {
+    height: 100vh;
+    height: 100svh;
+    min-height: 100vh;
+    min-height: 100svh;
+    display: flex;
+    flex-direction: column;
+  }
+  .story-band-inner {
+    flex: 1 1 auto;
+    min-height: 0;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    padding-top: var(--header-h, 68px);
+  }
+  .hero-block-stage {
+    flex: 1 1 auto;
+    min-height: 0;
+    height: auto;
+    padding-top: 0;
+  }
+  .hero-cta-strip {
+    flex: 0 0 auto;
+    padding: 26px 0 32px;
+  }
 }
 
 .story-band-head {
@@ -1106,11 +1168,11 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
 .sd-lock { font-family: var(--mono); font-size: 0.62rem; padding: 2px 7px; border-radius: 999px; background: var(--stone-deep); color: var(--ink-soft); }
 .sd-msg { margin: 0; font-size: 0.78rem; line-height: 1.4; color: var(--ink); }
 
-/* Narrative subtitle + Replay CTA directly beneath the unboxed diorama (crisp on desktop & mobile) */
+/* Narrative subtitle + Replay CTA docked cleanly above the mycelial timeline */
 .scene-subtitle-wrap {
   position: relative;
   z-index: 15;
-  margin: clamp(12px, 1.8vh, 24px) auto clamp(14px, 2vh, 24px);
+  margin: 0 auto 12px;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -1211,7 +1273,7 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
 .myc-timeline {
   position: relative;
   z-index: 40;
-  margin-top: clamp(12px, 1.6vh, 22px);
+  margin-top: 0;
   display: flex;
   align-items: center;
   gap: 16px;
@@ -3728,6 +3790,7 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   background: linear-gradient(180deg, rgba(25, 29, 23, 0.9) 0%, rgba(16, 20, 14, 0.94) 100%);
   border: 1px solid rgba(244, 241, 232, 0.14);
   padding: 12px 13px;
+  overflow: hidden;
 }
 
 .gm-row {
@@ -3739,6 +3802,12 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   font-size: 0.63rem;
   color: #b5b1a4;
   margin-bottom: 5px;
+  min-width: 0;
+}
+
+.gm-row span {
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .gm-row strong {
@@ -3786,8 +3855,11 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   margin-top: 6px;
   font-family: var(--mono);
   font-size: 0.57rem;
+  line-height: 1.35;
   color: #939084;
-  white-space: nowrap;
+  white-space: normal;
+  max-width: 100%;
+  overflow: hidden;
 }
 
 /* Floating packets inside the Gate animation */
@@ -4732,9 +4804,8 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
   .hub-right-stack { grid-template-rows: auto; gap: 18px; }
   .hub-core-card { max-width: 420px; }
   .hub-tile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .hero-cta-strip { gap: 22px; margin-top: 34px; padding-top: 26px; }
+  .hero-cta-strip { gap: 22px; padding: 32px 0 44px; }
   .nav-links { display: none; }
-  .scene-subtitle-wrap { margin-top: 8px; }
   .compare-table { font-size: 0.82rem; }
   .compare-table th, .compare-table td { padding: 11px 12px; }
 }
@@ -4778,7 +4849,10 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
   .brand-cli { display: none; }
   .nav-right .btn-ghost { display: none; }
   .btn-pill { padding: 7px 14px; font-size: 0.8rem; }
-  .story-band { padding: 66px 0 42px; }
+  .hero-block-stage { padding-top: 66px; }
+  .hero-stage-center { padding: 8px 0; }
+  .hero-controls-dock { padding-bottom: 16px; }
+  .hero-cta-strip { padding: 28px 0 40px; }
   .scene-subtitle { font-size: 0.8rem; padding: 8px 12px; border-radius: 12px; max-width: 100%; }
   .myc-timeline { gap: 8px; margin-top: 8px; flex-wrap: wrap; height: auto; justify-content: center; }
   .tl-track-wrap { min-width: 100%; }

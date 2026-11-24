@@ -13,9 +13,11 @@ function esc(s) {
   function syncHeaderTheme() {
     const heroBottom = heroBand.getBoundingClientRect().bottom;
     const headerH = header.offsetHeight || 68;
+    document.documentElement.style.setProperty("--header-h", `${headerH}px`);
     const pastHero = heroBottom <= headerH + 6;
     header.classList.toggle("header-light", pastHero);
     header.classList.toggle("header-dark", !pastHero);
+    header.classList.toggle("is-scrolled", !pastHero && window.scrollY > 24);
   }
 
   syncHeaderTheme();
@@ -23,8 +25,17 @@ function esc(s) {
   window.addEventListener("resize", syncHeaderTheme, { passive: true });
 })();
 
-// Proportional 1200x590 stage scaling so sprites, wires, bubbles & packets stay pixel-exact from mobile to ultrawide displays
+// Proportional 1200x590 stage scaling driven by real rendered container geometry:
+// - Mobile (<= 760px): natural vertical flow
+// - Mode A (Laptop / Standard Desktop, > 760px and < 990px tall or < 1100px wide):
+//   Header + Hero #1 = exact 100svh; animation stays <= 1.0x centered in .hero-stage-center
+// - Mode B (Big / Tall Desktop, >= 1100px wide and >= 990px tall):
+//   Header + Hero #1 + Divider + Hero #2 = exact 100svh; animation scales smoothly up to 1.28x
 (function initResponsiveStage() {
+  const header = document.getElementById("siteHeader");
+  const stageCenter = document.getElementById("heroStageCenter");
+  const controlsDock = document.getElementById("heroControlsDock");
+  const ctaStrip = document.getElementById("cta-install");
   const viewport = document.getElementById("storyViewport");
   const stage = document.getElementById("storyStage");
   if (!viewport || !stage) return;
@@ -33,13 +44,27 @@ function esc(s) {
   const LOGICAL_H = 590;
 
   function fitStage() {
-    const availW = viewport.clientWidth || LOGICAL_W;
+    const vw = window.innerWidth || 1280;
     const vh = window.innerHeight || 900;
-    // Scale down cleanly on narrow viewports; on large/tall displays scale smoothly up to 1.28x
-    // while keeping the subtitle, timeline, and hero CTA comfortably balanced on screen.
-    const maxScaleByHeight = Math.max(0.72, Math.min(1.28, (vh - 340) / LOGICAL_H));
-    const maxScale = vh >= 960 ? maxScaleByHeight : Math.min(1, Math.max(0.84, (vh - 300) / LOGICAL_H));
-    const scale = Math.min(maxScale, availW / LOGICAL_W);
+    const headerH = header ? header.offsetHeight : 68;
+    document.documentElement.style.setProperty("--header-h", `${headerH}px`);
+
+    const availW = (stageCenter ? stageCenter.clientWidth : viewport.clientWidth) || LOGICAL_W;
+    const isMobile = vw <= 760;
+    const isBigScreen = vw >= 1100 && vh >= 990;
+
+    let scale;
+    if (isMobile) {
+      scale = Math.min(1, availW / LOGICAL_W);
+    } else {
+      const dockH = controlsDock ? controlsDock.offsetHeight : 112;
+      const ctaH = isBigScreen && ctaStrip ? ctaStrip.offsetHeight : 0;
+      const stagePadY = 28; // 12px top + 12px bottom + 4px safety margin
+      const availH = Math.max(240, vh - headerH - dockH - ctaH - stagePadY);
+      const maxScale = isBigScreen ? 1.28 : 1.0;
+      scale = Math.min(maxScale, availW / LOGICAL_W, availH / LOGICAL_H);
+    }
+
     const offsetX = Math.max(0, (availW - LOGICAL_W * scale) / 2);
     stage.style.transform = `translateX(${offsetX.toFixed(1)}px) scale(${scale.toFixed(4)})`;
     viewport.style.height = `${Math.round(LOGICAL_H * scale)}px`;
@@ -47,7 +72,11 @@ function esc(s) {
 
   fitStage();
   if (typeof ResizeObserver !== "undefined") {
-    new ResizeObserver(fitStage).observe(viewport);
+    const ro = new ResizeObserver(fitStage);
+    if (stageCenter) ro.observe(stageCenter);
+    else ro.observe(viewport);
+    if (controlsDock) ro.observe(controlsDock);
+    if (ctaStrip) ro.observe(ctaStrip);
   }
   window.addEventListener("resize", fitStage, { passive: true });
 })();
@@ -87,7 +116,7 @@ renderHeroInstall();
 // ============================================================================
 const CHAPTERS = [
   {
-    durationMs: 7400,
+    durationMs: 5800,
     tip: "1 · Alex joins Team Node -> peers bloom one by one",
     caption: "<strong>1/7</strong> · <strong>Alex</strong> (Claude in Herdr) joins the <strong>Team Node</strong> — immediately unlocking <code>#channels</code>, streams, <strong>Alice's Codex</strong> (OpenClaw), and <strong>Jack's ops &amp; release mgr</strong> (T3 Code).",
     visible: ["ent-alex", "ent-node"],
@@ -153,7 +182,7 @@ const CHAPTERS = [
     ],
   },
   {
-    durationMs: 5400,
+    durationMs: 3500,
     tip: "2 · Fleet alert wakes Jack's ops -> CODEOWNERS",
     caption: "<strong>2/7</strong> · <span class='coral-txt'>Prometheus fires HighErrorRate (4.2%)</span>. The node filter wakes <strong>Jack's ops</strong>, who checks <code>CODEOWNERS</code> -> Alex owns <code>checkout-api</code>.",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-prom"],
@@ -194,7 +223,7 @@ const CHAPTERS = [
     ],
   },
   {
-    durationMs: 7000,
+    durationMs: 4900,
     tip: "3 · Ops calls hyp_send -> Alex + Local Node Slack + #deploys",
     caption: "<strong>3/7</strong> · Jack's ops sends a <code>hyp_send</code> to <strong>Alex</strong>. Alex joins <code>#deploys</code> with ops and wires a <strong>Local Node · Bridge -> Slack</strong> to DM Alex.",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-prom"],
@@ -244,7 +273,7 @@ const CHAPTERS = [
     ],
   },
   {
-    durationMs: 7000,
+    durationMs: 5200,
     tip: "4 · Alex fixes bug, opens PR #412 & subscribes -> CI Done ✓",
     caption: "<strong>4/7</strong> · Alex fixes the Redis pool leak, opens <strong>PR #412</strong>, subscribes to it on the Team Node, and receives <strong>CI Done ✓</strong> from GitHub.",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-prom", "ent-code"],
@@ -295,7 +324,7 @@ const CHAPTERS = [
     ],
   },
   {
-    durationMs: 7400,
+    durationMs: 5400,
     tip: "5 · Alex assigns Alice on GitHub -> GitHub notifies Alice -> spawns sub-agent",
     caption: "<strong>5/7</strong> · Alex assigns <strong>@alice</strong> as reviewer on <strong>GitHub PR #412</strong> -> Team Node notifies <strong>Alice</strong> -> Alice joins <code>#deploys</code> &amp; spawns a <strong>review sub-agent</strong>.",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-gh"],
@@ -353,7 +382,7 @@ const CHAPTERS = [
     ],
   },
   {
-    durationMs: 8800,
+    durationMs: 6600,
     tip: "6 · Alice rejects PR on GitHub -> Alex notified & patches -> Alice approves ✓",
     caption: "<strong>6/7</strong> · Alice's sub-agent finds an edge case -> Alice <strong>rejects PR #412 on GitHub</strong> -> <strong>Alex is notified</strong> &amp; pushes a 2-line fix -> <strong>Alice approves PR #412 ✓</strong>.",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-gh", "ent-subagent"],
@@ -426,7 +455,7 @@ const CHAPTERS = [
     ],
   },
   {
-    durationMs: 8200,
+    durationMs: 6900,
     tip: "7 · Release Mgr ships -> Alert fixed -> #deploys fan-out & banter",
     caption: "<strong>7/7</strong> · <strong>Jack's release mgr</strong> ships <code>v2.14.1</code> -> <span style='color:var(--chartreuse);font-weight:600;'>alert fixed (0.0%)</span> -> <code>#deploys</code> notifies everyone (+ Slack DM).",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-gh", "ent-prom"],
@@ -489,19 +518,19 @@ const CHAPTERS = [
         addVisible: ["ent-slack"],
       },
       {
-        at: 4450,
+        at: 4120,
         bubbles: {
           "bub-ops": { text: "0.0% errors across all 14 servers. Nice save, team.", alert: false },
         },
       },
       {
-        at: 5350,
+        at: 4720,
         bubbles: {
           "bub-alice": { text: "Glad my sub-agent caught that timeout. Coffee's on Alex.", alert: false },
         },
       },
       {
-        at: 6300,
+        at: 5220,
         bubbles: {
           "bub-alex": { text: "Deal. Next outage is Jack's turn.", alert: false },
           "bub-release": { text: "Please don't jinx v2.14.1.", alert: false },
@@ -1472,10 +1501,10 @@ resetStoryTimer();
       rulePillCls = "amber";
     }
 
-    // Dynamic telemetry calculations
+    // Dynamic telemetry calculations (kept concise so #gateMeter never wraps or overflows)
     let deliveredLabel = "Delivery";
     let deliveredText = "quiet · 0 wakes";
-    let blockedLabel = "Stopped / capped";
+    let blockedLabel = "Stopped";
     const stopParts = [];
     if (burstCapped > 0) stopParts.push(`${burstCapped} burst`);
     if (droppedCount > 0) stopParts.push(`${droppedCount} drop`);
@@ -1485,25 +1514,25 @@ resetStoryTimer();
     let savedLabel = "Context saved";
     let barPct = 94;
     let barDanger = false;
-    let foot = "Delivers on idle · P2P diff → disk";
+    let foot = "Delivers on idle · P2P → disk";
 
     if (leakedInject) {
       deliveredText = st.focus ? "⚠ digest + inject" : "⚠ unguarded inject";
-      blockedLabel = "Guard status";
-      blockedText = "1 injection leaked!";
+      blockedLabel = "Guard";
+      blockedText = "1 inject leaked!";
       blockedCls = "coral";
       savedLabel = "Prompt safety";
       barPct = 26;
       barDanger = true;
-      foot = "Enable 🛡 Injection Guard to quarantine attacks";
+      foot = "Enable Guard to block injections";
     } else if (st.focus) {
       deliveredText = hasInterrupt ? "⚡ 1 VIP + 1 digest" : `1-line digest (${notifyItems.length})`;
-      blockedLabel = "Held in inbox";
+      blockedLabel = "Held";
       blockedText = `${notifyItems.length} notify · ${burstCapped + droppedCount} stopped`;
       barPct = Math.min(99, 95 + (st.ciMode !== "all" ? 2 : 0) + (st.deploysMode === "mute" ? 1 : 0));
       foot = hasInterrupt
-        ? "VIP interrupt (@alice) breaks through Focus"
-        : "Held in local inbox · paginate via cursor";
+        ? "VIP @alice breaks through Focus"
+        : "Held in inbox · 1-line digest";
     } else {
       if (hasInterrupt) {
         deliveredText = `⚡ interrupt + ${queuedItems.length} queue`;
@@ -1527,10 +1556,10 @@ resetStoryTimer();
       barPct = Math.max(24, Math.min(99, score));
 
       foot = hasInterrupt
-        ? "Urgent interrupt wakes agent immediately"
+        ? "Urgent interrupt wakes now"
         : st.publicLinked
-        ? "3 topologies live · P2P diff → disk"
-        : "Delivers on idle · P2P diff → disk";
+        ? "3 topologies · P2P → disk"
+        : "Delivers on idle · P2P → disk";
     }
 
     return {
