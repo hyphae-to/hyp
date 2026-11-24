@@ -98,8 +98,8 @@
             <path class="myc-strand amber" id="p-gh-node" d="M 275 68 C 385 135, 470 185, 565 255" />
             <path class="myc-strand amber" id="p-node-builder-pr" d="M 565 255 C 740 315, 860 442, 1020 468" />
             <path class="myc-strand amber" id="p-builder-sub" d="M 1020 468 C 945 505, 880 518, 785 518" />
-            <path class="myc-strand moss" id="p-alex-priv" d="M 150 265 C 138 370, 144 425, 150 480" />
-            <path class="myc-strand moss" id="p-priv-slack" d="M 150 480 C 235 485, 275 486, 330 486" />
+            <path class="myc-strand moss" id="p-alex-priv" d="M 150 265 C 138 350, 144 400, 150 441" />
+            <path class="myc-strand moss" id="p-priv-slack" d="M 150 441 C 235 444, 275 444, 330 444" />
 
             <!-- Travelling glowing spore packets -->
             <circle class="spore-orb" id="orb1" r="5.5" cx="0" cy="0" />
@@ -175,39 +175,59 @@
             <span id="subagentText">sub-agent · auditing PR #412</span>
           </div>
 
+          <!-- Alex's live in-scene coding & subscribe card (shows fix -> PR #412 -> mesh_subscribe) -->
+          <div class="code-card" id="ent-code" style="left:25.5%; top:76%;">
+            <div class="cc-head">
+              <span>redis-pool.ts</span>
+              <span id="ccStatus" style="color:var(--chartreuse);">42/42 ✓</span>
+            </div>
+            <span class="cc-del">- queueLimit: Infinity</span>
+            <span class="cc-add">+ queueLimit: 128, timeoutMs: 400</span>
+            <span class="cc-act" id="ccAction">→ opened PR #412 · mesh_subscribe()</span>
+          </div>
+
           <!-- Alex's Private Node -> Slack DM -->
-          <div class="priv-node" id="ent-priv" style="left:12.5%; top:82.8%;">
+          <div class="priv-node" id="ent-priv" style="left:12.5%; top:76%;">
             <span class="priv-k">Private Node</span>
             <span class="priv-v">localhost · 0600</span>
           </div>
 
-          <div class="slack-dm" id="ent-slack" style="left:36%; top:83.8%;">
+          <div class="slack-dm" id="ent-slack" style="left:36%; top:76.5%;">
             <div class="sd-head">
               <span class="sd-app">Slack · DM to Alex</span>
               <span class="sd-lock">token isolated</span>
             </div>
             <p class="sd-msg" id="slackDmMsg">“Jack's ops paged on <strong>checkout-api</strong> (4.2%). Investigating now.”</p>
           </div>
+
+          <!-- In-scene narrative subtitle (story lives right inside the stage) -->
+          <div class="scene-subtitle" id="storyCaption"></div>
         </div>
 
-        <!-- Minimalist Line + Dots Timeline with Hover Popovers -->
-        <div class="story-bar">
-          <div class="story-progress" id="storyProgress"></div>
-          <div class="story-caption-row">
-            <span class="story-step-num" id="storyStepNum">1 / 9</span>
-            <div class="story-caption" id="storyCaption"></div>
+        <!-- Single-line Organic Mycelial Timeline (intertwining growing vine + glowing spore dots + popovers) -->
+        <div class="myc-timeline">
+          <div class="tl-track-wrap">
+            <svg class="tl-vine-svg" viewBox="0 0 1000 34" preserveAspectRatio="none" aria-hidden="true">
+              <defs>
+                <linearGradient id="vineGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                  <stop offset="0%" stop-color="#b7d956" />
+                  <stop offset="55%" stop-color="#e8a331" />
+                  <stop offset="100%" stop-color="#7fc97b" />
+                </linearGradient>
+              </defs>
+              <!-- Dormant organic intertwining root guides -->
+              <path class="tl-vine-bg" d="M 7 17 C 75 9, 130 25, 200 17 C 275 8, 335 26, 420 17 C 500 8, 575 26, 660 17 C 745 8, 825 25, 910 17 C 945 13, 972 17, 993 17" />
+              <path class="tl-vine-bg thin" d="M 7 17 C 85 26, 155 8, 240 18 C 325 27, 405 9, 495 17 C 585 26, 675 9, 765 18 C 845 25, 920 11, 993 17" />
+              <!-- Active growing mycelium tendrils -->
+              <path class="tl-vine-grow" id="tlVineMain" d="M 7 17 C 75 9, 130 25, 200 17 C 275 8, 335 26, 420 17 C 500 8, 575 26, 660 17 C 745 8, 825 25, 910 17 C 945 13, 972 17, 993 17" />
+              <path class="tl-vine-grow secondary" id="tlVineSub" d="M 7 17 C 85 26, 155 8, 240 18 C 325 27, 405 9, 495 17 C 585 26, 675 9, 765 18 C 845 25, 920 11, 993 17" />
+            </svg>
+            <div class="tl-dots" id="tlDots"></div>
           </div>
-          <div class="story-nav">
-            <div class="tl-track-wrap">
-              <div class="tl-line-bg"></div>
-              <div class="tl-line-fill" id="tlFill"></div>
-              <div class="tl-dots" id="tlDots"></div>
-            </div>
-            <div class="story-transport">
-              <button class="story-play-btn" id="storyPrevBtn" type="button" aria-label="Previous step">←</button>
-              <button class="story-play-btn" id="storyPlayBtn" type="button">Pause</button>
-              <button class="story-play-btn" id="storyNextBtn" type="button" aria-label="Next step">→</button>
-            </div>
+          <div class="story-transport">
+            <button class="story-play-btn" id="storyPrevBtn" type="button" aria-label="Previous step">←</button>
+            <button class="story-play-btn" id="storyPlayBtn" type="button">Pause</button>
+            <button class="story-play-btn" id="storyNextBtn" type="button" aria-label="Next step">→</button>
           </div>
         </div>
       </div>

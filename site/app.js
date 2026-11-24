@@ -160,20 +160,21 @@ const CHAPTERS = [
   },
   {
     tip: "6 · Alex codes fix & opens PR #412",
-    caption: "Alex's agent reproduces the Redis pool bug, writes the fix, opens <strong>PR #412</strong>, and subscribes to it on the Team Node for reviews &amp; CI status.",
-    visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-builder", "ent-prom", "ent-gh"],
+    caption: "<strong>6/9</strong> · Alex fixes the Redis pool leak, opens <strong>PR #412</strong>, and subscribes on the Team Node for reviews &amp; CI.",
+    visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-builder", "ent-prom", "ent-gh", "ent-code"],
     dim: ["ent-alice", "ent-ops", "ent-builder"],
     spotlight: ["ent-alex"],
     alertHit: [],
     strands: ["p-alex-gh", "p-gh-node", "p-alex-node"],
     softStrands: [],
     bubbles: {
-      "bub-alex": { text: "Fixed pool leak -> opened PR #412 & subscribed.", alert: false },
+      "bub-alex": { text: "Fixed Redis pool leak -> PR #412 open & subscribed.", alert: false },
     },
     caps: ["cap-gh"],
     ghActive: "amber",
     ghTitle: "GitHub · PR #412",
     ghSub: "open · CI running · subscribed",
+    ccAction: "→ opened PR #412 · mesh_subscribe(PR #412)",
     promSub: "14 servers · mitigating",
     codePill: "coding fix -> PR #412",
     filterTag: false,
@@ -239,7 +240,7 @@ const CHAPTERS = [
   },
   {
     tip: "9 · PR Ready -> Alex notified on Slack",
-    caption: "The Team Node notifies Alex's subscribed thread that <strong>PR #412 is ready to merge</strong> — Alex's Private Node sends the all-clear DM to Alex on Slack.",
+    caption: "<strong>9/9</strong> · Team Node notifies Alex that <strong>PR #412 is ready to merge</strong> — Alex's Private Node sends the all-clear DM on Slack.",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-builder", "ent-gh", "ent-priv", "ent-slack"],
     dim: ["ent-alice", "ent-ops"],
     spotlight: ["ent-alex"],
@@ -274,12 +275,17 @@ document.querySelectorAll(".myc-strand").forEach((path) => {
   path.style.strokeDashoffset = `${len}`;
 });
 
+const vineMain = document.getElementById("tlVineMain");
+const vineSub = document.getElementById("tlVineSub");
+const vineMainLen = vineMain ? vineMain.getTotalLength() : 1000;
+const vineSubLen = vineSub ? vineSub.getTotalLength() : 1000;
+if (vineMain) { vineMain.style.strokeDasharray = `${vineMainLen}`; vineMain.style.strokeDashoffset = `${vineMainLen}`; }
+if (vineSub) { vineSub.style.strokeDasharray = `${vineSubLen}`; vineSub.style.strokeDashoffset = `${vineSubLen}`; }
+
 let chapterIdx = 0;
 let storyPlaying = true;
 let storyTimer = null;
 let orbRaf = null;
-let progressRaf = null;
-let stepStartedAt = performance.now();
 
 function animateOrbs(orbSpecs) {
   if (orbRaf) cancelAnimationFrame(orbRaf);
@@ -317,28 +323,16 @@ function animateOrbs(orbSpecs) {
   orbRaf = requestAnimationFrame(frame);
 }
 
-function updateProgressBar() {
-  if (progressRaf) cancelAnimationFrame(progressRaf);
-  const bar = document.getElementById("storyProgress");
-  if (!bar) return;
-  if (!storyPlaying) {
-    bar.style.width = `${((chapterIdx + 1) / CHAPTERS.length) * 100}%`;
-    return;
-  }
-  stepStartedAt = performance.now();
-  function tick(now) {
-    if (!storyPlaying) return;
-    const pct = Math.min(100, ((now - stepStartedAt) / STEP_MS) * 100);
-    bar.style.width = `${pct.toFixed(1)}%`;
-    if (pct < 100) progressRaf = requestAnimationFrame(tick);
-  }
-  progressRaf = requestAnimationFrame(tick);
+function updateVineProgress() {
+  const frac = CHAPTERS.length > 1 ? chapterIdx / (CHAPTERS.length - 1) : 1;
+  if (vineMain) vineMain.style.strokeDashoffset = `${(vineMainLen * (1 - frac)).toFixed(1)}`;
+  if (vineSub) vineSub.style.strokeDashoffset = `${(vineSubLen * (1 - frac)).toFixed(1)}`;
 }
 
 function renderChapter() {
   const ch = CHAPTERS[chapterIdx];
 
-  const allEnts = ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-builder", "ent-gh", "ent-prom", "ent-priv", "ent-slack", "ent-subagent"];
+  const allEnts = ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-builder", "ent-gh", "ent-prom", "ent-priv", "ent-slack", "ent-subagent", "ent-code"];
   allEnts.forEach((id) => {
     const el = document.getElementById(id);
     if (!el) return;
@@ -355,6 +349,7 @@ function renderChapter() {
   ghEl.classList.toggle("active-green", ch.ghActive === "green");
   document.getElementById("ghTitle").textContent = ch.ghTitle;
   document.getElementById("ghSub").textContent = ch.ghSub;
+  if (ch.ccAction) document.getElementById("ccAction").textContent = ch.ccAction;
 
   document.getElementById("ent-prom").classList.toggle("active-coral", Boolean(ch.promActive));
   document.getElementById("promSub").textContent = ch.promSub;
@@ -403,11 +398,9 @@ function renderChapter() {
     }
   });
 
-  document.getElementById("storyStepNum").textContent = `${chapterIdx + 1} / ${CHAPTERS.length}`;
+  // In-scene subtitle + single-line mycelial timeline
   document.getElementById("storyCaption").innerHTML = ch.caption;
-
-  const fillPct = CHAPTERS.length > 1 ? (chapterIdx / (CHAPTERS.length - 1)) * 100 : 0;
-  document.getElementById("tlFill").style.width = `calc(${fillPct.toFixed(1)}% - 12px)`;
+  updateVineProgress();
 
   const dotsHost = document.getElementById("tlDots");
   dotsHost.innerHTML = CHAPTERS.map((c, i) => `
@@ -428,7 +421,6 @@ function renderChapter() {
   });
 
   animateOrbs(ch.orbs);
-  updateProgressBar();
 }
 
 function resetStoryTimer() {
@@ -444,7 +436,6 @@ document.getElementById("storyPlayBtn").addEventListener("click", (e) => {
   storyPlaying = !storyPlaying;
   e.currentTarget.textContent = storyPlaying ? "Pause" : "Play";
   resetStoryTimer();
-  updateProgressBar();
 });
 
 document.getElementById("storyPrevBtn").addEventListener("click", () => {

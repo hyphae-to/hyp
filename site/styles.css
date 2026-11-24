@@ -297,7 +297,7 @@ header {
   border-top: 1px solid rgba(244, 241, 232, 0.1);
   border-bottom: 1px solid rgba(244, 241, 232, 0.1);
   overflow: hidden;
-  padding: 26px 0 34px;
+  padding: 24px 0 26px;
 }
 
 .story-bg {
@@ -771,95 +771,124 @@ header {
 .sd-lock { font-family: var(--mono); font-size: 0.62rem; padding: 2px 7px; border-radius: 999px; background: var(--stone-deep); color: var(--ink-soft); }
 .sd-msg { margin: 0; font-size: 0.78rem; line-height: 1.4; color: var(--ink); }
 
-/* Minimalist Narrator Bar + Line & Dots Timeline with Hover Popovers */
-.story-bar {
-  position: relative;
-  margin-top: 14px;
-  border-radius: 16px;
-  border: 1px solid rgba(244, 241, 232, 0.1);
-  background: rgba(12, 14, 11, 0.85);
-  padding: 16px 20px 14px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.story-progress {
+/* In-scene floating subtitle & coding diff card (keeps the whole story inside the scene!) */
+.scene-subtitle {
   position: absolute;
-  top: 0;
-  left: 0;
-  height: 2px;
-  width: 0%;
-  background: linear-gradient(90deg, var(--chartreuse), var(--amber));
-  pointer-events: none;
-  border-radius: 2px;
-}
-
-.story-caption-row {
-  display: flex;
-  align-items: baseline;
-  gap: 12px;
-}
-
-.story-step-num {
-  font-family: var(--mono);
-  font-size: 0.7rem;
-  color: var(--chartreuse);
-  background: rgba(183, 217, 86, 0.12);
-  border: 1px solid rgba(183, 217, 86, 0.3);
-  padding: 2px 9px;
-  border-radius: 999px;
-  white-space: nowrap;
-  flex-shrink: 0;
-}
-
-.story-caption {
-  font-size: 0.92rem;
-  line-height: 1.48;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  z-index: 15;
+  max-width: min(88%, 820px);
+  background: rgba(14, 16, 12, 0.86);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(244, 241, 232, 0.14);
+  border-radius: 14px;
+  padding: 7px 18px;
+  font-size: 0.81rem;
+  line-height: 1.4;
   color: var(--cream);
-  min-height: 1.6em;
+  text-align: center;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
 }
 
-.story-caption strong { color: var(--chartreuse); font-weight: 600; }
-.story-caption .coral-txt { color: #ff9c87; font-weight: 600; }
-.story-caption code { font-family: var(--mono); font-size: 0.85em; color: var(--amber); }
+.scene-subtitle strong { color: var(--chartreuse); font-weight: 600; }
+.scene-subtitle .coral-txt { color: #ff9c87; font-weight: 600; }
+.scene-subtitle code { font-family: var(--mono); font-size: 0.84em; color: var(--amber); }
 
-.story-nav {
+.code-card {
+  position: absolute;
+  transform: translate(-50%, -50%) scale(0.88);
+  opacity: 0;
+  transition: all 0.55s cubic-bezier(0.22, 1, 0.36, 1);
+  width: 238px;
+  background: rgba(18, 22, 16, 0.96);
+  border: 1px solid rgba(183, 217, 86, 0.48);
+  border-radius: 13px;
+  padding: 9px 12px;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.55), 0 0 24px rgba(183, 217, 86, 0.15);
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  line-height: 1.5;
+  text-align: left;
+  z-index: 9;
+  pointer-events: none;
+}
+
+.code-card.visible {
+  opacity: 1;
+  transform: translate(-50%, -50%) scale(1);
+}
+
+.cc-head {
+  display: flex;
+  justify-content: space-between;
+  color: #a9a599;
+  margin-bottom: 5px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid rgba(244, 241, 232, 0.1);
+}
+
+.cc-add { color: var(--chartreuse); display: block; }
+.cc-del { color: #ff9c87; display: block; opacity: 0.85; }
+.cc-act { color: var(--amber); display: block; margin-top: 4px; }
+
+/* Single-line Organic Mycelial Timeline (only the vine, spore dots & minimal controls) */
+.myc-timeline {
+  margin-top: 12px;
   display: flex;
   align-items: center;
-  gap: 18px;
+  gap: 16px;
+  height: 36px;
+  padding: 0 4px;
 }
 
 .tl-track-wrap {
   position: relative;
   flex: 1;
-  height: 26px;
+  height: 34px;
   display: flex;
   align-items: center;
 }
 
-.tl-line-bg {
+.tl-vine-svg {
   position: absolute;
-  left: 6px;
-  right: 6px;
-  height: 2px;
-  background: rgba(244, 241, 232, 0.18);
-  border-radius: 2px;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
 }
 
-.tl-line-fill {
-  position: absolute;
-  left: 6px;
-  height: 2px;
-  width: 0%;
-  background: linear-gradient(90deg, var(--chartreuse), var(--amber));
-  border-radius: 2px;
-  transition: width 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+.tl-vine-bg {
+  fill: none;
+  stroke: rgba(244, 241, 232, 0.16);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+
+.tl-vine-bg.thin {
+  stroke: rgba(244, 241, 232, 0.08);
+  stroke-width: 1;
+  stroke-dasharray: 3 5;
+}
+
+.tl-vine-grow {
+  fill: none;
+  stroke: url(#vineGrad);
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 0.7s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.tl-vine-grow.secondary {
+  stroke: rgba(183, 217, 86, 0.45);
+  stroke-width: 1.25;
 }
 
 .tl-dots {
   position: relative;
-  z-index: 2;
+  z-index: 3;
   width: 100%;
   display: flex;
   justify-content: space-between;
@@ -872,33 +901,53 @@ header {
   height: 14px;
   padding: 0;
   border-radius: 50%;
-  border: 2px solid rgba(244, 241, 232, 0.34);
+  border: 2px solid rgba(244, 241, 232, 0.3);
   background: #141712;
   cursor: pointer;
-  transition: transform 0.2s ease, border-color 0.2s ease, background 0.2s ease, box-shadow 0.2s ease;
+  transition: transform 0.22s ease, border-color 0.22s ease, background 0.22s ease, box-shadow 0.22s ease;
 }
 
 .tl-dot:hover,
 .tl-dot:focus-visible {
-  transform: scale(1.28);
+  transform: scale(1.32);
   border-color: var(--chartreuse);
   outline: none;
 }
 
-.tl-dot.passed { background: var(--olive); border-color: var(--chartreuse); }
+.tl-dot.passed {
+  background: var(--olive);
+  border-color: var(--chartreuse);
+  box-shadow: 0 0 10px rgba(183, 217, 86, 0.28);
+}
 
 .tl-dot.active {
   background: var(--chartreuse);
   border-color: var(--cream);
-  transform: scale(1.32);
-  box-shadow: 0 0 0 5px rgba(183, 217, 86, 0.22);
+  transform: scale(1.36);
+  box-shadow: 0 0 0 5px rgba(183, 217, 86, 0.22), 0 0 16px rgba(183, 217, 86, 0.65);
+}
+
+/* Delicate organic spore halo rings on active dot */
+.tl-dot.active::before {
+  content: "";
+  position: absolute;
+  inset: -6px;
+  border-radius: 50%;
+  border: 1px dashed rgba(232, 163, 49, 0.55);
+  animation: spinSlow 9s linear infinite;
+  pointer-events: none;
+}
+
+@keyframes spinSlow {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 
 /* Popover tooltip on dot hover/focus */
 .tl-dot::after {
   content: attr(data-tip);
   position: absolute;
-  bottom: calc(100% + 12px);
+  bottom: calc(100% + 14px);
   left: 50%;
   transform: translateX(-50%) translateY(4px);
   background: var(--stone-light);
@@ -909,11 +958,11 @@ header {
   padding: 5px 10px;
   border-radius: 8px;
   white-space: nowrap;
-  box-shadow: 0 12px 26px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 12px 26px rgba(0, 0, 0, 0.55);
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.18s ease, transform 0.18s ease;
-  z-index: 20;
+  z-index: 25;
 }
 
 .tl-dot:first-child::after { left: 0; transform: translateX(0) translateY(4px); }
@@ -934,7 +983,7 @@ header {
   color: var(--cream);
   font-family: var(--mono);
   font-size: 0.68rem;
-  padding: 5px 11px;
+  padding: 4px 10px;
   border-radius: 999px;
   cursor: pointer;
 }
