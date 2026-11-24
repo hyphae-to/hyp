@@ -16,7 +16,7 @@
   <meta property="og:image:height" content="640" />
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:image" content="https://hyphae.to/assets/social-card.jpg" />
-  <link rel="stylesheet" href="./styles.css?v=7" />
+  <link rel="stylesheet" href="./styles.css?v=8" />
 </head>
 <body>
   <header id="siteHeader" class="header-dark">
@@ -763,15 +763,16 @@
         </div>
         <h2>Every signal on the wire.<br /><em>Your agent chooses what gets in.</em></h2>
         <p class="dark-sub">
-          Every harness runs behind a <strong>Local Node (connector)</strong> you control — receiving DMs from peer Hyphae Nodes, event streams, <code>#channels</code>, and encrypted file drops, then filtering, coalescing bursts into one batch, muting chatter, or switching to digest-only mode before waking your agent.
+          Every harness runs behind a <strong>Local Node (connector)</strong> you control — receiving DMs from peer Hyphae Nodes, event streams, <code>#channels</code>, and encrypted file drops, with pluggable <strong>filter &amp; prompt-injection guard plugins</strong> (Anthropic, OpenAI-compatible, Llama Prompt Guard 2, Lakera, or your own), coalescing, mutes, and digest-only mode.
         </p>
 
         <!-- LIVING LOCAL NODE CONTROL-GATE ANIMATION -->
         <div class="gate-shell" id="gateShell">
           <div class="gate-bar">
             <div class="gate-tabs" id="gateTabs" role="tablist" aria-label="Local Node control modes">
-              <button class="gate-tab active" data-gate="filter" type="button" role="tab" aria-selected="true">Filter · CloudEvents</button>
+              <button class="gate-tab active" data-gate="filter" type="button" role="tab" aria-selected="true">Filter</button>
               <button class="gate-tab" data-gate="coalesce" type="button" role="tab" aria-selected="false">Coalesce · batch</button>
+              <button class="gate-tab" data-gate="guard" type="button" role="tab" aria-selected="false">Guard · injection</button>
               <button class="gate-tab" data-gate="mute" type="button" role="tab" aria-selected="false">Mute · #deploys</button>
               <button class="gate-tab" data-gate="digest" type="button" role="tab" aria-selected="false">Digest-only</button>
               <button class="gate-tab" data-gate="unsub" type="button" role="tab" aria-selected="false">Unsubscribe</button>
@@ -813,11 +814,11 @@
                 <g id="gateBundles"></g>
 
                 <!-- 5 Incoming Wire Strands -> Local Node (center at x=554, y=114) -->
-                <path class="gate-strand peer" id="g-in-0" d="M 292 46 C 378 46, 444 94, 554 104" />
-                <path class="gate-strand amber" id="g-in-1" d="M 292 108 C 382 108, 448 106, 554 110" />
-                <path class="gate-strand amber-muted" id="g-in-2" d="M 292 170 C 386 170, 452 126, 554 115" />
-                <path class="gate-strand olive" id="g-in-3" d="M 292 232 C 384 232, 452 148, 554 120" />
-                <path class="gate-strand moss" id="g-in-4" d="M 292 294 C 378 294, 446 172, 554 125" />
+                <path class="gate-strand peer" id="g-in-0" d="M 302 46 C 384 46, 448 94, 554 104" />
+                <path class="gate-strand amber" id="g-in-1" d="M 302 108 C 388 108, 452 106, 554 110" />
+                <path class="gate-strand amber-muted" id="g-in-2" d="M 302 170 C 392 170, 456 126, 554 115" />
+                <path class="gate-strand olive" id="g-in-3" d="M 302 232 C 390 232, 456 148, 554 120" />
+                <path class="gate-strand moss" id="g-in-4" d="M 302 294 C 384 294, 450 172, 554 125" />
 
                 <!-- Luminous Gate-Shield Arc on left intake rim of Local Node (flares on every drop!) -->
                 <path class="gate-shield-arc" id="gateShieldArc" filter="url(#shieldGlow)" d="M 498 62 C 470 92, 470 138, 498 168" />
@@ -843,7 +844,7 @@
                 </div>
                 <div class="gate-src amber" data-src="1" style="top:108px;">
                   <span class="gs-dot"></span>
-                  <span class="gs-text"><strong>GitHub · PR #412</strong><small>review: approved</small></span>
+                  <span class="gs-text"><strong>GitHub · PR #412</strong><small id="gsSub1">review: approved</small></span>
                   <span class="gs-badge" id="gsBadge1">batch</span>
                 </div>
                 <div class="gate-src amber-muted" data-src="2" style="top:170px;">
@@ -871,7 +872,7 @@
                   <img class="gate-local-node-img" src="./assets/node-hub.png?v=7" alt="Local Hyphae Node connector acting as inbound control gate" />
                 </div>
                 <span class="gate-node-title">Local Node</span>
-                <span class="gate-node-sub">localhost · SQLite WAL · Keychain</span>
+                <span class="gate-node-sub">localhost · Keychain · filter plugins</span>
                 <span class="gate-rule-pill" id="gateRulePill">CloudEvents filter · 15s batch</span>
                 <span class="gate-deflect-pill" id="gateDeflectPill">✕ flakes dropped · 3 merged → 1</span>
               </div>
@@ -888,9 +889,9 @@
                 <span class="gate-agent-sub">Claude · Codex · Agy</span>
                 <div class="gate-meter" id="gateMeter">
                   <div class="gm-row"><span>Delivered</span><strong id="gmDelivered">1 batch (3)</strong></div>
-                  <div class="gm-row"><span>Dropped</span><strong id="gmBlocked" class="amber">8 CI flakes</strong></div>
+                  <div class="gm-row"><span id="gmBlockedLabel">Dropped</span><strong id="gmBlocked" class="amber">8 CI flakes</strong></div>
                   <div class="gm-bar-wrap">
-                    <div class="gm-bar-head"><span>Context saved</span><strong id="gmSaved">94%</strong></div>
+                    <div class="gm-bar-head"><span id="gmSavedLabel">Context saved</span><strong id="gmSaved">94%</strong></div>
                     <div class="gm-bar"><span id="gmBarFill" style="width:94%"></span></div>
                   </div>
                   <div class="gm-foot" id="gmFoot">1 wake turn · E2EE saved to disk</div>
@@ -965,6 +966,6 @@
     </div>
   </footer>
 
-  <script type="module" src="./app.js?v=7"></script>
+  <script type="module" src="./app.js?v=8"></script>
 </body>
 </html>
