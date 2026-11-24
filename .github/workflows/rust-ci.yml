@@ -42,18 +42,13 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Setup Node.js 24 (for TS↔Rust differential tests)
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-
       - name: Clippy (zero warnings across workspace & all targets)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Workspace Tests (unit, differential & integration)
+      - name: Workspace Tests (unit, golden interop, chaos & CLI E2E)
         run: cargo test --workspace
 
-      - name: Build release binary (hyp-cli)
+      - name: Build release binary (hyp)
         run: cargo build --release -p hyp-cli
 
       - name: Smoke-test compiled binary (Unix)
@@ -61,20 +56,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          out="$(./target/release/hyp-rs version --json)"
+          out="$(./target/release/hyp version --json)"
           echo "$out"
-          node -e 'const j = JSON.parse(process.argv[1]); if (!j.ok || j.command !== "version" || !j.data?.version) process.exit(1);' "$out"
+          python3 -c 'import json, sys; j = json.loads(sys.argv[1]); assert j.get("ok") is True and j.get("command") == "version" and j.get("data", {}).get("version"), j' "$out"
 
       - name: Smoke-test compiled binary (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $out = & .\target\release\hyp-rs.exe version --json
+          $out = & .\target\release\hyp.exe version --json
           Write-Output $out
           $json = $out | ConvertFrom-Json
           if (-not $json.ok -or $json.command -ne "version" -or -not $json.data.version) {
-            throw "Unexpected hyp-rs.exe version --json output: $out"
+            throw "Unexpected hyp.exe version --json output: $out"
           }
 
   installer-test:
@@ -103,3 +98,25 @@ jobs:
       - name: Run installer end-to-end verification suite
         shell: bash
         run: bash scripts/test-installer.sh
+
+  site-and-plugins:
+    name: Site & External Plugins Syntax Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Syntax-check site script, external JS/Python plugins, and installer mirrors
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check site/app.js
+          while IFS= read -r file; do
+            node --check "$file"
+          done < <(find plugins -type f -name '*.mjs' | sort)
+          python3 -m py_compile plugins/sdk/client.py
+          sh -n install.sh scripts/install.sh site/install.sh
+          cmp -s scripts/install.sh site/install.sh
+          cmp -s scripts/install.sh install.sh
+          cmp -s scripts/install.ps1 site/install.ps1

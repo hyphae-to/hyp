@@ -1,4 +1,4 @@
-//! Comprehensive integration tests for `hyp-rs deploy` and `hyp-rs pair`.
+//! Comprehensive integration tests for `hyp deploy` and `hyp pair`.
 //!
 //! Security & isolation invariants:
 //! - Uses `tempfile::TempDir` everywhere (NEVER touches live macOS Keychain or `~/.config/hyphae`).
@@ -27,7 +27,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 
 fn hyp_rs_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_hyp-rs")
+    env!("CARGO_BIN_EXE_hyp")
 }
 
 fn spawn_one_shot_http_server(status_line: &str, body: String) -> (String, thread::JoinHandle<()>) {
@@ -1320,7 +1320,7 @@ fn pair_join_verifies_live_rust_node_manifest_rejects_tampered_and_supports_offl
     let hub_tmp = tempfile::tempdir().unwrap();
     let client_tmp = tempfile::tempdir().unwrap();
 
-    // 1. Start a live native Rust `hyp-rs node start --profile router --bind 127.0.0.1:0` serving `/v1/manifest`
+    // 1. Start a live native Rust `hyp node start --profile router --bind 127.0.0.1:0` serving `/v1/manifest`
     let mut hub_child = Command::new(hyp_rs_bin())
         .args([
             "node",
@@ -1353,7 +1353,7 @@ fn pair_join_verifies_live_rust_node_manifest_rejects_tampered_and_supports_offl
     let hub_endpoint = hub_env["data"]["endpoint"].as_str().unwrap().to_string();
     let hub_kid = hub_env["data"]["kid"].as_str().unwrap().to_string();
 
-    // 2. Run `hyp-rs pair join <hub_endpoint> --state-dir <client_tmp> --json`
+    // 2. Run `hyp pair join <hub_endpoint> --state-dir <client_tmp> --json`
     let join_out = Command::new(hyp_rs_bin())
         .args([
             "pair",

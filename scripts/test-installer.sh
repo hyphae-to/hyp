@@ -78,7 +78,7 @@ TAMPER_DIR="${SERVE_ROOT}/tampered"
 STAGE_DIR="${TMP_ROOT}/stage"
 mkdir -p "$GOOD_DIR" "$TAMPER_DIR" "$STAGE_DIR"
 
-cp "${REPO_ROOT}/target/release/hyp-rs" "${STAGE_DIR}/hyp"
+cp "${REPO_ROOT}/target/release/hyp" "${STAGE_DIR}/hyp"
 chmod 0755 "${STAGE_DIR}/hyp"
 tar -C "$STAGE_DIR" -czf "${GOOD_DIR}/${ARCHIVE_NAME}" hyp
 
@@ -212,6 +212,10 @@ sh -n "${REPO_ROOT}/site/install.sh"
 
 if ! cmp -s "${REPO_ROOT}/scripts/install.sh" "${REPO_ROOT}/site/install.sh"; then
   echo "FAIL [Test 3]: scripts/install.sh and site/install.sh differ!" >&2
+  exit 1
+fi
+if ! cmp -s "${REPO_ROOT}/scripts/install.sh" "${REPO_ROOT}/install.sh"; then
+  echo "FAIL [Test 3]: scripts/install.sh and root install.sh differ!" >&2
   exit 1
 fi
 if ! cmp -s "${REPO_ROOT}/scripts/install.ps1" "${REPO_ROOT}/site/install.ps1"; then

@@ -1,4 +1,4 @@
-//! `hyp-rs secret` — Zero-leak secret management backed by `hyp-crypto::keystore::SecretStore`.
+//! `hyp secret` — Zero-leak secret management backed by `hyp-crypto::keystore::SecretStore`.
 //!
 //! Security invariants:
 //! - Secrets are NEVER accepted via CLI argv flags (no `--value` flag!).
@@ -167,7 +167,7 @@ fn run_secret_set(
             EXIT_USAGE,
             "MISSING_NAME",
             "Missing secret name (pass `<name>` or `--name <name>`)",
-            Some("Example: printf '%s' \"$API_KEY\" | hyp-rs secret set anthropic-api-key".to_string()),
+            Some("Example: printf '%s' \"$API_KEY\" | hyp secret set anthropic-api-key".to_string()),
         );
     };
 
@@ -281,7 +281,7 @@ fn run_secret_set(
             "EMPTY_SECRET",
             format!("No secret value received on stdin for '{name}'"),
             Some(format!(
-                "Pipe secret over stdin (`hyp-rs secret set {name} <<< \"$SECRET\"`) or run `hyp-rs secret set {name} --web`."
+                "Pipe secret over stdin (`hyp secret set {name} <<< \"$SECRET\"`) or run `hyp secret set {name} --web`."
             )),
         );
     }
@@ -378,7 +378,7 @@ fn run_secret_list(state_dir: Option<PathBuf>, as_json: bool) -> ExitCode {
             })),
             warnings,
             next: if items.is_empty() {
-                vec!["hyp-rs secret set <name> --web".to_string()]
+                vec!["hyp secret set <name> --web".to_string()]
             } else {
                 Vec::new()
             },
@@ -466,7 +466,7 @@ fn run_secret_delete(
             EXIT_ERROR,
             "SECRET_NOT_FOUND",
             format!("Secret '{name}' was not found"),
-            Some("Run `hyp-rs secret list` to inspect stored secrets.".to_string()),
+            Some("Run `hyp secret list` to inspect stored secrets.".to_string()),
         ),
         Err(e) => emit_error(
             cmd,

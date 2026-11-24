@@ -1,4 +1,4 @@
-//! Shared config, state-dir, secret-store, and atomic private file helpers for `hyp-rs`.
+//! Shared config, state-dir, secret-store, and atomic private file helpers for `hyp`.
 //!
 //! Supports both Hyphae v2 `node.json` and transparent legacy v1 `connector.json` auto-reading,
 //! with portable `#[cfg(unix)]` / `#[cfg(not(unix))]` permissions enforcement.

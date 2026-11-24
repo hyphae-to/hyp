@@ -1,9 +1,9 @@
-//! `hyp-rs setup` & `hyp-rs onboard` — Zero-Node-prerequisite harness configurator and
+//! `hyp setup` & `hyp onboard` — Zero-Node-prerequisite harness configurator and
 //! one-command node bootstrapper.
 //!
 //! Configures all 9 supported harnesses (`antigravity`, `claude`, `codex`, `cursor`, `opencode`,
 //! `gemini`, `openclaw`, `herdr`, `t3`) idempotently, preserving existing user JSON/TOML settings
-//! and pointing hooks & MCP entries directly to the static Rust `hyp-rs` binary.
+//! and pointing hooks & MCP entries directly to the static Rust `hyp` binary.
 
 use crate::config_file::{
     default_node_id, ensure_dir, ensure_v2_node_json_defaults, open_secret_store, profile_as_str,
@@ -156,7 +156,7 @@ pub fn run_setup(args: SetupArgs) -> ExitCode {
 
     if targets.is_empty() {
         warnings.push(format!(
-            "No installed harnesses detected under {}. Run `hyp-rs setup --harness all --home {}` to configure all 9 harnesses.",
+            "No installed harnesses detected under {}. Run `hyp setup --harness all --home {}` to configure all 9 harnesses.",
             home.display(),
             home.display()
         ));
@@ -188,11 +188,11 @@ pub fn run_setup(args: SetupArgs) -> ExitCode {
     let next = if args.dry_run {
         vec!["Re-run without --dry-run to apply the planned harness changes.".to_string()]
     } else if results.is_empty() {
-        vec!["hyp-rs setup --harness all".to_string()]
+        vec!["hyp setup --harness all".to_string()]
     } else {
         vec![
-            "hyp-rs doctor".to_string(),
-            "hyp-rs node start".to_string(),
+            "hyp doctor".to_string(),
+            "hyp node start".to_string(),
         ]
     };
 
@@ -431,23 +431,23 @@ pub fn run_onboard(args: OnboardArgs) -> ExitCode {
 
     let mut next = vec![
         format!(
-            "hyp-rs node start --config {} --state-dir {}",
+            "hyp node start --config {} --state-dir {}",
             config_path.display(),
             state_dir.display()
         ),
         format!(
-            "hyp-rs status --state-dir {}",
+            "hyp status --state-dir {}",
             state_dir.display()
         ),
         format!(
-            "hyp-rs doctor --state-dir {} --config {}",
+            "hyp doctor --state-dir {} --config {}",
             state_dir.display(),
             config_path.display()
         ),
     ];
     if configured_harnesses.is_empty() {
         next.push(format!(
-            "hyp-rs setup --harness all --home {}",
+            "hyp setup --harness all --home {}",
             home.display()
         ));
     }
@@ -560,7 +560,7 @@ fn read_and_stage_join_token(
                 EXIT_USAGE,
                 "RAW_TOKEN_IN_ARGV",
                 "Refusing raw pairing token in CLI argv (leaks to process list `ps`)".to_string(),
-                Some("Write the token to a 0600 file and pass `--join <file>`, or pipe via stdin (`hyp-rs onboard --join - <<< '<token>'`).".to_string()),
+                Some("Write the token to a 0600 file and pass `--join <file>`, or pipe via stdin (`hyp onboard --join - <<< '<token>'`).".to_string()),
             ));
         }
         #[cfg(unix)]
@@ -688,7 +688,7 @@ fn resolve_binary_path(explicit: Option<&Path>) -> Result<String, String> {
         return Ok(p.display().to_string());
     }
     let exe = std::env::current_exe()
-        .map_err(|e| format!("failed to determine current hyp-rs binary path: {e}"))?;
+        .map_err(|e| format!("failed to determine current hyp binary path: {e}"))?;
     Ok(exe.display().to_string())
 }
 
@@ -833,7 +833,7 @@ pub fn detect_harness_statuses(home: &Path, config_path: Option<&Path>) -> Vec<H
                 "Not detected".to_string()
             };
             let fix = if detected && !configured {
-                Some(format!("hyp-rs setup --harness {}", kind.as_str()))
+                Some(format!("hyp setup --harness {}", kind.as_str()))
             } else {
                 None
             };
@@ -876,7 +876,7 @@ fn mcp_args(socket: Option<&str>, extra: &[&str]) -> Vec<Value> {
 fn contains_hyphae_hook(content: &str) -> bool {
     content.contains("hyphae")
         || content.contains("agents-mesh")
-        || content.contains("hyp-rs hook ")
+        || content.contains("hyp hook ")
         || content.contains("hyp hook ")
         || [
             "hook antigravity",
@@ -1207,7 +1207,7 @@ fn setup_codex(
         .collect();
     let toml_block = format!(
         "[mcp_servers.hyphae]\ncommand = {}\nargs = [{}]\nenv_vars = [\"CODEX_HOME\", \"HYPHAE_SOCKET\"]",
-        serde_json::to_string(bin).unwrap_or_else(|_| "\"hyp-rs\"".to_string()),
+        serde_json::to_string(bin).unwrap_or_else(|_| "\"hyp\"".to_string()),
         args_vec.join(", ")
     );
     let existing_toml = if config_toml.exists() {
@@ -1396,9 +1396,9 @@ fn setup_opencode(
     let sock_arg = socket
         .map(|s| format!(", \"--socket\", {}", serde_json::to_string(s).unwrap_or_default()))
         .unwrap_or_default();
-    let bin_json = serde_json::to_string(bin).unwrap_or_else(|_| "\"hyp-rs\"".to_string());
+    let bin_json = serde_json::to_string(bin).unwrap_or_else(|_| "\"hyp\"".to_string());
     let plugin_source = format!(
-        "// Auto-generated by hyp-rs setup --harness opencode (static Rust binary)\n\
+        "// Auto-generated by hyp setup --harness opencode (static Rust binary)\n\
          import {{ execFile }} from \"node:child_process\";\n\
          const HYP_BIN = {bin_json};\n\
          function runMeshHook(event: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {{\n\

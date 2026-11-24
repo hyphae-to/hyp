@@ -1,23 +1,23 @@
 # Deploying & Pairing Hyphae v2 Nodes
 
-Hyphae v2 collapses the legacy *Connector vs. Router* split into **one unified `Node` binary** configured by profile (`local`, `router`, or `p2p`). Use `hyp-rs deploy` to generate hardened internet deployment kits and validate live security posture, and `hyp-rs pair` to issue and inspect permissioned invites without ever leaking tokens into CLI arguments.
+Hyphae v2 collapses the legacy *Connector vs. Router* split into **one unified `Node` binary** configured by profile (`local`, `router`, or `p2p`). Use `hyp deploy` to generate hardened internet deployment kits and validate live security posture, and `hyp pair` to issue and inspect permissioned invites without ever leaking tokens into CLI arguments.
 
 ---
 
 ## 1. Choose an Internet Deployment Path
 
-Run `hyp-rs deploy providers` (or `hyp-rs deploy providers --json`) to inspect all six supported methods and auto-detect installed local tools (`tailscale`, `cloudflared`, `docker`, `caddy`, `flyctl`, `systemctl`):
+Run `hyp deploy providers` (or `hyp deploy providers --json`) to inspect all six supported methods and auto-detect installed local tools (`tailscale`, `cloudflared`, `docker`, `caddy`, `flyctl`, `systemctl`):
 
 | Provider | TLS Termination | NAT / Firewall Requirement | Best For | Generator Command |
 | --- | --- | --- | --- | --- |
-| **`tailscale`** | Tailscale Serve MagicDNS HTTPS (+ optional path-scoped Funnel) | Zero open ports; works behind CGNAT | Multi-machine private meshes & direct P2P laptops | `hyp-rs deploy init tailscale` |
-| **`vps`** | Caddy automatic Let's Encrypt HTTPS (`flush_interval -1`) | Public IP with inbound TCP 80/443; Hyphae on `127.0.0.1:8790` | Production team hubs on Hetzner / DO / AWS / Linode | `hyp-rs deploy init vps` |
-| **`docker`** | Caddy sidecar auto-TLS on isolated bridge network | Only Caddy publishes 80/443; `hyphae-node` stays internal | Container-first teams & CI/CD rollouts | `hyp-rs deploy init docker` |
-| **`cloudflare`** | Cloudflare Edge TLS over outbound `cloudflared` tunnel | Zero open inbound ports; works behind CGNAT/homelabs | Homelabs, residential ISPs, and NAT'd devboxes | `hyp-rs deploy init cloudflare` |
-| **`fly`** | Fly Proxy auto-HTTPS (`force_https = true`) | Managed edge; `min_machines_running = 1` keeps SSE warm | Zero-ops always-on cloud hubs in < 3 minutes | `hyp-rs deploy init fly` |
-| **`public-node`** | Caddy auto-TLS + systemd + Docker Compose kit | Public HTTPS 80/443; `guest-ro` confined read-only hub | Hosting `public.hyphae.to` or an OSS GitHub event hub | `hyp-rs deploy init public-node` |
+| **`tailscale`** | Tailscale Serve MagicDNS HTTPS (+ optional path-scoped Funnel) | Zero open ports; works behind CGNAT | Multi-machine private meshes & direct P2P laptops | `hyp deploy init tailscale` |
+| **`vps`** | Caddy automatic Let's Encrypt HTTPS (`flush_interval -1`) | Public IP with inbound TCP 80/443; Hyphae on `127.0.0.1:8790` | Production team hubs on Hetzner / DO / AWS / Linode | `hyp deploy init vps` |
+| **`docker`** | Caddy sidecar auto-TLS on isolated bridge network | Only Caddy publishes 80/443; `hyphae-node` stays internal | Container-first teams & CI/CD rollouts | `hyp deploy init docker` |
+| **`cloudflare`** | Cloudflare Edge TLS over outbound `cloudflared` tunnel | Zero open inbound ports; works behind CGNAT/homelabs | Homelabs, residential ISPs, and NAT'd devboxes | `hyp deploy init cloudflare` |
+| **`fly`** | Fly Proxy auto-HTTPS (`force_https = true`) | Managed edge; `min_machines_running = 1` keeps SSE warm | Zero-ops always-on cloud hubs in < 3 minutes | `hyp deploy init fly` |
+| **`public-node`** | Caddy auto-TLS + systemd + Docker Compose kit | Public HTTPS 80/443; `guest-ro` confined read-only hub | Hosting `public.hyphae.to` or an OSS GitHub event hub | `hyp deploy init public-node` |
 
-> **Overwrite safety:** `hyp-rs deploy init` refuses to overwrite existing files in `--out` unless you explicitly pass `--force`.
+> **Overwrite safety:** `hyp deploy init` refuses to overwrite existing files in `--out` unless you explicitly pass `--force`.
 
 ---
 
@@ -28,14 +28,14 @@ Run `hyp-rs deploy providers` (or `hyp-rs deploy providers --json`) to inspect a
 Zero open public ports. Hyphae binds strictly to `127.0.0.1:8790` and Tailscale terminates TLS inside your tailnet:
 
 ```sh
-hyp-rs deploy init tailscale \
+hyp deploy init tailscale \
   --node-id acme-tailnet \
   --domain hyphae.your-tailnet.ts.net \
   --out ./deploy-tailscale
 
-hyp-rs deploy check --config ./deploy-tailscale/node.json
+hyp deploy check --config ./deploy-tailscale/node.json
 bash ./deploy-tailscale/tailscale-serve.sh
-hyp-rs deploy check --url https://hyphae.your-tailnet.ts.net --config ./deploy-tailscale/node.json
+hyp deploy check --url https://hyphae.your-tailnet.ts.net --config ./deploy-tailscale/node.json
 ```
 
 > **Webhook Funnel rule:** If you need external GitHub webhooks, expose **only** the webhook subpath (`tailscale funnel --bg --https=443 --set-path=/webhooks http://127.0.0.1:8790/webhooks`) — never Funnel the full peer/admin surface.
@@ -45,7 +45,7 @@ hyp-rs deploy check --url https://hyphae.your-tailnet.ts.net --config ./deploy-t
 Generates `node.json`, `Caddyfile` (with **`flush_interval -1`** so SSE `/v1/inbox` events flush immediately with zero proxy buffering), and a hardened `hyphae-node.service` (`StateDirectory=hyphae`, `StateDirectoryMode=0700`, `ProtectSystem=strict`, `NoNewPrivileges=yes`, `UMask=0077`):
 
 ```sh
-hyp-rs deploy init vps \
+hyp deploy init vps \
   --node-id acme-team \
   --domain mesh.example.com \
   --out ./deploy-vps
@@ -57,7 +57,7 @@ sudo cp ./deploy-vps/Caddyfile /etc/caddy/Caddyfile
 sudo systemctl daemon-reload
 sudo systemctl enable --now hyphae-node caddy
 
-hyp-rs deploy check --url https://mesh.example.com --config /etc/hyphae/node.json
+hyp deploy check --url https://mesh.example.com --config /etc/hyphae/node.json
 ```
 
 Checked-in reference units also live at `deploy/Caddyfile.example` and `deploy/systemd/hyphae-node.service`.
@@ -67,13 +67,13 @@ Checked-in reference units also live at `deploy/Caddyfile.example` and `deploy/s
 Pairs a minimal multi-stage static Rust `Dockerfile` (non-root UID `10001`, built-in `/v1/manifest` `HEALTHCHECK`) with `caddy:2-alpine` over a private Docker bridge network (`hyphae-node` never binds host port `8790`):
 
 ```sh
-hyp-rs deploy init docker \
+hyp deploy init docker \
   --node-id acme-team \
   --domain mesh.example.com \
   --out ./deploy-docker
 
 cd ./deploy-docker && docker compose up -d --build
-hyp-rs deploy check --url https://mesh.example.com --config ./node.json
+hyp deploy check --url https://mesh.example.com --config ./node.json
 ```
 
 Checked-in templates live at `deploy/Dockerfile` and `deploy/docker-compose.yml`.
@@ -83,7 +83,7 @@ Checked-in templates live at `deploy/Dockerfile` and `deploy/docker-compose.yml`
 Ideal behind CGNAT, office NAT, or homelabs with zero open inbound firewall ports:
 
 ```sh
-hyp-rs deploy init cloudflare \
+hyp deploy init cloudflare \
   --node-id homelab-node \
   --domain mesh.example.com \
   --out ./deploy-cloudflare
@@ -93,7 +93,7 @@ cloudflared tunnel route dns homelab-node mesh.example.com
 # Replace <TUNNEL_UUID> in ./deploy-cloudflare/cloudflared.yml, then run:
 cloudflared tunnel --config ./deploy-cloudflare/cloudflared.yml run
 
-hyp-rs deploy check --url https://mesh.example.com --config ./deploy-cloudflare/node.json
+hyp deploy check --url https://mesh.example.com --config ./deploy-cloudflare/node.json
 ```
 
 Checked-in reference config: `deploy/cloudflared.yml.example`.
@@ -103,7 +103,7 @@ Checked-in reference config: `deploy/cloudflared.yml.example`.
 Generates `fly.toml` with a persistent `/var/lib/hyphae` volume (preserving `node.sqlite` and keys), `force_https = true`, `/v1/manifest` health checks, and `min_machines_running = 1` + `auto_stop_machines = "off"` so long-lived SSE streams never drop:
 
 ```sh
-hyp-rs deploy init fly \
+hyp deploy init fly \
   --node-id fly-node \
   --domain hyphae-node.fly.dev \
   --out ./deploy-fly
@@ -112,7 +112,7 @@ cd ./deploy-fly
 flyctl apps create hyphae-node
 flyctl volumes create hyphae_data --size 1
 flyctl deploy
-hyp-rs deploy check --url https://hyphae-node.fly.dev --config ./node.json
+hyp deploy check --url https://hyphae-node.fly.dev --config ./node.json
 ```
 
 Checked-in reference config: `deploy/fly.toml.example`.
@@ -122,7 +122,7 @@ Checked-in reference config: `deploy/fly.toml.example`.
 Run a zero-friction public GitHub event hub for open-source repositories without exposing DMs, `#channels`, or KV writes:
 
 ```sh
-hyp-rs deploy init public-node \
+hyp deploy init public-node \
   --node-id public.hyphae.to \
   --domain public.hyphae.to \
   --out ./deploy-public
@@ -138,25 +138,25 @@ What this turnkey kit configures:
 
 ## 3. Permissioned Pairing Topologies
 
-Run `hyp-rs pair guide` (or `--mode team|p2p|public --json`) at any time for an agent-first reference.
+Run `hyp pair guide` (or `--mode team|p2p|public --json`) at any time for an agent-first reference.
 
 | Topology | Token Prefix | Trust Model | Invite Command | Peer Accept (Stdin-Safe!) |
 | --- | --- | --- | --- | --- |
-| **Team Hub** | `am2_` | Offline Org Admin-CA signs per-device grants; hub never holds the Admin private key | `hyp-rs pair invite --mode team --node-id acme-team --endpoint https://mesh.example.com --peer alice@laptop --preset member` | `hyp onboard --join <<< '<token>'` |
-| **Direct P2P** | `hp2p1_` | Zero central CA, zero TOFU window: OKP JWKs + 160-bit CSPRNG secret travel out-of-band | `hyp-rs pair invite --mode p2p --node-id alice@macbook --endpoint https://alice.tailnet.ts.net --grant dm:send dm:receive files:send=25mb --request kv:read=pair/*` | `hyp peer accept <<< '<token>'` |
-| **Public Read-Only** | `guest-ro` | Self-service read-only confined guest scopes (`exact.repo`, max 10 repos, 60 wakes/hr) | `hyp-rs deploy init public-node` | `hyp peer join https://public.hyphae.to` |
+| **Team Hub** | `am2_` | Offline Org Admin-CA signs per-device grants; hub never holds the Admin private key | `hyp pair invite --mode team --node-id acme-team --endpoint https://mesh.example.com --peer alice@laptop --preset member` | `hyp onboard --join <<< '<token>'` |
+| **Direct P2P** | `hp2p1_` | Zero central CA, zero TOFU window: OKP JWKs + 160-bit CSPRNG secret travel out-of-band | `hyp pair invite --mode p2p --node-id alice@macbook --endpoint https://alice.tailnet.ts.net --grant dm:send dm:receive files:send=25mb --request kv:read=pair/*` | `hyp peer accept <<< '<token>'` |
+| **Public Read-Only** | `guest-ro` | Self-service read-only confined guest scopes (`exact.repo`, max 10 repos, 60 wakes/hr) | `hyp deploy init public-node` | `hyp peer join https://public.hyphae.to` |
 
 ### Stdin-Only Token Inspection (Never Put Tokens in CLI Argv!)
 
-`hyp-rs pair inspect` deliberately has **no `--token <value>` flag** so secrets never leak to `ps` or shell history. Always pipe via stdin or read from a `0600` file:
+`hyp pair inspect` deliberately has **no `--token <value>` flag** so secrets never leak to `ps` or shell history. Always pipe via stdin or read from a `0600` file:
 
 ```sh
 # Inspect via stdin (recommended)
-hyp-rs pair inspect <<< "$HYPHAE_TOKEN"
-hyp-rs pair inspect --json <<< "$HYPHAE_TOKEN"
+hyp pair inspect <<< "$HYPHAE_TOKEN"
+hyp pair inspect --json <<< "$HYPHAE_TOKEN"
 
 # Or inspect from a 0600 file
-hyp-rs pair inspect --token-file /path/to/invite.token --json
+hyp pair inspect --token-file /path/to/invite.token --json
 ```
 
 `pair inspect` verifies `hp2p1_`, `am2_`, and legacy `t3mp1_` tokens with `hyp-crypto`, checks RFC 7638 JWK `kid` thumbprints, reports expiry (`OK` / `EXPIRED`, failing closed with exit code `1` on expired or tampered tokens), and frames any remote escalation note as untrusted external data (`untrusted: true`).
@@ -179,7 +179,7 @@ hyp-rs pair inspect --token-file /path/to/invite.token --json
 
 ## 4. Production Security Hardening Checklist
 
-Run `hyp-rs deploy check --url https://<your-domain> --config /etc/hyphae/node.json` after every deploy or upgrade:
+Run `hyp deploy check --url https://<your-domain> --config /etc/hyphae/node.json` after every deploy or upgrade:
 
 - [ ] **Loopback bind + TLS proxy:** Bind `127.0.0.1:8790` on VPS/Tailscale/Cloudflare hosts (or an internal non-published Docker bridge network). Never expose plaintext HTTP on `0.0.0.0:8790` directly to the internet.
 - [ ] **Zero-buffering SSE:** Verify Caddy sets `flush_interval -1` (and `read_timeout 0` / `write_timeout 0`) so `/v1/inbox` streams instantaneously.

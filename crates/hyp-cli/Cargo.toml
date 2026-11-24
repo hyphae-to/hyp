@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "hyp-rs"
+name = "hyp"
 path = "src/main.rs"
 
 [dependencies]

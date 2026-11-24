@@ -1,4 +1,4 @@
-//! `hyp-rs update` — Cryptographically signed self-update, atomic binary swap with
+//! `hyp update` — Cryptographically signed self-update, atomic binary swap with
 //! smoke-check rollback, `--all` fleet orchestration (remote first, local last), and
 //! 48h nightly / 168h stable agent notification cooldown.
 //!
@@ -671,7 +671,7 @@ fn run_update_channel(
                         "configPath": cfg_path.display().to_string(),
                     })),
                     warnings: Vec::new(),
-                    next: vec![format!("hyp-rs update check --channel {}", setting.as_str())],
+                    next: vec![format!("hyp update check --channel {}", setting.as_str())],
                     error: None,
                 };
                 print_json(&envelope);
@@ -877,8 +877,8 @@ fn run_update_check(
 
     let mut next = Vec::new();
     if update_available {
-        next.push(format!("hyp-rs update --channel {}", channel.as_str()));
-        next.push(format!("hyp-rs update dismiss {}", manifest.version));
+        next.push(format!("hyp update --channel {}", channel.as_str()));
+        next.push(format!("hyp update dismiss {}", manifest.version));
     }
 
     if as_json {
@@ -1208,7 +1208,7 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
                 "rolloutOrder": rollout_order,
             })),
             warnings,
-            next: vec!["hyp-rs version --json".to_string()],
+            next: vec!["hyp version --json".to_string()],
             error: if ok {
                 None
             } else {
@@ -1271,7 +1271,7 @@ fn print_fleet_table(plan: &[FleetPeerPlan]) {
     }
 }
 
-/// Classifies a paired peer for `hyp-rs update --all`:
+/// Classifies a paired peer for `hyp update --all`:
 /// ONLY peers with `PeerStatus::Active`, reachable `endpoint`, `node:update` scope, AND
 /// `node.self-update.v1` advertised capability are `ELIGIBLE`. Public guest hubs (`public.hyphae.to`)
 /// and teammate peers without `node:update` are cleanly `SKIPPED`.
@@ -1379,7 +1379,7 @@ async fn download_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>, (&'stati
         .uri(&uri)
         .header(
             header::USER_AGENT,
-            format!("hyp-rs/{}", env!("CARGO_PKG_VERSION")),
+            format!("hyp/{}", env!("CARGO_PKG_VERSION")),
         )
         .body(Empty::new())
         .map_err(|e| ("HTTP_ERROR", format!("Failed to build request: {e}")))?;
@@ -1439,7 +1439,7 @@ async fn trigger_remote_peer_update(
         .header(header::CONTENT_TYPE, "application/json")
         .header(
             header::USER_AGENT,
-            format!("hyp-rs/{}", env!("CARGO_PKG_VERSION")),
+            format!("hyp/{}", env!("CARGO_PKG_VERSION")),
         )
         .body(Full::new(Bytes::from(body)))
         .map_err(|e| format!("failed to construct remote update request: {e}"))?;
@@ -1666,7 +1666,7 @@ fn extract_binary_into_stage(
             })
             .ok_or_else(|| SwapFailure {
                 code: "EXTRACT_FAILED",
-                message: "Release tar.gz archive did not contain a 'hyp' or 'hyp-rs' executable"
+                message: "Release tar.gz archive did not contain a 'hyp' executable"
                     .to_string(),
                 rolled_back: false,
                 original_preserved: true,

@@ -1,7 +1,7 @@
-//! `hyp-rs` — Hyphae v2 native CLI (`hook`, `mcp`, `wait`, `watch`, `node`/`daemon`, `onboard`,
+//! `hyp` — Hyphae v2 native CLI (`hook`, `mcp`, `wait`, `watch`, `node`/`daemon`, `onboard`,
 //! `setup`, `status`, `doctor`, `secret`, `gate`, `inbox`, `kv`, `update`, `deploy`, `pair`, `version`).
 //!
-//! Performance note: `hyp-rs hook` intercepts `std::env::args()` BEFORE constructing `clap`
+//! Performance note: `hyp hook` intercepts `std::env::args()` BEFORE constructing `clap`
 //! or Tokio so hook invocations pay zero async-runtime startup overhead (1–3 ms cold start).
 
 mod config_file;
@@ -30,7 +30,7 @@ use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE};
 
 #[derive(Parser)]
 #[command(
-    name = "hyp-rs",
+    name = "hyp",
     about = "Hyphae v2 native CLI (hook, mcp, wait, watch, node, onboard, setup, status, doctor, secret, gate, inbox, kv, update, deploy, pair, version)",
     version
 )]
@@ -179,7 +179,7 @@ fn current_cli_command() -> String {
         .unwrap_or_else(|| "hyp".to_string())
 }
 
-/// Zero-clap, zero-Tokio fast path for `hyp-rs hook <harness> <event> [--socket <path>]`.
+/// Zero-clap, zero-Tokio fast path for `hyp hook <harness> <event> [--socket <path>]`.
 /// Returns `Some(ExitCode)` when handled directly, or `None` to fall through to `clap` (e.g. `--help`).
 fn try_hook_fast_path() -> Option<ExitCode> {
     let mut args = std::env::args();
@@ -220,7 +220,7 @@ fn try_hook_fast_path() -> Option<ExitCode> {
 
     if positionals.len() != 2 {
         eprintln!(
-            "error: Invalid hook arguments\nusage: hyp-rs hook <harness> <event> [--socket <path>]"
+            "error: Invalid hook arguments\nusage: hyp hook <harness> <event> [--socket <path>]"
         );
         return Some(ExitCode::from(EXIT_USAGE));
     }

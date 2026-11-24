@@ -9,7 +9,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-RUN cargo build --release --locked --bin hyp-rs
+RUN cargo build --release --locked --bin hyp
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -21,7 +21,7 @@ RUN apt-get update \
     && chown 10001:10001 /var/lib/hyphae /etc/hyphae \
     && chmod 0700 /var/lib/hyphae
 
-COPY --from=builder /src/target/release/hyp-rs /usr/local/bin/hyp-rs
+COPY --from=builder /src/target/release/hyp /usr/local/bin/hyp
 
 ENV HYPHAE_SECRET_BACKEND=file \
     HYPHAE_STATE_DIR=/var/lib/hyphae \
@@ -32,7 +32,7 @@ WORKDIR /var/lib/hyphae
 EXPOSE 8790
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["/usr/local/bin/hyp-rs", "deploy", "check", "--url", "http://127.0.0.1:8790", "--json"]
+    CMD ["/usr/local/bin/hyp", "deploy", "check", "--url", "http://127.0.0.1:8790", "--json"]
 
-ENTRYPOINT ["/usr/local/bin/hyp-rs"]
+ENTRYPOINT ["/usr/local/bin/hyp"]
 CMD ["version"]

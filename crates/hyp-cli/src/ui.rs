@@ -1,4 +1,4 @@
-//! Agent-first CLI output contract shared across `hyp-rs` subcommands (`AGENTS.md`, `src/cli-ui.ts`).
+//! Agent-first CLI output contract shared across `hyp` subcommands (`AGENTS.md`, `src/cli-ui.ts`).
 //!
 //! Every subcommand supports `--json` returning the uniform envelope:
 //! `{ ok, command, summary?, data?, warnings?, next?, error? }`

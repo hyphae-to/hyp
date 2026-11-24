@@ -1,4 +1,4 @@
-//! 100% Pure-Rust end-to-end CLI binary tests for `hyp-rs` (`daemon`, `node start`, `version`,
+//! 100% Pure-Rust end-to-end CLI binary tests for `hyp` (`daemon`, `node start`, `version`,
 //! `hook`, `mcp`, `wait`, `watch`, `status`) — ZERO Node.js!
 //!
 //! Strict isolation invariant: every test runs against ephemeral `tempfile::TempDir`,
@@ -12,7 +12,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 fn hyp_rs_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_hyp-rs")
+    env!("CARGO_BIN_EXE_hyp")
 }
 
 fn isolated_cmd(base_dir: &Path) -> Command {
@@ -98,7 +98,7 @@ fn start_native_rust_daemon_with_args(extra_args: &[&str]) -> NativeRustDaemon {
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().expect("spawn native Rust hyp-rs daemon");
+    let mut child = cmd.spawn().expect("spawn native Rust hyp daemon");
     let stdout = child.stdout.take().expect("daemon stdout");
     let mut line = String::new();
     BufReader::new(stdout)
@@ -156,7 +156,7 @@ fn run_claude_pre_tool_use_hook(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn hyp-rs hook");
+        .expect("spawn hyp hook");
     hook_proc
         .stdin
         .take()
@@ -199,7 +199,7 @@ fn version_plain_and_json_envelope() {
     let plain = Command::new(hyp_rs_bin())
         .arg("version")
         .output()
-        .expect("run hyp-rs version");
+        .expect("run hyp version");
     assert_eq!(plain.status.code(), Some(0));
     assert!(
         String::from_utf8_lossy(&plain.stdout).starts_with("hyphae "),
@@ -210,7 +210,7 @@ fn version_plain_and_json_envelope() {
     let json_out = Command::new(hyp_rs_bin())
         .args(["version", "--json"])
         .output()
-        .expect("run hyp-rs version --json");
+        .expect("run hyp version --json");
     assert_eq!(json_out.status.code(), Some(0));
     let env: Value = serde_json::from_slice(&json_out.stdout).expect("valid JSON envelope");
     assert_eq!(env["ok"], true);
@@ -236,7 +236,7 @@ fn hook_fast_path_fails_safe_and_validates_usage() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .expect("spawn hyp-rs hook");
+        .expect("spawn hyp hook");
     child
         .stdin
         .take()
@@ -259,7 +259,7 @@ fn hook_fast_path_fails_safe_and_validates_usage() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .expect("spawn hyp-rs hook antigravity");
+        .expect("spawn hyp hook antigravity");
     ag_child
         .stdin
         .take()
@@ -293,7 +293,7 @@ fn cli_subprocesses_mcp_hook_and_wait_interop() {
     );
     let sock_str = socket_path.to_str().unwrap();
 
-    // Verify `node.status.json` and `hyp-rs status --json` expose `socketPath`.
+    // Verify `node.status.json` and `hyp status --json` expose `socketPath`.
     let status_file: Value = serde_json::from_str(
         &fs::read_to_string(daemon.state_dir.join("node.status.json")).unwrap(),
     )
@@ -317,14 +317,14 @@ fn cli_subprocesses_mcp_hook_and_wait_interop() {
     assert_eq!(status_json["ok"], true);
     assert_eq!(status_json["data"]["node"]["socketPath"], sock_str);
 
-    // 1. Spawn `hyp-rs mcp <socket>` subprocess
+    // 1. Spawn `hyp mcp <socket>` subprocess
     let mut mcp = isolated_cmd(daemon.tmp.path())
         .args(["mcp", sock_str])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn hyp-rs mcp");
+        .expect("spawn hyp mcp");
 
     let mut mcp_in = mcp.stdin.take().unwrap();
     let mut mcp_out = BufReader::new(mcp.stdout.take().unwrap());
@@ -384,7 +384,7 @@ fn cli_subprocesses_mcp_hook_and_wait_interop() {
             .contains("caller_unverifiable")
     );
 
-    // 2. Run real `hyp-rs hook claude pre-tool-use` binary to register Alice's join call
+    // 2. Run real `hyp hook claude pre-tool-use` binary to register Alice's join call
     run_claude_pre_tool_use_hook(
         daemon.tmp.path(),
         sock_str,
@@ -416,7 +416,7 @@ fn cli_subprocesses_mcp_hook_and_wait_interop() {
             .contains("cli@local/alice")
     );
 
-    // 3. Run real `hyp-rs wait --session claude:cli-s1 --timeout 0.1` -> exits 0 cleanly on timeout
+    // 3. Run real `hyp wait --session claude:cli-s1 --timeout 0.1` -> exits 0 cleanly on timeout
     let wait_timeout = isolated_cmd(daemon.tmp.path())
         .args([
             "wait",
@@ -431,7 +431,7 @@ fn cli_subprocesses_mcp_hook_and_wait_interop() {
         .unwrap();
     assert_eq!(wait_timeout.status.code(), Some(0));
 
-    // 4. End-to-end delivery through the compiled Rust daemon: Bob joins, sends DM waking Alice's live `hyp-rs wait`!
+    // 4. End-to-end delivery through the compiled Rust daemon: Bob joins, sends DM waking Alice's live `hyp wait`!
     run_claude_pre_tool_use_hook(
         daemon.tmp.path(),
         sock_str,
@@ -462,7 +462,7 @@ fn cli_subprocesses_mcp_hook_and_wait_interop() {
             .contains("cli@local/bob")
     );
 
-    // Arm Alice's zero-polling `hyp-rs wait --json` before Bob sends!
+    // Arm Alice's zero-polling `hyp wait --json` before Bob sends!
     let wait_live = isolated_cmd(daemon.tmp.path())
         .args([
             "wait",
@@ -477,7 +477,7 @@ fn cli_subprocesses_mcp_hook_and_wait_interop() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn live hyp-rs wait");
+        .expect("spawn live hyp wait");
 
     std::thread::sleep(Duration::from_millis(120));
 

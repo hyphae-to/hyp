@@ -1,4 +1,4 @@
-//! Async stdio JSON-RPC 2.0 MCP server (`hyp-rs mcp`).
+//! Async stdio JSON-RPC 2.0 MCP server (`hyp mcp`).
 //!
 //! Exposes the lean **Rust v2 4-tool core catalog** (`hyp_send`, `hyp_inbox`, `hyp_mesh`,
 //! `hyp_stream`) plus conditional `hyp_bridge` (included ONLY when `hasPlugins == true` — 0 tokens

@@ -1,4 +1,4 @@
-//! Ultra-fast synchronous hook shim (`hyp-rs hook <harness> <event>`).
+//! Ultra-fast synchronous hook shim (`hyp hook <harness> <event>`).
 //!
 //! Runs completely synchronously on a Unix domain socket (`connector.sock`) on Unix or
 //! loopback TCP (`connector.addr` / `127.0.0.1:<port>`) on Windows (zero Tokio runtime boot)

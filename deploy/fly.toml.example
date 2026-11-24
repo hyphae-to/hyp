@@ -1,14 +1,14 @@
 # Fly.io configuration example for a Hyphae v2 Node
 #
 # Quick start:
-#   1. Copy to fly.toml (or run `hyp-rs deploy init fly --node-id my-hub --domain my-hub.fly.dev`)
+#   1. Copy to fly.toml (or run `hyp deploy init fly --node-id my-hub --domain my-hub.fly.dev`)
 #   2. Create app & persistent state volume:
 #        flyctl apps create hyphae-node
 #        flyctl volumes create hyphae_data --size 1 --region iad
 #   3. Deploy:
 #        flyctl deploy
 #   4. Verify manifest & anti-recon posture:
-#        hyp-rs deploy check --url https://hyphae-node.fly.dev
+#        hyp deploy check --url https://hyphae-node.fly.dev
 
 app = "hyphae-node"
 primary_region = "iad"

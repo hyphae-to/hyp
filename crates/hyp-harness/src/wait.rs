@@ -1,4 +1,4 @@
-//! Zero-polling blocking waiter (`hyp-rs wait`) and streaming watcher (`hyp-rs watch`)
+//! Zero-polling blocking waiter (`hyp wait`) and streaming watcher (`hyp watch`)
 //! on `connector.sock`, matching `src/wait.ts` flags, timeouts, formatting, and signal handling.
 
 use crate::sock::{
@@ -151,7 +151,7 @@ pub fn format_once_output(items: &[Map<String, Value>], as_json: bool) -> String
     format!("{formatted}\n")
 }
 
-/// Formats a single item line for `mode: stream` (`hyp-rs watch`), matching `src/wait.ts`.
+/// Formats a single item line for `mode: stream` (`hyp watch`), matching `src/wait.ts`.
 pub fn format_stream_item(item: &Map<String, Value>) -> String {
     let mut obj = Map::new();
     if let Some(router) = item.get("router") {

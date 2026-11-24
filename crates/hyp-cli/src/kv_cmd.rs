@@ -1,4 +1,4 @@
-//! `hyp-rs kv` — Direct CLI access to `NodeDb::kv()` (Shared KV / Blackboard).
+//! `hyp kv` — Direct CLI access to `NodeDb::kv()` (Shared KV / Blackboard).
 //!
 //! Supports `get`, `set`, `delete`, and `list` across all three write models (`owner`, `shared`
 //! optimistic CAS with clean exit `1` conflict reporting, and `allowlist`).
@@ -218,7 +218,7 @@ fn emit_version_conflict(
         expected_version
     );
     let fix = format!(
-        "Re-read latest value (`hyp-rs kv get --ns {ns} --key {key}`) and retry with `--expected-version {current_version}`."
+        "Re-read latest value (`hyp kv get --ns {ns} --key {key}`) and retry with `--expected-version {current_version}`."
     );
     if as_json {
         let envelope = JsonEnvelope {
@@ -305,7 +305,7 @@ fn run_kv_get(
             EXIT_ERROR,
             "NOT_FOUND",
             format!("KV entry '{node}/{ns}/{key}' not found"),
-            Some(format!("List keys with `hyp-rs kv list --ns {ns}`.")),
+            Some(format!("List keys with `hyp kv list --ns {ns}`.")),
         ),
         Err(e) => emit_error(cmd, as_json, EXIT_ERROR, "KV_ERROR", e.to_string(), None),
     }

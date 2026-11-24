@@ -8,7 +8,7 @@
 #   3. cloudflared tunnel route dns hyphae-node mesh.example.com
 #   4. Copy this file to /etc/cloudflared/config.yml, replace <TUNNEL_UUID> & hostname
 #   5. cloudflared tunnel --config /etc/cloudflared/config.yml run
-#   6. Verify with: hyp-rs deploy check --url https://mesh.example.com
+#   6. Verify with: hyp deploy check --url https://mesh.example.com
 
 tunnel: <TUNNEL_UUID>
 credentials-file: /etc/cloudflared/<TUNNEL_UUID>.json

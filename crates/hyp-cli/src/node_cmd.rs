@@ -1,4 +1,4 @@
-//! `hyp-rs node start` (alias `hyp-rs daemon`) — Unified Hyphae v2 Rust Node runtime.
+//! `hyp node start` (alias `hyp daemon`) — Unified Hyphae v2 Rust Node runtime.
 //!
 //! Loads v2 `node.json` (or auto-reads legacy v1 `connector.json`), initializes `UnifiedNode`
 //! (`node.sqlite` WAL + persistent Ed25519/X25519 keys + exact zero-polling deadline scheduler),
@@ -102,7 +102,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                     EXIT_ERROR,
                     "CONFIG_ERROR",
                     e,
-                    Some("Verify node.json syntax or run `hyp-rs onboard`.".to_string()),
+                    Some("Verify node.json syntax or run `hyp onboard`.".to_string()),
                 );
             }
         }
@@ -113,7 +113,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             EXIT_ERROR,
             "CONFIG_NOT_FOUND",
             format!("Config file does not exist: {}", config_path.display()),
-            Some("Check --config path or run `hyp-rs onboard`.".to_string()),
+            Some("Check --config path or run `hyp onboard`.".to_string()),
         );
     } else {
         None
@@ -330,8 +330,8 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                 data: Some(status_doc),
                 warnings,
                 next: vec![
-                    format!("hyp-rs status --state-dir {}", state_dir.display()),
-                    format!("hyp-rs doctor --state-dir {}", state_dir.display()),
+                    format!("hyp status --state-dir {}", state_dir.display()),
+                    format!("hyp doctor --state-dir {}", state_dir.display()),
                 ],
                 error: None,
             };

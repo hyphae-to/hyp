@@ -3,11 +3,11 @@
 //!
 //! Provides BOTH:
 //! - A **zero-Tokio synchronous fast-path** (`std::os::unix::net::UnixStream` on Unix,
-//!   loopback `std::net::TcpStream` on Windows) for `hyp-rs hook`, keeping cold-start
+//!   loopback `std::net::TcpStream` on Windows) for `hyp hook`, keeping cold-start
 //!   latency at 1–3 ms.
 //! - An **async Tokio client** (`tokio::net::UnixStream` on Unix, loopback
 //!   `tokio::net::TcpStream` on Windows) with bounded NDJSON line reading for
-//!   `hyp-rs mcp`, `hyp-rs wait`, and `hyp-rs watch`.
+//!   `hyp mcp`, `hyp wait`, and `hyp watch`.
 
 use serde_json::{Map, Value};
 use std::collections::HashMap;

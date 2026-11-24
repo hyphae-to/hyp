@@ -1,4 +1,4 @@
-//! `hyp-rs status` & `hyp-rs doctor` — Node identity, Peer Capabilities & Version Skew UX
+//! `hyp status` & `hyp doctor` — Node identity, Peer Capabilities & Version Skew UX
 //! (`docs/architecture-v2.md §3.3`), Security Gate policy verification, update notice, and
 //! harness setup diagnostics.
 
@@ -114,7 +114,7 @@ fn run_status_or_doctor(
                     checks.push(CliCheck::warn(
                         "config",
                         format!("Loaded legacy v1 connector config at {}", cfg.path.display()),
-                        Some("Run `hyp-rs onboard` to write native v2 node.json.".to_string()),
+                        Some("Run `hyp onboard` to write native v2 node.json.".to_string()),
                     ));
                 } else {
                     checks.push(CliCheck::ok(
@@ -136,7 +136,7 @@ fn run_status_or_doctor(
         checks.push(CliCheck::warn(
             "config",
             format!("No node.json found at {}", config_path.display()),
-            Some("Run `hyp-rs onboard` to initialize node.json and keys.".to_string()),
+            Some("Run `hyp onboard` to initialize node.json and keys.".to_string()),
         ));
     }
 
@@ -176,7 +176,7 @@ fn run_status_or_doctor(
         checks.push(CliCheck::warn(
             "store.sqlite",
             format!("Database not initialized yet at {}", db_path.display()),
-            Some("Run `hyp-rs onboard` or `hyp-rs node start`.".to_string()),
+            Some("Run `hyp onboard` or `hyp node start`.".to_string()),
         ));
         None
     };
@@ -234,7 +234,7 @@ fn run_status_or_doctor(
             checks.push(CliCheck::warn(
                 "daemon.socket",
                 format!("Recorded local IPC socket missing: {sock}"),
-                Some("Restart `hyp-rs node start` to recreate the local IPC socket.".to_string()),
+                Some("Restart `hyp node start` to recreate the local IPC socket.".to_string()),
             ));
         }
     }
@@ -308,7 +308,7 @@ fn run_status_or_doctor(
             "gate.policy_sig",
             gate_status.detail.clone(),
             Some(format!(
-                "Inspect {} for unauthorized edits, then re-sign via `hyp-rs gate lock --config {} --state-dir {}`.",
+                "Inspect {} for unauthorized edits, then re-sign via `hyp gate lock --config {} --state-dir {}`.",
                 config_path.display(),
                 config_path.display(),
                 state_dir.display()
@@ -320,7 +320,7 @@ fn run_status_or_doctor(
                     "gate.policy_sig",
                     gate_status.detail.clone(),
                     Some(format!(
-                        "hyp-rs gate lock --config {} --state-dir {}",
+                        "hyp gate lock --config {} --state-dir {}",
                         config_path.display(),
                         state_dir.display()
                     )),
@@ -337,7 +337,7 @@ fn run_status_or_doctor(
                 "{} quarantined item(s) awaiting human CLI review",
                 gate_status.quarantined_count
             ),
-            Some(format!("hyp-rs gate review --state-dir {}", state_dir.display())),
+            Some(format!("hyp gate review --state-dir {}", state_dir.display())),
         ));
     }
 
@@ -355,7 +355,7 @@ fn run_status_or_doctor(
                     "New {} release available: {} (current: {})",
                     update_status.channel, avail, update_status.current_version
                 ),
-                Some(format!("hyp-rs update --channel {}", update_status.channel)),
+                Some(format!("hyp update --channel {}", update_status.channel)),
             ));
         }
     }

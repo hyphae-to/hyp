@@ -176,7 +176,7 @@ jobs:
           STAGE="$(mktemp -d)"
           trap 'rm -rf "$STAGE"' EXIT
 
-          cp "target/${TARGET}/release/hyp-rs" "${STAGE}/hyp"
+          cp "target/${TARGET}/release/hyp" "${STAGE}/hyp"
           chmod 0755 "${STAGE}/hyp"
 
           if [ "$SMOKE_TEST" = "true" ]; then
@@ -201,7 +201,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
 
           $bin = Join-Path $stage "hyp.exe"
-          Copy-Item -Path "target\$($env:TARGET)\release\hyp-rs.exe" -Destination $bin -Force
+          Copy-Item -Path "target\$($env:TARGET)\release\hyp.exe" -Destination $bin -Force
           & $bin version --json
 
           Compress-Archive -Path $bin -DestinationPath "dist\$archive" -Force

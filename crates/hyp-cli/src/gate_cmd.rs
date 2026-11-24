@@ -1,4 +1,4 @@
-//! `hyp-rs gate` (`init`, `propose`, `lock`, `review`, `log`) & `hyp-rs inbox` (`approve`, `reject`).
+//! `hyp gate` (`init`, `propose`, `lock`, `review`, `log`) & `hyp inbox` (`approve`, `reject`).
 //!
 //! Human-CLI-only Local Security Gate management:
 //! - Never writes plaintext API keys (`{ "secret": "<name>" }` / `api_key_secret` references only!).
@@ -327,7 +327,7 @@ pub fn inspect_gate_status(
             gate_policy_sig: "UNSIGNED".to_string(),
             tampered: false,
             detail: format!(
-                "Unsigned gate policy ({} filter adapter(s)); run `hyp-rs gate lock` to enforce tamper-evident signing",
+                "Unsigned gate policy ({} filter adapter(s)); run `hyp gate lock` to enforce tamper-evident signing",
                 filters.len()
             ),
             filters,
@@ -452,7 +452,7 @@ fn build_filter_plugin_from_args(args: &GateInitArgs) -> Result<FilterPluginConf
     if let Some(ref secret_name) = args.secret {
         if looks_like_raw_api_key(secret_name) {
             return Err(
-                "Refusing plaintext API key in --secret; pass a SecretStore name (e.g. --secret anthropic-api-key) and store the key via `hyp-rs secret set <name>`."
+                "Refusing plaintext API key in --secret; pass a SecretStore name (e.g. --secret anthropic-api-key) and store the key via `hyp secret set <name>`."
                     .to_string(),
             );
         }
@@ -651,7 +651,7 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
         let next = vec![
             format!("Review proposed policy at {}", proposal_path.display()),
             format!(
-                "Approve & lock as human: hyp-rs gate init --adapter {} --config {} --state-dir {} --lock",
+                "Approve & lock as human: hyp gate init --adapter {} --config {} --state-dir {} --lock",
                 args.adapter.as_str(),
                 config_path.display(),
                 state_dir.display()
@@ -743,18 +743,18 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
     let mut next = Vec::new();
     if let Some(ref secret_ref) = summary_filter.api_key_secret {
         next.push(format!(
-            "Store API key out-of-band: hyp-rs secret set {secret_ref} --web"
+            "Store API key out-of-band: hyp secret set {secret_ref} --web"
         ));
     }
     if !locked {
         next.push(format!(
-            "Lock tamper-evident signature: hyp-rs gate lock --config {} --state-dir {}",
+            "Lock tamper-evident signature: hyp gate lock --config {} --state-dir {}",
             config_path.display(),
             state_dir.display()
         ));
     }
     next.push(format!(
-        "hyp-rs doctor --config {} --state-dir {}",
+        "hyp doctor --config {} --state-dir {}",
         config_path.display(),
         state_dir.display()
     ));
@@ -815,7 +815,7 @@ fn run_gate_lock(
             EXIT_ERROR,
             "CONFIG_NOT_FOUND",
             format!("Config file not found: {}", config_path.display()),
-            Some("Run `hyp-rs gate init --adapter ...` or `hyp-rs onboard` first.".to_string()),
+            Some("Run `hyp gate init --adapter ...` or `hyp onboard` first.".to_string()),
         );
     }
 
@@ -888,7 +888,7 @@ fn run_gate_lock(
     }
 
     let next = vec![format!(
-        "hyp-rs doctor --config {} --state-dir {}",
+        "hyp doctor --config {} --state-dir {}",
         config_path.display(),
         dir.display()
     )];
@@ -965,12 +965,12 @@ fn run_gate_review(
     let next: Vec<String> = if let Some(first) = items.first() {
         vec![
             format!(
-                "Approve: hyp-rs inbox approve {} --state-dir {}",
+                "Approve: hyp inbox approve {} --state-dir {}",
                 first.receipt,
                 dir.display()
             ),
             format!(
-                "Reject & mute sender: hyp-rs inbox reject {} --mute --state-dir {}",
+                "Reject & mute sender: hyp inbox reject {} --mute --state-dir {}",
                 first.receipt,
                 dir.display()
             ),

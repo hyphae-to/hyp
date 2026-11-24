@@ -2,13 +2,13 @@
 #
 # Quick start:
 #   1. Generate a hardened node.json and Caddyfile:
-#        hyp-rs deploy init docker --node-id acme-team --domain mesh.example.com --out ./deploy-out
+#        hyp deploy init docker --node-id acme-team --domain mesh.example.com --out ./deploy-out
 #      Or copy deploy/Caddyfile.example -> deploy/Caddyfile and create deploy/node.json
 #      (with upstream set to `hyphae-node:8790` in Caddyfile).
 #   2. Start the stack from repo root:
 #        docker compose -f deploy/docker-compose.yml up -d --build
 #   3. Verify anti-recon & TLS health:
-#        hyp-rs deploy check --url https://mesh.example.com --config ./deploy/node.json
+#        hyp deploy check --url https://mesh.example.com --config ./deploy/node.json
 
 services:
   hyphae-node:

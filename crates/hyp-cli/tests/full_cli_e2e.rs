@@ -1,4 +1,4 @@
-//! Comprehensive end-to-end integration tests for the full Rust `hyp-rs` CLI:
+//! Comprehensive end-to-end integration tests for the full Rust `hyp` CLI:
 //! 1. `onboard_and_setup_all_nine_harnesses_in_isolated_home`
 //! 2. `secret_stdin_and_web_out_of_band_capture`
 //! 3. `gate_init_lock_tamper_review_approve_reject_and_audit_log`
@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::net::TcpListener;
 
 fn hyp_rs_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_hyp-rs")
+    env!("CARGO_BIN_EXE_hyp")
 }
 
 fn isolated_cmd(home: &Path) -> Command {
@@ -193,7 +193,7 @@ fn onboard_and_setup_all_nine_harnesses_in_isolated_home() {
     )
     .unwrap();
 
-    // 1. Run `hyp-rs onboard` with isolated --state-dir & --home
+    // 1. Run `hyp onboard` with isolated --state-dir & --home
     let onboard_out = isolated_cmd(&home)
         .args([
             "onboard",
@@ -1190,7 +1190,7 @@ fn self_update_signed_manifest_atomic_swap_rollback_tamper_and_fleet_all() {
     fs::create_dir_all(&home).unwrap();
 
     // Build real tar.gz archives:
-    // 1) Good archive containing a real copy of `hyp-rs` executable (passes `version --json`)
+    // 1) Good archive containing a real copy of `hyp` executable (passes `version --json`)
     let good_archive = {
         let mut buf = Vec::new();
         let entry_name = if cfg!(windows) { "hyp.exe" } else { "hyp" };
@@ -1787,7 +1787,7 @@ fn node_start_legacy_v1_and_http_manifest_probe() {
     assert_eq!(status_doc["nodeId"], "legacy@devbox");
     let endpoint = status_doc["endpoint"].as_str().unwrap().to_string();
 
-    // Probe live `GET /v1/manifest` over HTTP using `hyp-rs deploy check --url`!
+    // Probe live `GET /v1/manifest` over HTTP using `hyp deploy check --url`!
     let check_out = isolated_cmd(&home)
         .args(["deploy", "check", "--url", &endpoint, "--json"])
         .output()
