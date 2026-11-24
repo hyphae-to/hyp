@@ -1035,7 +1035,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["/usr/local/bin/hyp", "deploy", "check", "--url", "http://127.0.0.1:8790", "--json"]
 
 ENTRYPOINT ["/usr/local/bin/hyp"]
-CMD ["version"]
+CMD ["node", "start", "--config", "/etc/hyphae/node.json", "--no-local-socket"]
 "#
     .to_string()
 }
@@ -1152,7 +1152,7 @@ primary_region = "iad"
     interval = "30s"
     method = "GET"
     timeout = "5s"
-    path = "/v1/manifest"
+    path = "/v1/health"
 
 [[mounts]]
   source = "hyphae_data"
@@ -1432,7 +1432,7 @@ fn build_init_next_steps(
 ) -> Vec<String> {
     let dir = out_dir.display();
     let pair_cmd = match profile {
-        DeployProfile::Public => format!("hyp peer join https://{domain}"),
+        DeployProfile::Public => format!("hyp pair join https://{domain}"),
         DeployProfile::P2p => format!(
             "hyp pair invite --mode p2p --node-id {node_id} --endpoint https://{domain} --preset member"
         ),

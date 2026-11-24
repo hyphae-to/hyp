@@ -227,6 +227,16 @@ impl GitHubPublicAdapter {
         })
     }
 
+    /// Returns the topic served by this `github-public` adapter (default `"github"`).
+    pub fn topic(&self) -> &str {
+        &self.inner.config.topic
+    }
+
+    /// Returns `true` if a GitHub App HMAC-SHA256 webhook secret is configured.
+    pub fn has_app_webhook_secret(&self) -> bool {
+        self.inner.config.app_webhook_secret.is_some()
+    }
+
     /// Returns a point-in-time telemetry snapshot of active pollers, refcounts, and HTTP outcomes.
     pub async fn stats(&self) -> GitHubPublicStats {
         let demand = self.inner.demand.lock().await;
@@ -294,6 +304,15 @@ impl GitHubPublicAdapter {
             }
         }
         Ok(())
+    }
+
+    /// Alias for [`Self::ingest_app_webhook`] used by HTTP webhook routes.
+    pub async fn handle_app_webhook(
+        &self,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> Result<WebhookIngestOutcome, AdapterError> {
+        self.ingest_app_webhook(headers, body).await
     }
 
     /// Ingests an HMAC-SHA256-verified "Hyphae Public" GitHub App webhook delivery directly onto

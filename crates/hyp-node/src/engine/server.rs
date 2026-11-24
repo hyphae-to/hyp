@@ -42,21 +42,23 @@ use hyp_proto::address::Channel;
 use hyp_proto::problem::ProblemDetails;
 use hyp_store::{KvDeleteInput, KvSetInput, StoreError, now_ms};
 
+use crate::adapters::{AdapterError, WebhookIngestOutcome};
 use crate::engine::config::NodeError;
 use crate::engine::http_util::{
     BoxedBody, SseEvent, bytes_response, etag_matches_if_none_match, format_version_etag,
     json_response, json_response_with_etag, not_modified_response, parse_if_match_version,
     parse_query, percent_decode, problem_response, read_body_bytes, sse_keepalive_frame,
-    sse_response,
+    sse_response, with_retry_after,
 };
 use crate::engine::node::{AuthenticatedPeer, UnifiedNode};
 use crate::engine::peer_link::{
     ChannelEpochResponse, ChannelJoinRequest, ChannelJoinResponse, ChannelLeaveRequest,
-    ChannelPostRequest, ChannelsResponse, HandlesResponse, InboxAckRequest, InboxAckResponse,
-    KvDeleteBody, KvEpochResponse, KvListResponse, KvSetBody, PairRequestV2, PeerKeysResponse,
-    PostMessageRequest, PostMessageResponse, PublishEventRequest, PutChannelEpochRequest,
-    PutHandlesRequest, PutKeyRequest, PutKvEpochRequest, PutSubscriptionsRequest,
-    PutSubscriptionsResponse, SubscriptionsResponse, TransferUploadResponse,
+    ChannelPostRequest, ChannelsResponse, GuestPairRequest, HandlesResponse, InboxAckRequest,
+    InboxAckResponse, KvDeleteBody, KvEpochResponse, KvListResponse, KvSetBody, PairRequestV2,
+    PeerKeysResponse, PostMessageRequest, PostMessageResponse, PublishEventRequest,
+    PutChannelEpochRequest, PutHandlesRequest, PutKeyRequest, PutKvEpochRequest,
+    PutSubscriptionsRequest, PutSubscriptionsResponse, SubscriptionsResponse,
+    TransferUploadResponse,
 };
 
 const MAX_JSON_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -114,7 +116,19 @@ async fn handle_http_request(
 ) -> Response<BoxedBody> {
     match route_request(node, req).await {
         Ok(resp) => resp,
-        Err(err) => problem_response(&err.to_problem_details()),
+        Err(err) => {
+            let retry_after = match &err {
+                NodeError::RateLimited {
+                    retry_after_secs, ..
+                } => *retry_after_secs,
+                _ => None,
+            };
+            let resp = problem_response(&err.to_problem_details());
+            match retry_after {
+                Some(secs) => with_retry_after(resp, secs),
+                None => resp,
+            }
+        }
     }
 }
 
@@ -156,6 +170,40 @@ async fn route_request(
 
     // ---- Unauthenticated or Optionally Authenticated Endpoints ----
 
+    if method == Method::GET && path == "/v1/health" {
+        let gh_summary = match node.github_public_adapter() {
+            Some(adapter) => {
+                let stats = adapter.stats().await;
+                json!({
+                    "enabled": true,
+                    "activePollers": stats.active_pollers,
+                    "pollsTotal": stats.polls_total,
+                    "polls200": stats.polls_200,
+                    "polls304": stats.polls_304,
+                    "appWebhooksPublished": stats.app_webhooks_published,
+                })
+            }
+            None => json!({
+                "enabled": false,
+                "activePollers": 0,
+                "pollsTotal": 0,
+                "polls200": 0,
+                "polls304": 0,
+                "appWebhooksPublished": 0,
+            }),
+        };
+        return Ok(json_response(
+            StatusCode::OK,
+            &json!({
+                "ok": true,
+                "nodeId": node.node_id().as_str(),
+                "profile": node.config().profile,
+                "guestPairingEnabled": node.config().guest_pairing.enabled,
+                "githubPublic": gh_summary,
+            }),
+        ));
+    }
+
     if method == Method::GET && path == "/v1/manifest" {
         let caller = node.authenticate_request(&headers, "GET", &path_and_query, &body_sha)?;
         let (signed, _payload, etag) = node.build_signed_manifest(caller.as_ref())?;
@@ -181,6 +229,63 @@ async fn route_request(
         let pair_req: PairRequestV2 = serde_json::from_slice(&body_bytes)?;
         let reply = node.handle_admin_pair_request(&pair_req)?;
         return Ok(json_response(StatusCode::OK, &reply));
+    }
+
+    if method == Method::POST && path == "/v1/guest/pair" {
+        if !node.config().guest_pairing.enabled {
+            return Err(NodeError::NotFound(
+                "guest pairing is disabled on this node".into(),
+            ));
+        }
+        let guest_req: GuestPairRequest = serde_json::from_slice(&body_bytes)?;
+        let reply = node.handle_guest_pair_request(&guest_req)?;
+        return Ok(json_response(StatusCode::OK, &reply));
+    }
+
+    if method == Method::POST && path == "/v1/webhooks/github-app" {
+        let Some(adapter) = node
+            .github_public_adapter()
+            .filter(|a| a.has_app_webhook_secret())
+        else {
+            return Err(NodeError::NotFound(
+                "github-app webhook endpoint is disabled on this node".into(),
+            ));
+        };
+        let outcome = adapter
+            .handle_app_webhook(&headers, &body_bytes)
+            .await
+            .map_err(|err| match err {
+                AdapterError::Unauthorized(m) => NodeError::Unauthorized(m),
+                AdapterError::InvalidInput(m) => NodeError::BadRequest(m),
+                AdapterError::PayloadTooLarge(m) => NodeError::PayloadTooLarge(m),
+                other => NodeError::Http(other.to_string()),
+            })?;
+        let payload = match outcome {
+            WebhookIngestOutcome::Published { event_id, outcome } => json!({
+                "ok": true,
+                "status": "published",
+                "eventId": event_id,
+                "publishStatus": outcome.status,
+                "matched": outcome.matched,
+            }),
+            WebhookIngestOutcome::PublishedMany {
+                event_ids,
+                stored,
+                duplicates,
+            } => json!({
+                "ok": true,
+                "status": "published_many",
+                "eventIds": event_ids,
+                "stored": stored,
+                "duplicates": duplicates,
+            }),
+            WebhookIngestOutcome::Ignored { reason } => json!({
+                "ok": true,
+                "status": "ignored",
+                "reason": reason,
+            }),
+        };
+        return Ok(json_response(StatusCode::OK, &payload));
     }
 
     if method == Method::POST {
@@ -414,8 +519,9 @@ async fn route_request(
         return match method {
             Method::PUT => {
                 let put_req: PutSubscriptionsRequest = serde_json::from_slice(&body_bytes)?;
-                let (subscriptions, diagnostics) =
-                    node.handle_server_put_subscriptions(&caller, put_req)?;
+                let (subscriptions, diagnostics) = node
+                    .handle_server_put_subscriptions(&caller, put_req)
+                    .await?;
                 Ok(json_response(
                     StatusCode::OK,
                     &PutSubscriptionsResponse {
@@ -447,12 +553,7 @@ async fn route_request(
                 let id = query
                     .get("id")
                     .ok_or_else(|| NodeError::BadRequest("missing id query param".into()))?;
-                let namespaced = format!("{}::{id}", caller.peer_id);
-                let deleted = {
-                    let db = node.db();
-                    db.events().delete_subscription(&namespaced)?
-                        || db.events().delete_subscription(id)?
-                };
+                let deleted = node.handle_server_delete_subscription(&caller, id).await?;
                 Ok(json_response(StatusCode::OK, &json!({ "deleted": deleted })))
             }
             _ => Err(NodeError::BadRequest("method not allowed".into())),

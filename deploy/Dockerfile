@@ -31,8 +31,10 @@ USER 10001:10001
 WORKDIR /var/lib/hyphae
 EXPOSE 8790
 
+# Built-in manifest + anti-recon check (zero external curl/wget needed);
+# external load balancers/probes may also hit GET /v1/health.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["/usr/local/bin/hyp", "deploy", "check", "--url", "http://127.0.0.1:8790", "--json"]
 
 ENTRYPOINT ["/usr/local/bin/hyp"]
-CMD ["version"]
+CMD ["node", "start", "--config", "/etc/hyphae/node.json", "--no-local-socket"]

@@ -91,6 +91,58 @@ pub struct P2pPairServerReply {
     pub signed_manifest: SignedNodeManifest,
 }
 
+/// Self-service guest-ro pairing request for `POST /v1/guest/pair`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestPairRequest {
+    pub node_id: String,
+    pub ed25519_jwk: CryptoOkpJwk,
+    pub x25519_jwk: CryptoOkpJwk,
+    pub timestamp: String,
+    pub proof_sig: String,
+}
+
+/// Canonical RFC 8785 JCS proof payload signed under domain `"guest-pair"` for `POST /v1/guest/pair`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestPairProofPayload<'a> {
+    pub ed25519_jwk: &'a CryptoOkpJwk,
+    pub hub_node_id: &'a str,
+    pub node_id: &'a str,
+    pub timestamp: &'a str,
+    pub x25519_jwk: &'a CryptoOkpJwk,
+}
+
+/// Computes the canonical RFC 8785 JCS bytes signed under domain `"guest-pair"`.
+pub fn guest_pair_proof_canonical(
+    hub_node_id: &str,
+    node_id: &str,
+    ed25519_jwk: &CryptoOkpJwk,
+    x25519_jwk: &CryptoOkpJwk,
+    timestamp: &str,
+) -> Result<String, hyp_crypto::CryptoError> {
+    let payload = GuestPairProofPayload {
+        ed25519_jwk,
+        hub_node_id,
+        node_id,
+        timestamp,
+        x25519_jwk,
+    };
+    hyp_crypto::jcs::to_canonical_json(&payload)
+}
+
+/// Server reply to `POST /v1/guest/pair`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestPairReply {
+    pub ok: bool,
+    pub node_id: String,
+    pub peer_id: String,
+    pub preset: String,
+    pub scopes: Vec<String>,
+    pub manifest: SignedNodeManifest,
+}
+
 /// Entry in the `GET /v1/keys` peer key directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

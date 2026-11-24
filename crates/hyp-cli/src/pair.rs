@@ -16,10 +16,13 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::{Subcommand, ValueEnum};
 use http::{Method, Request, header};
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Empty, Full};
 use hyp_crypto::compat_v1::{issue_grant_v1, parse_pairing_code_v1};
 use hyp_crypto::jcs::to_canonical_json;
-use hyp_crypto::keys::{Ed25519KeyPair, Ed25519PublicKey, OkpJwk as CryptoOkpJwk, SignedPayload, X25519PublicKey};
+use hyp_crypto::keys::{
+    Ed25519KeyPair, Ed25519PublicKey, NodeIdentityKeys, OkpJwk as CryptoOkpJwk, SignedPayload,
+    X25519PublicKey,
+};
 use hyp_crypto::keystore::{SecretBackend, SecretStore};
 use hyp_crypto::pairing::{
     AM2_PREFIX, AdminInviteV2, GrantV2, HP2P1_PREFIX, P2P_SECRET_BYTES, create_p2p_offer,
@@ -27,8 +30,10 @@ use hyp_crypto::pairing::{
     verify_grant_v2,
 };
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms, parse_rfc3339_millis};
+use hyp_node::engine::{GuestPairReply, GuestPairRequest, guest_pair_proof_canonical};
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
 use hyp_proto::manifest::{NodeManifestPayload, NodeProfile as ProtoNodeProfile, SignedNodeManifest};
+use hyp_proto::problem::ProblemDetails;
 use hyp_proto::scopes::{EscalationNote, ScopePreset, ScopeSet, expand_v2_scopes};
 use hyp_store::{
     GrantDirection, GrantInput, KeyStatus, KeyUse, ManifestCacheUpdate, NodeDb, PeerInput,
@@ -3073,6 +3078,265 @@ fn fetch_and_verify_manifest(base_url: &str) -> Result<VerifiedLiveManifest, (&'
     })
 }
 
+enum GuestEnrollOutcome {
+    Enrolled {
+        preset: String,
+        scopes: Vec<String>,
+        manifest: SignedNodeManifest,
+        manifest_payload: Box<NodeManifestPayload>,
+    },
+    NotEnabled,
+}
+
+fn attempt_guest_self_enroll(
+    base_url: &str,
+    hub_node_id: &str,
+    hub_signing_pk: &Ed25519PublicKey,
+    local_node_id: &str,
+    local_keys: &NodeIdentityKeys,
+) -> Result<GuestEnrollOutcome, (&'static str, String)> {
+    let pair_url = format!("{}/v1/guest/pair", base_url.trim_end_matches('/'));
+    let uri: http::Uri = pair_url.parse().map_err(|e| {
+        (
+            "INVALID_ENDPOINT",
+            format!("Invalid guest pairing URI '{pair_url}': {e}"),
+        )
+    })?;
+
+    let ed25519_jwk = local_keys.signing_jwk();
+    let x25519_jwk = local_keys.encryption_jwk();
+    let timestamp = format_rfc3339_millis(now_unix_ms());
+    let canonical = guest_pair_proof_canonical(
+        hub_node_id,
+        local_node_id,
+        &ed25519_jwk,
+        &x25519_jwk,
+        &timestamp,
+    )
+    .map_err(|e| ("ENCODE_ERROR", format!("Failed to canonicalize guest-pair proof: {e}")))?;
+    let proof_sig = local_keys
+        .signing
+        .sign_domain_b64("guest-pair", canonical.as_bytes());
+
+    let req_body = GuestPairRequest {
+        node_id: local_node_id.to_string(),
+        ed25519_jwk,
+        x25519_jwk,
+        timestamp,
+        proof_sig,
+    };
+    let req_bytes = serde_json::to_vec(&req_body)
+        .map_err(|e| ("ENCODE_ERROR", format!("Failed to serialize guest-pair request: {e}")))?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| ("RUNTIME_ERROR", format!("Failed to start async runtime: {e}")))?;
+
+    let (status, body_bytes) = rt.block_on(async {
+        let client = build_http_client::<Full<Bytes>>()
+            .map_err(|e| ("HTTP_ERROR", format!("Failed to initialize HTTP client: {e}")))?;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(&uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json")
+            .header(
+                header::USER_AGENT,
+                format!("hyp/{}", env!("CARGO_PKG_VERSION")),
+            )
+            .body(Full::new(Bytes::from(req_bytes)))
+            .map_err(|e| ("HTTP_ERROR", format!("Failed to build guest-pair request: {e}")))?;
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS),
+            client.request(req),
+        )
+        .await
+        .map_err(|_| {
+            (
+                "GUEST_PAIR_FAILED",
+                format!("POST {pair_url} timed out after {MANIFEST_FETCH_TIMEOUT_SECS}s"),
+            )
+        })?
+        .map_err(|e| ("GUEST_PAIR_FAILED", format!("POST {pair_url} failed: {e}")))?;
+
+        let status = resp.status().as_u16();
+        let bytes = tokio::time::timeout(Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS), async {
+            let mut body = resp.into_body();
+            let mut out = Vec::new();
+            while let Some(frame_res) = body.frame().await {
+                let frame = frame_res.map_err(|e| {
+                    (
+                        "GUEST_PAIR_FAILED",
+                        format!("Guest pair body read error: {e}"),
+                    )
+                })?;
+                if let Some(chunk) = frame.data_ref() {
+                    if out.len() + chunk.len() > MAX_MANIFEST_RESPONSE_BYTES {
+                        return Err((
+                            "GUEST_PAIR_INVALID",
+                            format!(
+                                "Guest pair response exceeds {MAX_MANIFEST_RESPONSE_BYTES} byte cap"
+                            ),
+                        ));
+                    }
+                    out.extend_from_slice(chunk);
+                }
+            }
+            Ok::<Vec<u8>, (&'static str, String)>(out)
+        })
+        .await
+        .map_err(|_| {
+            (
+                "GUEST_PAIR_FAILED",
+                "Timed out reading /v1/guest/pair response body".to_string(),
+            )
+        })??;
+
+        Ok::<(u16, Vec<u8>), (&'static str, String)>((status, bytes))
+    })?;
+
+    if status == 404 {
+        return Ok(GuestEnrollOutcome::NotEnabled);
+    }
+
+    if status != 200 {
+        let (code, detail) = if let Ok(problem) = serde_json::from_slice::<ProblemDetails>(&body_bytes) {
+            let err_code = match (status, problem.error.as_str()) {
+                (_, "peer_key_mismatch") => "PEER_KEY_MISMATCH",
+                (429, _) | (_, "rate_limited") => "RATE_LIMITED",
+                (409, _) => "GUEST_PAIR_CONFLICT",
+                (403, _) | (401, _) => "GUEST_PAIR_REJECTED",
+                _ => "GUEST_PAIR_FAILED",
+            };
+            let msg = problem
+                .detail
+                .unwrap_or_else(|| format!("{} (HTTP {status})", problem.title));
+            (err_code, format!("POST {pair_url} rejected ({}): {msg}", problem.error))
+        } else {
+            let snippet: String = String::from_utf8_lossy(&body_bytes).chars().take(200).collect();
+            let err_code = match status {
+                409 => "GUEST_PAIR_CONFLICT",
+                429 => "RATE_LIMITED",
+                401 | 403 => "GUEST_PAIR_REJECTED",
+                _ => "GUEST_PAIR_FAILED",
+            };
+            (
+                err_code,
+                format!("POST {pair_url} returned HTTP {status}: {snippet}"),
+            )
+        };
+        return Err((code, detail));
+    }
+
+    let reply: GuestPairReply = serde_json::from_slice(&body_bytes).map_err(|e| {
+        (
+            "GUEST_PAIR_INVALID",
+            format!("Invalid GuestPairReply JSON from {pair_url}: {e}"),
+        )
+    })?;
+    if !reply.ok {
+        return Err((
+            "GUEST_PAIR_REJECTED",
+            format!("Hub '{hub_node_id}' returned ok=false on /v1/guest/pair"),
+        ));
+    }
+    if reply.node_id != hub_node_id {
+        return Err((
+            "NODE_ID_MISMATCH",
+            format!(
+                "Hub /v1/guest/pair nodeId '{}' does not match verified manifest nodeId '{hub_node_id}'",
+                reply.node_id
+            ),
+        ));
+    }
+    if reply.peer_id != local_node_id {
+        return Err((
+            "GUEST_PAIR_INVALID",
+            format!(
+                "Hub /v1/guest/pair peerId '{}' does not match local nodeId '{local_node_id}'",
+                reply.peer_id
+            ),
+        ));
+    }
+    if reply.scopes.is_empty() {
+        return Err((
+            "GUEST_PAIR_INVALID",
+            "Hub /v1/guest/pair returned empty granted scopes".to_string(),
+        ));
+    }
+    let validated_scopes = expand_v2_scopes(&reply.scopes).map_err(|e| {
+        (
+            "GUEST_PAIR_INVALID",
+            format!("Hub /v1/guest/pair returned invalid scopes: {e}"),
+        )
+    })?;
+
+    // Verify the authenticated manifest returned by `/v1/guest/pair` against the pinned hub signing key!
+    let manifest_payload = reply.manifest.decode_payload().map_err(|e| {
+        (
+            "INVALID_MANIFEST",
+            format!("Invalid NodeManifestPayload in /v1/guest/pair reply: {e}"),
+        )
+    })?;
+    if manifest_payload.node_id.as_str() != hub_node_id {
+        return Err((
+            "NODE_ID_MISMATCH",
+            format!(
+                "Manifest nodeId '{}' in /v1/guest/pair reply does not match '{hub_node_id}'",
+                manifest_payload.node_id
+            ),
+        ));
+    }
+    let canonical_manifest = manifest_payload.to_canonical_payload().map_err(|e| {
+        (
+            "INVALID_MANIFEST",
+            format!("Failed to canonicalize guest-pair manifest payload: {e}"),
+        )
+    })?;
+    if canonical_manifest != reply.manifest.payload {
+        return Err((
+            "NON_CANONICAL_MANIFEST",
+            "Manifest in /v1/guest/pair reply is not canonical RFC 8785 JCS (fail-closed)"
+                .to_string(),
+        ));
+    }
+    hub_signing_pk
+        .verify_domain_b64(
+            "manifest",
+            reply.manifest.payload.as_bytes(),
+            &reply.manifest.sig,
+        )
+        .map_err(|e| {
+            (
+                "INVALID_SIGNATURE",
+                format!(
+                    "Manifest signature in /v1/guest/pair reply failed pinned hub key verification: {e}"
+                ),
+            )
+        })?;
+    let exp_ms = parse_rfc3339_millis(&manifest_payload.expires_at).map_err(|e| {
+        (
+            "INVALID_MANIFEST",
+            format!("Invalid expiresAt in /v1/guest/pair manifest: {e}"),
+        )
+    })?;
+    if now_unix_ms() > exp_ms {
+        return Err((
+            "MANIFEST_EXPIRED",
+            format!("Hub manifest in /v1/guest/pair expired at {}", manifest_payload.expires_at),
+        ));
+    }
+
+    Ok(GuestEnrollOutcome::Enrolled {
+        preset: reply.preset,
+        scopes: validated_scopes,
+        manifest: reply.manifest,
+        manifest_payload: Box::new(manifest_payload),
+    })
+}
+
 fn run_join(
     url: String,
     state_dir_arg: Option<PathBuf>,
@@ -3235,15 +3499,66 @@ fn run_join(
     };
 
     let secrets = crate::config_file::open_secret_store(&state_dir, explicit_state);
-    if let Err(e) = secrets.load_or_create_node_keys(&local_node_id) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "KEYSTORE_ERROR",
-            format!("Failed to load/create local node keys: {e}"),
-            None,
-        );
+    let local_keys = match secrets.load_or_create_node_keys(&local_node_id) {
+        Ok(k) => k,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "KEYSTORE_ERROR",
+                format!("Failed to load/create local node keys: {e}"),
+                None,
+            );
+        }
+    };
+
+    // Attempt opt-in self-service `POST /v1/guest/pair` enrollment when online.
+    let mut enrolled = false;
+    let mut effective_preset = preset.as_str().to_string();
+    let mut effective_scopes = scopes;
+    let mut effective_signed_manifest: Option<SignedNodeManifest> = None;
+    let mut effective_manifest_payload: Option<NodeManifestPayload> = None;
+
+    if let Some(ref v) = verified_live {
+        match attempt_guest_self_enroll(
+            &base_url,
+            &peer_id,
+            &v.signing_pk,
+            &local_node_id,
+            &local_keys,
+        ) {
+            Ok(GuestEnrollOutcome::Enrolled {
+                preset: granted_preset,
+                scopes: granted_scopes,
+                manifest,
+                manifest_payload,
+            }) => {
+                enrolled = true;
+                effective_preset = granted_preset;
+                effective_scopes = granted_scopes;
+                effective_signed_manifest = Some(manifest);
+                effective_manifest_payload = Some(*manifest_payload);
+            }
+            Ok(GuestEnrollOutcome::NotEnabled) => {
+                warnings.push(format!(
+                    "Node '{peer_id}' does not expose self-service guest pairing (POST /v1/guest/pair returned 404); request an am2_ invite from the hub admin to enroll."
+                ));
+            }
+            Err((code, msg)) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    code,
+                    msg,
+                    Some(
+                        "Verify the local --node-id is not already claimed by another keypair, or retry after rate-limit cooldown."
+                            .to_string(),
+                    ),
+                );
+            }
+        }
     }
 
     let now_db = now_ms();
@@ -3256,7 +3571,7 @@ fn run_join(
             profile: peer_profile,
             trust_tier,
             status: PeerStatus::Active,
-            scopes: scopes.clone(),
+            scopes: effective_scopes.clone(),
             auth_credential_ref: None,
         },
         now_db,
@@ -3278,6 +3593,9 @@ fn run_join(
     let mut capabilities: Vec<String> = Vec::new();
 
     if let Some(ref v) = verified_live {
+        let signed_to_cache = effective_signed_manifest.as_ref().unwrap_or(&v.signed);
+        let payload_to_cache = effective_manifest_payload.as_ref().unwrap_or(&v.payload);
+
         let sign_jwk = proto_jwk_to_crypto(&v.payload.identity.signing_jwk);
         let enc_jwk = proto_jwk_to_crypto(&v.payload.identity.encryption_jwk);
         let k = v.signing_pk.kid();
@@ -3334,20 +3652,19 @@ fn run_join(
             );
         }
 
-        capabilities = v
-            .payload
+        capabilities = payload_to_cache
             .capabilities
             .iter()
             .map(|c| c.as_str().to_string())
             .collect();
-        let manifest_json = match serde_json::to_string(&v.signed) {
+        let manifest_json = match serde_json::to_string(signed_to_cache) {
             Ok(s) => s,
             Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
         };
         if let Err(e) = db.peers().cache_manifest(
             &peer_id,
             &ManifestCacheUpdate {
-                manifest_version: v.payload.manifest_version as i64,
+                manifest_version: payload_to_cache.manifest_version as i64,
                 manifest_json,
                 etag: v.etag.clone(),
                 capabilities: capabilities.clone(),
@@ -3368,7 +3685,7 @@ fn run_join(
         kid = Some(k);
         enc_kid = Some(ek);
         fingerprint = Some(fp);
-        hyphae_version = Some(v.payload.hyphae_version.clone());
+        hyphae_version = Some(payload_to_cache.hyphae_version.clone());
     }
 
     let manifest_verified = verified_live.is_some();
@@ -3383,10 +3700,11 @@ fn run_join(
         "peerId": peer_id,
         "endpoint": base_url,
         "profile": peer_profile.as_str(),
-        "preset": preset.as_str(),
+        "preset": effective_preset,
         "trustTier": trust_tier.as_str(),
-        "scopes": scopes,
+        "scopes": effective_scopes,
         "offline": offline,
+        "enrolled": enrolled,
         "manifestVerified": manifest_verified,
         "kid": kid,
         "encryptionKid": enc_kid,
@@ -3400,19 +3718,20 @@ fn run_join(
         let envelope = JsonEnvelope {
             ok: true,
             command: cmd.to_string(),
-            summary: Some(if manifest_verified {
+            summary: Some(if enrolled {
+                format!(
+                    "Joined and enrolled on '{}' ({}) with {} scopes",
+                    peer_id, base_url, effective_preset
+                )
+            } else if manifest_verified {
                 format!(
                     "Joined '{}' ({}) with verified signed manifest (preset={})",
-                    peer_id,
-                    base_url,
-                    preset.as_str()
+                    peer_id, base_url, effective_preset
                 )
             } else {
                 format!(
                     "Pre-configured '{}' ({}) offline (preset={})",
-                    peer_id,
-                    base_url,
-                    preset.as_str()
+                    peer_id, base_url, effective_preset
                 )
             }),
             data: Some(data),
@@ -3425,7 +3744,9 @@ fn run_join(
         println!(
             "OK    Joined Hyphae node '{}' ({})",
             peer_id,
-            if manifest_verified {
+            if enrolled {
+                "enrolled guest-ro + signed manifest verified"
+            } else if manifest_verified {
                 "signed manifest verified"
             } else {
                 "offline pre-configured"
@@ -3434,7 +3755,12 @@ fn run_join(
         println!("      Local Node:  {local_node_id}");
         println!("      Peer ID:     {peer_id}");
         println!("      Endpoint:    {base_url}");
-        println!("      Preset:      {} (tier={})", preset.as_str(), trust_tier.as_str());
+        println!(
+            "      Preset:      {} (tier={}, enrolled={})",
+            effective_preset,
+            trust_tier.as_str(),
+            enrolled
+        );
         if let Some(ref k) = kid {
             println!("      JWK kid:     {k}");
         }
@@ -3444,7 +3770,7 @@ fn run_join(
         if let Some(ref v) = hyphae_version {
             println!("      Version:     {v}");
         }
-        println!("      Scopes:      {}", scopes.join(" "));
+        println!("      Scopes:      {}", effective_scopes.join(" "));
         print_warnings(&warnings);
         print_next_steps(&next);
     }
