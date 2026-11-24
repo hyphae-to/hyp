@@ -31,7 +31,7 @@
 
       <nav class="nav-links">
         <a href="#story">How it flows</a>
-        <a href="#why">Channels &amp; Why</a>
+        <a href="#why">Compare</a>
         <a href="#streams">Streams &amp; Bridges</a>
         <a href="#install">Quick start</a>
       </nav>
@@ -313,100 +313,144 @@
       </div>
     </section>
 
-    <!-- GRANOLA-STYLE LAYERED COLLAGE: Live #channels (#incidents & #deploys) + Honest Landscape -->
+    <!-- SIMPLIFIED POSITIONING + COMPETITIVE FEATURE COMPARISON TABLE -->
     <section id="why" class="section">
       <div class="wrap">
         <div class="section-intro">
           <h2>Everybody is duct-taping their own version of this.</h2>
-            <p>
-              Shell loops polling SQLite. Copy-pasting stack traces between Claude and Codex. Bot tokens rotting in <code>.env</code> files.
-              Hyphae replaces all that brittle glue with one tiny daemon per machine and lightweight team or private nodes.
-            </p>
+          <p>
+            Hyphae doesn't replace your coding agents or frameworks — it replaces the polling loops, single-host silos, and <code>.env</code> bot glue underneath them.
+          </p>
         </div>
 
-        <div class="collage-frame">
-          <!-- Floating Card 1: Live multi-agent #channels (#incidents & #deploys) -->
-          <div class="paper-window">
-            <div class="win-bar">
-              <div class="win-dots"><i></i><i></i><i></i></div>
-              <div class="win-tabs" id="chRoomTabs">
-                <button class="win-tab active" data-room="#incidents" type="button">#incidents</button>
-                <button class="win-tab" data-room="#deploys" type="button">#deploys</button>
-              </div>
-            </div>
-            <div class="win-body">
-              <div id="channelMembers"></div>
-              <div class="mini-log" id="channelLog"></div>
-              <div class="chat-input-row">
-                <input class="clean-input" id="channelInput" placeholder="Post to #incidents as jack@prod/ops..." />
-                <button class="btn-pill btn-olive" id="channelSendBtn" type="button">Post</button>
-              </div>
-            </div>
+        <div class="layer-strip">
+          <div class="layer-card replaces">
+            <span class="layer-kicker">Replaces</span>
+            <p><code>tmux send-keys</code> &amp; SQLite polling loops · single-host polling inboxes · plaintext <code>.env</code> chat bots &amp; raw webhook tunnels</p>
           </div>
+          <div class="layer-card layers">
+            <span class="layer-kicker">Sits underneath &amp; pairs with</span>
+            <p>Claude Code &amp; Agent Teams · Codex &amp; T3 Code · Antigravity &amp; Herdr · OpenClaw (<code>hyp setup openclaw</code>) · LangGraph / CrewAI / A2A via HTTP &amp; fd-3</p>
+          </div>
+        </div>
 
-          <!-- Floating Card 2: Honest landscape snapshot -->
-          <div class="paper-window">
-            <div class="win-bar">
-              <div class="win-dots"><i></i><i></i><i></i></div>
-              <span class="win-title">What exists today</span>
-            </div>
-            <div class="win-body">
-              <div class="alt-row">
-                <div class="alt-head">
-                  <strong>Claude Code Agent Teams</strong>
-                  <span class="alt-badge">1 harness · 1 host</span>
-                </div>
-                <p>Native inside Claude Code, but can't wake Alice's Codex, Jack's T3 server, or a teammate's laptop.</p>
-              </div>
-              <div class="alt-row">
-                <div class="alt-head">
-                  <strong>MCP Agent Mail / xats / crewchat</strong>
-                  <span class="alt-badge">Polling inbox</span>
-                </div>
-                <p>Cross-harness mailboxes, mostly single-host, burning tokens checking for mail instead of push wakeup.</p>
-              </div>
-              <div class="alt-row">
-                <div class="alt-head">
-                  <strong>Google A2A Protocol</strong>
-                  <span class="alt-badge">Cloud RPC</span>
-                </div>
-                <p>Built for enterprise HTTP microservices, not waking local coding threads over Tailscale.</p>
-              </div>
-              <div class="alt-row">
-                <div class="alt-head">
-                  <strong>OpenClaw Gateway</strong>
-                  <span class="alt-badge">Pairs with hyp</span>
-                </div>
-                <p>Great self-hosted chat &amp; agent gateway — plug it straight into any Hyphae node with <code>hyp setup openclaw</code>.</p>
-              </div>
-              <div class="alt-row hyphae-win">
-                <div class="alt-head">
-                  <strong>Hyphae (hyp)</strong>
-                  <span class="alt-badge">Unified substrate</span>
-                </div>
-                <p>Team &amp; private nodes across harnesses, owners, and servers. Native zero-polling wakeup, <code>#channels</code>, filtered streams, and private chat bridges.</p>
-              </div>
-            </div>
+        <div class="compare-shell">
+          <div class="compare-scroll">
+            <table class="compare-table" aria-label="Feature comparison between Hyphae and comparable multi-agent tools">
+              <thead>
+                <tr>
+                  <th scope="col">Capability</th>
+                  <th scope="col" class="col-hyp">Hyphae <code>hyp</code></th>
+                  <th scope="col">DIY <code>tmux</code> / SQLite</th>
+                  <th scope="col">Claude Teams / Codex</th>
+                  <th scope="col">MCP Agent Mail <span>(Rust)</span></th>
+                  <th scope="col">A2A / Frameworks <span>(LangGraph · CrewAI)</span></th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <th scope="row">Cross-harness interop</th>
+                  <td class="col-hyp"><span class="cmp-yes">✓</span> <strong>9 harnesses</strong><small>Claude, Codex, T3, Herdr, OpenClaw, Cursor, AGY…</small></td>
+                  <td><span class="cmp-part">~</span> Fragile PTY<small>Custom scraping per CLI</small></td>
+                  <td><span class="cmp-no">—</span> Single vendor<small>Claude-only or Codex-only</small></td>
+                  <td><span class="cmp-part">~</span> MCP tools only<small>No native harness RPC/hooks</small></td>
+                  <td><span class="cmp-part">~</span> Cloud / in-app<small>Not local IDE/CLI sessions</small></td>
+                </tr>
+                <tr>
+                  <th scope="row">Zero-polling wakeup</th>
+                  <td class="col-hyp"><span class="cmp-yes">✓</span> <strong>Native push</strong><small><code>codex queue</code>, T3 RPC, <code>hc</code>, <code>hyp wait</code></small></td>
+                  <td><span class="cmp-no">—</span> Cron / sleep<small>Burns tokens &amp; CPU polling</small></td>
+                  <td><span class="cmp-part">~</span> Same host<small><code>--channels</code>: 1 CLI session</small></td>
+                  <td><span class="cmp-no">—</span> Pull inbox<small>Agents poll MCP tools</small></td>
+                  <td><span class="cmp-part">~</span> Public HTTPS<small>A2A push needs tunnels</small></td>
+                </tr>
+                <tr>
+                  <th scope="row">Shared <code>#channels</code> &amp; DMs</th>
+                  <td class="col-hyp"><span class="cmp-yes">✓</span> <strong>Multi-host</strong><small>SQLite rooms, no self-echo</small></td>
+                  <td><span class="cmp-part">~</span> DIY files<small>Manual <code>send-keys</code> scripts</small></td>
+                  <td><span class="cmp-part">~</span> Local inbox<small>Flat lead/worker <code>~/.teams/</code></small></td>
+                  <td><span class="cmp-yes">✓</span> Mailboxes<small>Threads + advisory file leases</small></td>
+                  <td><span class="cmp-no">—</span> Build yourself<small>Custom per framework</small></td>
+                </tr>
+                <tr>
+                  <th scope="row">CloudEvents v1.0 streams</th>
+                  <td class="col-hyp"><span class="cmp-yes">✓</span> <strong>Filter + coalesce</strong><small>Subscriptions API, wake caps, lint</small></td>
+                  <td><span class="cmp-no">—</span> None</td>
+                  <td><span class="cmp-no">—</span> Raw webhook<small>No coalescing or reachability lint</small></td>
+                  <td><span class="cmp-no">—</span> None</td>
+                  <td><span class="cmp-no">—</span> External broker<small>Requires NATS / Inngest / DIY</small></td>
+                </tr>
+                <tr>
+                  <th scope="row">Private chat bridges</th>
+                  <td class="col-hyp"><span class="cmp-yes">✓</span> <strong>OS Keychain</strong><small>Slack, TG, WhatsApp via <code>--web</code></small></td>
+                  <td><span class="cmp-no">—</span> <code>.env</code> scripts<small>Plaintext tokens on disk</small></td>
+                  <td><span class="cmp-part">~</span> 1 CLI terminal<small>TG/Discord plugin, no Keychain form</small></td>
+                  <td><span class="cmp-no">—</span> None</td>
+                  <td><span class="cmp-no">—</span> Custom bot</td>
+                </tr>
+                <tr>
+                  <th scope="row">Per-call caller verify</th>
+                  <td class="col-hyp"><span class="cmp-yes">✓</span> <strong>Host-verified</strong><small>192-bit hook token, rollouts, T3 DB</small></td>
+                  <td><span class="cmp-no">—</span> Spoofable<small>Shared shell / open socket</small></td>
+                  <td><span class="cmp-yes">✓</span> Internal only<small>Single vendor process</small></td>
+                  <td><span class="cmp-no">—</span> Name param<small>No shared-tab anti-spoofing</small></td>
+                  <td><span class="cmp-part">~</span> OAuth / mTLS<small>Cloud RPC, not desktop MCP tabs</small></td>
+                </tr>
+                <tr>
+                  <th scope="row">Laptops &amp; servers (NAT)</th>
+                  <td class="col-hyp"><span class="cmp-yes">✓</span> <strong>Outbound SSE</strong><small>Team + Private Nodes over Tailscale</small></td>
+                  <td><span class="cmp-part">~</span> SSH pipes<small>Breaks on laptop sleep</small></td>
+                  <td><span class="cmp-no">—</span> Single host<small>Local worktrees only</small></td>
+                  <td><span class="cmp-part">~</span> Central HTTP<small>Self-hosted server required</small></td>
+                  <td><span class="cmp-part">~</span> Needs tunnels<small>Assumes reachable HTTPS</small></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="compare-foot">
+            <span>Honest boundary: <code>mcp_agent_mail_rust</code> ships Git-backed message archives &amp; file-edit leases; OpenClaw ships a full personal agent OS. Hyphae focuses purely on the cross-harness messaging, push wakeup &amp; filtered event substrate underneath.</span>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- DARK OBSIDIAN STREAMS, #CHANNELS & PRIVATE BRIDGES DECK -->
+    <!-- DARK OBSIDIAN STREAMS, CLOUDEVENTS FILTER SPEC, #CHANNELS & PRIVATE BRIDGES DECK -->
     <section id="streams" class="dark-band">
       <div class="wrap">
         <h2>One incoming stream.<br /><em>Every agent, every chat app.</em></h2>
         <p class="dark-sub">
-          Filter Prometheus alerts and GitHub PR events right on the node before they wake a single token.
-          Fan out across <code>#channels</code>, or link/unlink Slack, Telegram, and WhatsApp on a private node live.
+          Every webhook normalizes into structured <strong>CloudEvents v1.0</strong> and evaluates <strong>CloudEvents Subscriptions API v1.0</strong> filter ASTs on the node — coalescing bursts, capping wakes, linting dead filters, and waking only matching threads.
         </p>
+
+        <div class="spec-cards">
+          <div class="scard">
+            <span class="scard-kicker">01 · Envelope Spec</span>
+            <h4>CloudEvents v1.0 JSON</h4>
+            <p>Strict <code>specversion: "1.0"</code>, <code>id</code>, <code>source</code>, <code>type</code>, <code>subject</code>, <code>time</code> + lowercase extension attributes (<code>repo</code>, <code>action</code>, <code>actor</code>). Bounded <code>8 KiB</code> data / <code>12 KiB</code> event, with 7-day SHA-256 idempotency (<code>409</code> on conflict).</p>
+          </div>
+          <div class="scard">
+            <span class="scard-kicker">02 · Filter Dialects</span>
+            <h4>Subscriptions API v1.0</h4>
+            <p>Deterministic server-side AST: <code>exact</code>, <code>prefix</code>, <code>suffix</code>, <code>all</code>, <code>any</code>, <code>not</code> (max depth <code>8</code>, <code>4 KiB</code>). Matches envelope attributes or top-level <code>data.&lt;field&gt;</code> with scalar coercion &amp; 1-level array membership (e.g. <code>data.pr_numbers: "412"</code>).</p>
+          </div>
+          <div class="scard">
+            <span class="scard-kicker">03 · Noise &amp; Safety</span>
+            <h4>Coalesce, Budgets &amp; Lint</h4>
+            <p>Quiet-window batching (<code>coalesceSeconds</code>, max <code>20</code> events / <code>5m</code>), wake budgets (<code>30/hr</code> router, <code>120/hr</code> bridge), and <code>strict: true</code> reachability lint catching typos like <code>subject</code> vs <code>repo</code> or unmonitored repos at subscribe time.</p>
+          </div>
+          <div class="scard">
+            <span class="scard-kicker">04 · Secret Isolation</span>
+            <h4>Team vs. Private Nodes</h4>
+            <p>Team Nodes verify HMAC-SHA256 webhooks with scrubbed child envs. Personal Slack, Telegram &amp; WhatsApp tokens stay on your localhost Private Node inside OS Keychain / Secret Service (<code>--web</code>) — never shared with team nodes or LLMs.</p>
+          </div>
+        </div>
 
         <div class="stream-deck">
           <div class="deck-tabs" id="deckTabs">
-            <button class="deck-tab active" data-deck="prometheus" type="button">Prometheus · Fleet Alert</button>
-            <button class="deck-tab" data-deck="github" type="button">GitHub · PR #412 Review</button>
-            <button class="deck-tab" data-deck="channels" type="button">#channels · Multi-Agent</button>
-            <button class="deck-tab" data-deck="chat" type="button">Private Node · Slack / Telegram / WhatsApp</button>
+            <button class="deck-tab active" data-deck="prometheus" type="button">Prometheus · Alert Filters</button>
+            <button class="deck-tab" data-deck="github" type="button">GitHub · PR Filters &amp; Lint</button>
+            <button class="deck-tab" data-deck="channels" type="button">#channels · Live Rooms</button>
+            <button class="deck-tab" data-deck="chat" type="button">Private Node · Chat Bridges</button>
           </div>
           <div class="deck-grid" id="deckBody"></div>
         </div>

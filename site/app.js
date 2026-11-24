@@ -1054,8 +1054,269 @@ renderChapter();
 resetStoryTimer();
 
 // ============================================================================
-// 3. INTERACTIVE #CHANNELS CARD (#incidents & #deploys with Alex, Alice, Jack)
+// 3. REAL CLOUDEVENTS SUBSCRIPTIONS API v1.0 EVALUATOR (mirrors src/core/router/filter.ts)
 // ============================================================================
+function ceTexts(value) {
+  if (typeof value === "string") return [value];
+  if (typeof value === "number" || typeof value === "boolean") return [JSON.stringify(value)];
+  if (Array.isArray(value)) return value.flatMap((item) => (Array.isArray(item) ? [] : ceTexts(item)));
+  return [];
+}
+
+function ceLookup(event, key) {
+  if (key.startsWith("data.")) {
+    const field = key.slice(5);
+    return event.data && Object.prototype.hasOwnProperty.call(event.data, field) ? ceTexts(event.data[field]) : [];
+  }
+  if (key === "data" || !Object.prototype.hasOwnProperty.call(event, key)) return [];
+  return ceTexts(event[key]);
+}
+
+function ceCompare(pairs, event, fn) {
+  return Object.entries(pairs).every(([k, expected]) => ceLookup(event, k).some((actual) => fn(actual, expected)));
+}
+
+function ceMatchesFilter(filter, event) {
+  if ("exact" in filter) return ceCompare(filter.exact, event, (a, e) => a === e);
+  if ("prefix" in filter) return ceCompare(filter.prefix, event, (a, e) => a.startsWith(e));
+  if ("suffix" in filter) return ceCompare(filter.suffix, event, (a, e) => a.endsWith(e));
+  if ("all" in filter) return filter.all.every((inner) => ceMatchesFilter(inner, event));
+  if ("any" in filter) return filter.any.some((inner) => ceMatchesFilter(inner, event));
+  if ("not" in filter) return !ceMatchesFilter(filter.not, event);
+  return false;
+}
+
+function ceMatchesFilters(filters, event) {
+  return filters.every((f) => ceMatchesFilter(f, event));
+}
+
+// ============================================================================
+// 4. DARK STREAMS, REAL CLOUDEVENTS FILTER DECK, #CHANNELS & PRIVATE BRIDGES
+// ============================================================================
+let activeDeck = "prometheus";
+let activePromCase = "critical-firing";
+let activeGhCase = "pr-approved";
+let activeRoom = "#incidents";
+const chatLinked = new Set(["alex@laptop/claude"]);
+let chatApp = "slack";
+
+const PROM_CASES = {
+  "critical-firing": {
+    label: "Critical · checkout-api (firing)",
+    event: {
+      specversion: "1.0",
+      id: "8f3c1a9b:firing:2026-11-24T12:00:00Z",
+      type: "io.prometheus.alert.firing",
+      source: "prometheus/alertmanager",
+      subject: "severity=critical/HighErrorRate",
+      time: "2026-11-24T12:00:00Z",
+      datacontenttype: "application/json",
+      data: {
+        status: "firing",
+        alertname: "HighErrorRate",
+        severity: "critical",
+        service: "checkout-api",
+        summary: "5xx error rate at 4.2% across 14 prod nodes",
+      },
+    },
+  },
+  "warning-firing": {
+    label: "Warning · billing-db (firing)",
+    event: {
+      specversion: "1.0",
+      id: "4d9a22e1:firing:2026-11-24T12:03:10Z",
+      type: "io.prometheus.alert.firing",
+      source: "prometheus/alertmanager",
+      subject: "severity=warning/ReplicationLag",
+      time: "2026-11-24T12:03:10Z",
+      datacontenttype: "application/json",
+      data: {
+        status: "firing",
+        alertname: "ReplicationLag",
+        severity: "warning",
+        service: "billing-db",
+        summary: "Read replica lag 4.1s (threshold 3s)",
+      },
+    },
+  },
+  "critical-resolved": {
+    label: "Critical · checkout-api (resolved)",
+    event: {
+      specversion: "1.0",
+      id: "8f3c1a9b:resolved:2026-11-24T12:14:22Z",
+      type: "io.prometheus.alert.resolved",
+      source: "prometheus/alertmanager",
+      subject: "severity=critical/HighErrorRate",
+      time: "2026-11-24T12:14:22Z",
+      datacontenttype: "application/json",
+      data: {
+        status: "resolved",
+        alertname: "HighErrorRate",
+        severity: "critical",
+        service: "checkout-api",
+        summary: "5xx error rate back to 0.0%",
+      },
+    },
+  },
+};
+
+const PROM_SUBS = [
+  {
+    addr: "jack@prod/ops",
+    harness: "T3 Code · mode: interrupt · coalesce: 10s",
+    mode: "interrupt",
+    filters: [
+      { exact: { type: "io.prometheus.alert.firing", "data.severity": "critical" } },
+      { prefix: { subject: "severity=critical/" } },
+    ],
+  },
+  {
+    addr: "alex@laptop/claude",
+    harness: "Claude in Herdr · mode: queue · coalesce: 15s",
+    mode: "queue",
+    filters: [
+      { exact: { "data.service": "checkout-api" } },
+      { any: [
+        { exact: { type: "io.prometheus.alert.firing" } },
+        { exact: { type: "io.prometheus.alert.resolved" } },
+      ]},
+    ],
+  },
+  {
+    addr: "alice@laptop/codex",
+    harness: "Codex via OpenClaw · mode: queue · coalesce: 60s",
+    mode: "queue",
+    filters: [
+      { exact: { type: "io.prometheus.alert.firing" } },
+      { not: { exact: { "data.severity": "critical" } } },
+    ],
+  },
+];
+
+const GH_CASES = {
+  "pr-approved": {
+    label: "PR #412 Approved",
+    event: {
+      specversion: "1.0",
+      id: "72d91b40-9a12-11ef-8120-0242ac120003",
+      source: "github.com/acme/checkout-api",
+      type: "com.github.pull_request_review.submitted",
+      time: "2026-11-24T12:05:12Z",
+      datacontenttype: "application/json",
+      subject: "pull/412",
+      repo: "acme/checkout-api",
+      action: "submitted",
+      actor: "alice-bot",
+      data: {
+        number: 412,
+        pr_numbers: [412],
+        title: "Bound Redis pool queueLimit",
+        state: "approved",
+        labels: ["release-ready"],
+        author: "alice-bot",
+      },
+    },
+  },
+  "ci-failed": {
+    label: "PR #412 CI Failed",
+    event: {
+      specversion: "1.0",
+      id: "91e04c12-9a12-11ef-8120-0242ac120003",
+      source: "github.com/acme/checkout-api",
+      type: "com.github.workflow_run.completed",
+      time: "2026-11-24T12:02:01Z",
+      datacontenttype: "application/json",
+      subject: "actions/runs/982144",
+      repo: "acme/checkout-api",
+      action: "completed",
+      actor: "alex",
+      data: {
+        pr_numbers: [412],
+        conclusion: "failure",
+        workflow_path: ".github/workflows/ci.yml",
+        branch: "fix/redis-pool",
+      },
+    },
+  },
+  "dependabot-pr": {
+    label: "Dependabot PR #419",
+    event: {
+      specversion: "1.0",
+      id: "11c8a9f0-9a12-11ef-8120-0242ac120003",
+      source: "github.com/acme/checkout-api",
+      type: "com.github.pull_request.opened",
+      time: "2026-11-24T12:08:40Z",
+      datacontenttype: "application/json",
+      subject: "pull/419",
+      repo: "acme/checkout-api",
+      action: "opened",
+      actor: "dependabot[bot]",
+      data: {
+        number: 419,
+        pr_numbers: [419],
+        title: "Bump eslint from 9.10 to 9.11",
+        labels: ["dependencies"],
+      },
+    },
+  },
+  "strict-lint": {
+    label: "Reachability Lint (strict: true)",
+    lintDemo: true,
+    call: {
+      tool: "hyp_subscribe",
+      key: "gh:broken-typo",
+      topic: "github",
+      strict: true,
+      filters: [
+        { exact: { subject: "acme/checkout-api" } },
+      ],
+    },
+    response: {
+      ok: false,
+      code: "unreachable_subscription",
+      rolledBack: true,
+      diagnostics: [
+        {
+          code: "invalid_github_subject_filter",
+          message: "GitHub `subject` is `pull/<n>`, `issues/<n>`, or `actions/runs/<id>` — use the `repo` extension attribute for `owner/repo`.",
+          suggestedFilter: { exact: { repo: "acme/checkout-api" } },
+        },
+      ],
+    },
+  },
+};
+
+const GH_SUBS = [
+  {
+    addr: "jack@prod/release",
+    harness: "T3 Code · mode: queue · coalesce: 15s · strict: true",
+    mode: "queue",
+    filters: [
+      { exact: { repo: "acme/checkout-api", type: "com.github.pull_request_review.submitted" } },
+      { exact: { "data.state": "approved", "data.labels": "release-ready" } },
+    ],
+  },
+  {
+    addr: "alex@laptop/claude",
+    harness: "Claude in Herdr · mode: queue · array match on data.pr_numbers",
+    mode: "queue",
+    filters: [
+      { exact: { repo: "acme/checkout-api", "data.pr_numbers": "412" } },
+      { not: { exact: { actor: "dependabot[bot]" } } },
+    ],
+  },
+  {
+    addr: "alice@laptop/codex",
+    harness: "Codex via OpenClaw · suffix + not bot exclusion",
+    mode: "queue",
+    filters: [
+      { exact: { repo: "acme/checkout-api" } },
+      { suffix: { type: ".opened" } },
+      { not: { exact: { actor: "dependabot[bot]" } } },
+    ],
+  },
+];
+
 const chMembers = [
   { id: "jack@prod/ops", sub: "T3 Code · Linux server · Prometheus subscriber" },
   { id: "alex@laptop/claude", sub: "Claude in Herdr · laptop · checkout-api owner" },
@@ -1068,7 +1329,7 @@ const ROOM_STATE = {
     joined: new Set(["jack@prod/ops", "alex@laptop/claude"]),
     sender: "jack@prod/ops",
     log: [
-      "#incidents · 2 enrolled across server & laptop",
+      "#incidents · Team Node SQLite room (2 enrolled · no sender echo)",
       "jack@prod/ops: checkout-api HighErrorRate (4.2%) — CODEOWNERS -> alex",
       "alex@laptop/claude: Fixed Redis pool leak; handed PR #412 to Alice",
     ],
@@ -1077,130 +1338,8 @@ const ROOM_STATE = {
     joined: new Set(["alex@laptop/claude", "alice@laptop/codex", "jack@prod/ops", "jack@prod/release"]),
     sender: "jack@prod/release",
     log: [
-      "#deploys · release notification channel (4 members)",
+      "#deploys · release fan-out room (4 enrolled · no sender echo)",
       "jack@prod/release: Merged PR #412 (approved by Alice) -> v2.14.1 live ✓ · alert resolved (0.0%)",
-    ],
-  },
-};
-
-let activeRoom = "#incidents";
-
-function renderChannel() {
-  const room = ROOM_STATE[activeRoom];
-  document.querySelectorAll("#chRoomTabs .win-tab").forEach((b) =>
-    b.classList.toggle("active", b.dataset.room === activeRoom)
-  );
-  document.getElementById("channelInput").placeholder = `Post to ${activeRoom} as ${room.sender}...`;
-
-  const host = document.getElementById("channelMembers");
-  host.innerHTML = chMembers.map((m) => {
-    const on = room.joined.has(m.id);
-    return `
-      <div class="member-row">
-        <div>
-          <span class="m-name">${m.id}</span>
-          <span class="m-sub">${m.sub}</span>
-        </div>
-        <button class="toggle-pill ${on ? "on" : ""}" data-cm="${m.id}" type="button">${on ? "joined" : "join"}</button>
-      </div>
-    `;
-  }).join("");
-
-  host.querySelectorAll("[data-cm]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const id = btn.dataset.cm;
-      if (room.joined.has(id)) {
-        room.joined.delete(id);
-        room.log.push(`hyp_channel_leave('${activeRoom}') -> ${id}`);
-      } else {
-        room.joined.add(id);
-        room.log.push(`hyp_channel_join('${activeRoom}') -> ${id}`);
-      }
-      renderChannel();
-    });
-  });
-
-  const logEl = document.getElementById("channelLog");
-  logEl.innerHTML = room.log.map((line, i) =>
-    `<div class="${i === room.log.length - 1 ? "hl" : ""}">${esc(line)}</div>`
-  ).join("");
-  logEl.scrollTop = logEl.scrollHeight;
-}
-
-function postChannel() {
-  const room = ROOM_STATE[activeRoom];
-  const input = document.getElementById("channelInput");
-  const text = input.value.trim() || (activeRoom === "#incidents"
-    ? "PR #412 merged — error rate back to 0.0%."
-    : "Shipping checkout-api v2.14.1 to prod.");
-  input.value = "";
-  const recips = [...room.joined].filter((x) => x !== room.sender);
-  room.log.push(`${room.sender}: ${text}`);
-  room.log.push(`-> pushed natively to [${recips.join(", ") || "nobody"}]`);
-  renderChannel();
-}
-
-document.querySelectorAll("#chRoomTabs .win-tab").forEach((b) => {
-  b.addEventListener("click", () => { activeRoom = b.dataset.room; renderChannel(); });
-});
-document.getElementById("channelSendBtn").addEventListener("click", postChannel);
-document.getElementById("channelInput").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") postChannel();
-});
-renderChannel();
-
-// ============================================================================
-// 4. DARK STREAMS, #CHANNELS & PRIVATE BRIDGES DECK
-// ============================================================================
-let activeDeck = "prometheus";
-const chatLinked = new Set(["alex@laptop/claude"]);
-let chatApp = "slack";
-
-const DECK_VIEWS = {
-  prometheus: {
-    payload: {
-      specversion: "1.0",
-      source: "prometheus/server-fleet",
-      type: "io.prometheus.alert.firing",
-      subject: "severity=critical/HighErrorRate",
-      data: { service: "checkout-api", rate: "4.2%", codeowners: ["alex"] },
-    },
-    routes: [
-      { addr: "jack@prod/ops", sub: "filter: subject startsWith 'severity=critical' · T3 dispatch", match: true, interrupt: true },
-      { addr: "alex@laptop/claude", sub: "notified by jack/ops via hyp_send after CODEOWNERS check", match: true, interrupt: false },
-      { addr: "alice@laptop/codex", sub: "filter: PR reviews only · stays quiet", match: false, interrupt: false },
-      { addr: "jack@prod/release", sub: "filter: approved PRs only · stays quiet", match: false, interrupt: false },
-    ],
-  },
-  github: {
-    payload: {
-      specversion: "1.0",
-      source: "github/acme/checkout-api",
-      type: "com.github.pull_request_review.submitted",
-      subject: "acme/checkout-api#412",
-      data: { author: "alex", reviewer: "alice/codex", state: "approved", checks: "42/42 green" },
-    },
-    routes: [
-      { addr: "jack@prod/release", sub: "filter: state=='approved' && checks=='green' -> merges & ships v2.14.1", match: true, interrupt: false },
-      { addr: "alex@laptop/claude", sub: "subscribed to PR #412 -> woken on CI Done & review updates", match: true, interrupt: false },
-      { addr: "alice@laptop/codex", sub: "subscribed to PR #412 -> ran sub-agent audit & approved", match: true, interrupt: false },
-      { addr: "jack@prod/ops", sub: "filter: topic == 'prometheus' · stays quiet", match: false, interrupt: false },
-    ],
-  },
-  channels: {
-    payload: {
-      tool: "hyp_channel_post",
-      node: "team-node (SQLite channel_members)",
-      channel: "#deploys",
-      from: "jack@prod/release",
-      text: "v2.14.1 live (PR #412) — checkout-api alert resolved (0.0% errors).",
-      noSenderEcho: true,
-    },
-    routes: [
-      { addr: "alex@laptop/claude", sub: "joined #deploys -> posts all-clear via Private Node Slack DM", match: true, interrupt: false },
-      { addr: "alice@laptop/codex", sub: "joined #deploys -> woken via codex queue", match: true, interrupt: false },
-      { addr: "jack@prod/ops", sub: "joined #deploys -> marks alert resolved", match: true, interrupt: false },
-      { addr: "jack@prod/release", sub: "sender · no self-echo", match: false, interrupt: false },
     ],
   },
 };
@@ -1212,59 +1351,222 @@ const CHAT_THREADS = [
   { id: "jack@prod/release", sub: "T3 Code · Jack's Release Manager" },
 ];
 
+const BRIDGE_SECRET_ENV = {
+  slack: {
+    SLACK_APP_TOKEN: { secret: "slack-app-token" },
+    SLACK_BOT_TOKEN: { secret: "slack-bot-token" },
+    SLACK_ALLOWED_USERS: "U01234567",
+  },
+  telegram: {
+    TELEGRAM_BOT_TOKEN: { secret: "telegram-bot-token" },
+    TELEGRAM_ALLOWED_USERS: "981234567",
+  },
+  whatsapp: {
+    WHATSAPP_ACCESS_TOKEN: { secret: "whatsapp-access-token" },
+    WHATSAPP_APP_SECRET: { secret: "whatsapp-app-secret" },
+    WHATSAPP_ALLOWED_NUMBERS: "15551234567",
+  },
+  "byo-fd3": {
+    exec: "/usr/local/bin/my-bridge.py",
+    protocol: "NDJSON over fd 3 (plugins/sdk/client.{mjs,py})",
+    BRIDGE_API_KEY: { secret: "my-bridge-key" },
+  },
+};
+
+function renderEventEvaluator(topic, cases, activeKey, setKey, subs) {
+  const current = cases[activeKey];
+  const chips = Object.entries(cases)
+    .map(([k, c]) => `<button class="sub-chip ${c.lintDemo ? "lint" : ""} ${activeKey === k ? "active" : ""}" data-case="${k}" type="button">${esc(c.label)}</button>`)
+    .join("");
+
+  if (current.lintDemo) {
+    return `
+      <div>
+        <div class="deck-col-label"><span>Subscribe Call</span><code>strict: true</code></div>
+        <div class="deck-subtabs">${chips}</div>
+        <pre class="payload-pre">${esc(JSON.stringify(current.call, null, 2))}</pre>
+      </div>
+      <div>
+        <div class="deck-col-label"><span>Router Reachability Lint</span><code>fail-closed rollback</code></div>
+        <div class="route-item lint-warn">
+          <div class="route-top">
+            <div>
+              <span class="ri-addr">invalid_github_subject_filter</span>
+              <span class="ri-sub">Caught before saving — never silently waits forever on an unreachable filter.</span>
+            </div>
+            <span class="ri-pill">rejected</span>
+          </div>
+          <pre class="ri-filter">${esc(JSON.stringify(current.response, null, 2))}</pre>
+        </div>
+        <div class="route-item matched">
+          <div class="route-top">
+            <div>
+              <span class="ri-addr">Also linted at subscribe time</span>
+              <span class="ri-sub"><code>unknown_topic</code> · <code>unmonitored_repo</code> (checks <code>GITHUB_REPOS</code> / <code>GITHUB_ORGS</code>) · <code>unknown_filter_attribute</code> · <code>unprovisioned_publisher</code></span>
+            </div>
+            <span class="ri-pill">hyp_topics</span>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  const ev = current.event;
+  return `
+    <div>
+      <div class="deck-col-label"><span>Incoming CloudEvent v1.0</span><code>topic: "${topic}"</code></div>
+      <div class="deck-subtabs">${chips}</div>
+      <pre class="payload-pre">${esc(JSON.stringify(ev, null, 2))}</pre>
+    </div>
+    <div>
+      <div class="deck-col-label"><span>Live Subscriptions API v1.0 Evaluation</span><code>filter.ts</code></div>
+      ${subs.map((s) => {
+        const matched = ceMatchesFilters(s.filters, ev);
+        const cls = matched ? (s.mode === "interrupt" ? "interrupt" : "matched") : "dim";
+        const pill = matched ? (s.mode === "interrupt" ? "interrupt" : "woken") : "filtered";
+        return `
+          <div class="route-item ${cls}">
+            <div class="route-top">
+              <div>
+                <span class="ri-addr">${esc(s.addr)}</span>
+                <span class="ri-sub">${esc(s.harness)}</span>
+              </div>
+              <span class="ri-pill">${pill}</span>
+            </div>
+            <pre class="ri-filter">filters: ${esc(JSON.stringify(s.filters))}</pre>
+          </div>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
 function renderDeck() {
   document.querySelectorAll("#deckTabs .deck-tab").forEach((b) =>
     b.classList.toggle("active", b.dataset.deck === activeDeck)
   );
   const body = document.getElementById("deckBody");
+  if (!body) return;
 
-  if (activeDeck !== "chat") {
-    const d = DECK_VIEWS[activeDeck];
+  if (activeDeck === "prometheus") {
+    body.innerHTML = renderEventEvaluator("alerts", PROM_CASES, activePromCase, (k) => { activePromCase = k; }, PROM_SUBS);
+    body.querySelectorAll("[data-case]").forEach((btn) => {
+      btn.addEventListener("click", () => { activePromCase = btn.dataset.case; renderDeck(); });
+    });
+    return;
+  }
+
+  if (activeDeck === "github") {
+    body.innerHTML = renderEventEvaluator("github", GH_CASES, activeGhCase, (k) => { activeGhCase = k; }, GH_SUBS);
+    body.querySelectorAll("[data-case]").forEach((btn) => {
+      btn.addEventListener("click", () => { activeGhCase = btn.dataset.case; renderDeck(); });
+    });
+    return;
+  }
+
+  if (activeDeck === "channels") {
+    const room = ROOM_STATE[activeRoom];
     body.innerHTML = `
       <div>
-        <pre class="payload-pre">${esc(JSON.stringify(d.payload, null, 2))}</pre>
+        <div class="deck-col-label"><span>Multi-Agent Room Log</span><code>hyp_channel_post</code></div>
+        <div class="deck-subtabs">
+          <button class="sub-chip ${activeRoom === "#incidents" ? "active" : ""}" data-room="#incidents" type="button">#incidents</button>
+          <button class="sub-chip ${activeRoom === "#deploys" ? "active" : ""}" data-room="#deploys" type="button">#deploys</button>
+        </div>
+        <div class="deck-log" id="deckChannelLog">
+          ${room.log.map((line, i) => `<div class="${i === room.log.length - 1 ? "hl" : ""}">${esc(line)}</div>`).join("")}
+        </div>
+        <div class="deck-input-row">
+          <input class="deck-input" id="deckChannelInput" placeholder="Post to ${esc(activeRoom)} as ${esc(room.sender)}..." />
+          <button class="deck-send-btn" id="deckChannelSendBtn" type="button">Post</button>
+        </div>
       </div>
       <div>
-        ${d.routes.map((r) => `
-          <div class="route-item ${r.match ? (r.interrupt ? "interrupt" : "matched") : "dim"}">
-            <div>
-              <span class="ri-addr">${r.addr}</span>
-              <span class="ri-sub">${r.sub}</span>
+        <div class="deck-col-label"><span>Room Membership</span><code>toggle join / leave</code></div>
+        ${chMembers.map((m) => {
+          const on = room.joined.has(m.id);
+          return `
+            <div class="route-item inline ${on ? "matched" : "dim"}">
+              <div>
+                <span class="ri-addr">${esc(m.id)}</span>
+                <span class="ri-sub">${esc(m.sub)}</span>
+              </div>
+              <button class="ri-pill" data-cm="${esc(m.id)}" type="button">${on ? "joined · leave" : "join room"}</button>
             </div>
-            <span class="ri-pill">${r.match ? (r.interrupt ? "interrupt" : "woken") : "filtered"}</span>
-          </div>
-        `).join("")}
+          `;
+        }).join("")}
       </div>
     `;
+    const logEl = document.getElementById("deckChannelLog");
+    if (logEl) logEl.scrollTop = logEl.scrollHeight;
+    const postMsg = () => {
+      const input = document.getElementById("deckChannelInput");
+      const text = (input?.value || "").trim() || (activeRoom === "#incidents"
+        ? "PR #412 merged — checkout-api errors back to 0.0%."
+        : "Shipping checkout-api v2.14.1 to prod.");
+      if (input) input.value = "";
+      const recips = [...room.joined].filter((x) => x !== room.sender);
+      room.log.push(`${room.sender}: ${text}`);
+      room.log.push(`-> pushed natively to [${recips.join(", ") || "nobody"}] (no self-echo)`);
+      renderDeck();
+    };
+    body.querySelectorAll("[data-room]").forEach((btn) => {
+      btn.addEventListener("click", () => { activeRoom = btn.dataset.room; renderDeck(); });
+    });
+    body.querySelectorAll("[data-cm]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const id = btn.dataset.cm;
+        if (room.joined.has(id)) {
+          room.joined.delete(id);
+          room.log.push(`hyp_channel_leave('${activeRoom}') -> ${id}`);
+        } else {
+          room.joined.add(id);
+          room.log.push(`hyp_channel_join('${activeRoom}') -> ${id}`);
+        }
+        renderDeck();
+      });
+    });
+    document.getElementById("deckChannelSendBtn")?.addEventListener("click", postMsg);
+    document.getElementById("deckChannelInput")?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") postMsg();
+    });
     return;
   }
 
   const linkedList = [...chatLinked];
   body.innerHTML = `
     <div>
-      <div class="deck-tabs" style="margin-bottom:14px;">
+      <div class="deck-col-label"><span>Private Node Bridge Config</span><code>connector.json</code></div>
+      <div class="deck-subtabs">
         ${["slack", "telegram", "whatsapp", "byo-fd3"].map((app) =>
-          `<button class="deck-tab ${chatApp === app ? "active" : ""}" data-capp="${app}" type="button">${app}</button>`
+          `<button class="sub-chip ${chatApp === app ? "active" : ""}" data-capp="${app}" type="button">${app}</button>`
         ).join("")}
       </div>
       <pre class="payload-pre">${esc(JSON.stringify({
-        node: "Private Node (localhost — never shared with Team Node)",
-        bridge: `${chatApp}/dm-alex`,
-        secrets: "OS Keychain / Linux Secret Service · captured via hyp secret set --web",
-        linkedThreads: linkedList,
-        liveHandoff: "hyp_plugin_handoff (zero daemon restart)",
+        node: "Private Node (127.0.0.1 — never shared with Team Node)",
+        plugin: chatApp,
+        env: BRIDGE_SECRET_ENV[chatApp],
+        target: {
+          name: "dm-alex",
+          coalesceSeconds: 5,
+          maxWaitSeconds: 30,
+          wakesPerHour: 120,
+          linkedThreads: linkedList,
+        },
+        outboundReply: 'hyp_plugin_post({ plugin: "' + chatApp + '", target: "dm-alex", text: "..." })',
       }, null, 2))}</pre>
     </div>
     <div>
+      <div class="deck-col-label"><span>Live Multi-Thread Fan-In</span><code>hyp_bridge_link / unlink</code></div>
       ${CHAT_THREADS.map((t) => {
         const on = chatLinked.has(t.id);
         return `
-          <div class="route-item ${on ? "matched" : "dim"}">
+          <div class="route-item inline ${on ? "matched" : "dim"}">
             <div>
-              <span class="ri-addr">${t.id}</span>
-              <span class="ri-sub">${t.sub}</span>
+              <span class="ri-addr">${esc(t.id)}</span>
+              <span class="ri-sub">${esc(t.sub)}</span>
             </div>
-            <button class="ri-pill" data-ct="${t.id}" type="button">${on ? "linked · unlink" : "link thread"}</button>
+            <button class="ri-pill" data-ct="${esc(t.id)}" type="button">${on ? "linked · unlink" : "link thread"}</button>
           </div>
         `;
       }).join("")}
