@@ -189,12 +189,12 @@ if (-not [string]::IsNullOrWhiteSpace($BaseUrl)) {
 $BinPath = Join-Path $InstallDir "hyp.exe"
 
 if ($DryRun) {
-    Write-Host "Hyphae installer dry-run:"
-    Write-Host "  Version:      $Version"
-    Write-Host "  Target:       $Target"
-    Write-Host "  Archive URL:  $ArchiveUrl"
-    Write-Host "  Checksums:    $SumsUrl"
-    Write-Host "  Install path: $BinPath"
+    Write-Output "Hyphae installer dry-run:"
+    Write-Output "  Version:      $Version"
+    Write-Output "  Target:       $Target"
+    Write-Output "  Archive URL:  $ArchiveUrl"
+    Write-Output "  Checksums:    $SumsUrl"
+    Write-Output "  Install path: $BinPath"
     return
 }
 
