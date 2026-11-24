@@ -104,6 +104,9 @@ export class State {
     }
   }
 
+  /** Internal SQLite handle shared with co-located stores (e.g. LocalEvents). Owned by State. */
+  database(): DatabaseSync { return this.#db; }
+
   close(): void { this.#db.close(); }
 
   register(id: string, backend: Backend, now = Date.now()): void {

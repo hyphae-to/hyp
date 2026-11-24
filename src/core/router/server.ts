@@ -12,15 +12,17 @@ import { RouterCore } from "./core.ts";
 import type { PublishError } from "./events.ts";
 import type { PairingError, PairingResult } from "./pairing.ts";
 import type { TransferError } from "./transfers.ts";
-import { MAX_TEXT_BYTES, type InboundOutcome, type SendError } from "./types.ts";
+import { MAX_TEXT_BYTES, toRouterOutcome, type SendError } from "./types.ts";
 
 const MAX_BODY_BYTES = MAX_TEXT_BYTES * 2 + 4096;
 /** The event limit applies to the event as re-serialized; this leaves room for whitespace. */
 const MAX_EVENT_BODY_BYTES = MAX_EVENT_BYTES * 2 + 4096;
 /** 200 subscriptions with 4 KiB of filters each. */
 const MAX_SUBSCRIPTIONS_BODY_BYTES = 1024 * 1024;
-/** Event batches close on this tick, so it bounds how late a coalescing window ends. */
-const TICK_MS = 1_000;
+/** Upper bound on a single deadline timer sleep (1 hour), so long-horizon deadlines re-check safely. */
+const MAX_TICK_SLEEP_MS = 60 * 60 * 1000;
+/** Backoff before retrying a failed tick (e.g. SQLite stayed busy past busy_timeout). */
+const TICK_ERROR_RETRY_MS = 1_000;
 const KEEPALIVE_MS = 15_000;
 
 const HandlesBody = Schema.Struct({ handles: Schema.Array(Schema.String) });
@@ -172,14 +174,54 @@ export interface RunningRouter {
 
 export async function serveRouter(options: RouterServerOptions): Promise<RunningRouter> {
   const { core } = options;
-  const ticker = setInterval(() => {
-    // A failed tick (e.g. the database stayed locked past the busy timeout) is retried on the next one.
+  let closed = false;
+  let ticking = false;
+  let tickTimer: NodeJS.Timeout | null = null;
+
+  const armTimer = (delayMs: number) => {
+    tickTimer = setTimeout(runTick, delayMs);
+    tickTimer.unref();
+  };
+
+  const scheduleTick = () => {
+    if (closed || ticking) return;
+    if (tickTimer !== null) {
+      clearTimeout(tickTimer);
+      tickTimer = null;
+    }
+    let nextAt: number | null;
+    try {
+      nextAt = core.nextDeadlineMs();
+    } catch (error) {
+      log("error", "router.tick_failed", { error: errorMessage(error) });
+      armTimer(TICK_ERROR_RETRY_MS);
+      return;
+    }
+    if (nextAt === null) return;
+    const delayMs = Math.min(MAX_TICK_SLEEP_MS, Math.max(1, nextAt - core.now()));
+    armTimer(delayMs);
+  };
+
+  const runTick = () => {
+    tickTimer = null;
+    if (closed) return;
+    ticking = true;
+    let failed = false;
     try {
       core.tick();
     } catch (error) {
+      failed = true;
       log("error", "router.tick_failed", { error: errorMessage(error) });
+    } finally {
+      ticking = false;
     }
-  }, TICK_MS);
+    if (closed) return;
+    if (failed) armTimer(TICK_ERROR_RETRY_MS);
+    else scheduleTick();
+  };
+
+  core.setScheduleListener(scheduleTick);
+  scheduleTick();
 
   const server = createServer(async (request, response) => {
     try {
@@ -360,10 +402,7 @@ export async function serveRouter(options: RouterServerOptions): Promise<Running
       if (ackMatch?.[1] !== undefined) {
         const body = decodeAck(await readJson(request));
         if (body._tag === "None") throw new HttpError(400, "invalid", "expected {outcome, reason?}");
-        const outcome: InboundOutcome =
-          body.value.outcome === "delivered"
-            ? { kind: "delivered" }
-            : { kind: body.value.outcome, reason: body.value.reason };
+        const outcome = toRouterOutcome(body.value);
         const settled = core.ack(connectorId, decodeURIComponent(ackMatch[1]), outcome);
         json(response, settled ? 200 : 404, settled ? { ok: true } : { error: "not_found", message: "no such pending message" });
         return;
@@ -427,7 +466,12 @@ export async function serveRouter(options: RouterServerOptions): Promise<Running
     url: `http://${options.host}:${port}`,
     close: () =>
       new Promise<void>((resolve) => {
-        clearInterval(ticker);
+        closed = true;
+        core.setScheduleListener(null);
+        if (tickTimer !== null) {
+          clearTimeout(tickTimer);
+          tickTimer = null;
+        }
         server.closeAllConnections();
         server.close(() => resolve());
       }),

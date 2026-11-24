@@ -1,9 +1,10 @@
 // The connector's plugins (SPEC.md section 13): their processes, the local event store, delivery
 // while T3 is connected, and backlog status lines to each plugin.
+import type { DatabaseSync } from "node:sqlite";
 import type { PluginConfig } from "./types.ts";
 import { errorMessage, log } from "../log.ts";
 import type { InboundEventBatch, InboundOutcome } from "../router/types.ts";
-import { LocalEvents, type TargetRef } from "./store.ts";
+import { LocalEvents, type LocalEventsOptions, type TargetRef } from "./store.ts";
 import { PluginProcess, type SupervisorOptions } from "./supervisor.ts";
 
 /** A target's backlog is reported once its oldest pending batch is this old, and then at most this often. */
@@ -11,7 +12,10 @@ const STATUS_AFTER_MS = 60_000;
 const STATUS_CHECK_MS = 5_000;
 
 export interface PluginsOptions {
-  readonly dbPath: string;
+  /** Shared SQLite connection (e.g. `state.database()`); never closed by `Plugins.stop()`. */
+  readonly db?: DatabaseSync;
+  /** Standalone SQLite path (for unit tests); opened and closed by `LocalEvents`. */
+  readonly dbPath?: string;
   readonly plugins: readonly PluginConfig[];
   readonly supervisor?: SupervisorOptions;
   readonly statusAfterMs?: number;
@@ -37,7 +41,15 @@ export class Plugins {
 
   constructor(options: PluginsOptions) {
     this.#now = options.now ?? Date.now;
-    this.#events = new LocalEvents({ dbPath: options.dbPath, plugins: options.plugins, now: this.#now });
+    let storeOptions: LocalEventsOptions;
+    if (options.db !== undefined) {
+      storeOptions = { db: options.db, plugins: options.plugins, now: this.#now };
+    } else if (options.dbPath !== undefined) {
+      storeOptions = { dbPath: options.dbPath, plugins: options.plugins, now: this.#now };
+    } else {
+      throw new Error("Plugins requires either db or dbPath");
+    }
+    this.#events = new LocalEvents(storeOptions);
     this.#processes = new Map(
       options.plugins.map((plugin) => [
         plugin.name,

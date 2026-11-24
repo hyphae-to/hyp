@@ -1,8 +1,7 @@
-import { join } from "node:path";
 import type { AgentPluginConfig, AgentPluginTarget } from "./config.ts";
 import { RouterError } from "./router.ts";
 import type { Session, State } from "./state.ts";
-import type { Outcome } from "./protocol.ts";
+import { delivered, hold, reject, toRouterOutcome, type Outcome } from "./protocol.ts";
 import { Plugins } from "./core/plugins/plugins.ts";
 import { formatPluginDelivery } from "./core/plugins/delivery.ts";
 import type { PluginConfig as T3PluginConfig } from "./core/plugins/types.ts";
@@ -14,7 +13,7 @@ export interface PluginDeliverySink {
 
 /**
  * Universal local plugin host for `hyphae`: runs the fd-3 process supervisor,
- * SQLite coalescing/retention store (`local.db`), and safe CloudEvent formatting,
+ * SQLite coalescing/retention store (hosted inside `state.sqlite`), and safe CloudEvent formatting,
  * routing targets dynamically to ANY enrolled harness session (Antigravity, Claude, Codex, Herdr).
  */
 export class PluginHost {
@@ -22,7 +21,7 @@ export class PluginHost {
   readonly #state: State;
   readonly #plugins: Plugins;
 
-  constructor(stateDir: string, configs: readonly AgentPluginConfig[], state: State) {
+  constructor(_stateDir: string, configs: readonly AgentPluginConfig[], state: State) {
     this.#configs = configs;
     this.#state = state;
     const t3Configs: T3PluginConfig[] = configs.map((plugin) => ({
@@ -39,7 +38,7 @@ export class PluginHost {
         wakesPerHour: target.wakesPerHour,
       })),
     }));
-    this.#plugins = new Plugins({ dbPath: join(stateDir, "local.db"), plugins: t3Configs });
+    this.#plugins = new Plugins({ db: state.database(), plugins: t3Configs });
   }
 
   get names(): string[] {
@@ -128,10 +127,10 @@ export class PluginHost {
 
   async #deliver(batch: InboundEventBatch, sink: PluginDeliverySink): Promise<InboundOutcome> {
     const route = this.#plugins.route(batch.subscriptionId);
-    if (!route) return { kind: "rejected", reason: "unknown_target" };
-    if (batch.events.length === 0) return { kind: "rejected", reason: "no_valid_events" };
+    if (!route) return toRouterOutcome(reject("unknown_target"));
+    if (batch.events.length === 0) return toRouterOutcome(reject("no_valid_events"));
     const recipients = this.#resolveRecipients(route.plugin, route.target);
-    if (recipients.length === 0) return { kind: "hold", reason: "target_unavailable" };
+    if (recipients.length === 0) return toRouterOutcome(hold("target_unavailable"));
 
     const text = formatPluginDelivery(route.plugin, batch);
     let deliveredCount = 0;
@@ -145,11 +144,11 @@ export class PluginHost {
       else rejectedReason ??= outcome.reason;
     }
 
-    if (holdReason !== undefined) return { kind: "hold", reason: holdReason };
-    if (deliveredCount > 0) return { kind: "delivered" };
+    if (holdReason !== undefined) return toRouterOutcome(hold(holdReason));
+    if (deliveredCount > 0) return toRouterOutcome(delivered);
     const reason = rejectedReason ?? "delivery_rejected";
     this.#plugins.reportDeliveryFailed(route, batch, reason);
-    return { kind: "rejected", reason };
+    return toRouterOutcome(reject(reason));
   }
 
   listForSession(callerSessionId: string): {

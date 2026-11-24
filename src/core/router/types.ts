@@ -78,6 +78,27 @@ export type InboundOutcome =
   /** Keep at the router and offer again later. */
   | { readonly kind: "hold"; readonly reason: string };
 
+/** Wire/connector representation of an inbox ack (`POST /v1/messages/:id/ack`). */
+export type WireOutcome =
+  | { outcome: "delivered" }
+  | { outcome: "hold" | "rejected"; reason: string };
+
+/** Converts a wire/connector `{ outcome }` into a router-internal `{ kind }` `InboundOutcome`. */
+export function toRouterOutcome(
+  value: { readonly outcome: "delivered" } | { readonly outcome: "hold" | "rejected"; readonly reason: string },
+): InboundOutcome {
+  return value.outcome === "delivered"
+    ? { kind: "delivered" }
+    : { kind: value.outcome, reason: value.reason };
+}
+
+/** Converts a router-internal `{ kind }` `InboundOutcome` into a wire/connector `{ outcome }`. */
+export function fromRouterOutcome(value: InboundOutcome): WireOutcome {
+  return value.kind === "delivered"
+    ? { outcome: "delivered" }
+    : { outcome: value.kind, reason: value.reason };
+}
+
 export interface Peer {
   readonly address: string;
   readonly online: boolean;

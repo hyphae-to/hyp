@@ -40,8 +40,37 @@ export function fenceFor(text: string): string {
   return "`".repeat(Math.max(3, longest + 1));
 }
 
-/** An event's data as compact JSON in which no T3 context link can match. */
-export const dataJson = (data: unknown): string => JSON.stringify(data ?? null).replaceAll("(", "\\u0028");
+/**
+ * Serializes `value` as compact JSON with prompt-unsafe characters escaped as `\uXXXX`:
+ * - `<`, `>`, `` ` `` (cannot close XML/channel tags or Markdown code fences)
+ * - `(` (cannot form T3 `[label](t3-context://...)` context links)
+ * - C1/DEL control chars (`\u007f-\u009f`) and JS line separators (`\u2028`, `\u2029`)
+ *
+ * Still standard valid JSON that `JSON.parse` decodes back losslessly.
+ */
+export const promptSafeJson = (value: unknown): string =>
+  (JSON.stringify(value) ?? "null").replace(/[<>`(\u007f-\u009f\u2028\u2029]/g, (character) =>
+    `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
+
+/**
+ * Recursively drops `null`, `undefined`, and empty-array fields from plain objects
+ * so delivered CloudEvent payloads stay compact while preserving meaningful fields.
+ */
+export function pruneEmptyFields(value: unknown): unknown {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== "object" || value === null) return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (entry === null || entry === undefined) continue;
+    if (Array.isArray(entry) && entry.length === 0) continue;
+    out[key] = typeof entry === "object" && !Array.isArray(entry) ? pruneEmptyFields(entry) : entry;
+  }
+  return out;
+}
+
+/** An event's data as compact prompt-safe JSON (pruning empty/null fields, escaping unsafe chars). */
+export const dataJson = (data: unknown): string =>
+  promptSafeJson(data === undefined || data === null ? null : pruneEmptyFields(data));
 
 /**
  * One compact JSON object per line. Past the budget, the largest data are replaced by null first, so
