@@ -93,15 +93,27 @@ impl UnifiedNode {
                     Err(_) => continue,
                 };
                 let conn_node = Arc::clone(&node);
+                let mut conn_shutdown = node.shutdown_receiver();
                 tokio::spawn(async move {
+                    if *conn_shutdown.borrow() {
+                        return;
+                    }
                     let io = TokioIo::new(stream);
                     let service = service_fn(move |req: Request<Incoming>| {
                         let n = Arc::clone(&conn_node);
                         async move { Ok::<_, Infallible>(handle_http_request(n, req).await) }
                     });
-                    let _ = AutoServerBuilder::new(TokioExecutor::new())
-                        .serve_connection(io, service)
-                        .await;
+                    let builder = AutoServerBuilder::new(TokioExecutor::new());
+                    let conn = builder.serve_connection(io, service);
+                    tokio::pin!(conn);
+                    tokio::select! {
+                        _ = conn.as_mut() => {}
+                        _ = conn_shutdown.changed() => {
+                            if *conn_shutdown.borrow() {
+                                conn.as_mut().graceful_shutdown();
+                            }
+                        }
+                    }
                 });
             }
         });
@@ -852,6 +864,9 @@ fn start_inbox_sse_stream(
     tokio::spawn(async move {
         let mut wake_rx = node.subscribe_peer_inbox_wakeups();
         let mut shutdown_rx = node.shutdown_receiver();
+        if *shutdown_rx.borrow() {
+            return;
+        }
 
         // Reset stale in-flight entries when peer reconnects so unacked items redeliver cleanly!
         node.clear_all_in_flight_for_peer(&peer_id);
@@ -863,6 +878,9 @@ fn start_inbox_sse_stream(
         keepalive.tick().await; // consume immediate first tick
 
         loop {
+            if *shutdown_rx.borrow() {
+                break;
+            }
             if !push_due_items_to_sse(&node, &peer_id, &tx).await {
                 break;
             }

@@ -1239,10 +1239,11 @@ async fn chaos_hub_restart_mid_sse_crash_safe_idempotency() {
     let _hub2_srv = restarted_srv.expect("hub2 server started");
 
     // Verify Bob's existing SSE worker auto-reconnects and receives ALL 3 reboot-window events!
+    // Use 15s timeout to accommodate Windows loopback SYN-refused backoff (~2s per down probe).
     let reboot_evs = wait_for_events_by_id(
         &bob,
         "sess-bob",
-        8,
+        15,
         &["reboot-window-ev-0", "reboot-window-ev-1", "reboot-window-ev-2"],
     )
     .await;
