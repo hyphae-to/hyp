@@ -2,5 +2,6 @@ node_modules/
 .mesh/
 .claude/settings.local.json
 dist/
+target/
 *.tgz
 .DS_Store

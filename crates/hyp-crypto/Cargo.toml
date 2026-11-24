@@ -1,0 +1,13 @@
+[package]
+name = "hyp-crypto"
+description = "Hyphae v2 cryptography: Ed25519, X25519, RFC 9180 HPKE, RFC 8785 JCS, JWK Thumbprints, zeroized keys, streaming chunked AEAD, v1 t3-mesh interop, OS keyring"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hyp-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

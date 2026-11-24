@@ -1,0 +1,15 @@
+[package]
+name = "hyp-node"
+description = "Hyphae v2 unified Node engine: PeerLinks, subscription pushdown, forwarding/loop guard, github-public poller, fd-3 supervisor, Local Security Gates"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hyp-proto.workspace = true
+hyp-crypto.workspace = true
+hyp-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

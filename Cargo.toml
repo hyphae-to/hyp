@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/hyp-proto",
+  "crates/hyp-crypto",
+  "crates/hyp-store",
+  "crates/hyp-node",
+  "crates/hyp-harness",
+  "crates/hyp-cli",
+]
+
+[workspace.package]
+version = "0.2.0-alpha.0"
+edition = "2024"
+rust-version = "1.87"
+license = "MIT"
+repository = "https://github.com/hyphae-to/hyp"
+homepage = "https://hyphae.to"
+
+[workspace.dependencies]
+hyp-proto = { path = "crates/hyp-proto" }
+hyp-crypto = { path = "crates/hyp-crypto" }
+hyp-store = { path = "crates/hyp-store" }
+hyp-node = { path = "crates/hyp-node" }
+hyp-harness = { path = "crates/hyp-harness" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+base64 = "0.22"
+hex = "0.4"
+time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+semver = { version = "1", features = ["serde"] }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive", "env"] }
+ring = "0.17"
+sha2 = "0.10"
+hmac = "0.12"
+pkcs8 = "0.10"
+der = "0.7"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+flate2 = "1"
+axum = "0.8"
+tower = "0.5"
+tower-http = "0.6"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+regex = "1"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

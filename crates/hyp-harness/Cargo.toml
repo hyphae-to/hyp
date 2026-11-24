@@ -1,0 +1,13 @@
+[package]
+name = "hyp-harness"
+description = "Hyphae v2 harness runtime: 1-3ms hook fast-path, MCP stdio shim, wait/watch client, CallRegistry, and 9 harness adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hyp-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

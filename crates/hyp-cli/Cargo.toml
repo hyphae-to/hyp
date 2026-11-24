@@ -1,0 +1,18 @@
+[package]
+name = "hyp-cli"
+description = "Hyphae v2 single static binary (hyp)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hyp-rs"
+path = "src/main.rs"
+
+[dependencies]
+hyp-proto.workspace = true
+hyp-harness.workspace = true
+hyp-node.workspace = true
+clap.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "hyp-proto"
+description = "Hyphae v2 standards-first wire protocol: CloudEvents v1.0, Subscriptions API v1.0 filters, RFC 9457 Problem Details, Scopes v2, Capability Manifest, JSON-RPC 2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
