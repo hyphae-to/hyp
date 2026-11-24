@@ -90,6 +90,8 @@ export interface McpOptions {
   t3Url?: string;
   /** Optional T3 Code base directory (`T3CODE_HOME`) when `--backend t3`. */
   t3BaseDir?: string;
+  /** Expose legacy 23-tool catalog instead of consolidated 5-6 polymorphic tools. */
+  legacyTools?: boolean;
   /** Explicit opt-in ephemeral per-process session ID (for scratch testing without hooks). */
   ephemeral?: boolean;
 }

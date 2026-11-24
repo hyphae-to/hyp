@@ -3,7 +3,7 @@
 // it asks this class which batches are due and offers them next to messages.
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import * as Schema from "effect/Schema";
+import * as Schema from "../validate.ts";
 import { isConnectorId } from "../address.ts";
 import { checkCloudEvent, eventDigest, isTopic, type CloudEvent } from "./cloudevent.ts";
 import { checkFilters, matchesFilters, type Filter } from "./filter.ts";

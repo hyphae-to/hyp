@@ -51,6 +51,10 @@ export interface ReceiverOptions {
   readonly topic: string;
   readonly secret: string;
   readonly token: string;
+  /** Optional allowlist of `owner/repo` repositories; when non-empty (with `allowedOrgs`), uncovered repos are dropped before publishing. */
+  readonly allowedRepos?: readonly string[];
+  /** Optional allowlist of GitHub organization/owner names; when non-empty (with `allowedRepos`), uncovered repos are dropped before publishing. */
+  readonly allowedOrgs?: readonly string[];
   readonly now?: () => Date;
   readonly limits?: ReceiverLimits;
 }
@@ -136,6 +140,9 @@ export async function serveReceiver(options: ReceiverOptions): Promise<RunningRe
   }
   if (options.secret.length === 0) throw new Error("the webhook secret is empty");
   const resolved: ReceiverOptions = { ...options, routerUrl: routerUrl.origin };
+  const allowedRepoSet = new Set((options.allowedRepos ?? []).map((r) => r.trim().toLowerCase()).filter(Boolean));
+  const allowedOrgSet = new Set((options.allowedOrgs ?? []).map((o) => o.trim().toLowerCase()).filter(Boolean));
+  const enforceScope = allowedRepoSet.size > 0 || allowedOrgSet.size > 0;
   const limits = options.limits ?? DEFAULT_RECEIVER_LIMITS;
   let bytesInFlight = 0;
 
@@ -211,6 +218,16 @@ export async function serveReceiver(options: ReceiverOptions): Promise<RunningRe
         log("info", "github.ignored", { delivery, event, reason: normalized.reason });
         reply(response, 200, { status: "ignored" });
         return;
+      }
+      if (enforceScope) {
+        const rawRepo = typeof normalized.event["repo"] === "string" ? normalized.event["repo"].toLowerCase() : "";
+        const owner = rawRepo.includes("/") ? rawRepo.slice(0, rawRepo.indexOf("/")) : "";
+        const allowed = (rawRepo.length > 0 && allowedRepoSet.has(rawRepo)) || (owner.length > 0 && allowedOrgSet.has(owner));
+        if (!allowed) {
+          log("info", "github.ignored", { delivery, event, repo: normalized.event["repo"], reason: "repo_not_allowed" });
+          reply(response, 200, { status: "ignored", reason: "repo_not_allowed" });
+          return;
+        }
       }
       const checked = checkCloudEvent(normalized.event);
       if (!checked.ok) {

@@ -1,6 +1,6 @@
 // The plugin channel (SPEC.md section 13.3): newline-delimited JSON on fd 3, at most 64 KiB per line.
 // Parsing of plugin lines, the connector's replies, and a line splitter that bounds what it buffers.
-import * as Schema from "effect/Schema";
+import * as Schema from "../validate.ts";
 
 export const PROTOCOL_VERSION = 1;
 /**

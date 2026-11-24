@@ -10,7 +10,7 @@ import {
   randomBytes,
   type KeyObject,
 } from "node:crypto";
-import * as Schema from "effect/Schema";
+import * as Schema from "../validate.ts";
 import { isConnectorId, isHandle } from "../address.ts";
 import { generatePrivateKey, isRawKey, publicKeyFromRaw, rawPublicKey, signValue, verifyPayload, type Signed } from "../identity/keys.ts";
 

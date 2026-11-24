@@ -5,7 +5,7 @@ import { createReadStream, createWriteStream, rmSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import * as Schema from "effect/Schema";
+import * as Schema from "../validate.ts";
 import { errorMessage, log } from "../log.ts";
 import { MAX_EVENT_BYTES } from "./cloudevent.ts";
 import { RouterCore } from "./core.ts";

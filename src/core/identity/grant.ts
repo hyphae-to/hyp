@@ -1,6 +1,6 @@
 // Grants, bindings, entries, revocations and pairing codes (SPEC.md sections 14.2-14.3).
 import { hkdfSync, randomBytes, randomUUID, type KeyObject } from "node:crypto";
-import * as Schema from "effect/Schema";
+import * as Schema from "../validate.ts";
 import { isConnectorId } from "../address.ts";
 import { expandScopes } from "./scopes.ts";
 import {

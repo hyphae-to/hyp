@@ -51,6 +51,7 @@ export class State {
 
   constructor(path: string, identity: string) {
     this.#db = new DatabaseSync(path);
+    this.#db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, backend TEXT NOT NULL, handle TEXT UNIQUE, last_seen INTEGER NOT NULL DEFAULT 0, delivery_mode TEXT NOT NULL DEFAULT 'full');

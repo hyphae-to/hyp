@@ -241,6 +241,8 @@ export class RouterStreamHost {
       topic: cfg.topic,
       secret,
       token,
+      ...(cfg.scope?.repos && cfg.scope.repos.length > 0 ? { allowedRepos: cfg.scope.repos } : {}),
+      ...(cfg.scope?.orgs && cfg.scope.orgs.length > 0 ? { allowedOrgs: cfg.scope.orgs } : {}),
     });
     entry.receiver = receiver;
     log("info", "stream.started", { stream: cfg.name, kind: "github-webhook", topic: cfg.topic, url: receiver.url });

@@ -5,7 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import * as Schema from "effect/Schema";
+import * as Schema from "../validate.ts";
 import type { Identity } from "../identity/grant.ts";
 import { publicKeyFromRaw, type Signed } from "../identity/keys.ts";
 import { ScopeSet } from "../identity/scopes.ts";

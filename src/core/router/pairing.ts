@@ -3,7 +3,7 @@
 // against the pinned admin key; the router can store and serve entries but not create them.
 import type { KeyObject } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import * as Schema from "effect/Schema";
+import * as Schema from "../validate.ts";
 import {
   EntrySchema,
   SignedBindingSchema,

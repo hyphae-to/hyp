@@ -6,7 +6,7 @@ import { appendFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import * as Schema from "effect/Schema";
+import * as Schema from "../validate.ts";
 import { formatAddress, isConnectorId, isHandle, parseAddress } from "../address.ts";
 import { ScopeSet, UNPAIRED_SCOPES } from "../identity/scopes.ts";
 import { DEFAULT_EVENT_LIMITS, EventRouter, type EventLimits } from "./events.ts";
@@ -29,6 +29,8 @@ export interface RouterLimits {
   readonly holdRetryMs: number;
   /** How long an offered message may go unanswered before it is offered again. */
   readonly ackTimeoutMs: number;
+  /** How long settled (`delivered` / `rejected` / `expired`) message rows are retained before pruning. Defaults to 7 days. */
+  readonly settledRetentionMs?: number;
 }
 
 export const DEFAULT_LIMITS: RouterLimits = {
@@ -37,7 +39,11 @@ export const DEFAULT_LIMITS: RouterLimits = {
   maxPerHourPerRecipient: 30,
   holdRetryMs: 30_000,
   ackTimeoutMs: 60_000,
+  settledRetentionMs: 7 * 24 * 60 * 60 * 1000,
 };
+
+const DEFAULT_SETTLED_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const MESSAGE_PRUNE_INTERVAL_MS = 60_000;
 
 const HOUR_MS = 60 * 60 * 1000;
 /**
@@ -150,6 +156,7 @@ export class RouterCore {
   readonly #now: () => number;
   readonly #attached = new Map<string, Attachment>();
   readonly #onDeferredError: ((error: unknown) => void) | undefined;
+  #lastMessagePruneAt = -Infinity;
   /** Topics, publishers, subscriptions and event batches. */
   readonly events: EventRouter;
   /** Grants, paired entries, revocations and the directory. */
@@ -606,6 +613,13 @@ export class RouterCore {
     for (const message of expired) {
       this.#db.prepare("UPDATE messages SET state = 'expired', settled_at = ? WHERE id = ?").run(now, message.id);
       this.#audit({ event: "message.expired", id: message.id, from: message.from_addr, to: message.to_addr });
+    }
+    const settledRetentionMs = this.#limits.settledRetentionMs ?? DEFAULT_SETTLED_RETENTION_MS;
+    if (now - this.#lastMessagePruneAt >= MESSAGE_PRUNE_INTERVAL_MS) {
+      this.#lastMessagePruneAt = now;
+      this.#db
+        .prepare("DELETE FROM messages WHERE state != 'pending' AND settled_at IS NOT NULL AND settled_at <= ?")
+        .run(now - settledRetentionMs);
     }
     for (const [connectorId, attachment] of this.#attached) {
       for (const [id, offeredAt] of attachment.inFlight) {
