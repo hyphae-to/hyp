@@ -24,7 +24,7 @@ If `hyp` is not installed yet (requires Node 24+):
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/hyphae-to/hyp/main/install.sh)"
 
 # Option B: npm
-npm install -g @bowd/hyphae
+npm install -g @hyphae-to/hyp
 ```
 
 ---

@@ -62,7 +62,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/hyphae-to/hyp/main/insta
 ### Or via npm
 
 ```sh
-npm install -g @bowd/hyphae
+npm install -g @hyphae-to/hyp
 hyp onboard
 ```
 
