@@ -1,6 +1,7 @@
 //! Outbound `PeerLink` HTTP/SSE client, shared wire DTOs, authenticated request signing
 //! (Bearer & Ed25519), and crash-safe commit-before-ack WHATWG SSE `/v1/inbox` consumer.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -181,6 +182,8 @@ pub struct PutKeyRequest {
 #[serde(rename_all = "camelCase")]
 pub struct PutHandlesRequest {
     pub handles: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub descriptions: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -649,7 +652,19 @@ impl PeerLink {
     }
 
     pub async fn put_handles(&self, handles: Vec<String>) -> Result<HandlesResponse, NodeError> {
-        let body = PutHandlesRequest { handles };
+        self.put_handles_with_descriptions(&handles, &BTreeMap::new())
+            .await
+    }
+
+    pub async fn put_handles_with_descriptions(
+        &self,
+        handles: &[String],
+        descriptions: &BTreeMap<String, String>,
+    ) -> Result<HandlesResponse, NodeError> {
+        let body = PutHandlesRequest {
+            handles: handles.to_vec(),
+            descriptions: descriptions.clone(),
+        };
         self.send_json(Method::PUT, "/v1/handles", Some(&body), &[])
             .await
     }

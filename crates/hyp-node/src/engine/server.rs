@@ -336,11 +336,15 @@ async fn route_request(
         return match method {
             Method::PUT => {
                 let put_req: PutHandlesRequest = serde_json::from_slice(&body_bytes)?;
-                let refs: Vec<&str> = put_req.handles.iter().map(String::as_str).collect();
+                let pairs: Vec<(&str, Option<&str>)> = put_req
+                    .handles
+                    .iter()
+                    .map(|h| (h.as_str(), put_req.descriptions.get(h).map(String::as_str)))
+                    .collect();
                 let handles = {
                     let db = node.db();
                     db.messages()
-                        .set_handles(&caller.peer_id, &refs, now_ms())?
+                        .set_handles_with_descriptions(&caller.peer_id, &pairs, now_ms())?
                 };
                 Ok(json_response(StatusCode::OK, &HandlesResponse { handles }))
             }

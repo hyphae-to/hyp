@@ -16,8 +16,8 @@ pub use config::{
     NodeConfig, NodeError, NodeProfile, PeerConfig, TopicConfig,
 };
 pub use node::{
-    AuthenticatedPeer, KvWriteRequest, PeerLinkInfo, SendDmResult, SubscribeRequest,
-    SubscribeResult, TransferSendResult, UnifiedNode,
+    AuthenticatedPeer, DiscoveredPeerHandle, KvWriteRequest, PeerLinkInfo, SendDmResult,
+    SubscribeRequest, SubscribeResult, TransferSendResult, UnifiedNode,
 };
 pub use peer_link::{
     ChannelDirectoryEntry, ChannelJoinResponse, ChannelsResponse, GuestPairProofPayload,
