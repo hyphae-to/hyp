@@ -21,6 +21,7 @@ pub const TYPE_KV_DELETED: &str = "to.hyphae.kv.deleted";
 pub const TYPE_TRANSFER_V1: &str = "to.hyphae.transfer.v1";
 pub const TYPE_NODE_MANIFEST: &str = "to.hyphae.node.manifest";
 pub const TYPE_NODE_DIRECTORY: &str = "to.hyphae.node.directory";
+pub const TYPE_WAKEUP_V1: &str = "to.hyphae.wakeup.v1";
 
 pub const CONTENT_TYPE_JSON: &str = "application/json";
 pub const CONTENT_TYPE_E2EE_JSON: &str = "application/hyphae-e2ee+json";

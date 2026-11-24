@@ -56,6 +56,16 @@ pub struct MailboxInsert {
     pub traceparent: Option<String>,
 }
 
+/// Optional coalescing and TTL controls for [`LocalStateStore::put_in_mailbox_ex`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailboxPutOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coalesce_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+}
+
 /// Outcome of inserting an item into a local session's mailbox.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MailboxPutResult {
@@ -81,6 +91,18 @@ pub struct MailboxEntry {
     pub traceparent: Option<String>,
     pub payload_sha256: Option<String>,
     pub reviewed_at: Option<i64>,
+}
+
+/// Extended mailbox item record including schema v3 coalescing, TTL, and missed-tick metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailboxEntryEx {
+    #[serde(flatten)]
+    pub entry: MailboxEntry,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coalesce_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    pub missed_count: u64,
 }
 
 /// Metadata-only unread summary for a session (never leaks quarantined payload bodies!).
@@ -402,6 +424,11 @@ impl<'a> LocalStateStore<'a> {
                 .execute("DELETE FROM bridge_links WHERE session_id = ?1", params![id])?;
             tx.conn()
                 .execute("DELETE FROM plugin_targets WHERE session_id = ?1", params![id])?;
+            tx.conn().execute(
+                "UPDATE wakeups SET state = 'cancelled', updated_at = ?1
+                 WHERE owner_session_id = ?2 AND state IN ('active', 'paused')",
+                params![cutoff_ms, id],
+            )?;
             tx.conn()
                 .execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
         }
@@ -423,16 +450,109 @@ impl<'a> LocalStateStore<'a> {
         input: &MailboxInsert,
         now_ms: i64,
     ) -> StoreResult<MailboxPutResult> {
+        self.put_in_mailbox_ex(input, &MailboxPutOptions::default(), now_ms)
+    }
+
+    /// Inserts an item into a session's mailbox with optional coalescing (`coalesce_key`) and
+    /// TTL (`expires_at`).
+    ///
+    /// When `input.gate_state == GateState::Pending` and `opts.coalesce_key` is `Some(key)`,
+    /// if a `pending` row already exists for `(session_id, key)`, it is superseded in place
+    /// (updating `origin_node`, `item_id`, `text`, `received_at`, `kind`, `source`, `expires_at`,
+    /// resetting `notified = 0`, and incrementing `missed_count = missed_count + 1`) while
+    /// reusing the existing receipt.
+    pub fn put_in_mailbox_ex(
+        &self,
+        input: &MailboxInsert,
+        opts: &MailboxPutOptions,
+        now_ms: i64,
+    ) -> StoreResult<MailboxPutResult> {
         if input.session_id.is_empty() || input.origin_node.is_empty() || input.item_id.is_empty() {
             return Err(StoreError::InvalidInput(
                 "session_id, origin_node, and item_id must be non-empty".to_string(),
             ));
         }
+        if let Some(key) = opts.coalesce_key.as_deref() {
+            if key.trim().is_empty() {
+                return Err(StoreError::InvalidInput(
+                    "coalesce_key must be non-empty when provided".to_string(),
+                ));
+            }
+        }
         let max_pending = self.db.config().mailbox_max_pending_per_session;
         let payload_sha256 = sha256_hex(input.text.as_bytes());
 
         let tx = self.db.immediate_tx()?;
+
+        // Coalesce in-place into an existing pending row for `(session_id, coalesce_key)` before
+        // checking queue capacity, because superseding does not grow the pending queue.
         if input.gate_state == GateState::Pending {
+            if let Some(coalesce_key) = opts.coalesce_key.as_deref() {
+                let duplicate_exists: bool = tx.conn().query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM mailbox
+                         WHERE origin_node = ?1 AND item_id = ?2 AND session_id = ?3
+                     )",
+                    params![&input.origin_node, &input.item_id, &input.session_id],
+                    |row| row.get(0),
+                )?;
+                if duplicate_exists {
+                    tx.commit()?;
+                    return Ok(MailboxPutResult::Duplicate);
+                }
+
+                let existing_receipt: Option<String> = tx
+                    .conn()
+                    .query_row(
+                        "SELECT receipt FROM mailbox
+                         WHERE session_id = ?1 AND gate_state = 'pending' AND coalesce_key = ?2
+                         ORDER BY received_at DESC, receipt ASC
+                         LIMIT 1",
+                        params![&input.session_id, coalesce_key],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+
+                if let Some(receipt) = existing_receipt {
+                    tx.conn().execute(
+                        "UPDATE mailbox
+                         SET origin_node = ?1,
+                             item_id = ?2,
+                             text = ?3,
+                             received_at = ?4,
+                             kind = ?5,
+                             source = ?6,
+                             notified = 0,
+                             gate_reason = ?7,
+                             traceparent = ?8,
+                             payload_sha256 = ?9,
+                             expires_at = ?10,
+                             missed_count = missed_count + 1
+                         WHERE receipt = ?11 AND gate_state = 'pending'",
+                        params![
+                            &input.origin_node,
+                            &input.item_id,
+                            &input.text,
+                            now_ms,
+                            input.kind.as_str(),
+                            &input.source,
+                            input.gate_reason.as_deref(),
+                            input.traceparent.as_deref(),
+                            &payload_sha256,
+                            opts.expires_at,
+                            &receipt,
+                        ],
+                    )?;
+                    tx.conn().execute(
+                        "INSERT OR REPLACE INTO deliveries (origin_node, item_id, state, created_at)
+                         VALUES (?1, ?2, 'submitted', ?3)",
+                        params![&input.origin_node, &input.item_id, now_ms],
+                    )?;
+                    tx.commit()?;
+                    return Ok(MailboxPutResult::Stored { receipt });
+                }
+            }
+
             let count: i64 = tx.conn().query_row(
                 "SELECT COUNT(*) FROM mailbox WHERE session_id = ?1 AND gate_state = 'pending'",
                 params![&input.session_id],
@@ -447,8 +567,9 @@ impl<'a> LocalStateStore<'a> {
         let inserted = tx.conn().execute(
             "INSERT OR IGNORE INTO mailbox
              (receipt, session_id, origin_node, item_id, text, received_at, kind, source,
-              notified, gate_state, gate_reason, traceparent, payload_sha256)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12)",
+              notified, gate_state, gate_reason, traceparent, payload_sha256,
+              coalesce_key, expires_at, missed_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, 0)",
             params![
                 &receipt,
                 &input.session_id,
@@ -461,7 +582,9 @@ impl<'a> LocalStateStore<'a> {
                 input.gate_state.as_str(),
                 input.gate_reason.as_deref(),
                 input.traceparent.as_deref(),
-                &payload_sha256
+                &payload_sha256,
+                opts.coalesce_key.as_deref(),
+                opts.expires_at,
             ],
         )?;
 
@@ -482,6 +605,43 @@ impl<'a> LocalStateStore<'a> {
         )?;
         tx.commit()?;
         Ok(MailboxPutResult::Stored { receipt })
+    }
+
+    /// Removes pending mailbox entries whose `expires_at <= now_ms`.
+    ///
+    /// Takes zero write lock when no pending entries have expired.
+    pub fn expire_pending_mailbox(&self, now_ms: i64) -> StoreResult<usize> {
+        let has_expired: bool = self.db.conn().query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM mailbox
+                 WHERE gate_state = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?1
+             )",
+            params![now_ms],
+            |row| row.get(0),
+        )?;
+        if !has_expired {
+            return Ok(0);
+        }
+
+        let tx = self.db.immediate_tx()?;
+        let removed = tx.conn().execute(
+            "DELETE FROM mailbox
+             WHERE gate_state = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?1",
+            params![now_ms],
+        )?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// Returns the earliest `expires_at` among pending mailbox entries, or `None` when none have TTLs.
+    pub fn next_mailbox_ttl_deadline_ms(&self) -> StoreResult<Option<i64>> {
+        let next: Option<i64> = self.db.conn().query_row(
+            "SELECT MIN(expires_at) FROM mailbox
+             WHERE gate_state = 'pending' AND expires_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(next)
     }
 
     /// Peeks up to `limit` **pending** (gate-allowed) mailbox items for `session_id`.
@@ -654,6 +814,67 @@ impl<'a> LocalStateStore<'a> {
                 .collect::<Result<Vec<_>, _>>()?;
             rows.into_iter().collect()
         }
+    }
+
+    /// Peeks up to `limit` **pending** (gate-allowed) mailbox items for `session_id`,
+    /// including schema v3 coalescing, TTL, and missed-tick metadata.
+    pub fn peek_inbox_ex(&self, session_id: &str, limit: usize) -> StoreResult<Vec<MailboxEntryEx>> {
+        let mut stmt = self.db.conn().prepare(
+            "SELECT * FROM mailbox
+             WHERE session_id = ?1 AND gate_state = 'pending'
+             ORDER BY received_at ASC, receipt ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id, limit as i64], decode_mailbox_row_ex)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().collect()
+    }
+
+    /// Atomically pops up to `limit` **pending** items for `session_id` with extended v3 metadata,
+    /// transitioning them to `gate_state = 'delivered'`. Quarantined items are never touched.
+    pub fn drain_inbox_ex(
+        &self,
+        session_id: &str,
+        limit: usize,
+        now_ms: i64,
+    ) -> StoreResult<Vec<MailboxEntryEx>> {
+        let tx = self.db.immediate_tx()?;
+        let mut stmt = tx.conn().prepare(
+            "SELECT * FROM mailbox
+             WHERE session_id = ?1 AND gate_state = 'pending'
+             ORDER BY received_at ASC, receipt ASC
+             LIMIT ?2",
+        )?;
+        let entries = stmt
+            .query_map(params![session_id, limit as i64], decode_mailbox_row_ex)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect::<StoreResult<Vec<_>>>()?;
+        drop(stmt);
+
+        for item in &entries {
+            tx.conn().execute(
+                "UPDATE mailbox SET gate_state = 'delivered', notified = 1, reviewed_at = COALESCE(reviewed_at, ?1)
+                 WHERE session_id = ?2 AND receipt = ?3 AND gate_state = 'pending'",
+                params![now_ms, session_id, &item.entry.receipt],
+            )?;
+        }
+        tx.commit()?;
+        Ok(entries)
+    }
+
+    /// Looks up a single mailbox entry by `receipt_id` with extended v3 metadata.
+    pub fn get_mailbox_entry_ex(&self, receipt_id: &str) -> StoreResult<Option<MailboxEntryEx>> {
+        self.db
+            .conn()
+            .query_row(
+                "SELECT * FROM mailbox WHERE receipt = ?1",
+                params![receipt_id],
+                decode_mailbox_row_ex,
+            )
+            .optional()?
+            .transpose()
     }
 
     /// Looks up a single mailbox entry by `receipt_id`.
@@ -1232,6 +1453,19 @@ fn decode_mailbox_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<M
             reviewed_at,
         })
     })())
+}
+
+fn decode_mailbox_row_ex(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<MailboxEntryEx>> {
+    let entry_res = decode_mailbox_row(row)?;
+    let coalesce_key: Option<String> = row.get("coalesce_key")?;
+    let expires_at: Option<i64> = row.get("expires_at")?;
+    let missed_count: i64 = row.get("missed_count")?;
+    Ok(entry_res.map(|entry| MailboxEntryEx {
+        entry,
+        coalesce_key,
+        expires_at,
+        missed_count: missed_count.max(0) as u64,
+    }))
 }
 
 fn decode_mute_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MuteRule> {
