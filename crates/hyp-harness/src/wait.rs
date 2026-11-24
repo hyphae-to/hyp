@@ -337,9 +337,8 @@ mod tests {
         );
     }
 
-    #[cfg(not(unix))]
     #[tokio::test]
-    async fn windows_tcp_loopback_wait_once_receives_items() {
+    async fn tcp_loopback_wait_once_receives_items() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
