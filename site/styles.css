@@ -590,6 +590,39 @@ header {
   white-space: nowrap;
 }
 
+.ent-tags {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+  justify-content: center;
+  min-height: 17px;
+}
+
+.sub-badge {
+  font-family: var(--mono);
+  font-size: 0.58rem;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(183, 217, 86, 0.16);
+  border: 1px solid rgba(183, 217, 86, 0.5);
+  color: var(--chartreuse);
+  opacity: 0;
+  transform: scale(0.82);
+  transition: opacity 0.35s ease, transform 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+  white-space: nowrap;
+}
+
+.sub-badge.amber {
+  background: rgba(232, 163, 49, 0.16);
+  border-color: rgba(232, 163, 49, 0.55);
+  color: var(--amber);
+}
+
+.sub-badge.show {
+  opacity: 1;
+  transform: scale(1);
+}
+
 .hub-badge {
   margin-bottom: 6px;
   font-family: var(--mono);

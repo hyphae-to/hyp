@@ -90,14 +90,15 @@
             <!-- Progressive organic mycelium strands -->
             <path class="myc-strand" id="p-alex-node" d="M 150 265 C 300 265, 400 255, 565 255" />
             <path class="myc-strand amber" id="p-node-alice" d="M 565 255 C 745 215, 860 122, 1020 108" />
+            <path class="myc-strand" id="p-node-alice-green" d="M 565 255 C 745 215, 860 122, 1020 108" />
             <path class="myc-strand" id="p-node-ops" d="M 565 255 C 740 262, 860 284, 1020 290" />
-            <path class="myc-strand" id="p-node-builder" d="M 565 255 C 740 315, 860 442, 1020 468" />
+            <path class="myc-strand" id="p-node-release" d="M 565 255 C 740 315, 860 442, 1020 468" />
             <path class="myc-strand coral" id="p-prom-node" d="M 565 56 C 565 125, 565 170, 565 255" />
+            <path class="myc-strand" id="p-prom-node-ok" d="M 565 56 C 565 125, 565 170, 565 255" />
             <path class="myc-strand coral" id="p-node-ops-alert" d="M 565 255 C 740 262, 860 284, 1020 290" />
             <path class="myc-strand amber" id="p-alex-gh" d="M 150 265 C 160 168, 200 104, 275 68" />
             <path class="myc-strand amber" id="p-gh-node" d="M 275 68 C 385 135, 470 185, 565 255" />
-            <path class="myc-strand amber" id="p-node-builder-pr" d="M 565 255 C 740 315, 860 442, 1020 468" />
-            <path class="myc-strand amber" id="p-builder-sub" d="M 1020 468 C 945 505, 880 518, 785 518" />
+            <path class="myc-strand amber" id="p-alice-sub" d="M 1020 108 C 945 155, 885 182, 786 180" />
             <path class="myc-strand moss" id="p-alex-priv" d="M 150 265 C 138 350, 144 400, 150 441" />
             <path class="myc-strand moss" id="p-priv-slack" d="M 150 441 C 235 444, 275 444, 330 444" />
           </svg>
@@ -125,7 +126,10 @@
             <div class="avatar-ring"><img src="./assets/sprite-alex.jpg" alt="Alex's agent sprite" /></div>
             <span class="ent-name">alex · Claude</span>
             <span class="ent-sub">Herdr · laptop</span>
-            <span class="code-pill" id="alexCodePill">coding fix…</span>
+            <div class="ent-tags">
+              <span class="sub-badge amber" id="sub-alex-pr">sub: PR #412</span>
+              <span class="sub-badge" id="sub-alex-dep">#deploys</span>
+            </div>
           </div>
 
           <!-- Central Team Node (unframed, blended organically into the dark stage) -->
@@ -144,9 +148,20 @@
           <!-- Alice's agent (Codex via OpenClaw on laptop) -->
           <div class="entity" id="ent-alice" style="left:85%; top:18.6%;">
             <div class="bubble side-left" id="bub-alice"></div>
+            <div class="ping-ripple" id="rip-alice"></div>
             <div class="avatar-ring"><img src="./assets/sprite-alice.jpg" alt="Alice's Codex sprite" /></div>
             <span class="ent-name">alice · Codex</span>
             <span class="ent-sub">OpenClaw · laptop</span>
+            <div class="ent-tags">
+              <span class="sub-badge amber" id="sub-alice-pr">sub: PR #412</span>
+              <span class="sub-badge" id="sub-alice-dep">#deploys</span>
+            </div>
+          </div>
+
+          <!-- Alice's spawned Reviewer Sub-Agent -->
+          <div class="subagent-pill" id="ent-subagent" style="left:65.5%; top:31%;">
+            <span class="sub-orb"></span>
+            <span id="subagentText">sub-agent · auditing PR #412</span>
           </div>
 
           <!-- Jack's OPS agent (T3 Code on Linux server) -->
@@ -156,21 +171,21 @@
             <div class="avatar-ring"><img src="./assets/sprite-ops.jpg" alt="Jack's ops agent sprite" /></div>
             <span class="ent-name">jack · ops</span>
             <span class="ent-sub">T3 Code · server</span>
+            <div class="ent-tags">
+              <span class="sub-badge" id="sub-ops-dep">#deploys</span>
+            </div>
           </div>
 
-          <!-- Jack's BUILDER agent (T3 Code on Linux server) -->
-          <div class="entity" id="ent-builder" style="left:85%; top:80.7%;">
-            <div class="bubble side-left" id="bub-builder"></div>
-            <div class="ping-ripple" id="rip-builder"></div>
-            <div class="avatar-ring"><img src="./assets/sprite-jack.jpg" alt="Jack's builder agent sprite" /></div>
-            <span class="ent-name">jack · builder</span>
-            <span class="ent-sub">T3 Code · server</span>
-          </div>
-
-          <!-- Builder's spawned Reviewer Sub-Agent -->
-          <div class="subagent-pill" id="ent-subagent" style="left:64.6%; top:89.3%;">
-            <span class="sub-orb"></span>
-            <span id="subagentText">sub-agent · auditing PR #412</span>
+          <!-- Jack's RELEASE MANAGER agent (T3 Code on Linux server) -->
+          <div class="entity" id="ent-release" style="left:85%; top:80.7%;">
+            <div class="bubble side-left" id="bub-release"></div>
+            <div class="ping-ripple" id="rip-release"></div>
+            <div class="avatar-ring"><img src="./assets/sprite-jack.jpg" alt="Jack's release manager sprite" /></div>
+            <span class="ent-name">jack · release</span>
+            <span class="ent-sub">T3 Code · release mgr</span>
+            <div class="ent-tags">
+              <span class="sub-badge amber" id="sub-rel-pr">sub: PRs</span>
+            </div>
           </div>
 
           <!-- Alex's live in-scene coding & subscribe card (shows fix -> PR #412 -> mesh_subscribe) -->
