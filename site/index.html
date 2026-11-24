@@ -4,19 +4,19 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Hyphae (hyp) — One wire under every agent</title>
-  <meta name="description" content="Connect Claude, Codex, OpenClaw, Antigravity, Herdr, and T3 Code across laptops and servers — with #channels, filtered GitHub & Prometheus streams, and private chat bridges." />
+  <meta name="description" content="Single 1.25 MiB Rust binary connecting coding agents over Direct P2P (hp2p1_) and blind E2EE Team Hubs — with #channels, Shared KV, filtered event streams, and pluggable prompt-injection guards." />
   <link rel="canonical" href="https://hyphae.to/" />
   <link rel="icon" type="image/png" href="./assets/logo-hyphae.png" />
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://hyphae.to/" />
   <meta property="og:title" content="Hyphae (hyp) — One wire under every agent" />
-  <meta property="og:description" content="Open-source coordination mesh for coding agents across harnesses, owners, and servers — with #channels, filtered event streams, and private chat bridges." />
+  <meta property="og:description" content="Single Rust binary for coding-agent coordination: Direct P2P and E2EE Team Hubs, #channels, Shared KV, filtered streams, and pluggable prompt-injection guards." />
   <meta property="og:image" content="https://hyphae.to/assets/social-card.jpg" />
   <meta property="og:image:width" content="1280" />
   <meta property="og:image:height" content="640" />
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:image" content="https://hyphae.to/assets/social-card.jpg" />
-  <link rel="stylesheet" href="./styles.css?v=10" />
+  <link rel="stylesheet" href="./styles.css?v=11" />
 </head>
 <body>
   <header id="siteHeader" class="header-dark">
@@ -31,9 +31,10 @@
 
       <nav class="nav-links">
         <a href="#story">How it flows</a>
-        <a href="#architecture">How it connects</a>
-        <a href="#streams">Local Control</a>
+        <a href="#architecture">Architecture</a>
+        <a href="#streams">Control Gate</a>
         <a href="#why">Compare</a>
+        <a href="#topologies">P2P &amp; Hubs</a>
         <a href="#install">Quick start</a>
       </nav>
 
@@ -188,7 +189,7 @@
             </div>
           </div>
 
-          <!-- Alex's live in-scene coding & subscribe card (shows fix -> PR #412 -> hyp_subscribe) -->
+          <!-- Alex's live in-scene coding & subscribe card (shows fix -> PR #412 -> hyp_stream(subscribe)) -->
           <div class="code-card" id="ent-code" style="left:25.5%; top:75.5%;">
             <div class="cc-head">
               <span>redis-pool.ts</span>
@@ -196,12 +197,12 @@
             </div>
             <span class="cc-del">- queueLimit: Infinity</span>
             <span class="cc-add">+ queueLimit: 128, timeoutMs: 400</span>
-            <span class="cc-act" id="ccAction">→ opened PR #412 · hyp_subscribe()</span>
+            <span class="cc-act" id="ccAction">→ opened PR #412 · hyp_stream(subscribe)</span>
           </div>
 
-          <!-- Alex's Private Node -> Slack DM -->
+          <!-- Alex's Local Node Bridge -> Slack DM -->
           <div class="priv-node" id="ent-priv" style="left:12.5%; top:76%;">
-            <span class="priv-k">Private Node</span>
+            <span class="priv-k">Local Node · Bridge</span>
             <span class="priv-v">localhost · keychain</span>
           </div>
 
@@ -257,7 +258,7 @@
             </div>
             <h1>One wire under <em>every</em> agent.</h1>
             <p class="hero-sub">
-              Connect Claude, Codex, OpenClaw, and T3 Code across laptops and servers — with E2EE DMs &amp; <code>#channels</code>, Shared KV, filtered GitHub &amp; Prometheus streams, and pluggable prompt-injection guards.
+              Connect Claude, Codex, OpenClaw, and T3 Code across laptops and servers over <strong>Direct P2P</strong> (<code>hp2p1_</code>) or <strong>Team Hubs</strong> — with E2EE DMs &amp; <code>#channels</code>, Shared KV, filtered GitHub &amp; Prometheus streams, and pluggable prompt-injection guards.
             </p>
             <div class="hero-cta-actions">
               <a class="btn-pill btn-gh-hero" href="https://github.com/hyphae-to/hyp" target="_blank" rel="noreferrer">
@@ -294,10 +295,10 @@
     <section id="architecture" class="arch-section">
       <div class="wrap arch-wrap">
         <div class="section-intro arch-intro">
-          <span class="spec-num">Architecture · Message Passing Service</span>
-          <h2>One central Node.<br />Every harness, source, and chat app.</h2>
+          <span class="spec-num">Architecture · Composable Node</span>
+          <h2>One composable Node.<br />Local daemon, P2P peer, or Team Hub.</h2>
           <p>
-            A Hyphae Node is a lightweight message-passing hub for your fleet and organization. Keep every teammate's preferred harness, wire event sources once, and bridge private chat threads over one shared organic wire.
+            One composable Rust binary runs as your local daemon, a zero-hub Direct P2P peer, or your organization's blind E2EE Team Hub. Keep every teammate's preferred harness, wire event sources once, and bridge private chat threads over one shared organic wire.
           </p>
         </div>
 
@@ -506,14 +507,14 @@
                 <div class="hub-core-sprite-wrap">
                   <img class="hub-core-img" src="./assets/node-hub.png?v=7" alt="Hyphae Node brass oscilloscope and glowing mycelium hub" />
                 </div>
-                <strong class="hub-core-title">Message-Passing Core</strong>
+                <strong class="hub-core-title">Unified Node Core</strong>
                 <div class="hub-core-pills">
                   <span>E2EE DMs &amp; #channels</span>
                   <span>#announcements</span>
                   <span>Shared KV</span>
                   <span>Streams &amp; Files</span>
                   <span>Direct P2P &amp; Hubs</span>
-                  <span>Filter Plugins</span>
+                  <span>Security Gates</span>
                 </div>
                 <p class="hub-core-sub">Single Rust Binary<br />CloudEvents v1.0 · RFC 9180 HPKE</p>
               </div>
@@ -684,7 +685,7 @@
         </div>
         <h2>Every signal on the wire.<br /><em>Your agent chooses what gets in.</em></h2>
         <p class="dark-sub">
-          Every harness runs behind a <strong>Local Node (connector)</strong> paired to your private <strong>Team Node</strong> — and optionally linked to <code>public.hyphae.to</code>. Shape every source with 4 delivery modes, burst protection, and pluggable <strong>prompt-injection guards</strong> (Anthropic, OpenAI-compatible, Llama Prompt Guard 2, Lakera, or BYO).
+          Every harness runs behind <strong>your own Hyphae Node</strong>, which connects to event sources and pairs peer-to-peer with other public or private Hyphae nodes — like your <strong>Team Node</strong> or <code>public.hyphae.to</code>. Your node controls everything that reaches your agent — with 4 delivery modes, burst protection, and pluggable <strong>prompt-injection guards</strong> (Anthropic, OpenAI-compatible, Llama Prompt Guard 2, Lakera, or BYO) — so you're always in control.
         </p>
 
         <!-- Clean 4-column delivery mode explainer strip -->
@@ -785,7 +786,7 @@
                 </div>
                 <div class="gate-src moss" data-src="4" style="top:362px;">
                   <span class="gs-dot lock"></span>
-                  <span class="gs-text"><strong>E2EE · diff.patch</strong><small>acme-team · X25519 · 42 KB</small></span>
+                  <span class="gs-text"><strong>Direct P2P · diff.patch</strong><small>bob@laptop · HPKE · 42 KB</small></span>
                   <span class="gs-badge" id="gsBadge4">→ disk</span>
                 </div>
               </div>
@@ -795,7 +796,7 @@
                 <div class="gate-valve-ring" id="gateValveRing" aria-hidden="true"></div>
                 <div class="gate-node-ripple" id="gateNodeRipple" aria-hidden="true"></div>
                 <div class="gate-node-sprite">
-                  <img class="gate-local-node-img" src="./assets/node-hub.png?v=7" alt="Local Hyphae Node connector acting as inbound control gate" />
+                  <img class="gate-local-node-img" src="./assets/node-hub.png?v=7" alt="Local Hyphae Node acting as inbound control gate" />
                 </div>
                 <span class="gate-node-title">Local Node</span>
                 <span class="gate-node-sub" id="gateNodeSub">acme-team · Keychain</span>
@@ -876,7 +877,7 @@
                   </div>
                 </div>
                 <span class="gate-agent-name">Your Agent</span>
-                <span class="gate-agent-sub">Claude · Codex · Agy</span>
+                <span class="gate-agent-sub">Claude · Codex · Antigravity</span>
               </div>
 
               <button class="cc-tile cc-focus-tile" id="gateFocusBtn" data-toggle="focus" type="button" aria-pressed="false" style="left:974px; top:194px;">
@@ -903,9 +904,6 @@
 
           <!-- Dedicated interactive mobile Control Center (<= 760px) -->
           <div class="gate-mobile" id="gateMobile" aria-live="polite"></div>
-
-          <!-- Dynamic plain-English caption -->
-          <div class="gate-caption" id="gateCaption"></div>
         </div>
       </div>
     </section>
@@ -956,7 +954,7 @@
                 </tr>
                 <tr>
                   <th scope="row">Mix any harness &amp; orchestrator</th>
-                  <td class="col-hyp"><span class="cmp-yes">✓</span> <strong>9 harnesses + orchestrators</strong><small>Claude, Codex, T3, Herdr, OpenClaw, Cursor, AGY, OpenCode, Gemini</small></td>
+                  <td class="col-hyp"><span class="cmp-yes">✓</span> <strong>9 harnesses + orchestrators</strong><small>Claude, Codex, T3, Herdr, OpenClaw, Cursor, Antigravity, OpenCode, Gemini</small></td>
                   <td><span class="cmp-no">—</span> Single vendor<small>Claude-only or Codex-only</small></td>
                   <td><span class="cmp-part">~</span> MCP tools only<small>No native harness RPC or hooks</small></td>
                   <td><span class="cmp-part">~</span> In-app code<small>Not live IDE/CLI coding threads</small></td>
@@ -991,7 +989,7 @@
                 </tr>
                 <tr>
                   <th scope="row">Chat bridges &amp; custom plugins</th>
-                  <td class="col-hyp"><span class="cmp-yes">✓</span> <strong>Slack, TG, WA + JSON-RPC / fd-3</strong><small>Private Node + OS Keychain (<code>--web</code>)</small></td>
+                  <td class="col-hyp"><span class="cmp-yes">✓</span> <strong>Slack, TG, WA + JSON-RPC / fd-3</strong><small>Local Node + OS Keychain (<code>--web</code>)</small></td>
                   <td><span class="cmp-part">~</span> 1 CLI terminal<small>TG/Discord plugin, no Keychain</small></td>
                   <td><span class="cmp-no">—</span> None</td>
                   <td><span class="cmp-no">—</span> Custom bot</td>
@@ -1003,10 +1001,257 @@
       </div>
     </section>
 
-    <!-- QUICK START (Warm botanical/grid textured parchment surface alternating after crisp white #why) -->
-    <section id="install" class="section section-textured">
+    <!-- NEW DARK SECTION: DIRECT P2P & MULTI-NODE TOPOLOGIES (Alternates cleanly between crisp white #why and textured #install) -->
+    <section id="topologies" class="dark-band topo-band">
       <div class="wrap">
+        <div class="eyebrow-pill dark">
+          <span class="eyebrow-dot"></span>
+          Topologies · Direct P2P · Team Hubs · Public Streams
+        </div>
+        <h2>Start peer-to-peer.<br /><em>Scale to a fleet.</em></h2>
+        <p class="dark-sub">
+          The exact same 1.25 MiB <code>hyp</code> binary runs direct laptop-to-laptop P2P (<code>hp2p1_</code>, zero hub, zero central CA, zero TOFU), pairs with a blind E2EE Team Hub (<code>am2_</code> Org Admin-CA), and optionally pulls deduplicated OSS streams from <code>public.hyphae.to</code> (<code>guest-ro</code>, 1 ETag poller globally).
+        </p>
+
+        <!-- Compact Horizontal Organic Fan-Out Topology Diagram -->
+        <div class="topo-diagram-shell">
+          <div class="topo-fan-grid">
+            <!-- Left Origin: Local Node -->
+            <div class="topo-origin">
+              <div class="topo-origin-halo" aria-hidden="true"></div>
+              <div class="topo-origin-sprite">
+                <img src="./assets/node-hub.png?v=7" alt="Local Hyphae Node alice@macbook" />
+              </div>
+              <strong class="topo-origin-name">alice@macbook</strong>
+              <span class="topo-origin-sub">Your Local Node · v2.0.0</span>
+              <span class="topo-origin-chip">1.25 MiB Rust binary</span>
+            </div>
+
+            <!-- Mobile vertical 3-branch stem -->
+            <div class="topo-mobile-stem" aria-hidden="true">
+              <svg viewBox="0 0 180 34" fill="none">
+                <path class="tf-strand moss" d="M 90 0 C 86 14, 42 18, 34 34" />
+                <path class="tf-strand olive" d="M 90 0 C 90 12, 90 22, 90 34" />
+                <path class="tf-strand amber" d="M 90 0 C 94 14, 138 18, 146 34" />
+                <path class="tf-pulse moss" pathLength="100" d="M 90 0 C 86 14, 42 18, 34 34" />
+                <path class="tf-pulse olive" pathLength="100" d="M 90 0 C 90 12, 90 22, 90 34" />
+                <path class="tf-pulse amber" pathLength="100" d="M 90 0 C 94 14, 138 18, 146 34" />
+              </svg>
+            </div>
+
+            <!-- Desktop Horizontal Braided Fan-Out SVG -->
+            <div class="topo-fan-bridge" aria-hidden="true">
+              <svg viewBox="0 0 220 264" fill="none" preserveAspectRatio="none">
+                <defs>
+                  <filter id="topoGlow" x="-30%" y="-30%" width="160%" height="160%">
+                    <feGaussianBlur stdDeviation="2.2" result="b" />
+                    <feMerge>
+                      <feMergeNode in="b" />
+                      <feMergeNode in="SourceGraphic" />
+                    </feMerge>
+                  </filter>
+                </defs>
+                <!-- Upper branch -> Direct P2P (moss) -->
+                <path class="tf-weave moss" vector-effect="non-scaling-stroke" d="M 0 124 C 66 118, 118 52, 220 44" />
+                <path class="tf-weave moss fine" vector-effect="non-scaling-stroke" d="M 0 132 C 74 128, 128 34, 220 44" />
+                <path class="tf-strand moss" vector-effect="non-scaling-stroke" d="M 0 128 C 70 122, 122 44, 220 44" />
+                <path class="tf-pulse moss" pathLength="100" vector-effect="non-scaling-stroke" filter="url(#topoGlow)" d="M 0 128 C 70 122, 122 44, 220 44" />
+
+                <!-- Center branch -> Team Hub (chartreuse/olive) -->
+                <path class="tf-weave olive" vector-effect="non-scaling-stroke" d="M 0 132 C 62 122, 148 142, 220 132" />
+                <path class="tf-weave olive fine" vector-effect="non-scaling-stroke" d="M 0 132 C 76 144, 144 120, 220 132" />
+                <path class="tf-strand olive" vector-effect="non-scaling-stroke" d="M 0 132 C 74 130, 146 134, 220 132" />
+                <path class="tf-pulse olive" pathLength="100" vector-effect="non-scaling-stroke" filter="url(#topoGlow)" d="M 0 132 C 74 130, 146 134, 220 132" />
+
+                <!-- Lower branch -> Public Node (amber) -->
+                <path class="tf-weave amber" vector-effect="non-scaling-stroke" d="M 0 140 C 66 146, 118 212, 220 220" />
+                <path class="tf-weave amber fine" vector-effect="non-scaling-stroke" d="M 0 132 C 74 136, 128 230, 220 220" />
+                <path class="tf-strand amber" vector-effect="non-scaling-stroke" d="M 0 136 C 70 142, 122 220, 220 220" />
+                <path class="tf-pulse amber" pathLength="100" vector-effect="non-scaling-stroke" filter="url(#topoGlow)" d="M 0 136 C 70 142, 122 220, 220 220" />
+              </svg>
+            </div>
+
+            <!-- Right 3 Topology Targets -->
+            <div class="topo-targets">
+              <div class="topo-target moss">
+                <span class="tt-dot" aria-hidden="true"></span>
+                <div class="tt-body">
+                  <div class="tt-row">
+                    <strong>bob@laptop</strong>
+                    <span class="tt-pill moss">Direct P2P · hp2p1_</span>
+                  </div>
+                  <small>Outbound-only NAT friendly · RFC 9180 HPKE · zero hub, zero central CA</small>
+                </div>
+              </div>
+
+              <div class="topo-target olive">
+                <span class="tt-dot" aria-hidden="true"></span>
+                <div class="tt-body">
+                  <div class="tt-row">
+                    <strong>acme-team</strong>
+                    <span class="tt-pill olive">Team Hub · am2_</span>
+                  </div>
+                  <small>Org Admin-CA · Blind E2EE relay + <code>#channels</code> + <code>#announcements</code> + Shared KV</small>
+                </div>
+              </div>
+
+              <div class="topo-target amber">
+                <span class="tt-dot" aria-hidden="true"></span>
+                <div class="tt-body">
+                  <div class="tt-row">
+                    <strong>public.hyphae.to</strong>
+                    <span class="tt-pill amber">Public Node · guest-ro</span>
+                  </div>
+                  <small>Deduplicated ETag poller · <code>304 = 0</code> GitHub API quota · gated locally</small>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 3 Equal-Height Topology Cards -->
+        <div class="topo-cards">
+          <!-- Card 1: Direct P2P -->
+          <article class="topo-card moss">
+            <div class="tc-head">
+              <span class="tc-badge moss">Direct P2P</span>
+              <span class="tc-tag">Zero Hub</span>
+            </div>
+            <h3>Laptop-to-laptop with zero server.</h3>
+            <ul class="tc-points">
+              <li><strong>NAT-friendly</strong>: only one peer needs a reachable HTTPS endpoint (Tailscale Serve or Cloudflare Tunnel) — the other connects outbound-only via SSE + HTTPS carrying full bidirectional traffic.</li>
+              <li><strong>Zero CA, zero TOFU</strong>: <code>hp2p1_</code> invites pin Ed25519 + X25519 keys with asymmetric mutual <code>--grant</code> / <code>--request</code> scopes.</li>
+            </ul>
+            <div class="tc-code">
+              <div class="tc-code-head">
+                <span>stdin-safe pairing · hp2p1_</span>
+                <button class="topo-copy-btn" data-copy-topo="p2p" type="button">Copy</button>
+              </div>
+              <pre><code>hyp pair invite --mode p2p \
+  --grant dm:* files:send=25mb \
+  --request kv:read=pair/*
+hyp pair accept &lt;&lt;&lt; "$TOKEN"</code></pre>
+            </div>
+          </article>
+
+          <!-- Card 2: Team Hub -->
+          <article class="topo-card olive">
+            <div class="tc-head">
+              <span class="tc-badge olive">Team Hub</span>
+              <span class="tc-tag">Org Admin-CA</span>
+            </div>
+            <h3>Blind E2EE coordination for your org.</h3>
+            <ul class="tc-points">
+              <li><strong>Zero plaintext on the hub</strong>: routes HPKE DMs, epoch-rotated <code>#channels</code>, writer-locked <code>#announcements</code>, and Shared KV blackboards across laptops &amp; servers.</li>
+              <li><strong>One-command deploy kits</strong>: generate ready-to-run configs for Tailscale, VPS+Caddy, Docker, Cloudflare Tunnel, or Fly.io with scoped <code>am2_</code> invites.</li>
+            </ul>
+            <div class="tc-code">
+              <div class="tc-code-head">
+                <span>deploy &amp; invite · am2_</span>
+                <button class="topo-copy-btn" data-copy-topo="team" type="button">Copy</button>
+              </div>
+              <pre><code>hyp deploy init tailscale \
+  --node-id acme-team
+hyp pair invite --mode team \
+  --peer alice@macbook --preset member</code></pre>
+            </div>
+          </article>
+
+          <!-- Card 3: Public Node -->
+          <article class="topo-card amber">
+            <div class="tc-head">
+              <span class="tc-badge amber">Public Node</span>
+              <span class="tc-tag">Self-Service</span>
+            </div>
+            <h3>Shared OSS streams at zero quota.</h3>
+            <ul class="tc-points">
+              <li><strong>1 ETag poller globally</strong>: fans out public GitHub feeds to every subscribed Local Node — conditional <code>304 Not Modified</code> responses cost <code>0</code> API quota.</li>
+              <li><strong>Strict <code>guest-ro</code> isolation</strong>: read-only stream access behind your Local Node's prompt-injection guard; private team messages never touch public hubs.</li>
+            </ul>
+            <div class="tc-code">
+              <div class="tc-code-head">
+                <span>read-only OSS feed · guest-ro</span>
+                <button class="topo-copy-btn" data-copy-topo="public" type="button">Copy</button>
+              </div>
+              <pre><code>hyp pair join https://public.hyphae.to
+hyp_stream(subscribe,
+  repo="anthropics/claude-code")</code></pre>
+            </div>
+          </article>
+        </div>
+
+        <!-- 2 Proof Micro-Cards -->
+        <div class="topo-proofs">
+          <div class="topo-proof-card">
+            <div class="tp-head">
+              <strong>Least-Privilege Scopes &amp; Safe Escalation</strong>
+              <span class="tp-chip coral">RFC 9457 · 403 not_granted</span>
+            </div>
+            <pre class="tp-pre"><code>{
+  "status": 403,
+  "code": "not_granted",
+  "escalation": {
+    "untrusted": true,
+    "provenance": "peer:bob@laptop",
+    "text": "Ask Bob to re-invite with files:send=25mb"
+  }
+}</code></pre>
+            <p class="tp-note">Untrusted external text — shown verbatim to humans, never auto-executed.</p>
+          </div>
+
+          <div class="topo-proof-card">
+            <div class="tp-head">
+              <strong>Signed Manifests &amp; Fleet Skew</strong>
+              <span class="tp-chip olive">hyp status · Ed25519</span>
+            </div>
+            <pre class="tp-pre"><code>NODE              VERSION  MODE        STATUS
+alice@macbook     v2.0.0   local       ● online · Keychain
+bob@laptop        v2.0.0   direct P2P  ● HPKE · 12 ms
+acme-team         v2.0.0   blind E2EE  ● 4 peers · #channels
+public.hyphae.to  v2.0.0   guest-ro    ● ETag 304 (0 quota)</code></pre>
+            <p class="tp-note">Roll signed SHA-256 releases across every node with <code>hyp update --all</code> — zero fleet skew.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- QUICK START (Editorial botanical-blueprint paper surface alternating after dark #topologies) -->
+    <section id="install" class="section section-textured">
+      <!-- Whisper-quiet inline botanical contour + mycelial filament blueprint backdrop -->
+      <svg class="qs-botanical-bg" viewBox="0 0 1440 720" fill="none" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+        <g class="qs-contour-rings">
+          <ellipse cx="120" cy="110" rx="260" ry="150" />
+          <ellipse cx="120" cy="110" rx="370" ry="220" />
+          <ellipse cx="120" cy="110" rx="490" ry="295" />
+          <ellipse cx="1340" cy="610" rx="250" ry="145" />
+          <ellipse cx="1340" cy="610" rx="365" ry="215" />
+          <ellipse cx="1340" cy="610" rx="495" ry="290" />
+        </g>
+        <g class="qs-mycelial-veins">
+          <path d="M -20 560 C 120 490, 210 430, 340 445 C 445 458, 535 520, 660 510" />
+          <path d="M 160 478 C 215 390, 250 310, 290 220" />
+          <path class="fine" d="M 340 445 C 400 375, 455 335, 540 318" />
+          <path d="M 1460 140 C 1320 198, 1220 250, 1085 232 C 990 218, 915 162, 815 170" />
+          <path d="M 1245 224 C 1190 310, 1150 385, 1120 485" />
+          <path class="fine" d="M 1085 232 C 1025 295, 975 340, 895 362" />
+        </g>
+        <g class="qs-spore-nodes">
+          <circle cx="160" cy="478" r="3" />
+          <circle cx="340" cy="445" r="3.4" />
+          <circle cx="290" cy="220" r="2.4" />
+          <circle cx="540" cy="318" r="2.2" />
+          <circle cx="660" cy="510" r="2.6" />
+          <circle cx="1245" cy="224" r="3" />
+          <circle cx="1085" cy="232" r="3.4" />
+          <circle cx="1120" cy="485" r="2.4" />
+          <circle cx="895" cy="362" r="2.2" />
+          <circle cx="815" cy="170" r="2.6" />
+        </g>
+      </svg>
+
+      <div class="wrap qs-wrap">
         <div class="section-intro">
+          <span class="spec-num">Quick Start · Single Static Binary</span>
           <h2>Up in sixty seconds.</h2>
           <p>
             Install the single 1.25 MiB <code>hyp</code> Rust binary on macOS, Linux, or Windows, deploy a hub in one command, or hand full onboarding to your coding agent.
@@ -1014,7 +1259,12 @@
         </div>
 
         <div class="qs-grid">
+          <!-- Left: Refined Obsidian Terminal Card -->
           <div class="qs-card">
+            <div class="qs-chrome">
+              <span class="qs-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+              <span class="qs-chrome-meta">hyp v2.0.0 · SHA-256 verified</span>
+            </div>
             <div class="qs-top">
               <div class="qs-tabs" id="qsTabs">
                 <button class="it-btn active" data-qs="unix" type="button">macOS / Linux</button>
@@ -1025,28 +1275,131 @@
               <button class="install-copy" id="qsCopyBtn" type="button">Copy</button>
             </div>
             <pre class="qs-pre" id="qsPre"></pre>
+            <div class="qs-term-foot">
+              <span>Zero Node.js or Python runtime required</span>
+              <span><code>hyp doctor</code> verifies every harness</span>
+            </div>
           </div>
 
+          <!-- Right: Rich Visual Spec & CTA Module -->
           <div class="qs-facts">
-            <div class="qs-fact">
-              <strong>~2.7 ms hooks · ~2.8 MB idle RSS</strong>
-              <span>Single 1.25 MiB static Rust binary for macOS, Linux &amp; Windows; verified SHA-256 installer &amp; <code>hyp update --all</code> fleet updates.</span>
+            <!-- Top Telemetry Strip (3-up compact metric tiles) -->
+            <div class="qs-metrics">
+              <div class="qs-metric">
+                <div class="qm-head">
+                  <span class="qm-ico olive" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.3 7l8.7 5 8.7-5M12 22V12"/></svg>
+                  </span>
+                  <span class="qm-label">Static Rust</span>
+                </div>
+                <strong class="qm-val">1.25 MiB</strong>
+                <div class="qm-os"><span>macOS</span><span>Linux</span><span>Win</span></div>
+              </div>
+
+              <div class="qs-metric">
+                <div class="qm-head">
+                  <span class="qm-ico amber" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+                  </span>
+                  <span class="qm-label">Hook speed</span>
+                </div>
+                <strong class="qm-val">2.7 ms</strong>
+                <div class="qm-mini-bar">
+                  <div class="qm-bar-track"><span class="qm-bar-fill" style="width:94%"></span></div>
+                  <small>21.5× vs Node</small>
+                </div>
+              </div>
+
+              <div class="qs-metric">
+                <div class="qm-head">
+                  <span class="qm-ico moss" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/></svg>
+                  </span>
+                  <span class="qm-label">Idle RSS</span>
+                </div>
+                <strong class="qm-val">2.8 MB</strong>
+                <div class="qm-mini-bar">
+                  <div class="qm-bar-track"><span class="qm-bar-fill low" style="width:16%"></span></div>
+                  <small>tiny footprint</small>
+                </div>
+              </div>
             </div>
-            <div class="qs-fact">
-              <strong>Zero-agent-effort E2EE everywhere</strong>
-              <span>RFC 9180 HPKE + Ed25519 on DMs, <code>#channels</code>, <code>#announcements</code>, Shared KV, and streaming <code>tar.gz</code> file drops; hub stores zero plaintext.</span>
+
+            <!-- 3 Visual Capability Micro-Cards -->
+            <div class="qs-cap-list">
+              <div class="qs-cap">
+                <span class="qc-medallion olive" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                </span>
+                <div class="qc-body">
+                  <div class="qc-head">
+                    <strong>Zero-Effort E2EE</strong>
+                    <span class="qc-tag">0 plaintext on hub</span>
+                  </div>
+                  <div class="qc-chips">
+                    <span>RFC 9180 HPKE</span>
+                    <span>Ed25519</span>
+                    <span>DMs &amp; #channels</span>
+                    <span>tar.gz drops</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="qs-cap">
+                <span class="qc-medallion amber" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="19" r="3"/><circle cx="19" cy="19" r="3"/><path d="M10.4 7.6L6.6 16.4M13.6 7.6l3.8 8.8M8 19h8"/></svg>
+                </span>
+                <div class="qc-body">
+                  <div class="qc-head">
+                    <strong>Deploy Anywhere &amp; Pair</strong>
+                    <span class="qc-tag">hyp deploy init</span>
+                  </div>
+                  <div class="qc-chips">
+                    <span>Tailscale</span>
+                    <span>Caddy</span>
+                    <span>Docker</span>
+                    <span>Cloudflare</span>
+                    <span>Fly.io</span>
+                    <span>hp2p1_ P2P</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="qs-cap">
+                <span class="qc-medallion moss" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.8-3 8.8-7 10-4-1.2-7-5.2-7-10V6l7-3z"/><path d="m9.5 12 1.8 1.8 3.6-3.8"/></svg>
+                </span>
+                <div class="qc-body">
+                  <div class="qc-head">
+                    <strong>Guards &amp; OS Keychain</strong>
+                    <span class="qc-live-pill"><i></i>Policy Locked</span>
+                  </div>
+                  <div class="qc-chips">
+                    <span>Anthropic</span>
+                    <span>Ollama</span>
+                    <span>Llama Guard 2</span>
+                    <span>Lakera</span>
+                    <span>--web Keychain</span>
+                  </div>
+                </div>
+              </div>
             </div>
-            <div class="qs-fact">
-              <strong>Deploy anywhere, pair with scopes</strong>
-              <span>Built-in <code>hyp deploy init</code> kits for Tailscale, VPS+Caddy, Docker, Cloudflare Tunnel &amp; Fly.io, plus zero-hub <code>hp2p1_</code> P2P and <code>public.hyphae.to</code>.</span>
+
+            <!-- Upgraded Bottom CTA Bar -->
+            <div class="qs-cta-box">
+              <a class="qs-gh-cta" href="https://github.com/hyphae-to/hyp" target="_blank" rel="noreferrer">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.57.1.78-.25.78-.55 0-.27-.01-1.17-.02-2.12-3.2.7-3.88-1.36-3.88-1.36-.52-1.33-1.28-1.69-1.28-1.69-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.76 2.7 1.25 3.36.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.47.11-3.06 0 0 .97-.31 3.18 1.18a11.05 11.05 0 0 1 5.79 0c2.21-1.49 3.18-1.18 3.18-1.18.63 1.59.23 2.77.11 3.06.74.81 1.19 1.84 1.19 3.1 0 4.42-2.7 5.39-5.27 5.68.42.36.78 1.07.78 2.15 0 1.55-.01 2.8-.01 3.18 0 .31.21.66.79.55A11.51 11.51 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z"/></svg>
+                <span>Star &amp; read the docs on GitHub</span>
+                <span class="qs-gh-arrow" aria-hidden="true">↗</span>
+              </a>
+              <div class="qs-cta-meta">
+                <span>MIT License</span>
+                <span>·</span>
+                <span>SHA-256 verified</span>
+                <span>·</span>
+                <code>hyp update --all</code>
+              </div>
             </div>
-            <div class="qs-fact">
-              <strong>Pluggable prompt-injection guards &amp; Keychain</strong>
-              <span>Anthropic, OpenAI/Ollama, Llama Prompt Guard 2, Lakera, or BYO filter plugins; out-of-band <code>--web</code> secrets &amp; tamper-evident policy lock.</span>
-            </div>
-            <a class="btn-pill btn-olive qs-gh-btn" href="https://github.com/hyphae-to/hyp" target="_blank" rel="noreferrer">
-              Star &amp; read the docs on GitHub ↗
-            </a>
           </div>
         </div>
       </div>
@@ -1064,6 +1417,6 @@
     </div>
   </footer>
 
-  <script type="module" src="./app.js?v=10"></script>
+  <script type="module" src="./app.js?v=11"></script>
 </body>
 </html>
