@@ -511,7 +511,50 @@ export const AgentsMeshPlugin = async (ctx: { client?: { session?: { prompt?: (i
   },
 });
 
-export default AgentsMeshPlugin;
+export default {
+  id: "hyphae",
+  setup: async (ctx: {
+    tool?: {
+      hook?: (name: string, fn: (arg: Record<string, unknown>) => Promise<void> | void) => Promise<void> | void;
+    };
+  }) => {
+    if (!ctx.tool?.hook) return;
+    await ctx.tool.hook("execute.before", async (arg) => {
+      const tool = typeof arg.tool === "string" ? arg.tool : undefined;
+      if (!tool || !/hyp_[a-z_]+$/.test(tool)) return;
+      const res = await runMeshHook("pre-tool-use", {
+        session_id: arg.sessionID,
+        tool_name: tool,
+        call_id: arg.id,
+      });
+      if (typeof res.callToken === "string" && arg.input && typeof arg.input === "object") {
+        (arg.input as Record<string, unknown>)._meshCall = res.callToken;
+      }
+    });
+    await ctx.tool.hook("execute.after", async (arg) => {
+      const result = arg.result && typeof arg.result === "object" ? (arg.result as Record<string, unknown>) : null;
+      const nested = result?.output && typeof result.output === "object" ? (result.output as Record<string, unknown>) : null;
+      const canInject = result !== null && (typeof result.output === "string" || typeof nested?.output === "string");
+      if (!canInject) return;
+      const res = await runMeshHook("post-tool-use", {
+        session_id: arg.sessionID,
+        tool_name: arg.tool,
+        call_id: arg.id,
+      });
+      if (typeof res.additionalContext === "string" && res.additionalContext.length > 0) {
+        if (typeof result.output === "string") {
+          result.output = result.output + "\\n\\n" + res.additionalContext;
+        } else if (nested && typeof nested.output === "string") {
+          nested.output = nested.output + "\\n\\n" + res.additionalContext;
+        }
+        if (Array.isArray(result.content) && result.content[0] && typeof (result.content[0] as Record<string, unknown>).text === "string") {
+          (result.content[0] as Record<string, unknown>).text =
+            String((result.content[0] as Record<string, unknown>).text) + "\\n\\n" + res.additionalContext;
+        }
+      }
+    });
+  },
+};
 `;
   mkdirSync(dirname(pluginFile), { recursive: true });
   writeFileSync(pluginFile, pluginSource, "utf8");

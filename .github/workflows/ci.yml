@@ -28,11 +28,17 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Test
+      - name: Unit & Differential Tests
         run: npm test
+
+      - name: Integration Tests
+        run: npm run test:integration
 
       - name: Build
         run: npm run build
+
+      - name: Package Tarball Dry-Run
+        run: npm pack --dry-run
 
       - name: Syntax check JS plugins and site script
         run: |

@@ -311,7 +311,12 @@ test("setup commands generate valid, idempotent configs for Antigravity, Claude,
     const openCodeCfg = JSON.parse(readFileSync(join(home, ".config", "opencode", "opencode.json"), "utf8")) as { mcp: Record<string, { type: string; command: string[] }> };
     assert.equal(openCodeCfg.mcp["hyphae"].type, "local");
     assert.equal(openCodeCfg.mcp["hyphae"].command[0], "/opt/node24/bin/node");
-    assert.ok(existsSync(join(home, ".config", "opencode", "plugins", "hyphae.ts")));
+    const openCodePluginPath = join(home, ".config", "opencode", "plugins", "hyphae.ts");
+    assert.ok(existsSync(openCodePluginPath));
+    const openCodePluginSrc = readFileSync(openCodePluginPath, "utf8");
+    assert.match(openCodePluginSrc, /id:\s*"hyphae"/);
+    assert.match(openCodePluginSrc, /execute\.before/);
+    assert.match(openCodePluginSrc, /execute\.after/);
 
     const geminiSettings = JSON.parse(readFileSync(join(home, ".gemini", "settings.json"), "utf8")) as {
       mcpServers: Record<string, unknown>;

@@ -6,6 +6,7 @@ export type HookEvent = "pre-tool-use" | "post-tool-use" | "pre-invocation" | "s
 interface DaemonRpcResult {
   ok: boolean;
   result?: Record<string, unknown>;
+  error?: string;
 }
 
 /** Fast single-shot local Unix socket RPC for synchronous hooks (fails open when daemon is offline). */
@@ -36,6 +37,10 @@ export function daemonRpc(socketPath: string, packet: Record<string, unknown>, t
           done({ ok: true, result: parsed.result });
           return;
         }
+        if (object(parsed) && parsed.ok === false && typeof parsed.error === "string") {
+          done({ ok: false, error: parsed.error });
+          return;
+        }
       } catch {}
       done({ ok: false });
     });
@@ -51,17 +56,21 @@ function readStdin(): Promise<string> {
   });
 }
 
+function qualifySessionId(harness: HarnessKind, id: unknown): string | null {
+  if (typeof id !== "string" || id.length === 0) return null;
+  const prefix = `${harness}:`;
+  if (id.startsWith(prefix)) return id.length > prefix.length ? id : null;
+  return `${prefix}${id}`;
+}
+
 function extractSessionId(harness: HarnessKind, payload: Record<string, unknown>): string | null {
   if (harness === "antigravity") {
-    const id = payload.conversationId;
-    return typeof id === "string" && id.length > 0 ? `antigravity:${id}` : null;
+    return qualifySessionId("antigravity", payload.conversationId);
   }
   if (harness === "cursor") {
-    const id = payload.conversation_id ?? payload.conversationId ?? payload.session_id ?? payload.sessionId;
-    return typeof id === "string" && id.length > 0 ? `cursor:${id}` : null;
+    return qualifySessionId("cursor", payload.conversation_id ?? payload.conversationId ?? payload.session_id ?? payload.sessionId);
   }
-  const id = payload.session_id ?? payload.sessionId ?? payload.thread_id ?? payload.threadId;
-  return typeof id === "string" && id.length > 0 ? `${harness}:${id}` : null;
+  return qualifySessionId(harness, payload.session_id ?? payload.sessionId ?? payload.thread_id ?? payload.threadId);
 }
 
 function extractToolInfo(

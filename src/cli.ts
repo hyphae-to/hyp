@@ -1534,8 +1534,7 @@ async function runCli(ctx: ExecutionContext): Promise<void> {
       options: { socket: { type: "string" }, list: { type: "boolean" } },
     });
     const socketPath = values.socket ?? defaultSocketPath();
-
-    if (action === "mutes" || values.list === true || (action === "mute" && (!positionals[0] || positionals[0] === "list"))) {
+    if (action === "mutes" || values.list === true || (action === "mute" && (positionals.length === 0 || positionals[0] === "list"))) {
       ctx.command = "mutes";
       const res = await daemonRpc(socketPath, { type: "mute.list" });
       if (!res.ok || !res.result) {
@@ -1590,7 +1589,7 @@ async function runCli(ctx: ExecutionContext): Promise<void> {
     const res = await daemonRpc(socketPath, { type: action === "mute" ? "mute.add" : "mute.remove", target });
     if (!res.ok || !res.result) {
       throw new CliOperationalError(
-        `Could not ${action} '${target}' (is the Connector daemon running at ${socketPath}?)`,
+        res.error ?? `Could not ${action} '${target}' (is the Connector daemon running at ${socketPath}?)`,
         {
           code: action === "mute" ? "MUTE_FAILED" : "UNMUTE_FAILED",
           fix: "Verify the daemon is running (`hyp status`) and the target pattern is valid",

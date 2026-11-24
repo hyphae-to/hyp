@@ -586,13 +586,22 @@ export async function startDaemon(config: Config, options: StartDaemonOptions = 
     });
   });
 
-  await new Promise<void>((resolveListen, rejectListen) => {
-    server.once("error", rejectListen);
-    server.listen(socketPath, () => {
-      try { chmodSync(socketPath, 0o600); } catch {}
-      resolveListen();
+  try {
+    await new Promise<void>((resolveListen, rejectListen) => {
+      server.once("error", rejectListen);
+      server.listen(socketPath, () => {
+        try { chmodSync(socketPath, 0o600); } catch {}
+        resolveListen();
+      });
     });
-  });
+  } catch (error) {
+    if (pluginHost) await pluginHost.stop().catch(() => {});
+    if (streamHost) await streamHost.stop().catch(() => {});
+    try { state.close(); } catch {}
+    if (embeddedRouter) await embeddedRouter.close().catch(() => {});
+    try { embeddedCore?.close(); } catch {}
+    throw error;
+  }
 
   const shutdown = new AbortController();
   const staleMs = options.staleSessionMs ?? DEFAULT_STALE_SESSION_MS;
