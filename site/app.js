@@ -33,58 +33,21 @@ document.getElementById("heroCopyBtn").addEventListener("click", (e) => {
 renderHeroInstall();
 
 // ============================================================================
-// 2. PANORAMIC 8-CHAPTER HERO STORY DIORAMA (Causal staged reveals + living mycelium)
+// 2. PANORAMIC 7-CHAPTER HERO STORY DIORAMA (Causal staged reveals + living mycelium)
 // ============================================================================
 const CHAPTERS = [
   {
-    durationMs: 4900,
-    tip: "1 · Alex starts solo & joins the Team Node",
-    caption: "<strong>1/8</strong> · <strong>Alex's agent thread</strong> (Claude in Herdr on laptop) calls <code>mesh_join</code> on the <strong>Team Node</strong> — unlocking shared <code>#channels</code> and event streams.",
-    visible: ["ent-alex"],
+    durationMs: 7400,
+    tip: "1 · Alex joins Team Node -> peers bloom one by one",
+    caption: "<strong>1/7</strong> · <strong>Alex</strong> (Claude in Herdr) joins the <strong>Team Node</strong> — immediately unlocking <code>#channels</code>, streams, <strong>Alice's Codex</strong> (OpenClaw), and <strong>Jack's ops &amp; release mgr</strong> (T3 Code).",
+    visible: ["ent-alex", "ent-node"],
     dim: [],
     spotlight: ["ent-alex"],
     alertHit: [],
-    strands: [],
+    strands: ["p-alex-node"],
     softStrands: [],
-    bubbles: { "bub-alex": { text: "Just me & 47 tabs… joining the Team Node.", alert: false } },
+    bubbles: { "bub-alex": { text: "Calling mesh_join on the Team Node…", alert: false } },
     caps: [],
-    subs: [],
-    promState: "",
-    promSub: "14 servers · quiet",
-    ghTitle: "GitHub · stream",
-    ghSub: "ready on node",
-    filterTag: false,
-    ripples: [],
-    packets: [
-      { path: "p-alex-node", reverse: false, cls: "", label: "mesh_join", delay: 1050, dur: 1150 },
-    ],
-    stages: [
-      {
-        at: 850,
-        addVisible: ["ent-node"],
-        addStrands: ["p-alex-node"],
-      },
-      {
-        at: 2230,
-        spotlight: ["ent-alex", "ent-node"],
-        caps: ["cap-ch", "cap-dep", "cap-gh", "cap-pr"],
-        ripples: ["rip-node"],
-        bubbles: { "bub-alex": { text: "Connected! #channels & streams unlocked.", alert: false } },
-      },
-    ],
-  },
-  {
-    durationMs: 7100,
-    tip: "2 · Mesh peers reveal one by one (Alice, Jack ops & release)",
-    caption: "<strong>2/8</strong> · The mesh blooms peer by peer: <strong>Alice's Codex</strong> (OpenClaw, laptop), then <strong>Jack's ops</strong> &amp; <strong>release manager</strong> (T3 Code, server).",
-    visible: ["ent-alex", "ent-node"],
-    dim: [],
-    spotlight: ["ent-node"],
-    alertHit: [],
-    strands: [],
-    softStrands: ["p-alex-node"],
-    bubbles: {},
-    caps: ["cap-ch", "cap-dep", "cap-gh", "cap-pr"],
     subs: [],
     promState: "",
     promSub: "14 servers · healthy",
@@ -93,39 +56,44 @@ const CHAPTERS = [
     filterTag: false,
     ripples: [],
     packets: [
-      { path: "p-node-alice", reverse: false, cls: "amber", label: "alice · Codex online", delay: 200, dur: 980 },
-      { path: "p-node-ops", reverse: false, cls: "", label: "jack · ops online", delay: 1750, dur: 980 },
-      { path: "p-node-release", reverse: false, cls: "", label: "sub: approved PRs", delay: 3300, dur: 1020 },
+      { path: "p-alex-node", reverse: false, cls: "", label: "mesh_join", delay: 150, dur: 900 },
+      { path: "p-node-alice", reverse: false, cls: "amber", label: "alice · Codex online", delay: 1240, dur: 860 },
+      { path: "p-node-ops", reverse: false, cls: "", label: "jack · ops online", delay: 2420, dur: 860 },
+      { path: "p-node-release", reverse: false, cls: "", label: "sub: approved PRs", delay: 3620, dur: 900 },
     ],
     stages: [
       {
-        at: 120,
+        at: 1080,
+        spotlight: ["ent-node"],
+        caps: ["cap-ch", "cap-dep", "cap-gh", "cap-pr"],
+        ripples: ["rip-node"],
+        bubbles: { "bub-alex": { text: "Connected! #channels & streams unlocked.", alert: false } },
         addStrands: ["p-node-alice"],
       },
       {
-        at: 1190,
+        at: 2120,
         addVisible: ["ent-alice"],
         spotlight: ["ent-alice"],
         ripples: ["rip-alice"],
-        bubbles: { "bub-alice": { text: "Shipping auth from café Wi-Fi.", alert: false } },
+        bubbles: { "bub-alice": { text: "Subscribed to PRs assigned to me.", alert: false } },
       },
       {
-        at: 1680,
+        at: 2360,
         addStrands: ["p-node-ops"],
       },
       {
-        at: 2740,
+        at: 3300,
         addVisible: ["ent-ops"],
         spotlight: ["ent-alice", "ent-ops"],
         ripples: ["rip-ops"],
         bubbles: { "bub-ops": { text: "Watching 14 prod servers.", alert: false } },
       },
       {
-        at: 3220,
+        at: 3560,
         addStrands: ["p-node-release"],
       },
       {
-        at: 4330,
+        at: 4540,
         addVisible: ["ent-release"],
         spotlight: ["ent-alice", "ent-ops", "ent-release"],
         ripples: ["rip-release"],
@@ -135,9 +103,9 @@ const CHAPTERS = [
     ],
   },
   {
-    durationMs: 5600,
-    tip: "3 · Fleet alert wakes Jack's ops -> CODEOWNERS",
-    caption: "<strong>3/8</strong> · <span class='coral-txt'>Prometheus fires HighErrorRate (4.2%)</span>. The node filter wakes <strong>Jack's ops</strong>, who checks <code>CODEOWNERS</code> -> Alex owns <code>checkout-api</code>.",
+    durationMs: 5400,
+    tip: "2 · Fleet alert wakes Jack's ops -> CODEOWNERS",
+    caption: "<strong>2/7</strong> · <span class='coral-txt'>Prometheus fires HighErrorRate (4.2%)</span>. The node filter wakes <strong>Jack's ops</strong>, who checks <code>CODEOWNERS</code> -> Alex owns <code>checkout-api</code>.",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-prom"],
     dim: ["ent-alice", "ent-release"],
     spotlight: ["ent-node"],
@@ -155,18 +123,18 @@ const CHAPTERS = [
     filterTag: false,
     ripples: [],
     packets: [
-      { path: "p-prom-node", reverse: false, cls: "coral", label: "HighErrorRate 4.2%", delay: 150, dur: 950 },
-      { path: "p-node-ops-alert", reverse: false, cls: "coral", label: "alert -> jack/ops", delay: 1200, dur: 1050 },
+      { path: "p-prom-node", reverse: false, cls: "coral", label: "HighErrorRate 4.2%", delay: 150, dur: 920 },
+      { path: "p-node-ops-alert", reverse: false, cls: "coral", label: "alert -> jack/ops", delay: 1150, dur: 1020 },
     ],
     stages: [
       {
-        at: 1120,
+        at: 1090,
         coralCaps: ["cap-pr"],
         filterTag: true,
         addStrands: ["p-node-ops-alert"],
       },
       {
-        at: 2270,
+        at: 2190,
         alertHit: ["ent-ops"],
         ripples: ["rip-ops"],
         bubbles: {
@@ -176,9 +144,9 @@ const CHAPTERS = [
     ],
   },
   {
-    durationMs: 7200,
-    tip: "4 · Ops calls mesh_send -> Alex + Private Slack + #deploys",
-    caption: "<strong>4/8</strong> · Jack's ops sends a <code>mesh_send</code> to <strong>Alex</strong>. Alex joins <code>#deploys</code> with ops and wires a <strong>Private Node -> Slack</strong> to DM Alex.",
+    durationMs: 7000,
+    tip: "3 · Ops calls mesh_send -> Alex + Private Slack + #deploys",
+    caption: "<strong>3/7</strong> · Jack's ops sends a <code>mesh_send</code> to <strong>Alex</strong>. Alex joins <code>#deploys</code> with ops and wires a <strong>Private Node -> Slack</strong> to DM Alex.",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-prom"],
     dim: ["ent-alice", "ent-release"],
     spotlight: ["ent-ops"],
@@ -199,13 +167,13 @@ const CHAPTERS = [
     filterTag: false,
     ripples: [],
     packets: [
-      { path: "p-node-ops-alert", reverse: true, cls: "coral", label: "mesh_send(trace)", delay: 150, dur: 960 },
-      { path: "p-alex-node", reverse: true, cls: "coral", label: "mesh_send -> alex", delay: 1180, dur: 1020 },
-      { path: "p-priv-slack", reverse: false, cls: "moss", label: "DM: 4.2% error", delay: 2750, dur: 900 },
+      { path: "p-node-ops-alert", reverse: true, cls: "coral", label: "mesh_send(trace)", delay: 150, dur: 940 },
+      { path: "p-alex-node", reverse: true, cls: "coral", label: "mesh_send -> alex", delay: 1150, dur: 1000 },
+      { path: "p-priv-slack", reverse: false, cls: "moss", label: "DM: 4.2% error", delay: 2700, dur: 880 },
     ],
     stages: [
       {
-        at: 2220,
+        at: 2170,
         spotlight: ["ent-ops", "ent-alex"],
         ripples: ["rip-alex"],
         addSubs: ["sub-alex-dep"],
@@ -216,19 +184,19 @@ const CHAPTERS = [
         addStrands: ["p-alex-priv"],
       },
       {
-        at: 2660,
+        at: 2620,
         addStrands: ["p-priv-slack"],
       },
       {
-        at: 3670,
+        at: 3600,
         addVisible: ["ent-slack"],
       },
     ],
   },
   {
-    durationMs: 7200,
-    tip: "5 · Alex fixes bug, opens PR #412 & subscribes -> CI Done ✓",
-    caption: "<strong>5/8</strong> · Alex fixes the Redis pool leak, opens <strong>PR #412</strong>, subscribes to it on the Team Node, and receives <strong>CI Done ✓</strong> from GitHub.",
+    durationMs: 7000,
+    tip: "4 · Alex fixes bug, opens PR #412 & subscribes -> CI Done ✓",
+    caption: "<strong>4/7</strong> · Alex fixes the Redis pool leak, opens <strong>PR #412</strong>, subscribes to it on the Team Node, and receives <strong>CI Done ✓</strong> from GitHub.",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-prom", "ent-code"],
     dim: ["ent-alice", "ent-ops", "ent-release"],
     spotlight: ["ent-alex"],
@@ -249,26 +217,26 @@ const CHAPTERS = [
     filterTag: false,
     ripples: [],
     packets: [
-      { path: "p-alex-gh", reverse: false, cls: "amber", label: "open PR #412", delay: 150, dur: 920 },
-      { path: "p-alex-node", reverse: false, cls: "", label: "mesh_subscribe(PR #412)", delay: 300, dur: 950 },
-      { path: "p-gh-node", reverse: false, cls: "", label: "CI Done ✓", delay: 2050, dur: 900 },
-      { path: "p-alex-node", reverse: true, cls: "", label: "CI Done ✓", delay: 3000, dur: 960 },
+      { path: "p-alex-gh", reverse: false, cls: "amber", label: "open PR #412", delay: 150, dur: 900 },
+      { path: "p-alex-node", reverse: false, cls: "", label: "mesh_subscribe(PR #412)", delay: 280, dur: 920 },
+      { path: "p-gh-node", reverse: false, cls: "", label: "CI Done ✓", delay: 2000, dur: 880 },
+      { path: "p-alex-node", reverse: true, cls: "", label: "CI Done ✓", delay: 2940, dur: 940 },
     ],
     stages: [
       {
-        at: 1120,
+        at: 1080,
         addVisible: ["ent-gh"],
         addSubs: ["sub-alex-pr"],
         caps: ["cap-gh"],
         addStrands: ["p-gh-node"],
       },
       {
-        at: 1950,
+        at: 1900,
         ghActive: "green",
         ghSub: "open · CI Done ✓ · subscribed",
       },
       {
-        at: 3980,
+        at: 3900,
         ripples: ["rip-alex"],
         bubbles: {
           "bub-alex": { text: "PR #412 open & subscribed — CI Done ✓ just arrived!", alert: false },
@@ -277,114 +245,140 @@ const CHAPTERS = [
     ],
   },
   {
-    durationMs: 6500,
-    tip: "6 · Alex hands PR #412 to Alice -> spawns review sub-agent",
-    caption: "<strong>6/8</strong> · Alex hands <strong>PR #412</strong> to <strong>Alice</strong>. Alice subscribes to PR #412 + <code>#deploys</code> and spawns a <strong>review sub-agent</strong>.",
+    durationMs: 7400,
+    tip: "5 · Alex assigns Alice on GitHub -> GitHub notifies Alice -> spawns sub-agent",
+    caption: "<strong>5/7</strong> · Alex assigns <strong>@alice</strong> as reviewer on <strong>GitHub PR #412</strong> -> Team Node notifies <strong>Alice</strong> -> Alice joins <code>#deploys</code> &amp; spawns a <strong>review sub-agent</strong>.",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-gh"],
     dim: ["ent-alice", "ent-ops", "ent-release"],
     spotlight: ["ent-alex"],
     alertHit: [],
-    strands: ["p-alex-node"],
-    softStrands: ["p-gh-node"],
+    strands: ["p-alex-gh"],
+    softStrands: ["p-alex-node"],
     bubbles: {
-      "bub-alex": { text: "Handing PR #412 to Alice for review.", alert: false },
+      "bub-alex": { text: "Assigning @alice as reviewer on GitHub PR #412.", alert: false },
     },
     caps: ["cap-gh"],
     subs: ["sub-alex-pr", "sub-alex-dep", "sub-ops-dep", "sub-rel-pr"],
     ghActive: "green",
     ghTitle: "GitHub · PR #412",
-    ghSub: "CI Done ✓ · ready for review",
+    ghSub: "CI Done ✓ · assigning reviewer…",
     subagentText: "sub-agent · auditing PR #412",
     promState: "",
     promSub: "14 servers · mitigating",
     filterTag: false,
     ripples: [],
     packets: [
-      { path: "p-alex-node", reverse: false, cls: "amber", label: "handover PR #412", delay: 150, dur: 920 },
-      { path: "p-node-alice", reverse: false, cls: "amber", label: "review PR #412", delay: 1120, dur: 1020 },
-      { path: "p-alice-sub", reverse: false, cls: "amber", label: "spawn sub-agent", delay: 2320, dur: 920 },
+      { path: "p-alex-gh", reverse: false, cls: "amber", label: "assign @alice", delay: 150, dur: 900 },
+      { path: "p-gh-node", reverse: false, cls: "amber", label: "review_requested(@alice)", delay: 1120, dur: 900 },
+      { path: "p-node-alice", reverse: false, cls: "amber", label: "assigned: PR #412", delay: 2080, dur: 960 },
+      { path: "p-alice-sub", reverse: false, cls: "amber", label: "spawn sub-agent", delay: 3240, dur: 880 },
     ],
     stages: [
       {
         at: 1080,
-        addStrands: ["p-node-alice"],
+        addStrands: ["p-gh-node"],
         ghActive: "amber",
-        ghSub: "reviewer: alice/codex",
+        ghSub: "reviewer assigned: @alice",
       },
       {
-        at: 2160,
+        at: 2040,
+        addStrands: ["p-node-alice"],
+      },
+      {
+        at: 3060,
         undim: ["ent-alice"],
         spotlight: ["ent-alice"],
         ripples: ["rip-alice"],
         caps: ["cap-gh", "cap-dep"],
         addSubs: ["sub-alice-pr", "sub-alice-dep"],
         bubbles: {
-          "bub-alice": { text: "Subscribed to PR #412 + #deploys! Spawning reviewer.", alert: false },
+          "bub-alice": { text: "GitHub notified me: assigned to PR #412! Spawning reviewer.", alert: false },
         },
         addStrands: ["p-alice-sub"],
       },
       {
-        at: 3260,
+        at: 4140,
         addVisible: ["ent-subagent"],
       },
     ],
   },
   {
-    durationMs: 7200,
-    tip: "7 · Review loop -> Alex patches -> Alice approves PR #412 ✓",
-    caption: "<strong>7/8</strong> · Alice's sub-agent catches a timeout edge case -> Alex pushes a 2-line fix -> <strong>Alice approves PR #412 ✓</strong>.",
+    durationMs: 8800,
+    tip: "6 · Alice rejects PR on GitHub -> Alex notified & patches -> Alice approves ✓",
+    caption: "<strong>6/7</strong> · Alice's sub-agent finds an edge case -> Alice <strong>rejects PR #412 on GitHub</strong> -> <strong>Alex is notified</strong> &amp; pushes a 2-line fix -> <strong>Alice approves PR #412 ✓</strong>.",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-gh", "ent-subagent"],
     dim: ["ent-ops", "ent-release"],
     spotlight: ["ent-alice"],
     alertHit: [],
-    strands: ["p-alice-sub", "p-node-alice", "p-alex-node"],
-    softStrands: ["p-gh-node"],
+    strands: ["p-alice-sub", "p-alice-gh-reject"],
+    softStrands: ["p-node-alice"],
     bubbles: {
-      "bub-alice": { text: "Sub-agent caught a timeout edge case — sending to Alex.", alert: false },
+      "bub-alice": { text: "Sub-agent found a timeout bug — rejecting PR #412 on GitHub.", alert: false },
     },
     caps: ["cap-gh"],
     subs: ["sub-alex-pr", "sub-alex-dep", "sub-alice-pr", "sub-alice-dep", "sub-ops-dep", "sub-rel-pr"],
     ghActive: "amber",
     ghTitle: "GitHub · PR #412",
-    ghSub: "changes requested · timeout guard",
-    subagentText: "sub-agent · found edge case",
+    ghSub: "under review by @alice",
+    subagentText: "sub-agent · timeout edge case",
     promState: "",
     promSub: "14 servers · recovering",
     filterTag: false,
     ripples: [],
     packets: [
-      { path: "p-node-alice", reverse: true, cls: "amber", label: "review: timeout fix", delay: 150, dur: 860 },
-      { path: "p-alex-node", reverse: true, cls: "amber", label: "review: timeout fix", delay: 1060, dur: 900 },
-      { path: "p-alex-gh", reverse: false, cls: "", label: "push 2-line fix", delay: 2100, dur: 860 },
-      { path: "p-node-alice-green", reverse: true, cls: "", label: "PR #412 Approved ✓", delay: 3200, dur: 980 },
+      { path: "p-alice-gh-reject", reverse: false, cls: "coral", label: "reject PR #412", delay: 150, dur: 960 },
+      { path: "p-gh-node-reject", reverse: false, cls: "coral", label: "PR #412 rejected", delay: 1180, dur: 860 },
+      { path: "p-alex-node", reverse: true, cls: "coral", label: "PR #412 rejected", delay: 2100, dur: 900 },
+      { path: "p-alex-gh", reverse: false, cls: "", label: "push 2-line fix", delay: 3250, dur: 860 },
+      { path: "p-alice-gh-ok", reverse: false, cls: "", label: "approve PR #412 ✓", delay: 4320, dur: 960 },
     ],
     stages: [
       {
-        at: 1980,
+        at: 1130,
+        ghActive: "coral",
+        ghTitle: "GitHub · PR #412 Rejected",
+        ghSub: "changes requested · timeout guard",
+        coralCaps: ["cap-gh"],
+        addStrands: ["p-gh-node-reject"],
+      },
+      {
+        at: 2060,
+        addStrands: ["p-alex-node"],
+      },
+      {
+        at: 3020,
         spotlight: ["ent-alex", "ent-alice"],
+        alertHit: ["ent-alex"],
         ripples: ["rip-alex"],
         addStrands: ["p-alex-gh"],
         bubbles: {
-          "bub-alex": { text: "2-line timeout patch pushed! All checks green.", alert: false },
+          "bub-alex": { text: "PR #412 rejected on timeout guard — pushing 2-line fix!", alert: false },
         },
       },
       {
-        at: 3080,
+        at: 4160,
         subagentText: "sub-agent · diff clean ✓",
-        addStrands: ["p-node-alice-green", "p-gh-node"],
-        ghActive: "green",
-        ghTitle: "GitHub · PR #412 ✓",
-        ghSub: "Approved by Alice · CI green",
+        coralCaps: [],
+        caps: ["cap-gh"],
+        hideStrands: ["p-alice-gh-reject", "p-gh-node-reject"],
+        addStrands: ["p-alice-gh-ok"],
         bubbles: {
-          "bub-alice": { text: "Sub-agent verified fix — Approved ✓!", alert: false },
+          "bub-alice": { text: "Fix verified — approving PR #412 on GitHub ✓!", alert: false },
         },
+      },
+      {
+        at: 5300,
+        ghActive: "green",
+        ghTitle: "GitHub · PR #412 Approved ✓",
+        ghSub: "Approved by Alice · CI green",
+        addStrands: ["p-gh-node"],
       },
     ],
   },
   {
-    durationMs: 7800,
-    tip: "8 · Release Mgr ships -> Alert fixed -> #deploys fan-out",
-    caption: "<strong>8/8</strong> · <strong>Jack's release mgr</strong> merges &amp; ships <code>v2.14.1</code> -> <span style='color:var(--chartreuse);font-weight:600;'>alert fixed (0.0%)</span> -> <code>#deploys</code> notifies Alex, Alice &amp; Jack's ops (+ Slack DM).",
+    durationMs: 7600,
+    tip: "7 · Release Mgr ships -> Alert fixed -> #deploys fan-out",
+    caption: "<strong>7/7</strong> · <strong>Jack's release mgr</strong> merges &amp; ships <code>v2.14.1</code> -> <span style='color:var(--chartreuse);font-weight:600;'>alert fixed (0.0%)</span> -> <code>#deploys</code> notifies Alex, Alice &amp; Jack's ops (+ Slack DM).",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-gh", "ent-prom"],
     dim: [],
     spotlight: ["ent-release"],
@@ -406,20 +400,20 @@ const CHAPTERS = [
     filterTag: false,
     ripples: ["rip-release"],
     packets: [
-      { path: "p-node-release", reverse: true, cls: "", label: "ship v2.14.1 -> #deploys", delay: 150, dur: 1020 },
-      { path: "p-alex-node", reverse: true, cls: "", label: "#deploys: v2.14.1 ✓", delay: 1240, dur: 1060 },
-      { path: "p-node-alice-green", reverse: false, cls: "", label: "#deploys: v2.14.1 ✓", delay: 1240, dur: 1060 },
-      { path: "p-node-ops", reverse: false, cls: "", label: "#deploys: v2.14.1 ✓", delay: 1240, dur: 1060 },
-      { path: "p-priv-slack", reverse: false, cls: "moss", label: "DM: alert fixed ✓", delay: 2780, dur: 880 },
+      { path: "p-node-release", reverse: true, cls: "", label: "ship v2.14.1 -> #deploys", delay: 150, dur: 1000 },
+      { path: "p-alex-node", reverse: true, cls: "", label: "#deploys: v2.14.1 ✓", delay: 1220, dur: 1040 },
+      { path: "p-node-alice-green", reverse: false, cls: "", label: "#deploys: v2.14.1 ✓", delay: 1220, dur: 1040 },
+      { path: "p-node-ops", reverse: false, cls: "", label: "#deploys: v2.14.1 ✓", delay: 1220, dur: 1040 },
+      { path: "p-priv-slack", reverse: false, cls: "moss", label: "DM: alert fixed ✓", delay: 2740, dur: 860 },
     ],
     stages: [
       {
-        at: 1180,
+        at: 1160,
         caps: ["cap-ch", "cap-dep", "cap-gh"],
         addStrands: ["p-alex-node", "p-node-alice-green", "p-node-ops"],
       },
       {
-        at: 1850,
+        at: 1820,
         caps: ["cap-ch", "cap-dep", "cap-gh", "cap-pr"],
         coralCaps: [],
         addStrands: ["p-prom-node-ok"],
@@ -427,7 +421,7 @@ const CHAPTERS = [
         promSub: "0.0% · Alert resolved ✓",
       },
       {
-        at: 2320,
+        at: 2280,
         spotlight: ["ent-release", "ent-alex", "ent-alice", "ent-ops"],
         ripples: ["rip-alex", "rip-alice", "rip-ops"],
         bubbles: {
@@ -437,11 +431,11 @@ const CHAPTERS = [
         addStrands: ["p-alex-priv"],
       },
       {
-        at: 2700,
+        at: 2660,
         addStrands: ["p-priv-slack"],
       },
       {
-        at: 3680,
+        at: 3620,
         addVisible: ["ent-slack"],
       },
     ],
@@ -696,6 +690,9 @@ function applyStage(st) {
       if (el) el.classList.add("alert-hit");
     });
   }
+  if (st.hideStrands) {
+    st.hideStrands.forEach((id) => setStrandState(id, "hidden"));
+  }
   if (st.addStrands) {
     st.addStrands.forEach((id) => setStrandState(id, "grown"));
   }
@@ -729,6 +726,7 @@ function applyStage(st) {
   if (st.ghActive !== undefined) {
     const ghEl = document.getElementById("ent-gh");
     ghEl.classList.toggle("active-amber", st.ghActive === "amber");
+    ghEl.classList.toggle("active-coral", st.ghActive === "coral");
     ghEl.classList.toggle("active-green", st.ghActive === "green");
   }
   if (st.ghTitle) document.getElementById("ghTitle").textContent = st.ghTitle;
@@ -786,6 +784,7 @@ function renderChapter() {
 
   const ghEl = document.getElementById("ent-gh");
   ghEl.classList.toggle("active-amber", ch.ghActive === "amber");
+  ghEl.classList.toggle("active-coral", ch.ghActive === "coral");
   ghEl.classList.toggle("active-green", ch.ghActive === "green");
   document.getElementById("ghTitle").textContent = ch.ghTitle;
   document.getElementById("ghSub").textContent = ch.ghSub;
