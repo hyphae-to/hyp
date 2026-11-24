@@ -2851,8 +2851,19 @@ impl UnifiedNode {
             }
         };
 
+        // Direct P2P DMs and remote posts into locally-hosted `#channels` verify HPKE/channel AAD
+        // against `origin_node == self.config.node_id`, but MUST attribute the mailbox entry to
+        // `sender_node` so downstream Security Gates never misclassify remote P2P traffic as `SelfHost`.
+        let delivery_origin = if origin_node == self.config.node_id.as_str()
+            && sender_node != self.config.node_id.as_str()
+        {
+            sender_node
+        } else {
+            origin_node
+        };
+
         self.deliver_plaintext_to_local_handle(
-            origin_node,
+            delivery_origin,
             &msg.id,
             to_handle,
             &source_label,
@@ -4510,8 +4521,18 @@ impl UnifiedNode {
             }
         };
 
+        // Direct P2P transfers arrive with `origin_node == self.config.node_id`; attribute them to
+        // the remote sender node so Security Gates never misclassify remote transfers as `SelfHost`.
+        let delivery_origin = if origin_node == self.config.node_id.as_str()
+            && transfer.from_node != self.config.node_id.as_str()
+        {
+            transfer.from_node.as_str()
+        } else {
+            origin_node
+        };
+
         self.deliver_plaintext_to_local_handle(
-            origin_node,
+            delivery_origin,
             &format!("transfer:{}", transfer.id),
             &target_handle,
             &transfer.from_node,

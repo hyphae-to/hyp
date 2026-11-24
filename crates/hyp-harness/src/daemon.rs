@@ -789,64 +789,82 @@ impl LocalDaemonInner {
             }
 
             // Newly arrived raw item from `UnifiedNode`!
+            // Skip re-evaluating items that were already explicitly approved by a human operator
+            // via `hyp inbox approve` (`reviewed_at.is_some()`), so an approved quarantined item is
+            // delivered instead of immediately re-quarantined.
             let mut gate_downgraded = false;
-            if let Some(ref pipeline) = self.gate {
-                let parsed = hyp_node::delivery::ParsedMailboxSource::from_entry(&entry);
-                let trust_tier = self.resolve_peer_trust_tier(&entry.origin_node);
-                let ce = ProtoCloudEvent {
-                    specversion: "1.0".into(),
-                    id: format!("gate:{}", entry.item_id),
-                    source: entry.source.clone(),
-                    event_type: format!("to.hyphae.mailbox.{}", entry.kind.as_str()),
-                    datacontenttype: Some(CONTENT_TYPE_JSON.into()),
-                    dataschema: None,
-                    subject: parsed.channel.clone().or(parsed.topic.clone()),
-                    time: None,
-                    data: Some(json!({ "text": entry.text })),
-                    data_base64: None,
-                    extensions: BTreeMap::new(),
-                };
-                let ctx = InboundContext {
-                    session_id: session_id.to_string(),
-                    origin_node: entry.origin_node.clone(),
-                    sender: entry.source.clone(),
-                    trust_tier,
-                    e2ee_verified: true,
-                    identity_verified: true,
-                    kind: entry.kind,
-                    channel: parsed.channel,
-                    topic: parsed.topic,
-                    bridge: parsed.bridge,
-                    event: ce,
-                    transfer_paths: Vec::new(),
-                    rendered_text: Some(entry.text.clone()),
-                };
-                match pipeline.evaluate_inbound(&ctx, now).await {
-                    Ok(eval) => match eval.decision {
-                        GateDecision::Allow {
-                            downgraded_to_notify,
-                        } => {
-                            gate_downgraded = downgraded_to_notify;
-                            // If pipeline shares the same SQLite DB and inserted a duplicate `gate:` row,
-                            // dismiss the duplicate so we keep exactly one row (`entry.receipt`).
-                            if let Some(dup_receipt) = eval.receipt {
-                                if dup_receipt != entry.receipt {
-                                    self.dismissed_receipts
-                                        .lock()
-                                        .expect("dismissed lock poisoned")
-                                        .insert(dup_receipt.clone());
-                                    let db = self.node.db();
-                                    let _ = db.local().acknowledge_inbox(
-                                        session_id,
-                                        &[dup_receipt.as_str()],
-                                        now,
-                                    );
+            if entry.reviewed_at.is_none() {
+                if let Some(ref pipeline) = self.gate {
+                    let parsed = hyp_node::delivery::ParsedMailboxSource::from_entry(&entry);
+                    let effective_origin = self.effective_gate_origin(&entry, &parsed);
+                    let trust_tier = self.resolve_peer_trust_tier(&effective_origin);
+                    let ce = ProtoCloudEvent {
+                        specversion: "1.0".into(),
+                        id: format!("gate:{}", entry.item_id),
+                        source: entry.source.clone(),
+                        event_type: format!("to.hyphae.mailbox.{}", entry.kind.as_str()),
+                        datacontenttype: Some(CONTENT_TYPE_JSON.into()),
+                        dataschema: None,
+                        subject: parsed.channel.clone().or(parsed.topic.clone()),
+                        time: None,
+                        data: Some(json!({ "text": entry.text })),
+                        data_base64: None,
+                        extensions: BTreeMap::new(),
+                    };
+                    let ctx = InboundContext {
+                        session_id: session_id.to_string(),
+                        origin_node: effective_origin,
+                        sender: entry.source.clone(),
+                        trust_tier,
+                        e2ee_verified: true,
+                        identity_verified: true,
+                        kind: entry.kind,
+                        channel: parsed.channel,
+                        topic: parsed.topic,
+                        bridge: parsed.bridge,
+                        event: ce,
+                        transfer_paths: Vec::new(),
+                        rendered_text: Some(entry.text.clone()),
+                    };
+                    match pipeline.evaluate_inbound(&ctx, now).await {
+                        Ok(eval) => match eval.decision {
+                            GateDecision::Allow {
+                                downgraded_to_notify,
+                            } => {
+                                gate_downgraded = downgraded_to_notify;
+                                // If pipeline shares the same SQLite DB and inserted a duplicate `gate:` row,
+                                // dismiss the duplicate so we keep exactly one row (`entry.receipt`).
+                                if let Some(dup_receipt) = eval.receipt {
+                                    if dup_receipt != entry.receipt {
+                                        self.dismissed_receipts
+                                            .lock()
+                                            .expect("dismissed lock poisoned")
+                                            .insert(dup_receipt.clone());
+                                        let db = self.node.db();
+                                        let _ = db.local().acknowledge_inbox(
+                                            session_id,
+                                            &[dup_receipt.as_str()],
+                                            now,
+                                        );
+                                    }
                                 }
                             }
-                        }
-                        GateDecision::Quarantine { .. }
-                        | GateDecision::Block { .. }
-                        | GateDecision::Hold { .. } => {
+                            GateDecision::Quarantine { .. }
+                            | GateDecision::Block { .. }
+                            | GateDecision::Hold { .. } => {
+                                self.dismissed_receipts
+                                    .lock()
+                                    .expect("dismissed lock poisoned")
+                                    .insert(entry.receipt.clone());
+                                let db = self.node.db();
+                                let _ = db
+                                    .local()
+                                    .acknowledge_inbox(session_id, &[entry.receipt.as_str()], now);
+                                continue;
+                            }
+                        },
+                        Err(_) => {
+                            // Fail closed on gate error: suppress delivery.
                             self.dismissed_receipts
                                 .lock()
                                 .expect("dismissed lock poisoned")
@@ -857,18 +875,6 @@ impl LocalDaemonInner {
                                 .acknowledge_inbox(session_id, &[entry.receipt.as_str()], now);
                             continue;
                         }
-                    },
-                    Err(_) => {
-                        // Fail closed on gate error: suppress delivery.
-                        self.dismissed_receipts
-                            .lock()
-                            .expect("dismissed lock poisoned")
-                            .insert(entry.receipt.clone());
-                        let db = self.node.db();
-                        let _ = db
-                            .local()
-                            .acknowledge_inbox(session_id, &[entry.receipt.as_str()], now);
-                        continue;
                     }
                 }
             }
@@ -930,6 +936,37 @@ impl LocalDaemonInner {
             },
         );
         Some(classification.effective_urgency)
+    }
+
+    /// Defense-in-depth origin node resolution for Security Gate trust-tier classification.
+    ///
+    /// Even if a legacy or Direct P2P mailbox entry recorded `origin_node == self.node.node_id()`
+    /// (or `"local"`), any entry whose sender address belongs to a remote peer MUST resolve
+    /// against that remote peer node so it can never be misclassified as `GateTrustTier::SelfHost`.
+    fn effective_gate_origin(
+        &self,
+        entry: &MailboxEntry,
+        parsed: &hyp_node::delivery::ParsedMailboxSource,
+    ) -> String {
+        let my_id = self.node.node_id().as_str();
+        if entry.origin_node == "local" || entry.origin_node == my_id {
+            let remote_sender_node = parsed
+                .sender_addr
+                .as_deref()
+                .and_then(parse_address)
+                .map(|(node, _)| node)
+                .or_else(|| parse_address(&entry.source).map(|(node, _)| node))
+                .or_else(|| {
+                    (entry.kind == MailboxKind::Transfer && !entry.source.is_empty())
+                        .then_some(entry.source.as_str())
+                });
+            if let Some(sender_node) = remote_sender_node {
+                if sender_node != "local" && sender_node != my_id {
+                    return sender_node.to_string();
+                }
+            }
+        }
+        entry.origin_node.clone()
     }
 
     fn resolve_peer_trust_tier(&self, origin_node: &str) -> GateTrustTier {

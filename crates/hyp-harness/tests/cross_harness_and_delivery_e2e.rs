@@ -39,7 +39,7 @@ use hyp_node::gates::{
 use hyp_proto::address::NodeId;
 use hyp_proto::manifest::{OkpCurve, OkpJwk};
 use hyp_proto::scopes::ScopePreset;
-use hyp_store::{MailboxKind, NodeDb, TrustTier, now_ms};
+use hyp_store::{GateState, MailboxInsert, MailboxKind, NodeDb, TrustTier, now_ms};
 use serde_json::{Map, Value, json};
 use tempfile::TempDir;
 use tokio::io::BufReader;
@@ -2156,4 +2156,188 @@ async fn suite_6_cross_os_start_tcp_connector_addr_differential_parity() {
     assert!(tcp_snapshot.wait_contains_msg1);
     assert!(tcp_snapshot.post_hook_contains_msg2);
     assert_eq!(tcp_snapshot.delivered_count, 2);
+}
+
+// ============================================================================
+// Suite 7: Direct P2P Security Gate Lockdown + Human Approval Without Re-Quarantine
+// ============================================================================
+
+#[tokio::test]
+async fn suite_7_direct_p2p_security_gate_lockdown_and_human_approve_without_requarantine() {
+    let dir_alice = TempDir::new().unwrap();
+    let dir_bob = TempDir::new().unwrap();
+
+    // 1. Bob runs an HTTP P2P node; Alice pairs directly with Bob via real `hp2p1_` (zero hub).
+    let alice = open_local_node("alice@macbook", dir_alice.path());
+    let mut bob_cfg = NodeConfig::local(NodeId::new("bob@laptop").unwrap(), dir_bob.path());
+    bob_cfg.secret_backend = Some(SecretBackend::File);
+    let bob = UnifiedNode::open(bob_cfg).unwrap();
+    let (_bob_addr, _bob_srv) = Arc::clone(&bob).serve(loopback_zero()).await.unwrap();
+
+    let peer_scopes = ScopePreset::Member.expand();
+    let (hp2p1, _) = bob
+        .create_p2p_invite(peer_scopes.clone(), peer_scopes.clone(), 300_000)
+        .expect("bob creates hp2p1 invite");
+    alice
+        .accept_p2p_invite(&hp2p1, peer_scopes)
+        .await
+        .expect("alice accepts hp2p1 invite over real HTTP P2P");
+
+    // 2. Start Bob's LocalDaemon with a TAMPERED SecurityGatePipeline (`is_policy_tampered == true`).
+    let gate_cfg = SecurityGateConfig {
+        require_signed_policy: true,
+        policy_signature: Some("hmac-sha256:deadbeef00000000".to_string()),
+        ..Default::default()
+    };
+    let gate_db = Arc::new(Mutex::new(
+        NodeDb::open(dir_bob.path().join("node.sqlite")).unwrap(),
+    ));
+    let gate_pipeline = Arc::new(SecurityGatePipeline::new(gate_cfg, gate_db, None).unwrap());
+    assert!(
+        gate_pipeline.is_policy_tampered(),
+        "test setup must run with tampered gate policy"
+    );
+
+    let bob_daemon = LocalDaemon::start(
+        Arc::clone(&bob),
+        Some(Arc::clone(&gate_pipeline)),
+        LocalDaemonConfig::default(),
+    )
+    .await
+    .unwrap();
+    let bob_sock = bob_daemon.socket_path().to_path_buf();
+
+    // Enroll Bob's Claude session (`bob@laptop:bob`).
+    let _ = run_hook(
+        &bob_sock,
+        HarnessKind::Claude,
+        HookEvent::SessionStart,
+        json!({ "session_id": "bob-p2p-gate" }),
+    )
+    .await;
+    let mut bob_mcp = TestMcpClient::spawn(McpOptions::new(bob_sock.clone()));
+    bob_mcp.initialize().await;
+    let (_join_res, join_err) = bob_mcp
+        .call_verified_claude(
+            &bob_sock,
+            "bob-p2p-gate",
+            "hyp_mesh",
+            json!({ "action": "join", "handle": "bob" }),
+        )
+        .await;
+    assert!(!join_err);
+
+    // 3. Alice sends a real Direct P2P E2EE DM to Bob.
+    let sent = alice
+        .send_dm("alice", "bob@laptop/bob", "P2P_SECRET_PAYLOAD_42")
+        .await
+        .expect("direct P2P E2EE DM succeeds at transport layer");
+    assert!(sent.encrypted, "Direct P2P DM must be E2EE");
+
+    // Verify `node.rs` attributed `origin_node` to `alice@macbook` (NOT `bob@laptop`),
+    // AND Bob's tampered SecurityGatePipeline quarantined it fail-closed!
+    let post_locked = run_hook(
+        &bob_sock,
+        HarnessKind::Claude,
+        HookEvent::PostToolUse,
+        json!({ "session_id": "bob-p2p-gate", "tool_name": "Bash", "tool_use_id": "tu-p2p-1" }),
+    )
+    .await;
+    assert!(
+        !post_locked.to_string().contains("P2P_SECRET_PAYLOAD_42"),
+        "tampered gate MUST NOT deliver Direct P2P DM to agent hook: {post_locked}"
+    );
+    let (inbox_locked, _) = bob_mcp
+        .call_verified_claude(&bob_sock, "bob-p2p-gate", "hyp_inbox", json!({}))
+        .await;
+    assert!(
+        !inbox_locked.to_string().contains("P2P_SECRET_PAYLOAD_42"),
+        "tampered gate MUST NOT expose quarantined Direct P2P DM via hyp_inbox: {inbox_locked}"
+    );
+
+    let quarantined = bob
+        .db()
+        .local()
+        .list_quarantined(None, 50)
+        .expect("list_quarantined");
+    let p2p_q = quarantined
+        .iter()
+        .find(|e| e.text.contains("P2P_SECRET_PAYLOAD_42"))
+        .expect("Direct P2P DM MUST be quarantined fail-closed under gate_policy_tampered");
+    assert_eq!(
+        p2p_q.origin_node, "alice@macbook",
+        "Direct P2P inbound DM must attribute origin_node to sender_node, never self.node_id"
+    );
+    assert_eq!(p2p_q.gate_reason.as_deref(), Some("gate_policy_tampered"));
+    let p2p_receipt = p2p_q.receipt.clone();
+
+    // 4. Defense-in-depth check: even a synthetic legacy mailbox row with `origin_node == "bob@laptop"`
+    //    and remote `source == "alice@macbook/alice"` MUST be quarantined by `reconcile_session_inbox`
+    //    (never misclassified as `SelfHost`).
+    {
+        let db = bob.db();
+        db.local()
+            .put_in_mailbox(
+                &MailboxInsert {
+                    session_id: "claude:bob-p2p-gate".to_string(),
+                    origin_node: "bob@laptop".to_string(),
+                    item_id: "legacy-p2p-row-1".to_string(),
+                    source: "alice@macbook/alice".to_string(),
+                    text: "LEGACY_SPOOFED_SELFHOST_PAYLOAD".to_string(),
+                    kind: MailboxKind::Message,
+                    gate_state: GateState::Pending,
+                    gate_reason: None,
+                    traceparent: None,
+                },
+                now_ms(),
+            )
+            .expect("insert legacy row");
+    }
+    let post_legacy = run_hook(
+        &bob_sock,
+        HarnessKind::Claude,
+        HookEvent::PostToolUse,
+        json!({ "session_id": "bob-p2p-gate", "tool_name": "Bash", "tool_use_id": "tu-p2p-2" }),
+    )
+    .await;
+    assert!(
+        !post_legacy
+            .to_string()
+            .contains("LEGACY_SPOOFED_SELFHOST_PAYLOAD"),
+        "defense-in-depth MUST quarantine legacy self-origin remote-source row: {post_legacy}"
+    );
+    let q_after_legacy = bob.db().local().list_quarantined(None, 50).unwrap();
+    assert!(
+        q_after_legacy
+            .iter()
+            .any(|e| e.text.contains("LEGACY_SPOOFED_SELFHOST_PAYLOAD")),
+        "legacy row must appear in quarantine"
+    );
+
+    // 5. Human operator approves `p2p_receipt` (`reviewed_at = Some(...)`) while the live daemon
+    //    STILL holds the tampered SecurityGatePipeline in memory. It MUST deliver cleanly and
+    //    NEVER be re-quarantined by `reconcile_session_inbox`!
+    let approved = bob
+        .db()
+        .local()
+        .approve_quarantined(&p2p_receipt, "human verified", now_ms())
+        .expect("approve_quarantined succeeds");
+    assert!(approved.reviewed_at.is_some());
+
+    let post_approved = run_hook(
+        &bob_sock,
+        HarnessKind::Claude,
+        HookEvent::PostToolUse,
+        json!({ "session_id": "bob-p2p-gate", "tool_name": "Bash", "tool_use_id": "tu-p2p-3" }),
+    )
+    .await;
+    assert!(
+        post_approved.to_string().contains("P2P_SECRET_PAYLOAD_42"),
+        "human-approved receipt MUST deliver immediately without being re-quarantined: {post_approved}"
+    );
+
+    bob_mcp.close().await;
+    bob_daemon.stop().await;
+    alice.shutdown();
+    bob.shutdown();
 }
