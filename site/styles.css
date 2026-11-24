@@ -757,11 +757,11 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
 .avatar-ring {
   position: relative;
   z-index: 2;
-  width: 96px;
-  height: 96px;
+  width: 106px;
+  height: 106px;
   border-radius: 50%;
   overflow: hidden;
-  background: #171a15;
+  background: #161b15;
   border: 2.5px solid rgba(244, 241, 232, 0.24);
   box-shadow: 0 16px 32px rgba(0, 0, 0, 0.55);
   transition: box-shadow 0.35s ease, border-color 0.35s ease;
@@ -769,8 +769,8 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
 }
 
 .avatar-ring.hub-ring {
-  width: 238px;
-  height: 238px;
+  width: 222px;
+  height: 222px;
   margin: 2px 0 4px;
   border-radius: 0;
   border: none;
@@ -806,8 +806,8 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   position: absolute;
   top: 50%;
   left: 50%;
-  width: 96px;
-  height: 96px;
+  width: 106px;
+  height: 106px;
   border-radius: 50%;
   border: 2.5px solid var(--chartreuse);
   pointer-events: none;
