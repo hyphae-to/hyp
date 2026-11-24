@@ -86,13 +86,21 @@ pub fn extract_meta_call_id(meta: Option<&Map<String, Value>>) -> Option<String>
     None
 }
 
+/// Conditional capability flags returned by the daemon's `mcp.caps` RPC.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct McpToolCaps {
+    pub has_plugins: bool,
+    pub has_kv: bool,
+}
+
 /// Returns the final Rust v2 MCP tool catalog:
-/// - Always 4 crisp, self-documenting core tools: `hyp_send`, `hyp_inbox`, `hyp_mesh`, `hyp_stream`
+/// - Always 4 crisp core tools: `hyp_send`, `hyp_inbox`, `hyp_mesh`, `hyp_stream`
 /// - Conditionally appends `hyp_bridge` ONLY when `has_plugins == true` (0 tokens otherwise!)
+/// - Conditionally appends `hyp_kv` ONLY when `has_kv == true` (0 tokens otherwise!)
 ///
 /// Omits `additionalProperties: false` so PreToolUse hooks (e.g. Antigravity `overwrite`)
 /// can attach `_meshCall` tokens cleanly.
-pub fn select_tools_for_list(has_plugins: bool) -> Vec<Value> {
+pub fn select_tools_for_caps(caps: McpToolCaps) -> Vec<Value> {
     let s = json!({"type": "string"});
     let mut tools = vec![
         json!({
@@ -111,15 +119,29 @@ pub fn select_tools_for_list(has_plugins: bool) -> Vec<Value> {
         }),
         json!({
             "name": "hyp_inbox",
-            "description": "Read/ack inbox, set delivery mode ('full'|'notify'), or mute/unmute sources. Never poll.",
+            "description": "Query/ack inbox (unread|muted|delivered), set mode (queue|notify), or delivery rules. Never poll.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "state": {"type": "string", "enum": ["unread", "muted", "delivered"]},
+                    "filter": {"type": "object"},
+                    "cursor": s,
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                    "summary": {"type": "boolean"},
                     "ack": {"type": "boolean"},
                     "ids": {"type": "array", "items": s},
-                    "summary": {"type": "boolean"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 50},
-                    "mode": {"type": "string", "enum": ["full", "notify"]},
+                    "mode": {"type": "string", "enum": ["queue", "notify"]},
+                    "rules": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "target": s,
+                                "delivery": {"type": "string", "enum": ["interrupt", "queue", "notify", "mute"]}
+                            },
+                            "required": ["target", "delivery"]
+                        }
+                    },
                     "mute": s,
                     "unmute": s,
                     "scope": {"type": "string", "enum": ["connector", "session"]}
@@ -150,7 +172,7 @@ pub fn select_tools_for_list(has_plugins: bool) -> Vec<Value> {
                     "topic": s,
                     "key": s,
                     "filters": {"type": "array", "items": {"type": "object"}},
-                    "mode": {"type": "string", "enum": ["queue", "interrupt"]},
+                    "mode": {"type": "string", "enum": ["interrupt", "queue", "notify"]},
                     "coalesceSeconds": {"type": "integer", "minimum": 0, "maximum": 600},
                     "strict": {"type": "boolean"}
                 },
@@ -159,7 +181,7 @@ pub fn select_tools_for_list(has_plugins: bool) -> Vec<Value> {
         }),
     ];
 
-    if has_plugins {
+    if caps.has_plugins {
         tools.push(json!({
             "name": "hyp_bridge",
             "description": "List, link, unlink, or hand off local chat/webhook bridge targets.",
@@ -177,7 +199,38 @@ pub fn select_tools_for_list(has_plugins: bool) -> Vec<Value> {
         }));
     }
 
+    if caps.has_kv {
+        tools.push(json!({
+            "name": "hyp_kv",
+            "description": "Read, write (CAS/E2EE), list, or delete Shared KV blackboard entries.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["get", "set", "delete", "list"]},
+                    "node": s,
+                    "namespace": s,
+                    "key": s,
+                    "value": {},
+                    "prefix": s,
+                    "expectedVersion": {"type": "integer", "minimum": 0},
+                    "writeModel": {"type": "string", "enum": ["owner", "shared", "allowlist"]},
+                    "ttlMs": {"type": "integer", "minimum": 1},
+                    "encrypt": {"type": "boolean"}
+                },
+                "required": ["action", "namespace"]
+            }
+        }));
+    }
+
     tools
+}
+
+/// Backward-compatible wrapper returning the 4 core tools + conditional `hyp_bridge` (`has_kv = false`).
+pub fn select_tools_for_list(has_plugins: bool) -> Vec<Value> {
+    select_tools_for_caps(McpToolCaps {
+        has_plugins,
+        has_kv: false,
+    })
 }
 
 /// Translated daemon tool call `(daemon_tool_name, daemon_args)`.
@@ -217,6 +270,12 @@ pub fn translate_tool_call(
                 let mut out = Map::new();
                 out.insert("action".into(), json!("mode"));
                 out.insert("mode".into(), json!(mode));
+                if let Some(rules) = args.get("rules") {
+                    out.insert("rules".into(), rules.clone());
+                }
+                if let Some(vips) = args.get("focusAllowInterruptVips") {
+                    out.insert("focusAllowInterruptVips".into(), vips.clone());
+                }
                 return Ok(TranslatedCall {
                     name: "hyp_session".into(),
                     args: out,
@@ -790,14 +849,22 @@ where
                         let result_val = resp.remove("result");
                         match req.kind {
                             PendingKind::ToolsList { jsonrpc_id } => {
-                                let has_plugins = error_val.is_none()
-                                    && result_val
-                                        .as_ref()
-                                        .and_then(Value::as_object)
-                                        .and_then(|o| o.get("hasPlugins"))
-                                        .and_then(Value::as_bool)
-                                        == Some(true);
-                                let tools = select_tools_for_list(has_plugins);
+                                let caps = if error_val.is_none() {
+                                    let obj = result_val.as_ref().and_then(Value::as_object);
+                                    McpToolCaps {
+                                        has_plugins: obj
+                                            .and_then(|o| o.get("hasPlugins"))
+                                            .and_then(Value::as_bool)
+                                            == Some(true),
+                                        has_kv: obj
+                                            .and_then(|o| o.get("hasKv"))
+                                            .and_then(Value::as_bool)
+                                            == Some(true),
+                                    }
+                                } else {
+                                    McpToolCaps::default()
+                                };
+                                let tools = select_tools_for_caps(caps);
                                 write_stdout_json(
                                     &mut stdout,
                                     &jsonrpc_result(jsonrpc_id, json!({ "tools": tools })),
@@ -1079,12 +1146,25 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt};
 
     #[test]
-    fn catalog_is_four_core_tools_plus_conditional_bridge() {
+    fn catalog_is_four_core_tools_plus_conditional_bridge_and_kv() {
         let core = select_tools_for_list(false);
         let with_bridge = select_tools_for_list(true);
+        let with_kv = select_tools_for_caps(McpToolCaps {
+            has_plugins: false,
+            has_kv: true,
+        });
+        let with_both = select_tools_for_caps(McpToolCaps {
+            has_plugins: true,
+            has_kv: true,
+        });
 
         let core_names: Vec<&str> = core.iter().map(|t| t["name"].as_str().unwrap()).collect();
         let bridge_names: Vec<&str> = with_bridge
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        let kv_names: Vec<&str> = with_kv.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        let both_names: Vec<&str> = with_both
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
@@ -1094,14 +1174,52 @@ mod tests {
             bridge_names,
             vec!["hyp_send", "hyp_inbox", "hyp_mesh", "hyp_stream", "hyp_bridge"]
         );
+        assert_eq!(
+            kv_names,
+            vec!["hyp_send", "hyp_inbox", "hyp_mesh", "hyp_stream", "hyp_kv"]
+        );
+        assert_eq!(
+            both_names,
+            vec![
+                "hyp_send",
+                "hyp_inbox",
+                "hyp_mesh",
+                "hyp_stream",
+                "hyp_bridge",
+                "hyp_kv"
+            ]
+        );
+
+        // Verify upgraded `hyp_inbox` & `hyp_stream` schemas
+        let inbox_props = &core[1]["inputSchema"]["properties"];
+        assert_eq!(
+            inbox_props["state"]["enum"],
+            json!(["unread", "muted", "delivered"])
+        );
+        assert!(inbox_props["filter"].is_object());
+        assert!(inbox_props["cursor"].is_object());
+        assert_eq!(inbox_props["mode"]["enum"], json!(["queue", "notify"]));
+        assert_eq!(
+            inbox_props["rules"]["items"]["properties"]["delivery"]["enum"],
+            json!(["interrupt", "queue", "notify", "mute"])
+        );
+
+        let stream_props = &core[3]["inputSchema"]["properties"];
+        assert_eq!(
+            stream_props["mode"]["enum"],
+            json!(["interrupt", "queue", "notify"])
+        );
 
         let core_bytes = serde_json::to_string(&core).unwrap().len();
         let with_bridge_bytes = serde_json::to_string(&with_bridge).unwrap().len();
+        let with_kv_bytes = serde_json::to_string(&with_kv).unwrap().len();
         assert!(
-            core_bytes < 1800,
-            "Expected lean 4-tool core schema < 1800 bytes (~450 tokens), got {core_bytes}"
+            core_bytes <= 2150,
+            "Expected lean 4-tool core schema <= 2150 bytes (~450-520 tokens), got {core_bytes} (~{} tokens)",
+            core_bytes / 4
         );
         assert!(with_bridge_bytes > core_bytes);
+        assert!(with_kv_bytes > core_bytes);
     }
 
     #[test]
