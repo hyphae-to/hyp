@@ -87,20 +87,20 @@
 
         <div class="story-stage">
           <svg class="story-svg" viewBox="0 0 1200 580" preserveAspectRatio="none" aria-hidden="true">
-            <!-- Progressive organic mycelium strands -->
-            <path class="myc-strand" id="p-alex-node" d="M 150 265 C 300 265, 400 255, 565 255" />
-            <path class="myc-strand amber" id="p-node-alice" d="M 565 255 C 745 215, 860 122, 1020 108" />
-            <path class="myc-strand" id="p-node-alice-green" d="M 565 255 C 745 215, 860 122, 1020 108" />
-            <path class="myc-strand" id="p-node-ops" d="M 565 255 C 740 262, 860 284, 1020 290" />
-            <path class="myc-strand" id="p-node-release" d="M 565 255 C 740 315, 860 442, 1020 468" />
-            <path class="myc-strand coral" id="p-prom-node" d="M 565 56 C 565 125, 565 170, 565 255" />
-            <path class="myc-strand" id="p-prom-node-ok" d="M 565 56 C 565 125, 565 170, 565 255" />
-            <path class="myc-strand coral" id="p-node-ops-alert" d="M 565 255 C 740 262, 860 284, 1020 290" />
-            <path class="myc-strand amber" id="p-alex-gh" d="M 150 265 C 160 168, 200 104, 275 68" />
-            <path class="myc-strand amber" id="p-gh-node" d="M 275 68 C 385 135, 470 185, 565 255" />
-            <path class="myc-strand amber" id="p-alice-sub" d="M 1020 108 C 945 155, 885 182, 786 180" />
-            <path class="myc-strand moss" id="p-alex-priv" d="M 150 265 C 138 350, 144 400, 150 441" />
-            <path class="myc-strand moss" id="p-priv-slack" d="M 150 441 C 235 444, 275 444, 330 444" />
+            <!-- Progressive organic mycelium strands (perimeter-routed so wires & packets never cross faces or bubbles) -->
+            <path class="myc-strand" id="p-alex-node" d="M 200 265 C 315 265, 395 256, 488 256" />
+            <path class="myc-strand amber" id="p-node-alice" d="M 636 226 C 755 186, 855 128, 972 114" />
+            <path class="myc-strand" id="p-node-alice-green" d="M 636 226 C 755 186, 855 128, 972 114" />
+            <path class="myc-strand" id="p-node-ops" d="M 642 262 C 755 268, 860 284, 972 290" />
+            <path class="myc-strand" id="p-node-release" d="M 624 298 C 708 424, 825 488, 974 466" />
+            <path class="myc-strand coral" id="p-prom-node" d="M 565 82 C 565 116, 565 142, 565 162" />
+            <path class="myc-strand" id="p-prom-node-ok" d="M 565 82 C 565 116, 565 142, 565 162" />
+            <path class="myc-strand coral" id="p-node-ops-alert" d="M 642 262 C 755 268, 860 284, 972 290" />
+            <path class="myc-strand amber" id="p-alex-gh" d="M 164 216 C 186 154, 218 112, 255 92" />
+            <path class="myc-strand amber" id="p-gh-node" d="M 332 90 C 408 134, 466 176, 514 212" />
+            <path class="myc-strand amber" id="p-alice-sub" d="M 992 178 C 948 206, 908 218, 876 218" />
+            <path class="myc-strand moss" id="p-alex-priv" d="M 150 356 C 148 384, 150 402, 150 418" />
+            <path class="myc-strand moss" id="p-priv-slack" d="M 218 442 C 250 443, 276 443, 306 443" />
           </svg>
 
           <!-- Dynamic layer for one-shot labeled wire messages -->
@@ -159,7 +159,7 @@
           </div>
 
           <!-- Alice's spawned Reviewer Sub-Agent -->
-          <div class="subagent-pill" id="ent-subagent" style="left:65.5%; top:31%;">
+          <div class="subagent-pill" id="ent-subagent" style="left:66%; top:37.5%;">
             <span class="sub-orb"></span>
             <span id="subagentText">sub-agent · auditing PR #412</span>
           </div>
@@ -177,7 +177,7 @@
           </div>
 
           <!-- Jack's RELEASE MANAGER agent (T3 Code on Linux server) -->
-          <div class="entity" id="ent-release" style="left:85%; top:80.7%;">
+          <div class="entity" id="ent-release" style="left:85%; top:78.8%;">
             <div class="bubble side-left" id="bub-release"></div>
             <div class="ping-ripple" id="rip-release"></div>
             <div class="avatar-ring"><img src="./assets/sprite-jack.jpg" alt="Jack's release manager sprite" /></div>
@@ -189,7 +189,7 @@
           </div>
 
           <!-- Alex's live in-scene coding & subscribe card (shows fix -> PR #412 -> mesh_subscribe) -->
-          <div class="code-card" id="ent-code" style="left:25.5%; top:76%;">
+          <div class="code-card" id="ent-code" style="left:25.5%; top:75.5%;">
             <div class="cc-head">
               <span>redis-pool.ts</span>
               <span id="ccStatus" style="color:var(--chartreuse);">42/42 ✓</span>
@@ -205,7 +205,7 @@
             <span class="priv-v">localhost · 0600</span>
           </div>
 
-          <div class="slack-dm" id="ent-slack" style="left:36%; top:76.5%;">
+          <div class="slack-dm" id="ent-slack" style="left:37.5%; top:76.5%;">
             <div class="sd-head">
               <span class="sd-app">Slack · DM to Alex</span>
               <span class="sd-lock">token isolated</span>

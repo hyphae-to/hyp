@@ -33,11 +33,11 @@ document.getElementById("heroCopyBtn").addEventListener("click", (e) => {
 renderHeroInstall();
 
 // ============================================================================
-// 2. PANORAMIC 9-CHAPTER HERO STORY DIORAMA (Per-stage timing + one-shot messages)
+// 2. PANORAMIC 9-CHAPTER HERO STORY DIORAMA (Causal staged reveals + one-shot messages)
 // ============================================================================
 const CHAPTERS = [
   {
-    durationMs: 5600,
+    durationMs: 5200,
     tip: "1 · Solo agent on laptop",
     caption: "<strong>1/9</strong> · Meet <strong>Alex's agent thread</strong> — running Claude inside Herdr on a laptop. Smart, caffeinated, and totally alone.",
     visible: ["ent-alex"],
@@ -56,6 +56,7 @@ const CHAPTERS = [
     filterTag: false,
     ripples: [],
     packets: [],
+    stages: [],
   },
   {
     durationMs: 6200,
@@ -63,21 +64,29 @@ const CHAPTERS = [
     caption: "<strong>2/9</strong> · Alex calls <code>mesh_join</code> on the <strong>Team Node</strong> — unlocking shared <code>#channels</code> and subscribable event flows.",
     visible: ["ent-alex", "ent-node"],
     dim: [],
-    spotlight: ["ent-alex", "ent-node"],
+    spotlight: ["ent-alex"],
     alertHit: [],
     strands: ["p-alex-node"],
     softStrands: [],
     bubbles: { "bub-alex": { text: "Joining the Team Node… oh hello.", alert: false } },
-    caps: ["cap-ch", "cap-dep", "cap-gh", "cap-pr"],
+    caps: [],
     subs: [],
     promState: "",
     promSub: "14 servers · quiet",
     ghTitle: "GitHub · stream",
     ghSub: "ready on node",
     filterTag: false,
-    ripples: ["rip-node"],
+    ripples: [],
     packets: [
-      { path: "p-alex-node", reverse: false, cls: "", label: "mesh_join", delay: 250, dur: 1600, hold: true },
+      { path: "p-alex-node", reverse: false, cls: "", label: "mesh_join", delay: 250, dur: 1450 },
+    ],
+    stages: [
+      {
+        at: 1650,
+        spotlight: ["ent-alex", "ent-node"],
+        caps: ["cap-ch", "cap-dep", "cap-gh", "cap-pr"],
+        ripples: ["rip-node"],
+      },
     ],
   },
   {
@@ -86,17 +95,13 @@ const CHAPTERS = [
     caption: "<strong>3/9</strong> · The network lights up: <strong>Alice's Codex</strong> (OpenClaw, laptop) plus <strong>Jack's ops &amp; release manager</strong> (T3 Code, server).",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release"],
     dim: [],
-    spotlight: ["ent-alice", "ent-ops", "ent-release"],
+    spotlight: ["ent-node"],
     alertHit: [],
     strands: ["p-node-alice", "p-node-ops", "p-node-release"],
     softStrands: ["p-alex-node"],
-    bubbles: {
-      "bub-alice": { text: "Shipping auth from café Wi-Fi.", alert: false },
-      "bub-ops": { text: "Watching 14 prod servers.", alert: false },
-      "bub-release": { text: "Subscribed to approved PRs for deploy.", alert: false },
-    },
+    bubbles: {},
     caps: ["cap-ch", "cap-dep", "cap-gh", "cap-pr"],
-    subs: ["sub-rel-pr"],
+    subs: [],
     promState: "",
     promSub: "14 servers · healthy",
     ghTitle: "GitHub · stream",
@@ -104,9 +109,26 @@ const CHAPTERS = [
     filterTag: false,
     ripples: [],
     packets: [
-      { path: "p-node-alice", reverse: false, cls: "amber", label: "peer online", delay: 300, dur: 1450 },
-      { path: "p-node-ops", reverse: false, cls: "", label: "peer online", delay: 500, dur: 1450 },
-      { path: "p-node-release", reverse: false, cls: "", label: "sub: approved PRs", delay: 700, dur: 1450, hold: true },
+      { path: "p-node-alice", reverse: false, cls: "amber", label: "peer online", delay: 250, dur: 1250 },
+      { path: "p-node-ops", reverse: false, cls: "", label: "peer online", delay: 450, dur: 1250 },
+      { path: "p-node-release", reverse: false, cls: "", label: "sub: approved PRs", delay: 650, dur: 1300 },
+    ],
+    stages: [
+      {
+        at: 1450,
+        spotlight: ["ent-alice", "ent-ops", "ent-release"],
+        bubbles: {
+          "bub-alice": { text: "Shipping auth from café Wi-Fi.", alert: false },
+          "bub-ops": { text: "Watching 14 prod servers.", alert: false },
+        },
+      },
+      {
+        at: 1950,
+        bubbles: {
+          "bub-release": { text: "Subscribed to approved PRs for deploy.", alert: false },
+        },
+        subs: ["sub-rel-pr"],
+      },
     ],
   },
   {
@@ -116,177 +138,309 @@ const CHAPTERS = [
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-prom"],
     dim: ["ent-alice", "ent-release"],
     spotlight: ["ent-node"],
-    alertHit: ["ent-ops"],
-    strands: ["p-prom-node", "p-node-ops-alert"],
+    alertHit: [],
+    strands: ["p-prom-node"],
     softStrands: ["p-alex-node"],
-    bubbles: {
-      "bub-ops": { text: "checkout-api spiking! CODEOWNERS says Alex.", alert: true },
-    },
+    bubbles: {},
     caps: ["cap-ch"],
-    coralCaps: ["cap-pr"],
+    coralCaps: [],
     subs: ["sub-rel-pr"],
     promState: "coral",
     promSub: "HighErrorRate · 4.2%!",
     ghTitle: "GitHub · stream",
     ghSub: "ready on node",
-    filterTag: true,
-    ripples: ["rip-ops"],
+    filterTag: false,
+    ripples: [],
     packets: [
-      { path: "p-prom-node", reverse: false, cls: "coral", label: "HighErrorRate 4.2%", delay: 200, dur: 1300 },
-      { path: "p-node-ops-alert", reverse: false, cls: "coral", label: "alert -> jack/ops", delay: 1600, dur: 1450, hold: true },
+      { path: "p-prom-node", reverse: false, cls: "coral", label: "HighErrorRate 4.2%", delay: 200, dur: 1200 },
+      { path: "p-node-ops-alert", reverse: false, cls: "coral", label: "alert -> jack/ops", delay: 1500, dur: 1350 },
+    ],
+    stages: [
+      {
+        at: 1400,
+        coralCaps: ["cap-pr"],
+        filterTag: true,
+        addStrands: ["p-node-ops-alert"],
+      },
+      {
+        at: 2850,
+        alertHit: ["ent-ops"],
+        ripples: ["rip-ops"],
+        bubbles: {
+          "bub-ops": { text: "checkout-api spiking! CODEOWNERS says Alex.", alert: true },
+        },
+      },
     ],
   },
   {
     durationMs: 8800,
     tip: "5 · Ops calls mesh_send -> Alex + Private Slack + #deploys",
     caption: "<strong>5/9</strong> · Jack's ops sends a <code>mesh_send</code> to <strong>Alex</strong>. Alex joins <code>#deploys</code> with ops and wires a <strong>Private Node -> Slack</strong> to DM Alex.",
-    visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-prom", "ent-priv", "ent-slack"],
+    visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-prom"],
     dim: ["ent-alice", "ent-release"],
-    spotlight: ["ent-ops", "ent-alex"],
+    spotlight: ["ent-ops"],
     alertHit: [],
-    strands: ["p-node-ops-alert", "p-alex-node", "p-alex-priv", "p-priv-slack"],
+    strands: ["p-node-ops-alert", "p-alex-node"],
     softStrands: ["p-prom-node"],
     bubbles: {
       "bub-ops": { text: "mesh_send -> alex: trace attached. Joining #deploys.", alert: false },
-      "bub-alex": { text: "Got it! Joining #deploys & DMing Alex on Slack.", alert: false },
     },
     caps: ["cap-ch", "cap-dep"],
     coralCaps: ["cap-pr"],
-    subs: ["sub-alex-dep", "sub-ops-dep", "sub-rel-pr"],
+    subs: ["sub-ops-dep", "sub-rel-pr"],
     promState: "coral",
     promSub: "HighErrorRate · 4.2%!",
     ghTitle: "GitHub · stream",
     ghSub: "ready on node",
     slackMsg: "“Jack's ops sent a trace on <strong>checkout-api</strong> (4.2%). Investigating now.”",
     filterTag: false,
-    ripples: ["rip-alex"],
+    ripples: [],
     packets: [
-      { path: "p-node-ops-alert", reverse: true, cls: "coral", label: "mesh_send(trace)", delay: 200, dur: 1350 },
-      { path: "p-alex-node", reverse: true, cls: "coral", label: "mesh_send -> alex", delay: 1600, dur: 1400 },
-      { path: "p-priv-slack", reverse: false, cls: "moss", label: "DM: 4.2% error", delay: 3200, dur: 1350, hold: true },
+      { path: "p-node-ops-alert", reverse: true, cls: "coral", label: "mesh_send(trace)", delay: 200, dur: 1250 },
+      { path: "p-alex-node", reverse: true, cls: "coral", label: "mesh_send -> alex", delay: 1500, dur: 1300 },
+      { path: "p-priv-slack", reverse: false, cls: "moss", label: "DM: 4.2% error", delay: 3550, dur: 1100 },
+    ],
+    stages: [
+      {
+        at: 2800,
+        spotlight: ["ent-ops", "ent-alex"],
+        ripples: ["rip-alex"],
+        addSubs: ["sub-alex-dep"],
+        bubbles: {
+          "bub-alex": { text: "Got it! Joining #deploys & DMing Alex on Slack.", alert: false },
+        },
+        addVisible: ["ent-priv"],
+        addStrands: ["p-alex-priv"],
+      },
+      {
+        at: 3450,
+        addStrands: ["p-priv-slack"],
+      },
+      {
+        at: 4650,
+        addVisible: ["ent-slack"],
+      },
     ],
   },
   {
-    durationMs: 9200,
+    durationMs: 9400,
     tip: "6 · Alex fixes bug, opens PR #412 & subscribes -> CI Done ✓",
     caption: "<strong>6/9</strong> · Alex fixes the Redis pool leak, opens <strong>PR #412</strong>, subscribes to it on the Team Node, and receives <strong>CI Done ✓</strong> from GitHub.",
-    visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-prom", "ent-gh", "ent-code"],
+    visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-prom", "ent-code"],
     dim: ["ent-alice", "ent-ops", "ent-release"],
     spotlight: ["ent-alex"],
     alertHit: [],
-    strands: ["p-alex-gh", "p-gh-node", "p-alex-node"],
+    strands: ["p-alex-gh", "p-alex-node"],
     softStrands: [],
     bubbles: {
-      "bub-alex": { text: "PR #412 open & subscribed — CI Done ✓ just arrived!", alert: false },
+      "bub-alex": { text: "Fixed Redis pool leak — opening PR #412 & subscribing.", alert: false },
+    },
+    caps: [],
+    subs: ["sub-alex-dep", "sub-ops-dep", "sub-rel-pr"],
+    ghActive: "amber",
+    ghTitle: "GitHub · PR #412",
+    ghSub: "open · CI running…",
+    ccAction: "→ opened PR #412 · mesh_subscribe(PR #412)",
+    promState: "coral",
+    promSub: "HighErrorRate · 4.2%!",
+    filterTag: false,
+    ripples: [],
+    packets: [
+      { path: "p-alex-gh", reverse: false, cls: "amber", label: "open PR #412", delay: 250, dur: 1150 },
+      { path: "p-alex-node", reverse: false, cls: "", label: "mesh_subscribe(PR #412)", delay: 450, dur: 1150 },
+      { path: "p-gh-node", reverse: false, cls: "", label: "CI Done ✓", delay: 2550, dur: 1150 },
+      { path: "p-alex-node", reverse: true, cls: "", label: "CI Done ✓", delay: 3750, dur: 1250 },
+    ],
+    stages: [
+      {
+        at: 1450,
+        addVisible: ["ent-gh"],
+        addSubs: ["sub-alex-pr"],
+        caps: ["cap-gh"],
+        addStrands: ["p-gh-node"],
+      },
+      {
+        at: 2450,
+        ghActive: "green",
+        ghSub: "open · CI Done ✓ · subscribed",
+      },
+      {
+        at: 5000,
+        ripples: ["rip-alex"],
+        bubbles: {
+          "bub-alex": { text: "PR #412 open & subscribed — CI Done ✓ just arrived!", alert: false },
+        },
+      },
+    ],
+  },
+  {
+    durationMs: 9600,
+    tip: "7 · Alex hands PR #412 to Alice -> spawns review sub-agent",
+    caption: "<strong>7/9</strong> · Alex hands <strong>PR #412</strong> to <strong>Alice</strong>. Alice subscribes to PR #412 + <code>#deploys</code> and spawns a <strong>review sub-agent</strong>.",
+    visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-gh"],
+    dim: ["ent-alice", "ent-ops", "ent-release"],
+    spotlight: ["ent-alex"],
+    alertHit: [],
+    strands: ["p-alex-node"],
+    softStrands: ["p-gh-node"],
+    bubbles: {
+      "bub-alex": { text: "Handing PR #412 to Alice for review.", alert: false },
     },
     caps: ["cap-gh"],
     subs: ["sub-alex-pr", "sub-alex-dep", "sub-ops-dep", "sub-rel-pr"],
     ghActive: "green",
     ghTitle: "GitHub · PR #412",
-    ghSub: "open · CI Done ✓ · subscribed",
-    ccAction: "→ opened PR #412 · mesh_subscribe(PR #412)",
-    promState: "coral",
-    promSub: "HighErrorRate · 4.2%!",
-    filterTag: false,
-    ripples: ["rip-alex"],
-    packets: [
-      { path: "p-alex-gh", reverse: false, cls: "amber", label: "open PR #412", delay: 200, dur: 1200 },
-      { path: "p-alex-node", reverse: false, cls: "", label: "mesh_subscribe(PR #412)", delay: 350, dur: 1200 },
-      { path: "p-gh-node", reverse: false, cls: "", label: "CI Done ✓", delay: 1700, dur: 1250 },
-      { path: "p-alex-node", reverse: true, cls: "", label: "CI Done ✓", delay: 3000, dur: 1350, hold: true },
-    ],
-  },
-  {
-    durationMs: 9200,
-    tip: "7 · Alex hands PR #412 to Alice -> spawns review sub-agent",
-    caption: "<strong>7/9</strong> · Alex hands <strong>PR #412</strong> to <strong>Alice</strong>. Alice subscribes to PR #412 + <code>#deploys</code> and spawns a <strong>review sub-agent</strong>.",
-    visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-gh", "ent-subagent"],
-    dim: ["ent-ops", "ent-release"],
-    spotlight: ["ent-alice"],
-    alertHit: [],
-    strands: ["p-alex-node", "p-node-alice", "p-alice-sub"],
-    softStrands: ["p-gh-node"],
-    bubbles: {
-      "bub-alex": { text: "Handing PR #412 to Alice for review.", alert: false },
-      "bub-alice": { text: "Subscribed to PR #412 + #deploys! Spawning reviewer.", alert: false },
-    },
-    caps: ["cap-gh", "cap-dep"],
-    subs: ["sub-alex-pr", "sub-alex-dep", "sub-alice-pr", "sub-alice-dep", "sub-ops-dep", "sub-rel-pr"],
-    ghActive: "amber",
-    ghTitle: "GitHub · PR #412",
-    ghSub: "reviewer: alice/codex",
+    ghSub: "CI Done ✓ · ready for review",
     subagentText: "sub-agent · auditing PR #412",
     promState: "",
     promSub: "14 servers · mitigating",
     filterTag: false,
-    ripples: ["rip-alice"],
+    ripples: [],
     packets: [
-      { path: "p-alex-node", reverse: false, cls: "amber", label: "handover PR #412", delay: 200, dur: 1250 },
-      { path: "p-node-alice", reverse: false, cls: "amber", label: "review PR #412", delay: 1500, dur: 1350 },
-      { path: "p-alice-sub", reverse: false, cls: "amber", label: "spawn sub-agent", delay: 2950, dur: 1250, hold: true },
+      { path: "p-alex-node", reverse: false, cls: "amber", label: "handover PR #412", delay: 250, dur: 1200 },
+      { path: "p-node-alice", reverse: false, cls: "amber", label: "review PR #412", delay: 1500, dur: 1300 },
+      { path: "p-alice-sub", reverse: false, cls: "amber", label: "spawn sub-agent", delay: 3000, dur: 1100 },
+    ],
+    stages: [
+      {
+        at: 1450,
+        addStrands: ["p-node-alice"],
+        ghActive: "amber",
+        ghSub: "reviewer: alice/codex",
+      },
+      {
+        at: 2800,
+        undim: ["ent-alice"],
+        spotlight: ["ent-alice"],
+        ripples: ["rip-alice"],
+        caps: ["cap-gh", "cap-dep"],
+        addSubs: ["sub-alice-pr", "sub-alice-dep"],
+        bubbles: {
+          "bub-alice": { text: "Subscribed to PR #412 + #deploys! Spawning reviewer.", alert: false },
+        },
+        addStrands: ["p-alice-sub"],
+      },
+      {
+        at: 4100,
+        addVisible: ["ent-subagent"],
+      },
     ],
   },
   {
-    durationMs: 9200,
+    durationMs: 9600,
     tip: "8 · Review loop -> Alex patches -> Alice approves PR #412 ✓",
     caption: "<strong>8/9</strong> · Alice's sub-agent catches a timeout edge case -> Alex pushes a 2-line fix -> <strong>Alice approves PR #412 ✓</strong>.",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-gh", "ent-subagent"],
     dim: ["ent-ops", "ent-release"],
-    spotlight: ["ent-alex", "ent-alice"],
+    spotlight: ["ent-alice"],
     alertHit: [],
-    strands: ["p-alice-sub", "p-node-alice-green", "p-alex-node", "p-gh-node"],
-    softStrands: [],
+    strands: ["p-alice-sub", "p-node-alice", "p-alex-node"],
+    softStrands: ["p-gh-node"],
     bubbles: {
-      "bub-alice": { text: "Sub-agent verified edge case fix — Approved ✓!", alert: false },
-      "bub-alex": { text: "2-line timeout patch pushed! All checks green.", alert: false },
+      "bub-alice": { text: "Sub-agent caught a timeout edge case — sending to Alex.", alert: false },
     },
     caps: ["cap-gh"],
     subs: ["sub-alex-pr", "sub-alex-dep", "sub-alice-pr", "sub-alice-dep", "sub-ops-dep", "sub-rel-pr"],
-    ghActive: "green",
-    ghTitle: "GitHub · PR #412 ✓",
-    ghSub: "Approved by Alice · CI green",
-    subagentText: "sub-agent · diff clean ✓",
+    ghActive: "amber",
+    ghTitle: "GitHub · PR #412",
+    ghSub: "changes requested · timeout guard",
+    subagentText: "sub-agent · found edge case",
     promState: "",
     promSub: "14 servers · recovering",
     filterTag: false,
     ripples: [],
     packets: [
-      { path: "p-node-alice", reverse: true, cls: "amber", label: "review: timeout fix", delay: 200, dur: 1250 },
-      { path: "p-alex-node", reverse: true, cls: "amber", label: "review: timeout fix", delay: 1500, dur: 1250 },
-      { path: "p-alex-gh", reverse: false, cls: "", label: "push 2-line fix", delay: 2850, dur: 1150 },
-      { path: "p-node-alice-green", reverse: true, cls: "", label: "PR #412 Approved ✓", delay: 4100, dur: 1300, hold: true },
+      { path: "p-node-alice", reverse: true, cls: "amber", label: "review: timeout fix", delay: 250, dur: 1150 },
+      { path: "p-alex-node", reverse: true, cls: "amber", label: "review: timeout fix", delay: 1450, dur: 1150 },
+      { path: "p-alex-gh", reverse: false, cls: "", label: "push 2-line fix", delay: 2800, dur: 1100 },
+      { path: "p-node-alice-green", reverse: true, cls: "", label: "PR #412 Approved ✓", delay: 4200, dur: 1200 },
+    ],
+    stages: [
+      {
+        at: 2650,
+        spotlight: ["ent-alex", "ent-alice"],
+        ripples: ["rip-alex"],
+        addStrands: ["p-alex-gh"],
+        bubbles: {
+          "bub-alex": { text: "2-line timeout patch pushed! All checks green.", alert: false },
+        },
+      },
+      {
+        at: 4050,
+        subagentText: "sub-agent · diff clean ✓",
+        addStrands: ["p-node-alice-green", "p-gh-node"],
+        ghActive: "green",
+        ghTitle: "GitHub · PR #412 ✓",
+        ghSub: "Approved by Alice · CI green",
+        bubbles: {
+          "bub-alice": { text: "Sub-agent verified fix — Approved ✓!", alert: false },
+        },
+      },
     ],
   },
   {
-    durationMs: 10200,
+    durationMs: 10600,
     tip: "9 · Release Mgr ships -> Alert fixed -> #deploys fan-out",
     caption: "<strong>9/9</strong> · <strong>Jack's release mgr</strong> merges &amp; ships <code>v2.14.1</code> -> <span style='color:var(--chartreuse);font-weight:600;'>alert fixed (0.0%)</span> -> <code>#deploys</code> notifies Alex, Alice &amp; Jack's ops (+ Slack DM).",
-    visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-gh", "ent-prom", "ent-priv", "ent-slack"],
+    visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-gh", "ent-prom"],
     dim: [],
-    spotlight: ["ent-release", "ent-alex", "ent-alice", "ent-ops"],
+    spotlight: ["ent-release"],
     alertHit: [],
-    strands: ["p-node-release", "p-alex-node", "p-node-alice-green", "p-node-ops", "p-prom-node-ok", "p-alex-priv", "p-priv-slack"],
-    softStrands: ["p-gh-node"],
+    strands: ["p-node-release"],
+    softStrands: ["p-gh-node", "p-prom-node"],
     bubbles: {
-      "bub-release": { text: "Merged PR #412 -> v2.14.1 live! Posting #deploys.", alert: false },
-      "bub-alex": { text: "v2.14.1 live & alert cleared! DMing Alex on Slack.", alert: false },
+      "bub-release": { text: "PR #412 approved! Merging & shipping v2.14.1.", alert: false },
     },
-    caps: ["cap-ch", "cap-dep", "cap-gh", "cap-pr"],
+    caps: ["cap-ch", "cap-gh"],
+    coralCaps: ["cap-pr"],
     subs: ["sub-alex-pr", "sub-alex-dep", "sub-alice-pr", "sub-alice-dep", "sub-ops-dep", "sub-rel-pr"],
     ghActive: "green",
     ghTitle: "GitHub · PR #412 Merged ✓",
     ghSub: "released v2.14.1",
-    promState: "green",
-    promSub: "0.0% · Alert resolved ✓",
+    promState: "coral",
+    promSub: "HighErrorRate · rolling out…",
     slackMsg: "“<strong>v2.14.1</strong> shipped by Jack's release mgr — <strong>checkout-api</strong> alert resolved (0.0%)!”",
     filterTag: false,
-    ripples: ["rip-release", "rip-alex", "rip-alice"],
+    ripples: ["rip-release"],
     packets: [
-      { path: "p-node-release", reverse: true, cls: "", label: "ship v2.14.1 -> #deploys", delay: 200, dur: 1350 },
-      { path: "p-alex-node", reverse: true, cls: "", label: "#deploys: v2.14.1 ✓", delay: 1650, dur: 1400, hold: true },
-      { path: "p-node-alice-green", reverse: false, cls: "", label: "#deploys: v2.14.1 ✓", delay: 1650, dur: 1400, hold: true },
-      { path: "p-node-ops", reverse: false, cls: "", label: "#deploys: v2.14.1 ✓", delay: 1650, dur: 1400 },
-      { path: "p-priv-slack", reverse: false, cls: "moss", label: "DM: alert fixed ✓", delay: 3300, dur: 1350, hold: true },
+      { path: "p-node-release", reverse: true, cls: "", label: "ship v2.14.1 -> #deploys", delay: 250, dur: 1300 },
+      { path: "p-alex-node", reverse: true, cls: "", label: "#deploys: v2.14.1 ✓", delay: 1650, dur: 1350 },
+      { path: "p-node-alice-green", reverse: false, cls: "", label: "#deploys: v2.14.1 ✓", delay: 1650, dur: 1350 },
+      { path: "p-node-ops", reverse: false, cls: "", label: "#deploys: v2.14.1 ✓", delay: 1650, dur: 1350 },
+      { path: "p-priv-slack", reverse: false, cls: "moss", label: "DM: alert fixed ✓", delay: 3700, dur: 1050 },
+    ],
+    stages: [
+      {
+        at: 1600,
+        caps: ["cap-ch", "cap-dep", "cap-gh"],
+        addStrands: ["p-alex-node", "p-node-alice-green", "p-node-ops"],
+      },
+      {
+        at: 2400,
+        caps: ["cap-ch", "cap-dep", "cap-gh", "cap-pr"],
+        coralCaps: [],
+        addStrands: ["p-prom-node-ok"],
+        promState: "green",
+        promSub: "0.0% · Alert resolved ✓",
+      },
+      {
+        at: 3050,
+        spotlight: ["ent-release", "ent-alex", "ent-alice", "ent-ops"],
+        ripples: ["rip-alex", "rip-alice", "rip-ops"],
+        bubbles: {
+          "bub-alex": { text: "v2.14.1 live & alert cleared! DMing Alex on Slack.", alert: false },
+        },
+        addVisible: ["ent-priv"],
+        addStrands: ["p-alex-priv"],
+      },
+      {
+        at: 3650,
+        addStrands: ["p-priv-slack"],
+      },
+      {
+        at: 4750,
+        addVisible: ["ent-slack"],
+      },
     ],
   },
 ];
@@ -310,15 +464,21 @@ let chapterIdx = 0;
 let storyPlaying = true;
 let storyTimer = null;
 let pktRaf = null;
+let stagedTimers = [];
+
+function clearStagedTimers() {
+  for (const t of stagedTimers) clearTimeout(t);
+  stagedTimers = [];
+}
 
 function easeInOutCubic(t) {
   return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
 }
 
 /**
- * Plays ONE-SHOT sequential labeled message packets along the exact SVG paths
- * (no continuous looping dots!). Optional `hold: true` gently rests the final packet
- * near the midpoint/arrival for readability once its hop completes.
+ * Plays ONE-SHOT sequential labeled message packets along the exact SVG paths.
+ * Packets travel cleanly from source to destination and dissolve upon arrival
+ * (no orphaned pills parked on top of sprites or badges).
  */
 function playWirePackets(specs) {
   if (pktRaf) cancelAnimationFrame(pktRaf);
@@ -328,6 +488,8 @@ function playWirePackets(specs) {
   if (!specs || !specs.length) return;
 
   const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  if (reduced) return;
+
   const items = specs.map((spec) => {
     const path = document.getElementById(spec.path);
     if (!path) return null;
@@ -337,19 +499,6 @@ function playWirePackets(specs) {
     host.appendChild(el);
     return { ...spec, el, path, len: path.getTotalLength() };
   }).filter(Boolean);
-
-  if (reduced) {
-    // Show held/final packet cleanly at path midpoint
-    const last = items.find((i) => i.hold) || items[items.length - 1];
-    if (last) {
-      const pt = last.path.getPointAtLength(last.len * 0.5);
-      last.el.style.left = `${(pt.x / 1200) * 100}%`;
-      last.el.style.top = `${(pt.y / 580) * 100}%`;
-      last.el.style.opacity = "1";
-      last.el.style.transform = "translate(-50%, -50%) scale(1)";
-    }
-    return;
-  }
 
   const startTime = performance.now();
   function tick(now) {
@@ -366,9 +515,7 @@ function playWirePackets(specs) {
       const raw = Math.min(1, local / item.dur);
       if (raw < 1) anyPending = true;
 
-      // For held final message, settle gently at 56% along the wire so the label stays readable
-      const targetEnd = item.hold ? 0.56 : 0.96;
-      const travel = easeInOutCubic(raw) * targetEnd;
+      const travel = easeInOutCubic(raw) * 0.94;
       const t = item.reverse ? 1 - travel : travel;
       const pt = item.path.getPointAtLength(item.len * t);
 
@@ -377,7 +524,7 @@ function playWirePackets(specs) {
 
       let opacity = 1;
       if (raw < 0.14) opacity = raw / 0.14;
-      else if (!item.hold && raw > 0.82) opacity = Math.max(0, (1 - raw) / 0.18);
+      else if (raw > 0.80) opacity = Math.max(0, (1 - raw) / 0.20);
 
       item.el.style.opacity = opacity.toFixed(2);
       item.el.style.transform = `translate(-50%, -50%) scale(${(0.88 + 0.12 * Math.min(1, raw * 4)).toFixed(3)})`;
@@ -388,13 +535,112 @@ function playWirePackets(specs) {
   pktRaf = requestAnimationFrame(tick);
 }
 
+function applyStage(st) {
+  if (st.addVisible) {
+    st.addVisible.forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.classList.add("visible");
+    });
+  }
+  if (st.undim) {
+    st.undim.forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.classList.remove("dim");
+    });
+  }
+  if (st.spotlight) {
+    ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release"].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.classList.toggle("spotlight", st.spotlight.includes(id));
+    });
+  }
+  if (st.alertHit) {
+    st.alertHit.forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.classList.add("alert-hit");
+    });
+  }
+  if (st.addStrands) {
+    st.addStrands.forEach((id) => {
+      const path = document.getElementById(id);
+      if (path) {
+        path.classList.remove("soft");
+        path.classList.add("grown");
+        path.style.strokeDashoffset = "0";
+      }
+    });
+  }
+  if (st.caps) {
+    ["cap-ch", "cap-dep", "cap-gh", "cap-pr"].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.classList.toggle("lit", st.caps.includes(id));
+    });
+  }
+  if (st.coralCaps) {
+    ["cap-ch", "cap-dep", "cap-gh", "cap-pr"].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.classList.toggle("lit-coral", st.coralCaps.includes(id));
+    });
+  }
+  if (st.subs) {
+    ["sub-alex-pr", "sub-alex-dep", "sub-alice-pr", "sub-alice-dep", "sub-ops-dep", "sub-rel-pr"].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.classList.toggle("show", st.subs.includes(id));
+    });
+  }
+  if (st.addSubs) {
+    st.addSubs.forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.classList.add("show");
+    });
+  }
+  if (st.filterTag !== undefined) {
+    document.getElementById("filterTag")?.classList.toggle("show", Boolean(st.filterTag));
+  }
+  if (st.ghActive !== undefined) {
+    const ghEl = document.getElementById("ent-gh");
+    ghEl.classList.toggle("active-amber", st.ghActive === "amber");
+    ghEl.classList.toggle("active-green", st.ghActive === "green");
+  }
+  if (st.ghTitle) document.getElementById("ghTitle").textContent = st.ghTitle;
+  if (st.ghSub) document.getElementById("ghSub").textContent = st.ghSub;
+  if (st.promState !== undefined) {
+    const promEl = document.getElementById("ent-prom");
+    promEl.classList.toggle("active-coral", st.promState === "coral");
+    promEl.classList.toggle("active-green", st.promState === "green");
+  }
+  if (st.promSub) document.getElementById("promSub").textContent = st.promSub;
+  if (st.subagentText) document.getElementById("subagentText").textContent = st.subagentText;
+  if (st.bubbles) {
+    Object.entries(st.bubbles).forEach(([id, spec]) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.textContent = spec.text;
+      el.classList.toggle("alert", Boolean(spec.alert));
+      el.classList.add("show");
+    });
+  }
+  if (st.ripples) {
+    st.ripples.forEach((id) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.classList.remove("fire");
+      void el.offsetWidth;
+      el.classList.add("fire");
+    });
+  }
+}
+
 function updateVineProgress() {
   const frac = CHAPTERS.length > 1 ? chapterIdx / (CHAPTERS.length - 1) : 1;
   if (vineMain) vineMain.style.strokeDashoffset = `${(vineMainLen * (1 - frac)).toFixed(1)}`;
   if (vineSub) vineSub.style.strokeDashoffset = `${(vineSubLen * (1 - frac)).toFixed(1)}`;
 }
 
+let forceSettled = new URLSearchParams(window.location.search).get("settled") === "1";
+
 function renderChapter() {
+  clearStagedTimers();
   const ch = CHAPTERS[chapterIdx];
 
   const allEnts = ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release", "ent-gh", "ent-prom", "ent-priv", "ent-slack", "ent-subagent", "ent-code"];
@@ -489,7 +735,20 @@ function renderChapter() {
     });
   });
 
-  playWirePackets(ch.packets);
+  const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  const settleNow = reduced || forceSettled;
+  forceSettled = false;
+  if (ch.stages && ch.stages.length) {
+    if (settleNow) {
+      ch.stages.forEach((st) => applyStage(st));
+    } else {
+      ch.stages.forEach((st) => {
+        stagedTimers.push(setTimeout(() => applyStage(st), st.at));
+      });
+    }
+  }
+
+  playWirePackets(settleNow ? [] : ch.packets);
 }
 
 function resetStoryTimer() {

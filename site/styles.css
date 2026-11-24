@@ -297,7 +297,7 @@ header {
   border-top: 1px solid rgba(244, 241, 232, 0.1);
   border-bottom: 1px solid rgba(244, 241, 232, 0.1);
   overflow: hidden;
-  padding: 24px 0 26px;
+  padding: 24px 0 54px;
 }
 
 .story-bg {
@@ -374,6 +374,7 @@ header {
   height: 100%;
   overflow: visible;
   pointer-events: none;
+  z-index: 2;
 }
 
 .myc-strand {
@@ -853,8 +854,8 @@ header {
   bottom: 12px;
   transform: translateX(-50%);
   z-index: 15;
-  max-width: min(88%, 820px);
-  background: rgba(14, 16, 12, 0.86);
+  max-width: min(82%, 740px);
+  background: rgba(14, 16, 12, 0.88);
   backdrop-filter: blur(12px);
   border: 1px solid rgba(244, 241, 232, 0.14);
   border-radius: 14px;
@@ -910,6 +911,8 @@ header {
 
 /* Single-line Organic Mycelial Timeline (only the vine, spore dots & minimal controls) */
 .myc-timeline {
+  position: relative;
+  z-index: 40;
   margin-top: 12px;
   display: flex;
   align-items: center;
@@ -984,9 +987,10 @@ header {
 
 .tl-dot:hover,
 .tl-dot:focus-visible {
-  transform: scale(1.32);
   border-color: var(--chartreuse);
+  box-shadow: 0 0 0 4px rgba(183, 217, 86, 0.25);
   outline: none;
+  z-index: 50;
 }
 
 .tl-dot.passed {
@@ -996,9 +1000,10 @@ header {
 }
 
 .tl-dot.active {
+  width: 18px;
+  height: 18px;
   background: var(--chartreuse);
   border-color: var(--cream);
-  transform: scale(1.36);
   box-shadow: 0 0 0 5px rgba(183, 217, 86, 0.22), 0 0 16px rgba(183, 217, 86, 0.65);
 }
 
@@ -1018,13 +1023,14 @@ header {
   to { transform: rotate(360deg); }
 }
 
-/* Popover tooltip on dot hover/focus */
+/* Popover tooltip opens cleanly BELOW the timeline so it never touches the stage subtitle */
 .tl-dot::after {
   content: attr(data-tip);
   position: absolute;
-  bottom: calc(100% + 14px);
+  top: calc(100% + 12px);
+  bottom: auto;
   left: 50%;
-  transform: translateX(-50%) translateY(4px);
+  transform: translateX(-50%) translateY(-4px);
   background: var(--stone-light);
   color: var(--ink);
   font-family: var(--mono);
@@ -1037,11 +1043,11 @@ header {
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.18s ease, transform 0.18s ease;
-  z-index: 25;
+  z-index: 60;
 }
 
-.tl-dot:first-child::after { left: 0; transform: translateX(0) translateY(4px); }
-.tl-dot:last-child::after { left: auto; right: 0; transform: translateX(0) translateY(4px); }
+.tl-dot:first-child::after { left: 0; transform: translateX(0) translateY(-4px); }
+.tl-dot:last-child::after { left: auto; right: 0; transform: translateX(0) translateY(-4px); }
 
 .tl-dot:hover::after,
 .tl-dot:focus-visible::after { opacity: 1; transform: translateX(-50%) translateY(0); }
