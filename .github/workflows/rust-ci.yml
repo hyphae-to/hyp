@@ -72,6 +72,33 @@ jobs:
             throw "Unexpected hyp.exe version --json output: $out"
           }
 
+      - name: Syntax-check Windows PowerShell installer & mirror parity
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($path in @("scripts/install.ps1", "site/install.ps1")) {
+            $tokens = $null
+            $errors = $null
+            $resolved = (Resolve-Path $path).Path
+            [void][System.Management.Automation.Language.Parser]::ParseFile($resolved, [ref]$tokens, [ref]$errors)
+            if ($errors -and $errors.Count -gt 0) {
+              $msg = ($errors | ForEach-Object { $_.ToString() }) -join "`n"
+              throw "PowerShell syntax error(s) in ${path}:`n$msg"
+            }
+          }
+          $a = [System.IO.File]::ReadAllBytes((Resolve-Path "scripts/install.ps1").Path)
+          $b = [System.IO.File]::ReadAllBytes((Resolve-Path "site/install.ps1").Path)
+          if ($a.Length -ne $b.Length) {
+            throw "scripts/install.ps1 and site/install.ps1 differ in length ($($a.Length) vs $($b.Length))."
+          }
+          for ($i = 0; $i -lt $a.Length; $i++) {
+            if ($a[$i] -ne $b[$i]) {
+              throw "scripts/install.ps1 and site/install.ps1 differ at byte offset $i."
+            }
+          }
+          Write-Host "PowerShell AST parse & byte-identical mirror parity verified."
+
   installer-test:
     name: Installer Verification (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -100,9 +127,9 @@ jobs:
         run: bash scripts/test-installer.sh
 
   site-and-plugins:
-    name: Site & External Plugins Syntax Check
+    name: Site & External Plugins (Syntax + Live E2E)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -120,3 +147,12 @@ jobs:
           cmp -s scripts/install.sh site/install.sh
           cmp -s scripts/install.sh install.sh
           cmp -s scripts/install.ps1 site/install.ps1
+
+      - name: Install Rust 1.87.0
+        uses: dtolnay/rust-toolchain@1.87.0
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run live Node.js & Python external plugin E2E suite
+        run: cargo test -p hyp-node --test real_plugins_e2e
