@@ -79,15 +79,19 @@ pub const V2_CORE_MCP_TOOLS: &[&str] = &["hyp_send", "hyp_inbox", "hyp_mesh", "h
 /// Conditional bridge tool (included in `tools/list` ONLY when `hasPlugins == true`).
 pub const BRIDGE_MCP_TOOL: &str = "hyp_bridge";
 
+/// Conditional wakeup tool (included in `tools/list` ONLY when `hasWakeup == true`).
+pub const WAKEUP_MCP_TOOL: &str = "hyp_wakeup";
+
 /// Known Hyphae tool names recognized by PreToolUse hook normalization (v2 4+1 tools plus v1 daemon tools).
 const KNOWN_MESH_TOOLS: &[&str] = &[
-    // Rust v2 4+1 tools (+ reserved hyp_kv)
+    // Rust v2 4 core + conditional tools (`hyp_bridge`, `hyp_kv`, `hyp_wakeup`)
     "hyp_send",
     "hyp_inbox",
     "hyp_mesh",
     "hyp_stream",
     "hyp_bridge",
     "hyp_kv",
+    "hyp_wakeup",
     // Live v1 daemon tool names (for interop with existing hook setups)
     "hyp_session",
     "hyp_channel",
@@ -253,6 +257,14 @@ mod tests {
             Some("hyp_bridge")
         );
         assert_eq!(
+            normalize_mesh_tool_name("hyp_wakeup"),
+            Some("hyp_wakeup")
+        );
+        assert_eq!(
+            normalize_mesh_tool_name("mcp__hyphae__hyp_wakeup"),
+            Some("hyp_wakeup")
+        );
+        assert_eq!(
             normalize_mesh_tool_name("hyphae/hyp_peers"),
             Some("hyp_peers")
         );
@@ -305,5 +317,6 @@ mod tests {
         assert_eq!(resolve_v1_daemon_tool("hyp_stream", None), "hyp_stream");
         assert_eq!(resolve_v1_daemon_tool("hyp_send", None), "hyp_send");
         assert_eq!(resolve_v1_daemon_tool("hyp_bridge", None), "hyp_bridge");
+        assert_eq!(resolve_v1_daemon_tool("hyp_wakeup", None), "hyp_wakeup");
     }
 }
