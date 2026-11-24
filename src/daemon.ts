@@ -1,7 +1,6 @@
 import { chmodSync, lstatSync, mkdirSync, rmSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
-import { createInterface } from "node:readline";
 import { CallRegistry, resolveCodexCallerFromRollouts } from "./caller.ts";
 import { parseBackend, type Config } from "./config.ts";
 import { Connector } from "./connector.ts";
@@ -11,6 +10,7 @@ import { delivered, hold, isHarness, object, reject, sessionIdPattern, type Outc
 import { RouterError } from "./router.ts";
 import { State } from "./state.ts";
 import { buildStreamTopicMap, RouterStreamHost } from "./streams.ts";
+import { LineSplitter } from "./core/plugins/protocol.ts";
 import { RouterCore } from "./core/router/core.ts";
 import { serveRouter, type RunningRouter } from "./core/router/server.ts";
 
@@ -39,6 +39,7 @@ interface McpSocketContext {
 
 const DEFAULT_STALE_SESSION_MS = 7 * 86_400_000;
 const STALE_SWEEP_MS = 60 * 60 * 1000;
+const MAX_SOCKET_LINE_BYTES = 1024 * 1024;
 
 const send = (socket: Socket, packet: unknown) => {
   if (!socket.destroyed) socket.write(JSON.stringify(packet) + "\n");
@@ -292,11 +293,24 @@ export async function startDaemon(config: Config, options: StartDaemonOptions = 
       channelRequests.clear();
     });
 
-    const rl = createInterface({ input: socket });
-    rl.on("error", () => {});
-    rl.on("line", (line) => {
+    const splitter = new LineSplitter(MAX_SOCKET_LINE_BYTES, false);
+    let rejecting = false;
+    const rejectAndClose = (error: string) => {
+      if (rejecting) return;
+      rejecting = true;
+      socket.pause();
+      if (!socket.destroyed && socket.writable) {
+        socket.end(JSON.stringify({ ok: false, error }) + "\n");
+      } else {
+        socket.destroy();
+      }
+      setTimeout(() => { if (!socket.destroyed) socket.destroy(); }, 250).unref();
+    };
+
+    const handleLine = (line: string) => {
+      if (rejecting || socket.destroyed) return;
       let packet: unknown;
-      try { packet = JSON.parse(line); } catch { socket.destroy(); return; }
+      try { packet = JSON.parse(line); } catch { rejectAndClose("invalid_json"); return; }
       if (!object(packet)) return;
 
       void (async () => {
@@ -590,6 +604,22 @@ export async function startDaemon(config: Config, options: StartDaemonOptions = 
           }
         }
       })().catch(() => {});
+    };
+
+    socket.on("data", (rawChunk: Buffer | string) => {
+      if (rejecting || socket.destroyed) return;
+      const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
+      splitter.push(chunk, (line, truncated) => {
+        if (rejecting || socket.destroyed) return;
+        if (truncated) {
+          rejectAndClose("line_too_large");
+          return;
+        }
+        handleLine(line);
+      });
+      if (!rejecting && splitter.overflowing) {
+        rejectAndClose("line_too_large");
+      }
     });
   });
 
