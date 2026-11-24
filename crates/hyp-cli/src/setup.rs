@@ -6,15 +6,17 @@
 //! and pointing hooks & MCP entries directly to the static Rust `hyp` binary.
 
 use crate::config_file::{
-    default_node_id, ensure_dir, ensure_v2_node_json_defaults, open_secret_store, profile_as_str,
+    ensure_dir, ensure_v2_node_json_defaults, open_secret_store, profile_as_str,
     read_json_object_or_empty, resolve_config_path_for_write, resolve_home_dir, resolve_state_dir,
     write_atomic_file, write_atomic_json,
 };
 use crate::node_cmd::CliNodeProfile;
+use crate::service;
 use crate::ui::{
     EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
     print_warnings,
 };
+use crate::wizard;
 use clap::Args;
 use hyp_crypto::compat_v1::parse_pairing_code_v1;
 use hyp_crypto::pairing::{AM2_PREFIX, HP2P1_PREFIX, decode_am2, decode_hp2p1};
@@ -26,7 +28,7 @@ use hyp_store::{NodeDb, PeerInput, PeerProfile, PeerStatus, TrustTier, now_ms};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::fs;
-use std::io::{self, Read as _};
+use std::io::{self, IsTerminal as _, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -83,6 +85,24 @@ pub struct OnboardArgs {
     /// Optional harness selection (defaults to auto-detected harnesses under --home)
     #[arg(long)]
     pub harness: Option<String>,
+    /// Skip interactive wizard and run deterministic local CLI onboarding directly
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+    /// Install the 'hyphae-setup' skill and launch guided onboarding in an agent harness (auto, claude, codex, agy, opencode, cursor, gemini)
+    #[arg(long, num_args = 0..=1, default_missing_value = "auto", value_name = "HARNESS")]
+    pub assist: Option<String>,
+    /// Install the embedded 'hyphae-setup' skill for detected (or --harness) harnesses and exit
+    #[arg(long)]
+    pub install_skill: bool,
+    /// Disable the dot-matrix mycelium intro animation
+    #[arg(long)]
+    pub no_anim: bool,
+    /// Play the dot-matrix mycelium intro animation and exit
+    #[arg(long)]
+    pub preview_anim: bool,
+    /// Do not automatically install/start the background daemon service after local onboarding
+    #[arg(long)]
+    pub no_start: bool,
     /// Output structured JSON envelope
     #[arg(long)]
     pub json: bool,
@@ -246,6 +266,10 @@ pub fn run_setup(args: SetupArgs) -> ExitCode {
 }
 
 pub fn run_onboard(args: OnboardArgs) -> ExitCode {
+    if args.preview_anim {
+        return wizard::run_preview_animation(args.no_anim);
+    }
+
     let cmd = "onboard";
     let as_json = args.json;
 
@@ -259,6 +283,34 @@ pub fn run_onboard(args: OnboardArgs) -> ExitCode {
             None,
         );
     };
+
+    if args.install_skill {
+        return wizard::run_install_skill(
+            &home,
+            args.home.is_some(),
+            args.harness.as_deref(),
+            as_json,
+        );
+    }
+
+    if let Some(ref assist_target) = args.assist {
+        match wizard::run_assist(&args, &home, assist_target) {
+            wizard::WizardOutcome::Finished(code) => return code,
+            wizard::WizardOutcome::RunLocalCliSetup => {}
+        }
+    } else if wizard::should_launch_interactive_wizard(&args, io::stdout().is_terminal()) {
+        match wizard::run_interactive_wizard(&args, &home) {
+            wizard::WizardOutcome::Finished(code) => return code,
+            wizard::WizardOutcome::RunLocalCliSetup => {}
+        }
+    }
+
+    run_onboard_deterministic(args, home)
+}
+
+fn run_onboard_deterministic(args: OnboardArgs, home: PathBuf) -> ExitCode {
+    let cmd = "onboard";
+    let as_json = args.json;
 
     let profile = args.profile.to_node_profile();
     let node_id = args.node_id.unwrap_or_else(default_node_id);
@@ -429,27 +481,55 @@ pub fn run_onboard(args: OnboardArgs) -> ExitCode {
         }
     }
 
-    let mut next = vec![
-        format!(
-            "hyp node start --config {} --state-dir {}",
-            config_path.display(),
-            state_dir.display()
-        ),
-        format!(
-            "hyp status --state-dir {}",
-            state_dir.display()
-        ),
-        format!(
-            "hyp doctor --state-dir {} --config {}",
-            state_dir.display(),
-            config_path.display()
-        ),
-    ];
+    // 6. Auto-install & start background daemon OS service on real default workstation onboarding
+    //    (never touches live LaunchAgents/systemd when --no-start, --home, --state-dir, CI, or HYPHAE_NO_SERVICE=1).
+    let using_default_paths = args.state_dir.is_none() && args.home.is_none();
+    let ci_active = std::env::var("CI").ok().is_some_and(|v| !v.is_empty());
+    let no_service_env = std::env::var("HYPHAE_NO_SERVICE").ok().as_deref() == Some("1");
+    let daemon_auto = if !args.no_start && using_default_paths && !ci_active && !no_service_env {
+        let res = service::install_and_start_default(Path::new(&bin_path), &home, &state_dir);
+        if let Some(ref w) = res.warning {
+            warnings.push(w.clone());
+        }
+        Some(res)
+    } else {
+        None
+    };
+
+    let daemon_started = daemon_auto.as_ref().is_some_and(|d| d.started);
+
+    let mut next = if using_default_paths {
+        let mut steps = Vec::new();
+        if !daemon_started {
+            steps.push("hyp daemon".to_string());
+        }
+        steps.push("hyp status".to_string());
+        steps.push("hyp doctor".to_string());
+        steps
+    } else {
+        vec![
+            format!(
+                "hyp node start --config {} --state-dir {}",
+                config_path.display(),
+                state_dir.display()
+            ),
+            format!("hyp status --state-dir {}", state_dir.display()),
+            format!(
+                "hyp doctor --state-dir {} --config {}",
+                state_dir.display(),
+                config_path.display()
+            ),
+        ]
+    };
     if configured_harnesses.is_empty() {
-        next.push(format!(
-            "hyp setup --harness all --home {}",
-            home.display()
-        ));
+        if using_default_paths {
+            next.push("hyp setup --harness all".to_string());
+        } else {
+            next.push(format!(
+                "hyp setup --harness all --home {}",
+                home.display()
+            ));
+        }
     }
     if staged_join.is_some() {
         next.insert(
@@ -467,6 +547,16 @@ pub fn run_onboard(args: OnboardArgs) -> ExitCode {
             "kid": s.kid,
             "scopes": s.scopes,
             "secretRef": "staged-join-token",
+        })
+    });
+
+    let daemon_json = daemon_auto.as_ref().map(|d| {
+        json!({
+            "started": d.started,
+            "installed": d.installed,
+            "manager": d.manager,
+            "service": d.service,
+            "detail": d.detail,
         })
     });
 
@@ -492,6 +582,7 @@ pub fn run_onboard(args: OnboardArgs) -> ExitCode {
                 "dbPath": db_path.display().to_string(),
                 "binary": bin_path,
                 "stagedJoin": staged_json,
+                "daemon": daemon_json,
                 "harnesses": configured_harnesses,
             })),
             warnings,
@@ -517,6 +608,9 @@ pub fn run_onboard(args: OnboardArgs) -> ExitCode {
                 s.endpoint.as_deref().unwrap_or("-")
             );
         }
+        if let Some(ref d) = daemon_auto {
+            println!("      Daemon:      {}", d.detail);
+        }
         println!(
             "      Harnesses:   {} configured",
             configured_harnesses.len()
@@ -526,6 +620,87 @@ pub fn run_onboard(args: OnboardArgs) -> ExitCode {
     }
 
     ExitCode::from(EXIT_OK)
+}
+
+/// Resolves a clean default `user@host` nodeId, falling back to `hostname -s` and (on macOS)
+/// `scutil --get LocalHostName` whenever `$HOSTNAME` is unset or returns `localhost`/`local-host`.
+pub(crate) fn default_node_id() -> String {
+    let raw_user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "user".to_string());
+    let env_host = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok();
+    let host = resolve_machine_hostname(env_host.as_deref());
+    format_default_node_id(&raw_user, &host)
+}
+
+fn is_generic_localhost(raw: &str) -> bool {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    let short = trimmed.split('.').next().unwrap_or("");
+    short.is_empty() || matches!(short, "localhost" | "local-host" | "localdomain")
+}
+
+fn run_trimmed_stdout(program: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(program).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
+}
+
+fn resolve_machine_hostname(env_host: Option<&str>) -> String {
+    if let Some(h) = env_host.filter(|h| !is_generic_localhost(h)) {
+        return h.to_string();
+    }
+    if let Some(h) = run_trimmed_stdout("hostname", &["-s"]).filter(|h| !is_generic_localhost(h)) {
+        return h;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(h) = run_trimmed_stdout("scutil", &["--get", "LocalHostName"])
+            .filter(|h| !is_generic_localhost(h))
+        {
+            return h;
+        }
+        if let Some(h) = run_trimmed_stdout("scutil", &["--get", "ComputerName"])
+            .filter(|h| !is_generic_localhost(h))
+        {
+            return h;
+        }
+    }
+    "local-host".to_string()
+}
+
+fn sanitize_node_segment(raw: &str, fallback: &str) -> String {
+    let mut out = String::new();
+    for ch in raw.chars() {
+        let low = ch.to_ascii_lowercase();
+        if low.is_ascii_alphanumeric() || matches!(low, '.' | '_' | '-') {
+            out.push(low);
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.chars().take(28).collect()
+    }
+}
+
+fn format_default_node_id(raw_user: &str, raw_host: &str) -> String {
+    let user = sanitize_node_segment(raw_user, "user");
+    let host_short = raw_host.split('.').next().unwrap_or("local-host");
+    let host = sanitize_node_segment(host_short, "local-host");
+    let candidate = format!("{user}@{host}");
+    if candidate != LOCAL_NODE_ID && is_valid_node_id(&candidate) {
+        candidate
+    } else {
+        "user@local-host".to_string()
+    }
 }
 
 struct StagedJoin {
@@ -1137,6 +1312,20 @@ fn setup_claude(
         .cloned()
         .unwrap_or_default();
     hooks.insert(
+        "SessionStart".to_string(),
+        merge_hook_groups(
+            hooks.get("SessionStart"),
+            json!({
+                "hooks": [{
+                    "type": "command",
+                    "command": hook_command(bin, "claude", "session-start", socket),
+                    "statusMessage": "Hyphae · Register session",
+                    "timeout": 10
+                }]
+            }),
+        ),
+    );
+    hooks.insert(
         "PreToolUse".to_string(),
         merge_hook_groups(
             hooks.get("PreToolUse"),
@@ -1145,6 +1334,7 @@ fn setup_claude(
                 "hooks": [{
                     "type": "command",
                     "command": hook_command(bin, "claude", "pre-tool-use", socket),
+                    "statusMessage": "Hyphae · Verify MCP caller",
                     "timeout": 10
                 }]
             }),
@@ -1159,6 +1349,7 @@ fn setup_claude(
                 "hooks": [{
                     "type": "command",
                     "command": hook_command(bin, "claude", "post-tool-use", socket),
+                    "statusMessage": "Hyphae · Deliver inbox messages",
                     "timeout": 10
                 }]
             }),
@@ -1172,6 +1363,7 @@ fn setup_claude(
                 "hooks": [{
                     "type": "command",
                     "command": hook_command(bin, "claude", "stop", socket),
+                    "statusMessage": "Hyphae · Check inbox on turn end",
                     "timeout": 10
                 }]
             }),
@@ -1226,6 +1418,20 @@ fn setup_codex(
         .cloned()
         .unwrap_or_default();
     hooks.insert(
+        "SessionStart".to_string(),
+        merge_hook_groups(
+            hooks.get("SessionStart"),
+            json!({
+                "hooks": [{
+                    "type": "command",
+                    "command": hook_command(bin, "codex", "session-start", socket),
+                    "statusMessage": "Hyphae · Register session",
+                    "timeout": 10
+                }]
+            }),
+        ),
+    );
+    hooks.insert(
         "PreToolUse".to_string(),
         merge_hook_groups(
             hooks.get("PreToolUse"),
@@ -1234,6 +1440,7 @@ fn setup_codex(
                 "hooks": [{
                     "type": "command",
                     "command": hook_command(bin, "codex", "pre-tool-use", socket),
+                    "statusMessage": "Hyphae · Verify MCP caller",
                     "timeout": 10
                 }]
             }),
@@ -1248,6 +1455,7 @@ fn setup_codex(
                 "hooks": [{
                     "type": "command",
                     "command": hook_command(bin, "codex", "post-tool-use", socket),
+                    "statusMessage": "Hyphae · Deliver inbox messages",
                     "timeout": 10
                 }]
             }),
@@ -1261,6 +1469,7 @@ fn setup_codex(
                 "hooks": [{
                     "type": "command",
                     "command": hook_command(bin, "codex", "stop", socket),
+                    "statusMessage": "Hyphae · Check inbox on turn end",
                     "timeout": 10
                 }]
             }),
@@ -1650,4 +1859,31 @@ fn setup_t3(
             "T3 Code adapter configured with secret ref 't3-session-token' (never plaintext).".to_string(),
         ],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generic_localhost_detection_catches_macos_fallbacks() {
+        assert!(is_generic_localhost(""));
+        assert!(is_generic_localhost("localhost"));
+        assert!(is_generic_localhost("localhost.localdomain"));
+        assert!(is_generic_localhost("LOCAL-HOST"));
+        assert!(!is_generic_localhost("MacBook-Pro-8"));
+        assert!(!is_generic_localhost("workstation.local"));
+    }
+
+    #[test]
+    fn format_default_node_id_sanitizes_macos_local_host_name() {
+        assert_eq!(
+            format_default_node_id("Bogdan", "MacBook-Pro-8"),
+            "bogdan@macbook-pro-8"
+        );
+        assert_eq!(
+            format_default_node_id("Alice", "Alice's MacBook Pro.local"),
+            "alice@alice-s-macbook-pro"
+        );
+    }
 }

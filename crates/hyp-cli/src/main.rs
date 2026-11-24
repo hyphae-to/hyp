@@ -11,10 +11,12 @@ mod kv_cmd;
 mod node_cmd;
 mod pair;
 mod secret_cmd;
+mod service;
 mod setup;
 mod status_doctor;
 mod ui;
 mod update;
+mod wizard;
 
 use clap::{Parser, Subcommand};
 use hyp_harness::hooks::{HandleHookOptions, HookEvent, run_hook_sync, shell_quote_cli};
@@ -123,6 +125,11 @@ enum Commands {
     },
     /// Alias for `node start` — runs the unified Hyphae v2 Node daemon
     Daemon(node_cmd::NodeStartArgs),
+    /// Manage the Hyphae background daemon OS service (`install`, `uninstall`, `start`, `stop`, `restart`, `status`)
+    Service {
+        #[command(subcommand)]
+        command: service::ServiceCommand,
+    },
     /// Configure hooks & MCP entries for installed agent harnesses pointing to the static Rust binary
     Setup(setup::SetupArgs),
     /// One-command Hyphae v2 onboarding (node.json, persistent keys, optional join token, harness setup)
@@ -422,6 +429,7 @@ fn main() -> ExitCode {
         }
         Commands::Node { command } => node_cmd::run_node(command),
         Commands::Daemon(args) => node_cmd::run_node_start(args),
+        Commands::Service { command } => service::run_service(command),
         Commands::Setup(args) => setup::run_setup(args),
         Commands::Onboard(args) => setup::run_onboard(args),
         Commands::Status(args) => status_doctor::run_status(args),
