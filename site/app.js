@@ -23,18 +23,23 @@ function esc(s) {
   window.addEventListener("resize", syncHeaderTheme, { passive: true });
 })();
 
-// Proportional 1200x555 stage scaling so sprites, wires, bubbles & packets stay pixel-exact on desktop, tablet & mobile
+// Proportional 1200x590 stage scaling so sprites, wires, bubbles & packets stay pixel-exact from mobile to ultrawide displays
 (function initResponsiveStage() {
   const viewport = document.getElementById("storyViewport");
   const stage = document.getElementById("storyStage");
   if (!viewport || !stage) return;
 
   const LOGICAL_W = 1200;
-  const LOGICAL_H = 555;
+  const LOGICAL_H = 590;
 
   function fitStage() {
     const availW = viewport.clientWidth || LOGICAL_W;
-    const scale = Math.min(1, availW / LOGICAL_W);
+    const vh = window.innerHeight || 900;
+    // Scale down cleanly on narrow viewports; on large/tall displays scale smoothly up to 1.28x
+    // while keeping the subtitle, timeline, and hero CTA comfortably balanced on screen.
+    const maxScaleByHeight = Math.max(0.72, Math.min(1.28, (vh - 340) / LOGICAL_H));
+    const maxScale = vh >= 960 ? maxScaleByHeight : Math.min(1, Math.max(0.84, (vh - 300) / LOGICAL_H));
+    const scale = Math.min(maxScale, availW / LOGICAL_W);
     const offsetX = Math.max(0, (availW - LOGICAL_W * scale) / 2);
     stage.style.transform = `translateX(${offsetX.toFixed(1)}px) scale(${scale.toFixed(4)})`;
     viewport.style.height = `${Math.round(LOGICAL_H * scale)}px`;

@@ -29,7 +29,7 @@
 }
 
 * { box-sizing: border-box; }
-html { scroll-behavior: smooth; }
+html { scroll-behavior: smooth; overflow-x: clip; }
 
 body {
   margin: 0;
@@ -38,7 +38,7 @@ body {
   font-family: var(--sans);
   line-height: 1.55;
   -webkit-font-smoothing: antialiased;
-  overflow-x: hidden;
+  overflow-x: clip;
 }
 
 /* Tactile risograph grain overlay */
@@ -53,9 +53,20 @@ body::after {
 }
 
 .wrap {
-  max-width: 1240px;
+  max-width: min(1320px, 92vw);
   margin: 0 auto;
-  padding: 0 28px;
+  padding: 0 clamp(20px, 3vw, 44px);
+}
+
+header .wrap,
+.story-band .wrap {
+  max-width: min(1500px, 94vw);
+}
+
+@media (min-width: 1720px) {
+  .wrap { max-width: min(1440px, 88vw); }
+  header .wrap,
+  .story-band .wrap { max-width: min(1640px, 92vw); }
 }
 
 /* ================= SMART SCROLL-AWARE NAV ================= */
@@ -82,11 +93,11 @@ header.header-light {
 }
 
 .nav-bar {
-  height: 68px;
+  height: clamp(64px, 6.2vh, 80px);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 20px;
+  gap: 24px;
 }
 
 .brand {
@@ -232,12 +243,12 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
 
 /* ================= HERO CTA STRIP (Right below the animated show) ================= */
 .hero-cta-strip {
-  margin-top: 48px;
-  padding-top: 34px;
+  margin-top: clamp(36px, 4.8vh, 72px);
+  padding-top: clamp(28px, 3.8vh, 52px);
   border-top: 1px solid rgba(244, 241, 232, 0.1);
   display: grid;
   grid-template-columns: 1.08fr 0.92fr;
-  gap: 40px;
+  gap: clamp(28px, 4vw, 68px);
   align-items: center;
   scroll-margin-top: 90px;
 }
@@ -422,14 +433,23 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   color: var(--cream);
   border-bottom: 1px solid rgba(244, 241, 232, 0.1);
   overflow: hidden;
-  padding: 76px 0 58px;
+  padding: clamp(92px, 9.5vh, 148px) 0 clamp(56px, 6.8vh, 104px);
+}
+
+@media (min-width: 1440px) and (min-height: 960px) {
+  .story-band {
+    min-height: min(94vh, 1180px);
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+  }
 }
 
 .story-bg {
   position: absolute;
   inset: 0;
   background-image: url("./assets/hero-mycelium.jpg");
-  background-size: 1380px auto;
+  background-size: max(1380px, 78vw) auto;
   background-position: center top;
   background-repeat: repeat;
   opacity: 0.62;
@@ -458,6 +478,7 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
 .story-band-inner {
   position: relative;
   z-index: 2;
+  width: 100%;
 }
 
 .story-band-head {
@@ -483,7 +504,7 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   color: var(--cream-soft);
 }
 
-/* Unboxed, proportionally scaled 1200x555 diorama — zero box border, zero horizontal overflow */
+/* Unboxed, proportionally scaled 1200x590 diorama — zero box border, zero horizontal overflow */
 .story-viewport {
   position: relative;
   width: 100%;
@@ -500,7 +521,7 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   top: 0;
   left: 0;
   width: 1200px;
-  height: 555px;
+  height: 590px;
   transform-origin: top left;
   overflow: visible;
   background: transparent;
@@ -1078,13 +1099,13 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
 .scene-subtitle-wrap {
   position: relative;
   z-index: 15;
-  margin: -6px auto 14px;
+  margin: clamp(12px, 1.8vh, 24px) auto clamp(14px, 2vh, 24px);
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   justify-content: center;
   gap: 10px;
-  max-width: min(100%, 820px);
+  max-width: min(100%, 880px);
 }
 
 .scene-subtitle {
@@ -1179,7 +1200,7 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
 .myc-timeline {
   position: relative;
   z-index: 40;
-  margin-top: 12px;
+  margin-top: clamp(12px, 1.6vh, 22px);
   display: flex;
   align-items: center;
   gap: 16px;
@@ -1712,7 +1733,9 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
 }
 
 @media (max-width: 640px) {
-  .wrap { padding: 0 16px; }
+  .wrap,
+  header .wrap,
+  .story-band .wrap { max-width: 100%; padding: 0 16px; }
   .nav-bar { height: 58px; gap: 10px; }
   .brand-word { font-size: 1.24rem; }
   .brand-cli { display: none; }
