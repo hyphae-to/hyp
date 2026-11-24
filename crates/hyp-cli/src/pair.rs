@@ -1,9 +1,13 @@
 //! `hyp-rs pair` — Permissioned pairing guide, cryptographic invite generator (`hp2p1_` / `am2_`),
-//! and stdin/`--token-file`-safe token inspector (`hp2p1_` / `am2_` / legacy `t3mp1_`).
+//! stdin/`--token-file`-safe token inspector & acceptor (`accept`), and public/team node `join`.
 //!
 //! Security invariant: pairing tokens and secrets are NEVER accepted via CLI argv flags
 //! where they could leak to `ps` — always read from stdin or `--token-file`.
 
+use crate::config_file::{
+    build_http_client, ensure_dir, load_node_or_legacy_config, resolve_config_path_for_read,
+    resolve_effective_node_id, resolve_state_dir,
+};
 use crate::ui::{
     CliError, EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json,
     print_next_steps, print_warnings,
@@ -11,17 +15,26 @@ use crate::ui::{
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::{Subcommand, ValueEnum};
+use http::{Method, Request, header};
+use http_body_util::{BodyExt, Empty};
 use hyp_crypto::compat_v1::{issue_grant_v1, parse_pairing_code_v1};
 use hyp_crypto::jcs::to_canonical_json;
-use hyp_crypto::keys::Ed25519KeyPair;
+use hyp_crypto::keys::{Ed25519KeyPair, Ed25519PublicKey, OkpJwk as CryptoOkpJwk, SignedPayload, X25519PublicKey};
 use hyp_crypto::keystore::{SecretBackend, SecretStore};
 use hyp_crypto::pairing::{
     AM2_PREFIX, AdminInviteV2, GrantV2, HP2P1_PREFIX, P2P_SECRET_BYTES, create_p2p_offer,
     decode_am2, decode_hp2p1, encode_am2, encode_hp2p1, sign_grant_v2, validate_endpoint_origin,
+    verify_grant_v2,
 };
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms, parse_rfc3339_millis};
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
+use hyp_proto::manifest::{NodeManifestPayload, NodeProfile as ProtoNodeProfile, SignedNodeManifest};
 use hyp_proto::scopes::{EscalationNote, ScopePreset, ScopeSet, expand_v2_scopes};
+use hyp_store::{
+    GrantDirection, GrantInput, KeyStatus, KeyUse, ManifestCacheUpdate, NodeDb, PeerInput,
+    PeerKeyInput, PeerProfile, PeerStatus, StoreError, TrustTier as StoreTrustTier, now_ms,
+};
+use hyper::body::Bytes;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -30,9 +43,12 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 const MAX_TOKEN_INPUT_BYTES: u64 = 64 * 1024;
 const MAX_EXPIRES_HOURS: u64 = 24 * 365;
+const MAX_MANIFEST_RESPONSE_BYTES: usize = 512 * 1024;
+const MANIFEST_FETCH_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -77,6 +93,16 @@ impl CliScopePreset {
             Self::Observer => ScopePreset::Observer,
             Self::Member => ScopePreset::Member,
             Self::Full => ScopePreset::Full,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GuestRo => "guest-ro",
+            Self::Guest => "guest",
+            Self::Observer => "observer",
+            Self::Member => "member",
+            Self::Full => "full",
         }
     }
 }
@@ -137,6 +163,47 @@ pub enum PairCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Verify and accept an hp2p1_ P2P offer or am2_ Org Admin-CA invite from stdin or --token-file
+    Accept {
+        /// Read pairing token from a private file instead of stdin (never pass tokens in CLI argv!)
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        /// Explicit state directory containing node.sqlite and secrets/
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Local node's canonical nodeId override (e.g. bob@laptop)
+        #[arg(long)]
+        node_id: Option<String>,
+        /// Optional counter-grant scopes to offer the peer in return (P2P mutual pairing)
+        #[arg(long, num_args = 1..)]
+        grant: Vec<String>,
+        /// Output structured JSON envelope
+        #[arg(long)]
+        json: bool,
+    },
+    /// Join a public or team Hyphae node by URL (verifies signed /v1/manifest unless --offline)
+    Join {
+        /// Target node URL (https:// or loopback http://127.0.0.1 for local testing)
+        url: String,
+        /// Explicit state directory containing node.sqlite and secrets/
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Local node's canonical nodeId override (e.g. alice@macbook)
+        #[arg(long)]
+        node_id: Option<String>,
+        /// Optional peer nodeId override (used when --offline; cross-checked against manifest when online)
+        #[arg(long)]
+        node_name: Option<String>,
+        /// Scope preset to register for this peer (default: guest-ro)
+        #[arg(long, value_enum, default_value_t = CliScopePreset::GuestRo)]
+        preset: CliScopePreset,
+        /// Skip live GET /v1/manifest verification when pre-configuring offline
+        #[arg(long)]
+        offline: bool,
+        /// Output structured JSON envelope
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run_pair(command: PairCommand) -> ExitCode {
@@ -168,6 +235,22 @@ pub fn run_pair(command: PairCommand) -> ExitCode {
             json,
         ),
         PairCommand::Inspect { token_file, json } => run_inspect(token_file, json),
+        PairCommand::Accept {
+            token_file,
+            state_dir,
+            node_id,
+            grant,
+            json,
+        } => run_accept(token_file, state_dir, node_id, grant, json),
+        PairCommand::Join {
+            url,
+            state_dir,
+            node_id,
+            node_name,
+            preset,
+            offline,
+            json,
+        } => run_join(url, state_dir, node_id, node_name, preset, offline, json),
     }
 }
 
@@ -216,8 +299,8 @@ fn build_topologies() -> Vec<TopologyGuide> {
             token_prefix: "am2_",
             trust_model: "Offline Org Root Admin-CA signs per-member grants; hub never holds the Admin private key.",
             summary: "Hub-and-spoke federation for companies and teams sharing org streams, #channels, blind E2EE relay, and shared KV.",
-            invite_example: "hyp-rs pair invite --mode team --node-id acme-team --endpoint https://mesh.acme.internal --peer alice@macbook --preset member",
-            accept_example: "hyp onboard --join <<< '<am2_token>'",
+            invite_example: "hyp pair invite --mode team --node-id acme-team --endpoint https://mesh.acme.internal --peer alice@macbook --preset member",
+            accept_example: "hyp pair accept <<< '<am2_token>'",
             nat_notes: "Only the Team Hub needs a reachable HTTPS endpoint (VPS+Caddy, Tailscale Serve, Cloudflare Tunnel, or Fly.io); member laptops connect outbound-only.",
         },
         TopologyGuide {
@@ -226,8 +309,8 @@ fn build_topologies() -> Vec<TopologyGuide> {
             token_prefix: "hp2p1_",
             trust_model: "Zero central CA and zero TOFU window: Alice's Ed25519/X25519 OKP JWKs + 160-bit CSPRNG secret travel out-of-band in hp2p1_.",
             summary: "Direct laptop-to-laptop E2EE DMs, file transfers, events, and asymmetric mutual scopes between two collaborators.",
-            invite_example: "hyp-rs pair invite --mode p2p --node-id alice@macbook --endpoint https://alice.tailnet.ts.net --grant dm:send dm:receive files:send=25mb --request kv:read=pair/*",
-            accept_example: "hyp peer accept <<< '<hp2p1_token>'",
+            invite_example: "hyp pair invite --mode p2p --node-id alice@macbook --endpoint https://alice.tailnet.ts.net --grant dm:send dm:receive files:send=25mb --request kv:read=pair/*",
+            accept_example: "hyp pair accept <<< '<hp2p1_token>'",
             nat_notes: "Outbound-only friendly: if Bob is behind strict NAT, Bob omits bobEndpoint and holds the outbound HTTPS+SSE link to Alice (bidirectional traffic). If both are behind NAT without Tailscale, use a stateless blind WebSocket relay (p2p.relay.v1).",
         },
         TopologyGuide {
@@ -236,8 +319,8 @@ fn build_topologies() -> Vec<TopologyGuide> {
             token_prefix: "guest-ro (self-service)",
             trust_model: "Self-service read-only guest tier with strictly confined stream scopes (exact.repo required, max 10 repos, 60 wakes/hr; zero DM/channel/KV writes).",
             summary: "Zero-friction public stream hub powered by demand-driven deduplicated GitHub ETag polling (304 Not Modified = 0 quota).",
-            invite_example: "hyp-rs deploy init public-node --node-id public.hyphae.to --domain public.hyphae.to",
-            accept_example: "hyp peer join https://public.hyphae.to",
+            invite_example: "hyp deploy init public-node --node-id public.hyphae.to --domain public.hyphae.to",
+            accept_example: "hyp pair join https://public.hyphae.to",
             nat_notes: "Hosted behind public HTTPS (Caddy auto-TLS / Fly.io); developer laptops connect outbound-only with zero webhook setup.",
         },
     ]
@@ -709,6 +792,7 @@ fn run_invite(
 
             let token = match encode_hp2p1_with_metadata(
                 &offer,
+                &keys.signing,
                 sanitized_escalation.as_ref().map(EscalationNote::as_str),
                 preset.map(|_| trust_tier),
                 peer.as_deref(),
@@ -733,8 +817,8 @@ fn run_invite(
             // Stdin-safe next commands (NEVER pass token as an argv flag!).
             let next = vec![
                 "Send this one-shot hp2p1_ token to your peer over an out-of-band channel (Signal/Slack/1Password).".to_string(),
-                "Peer inspects first (stdin-safe): hyp-rs pair inspect <<< '<token>'".to_string(),
-                "Peer accepts (stdin-safe):        hyp peer accept <<< '<token>'".to_string(),
+                "Peer inspects first (stdin-safe): hyp pair inspect <<< '<token>'".to_string(),
+                "Peer accepts (stdin-safe):        hyp pair accept <<< '<token>'".to_string(),
             ];
 
             if as_json {
@@ -762,7 +846,7 @@ fn run_invite(
                         "expiresAt": expires_at,
                         "escalationNote": sanitized_escalation.as_ref().map(EscalationNote::as_str),
                         "secretBackend": store.backend().as_str(),
-                        "acceptCommandTemplate": "hyp peer accept <<< '<token>'",
+                        "acceptCommandTemplate": "hyp pair accept <<< '<token>'",
                     })),
                     warnings,
                     next,
@@ -873,6 +957,7 @@ fn run_invite(
                 trust_tier,
                 &expires_at,
                 sanitized_escalation.as_ref().map(EscalationNote::as_str),
+                &signed_grant_v2,
             ) {
                 Ok(t) => t,
                 Err(e) => {
@@ -891,8 +976,8 @@ fn run_invite(
             let fingerprint = admin_key.fingerprint();
             let next = vec![
                 "Send this one-shot am2_ bundle to the invited teammate over an out-of-band channel.".to_string(),
-                "Peer inspects first (stdin-safe): hyp-rs pair inspect <<< '<token>'".to_string(),
-                "Peer joins (stdin-safe):          hyp onboard --join <<< '<token>'".to_string(),
+                "Peer inspects first (stdin-safe): hyp pair inspect <<< '<token>'".to_string(),
+                "Peer accepts (stdin-safe):        hyp pair accept <<< '<token>'".to_string(),
             ];
 
             if as_json {
@@ -920,7 +1005,7 @@ fn run_invite(
                         "escalationNote": sanitized_escalation.as_ref().map(EscalationNote::as_str),
                         "signedGrantV2": signed_grant_v2,
                         "secretBackend": store.backend().as_str(),
-                        "acceptCommandTemplate": "hyp onboard --join <<< '<token>'",
+                        "acceptCommandTemplate": "hyp pair accept <<< '<token>'",
                     })),
                     warnings,
                     next,
@@ -954,19 +1039,20 @@ fn run_invite(
 
 fn encode_hp2p1_with_metadata(
     offer: &hyp_crypto::pairing::P2pOfferToken,
+    signing_key: &Ed25519KeyPair,
     escalation_note: Option<&str>,
     trust_tier: Option<&str>,
     peer_id: Option<&str>,
 ) -> Result<String, String> {
     // Always run strict hyp-crypto validation first.
-    let base_encoded = encode_hp2p1(offer).map_err(|e| e.to_string())?;
-    if escalation_note.is_none() && trust_tier.is_none() && peer_id.is_none() {
-        return Ok(base_encoded);
-    }
+    let _ = encode_hp2p1(offer).map_err(|e| e.to_string())?;
+    let offer_canon = to_canonical_json(offer).map_err(|e| e.to_string())?;
+    let offer_sig = signing_key.sign_domain_b64("p2p-offer", offer_canon.as_bytes());
     let mut map = match serde_json::to_value(offer).map_err(|e| e.to_string())? {
         Value::Object(m) => m,
         _ => return Err("unexpected offer serialization".to_string()),
     };
+    map.insert("offerSig".to_string(), Value::String(offer_sig));
     if let Some(note) = escalation_note {
         map.insert("escalationNote".to_string(), Value::String(note.to_string()));
     }
@@ -983,6 +1069,7 @@ fn encode_hp2p1_with_metadata(
     Ok(token)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_am2_with_metadata(
     invite: &AdminInviteV2,
     node_id: &str,
@@ -991,6 +1078,7 @@ fn encode_am2_with_metadata(
     trust_tier: &str,
     expires_at: &str,
     escalation_note: Option<&str>,
+    signed_grant_v2: &SignedPayload,
 ) -> Result<String, String> {
     // Strictly validate via hyp-crypto first.
     let _ = encode_am2(invite).map_err(|e| e.to_string())?;
@@ -1006,6 +1094,10 @@ fn encode_am2_with_metadata(
     );
     map.insert("trustTier".to_string(), Value::String(trust_tier.to_string()));
     map.insert("expiresAt".to_string(), Value::String(expires_at.to_string()));
+    map.insert(
+        "signedGrantV2".to_string(),
+        serde_json::to_value(signed_grant_v2).map_err(|e| e.to_string())?,
+    );
     if let Some(note) = escalation_note {
         map.insert("escalationNote".to_string(), Value::String(note.to_string()));
     }
@@ -1214,6 +1306,16 @@ fn inspect_hp2p1(token: &str, mut warnings: Vec<String>, as_json: bool) -> ExitC
     let expiry_status = if expired { "EXPIRED" } else { "OK" };
 
     let raw_map = extract_raw_json_object(HP2P1_PREFIX, token);
+    if let Err((code, msg)) = verify_optional_hp2p1_sig(&offer, &signing_pk, raw_map.as_ref()) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            code,
+            msg,
+            Some("Ask the inviter to generate a fresh hp2p1_ token with `hyp pair invite --mode p2p`.".to_string()),
+        );
+    }
     let peer_id = raw_map
         .as_ref()
         .and_then(|m| m.get("peerId"))
@@ -1235,7 +1337,7 @@ fn inspect_hp2p1(token: &str, mut warnings: Vec<String>, as_json: bool) -> ExitC
     let next = if ok {
         vec![
             format!("Verify JWK kid '{kid}' out-of-band with '{}'.", offer.node_id),
-            "Accept via stdin: hyp peer accept <<< '<token>'".to_string(),
+            "Accept via stdin: hyp pair accept <<< '<token>'".to_string(),
         ]
     } else {
         vec![format!(
@@ -1359,6 +1461,20 @@ fn inspect_am2(token: &str, mut warnings: Vec<String>, as_json: bool) -> ExitCod
     };
 
     let raw_map = extract_raw_json_object(AM2_PREFIX, token);
+    if let Err((code, msg)) = verify_optional_am2_signed_grant(
+        &admin_pk,
+        parsed_v1.as_ref().map(|p| p.grant_id.as_str()),
+        raw_map.as_ref(),
+    ) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            code,
+            msg,
+            Some("Ask your organization administrator for a fresh am2_ invite bundle.".to_string()),
+        );
+    }
     let node_id = raw_map
         .as_ref()
         .and_then(|m| m.get("nodeId"))
@@ -1423,7 +1539,7 @@ fn inspect_am2(token: &str, mut warnings: Vec<String>, as_json: bool) -> ExitCod
     let next = if ok {
         vec![
             format!("Verify Admin JWK kid '{kid}' with your organization administrator."),
-            "Join via stdin: hyp onboard --join <<< '<token>'".to_string(),
+            "Accept via stdin: hyp pair accept <<< '<token>'".to_string(),
         ]
     } else {
         vec!["Request a fresh am2_ invite bundle from your organization administrator.".to_string()]
@@ -1574,6 +1690,1764 @@ fn inspect_t3mp1(token: &str, mut warnings: Vec<String>, as_json: bool) -> ExitC
         print_next_steps(&next);
     }
 
+    ExitCode::from(EXIT_OK)
+}
+
+// ============================================================================
+// Verification & Storage Helpers shared by `inspect`, `accept`, and `join`
+// ============================================================================
+
+fn verify_optional_hp2p1_sig(
+    offer: &hyp_crypto::pairing::P2pOfferToken,
+    signing_pk: &Ed25519PublicKey,
+    raw_map: Option<&Map<String, Value>>,
+) -> Result<(), (&'static str, String)> {
+    let Some(sig_val) = raw_map.and_then(|m| m.get("offerSig")) else {
+        return Ok(());
+    };
+    let Some(sig) = sig_val.as_str().filter(|s| !s.is_empty()) else {
+        return Err((
+            "INVALID_TOKEN",
+            "Malformed offerSig field in hp2p1_ pairing token".to_string(),
+        ));
+    };
+    let canon = to_canonical_json(offer).map_err(|e| {
+        (
+            "INVALID_TOKEN",
+            format!("Failed to canonicalize hp2p1_ offer: {e}"),
+        )
+    })?;
+    signing_pk
+        .verify_domain_b64("p2p-offer", canon.as_bytes(), sig)
+        .map_err(|e| {
+            (
+                "INVALID_SIGNATURE",
+                format!("hp2p1_ offer Ed25519 signature verification failed (fail-closed): {e}"),
+            )
+        })
+}
+
+fn verify_optional_am2_signed_grant(
+    admin_pk: &Ed25519PublicKey,
+    parsed_v1_grant_id: Option<&str>,
+    raw_map: Option<&Map<String, Value>>,
+) -> Result<Option<(SignedPayload, GrantV2)>, (&'static str, String)> {
+    let Some(sg_val) = raw_map.and_then(|m| m.get("signedGrantV2")) else {
+        return Ok(None);
+    };
+    let signed: SignedPayload = serde_json::from_value(sg_val.clone()).map_err(|e| {
+        (
+            "INVALID_TOKEN",
+            format!("Malformed signedGrantV2 inside am2_ bundle: {e}"),
+        )
+    })?;
+    let grant = verify_grant_v2(&signed, admin_pk).map_err(|e| {
+        (
+            "INVALID_SIGNATURE",
+            format!("am2_ Admin-CA GrantV2 signature verification failed (fail-closed): {e}"),
+        )
+    })?;
+    if let Some(v1_id) = parsed_v1_grant_id {
+        if v1_id != grant.id {
+            return Err((
+                "INVALID_TOKEN",
+                format!(
+                    "am2_ pairingCode grantId '{v1_id}' does not match signedGrantV2 id '{}'",
+                    grant.id
+                ),
+            ));
+        }
+    }
+    if let Some(meta_scopes) = raw_map
+        .and_then(|m| m.get("scopes"))
+        .and_then(Value::as_array)
+    {
+        let meta_list: Vec<String> = meta_scopes
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect();
+        if meta_list.len() != meta_scopes.len() || meta_list != grant.scopes {
+            return Err((
+                "INVALID_TOKEN",
+                "am2_ metadata scopes do not match Admin-CA signedGrantV2 scopes (possible tampering)"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(Some((signed, grant)))
+}
+
+fn parse_store_trust_tier(raw: &str, default: StoreTrustTier) -> StoreTrustTier {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "org" => StoreTrustTier::Org,
+        "peer" => StoreTrustTier::Peer,
+        "guest" => StoreTrustTier::Guest,
+        "self" => StoreTrustTier::SelfNode,
+        _ => default,
+    }
+}
+
+fn proto_tier_to_store(tier: hyp_proto::scopes::TrustTier) -> StoreTrustTier {
+    match tier {
+        hyp_proto::scopes::TrustTier::SelfNode => StoreTrustTier::SelfNode,
+        hyp_proto::scopes::TrustTier::Org => StoreTrustTier::Org,
+        hyp_proto::scopes::TrustTier::Peer => StoreTrustTier::Peer,
+        hyp_proto::scopes::TrustTier::Guest
+        | hyp_proto::scopes::TrustTier::ExternalWebhook
+        | hyp_proto::scopes::TrustTier::Bridge => StoreTrustTier::Guest,
+    }
+}
+
+fn proto_profile_to_store(profile: ProtoNodeProfile) -> PeerProfile {
+    match profile {
+        ProtoNodeProfile::Local => PeerProfile::Local,
+        ProtoNodeProfile::Router => PeerProfile::Router,
+        ProtoNodeProfile::P2p => PeerProfile::P2p,
+    }
+}
+
+fn proto_jwk_to_crypto(jwk: &hyp_proto::manifest::OkpJwk) -> CryptoOkpJwk {
+    CryptoOkpJwk {
+        kty: jwk.kty.clone(),
+        crv: jwk.crv.as_str().to_string(),
+        x: jwk.x.clone(),
+    }
+}
+
+fn credential_secret_name(prefix: &str, peer_id: &str) -> String {
+    let hash = hex::encode(Sha256::digest(peer_id.as_bytes()));
+    format!("{prefix}-{}", &hash[..12])
+}
+
+fn derive_peer_id_from_url(url: &str) -> Result<String, String> {
+    let trimmed = url.trim();
+    let rest = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .ok_or_else(|| format!("unsupported URL scheme: {url}"))?;
+    let authority = rest.split('/').next().unwrap_or("");
+    if authority.is_empty() || authority.starts_with('[') {
+        return Err(format!(
+            "cannot derive a canonical nodeId from '{url}'; pass --node-name <node-id>"
+        ));
+    }
+    let host = authority
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if host == LOCAL_NODE_ID || !is_valid_node_id(&host) {
+        return Err(format!(
+            "derived host '{host}' from '{url}' is not a valid nodeId; pass --node-name <node-id>"
+        ));
+    }
+    Ok(host)
+}
+
+fn resolve_local_node_id(
+    explicit: Option<&str>,
+    state_dir: &Path,
+    db: Option<&NodeDb>,
+) -> Result<String, (u8, &'static str, String)> {
+    if let Some(raw) = explicit {
+        if raw == LOCAL_NODE_ID || !is_valid_node_id(raw) {
+            return Err((
+                EXIT_USAGE,
+                "INVALID_NODE_ID",
+                format!(
+                    "Invalid --node-id '{raw}': must match /^[a-z0-9][a-z0-9@._-]{{0,63}}$/ and cannot be 'local'"
+                ),
+            ));
+        }
+        return Ok(raw.to_string());
+    }
+    let cfg_path = resolve_config_path_for_read(None, Some(state_dir), None);
+    let loaded = if cfg_path.exists() {
+        load_node_or_legacy_config(&cfg_path).ok()
+    } else {
+        None
+    };
+    Ok(resolve_effective_node_id(loaded.as_ref(), db))
+}
+
+fn save_grant_idempotent(db: &NodeDb, input: &GrantInput, now: i64) -> Result<(), String> {
+    match db.peers().add_grant(input, now) {
+        Ok(_) => Ok(()),
+        Err(StoreError::IdConflict(_)) => {
+            let digest = hex::encode(Sha256::digest(input.signed_json.as_bytes()));
+            let mut alt = input.clone();
+            alt.id = format!("{}-{}", input.id, &digest[..8]);
+            db.peers()
+                .add_grant(&alt, now)
+                .map(|_| ())
+                .map_err(|e| format!("failed to persist grant '{}': {e}", alt.id))
+        }
+        Err(e) => Err(format!("failed to persist grant '{}': {e}", input.id)),
+    }
+}
+
+fn check_existing_signing_pin(
+    db: &NodeDb,
+    peer_id: &str,
+    expected_kid: &str,
+) -> Result<(), (&'static str, String)> {
+    let existing = db
+        .peers()
+        .list_peer_keys(peer_id, Some(KeyUse::Signing), true)
+        .map_err(|e| {
+            (
+                "DB_ERROR",
+                format!("Failed to query pinned keys for '{peer_id}': {e}"),
+            )
+        })?;
+    if !existing.is_empty() && !existing.iter().any(|k| k.kid == expected_kid) {
+        return Err((
+            "KEY_PIN_MISMATCH",
+            format!(
+                "Peer '{peer_id}' signing key '{expected_kid}' does not match previously pinned key '{}' (refusing silent key rotation)",
+                existing[0].kid
+            ),
+        ));
+    }
+    Ok(())
+}
+
+// ============================================================================
+// `pair accept` (stdin or --token-file ONLY)
+// ============================================================================
+
+fn run_accept(
+    token_file: Option<PathBuf>,
+    state_dir_arg: Option<PathBuf>,
+    node_id_arg: Option<String>,
+    grant_args: Vec<String>,
+    as_json: bool,
+) -> ExitCode {
+    let cmd = "pair accept";
+
+    // Validate explicit --node-id early before reading stdin/opening disk state.
+    if let Some(ref raw) = node_id_arg {
+        if raw == LOCAL_NODE_ID || !is_valid_node_id(raw) {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "INVALID_NODE_ID",
+                format!(
+                    "Invalid --node-id '{raw}': must match /^[a-z0-9][a-z0-9@._-]{{0,63}}$/ and cannot be 'local'"
+                ),
+                Some("Example: --node-id bob@laptop".to_string()),
+            );
+        }
+    }
+
+    // Validate explicit --grant scopes early.
+    let explicit_grant_scopes = if grant_args.is_empty() {
+        None
+    } else {
+        let tokenized = tokenize_scope_args(&grant_args);
+        match expand_v2_scopes(&tokenized) {
+            Ok(expanded) => Some(expanded),
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_USAGE,
+                    "INVALID_SCOPE",
+                    format!("Invalid --grant scope: {e}"),
+                    Some("Run `hyp pair guide` to see valid v2 scopes.".to_string()),
+                );
+            }
+        }
+    };
+
+    let mut warnings = Vec::new();
+    let token = match read_bounded_token(token_file.as_deref(), &mut warnings) {
+        Ok(t) => t,
+        Err((code, err_code, msg)) => {
+            return emit_error(
+                cmd,
+                as_json,
+                code,
+                err_code,
+                msg,
+                Some(
+                    "Pipe a token via stdin (`hyp pair accept <<< '<token>'`) or pass `--token-file <path>`."
+                        .to_string(),
+                ),
+            );
+        }
+    };
+
+    if token.starts_with(HP2P1_PREFIX) {
+        accept_hp2p1(
+            &token,
+            state_dir_arg,
+            node_id_arg,
+            explicit_grant_scopes,
+            warnings,
+            as_json,
+        )
+    } else if token.starts_with(AM2_PREFIX) {
+        accept_am2(
+            &token,
+            state_dir_arg,
+            node_id_arg,
+            explicit_grant_scopes,
+            warnings,
+            as_json,
+        )
+    } else if token.starts_with("t3mp1_") {
+        emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "UNSUPPORTED_TOKEN",
+            "Legacy v1 t3mp1_ codes do not include a router URL or Admin-CA JWK; use a v2 am2_ or hp2p1_ token.",
+            Some("Generate a v2 invite via `hyp pair invite --mode team` or `--mode p2p`.".to_string()),
+        )
+    } else {
+        emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "INVALID_TOKEN",
+            "Unrecognized pairing token format (expected hp2p1_ or am2_ prefix)",
+            Some("Verify the full token was copied without extra text or truncation.".to_string()),
+        )
+    }
+}
+
+fn accept_hp2p1(
+    token: &str,
+    state_dir_arg: Option<PathBuf>,
+    node_id_arg: Option<String>,
+    explicit_grant_scopes: Option<Vec<String>>,
+    warnings: Vec<String>,
+    as_json: bool,
+) -> ExitCode {
+    let cmd = "pair accept";
+    let offer = match decode_hp2p1(token) {
+        Ok(o) => o,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "INVALID_TOKEN",
+                format!("Invalid or tampered hp2p1_ pairing token: {e}"),
+                Some("Ask the inviter to generate a fresh token with `hyp pair invite --mode p2p`.".to_string()),
+            );
+        }
+    };
+
+    if offer.node_id == LOCAL_NODE_ID || !is_valid_node_id(&offer.node_id) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "INVALID_TOKEN",
+            format!("Invalid peer nodeId '{}' in hp2p1_ token", offer.node_id),
+            None,
+        );
+    }
+
+    if let Err(e) = validate_endpoint_origin(&offer.endpoint) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "INVALID_ENDPOINT",
+            format!("Untrusted endpoint '{}' in hp2p1_ token: {e}", offer.endpoint),
+            Some("Peer endpoints must use https:// (or loopback http://127.0.0.1 for local testing).".to_string()),
+        );
+    }
+
+    let signing_pk = match offer.signing_jwk.to_ed25519() {
+        Ok(pk) => pk,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "INVALID_KEY",
+                format!("Invalid signingJwk in hp2p1_ token: {e}"),
+                None,
+            );
+        }
+    };
+    let encryption_pk = match offer.encryption_jwk.to_x25519() {
+        Ok(pk) => pk,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "INVALID_KEY",
+                format!("Invalid encryptionJwk in hp2p1_ token: {e}"),
+                None,
+            );
+        }
+    };
+
+    let raw_map = extract_raw_json_object(HP2P1_PREFIX, token);
+    if let Err((code, msg)) = verify_optional_hp2p1_sig(&offer, &signing_pk, raw_map.as_ref()) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            code,
+            msg,
+            Some("Request a fresh unmodified hp2p1_ offer from the peer.".to_string()),
+        );
+    }
+
+    let exp_ms = match parse_rfc3339_millis(&offer.expires_at) {
+        Ok(ms) => ms,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "INVALID_TOKEN",
+                format!("Invalid expiresAt timestamp: {e}"),
+                None,
+            );
+        }
+    };
+    let now = now_unix_ms();
+    if now > exp_ms {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "TOKEN_EXPIRED",
+            format!(
+                "P2P pairing offer '{}' from '{}' expired at {}",
+                offer.offer_id, offer.node_id, offer.expires_at
+            ),
+            Some(format!(
+                "Ask '{}' to generate a fresh hp2p1_ invite.",
+                offer.node_id
+            )),
+        );
+    }
+
+    let expanded_offered = if offer.offered_scopes.is_empty() {
+        Vec::new()
+    } else {
+        match expand_v2_scopes(&offer.offered_scopes) {
+            Ok(s) => s,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "INVALID_TOKEN",
+                    format!("Invalid offeredScopes in hp2p1_ token: {e}"),
+                    None,
+                );
+            }
+        }
+    };
+
+    let expanded_requested = if offer.requested_scopes.is_empty() {
+        Vec::new()
+    } else {
+        match expand_v2_scopes(&offer.requested_scopes) {
+            Ok(s) => s,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "INVALID_TOKEN",
+                    format!("Invalid requestedScopes in hp2p1_ token: {e}"),
+                    None,
+                );
+            }
+        }
+    };
+
+    let granted_scopes = if let Some(explicit) = explicit_grant_scopes {
+        explicit
+    } else if !expanded_requested.is_empty() {
+        expanded_requested.clone()
+    } else if !expanded_offered.is_empty() {
+        expanded_offered.clone()
+    } else {
+        ScopePreset::Member.expand()
+    };
+
+    let trust_tier_raw = raw_map
+        .as_ref()
+        .and_then(|m| m.get("trustTier"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| infer_trust_tier(InviteMode::P2p, None, &expanded_offered));
+    let trust_tier = parse_store_trust_tier(trust_tier_raw, StoreTrustTier::Peer);
+    let untrusted_note = extract_untrusted_escalation(raw_map.as_ref(), &offer.node_id);
+
+    // All cryptographic checks passed — now persist peer, pinned JWKs, grant, and secret credential!
+    let explicit_state = state_dir_arg.is_some();
+    let state_dir = resolve_state_dir(state_dir_arg.as_deref(), None, None);
+    if let Err(e) = ensure_dir(&state_dir, true) {
+        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
+    }
+
+    let db_path = state_dir.join("node.sqlite");
+    let db = match NodeDb::open(&db_path) {
+        Ok(d) => d,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "DB_ERROR",
+                format!("Failed to open {}: {e}", db_path.display()),
+                None,
+            );
+        }
+    };
+
+    let local_node_id = match resolve_local_node_id(node_id_arg.as_deref(), &state_dir, Some(&db)) {
+        Ok(id) => id,
+        Err((exit, code, msg)) => return emit_error(cmd, as_json, exit, code, msg, None),
+    };
+
+    let kid = signing_pk.kid();
+    let enc_kid = encryption_pk.kid();
+    let fingerprint = signing_pk.fingerprint();
+    if let Err((code, msg)) = check_existing_signing_pin(&db, &offer.node_id, &kid) {
+        return emit_error(cmd, as_json, EXIT_ERROR, code, msg, None);
+    }
+
+    let secrets = crate::config_file::open_secret_store(&state_dir, explicit_state);
+    let local_keys = match secrets.load_or_create_node_keys(&local_node_id) {
+        Ok(k) => k,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "KEYSTORE_ERROR",
+                format!("Failed to load/create local node keys: {e}"),
+                None,
+            );
+        }
+    };
+
+    let cred_ref = credential_secret_name("pair-p2p", &offer.node_id);
+    if let Err(e) = secrets.set(&cred_ref, token) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "KEYSTORE_ERROR",
+            format!("Failed to store pairing credential in SecretStore: {e}"),
+            None,
+        );
+    }
+
+    let now_db = now_ms();
+    let _ = db.local().ensure_metadata("node_id", &local_node_id);
+
+    if let Err(e) = db.peers().upsert_peer(
+        &PeerInput {
+            peer_id: offer.node_id.clone(),
+            endpoint: Some(offer.endpoint.clone()),
+            profile: PeerProfile::P2p,
+            trust_tier,
+            status: PeerStatus::Active,
+            scopes: granted_scopes.clone(),
+            auth_credential_ref: Some(cred_ref.clone()),
+        },
+        now_db,
+    ) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "DB_ERROR",
+            format!("Failed to upsert peer '{}': {e}", offer.node_id),
+            None,
+        );
+    }
+
+    let sign_jwk_json = match serde_json::to_string(&offer.signing_jwk) {
+        Ok(s) => s,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+    };
+    let enc_jwk_json = match serde_json::to_string(&offer.encryption_jwk) {
+        Ok(s) => s,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+    };
+
+    if let Err(e) = db.peers().upsert_peer_key(
+        &PeerKeyInput {
+            peer_id: offer.node_id.clone(),
+            kid: kid.clone(),
+            key_use: KeyUse::Signing,
+            jwk_json: sign_jwk_json,
+            status: KeyStatus::Active,
+            expires_at: None,
+        },
+        now_db,
+    ) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "DB_ERROR",
+            format!("Failed to pin peer signing JWK: {e}"),
+            None,
+        );
+    }
+    if let Err(e) = db.peers().upsert_peer_key(
+        &PeerKeyInput {
+            peer_id: offer.node_id.clone(),
+            kid: enc_kid.clone(),
+            key_use: KeyUse::Encryption,
+            jwk_json: enc_jwk_json,
+            status: KeyStatus::Active,
+            expires_at: None,
+        },
+        now_db,
+    ) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "DB_ERROR",
+            format!("Failed to pin peer encryption JWK: {e}"),
+            None,
+        );
+    }
+
+    // Sign and persist local counter-grant (`GrantV2`) targeting the paired P2P peer.
+    let counter_grant_id = format!("p2p-{}", offer.offer_id);
+    let counter_grant = GrantV2 {
+        v: 2,
+        id: counter_grant_id.clone(),
+        node_id: offer.node_id.clone(),
+        scopes: granted_scopes.clone(),
+        trust_tier: Some(trust_tier.as_str().to_string()),
+        pairing_key: None,
+        subject_signing_jwk: Some(offer.signing_jwk.clone()),
+        subject_encryption_jwk: Some(offer.encryption_jwk.clone()),
+        issued_at: format_rfc3339_millis(now_db),
+        pair_by: Some(offer.expires_at.clone()),
+        expires_at: Some(offer.expires_at.clone()),
+    };
+    let signed_counter = match sign_grant_v2(&counter_grant, &local_keys.signing) {
+        Ok(sg) => sg,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "GRANT_ERROR",
+                format!("Failed to sign local P2P counter-grant: {e}"),
+                None,
+            );
+        }
+    };
+    let signed_counter_json = match serde_json::to_string(&signed_counter) {
+        Ok(s) => s,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+    };
+    if let Err(e) = save_grant_idempotent(
+        &db,
+        &GrantInput {
+            id: counter_grant_id,
+            peer_id: offer.node_id.clone(),
+            direction: GrantDirection::Inbound,
+            signed_json: signed_counter_json,
+            scopes: granted_scopes.clone(),
+            trust_tier,
+            issued_at: now_db,
+            pair_by: Some(exp_ms),
+            expires_at: Some(exp_ms),
+        },
+        now_db,
+    ) {
+        return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None);
+    }
+
+    let next = vec![
+        format!("hyp status --state-dir {}", state_dir.display()),
+        format!("hyp daemon --state-dir {}", state_dir.display()),
+    ];
+
+    let data = json!({
+        "mode": "p2p",
+        "format": "hp2p1",
+        "offerId": offer.offer_id,
+        "nodeId": local_node_id,
+        "peerId": offer.node_id,
+        "endpoint": offer.endpoint,
+        "kid": kid,
+        "encryptionKid": enc_kid,
+        "fingerprint": fingerprint,
+        "trustTier": trust_tier.as_str(),
+        "offeredScopes": expanded_offered,
+        "requestedScopes": expanded_requested,
+        "grantedScopes": granted_scopes,
+        "scopes": granted_scopes,
+        "expiresAt": offer.expires_at,
+        "escalationNote": untrusted_note,
+        "credentialRef": cred_ref,
+        "secretBackend": secrets.backend().as_str(),
+        "stateDir": state_dir.display().to_string(),
+    });
+
+    if as_json {
+        let envelope = JsonEnvelope {
+            ok: true,
+            command: cmd.to_string(),
+            summary: Some(format!(
+                "Accepted hp2p1_ P2P offer from '{}' (kid {})",
+                offer.node_id, kid
+            )),
+            data: Some(data),
+            warnings,
+            next,
+            error: None,
+        };
+        print_json(&envelope);
+    } else {
+        println!("OK    Accepted Direct P2P pairing offer (hp2p1_)");
+        println!("      Local Node:  {local_node_id}");
+        println!("      Peer ID:     {}", offer.node_id);
+        println!("      Endpoint:    {}", offer.endpoint);
+        println!("      Offer ID:    {}", offer.offer_id);
+        println!("      JWK kid:     {kid}");
+        println!("      Enc kid:     {enc_kid}");
+        println!("      Fingerprint: {fingerprint}");
+        println!("      Trust Tier:  {}", trust_tier.as_str());
+        println!("      Offered:     {}", expanded_offered.join(" "));
+        println!("      Granted:     {}", granted_scopes.join(" "));
+        if let Some(ref note) = untrusted_note {
+            println!(
+                "      Access hint (untrusted, reported by {}): {}",
+                offer.node_id, note.text
+            );
+        }
+        print_warnings(&warnings);
+        print_next_steps(&next);
+    }
+    ExitCode::from(EXIT_OK)
+}
+
+fn accept_am2(
+    token: &str,
+    state_dir_arg: Option<PathBuf>,
+    node_id_arg: Option<String>,
+    explicit_grant_scopes: Option<Vec<String>>,
+    mut warnings: Vec<String>,
+    as_json: bool,
+) -> ExitCode {
+    let cmd = "pair accept";
+    let invite = match decode_am2(token) {
+        Ok(i) => i,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "INVALID_TOKEN",
+                format!("Invalid or tampered am2_ invite bundle: {e}"),
+                Some("Verify the am2_ bundle was not truncated or modified.".to_string()),
+            );
+        }
+    };
+
+    if let Err(e) = validate_endpoint_origin(&invite.router) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "INVALID_ENDPOINT",
+            format!("Untrusted router endpoint '{}' in am2_ bundle: {e}", invite.router),
+            None,
+        );
+    }
+
+    let admin_pk = match invite.admin_jwk.to_ed25519() {
+        Ok(pk) => pk,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "INVALID_KEY",
+                format!("Invalid adminJwk in am2_ bundle: {e}"),
+                None,
+            );
+        }
+    };
+    let kid = admin_pk.kid();
+    let admin_fingerprint = admin_pk.fingerprint();
+
+    let parsed_v1 = if invite.pairing_code.starts_with("t3mp1_") {
+        match parse_pairing_code_v1(&invite.pairing_code) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "INVALID_TOKEN",
+                    format!("Malformed pairingCode in am2_ bundle: {e}"),
+                    None,
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    let raw_map = extract_raw_json_object(AM2_PREFIX, token);
+    let verified_grant_pair = match verify_optional_am2_signed_grant(
+        &admin_pk,
+        parsed_v1.as_ref().map(|p| p.grant_id.as_str()),
+        raw_map.as_ref(),
+    ) {
+        Ok(v) => v,
+        Err((code, msg)) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                code,
+                msg,
+                Some("Request a fresh unmodified am2_ bundle from your organization administrator.".to_string()),
+            );
+        }
+    };
+
+    let now = now_unix_ms();
+    let mut expires_at_str = raw_map
+        .as_ref()
+        .and_then(|m| m.get("expiresAt"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    if expires_at_str.is_none() {
+        expires_at_str = verified_grant_pair
+            .as_ref()
+            .and_then(|(_, g)| g.expires_at.clone().or_else(|| g.pair_by.clone()));
+    }
+
+    let mut expires_at_ms: Option<i64> = None;
+    if let Some(ref ts) = expires_at_str {
+        match parse_rfc3339_millis(ts) {
+            Ok(ms) if now > ms => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "TOKEN_EXPIRED",
+                    format!("Org Admin-CA invite bundle expired at {ts}"),
+                    Some("Request a fresh am2_ invite bundle from your organization administrator.".to_string()),
+                );
+            }
+            Ok(ms) => expires_at_ms = Some(ms),
+            Err(_) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "INVALID_TOKEN",
+                    format!("Malformed expiresAt '{ts}' in am2_ bundle"),
+                    None,
+                );
+            }
+        }
+    }
+    if let Some((_, ref g)) = verified_grant_pair {
+        for ts in [g.pair_by.as_deref(), g.expires_at.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Ok(ms) = parse_rfc3339_millis(ts) {
+                if now > ms {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "TOKEN_EXPIRED",
+                        format!("Admin-CA grant '{}' expired at {ts}", g.id),
+                        Some("Request a fresh am2_ invite bundle from your organization administrator.".to_string()),
+                    );
+                }
+            }
+        }
+    }
+
+    let peer_id = match raw_map
+        .as_ref()
+        .and_then(|m| m.get("nodeId"))
+        .and_then(Value::as_str)
+    {
+        Some(raw_nid) => {
+            if raw_nid == LOCAL_NODE_ID || !is_valid_node_id(raw_nid) {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "INVALID_TOKEN",
+                    format!("Invalid hub nodeId '{raw_nid}' in am2_ bundle"),
+                    None,
+                );
+            }
+            raw_nid.to_string()
+        }
+        None => match derive_peer_id_from_url(&invite.router) {
+            Ok(host) => host,
+            Err(e) => {
+                return emit_error(cmd, as_json, EXIT_ERROR, "INVALID_TOKEN", e, None);
+            }
+        },
+    };
+
+    let target_peer_id = verified_grant_pair
+        .as_ref()
+        .map(|(_, g)| g.node_id.clone())
+        .or_else(|| {
+            raw_map
+                .as_ref()
+                .and_then(|m| m.get("peerId"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        });
+
+    let scopes = if let Some((_, ref g)) = verified_grant_pair {
+        match expand_v2_scopes(&g.scopes) {
+            Ok(s) => s,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "INVALID_TOKEN",
+                    format!("Invalid scopes in signedGrantV2: {e}"),
+                    None,
+                );
+            }
+        }
+    } else {
+        let raw_scopes: Vec<String> = raw_map
+            .as_ref()
+            .and_then(|m| m.get("scopes"))
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if raw_scopes.is_empty() {
+            ScopePreset::Member.expand()
+        } else {
+            match expand_v2_scopes(&raw_scopes) {
+                Ok(s) => s,
+                Err(e) => {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "INVALID_TOKEN",
+                        format!("Invalid scopes in am2_ bundle: {e}"),
+                        None,
+                    );
+                }
+            }
+        }
+    };
+
+    if explicit_grant_scopes.is_some() {
+        warnings.push(
+            "--grant is only used for P2P counter-grants; am2_ team scopes are signed by the Org Admin-CA."
+                .to_string(),
+        );
+    }
+
+    let trust_tier_raw = verified_grant_pair
+        .as_ref()
+        .and_then(|(_, g)| g.trust_tier.as_deref())
+        .or_else(|| {
+            raw_map
+                .as_ref()
+                .and_then(|m| m.get("trustTier"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("org");
+    let trust_tier = parse_store_trust_tier(trust_tier_raw, StoreTrustTier::Org);
+    let untrusted_note = extract_untrusted_escalation(raw_map.as_ref(), &peer_id);
+
+    let explicit_state = state_dir_arg.is_some();
+    let state_dir = resolve_state_dir(state_dir_arg.as_deref(), None, None);
+    if let Err(e) = ensure_dir(&state_dir, true) {
+        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
+    }
+
+    let db_path = state_dir.join("node.sqlite");
+    let db = match NodeDb::open(&db_path) {
+        Ok(d) => d,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "DB_ERROR",
+                format!("Failed to open {}: {e}", db_path.display()),
+                None,
+            );
+        }
+    };
+
+    let local_node_id = match resolve_local_node_id(node_id_arg.as_deref(), &state_dir, Some(&db)) {
+        Ok(id) => id,
+        Err((exit, code, msg)) => return emit_error(cmd, as_json, exit, code, msg, None),
+    };
+
+    let secrets = crate::config_file::open_secret_store(&state_dir, explicit_state);
+    if let Err(e) = secrets.load_or_create_node_keys(&local_node_id) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "KEYSTORE_ERROR",
+            format!("Failed to load/create local node keys: {e}"),
+            None,
+        );
+    }
+
+    let cred_ref = credential_secret_name("pair-am2", &peer_id);
+    if let Err(e) = secrets.set(&cred_ref, token) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "KEYSTORE_ERROR",
+            format!("Failed to store am2_ invite credential in SecretStore: {e}"),
+            None,
+        );
+    }
+
+    let now_db = now_ms();
+    let _ = db.local().ensure_metadata("node_id", &local_node_id);
+
+    if let Err(e) = db.peers().upsert_peer(
+        &PeerInput {
+            peer_id: peer_id.clone(),
+            endpoint: Some(invite.router.clone()),
+            profile: PeerProfile::Router,
+            trust_tier,
+            status: PeerStatus::Active,
+            scopes: scopes.clone(),
+            auth_credential_ref: Some(cred_ref.clone()),
+        },
+        now_db,
+    ) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "DB_ERROR",
+            format!("Failed to upsert team hub peer '{peer_id}': {e}"),
+            None,
+        );
+    }
+
+    let admin_jwk_json = match serde_json::to_string(&invite.admin_jwk) {
+        Ok(s) => s,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+    };
+    if let Err(e) = db.peers().upsert_peer_key(
+        &PeerKeyInput {
+            peer_id: peer_id.clone(),
+            kid: kid.clone(),
+            key_use: KeyUse::Admin,
+            jwk_json: admin_jwk_json,
+            status: KeyStatus::Active,
+            expires_at: None,
+        },
+        now_db,
+    ) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "DB_ERROR",
+            format!("Failed to pin Admin-CA JWK: {e}"),
+            None,
+        );
+    }
+
+    let grant_id = verified_grant_pair
+        .as_ref()
+        .map(|(_, g)| g.id.clone())
+        .or_else(|| parsed_v1.as_ref().map(|p| p.grant_id.clone()))
+        .unwrap_or_else(|| format!("am2-{}", &hex::encode(Sha256::digest(token.as_bytes()))[..12]));
+
+    let stored_grant_json = if let Some((ref sg, _)) = verified_grant_pair {
+        match serde_json::to_string(sg) {
+            Ok(s) => s,
+            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+        }
+    } else {
+        json!({
+            "format": "am2",
+            "grantId": grant_id,
+            "router": invite.router,
+            "adminKid": kid,
+            "adminFingerprint": admin_fingerprint,
+            "scopes": scopes,
+            "trustTier": trust_tier.as_str(),
+            "requireE2ee": invite.require_e2ee.unwrap_or(true),
+        })
+        .to_string()
+    };
+
+    if let Err(e) = save_grant_idempotent(
+        &db,
+        &GrantInput {
+            id: grant_id.clone(),
+            peer_id: peer_id.clone(),
+            direction: GrantDirection::Outbound,
+            signed_json: stored_grant_json,
+            scopes: scopes.clone(),
+            trust_tier,
+            issued_at: now_db,
+            pair_by: expires_at_ms,
+            expires_at: expires_at_ms,
+        },
+        now_db,
+    ) {
+        return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None);
+    }
+
+    let next = vec![
+        format!("hyp status --state-dir {}", state_dir.display()),
+        format!("hyp daemon --state-dir {}", state_dir.display()),
+    ];
+
+    let data = json!({
+        "mode": "team",
+        "format": "am2",
+        "grantId": grant_id,
+        "nodeId": local_node_id,
+        "peerId": peer_id,
+        "targetPeerId": target_peer_id,
+        "endpoint": invite.router,
+        "kid": kid,
+        "adminFingerprint": admin_fingerprint,
+        "requireE2ee": invite.require_e2ee.unwrap_or(true),
+        "trustTier": trust_tier.as_str(),
+        "scopes": scopes,
+        "expiresAt": expires_at_str,
+        "escalationNote": untrusted_note,
+        "credentialRef": cred_ref,
+        "secretBackend": secrets.backend().as_str(),
+        "stateDir": state_dir.display().to_string(),
+    });
+
+    if as_json {
+        let envelope = JsonEnvelope {
+            ok: true,
+            command: cmd.to_string(),
+            summary: Some(format!(
+                "Accepted am2_ Org Admin-CA invite for '{}' (grant {}, admin kid {})",
+                peer_id, grant_id, kid
+            )),
+            data: Some(data),
+            warnings,
+            next,
+            error: None,
+        };
+        print_json(&envelope);
+    } else {
+        println!("OK    Accepted Org Admin-CA Team invite (am2_)");
+        println!("      Local Node:  {local_node_id}");
+        println!("      Hub Peer ID: {peer_id}");
+        if let Some(ref tp) = target_peer_id {
+            println!("      Grant For:   {tp}");
+        }
+        println!("      Endpoint:    {}", invite.router);
+        println!("      Grant ID:    {grant_id}");
+        println!("      Admin kid:   {kid}");
+        println!("      Fingerprint: {admin_fingerprint}");
+        println!("      Trust Tier:  {}", trust_tier.as_str());
+        println!("      Scopes:      {}", scopes.join(" "));
+        if let Some(ref note) = untrusted_note {
+            println!(
+                "      Access hint (untrusted, reported by {}): {}",
+                peer_id, note.text
+            );
+        }
+        print_warnings(&warnings);
+        print_next_steps(&next);
+    }
+    ExitCode::from(EXIT_OK)
+}
+
+// ============================================================================
+// `pair join` (public / team node URL + signed `/v1/manifest` verification)
+// ============================================================================
+
+struct VerifiedLiveManifest {
+    signed: SignedNodeManifest,
+    payload: NodeManifestPayload,
+    signing_pk: Ed25519PublicKey,
+    encryption_pk: X25519PublicKey,
+    etag: Option<String>,
+}
+
+fn fetch_and_verify_manifest(base_url: &str) -> Result<VerifiedLiveManifest, (&'static str, String)> {
+    let manifest_url = format!("{}/v1/manifest", base_url.trim_end_matches('/'));
+    let uri: http::Uri = manifest_url.parse().map_err(|e| {
+        (
+            "INVALID_ENDPOINT",
+            format!("Invalid manifest URI '{manifest_url}': {e}"),
+        )
+    })?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| ("RUNTIME_ERROR", format!("Failed to start async runtime: {e}")))?;
+
+    let (body_bytes, etag) = rt.block_on(async {
+        let client = build_http_client::<Empty<Bytes>>()
+            .map_err(|e| ("HTTP_ERROR", format!("Failed to initialize HTTP client: {e}")))?;
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .header(header::ACCEPT, "application/json")
+            .header(
+                header::USER_AGENT,
+                format!("hyp-rs/{}", env!("CARGO_PKG_VERSION")),
+            )
+            .body(Empty::new())
+            .map_err(|e| ("HTTP_ERROR", format!("Failed to build request: {e}")))?;
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS),
+            client.request(req),
+        )
+        .await
+        .map_err(|_| {
+            (
+                "MANIFEST_FETCH_FAILED",
+                format!(
+                    "GET {manifest_url} timed out after {MANIFEST_FETCH_TIMEOUT_SECS}s"
+                ),
+            )
+        })?
+        .map_err(|e| (
+            "MANIFEST_FETCH_FAILED",
+            format!("GET {manifest_url} failed: {e}"),
+        ))?;
+
+        let status = resp.status().as_u16();
+        if status != 200 {
+            return Err((
+                "MANIFEST_FETCH_FAILED",
+                format!("GET {manifest_url} returned HTTP {status} (expected 200)"),
+            ));
+        }
+        let etag = resp
+            .headers()
+            .get(header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(ToOwned::to_owned);
+
+        let bytes = tokio::time::timeout(Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS), async {
+            let mut body = resp.into_body();
+            let mut out = Vec::new();
+            while let Some(frame_res) = body.frame().await {
+                let frame = frame_res.map_err(|e| {
+                    ("MANIFEST_FETCH_FAILED", format!("Manifest body read error: {e}"))
+                })?;
+                if let Some(chunk) = frame.data_ref() {
+                    if out.len() + chunk.len() > MAX_MANIFEST_RESPONSE_BYTES {
+                        return Err((
+                            "INVALID_MANIFEST",
+                            format!(
+                                "Manifest response exceeds {MAX_MANIFEST_RESPONSE_BYTES} byte safety cap"
+                            ),
+                        ));
+                    }
+                    out.extend_from_slice(chunk);
+                }
+            }
+            Ok::<Vec<u8>, (&'static str, String)>(out)
+        })
+        .await
+        .map_err(|_| {
+            (
+                "MANIFEST_FETCH_FAILED",
+                "Timed out reading /v1/manifest response body".to_string(),
+            )
+        })??;
+
+        Ok::<(Vec<u8>, Option<String>), (&'static str, String)>((bytes, etag))
+    })?;
+
+    let signed: SignedNodeManifest = serde_json::from_slice(&body_bytes).map_err(|e| {
+        (
+            "INVALID_MANIFEST",
+            format!("Response from {manifest_url} is not a valid SignedNodeManifest: {e}"),
+        )
+    })?;
+
+    let payload = signed.decode_payload().map_err(|e| {
+        (
+            "INVALID_MANIFEST",
+            format!("Invalid NodeManifestPayload in signed manifest: {e}"),
+        )
+    })?;
+
+    let canonical = payload.to_canonical_payload().map_err(|e| {
+        (
+            "INVALID_MANIFEST",
+            format!("Failed to canonicalize manifest payload: {e}"),
+        )
+    })?;
+    if canonical != signed.payload {
+        return Err((
+            "NON_CANONICAL_MANIFEST",
+            "Signed manifest payload is not canonical RFC 8785 JCS (fail-closed)".to_string(),
+        ));
+    }
+
+    let crypto_sign_jwk = proto_jwk_to_crypto(&payload.identity.signing_jwk);
+    let crypto_enc_jwk = proto_jwk_to_crypto(&payload.identity.encryption_jwk);
+    let signing_pk = crypto_sign_jwk.to_ed25519().map_err(|e| {
+        (
+            "INVALID_KEY",
+            format!("Invalid signingJwk in manifest: {e}"),
+        )
+    })?;
+    let encryption_pk = crypto_enc_jwk.to_x25519().map_err(|e| {
+        (
+            "INVALID_KEY",
+            format!("Invalid encryptionJwk in manifest: {e}"),
+        )
+    })?;
+
+    signing_pk
+        .verify_domain_b64("manifest", signed.payload.as_bytes(), &signed.sig)
+        .map_err(|e| {
+            (
+                "INVALID_SIGNATURE",
+                format!("Manifest Ed25519 signature verification failed (fail-closed): {e}"),
+            )
+        })?;
+
+    let exp_ms = parse_rfc3339_millis(&payload.expires_at).map_err(|e| {
+        (
+            "INVALID_MANIFEST",
+            format!("Invalid manifest expiresAt '{}': {e}", payload.expires_at),
+        )
+    })?;
+    if now_unix_ms() > exp_ms {
+        return Err((
+            "MANIFEST_EXPIRED",
+            format!(
+                "Node '{}' manifest expired at {}",
+                payload.node_id, payload.expires_at
+            ),
+        ));
+    }
+
+    Ok(VerifiedLiveManifest {
+        signed,
+        payload,
+        signing_pk,
+        encryption_pk,
+        etag,
+    })
+}
+
+fn run_join(
+    url: String,
+    state_dir_arg: Option<PathBuf>,
+    node_id_arg: Option<String>,
+    node_name_arg: Option<String>,
+    preset: CliScopePreset,
+    offline: bool,
+    as_json: bool,
+) -> ExitCode {
+    let cmd = "pair join";
+
+    if let Err(e) = validate_endpoint_origin(&url) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "INVALID_ENDPOINT",
+            format!("Invalid target URL '{url}': {e}"),
+            Some("Use https:// (or loopback http://127.0.0.1 for local testing).".to_string()),
+        );
+    }
+
+    let trimmed = url.trim().trim_end_matches('/');
+    let base_url = trimmed
+        .strip_suffix("/v1/manifest")
+        .unwrap_or(trimmed)
+        .to_string();
+
+    if let Some(ref raw) = node_id_arg {
+        if raw == LOCAL_NODE_ID || !is_valid_node_id(raw) {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "INVALID_NODE_ID",
+                format!(
+                    "Invalid --node-id '{raw}': must match /^[a-z0-9][a-z0-9@._-]{{0,63}}$/ and cannot be 'local'"
+                ),
+                Some("Example: --node-id alice@macbook".to_string()),
+            );
+        }
+    }
+
+    if let Some(ref name) = node_name_arg {
+        if name == LOCAL_NODE_ID || !is_valid_node_id(name) {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "INVALID_PEER_ID",
+                format!(
+                    "Invalid --node-name '{name}': must match /^[a-z0-9][a-z0-9@._-]{{0,63}}$/ and cannot be 'local'"
+                ),
+                None,
+            );
+        }
+    }
+
+    let scopes = preset.to_proto().expand();
+    let trust_tier = proto_tier_to_store(preset.to_proto().trust_tier());
+    let mut warnings = Vec::new();
+
+    // Fetch and cryptographically verify `/v1/manifest` BEFORE touching disk state!
+    let verified_live = if offline {
+        warnings.push(
+            "Joined in --offline mode; manifest signature and pinned JWKs will be verified on first live connection."
+                .to_string(),
+        );
+        None
+    } else {
+        match fetch_and_verify_manifest(&base_url) {
+            Ok(v) => {
+                if let Some(ref expected_name) = node_name_arg {
+                    if v.payload.node_id.as_str() != expected_name {
+                        return emit_error(
+                            cmd,
+                            as_json,
+                            EXIT_ERROR,
+                            "NODE_ID_MISMATCH",
+                            format!(
+                                "Signed manifest nodeId '{}' does not match --node-name '{expected_name}'",
+                                v.payload.node_id
+                            ),
+                            None,
+                        );
+                    }
+                }
+                Some(v)
+            }
+            Err((code, msg)) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    code,
+                    msg,
+                    Some(format!(
+                        "Verify {base_url}/v1/manifest is reachable and serving a valid SignedNodeManifest, or pass --offline to pre-configure."
+                    )),
+                );
+            }
+        }
+    };
+
+    let peer_id = if let Some(ref v) = verified_live {
+        v.payload.node_id.as_str().to_string()
+    } else if let Some(name) = node_name_arg {
+        name
+    } else {
+        match derive_peer_id_from_url(&base_url) {
+            Ok(host) => host,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_USAGE,
+                    "INVALID_PEER_ID",
+                    e,
+                    Some("Example: --node-name public.hyphae.to".to_string()),
+                );
+            }
+        }
+    };
+
+    let peer_profile = verified_live
+        .as_ref()
+        .map(|v| proto_profile_to_store(v.payload.profile))
+        .unwrap_or(PeerProfile::Router);
+
+    let explicit_state = state_dir_arg.is_some();
+    let state_dir = resolve_state_dir(state_dir_arg.as_deref(), None, None);
+    if let Err(e) = ensure_dir(&state_dir, true) {
+        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
+    }
+
+    let db_path = state_dir.join("node.sqlite");
+    let db = match NodeDb::open(&db_path) {
+        Ok(d) => d,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "DB_ERROR",
+                format!("Failed to open {}: {e}", db_path.display()),
+                None,
+            );
+        }
+    };
+
+    if let Some(ref v) = verified_live {
+        if let Err((code, msg)) = check_existing_signing_pin(&db, &peer_id, &v.signing_pk.kid()) {
+            return emit_error(cmd, as_json, EXIT_ERROR, code, msg, None);
+        }
+    }
+
+    let local_node_id = match resolve_local_node_id(node_id_arg.as_deref(), &state_dir, Some(&db)) {
+        Ok(id) => id,
+        Err((exit, code, msg)) => return emit_error(cmd, as_json, exit, code, msg, None),
+    };
+
+    let secrets = crate::config_file::open_secret_store(&state_dir, explicit_state);
+    if let Err(e) = secrets.load_or_create_node_keys(&local_node_id) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "KEYSTORE_ERROR",
+            format!("Failed to load/create local node keys: {e}"),
+            None,
+        );
+    }
+
+    let now_db = now_ms();
+    let _ = db.local().ensure_metadata("node_id", &local_node_id);
+
+    if let Err(e) = db.peers().upsert_peer(
+        &PeerInput {
+            peer_id: peer_id.clone(),
+            endpoint: Some(base_url.clone()),
+            profile: peer_profile,
+            trust_tier,
+            status: PeerStatus::Active,
+            scopes: scopes.clone(),
+            auth_credential_ref: None,
+        },
+        now_db,
+    ) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "DB_ERROR",
+            format!("Failed to register peer '{peer_id}': {e}"),
+            None,
+        );
+    }
+
+    let mut kid: Option<String> = None;
+    let mut enc_kid: Option<String> = None;
+    let mut fingerprint: Option<String> = None;
+    let mut hyphae_version: Option<String> = None;
+    let mut capabilities: Vec<String> = Vec::new();
+
+    if let Some(ref v) = verified_live {
+        let sign_jwk = proto_jwk_to_crypto(&v.payload.identity.signing_jwk);
+        let enc_jwk = proto_jwk_to_crypto(&v.payload.identity.encryption_jwk);
+        let k = v.signing_pk.kid();
+        let ek = v.encryption_pk.kid();
+        let fp = v.signing_pk.fingerprint();
+
+        let sign_json = match serde_json::to_string(&sign_jwk) {
+            Ok(s) => s,
+            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+        };
+        let enc_json = match serde_json::to_string(&enc_jwk) {
+            Ok(s) => s,
+            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+        };
+
+        if let Err(e) = db.peers().upsert_peer_key(
+            &PeerKeyInput {
+                peer_id: peer_id.clone(),
+                kid: k.clone(),
+                key_use: KeyUse::Signing,
+                jwk_json: sign_json,
+                status: KeyStatus::Active,
+                expires_at: None,
+            },
+            now_db,
+        ) {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "DB_ERROR",
+                format!("Failed to pin signing JWK for '{peer_id}': {e}"),
+                None,
+            );
+        }
+        if let Err(e) = db.peers().upsert_peer_key(
+            &PeerKeyInput {
+                peer_id: peer_id.clone(),
+                kid: ek.clone(),
+                key_use: KeyUse::Encryption,
+                jwk_json: enc_json,
+                status: KeyStatus::Active,
+                expires_at: None,
+            },
+            now_db,
+        ) {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "DB_ERROR",
+                format!("Failed to pin encryption JWK for '{peer_id}': {e}"),
+                None,
+            );
+        }
+
+        capabilities = v
+            .payload
+            .capabilities
+            .iter()
+            .map(|c| c.as_str().to_string())
+            .collect();
+        let manifest_json = match serde_json::to_string(&v.signed) {
+            Ok(s) => s,
+            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+        };
+        if let Err(e) = db.peers().cache_manifest(
+            &peer_id,
+            &ManifestCacheUpdate {
+                manifest_version: v.payload.manifest_version as i64,
+                manifest_json,
+                etag: v.etag.clone(),
+                capabilities: capabilities.clone(),
+                accept_downgrade: false,
+            },
+            now_db,
+        ) {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "MANIFEST_CACHE_ERROR",
+                format!("Failed to cache verified manifest for '{peer_id}': {e}"),
+                None,
+            );
+        }
+
+        kid = Some(k);
+        enc_kid = Some(ek);
+        fingerprint = Some(fp);
+        hyphae_version = Some(v.payload.hyphae_version.clone());
+    }
+
+    let manifest_verified = verified_live.is_some();
+    let next = vec![
+        format!("hyp status --state-dir {}", state_dir.display()),
+        format!("hyp daemon --state-dir {}", state_dir.display()),
+    ];
+
+    let data = json!({
+        "mode": "public",
+        "nodeId": local_node_id,
+        "peerId": peer_id,
+        "endpoint": base_url,
+        "profile": peer_profile.as_str(),
+        "preset": preset.as_str(),
+        "trustTier": trust_tier.as_str(),
+        "scopes": scopes,
+        "offline": offline,
+        "manifestVerified": manifest_verified,
+        "kid": kid,
+        "encryptionKid": enc_kid,
+        "fingerprint": fingerprint,
+        "hyphaeVersion": hyphae_version,
+        "capabilities": capabilities,
+        "stateDir": state_dir.display().to_string(),
+    });
+
+    if as_json {
+        let envelope = JsonEnvelope {
+            ok: true,
+            command: cmd.to_string(),
+            summary: Some(if manifest_verified {
+                format!(
+                    "Joined '{}' ({}) with verified signed manifest (preset={})",
+                    peer_id,
+                    base_url,
+                    preset.as_str()
+                )
+            } else {
+                format!(
+                    "Pre-configured '{}' ({}) offline (preset={})",
+                    peer_id,
+                    base_url,
+                    preset.as_str()
+                )
+            }),
+            data: Some(data),
+            warnings,
+            next,
+            error: None,
+        };
+        print_json(&envelope);
+    } else {
+        println!(
+            "OK    Joined Hyphae node '{}' ({})",
+            peer_id,
+            if manifest_verified {
+                "signed manifest verified"
+            } else {
+                "offline pre-configured"
+            }
+        );
+        println!("      Local Node:  {local_node_id}");
+        println!("      Peer ID:     {peer_id}");
+        println!("      Endpoint:    {base_url}");
+        println!("      Preset:      {} (tier={})", preset.as_str(), trust_tier.as_str());
+        if let Some(ref k) = kid {
+            println!("      JWK kid:     {k}");
+        }
+        if let Some(ref fp) = fingerprint {
+            println!("      Fingerprint: {fp}");
+        }
+        if let Some(ref v) = hyphae_version {
+            println!("      Version:     {v}");
+        }
+        println!("      Scopes:      {}", scopes.join(" "));
+        print_warnings(&warnings);
+        print_next_steps(&next);
+    }
     ExitCode::from(EXIT_OK)
 }
 

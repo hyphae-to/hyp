@@ -18,9 +18,10 @@ use hyp_proto::manifest::{
     NodeManifestPayload, NodeProfile, OkpCurve, OkpJwk, ProtocolRange, SignedNodeManifest,
 };
 use hyp_proto::scopes::EscalationConfig;
+use hyp_store::{KeyUse, NodeDb, PeerProfile, PeerStatus, TrustTier};
 use serde_json::{Value, json};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -961,4 +962,544 @@ fn plain_tty_output_and_additional_config_fail_closed_checks() {
         .unwrap()
         .iter()
         .any(|c| c["name"] == "probe.http" && c["status"] == "fail"));
+}
+
+#[test]
+fn pair_accept_p2p_and_team_persists_peers_keys_grants_and_rejects_tampered_or_expired() {
+    let inviter_state = tempfile::tempdir().unwrap();
+    let accepter_state = tempfile::tempdir().unwrap();
+
+    // 1. P2P invite -> pair accept (stdin) with custom counter-grant & untrusted escalationNote
+    let p2p_inv = Command::new(hyp_rs_bin())
+        .args([
+            "pair",
+            "invite",
+            "--mode",
+            "p2p",
+            "--node-id",
+            "alice@macbook",
+            "--endpoint",
+            "https://alice.tailnet.ts.net",
+            "--peer",
+            "bob@laptop",
+            "--grant",
+            "dm:*,files:send=25mb",
+            "--request",
+            "dm:send,kv:read=pair/*",
+            "--escalation",
+            "Ping @alice in #ops\x1b[31m\n for extra access",
+            "--state-dir",
+            inviter_state.path().to_str().unwrap(),
+            "--json",
+        ])
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .output()
+        .unwrap();
+    assert_eq!(p2p_inv.status.code(), Some(0));
+    let p2p_inv_env: Value = serde_json::from_slice(&p2p_inv.stdout).unwrap();
+    let hp2p1_token = p2p_inv_env["data"]["token"].as_str().unwrap();
+    let alice_kid = p2p_inv_env["data"]["kid"].as_str().unwrap();
+    let alice_enc_kid = p2p_inv_env["data"]["encryptionKid"].as_str().unwrap();
+    assert!(hp2p1_token.starts_with("hp2p1_"));
+    assert_eq!(
+        p2p_inv_env["data"]["acceptCommandTemplate"],
+        "hyp pair accept <<< '<token>'"
+    );
+
+    let mut accept_proc = Command::new(hyp_rs_bin())
+        .args([
+            "pair",
+            "accept",
+            "--state-dir",
+            accepter_state.path().to_str().unwrap(),
+            "--node-id",
+            "bob@laptop",
+            "--grant",
+            "dm:send",
+            "kv:read=pair/*",
+            "--json",
+        ])
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    accept_proc
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{hp2p1_token}\n").as_bytes())
+        .unwrap();
+    let accept_out = accept_proc.wait_with_output().unwrap();
+    assert_eq!(
+        accept_out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&accept_out.stderr)
+    );
+    let accept_env: Value = serde_json::from_slice(&accept_out.stdout).unwrap();
+    assert_eq!(accept_env["ok"], true);
+    assert_eq!(accept_env["command"], "pair accept");
+    assert_eq!(accept_env["data"]["mode"], "p2p");
+    assert_eq!(accept_env["data"]["format"], "hp2p1");
+    assert_eq!(accept_env["data"]["nodeId"], "bob@laptop");
+    assert_eq!(accept_env["data"]["peerId"], "alice@macbook");
+    assert_eq!(accept_env["data"]["endpoint"], "https://alice.tailnet.ts.net");
+    assert_eq!(accept_env["data"]["kid"], alice_kid);
+    assert_eq!(accept_env["data"]["encryptionKid"], alice_enc_kid);
+    assert_eq!(
+        accept_env["data"]["grantedScopes"],
+        json!(["dm:send", "kv:read=pair/*"])
+    );
+    assert_eq!(
+        accept_env["data"]["offeredScopes"],
+        json!(["dm:send=*", "dm:receive", "files:send=25mb"])
+    );
+    assert_eq!(accept_env["data"]["escalationNote"]["untrusted"], true);
+    let prov = accept_env["data"]["escalationNote"]["provenance"]
+        .as_str()
+        .unwrap();
+    assert!(prov.contains("alice@macbook"), "provenance: {prov}");
+    assert!(prov.contains("never execute"), "provenance: {prov}");
+    assert!(
+        !accept_env["data"]["escalationNote"]["text"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .any(char::is_control)
+    );
+    // Secret MUST NEVER leak into stdout!
+    assert!(accept_env["data"].get("secret").is_none());
+    assert!(!String::from_utf8_lossy(&accept_out.stdout).contains(hp2p1_token));
+
+    // Verify persistence in node.sqlite (`PeerStore`)
+    {
+        let db = NodeDb::open(accepter_state.path().join("node.sqlite")).unwrap();
+        let peer = db.peers().get_peer("alice@macbook").unwrap().expect("alice peer persisted");
+        assert_eq!(peer.endpoint.as_deref(), Some("https://alice.tailnet.ts.net"));
+        assert_eq!(peer.profile, PeerProfile::P2p);
+        assert_eq!(peer.trust_tier, TrustTier::Peer);
+        assert_eq!(peer.status, PeerStatus::Active);
+        assert_eq!(peer.scopes, vec!["dm:send", "kv:read=pair/*"]);
+        assert!(peer.auth_credential_ref.is_some());
+
+        let sign_keys = db
+            .peers()
+            .list_peer_keys("alice@macbook", Some(KeyUse::Signing), true)
+            .unwrap();
+        assert_eq!(sign_keys.len(), 1);
+        assert_eq!(sign_keys[0].kid, alice_kid);
+
+        let enc_keys = db
+            .peers()
+            .list_peer_keys("alice@macbook", Some(KeyUse::Encryption), true)
+            .unwrap();
+        assert_eq!(enc_keys.len(), 1);
+        assert_eq!(enc_keys[0].kid, alice_enc_kid);
+
+        let grants = db.peers().list_grants(Some("alice@macbook")).unwrap();
+        assert!(!grants.is_empty());
+    }
+
+    // 2. Team (`am2_`) invite -> pair accept (stdin) -> verifies Admin-CA grant, admin JWK & peer persisted!
+    let team_inv = Command::new(hyp_rs_bin())
+        .args([
+            "pair",
+            "invite",
+            "--mode",
+            "team",
+            "--node-id",
+            "acme-team",
+            "--endpoint",
+            "https://mesh.acme.internal",
+            "--peer",
+            "bob@laptop",
+            "--preset",
+            "member",
+            "--escalation",
+            "Ask #secops for full scope",
+            "--state-dir",
+            inviter_state.path().to_str().unwrap(),
+            "--json",
+        ])
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .output()
+        .unwrap();
+    assert_eq!(team_inv.status.code(), Some(0));
+    let team_env: Value = serde_json::from_slice(&team_inv.stdout).unwrap();
+    let am2_token = team_env["data"]["token"].as_str().unwrap();
+    let admin_kid = team_env["data"]["kid"].as_str().unwrap();
+    let grant_id = team_env["data"]["grantId"].as_str().unwrap();
+    assert!(am2_token.starts_with("am2_"));
+
+    let mut team_accept = Command::new(hyp_rs_bin())
+        .args([
+            "pair",
+            "accept",
+            "--state-dir",
+            accepter_state.path().to_str().unwrap(),
+            "--node-id",
+            "bob@laptop",
+            "--json",
+        ])
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    team_accept
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(am2_token.as_bytes())
+        .unwrap();
+    let team_accept_out = team_accept.wait_with_output().unwrap();
+    assert_eq!(
+        team_accept_out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&team_accept_out.stderr)
+    );
+    let team_accept_env: Value = serde_json::from_slice(&team_accept_out.stdout).unwrap();
+    assert_eq!(team_accept_env["ok"], true);
+    assert_eq!(team_accept_env["command"], "pair accept");
+    assert_eq!(team_accept_env["data"]["mode"], "team");
+    assert_eq!(team_accept_env["data"]["format"], "am2");
+    assert_eq!(team_accept_env["data"]["peerId"], "acme-team");
+    assert_eq!(team_accept_env["data"]["grantId"], grant_id);
+    assert_eq!(team_accept_env["data"]["kid"], admin_kid);
+    assert_eq!(team_accept_env["data"]["escalationNote"]["untrusted"], true);
+
+    {
+        let db = NodeDb::open(accepter_state.path().join("node.sqlite")).unwrap();
+        let hub = db.peers().get_peer("acme-team").unwrap().expect("acme-team peer persisted");
+        assert_eq!(hub.endpoint.as_deref(), Some("https://mesh.acme.internal"));
+        assert_eq!(hub.profile, PeerProfile::Router);
+        assert_eq!(hub.trust_tier, TrustTier::Org);
+        assert_eq!(hub.status, PeerStatus::Active);
+        assert!(!hub.scopes.is_empty());
+
+        let admin_keys = db
+            .peers()
+            .list_peer_keys("acme-team", Some(KeyUse::Admin), true)
+            .unwrap();
+        assert_eq!(admin_keys.len(), 1);
+        assert_eq!(admin_keys[0].kid, admin_kid);
+
+        let stored_grant = db.peers().get_grant(grant_id).unwrap().expect("Admin-CA grant persisted");
+        assert_eq!(stored_grant.peer_id, "acme-team");
+        assert_eq!(stored_grant.trust_tier, TrustTier::Org);
+    }
+
+    // 3. Fail-closed mutation tests on `pair accept`!
+    let reject_state = tempfile::tempdir().unwrap();
+
+    // (a) Tampered hp2p1_ offer scope (signature mismatch!) -> exit 1 & zero DB write!
+    let mut hp2p1_obj: Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(hp2p1_token.strip_prefix("hp2p1_").unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    hp2p1_obj["offeredScopes"] = json!(["*"]);
+    let tampered_hp2p1 = format!(
+        "hp2p1_{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&hp2p1_obj).unwrap())
+    );
+    let mut t1 = Command::new(hyp_rs_bin())
+        .args([
+            "pair",
+            "accept",
+            "--state-dir",
+            reject_state.path().to_str().unwrap(),
+            "--json",
+        ])
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    t1.stdin
+        .take()
+        .unwrap()
+        .write_all(tampered_hp2p1.as_bytes())
+        .unwrap();
+    let t1_out = t1.wait_with_output().unwrap();
+    assert_eq!(t1_out.status.code(), Some(1));
+    let t1_env: Value = serde_json::from_slice(&t1_out.stdout).unwrap();
+    assert_eq!(t1_env["ok"], false);
+    assert_eq!(t1_env["error"]["code"], "INVALID_SIGNATURE");
+
+    // (b) Expired hp2p1_ offer -> exit 1 (`TOKEN_EXPIRED`)
+    let alice_tmp = NodeIdentityKeys::generate().unwrap();
+    let expired_offer = create_p2p_offer(
+        "offer-expired-accept",
+        "alice@expired",
+        "https://alice.tailnet.ts.net",
+        &alice_tmp,
+        vec!["dm:send".into()],
+        vec![],
+        "2020-01-01T00:00:00Z",
+    )
+    .unwrap();
+    let expired_tok = encode_hp2p1(&expired_offer).unwrap();
+    let mut t2 = Command::new(hyp_rs_bin())
+        .args([
+            "pair",
+            "accept",
+            "--state-dir",
+            reject_state.path().to_str().unwrap(),
+            "--json",
+        ])
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    t2.stdin
+        .take()
+        .unwrap()
+        .write_all(expired_tok.as_bytes())
+        .unwrap();
+    let t2_out = t2.wait_with_output().unwrap();
+    assert_eq!(t2_out.status.code(), Some(1));
+    let t2_env: Value = serde_json::from_slice(&t2_out.stdout).unwrap();
+    assert_eq!(t2_env["ok"], false);
+    assert_eq!(t2_env["error"]["code"], "TOKEN_EXPIRED");
+
+    // (c) Tampered am2_ scopes -> exit 1!
+    let mut am2_obj: Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(am2_token.strip_prefix("am2_").unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    am2_obj["scopes"] = json!(["*"]);
+    let tampered_am2 = format!(
+        "am2_{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&am2_obj).unwrap())
+    );
+    let mut t3 = Command::new(hyp_rs_bin())
+        .args([
+            "pair",
+            "accept",
+            "--state-dir",
+            reject_state.path().to_str().unwrap(),
+            "--json",
+        ])
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    t3.stdin
+        .take()
+        .unwrap()
+        .write_all(tampered_am2.as_bytes())
+        .unwrap();
+    let t3_out = t3.wait_with_output().unwrap();
+    assert_eq!(t3_out.status.code(), Some(1));
+    let t3_env: Value = serde_json::from_slice(&t3_out.stdout).unwrap();
+    assert_eq!(t3_env["ok"], false);
+
+    // (d) Security invariant: `pair accept` MUST NOT accept `--token <value>` in argv!
+    let argv_tok = Command::new(hyp_rs_bin())
+        .args(["pair", "accept", "--token", hp2p1_token])
+        .output()
+        .unwrap();
+    assert_eq!(argv_tok.status.code(), Some(2));
+
+    // Verify rejected state_dir has zero peers persisted!
+    assert!(!reject_state.path().join("node.sqlite").exists());
+}
+
+#[test]
+fn pair_join_verifies_live_rust_node_manifest_rejects_tampered_and_supports_offline() {
+    let hub_tmp = tempfile::tempdir().unwrap();
+    let client_tmp = tempfile::tempdir().unwrap();
+
+    // 1. Start a live native Rust `hyp-rs node start --profile router --bind 127.0.0.1:0` serving `/v1/manifest`
+    let mut hub_child = Command::new(hyp_rs_bin())
+        .args([
+            "node",
+            "start",
+            "--profile",
+            "router",
+            "--node-id",
+            "public.local",
+            "--bind",
+            "127.0.0.1:0",
+            "--no-local-socket",
+            "--state-dir",
+            hub_tmp.path().to_str().unwrap(),
+            "--json",
+        ])
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .env("HOME", hub_tmp.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn live Rust router node");
+
+    let mut hub_line = String::new();
+    BufReader::new(hub_child.stdout.take().unwrap())
+        .read_line(&mut hub_line)
+        .unwrap();
+    let hub_env: Value = serde_json::from_str(hub_line.trim()).expect("valid node start JSON");
+    assert_eq!(hub_env["ok"], true);
+    assert!(hub_env["data"]["socketPath"].is_null());
+    let hub_endpoint = hub_env["data"]["endpoint"].as_str().unwrap().to_string();
+    let hub_kid = hub_env["data"]["kid"].as_str().unwrap().to_string();
+
+    // 2. Run `hyp-rs pair join <hub_endpoint> --state-dir <client_tmp> --json`
+    let join_out = Command::new(hyp_rs_bin())
+        .args([
+            "pair",
+            "join",
+            &hub_endpoint,
+            "--state-dir",
+            client_tmp.path().to_str().unwrap(),
+            "--node-id",
+            "dev@laptop",
+            "--json",
+        ])
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .env("HOME", client_tmp.path())
+        .output()
+        .unwrap();
+
+    // Clean up live router subprocess immediately after join
+    let _ = hub_child.kill();
+    let _ = hub_child.wait();
+
+    assert_eq!(
+        join_out.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&join_out.stdout),
+        String::from_utf8_lossy(&join_out.stderr)
+    );
+    let join_env: Value = serde_json::from_slice(&join_out.stdout).unwrap();
+    assert_eq!(join_env["ok"], true);
+    assert_eq!(join_env["command"], "pair join");
+    assert_eq!(join_env["data"]["peerId"], "public.local");
+    assert_eq!(join_env["data"]["nodeId"], "dev@laptop");
+    assert_eq!(join_env["data"]["endpoint"], hub_endpoint);
+    assert_eq!(join_env["data"]["preset"], "guest-ro");
+    assert_eq!(join_env["data"]["trustTier"], "guest");
+    assert_eq!(join_env["data"]["offline"], false);
+    assert_eq!(join_env["data"]["manifestVerified"], true);
+    assert_eq!(join_env["data"]["kid"], hub_kid);
+
+    // Verify peer, pinned Ed25519 + X25519 keys, and cached manifest in node.sqlite (`PeerStore`)
+    {
+        let db = NodeDb::open(client_tmp.path().join("node.sqlite")).unwrap();
+        let peer = db
+            .peers()
+            .get_peer("public.local")
+            .unwrap()
+            .expect("public.local peer persisted");
+        assert_eq!(peer.endpoint.as_deref(), Some(hub_endpoint.as_str()));
+        assert_eq!(peer.profile, PeerProfile::Router);
+        assert_eq!(peer.trust_tier, TrustTier::Guest);
+        assert_eq!(peer.status, PeerStatus::Active);
+        assert_eq!(
+            peer.scopes,
+            vec!["stream:subscribe=github[require=exact.repo;maxValues=10;maxBatchesPerHour=60]"]
+        );
+        assert!(peer.manifest_json.is_some());
+
+        let sign_keys = db
+            .peers()
+            .list_peer_keys("public.local", Some(KeyUse::Signing), true)
+            .unwrap();
+        assert_eq!(sign_keys.len(), 1);
+        assert_eq!(sign_keys[0].kid, hub_kid);
+
+        let enc_keys = db
+            .peers()
+            .list_peer_keys("public.local", Some(KeyUse::Encryption), true)
+            .unwrap();
+        assert_eq!(enc_keys.len(), 1);
+    }
+
+    // 3. Fail-closed: tampered manifest signature MUST exit 1 and NOT persist peer!
+    let tampered_body = build_signed_manifest(
+        "tampered.local",
+        AdvertisedResources::default(),
+        None,
+        true,
+    );
+    let (tampered_url, srv) = spawn_one_shot_http_server("200 OK", tampered_body);
+    let bad_state = tempfile::tempdir().unwrap();
+    let bad_join = Command::new(hyp_rs_bin())
+        .args([
+            "pair",
+            "join",
+            &tampered_url,
+            "--state-dir",
+            bad_state.path().to_str().unwrap(),
+            "--json",
+        ])
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .output()
+        .unwrap();
+    srv.join().unwrap();
+    assert_eq!(bad_join.status.code(), Some(1));
+    let bad_env: Value = serde_json::from_slice(&bad_join.stdout).unwrap();
+    assert_eq!(bad_env["ok"], false);
+    assert_eq!(bad_env["error"]["code"], "INVALID_SIGNATURE");
+    assert!(!bad_state.path().join("node.sqlite").exists());
+
+    // 4. Fail-closed: remote plaintext `http://` URL rejected with exit 2 (`INVALID_ENDPOINT`)
+    let insecure_join = Command::new(hyp_rs_bin())
+        .args([
+            "pair",
+            "join",
+            "http://public.hyphae.to",
+            "--state-dir",
+            bad_state.path().to_str().unwrap(),
+            "--json",
+        ])
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .output()
+        .unwrap();
+    assert_eq!(insecure_join.status.code(), Some(2));
+    let insec_env: Value = serde_json::from_slice(&insecure_join.stdout).unwrap();
+    assert_eq!(insec_env["error"]["code"], "INVALID_ENDPOINT");
+
+    // 5. Offline pre-configuration (`--offline`) derives `public.hyphae.to` and persists peer cleanly
+    let offline_state = tempfile::tempdir().unwrap();
+    let offline_join = Command::new(hyp_rs_bin())
+        .args([
+            "pair",
+            "join",
+            "https://public.hyphae.to",
+            "--offline",
+            "--state-dir",
+            offline_state.path().to_str().unwrap(),
+            "--node-id",
+            "dev@laptop",
+            "--json",
+        ])
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .output()
+        .unwrap();
+    assert_eq!(offline_join.status.code(), Some(0));
+    let off_env: Value = serde_json::from_slice(&offline_join.stdout).unwrap();
+    assert_eq!(off_env["ok"], true);
+    assert_eq!(off_env["data"]["peerId"], "public.hyphae.to");
+    assert_eq!(off_env["data"]["offline"], true);
+    assert_eq!(off_env["data"]["manifestVerified"], false);
+
+    let off_db = NodeDb::open(offline_state.path().join("node.sqlite")).unwrap();
+    let off_peer = off_db
+        .peers()
+        .get_peer("public.hyphae.to")
+        .unwrap()
+        .expect("offline peer persisted");
+    assert_eq!(off_peer.trust_tier, TrustTier::Guest);
+    assert_eq!(off_peer.endpoint.as_deref(), Some("https://public.hyphae.to"));
 }

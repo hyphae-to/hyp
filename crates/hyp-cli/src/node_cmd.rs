@@ -6,22 +6,25 @@
 //! `node.pid` + `node.status.json`, and shuts down gracefully on `SIGINT`/`SIGTERM`.
 
 use crate::config_file::{
-    default_node_id, ensure_dir, load_node_or_legacy_config, profile_as_str,
+    default_node_id, ensure_dir, load_node_or_legacy_config, open_secret_store, profile_as_str,
     resolve_config_path_for_read, resolve_state_dir, write_atomic_file, write_atomic_json,
 };
-use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json};
+use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error};
 use clap::{Args, Subcommand, ValueEnum};
 use hyp_crypto::keystore::SecretBackend;
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
+use hyp_harness::daemon::{LocalDaemon, LocalDaemonConfig};
 use hyp_node::engine::{E2eePolicy, NodeConfig, NodeProfile, UnifiedNode};
+use hyp_node::gates::{SecurityGateConfig, SecurityGatePipeline};
 use hyp_proto::address::{LOCAL_NODE_ID, NodeId, is_valid_node_id};
+use hyp_store::NodeDb;
 use serde_json::json;
 use std::fs;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CliNodeProfile {
@@ -65,6 +68,12 @@ pub struct NodeStartArgs {
     /// Explicit state directory for node.sqlite, secrets/, and node.pid
     #[arg(long)]
     pub state_dir: Option<PathBuf>,
+    /// Explicit local Unix socket (connector.sock) or Windows loopback address file (connector.addr) path
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
+    /// Disable local harness IPC listener (e.g. for pure headless router containers)
+    #[arg(long)]
+    pub no_local_socket: bool,
     /// Output structured JSON envelope on startup
     #[arg(long)]
     pub json: bool,
@@ -188,9 +197,14 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             E2eePolicy::Prefer
         };
     }
-    if args.state_dir.is_some() && std::env::var_os("HYPHAE_SECRET_BACKEND").is_none() {
+    let explicit_state = args.state_dir.is_some();
+    if explicit_state && std::env::var_os("HYPHAE_SECRET_BACKEND").is_none() {
         node_cfg.secret_backend = Some(SecretBackend::File);
     }
+
+    let start_local_daemon = !args.no_local_socket
+        && (matches!(profile, NodeProfile::Local | NodeProfile::P2p) || args.socket.is_some());
+    let explicit_socket = args.socket.clone();
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -229,6 +243,34 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                 .set_metadata("node_version", env!("CARGO_PKG_VERSION"));
         }
 
+        let local_daemon = if start_local_daemon {
+            let gate_cfg: SecurityGateConfig = match loaded.as_ref().and_then(|c| c.raw.get("gate"))
+            {
+                Some(gate_val) => serde_json::from_value(gate_val.clone())
+                    .map_err(|e| format!("Invalid gate configuration in node.json: {e}"))?,
+                None => SecurityGateConfig::default(),
+            };
+            let gate_db = Arc::new(Mutex::new(
+                NodeDb::open(state_dir.join("node.sqlite"))
+                    .map_err(|e| format!("Failed to open SecurityGate NodeDb: {e}"))?,
+            ));
+            let gate_secrets = Arc::new(open_secret_store(&state_dir, explicit_state));
+            let pipeline = Arc::new(
+                SecurityGatePipeline::new(gate_cfg, gate_db, Some(gate_secrets))
+                    .map_err(|e| format!("Failed to initialize SecurityGatePipeline: {e}"))?,
+            );
+            let local_cfg = LocalDaemonConfig {
+                socket_path: explicit_socket,
+                ..Default::default()
+            };
+            let daemon = LocalDaemon::start(Arc::clone(&node), Some(pipeline), local_cfg)
+                .await
+                .map_err(|e| format!("Failed to start local harness IPC daemon: {e}"))?;
+            Some(daemon)
+        } else {
+            None
+        };
+
         let mut bound_addr: Option<SocketAddr> = None;
         let mut server_handle = None;
         if let Some(addr) = bind_addr {
@@ -249,6 +291,9 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         let endpoint = bound_addr.map(|a| format!("http://{a}")).or_else(|| {
             node.config().public_endpoint.clone()
         });
+        let socket_path_str = local_daemon
+            .as_ref()
+            .map(|d| d.socket_path().display().to_string());
 
         write_atomic_file(&pid_path, format!("{pid}\n").as_bytes(), true)?;
         let status_doc = json!({
@@ -260,6 +305,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             "fingerprint": fingerprint,
             "bind": bound_addr.map(|a| a.to_string()),
             "endpoint": endpoint,
+            "socketPath": socket_path_str,
             "stateDir": state_dir.display().to_string(),
             "configPath": loaded.as_ref().map(|c| c.path.display().to_string()),
             "startedAt": started_at,
@@ -289,7 +335,9 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                 ],
                 error: None,
             };
-            print_json(&envelope);
+            let line = serde_json::to_string(&envelope)
+                .map_err(|e| format!("Failed to serialize startup JSON envelope: {e}"))?;
+            println!("{line}");
             let _ = std::io::stdout().flush();
         } else {
             println!(
@@ -301,6 +349,11 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             println!("      State Dir:   {}", state_dir.display());
             println!("      JWK kid:     {kid}");
             println!("      Fingerprint: {fingerprint}");
+            if let Some(ref sock) = socket_path_str {
+                println!("      Local IPC:   {sock}");
+            } else {
+                println!("      Local IPC:   disabled");
+            }
             if let Some(addr) = bound_addr {
                 println!("      Peer HTTP:   http://{addr} (GET /v1/manifest)");
             } else {
@@ -314,6 +367,9 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
 
         wait_for_shutdown_signal().await;
 
+        if let Some(daemon) = local_daemon {
+            daemon.stop().await;
+        }
         node.shutdown();
         if let Some(handle) = server_handle {
             handle.abort();

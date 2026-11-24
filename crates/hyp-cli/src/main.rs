@@ -158,7 +158,7 @@ enum Commands {
         #[command(subcommand)]
         command: deploy::DeployCommand,
     },
-    /// Permissioned pairing guide, hp2p1_/am2_ invite generation, and stdin-safe token inspection
+    /// Permissioned pairing guide, hp2p1_/am2_ invite generation, stdin-safe inspection/acceptance, and node join
     Pair {
         #[command(subcommand)]
         command: pair::PairCommand,
