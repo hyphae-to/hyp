@@ -100,12 +100,10 @@
             <path class="myc-strand amber" id="p-builder-sub" d="M 1020 468 C 945 505, 880 518, 785 518" />
             <path class="myc-strand moss" id="p-alex-priv" d="M 150 265 C 138 350, 144 400, 150 441" />
             <path class="myc-strand moss" id="p-priv-slack" d="M 150 441 C 235 444, 275 444, 330 444" />
-
-            <!-- Travelling glowing spore packets -->
-            <circle class="spore-orb" id="orb1" r="5.5" cx="0" cy="0" />
-            <circle class="spore-orb" id="orb2" r="5.5" cx="0" cy="0" />
-            <circle class="spore-orb" id="orb3" r="5" cx="0" cy="0" />
           </svg>
+
+          <!-- Dynamic layer for one-shot labeled wire messages -->
+          <div id="wirePackets" aria-hidden="true"></div>
 
           <!-- Event flows configured on the Public Node -->
           <div class="flow-chip" id="ent-gh" style="left:22.9%; top:11.7%;">
@@ -118,7 +116,7 @@
           </div>
 
           <!-- Filter badge -->
-          <div class="filter-tag" id="filterTag" style="left:65.5%; top:39.5%;">filter: severity=critical</div>
+          <div class="filter-tag" id="filterTag" style="left:65.5%; top:59%;">filter: severity=critical</div>
 
           <!-- Alex's agent thread (Claude in Herdr on laptop) -->
           <div class="entity" id="ent-alex" style="left:12.5%; top:45.7%;">

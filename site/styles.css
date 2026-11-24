@@ -391,16 +391,58 @@ header {
 .myc-strand.grown { opacity: 0.94; }
 .myc-strand.soft { opacity: 0.32; }
 
-.spore-orb {
-  fill: var(--chartreuse);
+/* One-shot labeled message packets gliding along mycelium strands */
+.wire-pkt {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform: translate(-50%, -50%) scale(0.86);
   opacity: 0;
-  filter: drop-shadow(0 0 7px rgba(183, 217, 86, 0.95));
+  pointer-events: none;
+  z-index: 13;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px 3px 7px;
+  border-radius: 999px;
+  background: rgba(16, 20, 14, 0.94);
+  border: 1px solid rgba(183, 217, 86, 0.72);
+  color: var(--chartreuse);
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  font-weight: 600;
+  white-space: nowrap;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.55), 0 0 16px rgba(183, 217, 86, 0.25);
+  will-change: left, top, opacity, transform;
 }
 
-.spore-orb.show { opacity: 1; }
-.spore-orb.amber { fill: var(--amber); filter: drop-shadow(0 0 7px rgba(232, 163, 49, 0.95)); }
-.spore-orb.coral { fill: var(--coral); filter: drop-shadow(0 0 8px rgba(221, 81, 53, 0.95)); }
-.spore-orb.moss { fill: var(--moss); filter: drop-shadow(0 0 7px rgba(127, 201, 123, 0.95)); }
+.wire-pkt .pkt-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 8px currentColor;
+  flex-shrink: 0;
+}
+
+.wire-pkt.amber {
+  border-color: rgba(232, 163, 49, 0.8);
+  color: var(--amber);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.55), 0 0 16px rgba(232, 163, 49, 0.28);
+}
+
+.wire-pkt.coral {
+  background: rgba(38, 17, 13, 0.96);
+  border-color: rgba(221, 81, 53, 0.85);
+  color: #ff9c87;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.55), 0 0 18px rgba(221, 81, 53, 0.38);
+}
+
+.wire-pkt.moss {
+  border-color: rgba(127, 201, 123, 0.8);
+  color: #9ae096;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.55), 0 0 16px rgba(127, 201, 123, 0.28);
+}
 
 /* Entities — hidden until introduced gently */
 .entity {

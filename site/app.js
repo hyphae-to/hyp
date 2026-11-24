@@ -35,12 +35,12 @@ renderHeroInstall();
 // ============================================================================
 // 2. PANORAMIC 9-CHAPTER HERO STORY DIORAMA (Line + Dots + Hover Popovers)
 // ============================================================================
-const STEP_MS = 7800;
+const STEP_MS = 8200;
 
 const CHAPTERS = [
   {
     tip: "1 · Solo agent on laptop",
-    caption: "Meet <strong>Alex's agent thread</strong> — running Claude inside Herdr on a laptop. Smart, caffeinated, and totally alone.",
+    caption: "<strong>1/9</strong> · Meet <strong>Alex's agent thread</strong> — running Claude inside Herdr on a laptop. Smart, caffeinated, and totally alone.",
     visible: ["ent-alex"],
     dim: [],
     spotlight: ["ent-alex"],
@@ -55,11 +55,11 @@ const CHAPTERS = [
     codePill: "",
     filterTag: false,
     ripples: [],
-    orbs: [],
+    packets: [],
   },
   {
     tip: "2 · Joins the Team Node",
-    caption: "Alex's agent calls <code>mesh_join</code> on a <strong>Team Node</strong> — exposing shared <code>#channels</code> and subscribable event streams.",
+    caption: "<strong>2/9</strong> · Alex calls <code>mesh_join</code> on the <strong>Team Node</strong> — unlocking shared <code>#channels</code> and subscribable event streams.",
     visible: ["ent-alex", "ent-node"],
     dim: [],
     spotlight: ["ent-alex", "ent-node"],
@@ -74,11 +74,13 @@ const CHAPTERS = [
     codePill: "",
     filterTag: false,
     ripples: ["rip-node"],
-    orbs: [{ path: "p-alex-node", reverse: false, cls: "" }],
+    packets: [
+      { path: "p-alex-node", reverse: false, cls: "", label: "mesh_join", delay: 350, dur: 1700, hold: true },
+    ],
   },
   {
     tip: "3 · Meets Alice & Jack's ops + builder",
-    caption: "The network appears: <strong>Alice's Codex</strong> (OpenClaw, laptop) and <strong>Jack's ops + builder</strong> (T3 Code, Linux server).",
+    caption: "<strong>3/9</strong> · The network appears: <strong>Alice's Codex</strong> (OpenClaw, laptop) and <strong>Jack's ops + builder</strong> (T3 Code, Linux server).",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-builder"],
     dim: [],
     spotlight: ["ent-alice", "ent-ops", "ent-builder"],
@@ -97,15 +99,15 @@ const CHAPTERS = [
     codePill: "",
     filterTag: false,
     ripples: [],
-    orbs: [
-      { path: "p-node-alice", reverse: false, cls: "amber" },
-      { path: "p-node-ops", reverse: false, cls: "" },
-      { path: "p-node-builder", reverse: false, cls: "" },
+    packets: [
+      { path: "p-node-alice", reverse: false, cls: "amber", label: "peer online", delay: 400, dur: 1550 },
+      { path: "p-node-ops", reverse: false, cls: "", label: "peer online", delay: 600, dur: 1550 },
+      { path: "p-node-builder", reverse: false, cls: "", label: "peer online", delay: 800, dur: 1550 },
     ],
   },
   {
     tip: "4 · Fleet alert wakes Jack's ops -> CODEOWNERS",
-    caption: "<span class='coral-txt'>Prometheus fires HighErrorRate (4.2%)</span> across the fleet. The node's filter wakes <strong>Jack's ops</strong>, who checks <code>CODEOWNERS</code> -> Alex owns <code>checkout-api</code>.",
+    caption: "<strong>4/9</strong> · <span class='coral-txt'>Prometheus fires HighErrorRate (4.2%)</span>. The node's filter wakes <strong>Jack's ops</strong>, who checks <code>CODEOWNERS</code> -> Alex.",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-builder", "ent-prom"],
     dim: ["ent-alice", "ent-builder"],
     spotlight: ["ent-node"],
@@ -124,14 +126,14 @@ const CHAPTERS = [
     codePill: "",
     filterTag: true,
     ripples: ["rip-ops"],
-    orbs: [
-      { path: "p-prom-node", reverse: false, cls: "coral" },
-      { path: "p-node-ops-alert", reverse: false, cls: "coral" },
+    packets: [
+      { path: "p-prom-node", reverse: false, cls: "coral", label: "HighErrorRate 4.2%", delay: 150, dur: 1200 },
+      { path: "p-node-ops-alert", reverse: false, cls: "coral", label: "alert -> jack/ops", delay: 1400, dur: 1350, hold: true },
     ],
   },
   {
     tip: "5 · Ops wakes Alex + Private Node Slack DM",
-    caption: "Jack's ops wakes <strong>Alex's Claude thread</strong> across servers. Alex's agent also wires a <strong>Private Node -> Slack</strong> to DM Alex without ever exposing the Slack token.",
+    caption: "<strong>5/9</strong> · Jack's ops wakes <strong>Alex's Claude thread</strong>. Alex's agent also wires a <strong>Private Node -> Slack</strong> to DM Alex directly.",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-builder", "ent-prom", "ent-priv", "ent-slack"],
     dim: ["ent-alice", "ent-builder"],
     spotlight: ["ent-ops"],
@@ -152,15 +154,15 @@ const CHAPTERS = [
     codePill: "",
     filterTag: false,
     ripples: ["rip-alex"],
-    orbs: [
-      { path: "p-node-ops-alert", reverse: true, cls: "coral" },
-      { path: "p-alex-node", reverse: true, cls: "coral" },
-      { path: "p-priv-slack", reverse: false, cls: "moss" },
+    packets: [
+      { path: "p-node-ops-alert", reverse: true, cls: "coral", label: "trace + CODEOWNERS", delay: 150, dur: 1250 },
+      { path: "p-alex-node", reverse: true, cls: "coral", label: "hc interrupt", delay: 1450, dur: 1300 },
+      { path: "p-priv-slack", reverse: false, cls: "moss", label: "DM: 4.2% error", delay: 2850, dur: 1250, hold: true },
     ],
   },
   {
-    tip: "6 · Alex codes fix & opens PR #412",
-    caption: "<strong>6/9</strong> · Alex fixes the Redis pool leak, opens <strong>PR #412</strong>, and subscribes on the Team Node for reviews &amp; CI.",
+    tip: "6 · Alex codes fix, opens PR #412 & gets CI Done ✓",
+    caption: "<strong>6/9</strong> · Alex fixes the Redis pool leak, opens <strong>PR #412</strong>, subscribes on the Team Node, and receives <strong>CI Done ✓</strong> from GitHub.",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-builder", "ent-prom", "ent-gh", "ent-code"],
     dim: ["ent-alice", "ent-ops", "ent-builder"],
     spotlight: ["ent-alex"],
@@ -168,25 +170,27 @@ const CHAPTERS = [
     strands: ["p-alex-gh", "p-gh-node", "p-alex-node"],
     softStrands: [],
     bubbles: {
-      "bub-alex": { text: "Fixed Redis pool leak -> PR #412 open & subscribed.", alert: false },
+      "bub-alex": { text: "PR #412 open & subscribed — CI Done ✓ just landed!", alert: false },
     },
     caps: ["cap-gh"],
-    ghActive: "amber",
+    ghActive: "green",
     ghTitle: "GitHub · PR #412",
-    ghSub: "open · CI running · subscribed",
+    ghSub: "open · CI Done ✓ · subscribed",
     ccAction: "→ opened PR #412 · mesh_subscribe(PR #412)",
     promSub: "14 servers · mitigating",
     codePill: "coding fix -> PR #412",
     filterTag: false,
-    ripples: ["rip-node"],
-    orbs: [
-      { path: "p-alex-gh", reverse: false, cls: "amber" },
-      { path: "p-gh-node", reverse: false, cls: "amber" },
+    ripples: ["rip-alex"],
+    packets: [
+      { path: "p-alex-gh", reverse: false, cls: "amber", label: "open PR #412", delay: 150, dur: 1150 },
+      { path: "p-alex-node", reverse: false, cls: "", label: "mesh_subscribe", delay: 250, dur: 1150 },
+      { path: "p-gh-node", reverse: false, cls: "", label: "CI Done ✓", delay: 1450, dur: 1200 },
+      { path: "p-alex-node", reverse: true, cls: "", label: "CI Done ✓", delay: 2700, dur: 1300, hold: true },
     ],
   },
   {
     tip: "7 · Builder assigned -> spawns sub-agent",
-    caption: "GitHub assigns <strong>Jack's builder</strong> as reviewer on PR #412. The Team Node wakes builder instantly, who spawns a <strong>reviewer sub-agent</strong> to audit the diff.",
+    caption: "<strong>7/9</strong> · GitHub assigns <strong>Jack's builder</strong> on PR #412 -> Team Node wakes builder -> spawns a <strong>reviewer sub-agent</strong>.",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-builder", "ent-gh", "ent-subagent"],
     dim: ["ent-alice", "ent-ops"],
     spotlight: ["ent-builder"],
@@ -205,15 +209,15 @@ const CHAPTERS = [
     codePill: "",
     filterTag: false,
     ripples: ["rip-builder"],
-    orbs: [
-      { path: "p-gh-node", reverse: false, cls: "amber" },
-      { path: "p-node-builder-pr", reverse: false, cls: "amber" },
-      { path: "p-builder-sub", reverse: false, cls: "amber" },
+    packets: [
+      { path: "p-gh-node", reverse: false, cls: "amber", label: "review_requested", delay: 150, dur: 1200 },
+      { path: "p-node-builder-pr", reverse: false, cls: "amber", label: "assign PR #412", delay: 1400, dur: 1300 },
+      { path: "p-builder-sub", reverse: false, cls: "amber", label: "spawn sub-agent", delay: 2750, dur: 1250, hold: true },
     ],
   },
   {
     tip: "8 · Review feedback -> Alex fixes -> Approved",
-    caption: "The sub-agent catches a timeout edge case. Builder posts review notes -> Alex pushes a 2-line fix -> <strong>PR #412 approved &amp; CI green</strong>.",
+    caption: "<strong>8/9</strong> · Sub-agent catches a timeout edge case -> Alex pushes a 2-line fix -> <strong>PR #412 Approved ✓</strong>.",
     visible: ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-builder", "ent-gh", "ent-subagent"],
     dim: ["ent-alice", "ent-ops"],
     spotlight: ["ent-alex", "ent-builder"],
@@ -233,9 +237,11 @@ const CHAPTERS = [
     codePill: "pushed 2-line fix ✓",
     filterTag: false,
     ripples: [],
-    orbs: [
-      { path: "p-node-builder-pr", reverse: true, cls: "" },
-      { path: "p-alex-node", reverse: true, cls: "" },
+    packets: [
+      { path: "p-node-builder-pr", reverse: true, cls: "amber", label: "review: timeout fix", delay: 150, dur: 1250 },
+      { path: "p-alex-node", reverse: true, cls: "amber", label: "review: timeout fix", delay: 1450, dur: 1250 },
+      { path: "p-alex-gh", reverse: false, cls: "", label: "push 2-line fix", delay: 2800, dur: 1150 },
+      { path: "p-node-builder-pr", reverse: true, cls: "", label: "Approved ✓", delay: 4000, dur: 1250, hold: true },
     ],
   },
   {
@@ -259,10 +265,10 @@ const CHAPTERS = [
     codePill: "",
     filterTag: false,
     ripples: ["rip-alex"],
-    orbs: [
-      { path: "p-gh-node", reverse: false, cls: "" },
-      { path: "p-alex-node", reverse: true, cls: "" },
-      { path: "p-priv-slack", reverse: false, cls: "moss" },
+    packets: [
+      { path: "p-gh-node", reverse: false, cls: "", label: "PR #412 Ready ✓", delay: 150, dur: 1200 },
+      { path: "p-alex-node", reverse: true, cls: "", label: "PR #412 Ready ✓", delay: 1400, dur: 1300 },
+      { path: "p-priv-slack", reverse: false, cls: "moss", label: "DM: Ready to merge ✓", delay: 2800, dur: 1250, hold: true },
     ],
   },
 ];
@@ -285,42 +291,83 @@ if (vineSub) { vineSub.style.strokeDasharray = `${vineSubLen}`; vineSub.style.st
 let chapterIdx = 0;
 let storyPlaying = true;
 let storyTimer = null;
-let orbRaf = null;
+let pktRaf = null;
 
-function animateOrbs(orbSpecs) {
-  if (orbRaf) cancelAnimationFrame(orbRaf);
-  const orbEls = [document.getElementById("orb1"), document.getElementById("orb2"), document.getElementById("orb3")];
-  orbEls.forEach((el) => el.classList.remove("show", "amber", "coral", "moss"));
-  if (!orbSpecs.length || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+function easeInOutCubic(t) {
+  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+}
 
-  const active = orbSpecs.slice(0, 3).map((spec, idx) => ({
-    el: orbEls[idx],
-    path: document.getElementById(spec.path),
-    reverse: spec.reverse,
-    offset: idx * 0.34,
-    cls: spec.cls,
-  })).filter((item) => item.el && item.path);
+/**
+ * Plays ONE-SHOT sequential labeled message packets along the exact SVG paths
+ * (no continuous looping dots!). Optional `hold: true` gently rests the final packet
+ * near the midpoint/arrival for readability once its hop completes.
+ */
+function playWirePackets(specs) {
+  if (pktRaf) cancelAnimationFrame(pktRaf);
+  const host = document.getElementById("wirePackets");
+  if (!host) return;
+  host.innerHTML = "";
+  if (!specs || !specs.length) return;
 
-  active.forEach((item) => {
-    item.el.classList.add("show");
-    if (item.cls) item.el.classList.add(item.cls);
-  });
+  const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  const items = specs.map((spec) => {
+    const path = document.getElementById(spec.path);
+    if (!path) return null;
+    const el = document.createElement("div");
+    el.className = `wire-pkt ${spec.cls || ""}`.trim();
+    el.innerHTML = `<span class="pkt-dot"></span><span>${esc(spec.label)}</span>`;
+    host.appendChild(el);
+    return { ...spec, el, path, len: path.getTotalLength() };
+  }).filter(Boolean);
 
-  const t0 = performance.now();
-  const dur = 2500;
-  function frame(now) {
-    const u = (now - t0) / dur;
-    for (const item of active) {
-      const raw = (u + item.offset) % 1;
-      const t = item.reverse ? 1 - raw : raw;
-      const len = item.path.getTotalLength();
-      const pt = item.path.getPointAtLength(len * t);
-      item.el.setAttribute("cx", pt.x.toFixed(1));
-      item.el.setAttribute("cy", pt.y.toFixed(1));
+  if (reduced) {
+    // Show held/final packet cleanly at path midpoint
+    const last = items.find((i) => i.hold) || items[items.length - 1];
+    if (last) {
+      const pt = last.path.getPointAtLength(last.len * 0.5);
+      last.el.style.left = `${(pt.x / 1200) * 100}%`;
+      last.el.style.top = `${(pt.y / 580) * 100}%`;
+      last.el.style.opacity = "1";
+      last.el.style.transform = "translate(-50%, -50%) scale(1)";
     }
-    orbRaf = requestAnimationFrame(frame);
+    return;
   }
-  orbRaf = requestAnimationFrame(frame);
+
+  const startTime = performance.now();
+  function tick(now) {
+    const elapsed = now - startTime;
+    let anyPending = false;
+
+    for (const item of items) {
+      const local = elapsed - item.delay;
+      if (local < 0) {
+        anyPending = true;
+        item.el.style.opacity = "0";
+        continue;
+      }
+      const raw = Math.min(1, local / item.dur);
+      if (raw < 1) anyPending = true;
+
+      // For held final message, settle gently at 56% along the wire so the label stays readable
+      const targetEnd = item.hold ? 0.56 : 0.96;
+      const travel = easeInOutCubic(raw) * targetEnd;
+      const t = item.reverse ? 1 - travel : travel;
+      const pt = item.path.getPointAtLength(item.len * t);
+
+      item.el.style.left = `${(pt.x / 1200) * 100}%`;
+      item.el.style.top = `${(pt.y / 580) * 100}%`;
+
+      let opacity = 1;
+      if (raw < 0.14) opacity = raw / 0.14;
+      else if (!item.hold && raw > 0.82) opacity = Math.max(0, (1 - raw) / 0.18);
+
+      item.el.style.opacity = opacity.toFixed(2);
+      item.el.style.transform = `translate(-50%, -50%) scale(${(0.88 + 0.12 * Math.min(1, raw * 4)).toFixed(3)})`;
+    }
+
+    if (anyPending) pktRaf = requestAnimationFrame(tick);
+  }
+  pktRaf = requestAnimationFrame(tick);
 }
 
 function updateVineProgress() {
@@ -420,7 +467,7 @@ function renderChapter() {
     });
   });
 
-  animateOrbs(ch.orbs);
+  playWirePackets(ch.packets);
 }
 
 function resetStoryTimer() {
