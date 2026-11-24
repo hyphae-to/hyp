@@ -292,6 +292,10 @@ pub struct NodeConfig {
     pub escalation: EscalationConfig,
     /// Opt-in self-service `guest-ro` pairing policy (`POST /v1/guest/pair`; default disabled).
     pub guest_pairing: GuestPairingConfig,
+    /// Opt-in RAM-only Blind Ephemeral Drop Relay configuration (default: disabled).
+    pub drop_relay: crate::engine::drop_relay::DropRelayConfig,
+    /// Optional external blind drop relay base URL configured for this node (default: `None`).
+    pub drop_relay_url: Option<String>,
     pub peers: Vec<PeerConfig>,
     pub topics: Vec<TopicConfig>,
     pub kv_namespaces: Vec<KvNamespaceConfig>,
@@ -328,6 +332,8 @@ impl NodeConfig {
             forwarding: ForwardingPolicy::default(),
             escalation: EscalationConfig::default(),
             guest_pairing: GuestPairingConfig::default(),
+            drop_relay: crate::engine::drop_relay::DropRelayConfig::default(),
+            drop_relay_url: None,
             peers: Vec::new(),
             topics: Vec::new(),
             kv_namespaces: Vec::new(),
@@ -457,6 +463,9 @@ pub enum NodeError {
 
     #[error("payload too large: {0}")]
     PayloadTooLarge(String),
+
+    #[error("drop relay error: {0}")]
+    DropRelay(#[from] crate::engine::drop_relay::DropRelayError),
 
     #[error("http transport error: {0}")]
     Http(String),
@@ -605,6 +614,7 @@ impl NodeError {
                 e.to_string(),
             ),
             Self::Store(err) => store_error_to_problem(err),
+            Self::DropRelay(err) => err.to_problem_details(),
             Self::Http(msg) => ProblemDetails::new(
                 "bad_gateway",
                 "bad-gateway",

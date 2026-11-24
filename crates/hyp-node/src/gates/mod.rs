@@ -27,7 +27,7 @@ pub use policy::{
     GateDecision, GateError, InboundContext, LlmProvider, MAX_POLICY_NOTES_CHARS,
     MAX_VERDICT_REASON_CHARS, OutboundContext, RateLimitAction, RateLimitConfig,
     SecurityGateConfig, Stage1Config, Stage1DenyAction, Stage2Config, Stage2ErrorAction,
-    Stage2Matchers, TierDeliveryAction, TierPolicy, TokenBucket, TrustTier,
+    Stage2Matchers, TierDeliveryAction, TierPolicy, TokenBucket, TrustTier, VerifiedHumanClaim,
     default_stage2_policy_prompt, ensure_policy_signing_key, format_quarantine_notice,
     sign_gate_policy, verify_gate_policy_sig,
 };

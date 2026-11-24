@@ -39,7 +39,13 @@ use hyp_crypto::e2ee::{
     open_channel_message, open_dm, open_epoch_bundle, open_kv_entry, rotate_epoch_bundle,
     seal_channel_message, seal_dm, seal_kv_entry,
 };
+use hyp_crypto::human::{
+    HumanDropEnvelopeV1, HumanDropKind, HumanRevocationPayloadV1, NodeCertPayloadV1,
+    SignedHumanRevocationV1, SignedNodeCertV1, decode_hdrop1, encode_hcert1,
+    is_reserved_secret_name, open_human_drop, sign_node_cert, verify_human_revocation,
+};
 use hyp_crypto::jcs::to_canonical_json;
+use hyp_crypto::keystore::validate_secret_name;
 use hyp_crypto::pairing::{
     AdminInviteV2, GrantV2, P2P_SECRET_BYTES, P2pOfferToken, P2pPairConfirmation, P2pPairResponse,
     create_p2p_confirmation, create_p2p_offer, create_p2p_response, decode_am2, decode_hp2p1,
@@ -61,6 +67,7 @@ use hyp_proto::address::{
 };
 use hyp_proto::cloudevent::{
     CONTENT_TYPE_E2EE_JSON, CONTENT_TYPE_JSON, CloudEvent as ProtoCloudEvent, ProvenanceError,
+    TYPE_HUMAN_DROP_V1, TYPE_HUMAN_SECRET_STORED_V1,
 };
 use hyp_proto::filter::{
     DiagnosticSeverity, Filter as ProtoFilter, LocalSubscription, ObservedTopicStats,
@@ -74,12 +81,14 @@ use hyp_proto::manifest::{
 use hyp_proto::problem::ProblemDetails;
 use hyp_proto::scopes::{ScopePreset, ScopeSet, expand_v2_scopes, extract_confined_values};
 use hyp_store::{
-    AckOutcome, ChannelEpoch, ChannelEpochInput, DeliveryMode, DueBatch,
-    EnqueueMessage, GateState, GrantDirection, GrantInput, GrantRecord, HandleRecord, IngestResult,
-    KeyStatus, KeyUse, KvDeleteInput, KvDeleteResult, KvEntry, KvEpoch, KvEpochInput, KvSetInput,
-    MailboxEntry, MailboxInsert, MailboxKind, MailboxPutResult, ManifestCacheUpdate, MessageRecord,
-    NodeDb, PeerInput, PeerKeyInput, PeerRecord, PeerStatus, PostChannelInput, PostChannelResult,
-    Session, Subscription, SubscriptionSpec, TransferRecord, TransferSubmit, TrustTier,
+    AckOutcome, ChannelEpoch, ChannelEpochInput, DeliveryMode, DueBatch, EnqueueMessage,
+    FiredWakeup, GateAuditInput, GateDecision as StoreGateDecision, GateDirection, GateState,
+    GrantDirection, GrantInput, GrantRecord, HandleRecord, HumanAuthorityRecord,
+    HumanAuthorityRole, HumanClaimKind, HumanNodeCertInput, IngestResult, KeyStatus, KeyUse,
+    KvDeleteInput, KvDeleteResult, KvEntry, KvEpoch, KvEpochInput, KvSetInput, MailboxEntry,
+    MailboxInsert, MailboxKind, MailboxPutResult, ManifestCacheUpdate, MessageRecord, NodeDb,
+    PeerInput, PeerKeyInput, PeerRecord, PeerStatus, PostChannelInput, PostChannelResult, Session,
+    Subscription, SubscriptionSpec, TransferRecord, TransferSubmit, TrustTier,
     UpstreamPushdownInput, WriteModel, format_address, now_ms, parse_address, sha256_hex, uuid_v4,
 };
 
@@ -93,8 +102,13 @@ use crate::engine::config::{
     proto_ce_to_store, proto_filter_to_store, proto_jwk_to_crypto, store_ce_to_proto,
     store_filter_to_proto,
 };
+use crate::engine::drop_relay::DropRelay;
 use crate::engine::http_util::{
     HttpClient, compute_etag, full_body,
+};
+use crate::gates::{
+    GateDecision, InboundContext, SecurityGatePipeline, TrustTier as GateTrustTier,
+    VerifiedHumanClaim,
 };
 use crate::engine::peer_link::{
     ChannelDirectoryEntry, ChannelJoinResponse, ChannelPostRequest, GuestPairReply,
@@ -202,6 +216,30 @@ pub struct SubscribeResult {
     pub pushdown_shards: usize,
 }
 
+/// Metadata-only result returned by [`UnifiedNode::ingest_human_drop`].
+///
+/// **Zero-leak invariant:** Never contains secret payload bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IngestedHumanDrop {
+    pub claim_id: String,
+    pub human_id: String,
+    pub kid: String,
+    pub role: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_handle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mailbox_receipt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_seq: Option<i64>,
+    pub downgraded_to_notify: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ManifestWindow {
     version: u64,
@@ -214,6 +252,7 @@ pub struct UnifiedNode {
     identity: Arc<NodeIdentityKeys>,
     secrets: SecretStore,
     db: Mutex<NodeDb>,
+    drop_relay: Arc<DropRelay>,
     http_client: HttpClient,
     bound_addr: Mutex<Option<SocketAddr>>,
     manifest_window: Mutex<ManifestWindow>,
@@ -229,6 +268,7 @@ pub struct UnifiedNode {
     sse_tasks: Mutex<HashMap<String, JoinHandle<()>>>,
     inbox_tx: broadcast::Sender<String>,
     local_inbox_tx: broadcast::Sender<String>,
+    wakeups_tx: broadcast::Sender<FiredWakeup>,
     in_flight_by_peer: Mutex<HashMap<String, HashSet<String>>>,
     scheduler_notify: Arc<Notify>,
     shutdown_tx: watch::Sender<bool>,
@@ -295,8 +335,12 @@ impl UnifiedNode {
         );
 
         let http_client = HttpClient::new()?;
+        let drop_relay = Arc::new(
+            DropRelay::new(config.drop_relay.clone()).with_local_node_id(config.node_id.as_str()),
+        );
         let (inbox_tx, _) = broadcast::channel(256);
         let (local_inbox_tx, _) = broadcast::channel(256);
+        let (wakeups_tx, _) = broadcast::channel(256);
         let (shutdown_tx, _) = watch::channel(false);
 
         let node = Arc::new(Self {
@@ -304,6 +348,7 @@ impl UnifiedNode {
             identity,
             secrets,
             db: Mutex::new(db),
+            drop_relay,
             http_client,
             bound_addr: Mutex::new(None),
             manifest_window: Mutex::new(ManifestWindow::default()),
@@ -319,6 +364,7 @@ impl UnifiedNode {
             sse_tasks: Mutex::new(HashMap::new()),
             inbox_tx,
             local_inbox_tx,
+            wakeups_tx,
             in_flight_by_peer: Mutex::new(HashMap::new()),
             scheduler_notify: Arc::new(Notify::new()),
             shutdown_tx,
@@ -353,7 +399,11 @@ impl UnifiedNode {
                     if report.events.batches_closed > 0 {
                         node.notify_all_inbox_subscribers();
                     }
+                    for fired in &report.wakeups_fired {
+                        let _ = node.wakeups_tx.send(fired.clone());
+                    }
                 }
+                node.drop_relay.sweep_expired(now);
 
                 let next_deadline = step.1.ok().flatten();
                 match next_deadline {
@@ -474,6 +524,14 @@ impl UnifiedNode {
         &self.identity
     }
 
+    pub fn secret_store(&self) -> &SecretStore {
+        &self.secrets
+    }
+
+    pub fn drop_relay(&self) -> Arc<DropRelay> {
+        Arc::clone(&self.drop_relay)
+    }
+
     pub fn db(&self) -> MutexGuard<'_, NodeDb> {
         self.db.lock().expect("NodeDb mutex poisoned")
     }
@@ -511,6 +569,16 @@ impl UnifiedNode {
     /// Subscribes to zero-polling wakeups when new items land in any local session mailbox.
     pub fn subscribe_local_inbox(&self) -> broadcast::Receiver<String> {
         self.local_inbox_tx.subscribe()
+    }
+
+    /// Subscribes to fired scheduled wakeup events emitted by the zero-polling scheduler loop.
+    pub fn subscribe_fired_wakeups(&self) -> broadcast::Receiver<FiredWakeup> {
+        self.wakeups_tx.subscribe()
+    }
+
+    /// Immediately wakes the background zero-polling deadline scheduler loop.
+    pub fn wake_scheduler(&self) {
+        self.scheduler_notify.notify_one();
     }
 
     pub(crate) fn notify_scheduler(&self) {
@@ -1032,7 +1100,7 @@ impl UnifiedNode {
                 kid,
                 admin_jwk: self.config.admin_jwk.clone(),
             },
-            capabilities: self.config.advertised_capabilities(),
+            capabilities: self.effective_capabilities(),
             policy: ManifestPolicy {
                 require_pairing: self.config.require_pairing,
                 require_e2ee: self.config.e2ee_policy == E2eePolicy::Required,
@@ -1060,6 +1128,26 @@ impl UnifiedNode {
         Ok((signed, payload, etag))
     }
 
+    fn effective_capabilities(&self) -> Vec<CapabilityToken> {
+        let mut caps = self.config.advertised_capabilities();
+        if self.config.capabilities_override.is_none() {
+            let has_human_authorities = {
+                let db = self.db();
+                db.human()
+                    .list_authorities(false)
+                    .map(|list| !list.is_empty())
+                    .unwrap_or(false)
+            };
+            if has_human_authorities && !caps.contains(&CapabilityToken::HumanAuthV1) {
+                caps.push(CapabilityToken::HumanAuthV1);
+            }
+            if self.config.drop_relay.enabled && !caps.contains(&CapabilityToken::DropRelayV1) {
+                caps.push(CapabilityToken::DropRelayV1);
+            }
+        }
+        caps
+    }
+
     fn local_capabilities_view(&self) -> PeerCapabilitiesView {
         PeerCapabilitiesView {
             node_id: self.config.node_id.clone(),
@@ -1068,11 +1156,7 @@ impl UnifiedNode {
             manifest_version: self.current_manifest_version().ok(),
             audience: None,
             expires_at: None,
-            capabilities: self
-                .config
-                .advertised_capabilities()
-                .into_iter()
-                .collect(),
+            capabilities: self.effective_capabilities().into_iter().collect(),
             require_e2ee: self.config.e2ee_policy == E2eePolicy::Required,
             is_legacy_v1: false,
         }
@@ -1334,10 +1418,25 @@ impl UnifiedNode {
 
             let peer = {
                 let db = self.db();
-                let peer = load_active_authenticated_peer(&db, peer_id)?;
-                let signing_pk = lookup_peer_signing_key_in_db(&db, peer_id)?.ok_or_else(|| {
-                    NodeError::Unauthorized(format!("no pinned signing key for peer '{peer_id}'"))
-                })?;
+                let (peer, signing_pk) = if peer_id == self.config.node_id.as_str() {
+                    (
+                        AuthenticatedPeer {
+                            peer_id: self.config.node_id.to_string(),
+                            scopes: ScopeSet::from_strings(&["*"]),
+                            trust_tier: TrustTier::SelfNode,
+                        },
+                        self.identity.signing.public_key(),
+                    )
+                } else {
+                    let peer = load_active_authenticated_peer(&db, peer_id)?;
+                    let signing_pk =
+                        lookup_peer_signing_key_in_db(&db, peer_id)?.ok_or_else(|| {
+                            NodeError::Unauthorized(format!(
+                                "no pinned signing key for peer '{peer_id}'"
+                            ))
+                        })?;
+                    (peer, signing_pk)
+                };
                 let signing_input =
                     http_auth_signing_input(method, path_and_query, ts, nonce, body_sha256);
                 signing_pk
@@ -5542,6 +5641,531 @@ impl UnifiedNode {
         self.notify_scheduler();
         Ok(())
     }
+
+    // ========================================================================
+    // Verified Human Drops (`human.drop.v1` / `hdrop1_`), Zero-Knowledge Secret
+    // Sink, Human Key Revocation & Signed Node Certificates (`hcert1_`)
+    // ========================================================================
+
+    /// Decodes an armored `hdrop1_` token and ingests it via [`UnifiedNode::ingest_human_drop`].
+    pub async fn ingest_human_drop_token(
+        &self,
+        token: &str,
+        gate: Option<&SecurityGatePipeline>,
+        overwrite_secret: bool,
+    ) -> Result<IngestedHumanDrop, NodeError> {
+        let envelope = decode_hdrop1(token)
+            .map_err(|e| NodeError::Unauthorized(format!("invalid hdrop1_ token: {e}")))?;
+        self.ingest_human_drop(&envelope, gate, overwrite_secret)
+            .await
+    }
+
+    /// Strictly opens, verifies, replay-guards, and ingests a sealed [`HumanDropEnvelopeV1`]:
+    ///
+    /// - Fails closed if `gate` reports `is_policy_tampered() == true`.
+    /// - Decrypts Mode B HPKE (`human.drop.v1`) with this node's X25519 key, verifies the inner
+    ///   Ed25519 signature against an active authority in `human_authorities`, enforces audience
+    ///   (`nodeId`, `nodeEncKid`), monotonic `min_auth_epoch`, TTL (`<= 15m`), clock skew (`60s`),
+    ///   and single-use atomic `claim_id` nonce consumption.
+    /// - **`HumanDropKind::Secret`**: writes directly to [`SecretStore`] after reserved-name and
+    ///   overwrite checks; **zero** secret bytes ever touch SQLite, logs, errors, or return values;
+    ///   delivers a metadata-only notice to the target local session and records a `human_authority`
+    ///   audit row.
+    /// - **`HumanDropKind::Directive`**: delivers with [`GateTrustTier::HumanVerified`] through
+    ///   `gate` (bypassing Stage 2 / untrusted regexes while preserving anti-tamper & rate/size
+    ///   limits) or directly into `mailbox` + `gate_audit` when `gate` is `None`.
+    pub async fn ingest_human_drop(
+        &self,
+        envelope: &HumanDropEnvelopeV1,
+        gate: Option<&SecurityGatePipeline>,
+        overwrite_secret: bool,
+    ) -> Result<IngestedHumanDrop, NodeError> {
+        if let Some(g) = gate {
+            if g.is_policy_tampered() {
+                return Err(NodeError::Unauthorized("gate_policy_tampered".into()));
+            }
+        }
+
+        let now = now_ms();
+        let mut matched_authority: Option<HumanAuthorityRecord> = None;
+        let claim = Zeroizing::new(
+            open_human_drop(
+                envelope,
+                &self.identity.encryption,
+                self.node_id().as_str(),
+                now,
+                |human_id, human_kid| {
+                    let db = self.db();
+                    let min_epoch = db.human().min_auth_epoch().ok()?;
+                    let rec = db.human().get_active_authority_by_kid(human_kid).ok()??;
+                    if rec.human_id != human_id {
+                        return None;
+                    }
+                    let jwk: CryptoOkpJwk = serde_json::from_str(&rec.jwk_json).ok()?;
+                    let pk = jwk.to_ed25519().ok()?;
+                    matched_authority = Some(rec);
+                    Some((pk, min_epoch))
+                },
+            )
+            .map_err(|e| NodeError::Unauthorized(format!("human drop verification failed: {e}")))?,
+        );
+
+        let auth_rec = matched_authority.ok_or_else(|| {
+            NodeError::Unauthorized("verified human authority record unavailable".into())
+        })?;
+
+        let issued_at_ms = parse_rfc3339_millis(&claim.issued_at)
+            .map_err(|e| NodeError::BadRequest(format!("invalid claim issuedAt: {e}")))?;
+        let expires_at_ms = parse_rfc3339_millis(&claim.expires_at)
+            .map_err(|e| NodeError::BadRequest(format!("invalid claim expiresAt: {e}")))?;
+
+        let target_handle = claim.audience.handle.clone();
+        let target_session = self.resolve_human_drop_target_session(target_handle.as_deref())?;
+        let kid8: String = auth_rec.kid.chars().take(8).collect();
+        let source = format!("human:{}:{}", auth_rec.human_id, kid8);
+
+        let verified_claim = VerifiedHumanClaim {
+            human_id: auth_rec.human_id.clone(),
+            kid: auth_rec.kid.clone(),
+            role: auth_rec.role.as_str().to_string(),
+            claim_id: claim.claim_id.clone(),
+            issued_at_ms,
+            expires_at_ms,
+            kind: claim.kind.as_str().to_string(),
+        };
+
+        match claim.kind {
+            HumanDropKind::Secret => {
+                let spec = claim.secret_spec.as_ref().ok_or_else(|| {
+                    NodeError::BadRequest("secret drop claim missing secretSpec".into())
+                })?;
+                let secret_name = spec.name.trim();
+                if secret_name.is_empty() {
+                    return Err(NodeError::BadRequest(
+                        "secret drop name must not be empty".into(),
+                    ));
+                }
+                if is_reserved_human_drop_secret_name(secret_name) {
+                    return Err(NodeError::Unauthorized(format!(
+                        "reserved system secret name '{secret_name}' cannot be written via human drop"
+                    )));
+                }
+                validate_secret_name(secret_name)
+                    .map_err(|e| NodeError::BadRequest(format!("invalid secret name: {e}")))?;
+
+                let allow_overwrite = overwrite_secret || spec.overwrite;
+                if !allow_overwrite && self.secrets.get(secret_name).is_ok() {
+                    return Err(NodeError::Conflict(format!(
+                        "secret '{secret_name}' already exists; pass overwrite to replace"
+                    )));
+                }
+
+                // Atomically consume single-use claim nonce before writing to SecretStore.
+                let fresh = {
+                    let db = self.db();
+                    db.human().consume_claim_nonce(
+                        &claim.claim_id,
+                        &auth_rec.kid,
+                        HumanClaimKind::Secret,
+                        expires_at_ms,
+                        now,
+                    )?
+                };
+                if !fresh {
+                    return Err(NodeError::Unauthorized(
+                        "human drop claim replay detected".into(),
+                    ));
+                }
+
+                // Zero-knowledge secret sink: write directly to SecretStore; NEVER persist secret
+                // bytes into SQLite (`mailbox`, `gate_audit`, `events`), logs, errors, or replies.
+                let secret_val = Zeroizing::new(claim.body.clone());
+                self.secrets.set(secret_name, &secret_val)?;
+
+                let auth_json = serde_json::to_string(&verified_claim)?;
+                let notice_body = format!(
+                    "Secret '{secret_name}' stored in SecretStore by verified human '{}' (key {kid8}). Reference by name only.",
+                    auth_rec.human_id
+                );
+
+                let (mailbox_receipt, audit_seq) = {
+                    let db = self.db();
+                    let put_res = db.local().put_in_mailbox(
+                        &MailboxInsert {
+                            session_id: target_session.clone(),
+                            origin_node: self.node_id().to_string(),
+                            item_id: format!("human-secret:{}", claim.claim_id),
+                            text: notice_body,
+                            kind: MailboxKind::Event,
+                            source: source.clone(),
+                            gate_state: GateState::Pending,
+                            gate_reason: None,
+                            traceparent: None,
+                        },
+                        now,
+                    )?;
+                    let receipt = match put_res {
+                        MailboxPutResult::Stored { receipt } => {
+                            let _ = db.human().set_mailbox_human_auth(&receipt, &auth_json)?;
+                            Some(receipt)
+                        }
+                        MailboxPutResult::Duplicate | MailboxPutResult::QueueFull => None,
+                    };
+                    let seq = db.local().append_gate_audit(
+                        &GateAuditInput {
+                            direction: GateDirection::Inbound,
+                            stage: "human_authority".to_string(),
+                            decision: StoreGateDecision::Allow,
+                            origin_node: Some(self.node_id().to_string()),
+                            source: Some(source.clone()),
+                            session_id: Some(target_session.clone()),
+                            receipt_id: receipt.clone(),
+                            event_type: Some(TYPE_HUMAN_SECRET_STORED_V1.to_string()),
+                            trust_tier: Some("human-verified".to_string()),
+                            confidence: Some(1.0),
+                            categories: vec![
+                                "gate.allowed".to_string(),
+                                "human.verified".to_string(),
+                                "human.secret_stored".to_string(),
+                            ],
+                            reason: None,
+                            traceparent: None,
+                            payload_sha256: sha256_hex(b"redacted-secret"),
+                            reviewer: Some(source),
+                        },
+                        now,
+                    )?;
+                    (receipt, seq)
+                };
+
+                self.notify_local_session(&target_session);
+                self.notify_scheduler();
+
+                Ok(IngestedHumanDrop {
+                    claim_id: claim.claim_id.clone(),
+                    human_id: auth_rec.human_id,
+                    kid: auth_rec.kid,
+                    role: auth_rec.role.as_str().to_string(),
+                    kind: claim.kind.as_str().to_string(),
+                    target_handle,
+                    target_session: Some(target_session),
+                    secret_name: Some(secret_name.to_string()),
+                    mailbox_receipt,
+                    audit_seq: Some(audit_seq),
+                    downgraded_to_notify: false,
+                })
+            }
+            HumanDropKind::Directive => {
+                // Atomically consume single-use claim nonce before routing directive.
+                let fresh = {
+                    let db = self.db();
+                    db.human().consume_claim_nonce(
+                        &claim.claim_id,
+                        &auth_rec.kid,
+                        HumanClaimKind::Directive,
+                        expires_at_ms,
+                        now,
+                    )?
+                };
+                if !fresh {
+                    return Err(NodeError::Unauthorized(
+                        "human drop claim replay detected".into(),
+                    ));
+                }
+
+                let body = claim.body.clone();
+                let ce = ProtoCloudEvent::new(
+                    format!("human-drop:{}", claim.claim_id),
+                    source.clone(),
+                    TYPE_HUMAN_DROP_V1,
+                    json!({
+                        "text": body,
+                        "humanId": auth_rec.human_id,
+                        "kid": auth_rec.kid,
+                        "role": auth_rec.role.as_str(),
+                        "claimId": claim.claim_id,
+                    }),
+                );
+
+                if let Some(g) = gate {
+                    let ctx = InboundContext {
+                        session_id: target_session.clone(),
+                        origin_node: self.node_id().to_string(),
+                        sender: source,
+                        trust_tier: GateTrustTier::HumanVerified,
+                        e2ee_verified: true,
+                        identity_verified: true,
+                        kind: MailboxKind::Message,
+                        channel: None,
+                        topic: None,
+                        bridge: None,
+                        event: ce,
+                        transfer_paths: Vec::new(),
+                        rendered_text: Some(body),
+                        human_auth: Some(verified_claim),
+                    };
+                    let eval = g
+                        .evaluate_inbound(&ctx, now)
+                        .await
+                        .map_err(|e| NodeError::Unauthorized(format!("security gate error: {e}")))?;
+                    match eval.decision {
+                        GateDecision::Allow {
+                            downgraded_to_notify,
+                        } => {
+                            self.notify_local_session(&target_session);
+                            self.notify_scheduler();
+                            Ok(IngestedHumanDrop {
+                                claim_id: claim.claim_id.clone(),
+                                human_id: auth_rec.human_id,
+                                kid: auth_rec.kid,
+                                role: auth_rec.role.as_str().to_string(),
+                                kind: claim.kind.as_str().to_string(),
+                                target_handle,
+                                target_session: Some(target_session),
+                                secret_name: None,
+                                mailbox_receipt: eval.receipt,
+                                audit_seq: eval.audit_seq,
+                                downgraded_to_notify,
+                            })
+                        }
+                        GateDecision::Hold {
+                            reason,
+                            retry_after_ms,
+                        } => Err(NodeError::RateLimited {
+                            detail: reason,
+                            retry_after_secs: Some((retry_after_ms.saturating_add(999) / 1_000).max(1)),
+                        }),
+                        GateDecision::Block { reason } | GateDecision::Quarantine { reason, .. } => {
+                            Err(NodeError::Unauthorized(reason))
+                        }
+                    }
+                } else {
+                    let auth_json = serde_json::to_string(&verified_claim)?;
+                    let (mailbox_receipt, audit_seq) = {
+                        let db = self.db();
+                        let put_res = db.local().put_in_mailbox(
+                            &MailboxInsert {
+                                session_id: target_session.clone(),
+                                origin_node: self.node_id().to_string(),
+                                item_id: format!("human-drop:{}", claim.claim_id),
+                                text: body.clone(),
+                                kind: MailboxKind::Message,
+                                source: source.clone(),
+                                gate_state: GateState::Pending,
+                                gate_reason: None,
+                                traceparent: None,
+                            },
+                            now,
+                        )?;
+                        let receipt = match put_res {
+                            MailboxPutResult::Stored { receipt } => {
+                                let _ = db.human().set_mailbox_human_auth(&receipt, &auth_json)?;
+                                Some(receipt)
+                            }
+                            MailboxPutResult::Duplicate => None,
+                            MailboxPutResult::QueueFull => {
+                                return Err(NodeError::RateLimited {
+                                    detail: "local_inbox_full".into(),
+                                    retry_after_secs: Some(5),
+                                });
+                            }
+                        };
+                        let seq = db.local().append_gate_audit(
+                            &GateAuditInput {
+                                direction: GateDirection::Inbound,
+                                stage: "human_authority".to_string(),
+                                decision: StoreGateDecision::Allow,
+                                origin_node: Some(self.node_id().to_string()),
+                                source: Some(source.clone()),
+                                session_id: Some(target_session.clone()),
+                                receipt_id: receipt.clone(),
+                                event_type: Some(TYPE_HUMAN_DROP_V1.to_string()),
+                                trust_tier: Some("human-verified".to_string()),
+                                confidence: Some(1.0),
+                                categories: vec![
+                                    "gate.allowed".to_string(),
+                                    "human.verified".to_string(),
+                                ],
+                                reason: None,
+                                traceparent: None,
+                                payload_sha256: sha256_hex(body.as_bytes()),
+                                reviewer: Some(source),
+                            },
+                            now,
+                        )?;
+                        (receipt, seq)
+                    };
+
+                    self.notify_local_session(&target_session);
+                    self.notify_scheduler();
+
+                    Ok(IngestedHumanDrop {
+                        claim_id: claim.claim_id.clone(),
+                        human_id: auth_rec.human_id,
+                        kid: auth_rec.kid,
+                        role: auth_rec.role.as_str().to_string(),
+                        kind: claim.kind.as_str().to_string(),
+                        target_handle,
+                        target_session: Some(target_session),
+                        secret_name: None,
+                        mailbox_receipt,
+                        audit_seq: Some(audit_seq),
+                        downgraded_to_notify: false,
+                    })
+                }
+            }
+        }
+    }
+
+    /// Verifies and applies a signed human authority key revocation, requiring an active `admin`
+    /// issuer key and monotonically advancing `min_auth_epoch` in `NodeDb`.
+    pub fn ingest_human_revocation(
+        &self,
+        signed: &SignedHumanRevocationV1,
+    ) -> Result<(), NodeError> {
+        let preview: HumanRevocationPayloadV1 = serde_json::from_str(&signed.payload)?;
+        let issuer = {
+            let db = self.db();
+            db.human().get_active_authority_by_kid(&preview.issuer_kid)?
+        }
+        .ok_or_else(|| {
+            NodeError::Unauthorized(format!(
+                "unknown or inactive human revocation issuer kid '{}'",
+                preview.issuer_kid
+            ))
+        })?;
+
+        if issuer.role != HumanAuthorityRole::Admin {
+            return Err(NodeError::Unauthorized(format!(
+                "human authority '{}' kid '{}' does not have admin role required for revocation",
+                issuer.human_id, issuer.kid
+            )));
+        }
+
+        let jwk: CryptoOkpJwk = serde_json::from_str(&issuer.jwk_json)?;
+        let issuer_pk = jwk.to_ed25519()?;
+        let verified = verify_human_revocation(signed, &issuer_pk).map_err(|e| {
+            NodeError::Unauthorized(format!("human revocation signature verification failed: {e}"))
+        })?;
+
+        let signed_json = serde_json::to_string(signed)?;
+        let db = self.db();
+        let _ = db.human().revoke_authority_monotonic(
+            &verified.human_id,
+            &verified.revoked_kid,
+            verified.new_min_auth_epoch,
+            &signed_json,
+            now_ms(),
+        )?;
+        Ok(())
+    }
+
+    /// Signs, persists, and armors (`hcert1_`) a [`SignedNodeCertV1`] binding this node's Ed25519
+    /// and X25519 public keys under an active enrolled `admin` human authority key.
+    pub fn issue_node_cert(
+        &self,
+        admin_kp: &Ed25519KeyPair,
+        admin_kid: &str,
+        ttl_days: u32,
+    ) -> Result<(SignedNodeCertV1, String), NodeError> {
+        if ttl_days == 0 {
+            return Err(NodeError::BadRequest("ttl_days must be >= 1".into()));
+        }
+        if admin_kp.kid() != admin_kid {
+            return Err(NodeError::Unauthorized(
+                "admin keypair kid does not match admin_kid".into(),
+            ));
+        }
+
+        let (admin, min_epoch) = {
+            let db = self.db();
+            let rec = db.human().get_active_authority_by_kid(admin_kid)?;
+            let min_epoch = db.human().min_auth_epoch()?;
+            (rec, min_epoch)
+        };
+        let admin = admin.ok_or_else(|| {
+            NodeError::Unauthorized(format!(
+                "unknown or inactive admin authority kid '{admin_kid}'"
+            ))
+        })?;
+        if admin.role != HumanAuthorityRole::Admin {
+            return Err(NodeError::Unauthorized(format!(
+                "human authority '{}' kid '{admin_kid}' does not have admin role",
+                admin.human_id
+            )));
+        }
+
+        let now = now_ms();
+        let ttl_ms = i64::from(ttl_days).saturating_mul(86_400_000);
+        let expires_at_ms = now.saturating_add(ttl_ms);
+        let auth_epoch = admin.auth_epoch.max(min_epoch);
+
+        let payload = NodeCertPayloadV1 {
+            v: 1,
+            node_id: self.node_id().to_string(),
+            signing_jwk: self.identity.signing_jwk(),
+            encryption_jwk: self.identity.encryption_jwk(),
+            human_id: admin.human_id,
+            human_kid: admin_kid.to_string(),
+            auth_epoch,
+            issued_at: format_rfc3339_millis(now),
+            expires_at: format_rfc3339_millis(expires_at_ms),
+        };
+        let signed = sign_node_cert(&payload, admin_kp)?;
+        let armored = encode_hcert1(&signed)?;
+
+        {
+            let db = self.db();
+            let signed_json = serde_json::to_string(&signed)?;
+            let _ = db.human().put_node_cert(&HumanNodeCertInput {
+                node_id: self.node_id().to_string(),
+                human_kid: admin_kid.to_string(),
+                auth_epoch,
+                signed_json,
+                issued_at: now,
+                expires_at: expires_at_ms,
+            })?;
+        }
+
+        Ok((signed, armored))
+    }
+
+    fn resolve_human_drop_target_session(
+        &self,
+        target_handle: Option<&str>,
+    ) -> Result<String, NodeError> {
+        let db = self.db();
+        if let Some(handle) = target_handle {
+            if let Some(sess) = db.local().session_by_handle(handle)? {
+                return Ok(sess.id);
+            }
+            let handles = db.messages().list_handles(Some(self.node_id().as_str()))?;
+            if let Some(rec) = handles.into_iter().find(|h| h.handle == handle) {
+                if let Some(sid) = rec.session_id {
+                    return Ok(sid);
+                }
+            }
+            if let Some(sess) = db.local().get_session(handle)? {
+                return Ok(sess.id);
+            }
+            return Ok(handle.to_string());
+        }
+        let sessions = db.local().list_sessions()?;
+        if let Some(first) = sessions.first() {
+            return Ok(first.id.clone());
+        }
+        Ok(LOCAL_NODE_ID.to_string())
+    }
+}
+
+fn is_reserved_human_drop_secret_name(name: &str) -> bool {
+    if is_reserved_secret_name(name) {
+        return true;
+    }
+    let lower = name.trim().to_ascii_lowercase();
+    lower.starts_with("node-ed25519-")
+        || lower.starts_with("node-x25519-")
+        || lower.starts_with("peer-auth-")
 }
 
 // ============================================================================

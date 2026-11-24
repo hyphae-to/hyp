@@ -16,9 +16,14 @@ pub use config::{
     ForwardingMode, ForwardingPolicy, ForwardingRule, GuestPairingConfig, KvNamespaceConfig,
     NodeConfig, NodeError, NodeProfile, PeerConfig, TopicConfig,
 };
+pub use drop_relay::{
+    AckDropResponse, CreateDropRequest, CreateDropResponse, DROP_CAP_HEADER, DropCapRole, DropItem,
+    DropRelay, DropRelayConfig, DropRelayError, DropRelayHealth, DropSubscriberAuth,
+    DropSubscription, PostDropResponse,
+};
 pub use node::{
-    AuthenticatedPeer, DiscoveredPeerHandle, KvWriteRequest, PeerLinkInfo, SendDmResult,
-    SubscribeRequest, SubscribeResult, TransferSendResult, UnifiedNode,
+    AuthenticatedPeer, DiscoveredPeerHandle, IngestedHumanDrop, KvWriteRequest, PeerLinkInfo,
+    SendDmResult, SubscribeRequest, SubscribeResult, TransferSendResult, UnifiedNode,
 };
 pub use peer_link::{
     ChannelDirectoryEntry, ChannelJoinResponse, ChannelsResponse, GuestPairProofPayload,

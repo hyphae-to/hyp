@@ -71,6 +71,8 @@ pub enum GateError {
 pub enum TrustTier {
     #[serde(rename = "self")]
     SelfHost,
+    #[serde(rename = "human-verified")]
+    HumanVerified,
     Org,
     Peer,
     Guest,
@@ -82,6 +84,7 @@ impl TrustTier {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::SelfHost => "self",
+            Self::HumanVerified => "human-verified",
             Self::Org => "org",
             Self::Peer => "peer",
             Self::Guest => "guest",
@@ -94,6 +97,20 @@ impl TrustTier {
     pub const fn is_remote_peer(self) -> bool {
         matches!(self, Self::Org | Self::Peer | Self::Guest)
     }
+}
+
+/// Cryptographically verified human authority claim attached to `TrustTier::HumanVerified`
+/// inbound evaluations and persisted to `mailbox.human_auth_json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifiedHumanClaim {
+    pub human_id: String,
+    pub kid: String,
+    pub role: String,
+    pub claim_id: String,
+    pub issued_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub kind: String,
 }
 
 impl fmt::Display for TrustTier {
@@ -331,6 +348,17 @@ impl Stage1Config {
                     refill_per_min: 600,
                 },
                 max_payload_bytes: 1024 * 1024,
+                default_action: TierDeliveryAction::Allow,
+            },
+        );
+        map.insert(
+            TrustTier::HumanVerified,
+            TierPolicy {
+                rate_limit: RateLimitConfig {
+                    max_burst: 30,
+                    refill_per_min: 30,
+                },
+                max_payload_bytes: 32 * 1024,
                 default_action: TierDeliveryAction::Allow,
             },
         );
@@ -1032,6 +1060,10 @@ pub struct SecurityGateConfig {
     /// `SecretStore` key name holding the policy signing HMAC key (default: `"gate-policy-hmac-key"`).
     #[serde(default = "default_policy_signing_secret")]
     pub policy_signing_secret: String,
+    /// Optional canonical SHA-256 hex digest of `human_authorities` + `min_auth_epoch` bound into
+    /// `policy_signature` so unauthorized SQLite modifications fail closed (`gate_policy_tampered`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_authorities_digest: Option<String>,
     /// Tamper-evident signature over canonical RFC 8785 JCS of this gate policy (`"hmac-sha256:<hex>"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_signature: Option<String>,
@@ -1045,6 +1077,7 @@ impl Default for SecurityGateConfig {
             filters: Vec::new(),
             require_signed_policy: false,
             policy_signing_secret: default_policy_signing_secret(),
+            human_authorities_digest: None,
             policy_signature: None,
         }
     }
@@ -1194,6 +1227,8 @@ pub struct InboundContext {
     pub transfer_paths: Vec<String>,
     /// Optional human/agent-facing rendered body text (derived from `event.data` if absent).
     pub rendered_text: Option<String>,
+    /// Cryptographically verified human authority claim when `trust_tier == TrustTier::HumanVerified`.
+    pub human_auth: Option<VerifiedHumanClaim>,
 }
 
 impl InboundContext {
