@@ -11,6 +11,7 @@
  *   WEBHOOK_SECRET_FILE  - Optional 0600 file containing HMAC-SHA256 secret (verified via X-Webhook-Signature-256: sha256=<hex>)
  *   WEBHOOK_SOURCE       - CloudEvent source attribute (default webhook/local)
  *   WEBHOOK_EVENT_TYPE   - CloudEvent type attribute (default com.webhook.received)
+ *   WEBHOOK_POST_URL     - Optional outbound callback URL for hyp_plugin_post replies
  */
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -25,8 +26,40 @@ const secret =
   (process.env.WEBHOOK_SECRET_FILE ? readFileSync(process.env.WEBHOOK_SECRET_FILE, "utf8").trim() : null);
 const defaultSource = process.env.WEBHOOK_SOURCE ?? "webhook/local";
 const defaultType = process.env.WEBHOOK_EVENT_TYPE ?? "com.webhook.received";
+const postUrl = process.env.WEBHOOK_POST_URL?.trim() || null;
 
-const mesh = new MeshPluginClient();
+const mesh = new MeshPluginClient({
+  onPost: async (params) => {
+    if (!postUrl) {
+      throw new Error("post_not_configured: set WEBHOOK_POST_URL to enable outbound webhook replies");
+    }
+    const text = typeof params.text === "string" ? params.text : "";
+    if (!text.trim()) throw new Error("text is required");
+    const payload = {
+      target: params.target ?? target,
+      text,
+      ...(params.channel ? { channel: params.channel } : {}),
+      ...(params.chatId ? { chatId: params.chatId } : {}),
+      ...(params.to ? { to: params.to } : {}),
+      ...(params.threadTs ? { threadTs: params.threadTs } : {}),
+      ...(params.replyTo ? { replyTo: params.replyTo } : {}),
+      timestamp: new Date().toISOString(),
+    };
+    const raw = JSON.stringify(payload);
+    const headers = { "content-type": "application/json" };
+    if (secret) {
+      headers["x-webhook-signature-256"] = "sha256=" + createHmac("sha256", secret).update(raw).digest("hex");
+    }
+    const res = await fetch(postUrl, {
+      method: "POST",
+      headers,
+      body: raw,
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Error(`Webhook post failed with HTTP ${res.status}`);
+    return { ok: true, status: res.status };
+  },
+});
 const hello = await mesh.ready;
 const target = process.env.WEBHOOK_TARGET ?? hello.targets[0];
 if (!target || !hello.targets.includes(target)) {

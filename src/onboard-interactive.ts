@@ -145,7 +145,21 @@ export async function promptRouterStreams(configDir: string): Promise<Record<str
           },
         }),
       );
+      const repos = unwrap(
+        await p.text({
+          message: "Monitored GitHub repos (comma-separated owner/repo, optional — enables dead-subscription detection)",
+          placeholder: "hyphae-to/hyp,org/api",
+        }),
+      ).trim();
+      const orgs = unwrap(
+        await p.text({
+          message: "Monitored GitHub orgs (comma-separated org names, optional — for org webhook / org-wide GitHub App)",
+          placeholder: "hyphae-to",
+        }),
+      ).trim();
       env.GITHUB_WEBHOOK_PORT = port;
+      if (repos) env.GITHUB_REPOS = repos;
+      if (orgs) env.GITHUB_ORGS = orgs;
       streams.push({ name, topic, builtin: "github-webhook", env });
     } else if (id === "webhook-stream") {
       const port = unwrap(
@@ -162,6 +176,20 @@ export async function promptRouterStreams(configDir: string): Promise<Record<str
       env.WEBHOOK_TARGET = topic;
       env.WEBHOOK_SOURCE = `stream/${name}`;
       streams.push({ name, topic, builtin: "webhook-stream", env });
+    } else if (id === "prometheus-webhook") {
+      const port = unwrap(
+        await p.text({
+          message: "Local HTTP port for Alertmanager receiver (/alerts)",
+          initialValue: "8793",
+          validate: (v) => {
+            const n = Number(v);
+            return Number.isInteger(n) && n > 0 && n <= 65535 ? undefined : "Enter a valid TCP port";
+          },
+        }),
+      );
+      env.PROMETHEUS_PORT = port;
+      env.PROMETHEUS_TOPIC = topic;
+      streams.push({ name, topic, builtin: "prometheus-webhook", env });
     } else {
       const execPath = unwrap(
         await p.text({
@@ -289,6 +317,40 @@ export async function promptConnectorPlugins(configDir: string): Promise<Record<
       plugins.push({
         name,
         builtin: "telegram",
+        env,
+        targets: [{ name: targetHandle, handle: targetHandle, coalesceSeconds: 2, maxWaitSeconds: 10, wakesPerHour: 120 }],
+      });
+    } else if (id === "whatsapp") {
+      env.WHATSAPP_TARGET = targetHandle;
+      const phoneNumberId = unwrap(
+        await p.text({
+          message: "WhatsApp Cloud API Phone Number ID",
+          placeholder: "123456789012345",
+          validate: (v) => (v && v.trim().length > 0 ? undefined : "Phone Number ID is required"),
+        }),
+      ).trim();
+      const allowedNumbers = unwrap(
+        await p.text({
+          message: "Allowed sender phone numbers (comma-separated E.164 digits, e.g. 15551234567)",
+          placeholder: "15551234567",
+        }),
+      ).trim();
+      const port = unwrap(
+        await p.text({
+          message: "Local HTTP port for WhatsApp webhook (/whatsapp)",
+          initialValue: "8796",
+          validate: (v) => {
+            const n = Number(v);
+            return Number.isInteger(n) && n > 0 && n <= 65535 ? undefined : "Enter a valid TCP port";
+          },
+        }),
+      );
+      env.WHATSAPP_PHONE_NUMBER_ID = phoneNumberId;
+      env.WHATSAPP_PORT = port;
+      if (allowedNumbers) env.WHATSAPP_ALLOWED_NUMBERS = allowedNumbers;
+      plugins.push({
+        name,
+        builtin: "whatsapp",
         env,
         targets: [{ name: targetHandle, handle: targetHandle, coalesceSeconds: 2, maxWaitSeconds: 10, wakesPerHour: 120 }],
       });

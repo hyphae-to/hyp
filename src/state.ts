@@ -36,6 +36,14 @@ export interface PluginTargetHandoff {
   setBy: string;
 }
 
+export interface BridgeLink {
+  plugin: string;
+  target: string;
+  sessionId: string;
+  linkedAt: number;
+  linkedBy: string;
+}
+
 export type StoredSubscription = Subscription & { sessionId: string };
 
 export class State {
@@ -55,6 +63,8 @@ export class State {
         UNIQUE(router, item));
       CREATE TABLE IF NOT EXISTS plugin_targets (plugin TEXT NOT NULL, target TEXT NOT NULL,
         session TEXT NOT NULL, set_at INTEGER NOT NULL, set_by TEXT NOT NULL, PRIMARY KEY (plugin, target));
+      CREATE TABLE IF NOT EXISTS bridge_links (plugin TEXT NOT NULL, target TEXT NOT NULL,
+        session TEXT NOT NULL, linked_at INTEGER NOT NULL, linked_by TEXT NOT NULL, PRIMARY KEY (plugin, target, session));
       CREATE TABLE IF NOT EXISTS muted_sources (scope TEXT NOT NULL, pattern TEXT NOT NULL,
         muted_at INTEGER NOT NULL, muted_by TEXT NOT NULL, PRIMARY KEY (scope, pattern));
     `);
@@ -149,6 +159,43 @@ export class State {
 
   removePluginTarget(plugin: string, target: string): void {
     this.#db.prepare("DELETE FROM plugin_targets WHERE plugin = ? AND target = ?").run(plugin, target);
+  }
+
+  addBridgeLink(link: BridgeLink): void {
+    this.#db.prepare(
+      "INSERT OR REPLACE INTO bridge_links (plugin, target, session, linked_at, linked_by) VALUES (?, ?, ?, ?, ?)",
+    ).run(link.plugin, link.target, link.sessionId, link.linkedAt, link.linkedBy);
+  }
+
+  removeBridgeLink(plugin: string, target: string, sessionId?: string): number {
+    const res = sessionId !== undefined
+      ? this.#db.prepare("DELETE FROM bridge_links WHERE plugin = ? AND target = ? AND session = ?").run(plugin, target, sessionId)
+      : this.#db.prepare("DELETE FROM bridge_links WHERE plugin = ? AND target = ?").run(plugin, target);
+    return Number(res.changes ?? 0);
+  }
+
+  bridgeLinks(plugin: string, target: string): BridgeLink[] {
+    return this.#db.prepare(
+      "SELECT plugin, target, session, linked_at, linked_by FROM bridge_links WHERE plugin = ? AND target = ? ORDER BY linked_at, session",
+    ).all(plugin, target).map((row) => ({
+      plugin: String(row.plugin),
+      target: String(row.target),
+      sessionId: String(row.session),
+      linkedAt: Number(row.linked_at),
+      linkedBy: String(row.linked_by),
+    }));
+  }
+
+  bridgeLinksForSession(sessionId: string): BridgeLink[] {
+    return this.#db.prepare(
+      "SELECT plugin, target, session, linked_at, linked_by FROM bridge_links WHERE session = ? ORDER BY plugin, target",
+    ).all(sessionId).map((row) => ({
+      plugin: String(row.plugin),
+      target: String(row.target),
+      sessionId: String(row.session),
+      linkedAt: Number(row.linked_at),
+      linkedBy: String(row.linked_by),
+    }));
   }
 
   #decodeSession(row: Record<string, unknown>): Session {
@@ -362,6 +409,8 @@ export class State {
         this.#db.prepare("DELETE FROM session_subscriptions WHERE session = ?").run(id);
         this.#db.prepare("DELETE FROM mailbox WHERE session = ?").run(id);
         this.#db.prepare("DELETE FROM muted_sources WHERE scope = ?").run(id);
+        this.#db.prepare("DELETE FROM bridge_links WHERE session = ?").run(id);
+        this.#db.prepare("DELETE FROM plugin_targets WHERE session = ?").run(id);
         this.#db.prepare("DELETE FROM sessions WHERE id = ?").run(id);
       }
       this.#db.exec("COMMIT");

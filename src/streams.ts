@@ -6,7 +6,7 @@ import { object } from "./protocol.ts";
 import { serveReceiver, type RunningReceiver } from "./core/github/receiver.ts";
 import { log } from "./core/log.ts";
 import type { RouterCore } from "./core/router/core.ts";
-import type { Publisher } from "./core/router/events.ts";
+import type { Publisher, TopicMetadata } from "./core/router/events.ts";
 
 const MAX_FRAME_BYTES = 64 * 1024;
 const MAX_BACKOFF_MS = 30_000;
@@ -76,6 +76,76 @@ interface SupervisedStream {
  * - `builtin: "webhook-stream"` — runs the built-in signed HTTP webhook source over fd 3
  * - custom `exec` + `args` — any executable speaking the standard fd-3 NDJSON protocol v1
  */
+function metadataForStream(cfg: RouterStreamConfig): TopicMetadata {
+  if (cfg.builtin === "github-webhook") {
+    const port = cfg.env.GITHUB_WEBHOOK_PORT ?? "8791";
+    return {
+      kind: "github-webhook",
+      description: "Normalized GitHub repository/organization webhook & GitHub App CloudEvents.",
+      ...(cfg.scope ? { scope: cfg.scope } : {}),
+      schema: {
+        attributes: ["repo", "action", "actor", "subject", "source", "type"],
+        eventTypes: [
+          "com.github.pull_request.opened",
+          "com.github.pull_request.synchronize",
+          "com.github.pull_request.closed",
+          "com.github.pull_request_review.submitted",
+          "com.github.pull_request_review_comment.created",
+          "com.github.issues.opened",
+          "com.github.issue_comment.created",
+          "com.github.workflow_run.completed",
+          "com.github.push",
+          "com.github.ping",
+        ],
+        filterExamples: [
+          '{ exact: { repo: "owner/repo" } }',
+          '{ prefix: { repo: "org/" } }',
+          '{ all: [{ exact: { repo: "owner/repo" } }, { prefix: { type: "com.github.pull_request." } }] }',
+        ],
+      },
+      setupGuide:
+        `Point a GitHub Repository/Org Webhook OR GitHub App webhook at https://<public-host>/hooks/github (proxying to 127.0.0.1:${port}, content-type application/json, signed with github-webhook-secret). ` +
+        `Declare covered repos/orgs in GITHUB_REPOS ("owner/repo1,owner/repo2") or GITHUB_ORGS ("org") in connector.json so hyp_subscribe warns on unmonitored repos.`,
+    };
+  }
+  if (cfg.builtin === "prometheus-webhook") {
+    const port = cfg.env.PROMETHEUS_PORT ?? "8793";
+    return {
+      kind: "prometheus-webhook",
+      description: "Prometheus Alertmanager v4 firing and resolved alert CloudEvents.",
+      ...(cfg.scope ? { scope: cfg.scope } : {}),
+      schema: {
+        attributes: ["type", "source", "subject"],
+        eventTypes: ["io.prometheus.alert.firing", "io.prometheus.alert.resolved"],
+        filterExamples: [
+          '{ prefix: { subject: "severity=critical" } }',
+          '{ exact: { type: "io.prometheus.alert.firing" } }',
+        ],
+      },
+      setupGuide: `Configure Alertmanager webhook_configs url: http://127.0.0.1:${port}/alerts (with optional Bearer token or X-Webhook-Signature-256).`,
+    };
+  }
+  if (cfg.builtin === "webhook-stream") {
+    const port = cfg.env.WEBHOOK_PORT ?? "8792";
+    const path = cfg.env.WEBHOOK_PATH ?? "/webhook";
+    return {
+      kind: "webhook-stream",
+      description: "Signed HTTP JSON/CloudEvents webhook receiver.",
+      ...(cfg.scope ? { scope: cfg.scope } : {}),
+      schema: {
+        attributes: ["type", "source", "subject"],
+        filterExamples: ['{ prefix: { type: "com.ci." } }'],
+      },
+      setupGuide: `POST JSON/CloudEvents to http://127.0.0.1:${port}${path} (signed with X-Webhook-Signature-256 when WEBHOOK_SECRET is set).`,
+    };
+  }
+  return {
+    kind: "custom-stream",
+    description: `Custom fd-3 stream '${cfg.name}'.`,
+    ...(cfg.scope ? { scope: cfg.scope } : {}),
+  };
+}
+
 export class RouterStreamHost {
   readonly #core: RouterCore;
   readonly #routerUrl: string;
@@ -104,6 +174,7 @@ export class RouterStreamHost {
 
   async start(): Promise<void> {
     for (const entry of this.#streams) {
+      this.#core.events.setTopicMetadata(entry.config.topic, metadataForStream(entry.config));
       if (entry.config.builtin === "github-webhook") {
         await this.#startGithubReceiver(entry);
       } else {

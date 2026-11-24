@@ -49,7 +49,10 @@ export class RouterLink {
     await this.#request("PUT", "/v1/handles", { handles });
   }
 
-  async subscriptions(subscriptions: Subscription[]): Promise<string[]> {
+  async subscriptions(subscriptions: Subscription[]): Promise<{
+    unknownTopics: string[];
+    diagnostics: Record<string, unknown[]>;
+  }> {
     const specs = subscriptions.map(({ id, topic, filters, coalesceSeconds }) => ({ id, topic, filters, coalesceSeconds }));
     const response = await this.#request("PUT", "/v1/subscriptions", { subscriptions: specs });
     const payload: unknown = await response.json();
@@ -57,10 +60,16 @@ export class RouterLink {
         !payload.unknownTopics.every((value): value is string => typeof value === "string")) {
       throw new RouterError("router_protocol", "Invalid subscription response");
     }
-    return payload.unknownTopics;
+    const diagnostics: Record<string, unknown[]> = {};
+    if (object(payload.diagnostics)) {
+      for (const [subId, list] of Object.entries(payload.diagnostics)) {
+        if (Array.isArray(list)) diagnostics[subId] = list;
+      }
+    }
+    return { unknownTopics: payload.unknownTopics, diagnostics };
   }
 
-  async query(path: "/v1/peers" | "/v1/subscriptions/status"): Promise<unknown> {
+  async query(path: "/v1/peers" | "/v1/subscriptions/status" | "/v1/topics"): Promise<unknown> {
     return (await this.#request("GET", path)).json();
   }
 

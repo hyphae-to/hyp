@@ -19,6 +19,9 @@ export interface ConnectorHooks {
   readonly onMailboxItem?: (sessionId: string) => void;
   readonly listPluginTargets?: (sessionId: string) => unknown;
   readonly handoffPluginTarget?: (sessionId: string, args: Record<string, unknown>) => unknown;
+  readonly postPluginTarget?: (sessionId: string, args: Record<string, unknown>) => Promise<unknown>;
+  readonly linkBridgeTarget?: (sessionId: string, args: Record<string, unknown>) => unknown;
+  readonly unlinkBridgeTarget?: (sessionId: string, args: Record<string, unknown>) => unknown;
 }
 
 export interface SessionStatus {
@@ -42,6 +45,9 @@ export class Connector {
   readonly #onMailboxItem: (id: string) => void;
   readonly #listPluginTargets?: (id: string) => unknown;
   readonly #handoffPluginTarget?: (id: string, args: Record<string, unknown>) => unknown;
+  readonly #postPluginTarget?: (id: string, args: Record<string, unknown>) => Promise<unknown>;
+  readonly #linkBridgeTarget?: (id: string, args: Record<string, unknown>) => unknown;
+  readonly #unlinkBridgeTarget?: (id: string, args: Record<string, unknown>) => unknown;
   readonly #state: State;
   readonly #routers: Map<string, RouterLink>;
   readonly #mutations = new Map<string | symbol, Promise<unknown>>();
@@ -65,6 +71,9 @@ export class Connector {
       this.#onMailboxItem = hooksOrChannel.onMailboxItem ?? (() => {});
       this.#listPluginTargets = hooksOrChannel.listPluginTargets;
       this.#handoffPluginTarget = hooksOrChannel.handoffPluginTarget;
+      this.#postPluginTarget = hooksOrChannel.postPluginTarget;
+      this.#linkBridgeTarget = hooksOrChannel.linkBridgeTarget;
+      this.#unlinkBridgeTarget = hooksOrChannel.unlinkBridgeTarget;
     }
     this.#routers = new Map(config.routers.map((router) => [router.name, new RouterLink(router)]));
   }
@@ -552,6 +561,24 @@ export class Connector {
           ...item, delivery: statuses.get(item.router)?.find(({ id }) => id === item.id) ?? null,
         })) };
       }
+      case "hyp_topics": {
+        const routerFilter = typeof args.router === "string" && args.router.length > 0 ? args.router : undefined;
+        const names = routerFilter ? [routerFilter] : [...this.#routers.keys()];
+        const routers = await Promise.all(names.map(async (routerName) => {
+          const link = this.#router(routerName);
+          try {
+            const value = await link.query("/v1/topics");
+            const topics = object(value) && Array.isArray(value.topics) ? value.topics : [];
+            return { router: routerName, supported: true, topics };
+          } catch (error) {
+            if (error instanceof RouterError && error.code === "not_found") {
+              return { router: routerName, supported: false, topics: [] };
+            }
+            throw error;
+          }
+        }));
+        return { routers };
+      }
       case "hyp_plugin_targets": {
         if (!this.#listPluginTargets) throw new RouterError("no_plugins", "This connector has no local plugins configured");
         return this.#listPluginTargets(sessionId);
@@ -559,6 +586,18 @@ export class Connector {
       case "hyp_plugin_handoff": {
         if (!this.#handoffPluginTarget) throw new RouterError("no_plugins", "This connector has no local plugins configured");
         return this.#handoffPluginTarget(sessionId, args);
+      }
+      case "hyp_plugin_post": {
+        if (!this.#postPluginTarget) throw new RouterError("no_plugins", "This connector has no local plugins configured");
+        return this.#postPluginTarget(sessionId, args);
+      }
+      case "hyp_bridge_link": {
+        if (!this.#linkBridgeTarget) throw new RouterError("no_plugins", "This connector has no local plugins configured");
+        return this.#linkBridgeTarget(sessionId, args);
+      }
+      case "hyp_bridge_unlink": {
+        if (!this.#unlinkBridgeTarget) throw new RouterError("no_plugins", "This connector has no local plugins configured");
+        return this.#unlinkBridgeTarget(sessionId, args);
       }
       default:
         throw new RouterError("unknown_tool", `Unknown tool ${name}`);
@@ -577,6 +616,7 @@ export class Connector {
     const { key, topic, filters, mode } = args;
     const name = args.router ?? "primary";
     const coalesceSeconds = args.coalesceSeconds ?? 30;
+    const strict = args.strict === true;
     if (typeof key !== "string" || !/^[a-z][a-z0-9-]{0,31}:[A-Za-z0-9._/#:-]{1,120}$/.test(key) ||
         typeof topic !== "string" || !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(topic) ||
         !Array.isArray(filters) || Buffer.byteLength(JSON.stringify(filters)) > 4096 ||
@@ -600,11 +640,19 @@ export class Connector {
       const subscription = { id: existing?.id ?? randomUUID(), sessionId: session.id, key, topic, router: name, filters, coalesceSeconds, mode: selected };
       const routerChanged = existing === undefined || existing.coalesceSeconds !== coalesceSeconds ||
         JSON.stringify(existing.filters) !== JSON.stringify(filters);
-      if (routerChanged) {
+      let diagnostics: unknown[] = [];
+      if (routerChanged || strict) {
         const previous = all.filter((entry) => entry.router === name);
         try {
-          const unknown = await router.subscriptions([...previous.filter(({ id }) => id !== subscription.id), subscription]);
-          if (unknown.includes(topic)) throw new RouterError("unknown_topic", `No topic ${topic} on router ${name}`);
+          const syncRes = await router.subscriptions([...previous.filter(({ id }) => id !== subscription.id), subscription]);
+          if (syncRes.unknownTopics.includes(topic)) throw new RouterError("unknown_topic", `No topic ${topic} on router ${name}`);
+          diagnostics = syncRes.diagnostics[subscription.id] ?? [];
+          if (strict) {
+            const firstError = diagnostics.find((d) => object(d) && d.severity === "error");
+            if (object(firstError) && typeof firstError.message === "string") {
+              throw new RouterError("unreachable_subscription", firstError.message);
+            }
+          }
         } catch (error) {
           await router.subscriptions(previous).catch(() => this.#dirty.add(name));
           throw error;
@@ -612,7 +660,15 @@ export class Connector {
       }
       const outcome = existing === undefined ? "created" : routerChanged || existing.mode !== selected ? "updated" : "unchanged";
       if (outcome !== "unchanged") this.#state.store(subscription);
-      return { id: subscription.id, mode: selected, outcome, filters };
+      const reachable = !diagnostics.some((d) => object(d) && d.severity === "error");
+      return {
+        id: subscription.id,
+        mode: selected,
+        outcome,
+        filters,
+        reachable,
+        ...(diagnostics.length > 0 ? { diagnostics } : {}),
+      };
     }));
   }
 

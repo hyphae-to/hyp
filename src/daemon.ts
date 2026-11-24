@@ -178,6 +178,9 @@ export async function startDaemon(config: Config, options: StartDaemonOptions = 
       ? {
           listPluginTargets: (sessionId) => pluginHost.listForSession(sessionId),
           handoffPluginTarget: (sessionId, args) => pluginHost.handoff(sessionId, args),
+          postPluginTarget: (sessionId, args) => pluginHost.postToPlugin(sessionId, args),
+          linkBridgeTarget: (sessionId, args) => pluginHost.linkBridge(sessionId, args),
+          unlinkBridgeTarget: (sessionId, args) => pluginHost.unlinkBridge(sessionId, args),
         }
       : {}),
   });

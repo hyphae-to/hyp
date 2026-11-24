@@ -194,6 +194,8 @@ export type SubscriptionsResult =
       readonly ok: true;
       /** Topics of the set that the router does not serve; their subscriptions are kept but match nothing. */
       readonly unknownTopics: readonly string[];
+      /** Per-subscription reachability & filter lint diagnostics (empty map entries omitted). */
+      readonly diagnostics: Readonly<Record<string, readonly SubscriptionDiagnostic[]>>;
     }
   | {
       readonly ok: false;
@@ -202,6 +204,55 @@ export type SubscriptionsResult =
       readonly id?: string;
       readonly path?: string;
     };
+
+export interface TopicScope {
+  readonly repos?: readonly string[];
+  readonly orgs?: readonly string[];
+  readonly subjects?: readonly string[];
+}
+
+export interface TopicSchema {
+  readonly attributes?: readonly string[];
+  readonly eventTypes?: readonly string[];
+  readonly filterExamples?: readonly string[];
+}
+
+export interface TopicMetadata {
+  readonly kind?: string;
+  readonly description?: string;
+  readonly scope?: TopicScope;
+  readonly schema?: TopicSchema;
+  readonly setupGuide?: string;
+}
+
+export interface TopicInfo {
+  readonly topic: string;
+  readonly publishers: readonly { readonly id: string; readonly provisioned: boolean }[];
+  readonly metadata: TopicMetadata | null;
+  readonly observed: {
+    readonly eventCount: number;
+    readonly lastEventAt: string | null;
+    readonly sources: readonly string[];
+    readonly repos: readonly string[];
+  };
+}
+
+export interface SubscriptionDiagnostic {
+  readonly severity: "error" | "warn" | "info";
+  readonly code:
+    | "unknown_topic"
+    | "unprovisioned_publisher"
+    | "invalid_github_subject_filter"
+    | "invalid_github_repo_format"
+    | "invalid_github_source_format"
+    | "unknown_filter_attribute"
+    | "unmonitored_repo"
+    | "unobserved_repo"
+    | "topic_no_events_yet";
+  readonly message: string;
+  readonly remediation?: string;
+  readonly suggestedFilter?: Readonly<Record<string, unknown>>;
+}
 
 export interface Publisher {
   readonly id: string;
@@ -241,10 +292,57 @@ export interface PendingSummary {
 const isPositiveInteger = (value: number | undefined): boolean =>
   value === undefined || (Number.isInteger(value) && value > 0);
 
+const STANDARD_CE_ATTRIBUTES = new Set([
+  "specversion",
+  "id",
+  "source",
+  "type",
+  "subject",
+  "time",
+  "datacontenttype",
+  "dataschema",
+]);
+
+const GITHUB_SUBJECT_PREFIXES = ["pull/", "issues/", "actions/", "refs/"];
+const OWNER_REPO_LIKE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\/.*)?$/;
+
+interface FlatPredicate {
+  readonly dialect: "exact" | "prefix" | "suffix";
+  readonly key: string;
+  readonly value: string;
+}
+
+function collectPositivePredicates(filters: readonly Filter[], out: FlatPredicate[] = []): FlatPredicate[] {
+  for (const filter of filters) {
+    if ("exact" in filter) {
+      for (const [key, value] of Object.entries(filter.exact)) out.push({ dialect: "exact", key, value });
+    } else if ("prefix" in filter) {
+      for (const [key, value] of Object.entries(filter.prefix)) out.push({ dialect: "prefix", key, value });
+    } else if ("suffix" in filter) {
+      for (const [key, value] of Object.entries(filter.suffix)) out.push({ dialect: "suffix", key, value });
+    } else if ("all" in filter) {
+      collectPositivePredicates(filter.all, out);
+    } else if ("any" in filter) {
+      collectPositivePredicates(filter.any, out);
+    }
+    // Intentionally skip `not` branches: excluding a repo/source is not subscribing to it.
+  }
+  return out;
+}
+
+function normalizeRepoRef(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^https?:\/\/github\.com\//i, "")
+    .replace(/^github\.com\//i, "")
+    .replace(/\/+$/, "");
+}
+
 export class EventRouter {
   readonly #db: DatabaseSync;
   readonly #options: EventRouterOptions;
   readonly #limits: EventLimits;
+  readonly #topicMetadata = new Map<string, TopicMetadata>();
   #lastPrune = Number.NEGATIVE_INFINITY;
   /** Audit lines of the open transaction, written after COMMIT so a rollback leaves none. */
   #auditBuffer: Array<Readonly<Record<string, unknown>>> | null = null;
@@ -274,6 +372,216 @@ export class EventRouter {
 
   get topics(): ReadonlyMap<string, readonly string[]> {
     return this.#options.topics;
+  }
+
+  /** Attaches declared scope, CloudEvents schema, and setup guidance for a router topic. */
+  setTopicMetadata(topic: string, metadata: TopicMetadata): void {
+    this.#topicMetadata.set(topic, metadata);
+  }
+
+  topicInfo(topic: string): TopicInfo | null {
+    const allowedPublishers = this.#options.topics.get(topic);
+    if (allowedPublishers === undefined) return null;
+    const publishers = allowedPublishers.map((id) => {
+      const granted = this.#db
+        .prepare(
+          "SELECT p.id FROM publishers p JOIN publisher_grants g ON g.publisher_id = p.id " +
+            "WHERE p.id = ? AND g.topic = ? AND p.revoked_at IS NULL",
+        )
+        .get(id, topic);
+      return { id, provisioned: granted !== undefined };
+    });
+    const stats = this.#db
+      .prepare("SELECT COUNT(*) AS n, MAX(received_at) AS last FROM events WHERE topic = ?")
+      .get(topic) as { n?: unknown; last?: unknown } | undefined;
+    const eventCount = Number(stats?.n ?? 0);
+    const lastMs = stats?.last === null || stats?.last === undefined ? null : Number(stats.last);
+    const sourceRows = this.#db
+      .prepare("SELECT DISTINCT source FROM events WHERE topic = ? ORDER BY source LIMIT 50")
+      .all(topic) as Array<{ source?: unknown }>;
+    const sources = sourceRows.map((row) => String(row.source));
+    const repos = sources
+      .filter((s) => s.startsWith("github.com/") && s.split("/").length >= 3)
+      .map((s) => s.slice("github.com/".length));
+    return {
+      topic,
+      publishers,
+      metadata: this.#topicMetadata.get(topic) ?? null,
+      observed: {
+        eventCount,
+        lastEventAt: lastMs === null ? null : new Date(lastMs).toISOString(),
+        sources,
+        repos,
+      },
+    };
+  }
+
+  /** Lists every configured topic, its publisher provisioning state, declared scope/schema, and observed sources. */
+  topicCatalog(): TopicInfo[] {
+    return [...this.#options.topics.keys()]
+      .sort()
+      .map((topic) => this.topicInfo(topic))
+      .filter((info): info is TopicInfo => info !== null);
+  }
+
+  /**
+   * Static + dynamic reachability lint for a subscription's filters against a topic's declared
+   * scope, CloudEvents schema, and observed webhook deliveries. Catches dead subscriptions (such
+   * as filtering GitHub `subject` instead of `repo`, or subscribing to a repo without the GitHub
+   * webhook/App installed).
+   */
+  diagnoseSubscription(topic: string, filters: readonly Filter[]): SubscriptionDiagnostic[] {
+    const info = this.topicInfo(topic);
+    if (info === null) {
+      const available = [...this.#options.topics.keys()].sort();
+      return [{
+        severity: "error",
+        code: "unknown_topic",
+        message: `Topic '${topic}' is not configured on this router (available: ${available.length > 0 ? available.join(", ") : "none"}).`,
+        remediation: "Call hyp_topics to inspect available topics, or add the stream on your router host via `hyp connect add`.",
+      }];
+    }
+
+    const diagnostics: SubscriptionDiagnostic[] = [];
+    if (info.publishers.length === 0 || info.publishers.every((p) => !p.provisioned)) {
+      diagnostics.push({
+        severity: "warn",
+        code: "unprovisioned_publisher",
+        message: `Topic '${topic}' has no active provisioned publisher token on this router.`,
+        remediation: "Provision a publisher (`hyp node add-publisher <id> --topic " + topic + "`) or verify the stream started cleanly.",
+      });
+    }
+
+    const predicates = collectPositivePredicates(filters);
+    const isGithub = info.metadata?.kind === "github-webhook" || topic === "github";
+    const allowedAttributes = info.metadata?.schema?.attributes
+      ? new Set([...STANDARD_CE_ATTRIBUTES, ...info.metadata.schema.attributes])
+      : null;
+    const referencedRepos = new Set<string>();
+
+    for (const pred of predicates) {
+      if (allowedAttributes && !pred.key.startsWith("data.") && !allowedAttributes.has(pred.key)) {
+        diagnostics.push({
+          severity: "warn",
+          code: "unknown_filter_attribute",
+          message: `Filter references attribute '${pred.key}', which is not in '${topic}' schema attributes (${[...allowedAttributes].join(", ")}).`,
+          remediation: info.metadata?.schema?.filterExamples?.length
+            ? `Example valid filter: ${info.metadata.schema.filterExamples[0]}`
+            : undefined,
+        });
+      }
+
+      if (!isGithub) continue;
+
+      if (
+        pred.key === "subject" &&
+        pred.dialect !== "suffix" &&
+        OWNER_REPO_LIKE.test(pred.value) &&
+        !GITHUB_SUBJECT_PREFIXES.some((prefix) => pred.value.startsWith(prefix))
+      ) {
+        const cleanRepo = normalizeRepoRef(pred.value).split("/").slice(0, 2).join("/");
+        referencedRepos.add(cleanRepo);
+        diagnostics.push({
+          severity: "error",
+          code: "invalid_github_subject_filter",
+          message:
+            `Filter '${pred.dialect}.subject = ${JSON.stringify(pred.value)}' will NEVER match GitHub CloudEvents. ` +
+            `GitHub events put the repository in 'repo' ("owner/repo") and 'source' ("github.com/owner/repo"); ` +
+            `'subject' holds "pull/<n>", "issues/<n>", "actions/runs/<id>", or "refs/heads/<branch>".`,
+          remediation: `Replace the filter with { exact: { repo: ${JSON.stringify(cleanRepo)} } } (or { prefix: { repo: "owner/" } } for an org).`,
+          suggestedFilter: { exact: { repo: cleanRepo } },
+        });
+      } else if (pred.key === "repo") {
+        if (/^(?:https?:\/\/)?github\.com\//i.test(pred.value)) {
+          const cleanRepo = normalizeRepoRef(pred.value);
+          referencedRepos.add(cleanRepo);
+          diagnostics.push({
+            severity: "error",
+            code: "invalid_github_repo_format",
+            message:
+              `Filter '${pred.dialect}.repo = ${JSON.stringify(pred.value)}' includes a URL/host prefix and will NEVER match. ` +
+              `GitHub 'repo' is formatted as "owner/repo".`,
+            remediation: `Use { ${pred.dialect}: { repo: ${JSON.stringify(cleanRepo)} } }.`,
+            suggestedFilter: { [pred.dialect]: { repo: cleanRepo } },
+          });
+        } else if (pred.dialect !== "suffix" && pred.value.trim().length > 0) {
+          referencedRepos.add(normalizeRepoRef(pred.value));
+        }
+      } else if (pred.key === "source" && pred.dialect !== "suffix") {
+        if (/^github\.com\//i.test(pred.value)) {
+          const rest = normalizeRepoRef(pred.value);
+          if (rest.length > 0) referencedRepos.add(rest);
+        } else if (OWNER_REPO_LIKE.test(pred.value)) {
+          const cleanRepo = normalizeRepoRef(pred.value);
+          referencedRepos.add(cleanRepo);
+          diagnostics.push({
+            severity: "error",
+            code: "invalid_github_source_format",
+            message:
+              `Filter '${pred.dialect}.source = ${JSON.stringify(pred.value)}' omits the "github.com/" prefix and will NEVER match.`,
+            remediation: `Use { ${pred.dialect}: { source: ${JSON.stringify(`github.com/${cleanRepo}`)} } } or { ${pred.dialect}: { repo: ${JSON.stringify(cleanRepo)} } }.`,
+            suggestedFilter: { [pred.dialect]: { repo: cleanRepo } },
+          });
+        }
+      }
+    }
+
+    const scopeRepos = (info.metadata?.scope?.repos ?? []).map((r) => normalizeRepoRef(r).toLowerCase()).filter(Boolean);
+    const scopeOrgs = (info.metadata?.scope?.orgs ?? []).map((o) => o.trim().toLowerCase()).filter(Boolean);
+    const hasDeclaredScope = scopeRepos.length > 0 || scopeOrgs.length > 0;
+    const isCoveredByScope = (ref: string): boolean => {
+      const target = ref.toLowerCase();
+      if (scopeRepos.some((r) => r === target || r.startsWith(`${target}/`))) return true;
+      if (scopeOrgs.some((o) => target === o || target.startsWith(`${o}/`))) return true;
+      return false;
+    };
+
+    for (const ref of referencedRepos) {
+      if (hasDeclaredScope && !isCoveredByScope(ref)) {
+        const coveredSummary = [
+          ...(scopeRepos.length > 0 ? [`repos: [${scopeRepos.join(", ")}]`] : []),
+          ...(scopeOrgs.length > 0 ? [`orgs: [${scopeOrgs.join(", ")}]`] : []),
+        ].join(", ");
+        diagnostics.push({
+          severity: "error",
+          code: "unmonitored_repo",
+          message:
+            `Repository/org '${ref}' is NOT in the configured '${topic}' stream scope (${coveredSummary}). ` +
+            `This subscription will NEVER receive notifications until the GitHub App or webhook is installed on '${ref}' and added to GITHUB_REPOS / GITHUB_ORGS.`,
+          remediation:
+            info.metadata?.setupGuide ??
+            `Install the GitHub App or webhook on '${ref}' pointing to /hooks/github, add '${ref}' to GITHUB_REPOS in connector.json, and restart the daemon.`,
+        });
+      } else if (
+        info.observed.eventCount > 0 &&
+        !info.observed.repos.some((obs) => {
+          const low = obs.toLowerCase();
+          const target = ref.toLowerCase();
+          return low === target || low.startsWith(`${target}/`);
+        })
+      ) {
+        diagnostics.push({
+          severity: "warn",
+          code: "unobserved_repo",
+          message:
+            `No webhook deliveries from '${ref}' have been observed on topic '${topic}' yet ` +
+            `(observed repos: ${info.observed.repos.length > 0 ? info.observed.repos.join(", ") : "none"}).`,
+          remediation:
+            `Confirm the GitHub App or webhook is installed on '${ref}' and check Settings -> Webhooks -> Recent Deliveries (or send a ping delivery).`,
+        });
+      }
+    }
+
+    if (info.observed.eventCount === 0) {
+      diagnostics.push({
+        severity: "info",
+        code: "topic_no_events_yet",
+        message: `Topic '${topic}' has received 0 events so far on this router.`,
+        ...(info.metadata?.setupGuide ? { remediation: info.metadata.setupGuide } : {}),
+      });
+    }
+
+    return diagnostics;
   }
 
   #now(): number {
@@ -662,7 +970,12 @@ export class EventRouter {
     const unknownTopics = [...new Set(parsed.map(({ spec }) => spec.topic))].filter(
       (topic) => !this.#options.topics.has(topic),
     );
-    return { ok: true, unknownTopics };
+    const diagnostics: Record<string, readonly SubscriptionDiagnostic[]> = {};
+    for (const { spec, filters } of parsed) {
+      const issues = this.diagnoseSubscription(spec.topic, filters);
+      if (issues.length > 0) diagnostics[spec.id] = issues;
+    }
+    return { ok: true, unknownTopics, diagnostics };
   }
 
   /** Deletes all of a connector's subscriptions and their batches (connector revoked). */
