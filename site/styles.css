@@ -1360,80 +1360,272 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
 
 /* ================= VISUAL ARCHITECTURE HUB SECTION ================= */
 .arch-section {
-  background: var(--stone-light);
+  position: relative;
+  background:
+    radial-gradient(ellipse 62% 52% at 50% 58%, rgba(183, 217, 86, 0.11) 0%, rgba(232, 163, 49, 0.045) 42%, transparent 74%),
+    linear-gradient(180deg, #f7f5ef 0%, #f3efe6 100%);
   border-bottom: 1px solid var(--border-strong);
-  padding: 80px 0 60px;
+  padding: 84px 0 88px;
+  overflow: hidden;
 }
 
-.section-intro.arch-intro { max-width: 980px; margin-bottom: 36px; }
-.section-intro.arch-intro p { max-width: 740px; }
+.arch-wrap {
+  max-width: min(1400px, 95vw);
+  padding: 0 clamp(18px, 2.4vw, 38px);
+}
+
+@media (min-width: 1720px) {
+  .arch-wrap { max-width: min(1480px, 90vw); }
+}
+
+.section-intro.arch-intro { max-width: 960px; margin-bottom: 42px; position: relative; z-index: 2; }
+.section-intro.arch-intro p { max-width: 760px; }
 .arch-intro .spec-num { display: block; margin-bottom: 8px; }
 
-.hub-board {
-  display: grid;
-  grid-template-columns: minmax(0, 1.15fr) 38px minmax(244px, 272px) 38px minmax(0, 1.15fr);
-  gap: 0;
-  align-items: center;
-  margin-bottom: 44px;
+.spec-num {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--olive);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
-.hub-wing {
-  background: linear-gradient(180deg, #f3f0e7 0%, #ece8dc 100%);
+.hub-stage {
+  position: relative;
+}
+
+/* Subtle editorial botanical mycelium backdrop behind the hub board */
+.hub-backdrop-web {
+  position: absolute;
+  inset: -34px -38px;
+  width: calc(100% + 76px);
+  height: calc(100% + 68px);
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.9;
+}
+
+.hub-soil-veins path {
+  stroke: rgba(65, 89, 29, 0.13);
+  stroke-width: 1.15;
+  stroke-linecap: round;
+}
+
+.hub-soil-veins path.fine {
+  stroke: rgba(65, 89, 29, 0.09);
+  stroke-width: 0.9;
+  stroke-dasharray: 4 6;
+}
+
+.hub-soil-spores circle {
+  fill: rgba(65, 89, 29, 0.24);
+}
+
+.hub-board {
+  position: relative;
+  z-index: 2;
+  display: grid;
+  grid-template-columns: minmax(0, 1.07fr) clamp(50px, 5vw, 78px) clamp(246px, 20.5vw, 282px) clamp(50px, 5vw, 78px) minmax(0, 1.03fr);
+  gap: 0;
+  align-items: stretch;
+}
+
+.hub-right-stack {
+  display: grid;
+  grid-template-rows: 1fr 1fr;
+  gap: 22px;
+  min-width: 0;
+}
+
+/* Unified rich cards (01, 02, 03) */
+.hub-card {
+  position: relative;
+  z-index: 2;
+  background: linear-gradient(180deg, #faf8f2 0%, #f1ede2 100%);
   border: 1px solid rgba(22, 23, 20, 0.12);
   border-radius: 22px;
-  padding: 20px;
-  box-shadow: 0 16px 36px -24px rgba(22, 23, 20, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.65);
-}
-
-.wing-head {
+  padding: 22px 22px 20px;
+  box-shadow:
+    0 20px 44px -26px rgba(22, 23, 20, 0.3),
+    0 2px 6px rgba(22, 23, 20, 0.05),
+    inset 0 1px 0 rgba(255, 255, 255, 0.8);
+  overflow: hidden;
   display: flex;
-  align-items: center;
-  gap: 11px;
-  margin-bottom: 14px;
+  flex-direction: column;
+  min-width: 0;
 }
 
-.wing-head .wing-num {
+.hub-card-agents {
+  border-right-color: rgba(65, 89, 29, 0.24);
+}
+
+.hub-card-sources {
+  border-left-color: rgba(196, 132, 22, 0.28);
+}
+
+.hub-card-bridges {
+  border-left-color: rgba(65, 118, 63, 0.28);
+}
+
+/* Delicate botanical corner veins inside each card */
+.card-botanical-accent {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 142px;
+  height: auto;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.92;
+}
+
+.card-botanical-accent path {
+  stroke: rgba(65, 89, 29, 0.14);
+  stroke-width: 1.1;
+  stroke-linecap: round;
+}
+
+.card-botanical-accent path.thin {
+  stroke-width: 0.85;
+  opacity: 0.72;
+}
+
+.card-botanical-accent circle {
+  fill: rgba(65, 89, 29, 0.25);
+}
+
+.card-botanical-accent.amber path { stroke: rgba(196, 132, 22, 0.18); }
+.card-botanical-accent.amber circle { fill: rgba(196, 132, 22, 0.32); }
+
+.card-botanical-accent.moss path { stroke: rgba(65, 118, 63, 0.18); }
+.card-botanical-accent.moss circle { fill: rgba(65, 118, 63, 0.32); }
+
+.card-head {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.card-badge {
   display: grid;
   place-items: center;
-  width: 28px;
-  height: 28px;
+  width: 30px;
+  height: 30px;
   border-radius: 999px;
-  background: var(--obsidian);
-  color: var(--chartreuse);
   font-family: var(--mono);
-  font-size: 0.7rem;
+  font-size: 0.72rem;
   font-weight: 700;
   flex-shrink: 0;
-  box-shadow: 0 3px 10px rgba(18, 22, 16, 0.2);
+  margin-top: 2px;
 }
 
-.wing-head strong {
+.card-badge.olive {
+  background: var(--obsidian);
+  color: var(--chartreuse);
+  box-shadow: 0 4px 12px rgba(18, 22, 16, 0.22), 0 0 0 3px rgba(183, 217, 86, 0.18);
+}
+
+.card-badge.amber {
+  background: #271e12;
+  color: var(--amber);
+  box-shadow: 0 4px 12px rgba(39, 30, 18, 0.22), 0 0 0 3px rgba(232, 163, 49, 0.2);
+}
+
+.card-badge.moss {
+  background: #142416;
+  color: var(--moss);
+  box-shadow: 0 4px 12px rgba(20, 36, 22, 0.22), 0 0 0 3px rgba(127, 201, 123, 0.2);
+}
+
+.card-head-meta {
+  min-width: 0;
+}
+
+.card-kicker {
   display: block;
-  font-size: 0.92rem;
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.055em;
+  text-transform: uppercase;
+  margin-bottom: 3px;
+}
+
+.card-kicker.olive { color: var(--olive); }
+.card-kicker.amber { color: #9c640c; }
+.card-kicker.moss { color: #2e6632; }
+
+.card-head h3 {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: clamp(1.1rem, 1.32vw, 1.32rem);
+  font-weight: 500;
+  line-height: 1.18;
+  letter-spacing: -0.024em;
   color: var(--ink);
-  line-height: 1.25;
 }
 
-.wing-head > div > span {
-  display: block;
-  font-size: 0.74rem;
-  color: var(--ink-muted);
+.card-lead {
+  position: relative;
+  z-index: 1;
+  margin: 0 0 15px;
+  font-size: 0.83rem;
+  line-height: 1.5;
+  color: var(--ink-soft);
+}
+
+.card-lead code {
+  font-family: var(--mono);
+  font-size: 0.86em;
+  color: var(--olive);
+  background: rgba(65, 89, 29, 0.09);
+  padding: 1px 5px;
+  border-radius: 5px;
 }
 
 .wing-group-label {
+  position: relative;
+  z-index: 1;
   font-family: var(--mono);
-  font-size: 0.65rem;
+  font-size: 0.64rem;
   font-weight: 600;
   letter-spacing: 0.07em;
   text-transform: uppercase;
   color: var(--ink-muted);
-  margin: 13px 0 8px;
+  margin: 14px 0 8px;
+}
+
+.hub-card-agents .hub-tile-grid {
+  gap: 9px;
+}
+
+.hub-card-agents .orch-stack {
+  gap: 9px;
+}
+
+.hub-card-agents .wing-group-label {
+  margin: 16px 0 9px;
+}
+
+.hub-card-agents .wing-group-label:first-of-type {
+  margin-top: 2px;
 }
 
 .hub-tile-grid {
+  position: relative;
+  z-index: 1;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
+}
+
+.hub-card-sources .hub-tile-grid,
+.hub-card-bridges .hub-tile-grid {
+  margin-top: auto;
 }
 
 .hub-tile {
@@ -1442,27 +1634,26 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   gap: 9px;
   padding: 8px 10px;
   border-radius: 12px;
-  background: #fcfbf7;
+  background: #fdfcf9;
   border: 1px solid rgba(22, 23, 20, 0.09);
   box-shadow: 0 1px 2px rgba(22, 23, 20, 0.04);
   transition: transform 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease;
   min-width: 0;
-  overflow: hidden;
 }
 
 .hub-tile:hover {
   transform: translateY(-1px);
-  border-color: rgba(71, 90, 42, 0.36);
+  border-color: rgba(65, 89, 29, 0.36);
   box-shadow: 0 8px 18px -12px rgba(22, 23, 20, 0.28);
 }
 
 .hub-tile.rich {
-  padding: 9px 11px;
+  padding: 10px 11px;
 }
 
 .hub-tile.custom {
-  background: rgba(252, 251, 247, 0.68);
-  border: 1px dashed rgba(71, 90, 42, 0.45);
+  background: rgba(253, 252, 249, 0.72);
+  border: 1px dashed rgba(65, 89, 29, 0.44);
 }
 
 .hub-tile.custom .tile-copy strong {
@@ -1507,8 +1698,8 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
 }
 
 .tile-icon.glyph.olive {
-  background: rgba(71, 90, 42, 0.12);
-  border-color: rgba(71, 90, 42, 0.18);
+  background: rgba(65, 89, 29, 0.12);
+  border-color: rgba(65, 89, 29, 0.18);
   color: var(--olive);
 }
 
@@ -1522,7 +1713,7 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   display: flex;
   flex-direction: column;
   min-width: 0;
-  line-height: 1.2;
+  line-height: 1.22;
 }
 
 .tile-copy strong {
@@ -1532,21 +1723,19 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   color: var(--ink);
   letter-spacing: -0.01em;
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .tile-copy small {
   font-family: var(--mono);
-  font-size: 0.62rem;
+  font-size: 0.63rem;
   color: var(--ink-muted);
   margin-top: 2px;
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .orch-stack {
+  position: relative;
+  z-index: 1;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -1557,35 +1746,37 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 7px 11px;
+  padding: 7px 10px;
   border-radius: 12px;
-  background: #fcfbf7;
+  background: #fdfcf9;
   border: 1px solid rgba(22, 23, 20, 0.09);
   box-shadow: 0 1px 2px rgba(22, 23, 20, 0.04);
   transition: transform 0.16s ease, border-color 0.16s ease;
+  min-width: 0;
 }
 
 .orch-row:hover {
   transform: translateY(-1px);
-  border-color: rgba(71, 90, 42, 0.34);
+  border-color: rgba(65, 89, 29, 0.34);
 }
 
 .orch-host {
   display: inline-flex;
   align-items: center;
-  gap: 9px;
+  gap: 8px;
   font-family: var(--sans);
-  font-size: 0.82rem;
+  font-size: 0.81rem;
   font-weight: 600;
   color: var(--ink);
   letter-spacing: -0.01em;
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .orch-nested {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 4px;
   flex-shrink: 0;
 }
 
@@ -1595,13 +1786,14 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   gap: 4px;
   font-style: normal;
   font-family: var(--mono);
-  font-size: 0.64rem;
-  padding: 3px 8px 3px 6px;
+  font-size: 0.63rem;
+  padding: 3px 7px 3px 5px;
   border-radius: 999px;
   background: #f1efe6;
   border: 1px solid rgba(22, 23, 20, 0.09);
   color: var(--ink-soft);
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .orch-nested em img {
@@ -1609,128 +1801,294 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   height: 11px;
   object-fit: contain;
   display: block;
+  flex-shrink: 0;
 }
 
-.wing-divider {
-  height: 1px;
-  background: rgba(22, 23, 20, 0.1);
-  margin: 16px 0;
+.orch-nested em.orch-etc {
+  padding: 3px 7px;
+  background: rgba(241, 239, 230, 0.52);
+  border: 1px dashed rgba(22, 23, 20, 0.2);
+  color: var(--ink-muted);
+  font-weight: 500;
 }
 
-/* Mycelial SVG bridges linking wings into the central Node */
+/* Braided Organic Mycelial SVG Bridges linking Cards 01, 02, 03 into the Central Node */
 .hub-bridge {
-  width: 38px;
-  height: 260px;
+  position: relative;
+  width: calc(100% + 20px);
+  margin: 0 -10px;
+  height: 100%;
+  min-height: 440px;
   display: flex;
-  align-items: center;
+  align-items: stretch;
   pointer-events: none;
+  z-index: 1;
 }
 
 .hub-bridge svg {
   width: 100%;
   height: 100%;
+  display: block;
+  overflow: visible;
+}
+
+.hub-mobile-stem {
+  display: none;
+  justify-content: center;
+  align-items: center;
+  height: 36px;
+  margin: -18px 0;
+  position: relative;
+  z-index: 4;
+  pointer-events: none;
+}
+
+.hub-mobile-stem svg {
+  width: 120px;
+  height: 36px;
   overflow: visible;
 }
 
 .hb-strand {
-  stroke: rgba(71, 90, 42, 0.42);
-  stroke-width: 1.5;
+  stroke: rgba(65, 89, 29, 0.58);
+  stroke-width: 1.95;
   stroke-linecap: round;
-  stroke-dasharray: 4 4;
 }
 
 .hb-strand.primary {
   stroke: var(--olive);
-  stroke-width: 2;
-  stroke-dasharray: none;
+  stroke-width: 2.35;
 }
 
 .hb-strand.amber {
-  stroke: rgba(196, 132, 22, 0.62);
+  stroke: rgba(188, 122, 18, 0.74);
+  stroke-width: 2.15;
 }
 
 .hb-strand.moss {
-  stroke: rgba(65, 118, 63, 0.58);
+  stroke: rgba(52, 114, 56, 0.72);
+  stroke-width: 2.15;
 }
 
-.hb-dot {
-  fill: var(--olive);
+.hb-weave {
+  stroke: rgba(65, 89, 29, 0.36);
+  stroke-width: 1.15;
+  stroke-linecap: round;
 }
 
-.hb-dot.amber {
-  fill: #c98410;
+.hb-weave.fine {
+  stroke-width: 0.9;
+  opacity: 0.78;
+  stroke-dasharray: 5 4;
 }
 
-.hb-dot.moss {
-  fill: #41763f;
+.hb-weave.amber { stroke: rgba(196, 132, 22, 0.44); }
+.hb-weave.moss { stroke: rgba(65, 132, 68, 0.44); }
+
+.hb-twig {
+  stroke: rgba(65, 89, 29, 0.34);
+  stroke-width: 1.05;
+  stroke-linecap: round;
 }
+
+.hb-twig.amber { stroke: rgba(196, 132, 22, 0.44); }
+.hb-twig.moss { stroke: rgba(65, 132, 68, 0.44); }
+
+.hb-dot { fill: var(--olive); }
+.hb-dot.amber { fill: #c47e12; }
+.hb-dot.moss { fill: #3b7d40; }
 
 .hb-node-port {
   fill: var(--chartreuse);
   stroke: var(--obsidian);
-  stroke-width: 1.8;
+  stroke-width: 1.6;
 }
 
+.hb-node-port.amber { fill: var(--amber); }
+.hb-node-port.moss { fill: var(--moss); }
+
+/* Crisp circular glowing port sockets mounted directly on the central Node card flanks */
+.node-port {
+  position: absolute;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  border: 2px solid #12150f;
+  z-index: 4;
+  pointer-events: none;
+}
+
+.node-port.left {
+  left: -4.5px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: var(--chartreuse);
+  box-shadow: 0 0 10px rgba(183, 217, 86, 0.85);
+}
+
+.node-port.right-top {
+  right: -4.5px;
+  top: 44%;
+  transform: translateY(-50%);
+  background: var(--amber);
+  box-shadow: 0 0 10px rgba(232, 163, 49, 0.85);
+}
+
+.node-port.right-bot {
+  right: -4.5px;
+  top: 56%;
+  transform: translateY(-50%);
+  background: var(--moss);
+  box-shadow: 0 0 10px rgba(127, 201, 123, 0.85);
+}
+
+/* Subtle bioluminescent signal pulses drifting gently along the mycelial strands */
+.hb-pulse {
+  stroke-width: 2.4;
+  stroke-linecap: round;
+  stroke-dasharray: 16 84;
+  stroke-dashoffset: 100;
+  opacity: 0.88;
+  animation: hbFlowForward 4.6s cubic-bezier(0.35, 0, 0.65, 1) infinite;
+}
+
+.hb-pulse.chartreuse { stroke: #9ec438; }
+.hb-pulse.olive-glow { stroke: #8fb838; }
+.hb-pulse.amber { stroke: var(--amber); }
+.hb-pulse.moss { stroke: #68bf6a; }
+
+.hb-pulse.slow { animation-duration: 5.8s; }
+.hb-pulse.delay { animation-delay: -2.1s; animation-duration: 5.2s; }
+.hb-pulse.rev { animation-name: hbFlowReverse; animation-delay: -1.4s; }
+
+@keyframes hbFlowForward {
+  0% { stroke-dashoffset: 116; opacity: 0; }
+  12% { opacity: 0.92; }
+  84% { opacity: 0.92; }
+  100% { stroke-dashoffset: -16; opacity: 0; }
+}
+
+@keyframes hbFlowReverse {
+  0% { stroke-dashoffset: -16; opacity: 0; }
+  12% { opacity: 0.92; }
+  84% { opacity: 0.92; }
+  100% { stroke-dashoffset: 116; opacity: 0; }
+}
+
+/* Center Dark Obsidian Hyphae Node Card */
 .hub-center {
   position: relative;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
+  z-index: 3;
 }
 
 .hub-core-card {
   position: relative;
   z-index: 1;
   width: 100%;
-  background: radial-gradient(circle at 50% 34%, #252b1d 0%, #151812 68%, #10130e 100%);
+  background: radial-gradient(circle at 50% 34%, #262e1e 0%, #151912 66%, #0f120d 100%);
   color: var(--cream);
-  border: 1px solid rgba(183, 217, 86, 0.36);
-  border-radius: 24px;
-  padding: 20px 18px 20px;
+  border: 1px solid rgba(183, 217, 86, 0.4);
+  border-radius: 26px;
+  padding: 22px 18px 22px;
   text-align: center;
-  box-shadow: 0 28px 56px -18px rgba(18, 22, 16, 0.56), 0 0 0 5px rgba(183, 217, 86, 0.08);
-  overflow: hidden;
+  box-shadow:
+    0 30px 60px -18px rgba(18, 22, 16, 0.62),
+    0 0 0 5px rgba(183, 217, 86, 0.08),
+    inset 0 1px 0 rgba(244, 241, 232, 0.14);
+  overflow: visible;
 }
 
-.hub-core-halo {
+/* Refined botanical mycelium texture echo inside the obsidian Node card */
+.hub-core-mycelium {
   position: absolute;
-  top: 28px;
-  left: 50%;
-  transform: translateX(-50%);
-  width: 180px;
-  height: 180px;
-  border-radius: 50%;
-  background: radial-gradient(circle, rgba(183, 217, 86, 0.22) 0%, rgba(232, 163, 49, 0.09) 42%, transparent 72%);
+  inset: 0;
+  border-radius: inherit;
+  background-image: url("./assets/hero-mycelium.jpg");
+  background-size: cover;
+  background-position: center;
+  opacity: 0.28;
+  mix-blend-mode: screen;
   pointer-events: none;
   z-index: 0;
 }
 
-.hub-core-img {
-  position: relative;
-  z-index: 1;
-  width: 146px;
-  height: 146px;
-  object-fit: contain;
-  display: block;
-  margin: 4px auto 8px;
-  filter: drop-shadow(0 14px 24px rgba(0, 0, 0, 0.68)) drop-shadow(0 0 22px rgba(183, 217, 86, 0.22));
+.hub-core-veins {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.hub-core-veins path {
+  stroke: rgba(183, 217, 86, 0.16);
+  stroke-width: 1.1;
+  stroke-linecap: round;
+}
+
+.hub-core-halo {
+  position: absolute;
+  top: 26px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 210px;
+  height: 210px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(183, 217, 86, 0.28) 0%, rgba(232, 163, 49, 0.12) 44%, transparent 72%);
+  pointer-events: none;
+  z-index: 0;
 }
 
 .hub-core-badge {
   position: relative;
   z-index: 1;
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
   font-family: var(--mono);
   font-size: 0.63rem;
   font-weight: 700;
   letter-spacing: 0.11em;
   color: var(--chartreuse);
-  background: rgba(183, 217, 86, 0.14);
-  border: 1px solid rgba(183, 217, 86, 0.34);
-  padding: 3px 10px;
+  background: rgba(183, 217, 86, 0.13);
+  border: 1px solid rgba(183, 217, 86, 0.36);
+  padding: 4px 11px;
   border-radius: 999px;
-  margin-bottom: 4px;
+  margin-bottom: 6px;
+}
+
+.hub-live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--chartreuse);
+  box-shadow: 0 0 8px var(--chartreuse);
+  animation: pulse 2.6s ease-in-out infinite;
+}
+
+.hub-core-sprite-wrap {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  margin: 4px auto 10px;
+}
+
+.hub-core-img {
+  position: relative;
+  z-index: 1;
+  width: 164px;
+  height: 164px;
+  object-fit: contain;
+  display: block;
+  filter: drop-shadow(0 16px 26px rgba(0, 0, 0, 0.72)) drop-shadow(0 0 24px rgba(183, 217, 86, 0.28)) drop-shadow(0 0 14px rgba(232, 163, 49, 0.18));
+  animation: floatBob 6s ease-in-out infinite;
 }
 
 .hub-core-title {
@@ -1738,10 +2096,12 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   z-index: 1;
   display: block;
   font-family: var(--serif);
-  font-size: 1.38rem;
+  font-size: clamp(1.16rem, 1.38vw, 1.38rem);
   font-weight: 500;
+  letter-spacing: -0.02em;
   color: var(--cream);
-  margin-bottom: 10px;
+  margin-bottom: 12px;
+  white-space: nowrap;
 }
 
 .hub-core-pills {
@@ -1751,7 +2111,7 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   flex-wrap: wrap;
   justify-content: center;
   gap: 5px;
-  margin-bottom: 14px;
+  margin-bottom: 15px;
 }
 
 .hub-core-pills span {
@@ -1759,8 +2119,8 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   font-size: 0.64rem;
   padding: 3px 9px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.07);
-  border: 1px solid rgba(244, 241, 232, 0.15);
+  background: rgba(255, 255, 255, 0.075);
+  border: 1px solid rgba(244, 241, 232, 0.16);
   color: var(--cream);
 }
 
@@ -1769,57 +2129,20 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   z-index: 1;
   margin: 0;
   padding-top: 12px;
-  border-top: 1px solid rgba(244, 241, 232, 0.1);
+  border-top: 1px solid rgba(244, 241, 232, 0.11);
   font-family: var(--mono);
   font-size: 0.64rem;
-  line-height: 1.55;
-  color: #b7b3a6;
+  line-height: 1.56;
+  color: #bfbba9;
 }
 
-.arch-pillars {
-  border-top: 1px solid var(--border-strong);
-  padding-top: 8px;
-}
-
-.spec-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-}
-
-.spec-col {
-  padding: 24px 28px 6px;
-  border-right: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.spec-col:first-child { padding-left: 0; }
-.spec-col:last-child { border-right: none; padding-right: 0; }
-
-.spec-num {
-  font-family: var(--mono);
-  font-size: 0.72rem;
-  font-weight: 600;
-  color: var(--olive);
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-}
-
-.spec-col h3 {
-  margin: 0;
-  font-family: var(--serif);
-  font-size: 1.36rem;
-  font-weight: 500;
-  letter-spacing: -0.025em;
-  color: var(--ink);
-}
-
-.spec-note {
-  margin: 0;
-  font-size: 0.86rem;
-  line-height: 1.58;
-  color: var(--ink-soft);
+@media (prefers-reduced-motion: reduce) {
+  .hb-pulse,
+  .hub-live-dot,
+  .hub-core-img {
+    animation: none;
+  }
+  .hb-pulse { opacity: 0; }
 }
 
 /* ================= CLEAN COMPARISON TABLE ================= */
@@ -2255,12 +2578,15 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
 }
 
 @media (max-width: 1080px) {
-  .hero-cta-strip, .spec-grid, .hub-board, .deck-grid, .qs-grid { grid-template-columns: minmax(0, 1fr); gap: 18px; }
+  .hero-cta-strip, .hub-board, .deck-grid, .qs-grid { grid-template-columns: minmax(0, 1fr); gap: 18px; }
+  .hub-backdrop-web { display: none; }
   .hub-bridge { display: none; }
+  .hub-mobile-stem { display: flex; }
+  .node-port { display: none; }
+  .hub-right-stack { grid-template-rows: auto; gap: 18px; }
+  .hub-core-card { max-width: 420px; }
   .hub-tile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .hero-cta-strip { gap: 22px; margin-top: 34px; padding-top: 26px; }
-  .spec-col { border-right: none; border-bottom: 1px solid var(--border); padding: 20px 0; }
-  .spec-col:last-child { border-bottom: none; }
   .nav-links { display: none; }
   .scene-subtitle-wrap { margin-top: 8px; }
 }
@@ -2268,9 +2594,16 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
 @media (max-width: 640px) {
   .wrap,
   header .wrap,
-  .story-band .wrap { max-width: 100%; padding: 0 16px; }
-  .arch-section { padding: 54px 0 42px; }
-  .hub-tile-grid, .hub-tile-grid.rich { grid-template-columns: minmax(0, 1fr); }
+  .story-band .wrap,
+  .arch-wrap { max-width: 100%; padding: 0 16px; }
+  .arch-section { padding: 54px 0 52px; }
+  .hub-card { padding: 18px 16px 16px; border-radius: 18px; }
+  .hub-core-card { max-width: 100%; padding: 20px 16px; }
+  .hub-tile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+  .hub-tile { padding: 8px 8px; gap: 7px; }
+  .hub-tile.rich { padding: 9px 9px; }
+  .tile-copy strong { font-size: 0.77rem; }
+  .orch-row { padding: 7px 9px; flex-wrap: wrap; row-gap: 6px; }
   .nav-bar { height: 58px; gap: 10px; }
   .brand-word { font-size: 1.24rem; }
   .brand-cli { display: none; }
