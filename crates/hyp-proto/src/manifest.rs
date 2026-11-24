@@ -170,6 +170,8 @@ pub enum CapabilityToken {
     P2pRelayV1,
     KeysPrekeyV1,
     DirectoryCheckpointV1,
+    HumanAuthV1,
+    DropRelayV1,
     Other(String),
 }
 
@@ -197,6 +199,8 @@ impl CapabilityToken {
             Self::P2pRelayV1 => "p2p.relay.v1",
             Self::KeysPrekeyV1 => "keys.prekey.v1",
             Self::DirectoryCheckpointV1 => "directory.checkpoint.v1",
+            Self::HumanAuthV1 => "human.auth.v1",
+            Self::DropRelayV1 => "drop.relay.v1",
             Self::Other(s) => s.as_str(),
         }
     }
@@ -224,6 +228,8 @@ impl CapabilityToken {
             "p2p.relay.v1" => Self::P2pRelayV1,
             "keys.prekey.v1" => Self::KeysPrekeyV1,
             "directory.checkpoint.v1" => Self::DirectoryCheckpointV1,
+            "human.auth.v1" => Self::HumanAuthV1,
+            "drop.relay.v1" => Self::DropRelayV1,
             other => {
                 if !is_valid_topic(other) {
                     return Err(format!("invalid capability token {other:?}"));
@@ -1082,5 +1088,21 @@ mod tests {
         .unwrap();
         assert_eq!(legacy_ok.agreed_protocol, 1);
         assert_eq!(legacy_ok.status, NegotiationStatus::Warn);
+    }
+
+    #[test]
+    fn human_auth_and_drop_relay_capability_tokens_roundtrip() {
+        for (tok, expected) in [
+            (CapabilityToken::HumanAuthV1, "human.auth.v1"),
+            (CapabilityToken::DropRelayV1, "drop.relay.v1"),
+        ] {
+            assert_eq!(tok.as_str(), expected);
+            assert_eq!(CapabilityToken::from_token_str(expected).unwrap(), tok);
+            let encoded = serde_json::to_string(&tok).unwrap();
+            assert_eq!(encoded, format!("\"{expected}\""));
+            let decoded: CapabilityToken = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, tok);
+            assert!(!tok.is_anti_downgrade_security_cap());
+        }
     }
 }

@@ -1457,7 +1457,7 @@ fn migration_v2_to_v3_and_v1_to_v3_backup_parity_and_zero_data_loss() {
     assert_eq!(migrated_v2.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     assert_eq!(migrated_v1.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     assert_eq!(fresh_v3.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-    assert_eq!(CURRENT_SCHEMA_VERSION, 3);
+    assert!(migrated_v2.schema_version().unwrap() >= 3);
 
     // Exact schema parity: v2->v3 and v1->v2->v3 both match fresh v3 bit-for-bit!
     let fresh_cols = snapshot_schema_tables_and_columns(fresh_v3.connection());
@@ -1478,8 +1478,9 @@ fn migration_v2_to_v3_and_v1_to_v3_backup_parity_and_zero_data_loss() {
     assert_eq!(v2_backups.len(), 1);
     let bak_name = v2_backups[0].file_name().unwrap().to_str().unwrap();
     assert!(
-        bak_name.starts_with("node.sqlite.v2-to-v3-") && bak_name.ends_with(".bak"),
-        "unexpected v2->v3 backup name: {bak_name}"
+        bak_name.starts_with(&format!("node.sqlite.v2-to-v{CURRENT_SCHEMA_VERSION}-"))
+            && bak_name.ends_with(".bak"),
+        "unexpected v2->v{CURRENT_SCHEMA_VERSION} backup name: {bak_name}"
     );
     #[cfg(unix)]
     {
@@ -1496,7 +1497,7 @@ fn migration_v2_to_v3_and_v1_to_v3_backup_parity_and_zero_data_loss() {
     let bak_cols = snapshot_schema_tables_and_columns(&bak_conn);
     assert!(!bak_cols.contains_key("wakeups"));
 
-    // Verify v1->v3 backup exists and is a genuine v1 snapshot!
+    // Verify v1->latest backup exists and is a genuine v1 snapshot!
     let v1_backups = migrated_v1.list_migration_backups().unwrap();
     assert_eq!(v1_backups.len(), 1);
     assert!(
@@ -1505,7 +1506,7 @@ fn migration_v2_to_v3_and_v1_to_v3_backup_parity_and_zero_data_loss() {
             .unwrap()
             .to_str()
             .unwrap()
-            .starts_with("node.sqlite.v1-to-v3-")
+            .starts_with(&format!("node.sqlite.v1-to-v{CURRENT_SCHEMA_VERSION}-"))
     );
 
     // Verify all pre-existing v2 data survived untouched and mailbox defaults are clean.

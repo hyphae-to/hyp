@@ -311,7 +311,7 @@ fn create_seeded_v1_db(path: &Path, enable_wal: bool) {
 
 #[test]
 fn registry_invariants_and_invalid_registry_rejection() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, 3);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 4);
     assert_eq!(MIGRATIONS.len() as i64, CURRENT_SCHEMA_VERSION);
     let mut names = HashSet::new();
     for (idx, m) in MIGRATIONS.iter().enumerate() {
@@ -387,11 +387,12 @@ fn differential_schema_and_data_parity_v1_migrated_equals_fresh_v2() {
     let applied_migrated = migrated.applied_migrations().unwrap();
     assert_eq!(
         applied_migrated.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
-        vec![1, 2, 3]
+        vec![1, 2, 3, 4]
     );
     assert_eq!(applied_migrated[0].1, T0);
     assert!(applied_migrated[1].1 >= T0);
     assert!(applied_migrated[2].1 >= T0);
+    assert!(applied_migrated[3].1 >= T0);
 
     // 3. All seeded v1 rows survive untouched; handles default to `description: None`.
     let peer = migrated.peers().get_peer("acme-team").unwrap().unwrap();
@@ -511,6 +512,9 @@ fn differential_schema_and_data_parity_v1_migrated_equals_fresh_v2() {
     let bak_schema = snapshot_canonical_schema(&bak_conn);
     assert!(!bak_schema.table_sql.contains_key("peer_routes"));
     assert!(!bak_schema.table_sql.contains_key("wakeups"));
+    assert!(!bak_schema.table_sql.contains_key("human_authorities"));
+    assert!(!bak_schema.table_sql.contains_key("human_claim_nonces"));
+    assert!(!bak_schema.table_sql.contains_key("human_node_certs"));
     assert!(
         !bak_schema.table_columns["handles"]
             .iter()
@@ -641,21 +645,17 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
         .unwrap();
 
     // 1. Failing SQL next-version migration must roll back partial DDL atomically.
-    let failing_sql_migrations = [
-        MIGRATIONS[0],
-        MIGRATIONS[1],
-        MIGRATIONS[2],
-        Migration {
-            version: next_ver,
-            name: "0004_broken_sql",
-            disable_foreign_keys: false,
-            kind: MigrationKind::Sql(
-                "CREATE TABLE partial_should_rollback (id INTEGER PRIMARY KEY);
-                 INSERT INTO partial_should_rollback (id) VALUES (1);
-                 THIS IS INVALID SQL;",
-            ),
-        },
-    ];
+    let mut failing_sql_migrations = MIGRATIONS.to_vec();
+    failing_sql_migrations.push(Migration {
+        version: next_ver,
+        name: "0005_broken_sql",
+        disable_foreign_keys: false,
+        kind: MigrationKind::Sql(
+            "CREATE TABLE partial_should_rollback (id INTEGER PRIMARY KEY);
+             INSERT INTO partial_should_rollback (id) VALUES (1);
+             THIS IS INVALID SQL;",
+        ),
+    });
     let err = run_migrations_with(db.connection(), Some(&db_path), &failing_sql_migrations)
         .unwrap_err();
     assert!(matches!(err, StoreError::Sqlite(_)));
@@ -677,17 +677,13 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
         conn.execute_batch("CREATE TABLE fn_partial (id INTEGER PRIMARY KEY);")?;
         Err(StoreError::InvalidState("simulated fn error".to_string()))
     }
-    let failing_fn_migrations = [
-        MIGRATIONS[0],
-        MIGRATIONS[1],
-        MIGRATIONS[2],
-        Migration {
-            version: next_ver,
-            name: "0004_broken_fn",
-            disable_foreign_keys: false,
-            kind: MigrationKind::Fn(failing_fn),
-        },
-    ];
+    let mut failing_fn_migrations = MIGRATIONS.to_vec();
+    failing_fn_migrations.push(Migration {
+        version: next_ver,
+        name: "0005_broken_fn",
+        disable_foreign_keys: false,
+        kind: MigrationKind::Fn(failing_fn),
+    });
     let err =
         run_migrations_with(db.connection(), Some(&db_path), &failing_fn_migrations).unwrap_err();
     assert!(matches!(err, StoreError::InvalidState(_)));
@@ -704,19 +700,15 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
 
     // 3. `disable_foreign_keys: true` migration that leaves an FK violation must fail
     //    `PRAGMA foreign_key_check`, roll back, AND unconditionally restore `PRAGMA foreign_keys = ON`.
-    let fk_violation_migrations = [
-        MIGRATIONS[0],
-        MIGRATIONS[1],
-        MIGRATIONS[2],
-        Migration {
-            version: next_ver,
-            name: "0004_fk_orphan",
-            disable_foreign_keys: true,
-            kind: MigrationKind::Sql(
-                "INSERT INTO publisher_grants (publisher_id, topic) VALUES ('ghost-pub', 'alerts');",
-            ),
-        },
-    ];
+    let mut fk_violation_migrations = MIGRATIONS.to_vec();
+    fk_violation_migrations.push(Migration {
+        version: next_ver,
+        name: "0005_fk_orphan",
+        disable_foreign_keys: true,
+        kind: MigrationKind::Sql(
+            "INSERT INTO publisher_grants (publisher_id, topic) VALUES ('ghost-pub', 'alerts');",
+        ),
+    });
     let err = run_migrations_with(db.connection(), Some(&db_path), &fk_violation_migrations)
         .unwrap_err();
     assert!(
@@ -740,29 +732,25 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
     assert_eq!(fk_enabled, 1, "PRAGMA foreign_keys must be restored to ON after rollback");
 
     // 4. Valid `disable_foreign_keys: true` table rebuild succeeds and restores `PRAGMA foreign_keys = ON`.
-    let fk_rebuild_ok = [
-        MIGRATIONS[0],
-        MIGRATIONS[1],
-        MIGRATIONS[2],
-        Migration {
-            version: next_ver,
-            name: "0004_rebuild_publishers_ok",
-            disable_foreign_keys: true,
-            kind: MigrationKind::Sql(
-                "CREATE TABLE publishers_new (
-                    id TEXT PRIMARY KEY,
-                    token_hash TEXT NOT NULL UNIQUE,
-                    created_at INTEGER NOT NULL,
-                    revoked_at INTEGER,
-                    note TEXT
-                 );
-                 INSERT INTO publishers_new (id, token_hash, created_at, revoked_at, note)
-                 SELECT id, token_hash, created_at, revoked_at, 'migrated' FROM publishers;
-                 DROP TABLE publishers;
-                 ALTER TABLE publishers_new RENAME TO publishers;",
-            ),
-        },
-    ];
+    let mut fk_rebuild_ok = MIGRATIONS.to_vec();
+    fk_rebuild_ok.push(Migration {
+        version: next_ver,
+        name: "0005_rebuild_publishers_ok",
+        disable_foreign_keys: true,
+        kind: MigrationKind::Sql(
+            "CREATE TABLE publishers_new (
+                id TEXT PRIMARY KEY,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_at INTEGER NOT NULL,
+                revoked_at INTEGER,
+                note TEXT
+             );
+             INSERT INTO publishers_new (id, token_hash, created_at, revoked_at, note)
+             SELECT id, token_hash, created_at, revoked_at, 'migrated' FROM publishers;
+             DROP TABLE publishers;
+             ALTER TABLE publishers_new RENAME TO publishers;",
+        ),
+    });
     run_migrations_with(db.connection(), Some(&db_path), &fk_rebuild_ok).unwrap();
     assert_eq!(db.schema_version().unwrap(), next_ver);
     let fk_enabled_after: i64 = db
