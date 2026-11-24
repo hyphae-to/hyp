@@ -101,7 +101,7 @@ jobs:
           echo "changelog_summary=${SUMMARY}" >> "$GITHUB_OUTPUT"
 
   build:
-    name: Build Nightly (${{ matrix.target }})
+    name: Build Nightly (${{ matrix.label }})
     needs: prepare
     if: needs.prepare.outputs.should_build == 'true'
     runs-on: ${{ matrix.os }}
@@ -110,46 +110,42 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: aarch64-apple-darwin
+          - label: macos-arm64-and-x64
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
             os: macos-latest
-            archive_ext: tar.gz
-            smoke_test: true
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            archive_ext: tar.gz
-            smoke_test: false
-          - target: x86_64-unknown-linux-gnu
+            smoke_target: aarch64-apple-darwin
+          - label: x86_64-unknown-linux-gnu
+            targets: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            archive_ext: tar.gz
-            smoke_test: true
-          - target: x86_64-unknown-linux-musl
+            smoke_target: x86_64-unknown-linux-gnu
+          - label: x86_64-unknown-linux-musl
+            targets: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            archive_ext: tar.gz
             musl: true
-            smoke_test: true
-          - target: aarch64-unknown-linux-gnu
+            smoke_target: x86_64-unknown-linux-musl
+          - label: aarch64-unknown-linux-gnu
+            targets: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-            archive_ext: tar.gz
-            smoke_test: true
-          - target: x86_64-pc-windows-msvc
+            smoke_target: aarch64-unknown-linux-gnu
+          - label: x86_64-pc-windows-msvc
+            targets: x86_64-pc-windows-msvc
             os: windows-latest
-            archive_ext: zip
-            smoke_test: true
+            smoke_target: x86_64-pc-windows-msvc
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare.outputs.git_sha }}
 
-      - name: Install Rust 1.87.0 (${{ matrix.target }})
+      - name: Install Rust 1.87.0 (${{ matrix.targets }})
         uses: dtolnay/rust-toolchain@1.87.0
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.targets }}
 
-      - name: Rust cache (shared with release per target)
+      - name: Rust cache (shared with release per builder)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-${{ matrix.target }}
+          shared-key: release-${{ matrix.label }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install musl-tools (for x86_64-unknown-linux-musl)
@@ -162,19 +158,23 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         env:
-          TARGET: ${{ matrix.target }}
+          TARGETS: ${{ matrix.targets }}
           MACOSX_DEPLOYMENT_TARGET: "11.0"
           CC_x86_64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: |
           set -euo pipefail
-          cargo build --release --locked --target "$TARGET" -p hyp-cli
+          IFS=',' read -ra TRIPLE_LIST <<< "$TARGETS"
+          for TARGET in "${TRIPLE_LIST[@]}"; do
+            echo "=== Building ${TARGET} ==="
+            cargo build --release --locked --target "$TARGET" -p hyp-cli
+          done
 
       - name: Build stripped release binary (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          TARGET: ${{ matrix.target }}
+          TARGET: ${{ matrix.targets }}
         run: |
           $ErrorActionPreference = "Stop"
           cargo build --release --locked --target $env:TARGET -p hyp-cli
@@ -184,33 +184,36 @@ jobs:
         shell: bash
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
-          TARGET: ${{ matrix.target }}
-          SMOKE_TEST: ${{ matrix.smoke_test }}
+          TARGETS: ${{ matrix.targets }}
+          SMOKE_TARGET: ${{ matrix.smoke_target }}
         run: |
           set -euo pipefail
-          ARCHIVE="hyp-${TAG}-${TARGET}.tar.gz"
-          STAGE="$(mktemp -d)"
-          trap 'rm -rf "$STAGE"' EXIT
-
-          cp "target/${TARGET}/release/hyp" "${STAGE}/hyp"
-          chmod 0755 "${STAGE}/hyp"
-
-          if [ "$SMOKE_TEST" = "true" ]; then
-            out="$("${STAGE}/hyp" version --json)"
-            echo "$out"
-            python3 -c 'import json, sys; j = json.loads(sys.argv[1]); assert j.get("ok") is True and j.get("command") == "version" and j.get("data", {}).get("version"), j' "$out"
-          fi
-
           mkdir -p dist
-          tar -C "$STAGE" -czf "dist/${ARCHIVE}" hyp
-          ls -lh "dist/${ARCHIVE}"
+          IFS=',' read -ra TRIPLE_LIST <<< "$TARGETS"
+          for TARGET in "${TRIPLE_LIST[@]}"; do
+            ARCHIVE="hyp-${TAG}-${TARGET}.tar.gz"
+            STAGE="$(mktemp -d)"
+
+            cp "target/${TARGET}/release/hyp" "${STAGE}/hyp"
+            chmod 0755 "${STAGE}/hyp"
+
+            if [ "$TARGET" = "$SMOKE_TARGET" ]; then
+              out="$("${STAGE}/hyp" version --json)"
+              echo "$out"
+              python3 -c 'import json, sys; j = json.loads(sys.argv[1]); assert j.get("ok") is True and j.get("command") == "version" and j.get("data", {}).get("version"), j' "$out"
+            fi
+
+            tar -C "$STAGE" -czf "dist/${ARCHIVE}" hyp
+            rm -rf "$STAGE"
+            ls -lh "dist/${ARCHIVE}"
+          done
 
       - name: Package archive (Windows zip)
         if: runner.os == 'Windows'
         shell: pwsh
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
-          TARGET: ${{ matrix.target }}
+          TARGET: ${{ matrix.targets }}
         run: |
           $ErrorActionPreference = "Stop"
           $archive = "hyp-$($env:TAG)-$($env:TARGET).zip"
@@ -233,7 +236,7 @@ jobs:
       - name: Upload nightly target archive artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nightly-${{ matrix.target }}
+          name: nightly-${{ matrix.label }}
           path: dist/hyp-*
           retention-days: 7
           if-no-files-found: error
