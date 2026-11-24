@@ -62,6 +62,8 @@ Core commands:
       Wire (or re-wire) MCP, hooks, rules, skills, or OS auto-start service
   hyp skill [install [antigravity|claude|codex|cursor|openclaw|project|all] | print | path]
       Install or print the standalone Hyphae agent skill (starting point for any agent)
+  hyp mute <target> | hyp unmute <target> | hyp mutes
+      Drop noisy peers (<user@host/handle>, <user@host/*>), #channels, topics, or plugins at the connector
 
 Runtime:
   hyp daemon | hyp wait [--stream]
@@ -719,6 +721,38 @@ async function main(): Promise<void> {
       }
     }
     if (!allOk) process.exitCode = 1;
+    return;
+  }
+
+  if (action === "mute" || action === "unmute" || action === "mutes") {
+    const { values, positionals } = parseArgs({
+      args,
+      allowPositionals: true,
+      options: { socket: { type: "string" }, list: { type: "boolean" } },
+    });
+    const socketPath = values.socket ?? defaultSocketPath();
+    if (action === "mutes" || values.list === true || (action === "mute" && (!positionals[0] || positionals[0] === "list"))) {
+      const res = await daemonRpc(socketPath, { type: "mute.list" });
+      if (!res.ok || !res.result) throw new Error(`Daemon not reachable at ${socketPath}`);
+      const mutes = Array.isArray(res.result.mutes) ? res.result.mutes : [];
+      if (mutes.length === 0) {
+        console.log("No active connector-level mutes.");
+      } else {
+        for (const m of mutes as Array<{ pattern?: string; mutedBy?: string }>) {
+          console.log(`- ${m.pattern} (by ${m.mutedBy ?? "cli"})`);
+        }
+      }
+      return;
+    }
+    const target = positionals[0];
+    if (!target) {
+      throw new Error(`Usage: hyp ${action} <user@host/handle | user@host/* | #channel | topic:name | plugin:name>`);
+    }
+    const res = await daemonRpc(socketPath, { type: action === "mute" ? "mute.add" : "mute.remove", target });
+    if (!res.ok || !res.result) {
+      throw new Error(`Could not ${action} '${target}' (is daemon running at ${socketPath}?)`);
+    }
+    console.log(JSON.stringify(res.result, null, 2));
     return;
   }
 

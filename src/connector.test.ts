@@ -67,9 +67,9 @@ test("sessions share router enrollment but keep handles and inbox acknowledgemen
     assert.equal(mailbox.items.length, 1);
     const [itemReceipt] = mailbox.items;
     assert.ok(itemReceipt);
-    assert.deepEqual(await connector.call("b", "hyp_inbox", { acknowledge: [itemReceipt.receipt] }), { items: [] });
+    assert.deepEqual(await connector.call("b", "hyp_inbox", { acknowledge: [itemReceipt.receipt] }), { deliveryMode: "full", unread: 0, items: [] });
     assert.deepEqual(await connector.call("a", "hyp_inbox", {}), mailbox);
-    assert.deepEqual(await connector.call("a", "hyp_inbox", { acknowledge: [itemReceipt.receipt] }), { items: [] });
+    assert.deepEqual(await connector.call("a", "hyp_inbox", { acknowledge: [itemReceipt.receipt] }), { deliveryMode: "full", unread: 0, items: [] });
     assert.deepEqual(acked, [delivered, delivered]);
   } finally {
     lifecycle.abort();

@@ -83,6 +83,9 @@ Once enrolled, use the Hyphae MCP tools directly:
 - **External Chat Bridges (Telegram, WhatsApp, Slack, BYO)**:
   - `hyp_plugin_targets()` -> list local bridge targets
   - `hyp_plugin_handoff({ plugin: "telegram", target: "ops", toHandle: "frontend" })` -> link/transfer a live bridge target with zero daemon restart
+- **Connector-Level Muting & Slim Notification Mode**:
+  - `hyp_mute({ target: "alice@laptop/codex" })` -> drop messages/events at the connector level (supports `user@host/handle`, `user@host/*`, `#channel`, `topic:<name>`, `plugin:<name>`; optional `scope: "session"`). Manage with `hyp_unmute` / `hyp_mutes` or `hyp mute <target>`.
+  - `hyp_mode({ mode: "notify" })` -> push only a 1-line unread-count digest (`hyphae notice · 2 unread (...) · call hyp_inbox to read`) while keeping full items in SQLite until you read them via `hyp_inbox({ acknowledgeAll: true })` (switch back anytime with `hyp_mode({ mode: "full" })`).
 
 ---
 

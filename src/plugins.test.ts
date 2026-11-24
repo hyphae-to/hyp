@@ -548,3 +548,125 @@ test("installSkill installs canonical skills/hyphae/SKILL.md across harnesses an
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("connector-level muting drops messages from muted peers, connector wildcards, and #channels, and resumes on unmute", { timeout: 15_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hyphae-mute-"));
+  const routerCore = new RouterCore({ dbPath: join(dir, "router.sqlite") });
+  const token = routerCore.addConnector("bogdan@local");
+  const router = await serveRouter({ core: routerCore, host: "127.0.0.1", port: 0 });
+  const daemon = await startDaemon({
+    connectorId: "bogdan@local",
+    directory: join(dir, "state"),
+    routers: [{ name: "primary", url: router.url, token }],
+  }, { quiet: true });
+  try {
+    daemon.state.register("openclaw:oc-1", { kind: "openclaw" });
+    daemon.state.register("claude:noisy", { kind: "claude" });
+    daemon.state.register("antigravity:ally", { kind: "antigravity" });
+    await daemon.connector.call("openclaw:oc-1", "hyp_join", { handle: "alice" });
+    await daemon.connector.call("claude:noisy", "hyp_join", { handle: "noisy" });
+    await daemon.connector.call("antigravity:ally", "hyp_join", { handle: "ally" });
+
+    // Mute `bogdan@local/noisy` at connector level
+    const muted = await daemon.connector.call("openclaw:oc-1", "hyp_mute", { target: "bogdan@local/noisy" });
+    assert.deepEqual(muted, { muted: "bogdan@local/noisy", scope: "connector" });
+
+    // Send from noisy (must be dropped) AND from ally (must be delivered to openclaw durable mailbox!)
+    await daemon.connector.call("claude:noisy", "hyp_send", { to: "bogdan@local/alice", text: "spam 1" });
+    await daemon.connector.call("antigravity:ally", "hyp_send", { to: "bogdan@local/alice", text: "important from ally" });
+
+    const deadline = Date.now() + 3_000;
+    while (daemon.state.pendingCount("openclaw:oc-1") < 1 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    const items1 = daemon.connector.drainMailbox("openclaw:oc-1", 10);
+    assert.equal(items1.length, 1);
+    assert.match(items1[0].text, /important from ally/);
+    assert.doesNotMatch(items1[0].text, /spam 1/);
+
+    // Mute #deploys channel at connector level
+    await daemon.connector.call("openclaw:oc-1", "hyp_channel_join", { channel: "#deploys" });
+    await daemon.connector.call("antigravity:ally", "hyp_channel_join", { channel: "#deploys" });
+    await daemon.connector.call("openclaw:oc-1", "hyp_mute", { target: "#deploys" });
+    await daemon.connector.call("antigravity:ally", "hyp_channel_post", { channel: "#deploys", text: "muted deploy chatter" });
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(daemon.state.pendingCount("openclaw:oc-1"), 0);
+
+    // Unmute noisy and verify delivery resumes
+    const unmuted = await daemon.connector.call("openclaw:oc-1", "hyp_unmute", { target: "bogdan@local/noisy" });
+    assert.equal((unmuted as { removed: boolean }).removed, true);
+    await daemon.connector.call("claude:noisy", "hyp_send", { to: "bogdan@local/alice", text: "unmuted hello" });
+
+    const deadline2 = Date.now() + 3_000;
+    while (daemon.state.pendingCount("openclaw:oc-1") < 1 && Date.now() < deadline2) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    const items2 = daemon.connector.drainMailbox("openclaw:oc-1", 10);
+    assert.equal(items2.length, 1);
+    assert.match(items2[0].text, /unmuted hello/);
+  } finally {
+    await daemon.stop();
+    await router.close();
+    routerCore.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("notify mode pushes only a slim unread-count digest and keeps full items in hyp_inbox until queried", { timeout: 15_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hyphae-notify-"));
+  const routerCore = new RouterCore({ dbPath: join(dir, "router.sqlite") });
+  const token = routerCore.addConnector("bogdan@local");
+  const router = await serveRouter({ core: routerCore, host: "127.0.0.1", port: 0 });
+  const daemon = await startDaemon({
+    connectorId: "bogdan@local",
+    directory: join(dir, "state"),
+    routers: [{ name: "primary", url: router.url, token }],
+  }, { quiet: true });
+  try {
+    daemon.state.register("antigravity:reader", { kind: "antigravity" });
+    daemon.state.register("claude:sender", { kind: "claude" });
+    await daemon.connector.call("antigravity:reader", "hyp_join", { handle: "reader" });
+    await daemon.connector.call("claude:sender", "hyp_join", { handle: "sender" });
+
+    // Switch reader to slim notification mode
+    const modeRes = await daemon.connector.call("antigravity:reader", "hyp_mode", { mode: "notify" });
+    assert.deepEqual(modeRes, { deliveryMode: "notify", unread: 0 });
+
+    // Send 2 full messages to reader
+    await daemon.connector.call("claude:sender", "hyp_send", { to: "bogdan@local/reader", text: "secret full payload one" });
+    await daemon.connector.call("claude:sender", "hyp_send", { to: "bogdan@local/reader", text: "secret full payload two" });
+
+    const deadline = Date.now() + 3_000;
+    while (daemon.state.pendingCount("antigravity:reader") < 2 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+
+    // Hook/waiter drain returns ONE slim unread-count banner (NOT full payload bodies!)
+    const pushed = daemon.connector.drainForPush("antigravity:reader", 10);
+    assert.equal(pushed.length, 1);
+    assert.match(pushed[0].text, /hyphae notice · 2 unread \(2 messages\) · from bogdan@local\/sender · call hyp_inbox to read/);
+    assert.doesNotMatch(pushed[0].text, /secret full payload/);
+
+    // Subsequent drain without new arrivals stays quiet, while unread items remain intact in SQLite
+    assert.deepEqual(daemon.connector.drainForPush("antigravity:reader", 10), []);
+    assert.equal(daemon.state.pendingCount("antigravity:reader"), 2);
+
+    // Querying hyp_inbox returns all full unread items; acknowledgeAll clears them
+    const inbox1 = await daemon.connector.call("antigravity:reader", "hyp_inbox", {}) as { unread: number; deliveryMode: string; items: Array<{ text: string; receipt: string }> };
+    assert.equal(inbox1.deliveryMode, "notify");
+    assert.equal(inbox1.unread, 2);
+    assert.equal(inbox1.items.length, 2);
+    assert.match(inbox1.items[0].text, /secret full payload one/);
+    assert.match(inbox1.items[1].text, /secret full payload two/);
+
+    const inbox2 = await daemon.connector.call("antigravity:reader", "hyp_inbox", { acknowledgeAll: true }) as { unread: number; items: Array<{ text: string }> };
+    assert.equal(inbox2.items.length, 2);
+    assert.equal(inbox2.unread, 0);
+    assert.equal(daemon.state.pendingCount("antigravity:reader"), 0);
+  } finally {
+    await daemon.stop();
+    await router.close();
+    routerCore.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

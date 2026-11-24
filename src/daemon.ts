@@ -188,16 +188,16 @@ export async function startDaemon(config: Config, options: StartDaemonOptions = 
     flushing.add(sessionId);
     try {
       while (true) {
-        const pending = connector.peekMailbox(sessionId, 10);
-        if (pending.length === 0) break;
+        const peeked = connector.peekForPush(sessionId, 10);
+        if (peeked.items.length === 0) break;
 
         // Priority 1: Live Claude native channel
         const channel = channels.get(sessionId);
         if (channel && !channel.socket.destroyed) {
-          const [first] = pending;
+          const [first] = peeked.items;
           const outcome = await channel.deliver(first.text).catch(() => hold("claude_channel_failed"));
           if (outcome.outcome === "delivered") {
-            connector.acknowledgeMailbox(sessionId, [first.receipt]);
+            connector.ackPush(sessionId, [first.receipt], peeked.notifyOnly);
             continue;
           }
           break;
@@ -209,7 +209,7 @@ export async function startDaemon(config: Config, options: StartDaemonOptions = 
         // Priority 2: Streaming watcher (`hyp watch` / Claude Monitor)
         const streamWaiter = [...set].find((entry) => entry.mode === "stream" && !entry.socket.destroyed);
         if (streamWaiter) {
-          const items = connector.drainMailbox(sessionId, 10);
+          const items = connector.drainForPush(sessionId, 10);
           if (items.length === 0) break;
           send(streamWaiter.socket, { type: "wait.items", items });
           continue;
@@ -218,7 +218,7 @@ export async function startDaemon(config: Config, options: StartDaemonOptions = 
         // Priority 3: One-shot blocking waiter (`hyp wait` / Antigravity run_command)
         const onceWaiter = [...set].find((entry) => entry.mode === "once" && !entry.socket.destroyed);
         if (onceWaiter) {
-          const items = connector.drainMailbox(sessionId, 10);
+          const items = connector.drainForPush(sessionId, 10);
           if (items.length === 0) break;
           set.delete(onceWaiter);
           if (set.size === 0) waiters.delete(sessionId);
@@ -371,9 +371,40 @@ export async function startDaemon(config: Config, options: StartDaemonOptions = 
               plugins: pluginHost?.names ?? [],
               streams: streamHost?.names ?? [],
               topics: streamHost?.topics ?? [],
+              mutes: connector.listMutes(),
               sessions: connector.listSessions(),
             },
           });
+          socket.end();
+          return;
+        }
+
+        if (type === "mute.add") {
+          try {
+            const target = typeof packet.target === "string" ? packet.target : "";
+            const rule = connector.muteTarget(target, "*", "cli");
+            send(socket, { ok: true, result: { rule } });
+          } catch (error) {
+            send(socket, { ok: false, error: error instanceof Error ? error.message : "mute_failed" });
+          }
+          socket.end();
+          return;
+        }
+
+        if (type === "mute.remove") {
+          try {
+            const target = typeof packet.target === "string" ? packet.target : "";
+            const res = connector.unmuteTarget(target, "*");
+            send(socket, { ok: true, result: res });
+          } catch (error) {
+            send(socket, { ok: false, error: error instanceof Error ? error.message : "unmute_failed" });
+          }
+          socket.end();
+          return;
+        }
+
+        if (type === "mute.list") {
+          send(socket, { ok: true, result: { mutes: connector.listMutes() } });
           socket.end();
           return;
         }

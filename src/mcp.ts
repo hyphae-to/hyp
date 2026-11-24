@@ -24,8 +24,24 @@ const tools = [
       coalesceSeconds: { type: "integer", minimum: 0, maximum: 600 },
     }, ["key", "topic", "filters"]),
   tool("hyp_unsubscribe", "Remove this thread/conversation's subscription by ID or key.", { id: string, key: string }),
-  tool("hyp_inbox", "Inspect or acknowledge queued items directly (normally unnecessary when hooks, waiters, or channels push messages automatically).", { acknowledge: { type: "array", items: string } }),
+  tool("hyp_inbox", "Read unread messages/events from this session's durable inbox (especially in 'notify' mode) and optionally acknowledge them.", {
+    acknowledge: { type: "array", items: string },
+    acknowledgeAll: { type: "boolean", description: "Acknowledge and clear all returned items in one call." },
+    limit: { type: "integer", minimum: 1, maximum: 50 },
+  }),
   tool("hyp_subscriptions", "List this thread/conversation's subscriptions, delivery modes, and any router hold reasons."),
+  tool("hyp_mode", "Switch this session's inbound delivery mode: 'full' pushes full message/event payloads automatically; 'notify' sends only a slim unread-count notice and keeps full items in hyp_inbox until queried.", {
+    mode: { type: "string", enum: ["full", "notify"] },
+  }, ["mode"]),
+  tool("hyp_mute", "Drop inbound messages/events at the connector (default) or session level from a peer (<user@host/handle>), connector (<user@host/*>), #channel, topic:<name>, or plugin:<name>.", {
+    target: string,
+    scope: { type: "string", enum: ["connector", "session"], description: "Defaults to 'connector' (drops for all local sessions on this connector)." },
+  }, ["target"]),
+  tool("hyp_unmute", "Remove a previously added mute rule.", {
+    target: string,
+    scope: { type: "string", enum: ["connector", "session"] },
+  }, ["target"]),
+  tool("hyp_mutes", "List active connector-wide and session-scoped mute rules."),
   tool("hyp_channel_join", "Join a shared multi-agent chat channel (e.g. '#incidents', '#frontend') on the primary router.", { channel: string }, ["channel"]),
   tool("hyp_channel_leave", "Leave a shared multi-agent chat channel.", { channel: string }, ["channel"]),
   tool("hyp_channel_post", "Post a message to all other members of a joined chat channel (e.g. '#incidents').", { channel: string, text: string }, ["channel", "text"]),

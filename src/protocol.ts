@@ -1,4 +1,5 @@
 export type Mode = "queue" | "interrupt";
+export type DeliveryMode = "full" | "notify";
 export type Outcome = { outcome: "delivered" } | { outcome: "hold" | "rejected"; reason: string };
 export type HarnessKind = "antigravity" | "claude" | "codex" | "cursor" | "opencode" | "gemini" | "openclaw" | "herdr";
 
@@ -32,6 +33,10 @@ export const MESH_TOOLS = new Set([
   "hyp_channels",
   "hyp_plugin_targets",
   "hyp_plugin_handoff",
+  "hyp_mode",
+  "hyp_mute",
+  "hyp_unmute",
+  "hyp_mutes",
 ]);
 
 export const handlePattern = /^[a-z0-9][a-z0-9._-]{0,63}$/;
@@ -50,6 +55,56 @@ export const delivered: Outcome = { outcome: "delivered" };
 export const object = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 export const isMode = (value: unknown): value is Mode => value === "queue" || value === "interrupt";
+export const isDeliveryMode = (value: unknown): value is DeliveryMode => value === "full" || value === "notify";
+
+/**
+ * Validates and normalizes a connector/session mute target:
+ * - Peer address: `alice@laptop/codex`
+ * - Connector wildcard: `alice@laptop/*`
+ * - Channel: `#deploys`
+ * - Event topic: `topic:github`
+ * - Local plugin bridge: `plugin:slack`
+ */
+export function normalizeMutePattern(raw: string): string | null {
+  const trimmed = raw.trim().toLowerCase();
+  if (!trimmed || trimmed.length > 140) return null;
+  if (addressPattern.test(trimmed)) return trimmed;
+  if (trimmed.endsWith("/*")) {
+    const connector = trimmed.slice(0, -2);
+    return connectorPattern.test(connector) ? `${connector}/*` : null;
+  }
+  if (trimmed.startsWith("#")) {
+    return channelPattern.test(trimmed) ? trimmed : null;
+  }
+  if (trimmed.startsWith("topic:")) {
+    const topic = trimmed.slice("topic:".length);
+    return /^[a-z0-9][a-z0-9._-]{0,63}$/.test(topic) ? `topic:${topic}` : null;
+  }
+  if (trimmed.startsWith("plugin:")) {
+    const plugin = trimmed.slice("plugin:".length);
+    return /^[a-z0-9][a-z0-9._-]{0,63}$/.test(plugin) ? `plugin:${plugin}` : null;
+  }
+  return null;
+}
+
+export interface UnreadDigest {
+  readonly unread: number;
+  readonly unnotified: number;
+  readonly messages: number;
+  readonly events: number;
+  readonly plugins: number;
+  readonly sources: readonly string[];
+}
+
+export function formatUnreadDigest(digest: UnreadDigest): string {
+  const parts: string[] = [];
+  if (digest.messages > 0) parts.push(`${digest.messages} ${digest.messages === 1 ? "message" : "messages"}`);
+  if (digest.events > 0) parts.push(`${digest.events} ${digest.events === 1 ? "event" : "events"}`);
+  if (digest.plugins > 0) parts.push(`${digest.plugins} ${digest.plugins === 1 ? "bridge item" : "bridge items"}`);
+  const breakdown = parts.length > 0 ? ` (${parts.join(", ")})` : "";
+  const from = digest.sources.length > 0 ? ` · from ${digest.sources.slice(0, 4).join(", ")}${digest.sources.length > 4 ? ` +${digest.sources.length - 4}` : ""}` : "";
+  return `hyphae notice · ${digest.unread} unread${breakdown}${from} · call hyp_inbox to read`;
+}
 export const isHarness = (value: unknown): value is HarnessKind =>
   value === "antigravity" ||
   value === "claude" ||

@@ -122,6 +122,10 @@ Configure webhook or fd-3 publishers directly on a Team Node (`localRouter.strea
 ### Private Chat Bridges (Slack, Telegram, WhatsApp, fd-3)
 Run a Private Node on your laptop for personal chat bridges (`hyp connect slack` / `telegram` / `webhook`) with live `hyp_plugin_targets` & `hyp_plugin_handoff` across harnesses — zero daemon restarts, and your chat tokens never leave your machine.
 
+### Connector-Level Muting & Notification Mode
+- **Mute noisy peers/channels/topics at the connector**: `hyp_mute({ target: "jack@prod/*" })` or `hyp mute #deploys` drops matching messages before they ever reach an agent's mailbox (`user@host/handle`, `user@host/*`, `#channel`, `topic:<name>`, `plugin:<name>`).
+- **Slim notification mode (`notify`)**: Call `hyp_mode({ mode: "notify" })` to receive only a single-line unread-count digest (`hyphae notice · 3 unread (2 messages, 1 event) · call hyp_inbox to read`), keeping full payloads tucked safely in SQLite until you explicitly fetch them with `hyp_inbox({ acknowledgeAll: true })`.
+
 ---
 
 ## Everyday CLI

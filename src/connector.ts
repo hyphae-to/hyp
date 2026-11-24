@@ -1,9 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type { Config } from "./config.ts";
 import { createDelivery, usesDurableMailbox, type Channel, type Delivery } from "./delivery.ts";
-import { addressPattern, delivered, formatItem, handlePattern, hold, isMode, normalizeChannelName, object, reject, type InboxItem, type Mode, type Outcome } from "./protocol.ts";
+import {
+  addressPattern, delivered, formatItem, formatUnreadDigest, handlePattern, hold, isDeliveryMode, isMode,
+  normalizeChannelName, normalizeMutePattern, object, reject, type DeliveryMode, type InboxItem, type Mode, type Outcome,
+} from "./protocol.ts";
 import { RouterError, RouterLink } from "./router.ts";
-import type { MailboxEntry, Session, State } from "./state.ts";
+import type { MailboxEntry, MuteRule, Session, State } from "./state.ts";
 
 const SUBSCRIPTION_CHANGES = Symbol();
 const MAX_SUBSCRIPTIONS = 20;
@@ -25,6 +28,8 @@ export interface SessionStatus {
   address: string | null;
   subscriptions: number;
   pending: number;
+  unnotified: number;
+  deliveryMode: DeliveryMode;
   enrolled: boolean;
   hasLiveTransport: boolean;
   lastSeen: number;
@@ -142,15 +147,44 @@ export class Connector {
   }
 
   async #deliver(session: Session, router: string, item: InboxItem, mode: Mode): Promise<Outcome> {
+    const muteCandidates = this.#muteCandidates(item);
+    if (this.#state.isMuted(session.id, muteCandidates)) {
+      this.#state.record(router, item.id, "muted");
+      return delivered;
+    }
     const text = formatItem(item);
-    return this.#deliverPrepared(session, router, item.id, text, mode);
+    const meta = item.kind === "message"
+      ? { kind: "message" as const, source: this.#messageSource(item) }
+      : { kind: "event" as const, source: item.topic };
+    return this.#deliverPrepared(session, router, item.id, text, mode, meta);
+  }
+
+  #messageSource(item: Extract<InboxItem, { kind: "message" }>): string {
+    const ch = /^\[(#[^\]\s]+)\]\s/.exec(item.text);
+    return ch ? `${ch[1]} (${item.from})` : item.from;
+  }
+
+  #muteCandidates(item: InboxItem): string[] {
+    if (item.kind === "message") {
+      const from = item.from.toLowerCase();
+      const connector = from.split("/")[0];
+      const list = [from, `${connector}/*`];
+      const ch = /^\[(#[^\]\s]+)\]\s/.exec(item.text);
+      if (ch) list.push(ch[1].toLowerCase());
+      return list;
+    }
+    return [`topic:${item.topic.toLowerCase()}`];
   }
 
   /** Serialized delivery for local connector plugin batches into any harness session. */
   async deliverPluginText(session: Session, plugin: string, batchId: string, text: string): Promise<Outcome> {
     const routerKey = `plugin:${plugin}`;
+    if (this.#state.isMuted(session.id, [`plugin:${plugin.toLowerCase()}`])) {
+      this.#state.record(routerKey, batchId, "muted");
+      return delivered;
+    }
     const result = (this.#deliveryTails.get(session.id) ?? Promise.resolve()).then(() =>
-      this.#deliverPrepared(session, routerKey, batchId, text, "queue"),
+      this.#deliverPrepared(session, routerKey, batchId, text, "queue", { kind: "plugin", source: `plugin:${plugin}` }),
     );
     const tail = result.catch(() => {});
     this.#deliveryTails.set(session.id, tail);
@@ -161,23 +195,43 @@ export class Connector {
     }
   }
 
-  async #deliverPrepared(session: Session, router: string, itemId: string, text: string, mode: Mode): Promise<Outcome> {
+  async #deliverPrepared(
+    session: Session,
+    router: string,
+    itemId: string,
+    text: string,
+    mode: Mode,
+    meta: { kind?: "message" | "event" | "plugin"; source?: string } = {},
+  ): Promise<Outcome> {
     const receipt = this.#state.receipt(router, itemId);
-    if (receipt === "submitted") return delivered;
+    if (receipt === "submitted" || receipt === "muted") return delivered;
     if (receipt === "submitting") return reject("previous_submission_outcome_unknown");
     if (receipt !== undefined && receipt !== "interrupted") return reject(receipt);
     if (receipt === "interrupted") mode = "queue";
     if (Buffer.byteLength(text) > 100_000) return reject("event_prompt_too_large");
 
-    if (this.#usesDurableMailbox(session)) {
-      if (mode !== "queue") return hold("delivery_mode_unavailable");
-      const stored = this.#state.putInInbox(session.id, router, itemId, text);
+    const current = this.#state.session(session.id) ?? session;
+    const isNotifyMode = current.deliveryMode === "notify";
+
+    if (isNotifyMode || this.#usesDurableMailbox(current)) {
+      if (!isNotifyMode && mode !== "queue") return hold("delivery_mode_unavailable");
+      const stored = this.#state.putInInbox(current.id, router, itemId, text, meta);
       if (!stored) return hold("local_inbox_full");
-      this.#onMailboxItem(session.id);
+
+      if (isNotifyMode && !this.#usesDurableMailbox(current)) {
+        const digest = this.#state.unreadDigest(current.id);
+        const notice = formatUnreadDigest(digest);
+        const delivery = this.#delivery(current);
+        const outcome = await delivery.deliver(notice, "queue", (attempt) => attempt()).catch(() => hold("notify_push_failed"));
+        if (outcome.outcome === "delivered") this.#state.markMailboxNotified(current.id);
+        return delivered;
+      }
+
+      this.#onMailboxItem(current.id);
       return delivered;
     }
 
-    const delivery = this.#delivery(session);
+    const delivery = this.#delivery(current);
     if (!delivery.modes.includes(mode)) return hold("delivery_mode_unavailable");
     return delivery.deliver(text, mode, async (attempt) => {
       this.#state.record(router, itemId, "submitting");
@@ -192,9 +246,50 @@ export class Connector {
     });
   }
 
-  drainMailbox(sessionId: string, limit = 10): MailboxEntry[] {
+  drainForPush(sessionId: string, limit = 10): MailboxEntry[] {
     this.#state.touch(sessionId);
+    const session = this.#state.session(sessionId);
+    if (!session) return [];
+    if (session.deliveryMode === "notify") {
+      const digest = this.#state.unreadDigest(sessionId);
+      if (digest.unnotified === 0) return [];
+      this.#state.markMailboxNotified(sessionId);
+      return [{
+        receipt: `notice:${Date.now()}`,
+        router: "hyphae",
+        text: formatUnreadDigest(digest),
+        received: Date.now(),
+      }];
+    }
     return this.#state.drainInbox(sessionId, limit);
+  }
+
+  peekForPush(sessionId: string, limit = 10): { notifyOnly: boolean; items: MailboxEntry[] } {
+    const session = this.#state.session(sessionId);
+    if (!session) return { notifyOnly: false, items: [] };
+    if (session.deliveryMode === "notify") {
+      const digest = this.#state.unreadDigest(sessionId);
+      if (digest.unnotified === 0) return { notifyOnly: true, items: [] };
+      return {
+        notifyOnly: true,
+        items: [{
+          receipt: `notice:${Date.now()}`,
+          router: "hyphae",
+          text: formatUnreadDigest(digest),
+          received: Date.now(),
+        }],
+      };
+    }
+    return { notifyOnly: false, items: this.#state.peekInbox(sessionId, limit) };
+  }
+
+  ackPush(sessionId: string, receipts: readonly string[], notifyOnly: boolean): void {
+    if (notifyOnly) this.#state.markMailboxNotified(sessionId);
+    else this.#state.acknowledgeInbox(sessionId, receipts);
+  }
+
+  drainMailbox(sessionId: string, limit = 10): MailboxEntry[] {
+    return this.drainForPush(sessionId, limit);
   }
 
   peekMailbox(sessionId: string, limit = 5): MailboxEntry[] {
@@ -203,6 +298,24 @@ export class Connector {
 
   acknowledgeMailbox(sessionId: string, receipts: readonly string[]): void {
     this.#state.acknowledgeInbox(sessionId, receipts);
+  }
+
+  muteTarget(target: string, scope = "*", mutedBy = "cli"): MuteRule {
+    const pattern = normalizeMutePattern(target);
+    if (!pattern) {
+      throw invalid("Invalid mute target. Use peer (<user@host/handle>), connector (<user@host/*>), #channel, topic:<name>, or plugin:<name>.");
+    }
+    return this.#state.addMute(pattern, scope, mutedBy);
+  }
+
+  unmuteTarget(target: string, scope = "*"): { pattern: string; removed: boolean } {
+    const pattern = normalizeMutePattern(target);
+    if (!pattern) throw invalid("Invalid mute target");
+    return { pattern, removed: this.#state.removeMute(pattern, scope) };
+  }
+
+  listMutes(sessionId?: string): MuteRule[] {
+    return this.#state.listMutes(sessionId);
   }
 
   sessionStatus(sessionId: string): SessionStatus | undefined {
@@ -216,6 +329,8 @@ export class Connector {
       address: this.#address(session.handle),
       subscriptions,
       pending: this.#state.pendingCount(sessionId),
+      unnotified: this.#state.unnotifiedCount(sessionId),
+      deliveryMode: session.deliveryMode,
       enrolled: session.handle !== null || subscriptions > 0,
       hasLiveTransport: this.#hasLiveTransport(sessionId),
       lastSeen: session.lastSeen,
@@ -232,6 +347,8 @@ export class Connector {
         address: this.#address(session.handle),
         subscriptions,
         pending: this.#state.pendingCount(session.id),
+        unnotified: this.#state.unnotifiedCount(session.id),
+        deliveryMode: session.deliveryMode,
         enrolled: session.handle !== null || subscriptions > 0,
         hasLiveTransport: this.#hasLiveTransport(session.id),
         lastSeen: session.lastSeen,
@@ -269,16 +386,69 @@ export class Connector {
           sessionId: session.id,
           backend: session.backend.kind,
           modes: this.#delivery(session).modes,
+          deliveryMode: session.deliveryMode,
+          unread: this.#state.pendingCount(session.id),
+          mutes: this.#state.listMutes(session.id).length,
           routers: [...this.#routers.keys()],
           inbound: this.#inboundMode(session),
         };
+      case "hyp_mode": {
+        const { mode } = args;
+        if (!isDeliveryMode(mode)) throw invalid("Expected mode: 'full' or 'notify'");
+        this.#state.setDeliveryMode(session.id, mode);
+        if (mode === "full" && this.#state.pendingCount(session.id) > 0) {
+          this.#onMailboxItem(session.id);
+        }
+        return {
+          deliveryMode: mode,
+          unread: this.#state.pendingCount(session.id),
+        };
+      }
+      case "hyp_mute": {
+        const { target, scope } = args;
+        if (typeof target !== "string") throw invalid("Expected target (e.g. 'alice@laptop/codex', 'alice@laptop/*', '#deploys', 'topic:github', 'plugin:slack')");
+        const resolvedScope = scope === "session" ? session.id : "*";
+        const rule = this.muteTarget(target, resolvedScope, this.#address(session.handle) ?? session.id);
+        return {
+          muted: rule.pattern,
+          scope: resolvedScope === "*" ? "connector" : "session",
+        };
+      }
+      case "hyp_unmute": {
+        const { target, scope } = args;
+        if (typeof target !== "string") throw invalid("Expected target");
+        const resolvedScope = scope === "session" ? session.id : "*";
+        const res = this.unmuteTarget(target, resolvedScope);
+        return {
+          pattern: res.pattern,
+          scope: resolvedScope === "*" ? "connector" : "session",
+          removed: res.removed,
+        };
+      }
+      case "hyp_mutes": {
+        const rules = this.listMutes(session.id).map((rule) => ({
+          pattern: rule.pattern,
+          scope: rule.scope === "*" ? "connector" : "session",
+          mutedAt: rule.mutedAt,
+          mutedBy: rule.mutedBy,
+        }));
+        return { mutes: rules };
+      }
       case "hyp_inbox": {
         const acknowledge = args.acknowledge ?? [];
+        const acknowledgeAll = args.acknowledgeAll === true;
+        const limit = typeof args.limit === "number" && Number.isInteger(args.limit) && args.limit > 0 && args.limit <= 50
+          ? args.limit : 20;
         if (!Array.isArray(acknowledge) || acknowledge.length > 100 ||
             !acknowledge.every((id): id is string => typeof id === "string" && id.length <= 80)) {
           throw invalid("Expected at most 100 receipt IDs");
         }
-        return { items: this.#state.inbox(session.id, acknowledge) };
+        const items = this.#state.inbox(session.id, acknowledge, { limit, acknowledgeAll });
+        return {
+          deliveryMode: session.deliveryMode,
+          unread: this.#state.pendingCount(session.id),
+          items,
+        };
       }
       case "hyp_join": {
         const { handle } = args;
