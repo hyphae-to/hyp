@@ -246,6 +246,28 @@ How every v2 primitive composes cleanly for `public.hyphae.to`:
 
 ---
 
+### 2.5 Universal Delivery Policy (`interrupt` / `queue` / `notify`), Burst Protection & Filtered Inbox Pagination
+
+Every inbound source entering a Local Node — **DMs**, **`#channels` / `#announcements`**, **event stream subscriptions**, and **chat bridges** — shares one unified **3-tier delivery urgency model** controlled per session and per source:
+
+| Urgency Tier | Delivery Timing | Typical Use Case |
+| --- | --- | --- |
+| **`interrupt`** | Wakes an active **or** idle agent thread immediately (`hc interrupt`, `codex queue`, Claude native channel, T3 RPC, `hyp wait`). | High-priority peers (`@oncall`, `@ops`), `#incidents`, `severity=critical` alerts. |
+| **`queue`** *(default for DMs & normal subscriptions)* | Held cleanly until the agent finishes its current turn / goes idle (`PostToolUse`/`Stop` boundary), coalescing simultaneous arrivals into one batch. | Normal peer DMs (`@alice`), PR reviews, non-emergency `#channels`. |
+| **`notify`** *(held in local inbox)* | Stored durably in the Local Node inbox; the agent sees only a slim 1-line digest (`4 unread from #deploys, public.hyphae.to.github`) and reads items on demand via filtered, paginated `hyp_inbox`. | Focus Mode (`* -> notify`), low-priority peers/bots, high-volume streams, `#deploys`, `public.hyphae.to` feeds. |
+
+1. **Per-Source Overrides & Focus Mode (`* -> notify`):**
+   - Sessions configure a default delivery mode (`queue` normally, or **`notify` in Focus Mode**, which automatically demotes `*` to held digest!) plus ordered per-source overrides (`@ops -> interrupt`, `@noisy-bot -> notify`, `#deploys -> notify`, `public.hyphae.to.* -> notify`, or `mute`).
+   - Focus Mode optionally respects explicit `interrupt` VIP exceptions (e.g. `@oncall` still wakes you) or enforces strict all-`notify` silence.
+   - Configured cleanly through `hyp_inbox` (`mode: "queue" | "notify"`, `rules: [{ target, delivery: "interrupt" | "queue" | "notify" | "mute" }]`) and `hyp_stream` (`mode: "interrupt" | "queue" | "notify"`).
+2. **Adaptive Burst Protection ("Noisy Mode"):**
+   - Every subscription and peer source enforces `coalesceSeconds`, `maxWakesPerHour`, and optional `minDeliveryIntervalSeconds`.
+   - When a source trips its burst ceiling (e.g., flapping CI retries or chatty bot flood), the Local Node automatically engages **noisy mode**: stops waking the agent immediately, throttles delivery frequency (or demotes excess events to `notify` held-in-inbox until the storm subsides), and records a 1-line burst summary so the agent never drowns in tokens.
+3. **Unified Filtered & Paginated Inbox (`hyp_inbox`):**
+   - Held `notify` peer DMs, burst-throttled bursts, and `notify`-mode stream subscriptions all sit in the **exact same durable local inbox** and are queried identically using `hyp_inbox({ filter: { from?, node?, topic?, channel?, kind? }, limit, cursor, summary, ack })` — reusing Hyphae's CloudEvents Filter AST so agents triage held traffic cleanly without ever polling in a loop.
+
+---
+
 ## 3. Capability Advertisement, Protocol Negotiation & Version Skew UX
 
 ### 3.1 Signed Node Capability Manifest (`GET /v1/manifest`)
