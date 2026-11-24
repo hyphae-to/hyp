@@ -150,7 +150,7 @@ export class Connector {
 
   #ensureKeys(): ConnectorKeys {
     if (this.#keys) return this.#keys;
-    const keyDir = this.#config.configDir ?? this.#config.directory;
+    const keyDir = this.#config.directory;
     this.#keys = isAbsolute(keyDir)
       ? loadOrCreateConnectorKeys(keyDir, this.#config.connectorId)
       : createEphemeralConnectorKeys();

@@ -1772,7 +1772,7 @@ async function runCli(ctx: ExecutionContext): Promise<void> {
       if (!target) {
         throw new CliUsageError(`Invalid destination '${to}'`);
       }
-      const keys = loadOrCreateConnectorKeys(config.configDir ?? config.directory, config.connectorId);
+      const keys = loadOrCreateConnectorKeys(config.directory, config.connectorId);
       const router = new RouterLink(primaryCfg);
       await router.registerKeys(createKeyRegistration(config.connectorId, keys));
       const peerKeys = await router.peerKeys();

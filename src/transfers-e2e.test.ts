@@ -360,7 +360,7 @@ test("E2E encrypted file transfer: zero-knowledge router, immediate SSE delivery
 
     // Pre-create Alice's keys and pre-register them + pre-seed Alice's handle in her state.sqlite
     // while Alice's daemon is OFFLINE so we can inspect the pending transfer at rest on the router!
-    const aliceKeys = loadOrCreateConnectorKeys(aliceDir, "alice@laptop");
+    const aliceKeys = loadOrCreateConnectorKeys(join(aliceDir, "state"), "alice@laptop");
     const regRes = await fetch(`${router.url}/v1/keys`, {
       method: "PUT",
       headers: { authorization: `Bearer ${aliceToken}`, "content-type": "application/json" },
@@ -502,8 +502,8 @@ test("security mutations: tampered ciphertext on router and rogue/tampered heade
   const sampleFile = join(dir, "payload.txt");
   writeFileSync(sampleFile, "integrity-checked-secret-data", "utf8");
 
-  const alexKeys = loadOrCreateConnectorKeys(alexDir, "alex@laptop");
-  const aliceKeys = loadOrCreateConnectorKeys(aliceDir, "alice@laptop");
+  const alexKeys = loadOrCreateConnectorKeys(join(alexDir, "state"), "alex@laptop");
+  const aliceKeys = loadOrCreateConnectorKeys(join(aliceDir, "state"), "alice@laptop");
 
   // Register both keys on the router
   for (const [id, tok, keys] of [
