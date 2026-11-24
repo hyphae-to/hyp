@@ -12,6 +12,7 @@ pub mod hooks;
 pub mod mcp;
 pub mod protocol;
 pub mod sock;
+pub mod transport;
 pub mod wait;
 
 pub use hyp_proto::PROTOCOL_VERSION;

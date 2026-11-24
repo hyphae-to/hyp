@@ -509,10 +509,20 @@ dependencies = [
 name = "hyp-harness"
 version = "0.2.0"
 dependencies = [
+ "base64",
+ "bytes",
+ "http",
+ "http-body-util",
  "hyp-crypto",
  "hyp-node",
  "hyp-proto",
  "hyp-store",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "rand",
+ "ring",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

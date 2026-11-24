@@ -24,8 +24,11 @@ use serde_json::json;
 use std::collections::BTreeSet;
 use std::f64::consts::PI;
 use std::ffi::OsStr;
+#[cfg(unix)]
 use std::fs;
-use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+#[cfg(unix)]
+use std::io::BufReader;
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::thread;
