@@ -260,9 +260,13 @@ Every inbound source entering a Local Node — **DMs**, **`#channels` / `#announ
    - Sessions configure a default delivery mode (`queue` normally, or **`notify` in Focus Mode**, which automatically demotes `*` to held digest!) plus ordered per-source overrides (`@ops -> interrupt`, `@noisy-bot -> notify`, `#deploys -> notify`, `public.hyphae.to.* -> notify`, or `mute`).
    - Focus Mode optionally respects explicit `interrupt` VIP exceptions (e.g. `@oncall` still wakes you) or enforces strict all-`notify` silence.
    - Configured cleanly through `hyp_inbox` (`mode: "queue" | "notify"`, `rules: [{ target, delivery: "interrupt" | "queue" | "notify" | "mute" }]`) and `hyp_stream` (`mode: "interrupt" | "queue" | "notify"`).
-2. **Adaptive Burst Protection ("Noisy Mode"):**
-   - Every subscription and peer source enforces `coalesceSeconds`, `maxWakesPerHour`, and optional `minDeliveryIntervalSeconds`.
-   - When a source trips its burst ceiling (e.g., flapping CI retries or chatty bot flood), the Local Node automatically engages **noisy mode**: stops waking the agent immediately, throttles delivery frequency (or demotes excess events to `notify` held-in-inbox until the storm subsides), and records a 1-line burst summary so the agent never drowns in tokens.
+2. **Adaptive Burst Protection ("Noisy Mode") & Token-Budget-Aware Hybrid Batch Packing (Sane Defaults):**
+   - Every subscription and peer source enforces `coalesceSeconds` (default `15s` for streams, `2s` micro-batch for simultaneous DMs), `maxWakesPerHour`, and optional `minDeliveryIntervalSeconds`.
+   - When a source trips its burst ceiling (e.g., flapping CI retries or chatty bot flood), the Local Node automatically engages **noisy mode**: stops waking the agent immediately, throttles delivery frequency, and holds excess events in the local inbox.
+   - **Tunable Token-Budget Hybrid Batching (`delivery.maxBatchTokens`, default `1200` est. tokens / `~4800` chars; `maxInlineItems`, default `6`):**
+     - When flushing a batch to an agent, the Local Node sorts pending items by priority (**`interrupt` -> `queue` DMs/`#announcements` -> `queue` `#channels`/streams -> `notify`/burst overflow**).
+     - Highest-priority items pack **inline in full** up to `maxBatchTokens`. Any single oversized payload exceeding the budget emits a short preview while keeping its full body in the inbox.
+     - The moment remaining items would exceed `maxBatchTokens` or `maxInlineItems`, they **automatically spill into a compact 1-line digest footer** grouped by source with a ready-to-use `hyp_inbox({ filter, limit, cursor })` pagination hint — delivering critical signals immediately while hard-capping context-window impact on storms!
 3. **Unified Filtered & Paginated Inbox (`hyp_inbox`):**
    - Held `notify` peer DMs, burst-throttled bursts, and `notify`-mode stream subscriptions all sit in the **exact same durable local inbox** and are queried identically using `hyp_inbox({ filter: { from?, node?, topic?, channel?, kind? }, limit, cursor, summary, ack })` — reusing Hyphae's CloudEvents Filter AST so agents triage held traffic cleanly without ever polling in a loop.
 
