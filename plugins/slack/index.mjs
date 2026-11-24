@@ -31,6 +31,18 @@ const allowedUsers = csvSet("SLACK_ALLOWED_USERS");
 const allowedChannels = csvSet("SLACK_ALLOWED_CHANNELS");
 const allowAll = process.env.SLACK_ALLOW_ALL === "1";
 
+function resolveApiBase(raw, fallback) {
+  const value = (raw?.trim() || fallback).replace(/\/+$/, "");
+  const parsed = new URL(value);
+  const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(parsed.hostname);
+  if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) {
+    throw new Error(`SLACK_API_BASE must use https:// or loopback http:// (got ${value})`);
+  }
+  return value;
+}
+
+const apiBase = resolveApiBase(process.env.SLACK_API_BASE, "https://slack.com/api");
+
 if (!allowedUsers && !allowedChannels && !allowAll) {
   throw new Error("Refusing to start Slack bridge without SLACK_ALLOWED_USERS or SLACK_ALLOWED_CHANNELS (set SLACK_ALLOW_ALL=1 to explicitly allow any workspace member)");
 }
@@ -45,7 +57,7 @@ if (!target || !hello.targets.includes(target)) {
 }
 
 async function slackApi(method, token) {
-  const res = await fetch(`https://slack.com/api/${method}`, {
+  const res = await fetch(`${apiBase}/${method}`, {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
   });

@@ -42,7 +42,7 @@ export function inferSessionIdFromEnv(env: NodeJS.ProcessEnv = process.env): str
  *   Ideal for Claude Code's `Monitor` tool.
  */
 export function runWait(options: WaitOptions): Promise<number> {
-  const sessionId = options.sessionId ?? inferSessionIdFromEnv();
+  const sessionId = options.sessionId ?? (options.handle ? undefined : inferSessionIdFromEnv());
   if (!sessionId && !options.handle) {
     return Promise.reject(new Error("Could not infer session ID. Pass --session <id> or --handle <handle>."));
   }

@@ -32,6 +32,18 @@ const allowedUsers = csvSet("TELEGRAM_ALLOWED_USERS");
 const allowAll = process.env.TELEGRAM_ALLOW_ALL === "1";
 const stateFile = process.env.TELEGRAM_STATE_FILE;
 
+function resolveApiBase(raw, fallback) {
+  const value = (raw?.trim() || fallback).replace(/\/+$/, "");
+  const parsed = new URL(value);
+  const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(parsed.hostname);
+  if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) {
+    throw new Error(`TELEGRAM_API_BASE must use https:// or loopback http:// (got ${value})`);
+  }
+  return value;
+}
+
+const apiBase = resolveApiBase(process.env.TELEGRAM_API_BASE, "https://api.telegram.org");
+
 if (!allowedChats && !allowedUsers && !allowAll) {
   throw new Error("Refusing to start Telegram bridge without TELEGRAM_ALLOWED_USERS or TELEGRAM_ALLOWED_CHATS (set TELEGRAM_ALLOW_ALL=1 to explicitly allow any Telegram user)");
 }
@@ -63,7 +75,7 @@ function saveOffset(next) {
 let backoff = 1000;
 while (true) {
   try {
-    const res = await fetch(`https://api.telegram.org/bot${token}/getUpdates`, {
+    const res = await fetch(`${apiBase}/bot${token}/getUpdates`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ offset, timeout: 30, allowed_updates: ["message", "edited_message"] }),
