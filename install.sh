@@ -12,7 +12,13 @@ INSTALL_DIR="${HYPHAE_INSTALL_DIR:-$HOME/.local/bin}"
 BASE_URL="${HYPHAE_BASE_URL:-}"
 DRY_RUN=0
 ASSUME_YES=0
+FORCE=0
+NO_ONBOARD=0
+if [ -n "${HYPHAE_NO_ONBOARD:-}" ]; then
+  NO_ONBOARD=1
+fi
 TMP_DIR=""
+PROMPT_REPLY=""
 
 usage() {
   cat <<'EOF'
@@ -26,13 +32,16 @@ Options:
   --dir <path>        Install directory (default: $HOME/.local/bin)
   --base-url <url>    Base URL hosting release archives and SHA256SUMS.txt
   --dry-run           Print resolved target, URLs, and install path without writing
-  --yes, -y           Non-interactive mode
+  --yes, -y           Non-interactive mode (skip prompts and interactive wizard)
+  --force             Force download and reinstall even if already on the same version
+  --no-onboard        Skip auto-launching the interactive onboarding wizard
   --help, -h          Show this help message
 
 Environment overrides:
   HYPHAE_VERSION      Same as --version
   HYPHAE_INSTALL_DIR  Same as --dir
   HYPHAE_BASE_URL     Same as --base-url
+  HYPHAE_NO_ONBOARD   Set non-empty to skip interactive onboarding (same as --no-onboard)
 EOF
 }
 
@@ -42,6 +51,31 @@ log() {
 
 err() {
   printf 'error: %s\n' "$*" >&2
+}
+
+is_configured() {
+  cfg_dir="${HYPHAE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/hyphae}"
+  [ -f "${cfg_dir}/node.json" ] || [ -f "${cfg_dir}/connector.json" ]
+}
+
+is_interactive_tty() {
+  [ "$ASSUME_YES" -eq 0 ] && [ "$DRY_RUN" -eq 0 ] && [ -z "${CI:-}" ] && [ -t 1 ] && [ -r /dev/tty ]
+}
+
+read_tty_prompt() {
+  printf '%s' "$1"
+  PROMPT_REPLY=""
+  if ! IFS= read -r PROMPT_REPLY </dev/tty; then
+    PROMPT_REPLY=""
+  fi
+}
+
+print_next_steps() {
+  log ""
+  log "Next steps:"
+  log "  hyp deploy providers   # list one-click self-hosting targets"
+  log "  hyp pair guide         # pair laptops, servers, and agents"
+  log "  hyp onboard            # interactive mesh setup"
 }
 
 cleanup() {
@@ -98,6 +132,14 @@ while [ "$#" -gt 0 ]; do
       ASSUME_YES=1
       shift 1
       ;;
+    --force)
+      FORCE=1
+      shift 1
+      ;;
+    --no-onboard)
+      NO_ONBOARD=1
+      shift 1
+      ;;
     --help|-h)
       usage
       exit 0
@@ -108,9 +150,6 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
-
-# Suppress unused-variable warnings while preserving --yes flag semantics.
-: "$ASSUME_YES"
 
 # Validate version tag characters (no path traversal or shell metacharacters).
 normalize_and_validate_version() {
@@ -306,6 +345,71 @@ if [ "$DRY_RUN" -eq 1 ]; then
   exit 0
 fi
 
+# Inspect existing installation before downloading so updates and same-version runs behave gracefully.
+WAS_INSTALLED=0
+EXISTING_VER=""
+if [ -x "$INSTALL_PATH" ]; then
+  WAS_INSTALLED=1
+  EXISTING_VER="$("$INSTALL_PATH" version 2>/dev/null | awk '{print $2}' | sed 's/^v//' || true)"
+fi
+TARGET_VER="${VERSION#v}"
+
+if [ "$WAS_INSTALLED" -eq 1 ] && [ -n "$EXISTING_VER" ] && [ "$EXISTING_VER" = "$TARGET_VER" ]; then
+  if is_interactive_tty && [ "$FORCE" -eq 0 ]; then
+    log "Hyphae ${VERSION} is already installed and up to date at ${INSTALL_PATH}."
+    if ! is_configured && [ "$NO_ONBOARD" -eq 0 ]; then
+      read_tty_prompt "Hyphae is not configured yet. Start interactive onboarding wizard? [Y/n]: "
+      case "$PROMPT_REPLY" in
+        ""|y|Y|yes|YES)
+          log ""
+          log "Starting Hyphae interactive setup wizard..."
+          "$INSTALL_PATH" onboard </dev/tty
+          exit $?
+          ;;
+        *)
+          print_next_steps
+          exit 0
+          ;;
+      esac
+    elif is_configured; then
+      read_tty_prompt "Open setup/config wizard (w), run doctor (d), reinstall anyway (r), or exit (N)? [w/d/r/N]: "
+      case "$PROMPT_REPLY" in
+        w|W)
+          log ""
+          log "Starting Hyphae interactive setup wizard..."
+          "$INSTALL_PATH" onboard </dev/tty
+          exit $?
+          ;;
+        d|D)
+          "$INSTALL_PATH" doctor
+          exit $?
+          ;;
+        r|R)
+          ;;
+        *)
+          exit 0
+          ;;
+      esac
+    else
+      print_next_steps
+      exit 0
+    fi
+  fi
+elif [ "$WAS_INSTALLED" -eq 1 ] && [ -n "$EXISTING_VER" ] && [ "$EXISTING_VER" != "$TARGET_VER" ]; then
+  if is_interactive_tty && [ "$FORCE" -eq 0 ]; then
+    log "Hyphae v${EXISTING_VER} is already installed at ${INSTALL_PATH}."
+    read_tty_prompt "Update to ${VERSION}? [Y/n]: "
+    case "$PROMPT_REPLY" in
+      ""|y|Y|yes|YES)
+        ;;
+      *)
+        log "Update cancelled."
+        exit 0
+        ;;
+    esac
+  fi
+fi
+
 if ! command -v tar >/dev/null 2>&1; then
   err "tar is required to extract Hyphae"
   exit 1
@@ -365,7 +469,13 @@ cp "$SOURCE_BIN" "$STAGED_BIN"
 chmod 0755 "$STAGED_BIN"
 mv -f "$STAGED_BIN" "$INSTALL_PATH"
 
-log "Installed hyp to ${INSTALL_PATH}"
+IS_UPDATE=0
+if [ "$WAS_INSTALLED" -eq 1 ] && [ -n "$EXISTING_VER" ] && [ "$EXISTING_VER" != "$TARGET_VER" ]; then
+  IS_UPDATE=1
+  log "Updated hyp v${EXISTING_VER} -> ${VERSION} at ${INSTALL_PATH}"
+else
+  log "Installed hyp to ${INSTALL_PATH}"
+fi
 "$INSTALL_PATH" version
 
 case ":${PATH:-}:" in
@@ -381,8 +491,30 @@ case ":${PATH:-}:" in
     ;;
 esac
 
-log ""
-log "Next steps:"
-log "  hyp deploy providers   # list one-click self-hosting targets"
-log "  hyp pair guide         # pair laptops, servers, and agents"
-log "  hyp onboard            # interactive mesh setup"
+if [ "$IS_UPDATE" -eq 1 ] && is_configured; then
+  "$INSTALL_PATH" onboard --install-skill >/dev/null 2>&1 || true
+  SERVICE_RESTARTED=0
+  if [ -f "$HOME/Library/LaunchAgents/to.hyphae.daemon.plist" ] || [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/hyphae-daemon.service" ]; then
+    if "$INSTALL_PATH" service restart >/dev/null 2>&1; then
+      SERVICE_RESTARTED=1
+      log "Restarted background hyp daemon service."
+    fi
+  fi
+  if is_interactive_tty; then
+    log ""
+    log "Running post-update health check..."
+    "$INSTALL_PATH" doctor || true
+    if [ "$SERVICE_RESTARTED" -eq 0 ]; then
+      log ""
+      log "Tip: Restart any running 'hyp daemon' process (or run 'hyp service install') so the updated binary takes effect."
+    fi
+  else
+    print_next_steps
+  fi
+elif ! is_configured && [ "$NO_ONBOARD" -eq 0 ] && is_interactive_tty; then
+  log ""
+  log "Starting Hyphae interactive setup wizard..."
+  "$INSTALL_PATH" onboard </dev/tty
+else
+  print_next_steps
+fi

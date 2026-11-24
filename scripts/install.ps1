@@ -9,7 +9,9 @@ param(
     [string]$InstallDir = $env:HYPHAE_INSTALL_DIR,
     [string]$BaseUrl = $env:HYPHAE_BASE_URL,
     [switch]$DryRun,
-    [switch]$Yes
+    [switch]$Yes,
+    [switch]$Force,
+    [switch]$NoOnboard
 )
 
 Set-StrictMode -Version Latest
@@ -23,7 +25,7 @@ try {
 }
 
 $Repo = "hyphae-to/hyp"
-$null = $Yes
+$SkipOnboard = $NoOnboard.IsPresent -or (-not [string]::IsNullOrWhiteSpace($env:HYPHAE_NO_ONBOARD))
 
 if ([string]::IsNullOrWhiteSpace($InstallDir)) {
     $LocalAppData = $env:LOCALAPPDATA
@@ -31,6 +33,37 @@ if ([string]::IsNullOrWhiteSpace($InstallDir)) {
         $LocalAppData = Join-Path $HOME "AppData\Local"
     }
     $InstallDir = Join-Path $LocalAppData "Programs\hyphae\bin"
+}
+
+function Test-HyphaeConfigured {
+    $cfgDir = $env:HYPHAE_CONFIG_DIR
+    if ([string]::IsNullOrWhiteSpace($cfgDir)) {
+        if (-not [string]::IsNullOrWhiteSpace($env:XDG_CONFIG_HOME)) {
+            $cfgDir = Join-Path $env:XDG_CONFIG_HOME "hyphae"
+        } else {
+            $cfgDir = Join-Path (Join-Path $HOME ".config") "hyphae"
+        }
+    }
+    return (Test-Path -LiteralPath (Join-Path $cfgDir "node.json")) -or (Test-Path -LiteralPath (Join-Path $cfgDir "connector.json"))
+}
+
+function Test-InteractiveTty {
+    if ($Yes -or $DryRun -or (-not [string]::IsNullOrWhiteSpace($env:CI))) {
+        return $false
+    }
+    try {
+        return [Environment]::UserInteractive -and (-not [Console]::IsOutputRedirected) -and (-not [Console]::IsInputRedirected)
+    } catch {
+        return $false
+    }
+}
+
+function Write-NextSteps {
+    Write-Host ""
+    Write-Host "Next steps:"
+    Write-Host "  hyp deploy providers   # list one-click self-hosting targets"
+    Write-Host "  hyp pair guide         # pair laptops, servers, and agents"
+    Write-Host "  hyp onboard            # interactive mesh setup"
 }
 
 function Resolve-Target {
@@ -165,6 +198,72 @@ if ($DryRun) {
     return
 }
 
+# Inspect existing installation before downloading so updates and same-version runs behave gracefully.
+$WasInstalled = Test-Path -LiteralPath $BinPath
+$ExistingVer = ""
+if ($WasInstalled) {
+    try {
+        $verLine = (& $BinPath version 2>$null | Select-Object -First 1)
+        if ($verLine -and ($verLine -match 'hyphae\s+v?(\S+)')) {
+            $ExistingVer = $Matches[1].Trim()
+        }
+    } catch {
+        $ExistingVer = ""
+    }
+}
+$TargetVer = $Version.TrimStart('v')
+$IsInteractive = Test-InteractiveTty
+$IsConfigured = Test-HyphaeConfigured
+
+if ($WasInstalled -and (-not [string]::IsNullOrWhiteSpace($ExistingVer)) -and ($ExistingVer -eq $TargetVer)) {
+    if ($IsInteractive -and (-not $Force)) {
+        Write-Host "Hyphae $Version is already installed and up to date at $BinPath."
+        if ((-not $IsConfigured) -and (-not $SkipOnboard)) {
+            $reply = Read-Host "Hyphae is not configured yet. Start interactive onboarding wizard? [Y/n]"
+            if ([string]::IsNullOrWhiteSpace($reply) -or $reply -match '^(y|yes)$') {
+                Write-Host ""
+                Write-Host "Starting Hyphae interactive setup wizard..."
+                & $BinPath onboard
+                return
+            }
+            Write-NextSteps
+            return
+        } elseif ($IsConfigured) {
+            $reply = Read-Host "Open setup/config wizard (w), run doctor (d), reinstall anyway (r), or exit (N)? [w/d/r/N]"
+            switch -Regex ($reply.Trim()) {
+                '^(w)$' {
+                    Write-Host ""
+                    Write-Host "Starting Hyphae interactive setup wizard..."
+                    & $BinPath onboard
+                    return
+                }
+                '^(d)$' {
+                    & $BinPath doctor
+                    return
+                }
+                '^(r)$' {
+                    # Proceed with full SHA-256-verified reinstall.
+                }
+                default {
+                    return
+                }
+            }
+        } else {
+            Write-NextSteps
+            return
+        }
+    }
+} elseif ($WasInstalled -and (-not [string]::IsNullOrWhiteSpace($ExistingVer)) -and ($ExistingVer -ne $TargetVer)) {
+    if ($IsInteractive -and (-not $Force)) {
+        Write-Host "Hyphae v$ExistingVer is already installed at $BinPath."
+        $reply = Read-Host "Update to $Version? [Y/n]"
+        if ((-not [string]::IsNullOrWhiteSpace($reply)) -and ($reply -notmatch '^(y|yes)$')) {
+            Write-Host "Update cancelled."
+            return
+        }
+    }
+}
+
 $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("hyphae-install-" + [System.Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
 
@@ -208,14 +307,40 @@ try {
 
     Ensure-UserPathContains -Dir $InstallDir
 
-    Write-Host "Installed hyp to $BinPath"
+    $IsUpdate = $WasInstalled -and (-not [string]::IsNullOrWhiteSpace($ExistingVer)) -and ($ExistingVer -ne $TargetVer)
+    if ($IsUpdate) {
+        Write-Host "Updated hyp v$ExistingVer -> $Version at $BinPath"
+    } else {
+        Write-Host "Installed hyp to $BinPath"
+    }
     & $BinPath version
 
-    Write-Host ""
-    Write-Host "Next steps:"
-    Write-Host "  hyp deploy providers   # list one-click self-hosting targets"
-    Write-Host "  hyp pair guide         # pair laptops, servers, and agents"
-    Write-Host "  hyp onboard            # interactive mesh setup"
+    if ($IsUpdate -and $IsConfigured) {
+        try {
+            & $BinPath onboard --install-skill 2>$null | Out-Null
+        } catch {
+            # Best-effort skill refresh on update.
+        }
+        if ($IsInteractive) {
+            Write-Host ""
+            Write-Host "Running post-update health check..."
+            try {
+                & $BinPath doctor
+            } catch {
+                # Non-fatal post-update diagnostic check.
+            }
+            Write-Host ""
+            Write-Host "Tip: Restart any running 'hyp daemon' process so the updated binary takes effect."
+        } else {
+            Write-NextSteps
+        }
+    } elseif ((-not $IsConfigured) -and (-not $SkipOnboard) -and $IsInteractive) {
+        Write-Host ""
+        Write-Host "Starting Hyphae interactive setup wizard..."
+        & $BinPath onboard
+    } else {
+        Write-NextSteps
+    }
 } finally {
     if (Test-Path -LiteralPath $TmpDir) {
         Remove-Item -LiteralPath $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
