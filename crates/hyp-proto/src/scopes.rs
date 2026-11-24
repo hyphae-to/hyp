@@ -291,6 +291,7 @@ pub const V2_STAR_EXPANSION: &[&str] = &[
     "kv:write=*",
     "forks:send",
     "forks:receive/full-access",
+    "drop:create",
 ];
 
 /// Wildcard or explicit allowlist pattern for targets / channels / topics.
@@ -414,6 +415,8 @@ pub enum ParsedScopeV2 {
     ForwardVia(String),
     ForksSend(TargetFilter),
     ForksReceive(RuntimeMode),
+    /// Allows allocating ephemeral blind drop relay slots (`POST /v1/drops`).
+    DropCreate,
 }
 
 /// Result returned when `ScopeSet::check_stream_subscribe` approves a subscription.
@@ -615,6 +618,12 @@ pub fn parse_scope_v2(raw: &str) -> Result<ParsedScopeV2, ScopeError> {
                 Ok(ParsedScopeV2::ForksSend(TargetFilter::Allowlist(set)))
             }
         },
+        "drop:create" => {
+            if rhs.is_some() {
+                return Err(fail("drop:create does not accept parameters"));
+            }
+            Ok(ParsedScopeV2::DropCreate)
+        }
         _ => Err(fail("unknown scope")),
     }
 }
@@ -1162,6 +1171,13 @@ impl ScopeSet {
             })
             .max()
     }
+
+    /// Returns `true` if this grant allows creating ephemeral blind drop slots (`drop:create`).
+    pub fn allows_drop_create(&self) -> bool {
+        self.rules
+            .iter()
+            .any(|r| matches!(r, ParsedScopeV2::DropCreate))
+    }
 }
 
 /// Computes the guaranteed finite set of values of `attribute` required by `filters`
@@ -1458,5 +1474,32 @@ mod tests {
         assert!(wrapped.untrusted);
         assert!(wrapped.provenance.contains("acme-team"));
         assert_eq!(wrapped.text, note.as_str());
+    }
+
+    #[test]
+    fn drop_create_scope_parsing_and_grant_checks() {
+        assert_eq!(parse_scope_v2("drop:create").unwrap(), ParsedScopeV2::DropCreate);
+        assert!(parse_scope_v2("drop:create=extra").is_err());
+
+        let explicit = ScopeSet::from_strings(&["drop:create"]);
+        assert!(explicit.allows_drop_create());
+        assert!(!explicit.may_bridge_post("slack", "ops"));
+        assert!(!explicit.may_forward_via("acme-team"));
+
+        let full = ScopeSet::from_preset(ScopePreset::Full);
+        assert!(full.allows_drop_create());
+        let star = ScopeSet::from_strings(&["*"]);
+        assert!(star.allows_drop_create());
+        assert!(!star.may_bridge_post("slack", "ops"));
+        assert!(!star.may_forward_via("acme-team"));
+
+        // GuestRo stays strictly confined unless drop:create is explicitly granted alongside it.
+        let guest_ro = ScopeSet::from_preset(ScopePreset::GuestRo);
+        assert!(!guest_ro.allows_drop_create());
+        let mut guest_with_drop = ScopePreset::GuestRo.expand();
+        guest_with_drop.push("drop:create".to_string());
+        let guest_drop_set = ScopeSet::from_strings(&guest_with_drop);
+        assert!(guest_drop_set.allows_drop_create());
+        assert!(!guest_drop_set.may_dm_send("any/handle"));
     }
 }

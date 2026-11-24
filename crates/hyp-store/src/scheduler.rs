@@ -1,5 +1,6 @@
 //! Exact zero-polling deadline scheduler across all timed `node.sqlite` subsystems:
-//! `events`/`batches`, `messages`, `transfers`, `kv_entries`, `wakeups`, and `mailbox` TTLs.
+//! `events`/`batches`, `messages`, `transfers`, `kv_entries`, `wakeups`, `mailbox` TTLs,
+//! and `human_claim_nonces`.
 
 use crate::db::NodeDb;
 use crate::error::StoreResult;
@@ -17,6 +18,7 @@ pub struct DeadlineBreakdown {
     pub kv: Option<i64>,
     pub wakeups: Option<i64>,
     pub mailbox_ttl: Option<i64>,
+    pub human_nonces: Option<i64>,
     pub earliest: Option<i64>,
 }
 
@@ -30,6 +32,7 @@ impl DeadlineBreakdown {
             self.kv,
             self.wakeups,
             self.mailbox_ttl,
+            self.human_nonces,
         ]
         .into_iter()
         .flatten()
@@ -46,11 +49,12 @@ pub struct TickReport {
     pub kv_expired: usize,
     pub wakeups_fired: Vec<FiredWakeup>,
     pub mailbox_expired: usize,
+    pub human_nonces_pruned: usize,
 }
 
 impl NodeDb {
     /// Computes the exact earliest wake timestamp (epoch ms) across `events`/`batches`,
-    /// `messages`, `transfers`, `kv_entries`, `wakeups`, and `mailbox` TTLs.
+    /// `messages`, `transfers`, `kv_entries`, `wakeups`, `mailbox` TTLs, and `human_claim_nonces`.
     ///
     /// Returns `None` when the node is completely idle (zero polling!).
     pub fn next_deadline_ms(&self, now_ms: i64) -> StoreResult<Option<i64>> {
@@ -65,6 +69,7 @@ impl NodeDb {
         let kv = self.kv().next_deadline_ms()?;
         let wakeups = self.wakeups().next_deadline_ms()?;
         let mailbox_ttl = self.local().next_mailbox_ttl_deadline_ms()?;
+        let human_nonces = self.human().next_nonce_expiry_deadline_ms()?;
 
         let mut breakdown = DeadlineBreakdown {
             events,
@@ -73,6 +78,7 @@ impl NodeDb {
             kv,
             wakeups,
             mailbox_ttl,
+            human_nonces,
             earliest: None,
         };
         breakdown.earliest = breakdown.earliest();
@@ -87,6 +93,7 @@ impl NodeDb {
         let kv_expired = self.kv().tick(now_ms)?;
         let wakeups_fired = self.wakeups().claim_due_wakeups(now_ms)?;
         let mailbox_expired = self.local().expire_pending_mailbox(now_ms)?;
+        let human_nonces_pruned = self.human().prune_expired_nonces(now_ms)?;
         Ok(TickReport {
             events,
             messages,
@@ -94,6 +101,7 @@ impl NodeDb {
             kv_expired,
             wakeups_fired,
             mailbox_expired,
+            human_nonces_pruned,
         })
     }
 }

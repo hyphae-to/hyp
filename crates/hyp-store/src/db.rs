@@ -14,6 +14,7 @@ use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension};
 
 use crate::error::{StoreError, StoreResult};
 use crate::events::{CompiledSubscription, EventLimits, EventStore};
+use crate::human::HumanAuthorityStore;
 use crate::kv::KvStore;
 use crate::local::LocalStateStore;
 use crate::messages::{ChannelStore, MessageLimits, MessageStore};
@@ -23,7 +24,7 @@ use crate::types::now_ms;
 use crate::wakeups::{WakeupLimits, WakeupStore};
 
 /// Current unified schema version stored in `schema_version`.
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 /// Maximum number of pre-migration `node.sqlite.v*.bak` backups retained per database directory.
 pub const MAX_MIGRATION_BACKUPS: usize = 3;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -72,6 +73,12 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "wakeups_and_mailbox_ttl",
         disable_foreign_keys: false,
         kind: MigrationKind::Sql(include_str!("../migrations/0003_wakeups.sql")),
+    },
+    Migration {
+        version: 4,
+        name: "human_authority_drops",
+        disable_foreign_keys: false,
+        kind: MigrationKind::Sql(include_str!("../migrations/0004_human_authority.sql")),
     },
 ];
 
@@ -427,6 +434,10 @@ impl NodeDb {
 
     pub fn wakeups(&self) -> WakeupStore<'_> {
         WakeupStore::new(self)
+    }
+
+    pub fn human(&self) -> HumanAuthorityStore<'_> {
+        HumanAuthorityStore::new(self)
     }
 }
 
