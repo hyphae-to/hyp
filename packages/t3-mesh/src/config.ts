@@ -91,24 +91,8 @@ const ConfigFile = Schema.Struct({
 });
 const decodeConfigFile = Schema.decodeUnknownSync(ConfigFile);
 
-/** A thread a plugin may deliver into (SPEC.md section 13.2). */
-export interface PluginTarget {
-  readonly name: string;
-  /** The configured ("bootstrap") thread; mesh_plugin_handoff can move delivery elsewhere. */
-  readonly threadId: string;
-  readonly coalesceSeconds: number;
-  readonly maxWaitSeconds: number;
-  readonly wakesPerHour: number;
-}
-
-export interface PluginConfig {
-  readonly name: string;
-  readonly exec: string;
-  readonly args: readonly string[];
-  readonly env: Readonly<Record<string, string>>;
-  readonly cwd: string;
-  readonly targets: readonly PluginTarget[];
-}
+export type { PluginConfig, PluginTarget } from "./plugins/types.ts";
+import type { PluginConfig, PluginTarget } from "./plugins/types.ts";
 
 /** Plugin and target names: what a plugin addresses and what logs and headers show. */
 export const PLUGIN_NAME = /^[a-z0-9][a-z0-9._-]{0,31}$/;

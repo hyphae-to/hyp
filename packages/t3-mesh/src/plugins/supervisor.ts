@@ -3,7 +3,7 @@
 // or closes fd 3.
 import { spawn, type ChildProcess } from "node:child_process";
 import { Duplex } from "node:stream";
-import type { PluginConfig } from "../config.ts";
+import type { PluginConfig } from "./types.ts";
 import { errorMessage, log } from "../log.ts";
 import {
   encodeLine,

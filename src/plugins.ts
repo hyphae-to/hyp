@@ -5,7 +5,7 @@ import type { Session, State } from "./state.ts";
 import type { Outcome } from "./protocol.ts";
 import { Plugins } from "../packages/t3-mesh/src/plugins/plugins.ts";
 import { formatPluginDelivery } from "../packages/t3-mesh/src/plugins/delivery.ts";
-import type { PluginConfig as T3PluginConfig } from "../packages/t3-mesh/src/config.ts";
+import type { PluginConfig as T3PluginConfig } from "../packages/t3-mesh/src/plugins/types.ts";
 import type { InboundEventBatch, InboundOutcome } from "../packages/t3-mesh/src/router/types.ts";
 
 export interface PluginDeliverySink {

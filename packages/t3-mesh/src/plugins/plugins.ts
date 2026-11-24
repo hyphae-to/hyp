@@ -1,6 +1,6 @@
 // The connector's plugins (SPEC.md section 13): their processes, the local event store, delivery
 // while T3 is connected, and backlog status lines to each plugin.
-import type { PluginConfig } from "../config.ts";
+import type { PluginConfig } from "./types.ts";
 import { errorMessage, log } from "../log.ts";
 import type { InboundEventBatch, InboundOutcome } from "../router/types.ts";
 import { LocalEvents, type TargetRef } from "./store.ts";

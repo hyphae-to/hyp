@@ -3,7 +3,7 @@
 // semantics. Each (plugin, target) is one topic with one subscription; its publisher is
 // `plugin:<name>`. Topic and subscription IDs are derived from the names, so they survive restarts.
 import { createHash } from "node:crypto";
-import type { PluginConfig } from "../config.ts";
+import type { PluginConfig } from "./types.ts";
 import { errorMessage, log } from "../log.ts";
 import { RouterCore } from "../router/core.ts";
 import { DEFAULT_EVENT_LIMITS, type Publisher, type SubscriptionSpec } from "../router/events.ts";
