@@ -86,21 +86,41 @@
         </div>
 
         <div class="story-stage">
-          <svg class="story-svg" viewBox="0 0 1200 580" preserveAspectRatio="none" aria-hidden="true">
-            <!-- Progressive organic mycelium strands (perimeter-routed so wires & packets never cross faces or bubbles) -->
-            <path class="myc-strand" id="p-alex-node" d="M 200 265 C 315 265, 395 256, 488 256" />
-            <path class="myc-strand amber" id="p-node-alice" d="M 636 226 C 755 186, 855 128, 972 114" />
-            <path class="myc-strand" id="p-node-alice-green" d="M 636 226 C 755 186, 855 128, 972 114" />
-            <path class="myc-strand" id="p-node-ops" d="M 642 262 C 755 268, 860 284, 972 290" />
-            <path class="myc-strand" id="p-node-release" d="M 624 298 C 708 424, 825 488, 974 466" />
-            <path class="myc-strand coral" id="p-prom-node" d="M 565 82 C 565 116, 565 142, 565 162" />
-            <path class="myc-strand" id="p-prom-node-ok" d="M 565 82 C 565 116, 565 142, 565 162" />
-            <path class="myc-strand coral" id="p-node-ops-alert" d="M 642 262 C 755 268, 860 284, 972 290" />
-            <path class="myc-strand amber" id="p-alex-gh" d="M 164 216 C 186 154, 218 112, 255 92" />
-            <path class="myc-strand amber" id="p-gh-node" d="M 332 90 C 408 134, 466 176, 514 212" />
-            <path class="myc-strand amber" id="p-alice-sub" d="M 992 178 C 948 206, 908 218, 876 218" />
-            <path class="myc-strand moss" id="p-alex-priv" d="M 150 356 C 148 384, 150 402, 150 418" />
-            <path class="myc-strand moss" id="p-priv-slack" d="M 218 442 C 250 443, 276 443, 306 443" />
+          <svg class="story-svg" id="storySvg" viewBox="0 0 1200 580" preserveAspectRatio="none" aria-hidden="true">
+            <defs>
+              <filter id="hyphaGlow" x="-15%" y="-15%" width="130%" height="130%">
+                <feGaussianBlur stdDeviation="2.2" result="blur" />
+                <feMerge>
+                  <feMergeNode in="blur" />
+                  <feMergeNode in="SourceGraphic" />
+                </feMerge>
+              </filter>
+            </defs>
+            <!-- Subtle dormant soil root network (gives organic depth across top & bottom) -->
+            <g class="soil-web">
+              <path d="M 40 42 C 145 78, 225 46, 330 88 C 435 128, 495 142, 565 162" />
+              <path d="M 565 162 C 665 130, 775 74, 910 86 C 1015 95, 1110 64, 1175 48" />
+              <path d="M 32 496 C 138 468, 212 508, 345 488 C 485 468, 565 395, 624 318" />
+              <path d="M 624 318 C 725 438, 845 524, 985 504 C 1070 492, 1135 520, 1182 544" />
+              <path d="M 150 356 C 108 408, 92 465, 112 536" />
+              <path d="M 465 552 C 510 475, 536 392, 558 326" />
+            </g>
+            <!-- Procedurally braided companion hyphae & forked capillaries mount here -->
+            <g id="hyphaBundles"></g>
+            <!-- Progressive organic mycelium strands (enter dead-center behind every avatar/node/card) -->
+            <path class="myc-strand" id="p-alex-node" d="M 150 240 C 245 224, 345 272, 445 256 C 495 248, 530 250, 565 252" />
+            <path class="myc-strand amber" id="p-node-alice" d="M 565 252 C 675 204, 765 192, 848 142 C 912 104, 966 96, 1020 86" />
+            <path class="myc-strand" id="p-node-alice-green" d="M 565 252 C 675 204, 765 192, 848 142 C 912 104, 966 96, 1020 86" />
+            <path class="myc-strand" id="p-node-ops" d="M 565 252 C 675 240, 765 276, 865 264 C 930 256, 975 266, 1020 268" />
+            <path class="myc-strand" id="p-node-release" d="M 565 252 C 642 374, 738 456, 840 474 C 916 488, 972 452, 1020 434" />
+            <path class="myc-strand coral" id="p-prom-node" d="M 565 56 C 542 104, 588 152, 558 198 C 550 218, 562 238, 565 252" />
+            <path class="myc-strand" id="p-prom-node-ok" d="M 565 56 C 542 104, 588 152, 558 198 C 550 218, 562 238, 565 252" />
+            <path class="myc-strand coral" id="p-node-ops-alert" d="M 565 252 C 675 240, 765 276, 865 264 C 930 256, 975 266, 1020 268" />
+            <path class="myc-strand amber" id="p-alex-gh" d="M 150 240 C 158 182, 200 152, 214 120 C 224 94, 248 82, 275 68" />
+            <path class="myc-strand amber" id="p-gh-node" d="M 275 68 C 352 118, 418 124, 466 172 C 502 208, 534 226, 565 252" />
+            <path class="myc-strand amber" id="p-alice-sub" d="M 1020 86 C 982 162, 926 198, 868 214 C 836 222, 812 218, 792 217" />
+            <path class="myc-strand moss" id="p-alex-priv" d="M 142 246 C 96 314, 110 384, 150 441" />
+            <path class="myc-strand moss" id="p-priv-slack" d="M 150 441 C 225 426, 295 458, 365 442 C 402 434, 428 444, 450 444" />
           </svg>
 
           <!-- Dynamic layer for one-shot labeled wire messages -->
@@ -132,11 +152,11 @@
             </div>
           </div>
 
-          <!-- Central Team Node (unframed, blended organically into the dark stage) -->
+          <!-- Central Team Node (transparent cutout floating organically over the mycelium hub) -->
           <div class="entity" id="ent-node" style="left:47.1%; top:43.5%;">
-            <div class="ping-ripple" id="rip-node" style="width:168px; height:168px;"></div>
+            <div class="ping-ripple" id="rip-node" style="width:200px; height:200px;"></div>
             <span class="hub-badge">Team Node</span>
-            <div class="avatar-ring hub-ring"><img src="./assets/node-hub.jpg" alt="Hyphae Team Node switchboard" /></div>
+            <div class="avatar-ring hub-ring"><img src="./assets/node-hub.png" alt="Hyphae Team Node switchboard" /></div>
             <div class="hub-caps" style="margin-top:2px;">
               <span class="hub-cap" id="cap-ch">#incidents</span>
               <span class="hub-cap" id="cap-dep">#deploys</span>
