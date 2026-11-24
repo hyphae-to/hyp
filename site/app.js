@@ -23,6 +23,30 @@ function esc(s) {
   window.addEventListener("resize", syncHeaderTheme, { passive: true });
 })();
 
+// Proportional 1200x555 stage scaling so sprites, wires, bubbles & packets stay pixel-exact on desktop, tablet & mobile
+(function initResponsiveStage() {
+  const viewport = document.getElementById("storyViewport");
+  const stage = document.getElementById("storyStage");
+  if (!viewport || !stage) return;
+
+  const LOGICAL_W = 1200;
+  const LOGICAL_H = 555;
+
+  function fitStage() {
+    const availW = viewport.clientWidth || LOGICAL_W;
+    const scale = Math.min(1, availW / LOGICAL_W);
+    const offsetX = Math.max(0, (availW - LOGICAL_W * scale) / 2);
+    stage.style.transform = `translateX(${offsetX.toFixed(1)}px) scale(${scale.toFixed(4)})`;
+    viewport.style.height = `${Math.round(LOGICAL_H * scale)}px`;
+  }
+
+  fitStage();
+  if (typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(fitStage).observe(viewport);
+  }
+  window.addEventListener("resize", fitStage, { passive: true });
+})();
+
 // ============================================================================
 // 1. HERO INSTALL SWITCHER
 // ============================================================================
