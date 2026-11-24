@@ -33,127 +33,321 @@ document.getElementById("heroCopyBtn").addEventListener("click", (e) => {
 renderHeroInstall();
 
 // ============================================================================
-// 2. HERO LIVE TERMINAL + FLOATING CORNER TOAST
+// 2. LIVING HERO STORY DIORAMA (6 animated chapters + organic mycelium growth)
 // ============================================================================
-const HERO_EVENTS = [
+const CHAPTERS = [
   {
-    ts: "09:14:02",
-    src: "prometheus/prod",
-    srcCls: "alert",
-    alert: true,
-    msg: "HighErrorRate firing · checkout-api (4.2%)",
-    via: "hc interrupt",
-    toast: {
-      label: "ops@solace/herdr",
-      pill: "interrupted",
-      body: "Woke mid-turn via hc interrupt on Linux box solace — inspecting Redis pool.",
-      meta: "HMAC verified · topic:prometheus",
-    },
+    pill: "1 · Solo",
+    caption: "Meet <strong>Alex's agent</strong> — a Claude thread running in Herdr on a laptop. Smart, caffeinated, and completely isolated.",
+    visible: ["ent-alex"],
+    spotlight: ["ent-alex"],
+    alertHit: [],
+    strands: [],
+    softStrands: [],
+    bubbles: { "bub-alex": { text: "Just me, 47 tabs, and a blinking cursor.", alert: false } },
+    caps: [],
+    promSub: "14 servers · quiet",
+    filterTag: false,
+    ripples: [],
+    orbs: [],
   },
   {
-    ts: "09:14:04",
-    src: "ops@gn/openclaw",
-    srcCls: "",
-    alert: false,
-    msg: "#incidents -> fanned out to bogdan@macbook + maya@solace",
-    via: "channel_post",
-    toast: {
-      label: "#incidents · 3 owners",
-      pill: "fan-out",
-      body: "OpenClaw synced Antigravity (MacBook) & Codex (solace) in one SQLite room.",
-      meta: "mesh_channel_post · 0 echo",
-    },
+    pill: "2 · Join Node",
+    caption: "One call to <strong>mesh_join</strong> plugs into a <strong>Public Node</strong> — exposing peers, <code>#channels</code>, and subscribable event flows.",
+    visible: ["ent-alex", "ent-node"],
+    spotlight: ["ent-alex", "ent-node"],
+    alertHit: [],
+    strands: ["p-alex-node"],
+    softStrands: [],
+    bubbles: { "bub-alex": { text: "Plugging into team.hyphae.net… oh hello.", alert: false } },
+    caps: ["cap-ch", "cap-gh", "cap-pr"],
+    promSub: "14 servers · quiet",
+    filterTag: false,
+    ripples: ["rip-node"],
+    orbs: [{ path: "p-alex-node", reverse: false, cls: "" }],
   },
   {
-    ts: "09:14:07",
-    src: "maya@solace/codex",
-    srcCls: "",
-    alert: false,
-    msg: "Reproduced pool timeout & opened PR #412",
-    via: "codex queue",
-    toast: {
-      label: "maya@solace/codex",
-      pill: "rollout verified",
-      body: "Woke natively via codex queue with zero polling; messaged bogdan@macbook/agy.",
-      meta: "callId verified · codex CLI",
+    pill: "3 · Network",
+    caption: "Instant reach: <strong>Famela's Codex</strong> (OpenClaw, laptop) and <strong>Jack's builder &amp; ops</strong> (T3 Code, Linux server) appear on the same node.",
+    visible: ["ent-alex", "ent-node", "ent-famela", "ent-jack", "ent-gh", "ent-prom"],
+    spotlight: ["ent-famela", "ent-jack"],
+    alertHit: [],
+    strands: ["p-node-famela", "p-node-jack"],
+    softStrands: ["p-alex-node", "p-gh-node", "p-prom-node"],
+    bubbles: {
+      "bub-famela": { text: "Shipping auth from café Wi-Fi.", alert: false },
+      "bub-jack": { text: "Builder + ops live on prod-01. Zero polling.", alert: false },
     },
+    caps: ["cap-ch", "cap-gh", "cap-pr"],
+    promSub: "14 servers · healthy",
+    filterTag: false,
+    ripples: [],
+    orbs: [
+      { path: "p-node-famela", reverse: false, cls: "amber" },
+      { path: "p-node-jack", reverse: false, cls: "" },
+    ],
   },
   {
-    ts: "09:14:09",
-    src: "github/payments",
-    srcCls: "amber",
-    alert: false,
-    msg: "PR #412 opened -> dispatched review to maya@gn/t3",
-    via: "T3 dispatch",
-    toast: {
-      label: "maya@gn/t3",
-      pill: "T3 Code",
-      body: "Matched CloudEvents filter subject:'acme/payments' and started automated review.",
-      meta: "X-Hub-Signature-256 ok",
+    pill: "4 · Alerts",
+    caption: "Jack's ops subscribes with filters to the node's <strong>GitHub</strong> stream &amp; fleet <span class='coral-txt'>Prometheus alerts</span> — waking the instant checkout-api spikes.",
+    visible: ["ent-alex", "ent-node", "ent-famela", "ent-jack", "ent-gh", "ent-prom"],
+    spotlight: ["ent-node"],
+    alertHit: ["ent-jack"],
+    strands: ["p-gh-node", "p-prom-node", "p-node-jack-alert"],
+    softStrands: ["p-alex-node", "p-node-famela"],
+    bubbles: {
+      "bub-jack": { text: "Pager! HighErrorRate (4.2%) right after PR #412.", alert: true },
     },
+    caps: ["cap-gh"],
+    coralCaps: ["cap-pr"],
+    ghActive: true,
+    promActive: true,
+    promSub: "HighErrorRate · 4.2%!",
+    filterTag: true,
+    ripples: ["rip-jack"],
+    orbs: [
+      { path: "p-gh-node", reverse: false, cls: "amber" },
+      { path: "p-prom-node", reverse: false, cls: "coral" },
+      { path: "p-node-jack-alert", reverse: false, cls: "coral" },
+    ],
   },
   {
-    ts: "09:14:11",
-    src: "bogdan@mac/agy",
-    srcCls: "",
-    alert: false,
-    msg: "42/42 tests green -> posted summary to Telegram",
-    via: "hph wait + fd3",
-    toast: {
-      label: "Telegram · @OpsBot",
-      pill: "0600 isolated",
-      body: "\"PR #412 verified & merged — p99 38ms, 0 errors.\"",
-      meta: "bogdan@macbook/agy -> local fd-3 bridge",
+    pill: "5 · Wake Alex",
+    caption: "Jack's ops pushes the trace straight through the Public Node to <strong>Alex's Claude thread</strong> — waking it mid-turn across servers &amp; harnesses.",
+    visible: ["ent-alex", "ent-node", "ent-famela", "ent-jack", "ent-gh", "ent-prom"],
+    spotlight: ["ent-jack"],
+    alertHit: ["ent-alex"],
+    strands: ["p-node-jack-alert", "p-alex-node"],
+    softStrands: ["p-node-famela", "p-gh-node", "p-prom-node"],
+    bubbles: {
+      "bub-jack": { text: "Sending stack trace + PR #412 to Alex's laptop.", alert: false },
+      "bub-alex": { text: "Woke via hc interrupt! On it — checking Redis.", alert: true },
     },
+    caps: ["cap-ch", "cap-gh"],
+    coralCaps: ["cap-pr"],
+    promSub: "HighErrorRate · 4.2%!",
+    filterTag: false,
+    ripples: ["rip-alex"],
+    orbs: [
+      { path: "p-node-jack-alert", reverse: true, cls: "coral" },
+      { path: "p-alex-node", reverse: true, cls: "coral" },
+    ],
+  },
+  {
+    pill: "6 · Private Slack",
+    caption: "Alex's agent also wires a <strong>Private Node</strong> on localhost bridged to <strong>Slack</strong> — messaging Alex directly without ever exposing the Slack token.",
+    visible: ["ent-alex", "ent-node", "ent-famela", "ent-jack", "ent-gh", "ent-prom", "ent-priv", "ent-slack"],
+    spotlight: ["ent-alex"],
+    alertHit: [],
+    strands: ["p-alex-priv", "p-priv-slack"],
+    softStrands: ["p-alex-node", "p-node-famela", "p-node-jack"],
+    bubbles: {
+      "bub-alex": { text: "Keeping my Slack token on my Private Node.", alert: false },
+    },
+    caps: ["cap-ch", "cap-gh", "cap-pr"],
+    promSub: "14 servers · mitigating",
+    filterTag: false,
+    ripples: [],
+    orbs: [
+      { path: "p-alex-priv", reverse: false, cls: "moss" },
+      { path: "p-priv-slack", reverse: false, cls: "moss" },
+    ],
   },
 ];
 
-let heroIdx = 4; // Start on the full resolved story (shows all 5 lines + Telegram toast immediately!)
-let heroTimer = null;
+// Pre-measure every SVG path length for genuine stroke-dashoffset growth
+const strandLengths = new Map();
+document.querySelectorAll(".myc-strand").forEach((path) => {
+  const len = path.getTotalLength();
+  strandLengths.set(path.id, len);
+  path.style.strokeDasharray = `${len}`;
+  path.style.strokeDashoffset = `${len}`;
+});
 
-function renderHeroTerm() {
-  const container = document.getElementById("heroTermLines");
-  container.innerHTML = HERO_EVENTS.map((ev, i) => `
-    <div class="lt-line ${i === heroIdx ? "current" : i < heroIdx ? "seen" : ""} ${ev.alert ? "is-alert" : ""}" data-hi-ev="${i}">
-      <span class="lt-ts">${ev.ts}</span>
-      <span class="lt-src ${ev.srcCls}">${ev.src}</span>
-      <span class="lt-msg">${esc(ev.msg)}<span class="lt-via">${ev.via}</span></span>
-    </div>
-  `).join("");
+let chapterIdx = 0;
+let storyPlaying = true;
+let storyTimer = null;
+let orbRaf = null;
 
-  container.querySelectorAll("[data-hi-ev]").forEach((row) => {
-    row.addEventListener("click", () => {
-      heroIdx = Number(row.dataset.hiEv);
-      renderHeroTerm();
-      resetHeroTimer();
+function animateOrbs(orbSpecs) {
+  if (orbRaf) cancelAnimationFrame(orbRaf);
+  const orbEls = [document.getElementById("orb1"), document.getElementById("orb2"), document.getElementById("orb3")];
+  orbEls.forEach((el) => {
+    el.classList.remove("show", "amber", "coral", "moss");
+  });
+  if (!orbSpecs.length || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+
+  const active = orbSpecs.slice(0, 3).map((spec, idx) => ({
+    el: orbEls[idx],
+    path: document.getElementById(spec.path),
+    reverse: spec.reverse,
+    offset: idx * 0.31,
+    cls: spec.cls,
+  })).filter((item) => item.el && item.path);
+
+  active.forEach((item) => {
+    item.el.classList.add("show");
+    if (item.cls) item.el.classList.add(item.cls);
+  });
+
+  const t0 = performance.now();
+  const dur = 1650;
+  function frame(now) {
+    const u = (now - t0) / dur;
+    for (const item of active) {
+      const raw = (u + item.offset) % 1;
+      const t = item.reverse ? 1 - raw : raw;
+      const len = item.path.getTotalLength();
+      const pt = item.path.getPointAtLength(len * t);
+      item.el.setAttribute("cx", pt.x.toFixed(1));
+      item.el.setAttribute("cy", pt.y.toFixed(1));
+    }
+    orbRaf = requestAnimationFrame(frame);
+  }
+  orbRaf = requestAnimationFrame(frame);
+}
+
+function renderChapter() {
+  const ch = CHAPTERS[chapterIdx];
+
+  // Entities visibility & states
+  const allEnts = ["ent-alex", "ent-node", "ent-famela", "ent-jack", "ent-gh", "ent-prom", "ent-priv", "ent-slack"];
+  allEnts.forEach((id) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.classList.toggle("visible", ch.visible.includes(id));
+    el.classList.toggle("spotlight", ch.spotlight.includes(id));
+    el.classList.toggle("alert-hit", ch.alertHit.includes(id));
+  });
+
+  // Flow chips active highlight
+  document.getElementById("ent-gh").classList.toggle("active-amber", Boolean(ch.ghActive));
+  document.getElementById("ent-prom").classList.toggle("active-coral", Boolean(ch.promActive));
+  document.getElementById("promSub").textContent = ch.promSub;
+  document.getElementById("filterTag").classList.toggle("show", Boolean(ch.filterTag));
+
+  // Public Node capability pills
+  ["cap-ch", "cap-gh", "cap-pr"].forEach((id) => {
+    const el = document.getElementById(id);
+    el.classList.toggle("lit", (ch.caps || []).includes(id));
+    el.classList.toggle("lit-coral", (ch.coralCaps || []).includes(id));
+  });
+
+  // Growing SVG mycelium strands
+  document.querySelectorAll(".myc-strand").forEach((path) => {
+    const len = strandLengths.get(path.id) || 200;
+    const isActive = ch.strands.includes(path.id);
+    const isSoft = ch.softStrands.includes(path.id);
+    path.classList.toggle("grown", isActive);
+    path.classList.toggle("soft", isSoft);
+    path.style.strokeDashoffset = (isActive || isSoft) ? "0" : `${len}`;
+  });
+
+  // Witty speech bubbles
+  ["bub-alex", "bub-famela", "bub-jack"].forEach((id) => {
+    const el = document.getElementById(id);
+    const spec = ch.bubbles[id];
+    if (spec) {
+      el.textContent = spec.text;
+      el.classList.toggle("alert", spec.alert);
+      el.classList.add("show");
+    } else {
+      el.classList.remove("show", "alert");
+    }
+  });
+
+  // Ripple rings
+  ["rip-alex", "rip-node", "rip-jack"].forEach((id) => {
+    const el = document.getElementById(id);
+    el.classList.remove("fire");
+    if (ch.ripples.includes(id)) {
+      void el.offsetWidth;
+      el.classList.add("fire");
+    }
+  });
+
+  // Caption & chapter pills
+  document.getElementById("storyCaption").innerHTML = ch.caption;
+  const pillsHost = document.getElementById("chapterPills");
+  pillsHost.innerHTML = CHAPTERS.map((c, i) =>
+    `<button class="ch-pill ${i === chapterIdx ? "active" : ""}" data-ch="${i}" type="button">${c.pill}</button>`
+  ).join("");
+  pillsHost.querySelectorAll("[data-ch]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      chapterIdx = Number(btn.dataset.ch);
+      renderChapter();
+      resetStoryTimer();
     });
   });
 
-  const cur = HERO_EVENTS[heroIdx];
-  const toast = document.getElementById("heroToast");
-  toast.classList.toggle("is-alert", cur.alert);
-  document.getElementById("ctLabel").textContent = cur.toast.label;
-  document.getElementById("ctPill").textContent = cur.toast.pill;
-  document.getElementById("ctBody").textContent = cur.toast.body;
-  document.getElementById("ctMeta").textContent = cur.toast.meta;
+  animateOrbs(ch.orbs);
 }
 
-function resetHeroTimer() {
-  if (heroTimer) clearInterval(heroTimer);
-  heroTimer = setInterval(() => {
-    heroIdx = (heroIdx + 1) % HERO_EVENTS.length;
-    renderHeroTerm();
-  }, 3400);
+function resetStoryTimer() {
+  if (storyTimer) clearInterval(storyTimer);
+  if (!storyPlaying) return;
+  storyTimer = setInterval(() => {
+    chapterIdx = (chapterIdx + 1) % CHAPTERS.length;
+    renderChapter();
+  }, 4400);
 }
 
-document.getElementById("heroNextBtn").addEventListener("click", () => {
-  heroIdx = (heroIdx + 1) % HERO_EVENTS.length;
-  renderHeroTerm();
-  resetHeroTimer();
+document.getElementById("storyPlayBtn").addEventListener("click", (e) => {
+  storyPlaying = !storyPlaying;
+  e.currentTarget.textContent = storyPlaying ? "Pause" : "Play";
+  resetStoryTimer();
 });
 
-renderHeroTerm();
-resetHeroTimer();
+// Subtle drifting organic spore motes in the dark diorama backdrop
+(function initSporeCanvas() {
+  const canvas = document.getElementById("sporeCanvas");
+  if (!canvas || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+  const ctx = canvas.getContext("2d");
+  let w = 0, h = 0;
+  const motes = Array.from({ length: 24 }, () => ({
+    x: Math.random(),
+    y: Math.random(),
+    r: 0.9 + Math.random() * 1.5,
+    vy: 0.00018 + Math.random() * 0.00025,
+    vx: (Math.random() - 0.5) * 0.00015,
+    phase: Math.random() * Math.PI * 2,
+    gold: Math.random() > 0.55,
+  }));
+  function resize() {
+    const rect = canvas.getBoundingClientRect();
+    w = canvas.width = Math.max(1, Math.floor(rect.width));
+    h = canvas.height = Math.max(1, Math.floor(rect.height));
+  }
+  resize();
+  window.addEventListener("resize", resize);
+  function draw(now) {
+    ctx.clearRect(0, 0, w, h);
+    for (const m of motes) {
+      m.y -= m.vy;
+      m.x += m.vx + Math.sin(now * 0.0008 + m.phase) * 0.00008;
+      if (m.y < -0.05) { m.y = 1.05; m.x = Math.random(); }
+      if (m.x < 0) m.x = 1;
+      if (m.x > 1) m.x = 0;
+      const alpha = 0.16 + 0.16 * Math.sin(now * 0.0014 + m.phase);
+      ctx.fillStyle = m.gold ? `rgba(232,163,49,${alpha.toFixed(2)})` : `rgba(183,217,86,${alpha.toFixed(2)})`;
+      ctx.beginPath();
+      ctx.arc(m.x * w, m.y * h, m.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    requestAnimationFrame(draw);
+  }
+  requestAnimationFrame(draw);
+})();
+
+// Allow ?chapter=0..5 query param for direct linking / visual inspection; default starts at Beat 1 (0)
+const urlChapter = new URLSearchParams(window.location.search).get("chapter");
+if (urlChapter !== null && Number.isInteger(Number(urlChapter)) && Number(urlChapter) >= 0 && Number(urlChapter) < CHAPTERS.length) {
+  chapterIdx = Number(urlChapter);
+  storyPlaying = false;
+  document.getElementById("storyPlayBtn").textContent = "Play";
+}
+renderChapter();
+resetStoryTimer();
 
 // ============================================================================
 // 3. INTERACTIVE #INCIDENTS CHANNEL CARD (Inside Granola-style collage)
@@ -358,12 +552,12 @@ const QS = {
   curl: `# Install hph from GitHub and launch interactive onboarding
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/bowd/hyphae/main/install.sh)"
 
-# Verify Node 24, daemon, live router, 0600 secrets, and harnesses
+# Verify Node 24, daemon, live nodes, 0600 secrets, and harnesses
 hph status`,
   npm: `# Install globally via npm (Node 24+)
 npm install -g @bowd/hyphae
 
-# Pick Private / Public / Shared routers, harnesses, streams & SSH hosts
+# Pick Private / Public / Shared nodes, harnesses, streams & SSH hosts
 hph onboard`,
   assist: `# Install the standalone Hyphae skill across harnesses (agent starting point)
 hph skill install all
@@ -373,12 +567,12 @@ hph onboard --assist`,
   fleet: `# Wire OpenClaw as your fleet orchestrator
 hph setup openclaw
 
-# Share your private router on Tailscale & onboard remote Linux hosts over SSH
+# Share your private node on Tailscale & onboard remote Linux hosts over SSH
 hph share tailscale --service hyphae
 hph onboard --remote-ssh bogdan@solace --install-service
 
-# Store webhook & chat tokens out-of-band (0600, never enters LLM context)
-hph secret set telegram-bot-token --web`,
+# Store Slack/Telegram/webhook tokens out-of-band (0600, never enters LLM context)
+hph secret set slack-bot-token --web`,
 };
 
 let activeQs = "curl";

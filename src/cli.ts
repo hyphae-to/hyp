@@ -45,19 +45,19 @@ const configDir = (() => {
 const defaultConfigPath = () => join(configDir, "connector.json");
 const defaultSocketPath = () => process.env.HYPHAE_SOCKET ?? process.env.AGENTS_MESH_SOCKET ?? join(configDir, "state", "connector.sock");
 
-const usage = `Hyphae (hph) — cross-harness agent mesh & event router
+const usage = `Hyphae (hph) — cross-harness agent mesh & event node
 
 Core commands:
   hph onboard [--assist | --prompt | --join | --remote-ssh <host>]
-      Set up routers, harnesses, streams, bridges & SSH hosts (TUI or agent-led)
+      Set up private/public nodes, harnesses, streams, bridges & SSH hosts
   hph status [--sessions | --discover | --probe-ssh | --prune]
-      Health check (Node 24, daemon, routers, 0600 secrets, harnesses & live peers)
+      Health check (Node 24, daemon, nodes, 0600 secrets, harnesses & live peers)
   hph connect [add | list | guide [name]]
-      Configure or inspect data streams (GitHub, Prometheus) & chat bridges (Slack, Telegram)
+      Configure or inspect node event streams (GitHub, Prometheus) & chat bridges (Slack, Telegram)
   hph secret <set <name> [--web] | list | rm <name> | check>
       Manage 0600 secrets privately (hidden TTY prompt or --web out-of-band browser form)
   hph share <tailscale | invite <user@host> | stop>
-      Expose your private router on Tailscale Services and generate remote invite codes
+      Expose your node on Tailscale Services and generate remote invite codes
   hph setup <antigravity|claude|codex|cursor|opencode|gemini|openclaw|all|service>
       Wire (or re-wire) MCP, hooks, rules, skills, or OS auto-start service
   hph skill [install [antigravity|claude|codex|cursor|openclaw|project|all] | print | path]
@@ -66,7 +66,7 @@ Core commands:
 Runtime:
   hph daemon | hph wait [--stream]
 
-Run \`hph --help --all\` for advanced & plumbing commands (router, mcp, hook, init).`;
+Run \`hph --help --all\` for advanced & plumbing commands (node, mcp, hook, init).`;
 
 const fullUsage = `${usage}
 
@@ -76,7 +76,7 @@ Advanced & plumbing commands (aliases kept for hooks/scripts):
   hph hook <antigravity|claude|codex|cursor|opencode|gemini|openclaw> <pre-tool-use|post-tool-use|pre-invocation|stop>
   hph watch [--session <id> | --handle <handle>] [--timeout <sec>]   (alias: hph wait --stream)
   hph doctor | sessions | prune | discover | plugin | stream         (aliases under status / connect)
-  hph router <expose|unexpose|invite|serve|add-connector|revoke-connector|add-publisher|revoke-publisher|github-receiver>`;
+  hph node <expose|unexpose|invite|serve|add-connector|revoke-connector|add-publisher|revoke-publisher|github-receiver>`;
 
 function readStdinLine(): Promise<string> {
   return new Promise((resolve) => {
@@ -133,7 +133,7 @@ async function main(): Promise<void> {
     throw new Error("Usage: hph skill [install [harness|project|all] | print | path]");
   }
 
-  if (action === "router") {
+  if (action === "node" || action === "router") {
     const [sub, ...rest] = args;
     if (sub === "expose") {
       const { values, positionals } = parseArgs({
