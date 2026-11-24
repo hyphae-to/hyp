@@ -7,7 +7,13 @@ import type { RouterConfig } from "./router.ts";
 import { resolveEnvWithSecrets } from "./secrets.ts";
 import { isTopic } from "./core/router/cloudevent.ts";
 
-export type BuiltinStreamName = "github-webhook" | "webhook-stream";
+export type BuiltinStreamName = "github-webhook" | "webhook-stream" | "prometheus-webhook";
+
+export interface RouterStreamScope {
+  readonly repos?: readonly string[];
+  readonly orgs?: readonly string[];
+  readonly subjects?: readonly string[];
+}
 
 export interface RouterStreamConfig {
   readonly name: string;
@@ -17,6 +23,7 @@ export interface RouterStreamConfig {
   readonly args: readonly string[];
   readonly env: Readonly<Record<string, string>>;
   readonly cwd: string;
+  readonly scope?: RouterStreamScope;
 }
 
 export interface LocalRouterConfig {
@@ -28,7 +35,7 @@ export interface LocalRouterConfig {
   streams?: readonly RouterStreamConfig[];
 }
 
-export type BuiltinPluginName = "slack" | "telegram" | "webhook";
+export type BuiltinPluginName = "slack" | "telegram" | "whatsapp" | "webhook";
 
 export interface AgentPluginTarget {
   readonly name: string;
@@ -59,8 +66,8 @@ export interface Config {
 }
 
 const PLUGIN_NAME = /^[a-z0-9][a-z0-9._-]{0,31}$/;
-const BUILTIN_PLUGINS = new Set<BuiltinPluginName>(["slack", "telegram", "webhook"]);
-const BUILTIN_STREAMS = new Set<BuiltinStreamName>(["github-webhook", "webhook-stream"]);
+const BUILTIN_PLUGINS = new Set<BuiltinPluginName>(["slack", "telegram", "whatsapp", "webhook"]);
+const BUILTIN_STREAMS = new Set<BuiltinStreamName>(["github-webhook", "webhook-stream", "prometheus-webhook"]);
 
 function parseStreams(raw: unknown, configDir: string, stateDir: string): RouterStreamConfig[] {
   if (raw === undefined) return [];
@@ -82,19 +89,19 @@ function parseStreams(raw: unknown, configDir: string, stateDir: string): Router
 
     if (entry.builtin !== undefined) {
       if (typeof entry.builtin !== "string" || !BUILTIN_STREAMS.has(entry.builtin as BuiltinStreamName)) {
-        throw new Error(`Stream '${entry.name}' has unknown builtin '${String(entry.builtin)}' (expected github-webhook or webhook-stream)`);
+        throw new Error(`Stream '${entry.name}' has unknown builtin '${String(entry.builtin)}' (expected github-webhook, webhook-stream, or prometheus-webhook)`);
       }
       if (entry.exec !== undefined) throw new Error(`Stream '${entry.name}' cannot specify both builtin and exec`);
       builtin = entry.builtin as BuiltinStreamName;
-      if (builtin === "webhook-stream") {
+      if (builtin === "webhook-stream" || builtin === "prometheus-webhook") {
         exec = process.execPath;
         const extraArgs = entry.args === undefined ? [] : (Array.isArray(entry.args) && entry.args.every((a) => typeof a === "string") ? entry.args : null);
         if (!extraArgs) throw new Error(`Stream '${entry.name}' args must be an array of strings`);
-        args = [resolveBuiltinPluginScript("webhook"), ...extraArgs];
+        args = [resolveBuiltinPluginScript(builtin === "prometheus-webhook" ? "prometheus" : "webhook"), ...extraArgs];
       }
     } else {
       if (typeof entry.exec !== "string" || !isAbsolute(entry.exec)) {
-        throw new Error(`Stream '${entry.name}' needs an absolute exec path (or builtin: "github-webhook"|"webhook-stream")`);
+        throw new Error(`Stream '${entry.name}' needs an absolute exec path (or builtin: "github-webhook"|"webhook-stream"|"prometheus-webhook")`);
       }
       exec = entry.exec;
       if (entry.args !== undefined && (!Array.isArray(entry.args) || !entry.args.every((a) => typeof a === "string"))) {
@@ -106,11 +113,47 @@ function parseStreams(raw: unknown, configDir: string, stateDir: string): Router
     const cwd = entry.cwd === undefined ? stateDir : entry.cwd;
     if (typeof cwd !== "string" || !isAbsolute(cwd)) throw new Error(`Stream '${entry.name}' cwd must be an absolute path`);
     const { env } = resolveEnvWithSecrets(entry.env, configDir, `Stream '${entry.name}'`);
-    return { name: entry.name, topic: entry.topic, ...(builtin ? { builtin } : {}), ...(exec ? { exec } : {}), args, env, cwd };
+    const parseCsv = (rawCsv: string | undefined): string[] =>
+      rawCsv ? rawCsv.split(",").map((s) => s.trim()).filter(Boolean) : [];
+    const stringArray = (v: unknown, label: string): string[] | undefined => {
+      if (v === undefined) return undefined;
+      if (!Array.isArray(v) || !v.every((x) => typeof x === "string")) {
+        throw new Error(`Stream '${entry.name}' ${label} must be an array of strings`);
+      }
+      return v.map((s) => s.trim()).filter(Boolean);
+    };
+    let scope: RouterStreamScope | undefined;
+    const rawScope = object(entry.scope) ? entry.scope : undefined;
+    const scopeRepos = [
+      ...(stringArray(rawScope?.repos, "scope.repos") ?? []),
+      ...parseCsv(env.GITHUB_REPOS ?? env.GITHUB_ALLOWED_REPOS),
+    ];
+    const scopeOrgs = [
+      ...(stringArray(rawScope?.orgs, "scope.orgs") ?? []),
+      ...parseCsv(env.GITHUB_ORGS ?? env.GITHUB_ALLOWED_ORGS),
+    ];
+    const scopeSubjects = stringArray(rawScope?.subjects, "scope.subjects") ?? [];
+    if (scopeRepos.length > 0 || scopeOrgs.length > 0 || scopeSubjects.length > 0) {
+      scope = {
+        ...(scopeRepos.length > 0 ? { repos: [...new Set(scopeRepos)] } : {}),
+        ...(scopeOrgs.length > 0 ? { orgs: [...new Set(scopeOrgs)] } : {}),
+        ...(scopeSubjects.length > 0 ? { subjects: [...new Set(scopeSubjects)] } : {}),
+      };
+    }
+    return {
+      name: entry.name,
+      topic: entry.topic,
+      ...(builtin ? { builtin } : {}),
+      ...(exec ? { exec } : {}),
+      args,
+      env,
+      cwd,
+      ...(scope ? { scope } : {}),
+    };
   });
 }
 
-export function resolveBuiltinPluginScript(builtin: BuiltinPluginName): string {
+export function resolveBuiltinPluginScript(builtin: BuiltinPluginName | "prometheus"): string {
   const here = dirname(fileURLToPath(import.meta.url));
   const pkgRoot = here.endsWith(join("dist", "src")) ? resolve(here, "..", "..") : resolve(here, "..");
   const script = join(pkgRoot, "plugins", builtin, "index.mjs");
@@ -142,7 +185,7 @@ function parsePlugins(raw: unknown, configDir: string, stateDir: string): AgentP
     let builtin: BuiltinPluginName | undefined;
     if (entry.builtin !== undefined) {
       if (typeof entry.builtin !== "string" || !BUILTIN_PLUGINS.has(entry.builtin as BuiltinPluginName)) {
-        throw new Error(`Plugin '${entry.name}' has unknown builtin '${String(entry.builtin)}' (expected slack, telegram, or webhook)`);
+        throw new Error(`Plugin '${entry.name}' has unknown builtin '${String(entry.builtin)}' (expected slack, telegram, whatsapp, or webhook)`);
       }
       if (entry.exec !== undefined) throw new Error(`Plugin '${entry.name}' cannot specify both builtin and exec`);
       builtin = entry.builtin as BuiltinPluginName;
@@ -152,7 +195,7 @@ function parsePlugins(raw: unknown, configDir: string, stateDir: string): AgentP
       args = [resolveBuiltinPluginScript(builtin), ...extraArgs];
     } else {
       if (typeof entry.exec !== "string" || !isAbsolute(entry.exec)) {
-        throw new Error(`Plugin '${entry.name}' needs an absolute exec path (or builtin: "slack"|"telegram"|"webhook")`);
+        throw new Error(`Plugin '${entry.name}' needs an absolute exec path (or builtin: "slack"|"telegram"|"whatsapp"|"webhook")`);
       }
       exec = entry.exec;
       if (entry.args !== undefined && (!Array.isArray(entry.args) || !entry.args.every((a) => typeof a === "string"))) {

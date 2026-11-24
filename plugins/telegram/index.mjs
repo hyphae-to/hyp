@@ -7,6 +7,8 @@
  *   TELEGRAM_TARGET                                - Target name (defaults to first target in hello)
  *   TELEGRAM_ALLOWED_CHATS                         - Optional comma-separated numeric chat IDs allowlist
  *   TELEGRAM_ALLOWED_USERS                         - Optional comma-separated numeric user IDs allowlist
+ *   TELEGRAM_DEFAULT_CHAT                          - Optional default numeric chat ID for outbound hyp_plugin_post
+ *   TELEGRAM_API_BASE                              - Optional API base URL override (default https://api.telegram.org)
  *   TELEGRAM_STATE_FILE                            - Optional path to persist polling offset JSON
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -43,6 +45,7 @@ function resolveApiBase(raw, fallback) {
 }
 
 const apiBase = resolveApiBase(process.env.TELEGRAM_API_BASE, "https://api.telegram.org");
+let lastChatId = process.env.TELEGRAM_DEFAULT_CHAT?.trim() || null;
 
 if (!allowedChats && !allowedUsers && !allowAll) {
   throw new Error("Refusing to start Telegram bridge without TELEGRAM_ALLOWED_USERS or TELEGRAM_ALLOWED_CHATS (set TELEGRAM_ALLOW_ALL=1 to explicitly allow any Telegram user)");
@@ -50,6 +53,35 @@ if (!allowedChats && !allowedUsers && !allowAll) {
 
 const mesh = new MeshPluginClient({
   onDeliveryFailed: (msg) => console.error(`telegram plugin delivery_failed target=${msg.target} reason=${msg.reason}`),
+  onPost: async (params) => {
+    const text = typeof params.text === "string" ? params.text.trim() : "";
+    if (!text) throw new Error("text is required");
+    const rawChat = params.chatId ?? params.to ?? params.channel ?? lastChatId;
+    const chatId = rawChat !== undefined && rawChat !== null ? String(rawChat).trim() : "";
+    if (!chatId) {
+      throw new Error("No Telegram chatId specified and no recent inbound chat to reply to (pass chatId or set TELEGRAM_DEFAULT_CHAT)");
+    }
+    if (allowedChats && !allowedChats.has(chatId)) {
+      throw new Error(`Chat '${chatId}' is not in TELEGRAM_ALLOWED_CHATS`);
+    }
+    const rawReplyTo = params.replyTo !== undefined && params.replyTo !== null ? String(params.replyTo).trim() : "";
+    const replyToMessageId = rawReplyTo && /^\d+$/.test(rawReplyTo) ? Number(rawReplyTo) : undefined;
+    const res = await fetch(`${apiBase}/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        ...(replyToMessageId !== undefined ? { reply_to_message_id: replyToMessageId } : {}),
+      }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const body = await res.json();
+    if (!res.ok || !body.ok) {
+      throw new Error(`Telegram sendMessage failed: ${body.description ?? res.status}`);
+    }
+    return { ok: true, chatId, messageId: body.result?.message_id ?? null };
+  },
 });
 const hello = await mesh.ready;
 const target = process.env.TELEGRAM_TARGET ?? hello.targets[0];
@@ -93,6 +125,7 @@ while (true) {
         const chatId = String(msg.chat?.id ?? "");
         const userId = String(msg.from?.id ?? "");
         if ((!allowedChats || allowedChats.has(chatId)) && (!allowedUsers || allowedUsers.has(userId))) {
+          if (chatId) lastChatId = chatId;
           const text = String(msg.text ?? msg.caption ?? "").slice(0, 4000);
           const event = {
             specversion: "1.0",

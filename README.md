@@ -108,19 +108,29 @@ Any enrolled agent on any machine can join rooms and broadcast to teammates with
 
 ```text
 hyp_channel_join   { channel: "#deploys" }
-hyp_channel_post   { channel: "#deploys", body: "v2.14.1 live — checkout-api alert cleared (0.0%)" }
+hyp_channel_post   { channel: "#deploys", text: "v2.14.1 live — checkout-api alert cleared (0.0%)" }
 hyp_channel_leave  { channel: "#deploys" }
 ```
 
 ### Node Event Streams (GitHub, Prometheus, Custom fd-3)
 Configure webhook or fd-3 publishers directly on a Team Node (`localRouter.streams`), then subscribe from any thread with CloudEvents filters (`hyp_subscribe`):
 
-- **GitHub**: PR opened, CI done, review requested, changes requested, approved, merged.
-- **Prometheus / Alertmanager**: Server-side filter (`subject startsWith "severity=critical"`) wakes only your ops agent instead of burning tokens across the fleet.
-- **Bring your own stream**: Any executable writing JSON lines to fd 3.
+- **GitHub (`github-webhook`)**: PR opened, CI done, review requested, changes requested, approved, merged.
+- **Prometheus / Alertmanager (`prometheus-webhook`)**: Built-in Alertmanager v4 receiver (`POST /alerts`, default port `8793`) emitting `io.prometheus.alert.firing` / `io.prometheus.alert.resolved` with `subject: "severity=<severity>/<alertname>"` — filter server-side (`prefix: { subject: "severity=critical" }`) so only your ops agent wakes up.
+- **Signed webhooks & custom fd-3 streams (`webhook-stream`)**: Any HTTP publisher or executable writing CloudEvents JSON lines to fd 3.
 
-### Private Chat Bridges (Slack, Telegram, WhatsApp, fd-3)
-Run a Private Node on your laptop for personal chat bridges (`hyp connect slack` / `telegram` / `webhook`) with live `hyp_plugin_targets` & `hyp_plugin_handoff` across harnesses — zero daemon restarts, and your chat tokens never leave your machine.
+### Bidirectional Chat Bridges & Multi-Thread Fan-In
+Run a Private Node on your laptop for personal chat bridges whose tokens never leave your machine (`0600` secrets):
+
+| Built-in | Transport | Inbound CloudEvent | Outbound `hyp_plugin_post` |
+| --- | --- | --- | --- |
+| **`slack`** | Socket Mode WebSocket (no public URL) | DMs, `@mentions`, threads | `chat.postMessage` (`channel`, `threadTs`) |
+| **`telegram`** | Bot API long polling (durable offset) | Direct / allowed group messages | `sendMessage` (`chatId`, `replyTo`) |
+| **`whatsapp`** | Meta Business Cloud API webhook (`X-Hub-Signature-256`) | `com.whatsapp.message.received` (`subject: "wa/<from>"`) | Graph API `/${phoneNumberId}/messages` (`to`, `replyTo`) |
+| **`webhook`** | Loopback / tailnet HTTP (`X-Webhook-Signature-256`) | Custom CloudEvent type | Optional `WEBHOOK_POST_URL` callback |
+
+- **Reply directly from any authorized thread**: `hyp_plugin_post({ plugin, target, text, channel?, chatId?, threadTs?, replyTo?, to? })` sends replies back over bidirectional fd 3 — fail-closed (`not_target_holder`) unless the caller owns or is linked to the target.
+- **Share one bridge across multiple harnesses**: `hyp_bridge_link` / `hyp_bridge_unlink` fan inbound chat messages into multiple agent threads simultaneously (and grant reply access), `hyp_plugin_targets` inspects targets and `linkedSessions`, and `hyp_plugin_handoff` transfers primary ownership live with zero daemon restarts.
 
 ### Connector-Level Muting & Notification Mode
 - **Mute noisy peers/channels/topics at the connector**: `hyp_mute({ target: "jack@prod/*" })` or `hyp mute #deploys` drops matching messages before they ever reach an agent's mailbox (`user@host/handle`, `user@host/*`, `#channel`, `topic:<name>`, `plugin:<name>`).
@@ -133,13 +143,13 @@ Run a Private Node on your laptop for personal chat bridges (`hyp connect slack`
 Hyphae keeps the everyday surface down to **7 core commands** (run `hyp --help --all` for low-level router/hook/MCP plumbing):
 
 ```sh
-hyp onboard [--assist | --join | --yes]   # Interactive setup, AI concierge, or join a Team Node
-hyp status                                # Live daemon, node health, peers & doctor diagnostics
-hyp connect [slack|telegram|github|...]   # Wire chat bridges or node event streams
-hyp secret set <name> --web               # Capture a token out-of-band on 127.0.0.1 (0600)
-hyp share <user@host>                     # Expose via Tailscale & generate a one-shot invite
-hyp setup [harness|all|service]           # Configure harnesses or install launchd/systemd daemon
-hyp skill [install|print|path]            # Install the canonical Hyphae agent skill
+hyp onboard [--assist | --join | --yes]            # Interactive setup, AI concierge, or join a Team Node
+hyp status                                         # Live daemon, node health, peers & doctor diagnostics
+hyp connect [slack|telegram|whatsapp|github|...]   # Wire chat bridges or node event streams
+hyp secret set <name> --web                        # Capture a token out-of-band on 127.0.0.1 (0600)
+hyp share <user@host>                              # Expose via Tailscale & generate a one-shot invite
+hyp setup [harness|all|service]                    # Configure harnesses or install launchd/systemd daemon
+hyp skill [install|print|path]                     # Install the canonical Hyphae agent skill
 ```
 
 ### Multi-machine over Tailscale
@@ -170,12 +180,12 @@ See [docs/security.md](docs/security.md), [docs/design.md](docs/design.md), [doc
 ```sh
 npm install
 npm run typecheck          # Strict TypeScript check
-npm test                   # 29 unit + multi-session + #channels + stream integration tests
+npm test                   # Unit, multi-session, #channels, stream & bridge integration tests
 npm run test:harnesses     # Real local claude, codex, agy & herdr integration tests (zero API cost)
 npm run build              # Compile to dist/
 ```
 
 <div align="center">
   <br />
-  <a href="https://hyphae.to"><strong>hyphae.to</strong></a> · MIT License
+  <a href="https://hyphae.to"><strong>hyphae.to</strong></a> · <a href="LICENSE">MIT License</a>
 </div>

@@ -65,6 +65,19 @@ export class Plugins {
     return this.#events.route(subscriptionId);
   }
 
+  /** Sends an outbound request (e.g. `post`) to a supervised plugin process over fd 3. */
+  async request(
+    pluginName: string,
+    method: "post",
+    target: string,
+    params: Readonly<Record<string, unknown>>,
+    timeoutMs = 15_000,
+  ): Promise<{ ok: true; result: unknown } | { ok: false; error: string }> {
+    const runner = this.#processes.get(pluginName);
+    if (!runner) return { ok: false, error: `unknown_plugin:${pluginName}` };
+    return runner.request(method, target, params, timeoutMs);
+  }
+
   /** Tells the plugin that a stored batch for `ref` was dropped undelivered. */
   reportDeliveryFailed(ref: TargetRef, batch: InboundEventBatch, reason: string): void {
     this.#processes.get(ref.plugin)?.send({

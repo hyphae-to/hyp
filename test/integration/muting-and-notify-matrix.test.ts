@@ -217,23 +217,23 @@ test(
       }
 
       // ---- 2. Actuate all 5 mute target classes via CLI + MCP with uppercase normalization ----
-      // Class 1 (exact peer via CLI, uppercase -> lowercase)
-      const cliMutePeer = await runCli(["mute", "ALICE@LAPTOP/NOISY", "--socket", receiver.socketPath]);
+      // Class 1 (exact peer via CLI --json, uppercase -> lowercase)
+      const cliMutePeer = await runCli(["mute", "ALICE@LAPTOP/NOISY", "--socket", receiver.socketPath, "--json"]);
       assert.equal(cliMutePeer.code, 0, `CLI mute peer failed: ${cliMutePeer.stderr}`);
-      const peerRule = JSON.parse(cliMutePeer.stdout) as { rule: { pattern: string; scope: string; mutedBy: string } };
+      const peerRule = (JSON.parse(cliMutePeer.stdout) as { ok: boolean; data: { rule: { pattern: string; scope: string; mutedBy: string } } }).data;
       assert.equal(peerRule.rule.pattern, "alice@laptop/noisy");
       assert.equal(peerRule.rule.scope, "*");
       assert.equal(peerRule.rule.mutedBy, "cli");
 
-      // Class 2 (connector wildcard via CLI, uppercase -> lowercase)
-      const cliMuteWild = await runCli(["mute", "JACK@PROD/*", "--socket", receiver.socketPath]);
+      // Class 2 (connector wildcard via CLI --json, uppercase -> lowercase)
+      const cliMuteWild = await runCli(["mute", "JACK@PROD/*", "--socket", receiver.socketPath, "--json"]);
       assert.equal(cliMuteWild.code, 0, `CLI mute wildcard failed: ${cliMuteWild.stderr}`);
-      assert.equal((JSON.parse(cliMuteWild.stdout) as { rule: { pattern: string } }).rule.pattern, "jack@prod/*");
+      assert.equal((JSON.parse(cliMuteWild.stdout) as { data: { rule: { pattern: string } } }).data.rule.pattern, "jack@prod/*");
 
-      // Class 3 (#channel via CLI, uppercase -> lowercase)
-      const cliMuteChan = await runCli(["mute", "#NOISY-ROOM", "--socket", receiver.socketPath]);
+      // Class 3 (#channel via CLI --json, uppercase -> lowercase)
+      const cliMuteChan = await runCli(["mute", "#NOISY-ROOM", "--socket", receiver.socketPath, "--json"]);
       assert.equal(cliMuteChan.code, 0, `CLI mute #channel failed: ${cliMuteChan.stderr}`);
-      assert.equal((JSON.parse(cliMuteChan.stdout) as { rule: { pattern: string } }).rule.pattern, "#noisy-room");
+      assert.equal((JSON.parse(cliMuteChan.stdout) as { data: { rule: { pattern: string } } }).data.rule.pattern, "#noisy-room");
 
       // Class 4 (topic:<name> via MCP, scope: "connector", uppercase -> lowercase)
       const mcpMuteTopic = await callMcpAs(
@@ -467,9 +467,9 @@ test(
 
       // ---- 6. Unmute all 5 classes via CLI + MCP, verify hyp_capabilities=0 & delivery resumes ----
       for (const target of ["ALICE@LAPTOP/NOISY", "jack@prod/*", "#noisy-room"]) {
-        const res = await runCli(["unmute", target, "--socket", restarted.socketPath]);
+        const res = await runCli(["unmute", target, "--socket", restarted.socketPath, "--json"]);
         assert.equal(res.code, 0, `CLI unmute '${target}' failed: ${res.stderr}`);
-        assert.equal((JSON.parse(res.stdout) as { removed: boolean }).removed, true);
+        assert.equal((JSON.parse(res.stdout) as { data: { removed: boolean } }).data.removed, true);
       }
       const unmuteTopic = await callMcpAs(mcp2, restarted.socketPath, "claude", "main", "hyp_unmute", {
         target: "topic:builds",
@@ -487,7 +487,7 @@ test(
 
       const cliMutesEmpty = await runCli(["mutes", "--socket", restarted.socketPath]);
       assert.equal(cliMutesEmpty.code, 0, cliMutesEmpty.stderr);
-      assert.match(cliMutesEmpty.stdout, /No active connector-level mutes/i);
+      assert.match(cliMutesEmpty.stdout, /No active connector-level mute/i);
 
       const capsMainZero = (await callMcpAs(mcp2, restarted.socketPath, "claude", "main", "hyp_capabilities", {}, "cz1")).json() as { mutes: number };
       const capsSideZero = (await callMcpAs(mcp2, restarted.socketPath, "antigravity", "side", "hyp_capabilities", {}, "cz2")).json() as { mutes: number };

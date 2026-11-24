@@ -37,14 +37,28 @@ export const ROUTER_STREAM_GUIDES: readonly PluginOrStreamGuide[] = [
       },
     ],
     instructions: [
-      "1. In GitHub: Repo or Org -> Settings -> Webhooks -> Add webhook.",
-      "2. Payload URL: https://<your-public-host>/hooks/github (pointing to port GITHUB_WEBHOOK_PORT, default 8791).",
-      "3. Content type: application/json",
-      "4. Secret: the exact secret saved as `github-webhook-secret` in ~/.config/hyphae/secrets/.",
-      "5. Select individual events (Pull requests, Issues, Issue comments, Check runs, Pushes).",
+      "Option A — Repository or Organization Webhook (fastest):",
+      "  1. In GitHub: Repo or Org -> Settings -> Webhooks -> Add webhook.",
+      "  2. Payload URL: https://<your-public-host>/hooks/github (reverse-proxying to 127.0.0.1:<GITHUB_WEBHOOK_PORT>, default 8791).",
+      "  3. Content type: application/json",
+      "  4. Secret: the exact secret saved via `hyp secret set github-webhook-secret --web` (0600).",
+      "  5. Select individual events: Pull requests, Pull request reviews, Pull request review comments, Issues, Issue comments, Workflow runs, Pushes.",
+      "",
+      "Option B — GitHub App (best for orgs & selective repos):",
+      "  1. GitHub -> Settings -> Developer settings -> GitHub Apps -> New GitHub App.",
+      "  2. Webhook: Active = true, URL = https://<your-public-host>/hooks/github, Secret = `github-webhook-secret`.",
+      "  3. Permissions (Read-only): Pull requests, Issues, Actions, Contents, Metadata -> Subscribe to the matching events.",
+      "  4. Install the GitHub App on the exact repositories (or org) you want monitored.",
+      "",
+      "Scope & Reachability (prevents dead subscriptions!):",
+      "  - Set `GITHUB_REPOS` (e.g. `hyphae-to/hyp,org/api`) or `GITHUB_ORGS` (`hyphae-to`) in stream env (or `scope.repos` / `scope.orgs`).",
+      "  - `hyp_topics` advertises this scope + observed webhook sources to models, and `hyp_subscribe` warns if an agent subscribes to an unmonitored repo or filters `subject` instead of `repo`.",
+      "  - Verify delivery: click 'Redeliver' on the initial `ping` in GitHub Recent Deliveries (expect HTTP 202) and run `hyp_topics`.",
     ],
     agentUsage: [
-      'hyp_subscribe({ key: "github:my-prs", topic: "github", filters: [{ prefix: { subject: "org/repo" } }] })',
+      'Inspect monitored repos & schema first: hyp_topics()',
+      'Filter by repository (use `repo`, NOT `subject`!): hyp_subscribe({ key: "gh:hyp-prs", topic: "github", filters: [{ exact: { repo: "hyphae-to/hyp" } }, { prefix: { type: "com.github.pull_request." } }] })',
+      'Fail closed on unmonitored repos: hyp_subscribe({ key: "gh:strict", topic: "github", filters: [{ exact: { repo: "org/repo" } }], strict: true })',
     ],
   },
   {
@@ -71,6 +85,31 @@ export const ROUTER_STREAM_GUIDES: readonly PluginOrStreamGuide[] = [
     ],
     agentUsage: [
       'hyp_subscribe({ key: "ci:failures", topic: "webhooks", filters: [{ exact: { type: "com.ci.failed" } }] })',
+    ],
+  },
+  {
+    id: "prometheus-webhook",
+    kind: "router-stream",
+    label: "Prometheus Alertmanager Stream",
+    tagline: "Firing & resolved Alertmanager v4 alerts -> router topic `alerts`",
+    summary: "Receives standard Prometheus Alertmanager webhook payloads (optional Bearer token or HMAC verification) and publishes one CloudEvent per alert with subject `severity=<level>/<alertname>`.",
+    defaultName: "prometheus",
+    defaultTopicOrTarget: "alerts",
+    secrets: [
+      {
+        secretName: "prometheus-bearer-token",
+        envKey: "PROMETHEUS_BEARER_TOKEN",
+        prompt: "Optional Alertmanager Bearer token (leave blank to allow unauthenticated loopback)",
+        required: false,
+      },
+    ],
+    instructions: [
+      "1. In alertmanager.yml, add a webhook_configs receiver pointing to http://127.0.0.1:<PROMETHEUS_PORT>/alerts (default 8793).",
+      "2. If a Bearer token is set, configure `http_config: { authorization: { credentials: ... } }` in Alertmanager.",
+      "3. Alerts emit `io.prometheus.alert.firing` and `io.prometheus.alert.resolved` with subject `severity=<severity>/<alertname>`.",
+    ],
+    agentUsage: [
+      'hyp_subscribe({ key: "alerts:critical", topic: "alerts", filters: [{ prefix: { subject: "severity=critical" } }] })',
     ],
   },
   {
@@ -125,7 +164,8 @@ export const CONNECTOR_BRIDGE_GUIDES: readonly PluginOrStreamGuide[] = [
     ],
     agentUsage: [
       'Claim target handle: hyp_join({ handle: "pm" })',
-      'Inspect or hand off live: hyp_plugin_targets() / hyp_plugin_handoff({ plugin: "slack", target: "pm", handle: "other" })',
+      'Reply back to Slack: hyp_plugin_post({ plugin: "slack", target: "pm", text: "PR #42 merged." })',
+      'Link extra thread or hand off: hyp_bridge_link({ plugin: "slack", target: "pm", handle: "reviewer" }) / hyp_plugin_handoff(...)',
     ],
   },
   {
@@ -133,7 +173,7 @@ export const CONNECTOR_BRIDGE_GUIDES: readonly PluginOrStreamGuide[] = [
     kind: "connector-bridge",
     label: "Telegram Bot Bridge (Long Polling)",
     tagline: "Chat with a pinned agent directly from Telegram (no public URL needed)",
-    summary: "Uses Telegram Bot API long-polling with durable offset checkpointing. Bot token stays private on your machine.",
+    summary: "Uses Telegram Bot API long-polling with durable offset checkpointing. Supports outbound replies via `hyp_plugin_post` and multi-thread fan-in via `hyp_bridge_link`.",
     defaultName: "telegram",
     defaultTopicOrTarget: "assistant",
     secrets: [
@@ -152,7 +192,47 @@ export const CONNECTOR_BRIDGE_GUIDES: readonly PluginOrStreamGuide[] = [
     ],
     agentUsage: [
       'Claim target handle: hyp_join({ handle: "assistant" })',
-      'Hand off to another session/harness: hyp_plugin_handoff({ plugin: "telegram", target: "assistant", handle: "claude-ops" })',
+      'Reply back to Telegram: hyp_plugin_post({ plugin: "telegram", target: "assistant", text: "Done!" })',
+      'Link or hand off: hyp_bridge_link({ plugin: "telegram", target: "assistant", handle: "ops" }) / hyp_plugin_handoff(...)',
+    ],
+  },
+  {
+    id: "whatsapp",
+    kind: "connector-bridge",
+    label: "WhatsApp Cloud API Bridge",
+    tagline: "Bidirectional WhatsApp Business Cloud API webhook + outbound replies",
+    summary: "Verifies Meta webhook handshakes and HMAC-SHA256 signatures (`X-Hub-Signature-256`), enforces `WHATSAPP_ALLOWED_NUMBERS`, and supports outbound replies via `hyp_plugin_post`.",
+    defaultName: "whatsapp",
+    defaultTopicOrTarget: "assistant",
+    secrets: [
+      {
+        secretName: "whatsapp-verify-token",
+        envKey: "WHATSAPP_VERIFY_TOKEN",
+        prompt: "Meta Webhook Verify Token (for GET hub.verify_token handshake)",
+        required: true,
+      },
+      {
+        secretName: "whatsapp-app-secret",
+        envKey: "WHATSAPP_APP_SECRET",
+        prompt: "Meta App Secret (verifies X-Hub-Signature-256 on inbound POSTs)",
+        required: true,
+      },
+      {
+        secretName: "whatsapp-access-token",
+        envKey: "WHATSAPP_ACCESS_TOKEN",
+        prompt: "WhatsApp Cloud API permanent access token (for outbound hyp_plugin_post replies)",
+        required: true,
+      },
+    ],
+    instructions: [
+      "1. In Meta Developers -> WhatsApp -> Configuration, set Callback URL to https://<your-host>/whatsapp (proxying to WHATSAPP_PORT, default 8796).",
+      "2. Enter the exact Verify Token saved as `whatsapp-verify-token` and subscribe to the `messages` field.",
+      "3. Set `WHATSAPP_PHONE_NUMBER_ID` and `WHATSAPP_ALLOWED_NUMBERS` (comma-separated E.164 digits, e.g. 15551234567).",
+    ],
+    agentUsage: [
+      'Claim target handle: hyp_join({ handle: "assistant" })',
+      'Reply on WhatsApp: hyp_plugin_post({ plugin: "whatsapp", target: "assistant", text: "Deploy complete." })',
+      'Fan-in to another thread: hyp_bridge_link({ plugin: "whatsapp", target: "assistant", handle: "ops" })',
     ],
   },
   {

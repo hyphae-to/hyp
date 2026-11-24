@@ -208,10 +208,10 @@ test(
       assert.deepEqual(repaired.gateway, { port: 18799 });
       assert.equal(repairEnv.readHyphaeServerConfig().command, process.execPath);
 
-      // 4. Boot Session 1 strictly from generated `openclaw.json` -> verify 19 tools, capabilities & boundary errors
+      // 4. Boot Session 1 strictly from generated `openclaw.json` -> verify all tools, capabilities & boundary errors
       const s1 = await ocEnv.openSession();
       const listedTools = await s1.listTools();
-      assert.equal(listedTools.length, 19, `Expected all 19 Hyphae tools, got ${listedTools.length}`);
+      assert.equal(listedTools.length, MESH_TOOLS.size, `Expected all ${MESH_TOOLS.size} Hyphae tools, got ${listedTools.length}`);
       assert.deepEqual(
         new Set(listedTools.map((t) => t.name)),
         MESH_TOOLS,

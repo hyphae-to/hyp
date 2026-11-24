@@ -11,9 +11,11 @@ export class MeshPluginClient {
   #out;
   #pending = [];
   #closed = false;
+  #onPost;
 
-  constructor({ fd = Number(process.env.T3_MESH_FD ?? process.env.AGENTS_MESH_FD ?? 3), onStatus, onDeliveryFailed } = {}) {
+  constructor({ fd = Number(process.env.T3_MESH_FD ?? process.env.AGENTS_MESH_FD ?? 3), onStatus, onDeliveryFailed, onPost } = {}) {
     this.plugin = process.env.T3_MESH_PLUGIN ?? process.env.AGENTS_MESH_PLUGIN ?? "plugin";
+    this.#onPost = onPost;
     this.#out = createWriteStream("", { fd, autoClose: false });
     const input = createReadStream("", { fd, autoClose: false });
     const rl = createInterface({ input });
@@ -42,6 +44,8 @@ export class MeshPluginClient {
           onStatus?.(msg);
         } else if (msg.type === "delivery_failed") {
           onDeliveryFailed?.(msg);
+        } else if (msg.type === "request" && typeof msg.id === "string") {
+          void this.#handleRequest(msg);
         }
       });
       rl.on("close", () => {
@@ -53,6 +57,35 @@ export class MeshPluginClient {
         process.exit(0);
       });
     });
+  }
+
+  /** Register or replace the outbound `hyp_plugin_post` handler for this plugin. */
+  onPost(handler) {
+    this.#onPost = handler;
+  }
+
+  async #handleRequest(msg) {
+    const reply = (payload) => {
+      if (this.#closed) return;
+      this.#out.write(JSON.stringify({ type: "response", id: msg.id, ...payload }) + "\n");
+    };
+    if (msg.method !== "post") {
+      reply({ ok: false, error: `unsupported_method:${String(msg.method ?? "")}` });
+      return;
+    }
+    if (typeof this.#onPost !== "function") {
+      reply({ ok: false, error: "post_not_supported" });
+      return;
+    }
+    try {
+      const result = await this.#onPost({
+        target: msg.target,
+        ...(msg.params && typeof msg.params === "object" ? msg.params : {}),
+      });
+      reply({ ok: true, result: result ?? { sent: true } });
+    } catch (error) {
+      reply({ ok: false, error: error instanceof Error ? error.message : String(error) });
+    }
   }
 
   /** Sends one CloudEvent 1.0 to `to` (configured target name) and awaits durable ack/nack. */

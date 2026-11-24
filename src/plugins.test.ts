@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createServer as createHttpServer } from "node:http";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -665,6 +666,321 @@ test("notify mode pushes only a slim unread-count digest and keeps full items in
     assert.equal(daemon.state.pendingCount("antigravity:reader"), 0);
   } finally {
     await daemon.stop();
+    await router.close();
+    routerCore.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("multi-thread hyp_bridge_link fan-in and outbound hyp_plugin_post over fd 3 with authorization enforcement", { timeout: 15_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hyphae-bridge-"));
+  const routerCore = new RouterCore({ dbPath: join(dir, "router.sqlite") });
+  const token = routerCore.addConnector("bogdan@bridge");
+  const router = await serveRouter({ core: routerCore, host: "127.0.0.1", port: 0 });
+  const webhookPort = await freePort();
+
+  // Capture outbound webhook replies sent by hyp_plugin_post
+  const receivedPosts: Array<{ sig: string | undefined; body: Record<string, unknown> }> = [];
+  const postServer = createHttpServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const c of req) chunks.push(c as Buffer);
+    const raw = Buffer.concat(chunks).toString("utf8");
+    const sig = typeof req.headers["x-webhook-signature-256"] === "string" ? req.headers["x-webhook-signature-256"] : undefined;
+    receivedPosts.push({ sig, body: JSON.parse(raw) as Record<string, unknown> });
+    res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true }));
+  });
+  await new Promise<void>((r) => postServer.listen(0, "127.0.0.1", r));
+  const postAddr = postServer.address();
+  assert.ok(postAddr && typeof postAddr === "object");
+  const postUrl = `http://127.0.0.1:${postAddr.port}/reply`;
+
+  const tokenFile = join(dir, "connector.token");
+  const secretFile = join(dir, "webhook.secret");
+  writeFileSync(tokenFile, token + "\n", { mode: 0o600 });
+  writeFileSync(secretFile, "bridge-hmac-secret\n", { mode: 0o600 });
+  chmodSync(tokenFile, 0o600);
+  chmodSync(secretFile, 0o600);
+
+  const configPath = join(dir, "connector.json");
+  writeFileSync(configPath, JSON.stringify({
+    connectorId: "bogdan@bridge",
+    stateDir: "state",
+    routers: [{ name: "primary", url: router.url, tokenFile }],
+    plugins: [
+      {
+        name: "ops-hook",
+        builtin: "webhook",
+        env: {
+          WEBHOOK_HOST: "127.0.0.1",
+          WEBHOOK_PORT: String(webhookPort),
+          WEBHOOK_PATH: "/in",
+          WEBHOOK_SECRET_FILE: secretFile,
+          WEBHOOK_POST_URL: postUrl,
+        },
+        targets: [
+          { name: "ops", handle: "lead", coalesceSeconds: 0, maxWaitSeconds: 5, wakesPerHour: 120 },
+        ],
+      },
+    ],
+  }), { mode: 0o600 });
+
+  const daemon = await startDaemon(loadConfig(configPath), { quiet: true });
+  try {
+    daemon.state.register("antigravity:lead", { kind: "antigravity" });
+    daemon.state.register("claude:helper", { kind: "claude" });
+    daemon.state.register("codex:outsider", { kind: "codex" });
+    await daemon.connector.call("antigravity:lead", "hyp_join", { handle: "lead" });
+    await daemon.connector.call("claude:helper", "hyp_join", { handle: "helper" });
+    await daemon.connector.call("codex:outsider", "hyp_join", { handle: "outsider" });
+
+    // Non-holder cannot link into an already-held bridge or post to it
+    await assert.rejects(
+      () => daemon.connector.call("codex:outsider", "hyp_bridge_link", { plugin: "ops-hook", target: "ops" }),
+      /primary holder/i,
+    );
+    await assert.rejects(
+      () => daemon.connector.call("codex:outsider", "hyp_plugin_post", { plugin: "ops-hook", target: "ops", text: "forged" }),
+      /not the holder or a linked member/i,
+    );
+
+    // Primary holder links `helper` to receive fan-in copies
+    const linked = await daemon.connector.call("antigravity:lead", "hyp_bridge_link", {
+      plugin: "ops-hook",
+      target: "ops",
+      handle: "helper",
+    }) as { sessionId: string; linkedSessions: Array<{ sessionId: string; handle: string | null }> };
+    assert.equal(linked.sessionId, "claude:helper");
+    assert.deepEqual(linked.linkedSessions, [{ sessionId: "claude:helper", handle: "helper" }]);
+
+    // Helper now sees the bridge in hyp_plugin_targets
+    const helperTargets = await daemon.connector.call("claude:helper", "hyp_plugin_targets", {}) as {
+      targets: Array<{ plugin: string; target: string; linkedSessions: Array<{ sessionId: string }> }>;
+    };
+    assert.equal(helperTargets.targets.length, 1);
+    assert.equal(helperTargets.targets[0].linkedSessions[0].sessionId, "claude:helper");
+
+    const postInbound = async (id: string, msg: string) => {
+      const raw = JSON.stringify({ msg });
+      const sig = "sha256=" + createHmac("sha256", "bridge-hmac-secret").update(raw).digest("hex");
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        try {
+          return await fetch(`http://127.0.0.1:${webhookPort}/in`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-delivery-id": id, "x-webhook-signature-256": sig },
+            body: raw,
+          });
+        } catch {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
+      throw new Error("Webhook plugin did not listen in time");
+    };
+
+    // Inbound event fans in to BOTH lead (Antigravity) AND helper (Claude), never outsider
+    assert.equal((await postInbound("fan-1", "fan-in-hello")).status, 202);
+    const deadline = Date.now() + 4_000;
+    while ((daemon.state.pendingCount("antigravity:lead") < 1 || daemon.state.pendingCount("claude:helper") < 1) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const leadMsgs = daemon.connector.drainMailbox("antigravity:lead", 5);
+    const helperMsgs = daemon.connector.drainMailbox("claude:helper", 5);
+    assert.equal(leadMsgs.length, 1);
+    assert.match(leadMsgs[0].text, /fan-in-hello/);
+    assert.equal(helperMsgs.length, 1);
+    assert.match(helperMsgs[0].text, /fan-in-hello/);
+    assert.equal(daemon.state.pendingCount("codex:outsider"), 0);
+
+    // Linked helper can post outbound via hyp_plugin_post over fd 3 (with HMAC signature!)
+    const postRes = await daemon.connector.call("claude:helper", "hyp_plugin_post", {
+      plugin: "ops-hook",
+      target: "ops",
+      text: "Rollback complete!",
+      channel: "#ops",
+    }) as { plugin: string; target: string; result: { ok: boolean; status: number } };
+    assert.equal(postRes.result.ok, true);
+    assert.equal(receivedPosts.length, 1);
+    assert.equal(receivedPosts[0].body.text, "Rollback complete!");
+    assert.equal(receivedPosts[0].body.channel, "#ops");
+    assert.match(receivedPosts[0].sig ?? "", /^sha256=[0-9a-f]{64}$/);
+
+    // Helper unlinks itself -> stops receiving fan-in events and can no longer post
+    const unlinked = await daemon.connector.call("claude:helper", "hyp_bridge_unlink", {
+      plugin: "ops-hook",
+      target: "ops",
+    }) as { removed: boolean; linkedSessions: unknown[] };
+    assert.equal(unlinked.removed, true);
+    assert.deepEqual(unlinked.linkedSessions, []);
+
+    await assert.rejects(
+      () => daemon.connector.call("claude:helper", "hyp_plugin_post", { plugin: "ops-hook", target: "ops", text: "after-unlink" }),
+      /not the holder or a linked member/i,
+    );
+
+    assert.equal((await postInbound("fan-2", "lead-only-event")).status, 202);
+    const deadline2 = Date.now() + 4_000;
+    while (daemon.state.pendingCount("antigravity:lead") < 1 && Date.now() < deadline2) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.match(daemon.connector.drainMailbox("antigravity:lead", 5)[0].text, /lead-only-event/);
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(daemon.state.pendingCount("claude:helper"), 0);
+  } finally {
+    await daemon.stop();
+    await new Promise<void>((r) => postServer.close(() => r()));
+    await router.close();
+    routerCore.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("built-in Telegram and Slack bridges support outbound hyp_plugin_post against mock APIs", { timeout: 15_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hyphae-chatpost-"));
+  const routerCore = new RouterCore({ dbPath: join(dir, "router.sqlite") });
+  const token = routerCore.addConnector("bogdan@chat");
+  const router = await serveRouter({ core: routerCore, host: "127.0.0.1", port: 0 });
+
+  const tgSent: Array<Record<string, unknown>> = [];
+  let tgServedUpdate = false;
+  const slackSent: Array<Record<string, unknown>> = [];
+
+  const mockApi = createHttpServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const c of req) chunks.push(c as Buffer);
+    const body = chunks.length > 0 ? JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown> : {};
+    const url = req.url ?? "";
+
+    if (url === "/botTG_TEST_TOKEN/getUpdates") {
+      if (!tgServedUpdate) {
+        tgServedUpdate = true;
+        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
+          ok: true,
+          result: [{
+            update_id: 101,
+            message: { message_id: 42, date: Math.floor(Date.now() / 1000), chat: { id: 999111, type: "private" }, from: { id: 777, username: "bogdan" }, text: "ping from tg" },
+          }],
+        }));
+      } else {
+        setTimeout(() => {
+          if (!res.writableEnded) res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, result: [] }));
+        }, 500).unref();
+      }
+      return;
+    }
+    if (url === "/botTG_TEST_TOKEN/sendMessage") {
+      tgSent.push(body);
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, result: { message_id: 43 } }));
+      return;
+    }
+    if (url === "/slack/auth.test") {
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, user_id: "U_BOT", team_id: "T_TEST" }));
+      return;
+    }
+    if (url === "/slack/chat.postMessage") {
+      slackSent.push(body);
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, channel: body.channel, ts: "1700000000.000100" }));
+      return;
+    }
+    if (url === "/slack/apps.connections.open") {
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: false, error: "not_needed_for_post_test" }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise<void>((r) => mockApi.listen(0, "127.0.0.1", r));
+  const addr = mockApi.address();
+  assert.ok(addr && typeof addr === "object");
+  const apiOrigin = `http://127.0.0.1:${addr.port}`;
+
+  const tokenFile = join(dir, "connector.token");
+  writeFileSync(tokenFile, token + "\n", { mode: 0o600 });
+  chmodSync(tokenFile, 0o600);
+
+  const configPath = join(dir, "connector.json");
+  writeFileSync(configPath, JSON.stringify({
+    connectorId: "bogdan@chat",
+    stateDir: "state",
+    routers: [{ name: "primary", url: router.url, tokenFile }],
+    plugins: [
+      {
+        name: "tg",
+        builtin: "telegram",
+        env: {
+          TELEGRAM_BOT_TOKEN: "TG_TEST_TOKEN",
+          TELEGRAM_ALLOWED_USERS: "777",
+          TELEGRAM_API_BASE: apiOrigin,
+        },
+        targets: [{ name: "assistant", handle: "assistant", coalesceSeconds: 0, maxWaitSeconds: 5, wakesPerHour: 120 }],
+      },
+      {
+        name: "slk",
+        builtin: "slack",
+        env: {
+          SLACK_APP_TOKEN: "xapp-test",
+          SLACK_BOT_TOKEN: "xoxb-test",
+          SLACK_ALLOWED_CHANNELS: "C123",
+          SLACK_DEFAULT_CHANNEL: "C123",
+          SLACK_API_BASE: `${apiOrigin}/slack`,
+        },
+        targets: [{ name: "pm", handle: "assistant", coalesceSeconds: 0, maxWaitSeconds: 5, wakesPerHour: 120 }],
+      },
+    ],
+  }), { mode: 0o600 });
+
+  const daemon = await startDaemon(loadConfig(configPath), { quiet: true });
+  try {
+    daemon.state.register("antigravity:asst", { kind: "antigravity" });
+    await daemon.connector.call("antigravity:asst", "hyp_join", { handle: "assistant" });
+
+    // Wait for inbound Telegram message to arrive (also sets lastChatId = "999111")
+    const deadline = Date.now() + 5_000;
+    while (daemon.state.pendingCount("antigravity:asst") < 1 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const items = daemon.connector.drainMailbox("antigravity:asst", 5);
+    assert.equal(items.length, 1);
+    assert.match(items[0].text, /ping from tg/);
+
+    // Outbound Telegram reply uses lastChatId automatically + replyTo
+    const tgRes = await daemon.connector.call("antigravity:asst", "hyp_plugin_post", {
+      plugin: "tg",
+      target: "assistant",
+      text: "pong back on telegram",
+      replyTo: "42",
+    }) as { result: { ok: boolean; chatId: string; messageId: number } };
+    assert.deepEqual(tgRes.result, { ok: true, chatId: "999111", messageId: 43 });
+    assert.equal(tgSent.length, 1);
+    assert.equal(tgSent[0].chat_id, "999111");
+    assert.equal(tgSent[0].text, "pong back on telegram");
+    assert.equal(tgSent[0].reply_to_message_id, 42);
+
+    // Outbound Slack reply uses SLACK_DEFAULT_CHANNEL and enforces SLACK_ALLOWED_CHANNELS
+    const slkRes = await daemon.connector.call("antigravity:asst", "hyp_plugin_post", {
+      plugin: "slk",
+      target: "pm",
+      text: "Deploy green on Slack!",
+      threadTs: "1700000000.000001",
+    }) as { result: { ok: boolean; channel: string; ts: string } };
+    assert.equal(slkRes.result.ok, true);
+    assert.equal(slkRes.result.channel, "C123");
+    assert.equal(slackSent.length, 1);
+    assert.equal(slackSent[0].channel, "C123");
+    assert.equal(slackSent[0].text, "Deploy green on Slack!");
+    assert.equal(slackSent[0].thread_ts, "1700000000.000001");
+
+    // Non-allowlisted Slack channel fails closed
+    await assert.rejects(
+      () => daemon.connector.call("antigravity:asst", "hyp_plugin_post", {
+        plugin: "slk",
+        target: "pm",
+        channel: "C_FORBIDDEN",
+        text: "nope",
+      }),
+      /not in SLACK_ALLOWED_CHANNELS/i,
+    );
+  } finally {
+    await daemon.stop();
+    await new Promise<void>((r) => mockApi.close(() => r()));
     await router.close();
     routerCore.close();
     rmSync(dir, { recursive: true, force: true });

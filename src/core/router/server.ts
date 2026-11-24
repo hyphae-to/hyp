@@ -279,7 +279,11 @@ export async function serveRouter(options: RouterServerOptions): Promise<Running
         }
         const result = core.events.setSubscriptions(connectorId, body.value.subscriptions);
         if (result.ok) {
-          json(response, 200, { subscriptions: body.value.subscriptions.length, unknownTopics: result.unknownTopics });
+          json(response, 200, {
+            subscriptions: body.value.subscriptions.length,
+            unknownTopics: result.unknownTopics,
+            diagnostics: result.diagnostics,
+          });
         } else {
           const { ok: _ok, ...error } = result;
           json(response, result.error === "id_conflict" ? 409 : 400, error);
@@ -346,6 +350,10 @@ export async function serveRouter(options: RouterServerOptions): Promise<Running
       }
       if (route === "GET /v1/subscriptions/status") {
         json(response, 200, { subscriptions: core.events.deliveryStatus(connectorId) });
+        return;
+      }
+      if (route === "GET /v1/topics") {
+        json(response, 200, { topics: core.events.topicCatalog() });
         return;
       }
       if (route === "GET /v1/peers") {

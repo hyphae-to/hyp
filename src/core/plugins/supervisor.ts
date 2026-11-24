@@ -1,6 +1,7 @@
 // Runs one plugin process (SPEC.md sections 13.3 and 13.6): spawns it with the channel on fd 3,
 // answers its event lines, logs its stdout and stderr, and restarts it with backoff when it exits
 // or closes fd 3.
+import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { Duplex } from "node:stream";
 import type { PluginConfig } from "./types.ts";
@@ -71,6 +72,10 @@ export class PluginProcess {
   #restartTimer: NodeJS.Timeout | null = null;
   #stopping = false;
   #exited: Promise<void> = Promise.resolve();
+  readonly #pendingRequests = new Map<
+    string,
+    { resolve: (value: { ok: true; result: unknown } | { ok: false; error: string }) => void; timer: NodeJS.Timeout }
+  >();
 
   constructor(plugin: PluginConfig, store: StoreEvent, options: SupervisorOptions = {}) {
     this.#plugin = plugin;
@@ -130,6 +135,11 @@ export class PluginProcess {
       running.ending = true;
       if (this.#running === running) this.#running = null;
       channel.destroy();
+      for (const [reqId, pending] of this.#pendingRequests) {
+        clearTimeout(pending.timer);
+        pending.resolve({ ok: false, error: "plugin_exited" });
+        this.#pendingRequests.delete(reqId);
+      }
       const uptimeMs = Date.now() - running.startedAt;
       const restartInMs = this.#stopping ? null : this.#nextBackoff(uptimeMs);
       log(this.#stopping ? "info" : "warn", "plugin.exited", { plugin: this.#plugin.name, pid: child.pid, uptimeMs, ...fields, restartInMs });
@@ -157,6 +167,30 @@ export class PluginProcess {
     if (running === null || running.ending || !running.channel.writable) return false;
     running.channel.write(encodeLine(line));
     return true;
+  }
+
+  /** Sends a connector -> plugin request over fd 3 and awaits the matching `response` line. */
+  request(
+    method: "post",
+    target: string,
+    params: Readonly<Record<string, unknown>>,
+    timeoutMs = 15_000,
+  ): Promise<{ ok: true; result: unknown } | { ok: false; error: string }> {
+    const id = randomUUID();
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.#pendingRequests.delete(id);
+        resolve({ ok: false, error: "plugin_request_timeout" });
+      }, timeoutMs);
+      timer.unref();
+      this.#pendingRequests.set(id, { resolve, timer });
+      const sent = this.send({ type: "request", id, method, target, params });
+      if (!sent) {
+        clearTimeout(timer);
+        this.#pendingRequests.delete(id);
+        resolve({ ok: false, error: "plugin_offline" });
+      }
+    });
   }
 
   /** SIGTERM, then SIGKILL after the kill timeout; no restart. Resolves when the process is gone. */
@@ -231,6 +265,15 @@ export class PluginProcess {
   #handleLine(text: string): void {
     if (text.trim() === "") return;
     const line = parsePluginLine(text);
+    if (line.kind === "response") {
+      const pending = this.#pendingRequests.get(line.id);
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.#pendingRequests.delete(line.id);
+        pending.resolve(line.ok ? { ok: true, result: line.result ?? null } : { ok: false, error: line.error ?? "plugin_request_failed" });
+      }
+      return;
+    }
     if (line.kind === "nack") {
       log("warn", "plugin.event_rejected", { plugin: this.#plugin.name, error: line.nack.error });
       this.send(line.nack);

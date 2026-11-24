@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Hyphae (hyp) one-line installer
+# Hyphae (hyp) one-line installer — https://hyphae.to
 # Usage: bash -c "$(curl -fsSL https://raw.githubusercontent.com/hyphae-to/hyp/main/install.sh)"
 
 REPO="${HYPHAE_REPO:-https://github.com/hyphae-to/hyp.git}"
@@ -37,8 +37,19 @@ chmod +x "$INSTALL_DIR/bin/hyphae.mjs"
 ln -sf "$INSTALL_DIR/bin/hyphae.mjs" "$BIN_DIR/hyp"
 ln -sf "$INSTALL_DIR/bin/hyphae.mjs" "$BIN_DIR/hyphae"
 
+# Remove stale pre-rename symlink if it points to an old hyphae/agents-mesh install
+if [ -L "$BIN_DIR/hph" ]; then
+  LEGACY_TARGET="$(readlink "$BIN_DIR/hph" || true)"
+  case "$LEGACY_TARGET" in
+    *"hyphae"*|*"agents-mesh"*|"$INSTALL_DIR"/*)
+      rm -f "$BIN_DIR/hph"
+      ;;
+  esac
+fi
+
 echo ""
 echo "Installed hyp -> $BIN_DIR/hyp"
+echo "Docs & live demo: https://hyphae.to"
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) echo "Add $BIN_DIR to your PATH:  export PATH=\"$BIN_DIR:\$PATH\"" ;;

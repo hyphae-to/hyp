@@ -101,9 +101,10 @@ test(
         { env },
       );
       assert.equal(onboard.code, 0, `onboard failed: ${onboard.stderr}`);
-      assert.match(onboard.stdout, /hyp onboard complete!/);
+      assert.match(onboard.stdout, /COMMAND: onboard/);
+      assert.match(onboard.stdout, /STATUS: ok/);
       assert.match(onboard.stdout, /dev@box1/);
-      assert.match(onboard.stdout, /embedded local router/);
+      assert.match(onboard.stdout, /embedded local (?:router|Node)/i);
 
       const configDir = join(xdgConfig, "hyphae");
       const configPath = join(configDir, "connector.json");
@@ -175,7 +176,7 @@ test(
       // 4. Service setup (preview + isolated `--install`)
       const svcPreview = await runCli(["setup", "service"], { env });
       assert.equal(svcPreview.code, 0, `setup service preview failed: ${svcPreview.stderr}`);
-      assert.match(svcPreview.stdout, /Pass --install to write this file/);
+      assert.match(svcPreview.stdout, /pass --install to write/i);
       assert.match(svcPreview.stdout, new RegExp(configPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 
       const svcInstall = await runCli(["setup", "service", "--install"], { env });
@@ -201,9 +202,9 @@ test(
       // 6. `hyp doctor` BEFORE daemon starts -> fails `daemon` check with fix hint
       const docBefore = await runCli(["doctor"], { env });
       assert.equal(docBefore.code, 1, "doctor should fail before daemon starts");
-      assert.match(docBefore.stdout, /\[OK\] node:/);
-      assert.match(docBefore.stdout, /\[OK\] config:/);
-      assert.match(docBefore.stdout, /\[FAIL\] daemon: Not reachable/);
+      assert.match(docBefore.stdout, /\[OK\]\s+node\b/);
+      assert.match(docBefore.stdout, /\[OK\]\s+config\b/);
+      assert.match(docBefore.stdout, /\[FAIL\]\s+daemon\s+Not reachable/);
       assert.match(docBefore.stdout, /fix: Run `hyp onboard` or `hyp daemon`/);
 
       // 7. Start real daemon subprocess -> `hyp doctor` goes ALL GREEN
@@ -222,15 +223,15 @@ test(
       const docAfter = await runCli(["doctor"], { env });
       assert.equal(docAfter.code, 0, `doctor should be all green once daemon runs:\n${docAfter.stdout}\n${docAfter.stderr}`);
       assert.doesNotMatch(docAfter.stdout, /\[FAIL\]/);
-      assert.match(docAfter.stdout, /\[OK\] daemon: Running at/);
-      assert.match(docAfter.stdout, /\[OK\] router:primary:/);
-      assert.match(docAfter.stdout, /\[OK\] antigravity:/);
-      assert.match(docAfter.stdout, /\[OK\] claude:/);
-      assert.match(docAfter.stdout, /\[OK\] codex:/);
-      assert.match(docAfter.stdout, /\[OK\] cursor:/);
-      assert.match(docAfter.stdout, /\[OK\] opencode:/);
-      assert.match(docAfter.stdout, /\[OK\] gemini:/);
-      assert.match(docAfter.stdout, /\[OK\] openclaw:/);
+      assert.match(docAfter.stdout, /\[OK\]\s+daemon\s+Running at/);
+      assert.match(docAfter.stdout, /\[OK\]\s+router:primary\b/);
+      assert.match(docAfter.stdout, /\[OK\]\s+antigravity\b/);
+      assert.match(docAfter.stdout, /\[OK\]\s+claude\b/);
+      assert.match(docAfter.stdout, /\[OK\]\s+codex\b/);
+      assert.match(docAfter.stdout, /\[OK\]\s+cursor\b/);
+      assert.match(docAfter.stdout, /\[OK\]\s+opencode\b/);
+      assert.match(docAfter.stdout, /\[OK\]\s+gemini\b/);
+      assert.match(docAfter.stdout, /\[OK\]\s+openclaw\b/);
 
       await stopChild(daemonProc);
       daemonProc = undefined;
@@ -239,7 +240,7 @@ test(
       const secretValue = "sk-live-hyphae-never-print-918273645";
       const secretSet = await runCli(["secret", "set", "api-key"], { env, stdin: secretValue + "\n" });
       assert.equal(secretSet.code, 0, `secret set failed: ${secretSet.stderr}`);
-      assert.match(secretSet.stdout, /Saved secret 'api-key' \(0600\)/);
+      assert.match(secretSet.stdout, /Saved secret 'api-key'/i);
       assert.ok(!secretSet.stdout.includes(secretValue) && !secretSet.stderr.includes(secretValue), "secret set must never echo value");
 
       const secretPath = join(configDir, "secrets", "api-key.secret");
@@ -248,7 +249,8 @@ test(
 
       const secretList = await runCli(["secret", "list"], { env });
       assert.equal(secretList.code, 0, `secret list failed: ${secretList.stderr}`);
-      assert.match(secretList.stdout, /\[OK\] api-key/);
+      assert.match(secretList.stdout, /api-key/);
+      assert.match(secretList.stdout, /OK/);
       assert.ok(!secretList.stdout.includes(secretValue) && !secretList.stderr.includes(secretValue), "secret list must never print value");
 
       // Add a `{ secret: "api-key" }` ref to connector.json and verify `hyp secret check`
@@ -267,18 +269,19 @@ test(
 
       const secretCheckOk = await runCli(["secret", "check"], { env });
       assert.equal(secretCheckOk.code, 0, `secret check failed: ${secretCheckOk.stdout} ${secretCheckOk.stderr}`);
-      assert.match(secretCheckOk.stdout, /\[OK\]\s+api-key \(plugin:demo -> DEMO_API_KEY\)/);
+      assert.match(secretCheckOk.stdout, /\[OK\]\s+api-key/);
+      assert.match(secretCheckOk.stdout, /plugin:demo -> DEMO_API_KEY/);
       assert.ok(!secretCheckOk.stdout.includes(secretValue) && !secretCheckOk.stderr.includes(secretValue));
 
       const secretRm = await runCli(["secret", "rm", "api-key"], { env });
       assert.equal(secretRm.code, 0, `secret rm failed: ${secretRm.stderr}`);
-      assert.match(secretRm.stdout, /Removed secret 'api-key'/);
+      assert.match(secretRm.stdout, /Removed secret 'api-key'/i);
       assert.ok(!existsSync(secretPath), "secret file should be deleted");
       assert.ok(!secretRm.stdout.includes(secretValue) && !secretRm.stderr.includes(secretValue));
 
       const secretCheckMissing = await runCli(["secret", "check"], { env });
       assert.equal(secretCheckMissing.code, 1, "secret check should fail after secret removal");
-      assert.match(secretCheckMissing.stdout, /\[FAIL\] api-key/);
+      assert.match(secretCheckMissing.stdout, /\[FAIL\]\s+api-key/);
       assert.ok(!secretCheckMissing.stdout.includes(secretValue) && !secretCheckMissing.stderr.includes(secretValue));
     } finally {
       await stopChild(daemonProc);
@@ -361,11 +364,11 @@ test(
 
       // 3. Verify `hyp doctor` reports `router:primary` reachable over HTTPS
       const doctorRes = await runCli(["doctor"], { env: bobEnv });
-      assert.match(doctorRes.stdout, /\[OK\] config: bob@tlsbox/);
-      assert.match(doctorRes.stdout, /\[OK\] daemon: Running at/);
+      assert.match(doctorRes.stdout, /\[OK\]\s+config\s+bob@tlsbox/);
+      assert.match(doctorRes.stdout, /\[OK\]\s+daemon\s+Running at/);
       assert.match(
         doctorRes.stdout,
-        new RegExp(`\\[OK\\] router:primary: ${tlsProxy.url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} reachable`),
+        new RegExp(`\\[OK\\]\\s+router:primary\\s+${tlsProxy.url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} reachable`),
       );
 
       // 4. Exchange bidirectional messages over the TLS-proxied router (testing HTTPS + SSE streaming)
@@ -565,7 +568,8 @@ test(
         inviteCode,
       });
       assert.equal(onboardRes.ok, true, `onboardRemoteOverSsh failed:\nSTDOUT:\n${onboardRes.stdout}\nSTDERR:\n${onboardRes.stderr}`);
-      assert.match(onboardRes.stdout, /hyp onboard complete!/);
+      assert.match(onboardRes.stdout, /COMMAND: onboard/);
+      assert.match(onboardRes.stdout, /STATUS: ok/);
       assert.match(onboardRes.stdout, /deploy@prod-box/);
 
       // 4. Verify the invite code and raw token NEVER appeared in any `ssh` argv

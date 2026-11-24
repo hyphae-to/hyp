@@ -79,36 +79,108 @@ export class PluginHost {
     return this.#configuredSession(config);
   }
 
+  #resolveRecipients(pluginName: string, targetName: string): Session[] {
+    const recipients = new Map<string, Session>();
+    const primary = this.resolveTargetSession(pluginName, targetName);
+    if (primary) recipients.set(primary.id, primary);
+    for (const link of this.#state.bridgeLinks(pluginName, targetName)) {
+      const session = this.#state.session(link.sessionId);
+      if (session) recipients.set(session.id, session);
+      else this.#state.removeBridgeLink(pluginName, targetName, link.sessionId);
+    }
+    return [...recipients.values()];
+  }
+
+  #liveLinkedSessions(pluginName: string, targetName: string): Array<{ sessionId: string; handle: string | null }> {
+    const linked: Array<{ sessionId: string; handle: string | null }> = [];
+    for (const link of this.#state.bridgeLinks(pluginName, targetName)) {
+      const session = this.#state.session(link.sessionId);
+      if (session) linked.push({ sessionId: session.id, handle: session.handle });
+      else this.#state.removeBridgeLink(pluginName, targetName, link.sessionId);
+    }
+    return linked;
+  }
+
+  #holderStatus(callerSessionId: string, pluginName: string, targetName: string, config: AgentPluginTarget): {
+    current: Session | undefined;
+    configured: Session | undefined;
+    isPrimary: boolean;
+    isLinked: boolean;
+  } {
+    const current = this.resolveTargetSession(pluginName, targetName);
+    const configured = this.#configuredSession(config);
+    const isPrimary = callerSessionId === current?.id || callerSessionId === configured?.id;
+    const isLinked = this.#state.bridgeLinks(pluginName, targetName).some((link) => link.sessionId === callerSessionId);
+    return { current, configured, isPrimary, isLinked };
+  }
+
+  #resolveDestination(args: Record<string, unknown>, fallbackSessionId?: string): Session {
+    const { sessionId, handle, threadId } = args;
+    let destination: Session | undefined;
+    if (typeof sessionId === "string") destination = this.#state.session(sessionId);
+    else if (typeof handle === "string") destination = this.#state.byHandle(handle);
+    else if (typeof threadId === "string") destination = this.#state.byThreadId(threadId);
+    else if (fallbackSessionId !== undefined) destination = this.#state.session(fallbackSessionId);
+    else throw new RouterError("invalid", "Provide destination sessionId, handle, or threadId");
+    if (!destination) throw new RouterError("unknown_session", "Destination session is not registered on this connector");
+    return destination;
+  }
+
   async #deliver(batch: InboundEventBatch, sink: PluginDeliverySink): Promise<InboundOutcome> {
     const route = this.#plugins.route(batch.subscriptionId);
     if (!route) return { kind: "rejected", reason: "unknown_target" };
     if (batch.events.length === 0) return { kind: "rejected", reason: "no_valid_events" };
-    const session = this.resolveTargetSession(route.plugin, route.target);
-    if (!session) return { kind: "hold", reason: "target_unavailable" };
+    const recipients = this.#resolveRecipients(route.plugin, route.target);
+    if (recipients.length === 0) return { kind: "hold", reason: "target_unavailable" };
 
     const text = formatPluginDelivery(route.plugin, batch);
-    const outcome = await sink.deliverPluginText(session, route.plugin, batch.id, text);
-    if (outcome.outcome === "delivered") return { kind: "delivered" };
-    if (outcome.outcome === "hold") return { kind: "hold", reason: outcome.reason };
-    this.#plugins.reportDeliveryFailed(route, batch, outcome.reason);
-    return { kind: "rejected", reason: outcome.reason };
+    let deliveredCount = 0;
+    let holdReason: string | undefined;
+    let rejectedReason: string | undefined;
+
+    for (const session of recipients) {
+      const outcome = await sink.deliverPluginText(session, route.plugin, `${batch.id}:${session.id}`, text);
+      if (outcome.outcome === "delivered") deliveredCount++;
+      else if (outcome.outcome === "hold") holdReason ??= outcome.reason;
+      else rejectedReason ??= outcome.reason;
+    }
+
+    if (holdReason !== undefined) return { kind: "hold", reason: holdReason };
+    if (deliveredCount > 0) return { kind: "delivered" };
+    const reason = rejectedReason ?? "delivery_rejected";
+    this.#plugins.reportDeliveryFailed(route, batch, reason);
+    return { kind: "rejected", reason };
   }
 
-  listForSession(callerSessionId: string): { targets: Array<{ plugin: string; target: string; sessionId: string | null; handle: string | null }> } {
+  listForSession(callerSessionId: string): {
+    targets: Array<{
+      plugin: string;
+      target: string;
+      sessionId: string | null;
+      handle: string | null;
+      linkedSessions: Array<{ sessionId: string; handle: string | null }>;
+    }>;
+  } {
     if (this.#configs.length === 0) {
       throw new RouterError("no_plugins", "This connector has no local plugins configured");
     }
-    const results: Array<{ plugin: string; target: string; sessionId: string | null; handle: string | null }> = [];
+    const results: Array<{
+      plugin: string;
+      target: string;
+      sessionId: string | null;
+      handle: string | null;
+      linkedSessions: Array<{ sessionId: string; handle: string | null }>;
+    }> = [];
     for (const plugin of this.#configs) {
       for (const target of plugin.targets) {
-        const current = this.resolveTargetSession(plugin.name, target.name);
-        const configured = this.#configuredSession(target);
-        if (current?.id === callerSessionId || configured?.id === callerSessionId) {
+        const { current, isPrimary, isLinked } = this.#holderStatus(callerSessionId, plugin.name, target.name, target);
+        if (isPrimary || isLinked) {
           results.push({
             plugin: plugin.name,
             target: target.name,
             sessionId: current?.id ?? null,
             handle: current?.handle ?? target.handle ?? null,
+            linkedSessions: this.#liveLinkedSessions(plugin.name, target.name),
           });
         }
       }
@@ -120,27 +192,19 @@ export class PluginHost {
     if (this.#configs.length === 0) {
       throw new RouterError("no_plugins", "This connector has no local plugins configured");
     }
-    const { plugin, target, sessionId, handle, threadId } = args;
+    const { plugin, target } = args;
     if (typeof plugin !== "string" || typeof target !== "string") {
       throw new RouterError("invalid", "hyp_plugin_handoff needs {plugin, target} plus one of {sessionId, handle, threadId}");
     }
     const config = this.#findTarget(plugin, target);
     if (!config) throw new RouterError("unknown_target", `No target ${target} of plugin ${plugin}`);
 
-    const current = this.resolveTargetSession(plugin, target);
-    const configured = this.#configuredSession(config);
-    if (callerSessionId !== current?.id && callerSessionId !== configured?.id) {
+    const { isPrimary } = this.#holderStatus(callerSessionId, plugin, target, config);
+    if (!isPrimary) {
       throw new RouterError("not_target_holder", `Only the session holding ${plugin}/${target} or its configured target can hand it off`);
     }
 
-    let destination: Session | undefined;
-    if (typeof sessionId === "string") destination = this.#state.session(sessionId);
-    else if (typeof handle === "string") destination = this.#state.byHandle(handle);
-    else if (typeof threadId === "string") destination = this.#state.byThreadId(threadId);
-    else throw new RouterError("invalid", "Provide destination sessionId, handle, or threadId");
-
-    if (!destination) throw new RouterError("unknown_session", "Destination session is not registered on this connector");
-
+    const destination = this.#resolveDestination(args);
     this.#state.setPluginTarget({
       plugin,
       target,
@@ -149,5 +213,142 @@ export class PluginHost {
       setBy: callerSessionId,
     });
     return { plugin, target, sessionId: destination.id };
+  }
+
+  linkBridge(callerSessionId: string, args: Record<string, unknown>): {
+    plugin: string;
+    target: string;
+    sessionId: string;
+    handle: string | null;
+    linkedSessions: Array<{ sessionId: string; handle: string | null }>;
+  } {
+    if (this.#configs.length === 0) {
+      throw new RouterError("no_plugins", "This connector has no local plugins configured");
+    }
+    const { plugin, target } = args;
+    if (typeof plugin !== "string" || typeof target !== "string") {
+      throw new RouterError("invalid", "hyp_bridge_link needs {plugin, target} and optional {sessionId, handle, threadId}");
+    }
+    const config = this.#findTarget(plugin, target);
+    if (!config) throw new RouterError("unknown_target", `No target ${target} of plugin ${plugin}`);
+
+    const destination = this.#resolveDestination(args, callerSessionId);
+    const { current, configured, isPrimary } = this.#holderStatus(callerSessionId, plugin, target, config);
+    const hasActiveHolder = current !== undefined || configured !== undefined;
+    if (hasActiveHolder && !isPrimary) {
+      throw new RouterError(
+        "not_target_holder",
+        `Only the primary holder of ${plugin}/${target} can link additional sessions to this bridge`,
+      );
+    }
+
+    this.#state.addBridgeLink({
+      plugin,
+      target,
+      sessionId: destination.id,
+      linkedAt: Date.now(),
+      linkedBy: callerSessionId,
+    });
+    return {
+      plugin,
+      target,
+      sessionId: destination.id,
+      handle: destination.handle,
+      linkedSessions: this.#liveLinkedSessions(plugin, target),
+    };
+  }
+
+  unlinkBridge(callerSessionId: string, args: Record<string, unknown>): {
+    plugin: string;
+    target: string;
+    sessionId?: string;
+    removed: boolean;
+    removedCount: number;
+    linkedSessions: Array<{ sessionId: string; handle: string | null }>;
+  } {
+    if (this.#configs.length === 0) {
+      throw new RouterError("no_plugins", "This connector has no local plugins configured");
+    }
+    const { plugin, target, all } = args;
+    if (typeof plugin !== "string" || typeof target !== "string") {
+      throw new RouterError("invalid", "hyp_bridge_unlink needs {plugin, target} and optional {sessionId, handle, threadId, all}");
+    }
+    const config = this.#findTarget(plugin, target);
+    if (!config) throw new RouterError("unknown_target", `No target ${target} of plugin ${plugin}`);
+
+    const { isPrimary } = this.#holderStatus(callerSessionId, plugin, target, config);
+    if (all === true) {
+      if (!isPrimary) {
+        throw new RouterError("not_target_holder", `Only the primary holder of ${plugin}/${target} can unlink all sessions`);
+      }
+      const removedCount = this.#state.removeBridgeLink(plugin, target);
+      return { plugin, target, removed: removedCount > 0, removedCount, linkedSessions: [] };
+    }
+
+    const destination = this.#resolveDestination(args, callerSessionId);
+    if (!isPrimary && destination.id !== callerSessionId) {
+      throw new RouterError("not_target_holder", `Only the primary holder of ${plugin}/${target} can unlink another session`);
+    }
+    const removedCount = this.#state.removeBridgeLink(plugin, target, destination.id);
+    return {
+      plugin,
+      target,
+      sessionId: destination.id,
+      removed: removedCount > 0,
+      removedCount,
+      linkedSessions: this.#liveLinkedSessions(plugin, target),
+    };
+  }
+
+  async postToPlugin(callerSessionId: string, args: Record<string, unknown>): Promise<{
+    plugin: string;
+    target: string;
+    result: unknown;
+  }> {
+    if (this.#configs.length === 0) {
+      throw new RouterError("no_plugins", "This connector has no local plugins configured");
+    }
+    const { plugin, target, text } = args;
+    if (typeof plugin !== "string" || typeof target !== "string" || typeof text !== "string" || text.trim().length === 0) {
+      throw new RouterError("invalid", "hyp_plugin_post needs {plugin, target, text}");
+    }
+    if (Buffer.byteLength(text, "utf8") > 16_384) {
+      throw new RouterError("invalid", "hyp_plugin_post text exceeds 16 KiB");
+    }
+    const config = this.#findTarget(plugin, target);
+    if (!config) throw new RouterError("unknown_target", `No target ${target} of plugin ${plugin}`);
+
+    const { isPrimary, isLinked } = this.#holderStatus(callerSessionId, plugin, target, config);
+    if (!isPrimary && !isLinked) {
+      throw new RouterError(
+        "not_target_holder",
+        `Session is not the holder or a linked member of ${plugin}/${target}`,
+      );
+    }
+
+    const params: Record<string, unknown> = { text };
+    for (const key of ["channel", "threadTs", "replyTo", "to"] as const) {
+      const value = args[key];
+      if (value === undefined) continue;
+      if (typeof value !== "string" || value.length === 0 || value.length > 256) {
+        throw new RouterError("invalid", `${key} must be a non-empty string up to 256 characters`);
+      }
+      params[key] = value;
+    }
+    if (args.chatId !== undefined) {
+      if (typeof args.chatId === "number" && Number.isSafeInteger(args.chatId)) {
+        params.chatId = String(args.chatId);
+      } else if (typeof args.chatId === "string" && args.chatId.length > 0 && args.chatId.length <= 256) {
+        params.chatId = args.chatId;
+      } else {
+        throw new RouterError("invalid", "chatId must be a string or safe integer");
+      }
+    }
+
+    const response = await this.#plugins.request(plugin, "post", target, params);
+    if (!response.ok) {
+      throw new RouterError("plugin_post_failed", response.error);
+    }
+    return { plugin, target, result: response.result };
   }
 }

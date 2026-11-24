@@ -47,18 +47,35 @@ export type ConnectorLine =
       readonly target: string;
       readonly events: readonly { readonly id: string; readonly source: string }[];
       readonly reason: string;
+    }
+  | {
+      /** Bidirectional connector -> plugin request (e.g. outbound `hyp_plugin_post`). */
+      readonly type: "request";
+      readonly id: string;
+      readonly method: "post";
+      readonly target: string;
+      readonly params: Readonly<Record<string, unknown>>;
     };
 
-/** A plugin line: an event to store, or the nack it gets without reaching the store. */
+/** A plugin line: an event to store, a response to a connector request, or the nack it gets without reaching the store. */
 export type PluginLine =
   | { readonly kind: "event"; readonly to: string; readonly event: unknown; readonly id: string | null; readonly source: string | null }
+  | { readonly kind: "response"; readonly id: string; readonly ok: boolean; readonly result?: unknown; readonly error?: string }
   | { readonly kind: "nack"; readonly nack: Extract<ConnectorLine, { type: "nack" }> };
 
 const Line = Schema.Struct({ type: Schema.String });
 const EventLine = Schema.Struct({ type: Schema.Literal("event"), to: Schema.String, event: Schema.Unknown });
+const ResponseLine = Schema.Struct({
+  type: Schema.Literal("response"),
+  id: Schema.String,
+  ok: Schema.Boolean,
+  result: Schema.optionalKey(Schema.Unknown),
+  error: Schema.optionalKey(Schema.String),
+});
 const EventKey = Schema.Struct({ id: Schema.optionalKey(Schema.Unknown), source: Schema.optionalKey(Schema.Unknown) });
 const decodeLine = Schema.decodeUnknownOption(Line);
 const decodeEventLine = Schema.decodeUnknownOption(EventLine);
+const decodeResponseLine = Schema.decodeUnknownOption(ResponseLine);
 const decodeEventKey = Schema.decodeUnknownOption(EventKey);
 
 const echo = (value: unknown): string | null => (typeof value === "string" ? value.slice(0, MAX_ECHO_CHARS) : null);
@@ -80,6 +97,19 @@ export function parsePluginLine(text: string): PluginLine {
   const line = decodeLine(value);
   if (line._tag === "None") {
     return { kind: "nack", nack: nack(null, null, "invalid_event", "a line must be a JSON object with a string type") };
+  }
+  if (line.value.type === "response") {
+    const resp = decodeResponseLine(value);
+    if (resp._tag === "None") {
+      return { kind: "nack", nack: nack(null, null, "invalid_event", 'a response line is {"type":"response","id":<id>,"ok":<bool>}') };
+    }
+    return {
+      kind: "response",
+      id: resp.value.id,
+      ok: resp.value.ok,
+      ...(resp.value.result !== undefined ? { result: resp.value.result } : {}),
+      ...(resp.value.error !== undefined ? { error: resp.value.error } : {}),
+    };
   }
   if (line.value.type !== "event") {
     // Not a protocol violation: later protocol versions may add types.

@@ -1,0 +1,212 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        type: boolean
+        default: true
+        description: "Run full verification and npm pack/publish --dry-run without publishing"
+      dist_tag:
+        type: string
+        default: "latest"
+        description: "npm dist-tag (e.g. latest, next, rc)"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify & audit package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit & differential tests
+        run: npm test
+
+      - name: Integration tests (when configured)
+        run: |
+          if node -e 'const pkg = require("./package.json"); process.exit(pkg.scripts && Object.prototype.hasOwnProperty.call(pkg.scripts, "test:integration") ? 0 : 1)'; then
+            npm run test:integration
+          else
+            echo "Skipping test:integration (script not yet defined in package.json)"
+          fi
+
+      - name: Build
+        run: npm run build
+
+      - name: Syntax check plugins, CLI shim, and site script
+        run: |
+          node --check site/app.js
+          node --check bin/hyphae.mjs
+          while IFS= read -r file; do
+            node --check "$file"
+          done < <(find plugins -type f -name '*.mjs' | sort)
+
+      - name: Audit npm package tarball
+        run: |
+          node -e '
+            const { execFileSync } = require("node:child_process");
+            const raw = execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { encoding: "utf8" });
+            const jsonStart = raw.indexOf("[");
+            if (jsonStart < 0) throw new Error("npm pack --dry-run --json did not return JSON array");
+            const parsed = JSON.parse(raw.slice(jsonStart));
+            const pack = Array.isArray(parsed) ? parsed[0] : parsed;
+            const paths = new Set((pack.files || []).map((f) => f.path));
+
+            const required = [
+              "package.json",
+              "LICENSE",
+              "README.md",
+              "bin/hyphae.mjs",
+              "dist/src/cli.js",
+              "plugins/sdk/client.mjs",
+              "plugins/slack/index.mjs",
+              "plugins/telegram/index.mjs",
+              "plugins/whatsapp/index.mjs",
+              "plugins/prometheus/index.mjs",
+              "plugins/webhook/index.mjs",
+              "skills/hyphae/SKILL.md",
+            ];
+            const missing = required.filter((p) => !paths.has(p));
+
+            const forbiddenMatchers = [
+              /\.sqlite(?:-(?:wal|shm))?$/i,
+              /\.secret$/i,
+              /\.token$/i,
+              /\.test\.[cm]?[jt]s$/i,
+              /(?:^|\/)\.env(?:\..+)?$/i,
+            ];
+            const forbidden = [...paths].filter((p) => forbiddenMatchers.some((re) => re.test(p)));
+
+            if (missing.length > 0) {
+              console.error("Missing required files in tarball:", missing);
+              process.exit(1);
+            }
+            if (forbidden.length > 0) {
+              console.error("Forbidden files found in tarball:", forbidden);
+              process.exit(1);
+            }
+            console.log(`Tarball audit passed: ${paths.size} files (${pack.size} bytes packed).`);
+          '
+
+  publish:
+    name: Publish to npm & GitHub Release
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          cache: "npm"
+
+      - name: Install dependencies and build
+        run: npm ci && npm run build
+
+      - name: Verify git tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          PKG_TAG="v$(node -p 'require("./package.json").version')"
+          if [ "$PKG_TAG" != "$TAG_NAME" ]; then
+            echo "Tag/version mismatch: git tag is '$TAG_NAME', but package.json version is '$PKG_TAG'" >&2
+            exit 1
+          fi
+          echo "Verified tag $TAG_NAME matches package.json."
+
+      - name: Resolve release parameters
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TAG_NAME: ${{ github.ref_name }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          INPUT_DIST_TAG: ${{ inputs.dist_tag }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            DRY_RUN="${INPUT_DRY_RUN:-true}"
+            DIST_TAG="${INPUT_DIST_TAG:-latest}"
+          else
+            DRY_RUN="false"
+            if [[ "$TAG_NAME" == *-* ]]; then
+              DIST_TAG="next"
+            else
+              DIST_TAG="latest"
+            fi
+          fi
+          if ! [[ "$DIST_TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Invalid npm dist-tag: $DIST_TAG" >&2
+            exit 1
+          fi
+          echo "dry_run=$DRY_RUN" >> "$GITHUB_OUTPUT"
+          echo "dist_tag=$DIST_TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved release parameters: dry_run=$DRY_RUN dist_tag=$DIST_TAG"
+
+      - name: Publish package to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DRY_RUN: ${{ steps.meta.outputs.dry_run }}
+          DIST_TAG: ${{ steps.meta.outputs.dist_tag }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            unset NODE_AUTH_TOKEN
+            if [ -n "${NPM_CONFIG_USERCONFIG:-}" ] && [ -f "$NPM_CONFIG_USERCONFIG" ]; then
+              grep -v '_authToken=' "$NPM_CONFIG_USERCONFIG" > "${NPM_CONFIG_USERCONFIG}.tmp" || true
+              mv "${NPM_CONFIG_USERCONFIG}.tmp" "$NPM_CONFIG_USERCONFIG"
+            fi
+            npm publish --dry-run --access public --tag "$DIST_TAG"
+          else
+            if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+              # Unset empty token and strip placeholder auth line so npm OIDC Trusted Publishing applies cleanly.
+              unset NODE_AUTH_TOKEN
+              if [ -n "${NPM_CONFIG_USERCONFIG:-}" ] && [ -f "$NPM_CONFIG_USERCONFIG" ]; then
+                grep -v '_authToken=' "$NPM_CONFIG_USERCONFIG" > "${NPM_CONFIG_USERCONFIG}.tmp" || true
+                mv "${NPM_CONFIG_USERCONFIG}.tmp" "$NPM_CONFIG_USERCONFIG"
+              fi
+            fi
+            npm publish --access public --provenance --tag "$DIST_TAG"
+          fi
+
+      - name: Create or update GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') && steps.meta.outputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          RELEASE_ARGS=(--title "Hyphae $TAG_NAME")
+          if [[ "$TAG_NAME" == *-* ]]; then
+            RELEASE_ARGS+=(--prerelease)
+          fi
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release edit "$TAG_NAME" "${RELEASE_ARGS[@]}"
+          else
+            gh release create "$TAG_NAME" --generate-notes "${RELEASE_ARGS[@]}"
+          fi

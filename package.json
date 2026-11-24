@@ -1,10 +1,49 @@
 {
   "name": "@hyphae-to/hyp",
-  "private": true,
+  "version": "0.1.0",
+  "description": "Cross-harness coordination, event streams, and chat bridges for AI coding agents.",
+  "license": "MIT",
+  "homepage": "https://hyphae.to",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hyphae-to/hyp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hyphae-to/hyp/issues"
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "mcp",
+    "claude",
+    "codex",
+    "antigravity",
+    "openclaw",
+    "coordination",
+    "mesh",
+    "cloudevents"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "engines": {
     "node": ">=24"
   },
+  "bin": {
+    "hyp": "bin/hyphae.mjs",
+    "hyphae": "bin/hyphae.mjs"
+  },
+  "files": [
+    "LICENSE",
+    "bin",
+    "dist",
+    "docs",
+    "deploy",
+    "plugins",
+    "skills",
+    "install.sh"
+  ],
   "scripts": {
     "connector": "node src/cli.ts",
     "test": "node --test 'src/**/*.test.ts'",
@@ -16,26 +55,12 @@
     "build": "tsc -p tsconfig.build.json",
     "prepare": "npm run build"
   },
-  "devDependencies": {
-    "@types/node": "^24.0.0",
-    "typescript": "^5.9.3"
-  },
-  "bin": {
-    "hyp": "bin/hyphae.mjs",
-    "hyphae": "bin/hyphae.mjs"
-  },
   "dependencies": {
     "@clack/prompts": "^1.9.0",
     "effect": "4.1.5"
   },
-  "files": [
-    "bin",
-    "dist",
-    "docs",
-    "deploy",
-    "plugins",
-    "skills",
-    "install.sh"
-  ],
-  "version": "0.1.0"
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  }
 }
