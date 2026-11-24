@@ -475,6 +475,7 @@ dependencies = [
  "hyp-harness",
  "hyp-node",
  "hyp-proto",
+ "hyp-store",
  "hyper",
  "hyper-rustls",
  "hyper-util",
@@ -508,7 +509,10 @@ dependencies = [
 name = "hyp-harness"
 version = "0.2.0-alpha.0"
 dependencies = [
+ "hyp-crypto",
+ "hyp-node",
  "hyp-proto",
+ "hyp-store",
  "serde",
  "serde_json",
  "tempfile",
