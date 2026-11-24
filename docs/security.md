@@ -18,13 +18,14 @@ A single MCP shim subprocess can be shared by many tabs/conversations in Desktop
 
 ---
 
-## 2. Secrets Isolation (`~/.config/hyphae/secrets/`)
+## 2. Secrets Isolation (OS Keyring First)
 
-- **Zero plaintext secrets in config**: Plugins and router streams reference secrets via `{ "secret": "<name>" }` or `{ "secretFile": "<name>" }` in `connector.json`.
-- **Strict filesystem permissions**:
-  - `~/.config/hyphae/secrets/` must be a real `0700` directory (not a symlink) owned by the current UID.
-  - Every `<name>.secret` and router `tokenFile` is verified with `lstatSync` (never following symlinks), strict `0600` mode, and matching UID.
-  - `hyp secret set <name>` reads from a hidden TTY prompt or stdin — never CLI argv (keeping secrets out of `ps` and shell history).
+- **Zero plaintext secrets in config or LLM context**: Plugins and router streams reference secrets via `{ "secret": "<name>" }` (or `{ "secretFile": "<name>" }` for plugins expecting `*_FILE`) in `connector.json`. `hyp secret set <name> --web` captures tokens via a one-shot loopback form (`127.0.0.1`) with a random URL token and CSRF nonce so secret bytes never pass through an agent conversation; `hyp secret set <name>` reads from a hidden TTY prompt or stdin — never CLI argv (keeping secrets out of `ps` and shell history).
+- **OS Keyring-first storage backends**:
+  1. **macOS Keychain** (default on macOS): stores entries via `/usr/bin/security` under service `hyphae`, writing values over stdin so secret bytes never appear in process arguments.
+  2. **Linux Secret Service** (default on Linux desktop sessions when available): stores entries via `secret-tool` (GNOME Keyring, KDE KWallet, KeePassXC) over stdin.
+  3. **Private local file fallback** (headless servers / containers without a system keyring): stores `<name>.secret` in `~/.config/hyphae/secrets/` (a real user-owned directory, never a symlink) with user-only permissions. Fallback secret files and router `tokenFile`s are verified with `lstatSync` (never following symlinks), matching UID, and user-only permissions before reading.
+  - Override backend selection explicitly with `HYPHAE_SECRET_BACKEND=keychain|secret-service|file`.
   - `hyp secret check` and `hyp doctor` verify all referenced secrets without ever printing secret values.
 - **Subprocess environment scrubbing**: Both connector plugins (`PluginProcess`) and router data stream plugins (`RouterStreamHost`) spawn with a **minimal baseline environment** (`HOME`, `PATH`, `LANG`, `TMPDIR`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`) plus **only** the env vars/secrets explicitly configured for that plugin. Unrelated host variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `AWS_*`, `GH_TOKEN`, router tokens) are never inherited.
 

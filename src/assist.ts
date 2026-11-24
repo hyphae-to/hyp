@@ -69,7 +69,7 @@ export function buildAgentOnboardingPrompt(ctx: OnboardingContext): string {
     "",
     "## Hard Security Rules (NEVER break these)",
     "- NEVER read, print, log, or ask the user to paste raw secrets/API tokens/webhook secrets into chat or CLI arguments.",
-    "- Whenever a plugin, stream, or router needs a secret, run `hyp secret set <name> --web` so the user enters it in a one-shot local browser password box (0600, completely out-of-band from the LLM context), OR let them run `hyp secret set <name>` in their own terminal.",
+    "- Whenever a plugin, stream, or router needs a secret, run `hyp secret set <name> --web` so the user enters it in a one-shot local browser password box (stored in macOS Keychain / Linux Secret Service with private file fallback, completely out-of-band from the LLM context), OR let them run `hyp secret set <name>` in their own terminal.",
     "- Reference secrets in `connector.json` ONLY via `{ \"secret\": \"<name>\" }` or `{ \"secretFile\": \"<name>\" }`.",
     "- NEVER expose the main router with `tailscale funnel`; use private `hyp share tailscale --service hyphae` for private routers, and scope any public webhook exposure strictly to `/hooks/github` or a hardened reverse proxy.",
     "- Always enforce allowlists (`SLACK_ALLOWED_USERS`, `TELEGRAM_ALLOWED_USERS`, `WHATSAPP_ALLOWED_NUMBERS`) before enabling external chat bridges.",

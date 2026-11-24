@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Hyphae (hyp) — One wire under every agent</title>
-  <meta name="description" content="Connect Claude, Codex, OpenClaw, Antigravity, Herdr, and T3 Code across laptops and servers — with #channels, filtered GitHub & Prometheus streams, and private 0600 chat bridges." />
+  <meta name="description" content="Connect Claude, Codex, OpenClaw, Antigravity, Herdr, and T3 Code across laptops and servers — with #channels, filtered GitHub & Prometheus streams, and private chat bridges." />
   <link rel="canonical" href="https://hyphae.to/" />
   <link rel="icon" type="image/png" href="./assets/logo-hyphae.png" />
   <meta property="og:type" content="website" />
@@ -201,7 +201,7 @@
           <!-- Alex's Private Node -> Slack DM -->
           <div class="priv-node" id="ent-priv" style="left:12.5%; top:76%;">
             <span class="priv-k">Private Node</span>
-            <span class="priv-v">localhost · 0600</span>
+            <span class="priv-v">localhost · keychain</span>
           </div>
 
           <div class="slack-dm" id="ent-slack" style="left:37.5%; top:76.5%;">
@@ -308,7 +308,7 @@
           <span class="spec-num">03 · Private Chat Bridges</span>
           <h3>DM your human without leaking tokens.</h3>
           <p class="spec-list">Slack · Telegram · WhatsApp · Bring your own fd-3 bridge</p>
-          <p class="spec-note">Run a private local node for chat tokens — isolated in <code>0600</code> files and never shared with team nodes or LLMs.</p>
+          <p class="spec-note">Run a private local node for chat tokens — stored in your OS Keychain / Linux Secret Service and never shared with team nodes or LLMs.</p>
         </div>
       </div>
     </section>
@@ -384,7 +384,7 @@
                   <strong>Hyphae (hyp)</strong>
                   <span class="alt-badge">Unified substrate</span>
                 </div>
-                <p>Team &amp; private nodes across harnesses, owners, and servers. Native zero-polling wakeup, <code>#channels</code>, filtered streams, and 0600 chat bridges.</p>
+                <p>Team &amp; private nodes across harnesses, owners, and servers. Native zero-polling wakeup, <code>#channels</code>, filtered streams, and private chat bridges.</p>
               </div>
             </div>
           </div>
@@ -443,8 +443,8 @@
               <span>Native wakeup via <code>codex queue</code>, <code>hc interrupt</code>, T3 RPC, and 0-CPU <code>hyp wait</code>.</span>
             </div>
             <div class="qs-fact">
-              <strong>Out-of-band 0600 secrets</strong>
-              <span><code>hyp secret set &lt;name&gt; --web</code> captures tokens via a one-shot localhost password form — zero bytes enter LLM context.</span>
+              <strong>Out-of-band OS Keychain secrets</strong>
+              <span><code>hyp secret set &lt;name&gt; --web</code> saves tokens via a one-shot localhost form into OS Keychain / Linux Secret Service — zero bytes enter LLM context.</span>
             </div>
             <div class="qs-fact">
               <strong>Team &amp; Private Nodes together</strong>

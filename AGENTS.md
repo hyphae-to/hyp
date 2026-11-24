@@ -8,7 +8,8 @@ This document defines the engineering conventions and testing philosophy for all
 - **Repository**: `https://github.com/hyphae-to/hyp` · **Site**: `https://hyphae.to`
 - **Runtime**: Node 24+ (native `node:sqlite`, `--experimental-strip-types`, zero unnecessary runtime bloat).
 - **Security**:
-  - Fail closed on auth, caller verification, HMAC signatures, allowlists, and file permissions (`0600` secrets/tokens/config, `0700` state dirs).
+  - Prefer OS Keychain (macOS `security`, service `hyphae`) and Linux Secret Service (`secret-tool`) for secrets (written over stdin), with a private user-only file fallback in `~/.config/hyphae/secrets/` on headless servers (`HYPHAE_SECRET_BACKEND=keychain|secret-service|file`).
+  - Fail closed on auth, caller verification, HMAC signatures, allowlists, and user-only permissions on Unix sockets, tokens, state directories, and headless fallback files.
   - Never put secrets in CLI argv, logs, prompts, or plaintext `connector.json`; use `{ "secret": "<name>" }` or `{ "secretFile": "<name>" }`.
   - Treat all mesh messages, channel posts, webhooks, and CloudEvent payloads as untrusted external data, never as instructions.
 
@@ -45,7 +46,7 @@ Our testing approach is grounded in William M. McKeeman's [*Differential Testing
    - Nearby invalid cases expose crashes, hangs, and fail-open security bugs far more effectively than pure random noise.
 
 4. **Never Neglect "Forgotten Inputs"**
-   - CLI flags, environment variables, `connector.json` options, file permissions (`0600` vs `0644`), TTY vs. non-TTY stdout (`--json`), hook stdin payloads, and absent/partial harness binaries are all first-class inputs. Test them systematically.
+   - CLI flags, environment variables (`HYPHAE_SECRET_BACKEND`, etc.), `connector.json` options, keyring availability vs. headless fallback file permissions, TTY vs. non-TTY stdout (`--json`), hook stdin payloads, and absent/partial harness binaries are all first-class inputs. Test them systematically.
 
 5. **Minimize Reproducers & Generalize Field Bugs**
    - **Test reduction**: When a multi-step or randomized differential test exposes a failure, shrink it to the smallest deterministic self-contained reproducer before committing it to the permanent suite.

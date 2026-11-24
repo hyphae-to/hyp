@@ -957,7 +957,7 @@ export async function runDoctor(configPath: string, socketPath: string, homeDir 
           name: "secrets",
           ok: missing.length === 0,
           detail: missing.length === 0
-            ? `All ${refs.length} referenced plugin/stream secret(s) present (0600)`
+            ? `All ${refs.length} referenced plugin/stream secret(s) present`
             : `Missing or invalid secret(s): ${missing.join(", ")}`,
           ...(missing.length > 0 ? { fix: "Run `hyp secret set <name>`" } : {}),
         });

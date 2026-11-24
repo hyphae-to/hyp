@@ -8,7 +8,7 @@
  *   WEBHOOK_PORT         - Bind port (default 8795)
  *   WEBHOOK_PATH         - Expected path (default /webhook)
  *   WEBHOOK_TARGET       - Target name (defaults to first target in hello)
- *   WEBHOOK_SECRET_FILE  - Optional 0600 file containing HMAC-SHA256 secret (verified via X-Webhook-Signature-256: sha256=<hex>)
+ *   WEBHOOK_SECRET_FILE  - Optional private file containing HMAC-SHA256 secret (verified via X-Webhook-Signature-256: sha256=<hex>)
  *   WEBHOOK_SOURCE       - CloudEvent source attribute (default webhook/local)
  *   WEBHOOK_EVENT_TYPE   - CloudEvent type attribute (default com.webhook.received)
  *   WEBHOOK_POST_URL     - Optional outbound callback URL for hyp_plugin_post replies

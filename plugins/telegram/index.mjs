@@ -20,7 +20,7 @@ function readToken() {
   if (file) return readFileSync(file, "utf8").trim();
   const value = process.env.TELEGRAM_BOT_TOKEN?.trim();
   if (value) return value;
-  throw new Error("Set TELEGRAM_BOT_TOKEN_FILE (recommended, 0600 file) or TELEGRAM_BOT_TOKEN");
+  throw new Error('Set TELEGRAM_BOT_TOKEN (via { "secret": "<name>" }) or TELEGRAM_BOT_TOKEN_FILE');
 }
 
 const csvSet = (name) => {

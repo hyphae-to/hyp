@@ -147,7 +147,7 @@ export const CLI_VOCABULARY: Readonly<Record<string, string>> = {
   Bridge: "Connector chat plugin binding external threads to local agent handles",
   Session: "Connected harness conversation registered with the local connector",
   Rule: "Connector or session mute rule filtering noisy peers, channels, topics, or bridges",
-  Secret: "0600 private credential stored under ~/.config/hyphae/secrets/",
+  Secret: "Private credential stored in your OS Keychain / Secret Service (or local private file fallback)",
 };
 
 export const CLI_GLOBAL_FLAGS: readonly CliFlagSpec[] = [
@@ -192,7 +192,7 @@ export const CLI_COMMANDS: readonly CliCommandSpec[] = [
     name: "status",
     aliases: ["doctor"],
     group: "core",
-    summary: "Health check (Node 24, Connector daemon, Nodes, 0600 Secrets, harnesses & live Sessions)",
+    summary: "Health check (Node 24, Connector daemon, Nodes, Secrets, harnesses & live Sessions)",
     usage: "hyp status [config] [--sessions | --discover | --probe-ssh | --prune]",
     flags: [
       { flag: "--socket <path>", description: "Override local Connector socket path" },
@@ -225,7 +225,7 @@ export const CLI_COMMANDS: readonly CliCommandSpec[] = [
   {
     name: "secret",
     group: "core",
-    summary: "Manage 0600 Secrets privately (hidden TTY prompt, --web browser form, or stdin)",
+    summary: "Manage Secrets privately via OS Keychain / Secret Service (hidden TTY prompt, --web browser form, or stdin)",
     usage: "hyp secret <set <name> [--web] | list | rm <name> | check [config]>",
     flags: [
       { flag: "--web", description: "Capture secret via ephemeral localhost browser form (recommended for agents)" },
@@ -330,7 +330,7 @@ export const CLI_COMMANDS: readonly CliCommandSpec[] = [
   {
     name: "init",
     group: "advanced",
-    summary: "Create a minimal 0600 connector.json pointing at a remote Node and print its path",
+    summary: "Create a minimal connector.json pointing at a remote Node and print its path",
     usage: "hyp init [config] --id <user@host> --router <origin> --token-file <file>",
   },
   {
@@ -470,7 +470,7 @@ function inlineCheckTag(status: CheckStatus, mode: OutputMode): string {
 function formatTableCell(raw: CliTableCell, mode: OutputMode): string {
   const text = raw === null || raw === undefined ? "" : stripAnsi(String(raw));
   if (mode !== "pretty") return text;
-  if (text === "OK" || text === "0600 OK" || text === "yes" || text === "running") {
+  if (text === "OK" || text === "yes" || text === "running") {
     return paint(["green", "bold"], text);
   }
   if (text === "WARN") {

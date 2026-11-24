@@ -1250,7 +1250,7 @@ function renderDeck() {
       <pre class="payload-pre">${esc(JSON.stringify({
         node: "Private Node (localhost — never shared with Team Node)",
         bridge: `${chatApp}/dm-alex`,
-        secrets: "0600 local store · captured via hyp secret set --web",
+        secrets: "OS Keychain / Linux Secret Service · captured via hyp secret set --web",
         linkedThreads: linkedList,
         liveHandoff: "hyp_plugin_handoff (zero daemon restart)",
       }, null, 2))}</pre>
@@ -1296,7 +1296,7 @@ const QS = {
   curl: `# Install hyp from GitHub and launch interactive onboarding
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/hyphae-to/hyp/main/install.sh)"
 
-# Verify Node 24, daemon, live nodes, 0600 secrets, and harnesses
+# Verify Node 24, daemon, live nodes, secrets, and harnesses
 hyp status`,
   npm: `# Install globally via npm (Node 24+)
 npm install -g @hyphae-to/hyp
@@ -1315,7 +1315,7 @@ hyp setup openclaw
 hyp share tailscale --service hyphae
 hyp onboard --remote-ssh bogdan@solace --install-service
 
-# Store Slack/Telegram/webhook tokens out-of-band (0600, never enters LLM context)
+# Store Slack/Telegram/webhook tokens in OS Keychain / Secret Service (never enters LLM context)
 hyp secret set slack-bot-token --web`,
 };
 

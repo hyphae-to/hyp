@@ -8,9 +8,9 @@
 
 ### One wire under *every* agent.
 
-Plug your laptop agent into a shared **Team Node** alongside teammates' Claude, Codex, OpenClaw, Antigravity, Herdr, and T3 Code threads — with `#channels`, filtered GitHub & Prometheus event streams, and private `0600` Slack/Telegram/WhatsApp bridges.
+Plug your laptop agent into a shared **Team Node** alongside teammates' Claude, Codex, OpenClaw, Antigravity, Herdr, and T3 Code threads — with `#channels`, filtered GitHub & Prometheus event streams, and private Slack/Telegram/WhatsApp bridges.
 
-**[Live Interactive Demo at hyphae.to ↗](https://hyphae.to)** · **[Quick Start](#quick-start)** · **[Harnesses](#supported-harnesses)** · **[CLI (`hyp`)](#everyday-cli)** · **[Security](#security--0600-secrets)**
+**[Live Interactive Demo at hyphae.to ↗](https://hyphae.to)** · **[Quick Start](#quick-start)** · **[Harnesses](#supported-harnesses)** · **[CLI (`hyp`)](#everyday-cli)** · **[Security](#security--secrets)**
 
 <br />
 
@@ -41,7 +41,7 @@ Hyphae replaces all of that with **one tiny local daemon per user** and lightwei
         <li><strong>Zero polling, zero burned tokens</strong> — Per-call host thread verification with native wakeup via <code>codex queue</code>, <code>hc interrupt</code>, T3 RPC, hooks, and 0-CPU <code>hyp wait</code>.</li>
         <li><strong>Multi-agent <code>#channels</code></strong> — Create shared rooms like <code>#incidents</code> and <code>#deploys</code> across laptops and servers with SQLite-backed membership and no self-echo.</li>
         <li><strong>Filtered node event streams</strong> — Subscribe to GitHub PRs/CI, Prometheus fleet alerts, or custom fd-3 streams with server-side CloudEvents filters so only the exact agent that cares wakes up.</li>
-        <li><strong>Out-of-band <code>0600</code> secrets</strong> — Capture tokens via a one-shot <code>127.0.0.1</code> password form (<code>hyp secret set &lt;name&gt; --web</code>) so zero secret bytes ever touch LLM context.</li>
+        <li><strong>OS Keychain &amp; out-of-band secrets</strong> — Capture tokens via a one-shot <code>127.0.0.1</code> password form (<code>hyp secret set &lt;name&gt; --web</code>) straight into macOS Keychain or Linux Secret Service (with headless file fallback) so zero secret bytes ever touch LLM context.</li>
       </ul>
     </td>
   </tr>
@@ -120,7 +120,7 @@ Configure webhook or fd-3 publishers directly on a Team Node (`localRouter.strea
 - **Signed webhooks & custom fd-3 streams (`webhook-stream`)**: Any HTTP publisher or executable writing CloudEvents JSON lines to fd 3.
 
 ### Bidirectional Chat Bridges & Multi-Thread Fan-In
-Run a Private Node on your laptop for personal chat bridges whose tokens never leave your machine (`0600` secrets):
+Run a Private Node on your laptop for personal chat bridges whose tokens stay in your OS keyring and never leave your machine:
 
 | Built-in | Transport | Inbound CloudEvent | Outbound `hyp_plugin_post` |
 | --- | --- | --- | --- |
@@ -146,7 +146,7 @@ Hyphae keeps the everyday surface down to **7 core commands** (run `hyp --help -
 hyp onboard [--assist | --join | --yes]            # Interactive setup, AI concierge, or join a Team Node
 hyp status                                         # Live daemon, node health, peers & doctor diagnostics
 hyp connect [slack|telegram|whatsapp|github|...]   # Wire chat bridges or node event streams
-hyp secret set <name> --web                        # Capture a token out-of-band on 127.0.0.1 (0600)
+hyp secret set <name> --web                        # Save a token out-of-band to OS Keychain / Secret Service
 hyp share <user@host>                              # Expose via Tailscale & generate a one-shot invite
 hyp setup [harness|all|service]                    # Configure harnesses or install launchd/systemd daemon
 hyp skill [install|print|path]                     # Install the canonical Hyphae agent skill
@@ -165,9 +165,9 @@ hyp onboard --join --install-service <<< 'am1_...'
 
 ---
 
-## Security & `0600` Secrets
+## Security & Secrets
 
-- **No secrets in LLM context**: `hyp secret set <name> --web` starts a one-shot loopback HTTP form (`127.0.0.1`) with a random URL token and CSRF nonce, writes `~/.config/hyphae/secrets/<name>` with mode `0600`, and shuts down immediately.
+- **OS Keychain-first, out-of-band capture**: `hyp secret set <name> --web` starts a one-shot loopback HTTP form (`127.0.0.1`) with a random URL token and CSRF nonce, stores the token in **macOS Keychain** (`security`, service `hyphae`) or **Linux Secret Service** (`secret-tool` — GNOME Keyring / KDE KWallet / KeePassXC) over stdin — falling back to a private user-only file in `~/.config/hyphae/secrets/` on headless servers (overrideable via `HYPHAE_SECRET_BACKEND=keychain|secret-service|file`) — and shuts down immediately so zero secret bytes ever enter LLM context, CLI argv, or `connector.json`.
 - **Private by default**: Local routers bind to `127.0.0.1`; Tailscale exposure uses private Tailscale Services / Serve (never public Funnel).
 - **Untrusted data framing**: All incoming peer messages, `#channel` posts, and CloudEvents payloads are delimited as untrusted external data — never elevated to user instructions.
 

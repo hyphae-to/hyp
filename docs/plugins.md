@@ -1,13 +1,13 @@
 # Router Data Streams, Connector Thread Bridges & Secrets
 
-`hyphae` intentionally separates **Router Data Streams** (1-to-many pub/sub) from **Connector Thread Bridges** (thread-owned bidirectional messaging with multi-thread fan-in), while letting both share the **same fd-3 plugin SDK** (`plugins/sdk/client.{mjs,py}`) and **private `0600` secrets store** (`~/.config/hyphae/secrets/`).
+`hyphae` intentionally separates **Router Data Streams** (1-to-many pub/sub) from **Connector Thread Bridges** (thread-owned bidirectional messaging with multi-thread fan-in), while letting both share the **same fd-3 plugin SDK** (`plugins/sdk/client.{mjs,py}`) and **OS Keychain-first secrets store** (`hyp secret`).
 
 ## Why Both Layers Exist
 
 | Layer | Where it runs | Routing model | Where secrets live | Best for |
 | --- | --- | --- | --- | --- |
-| **Router Data Streams** (`localRouter.streams`) | Supervised on the **router host** (or external HTTP publisher posting to `POST /v1/events?topic=<name>`) | **1-to-many Pub/Sub** — any agent on any machine subscribes with CloudEvents filters (`hyp_subscribe`) | Router host's `~/.config/hyphae/secrets/` (`0600`) | **GitHub events** (`github-webhook`), **Prometheus / Alertmanager alerts** (`prometheus-webhook`), **CI / Linear / Sentry / Stripe** webhooks (`webhook-stream`), **custom polling/streaming data source plugins** |
-| **Connector Thread Bridges** (`plugins`) | Supervised on a **local connector daemon** (`hyp daemon`) | **Thread-Owned + Multi-Thread Fan-In + Outbound Replies** — pinned to a primary agent `handle` / `sessionId` with live `hyp_plugin_handoff`, multi-thread `hyp_bridge_link` fan-in, and outbound `hyp_plugin_post` replies | Local machine's `~/.config/hyphae/secrets/` (`0600`) — never sent to a shared router | **Personal Slack / Telegram / WhatsApp DM & mention bridges**, machine-local alerts, and **100% drop-in compatibility with existing `t3-mesh` plugins** |
+| **Router Data Streams** (`localRouter.streams`) | Supervised on the **router host** (or external HTTP publisher posting to `POST /v1/events?topic=<name>`) | **1-to-many Pub/Sub** — any agent on any machine subscribes with CloudEvents filters (`hyp_subscribe`) | Router host's OS keyring (or headless `~/.config/hyphae/secrets/` fallback) | **GitHub events** (`github-webhook`), **Prometheus / Alertmanager alerts** (`prometheus-webhook`), **CI / Linear / Sentry / Stripe** webhooks (`webhook-stream`), **custom polling/streaming data source plugins** |
+| **Connector Thread Bridges** (`plugins`) | Supervised on a **local connector daemon** (`hyp daemon`) | **Thread-Owned + Multi-Thread Fan-In + Outbound Replies** — pinned to a primary agent `handle` / `sessionId` with live `hyp_plugin_handoff`, multi-thread `hyp_bridge_link` fan-in, and outbound `hyp_plugin_post` replies | Local machine's OS keyring (or local fallback) — never sent to a shared router | **Personal Slack / Telegram / WhatsApp DM & mention bridges**, machine-local alerts, and **100% drop-in compatibility with existing `t3-mesh` plugins** |
 
 ### Interactive Setup & Built-In Guides
 
@@ -23,21 +23,24 @@ hyp plugin guide prometheus-webhook   # Prometheus Alertmanager v4 stream guide
 
 ---
 
-## 0. Private Secrets Management (`hyp secret`)
+## 0. Secrets Management (`hyp secret`)
 
-Never put raw API tokens or webhook secrets directly in `connector.json`. Store them in `~/.config/hyphae/secrets/<name>.secret` (strict `0600` inside `0700` directory):
+Never put raw API tokens or webhook secrets directly in `connector.json`. `hyp secret set` stores secrets in your OS keyring first, with a private local file fallback on headless hosts:
+- **macOS Keychain** (`security`, service `hyphae`, written over stdin so values never appear in argv/`ps`)
+- **Linux Secret Service** (`secret-tool` — GNOME Keyring, KDE KWallet, KeePassXC — written over stdin when a desktop keyring is available)
+- **Private local file fallback** (`~/.config/hyphae/secrets/<name>.secret` with user-only permissions) on headless servers and containers without a system keyring (overrideable via `HYPHAE_SECRET_BACKEND=keychain|secret-service|file`)
 
 ```sh
 hyp secret set slack-app-token --web  # one-shot 127.0.0.1 password form (zero secret bytes in LLM context)
 hyp secret set github-webhook-secret  # hidden TTY prompt (or reads stdin)
-hyp secret list                       # lists names & 0600 status (never prints values)
+hyp secret list                       # lists secret names & backend status (never prints values)
 hyp secret check                      # verifies every secret referenced in connector.json
 hyp secret rm old-token
 ```
 
 Reference secrets in any plugin or stream `env` block using:
-- `{ "secret": "<name>" }` — resolves the `0600` secret and injects it **only** into that plugin/stream child process's environment.
-- `{ "secretFile": "<name>" }` — validates permissions and passes the absolute `0600` file path (for plugins expecting `*_FILE`).
+- `{ "secret": "<name>" }` — resolves the secret from your OS keyring (or local fallback) and injects it **only** into that plugin/stream child process's environment.
+- `{ "secretFile": "<name>" }` — provides a private user-only file path (for plugins expecting `*_FILE`).
 
 ---
 
@@ -110,7 +113,7 @@ Configure streams directly under `localRouter.streams` in `connector.json` (no m
 ### Built-In `prometheus-webhook` Stream (`plugins/prometheus/index.mjs`)
 
 - Receives **Prometheus Alertmanager v4** webhook payloads on `POST /alerts` (default port `8793`).
-- Optional authentication via `PROMETHEUS_BEARER_TOKEN` (`Authorization: Bearer <token>`) and/or `PROMETHEUS_WEBHOOK_SECRET` (HMAC-SHA256), stored as `0600` secrets via `{ "secret": "..." }` or `{ "secretFile": "..." }`.
+- Optional authentication via `PROMETHEUS_BEARER_TOKEN` (`Authorization: Bearer <token>`) and/or `PROMETHEUS_WEBHOOK_SECRET` (HMAC-SHA256), referenced via `{ "secret": "..." }` or `{ "secretFile": "..." }`.
 - Emits one CloudEvent per alert in the batch:
   - `type`: `io.prometheus.alert.firing` or `io.prometheus.alert.resolved`
   - `subject`: `severity=<severity>/<alertname>` (e.g. `severity=critical/CheckoutHighErrorRate`)
@@ -145,7 +148,7 @@ Custom router data sources use the **exact same fd-3 SDK** (`plugins/sdk/client.
 `hyphae` builds on the battle-tested fd-3 plugin supervisor, SQLite coalescing/retention store (`local.db`), wake caps, backlog status reporting, and CloudEvent validation — while routing targets to **any** harness session on the daemon and adding **multi-thread fan-in** and **bidirectional outbound replies**.
 
 - **100% drop-in compatible with existing `t3-mesh` plugins**: Any plugin built for `t3-mesh` (such as Python Slack Socket Mode bridges, Telegram long-polling connectors, `bf-ops-alerts`, or `scalable`) runs unmodified under `hyp daemon`.
-- **Zero credentials shared**: Plugins hold their own secrets (e.g. `0600` files or `systemd-creds`), never see router tokens, and communicate solely over anonymous duplex fd 3 (`T3_MESH_FD=3` / `AGENTS_MESH_FD=3`).
+- **Zero credentials shared**: Plugins receive only their explicitly configured secrets (from OS Keychain / Linux Secret Service, local fallback, or `systemd-creds`), never see router tokens, and communicate solely over anonymous duplex fd 3 (`T3_MESH_FD=3` / `AGENTS_MESH_FD=3`).
 - **Durable buffering & coalescing**: Events are persisted in `state/local.db` (24h retention, 100 pending batches per target, configurable `coalesceSeconds`, `maxWaitSeconds`, `wakesPerHour`). If the target agent hasn't joined yet, batches wait durably and flush automatically once the target session enrolls.
 
 ### Target Addressing
@@ -293,7 +296,7 @@ hyp_plugin_post({
 - **Fail-closed allowlist**: drops inbound senders unless listed in `WHATSAPP_ALLOWED_NUMBERS` (or explicitly opted out via `WHATSAPP_ALLOW_ALL=1`).
 - **CloudEvents format**: emits `com.whatsapp.message.received` CloudEvents with `subject: "wa/<from>"`.
 - **Outbound `hyp_plugin_post`**: posts via Meta Graph API `/${phoneNumberId}/messages` using `WHATSAPP_ACCESS_TOKEN`, targeting explicit `to`, `WHATSAPP_DEFAULT_TO`, or the last inbound sender, with optional `replyTo` message ID.
-- All three secrets (`WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `WHATSAPP_ACCESS_TOKEN`) can be provided via `{ "secret": "..." }` or `0600` files via `{ "secretFile": "..." }` (`*_FILE`).
+- All three secrets (`WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `WHATSAPP_ACCESS_TOKEN`) can be provided via `{ "secret": "..." }` or `{ "secretFile": "..." }` (`*_FILE`).
 
 ### D. Local Webhook (`builtin: "webhook"`) — Loopback / Tailnet HTTP ↔ CloudEvent Bridge
 

@@ -28,7 +28,16 @@ import { runMcp } from "./mcp.ts";
 import { ALL_GUIDES, CONNECTOR_BRIDGE_GUIDES, findGuide, ROUTER_STREAM_GUIDES } from "./plugin-catalog.ts";
 import { connectorPattern, isHarness, object } from "./protocol.ts";
 import { detectExposedTailscaleUrl, encodeInvite, exposeTailscale, unexposeTailscale } from "./remote.ts";
-import { captureSecretViaWeb, collectSecretRefs, deleteSecret, listSecrets, readSecret, writeSecret } from "./secrets.ts";
+import {
+  captureSecretViaWeb,
+  collectSecretRefs,
+  deleteSecret,
+  detectSecretBackend,
+  listSecrets,
+  readSecret,
+  secretBackendLabel,
+  writeSecretDetailed,
+} from "./secrets.ts";
 import {
   ALL_CONFIGURABLE_HARNESSES,
   installSkill,
@@ -546,14 +555,14 @@ async function runCli(ctx: ExecutionContext): Promise<void> {
             ok: true,
             command: "secret set",
             title: "Secret Saved",
-            summary: `Saved secret '${target}' with 0600 permissions`,
+            summary: `Saved secret '${target}' in ${secretBackendLabel(res.backend)}`,
             fields: [
               { label: "Secret", value: target },
-              { label: "Mode", value: "0600" },
-              { label: "Path", value: res.path },
+              { label: "Store", value: secretBackendLabel(res.backend) },
+              { label: "Location", value: res.location },
             ],
             next: ["hyp secret check"],
-            data: { name: target, path: res.path, mode: "0600", source: "web" },
+            data: { name: target, backend: res.backend, location: res.location, path: res.path, source: "web" },
           },
           mode,
         );
@@ -577,20 +586,20 @@ async function runCli(ctx: ExecutionContext): Promise<void> {
           });
         }
       }
-      const savedPath = writeSecret(target, value, dir);
+      const saved = writeSecretDetailed(target, value, dir);
       emitResult(
         {
           ok: true,
           command: "secret set",
           title: "Secret Saved",
-          summary: `Saved secret '${target}' with 0600 permissions`,
+          summary: `Saved secret '${target}' in ${secretBackendLabel(saved.backend)}`,
           fields: [
             { label: "Secret", value: target },
-            { label: "Mode", value: "0600" },
-            { label: "Path", value: savedPath },
+            { label: "Store", value: secretBackendLabel(saved.backend) },
+            { label: "Location", value: saved.location },
           ],
           next: ["hyp secret check"],
-          data: { name: target, path: savedPath, mode: "0600" },
+          data: { name: target, backend: saved.backend, location: saved.location, path: saved.path },
         },
         mode,
       );
@@ -599,9 +608,10 @@ async function runCli(ctx: ExecutionContext): Promise<void> {
 
     if (sub === "list") {
       const secrets = listSecrets(dir);
+      const activeBackend = detectSecretBackend(dir);
       const secretsDirectory = join(dir, "secrets");
       const badSecrets = secrets.filter((s) => !s.modeOk);
-      const warnings = badSecrets.map((s) => `Secret '${s.name}' does not have 0600 permissions (${s.path})`);
+      const warnings = badSecrets.map((s) => `Secret '${s.name}' has overly broad file permissions (${s.path})`);
       const next = badSecrets.length > 0
         ? badSecrets.map((s) => `chmod 600 ${s.path}`)
         : secrets.length === 0
@@ -614,30 +624,31 @@ async function runCli(ctx: ExecutionContext): Promise<void> {
           command: "secret list",
           title: "Secrets",
           summary: secrets.length === 0
-            ? `No secrets stored in ${secretsDirectory}`
-            : `${secrets.length} secret(s) stored (${badSecrets.length === 0 ? "all 0600 OK" : `${badSecrets.length} bad mode`})`,
-          fields: [{ label: "Directory", value: secretsDirectory }],
+            ? `No secrets stored (default store: ${secretBackendLabel(activeBackend)})`
+            : `${secrets.length} secret(s) stored (${badSecrets.length === 0 ? "all OK" : `${badSecrets.length} permission warning(s)`})`,
+          fields: [{ label: "Default Store", value: secretBackendLabel(activeBackend) }],
           tables: [
             {
               title: "Stored Secrets",
               columns: [
-                { key: "status", header: "Mode" },
+                { key: "status", header: "Status" },
                 { key: "name", header: "Secret" },
-                { key: "bytes", header: "Bytes", align: "right" },
-                { key: "path", header: "Path" },
+                { key: "backend", header: "Store" },
+                { key: "location", header: "Location" },
               ],
               rows: secrets.map((s) => ({
-                status: s.modeOk ? "0600 OK" : "BAD_MODE",
+                status: s.modeOk ? "OK" : "BAD_MODE",
                 name: s.name,
-                bytes: s.bytes,
-                path: s.path,
+                backend: secretBackendLabel(s.backend),
+                location: s.location,
               })),
-              emptyText: `No secrets stored in ${secretsDirectory}`,
+              emptyText: `No secrets stored (default store: ${secretBackendLabel(activeBackend)})`,
             },
           ],
           ...(warnings.length > 0 ? { warnings } : {}),
           next,
           data: {
+            defaultBackend: activeBackend,
             directory: secretsDirectory,
             count: secrets.length,
             secrets,
@@ -691,7 +702,7 @@ async function runCli(ctx: ExecutionContext): Promise<void> {
           checks.push({
             name: ref.secret,
             status: "ok",
-            detail: `${ref.owner} -> ${ref.envKey} (0600 verified)`,
+            detail: `${ref.owner} -> ${ref.envKey} (verified)`,
           });
           refResults.push({ secret: ref.secret, owner: ref.owner, envKey: ref.envKey, ok: true });
         } catch (error) {
@@ -1203,7 +1214,7 @@ async function runCli(ctx: ExecutionContext): Promise<void> {
           ok: true,
           command: "init",
           title: "Config Initialized",
-          summary: `Wrote 0600 config at ${path}`,
+          summary: `Wrote config at ${path}`,
           fields: [
             { label: "Config", value: path },
             { label: "Connector", value: values.id },

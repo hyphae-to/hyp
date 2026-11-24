@@ -22,7 +22,7 @@ When run in an interactive terminal without `--yes`, `hyp onboard` launches a `@
   - **Setup Private Router** — connect all your sessions across harnesses & machines, subscribe to GitHub events & custom router data streams with filters, and bridge threads to 3rd-party messaging tools (Slack, Telegram).
   - **Setup Public Router** — internet-reachable HTTPS webhook & event hub (prints hardened Caddy / Tailscale Funnel config).
   - **Join a Shared Router** — join a team/org or existing `t3-mesh` router via `am1_...` invite or HTTPS URL + token (as `primary`, or as a secondary named router alongside your private router).
-- Presents checkbox multi-selects for **harness connectors** (all 6 harnesses), **router data streams** (**GitHub Events**, **Signed Webhook Stream**, **Custom Data Source Plugin**), and **connector thread bridges** (**Slack**, **Telegram**, **Local Webhook**, **Custom / t3-mesh Plugin**), storing secrets privately in `~/.config/hyphae/secrets/` (`0600`) with built-in step-by-step setup guides.
+- Presents checkbox multi-selects for **harness connectors** (all 6 harnesses), **router data streams** (**GitHub Events**, **Signed Webhook Stream**, **Custom Data Source Plugin**), and **connector thread bridges** (**Slack**, **Telegram**, **Local Webhook**, **Custom / t3-mesh Plugin**), storing secrets in your OS keyring (macOS Keychain / Linux Secret Service, with a private local file fallback in `~/.config/hyphae/secrets/` on headless servers) with built-in step-by-step setup guides.
 - Offers **Tailscale exposure** (`tailscale serve --service=svc:hyphae` or node-scoped Serve) and OS background service installation (`launchd` / `systemd --user`).
 - Discovers remote machines defined in **Herdr Core**, **`~/.ssh/config`**, and your **Tailscale** tailnet, probes SSH reachability in parallel with a spinner, and presents a checkbox selector to invite & onboard reachable hosts over SSH (piping one-shot invites over stdin).
 
@@ -45,7 +45,7 @@ Prefer a conversational setup where your coding agent inspects your environment,
 You can also choose **"Guided by an AI agent"** right at the start of `./bin/hyphae.mjs onboard`. The concierge receives a strictly **secret-free** snapshot and guides you to store tokens via `hyp secret set <name>` without ever handling raw secrets.
 
 What local `onboard` (alias `up`) configures:
-- Creates `~/.config/hyphae/connector.json` (`0600`) with an **embedded local router** (`127.0.0.1:8790`, SQLite DB at `~/.config/hyphae/router/router.sqlite`) and a private connector token (`0600`).
+- Creates `~/.config/hyphae/connector.json` with an **embedded local router** (`127.0.0.1:8790`, SQLite DB at `~/.config/hyphae/router/router.sqlite`) and a private user-only connector token.
 - Auto-detects installed harnesses (**Antigravity**, **Claude Code / Desktop**, **Codex / Desktop**) and merges MCP + hook configs non-destructively using your exact Node 24 binary path.
 - Starts `hyp daemon` (running both the embedded router and connector in one process). Pass `--install-service` to also install a macOS LaunchAgent or Linux `systemd --user` unit.
 
@@ -127,7 +127,7 @@ Run the printed command on the remote host (optionally adding `--install-service
 What `onboard --join` does automatically:
 1. Decodes `{ connectorId, router, token }` from stdin and enforces an `https://` origin.
 2. Runs a **live pre-flight check** (`GET <router>/v1/peers` with the bearer token) so VPN, Tailscale DNS, TLS, or auth errors are caught immediately before writing config (pass `--offline` to skip during image/Ansible provisioning).
-3. Saves the token to `~/.config/hyphae/tokens/primary.token` (`0600`) and writes `~/.config/hyphae/connector.json` (`0600`, remote mode with no embedded local router).
+3. Saves the token to `~/.config/hyphae/tokens/primary.token` (user-only permissions) and writes `~/.config/hyphae/connector.json` (remote mode with no embedded local router).
 4. Configures local harnesses (Antigravity, Claude, Codex), installs the OS background service if requested, and starts `hyp daemon`.
 
 > **Migrating an already-onboarded machine from local to remote**: pass `--replace` (or `--join` / `--router` automatically replaces `connector.json`), then restart the daemon so it connects to the remote router instead of its local embedded one.
@@ -142,7 +142,7 @@ If your router runs behind any private HTTPS reverse proxy on a VPN:
    ```sh
    hyp router add-connector bogdan@worker --db /path/to/router.sqlite --token-out connector.token
    ```
-2. Copy `connector.token` securely (`0600`) to the remote machine and onboard:
+2. Copy `connector.token` securely (user-only permissions) to the remote machine and onboard:
    ```sh
    hyp onboard --id bogdan@worker --router https://mesh.internal.example --token-file /path/to/connector.token --install-service
    ```

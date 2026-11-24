@@ -49,11 +49,11 @@ An agent can handle the **entire onboarding flow end-to-end** without ever touch
    hyp onboard --remote-ssh <host>             # invite & configure a reachable remote machine over SSH
    ```
 4. **Capture secrets safely OUT-OF-BAND** (NEVER ask the user to paste tokens/keys into chat or CLI args!):
-   - Run the one-shot localhost password prompt — it opens a tiny `127.0.0.1` form with a random CSRF token, saves directly to `0600 ~/.config/hyphae/secrets/<name>.secret`, shuts down immediately, and **zero secret bytes ever enter the LLM context**:
+   - Run the one-shot localhost password prompt — it opens a tiny `127.0.0.1` form with a random CSRF token, stores the secret directly in **macOS Keychain** or **Linux Secret Service** (`secret-tool`, falling back to a private user-only file in `~/.config/hyphae/secrets/` on headless servers), shuts down immediately, and **zero secret bytes ever enter the LLM context**:
      ```bash
      hyp secret set <name> --web
      ```
-   - Or if the user prefers their own terminal, have them run `hyp secret set <name>` directly.
+   - Or if the user prefers their own terminal, have them run `hyp secret set <name>` directly (override backend via `HYPHAE_SECRET_BACKEND=keychain|secret-service|file` if needed).
    - Reference secrets in `~/.config/hyphae/connector.json` ONLY as `{ "secret": "<name>" }` or `{ "secretFile": "<name>" }`.
 5. **Verify everything**:
    ```bash

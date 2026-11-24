@@ -41,7 +41,7 @@ export const ROUTER_STREAM_GUIDES: readonly PluginOrStreamGuide[] = [
       "  1. In GitHub: Repo or Org -> Settings -> Webhooks -> Add webhook.",
       "  2. Payload URL: https://<your-public-host>/hooks/github (reverse-proxying to 127.0.0.1:<GITHUB_WEBHOOK_PORT>, default 8791).",
       "  3. Content type: application/json",
-      "  4. Secret: the exact secret saved via `hyp secret set github-webhook-secret --web` (0600).",
+      "  4. Secret: the exact secret saved via `hyp secret set github-webhook-secret --web`.",
       "  5. Select individual events: Pull requests, Pull request reviews, Pull request review comments, Issues, Issue comments, Workflow runs, Pushes.",
       "",
       "Option B — GitHub App (best for orgs & selective repos):",

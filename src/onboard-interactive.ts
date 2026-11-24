@@ -75,14 +75,14 @@ async function promptSecretsForGuide(guide: PluginOrStreamGuide, configDir: stri
     const secretName = prefixName === guide.defaultName ? spec.secretName : `${prefixName}-${spec.secretName}`;
     const value = unwrap(
       await p.password({
-        message: `${spec.prompt} -> stored in secrets/${secretName}.secret (0600)`,
+        message: `${spec.prompt} -> stored in OS Keychain / secret store as '${secretName}'`,
         validate: (v) => (spec.required && (!v || v.trim().length === 0) ? "This secret is required (or press Ctrl+C to skip)" : undefined),
       }),
     );
     if (value && value.trim().length > 0) {
       writeSecret(secretName, value.trim(), configDir);
       env[spec.envKey] = spec.useFile ? { secretFile: secretName } : { secret: secretName };
-      p.log.success(`Saved private secret ${styleText("cyan", secretName)} (mode 0600)`);
+      p.log.success(`Saved secret ${styleText("cyan", secretName)}`);
     }
   }
   return env;
@@ -229,7 +229,7 @@ export async function promptRouterStreams(configDir: string): Promise<Record<str
         if (secretVal && secretVal.trim().length > 0) {
           writeSecret(secretName, secretVal.trim(), configDir);
           env[envKey] = { secret: secretName };
-          p.log.success(`Saved private secret ${styleText("cyan", secretName)} (mode 0600)`);
+          p.log.success(`Saved secret ${styleText("cyan", secretName)}`);
         }
       }
       streams.push({
@@ -246,7 +246,7 @@ export async function promptRouterStreams(configDir: string): Promise<Record<str
 
 /**
  * Interactive wizard to configure connector-level messaging & bridge plugins (`slack`, `telegram`,
- * `webhook`, or custom / existing `t3-mesh` plugins). Stores secrets privately (`0600`).
+ * `webhook`, or custom / existing `t3-mesh` plugins). Stores secrets in the OS keyring (or private local fallback).
  */
 export async function promptConnectorPlugins(configDir: string): Promise<Record<string, unknown>[]> {
   const cardLines = CONNECTOR_BRIDGE_GUIDES.flatMap((g) => [
@@ -486,7 +486,7 @@ export async function runPluginSetupWizard(configPath: string): Promise<void> {
  * - Environment detection card (6 harnesses + Herdr Core + T3 Code + Tailscale)
  * - Capability cards + multi-select for router roles (Private Router, Public Router, Join Shared Router)
  * - Checkbox multi-select for agent harnesses, router data streams, and connector thread bridges
- * - Private `0600` secrets store + step-by-step setup guides
+ * - OS Keychain / Linux Secret Service secrets store + step-by-step setup guides
  * - Tailscale Service / Serve private exposure + parallel SSH remote host onboarding
  */
 export async function runInteractiveOnboard(options: InteractiveOnboardOptions): Promise<void> {
@@ -690,7 +690,7 @@ export async function runInteractiveOnboard(options: InteractiveOnboardOptions):
       );
       const tokFile = unwrap(
         await p.text({
-          message: `Path to connector token file (0600) for '${sharedName}'`,
+          message: `Path to connector token file for '${sharedName}'`,
           placeholder: "~/.config/hyphae/tokens/shared.token",
           validate: (v) => (v && v.trim().length > 0 ? undefined : "Token file path is required"),
         }),

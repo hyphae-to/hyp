@@ -9,7 +9,7 @@ This document evaluates the engineering feasibility and concrete wire designs fo
 Node 24's built-in `node:crypto` natively supports **Ed25519**, **X25519** (Curve25519 ECDH), **HKDF-SHA256**, and **AES-256-GCM / ChaCha20-Poly1305**, and `packages/t3-mesh/src/identity/keys.ts` already implements Ed25519 connector identity keys.
 
 ### A. Direct Peer Messages (`hyp_send`) — ~1–2 days
-- **Key advertisement**: Each connector generates a static X25519 encryption keypair (`encPub`, `encPriv` in `state/` `0600`), signs `encPub` with its Ed25519 identity key, and publishes it to the router. `GET /v1/peers` returns `{ address, identityPub, encPub, encSig }`.
+- **Key advertisement**: Each connector generates a static X25519 encryption keypair (`encPub`, `encPriv` stored in the OS keyring or private `state/` fallback), signs `encPub` with its Ed25519 identity key, and publishes it to the router. `GET /v1/peers` returns `{ address, identityPub, encPub, encSig }`.
 - **Sealed envelope**: Before calling `POST /v1/messages`, the sender generates an ephemeral X25519 keypair, derives a per-message AEAD key via `HKDF-SHA256(X25519(ephPriv, recipientEncPub), salt, info="hyphae-dm-v1|" + from + "|" + to + "|" + msgId)`, and encrypts `text` with `AES-256-GCM` using the envelope metadata as AAD.
 - **Router blindness**: Even on a **public or shared team router**, the router sees only routing metadata (`from`, `to`, `id`, timestamp) and opaque ciphertext — never prompts, code snippets, or tool outputs.
 - **Compatibility**: Pure additive field (`ciphertext` / `enc: "x25519-aes256gcm-v1"`); plaintext peers continue working unless `requireE2EE: true` is set on the connector.
@@ -55,11 +55,11 @@ Plugin executes the native API call (Telegram `sendMessage`, WhatsApp Cloud API 
 ```json
 { "type": "post_ack", "id": "req-1", "ok": true, "externalId": "msg-998" }
 ```
-**Security win**: Agents NEVER see Telegram/WhatsApp/Slack bot tokens — the plugin holds the `0600` secret in an isolated subprocess, enforces per-target channel/user allowlists, and rate-limits outbound posts!
+**Security win**: Agents NEVER see Telegram/WhatsApp/Slack bot tokens — the plugin resolves its credentials from the OS keyring (or headless fallback) inside an isolated subprocess, enforces per-target channel/user allowlists, and rate-limits outbound posts!
 
 ### C. WhatsApp Support
 Two clean options fit the exact same fd-3 plugin model:
-1. **WhatsApp Cloud API (`builtin: "whatsapp-cloud"`)**: Official Meta webhook + Graph API (`WEBHOOK_SECRET` + `WHATSAPP_TOKEN` in `~/.config/hyphae/secrets/`), zero third-party deps.
+1. **WhatsApp Cloud API (`builtin: "whatsapp-cloud"`)**: Official Meta webhook + Graph API (`WEBHOOK_SECRET` + `WHATSAPP_TOKEN` via `hyp secret`), zero third-party deps.
 2. **OpenClaw Gateway Bridge**: Delegate WhatsApp/Telegram/Discord/Signal session management to an **OpenClaw** Gateway and connect it to the mesh via `openclaw mcp serve` or a tiny fd-3 bridge!
 
 ---

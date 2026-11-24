@@ -19,7 +19,7 @@ function readSecret(fileEnv, valEnv) {
   if (file) return readFileSync(file, "utf8").trim();
   const value = process.env[valEnv]?.trim();
   if (value) return value;
-  throw new Error(`Set ${fileEnv} (recommended, 0600 file) or ${valEnv}`);
+  throw new Error(`Set ${valEnv} (via { "secret": "<name>" }) or ${fileEnv}`);
 }
 
 const csvSet = (name) => {

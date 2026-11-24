@@ -351,11 +351,12 @@ describe("cli.ts subprocess integration", () => {
       assert.equal(setRes.status, 0);
       assert.equal(setRes.stdout.includes(secretValue), false, "secret value must never appear in stdout");
       assert.equal(setRes.stderr.includes(secretValue), false, "secret value must never appear in stderr");
-      const setParsed = JSON.parse(setRes.stdout) as { ok: boolean; command: string; data: { name: string; mode: string } };
+      const setParsed = JSON.parse(setRes.stdout) as { ok: boolean; command: string; data: { name: string; backend: string; location: string } };
       assert.equal(setParsed.ok, true);
       assert.equal(setParsed.command, "secret set");
       assert.equal(setParsed.data.name, "demo-token");
-      assert.equal(setParsed.data.mode, "0600");
+      assert.equal(setParsed.data.backend, "file");
+      assert.ok(setParsed.data.location.endsWith("demo-token.secret"));
 
       const populated = runCli(["secret", "list", "--config-dir", tmp, "--json"]);
       assert.equal(populated.status, 0);

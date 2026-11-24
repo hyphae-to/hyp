@@ -1,6 +1,6 @@
 # Connector and session design
 
-A connector daemon is the single local authority for a router identity. One shared daemon per OS user multiplexes **any number of agent threads/conversations across harnesses** (`antigravity`, `claude`, `codex`, `herdr`) over a private Unix socket (`connector.sock`, mode `0600`) and SQLite database (`state.sqlite`). A T3 Code instance uses its native daemon in [packages/t3-mesh](../packages/t3-mesh) with its own router connector ID.
+A connector daemon is the single local authority for a router identity. One shared daemon per OS user multiplexes **any number of agent threads/conversations across harnesses** (`antigravity`, `claude`, `codex`, `herdr`) over a private user-only Unix socket (`connector.sock`) and SQLite database (`state.sqlite`). A T3 Code instance uses its native daemon in [packages/t3-mesh](../packages/t3-mesh) with its own router connector ID.
 
 ## Per-call caller verification (never 1:1 per MCP process)
 
@@ -25,5 +25,5 @@ Desktop hosts (Antigravity 2.0, Claude Desktop Code tab, Codex Desktop) own thei
 
 ## Session hygiene & socket lifecycle
 
-- On startup, the daemon probes `connector.sock`: if a live daemon answers, startup fails cleanly; if the socket is stale (`ECONNREFUSED`), it is unlinked and rebound with `0600` permissions.
+- On startup, the daemon probes `connector.sock`: if a live daemon answers, startup fails cleanly; if the socket is stale (`ECONNREFUSED`), it is unlinked and rebound with user-only permissions.
 - Every tool call, hook invocation, and waiter attachment refreshes `sessions.last_seen`. A periodic sweep (and `hyp prune`) removes stale inactive sessions, their subscriptions, and their handles from the router while never pruning sessions with an active push transport.
