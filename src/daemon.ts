@@ -64,13 +64,18 @@ async function resolveHerdr(terminalId: string): Promise<{ id: string; backend: 
   let terminal: unknown;
   try { terminal = JSON.parse(result.stdout); } catch { return null; }
   if (!object(terminal) || terminal.address !== terminalId || terminal.state !== "live" || !object(terminal.status)) return null;
-  const backend = parseBackend({
-    kind: "herdr",
-    terminalId: terminal.address,
-    createdMs: terminal.created_ms,
-    pid: terminal.pid,
-    app: terminal.status.app,
-  });
+  let backend: Backend;
+  try {
+    backend = parseBackend({
+      kind: "herdr",
+      terminalId: terminal.address,
+      createdMs: terminal.created_ms,
+      pid: terminal.pid,
+      app: terminal.status.app,
+    });
+  } catch {
+    return null;
+  }
   if (backend.kind !== "herdr") return null;
   return { id: `herdr:${backend.terminalId}:${backend.createdMs}:${backend.pid}`, backend };
 }
