@@ -193,3 +193,22 @@ To receive sub-second push deliveries for repositories that install a GitHub App
      /usr/local/bin/hyp secret set github-app-webhook-secret --state-dir /var/lib/hyphae
    ```
 3. Restart `hyphae-node`. GitHub App deliveries to `POST https://<your-domain>/v1/webhooks/github-app` are strictly HMAC-SHA256 verified (`X-Hub-Signature-256`; invalid signatures return HTTP `401`) and deduplicated with the ETag poller pool. When `appWebhookSecret` is not configured, the route fails closed with HTTP `404`.
+
+---
+
+## Optional: Co-Hosting a RAM-Only Blind Drop Relay (`--enable-drop-relay`)
+
+You can optionally co-host Hyphae's RAM-only zeroized ciphertext **Drop Relay** (`drop.relay.v1`) on the same host by passing `--enable-drop-relay` (and optional `--max-memory-mb 256`) during kit generation:
+
+```sh
+hyp deploy init public-node \
+  --node-id mesh.example.org \
+  --domain mesh.example.org \
+  --enable-drop-relay \
+  --max-memory-mb 256 \
+  --out ./deploy-public
+```
+
+- **Strict `drop:create` isolation**: Default self-service `guest-ro` grants strictly **exclude** `drop:create`, so anonymous public-node guests cannot allocate relay slots. Operators grant `drop:create` explicitly only to trusted/paired nodes (or issue dedicated `am2_` grants).
+- **Zero-disk ciphertext & health telemetry**: Relay slots hold only bounded RAM-only ciphertext verified via stateless HMAC-SHA256 `hdcap1_` tokens before reading request bodies, burned on `POST /v1/drops/{id}/ack` or TTL expiry. `GET /v1/health` reports only aggregate `dropRelay` counters (zero slot IDs or payloads).
+- Want a dedicated relay-only host without public GitHub streams? Use `hyp deploy init drop-relay --domain drop.example.com --max-memory-mb 256` (see [docs/deploying.md](deploying.md)).

@@ -2391,6 +2391,16 @@ hyp secret set slack-bot-token --web
 # Lock guard policy & update every node
 hyp gate lock
 hyp update --all`,
+  drops: `# Pair phone Passkey & drop a Keychain secret
+hyp auth init --web
+hyp drop create --kind secret --secret-name stripe-key
+
+# Host a 256 MiB RAM-only Drop Relay in 60s
+hyp deploy init drop-relay --domain drop.example.com
+
+# Enable opt-in local wakeups & OS cron trigger
+hyp wakeup enable
+hyp wakeup fire --to dev --label morning-triage`,
 };
 
 function formatQsHtml(raw) {

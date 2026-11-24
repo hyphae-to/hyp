@@ -75,21 +75,23 @@ Every `Node` bundles four cleanly separated layers:
    - Published as standard **RFC 7517 / RFC 8037 OKP JWKs** (`Ed25519` + `X25519`) with **RFC 7638 SHA-256 JWK Thumbprints** (`kid`).
    - Optional offline Org Root Admin-CA keypair (`admin-ca-<hash12>`) used by admins to issue `am2_` grants without ever placing the Admin private key on the Team Hub host.
 
-2. **Single Unified SQLite WAL Store (`node.sqlite` in `crates/hyp-store`):**
+2. **Single Unified SQLite WAL Store (`node.sqlite` in `crates/hyp-store`, schema v4):**
    - One WAL-mode SQLite database (`rusqlite` bundled SQLite, `PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;`), driven by an exact deadline scheduler (`next_deadline_ms()`) with zero polling loops.
-   - Logical table groups migrated atomically in one `BEGIN IMMEDIATE` transaction:
+   - Logical table groups migrated atomically in one `BEGIN IMMEDIATE` transaction (through `CURRENT_SCHEMA_VERSION = 4`):
      - **Universal Event & Messaging Bus (`events.rs`, `messages.rs`, `transfers.rs`):** `handles`, `events`, `subscriptions`, `batches`, `batch_events`, `upstream_pushdowns`, `channel_members`, `channel_epochs`, `transfers`
      - **Shared State (`kv.rs`):** `kv_entries`, `kv_epochs`
      - **Federation & Trust (`peers.rs`):** `peers`, `grants`, `revocations`, `peer_keys`, `directory_checkpoints`
      - **Local Runtime & Security (`local.rs`):** `metadata`, `sessions`, `mailbox` (with `gate_state`), `deliveries`, `muted_sources`, `plugin_targets`, `bridge_links`, `gate_audit` (protected by SQLite immutability triggers)
+     - **Schema v3 — Opt-In Local Wakeups (`wakeups.rs`):** `wakeups` (durable one-shot timers and 5-field local/UTC crons claimed atomically by `next_deadline_ms()` with zero write-lock overhead when idle)
+     - **Schema v4 — Verified Human Authority (`human.rs`):** `human_authorities` (enrolled Tier 1 Ed25519 phone Passkey+PRF & CLI keys + revocation epoch), `human_nonces` (single-use `claim_id` replay protection pruned by deadline scheduler), and `human_node_certs` (`NodeCertV1` anti-phishing node bindings)
 
 3. **Uniform Composable Adapter Trait (`NodeAdapter` in `crates/hyp-node/src/adapters/trait_def.rs`):**
    Every external integration attaches to `UnifiedNode` through one narrow trait (`AdapterKind::{Harness, Source, Bridge, PeerLink}`):
 
 | Adapter Class | Concrete Implementations | Architectural Benefit |
 | --- | --- | --- |
-| **(a) Harness Adapters** (`crates/hyp-harness`) | Unix socket server (`connector.sock`, `0600`) / Windows loopback TCP (`connector.addr`), `CallRegistry` hooks (`PreToolUse`/`PostToolUse`/`PreInvocation`/`Stop`), Claude native channel, `hyp wait`/`hyp watch`, Codex rollout/queue, T3 Code (`statev2.sqlite`), Herdr (`hc`), Cursor, OpenCode, Gemini CLI, OpenClaw. | Calls `UnifiedNode` in-process with zero loopback HTTP overhead and ~2.7 ms hook latency. |
-| **(b) Compiled-In Event Source Adapters** (`crates/hyp-node/src/adapters/`) | Pure-Rust in-process `github-public`, `github-webhook`, `prometheus-webhook`, `webhook-stream` calling `host.publish_event()` directly + demand-driven `on_subscriptions_changed()` / `validate_subscription()` hooks. | Zero Node/Python runtime needed for core streams; no extra loopback webhook hop. |
+| **(a) Harness Adapters** (`crates/hyp-harness`, `crates/hyp-cli/src/skill_render.rs`) | Unix socket server (`connector.sock`, `0600`) / Windows loopback TCP (`connector.addr`), `CallRegistry` hooks (`PreToolUse`/`PostToolUse`/`PreInvocation`/`Stop`), Claude native channel, `hyp wait`/`hyp watch`, Codex rollout/queue, T3 Code (`statev2.sqlite`), Herdr (`hc`), Cursor, OpenCode, Gemini CLI, OpenClaw; orchestrator-aware tailored `hyphae/SKILL.md` rendering (`hyp setup --refresh-skills` / `--force-skills`) + dynamic backend-aware MCP `initialize.instructions`. | Calls `UnifiedNode` in-process with zero loopback HTTP overhead, ~2.7 ms hook latency, and zero duplicate messaging/scheduling instructions on OpenClaw or Antigravity. |
+| **(b) Compiled-In Event Source Adapters** (`crates/hyp-node/src/adapters/`) | Pure-Rust in-process `github-public`, `github-webhook`, `prometheus-webhook`, `webhook-stream`, and opt-in `wakeup` calling `host.publish_event()` directly + demand-driven `on_subscriptions_changed()` / `validate_subscription()` hooks. | Zero Node/Python runtime needed for core streams or local timer/cron/OS wakeups; no extra loopback webhook hop. |
 | **(c) Optional External Bridges & Custom Sources** (`plugins/` + `SubprocessSupervisor`) | Optional external scripts (`plugins/slack`, `plugins/telegram`, `plugins/whatsapp`, `plugins/webhook`, `plugins/prometheus`, or custom binaries) supervised over duplex Unix fd 3 (JSON-RPC 2.0 v2 + auto-detected legacy fd-3 v1). | One bounded 64 KiB supervisor with scrubbed `ALLOWED_PARENT_ENV`, `bridge_links`, live `handoff`, and outbound `hyp_send({ to: "<plugin>:<target>" })`. |
 | **(d) Peer Node Links** (`PeerLink` in `crates/hyp-node/src/engine/peer_link.rs`) | Bidirectional `hyper 1` HTTPS + WHATWG SSE link to any remote Hyphae `Node`. | Eliminates `"primary"` hegemony: Team Hubs, public read-only nodes, and Direct P2P laptops are all symmetric `PeerLink`s. |
 
@@ -235,6 +237,8 @@ Every v2 `Node` serves a signed **Node Capability Manifest** (`crates/hyp-proto/
 | `p2p.direct.v1` / `p2p.relay.v1` | Direct node-to-node peer links / optional blind relay |
 | `keys.prekey.v1` / `directory.checkpoint.v1` | Rotating prekeys / signed anti-rollback directory checkpoints |
 | `node.self-update.v1` | Signed remote fleet update orchestration (`hyp update --all`, requires `node:update` scope) |
+| `human.auth.v1` (`HumanAuthV1`) | Tier 1 Ed25519 Verified Human Drops (`hdrop1_`, `hcert1_`, `TrustTier::HumanVerified`, zero-knowledge `SecretStore` drops) |
+| `drop.relay.v1` (`DropRelayV1`) | RAM-only zeroized ciphertext Blind Drop Relay (`POST /v1/drops`, stateless `hdcap1_` caps, burn-after-read SSE catch-up) |
 
 ### 3.2 Capability Negotiation & Fail-Closed Skew Diagnostics
 
@@ -265,6 +269,7 @@ OAuth 2.0 (RFC 6749) space-delimited ASCII resource- and predicate-confined scop
 | `kv:read=<ns/prefix*>` / `kv:write=<ns/prefix*>` | Read/watch or mutate KV entries matching namespace + prefix glob. |
 | `bridge:post=<plugin:target>` | Post outbound to a node's chat bridge. **Never included in `*`; explicit opt-in only.** |
 | `forward:via=<node-pattern>` | Permit transit forwarding through this node. **Never included in `*`; explicit opt-in only.** |
+| `drop:create` | Allocate ephemeral RAM-only Blind Drop Relay slots (`POST /v1/drops`). Excluded from `guest-ro` unless explicitly granted. |
 
 **Built-In Presets (`hyp pair guide`):** `guest-ro`, `guest`, `observer`, `member`, `full` (`*`, explicitly excluding `bridge:post` and `forward:via`).
 
@@ -325,9 +330,9 @@ flowchart LR
 
 ### 5.2 Stage 1 (Deterministic) & Stage 2 (Pluggable `FilterPlugin` Chain)
 
-- **Stage 1 (`stage1.rs`):** Identity/E2EE verification, trust-tier tagging (`self`, `org`, `peer`, `guest`, `external-webhook`, `bridge`), mutes, CloudEvents Filter AST allow/denylists, per-sender token-bucket rate limits, payload size caps, inbound regex denylists, **outbound secret DLP scanner**, **streaming `tar.gz` attachment guard**, and automatic `guest`/`external-webhook` downgrade to `notify`/quarantine.
+- **Stage 1 (`stage1.rs`):** Identity/E2EE verification, trust-tier tagging (`self`, `human-verified`, `org`, `peer`, `guest`, `external-webhook`, `bridge`), mutes, CloudEvents Filter AST allow/denylists, per-sender token-bucket rate limits, payload size caps, inbound regex denylists, **outbound secret DLP scanner**, **streaming `tar.gz` attachment guard**, and automatic `guest`/`external-webhook` downgrade to `notify`/quarantine. Cryptographically verified human directives (`TrustTier::HumanVerified`) bypass Stage 2 untrusted-peer filters while recording immutable `human_authority` rows in `gate_audit`.
 - **Stage 2 (`stage2.rs`, `plugins.rs`):** Composable chain of 6 adapters (`anthropic`, `openai-compat`/Ollama, `google`, `lakera-guard`, `http-classifier`, JSON-RPC 2.0 `subprocess`), all isolated with zero tools/workspace/secrets, compiled-in immutable core rubric + additive `policy_notes`, randomized 64-bit untrusted payload fences, `max_input_chars = 16,384`, `max_output_tokens = 160`, `timeout_ms = 4,000`, `max_concurrent = 4` (`Hold("gate_busy")`), `min_allow_confidence = 0.75`, and fail-closed `on_error: quarantine | block`.
-- **Tamper-Evident Policy Signature (`gate_policy_sig`):** Domain-separated HMAC-SHA256 over canonical JCS of `gate` config keyed from `SecretStore` (`gate-policy-hmac-key`), locked via `hyp gate init --adapter ... --lock` or `hyp gate lock`.
+- **Tamper-Evident Policy Signature (`gate_policy_sig`):** Domain-separated HMAC-SHA256 over canonical JCS of `gate` config (binding `human_authorities_digest` against `node.sqlite`'s `human_authorities`) keyed from `SecretStore` (`gate-policy-hmac-key`), locked via `hyp gate init --adapter ... --lock` or `hyp gate lock`.
 - **Audit & Human Review CLI:**
   - `hyp gate log [--decision all|quarantined|blocked|allowed|error] [--limit 50] [--session <id>] [--json]`
   - `hyp gate review [--session <id>] [--limit 50] [--json]`

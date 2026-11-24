@@ -6,7 +6,7 @@ Hyphae v2 collapses the legacy *Connector vs. Router* split into **one unified `
 
 ## 1. Choose an Internet Deployment Path
 
-Run `hyp deploy providers` (or `hyp deploy providers --json`) to inspect all six supported methods and auto-detect installed local tools (`tailscale`, `cloudflared`, `docker`, `caddy`, `flyctl`, `systemctl`):
+Run `hyp deploy providers` (or `hyp deploy providers --json`) to inspect all seven supported methods and auto-detect installed local tools (`tailscale`, `cloudflared`, `docker`, `caddy`, `flyctl`, `systemctl`):
 
 | Provider | TLS Termination | NAT / Firewall Requirement | Best For | Generator Command |
 | --- | --- | --- | --- | --- |
@@ -16,8 +16,10 @@ Run `hyp deploy providers` (or `hyp deploy providers --json`) to inspect all six
 | **`cloudflare`** | Cloudflare Edge TLS over outbound `cloudflared` tunnel | Zero open inbound ports; works behind CGNAT/homelabs | Homelabs, residential ISPs, and NAT'd devboxes | `hyp deploy init cloudflare` |
 | **`fly`** | Fly Proxy auto-HTTPS (`force_https = true`) | Managed edge; `min_machines_running = 1` keeps SSE warm | Zero-ops always-on cloud hubs in < 3 minutes | `hyp deploy init fly` |
 | **`public-node`** | Caddy auto-TLS + systemd + Docker Compose kit | Public HTTPS 80/443; `guest-ro` confined read-only hub | Hosting a read-only public GitHub event hub (e.g. `public.hyphae.to` or your own community hub) | `hyp deploy init public-node` |
+| **`drop-relay`** | Caddy auto-TLS (`flush_interval -1`) + systemd + Docker Compose + Fly kit | Public HTTPS 80/443 (or Tailscale Serve); RAM-only ciphertext buffer | 60-second self-hosted Blind Drop Relay (`256 MiB` default RAM cap) for phone Passkey / CLI Verified Human Drops | `hyp deploy init drop-relay` |
 
 > **Overwrite safety:** `hyp deploy init` refuses to overwrite existing files in `--out` unless you explicitly pass `--force`.
+> **Co-hosting a Drop Relay on existing hubs:** Pass `--enable-drop-relay` (and optional `--max-memory-mb 256`) to `hyp deploy init <public-node|vps|docker|tailscale|fly>` to enable the RAM-only Blind Drop Relay alongside a Team Hub or Public Node.
 
 ---
 
@@ -134,6 +136,32 @@ What this turnkey kit configures:
 - **Strict Rate Limits & Fail-Closed Forwarding:** `forwarding.mode: "deny"`, 1 MB Caddy request cap, and hardened systemd + Docker Compose templates.
 - **One-Command Client Join:** Developer laptops pair read-only with `hyp pair join https://mesh.example.org` (or an example public node such as `hyp pair join https://public.hyphae.to`).
 
+### 2.7 60-Second Self-Hostable Blind Drop Relay (`drop-relay`)
+
+Stand up a dedicated, zero-disk, RAM-only Blind Drop Relay for **Verified Human Drops** (`hdrop1_`) — ideal for phone Passkey (`https://hyphae.to/drop`) and CLI secret/directive handoffs behind NAT:
+
+```sh
+hyp deploy init drop-relay \
+  --domain drop.example.com \
+  --max-memory-mb 256 \
+  --out ./deploy-drop-relay
+
+hyp deploy check --config ./deploy-drop-relay/node.json
+# Deploy with Docker Compose, systemd + Caddy, or Fly.io, then verify live:
+hyp deploy check --url https://drop.example.com --config ./deploy-drop-relay/node.json
+
+# Point client workstations at your relay:
+hyp relay set https://drop.example.com
+hyp relay status
+```
+
+What `drop-relay` (and `--enable-drop-relay` on `public-node`, `vps`, `docker`, `tailscale`, `fly`) configures:
+- **RAM-Only Bounded Zeroized Buffer**: Holds encrypted `hdrop1_` ciphertext strictly in bounded RAM (`maxMemoryMb: 256` default), zeroized on burn-after-read ack or TTL expiry — zero disk writes and zero plaintext ever in relay RAM.
+- **Stateless `hdcap1_` Capabilities**: Upload and claim requests carry HMAC-SHA256 stateless capability tokens (`hdcap1_`) verified **before** reading the HTTP request body, preventing unauthenticated memory exhaustion.
+- **Authenticated Slot Creation (`drop:create`)**: Only authorized paired peers holding `drop:create` can allocate ephemeral slots via `POST /v1/drops`.
+- **Burn-After-Read SSE Catch-Up**: Target nodes catch up over `GET /v1/drops/{id}/stream` (Caddy `flush_interval -1`) and atomically erase ciphertext via `POST /v1/drops/{id}/ack`.
+- **Strict CORS + Chrome PNA**: Serves explicit CORS and Chrome Private Network Access headers so `https://hyphae.to/drop` works seamlessly against both public relays and direct LAN/Tailscale drops.
+
 ---
 
 ## 3. Permissioned Pairing Topologies
@@ -170,7 +198,9 @@ hyp pair accept --token-file /path/to/invite.token
 | `guest` | `guest` | `dm:send`, `dm:receive`, `channel:join=#lobby`, `channel:post=#lobby` |
 | `observer` | `peer` | `dm:receive`, `channel:join=*`, `stream:subscribe=*`, `kv:read=*` |
 | `member` | `org` | `dm:send`, `dm:receive`, `channel:join=*`, `channel:post=*`, `stream:subscribe=*`, `files:send=50mb`, `files:receive=50mb`, `kv:read=shared/*`, `kv:write=shared/*` |
-| `full` | `org` | `*` — **explicitly excludes `bridge:post` and `forward:via` (opt-in only)** |
+| `full` | `org` | `*` (includes `drop:create`; **explicitly excludes `bridge:post` and `forward:via` — opt-in only**) |
+
+*(Add `drop:create` explicitly alongside narrower presets such as `member` or `guest-ro` when authorizing a peer to allocate Blind Drop Relay slots via `POST /v1/drops`.)*
 
 ### NAT Tips for Direct P2P (`hp2p1_`)
 - **Outbound-only peers:** Only *one* peer needs a reachable HTTPS or Tailscale endpoint. The peer behind strict NAT omits `bobEndpoint` and maintains an outbound HTTPS+SSE link carrying bidirectional DMs, files, events, and KV.

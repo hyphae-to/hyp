@@ -68,7 +68,36 @@ Implemented in `crates/hyp-node/src/gates/` and controlled strictly via the huma
 
 ---
 
-## 5. Secrets Isolation (`SecretStore` & Subprocess Scrubbing)
+## 5. Verified Human Drops & Human Authority (`human.auth.v1` / `drop.relay.v1`)
+
+Verified Human Drops provide a cryptographic out-of-band channel from an enrolled human (phone or laptop) directly to a target Hyphae Node without exposing secrets to relays, logs, SQLite, or agent LLM contexts:
+
+- **Tier 1 Ed25519-Only Human Authority**:
+  - **Phone WebAuthn Passkey+PRF** (`https://hyphae.to/drop` — self-contained static page, zero CDN, strict CSP; Face ID / Touch ID PRF output -> HKDF-SHA256 -> Ed25519 signing keypair).
+  - **Laptop CLI Ed25519 keys** stored strictly in `SecretStore` (macOS Keychain / Linux Secret Service / `0600` file).
+  - Managed strictly via human CLI: `hyp auth init [--web]`, `hyp auth add`, `hyp auth list`, `hyp auth revoke <kid> [--bump-epoch]`, `hyp auth certify-node`, and `hyp auth sign --kind directive|secret` (reading stdin).
+- **Anti-Phishing `NodeCertV1` (`hcert1_`) & Fresh-Input-Only Invariant**:
+  - Target nodes carry human-signed `NodeCertV1` certificates (`human_node_certs`) binding `nodeId` and X25519 encryption JWK so the portal verifies the recipient node before sealing.
+  - Drop links (`hyp drop create` or `hyp_mesh({ action: "drop_link", kind, secretName? })`) **never** carry agent-prefilled `proposedText` — defeating tap-to-approve phishing by requiring fresh human input for every directive or secret.
+- **Sealed Drops (`hdrop1_`) & Replay Protection**:
+  - Sealed with RFC 9180 HPKE (`DHKEM(X25519, HKDF-SHA256)` + `AES-256-GCM`) and Ed25519-signed over RFC 8785 JCS.
+  - Every drop embeds a single-use `claim_id` recorded atomically in `human_nonces` (and pruned after expiry by the exact deadline scheduler) so replayed envelopes fail closed.
+  - Revoking a key (`hyp auth revoke <kid> [--bump-epoch]`) advances the node's monotonic revocation epoch; drops signed by revoked keys or stale epochs fail closed.
+- **Zero-Knowledge Secret Sink & Reserved Denylist**:
+  - Secret drops (`kind: "secret"`) decrypt in memory and write directly into the target node's `SecretStore` (macOS Keychain / Linux Secret Service / `0600` file) with **zero secret bytes** ever written to SQLite, logs, relay plaintext RAM, or agent LLM context. The agent receives only a metadata-only confirmation notice.
+  - Reserved internal secret names and prefixes (`node-sign-*`, `node-enc-*`, `id-sign-*`, `id-enc-*`, `admin-ca*`, `gate-policy*`, `human-admin*`, `human-authority*`, `auth-token*`) are blocked fail-closed so a secret drop can never overwrite node identity or gate signing keys.
+- **Verified Human Directives (`TrustTier::HumanVerified`) & Tamper-Evident Policy Binding**:
+  - Cryptographically authenticated directives receive `TrustTier::HumanVerified`, bypassing Stage 2 untrusted-peer prompt-injection filters while still writing immutable `gate_audit` rows (`stage: "human_authority"`, `trust_tier: "human-verified"`).
+  - When a gate policy is locked (`hyp gate lock`), `human_authorities_digest` (computed over `human_authorities` in `node.sqlite`) is bound into `gate_policy_sig`. Unauthorized SQLite tampering with enrolled human keys fails closed at runtime and in `hyp doctor`.
+- **RAM-Only Blind Drop Relay (`dropRelay`)**:
+  - Holds ciphertext exclusively in a bounded RAM-only zeroized buffer (`256 MiB` default, zero disk writes, zero plaintext).
+  - Stateless HMAC-SHA256 `hdcap1_` upload and claim capability tokens are verified **before** reading the HTTP request body.
+  - Allocating slots (`POST /v1/drops`) requires the explicit `drop:create` scope (never included in `guest-ro`).
+  - Target nodes catch up via burn-after-read SSE (`GET /v1/drops/{id}/stream` + `POST /v1/drops/{id}/ack`), and strict CORS + Chrome Private Network Access (PNA) headers protect direct LAN/Tailscale drops.
+
+---
+
+## 6. Secrets Isolation (`SecretStore` & Subprocess Scrubbing)
 
 - **Zero plaintext secrets in config, argv, or LLM context**: `node.json` references credentials solely via `{ "secret": "<name>" }` (never raw strings). `hyp secret set <name> --web` launches an ephemeral `127.0.0.1` one-shot HTML form protected by a random 192-bit URL path token and a constant-time verified CSRF nonce so secret bytes never touch an agent conversation or shell history. Headless setups pipe values over stdin (`printf '%s' "$VAL" | hyp secret set <name>`).
 - **Three Storage Backends (`crates/hyp-crypto/src/keystore.rs`)**:
@@ -81,15 +110,15 @@ Implemented in `crates/hyp-node/src/gates/` and controlled strictly via the huma
 
 ---
 
-## 6. Untrusted External Framing & Chat Bridge Guards
+## 7. Untrusted External Framing & Chat Bridge Guards
 
-- **Untrusted external data**: All peer messages, `#channel` posts, webhooks, bridged chat texts, and remote `403 not_granted` escalation notes (capped at `512` UTF-8 bytes, stripped of control characters, wrapped as `{ untrusted: true, provenance, text }`) are strictly delimited as untrusted data — never instructions.
+- **Untrusted external data**: All peer messages, `#channel` posts, webhooks, wakeup `note`/`data` trigger payloads, bridged chat texts, and remote `403 not_granted` escalation notes (capped at `512` UTF-8 bytes, stripped of control characters, wrapped as `{ untrusted: true, provenance, text }`) are strictly delimited as untrusted data — never instructions.
 - **Fail-closed chat bridge allowlists**: Optional external scripts `plugins/slack/index.mjs`, `plugins/telegram/index.mjs`, and `plugins/whatsapp/index.mjs` drop unauthorized senders unless explicit allowlists (`SLACK_ALLOWED_USERS`/`SLACK_ALLOWED_CHANNELS`, `TELEGRAM_ALLOWED_USERS`/`TELEGRAM_ALLOWED_CHATS`, `WHATSAPP_ALLOWED_NUMBERS`) are configured.
 - **Constant-time signed webhooks**: Compiled-in `GitHubWebhookAdapter`, `GitHubPublicAdapter` (`POST /v1/webhooks/github-app`), `PrometheusWebhookAdapter`, and `GenericWebhookAdapter` verify `X-Hub-Signature-256` / bearer tokens / HMAC-SHA256 in constant time (`ring::hmac`).
 
 ---
 
-## 7. Network, Transport & Self-Update Hardening
+## 8. Network, Transport & Self-Update Hardening
 
 - **Loopback-only binding & private IPC**: Remote-capable profiles bind `127.0.0.1:8790` behind TLS termination (Tailscale Serve, Caddy, Cloudflare Tunnel, or Fly Proxy); `deploy check` fails closed on unprotected wildcard binds. Local IPC uses a `0600` Unix domain socket (`connector.sock`) on macOS/Linux or loopback `127.0.0.1` TCP (`connector.addr`) on Windows.
 - **No implicit open relay**: `forwarding.mode` defaults to `"deny"` (only `"deny"` or explicit `"allowlist"` is accepted), backed by `hyphaevia`/`hyphaehops` cycle and hop-limit checks (hard cap `4`).

@@ -4,19 +4,19 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Hyphae (hyp) — One wire under every agent</title>
-  <meta name="description" content="Single ~6 MiB Rust binary connecting coding agents over Direct P2P (hp2p1_) and blind E2EE Team Hubs — with #channels, Shared KV, filtered event streams, and pluggable prompt-injection guards." />
+  <meta name="description" content="Single ~6 MiB Rust binary connecting coding agents over Direct P2P (hp2p1_) and blind E2EE Team Hubs — with #channels, Shared KV, filtered streams, opt-in wakeups, Verified Human Drops, and prompt-injection guards." />
   <link rel="canonical" href="https://hyphae.to/" />
   <link rel="icon" type="image/png" href="./assets/logo-hyphae.png" />
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://hyphae.to/" />
   <meta property="og:title" content="Hyphae (hyp) — One wire under every agent" />
-  <meta property="og:description" content="Single Rust binary for coding-agent coordination: Direct P2P and E2EE Team Hubs, #channels, Shared KV, filtered streams, and pluggable prompt-injection guards." />
+  <meta property="og:description" content="Single Rust binary for coding-agent coordination: Direct P2P and E2EE Team Hubs, #channels, Shared KV, filtered streams, opt-in wakeups, Verified Human Drops, and prompt-injection guards." />
   <meta property="og:image" content="https://hyphae.to/assets/social-card.jpg" />
   <meta property="og:image:width" content="1280" />
   <meta property="og:image:height" content="640" />
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:image" content="https://hyphae.to/assets/social-card.jpg" />
-  <link rel="stylesheet" href="./styles.css?v=15" />
+  <link rel="stylesheet" href="./styles.css?v=16" />
 </head>
 <body>
   <header id="siteHeader" class="header-dark">
@@ -128,7 +128,7 @@
             </div>
           </div>
 
-          <!-- Central Team Node (transparent cutout floating organically over the mycelium hub) -->
+          <!-- Central Team Node (transparent artwork floating organically over the mycelium hub) -->
           <div class="entity" id="ent-node" style="left:47.1%; top:43.5%;">
             <span class="hub-badge">Team Node</span>
             <div class="avatar-wrap">
@@ -514,6 +514,8 @@
                   <span>#announcements</span>
                   <span>Shared KV</span>
                   <span>Streams &amp; Files</span>
+                  <span>Wakeups &amp; Cron</span>
+                  <span>Human Drops</span>
                   <span>Direct P2P &amp; Hubs</span>
                   <span>Security Gates</span>
                 </div>
@@ -576,7 +578,7 @@
                   </div>
                 </header>
                 <p class="card-lead">
-                  Subscribe agents to GitHub PRs, Prometheus alerts, public feeds, and shared state once. Filters wake only the threads that care.
+                  Subscribe agents to GitHub PRs, Prometheus alerts, opt-in local Wakeups &amp; Cron, public feeds, and shared state once. Filters wake only the threads that care.
                 </p>
 
                 <div class="hub-tile-grid rich">
@@ -609,7 +611,7 @@
                     </span>
                     <span class="tile-copy">
                       <strong>Shared KV</strong>
-                      <small>CAS &amp; webhooks</small>
+                      <small>CAS &amp; Wakeups</small>
                     </span>
                   </div>
                 </div>
@@ -633,7 +635,7 @@
                   </div>
                 </header>
                 <p class="card-lead">
-                  Connect private Slack, Telegram, or WhatsApp threads backed by your OS Keychain — with pluggable prompt-injection guards and custom plugins.
+                  Connect private Slack, Telegram, or WhatsApp threads backed by your OS Keychain — with prompt-injection guards, <a class="card-inline-link" href="./drop/">Verified Human Drops ↗</a>, and custom plugins.
                 </p>
 
                 <div class="hub-tile-grid rich">
@@ -1016,7 +1018,7 @@
                   <td class="col-hyp">
                     <div class="cmp-cell">
                       <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>9 harnesses &amp; orchestrators</strong></span>
-                      <button class="cmp-info-btn" type="button" aria-label="Details about Harnesses and orchestrators" data-info-title="Harnesses &amp; Orchestrators" data-info-body="Claude Code, Codex, Antigravity, Cursor, OpenCode, Gemini CLI, OpenClaw, Herdr Core &amp; T3 Code collaborating on one wire.">i</button>
+                      <button class="cmp-info-btn" type="button" aria-label="Details about Harnesses and orchestrators" data-info-title="Harnesses &amp; Orchestrators" data-info-body="Claude Code, Codex, Antigravity, Cursor, OpenCode, Gemini CLI, OpenClaw, Herdr Core &amp; T3 Code with orchestrator-aware tailored skills (zero bloat on OpenClaw/Antigravity) &amp; native push wakeups (hc, T3 RPC, codex queue).">i</button>
                     </div>
                   </td>
                   <td><span class="cmp-val"><span class="cmp-no">—</span><span>Single vendor</span></span></td>
@@ -1058,6 +1060,18 @@
                   <td><span class="cmp-val"><span class="cmp-no">—</span><span>None</span></span></td>
                   <td><span class="cmp-val"><span class="cmp-no">—</span><span>None</span></span></td>
                   <td><span class="cmp-val"><span class="cmp-part">~</span><span>DIY middleware</span></span></td>
+                </tr>
+                <tr>
+                  <th scope="row">Human Drops &amp; wakeups</th>
+                  <td class="col-hyp">
+                    <div class="cmp-cell">
+                      <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>Passkey Drops &amp; Cron</strong></span>
+                      <button class="cmp-info-btn" type="button" aria-label="Details about Human Drops and wakeups" data-info-title="Verified Human Drops &amp; Wakeups" data-info-body="WebAuthn Passkey+PRF phone-to-node directives &amp; zero-knowledge OS Keychain secrets over a RAM-only Drop Relay (/drop), plus opt-in hyp_wakeup &amp; OS cron triggers (crontab, systemd, launchd).">i</button>
+                    </div>
+                  </td>
+                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>None</span></span></td>
+                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>None</span></span></td>
+                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>External scheduler</span></span></td>
                 </tr>
               </tbody>
             </table>
@@ -1211,7 +1225,7 @@
             <img class="qs-sitter" src="./assets/sprite-terminal-sitter.png?v=1" alt="" aria-hidden="true" />
             <div class="qs-chrome">
               <span class="qs-dots" aria-hidden="true"><i></i><i></i><i></i></span>
-              <span class="qs-chrome-meta">hyp v0.3.0 · SHA-256 verified</span>
+              <span class="qs-chrome-meta">hyp v0.4.0 · SHA-256 verified</span>
             </div>
             <div class="qs-top">
               <div class="qs-tabs" id="qsTabs">
@@ -1219,6 +1233,7 @@
                 <button class="it-btn" data-qs="win" type="button">Windows</button>
                 <button class="it-btn" data-qs="deploy" type="button">Deploy &amp; Pair</button>
                 <button class="it-btn" data-qs="assist" type="button">AI Concierge</button>
+                <button class="it-btn" data-qs="drops" type="button">Drops &amp; Cron</button>
               </div>
               <button class="install-copy" id="qsCopyBtn" type="button">Copy</button>
             </div>
@@ -1328,6 +1343,7 @@
                     <span>Llama Guard 2</span>
                     <span>Lakera</span>
                     <span>--web Keychain</span>
+                    <span>Passkey Drops</span>
                   </div>
                 </div>
               </div>
@@ -1345,6 +1361,8 @@
                 <span>·</span>
                 <span>SHA-256 verified</span>
                 <span>·</span>
+                <a class="qs-meta-link" href="./drop/">Drop Portal ↗</a>
+                <span>·</span>
                 <code>hyp update --all</code>
               </div>
             </div>
@@ -1360,6 +1378,8 @@
       <span class="foot-links">
         <a href="https://hyphae.to" class="foot-link">hyphae.to</a>
         <span class="foot-sep" aria-hidden="true">·</span>
+        <a href="./drop/" class="foot-link">Drop Portal</a>
+        <span class="foot-sep" aria-hidden="true">·</span>
         <a href="https://github.com/hyphae-to/hyp" target="_blank" rel="noreferrer" class="foot-link">GitHub ↗</a>
         <span class="foot-sep" aria-hidden="true">·</span>
         <span>MIT License</span>
@@ -1373,6 +1393,6 @@
     <p class="cmp-pop-body" id="cmpPopBody"></p>
   </div>
 
-  <script type="module" src="./app.js?v=15"></script>
+  <script type="module" src="./app.js?v=16"></script>
 </body>
 </html>

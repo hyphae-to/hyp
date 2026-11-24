@@ -10,7 +10,7 @@ Hyphae v2 unifies event sources and chat bridges onto the single Rust `Node` Clo
 
 | Layer | Implementation | Routing Model | Secrets Location | Best For |
 | --- | --- | --- | --- | --- |
-| **Compiled-In Rust Event Sources** (`crates/hyp-node/src/adapters/`) | Pure Rust in-process (`github-public`, `github-webhook`, `prometheus-webhook`, `webhook-stream`) — zero Node/Python needed | **1-to-many Pub/Sub** via `hyp_stream` with server-side CloudEvents filter pushdown | Node's `SecretStore` (`{ "secret": "<name>" }` in `node.json`) | Public or org **GitHub** streams (`github-public` ETag poller + GitHub App webhooks), **Prometheus Alertmanager v4**, and signed **HTTP webhooks** |
+| **Compiled-In Rust Event Sources** (`crates/hyp-node/src/adapters/`) | Pure Rust in-process (`github-public`, `github-webhook`, `prometheus-webhook`, `webhook-stream`, opt-in `wakeup`) — zero Node/Python needed | **1-to-many Pub/Sub** via `hyp_stream` with server-side CloudEvents filter pushdown (and local scheduled wakeups via `hyp_wakeup` / `hyp wakeup`) | Node's `SecretStore` (`{ "secret": "<name>" }` in `node.json`) | Public or org **GitHub** streams (`github-public` ETag poller + GitHub App webhooks), **Prometheus Alertmanager v4**, signed **HTTP webhooks**, and opt-in local **Wakeups & OS Cron triggers** |
 | **External Subprocess Bridges & Custom Sources** (`plugins/`) | Optional self-contained scripts (`plugins/slack`, `plugins/telegram`, `plugins/whatsapp`, `plugins/webhook`, `plugins/prometheus`, or custom executables) supervised by `SubprocessSupervisor` over fd 3 | **Thread-owned + multi-thread fan-in + outbound replies** via `hyp_bridge` and `hyp_send({ to: "<plugin>:<target>", text })` | Local machine's `SecretStore` — scrubbed subprocess env, never sent to remote hubs | Personal **Slack / Telegram / WhatsApp** bridges, local callbacks, and custom scripts in any language |
 
 ---
@@ -75,6 +75,55 @@ Pure-Rust normalizers verify HMAC-SHA256 / bearer tokens in constant time (`ring
 - **GitHub (`com.github.*`)**: Attributes `repo` (`"owner/repo"`), `source` (`"github.com/owner/repo"`), `type` (`"com.github.pull_request.opened"`, etc.), `action`, `actor`, and `subject` (`"pull/<n>"`, `"issues/<n>"`, `"actions/runs/<id>"`, `"refs/heads/<branch>"`).
 - **Prometheus Alertmanager v4**: Emits one CloudEvent per alert (`io.prometheus.alert.firing` / `io.prometheus.alert.resolved`) with `alertname`, `severity`, `service`, and `subject: "severity=<severity>/<alertname>"`.
 - **Generic Webhook**: Optional constant-time HMAC-SHA256 verification and CloudEvents v1.0 pass-through/wrapping.
+
+### C. `wakeup` — Opt-In Local Timer, Cron & OS Scheduler Source
+
+Compiled directly into `hyp`, the opt-in `wakeup` source provides durable one-shot timers, 5-field local/UTC crons (stored in `node.sqlite`'s `wakeups` table and driven by `next_deadline_ms()` with zero polling loops), and direct local OS scheduler ingestion (`crontab`, `systemd --user`, `launchd`). See [skills/hyphae-wakeup/SKILL.md](../skills/hyphae-wakeup/SKILL.md) for agent recipes.
+
+Enable once via CLI (writes a `kind: "wakeup"` entry into `sources[]` in `node.json`):
+
+```sh
+hyp wakeup enable                         # default --mcp-tool auto
+hyp wakeup enable --mcp-tool always       # force hyp_wakeup on every harness
+hyp wakeup enable --mcp-tool never        # CLI & OS triggers only (0 MCP tool tokens)
+hyp wakeup disable                        # cleanly disable the wakeup source
+```
+
+```json
+{
+  "sources": [
+    {
+      "id": "wakeup",
+      "kind": "wakeup",
+      "enabled": true,
+      "mcpTool": "auto"
+    }
+  ]
+}
+```
+
+- **Orchestrator-aware MCP exposure (`mcpTool: "auto"`)**: Exposes `hyp_wakeup` on harnesses without native scheduling (**Herdr**, **Codex**, **Claude**, **T3 Code**, **Cursor**, **OpenCode**, **Gemini CLI**) while keeping **0 extra MCP tokens** on orchestrators with built-in schedulers (**OpenClaw** and **Antigravity**). Agent-created recurring crons enforce `maxIterations <= 50` so background loops stay bounded.
+- **CLI & OS triggers (`crontab`, `systemd --user`, `launchd`)**: Speaks directly over the user-only `0600` local daemon IPC socket (`connector.sock` / Windows `connector.addr`):
+  ```sh
+  # One-shot timers & recurring crons (machine local timezone by default; pass --timezone UTC for UTC)
+  hyp wakeup set --in 15m --label check-ci --note "Check macOS shard"
+  hyp wakeup set --at 2026-11-25T16:00:00Z --label release-cut --to release
+  hyp wakeup set --cron "0 9 * * 1-5" --timezone local --label morning-triage --to dev
+
+  # Manage active schedules
+  hyp wakeup list
+  hyp wakeup cancel <id>
+
+  # Immediate trigger one-liner for crontab / systemd --user / launchd
+  hyp wakeup fire --to dev --label nightly-audit --note "Review dependency advisories"
+
+  # Pipe compact JSON or CloudEvents v1.0 over stdin (safe for scripts & hooks)
+  printf '{"label":"backup-done","to":"ops","note":"Snapshot verified"}' | hyp wakeup emit
+  ```
+- **Best-effort Tier 1–4 delivery ladder**:
+  1. **Tier 1 / 2 (Native push)**: Delivers immediately to live sessions via `hc send`/`hc interrupt`, T3 RPC, `codex queue`, hooks, `--claude-channel`, or `hyp wait`.
+  2. **Tier 3 (Busy `Hold` backoff & durable mailbox)**: Busy turns enter bounded retry backoff (`5s -> 15s -> 30s -> 60s`), cancelled immediately if a hook drains first, and coalesce cleanly in the durable local mailbox with TTL.
+  3. **Tier 4 (Strictly opt-in cold revival)**: Offline sessions are never spawned unexpectedly unless explicitly opted in via `node.json` (`codexResume` or allowlisted `herdrSpawnAllowlist`).
 
 ### Subscribing from Any Agent (`hyp_stream`)
 

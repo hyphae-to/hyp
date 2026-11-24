@@ -2,8 +2,9 @@
 name: hyphae-setup
 description: >-
   Interactive setup, first-time onboarding, and ongoing configuration concierge for Hyphae (`hyp`) —
-  local node, 9 coding harnesses, native wakeup transports (Herdr `hc`, Codex Queue,
-  `--claude-channel`, T3 Code, OpenClaw), Direct P2P (`hp2p1_`), Team Hubs (`am2_`),
+  local node, 9 coding harnesses with orchestrator-aware skills, native wakeup transports (Herdr `hc`,
+  Codex Queue, `--claude-channel`, T3 Code, OpenClaw), opt-in local wakeups & OS cron triggers,
+  Verified Human Drops & Blind Drop Relay, Direct P2P (`hp2p1_`), Team Hubs (`am2_`),
   Public Nodes, GitHub/Prometheus/webhook streams, Slack/Telegram bridges, and Local Security Gates.
 ---
 
@@ -26,7 +27,7 @@ command -v hc >/dev/null && hc templates --json || true
 
 Use the results to pick the right mode automatically:
 - **Mode 1 — First-Time Onboarding**: no `~/.config/hyphae/node.json` (or legacy `connector.json`) exists yet, or identity keys / harnesses have not been configured.
-- **Mode 2 — Ongoing Configuration Changes**: a node already exists (`nodeId`, keys, and `node.sqlite` present) and the user wants to add/remove harnesses, configure native wakeup transports (Herdr, Codex Queue, `--claude-channel`, T3 Code, OpenClaw), pair a laptop/server, deploy a Team Hub or Public Node, wire streams/bridges, configure a Security Gate, or fix `hyp doctor` warnings.
+- **Mode 2 — Ongoing Configuration Changes**: a node already exists (`nodeId`, keys, and `node.sqlite` present) and the user wants to add/remove harnesses, refresh tailored skills (`--refresh-skills`), configure native wakeup transports or opt-in local wakeups (`hyp wakeup enable`), enroll Verified Human Drops (`hyp auth init --web`, `hyp drop`, `hyp relay`), pair a laptop/server, deploy a Team Hub / Public Node / Drop Relay, wire streams/bridges, configure a Security Gate, or fix `hyp doctor` warnings.
 
 ---
 
@@ -54,11 +55,11 @@ Start with **2–3 concise questions** (adapt based on what `hyp doctor --json` 
    - **Direct P2P** (`--profile p2p`, `hp2p1_`) — pair directly with another laptop/server (zero central hub).
    - **Team Hub** (`--profile router`, `am2_`) — join an org's blind E2EE Team Hub or deploy a new one.
    - **Public Read-Only Node** (`guest-ro`) — subscribe to read-only GitHub event streams (e.g., `https://public.hyphae.to` or self-hosted `public-node`).
-3. **Optional integrations**: Do they want event streams (GitHub `github-public`, webhooks, Prometheus Alertmanager v4), external local chat bridges (`plugins/slack`, `plugins/telegram`, `plugins/whatsapp`, `plugins/webhook`), or a Local Security Gate prompt-injection guard?
+3. **Optional integrations**: Do they want opt-in local wakeups & OS cron triggers (`hyp wakeup enable`), Verified Human Drops (`hyp auth init --web` + Drop Relay), event streams (GitHub `github-public`, webhooks, Prometheus Alertmanager v4), external local chat bridges (`plugins/slack`, `plugins/telegram`, `plugins/whatsapp`, `plugins/webhook`), or a Local Security Gate prompt-injection guard?
 
 ### Step 1.1 — Bootstrap Node, Keys & Harnesses
 
-Use `--yes` so `hyp onboard` runs non-interactively without re-entering the interactive TTY wizard:
+Running `hyp onboard` interactively opens the fullscreen arrow-key Mycelium TUI wizard; when driving setup as an agent, pass `--yes` so `hyp onboard` runs non-interactively:
 
 ```sh
 # Local workstation node (default profile: local)
@@ -113,7 +114,7 @@ Check which orchestrators and native push transports are present on this machine
     hyp deploy init tailscale --node-id acme-team --domain hyphae.your-tailnet.ts.net --out ./deploy-tailscale --json
     hyp deploy check --config ./deploy-tailscale/node.json --json
     ```
-    Supported providers: `tailscale`, `vps`, `docker`, `cloudflare`, `fly`, `public-node`.
+    Supported providers: `tailscale`, `vps`, `docker`, `cloudflare`, `fly`, `public-node`, `drop-relay` (pass `--enable-drop-relay` to co-host a RAM-only Blind Drop Relay on any hub provider).
   - To **invite** a teammate from the admin machine:
     ```sh
     hyp pair invite --mode team \
@@ -151,13 +152,18 @@ hyp doctor --json
 
 Identify what the user wants to change and execute only the targeted workflow:
 
-### A. Add, Update, or Remove Harnesses
-- **Add or re-wire harnesses** (idempotent — preserves unrelated user settings):
+### A. Add, Update, or Remove Harnesses & Refresh Skills
+- **Add or re-wire harnesses** (idempotent — renders orchestrator-aware tailored `hyphae/SKILL.md` per harness without duplicating native OpenClaw/Antigravity tools, and preserves unrelated user settings):
   ```sh
   hyp setup --harness <name> --dry-run --json
   hyp setup --harness <name> --json
   ```
   Valid harness names: `antigravity`, `claude`, `codex`, `cursor`, `opencode`, `gemini`, `openclaw`, `herdr`, `t3` (or `auto`, `all`).
+- **Refresh managed orchestrator-aware `hyphae/SKILL.md` files** after upgrades (preserves unmanaged custom edits unless `--force-skills` is passed):
+  ```sh
+  hyp setup --refresh-skills --json
+  hyp setup --force-skills --json
+  ```
 - **Refresh the `hyphae-setup` skill across detected harnesses**:
   ```sh
   hyp onboard --install-skill --json
@@ -174,16 +180,52 @@ Identify what the user wants to change and execute only the targeted workflow:
   ```
 - Join a public node: `hyp pair join https://public.hyphae.to --json`
 
-### C. Deploy or Validate a Hub / Public Node
+### C. Deploy or Validate a Hub, Public Node, or Blind Drop Relay
 ```sh
 hyp deploy providers --json
-hyp deploy init <tailscale|vps|docker|cloudflare|fly|public-node> \
+hyp deploy init <tailscale|vps|docker|cloudflare|fly|public-node|drop-relay> \
   --node-id <node-id> --domain <hostname> --out ./deploy-kit --json
+# Dedicated 256 MiB RAM-only Drop Relay:
+hyp deploy init drop-relay --domain drop.example.com --max-memory-mb 256 --out ./deploy-drop-relay --json
+# Or co-host a Drop Relay alongside a hub/public-node with --enable-drop-relay:
+hyp deploy init public-node --node-id mesh.example.org --domain mesh.example.org --enable-drop-relay --out ./deploy-public --json
 hyp deploy check --config ./deploy-kit/node.json --json
 hyp deploy check --url https://<hostname> --json
 ```
 
-### D. Configure Event Streams & External Chat Bridges
+### D. Enable Opt-In Local Wakeups & OS Cron Triggers
+- Enable the compiled-in `wakeup` source once (`--mcp-tool auto` exposes `hyp_wakeup` on Herdr/Codex/Claude/T3/Cursor/OpenCode/Gemini and keeps 0 extra tokens on OpenClaw & Antigravity). See `skills/hyphae-wakeup/SKILL.md` for full timer/cron & `crontab`/`systemd --user`/`launchd` recipes:
+  ```sh
+  hyp wakeup enable --mcp-tool auto --json
+  hyp wakeup set --in 15m --label check-ci --note "Check build status" --json
+  hyp wakeup set --cron "0 9 * * 1-5" --timezone local --label morning-triage --to dev --json
+  hyp wakeup list --json
+  hyp wakeup cancel <id> --json
+  hyp wakeup fire --to dev --label morning-triage --note "Run daily check" --json
+  hyp wakeup disable --json
+  ```
+
+### E. Verified Human Drops & Blind Drop Relay
+- Never ask the human to paste secrets in chat; use `hyp auth init --web` (phone WebAuthn Passkey+PRF via `https://hyphae.to/drop` or local Keychain Ed25519 key) and `hyp drop create` (or MCP `hyp_mesh({ action: "drop_link", kind: "secret", secretName: "<name>" })` — fresh human input only, zero secret bytes ever enter SQLite, logs, relay plaintext RAM, or LLM context):
+  ```sh
+  # Human runs locally to pair phone Passkey+PRF (or omit --web for CLI Keychain key)
+  hyp auth init --web
+  hyp auth list --json
+  hyp auth certify-node --json
+  hyp auth revoke <kid> --bump-epoch --json
+
+  # Point node at a self-hosted or team RAM-only Drop Relay
+  hyp relay set https://drop.example.com --json
+  hyp relay status --json
+
+  # Create a one-shot drop link (zero-knowledge Keychain secret or TrustTier::HumanVerified directive)
+  hyp drop create --kind secret --secret-name stripe-key --json
+  hyp drop create --kind directive --json
+  hyp drop wait --json
+  ```
+  *(Use `hyp drop ingest` reading stdin for offline/air-gapped `hdrop1_` envelopes.)*
+
+### F. Configure Event Streams & External Chat Bridges
 1. **Capture required tokens out-of-band** (never in chat, never in CLI argv):
    ```sh
    hyp secret set github-public-token --web
@@ -199,7 +241,7 @@ hyp deploy check --url https://<hostname> --json
    - Supervised over fd-3 JSON-RPC 2.0 by `hyp daemon`; always configure explicit allowlists (`SLACK_ALLOWED_USERS` / `SLACK_ALLOWED_CHANNELS`, `TELEGRAM_ALLOWED_USERS` / `TELEGRAM_ALLOWED_CHATS`, etc.) and reference tokens via `{ "secret": "<name>" }`.
 4. Restart the background daemon after editing `node.json` (`hyp service restart --json`), then verify with `hyp doctor --json`.
 
-### E. Propose & Lock a Local Security Gate
+### G. Propose & Lock a Local Security Gate
 1. Store the classifier API key out-of-band (skip for local Ollama `openai-compat` or local `subprocess` plugins):
    ```sh
    hyp secret set anthropic-api-key --web
@@ -208,7 +250,7 @@ hyp deploy check --url https://<hostname> --json
    ```sh
    hyp gate propose --adapter anthropic --secret anthropic-api-key --json
    ```
-3. Have the human review the proposed policy and lock the tamper-evident signature (`gate_policy_sig`):
+3. Have the human review the proposed policy and lock the tamper-evident signature (`gate_policy_sig`, binding `human_authorities_digest` when human keys are enrolled):
    ```sh
    hyp gate init --adapter anthropic --secret anthropic-api-key --lock
    # Or sign an already-edited gate block in node.json:
@@ -222,7 +264,7 @@ hyp deploy check --url https://<hostname> --json
    hyp gate log --decision all
    ```
 
-### F. Health, Background Daemon Service & Updates
+### H. Health, Background Daemon Service & Updates
 ```sh
 hyp service status --json   # check LaunchAgent / systemd --user & live connector.sock status
 hyp service install --json  # install & start auto-restarting background daemon service

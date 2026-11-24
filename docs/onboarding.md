@@ -33,7 +33,7 @@ cargo install --path crates/hyp-cli
 
 ## 2. Bootstrap Your Local Node
 
-Run `hyp onboard` to generate persistent Ed25519 + X25519 keys, initialize `~/.config/hyphae/node.json` and `~/.config/hyphae/node.sqlite` (WAL mode), and configure all detected agent harnesses automatically:
+Run `hyp onboard` in an interactive terminal to launch the fullscreen arrow-key **Mycelium onboarding TUI wizard** (automatically falling back to prompts/flags on non-TTY pipes, or pass `--assist` to let your coding agent run setup). To bootstrap non-interactively in one command:
 
 ```sh
 hyp onboard --profile local --node-id alice@macbook --harness auto
@@ -42,9 +42,9 @@ hyp onboard --profile local --node-id alice@macbook --harness auto
 What `hyp onboard` sets up:
 - **Persistent cryptographic identity**: Generates Ed25519 signing and X25519 encryption keypairs in your OS secret store (macOS Keychain via `/usr/bin/security`, Linux Secret Service via `secret-tool`, or `0600` files in `~/.config/hyphae/secrets/` on headless servers and Windows; overrideable with `HYPHAE_SECRET_BACKEND=keychain|secret-service|file`).
 - **Unified config & state**: Writes `~/.config/hyphae/node.json` (`0600`) and initializes `~/.config/hyphae/node.sqlite`. *(Existing legacy `connector.json` configs are also read transparently.)*
-- **Harness hooks & MCP wiring**: Points detected harnesses directly to the static `hyp` binary (no cached Node/NVM paths that break on upgrades).
+- **Orchestrator-aware harness wiring & tailored skills**: Points detected harnesses directly to the static `hyp` binary (no cached Node/NVM paths that break on upgrades) and renders tailored `hyphae/SKILL.md` files per harness (plus Desktop/IDE guides) so OpenClaw and Antigravity never receive duplicate messaging/scheduling instructions.
 
-You can also inspect or configure harnesses independently at any time:
+You can inspect, wire, or refresh managed skills independently at any time:
 
 ```sh
 # Preview planned harness changes without touching disk
@@ -53,11 +53,18 @@ hyp setup --harness auto --dry-run
 # Configure specific harnesses or all 9 harnesses
 hyp setup --harness claude,codex,antigravity
 hyp setup --harness all
+
+# Regenerate managed orchestrator-aware skills after an upgrade (use --force-skills to overwrite local edits)
+hyp setup --refresh-skills
 ```
 
-Start the unified Node + local harness IPC daemon (`connector.sock` on Unix, loopback TCP `connector.addr` on Windows):
+Install the persistent background daemon service (macOS LaunchAgent / Linux `systemd --user`) or run in the foreground:
 
 ```sh
+hyp service install
+hyp service status
+
+# Or run foreground directly (containers / Windows / debugging):
 hyp node start
 # Alias: hyp daemon
 ```
@@ -73,7 +80,7 @@ hyp doctor --json
 
 ### Agent-Led Onboarding
 
-Prefer having your coding agent guide setup? Every CLI command supports `--json`, and [skills/hyphae-onboard/SKILL.md](../skills/hyphae-onboard/SKILL.md) teaches agents how to inspect your environment (`hyp status --json`, `hyp deploy providers --json`, `hyp pair guide --json`) and capture credentials strictly out-of-band via `hyp secret set <name> --web`.
+Prefer having your coding agent guide setup? Run `hyp onboard --assist` or load [skills/hyphae-setup/SKILL.md](../skills/hyphae-setup/SKILL.md). Every CLI command supports `--json` so agents can inspect your environment (`hyp status --json`, `hyp deploy providers --json`, `hyp pair guide --json`) and capture credentials strictly out-of-band via `hyp secret set <name> --web`.
 
 ---
 
@@ -101,7 +108,7 @@ Prefer having your coding agent guide setup? Every CLI command supports `--json`
 
 ### B. Team Hub (`am2_`, Blind E2EE Org Admin-CA)
 
-1. **Deploy the Team Hub** using any of the 6 hardened deployment kits (`tailscale`, `vps`, `docker`, `cloudflare`, `fly`, `public-node`) documented in [docs/deploying.md](deploying.md):
+1. **Deploy the Team Hub** using any of the 7 hardened deployment kits (`tailscale`, `vps`, `docker`, `cloudflare`, `fly`, `public-node`, `drop-relay`) documented in [docs/deploying.md](deploying.md):
    ```sh
    hyp deploy init tailscale \
      --node-id acme-team \
@@ -166,7 +173,46 @@ hyp doctor
 
 ---
 
-## 5. Verification, Diagnostics & Updates
+## 5. Opt-In Wakeups & Verified Human Drops
+
+### A. Enable Local Wakeups & OS Cron Triggers
+
+Add the compiled-in `wakeup` event source once (writes a `kind: "wakeup"` entry in `node.json`; default `--mcp-tool auto` exposes `hyp_wakeup` on Herdr/Codex/Claude/T3/Cursor/OpenCode/Gemini while keeping 0 extra tokens on OpenClaw & Antigravity):
+
+```sh
+hyp wakeup enable
+hyp wakeup set --in 15m --label check-ci --note "Verify CI build"
+hyp wakeup set --cron "0 9 * * 1-5" --timezone local --label morning-triage --to dev
+
+# One-liner for crontab / systemd --user / launchd:
+hyp wakeup fire --to dev --label nightly-audit --note "Check advisories"
+```
+
+See [skills/hyphae-wakeup/SKILL.md](../skills/hyphae-wakeup/SKILL.md) and [docs/plugins.md](plugins.md) for OS scheduler examples and the Tier 1–4 delivery ladder.
+
+### B. Enroll a Phone Passkey & Configure a Drop Relay
+
+Verified Human Drops let you send zero-knowledge OS Keychain secrets and `TrustTier::HumanVerified` directives straight from your phone (`https://hyphae.to/drop`) or laptop CLI:
+
+```sh
+# 1. Pair your phone's WebAuthn Passkey+PRF (or omit --web for a local CLI Ed25519 key in Keychain)
+hyp auth init --web
+hyp auth list
+
+# 2. Point your node at a self-hosted (or team) RAM-only Drop Relay
+hyp relay set https://drop.example.com
+hyp relay status
+
+# 3. Mint a one-shot drop link (zero-knowledge secret or verified directive) and wait for it
+hyp drop create --kind secret --secret-name stripe-key
+hyp drop wait
+```
+
+*(Agents can also request a fresh human drop link via `hyp_mesh({ action: "drop_link", kind: "secret", secretName: "stripe-key" })` — never pre-filling directive text and never seeing secret bytes.)*
+
+---
+
+## 6. Verification, Diagnostics & Updates
 
 - **`hyp status [--json]`**: Renders node identity (`kid`, fingerprint), local IPC status, Security Gate signature & quarantine count, update channel status, and the **Peer Capabilities & Version Skew** table.
 - **`hyp doctor [--json]`**: Runs fail-closed diagnostics across `node.json`, `node.sqlite` WAL health, peer capability skew, `gate_policy_sig`, and all 9 harness integrations (exit `0` ok, `1` failure).
