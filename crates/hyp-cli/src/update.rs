@@ -149,7 +149,7 @@ pub struct UpdateArgs {
     pub manifest_url: Option<String>,
 
     /// Override pinned Ed25519 release signing public key (43-char base64url)
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub pubkey: Option<String>,
 
     /// Explicit target binary path to atomically replace (defaults to current_exe)
@@ -199,7 +199,7 @@ pub enum UpdateAction {
         #[arg(long)]
         manifest_url: Option<String>,
         /// Override pinned Ed25519 release signing public key (43-char base64url)
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         pubkey: Option<String>,
         /// Override target triple
         #[arg(long)]

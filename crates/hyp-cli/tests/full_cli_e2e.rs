@@ -15,7 +15,9 @@ use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full};
 use hyp_crypto::keys::Ed25519KeyPair;
 use hyp_crypto::keystore::{SecretBackend, SecretStore};
-use hyp_crypto::transfer::{TarInputEntry, TarPackOptions, pack_tar_gz, pack_tar_gz_bytes};
+#[cfg(windows)]
+use hyp_crypto::transfer::{TarInputEntry, pack_tar_gz};
+use hyp_crypto::transfer::{TarPackOptions, pack_tar_gz_bytes};
 use hyp_proto::address::NodeId;
 use hyp_proto::manifest::{
     AdvertisedResources, CapabilityToken, ManifestIdentity, ManifestPolicy, NodeManifestPayload,
@@ -1190,19 +1192,34 @@ fn self_update_signed_manifest_atomic_swap_rollback_tamper_and_fleet_all() {
     fs::create_dir_all(&home).unwrap();
 
     // Build real tar.gz archives:
-    // 1) Good archive containing a real copy of `hyp` executable (passes `version --json`)
+    // 1) Good archive containing an executable that runs our real compiled `hyp` (`version --json`).
+    //    On Unix, use a tiny POSIX exec wrapper so Linux unstripped debug ELF binaries (>128 MiB)
+    //    stay well under MAX_ARCHIVE_BYTES and run in milliseconds.
     let good_archive = {
         let mut buf = Vec::new();
-        let entry_name = if cfg!(windows) { "hyp.exe" } else { "hyp" };
-        pack_tar_gz(
-            &[TarInputEntry {
-                archive_path: entry_name.to_string(),
-                source_path: PathBuf::from(hyp_rs_bin()),
-            }],
-            &mut buf,
-            TarPackOptions::default(),
-        )
-        .unwrap();
+        #[cfg(windows)]
+        {
+            pack_tar_gz(
+                &[TarInputEntry {
+                    archive_path: "hyp.exe".to_string(),
+                    source_path: PathBuf::from(hyp_rs_bin()),
+                }],
+                &mut buf,
+                TarPackOptions::default(),
+            )
+            .unwrap();
+        }
+        #[cfg(not(windows))]
+        {
+            let escaped = hyp_rs_bin().replace('\'', "'\"'\"'");
+            let wrapper = format!("#!/bin/sh\nexec '{escaped}' \"$@\"\n");
+            pack_tar_gz_bytes(
+                &[("hyp", wrapper.as_bytes())],
+                &mut buf,
+                TarPackOptions::default(),
+            )
+            .unwrap();
+        }
         buf
     };
     let good_sha = hex::encode(Sha256::digest(&good_archive));
@@ -1589,7 +1606,13 @@ fn self_update_signed_manifest_atomic_swap_rollback_tamper_and_fleet_all() {
         ])
         .output()
         .unwrap();
-    assert_eq!(ok_out.status.code(), Some(0));
+    assert_eq!(
+        ok_out.status.code(),
+        Some(0),
+        "update --all failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&ok_out.stdout),
+        String::from_utf8_lossy(&ok_out.stderr)
+    );
     let ok_json = parse_json_stdout(&ok_out);
     assert_eq!(ok_json["ok"], true);
     assert_eq!(ok_json["data"]["signatureVerified"], true);

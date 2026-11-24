@@ -46,7 +46,7 @@ use hyp_crypto::rfc3339::format_rfc3339_millis;
 use hyp_crypto::transfer::{TarInputEntry, TarPackOptions, TarUnpackOptions, pack_tar_gz, unpack_tar_gz};
 use hyp_crypto::{Ed25519KeyPair, SecretBackend, SecretStore};
 use hyp_node::adapters::{
-    AdapterError, AdapterHealth, AdapterKind, BoxFuture, CompiledSubscription,
+    AdapterError, AdapterHealth, BoxFuture, CompiledSubscription,
     GitHubPublicAdapter, GitHubPublicConfig, GitHubWebhookAdapter, GitHubWebhookConfig,
     NodeAdapter, NodeAdapterHost, PrometheusWebhookAdapter, PrometheusWebhookConfig,
     PublishErrorCode, PublishOutcome, PublishStatus, WebhookIngestOutcome,
@@ -2940,7 +2940,9 @@ async fn chaos_webhook_transfer_and_subprocess_adapter_to_gated_node_e2e() {
     // 3. On Unix, wire a live JSON-RPC 2.0 fd-3 `SubprocessSupervisor` bridge into `ops-hub`!
     #[cfg(unix)]
     {
-        use hyp_node::adapters::{HelloMode, SubprocessConfig, SubprocessSupervisor, WireProtocol};
+        use hyp_node::adapters::{
+            AdapterKind, HelloMode, SubprocessConfig, SubprocessSupervisor, WireProtocol,
+        };
         if std::process::Command::new("python3")
             .arg("--version")
             .output()
