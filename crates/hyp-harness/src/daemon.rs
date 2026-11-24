@@ -823,6 +823,7 @@ impl LocalDaemon {
                 event: ce,
                 transfer_paths: Vec::new(),
                 rendered_text: Some(text.clone()),
+                human_auth: None,
             };
             let eval = pipeline
                 .evaluate_inbound(&ctx, now)
@@ -1215,6 +1216,7 @@ impl LocalDaemonInner {
             event: gate_ce,
             transfer_paths: Vec::new(),
             rendered_text: Some(formatted_text.to_string()),
+            human_auth: None,
         };
 
         let eval = pipeline
@@ -1952,6 +1954,7 @@ impl LocalDaemonInner {
                         event: ce,
                         transfer_paths: Vec::new(),
                         rendered_text: Some(entry.text.clone()),
+                        human_auth: None,
                     };
                     match pipeline.evaluate_inbound(&ctx, now).await {
                         Ok(eval) => match eval.decision {

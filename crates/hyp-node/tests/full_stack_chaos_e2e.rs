@@ -466,6 +466,7 @@ fn make_gated_event_ctx(
         event: ev,
         transfer_paths: Vec::new(),
         rendered_text: Some(rendered),
+        human_auth: None,
     }
 }
 
@@ -1992,6 +1993,7 @@ async fn chaos_mid_session_grant_revocation_and_tampered_gate_policy() {
             event: ev,
             transfer_paths: Vec::new(),
             rendered_text: Some("TAMPER_CANARY_MUST_NOT_LEAK".to_string()),
+            human_auth: None,
         };
         let eval = tampered_pipeline
             .evaluate_inbound(&ctx, now_ms())

@@ -274,6 +274,7 @@ fn make_inbound_dm(
         event,
         transfer_paths: Vec::new(),
         rendered_text: Some(text.to_string()),
+        human_auth: None,
     }
 }
 

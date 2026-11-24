@@ -156,7 +156,11 @@ impl Stage1Engine {
         now_ms: i64,
     ) -> Stage1Outcome {
         // 1. Cryptographic identity & anti-downgrade E2EE verification.
-        if ctx.trust_tier.is_remote_peer() {
+        if ctx.trust_tier == TrustTier::HumanVerified {
+            if ctx.human_auth.is_none() || !ctx.identity_verified || !ctx.e2ee_verified {
+                return Stage1Outcome::block("human_auth_unverified", "human_auth_unverified");
+            }
+        } else if ctx.trust_tier.is_remote_peer() {
             if !ctx.identity_verified {
                 return Stage1Outcome::block("unverified_identity", "identity_unverified");
             }
@@ -168,48 +172,52 @@ impl Stage1Engine {
             }
         }
 
-        // 2. Session/connector mute check against `NodeDb` `muted_sources`.
-        if let Some(node_db) = db {
-            let mut candidates: Vec<&str> = Vec::with_capacity(6);
-            if !ctx.sender.is_empty() {
-                candidates.push(ctx.sender.as_str());
-            }
-            if !ctx.origin_node.is_empty() {
-                candidates.push(ctx.origin_node.as_str());
-            }
-            if !ctx.event.source.is_empty() {
-                candidates.push(ctx.event.source.as_str());
-            }
-            if let Some(ch) = ctx.channel.as_deref() {
-                candidates.push(ch);
-            }
-            if let Some(topic) = ctx.topic.as_deref() {
-                candidates.push(topic);
-            }
-            if let Some(bridge) = ctx.bridge.as_deref() {
-                candidates.push(bridge);
-            }
-            match node_db.local().is_muted(&ctx.session_id, &candidates) {
-                Ok(Some(matched_pattern)) => {
-                    return Stage1Outcome::block(
-                        format!("muted_source:{matched_pattern}"),
-                        "muted_source",
-                    );
+        // 2. Session/connector mute check against `NodeDb` `muted_sources`
+        // (bypassed for verified human operator directives).
+        if ctx.trust_tier != TrustTier::HumanVerified {
+            if let Some(node_db) = db {
+                let mut candidates: Vec<&str> = Vec::with_capacity(6);
+                if !ctx.sender.is_empty() {
+                    candidates.push(ctx.sender.as_str());
                 }
-                Ok(None) => {}
-                Err(_) => {
-                    // Fail closed if mute lookup encounters a DB error.
-                    return Stage1Outcome::block("mute_lookup_error", "mute_lookup_error");
+                if !ctx.origin_node.is_empty() {
+                    candidates.push(ctx.origin_node.as_str());
+                }
+                if !ctx.event.source.is_empty() {
+                    candidates.push(ctx.event.source.as_str());
+                }
+                if let Some(ch) = ctx.channel.as_deref() {
+                    candidates.push(ch);
+                }
+                if let Some(topic) = ctx.topic.as_deref() {
+                    candidates.push(topic);
+                }
+                if let Some(bridge) = ctx.bridge.as_deref() {
+                    candidates.push(bridge);
+                }
+                match node_db.local().is_muted(&ctx.session_id, &candidates) {
+                    Ok(Some(matched_pattern)) => {
+                        return Stage1Outcome::block(
+                            format!("muted_source:{matched_pattern}"),
+                            "muted_source",
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        // Fail closed if mute lookup encounters a DB error.
+                        return Stage1Outcome::block("mute_lookup_error", "mute_lookup_error");
+                    }
                 }
             }
         }
 
         // 3. Inbound CloudEvents Filter AST ACL checks (denylist, global allowlist, session allowlist).
-        if self
-            .config
-            .inbound_denylist
-            .iter()
-            .any(|filter| matches_filter(filter, &ctx.event))
+        if ctx.trust_tier != TrustTier::HumanVerified
+            && self
+                .config
+                .inbound_denylist
+                .iter()
+                .any(|filter| matches_filter(filter, &ctx.event))
         {
             return Stage1Outcome::block("inbound_acl_denied", "acl_denied");
         }
@@ -251,8 +259,9 @@ impl Stage1Engine {
             }
         }
 
-        // 6. Deterministic inbound content regex denylist.
-        if !self.inbound_deny_regexes.is_empty() {
+        // 6. Deterministic inbound content regex denylist
+        // (bypassed for verified human operator directives).
+        if ctx.trust_tier != TrustTier::HumanVerified && !self.inbound_deny_regexes.is_empty() {
             let texts = collect_inbound_searchable_texts(ctx);
             for (idx, re) in self.inbound_deny_regexes.iter().enumerate() {
                 if texts.iter().any(|t| re.is_match(t)) {

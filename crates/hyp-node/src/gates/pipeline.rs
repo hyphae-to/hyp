@@ -130,7 +130,8 @@ impl SecurityGatePipeline {
         Arc::clone(&self.db)
     }
 
-    /// Returns `true` if `require_signed_policy` is active and the policy signature is missing or invalid.
+    /// Returns `true` if `require_signed_policy` is active and either the policy signature is
+    /// missing/invalid OR the signed `human_authorities_digest` no longer matches `NodeDb`.
     pub fn is_policy_tampered(&self) -> bool {
         if !self.config.require_signed_policy {
             return false;
@@ -141,7 +142,22 @@ impl SecurityGatePipeline {
         let Some(store) = self.secrets.as_deref() else {
             return true;
         };
-        verify_gate_policy_sig(&self.config, sig, store).is_err()
+        if verify_gate_policy_sig(&self.config, sig, store).is_err() {
+            return true;
+        }
+        if let Some(ref expected_digest) = self.config.human_authorities_digest {
+            let actual = {
+                let Ok(db) = self.db.lock() else {
+                    return true;
+                };
+                db.human().authorities_digest()
+            };
+            match actual {
+                Ok(digest) if digest == *expected_digest => {}
+                _ => return true,
+            }
+        }
+        false
     }
 
     /// Evaluates a single transfer archive relative path against Stage 1 attachment safety rules.
@@ -318,6 +334,97 @@ impl SecurityGatePipeline {
                 });
             }
         };
+
+        // Step 1.5: Cryptographically verified human authority directives bypass Stage 2 and
+        // `filters[]`, attach `human_auth_json` to the mailbox receipt, and write an immutable
+        // `human_authority` audit record.
+        if ctx.trust_tier == TrustTier::HumanVerified {
+            let Some(ref auth) = ctx.human_auth else {
+                return Ok(InboundEvaluation {
+                    decision: GateDecision::Block {
+                        reason: "human_auth_unverified".to_string(),
+                    },
+                    stage: "human_authority".to_string(),
+                    receipt: None,
+                    duplicate: false,
+                    payload_sha256,
+                    audit_seq: None,
+                    confidence: Some(1.0),
+                    categories: vec![
+                        "gate.blocked".to_string(),
+                        "human_auth_unverified".to_string(),
+                    ],
+                });
+            };
+            let (receipt, duplicate) = self.store_in_mailbox(
+                ctx,
+                &payload_text,
+                GateState::Pending,
+                downgraded_from_stage1.then(|| "downgraded_to_notify".to_string()),
+                traceparent.clone(),
+                now_ms,
+            )?;
+            if receipt.is_none() && !duplicate {
+                return Ok(InboundEvaluation {
+                    decision: GateDecision::Hold {
+                        reason: "local_inbox_full".to_string(),
+                        retry_after_ms: 5_000,
+                    },
+                    stage: "mailbox".to_string(),
+                    receipt: None,
+                    duplicate: false,
+                    payload_sha256,
+                    audit_seq: None,
+                    confidence: Some(1.0),
+                    categories: vec!["local_inbox_full".to_string()],
+                });
+            }
+            if let Some(ref r) = receipt {
+                let auth_json = serde_json::to_string(auth).map_err(|e| {
+                    GateError::InvalidConfig(format!("failed to serialize verified human claim: {e}"))
+                })?;
+                let db_guard = self
+                    .db
+                    .lock()
+                    .map_err(|_| GateError::LockPoisoned("node_db mutex poisoned".to_string()))?;
+                let _ = db_guard.human().set_mailbox_human_auth(r, &auth_json)?;
+            }
+            let kid8: String = auth.kid.chars().take(8).collect();
+            let mut cats = vec!["gate.allowed".to_string(), "human.verified".to_string()];
+            cats.extend(stage1_out.categories);
+            let audit_seq = self.record_audit(
+                &GateAuditInput {
+                    direction: GateDirection::Inbound,
+                    stage: "human_authority".to_string(),
+                    decision: StoreGateDecision::Allow,
+                    origin_node: Some(ctx.origin_node.clone()),
+                    source: Some(ctx.sender.clone()),
+                    session_id: Some(ctx.session_id.clone()),
+                    receipt_id: receipt.clone(),
+                    event_type: Some(ctx.event.event_type.clone()),
+                    trust_tier: Some("human-verified".to_string()),
+                    confidence: Some(1.0),
+                    categories: cats.clone(),
+                    reason: downgraded_from_stage1.then(|| "downgraded_to_notify".to_string()),
+                    traceparent,
+                    payload_sha256: payload_sha256.clone(),
+                    reviewer: Some(format!("human:{}:{}", auth.human_id, kid8)),
+                },
+                now_ms,
+            )?;
+            return Ok(InboundEvaluation {
+                decision: GateDecision::Allow {
+                    downgraded_to_notify: downgraded_from_stage1,
+                },
+                stage: "human_authority".to_string(),
+                receipt,
+                duplicate,
+                payload_sha256,
+                audit_seq: Some(audit_seq),
+                confidence: Some(1.0),
+                categories: cats,
+            });
+        }
 
         // Step 2: Composable FilterPlugin chain (legacy `stage2` + ordered `filters[]`).
         // Short-circuits fail-closed on the first Hold / Quarantine / Block!

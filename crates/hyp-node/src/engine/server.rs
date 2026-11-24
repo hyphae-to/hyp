@@ -26,11 +26,15 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::Bytes;
-use http::{Method, Request, Response, StatusCode};
+use http::header::{
+    ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_MAX_AGE, ORIGIN,
+};
+use http::{HeaderMap, Method, Request, Response, StatusCode};
 use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
+use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
@@ -44,11 +48,15 @@ use hyp_store::{KvDeleteInput, KvSetInput, StoreError, now_ms};
 
 use crate::adapters::{AdapterError, WebhookIngestOutcome};
 use crate::engine::config::NodeError;
+use crate::engine::drop_relay::{
+    CreateDropRequest, DROP_CAP_HEADER, DROP_SSE_KEEPALIVE_SECONDS, DropCapRole, DropRelay,
+    DropRelayError, DropSubscriberAuth, DropSubscription,
+};
 use crate::engine::http_util::{
-    BoxedBody, SseEvent, bytes_response, etag_matches_if_none_match, format_version_etag,
-    json_response, json_response_with_etag, not_modified_response, parse_if_match_version,
-    parse_query, percent_decode, problem_response, read_body_bytes, sse_keepalive_frame,
-    sse_response, with_retry_after,
+    BoxedBody, SseEvent, bytes_response, empty_body, etag_matches_if_none_match,
+    format_version_etag, json_response, json_response_with_etag, not_modified_response,
+    parse_if_match_version, parse_query, percent_decode, problem_response, read_body_bytes,
+    sse_keepalive_frame, sse_response, with_retry_after,
 };
 use crate::engine::node::{AuthenticatedPeer, UnifiedNode};
 use crate::engine::peer_link::{
@@ -62,7 +70,20 @@ use crate::engine::peer_link::{
 };
 
 const MAX_JSON_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DROP_CONTROL_BODY_BYTES: usize = 16 * 1024;
 const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(25);
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AckDropBody {
+    seq: u64,
+    #[serde(default = "default_true")]
+    burn: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
 
 impl UnifiedNode {
     /// Binds and serves this `UnifiedNode`'s HTTP/1.1+2 + WHATWG SSE peer server on `addr`
@@ -88,7 +109,7 @@ impl UnifiedNode {
                         continue;
                     }
                 };
-                let (stream, _peer_addr) = match accept {
+                let (stream, peer_addr) = match accept {
                     Ok(pair) => pair,
                     Err(_) => continue,
                 };
@@ -101,7 +122,9 @@ impl UnifiedNode {
                     let io = TokioIo::new(stream);
                     let service = service_fn(move |req: Request<Incoming>| {
                         let n = Arc::clone(&conn_node);
-                        async move { Ok::<_, Infallible>(handle_http_request(n, req).await) }
+                        async move {
+                            Ok::<_, Infallible>(handle_http_request(n, peer_addr, req).await)
+                        }
                     });
                     let builder = AutoServerBuilder::new(TokioExecutor::new());
                     let conn = builder.serve_connection(io, service);
@@ -124,9 +147,10 @@ impl UnifiedNode {
 
 async fn handle_http_request(
     node: Arc<UnifiedNode>,
+    peer_addr: SocketAddr,
     req: Request<Incoming>,
 ) -> Response<BoxedBody> {
-    match route_request(node, req).await {
+    match route_request(node, peer_addr, req).await {
         Ok(resp) => resp,
         Err(err) => {
             let retry_after = match &err {
@@ -134,6 +158,7 @@ async fn handle_http_request(
                     retry_after_secs, ..
                 } => *retry_after_secs,
                 NodeError::Store(StoreError::RateLimited(_)) => Some(60),
+                NodeError::DropRelay(e) => e.retry_after_secs(),
                 _ => None,
             };
             let resp = problem_response(&err.to_problem_details());
@@ -147,6 +172,7 @@ async fn handle_http_request(
 
 async fn route_request(
     node: Arc<UnifiedNode>,
+    peer_addr: SocketAddr,
     req: Request<Incoming>,
 ) -> Result<Response<BoxedBody>, NodeError> {
     let method = req.method().clone();
@@ -164,6 +190,23 @@ async fn route_request(
         let empty_sha = hex::encode(Sha256::digest(b""));
         let caller = require_auth(&node, &headers, "GET", &path_and_query, &empty_sha)?;
         return Ok(start_inbox_sse_stream(node, caller));
+    }
+
+    // RAM-only Blind Ephemeral Drop Relay endpoints MUST be handled BEFORE generic body reads
+    // so capability tokens are verified before allocating body bytes and SSE streams do not read
+    // request bodies.
+    if path == "/v1/drops" || path.starts_with("/v1/drops/") {
+        return handle_drop_relay_request(
+            node,
+            peer_addr,
+            method,
+            &path,
+            &path_and_query,
+            &query,
+            &headers,
+            req.into_body(),
+        )
+        .await;
     }
 
     // Determine max body cap (transfers permit up to configured `max_bytes`).
@@ -213,6 +256,7 @@ async fn route_request(
                 "profile": node.config().profile,
                 "guestPairingEnabled": node.config().guest_pairing.enabled,
                 "githubPublic": gh_summary,
+                "dropRelay": node.drop_relay().health(now_ms()),
             }),
         ));
     }
@@ -850,13 +894,310 @@ async fn route_request(
 
 fn require_auth(
     node: &UnifiedNode,
-    headers: &http::HeaderMap,
+    headers: &HeaderMap,
     method: &str,
     path_and_query: &str,
     body_sha256: &str,
 ) -> Result<AuthenticatedPeer, NodeError> {
     node.authenticate_request(headers, method, path_and_query, body_sha256)?
         .ok_or_else(|| NodeError::Unauthorized("missing Authorization header".into()))
+}
+
+fn request_origin(headers: &HeaderMap) -> Option<&str> {
+    headers.get(ORIGIN).and_then(|v| v.to_str().ok())
+}
+
+fn drop_cap_header(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(DROP_CAP_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn drop_relay_error_response(
+    relay: &DropRelay,
+    req_headers: &HeaderMap,
+    err: &DropRelayError,
+    with_cors: bool,
+) -> Response<BoxedBody> {
+    let mut resp = problem_response(&err.to_problem_details());
+    if let Some(secs) = err.retry_after_secs() {
+        resp = with_retry_after(resp, secs);
+    }
+    if with_cors {
+        relay.apply_cors_headers(request_origin(req_headers), resp.headers_mut());
+    }
+    resp
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_drop_relay_request(
+    node: Arc<UnifiedNode>,
+    peer_addr: SocketAddr,
+    method: Method,
+    path: &str,
+    path_and_query: &str,
+    query: &std::collections::BTreeMap<String, String>,
+    headers: &HeaderMap,
+    body: Incoming,
+) -> Result<Response<BoxedBody>, NodeError> {
+    let relay = node.drop_relay();
+    if !relay.is_enabled() {
+        return Ok(drop_relay_error_response(
+            &relay,
+            headers,
+            &DropRelayError::Disabled,
+            false,
+        ));
+    }
+
+    if method == Method::OPTIONS {
+        let mut resp = Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header(ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS")
+            .header(
+                ACCESS_CONTROL_ALLOW_HEADERS,
+                "Content-Type, X-Hyphae-Drop-Cap, Last-Event-ID",
+            )
+            .header(ACCESS_CONTROL_MAX_AGE, "600")
+            .body(empty_body())
+            .expect("valid 204 preflight response");
+        relay.apply_cors_headers(request_origin(headers), resp.headers_mut());
+        return Ok(resp);
+    }
+
+    let client_ip = peer_addr.ip().to_string();
+
+    // POST /v1/drops
+    if path == "/v1/drops" {
+        if method != Method::POST {
+            return Err(NodeError::BadRequest("method not allowed".into()));
+        }
+        let body_bytes = read_body_bytes(body, MAX_DROP_CONTROL_BODY_BYTES).await?;
+        let body_sha = hex::encode(Sha256::digest(&body_bytes));
+        let caller = require_auth(&node, headers, "POST", path_and_query, &body_sha)?;
+        let allowed =
+            caller.peer_id == node.node_id().as_str() || caller.scopes.allows_drop_create();
+        node.require_scope(&caller, allowed, "drop:create")?;
+        let create_req: CreateDropRequest = if body_bytes.is_empty() {
+            CreateDropRequest::default()
+        } else {
+            serde_json::from_slice(&body_bytes)?
+        };
+        return match relay.create_drop(&caller.peer_id, &client_ip, create_req, now_ms()) {
+            Ok(created) => Ok(json_response(StatusCode::CREATED, &created)),
+            Err(err) => Ok(drop_relay_error_response(&relay, headers, &err, false)),
+        };
+    }
+
+    let Some(rest) = path.strip_prefix("/v1/drops/") else {
+        return Err(NodeError::NotFound(format!("route '{method} {path}' not found")));
+    };
+
+    // GET /v1/drops/{id}/stream
+    if let Some(raw_id) = rest.strip_suffix("/stream") {
+        if raw_id.is_empty() || raw_id.contains('/') {
+            return Err(NodeError::NotFound(format!("route '{method} {path}' not found")));
+        }
+        if method != Method::GET {
+            return Err(NodeError::BadRequest("method not allowed".into()));
+        }
+        let drop_id = percent_decode(raw_id);
+        let cap_opt = drop_cap_header(headers);
+        let creator_id = if cap_opt.is_none() {
+            let empty_sha = hex::encode(Sha256::digest(b""));
+            let caller = require_auth(&node, headers, "GET", path_and_query, &empty_sha)?;
+            Some(caller.peer_id)
+        } else {
+            None
+        };
+        let sub_auth = match (cap_opt, creator_id.as_deref()) {
+            (Some(cap), _) => DropSubscriberAuth::SubCap(cap),
+            (None, Some(node_id)) => DropSubscriberAuth::CreatorNode(node_id),
+            (None, None) => unreachable!(),
+        };
+
+        let raw_cursor = headers
+            .get("last-event-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                query
+                    .get("after")
+                    .map(String::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            });
+        let last_event_id = match raw_cursor {
+            None => None,
+            Some(raw) => match raw.parse::<u64>() {
+                Ok(seq) => Some(seq),
+                Err(_) => {
+                    let err =
+                        DropRelayError::BadRequest(format!("invalid Last-Event-ID cursor '{raw}'"));
+                    return Ok(drop_relay_error_response(&relay, headers, &err, false));
+                }
+            },
+        };
+
+        return match relay.subscribe_drop(&drop_id, sub_auth, &client_ip, last_event_id, now_ms()) {
+            Ok(sub) => Ok(start_drop_sse_stream(node, sub)),
+            Err(err) => Ok(drop_relay_error_response(&relay, headers, &err, false)),
+        };
+    }
+
+    // POST /v1/drops/{id}/ack
+    if let Some(raw_id) = rest.strip_suffix("/ack") {
+        if raw_id.is_empty() || raw_id.contains('/') {
+            return Err(NodeError::NotFound(format!("route '{method} {path}' not found")));
+        }
+        if method != Method::POST {
+            return Err(NodeError::BadRequest("method not allowed".into()));
+        }
+        let drop_id = percent_decode(raw_id);
+        let body_bytes = read_body_bytes(body, MAX_DROP_CONTROL_BODY_BYTES).await?;
+        let body_sha = hex::encode(Sha256::digest(&body_bytes));
+        let cap_opt = drop_cap_header(headers);
+        let creator_id = if cap_opt.is_none() {
+            let caller = require_auth(&node, headers, "POST", path_and_query, &body_sha)?;
+            Some(caller.peer_id)
+        } else {
+            None
+        };
+        let sub_auth = match (cap_opt, creator_id.as_deref()) {
+            (Some(cap), _) => DropSubscriberAuth::SubCap(cap),
+            (None, Some(node_id)) => DropSubscriberAuth::CreatorNode(node_id),
+            (None, None) => unreachable!(),
+        };
+        let ack_body: AckDropBody = serde_json::from_slice(&body_bytes)?;
+        return match relay.ack_drop(&drop_id, sub_auth, ack_body.seq, ack_body.burn, now_ms()) {
+            Ok(resp) => Ok(json_response(StatusCode::OK, &resp)),
+            Err(err) => Ok(drop_relay_error_response(&relay, headers, &err, false)),
+        };
+    }
+
+    // POST /v1/drops/{id}
+    if !rest.is_empty() && !rest.contains('/') {
+        if method != Method::POST {
+            return Err(NodeError::BadRequest("method not allowed".into()));
+        }
+        let drop_id = percent_decode(rest);
+        let Some(cap) = drop_cap_header(headers) else {
+            let err = DropRelayError::Unauthorized(format!("missing {DROP_CAP_HEADER} header"));
+            return Ok(drop_relay_error_response(&relay, headers, &err, true));
+        };
+
+        // Constant-time stateless capability verification BEFORE reading request body bytes!
+        if let Err(err) = relay.verify_capability(&drop_id, cap, DropCapRole::Post, now_ms()) {
+            return Ok(drop_relay_error_response(&relay, headers, &err, true));
+        }
+
+        let max_payload = relay.config().max_payload_bytes;
+        let body_bytes = match read_body_bytes(body, max_payload).await {
+            Ok(bytes) => bytes,
+            Err(NodeError::PayloadTooLarge(_)) => {
+                let err = DropRelayError::PayloadTooLarge {
+                    size: max_payload.saturating_add(1),
+                    max_bytes: max_payload,
+                };
+                return Ok(drop_relay_error_response(&relay, headers, &err, true));
+            }
+            Err(err) => {
+                let mut resp = problem_response(&err.to_problem_details());
+                relay.apply_cors_headers(request_origin(headers), resp.headers_mut());
+                return Ok(resp);
+            }
+        };
+
+        return match relay.post_drop(&drop_id, cap, body_bytes.to_vec(), now_ms()) {
+            Ok(posted) => {
+                let mut resp = json_response(StatusCode::CREATED, &posted);
+                relay.apply_cors_headers(request_origin(headers), resp.headers_mut());
+                Ok(resp)
+            }
+            Err(err) => Ok(drop_relay_error_response(&relay, headers, &err, true)),
+        };
+    }
+
+    Err(NodeError::NotFound(format!("route '{method} {path}' not found")))
+}
+
+fn start_drop_sse_stream(
+    node: Arc<UnifiedNode>,
+    mut sub: DropSubscription,
+) -> Response<BoxedBody> {
+    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, io::Error>>(64);
+
+    tokio::spawn(async move {
+        let mut shutdown_rx = node.shutdown_receiver();
+        if *shutdown_rx.borrow() {
+            return;
+        }
+        if tx
+            .send(Ok(Frame::data(Bytes::from_static(b": connected\n\n"))))
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        for item in sub.drain_backlog() {
+            let encoded = item.to_sse_event().encode();
+            if tx.send(Ok(Frame::data(Bytes::from(encoded)))).await.is_err() {
+                return;
+            }
+        }
+
+        let mut keepalive = tokio::time::interval(Duration::from_secs(DROP_SSE_KEEPALIVE_SECONDS));
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        keepalive.tick().await;
+
+        loop {
+            if *shutdown_rx.borrow() {
+                break;
+            }
+            let remaining_ms = sub.expires_at_ms().saturating_sub(now_ms());
+            if remaining_ms <= 0 {
+                break;
+            }
+            let expiry_sleep = tokio::time::sleep(Duration::from_millis(remaining_ms as u64));
+            tokio::pin!(expiry_sleep);
+
+            tokio::select! {
+                item = sub.recv() => {
+                    match item {
+                        Some(item) => {
+                            let encoded = item.to_sse_event().encode();
+                            if tx.send(Ok(Frame::data(Bytes::from(encoded)))).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = keepalive.tick() => {
+                    if tx.send(Ok(Frame::data(sse_keepalive_frame()))).await.is_err() {
+                        break;
+                    }
+                }
+                _ = &mut expiry_sleep => {
+                    break;
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = tx.closed() => {
+                    break;
+                }
+            }
+        }
+    });
+
+    sse_response(rx)
 }
 
 fn start_inbox_sse_stream(
