@@ -5,13 +5,16 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   test:
+    name: Core, Differential & Virtual Integration Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -52,3 +55,56 @@ jobs:
             plugins/prometheus/index.mjs; do
             node --check "$f"
           done
+
+  real-harnesses:
+    name: Real Headless Harnesses (Claude, Codex Desktop Engine, OpenCode, Herdr, T3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install real headless harness binaries (zero cloud keys required)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin" "$HOME/.opencode/bin"
+          npm install -g @anthropic-ai/claude-code @openai/codex
+          curl -fsSL https://opencode.ai/v2/install | bash -s -- --no-modify-path
+          curl -fsSL https://releases.herdr.dev/core/install.sh | sh
+          curl -fsSL https://t3.codes/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Verify installed harness binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          for bin in claude codex opencode hc t3; do
+            bin_path="$(command -v "$bin")"
+            echo "=== $bin -> $bin_path ==="
+            "$bin" --version | head -n 2
+          done
+
+      - name: Run Real Harness Tests (test:harnesses)
+        env:
+          HYPHAE_REQUIRE_BINARIES: claude,codex,opencode,hc,t3
+        run: npm run test:harnesses
+
+      - name: Run Full Integration Suite with Real Binaries (test:integration)
+        env:
+          HYPHAE_REQUIRE_BINARIES: claude,codex,opencode,hc,t3
+        run: npm run test:integration
+
+      - name: Cleanup background Herdr daemon if running
+        if: always()
+        run: hc server stop || true

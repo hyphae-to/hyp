@@ -27,7 +27,10 @@ node --test test/integration/secrets-backends.test.ts
 node --test test/integration/bidirectional-bridges.test.ts
 node --test test/integration/differential-e2e.test.ts
 node --test test/integration/real-harnesses-v1.test.ts
+node --test test/integration/desktop-and-herdr-real.test.ts
 ```
+
+In CI (`.github/workflows/ci.yml`), the `real-harnesses` job installs real headless `claude`, `codex` (CLI + `app-server`), `opencode` v2, `hc` (Herdr Core), and `t3` on `ubuntu-latest` and sets `HYPHAE_REQUIRE_BINARIES=claude,codex,opencode,hc,t3` so missing binaries fail loudly instead of silently skipping.
 
 ## Architecture & Shims
 
@@ -66,12 +69,13 @@ Every test spins up an isolated `MeshTopology` ([harness/topology.ts](./harness/
 | [onboarding-and-multihost.test.ts](./onboarding-and-multihost.test.ts) | Real CLI `onboard` (local, `--join`, `--replace`), `setup all`, `setup service`, `skill install`, `doctor`, `secret set/list/check/rm`, HTTPS/TLS reverse proxy, virtual remote SSH host onboarding, and single-host network partition recovery. |
 | [muting-and-notify-matrix.test.ts](./muting-and-notify-matrix.test.ts) | Complete CLI + MCP muting matrix across all 5 target classes, persistence across daemon restart, stale-session mute pruning, mixed 4-category unread digests, idempotent re-notification, all-harness hooks + `--claude-channel` `notify` mode, and real `agy` in `notify` mode. |
 | [openclaw-env.test.ts](./openclaw-env.test.ts) | OpenClaw gateway setup, exact-config MCP boot, concurrent sessions, multi-connector fleet orchestration with Prometheus stream & `#incidents`, live delegation to real `opencode`/`claude` binary, and differential post-state equivalence vs Antigravity. |
-| [herdr-env.test.ts](./herdr-env.test.ts) | Stateful virtual `hc` actuation (`idle`/`done`/`working`/`blocked`), `interrupt` subscription preemption, exit `9`/`10` guard recovery, PID/`created_ms`/`app` drift protection, `notify` mode over Herdr, `hc machine ls` discovery, and real `hc` bare-shell fail-closed check. |
+| [herdr-env.test.ts](./herdr-env.test.ts) | Stateful virtual `hc` actuation (`idle`/`done`/`working`/`blocked`), `interrupt` subscription preemption, exit `9`/`10` guard recovery, PID/`created_ms`/`app` drift protection, `notify` mode over Herdr, `hc machine ls` discovery, and isolated real `hc` bare-shell fail-closed check. |
 | [t3-env.test.ts](./t3-env.test.ts) | Real `t3 serve` side-by-side boot, isolated `~/.t3-mesh` detection without secret leakage, paired Ed25519 grants + origin-tagged messages + sealed transfers + `byThreadId` handoff, `codex --thread --remote --resume` offline retry & `notify` mode, `--claude-channel` live push / disconnect buffering / reconnect auto-flush, and real `t3 serve` native Hyphae adapter (`setupT3`, `statev2.sqlite` caller verification, live WebSocket RPC `message.dispatch` delivery). |
 | [secrets-backends.test.ts](./secrets-backends.test.ts) | Cross-platform virtual Linux Secret Service (`secret-tool`) CLI + daemon + plugin `{ secret }` / `{ secretFile }` `.runtime/` materialization, zero-argv-leakage & fail-closed checks, real CLI `hyp secret set --web --no-open --json` HTTP/1.1 keep-alive & adversarial HTTP security, and real macOS Keychain end-to-end daemon/plugin verification (ephemeral `HYPHAE_KEYCHAIN_SERVICE`). |
 | [bidirectional-bridges.test.ts](./bidirectional-bridges.test.ts) | End-to-end bidirectional `slack`, `telegram`, and `webhook` (`WEBHOOK_POST_URL` + HMAC) bridges over real `hyp mcp`: multi-thread `hyp_bridge_link`/`unlink`, `hyp_plugin_post` auto-reply & explicit targets, allowlists, upstream fault recovery, `plugin:*` muting, and `hyp_plugin_handoff`. |
 | [differential-e2e.test.ts](./differential-e2e.test.ts) | Seeded multi-router / multi-connector / fd-3 bridge stateful differential oracle (`HYPHAE_DIFF_SEED`, McKeeman Levels 5–6), Level 1–2 fd-3 / Unix socket / HTTP framing & boundary perturbation resilience, and real CLI `--json` / `--plain` / `--pretty` / exit-code `0\|1\|2` contract verification. |
 | [real-harnesses-v1.test.ts](./real-harnesses-v1.test.ts) | Real `claude`, `agy`, and `opencode` v2 binaries driving v1 workflows: `hyp_topics` inspection, GitHub `subject`-vs-`repo` dead-subscription self-correction with `strict: true`, signed GitHub PR webhooks, multi-thread `hyp_bridge_link` fan-in, and outbound Slack/Telegram `hyp_plugin_post`. |
+| [desktop-and-herdr-real.test.ts](./desktop-and-herdr-real.test.ts) | Real headless `codex app-server` WebSocket (Codex Desktop engine: multi-thread rollout identity + real `codex queue --remote` parked-thread push wakeup), 100%-isolated real `hc` (Herdr Core) + real interactive `codex` TUI live `hc get`/`hc send` actuation across connectors, and Desktop Electron bare-`PATH` (`/usr/bin:/bin`) execution across all generated MCP/hook configs & `~/.local/bin/t3`. |
 
 ## Strict Isolation Guarantees
 

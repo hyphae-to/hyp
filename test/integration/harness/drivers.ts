@@ -38,6 +38,44 @@ export const BINARIES: DetectedBinaries = {
   t3: findBinary("t3"),
 };
 
+/**
+ * When `HYPHAE_REQUIRE_BINARIES` is set (e.g. `claude,codex,opencode,hc,t3` in CI),
+ * fail immediately if any required harness binary is missing rather than silently skipping tests.
+ */
+export function assertRequiredBinaries(): void {
+  const raw = process.env.HYPHAE_REQUIRE_BINARIES?.trim();
+  if (!raw) return;
+  const aliasMap: Record<string, keyof DetectedBinaries> = {
+    claude: "claude",
+    codex: "codex",
+    opencode: "opencode",
+    agy: "agy",
+    cursor: "cursorAgent",
+    "cursor-agent": "cursorAgent",
+    cursorAgent: "cursorAgent",
+    hc: "hc",
+    herdr: "hc",
+    t3: "t3",
+  };
+  const missing: string[] = [];
+  for (const item of raw.split(",").map((s) => s.trim()).filter(Boolean)) {
+    const key = aliasMap[item];
+    if (!key) {
+      throw new Error(`Unknown binary '${item}' in HYPHAE_REQUIRE_BINARIES`);
+    }
+    if (BINARIES[key] === null) {
+      missing.push(item);
+    }
+  }
+  if (missing.length > 0) {
+    throw new Error(
+      `HYPHAE_REQUIRE_BINARIES check failed — missing required binary(ies) on PATH: ${missing.join(", ")}`,
+    );
+  }
+}
+
+assertRequiredBinaries();
+
 export interface ProcessResult {
   readonly code: number | null;
   readonly stdout: string;

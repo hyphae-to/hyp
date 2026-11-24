@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -699,12 +699,52 @@ test(
   },
 );
 
+function runHcAsync(
+  bin: string,
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+  timeoutMs = 10_000,
+): Promise<{ readonly stdout: string; readonly stderr: string }> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    execFile(bin, [...args], { encoding: "utf8", env, timeout: timeoutMs }, (error, stdout, stderr) => {
+      if (error) {
+        rejectPromise(new Error(`hc ${args.join(" ")} failed: ${error.message}\nstdout: ${stdout}\nstderr: ${stderr}`));
+        return;
+      }
+      resolvePromise({ stdout, stderr });
+    });
+  });
+}
+
 test(
   "Herdr virtual env Test 5: REAL hc binary fail-closed sanity check on a disposable bare shell terminal",
   { skip: BINARIES.hc === null ? "hc (Herdr Core) not installed locally" : false, timeout: 30_000 },
   async () => {
-    assert.ok(BINARIES.hc);
+    const hcBin = BINARIES.hc;
+    assert.ok(hcBin);
     const rootDir = mkdtempSync(join(tmpdir(), "hi-"));
+    // Short /tmp/hc-XXXXXX root so hc's Unix socket stays well under macOS's 103-byte path limit.
+    const hcRoot = mkdtempSync("/tmp/hc-");
+    for (const sub of ["h", "r", "c", "d", "s"]) {
+      mkdirSync(join(hcRoot, sub), { recursive: true, mode: 0o700 });
+    }
+
+    const hcEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: join(hcRoot, "h"),
+      XDG_RUNTIME_DIR: join(hcRoot, "r"),
+      XDG_CONFIG_HOME: join(hcRoot, "c"),
+      XDG_DATA_HOME: join(hcRoot, "d"),
+      XDG_STATE_HOME: join(hcRoot, "s"),
+      HC_SESSION: "t",
+    };
+    delete hcEnv.HC_TERMINAL_ID;
+    delete hcEnv.ANTIGRAVITY_SOURCE_METADATA;
+    delete hcEnv.CLAUDE_SESSION_ID;
+    delete hcEnv.CODEX_THREAD_ID;
+    delete hcEnv.HYPHAE_SOCKET;
+    delete hcEnv.AGENTS_MESH_SOCKET;
+
     const auditPath = join(rootDir, "audit.jsonl");
     const core = new RouterCore({ dbPath: join(rootDir, "r.sqlite"), auditPath });
     const token = core.addConnector("dev@realhc");
@@ -713,11 +753,7 @@ test(
     let termId: string | undefined;
 
     try {
-      const cleanEnv: NodeJS.ProcessEnv = { ...process.env };
-      delete cleanEnv.HC_TERMINAL_ID;
-      delete cleanEnv.ANTIGRAVITY_SOURCE_METADATA;
-      delete cleanEnv.CLAUDE_SESSION_ID;
-      delete cleanEnv.CODEX_THREAD_ID;
+      await runHcAsync(hcBin, ["server", "start", "--json"], hcEnv);
 
       daemon = await startIsolatedDaemonSubprocess({
         rootDir,
@@ -725,40 +761,38 @@ test(
         connectorId: "dev@realhc",
         routerUrl: router.url,
         token,
-        env: cleanEnv,
+        env: hcEnv,
         auditPath,
       });
 
-      const started = execFileSync(BINARIES.hc, ["run", "--bg", "--json", "sh"], {
-        encoding: "utf8",
-        env: cleanEnv,
-      });
-      const parsed = JSON.parse(started) as { address?: string };
-      assert.ok(parsed.address && /^t[a-z0-9]+$/.test(parsed.address), `Unexpected hc run output: ${started}`);
+      const started = await runHcAsync(hcBin, ["run", "--bg", "--json", "sh"], hcEnv);
+      const parsed = JSON.parse(started.stdout) as { address?: string };
+      assert.ok(parsed.address && /^t[a-z0-9]+$/.test(parsed.address), `Unexpected hc run output: ${started.stdout}`);
       termId = parsed.address;
 
-      const info = JSON.parse(
-        execFileSync(BINARIES.hc, ["get", "--json", termId], { encoding: "utf8", env: cleanEnv }),
-      ) as { address: string; state: string; status: unknown };
+      const infoRes = await runHcAsync(hcBin, ["get", "--json", termId], hcEnv);
+      const info = JSON.parse(infoRes.stdout) as { address: string; state: string; status: unknown };
       assert.equal(info.address, termId);
       assert.equal(info.state, "live");
       assert.equal(info.status, null);
 
       // Real `hyp daemon` + `hyp mcp --backend herdr` must fail closed on a bare shell terminal
-      const herdrMcp = await daemon.openMcp(["--backend", "herdr"], { HC_TERMINAL_ID: termId });
+      const herdrMcp = await daemon.openMcp(["--backend", "herdr"], { ...hcEnv, HC_TERMINAL_ID: termId });
       const denied = await herdrMcp.callTool("hyp_capabilities", {});
       assert.equal(denied.isError, true, `Expected bare shell to fail closed, got: ${denied.text}`);
       const err = denied.json() as { code?: string };
       assert.equal(err.code, "caller_unverifiable");
     } finally {
-      if (termId && BINARIES.hc) {
-        try { execFileSync(BINARIES.hc, ["kill", termId], { stdio: "ignore" }); } catch {}
-        try { execFileSync(BINARIES.hc, ["rm", termId], { stdio: "ignore" }); } catch {}
+      if (termId) {
+        await runHcAsync(hcBin, ["kill", termId], hcEnv).catch(() => {});
+        await runHcAsync(hcBin, ["rm", termId], hcEnv).catch(() => {});
       }
+      await runHcAsync(hcBin, ["server", "stop"], hcEnv).catch(() => {});
       await daemon?.stop().catch(() => {});
       await router.close().catch(() => {});
       try { core.close(); } catch {}
       rmSync(rootDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+      rmSync(hcRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     }
   },
 );
