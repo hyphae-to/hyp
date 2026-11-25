@@ -1,0 +1,558 @@
+// Zero-dependency Node 24 test suite for plugins/herdr-mod.
+// Verifies terminal address parsing, state_dir resolution, session matching &
+// anti-recycle pinning, pill formatting, anti-body-leakage invariants,
+// quick-control argv generation, local watcher lifecycle, remote cache dedup,
+// pill.js composition rendering, and Herdr mod quality gates.
+
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import moduleApi from "node:module";
+import { fileURLToPath } from "node:url";
+
+import {
+  buildSessionControlArgs,
+  createHyphaeClient,
+  findLayoutNode,
+  formatNextFire,
+  formatPillMetrics,
+  formatRelativeAge,
+  parseSnapshotJson,
+  parseTerminalAddress,
+  resolveSessionById,
+  resolveSessionForTerminal,
+  resolveUiStateCandidates,
+  sanitizeUiText,
+  withAlpha,
+} from "../mods/hyphae-pane/shared-client.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const MOD_ROOT = path.resolve(__dirname, "..");
+
+test("parseTerminalAddress handles local, remote SSH, and empty inputs", () => {
+  assert.deepEqual(parseTerminalAddress("t4g"), {
+    machine: null,
+    rawTid: "t4g",
+    address: "t4g",
+  });
+  assert.deepEqual(parseTerminalAddress("solace/t4g"), {
+    machine: "solace",
+    rawTid: "t4g",
+    address: "solace/t4g",
+  });
+  assert.deepEqual(parseTerminalAddress("  great-northern/t12  "), {
+    machine: "great-northern",
+    rawTid: "t12",
+    address: "great-northern/t12",
+  });
+  assert.deepEqual(parseTerminalAddress(""), {
+    machine: null,
+    rawTid: null,
+    address: null,
+  });
+  assert.deepEqual(parseTerminalAddress(null), {
+    machine: null,
+    rawTid: null,
+    address: null,
+  });
+});
+
+test("resolveUiStateCandidates mirrors hyp-cli default and custom stateDir paths", () => {
+  const def = resolveUiStateCandidates("/Users/alice", null);
+  assert.deepEqual(def.dirs, [
+    "/Users/alice/.config/hyphae/ui",
+    "/Users/alice/.config/hyphae/state/ui",
+  ]);
+  assert.equal(def.files[0], "/Users/alice/.config/hyphae/ui/state.json");
+
+  const customAbs = resolveUiStateCandidates(
+    "/Users/alice",
+    JSON.stringify({ stateDir: "/var/lib/hyphae" })
+  );
+  assert.equal(customAbs.dirs[0], "/var/lib/hyphae/ui");
+  assert.equal(customAbs.dirs[1], "/Users/alice/.config/hyphae/ui");
+
+  const customTilde = resolveUiStateCandidates(
+    "/Users/alice",
+    JSON.stringify({ stateDir: "~/custom-hyp" })
+  );
+  assert.equal(customTilde.dirs[0], "/Users/alice/custom-hyp/ui");
+
+  const customRel = resolveUiStateCandidates(
+    "/Users/alice",
+    JSON.stringify({ stateDir: "state" })
+  );
+  assert.equal(customRel.dirs[0], "/Users/alice/.config/hyphae/state/ui");
+  assert.equal(customRel.dirs[1], "/Users/alice/.config/hyphae/ui");
+  assert.equal(customRel.dirs.length, 2);
+
+  // Malformed node.json safely falls back to defaults.
+  const malformed = resolveUiStateCandidates("/Users/alice", "{not json");
+  assert.deepEqual(malformed.dirs, def.dirs);
+});
+
+test("resolveSessionForTerminal resolves byHerdrTerminal and rejects recycled created_ms", () => {
+  const snapshot = {
+    schemaVersion: 1,
+    rev: 12,
+    sessions: [
+      {
+        sessionId: "claude:old",
+        harness: "claude",
+        enrolled: true,
+        handle: "old-agent",
+        herdrTerminalId: "t4g",
+        herdrCreatedMs: 1000,
+        lastSeen: 1500,
+        hasLiveTransport: false,
+      },
+      {
+        sessionId: "codex:live",
+        harness: "codex",
+        enrolled: true,
+        handle: "alice",
+        herdrTerminalId: "t4g",
+        herdrCreatedMs: 2000,
+        lastSeen: 2500,
+        hasLiveTransport: true,
+      },
+    ],
+    byHerdrTerminal: {
+      t4g: "claude:old",
+    },
+  };
+
+  // Without created_ms, follows byHerdrTerminal.
+  assert.equal(resolveSessionForTerminal(snapshot, "t4g")?.sessionId, "claude:old");
+
+  // With new recycled terminal created_ms=2000, rejects stale claude:old and picks codex:live!
+  assert.equal(resolveSessionForTerminal(snapshot, "t4g", 2000)?.sessionId, "codex:live");
+
+  // With brand-new created_ms=3000 matching neither pinned session, returns null!
+  assert.equal(resolveSessionForTerminal(snapshot, "t4g", 3000), null);
+
+  assert.equal(resolveSessionById(snapshot, "codex:live")?.handle, "alice");
+});
+
+test("formatPillMetrics hides plain shells and formats enrolled, queued, focus, muted, and quarantined states", () => {
+  // Unenrolled with 0 subs & 0 queued -> hidden (zero visual clutter)
+  const plain = formatPillMetrics({
+    enrolled: false,
+    handle: null,
+    counts: { subscriptions: 0, queued: 0, quarantined: 0 },
+  });
+  assert.equal(plain.visible, false);
+  assert.equal(formatPillMetrics(null).visible, false);
+
+  // Enrolled idle
+  const idle = formatPillMetrics({
+    enrolled: true,
+    handle: "alice",
+    focusMode: false,
+    mutedAll: false,
+    counts: { subscriptions: 3, queued: 0, quarantined: 0 },
+  });
+  assert.equal(idle.visible, true);
+  assert.equal(idle.tone, "active");
+  assert.equal(idle.compactLabel, "3s");
+  assert.equal(idle.mediumLabel, "3s");
+  assert.equal(idle.wideLabel, "@alice · 3 subs");
+  assert.equal(idle.alertLabel, null);
+
+  // Queued + Focus Mode
+  const queuedFocus = formatPillMetrics({
+    enrolled: true,
+    handle: "alice",
+    focusMode: true,
+    mutedAll: false,
+    counts: { subscriptions: 3, queued: 2, quarantined: 0 },
+  });
+  assert.equal(queuedFocus.visible, true);
+  assert.equal(queuedFocus.tone, "queued");
+  assert.equal(queuedFocus.chip, "focus");
+  assert.equal(queuedFocus.compactLabel, "3·2");
+  assert.equal(queuedFocus.mediumLabel, "focus · 3s · 2q");
+  assert.equal(queuedFocus.wideLabel, "@alice · FOCUS · 3 subs · 2 queued");
+
+  // Quarantined alert overrides tone and sets ⚠ N badge
+  const quarantined = formatPillMetrics({
+    enrolled: true,
+    handle: "alice\u001b[31m\x07",
+    focusMode: false,
+    mutedAll: true,
+    counts: { subscriptions: 1, queued: 0, quarantined: 2 },
+  });
+  assert.equal(quarantined.tone, "alert");
+  assert.equal(quarantined.chip, "muted");
+  assert.equal(quarantined.alertLabel, "⚠ 2");
+  assert.equal(quarantined.handle, "alice");
+  assert.ok(!quarantined.wideLabel.includes("\u001b"));
+});
+
+test("anti-body-leakage invariant: parseSnapshotJson strips body/text/note/payload/secret keys", () => {
+  const dirty = JSON.stringify({
+    ok: true,
+    command: "inspect",
+    data: {
+      schemaVersion: 1,
+      rev: 7,
+      updatedAt: 1795588123456,
+      daemon: {
+        online: true,
+        nodeId: "alice@mac",
+        secret: "SUPER_SECRET_KEY",
+      },
+      sessions: [
+        {
+          sessionId: "claude:1",
+          enrolled: true,
+          handle: "alice",
+          token: "hp2p1_never_leak",
+          counts: { subscriptions: 1, queued: 1, quarantined: 0 },
+          details: {
+            queuedItems: [
+              {
+                receipt: "rcpt_1",
+                kind: "message",
+                source: "bob/rev",
+                body: "SECRET_MESSAGE_BODY",
+                text: "SECRET_TEXT",
+                payload: { leak: true },
+              },
+            ],
+            wakeups: [
+              {
+                id: "wk_1",
+                label: "deploy-check",
+                triggerKind: "timer",
+                note: "SECRET_WAKEUP_NOTE",
+              },
+            ],
+          },
+        },
+      ],
+      byHerdrTerminal: { t4g: "claude:1" },
+    },
+  });
+
+  const snap = parseSnapshotJson(dirty);
+  assert.ok(snap);
+  const serialized = JSON.stringify(snap);
+  for (const sentinel of [
+    "SUPER_SECRET_KEY",
+    "hp2p1_never_leak",
+    "SECRET_MESSAGE_BODY",
+    "SECRET_TEXT",
+    "SECRET_WAKEUP_NOTE",
+  ]) {
+    assert.ok(!serialized.includes(sentinel), `Leaked sentinel: ${sentinel}`);
+  }
+  assert.equal(snap.sessions[0].details.queuedItems[0].source, "bob/rev");
+  assert.equal(snap.sessions[0].details.wakeups[0].label, "deploy-check");
+});
+
+test("sanitizeUiText strips ANSI CSI/OSC and control characters", () => {
+  assert.equal(sanitizeUiText("\u001b[1;31malice\u001b[0m\r\n\t"), "alice");
+  assert.equal(sanitizeUiText("\u001b]8;;https://evil.test\u0007click\u001b]8;;\u0007"), "click");
+  assert.equal(withAlpha("#33aa66", "26"), "#33aa6626");
+  assert.equal(withAlpha("#33aa6680", "26"), "#33aa6680");
+});
+
+test("buildSessionControlArgs generates exact hyp session CLI argv", () => {
+  assert.deepEqual(
+    buildSessionControlArgs("focus", { rawTid: "t4g" }, { enabled: true }),
+    ["session", "focus", "--herdr-terminal", "t4g", "on", "--json"]
+  );
+  assert.deepEqual(
+    buildSessionControlArgs("mute", { rawTid: "t4g" }, { pattern: "*", scope: "session" }),
+    ["session", "mute", "--herdr-terminal", "t4g", "--json", "*"]
+  );
+  assert.deepEqual(
+    buildSessionControlArgs("unmute", { sessionId: "claude:abc" }, { pattern: "-weird", scope: "connector" }),
+    ["session", "unmute", "--session", "claude:abc", "--scope", "connector", "--json", "--", "-weird"]
+  );
+  assert.deepEqual(
+    buildSessionControlArgs("rule", { rawTid: "t4g" }, { target: "bob/rev", delivery: "interrupt" }),
+    ["session", "rule", "--herdr-terminal", "t4g", "--json", "bob/rev", "interrupt"]
+  );
+  assert.deepEqual(
+    buildSessionControlArgs("unsubscribe", { rawTid: "t4g" }, { id: "sub_01" }),
+    ["session", "unsubscribe", "--herdr-terminal", "t4g", "--json", "sub_01"]
+  );
+  assert.deepEqual(
+    buildSessionControlArgs("leave", { rawTid: "t4g" }, { channel: "#ops" }),
+    ["session", "leave", "--herdr-terminal", "t4g", "--json", "#ops"]
+  );
+});
+
+test("relative age and next fire formatting", () => {
+  const now = 1_700_000_000_000;
+  assert.equal(formatRelativeAge(now - 2000, now), "now");
+  assert.equal(formatRelativeAge(now - 15_000, now), "15s");
+  assert.equal(formatRelativeAge(now - 180_000, now), "3m");
+  assert.equal(formatNextFire(now + 45_000, now), "in 45s");
+  assert.equal(formatNextFire(now - 1000, now), "due");
+});
+
+test("createHyphaeClient cancels watchFolder cleanly on dispose and deduplicates remote fetches", async () => {
+  let cancelled = 0;
+  let resolveWatch;
+  const watchPromise = new Promise((resolve) => {
+    resolveWatch = resolve;
+  });
+  watchPromise.cancel = () => {
+    cancelled += 1;
+    resolveWatch([]);
+  };
+
+  const sharedStore = {};
+  let execCalls = 0;
+  const host = {
+    home: () => "/Users/alice",
+    readTextFile: async (p) => {
+      if (p.endsWith("/ui/state.json")) {
+        return JSON.stringify({
+          schemaVersion: 1,
+          rev: 3,
+          sessions: [{ sessionId: "claude:1", enrolled: true, handle: "alice", herdrTerminalId: "t4g" }],
+          byHerdrTerminal: { t4g: "claude:1" },
+        });
+      }
+      return null;
+    },
+    watchFolder: () => watchPromise,
+    exec: async (_cmd, _args, opts) => {
+      execCalls += 1;
+      assert.equal(opts.on, "solace");
+      return {
+        code: 0,
+        stdout: JSON.stringify({
+          ok: true,
+          data: {
+            schemaVersion: 1,
+            rev: 9,
+            sessions: [{ sessionId: "codex:r1", enrolled: true, handle: "remote-bob", herdrTerminalId: "t2" }],
+            byHerdrTerminal: { t2: "codex:r1" },
+          },
+        }),
+        stderr: "",
+      };
+    },
+    shared: (k) => sharedStore[k],
+    setShared: (k, v) => {
+      sharedStore[k] = v;
+    },
+    terminals: () => [{ address: "t4g", created_ms: 100 }],
+  };
+
+  const pendingTasks = [];
+  const fakeCx = {
+    notify: () => {},
+    spawn: (fn) => {
+      pendingTasks.push(fn(fakeCx));
+    },
+  };
+
+  const client = createHyphaeClient(host);
+  client.ensureLocal(fakeCx);
+  // Wait a microtask tick for loadLocalOnce() to populate localSnapshot.
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(client.resolveTerminal("t4g").entry?.handle, "alice");
+
+  // Trigger two concurrent remote refreshes -> must dedup to 1 exec call!
+  client.ensureRemoteFresh("solace", fakeCx, false);
+  client.ensureRemoteFresh("solace", fakeCx, false);
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(execCalls, 1);
+  assert.equal(client.resolveTerminal("solace/t2").entry?.handle, "remote-bob");
+
+  // Dispose must call watch.cancel() cleanly.
+  client.dispose();
+  await Promise.allSettled(pendingTasks);
+  assert.equal(cancelled, 1);
+});
+
+test("pill.js renderHyphaePill integrates cleanly and dispatches dock vs overlay clicks", async () => {
+  const calls = { setShared: [], run: [], openOverlay: [] };
+  let mockLayout = {
+    id: "root",
+    children: [
+      {
+        id: "panel",
+        hidden: true,
+        children: [{ id: "panel-body", active: "files", children: [{ id: "files" }] }],
+      },
+    ],
+  };
+
+  // Register lightweight in-memory hooks for virtual Herdr modules in Node 24.
+  const hooks = moduleApi.registerHooks({
+    resolve(specifier, context, nextResolve) {
+      if (specifier === "gpui-kit" || specifier === "gpui-base" || specifier === "herdr") {
+        return { url: `hyphae-mock:${specifier}`, shortCircuit: true };
+      }
+      return nextResolve(specifier, context);
+    },
+    load(url, context, nextLoad) {
+      if (url === "hyphae-mock:gpui-kit") {
+        return {
+          format: "module",
+          shortCircuit: true,
+          source: `
+            function makeEl(tag, extra = {}) {
+              const node = { tag, props: { ...extra }, children: [], handlers: {} };
+              const proxy = new Proxy(node, {
+                get(target, prop) {
+                  if (prop in target) return target[prop];
+                  if (prop === "when") return (cond, fn) => (cond ? fn(proxy) : proxy);
+                  if (prop === "child") return (c) => { target.children.push(c); return proxy; };
+                  if (prop === "children") return (arr) => { target.children.push(...arr); return proxy; };
+                  if (prop === "on_click") return (fn) => { target.handlers.click = fn; return proxy; };
+                  if (prop === "on_mouse_down") return (_b, fn) => { target.handlers.mouseDown = fn; return proxy; };
+                  return (...args) => { target.props[prop] = args; return proxy; };
+                }
+              });
+              return proxy;
+            }
+            export const div = () => makeEl("div");
+            export const svg = (p) => makeEl("svg", { path: p });
+          `,
+        };
+      }
+      if (url === "hyphae-mock:gpui-base") {
+        return {
+          format: "module",
+          shortCircuit: true,
+          source: `
+            import { div } from "gpui-kit";
+            export const h_flex = () => div();
+          `,
+        };
+      }
+      if (url === "hyphae-mock:herdr") {
+        return {
+          format: "module",
+          shortCircuit: true,
+          source: `
+            export const layout = () => globalThis.__hyphaeTestMock.getLayout();
+            export const run = (cmd, args) => globalThis.__hyphaeTestMock.calls.run.push({ cmd, args });
+            export const openOverlay = (spec) => globalThis.__hyphaeTestMock.calls.openOverlay.push(spec);
+            export const setShared = (k, v) => globalThis.__hyphaeTestMock.calls.setShared.push({ k, v });
+          `,
+        };
+      }
+      return nextLoad(url, context);
+    },
+  });
+
+  globalThis.__hyphaeTestMock = {
+    getLayout: () => mockLayout,
+    calls,
+  };
+
+  try {
+    const pillMod = await import("../mods/hyphae-pane/pill.js");
+    const theme = {
+      foreground: "#ffffff",
+      muted: "#aaaaaa",
+      dim: "#777777",
+      border: "#333333",
+      hover: "#222222",
+      raised: "#1a1a1a",
+      surface: "#111111",
+      accent: "#5599ff",
+      done: "#44bb77",
+      blocked: "#ee9933",
+      ansi1: "#ee4444",
+      ansi2: "#44bb77",
+      ansi3: "#ee9933",
+    };
+
+    // Unenrolled empty -> returns null
+    const hidden = pillMod.renderHyphaePill({
+      theme,
+      paneId: "p1",
+      terminal: "t4g",
+      entry: { enrolled: false, counts: { subscriptions: 0, queued: 0, quarantined: 0 } },
+    });
+    assert.equal(hidden, null);
+
+    // Enrolled queued -> returns pill element and opens floating overlay when layout has no hyphae block
+    const el = pillMod.renderHyphaePill({
+      theme,
+      paneId: "p1",
+      terminal: "solace/t4g",
+      entry: {
+        sessionId: "claude:1",
+        enrolled: true,
+        handle: "alice",
+        focusMode: true,
+        counts: { subscriptions: 3, queued: 2, quarantined: 0 },
+      },
+      compact: true,
+    });
+    assert.ok(el);
+    let stopped = false;
+    el.handlers.click({}, { stop_propagation: () => { stopped = true; } });
+    assert.equal(stopped, true);
+    assert.equal(calls.setShared[0].k, "hyphae.selected");
+    assert.equal(calls.setShared[0].v.machine, "solace");
+    assert.equal(calls.setShared[0].v.rawTid, "t4g");
+    assert.equal(calls.openOverlay.length, 1);
+    assert.equal(calls.openOverlay[0].mod, "hyphae-panel");
+    assert.equal(calls.run.length, 0);
+
+    // When active layout has a `hyphae` child in `panel-body`, clicking selects & shows dock panel instead!
+    mockLayout.children[0].children[0].children.push({ id: "hyphae" });
+    el.handlers.click({}, { stop_propagation: () => {} });
+    assert.equal(calls.run.length, 2);
+    assert.deepEqual(calls.run[0], { cmd: "layout.select", args: { stack: "panel-body", child: "hyphae" } });
+    assert.deepEqual(calls.run[1], { cmd: "layout.show", args: { id: "panel" } });
+  } finally {
+    delete globalThis.__hyphaeTestMock;
+    hooks.deregister();
+  }
+});
+
+test("static Herdr mod quality gates & file parity", () => {
+  const paneClient = fs.readFileSync(path.join(MOD_ROOT, "mods/hyphae-pane/shared-client.js"), "utf8");
+  const panelClient = fs.readFileSync(path.join(MOD_ROOT, "mods/hyphae-panel/shared-client.js"), "utf8");
+  assert.equal(paneClient, panelClient, "shared-client.js must stay byte-identical across both mods");
+
+  const paneSvg = fs.readFileSync(path.join(MOD_ROOT, "mods/hyphae-pane/hyphae.svg"), "utf8");
+  const panelSvg = fs.readFileSync(path.join(MOD_ROOT, "mods/hyphae-panel/hyphae.svg"), "utf8");
+  assert.equal(paneSvg, panelSvg, "hyphae.svg must stay byte-identical across both mods");
+
+  const jsFiles = [
+    "mods/hyphae-pane/shared-client.js",
+    "mods/hyphae-pane/pill.js",
+    "mods/hyphae-pane/main.js",
+    "mods/hyphae-panel/shared-client.js",
+    "mods/hyphae-panel/main.js",
+  ];
+  for (const rel of jsFiles) {
+    const src = fs.readFileSync(path.join(MOD_ROOT, rel), "utf8");
+    assert.ok(!/\bsetTimeout\s*\(/.test(src), `${rel} must never call setTimeout`);
+    assert.ok(!/\bsetInterval\s*\(/.test(src), `${rel} must never call setInterval`);
+    assert.ok(!/from\s+["']\.\.\//.test(src), `${rel} must not use ../ imports (Herdr per-mod sandbox)`);
+  }
+
+  for (const modMain of ["mods/hyphae-pane/main.js", "mods/hyphae-panel/main.js"]) {
+    const src = fs.readFileSync(path.join(MOD_ROOT, modMain), "utf8");
+    assert.ok(src.includes("if (checking()) return;"), `${modMain} must guard init() with if (checking()) return;`);
+    assert.ok(src.includes("async close("), `${modMain} must implement async close(cx)`);
+    assert.ok(src.includes("this.client.dispose()"), `${modMain} must dispose watchFolder handle in close()`);
+  }
+
+  // Validate JSON metadata files
+  const keys = JSON.parse(fs.readFileSync(path.join(MOD_ROOT, "keys.json"), "utf8"));
+  assert.equal(keys.global["cmd-shift-h"], "mod.open:hyphae-panel");
+  const paneMod = JSON.parse(fs.readFileSync(path.join(MOD_ROOT, "mods/hyphae-pane/mod.json"), "utf8"));
+  assert.equal(paneMod.place, "none");
+  const panelMod = JSON.parse(fs.readFileSync(path.join(MOD_ROOT, "mods/hyphae-panel/mod.json"), "utf8"));
+  assert.equal(panelMod.focusable, true);
+  assert.equal(panelMod.overlay.kind, "window");
+
+  assert.equal(findLayoutNode({ id: "root", children: [{ id: "hyphae" }] }, "hyphae")?.id, "hyphae");
+});
