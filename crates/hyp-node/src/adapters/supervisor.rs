@@ -1,22 +1,25 @@
-//! Single unified fd-3 `SubprocessSupervisor` replacing BOTH v1 `PluginProcess`
+//! Single unified cross-platform `SubprocessSupervisor` replacing BOTH v1 `PluginProcess`
 //! (`src/core/plugins/supervisor.ts`) AND `RouterStreamHost` (`src/streams.ts`).
 //!
 //! Key guarantees:
-//! - Explicit private bidirectional Unix fd-3 IPC channel (`socketpair(AF_UNIX, SOCK_STREAM)`
-//!   duped onto fd 3 with `FD_CLOEXEC` cleared in `pre_exec`, compatible with both Node's
-//!   `createReadStream`/`createWriteStream({ fd: 3 })` and Python's `socket.socket(fileno=3)`).
-//! - Clean environment allowlist (`PATH`, `HOME`, `TMPDIR`, `LANG`, `XDG_RUNTIME_DIR`,
-//!   `DBUS_SESSION_BUS_ADDRESS`, `HYPHAE_PROTOCOL=2`, explicit plugin config env — never leaks
-//!   arbitrary host secrets).
-//! - Strictly bounded 64 KiB `hyp_proto::rpc::LineSplitter` on incoming fd-3 frames.
+//! - Dual cross-platform IPC transports feeding the exact same NDJSON / JSON-RPC 2.0 protocol loop:
+//!   - **Unix default (`PluginTransportMode::UnixFd3`)**: explicit private bidirectional Unix fd-3
+//!     IPC channel (`socketpair(AF_UNIX, SOCK_STREAM)` duped onto fd 3 with `FD_CLOEXEC` cleared in
+//!     `pre_exec`, compatible with Node's `createReadStream`/`createWriteStream({ fd: 3 })` and
+//!     Python's `socket.socket(fileno=3)`).
+//!   - **Windows default & Unix parity mode (`PluginTransportMode::LoopbackTcp`)**: ephemeral
+//!     loopback-only TCP (`127.0.0.1:0`) authenticated with a per-spawn 256-bit CSPRNG token passed
+//!     strictly via scrubbed child env (`HYPHAE_PLUGIN_ADDR`, `HYPHAE_PLUGIN_TOKEN`,
+//!     `HYPHAE_PLUGIN_TRANSPORT=tcp`), single-connection listener drop, bounded 4 KiB auth frame,
+//!     constant-time token verification, and automatic token redaction from stderr/logs.
+//! - Clean environment allowlist (never leaks arbitrary host secrets).
+//! - Strictly bounded 64 KiB `hyp_proto::rpc::LineSplitter` on incoming IPC frames.
 //! - Per-frame protocol auto-detection via `hyp_proto::rpc::decode_frame`, seamlessly supporting
 //!   BOTH JSON-RPC 2.0 v2 (`hyphae/hello`, `hyphae/publish`, `hyphae/post`, `hyphae/status`,
 //!   `hyphae/deliveryFailed`) AND legacy fd-3 v1 (`hello`, `event`, `ack`, `nack`, `request`,
 //!   `response`, `status`, `delivery_failed`).
 //! - Outbound `post()` request/response correlation with timeouts, exponential restart backoff on
-//!   unexpected child exit, and clean `SIGTERM` -> `SIGKILL` shutdown.
-//! - Clean cross-platform compilation: Unix fd-3 process management is gated behind `#[cfg(unix)]`,
-//!   returning `AdapterError::UnsupportedPlatform` cleanly on non-Unix platforms (e.g. Windows).
+//!   unexpected child exit, and clean shutdown on both Unix and Windows.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
@@ -46,13 +49,48 @@ pub const ALLOWED_PARENT_ENV: &[&str] = &[
     "LANG",
     "XDG_RUNTIME_DIR",
     "DBUS_SESSION_BUS_ADDRESS",
+    // Windows runtime essentials (OS/temp/profile paths required by Winsock, Node.js, and Python;
+    // never carry user credentials).
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
 ];
 
 const PROTO_UNKNOWN: u8 = 0;
 const PROTO_LEGACY_V1: u8 = 1;
 const PROTO_JSONRPC_V2: u8 = 2;
 
-/// Detected or configured wire protocol on the child's fd-3 channel.
+/// IPC transport used between `SubprocessSupervisor` and supervised plugin subprocesses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginTransportMode {
+    /// Private bidirectional Unix `socketpair(AF_UNIX, SOCK_STREAM)` duped onto fd 3.
+    #[cfg(unix)]
+    UnixFd3,
+    /// Authenticated loopback-only TCP (`127.0.0.1:0`) with a per-spawn 256-bit CSPRNG token.
+    LoopbackTcp,
+}
+
+impl Default for PluginTransportMode {
+    fn default() -> Self {
+        #[cfg(unix)]
+        {
+            Self::UnixFd3
+        }
+        #[cfg(not(unix))]
+        {
+            Self::LoopbackTcp
+        }
+    }
+}
+
+/// Detected or configured wire protocol on the child's IPC channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireProtocol {
     Auto,
@@ -78,7 +116,7 @@ pub enum HelloMode {
 pub type EnvResolver =
     Arc<dyn Fn() -> Result<BTreeMap<String, String>, String> + Send + Sync>;
 
-/// Configuration for a supervised fd-3 subprocess adapter.
+/// Configuration for a supervised plugin subprocess adapter.
 #[derive(Clone)]
 pub struct SubprocessConfig {
     pub id: String,
@@ -94,6 +132,11 @@ pub struct SubprocessConfig {
     /// e.g. to freshly load `{ "secret": "<name>" }` references from `SecretStore` and refresh
     /// stderr redaction needles).
     pub env_resolver: Option<EnvResolver>,
+    /// IPC transport (`UnixFd3` by default on Unix, `LoopbackTcp` by default on Windows and
+    /// selectable on Unix for differential parity testing).
+    pub transport_mode: PluginTransportMode,
+    /// Bounded startup/handshake timeout for `PluginTransportMode::LoopbackTcp` (default: 10 s).
+    pub startup_timeout: Duration,
     /// Protocol negotiation mode (`Auto` supports both JSON-RPC 2.0 v2 and legacy v1).
     pub hello_mode: HelloMode,
     /// Grace window in `HelloMode::Auto` before sending a legacy v1 hello to silent children.
@@ -104,7 +147,7 @@ pub struct SubprocessConfig {
     pub max_backoff: Duration,
     /// Uptime threshold after which backoff resets to `initial_backoff`.
     pub reset_after: Duration,
-    /// Delay between `SIGTERM` and `SIGKILL` during shutdown.
+    /// Delay between graceful termination request and forced kill during shutdown.
     pub kill_timeout: Duration,
     /// Optional explicit parent env map (defaults to `std::env::vars()` when `None`).
     pub parent_env_override: Option<BTreeMap<String, String>>,
@@ -131,6 +174,8 @@ impl std::fmt::Debug for SubprocessConfig {
             .field("targets", &self.targets)
             .field("env_keys", &self.env.keys().collect::<Vec<_>>())
             .field("has_env_resolver", &self.env_resolver.is_some())
+            .field("transport_mode", &self.transport_mode)
+            .field("startup_timeout", &self.startup_timeout)
             .field("hello_mode", &self.hello_mode)
             .field("auto_hello_grace", &self.auto_hello_grace)
             .field("initial_backoff", &self.initial_backoff)
@@ -152,6 +197,8 @@ pub const DEFAULT_MAX_STDERR_LOG_BYTES: u64 = 1024 * 1024;
 pub const DEFAULT_RAPID_CRASH_WINDOW: Duration = Duration::from_secs(5);
 /// Default consecutive rapid crashes before tripping into `CrashLoopBackOff`.
 pub const DEFAULT_MAX_RAPID_CRASHES: u32 = 5;
+/// Default loopback-TCP plugin startup & authentication handshake timeout (10 seconds).
+pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Returns `true` when an environment variable name looks like it carries a raw secret value
 /// (`TOKEN`, `SECRET`, `KEY`, `PASSWORD`, `AUTH`, `PASS`), excluding `*_FILE` path pointers.
@@ -182,6 +229,8 @@ impl SubprocessConfig {
             targets,
             env: BTreeMap::new(),
             env_resolver: None,
+            transport_mode: PluginTransportMode::default(),
+            startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             hello_mode: HelloMode::Auto,
             auto_hello_grace: Duration::from_millis(50),
             initial_backoff: Duration::from_secs(1),
@@ -199,7 +248,8 @@ impl SubprocessConfig {
 }
 
 /// Builds the isolated child environment from [`ALLOWED_PARENT_ENV`], explicit plugin `config.env`,
-/// and standard Hyphae protocol variables (`HYPHAE_PROTOCOL=2`, `HYPHAE_FD=3`, etc.).
+/// and standard Hyphae protocol variables (`HYPHAE_PROTOCOL=2`, `HYPHAE_FD=3` on Unix fd-3 or
+/// `HYPHAE_PLUGIN_TRANSPORT=tcp` on loopback-TCP, etc.).
 pub fn build_isolated_env(
     config: &SubprocessConfig,
     parent_env: &BTreeMap<String, String>,
@@ -215,20 +265,44 @@ pub fn build_isolated_env_with(
     plugin_env: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
-    for &key in ALLOWED_PARENT_ENV {
-        if let Some(val) = parent_env.get(key) {
-            env.insert(key.to_string(), val.clone());
+    for (k, v) in parent_env {
+        #[cfg(windows)]
+        let allowed = ALLOWED_PARENT_ENV
+            .iter()
+            .any(|allowed_key| allowed_key.eq_ignore_ascii_case(k));
+        #[cfg(not(windows))]
+        let allowed = ALLOWED_PARENT_ENV.contains(&k.as_str());
+        if allowed {
+            env.insert(k.clone(), v.clone());
         }
     }
     for (k, v) in plugin_env {
         env.insert(k.clone(), v.clone());
     }
-    env.insert("HYPHAE_FD".to_string(), "3".to_string());
+    #[cfg(unix)]
+    if config.transport_mode == PluginTransportMode::UnixFd3 {
+        env.remove("HYPHAE_PLUGIN_ADDR");
+        env.remove("HYPHAE_PLUGIN_TOKEN");
+        env.remove("HYPHAE_PLUGIN_TRANSPORT");
+        env.insert("HYPHAE_FD".to_string(), "3".to_string());
+        env.insert("AGENTS_MESH_FD".to_string(), "3".to_string());
+        env.insert("T3_MESH_FD".to_string(), "3".to_string());
+    } else {
+        env.remove("HYPHAE_FD");
+        env.remove("AGENTS_MESH_FD");
+        env.remove("T3_MESH_FD");
+        env.insert("HYPHAE_PLUGIN_TRANSPORT".to_string(), "tcp".to_string());
+    }
+    #[cfg(not(unix))]
+    {
+        env.remove("HYPHAE_FD");
+        env.remove("AGENTS_MESH_FD");
+        env.remove("T3_MESH_FD");
+        env.insert("HYPHAE_PLUGIN_TRANSPORT".to_string(), "tcp".to_string());
+    }
     env.insert("HYPHAE_PLUGIN".to_string(), config.id.clone());
     env.insert("HYPHAE_PROTOCOL".to_string(), "2".to_string());
-    env.insert("AGENTS_MESH_FD".to_string(), "3".to_string());
     env.insert("AGENTS_MESH_PLUGIN".to_string(), config.id.clone());
-    env.insert("T3_MESH_FD".to_string(), "3".to_string());
     env.insert("T3_MESH_PLUGIN".to_string(), config.id.clone());
     env.insert("T3_MESH_PROTOCOL".to_string(), "1".to_string());
     if config.kind == AdapterKind::Source {
@@ -509,44 +583,39 @@ impl NodeAdapter for SubprocessSupervisor {
         host: Arc<dyn NodeAdapterHost>,
     ) -> BoxFuture<'a, Result<(), AdapterError>> {
         Box::pin(async move {
-            #[cfg(not(unix))]
-            {
-                let _ = host;
-                Err(AdapterError::UnsupportedPlatform(
-                    "fd-3 subprocess plugins require Unix".to_string(),
-                ))
+            let mut handle_guard = self.inner.loop_handle.lock().await;
+            if handle_guard.is_some() {
+                return Err(AdapterError::AlreadyStarted(self.inner.config.id.clone()));
             }
 
-            #[cfg(unix)]
-            {
-                let mut handle_guard = self.inner.loop_handle.lock().await;
-                if handle_guard.is_some() {
-                    return Err(AdapterError::AlreadyStarted(self.inner.config.id.clone()));
-                }
+            self.inner.stopping.store(0, Ordering::Release);
+            self.inner
+                .crash_loop_backoff
+                .store(false, Ordering::Release);
+            *self.inner.last_error.write().expect("last_error lock") = None;
+            self.set_health(AdapterHealth::Starting);
+            host.update_status(&self.inner.config.id, AdapterHealth::Starting)
+                .await;
 
-                self.inner.stopping.store(0, Ordering::Release);
-                self.inner
-                    .crash_loop_backoff
-                    .store(false, Ordering::Release);
-                *self.inner.last_error.write().expect("last_error lock") = None;
-                self.set_health(AdapterHealth::Starting);
-                host.update_status(&self.inner.config.id, AdapterHealth::Starting)
-                    .await;
+            let inner = Arc::clone(&self.inner);
+            let ready_notify = Arc::new(Notify::new());
+            let ready_notify_bg = Arc::clone(&ready_notify);
 
-                let inner = Arc::clone(&self.inner);
-                let ready_notify = Arc::new(Notify::new());
-                let ready_notify_bg = Arc::clone(&ready_notify);
+            let task = tokio::spawn(async move {
+                runtime::supervise_loop(inner, host, Some(ready_notify_bg)).await;
+            });
 
-                let task = tokio::spawn(async move {
-                    unix_runtime::supervise_loop(inner, host, Some(ready_notify_bg)).await;
-                });
+            *handle_guard = Some(task);
+            drop(handle_guard);
 
-                *handle_guard = Some(task);
-                drop(handle_guard);
-
-                let _ = tokio::time::timeout(Duration::from_secs(2), ready_notify.notified()).await;
-                Ok(())
-            }
+            let wait_budget = self
+                .inner
+                .config
+                .startup_timeout
+                .saturating_add(Duration::from_millis(500))
+                .min(Duration::from_secs(5));
+            let _ = tokio::time::timeout(wait_budget, ready_notify.notified()).await;
+            Ok(())
         })
     }
 
@@ -570,13 +639,16 @@ impl NodeAdapter for SubprocessSupervisor {
     }
 }
 
-#[cfg(unix)]
-mod unix_runtime {
-    use std::collections::{HashMap, VecDeque};
+mod runtime {
+    use std::collections::{BTreeMap, HashMap, VecDeque};
     use std::fs::{self, DirBuilder, OpenOptions};
     use std::io::Write as _;
+    use std::net::SocketAddr;
+    #[cfg(unix)]
     use std::os::fd::AsRawFd;
+    #[cfg(unix)]
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    #[cfg(unix)]
     use std::os::unix::net::UnixStream as StdUnixStream;
     use std::path::Path;
     use std::process::Stdio;
@@ -594,8 +666,13 @@ mod unix_runtime {
         METHOD_PUBLISH, METHOD_STATUS, PluginFrame, PublishParams, RpcId, StatusParams,
         decode_frame, encode_frame,
     };
+    use ring::hmac;
+    use ring::rand::{SecureRandom, SystemRandom};
+    use serde::Deserialize;
     use serde_json::{Value, json};
-    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    #[cfg(unix)]
     use tokio::net::UnixStream as TokioUnixStream;
     use tokio::process::{Child, Command};
     use tokio::sync::{Mutex, Notify, mpsc};
@@ -607,10 +684,12 @@ mod unix_runtime {
 
     use super::{
         ActiveConnection, HelloMode, PROTO_JSONRPC_V2, PROTO_LEGACY_V1, PROTO_UNKNOWN, PendingMap,
-        SubprocessConfig, SupervisorInner, build_isolated_env_with, is_secret_like_env_key,
+        PluginTransportMode, SubprocessConfig, SupervisorInner, build_isolated_env_with,
+        is_secret_like_env_key,
     };
 
     const MAX_OUTPUT_LINE_BYTES: usize = 2 * 1024;
+    const MAX_AUTH_LINE_BYTES: usize = 4 * 1024;
     const MAX_ECHO_CHARS: usize = 256;
     const OUTBOUND_QUEUE_CAPACITY: usize = 256;
     const MAX_RECENT_STDERR_LINES: usize = 32;
@@ -619,7 +698,7 @@ mod unix_runtime {
 
     fn collect_redacted_secrets(
         config: &SubprocessConfig,
-        active_env: &std::collections::BTreeMap<String, String>,
+        active_env: &BTreeMap<String, String>,
         extra_redacted: &[String],
     ) -> Vec<String> {
         let mut secrets: Vec<String> = Vec::new();
@@ -665,7 +744,11 @@ mod unix_runtime {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
                 let mut builder = DirBuilder::new();
-                builder.recursive(true).mode(0o700);
+                builder.recursive(true);
+                #[cfg(unix)]
+                {
+                    builder.mode(0o700);
+                }
                 if builder.create(parent).is_err() {
                     return;
                 }
@@ -677,12 +760,13 @@ mod unix_runtime {
                 return;
             }
             if max_bytes > 0 && meta.len() >= max_bytes {
-                if let Ok(mut f) = OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(path)
+                let mut opts = OpenOptions::new();
+                opts.write(true).truncate(true);
+                #[cfg(unix)]
                 {
+                    opts.mode(0o600);
+                }
+                if let Ok(mut f) = opts.open(path) {
                     let _ = f.write_all(b"[log truncated]\n");
                 }
             }
@@ -691,12 +775,13 @@ mod unix_runtime {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        if let Ok(mut f) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(path)
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
         {
+            opts.mode(0o600);
+        }
+        if let Ok(mut f) = opts.open(path) {
             let _ = writeln!(f, "[{ts_ms}] {line}");
         }
     }
@@ -753,18 +838,56 @@ mod unix_runtime {
         }
     }
 
+    #[cfg(unix)]
     const F_SETFD: i32 = 2;
+    #[cfg(unix)]
     const SIGTERM: i32 = 15;
 
+    #[cfg(unix)]
     unsafe extern "C" {
         fn dup2(oldfd: i32, newfd: i32) -> i32;
         fn fcntl(fd: i32, cmd: i32, ...) -> i32;
         fn kill(pid: i32, sig: i32) -> i32;
     }
 
+    fn generate_handshake_token() -> std::io::Result<String> {
+        let rng = SystemRandom::new();
+        let mut bytes = [0u8; 32];
+        rng.fill(&mut bytes).map_err(|_| {
+            std::io::Error::other("CSPRNG failed generating plugin handshake token")
+        })?;
+        Ok(hex::encode(bytes))
+    }
+
+    /// Length-hiding constant-time token comparison via HMAC-SHA256 over a fresh CSPRNG key.
+    fn constant_time_token_eq(expected: &str, actual: &str) -> bool {
+        let rng = SystemRandom::new();
+        let mut rand_key = [0u8; 32];
+        if rng.fill(&mut rand_key).is_err() {
+            return false;
+        }
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &rand_key);
+        let tag = hmac::sign(&key, expected.as_bytes());
+        hmac::verify(&key, actual.as_bytes(), tag.as_ref()).is_ok()
+    }
+
+    #[derive(Deserialize)]
+    struct TcpAuthFrame {
+        #[serde(rename = "type")]
+        frame_type: String,
+        token: String,
+    }
+
+    enum TcpHandshakeError {
+        Stopped,
+        ChildExited(String),
+        AuthFailed(String),
+    }
+
+    #[cfg(unix)]
     fn spawn_with_fd3(
         config: &SubprocessConfig,
-        plugin_env: &std::collections::BTreeMap<String, String>,
+        plugin_env: &BTreeMap<String, String>,
     ) -> std::io::Result<(Child, TokioUnixStream)> {
         let (parent_sock, child_sock) = StdUnixStream::pair()?;
         parent_sock.set_nonblocking(true)?;
@@ -782,7 +905,8 @@ mod unix_runtime {
             .envs(&env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
 
         if let Some(cwd) = &config.cwd {
             cmd.current_dir(cwd);
@@ -811,25 +935,482 @@ mod unix_runtime {
         Ok((child, tokio_stream))
     }
 
+    fn spawn_with_loopback_tcp(
+        config: &SubprocessConfig,
+        plugin_env: &BTreeMap<String, String>,
+        bind_addr: SocketAddr,
+        handshake_token: &str,
+    ) -> std::io::Result<Child> {
+        let parent_env = config
+            .parent_env_override
+            .clone()
+            .unwrap_or_else(|| std::env::vars().collect());
+        let mut env = build_isolated_env_with(config, &parent_env, plugin_env);
+        env.insert("HYPHAE_PLUGIN_ADDR".to_string(), bind_addr.to_string());
+        env.insert(
+            "HYPHAE_PLUGIN_TOKEN".to_string(),
+            handshake_token.to_string(),
+        );
+        env.insert("HYPHAE_PLUGIN_TRANSPORT".to_string(), "tcp".to_string());
+
+        let mut cmd = Command::new(&config.exec);
+        cmd.args(&config.args)
+            .env_clear()
+            .envs(&env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        if let Some(cwd) = &config.cwd {
+            cmd.current_dir(cwd);
+        }
+
+        cmd.spawn()
+    }
+
+    async fn accept_and_authenticate_tcp(
+        listener: TcpListener,
+        expected_token: &str,
+        child: &mut Child,
+        inner: &SupervisorInner,
+        timeout_dur: Duration,
+    ) -> Result<(TcpStream, Vec<u8>), TcpHandshakeError> {
+        let deadline = tokio::time::Instant::now() + timeout_dur;
+        if inner.stopping.load(Ordering::Acquire) != 0 {
+            return Err(TcpHandshakeError::Stopped);
+        }
+
+        let (mut stream, peer_addr) = tokio::select! {
+            () = inner.stop_notify.notified() => {
+                return Err(TcpHandshakeError::Stopped);
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                return Err(TcpHandshakeError::AuthFailed(format!(
+                    "TCP plugin auth failed: child did not connect within {timeout_dur:?}"
+                )));
+            }
+            wait_res = child.wait() => {
+                let desc = match wait_res {
+                    Ok(status) => format!("exited ({status})"),
+                    Err(e) => format!("wait error: {e}"),
+                };
+                return Err(TcpHandshakeError::ChildExited(desc));
+            }
+            accept_res = listener.accept() => {
+                match accept_res {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        return Err(TcpHandshakeError::AuthFailed(format!(
+                            "TCP plugin auth failed: accept error: {e}"
+                        )));
+                    }
+                }
+            }
+        };
+
+        // Immediately drop listener so no second process can ever connect.
+        drop(listener);
+
+        if !peer_addr.ip().is_loopback() {
+            return Err(TcpHandshakeError::AuthFailed(format!(
+                "TCP plugin auth failed: rejected non-loopback peer {}",
+                peer_addr.ip()
+            )));
+        }
+        let _ = stream.set_nodelay(true);
+
+        let mut buf: Vec<u8> = Vec::with_capacity(256);
+        let mut chunk = [0u8; MAX_AUTH_LINE_BYTES];
+        let (line_bytes, leftover) = loop {
+            if inner.stopping.load(Ordering::Acquire) != 0 {
+                return Err(TcpHandshakeError::Stopped);
+            }
+            let n = tokio::select! {
+                () = inner.stop_notify.notified() => {
+                    return Err(TcpHandshakeError::Stopped);
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    return Err(TcpHandshakeError::AuthFailed(format!(
+                        "TCP plugin auth failed: auth frame timed out after {timeout_dur:?}"
+                    )));
+                }
+                read_res = stream.read(&mut chunk) => {
+                    match read_res {
+                        Ok(0) => {
+                            return Err(TcpHandshakeError::AuthFailed(
+                                "TCP plugin auth failed: connection closed before auth frame"
+                                    .to_string(),
+                            ));
+                        }
+                        Ok(n) => n,
+                        Err(e) => {
+                            return Err(TcpHandshakeError::AuthFailed(format!(
+                                "TCP plugin auth failed: I/O error reading auth frame: {e}"
+                            )));
+                        }
+                    }
+                }
+            };
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(nl_pos) = buf.iter().position(|&b| b == b'\n') {
+                if nl_pos >= MAX_AUTH_LINE_BYTES {
+                    return Err(TcpHandshakeError::AuthFailed(format!(
+                        "TCP plugin auth failed: auth frame exceeded {MAX_AUTH_LINE_BYTES} byte limit"
+                    )));
+                }
+                let mut line = &buf[..nl_pos];
+                if let Some(stripped) = line.strip_suffix(b"\r") {
+                    line = stripped;
+                }
+                let line_owned = line.to_vec();
+                let rest = buf[nl_pos + 1..].to_vec();
+                break (line_owned, rest);
+            }
+            if buf.len() >= MAX_AUTH_LINE_BYTES {
+                return Err(TcpHandshakeError::AuthFailed(format!(
+                    "TCP plugin auth failed: auth frame exceeded {MAX_AUTH_LINE_BYTES} byte limit"
+                )));
+            }
+        };
+
+        let line_str = std::str::from_utf8(&line_bytes).map_err(|_| {
+            TcpHandshakeError::AuthFailed(
+                "TCP plugin auth failed: auth frame is not valid UTF-8".to_string(),
+            )
+        })?;
+        let frame: TcpAuthFrame = serde_json::from_str(line_str).map_err(|_| {
+            TcpHandshakeError::AuthFailed(
+                "TCP plugin auth failed: expected {\"type\":\"auth\",\"token\":\"...\"}".to_string(),
+            )
+        })?;
+        if frame.frame_type != "auth" {
+            return Err(TcpHandshakeError::AuthFailed(
+                "TCP plugin auth failed: first frame must have type=\"auth\"".to_string(),
+            ));
+        }
+        if !constant_time_token_eq(expected_token, &frame.token) {
+            return Err(TcpHandshakeError::AuthFailed(
+                "TCP plugin auth failed: invalid handshake token".to_string(),
+            ));
+        }
+
+        Ok((stream, leftover))
+    }
+
     async fn terminate_child(child: &mut Child, kill_timeout: Duration) {
-        if let Some(pid) = child.id() {
-            if let Ok(pid_i32) = i32::try_from(pid) {
-                if pid_i32 > 0 {
-                    // SAFETY: Sending SIGTERM to a live child PID owned by this supervisor.
-                    unsafe {
-                        let _ = kill(pid_i32, SIGTERM);
+        #[cfg(unix)]
+        {
+            if let Some(pid) = child.id() {
+                if let Ok(pid_i32) = i32::try_from(pid) {
+                    if pid_i32 > 0 {
+                        // SAFETY: Sending SIGTERM to a live child PID owned by this supervisor.
+                        unsafe {
+                            let _ = kill(pid_i32, SIGTERM);
+                        }
+                    }
+                }
+            }
+            match tokio::time::timeout(kill_timeout, child.wait()).await {
+                Ok(_) => {}
+                Err(_) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                }
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            // On Windows, closing the TCP socket already signals EOF to well-behaved plugins;
+            // allow a brief bounded grace window before TerminateProcess via `child.kill()`.
+            let grace = kill_timeout.min(Duration::from_millis(500));
+            match tokio::time::timeout(grace, child.wait()).await {
+                Ok(_) => {}
+                Err(_) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                }
+            }
+        }
+    }
+
+    async fn drain_output_tasks(
+        stdout_task: Option<JoinHandle<()>>,
+        stderr_task: Option<JoinHandle<()>>,
+    ) {
+        if let Some(t) = stdout_task {
+            if tokio::time::timeout(Duration::from_secs(2), t)
+                .await
+                .is_err()
+            {
+                // Best-effort bounded drain; avoid hanging if a grandchild holds stdout open.
+            }
+        }
+        if let Some(t) = stderr_task {
+            if tokio::time::timeout(Duration::from_secs(2), t)
+                .await
+                .is_err()
+            {
+                // Best-effort bounded drain; avoid hanging if a grandchild holds stderr open.
+            }
+        }
+    }
+
+    async fn run_channel_io<R, W>(
+        inner: &Arc<SupervisorInner>,
+        host: &Arc<dyn NodeAdapterHost>,
+        mut read_half: R,
+        mut write_half: W,
+        initial_bytes: Vec<u8>,
+        first_ready: &mut Option<Arc<Notify>>,
+    ) -> bool
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (out_tx, mut out_rx) = mpsc::channel::<String>(OUTBOUND_QUEUE_CAPACITY);
+
+        let initial_proto = match inner.config.hello_mode {
+            HelloMode::LegacyV1 => PROTO_LEGACY_V1,
+            HelloMode::JsonRpcV2 => PROTO_JSONRPC_V2,
+            HelloMode::Auto => PROTO_UNKNOWN,
+        };
+        let detected_protocol = Arc::new(AtomicU8::new(initial_proto));
+        if initial_proto != PROTO_UNKNOWN {
+            inner
+                .last_detected_protocol
+                .store(initial_proto, Ordering::Release);
+        }
+
+        let pending_requests: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut active_guard = inner.active.lock().await;
+            *active_guard = Some(ActiveConnection {
+                tx: out_tx.clone(),
+                detected_protocol: Arc::clone(&detected_protocol),
+                pending_requests: Arc::clone(&pending_requests),
+            });
+        }
+
+        *inner.health.write().expect("health lock") = AdapterHealth::Healthy;
+        host.update_status(&inner.config.id, AdapterHealth::Healthy)
+            .await;
+
+        let writer_task = tokio::spawn(async move {
+            while let Some(line) = out_rx.recv().await {
+                if write_half.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+                if write_half.flush().await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let hello_cancel = Arc::new(Notify::new());
+        let hello_task = match inner.config.hello_mode {
+            HelloMode::LegacyV1 => {
+                let hello_frame = PluginFrame::LegacyV1(LegacyV1Frame::Hello {
+                    protocol: 1,
+                    plugin: inner.config.id.clone(),
+                    targets: inner.config.targets.clone(),
+                });
+                if let Ok(wire) = encode_frame(&hello_frame) {
+                    let _ = out_tx.send(wire).await;
+                }
+                None
+            }
+            HelloMode::JsonRpcV2 => {
+                let params = serde_json::to_value(HelloParams {
+                    protocol: 2,
+                    plugin: inner.config.id.clone(),
+                    targets: inner.config.targets.clone(),
+                })
+                .ok();
+                let hello_frame = PluginFrame::JsonRpcNotification(JsonRpcNotification::new(
+                    METHOD_HELLO,
+                    params,
+                ));
+                if let Ok(wire) = encode_frame(&hello_frame) {
+                    let _ = out_tx.send(wire).await;
+                }
+                None
+            }
+            HelloMode::Auto => {
+                let grace = inner.config.auto_hello_grace;
+                let tx_clone = out_tx.clone();
+                let proto_clone = Arc::clone(&detected_protocol);
+                let last_proto_inner = Arc::clone(inner);
+                let cancel_clone = Arc::clone(&hello_cancel);
+                let plugin_id = inner.config.id.clone();
+                let targets = inner.config.targets.clone();
+                Some(tokio::spawn(async move {
+                    tokio::select! {
+                        () = cancel_clone.notified() => {}
+                        () = tokio::time::sleep(grace) => {
+                            if proto_clone
+                                .compare_exchange(
+                                    PROTO_UNKNOWN,
+                                    PROTO_LEGACY_V1,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                )
+                                .is_ok()
+                            {
+                                last_proto_inner
+                                    .last_detected_protocol
+                                    .store(PROTO_LEGACY_V1, Ordering::Release);
+                                let hello_frame = PluginFrame::LegacyV1(LegacyV1Frame::Hello {
+                                    protocol: 1,
+                                    plugin: plugin_id,
+                                    targets,
+                                });
+                                if let Ok(wire) = encode_frame(&hello_frame) {
+                                    let _ = tx_clone.send(wire).await;
+                                }
+                            }
+                        }
+                    }
+                }))
+            }
+        };
+
+        if let Some(n) = first_ready.take() {
+            n.notify_waiters();
+        }
+
+        let mut splitter = LineSplitter::new(MAX_FRAME_BYTES, false);
+        if !initial_bytes.is_empty() {
+            let mut completed: Vec<(String, bool)> = Vec::new();
+            splitter.push(&initial_bytes, |line, truncated| {
+                completed.push((line, truncated));
+            });
+            for (line, truncated) in completed {
+                hello_cancel.notify_waiters();
+                handle_incoming_line(
+                    inner,
+                    host,
+                    &out_tx,
+                    &detected_protocol,
+                    &pending_requests,
+                    line,
+                    truncated,
+                )
+                .await;
+            }
+        }
+
+        let mut buf = [0u8; 4096];
+        let mut channel_closed = false;
+
+        loop {
+            if inner.stopping.load(Ordering::Acquire) != 0 {
+                break;
+            }
+            tokio::select! {
+                () = inner.stop_notify.notified() => {
+                    break;
+                }
+                read_res = read_half.read(&mut buf) => {
+                    match read_res {
+                        Ok(0) => {
+                            channel_closed = true;
+                            break;
+                        }
+                        Ok(n) => {
+                            let mut completed: Vec<(String, bool)> = Vec::new();
+                            splitter.push(&buf[..n], |line, truncated| {
+                                completed.push((line, truncated));
+                            });
+                            for (line, truncated) in completed {
+                                hello_cancel.notify_waiters();
+                                handle_incoming_line(
+                                    inner,
+                                    host,
+                                    &out_tx,
+                                    &detected_protocol,
+                                    &pending_requests,
+                                    line,
+                                    truncated,
+                                )
+                                .await;
+                            }
+                        }
+                        Err(_) => {
+                            channel_closed = true;
+                            break;
+                        }
                     }
                 }
             }
         }
 
-        match tokio::time::timeout(kill_timeout, child.wait()).await {
-            Ok(_) => {}
-            Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+        if let Some(ht) = hello_task {
+            ht.abort();
+        }
+
+        {
+            *inner.active.lock().await = None;
+            let mut map = pending_requests.lock().await;
+            for (_, sender) in map.drain() {
+                let _ = sender.send(Err(AdapterError::NotRunning(format!(
+                    "subprocess '{}' disconnected",
+                    inner.config.id
+                ))));
             }
         }
+        drop(out_tx);
+        let _ = writer_task.await;
+        drop(read_half);
+
+        channel_closed
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_rapid_failure_and_backoff(
+        inner: &SupervisorInner,
+        host: &Arc<dyn NodeAdapterHost>,
+        redacted_secrets: &[String],
+        first_ready: &mut Option<Arc<Notify>>,
+        backoff: &mut Duration,
+        consecutive_rapid_crashes: &mut u32,
+        crash_loop_msg: String,
+        degraded_msg: String,
+    ) -> bool {
+        if inner.config.max_rapid_crashes > 0
+            && *consecutive_rapid_crashes >= inner.config.max_rapid_crashes
+        {
+            inner.crash_loop_backoff.store(true, Ordering::Release);
+            record_stderr_line(inner, redacted_secrets, None, &crash_loop_msg);
+            *inner.last_error.write().expect("last_error lock") = Some(crash_loop_msg.clone());
+            *inner.health.write().expect("health lock") =
+                AdapterHealth::Degraded(crash_loop_msg.clone());
+            host.update_status(&inner.config.id, AdapterHealth::Degraded(crash_loop_msg))
+                .await;
+            if let Some(n) = first_ready.take() {
+                n.notify_waiters();
+            }
+            return false;
+        }
+
+        *inner.last_error.write().expect("last_error lock") = Some(degraded_msg.clone());
+        *inner.health.write().expect("health lock") =
+            AdapterHealth::Degraded(degraded_msg.clone());
+        host.update_status(&inner.config.id, AdapterHealth::Degraded(degraded_msg))
+            .await;
+        if let Some(n) = first_ready.take() {
+            n.notify_waiters();
+        }
+        if !sleep_or_stop(inner, *backoff).await {
+            *inner.health.write().expect("health lock") = AdapterHealth::Stopped;
+            host.update_status(&inner.config.id, AdapterHealth::Stopped)
+                .await;
+            return false;
+        }
+        *backoff = (*backoff * 2).min(inner.config.max_backoff);
+        inner.restart_count.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     pub(super) async fn supervise_loop(
@@ -860,248 +1441,250 @@ mod unix_runtime {
                 }
             }
 
+            let tcp_setup = if resolve_error.is_none()
+                && inner.config.transport_mode == PluginTransportMode::LoopbackTcp
+            {
+                match TcpListener::bind("127.0.0.1:0").await {
+                    Ok(listener) => match (listener.local_addr(), generate_handshake_token()) {
+                        (Ok(addr), Ok(token)) => {
+                            extra_redacted.push(token.clone());
+                            Ok(Some((listener, addr, token)))
+                        }
+                        (Err(e), _) | (_, Err(e)) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                }
+            } else {
+                Ok(None)
+            };
+
             let redacted_secrets = Arc::new(collect_redacted_secrets(
                 &inner.config,
                 &spawn_env,
                 &extra_redacted,
             ));
 
-            let spawned = match resolve_error {
-                Some(err) => Err(std::io::Error::other(format!("secret env resolution failed: {err}"))),
-                None => spawn_with_fd3(&inner.config, &spawn_env),
+            enum SpawnedTransport {
+                #[cfg(unix)]
+                UnixFd3(Child, TokioUnixStream),
+                LoopbackTcp(Child, TcpListener, String),
+            }
+
+            let spawned: std::io::Result<SpawnedTransport> = match resolve_error {
+                Some(err) => Err(std::io::Error::other(format!(
+                    "secret env resolution failed: {err}"
+                ))),
+                None => match tcp_setup {
+                    Err(err) => Err(err),
+                    Ok(Some((listener, addr, token))) => {
+                        spawn_with_loopback_tcp(&inner.config, &spawn_env, addr, &token)
+                            .map(|child| SpawnedTransport::LoopbackTcp(child, listener, token))
+                    }
+                    Ok(None) => {
+                        #[cfg(unix)]
+                        {
+                            spawn_with_fd3(&inner.config, &spawn_env)
+                                .map(|(child, stream)| SpawnedTransport::UnixFd3(child, stream))
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            unreachable!("LoopbackTcp is the only transport on non-Unix platforms")
+                        }
+                    }
+                },
             };
 
-            let (mut child, stream) = match spawned {
-                Ok(pair) => pair,
+            let spawned_transport = match spawned {
+                Ok(t) => t,
                 Err(err) => {
                     consecutive_rapid_crashes = consecutive_rapid_crashes.saturating_add(1);
-                    let err_msg = sanitize_and_redact(&format!("spawn failed: {err}"), &redacted_secrets);
+                    let err_msg =
+                        sanitize_and_redact(&format!("spawn failed: {err}"), &redacted_secrets);
                     record_stderr_line(&inner, &redacted_secrets, None, &err_msg);
-
-                    if inner.config.max_rapid_crashes > 0
-                        && consecutive_rapid_crashes >= inner.config.max_rapid_crashes
+                    let crash_msg = format!(
+                        "CrashLoopBackOff: failed to spawn {consecutive_rapid_crashes} consecutive times ({err_msg})"
+                    );
+                    if !handle_rapid_failure_and_backoff(
+                        &inner,
+                        &host,
+                        &redacted_secrets,
+                        &mut first_ready,
+                        &mut backoff,
+                        &mut consecutive_rapid_crashes,
+                        crash_msg,
+                        err_msg,
+                    )
+                    .await
                     {
-                        inner.crash_loop_backoff.store(true, Ordering::Release);
-                        let reason = format!(
-                            "CrashLoopBackOff: failed to spawn {consecutive_rapid_crashes} consecutive times ({err_msg})"
-                        );
-                        record_stderr_line(&inner, &redacted_secrets, None, &reason);
-                        *inner.last_error.write().expect("last_error lock") = Some(reason.clone());
-                        *inner.health.write().expect("health lock") =
-                            AdapterHealth::Degraded(reason.clone());
-                        host.update_status(&inner.config.id, AdapterHealth::Degraded(reason))
-                            .await;
-                        if let Some(n) = first_ready.take() {
-                            n.notify_waiters();
-                        }
                         break;
                     }
-
-                    *inner.last_error.write().expect("last_error lock") = Some(err_msg.clone());
-                    *inner.health.write().expect("health lock") =
-                        AdapterHealth::Degraded(err_msg.clone());
-                    host.update_status(&inner.config.id, AdapterHealth::Degraded(err_msg))
-                        .await;
-                    if let Some(n) = first_ready.take() {
-                        n.notify_waiters();
-                    }
-                    if !sleep_or_stop(&inner, backoff).await {
-                        *inner.health.write().expect("health lock") = AdapterHealth::Stopped;
-                        host.update_status(&inner.config.id, AdapterHealth::Stopped)
-                            .await;
-                        break;
-                    }
-                    backoff = (backoff * 2).min(inner.config.max_backoff);
-                    inner.restart_count.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
             };
 
             let run_stderr_tail = Arc::new(StdMutex::new(VecDeque::new()));
-            let stdout_task = child.stdout.take().map(drain_output_stream);
-            let stderr_task = child.stderr.take().map(|stderr| {
-                drain_stderr_stream(
-                    stderr,
-                    Arc::clone(&inner),
-                    Arc::clone(&redacted_secrets),
-                    Arc::clone(&run_stderr_tail),
-                )
-            });
 
-            let (mut read_half, mut write_half) = stream.into_split();
-            let (out_tx, mut out_rx) = mpsc::channel::<String>(OUTBOUND_QUEUE_CAPACITY);
-
-            let initial_proto = match inner.config.hello_mode {
-                HelloMode::LegacyV1 => PROTO_LEGACY_V1,
-                HelloMode::JsonRpcV2 => PROTO_JSONRPC_V2,
-                HelloMode::Auto => PROTO_UNKNOWN,
-            };
-            let detected_protocol = Arc::new(AtomicU8::new(initial_proto));
-            if initial_proto != PROTO_UNKNOWN {
-                inner
-                    .last_detected_protocol
-                    .store(initial_proto, Ordering::Release);
-            }
-
-            let pending_requests: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
-            {
-                let mut active_guard = inner.active.lock().await;
-                *active_guard = Some(ActiveConnection {
-                    tx: out_tx.clone(),
-                    detected_protocol: Arc::clone(&detected_protocol),
-                    pending_requests: Arc::clone(&pending_requests),
-                });
-            }
-
-            *inner.health.write().expect("health lock") = AdapterHealth::Healthy;
-            host.update_status(&inner.config.id, AdapterHealth::Healthy)
-                .await;
-
-            let writer_task = tokio::spawn(async move {
-                while let Some(line) = out_rx.recv().await {
-                    if write_half.write_all(line.as_bytes()).await.is_err() {
-                        break;
-                    }
-                    if write_half.flush().await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            let hello_cancel = Arc::new(Notify::new());
-            let hello_task = match inner.config.hello_mode {
-                HelloMode::LegacyV1 => {
-                    let hello_frame = PluginFrame::LegacyV1(LegacyV1Frame::Hello {
-                        protocol: 1,
-                        plugin: inner.config.id.clone(),
-                        targets: inner.config.targets.clone(),
+            #[allow(clippy::match_single_binding, clippy::infallible_destructuring_match)]
+            let (mut child, stdout_task, stderr_task, channel_closed) = match spawned_transport {
+                #[cfg(unix)]
+                SpawnedTransport::UnixFd3(mut child, unix_stream) => {
+                    let stdout_task = child.stdout.take().map(drain_output_stream);
+                    let stderr_task = child.stderr.take().map(|stderr| {
+                        drain_stderr_stream(
+                            stderr,
+                            Arc::clone(&inner),
+                            Arc::clone(&redacted_secrets),
+                            Arc::clone(&run_stderr_tail),
+                        )
                     });
-                    if let Ok(wire) = encode_frame(&hello_frame) {
-                        let _ = out_tx.send(wire).await;
-                    }
-                    None
+                    let (read_half, write_half) = unix_stream.into_split();
+                    let closed = run_channel_io(
+                        &inner,
+                        &host,
+                        read_half,
+                        write_half,
+                        Vec::new(),
+                        &mut first_ready,
+                    )
+                    .await;
+                    (child, stdout_task, stderr_task, closed)
                 }
-                HelloMode::JsonRpcV2 => {
-                    let params = serde_json::to_value(HelloParams {
-                        protocol: 2,
-                        plugin: inner.config.id.clone(),
-                        targets: inner.config.targets.clone(),
-                    })
-                    .ok();
-                    let hello_frame = PluginFrame::JsonRpcNotification(JsonRpcNotification::new(
-                        METHOD_HELLO,
-                        params,
-                    ));
-                    if let Ok(wire) = encode_frame(&hello_frame) {
-                        let _ = out_tx.send(wire).await;
-                    }
-                    None
-                }
-                HelloMode::Auto => {
-                    let grace = inner.config.auto_hello_grace;
-                    let tx_clone = out_tx.clone();
-                    let proto_clone = Arc::clone(&detected_protocol);
-                    let last_proto_inner = Arc::clone(&inner);
-                    let cancel_clone = Arc::clone(&hello_cancel);
-                    let plugin_id = inner.config.id.clone();
-                    let targets = inner.config.targets.clone();
-                    Some(tokio::spawn(async move {
-                        tokio::select! {
-                            () = cancel_clone.notified() => {}
-                            () = tokio::time::sleep(grace) => {
-                                if proto_clone
-                                    .compare_exchange(
-                                        PROTO_UNKNOWN,
-                                        PROTO_LEGACY_V1,
-                                        Ordering::AcqRel,
-                                        Ordering::Acquire,
-                                    )
-                                    .is_ok()
-                                {
-                                    last_proto_inner
-                                        .last_detected_protocol
-                                        .store(PROTO_LEGACY_V1, Ordering::Release);
-                                    let hello_frame = PluginFrame::LegacyV1(LegacyV1Frame::Hello {
-                                        protocol: 1,
-                                        plugin: plugin_id,
-                                        targets,
-                                    });
-                                    if let Ok(wire) = encode_frame(&hello_frame) {
-                                        let _ = tx_clone.send(wire).await;
-                                    }
-                                }
-                            }
+                SpawnedTransport::LoopbackTcp(mut child, listener, expected_token) => {
+                    let stdout_task = child.stdout.take().map(drain_output_stream);
+                    let stderr_task = child.stderr.take().map(|stderr| {
+                        drain_stderr_stream(
+                            stderr,
+                            Arc::clone(&inner),
+                            Arc::clone(&redacted_secrets),
+                            Arc::clone(&run_stderr_tail),
+                        )
+                    });
+
+                    match accept_and_authenticate_tcp(
+                        listener,
+                        &expected_token,
+                        &mut child,
+                        &inner,
+                        inner.config.startup_timeout,
+                    )
+                    .await
+                    {
+                        Ok((tcp_stream, leftover)) => {
+                            let (read_half, write_half) = tcp_stream.into_split();
+                            let closed = run_channel_io(
+                                &inner,
+                                &host,
+                                read_half,
+                                write_half,
+                                leftover,
+                                &mut first_ready,
+                            )
+                            .await;
+                            (child, stdout_task, stderr_task, closed)
                         }
-                    }))
+                        Err(TcpHandshakeError::Stopped) => {
+                            terminate_child(&mut child, inner.config.kill_timeout).await;
+                            drain_output_tasks(stdout_task, stderr_task).await;
+                            *inner.health.write().expect("health lock") = AdapterHealth::Stopped;
+                            host.update_status(&inner.config.id, AdapterHealth::Stopped)
+                                .await;
+                            if let Some(n) = first_ready.take() {
+                                n.notify_waiters();
+                            }
+                            break;
+                        }
+                        Err(TcpHandshakeError::ChildExited(exit_desc)) => {
+                            drain_output_tasks(stdout_task, stderr_task).await;
+                            if inner.stopping.load(Ordering::Acquire) != 0 {
+                                *inner.health.write().expect("health lock") =
+                                    AdapterHealth::Stopped;
+                                host.update_status(&inner.config.id, AdapterHealth::Stopped)
+                                    .await;
+                                if let Some(n) = first_ready.take() {
+                                    n.notify_waiters();
+                                }
+                                break;
+                            }
+                            consecutive_rapid_crashes = consecutive_rapid_crashes.saturating_add(1);
+                            let stderr_summary = format_stderr_summary(&run_stderr_tail);
+                            let crash_msg = if stderr_summary.is_empty() {
+                                format!(
+                                    "CrashLoopBackOff: subprocess {exit_desc} rapidly {consecutive_rapid_crashes} consecutive times"
+                                )
+                            } else {
+                                format!(
+                                    "CrashLoopBackOff: subprocess {exit_desc} rapidly {consecutive_rapid_crashes} consecutive times: {stderr_summary}"
+                                )
+                            };
+                            let degraded_msg = if stderr_summary.is_empty() {
+                                format!("subprocess {exit_desc} unexpectedly")
+                            } else {
+                                format!("subprocess {exit_desc} unexpectedly: {stderr_summary}")
+                            };
+                            if !handle_rapid_failure_and_backoff(
+                                &inner,
+                                &host,
+                                &redacted_secrets,
+                                &mut first_ready,
+                                &mut backoff,
+                                &mut consecutive_rapid_crashes,
+                                crash_msg,
+                                degraded_msg,
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(TcpHandshakeError::AuthFailed(raw_err)) => {
+                            terminate_child(
+                                &mut child,
+                                inner.config.kill_timeout.min(Duration::from_millis(500)),
+                            )
+                            .await;
+                            drain_output_tasks(stdout_task, stderr_task).await;
+                            if inner.stopping.load(Ordering::Acquire) != 0 {
+                                *inner.health.write().expect("health lock") =
+                                    AdapterHealth::Stopped;
+                                host.update_status(&inner.config.id, AdapterHealth::Stopped)
+                                    .await;
+                                if let Some(n) = first_ready.take() {
+                                    n.notify_waiters();
+                                }
+                                break;
+                            }
+                            consecutive_rapid_crashes = consecutive_rapid_crashes.saturating_add(1);
+                            let safe_err = sanitize_and_redact(&raw_err, &redacted_secrets);
+                            record_stderr_line(&inner, &redacted_secrets, None, &safe_err);
+                            let stderr_summary = format_stderr_summary(&run_stderr_tail);
+                            let full_err = if stderr_summary.is_empty() {
+                                safe_err
+                            } else {
+                                format!("{safe_err}: {stderr_summary}")
+                            };
+                            let crash_msg = format!(
+                                "CrashLoopBackOff: TCP handshake failed {consecutive_rapid_crashes} consecutive times ({full_err})"
+                            );
+                            if !handle_rapid_failure_and_backoff(
+                                &inner,
+                                &host,
+                                &redacted_secrets,
+                                &mut first_ready,
+                                &mut backoff,
+                                &mut consecutive_rapid_crashes,
+                                crash_msg,
+                                full_err,
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
                 }
             };
-
-            if let Some(n) = first_ready.take() {
-                n.notify_waiters();
-            }
-
-            let mut splitter = LineSplitter::new(MAX_FRAME_BYTES, false);
-            let mut buf = [0u8; 4096];
-            let mut channel_closed = false;
-
-            loop {
-                if inner.stopping.load(Ordering::Acquire) != 0 {
-                    break;
-                }
-                tokio::select! {
-                    () = inner.stop_notify.notified() => {
-                        break;
-                    }
-                    read_res = read_half.read(&mut buf) => {
-                        match read_res {
-                            Ok(0) => {
-                                channel_closed = true;
-                                break;
-                            }
-                            Ok(n) => {
-                                let mut completed: Vec<(String, bool)> = Vec::new();
-                                splitter.push(&buf[..n], |line, truncated| {
-                                    completed.push((line, truncated));
-                                });
-                                for (line, truncated) in completed {
-                                    hello_cancel.notify_waiters();
-                                    handle_incoming_line(
-                                        &inner,
-                                        &host,
-                                        &out_tx,
-                                        &detected_protocol,
-                                        &pending_requests,
-                                        line,
-                                        truncated,
-                                    )
-                                    .await;
-                                }
-                            }
-                            Err(_) => {
-                                channel_closed = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if let Some(ht) = hello_task {
-                ht.abort();
-            }
-
-            {
-                *inner.active.lock().await = None;
-                let mut map = pending_requests.lock().await;
-                for (_, sender) in map.drain() {
-                    let _ = sender.send(Err(AdapterError::NotRunning(format!(
-                        "subprocess '{}' disconnected",
-                        inner.config.id
-                    ))));
-                }
-            }
-            drop(out_tx);
-            let _ = writer_task.await;
 
             let stopping_now = inner.stopping.load(Ordering::Acquire) != 0;
             let exit_desc = if stopping_now {
@@ -1122,16 +1705,7 @@ mod unix_runtime {
                 }
             };
 
-            if let Some(t) = stdout_task {
-                if tokio::time::timeout(Duration::from_secs(2), t).await.is_err() {
-                    // Best-effort bounded drain; avoid hanging if a grandchild holds stdout open.
-                }
-            }
-            if let Some(t) = stderr_task {
-                if tokio::time::timeout(Duration::from_secs(2), t).await.is_err() {
-                    // Best-effort bounded drain; avoid hanging if a grandchild holds stderr open.
-                }
-            }
+            drain_output_tasks(stdout_task, stderr_task).await;
 
             if inner.stopping.load(Ordering::Acquire) != 0 {
                 *inner.health.write().expect("health lock") = AdapterHealth::Stopped;
@@ -1151,46 +1725,34 @@ mod unix_runtime {
             }
 
             let stderr_summary = format_stderr_summary(&run_stderr_tail);
-            if inner.config.max_rapid_crashes > 0
-                && consecutive_rapid_crashes >= inner.config.max_rapid_crashes
-            {
-                inner.crash_loop_backoff.store(true, Ordering::Release);
-                let reason = if stderr_summary.is_empty() {
-                    format!(
-                        "CrashLoopBackOff: subprocess {exit_desc} rapidly {consecutive_rapid_crashes} consecutive times"
-                    )
-                } else {
-                    format!(
-                        "CrashLoopBackOff: subprocess {exit_desc} rapidly {consecutive_rapid_crashes} consecutive times: {stderr_summary}"
-                    )
-                };
-                record_stderr_line(&inner, &redacted_secrets, None, &reason);
-                *inner.last_error.write().expect("last_error lock") = Some(reason.clone());
-                *inner.health.write().expect("health lock") =
-                    AdapterHealth::Degraded(reason.clone());
-                host.update_status(&inner.config.id, AdapterHealth::Degraded(reason))
-                    .await;
-                break;
-            }
-
-            let reason = if stderr_summary.is_empty() {
+            let crash_msg = if stderr_summary.is_empty() {
+                format!(
+                    "CrashLoopBackOff: subprocess {exit_desc} rapidly {consecutive_rapid_crashes} consecutive times"
+                )
+            } else {
+                format!(
+                    "CrashLoopBackOff: subprocess {exit_desc} rapidly {consecutive_rapid_crashes} consecutive times: {stderr_summary}"
+                )
+            };
+            let degraded_msg = if stderr_summary.is_empty() {
                 format!("subprocess {exit_desc} unexpectedly")
             } else {
                 format!("subprocess {exit_desc} unexpectedly: {stderr_summary}")
             };
-            *inner.last_error.write().expect("last_error lock") = Some(reason.clone());
-            *inner.health.write().expect("health lock") = AdapterHealth::Degraded(reason.clone());
-            host.update_status(&inner.config.id, AdapterHealth::Degraded(reason))
-                .await;
-
-            if !sleep_or_stop(&inner, backoff).await {
-                *inner.health.write().expect("health lock") = AdapterHealth::Stopped;
-                host.update_status(&inner.config.id, AdapterHealth::Stopped)
-                    .await;
+            if !handle_rapid_failure_and_backoff(
+                &inner,
+                &host,
+                &redacted_secrets,
+                &mut first_ready,
+                &mut backoff,
+                &mut consecutive_rapid_crashes,
+                crash_msg,
+                degraded_msg,
+            )
+            .await
+            {
                 break;
             }
-            backoff = (backoff * 2).min(inner.config.max_backoff);
-            inner.restart_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 

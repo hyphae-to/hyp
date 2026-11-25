@@ -1,14 +1,12 @@
 //! Real External Plugins & SDK Subprocess E2E Tests (`plugins/*` + `SubprocessSupervisor` + `UnifiedNode`).
 //!
-//! Spawns the **real repository plugin scripts** under `plugins/` over Unix fd-3 IPC via
+//! Spawns the **real repository plugin scripts** under `plugins/` over BOTH Unix fd-3 IPC (Unix)
+//! and authenticated loopback-TCP IPC (`PluginTransportMode::LoopbackTcp`, Unix + Windows) via
 //! `SubprocessSupervisor` wired into a live `UnifiedNode`, with loopback-only mock external APIs
 //! (`MockHttpServer`) and ephemeral `TempDir` state.
 //!
-//! Guarded cleanly with `#[cfg(unix)]` so Windows builds emit ZERO unused-import or dead-code
-//! warnings. Individual Node/Python tests skip gracefully ONLY if `node` or `python3` is missing
-//! from `PATH`.
+//! Individual Node/Python tests skip gracefully ONLY if `node` or Python 3 is missing from `PATH`.
 
-#[cfg(unix)]
 mod common;
 
 #[cfg(unix)]
@@ -2420,5 +2418,1135 @@ sys.exit(1)
 
         let _ = supervisor.stop().await;
         node.shutdown();
+    }
+}
+
+// ============================================================================
+// Cross-Platform (Windows + Unix) Authenticated Loopback-TCP Transport & SDK Parity
+// ============================================================================
+
+mod loopback_tcp_parity_tests {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use http::header::CONTENT_TYPE;
+    use http::{HeaderMap, Method, Request, StatusCode};
+    use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
+    use tempfile::TempDir;
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex as AsyncMutex;
+
+    use crate::common::{MockHttpServer, MockRequest, MockResponse, UnifiedNodeAdapterHost};
+    use hyp_crypto::SecretBackend;
+    use hyp_node::adapters::supervisor::PluginTransportMode;
+    use hyp_node::adapters::{
+        AdapterError, AdapterHealth, AdapterKind, HelloMode, NodeAdapter, SubprocessConfig,
+        SubprocessSupervisor, WireProtocol, compute_hmac_sha256_header, verify_hmac_sha256_header,
+    };
+    use hyp_node::engine::http_util::{HttpClient, empty_body, full_body};
+    use hyp_node::engine::{NodeConfig, SubscribeRequest, UnifiedNode};
+    use hyp_proto::address::NodeId;
+    use hyp_proto::rpc::StatusParams;
+    use hyp_store::{DeliveryMode, now_ms};
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("resolve repository root")
+    }
+
+    fn find_binary(name: &str) -> Option<String> {
+        let output = std::process::Command::new(name)
+            .arg("--version")
+            .output()
+            .ok()?;
+        if output.status.success() {
+            Some(name.to_string())
+        } else {
+            None
+        }
+    }
+
+    fn find_python3_binary() -> Option<String> {
+        for candidate in ["python3", "python"] {
+            let Ok(out) = std::process::Command::new(candidate)
+                .args(["-c", "import sys; print(sys.version_info[0])"])
+                .output()
+            else {
+                continue;
+            };
+            if out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "3" {
+                return Some(candidate.to_string());
+            }
+        }
+        None
+    }
+
+    async fn pick_free_loopback_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        port
+    }
+
+    async fn wait_for_http_ready(url: &str, timeout_dur: Duration) {
+        let client = HttpClient::new().unwrap();
+        let deadline = tokio::time::Instant::now() + timeout_dur;
+        loop {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(url)
+                .body(empty_body())
+                .unwrap();
+            if client.request(req).await.is_ok() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for plugin HTTP server at {url}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn open_test_node(name: &str, dir: &Path) -> Arc<UnifiedNode> {
+        let mut cfg = NodeConfig::local(NodeId::new(name).unwrap(), dir);
+        cfg.secret_backend = Some(SecretBackend::File);
+        UnifiedNode::open(cfg).unwrap()
+    }
+
+    #[tokio::test]
+    async fn loopback_tcp_node_sdk_client_mjs_jsonrpc_v2_and_real_webhook_bridge_parity_e2e() {
+        let Some(node_bin) = find_binary("node") else {
+            eprintln!(
+                "SKIP loopback_tcp_node_sdk_client_mjs_jsonrpc_v2_and_real_webhook_bridge_parity_e2e: `node` not on PATH"
+            );
+            return;
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let sdk_path = repo_root().join("plugins/sdk/client.mjs");
+        assert!(sdk_path.exists(), "missing {}", sdk_path.display());
+
+        // --------------------------------------------------------------------
+        // (1) Fail-closed non-loopback address guard in `plugins/sdk/client.mjs`
+        // --------------------------------------------------------------------
+        let guard_script = tmp.path().join("sdk_mjs_loopback_guard.mjs");
+        fs::write(
+            &guard_script,
+            r#"
+import { pathToFileURL } from "node:url";
+const { MeshPluginClient } = await import(pathToFileURL(process.env.SDK_MJS_PATH).href);
+for (const badAddr of ["192.168.1.10:8080", "0.0.0.0:8080", "evil.example.com:8080", "127.0.0.1:0", "not-a-host-port"]) {
+  process.env.HYPHAE_PLUGIN_ADDR = badAddr;
+  process.env.HYPHAE_PLUGIN_TOKEN = "a".repeat(64);
+  let threw = false;
+  try {
+    new MeshPluginClient();
+  } catch (err) {
+    threw = true;
+  }
+  if (!threw) {
+    throw new Error(`Expected MeshPluginClient to reject invalid/non-loopback addr: ${badAddr}`);
+  }
+}
+"#,
+        )
+        .unwrap();
+        let guard_out = tokio::process::Command::new(&node_bin)
+            .arg(&guard_script)
+            .env("SDK_MJS_PATH", &sdk_path)
+            .output()
+            .await
+            .expect("run client.mjs loopback guard check");
+        assert!(
+            guard_out.status.success(),
+            "client.mjs loopback guard failed: stderr={}",
+            String::from_utf8_lossy(&guard_out.stderr)
+        );
+
+        // --------------------------------------------------------------------
+        // (2) Real `plugins/sdk/client.mjs` over authenticated `LoopbackTcp`
+        // --------------------------------------------------------------------
+        let sdk_report_file = tmp.path().join("tcp_sdk_mjs_report.json");
+        let sdk_harness = tmp.path().join("tcp_sdk_mjs_harness.mjs");
+        fs::write(
+            &sdk_harness,
+            r#"
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const { MeshPluginClient } = await import(pathToFileURL(process.env.SDK_MJS_PATH).href);
+
+const transportBefore = process.env.HYPHAE_PLUGIN_TRANSPORT ?? null;
+const hadAddrBefore = Boolean(process.env.HYPHAE_PLUGIN_ADDR);
+const hadTokenBefore = Boolean(process.env.HYPHAE_PLUGIN_TOKEN);
+
+const mesh = new MeshPluginClient({
+  onPost: async (params) => {
+    if (params.fail) throw new Error("tcp_intentional_post_failure");
+    return { echoed: params.text, target: params.target, transport: transportBefore };
+  },
+});
+
+const tokenPoppedAfterCtor = process.env.HYPHAE_PLUGIN_TOKEN === undefined;
+const hello = await mesh.ready;
+
+const validEvent = {
+  specversion: "1.0",
+  id: "tcp-sdk-mjs-evt-1",
+  source: "sdk/node-tcp-test",
+  type: "com.hyphae.sdk.tcp.ping",
+  time: "2026-11-25T12:00:00Z",
+  datacontenttype: "application/json",
+  data: { ok: true, transport: "tcp", lang: "mjs" },
+};
+const ackStored = await mesh.send("sdk-tcp", validEvent);
+const ackDup = await mesh.send("sdk-tcp", validEvent);
+const nackInvalid = await mesh.send("sdk-tcp", {
+  specversion: "9.9",
+  id: "",
+  source: "bad",
+  type: "bad",
+});
+const nackTarget = await mesh.send("wrong-target", validEvent);
+
+writeFileSync(
+  process.env.SDK_REPORT_FILE,
+  JSON.stringify({
+    transportBefore,
+    hadAddrBefore,
+    hadTokenBefore,
+    tokenPoppedAfterCtor,
+    hello,
+    ackStored,
+    ackDup,
+    nackInvalid,
+    nackTarget,
+  }),
+  "utf8",
+);
+
+setInterval(() => {}, 10_000);
+"#,
+        )
+        .unwrap();
+
+        let sdk_node = open_test_node("tcp-sdk-mjs-node", &tmp.path().join("sdk-node"));
+        let sdk_host = UnifiedNodeAdapterHost::new(Arc::clone(&sdk_node));
+        let mut sdk_cfg = SubprocessConfig::new(
+            "sdk-mjs-tcp",
+            AdapterKind::Bridge,
+            node_bin.clone(),
+            vec![sdk_harness.to_string_lossy().into_owned()],
+            vec!["sdk-tcp".to_string()],
+        );
+        sdk_cfg.transport_mode = PluginTransportMode::LoopbackTcp;
+        sdk_cfg.hello_mode = HelloMode::Auto;
+        sdk_cfg
+            .env
+            .insert("SDK_MJS_PATH".into(), sdk_path.to_string_lossy().into_owned());
+        sdk_cfg.env.insert(
+            "SDK_REPORT_FILE".into(),
+            sdk_report_file.to_string_lossy().into_owned(),
+        );
+
+        let sdk_sup = SubprocessSupervisor::new(sdk_cfg);
+        sdk_sup.start(Arc::clone(&sdk_host) as _).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let report: Value = loop {
+            if let Ok(raw) = fs::read_to_string(&sdk_report_file) {
+                if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                    break v;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for tcp_sdk_mjs_report.json; health={:?} stderr={:?}",
+                sdk_sup.health(),
+                sdk_sup.recent_stderr()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+
+        assert_eq!(report["transportBefore"], "tcp");
+        assert_eq!(report["hadAddrBefore"], true);
+        assert_eq!(report["hadTokenBefore"], true);
+        assert_eq!(
+            report["tokenPoppedAfterCtor"], true,
+            "client.mjs MUST delete HYPHAE_PLUGIN_TOKEN from process.env immediately"
+        );
+        assert_eq!(report["hello"]["type"], "hello");
+        assert_eq!(report["hello"]["protocol"], 1);
+        assert_eq!(report["hello"]["targets"], json!(["sdk-tcp"]));
+        assert_eq!(report["ackStored"]["type"], "ack");
+        assert_eq!(report["ackStored"]["status"], "stored");
+        assert_eq!(report["ackDup"]["type"], "ack");
+        assert_eq!(report["ackDup"]["status"], "duplicate");
+        assert_eq!(report["nackInvalid"]["type"], "nack");
+        assert_eq!(report["nackInvalid"]["error"], "invalid_event");
+        assert_eq!(report["nackTarget"]["type"], "nack");
+        assert_eq!(report["nackTarget"]["error"], "unknown_target");
+
+        let post_ok = sdk_sup
+            .post(
+                "sdk-tcp",
+                BTreeMap::from([("text".to_string(), json!("hello over loopback tcp"))]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("outbound post over LoopbackTcp must succeed");
+        assert_eq!(
+            post_ok,
+            json!({ "echoed": "hello over loopback tcp", "target": "sdk-tcp", "transport": "tcp" })
+        );
+
+        let post_err = sdk_sup
+            .post(
+                "sdk-tcp",
+                BTreeMap::from([("fail".to_string(), json!(true))]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("intentional post error must propagate over LoopbackTcp");
+        assert!(
+            matches!(&post_err, AdapterError::RequestFailed(m) if m.contains("tcp_intentional_post_failure")),
+            "unexpected post_err: {post_err:?}"
+        );
+
+        let sdk_ingested = sdk_host.published_events().await;
+        assert_eq!(sdk_ingested.len(), 1);
+        assert_eq!(sdk_ingested[0].1.id, "tcp-sdk-mjs-evt-1");
+
+        let _ = sdk_sup.stop().await;
+        assert_eq!(sdk_sup.health(), AdapterHealth::Stopped);
+        sdk_node.shutdown();
+
+        // --------------------------------------------------------------------
+        // (3) JSON-RPC 2.0 v2 pipelined auth + `hyphae/hello` + `hyphae/publish` + `hyphae/post`
+        // --------------------------------------------------------------------
+        let v2_script = tmp.path().join("tcp_jsonrpc_v2.mjs");
+        fs::write(
+            &v2_script,
+            r#"
+import net from "node:net";
+import { createInterface } from "node:readline";
+
+const [host, portStr] = process.env.HYPHAE_PLUGIN_ADDR.split(":");
+const token = process.env.HYPHAE_PLUGIN_TOKEN;
+delete process.env.HYPHAE_PLUGIN_TOKEN;
+
+const sock = net.createConnection({ host, port: Number(portStr) });
+sock.setNoDelay(true);
+
+// Pipeline auth + hyphae/hello in ONE single TCP write to prove auth reader never eats leftover bytes!
+sock.write(
+  JSON.stringify({ type: "auth", token }) + "\n" +
+  JSON.stringify({ jsonrpc: "2.0", id: "h1", method: "hyphae/hello", params: { protocol: 2, plugin: "v2-tcp", targets: ["ops"] } }) + "\n",
+);
+
+const rl = createInterface({ input: sock });
+rl.on("line", (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.id === "h1" && msg.result) {
+    sock.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "p1",
+        method: "hyphae/publish",
+        params: {
+          to: "ops",
+          event: {
+            specversion: "1.0",
+            id: "v2-tcp-evt-1",
+            source: "tcp/jsonrpc-v2",
+            type: "to.hyphae.tcp.v2",
+            datacontenttype: "application/json",
+            data: { pipelined: true },
+          },
+        },
+      }) + "\n",
+    );
+  } else if (msg.method === "hyphae/post" && msg.id !== undefined) {
+    sock.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: { v2: true, target: msg.params.target, text: msg.params.params.text },
+      }) + "\n",
+    );
+  }
+});
+rl.on("close", () => process.exit(0));
+"#,
+        )
+        .unwrap();
+
+        let v2_node = open_test_node("tcp-v2-node", &tmp.path().join("v2-node"));
+        let v2_host = UnifiedNodeAdapterHost::new(Arc::clone(&v2_node));
+        let mut v2_cfg = SubprocessConfig::new(
+            "v2-tcp",
+            AdapterKind::Bridge,
+            node_bin.clone(),
+            vec![v2_script.to_string_lossy().into_owned()],
+            vec!["ops".to_string()],
+        );
+        v2_cfg.transport_mode = PluginTransportMode::LoopbackTcp;
+        v2_cfg.hello_mode = HelloMode::Auto;
+
+        let v2_sup = SubprocessSupervisor::new(v2_cfg);
+        v2_sup.start(Arc::clone(&v2_host) as _).await.unwrap();
+
+        let v2_events = v2_host.wait_for_event_count(1, Duration::from_secs(10)).await;
+        assert_eq!(v2_events[0].0, "ops");
+        assert_eq!(v2_events[0].1.id, "v2-tcp-evt-1");
+        assert_eq!(v2_sup.detected_protocol(), WireProtocol::JsonRpcV2);
+
+        let v2_post = v2_sup
+            .post(
+                "ops",
+                BTreeMap::from([("text".to_string(), json!("rpc-v2-tcp-ok"))]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("JSON-RPC 2.0 post over LoopbackTcp must succeed");
+        assert_eq!(
+            v2_post,
+            json!({ "v2": true, "target": "ops", "text": "rpc-v2-tcp-ok" })
+        );
+
+        let _ = v2_sup.stop().await;
+        v2_node.shutdown();
+
+        // --------------------------------------------------------------------
+        // (4) Real unmodified `plugins/webhook/index.mjs` over `LoopbackTcp`
+        //     (+ differential comparison against `UnixFd3` on Unix!)
+        // --------------------------------------------------------------------
+        let secret = "tcp-webhook-parity-secret-2026";
+        let secret_file = tmp.path().join("wh_tcp.secret");
+        fs::write(&secret_file, secret).unwrap();
+
+        let captured_outbound: Arc<AsyncMutex<Vec<(HeaderMap, Bytes)>>> =
+            Arc::new(AsyncMutex::new(Vec::new()));
+        let captured_srv = Arc::clone(&captured_outbound);
+        let mock_cb = MockHttpServer::start(move |req: MockRequest| {
+            let captured = Arc::clone(&captured_srv);
+            async move {
+                captured.lock().await.push((req.headers, req.body));
+                MockResponse::json(StatusCode::OK, &json!({ "received": true }))
+            }
+        })
+        .await;
+
+        let wh_node = open_test_node("wh-tcp-node", &tmp.path().join("wh-tcp-node"));
+        wh_node.register_handle("sess-tcp-wh", "agent").await.unwrap();
+        wh_node
+            .subscribe_local_or_remote(SubscribeRequest {
+                id: Some("sub-tcp-wh".to_string()),
+                subscriber_session: "sess-tcp-wh".to_string(),
+                qualified_topic: "local.webhook".to_string(),
+                filters: Vec::new(),
+                coalesce_seconds: 0,
+                mode: DeliveryMode::Full,
+            })
+            .await
+            .unwrap();
+        let wh_host = UnifiedNodeAdapterHost::new(Arc::clone(&wh_node));
+        let wh_port = pick_free_loopback_port().await;
+        let plugin_script = repo_root().join("plugins/webhook/index.mjs");
+
+        let mut wh_cfg = SubprocessConfig::new(
+            "webhook-tcp",
+            AdapterKind::Bridge,
+            node_bin.clone(),
+            vec![plugin_script.to_string_lossy().into_owned()],
+            vec!["webhook".to_string()],
+        );
+        wh_cfg.transport_mode = PluginTransportMode::LoopbackTcp;
+        wh_cfg.hello_mode = HelloMode::Auto;
+        wh_cfg.env.insert("WEBHOOK_HOST".into(), "127.0.0.1".into());
+        wh_cfg.env.insert("WEBHOOK_PORT".into(), wh_port.to_string());
+        wh_cfg.env.insert("WEBHOOK_PATH".into(), "/webhook".into());
+        wh_cfg.env.insert("WEBHOOK_TARGET".into(), "webhook".into());
+        wh_cfg.env.insert(
+            "WEBHOOK_SECRET_FILE".into(),
+            secret_file.to_string_lossy().into_owned(),
+        );
+        wh_cfg
+            .env
+            .insert("WEBHOOK_POST_URL".into(), mock_cb.url("/cb"));
+
+        let wh_sup = SubprocessSupervisor::new(wh_cfg);
+        wh_sup.start(Arc::clone(&wh_host) as _).await.unwrap();
+        wait_for_http_ready(
+            &format!("http://127.0.0.1:{wh_port}/ready-probe"),
+            Duration::from_secs(10),
+        )
+        .await;
+
+        let client = HttpClient::new().unwrap();
+        let wh_url = format!("http://127.0.0.1:{wh_port}/webhook");
+        let valid_body = serde_json::to_vec(&json!({
+            "type": "com.acme.tcp.deploy",
+            "source": "ci/win-runner",
+            "subject": "service/payments",
+            "data": { "sha": "faceb00c", "platform": "cross" }
+        }))
+        .unwrap();
+        let expected_id = format!("sha256:{}", hex::encode(Sha256::digest(&valid_body)));
+        let valid_sig = compute_hmac_sha256_header(secret.as_bytes(), &valid_body);
+
+        let req_ok = Request::builder()
+            .method(Method::POST)
+            .uri(&wh_url)
+            .header(CONTENT_TYPE, "application/json")
+            .header("x-webhook-signature-256", &valid_sig)
+            .body(full_body(valid_body.clone()))
+            .unwrap();
+        let resp_ok = client.request(req_ok).await.unwrap();
+        let (st_ok, _, body_ok) = HttpClient::collect(resp_ok, 64 * 1024).await.unwrap();
+        assert_eq!(st_ok, StatusCode::ACCEPTED);
+        let ack_json: Value = serde_json::from_slice(&body_ok).unwrap();
+        assert_eq!(ack_json["status"], "stored");
+        assert_eq!(ack_json["id"], expected_id);
+
+        let tcp_events = wh_host.wait_for_event_count(1, Duration::from_secs(5)).await;
+        assert_eq!(tcp_events[0].0, "webhook");
+        assert_eq!(tcp_events[0].1.id, expected_id);
+        assert_eq!(tcp_events[0].1.event_type, "com.acme.tcp.deploy");
+
+        // Verify persisted into UnifiedNode SQLite batch for local subscriber!
+        let batches = {
+            let db = wh_node.db();
+            let now = now_ms();
+            let _ = db.events().tick(now);
+            db.events().claim_due_batches("sess-tcp-wh", now).unwrap()
+        };
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].events[0].id, expected_id);
+
+        // Outbound signed post over LoopbackTcp!
+        let wh_post = wh_sup
+            .post(
+                "webhook",
+                BTreeMap::from([("text".to_string(), json!("Signed TCP webhook reply"))]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("webhook outbound post over LoopbackTcp must succeed");
+        assert_eq!(wh_post["ok"], json!(true));
+        let out_calls = captured_outbound.lock().await;
+        assert_eq!(out_calls.len(), 1);
+        let out_sig = out_calls[0]
+            .0
+            .get("x-webhook-signature-256")
+            .and_then(|v| v.to_str().ok());
+        assert!(verify_hmac_sha256_header(
+            secret.as_bytes(),
+            &out_calls[0].1,
+            out_sig,
+            true
+        ));
+        drop(out_calls);
+
+        // Differential Unix fd-3 vs LoopbackTcp parity check on Unix!
+        #[cfg(unix)]
+        {
+            let fd3_node = open_test_node("wh-fd3-node", &tmp.path().join("wh-fd3-node"));
+            let fd3_host = UnifiedNodeAdapterHost::new(Arc::clone(&fd3_node));
+            let fd3_port = pick_free_loopback_port().await;
+
+            let mut fd3_cfg = SubprocessConfig::new(
+                "webhook-fd3",
+                AdapterKind::Bridge,
+                node_bin,
+                vec![plugin_script.to_string_lossy().into_owned()],
+                vec!["webhook".to_string()],
+            );
+            fd3_cfg.transport_mode = PluginTransportMode::UnixFd3;
+            fd3_cfg.hello_mode = HelloMode::Auto;
+            fd3_cfg.env.insert("WEBHOOK_HOST".into(), "127.0.0.1".into());
+            fd3_cfg.env.insert("WEBHOOK_PORT".into(), fd3_port.to_string());
+            fd3_cfg.env.insert("WEBHOOK_PATH".into(), "/webhook".into());
+            fd3_cfg.env.insert("WEBHOOK_TARGET".into(), "webhook".into());
+            fd3_cfg.env.insert(
+                "WEBHOOK_SECRET_FILE".into(),
+                secret_file.to_string_lossy().into_owned(),
+            );
+
+            let fd3_sup = SubprocessSupervisor::new(fd3_cfg);
+            fd3_sup.start(Arc::clone(&fd3_host) as _).await.unwrap();
+            wait_for_http_ready(
+                &format!("http://127.0.0.1:{fd3_port}/ready-probe"),
+                Duration::from_secs(10),
+            )
+            .await;
+
+            let req_fd3 = Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://127.0.0.1:{fd3_port}/webhook"))
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-webhook-signature-256", &valid_sig)
+                .body(full_body(valid_body))
+                .unwrap();
+            assert_eq!(client.request(req_fd3).await.unwrap().status(), StatusCode::ACCEPTED);
+
+            let fd3_events = fd3_host.wait_for_event_count(1, Duration::from_secs(5)).await;
+            assert_eq!(tcp_events[0].0, fd3_events[0].0);
+            assert_eq!(tcp_events[0].1.id, fd3_events[0].1.id);
+            assert_eq!(tcp_events[0].1.event_type, fd3_events[0].1.event_type);
+            assert_eq!(tcp_events[0].1.source, fd3_events[0].1.source);
+            assert_eq!(tcp_events[0].1.subject, fd3_events[0].1.subject);
+            assert_eq!(tcp_events[0].1.data, fd3_events[0].1.data);
+
+            let _ = fd3_sup.stop().await;
+            fd3_node.shutdown();
+        }
+
+        let _ = wh_sup.stop().await;
+        wh_node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn loopback_tcp_python_sdk_client_py_hello_publish_status_and_post_e2e() {
+        let Some(python_bin) = find_python3_binary() else {
+            eprintln!(
+                "SKIP loopback_tcp_python_sdk_client_py_hello_publish_status_and_post_e2e: Python 3 not on PATH"
+            );
+            return;
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let sdk_dir = repo_root().join("plugins/sdk");
+        assert!(sdk_dir.join("client.py").exists(), "missing client.py");
+
+        // (1) Fail-closed non-loopback address guard in `plugins/sdk/client.py`
+        let guard_script = tmp.path().join("sdk_py_loopback_guard.py");
+        fs::write(
+            &guard_script,
+            r#"
+import os, sys
+sys.path.insert(0, os.environ["SDK_PY_DIR"])
+from client import MeshPluginClient
+
+for bad_addr in ["192.168.1.5:9000", "0.0.0.0:9000", "evil.example:9000", "127.0.0.1:0", "broken"]:
+    os.environ["HYPHAE_PLUGIN_ADDR"] = bad_addr
+    os.environ["HYPHAE_PLUGIN_TOKEN"] = "b" * 64
+    threw = False
+    try:
+        MeshPluginClient()
+    except (ValueError, RuntimeError):
+        threw = True
+    assert threw, f"expected MeshPluginClient to reject {bad_addr!r}"
+"#,
+        )
+        .unwrap();
+        let guard_out = tokio::process::Command::new(&python_bin)
+            .arg(&guard_script)
+            .env("SDK_PY_DIR", &sdk_dir)
+            .output()
+            .await
+            .expect("run client.py loopback guard check");
+        assert!(
+            guard_out.status.success(),
+            "client.py loopback guard failed: stderr={}",
+            String::from_utf8_lossy(&guard_out.stderr)
+        );
+
+        // (2) Full round-trip over `PluginTransportMode::LoopbackTcp`:
+        //     auth token popped + hello + publish + duplicate + nack + status + inbound on_post RPC!
+        let report_file = tmp.path().join("tcp_sdk_py_report.json");
+        let status_file = tmp.path().join("tcp_sdk_py_status.json");
+        let helper_script = tmp.path().join("tcp_sdk_py_harness.py");
+        fs::write(
+            &helper_script,
+            r#"
+import json
+import os
+import sys
+
+sys.path.insert(0, os.environ["SDK_PY_DIR"])
+from client import MeshPluginClient
+
+transport_before = os.environ.get("HYPHAE_PLUGIN_TRANSPORT")
+had_token_before = bool(os.environ.get("HYPHAE_PLUGIN_TOKEN"))
+
+def on_status(msg):
+    with open(os.environ["SDK_STATUS_FILE"], "w", encoding="utf-8") as f:
+        json.dump(msg, f)
+
+def on_post(params):
+    if params.get("fail"):
+        raise RuntimeError("py_tcp_post_error")
+    return {
+        "echoed": params.get("text"),
+        "target": params.get("target"),
+        "transport": transport_before,
+    }
+
+client = MeshPluginClient(on_status=on_status, on_post=on_post)
+token_popped = os.environ.get("HYPHAE_PLUGIN_TOKEN") is None
+
+valid_event = {
+    "specversion": "1.0",
+    "id": "tcp-sdk-py-evt-1",
+    "source": "sdk/python-tcp-test",
+    "type": "com.hyphae.sdk.py.tcp.ping",
+    "time": "2026-11-25T12:00:00Z",
+    "datacontenttype": "application/json",
+    "data": {"ok": True, "lang": "python", "transport": "tcp"},
+}
+
+ack_stored = client.send("sdk-py-tcp", valid_event, retry_unavailable=False)
+ack_dup = client.send("sdk-py-tcp", valid_event, retry_unavailable=False)
+
+nack_invalid_err = None
+try:
+    client.send("sdk-py-tcp", {"specversion": "9.9", "id": "", "source": "x", "type": "y"}, retry_unavailable=False)
+except RuntimeError as exc:
+    nack_invalid_err = str(exc)
+
+nack_target_err = None
+try:
+    client.send("wrong-target", valid_event, retry_unavailable=False)
+except RuntimeError as exc:
+    nack_target_err = str(exc)
+
+with open(os.environ["SDK_REPORT_FILE"], "w", encoding="utf-8") as f:
+    json.dump({
+        "transport_before": transport_before,
+        "had_token_before": had_token_before,
+        "token_popped": token_popped,
+        "plugin": client.plugin,
+        "targets": client.targets,
+        "ack_stored": ack_stored,
+        "ack_dup": ack_dup,
+        "nack_invalid_err": nack_invalid_err,
+        "nack_target_err": nack_target_err,
+    }, f)
+
+client._dead.wait(timeout=15)
+"#,
+        )
+        .unwrap();
+
+        let node = open_test_node("tcp-sdk-py-node", tmp.path());
+        let host = UnifiedNodeAdapterHost::new(Arc::clone(&node));
+
+        let mut cfg = SubprocessConfig::new(
+            "sdk-py-tcp-test",
+            AdapterKind::Bridge,
+            python_bin,
+            vec!["-u".to_string(), helper_script.to_string_lossy().into_owned()],
+            vec!["sdk-py-tcp".to_string()],
+        );
+        cfg.transport_mode = PluginTransportMode::LoopbackTcp;
+        cfg.hello_mode = HelloMode::Auto;
+        cfg.env
+            .insert("SDK_PY_DIR".into(), sdk_dir.to_string_lossy().into_owned());
+        cfg.env.insert(
+            "SDK_REPORT_FILE".into(),
+            report_file.to_string_lossy().into_owned(),
+        );
+        cfg.env.insert(
+            "SDK_STATUS_FILE".into(),
+            status_file.to_string_lossy().into_owned(),
+        );
+
+        let supervisor = SubprocessSupervisor::new(cfg);
+        supervisor.start(Arc::clone(&host) as _).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let report: Value = loop {
+            if let Ok(raw) = fs::read_to_string(&report_file) {
+                if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                    break v;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for tcp_sdk_py_report.json; health={:?} stderr={:?}",
+                supervisor.health(),
+                supervisor.recent_stderr()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+
+        assert_eq!(report["transport_before"], "tcp");
+        assert_eq!(report["had_token_before"], true);
+        assert_eq!(
+            report["token_popped"], true,
+            "client.py MUST pop HYPHAE_PLUGIN_TOKEN from os.environ immediately"
+        );
+        assert_eq!(report["plugin"], "sdk-py-tcp-test");
+        assert_eq!(report["targets"], json!(["sdk-py-tcp"]));
+        assert_eq!(report["ack_stored"]["type"], "ack");
+        assert_eq!(report["ack_stored"]["status"], "stored");
+        assert_eq!(report["ack_dup"]["type"], "ack");
+        assert_eq!(report["ack_dup"]["status"], "duplicate");
+        assert!(
+            report["nack_invalid_err"]
+                .as_str()
+                .is_some_and(|s| s.contains("invalid_event"))
+        );
+        assert!(
+            report["nack_target_err"]
+                .as_str()
+                .is_some_and(|s| s.contains("unknown_target"))
+        );
+
+        // Verify host -> Python `status` notification over LoopbackTcp.
+        supervisor
+            .send_status(StatusParams {
+                target: "sdk-py-tcp".to_string(),
+                pending: 4,
+                oldest_age_seconds: 19,
+                t3_connected: true,
+            })
+            .await
+            .expect("send_status over LoopbackTcp must succeed");
+
+        let st_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let st_msg: Value = loop {
+            if let Ok(raw) = fs::read_to_string(&status_file) {
+                if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                    break v;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < st_deadline,
+                "timed out waiting for Python TCP on_status callback"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert_eq!(st_msg["type"], "status");
+        assert_eq!(st_msg["target"], "sdk-py-tcp");
+        assert_eq!(st_msg["pending"], 4);
+
+        // Verify host -> Python outbound `post` -> `on_post` handler over LoopbackTcp!
+        let py_post_ok = supervisor
+            .post(
+                "sdk-py-tcp",
+                BTreeMap::from([("text".to_string(), json!("ping python tcp post"))]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("Python on_post over LoopbackTcp must succeed");
+        assert_eq!(
+            py_post_ok,
+            json!({
+                "echoed": "ping python tcp post",
+                "target": "sdk-py-tcp",
+                "transport": "tcp"
+            })
+        );
+
+        let py_post_err = supervisor
+            .post(
+                "sdk-py-tcp",
+                BTreeMap::from([("fail".to_string(), json!(true))]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("Python on_post failure must propagate over LoopbackTcp");
+        assert!(
+            matches!(&py_post_err, AdapterError::RequestFailed(m) if m.contains("py_tcp_post_error")),
+            "unexpected py_post_err: {py_post_err:?}"
+        );
+
+        let ingested = host.published_events().await;
+        assert_eq!(ingested.len(), 1);
+        assert_eq!(ingested[0].1.id, "tcp-sdk-py-evt-1");
+
+        let _ = supervisor.stop().await;
+        assert_eq!(supervisor.health(), AdapterHealth::Stopped);
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn loopback_tcp_fail_closed_auth_wrong_token_missing_auth_oversized_timeout_and_redaction() {
+        let Some(node_bin) = find_binary("node") else {
+            eprintln!(
+                "SKIP loopback_tcp_fail_closed_auth_wrong_token_missing_auth_oversized_timeout_and_redaction: `node` not on PATH"
+            );
+            return;
+        };
+
+        let tmp = TempDir::new().unwrap();
+
+        // --------------------------------------------------------------------
+        // (a) Wrong 1-bit-flipped token + leaked HYPHAE_PLUGIN_TOKEN in stderr
+        // --------------------------------------------------------------------
+        let wrong_tok_script = tmp.path().join("bad_auth_token.mjs");
+        fs::write(
+            &wrong_tok_script,
+            r#"
+import net from "node:net";
+const [host, portStr] = process.env.HYPHAE_PLUGIN_ADDR.split(":");
+const realToken = process.env.HYPHAE_PLUGIN_TOKEN ?? "";
+// Simulate a buggy plugin accidentally logging process.env / handshake token to stderr!
+process.stderr.write(`BUGGY_ENV_DUMP_START=${realToken}=BUGGY_ENV_DUMP_END\n`);
+const badToken = (realToken[0] === "0" ? "1" : "0") + realToken.slice(1);
+const sock = net.createConnection({ host, port: Number(portStr) });
+sock.on("error", () => {});
+sock.write(
+  JSON.stringify({ type: "auth", token: badToken }) + "\n" +
+  JSON.stringify({
+    type: "event",
+    to: "ops",
+    event: {
+      specversion: "1.0",
+      id: "unauth-evt-wrong-tok",
+      source: "attacker",
+      type: "com.evil.spoof",
+      data: { pwned: true }
+    }
+  }) + "\n",
+);
+setInterval(() => {}, 10_000);
+"#,
+        )
+        .unwrap();
+
+        let log_path = tmp.path().join("logs").join("plugin-bad-auth.log");
+        let node_a = open_test_node("tcp-auth-a", &tmp.path().join("node-a"));
+        let host_a = UnifiedNodeAdapterHost::new(Arc::clone(&node_a));
+        let mut cfg_a = SubprocessConfig::new(
+            "bad-auth-tok",
+            AdapterKind::Bridge,
+            node_bin.clone(),
+            vec![wrong_tok_script.to_string_lossy().into_owned()],
+            vec!["ops".to_string()],
+        );
+        cfg_a.transport_mode = PluginTransportMode::LoopbackTcp;
+        cfg_a.stderr_log_path = Some(log_path.clone());
+        cfg_a.initial_backoff = Duration::from_millis(20);
+        cfg_a.max_backoff = Duration::from_millis(40);
+        cfg_a.max_rapid_crashes = 2;
+        cfg_a.startup_timeout = Duration::from_secs(3);
+
+        let sup_a = SubprocessSupervisor::new(cfg_a);
+        sup_a.start(Arc::clone(&host_a) as _).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !sup_a.is_crash_loop_backoff() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected wrong-token plugin to fail closed into CrashLoopBackOff; health={:?}",
+                sup_a.health()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert!(!sup_a.is_connected().await, "unauthenticated child must never be connected");
+        assert!(
+            host_a.published_events().await.is_empty(),
+            "spoofed event after wrong auth token MUST NEVER reach UnifiedNode"
+        );
+        match sup_a.health() {
+            AdapterHealth::Degraded(msg) => {
+                assert!(
+                    msg.contains("invalid handshake token"),
+                    "expected invalid handshake token error, got: {msg}"
+                );
+                assert!(
+                    msg.contains("BUGGY_ENV_DUMP_START=[REDACTED]=BUGGY_ENV_DUMP_END"),
+                    "expected redacted HYPHAE_PLUGIN_TOKEN in health, got: {msg}"
+                );
+            }
+            other => panic!("expected Degraded on wrong auth token, got {other:?}"),
+        }
+        let recent = sup_a.recent_stderr();
+        assert!(
+            recent
+                .iter()
+                .any(|l| l.contains("BUGGY_ENV_DUMP_START=[REDACTED]=BUGGY_ENV_DUMP_END")),
+            "HYPHAE_PLUGIN_TOKEN MUST be redacted in recent_stderr: {recent:?}"
+        );
+        let log_raw = fs::read_to_string(&log_path).expect("read bad-auth stderr log");
+        assert!(
+            log_raw.contains("BUGGY_ENV_DUMP_START=[REDACTED]=BUGGY_ENV_DUMP_END"),
+            "HYPHAE_PLUGIN_TOKEN MUST be redacted in stderr log file: {log_raw}"
+        );
+
+        let _ = sup_a.stop().await;
+        node_a.shutdown();
+
+        // --------------------------------------------------------------------
+        // (b) Missing auth line: sends `event` directly without authenticating
+        // --------------------------------------------------------------------
+        let no_auth_script = tmp.path().join("missing_auth.mjs");
+        fs::write(
+            &no_auth_script,
+            r#"
+import net from "node:net";
+const [host, portStr] = process.env.HYPHAE_PLUGIN_ADDR.split(":");
+const sock = net.createConnection({ host, port: Number(portStr) });
+sock.on("error", () => {});
+sock.write(JSON.stringify({
+  type: "event",
+  to: "ops",
+  event: {
+    specversion: "1.0",
+    id: "unauth-evt-missing",
+    source: "attacker",
+    type: "com.evil.noauth",
+    data: { pwned: true }
+  }
+}) + "\n");
+setInterval(() => {}, 10_000);
+"#,
+        )
+        .unwrap();
+
+        let node_b = open_test_node("tcp-auth-b", &tmp.path().join("node-b"));
+        let host_b = UnifiedNodeAdapterHost::new(Arc::clone(&node_b));
+        let mut cfg_b = SubprocessConfig::new(
+            "missing-auth",
+            AdapterKind::Bridge,
+            node_bin.clone(),
+            vec![no_auth_script.to_string_lossy().into_owned()],
+            vec!["ops".to_string()],
+        );
+        cfg_b.transport_mode = PluginTransportMode::LoopbackTcp;
+        cfg_b.initial_backoff = Duration::from_millis(20);
+        cfg_b.max_backoff = Duration::from_millis(40);
+        cfg_b.max_rapid_crashes = 1;
+        cfg_b.startup_timeout = Duration::from_secs(3);
+
+        let sup_b = SubprocessSupervisor::new(cfg_b);
+        sup_b.start(Arc::clone(&host_b) as _).await.unwrap();
+
+        let deadline_b = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !sup_b.is_crash_loop_backoff() {
+            assert!(
+                tokio::time::Instant::now() < deadline_b,
+                "expected missing-auth plugin to fail closed; health={:?}",
+                sup_b.health()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(host_b.published_events().await.is_empty());
+        assert!(
+            sup_b
+                .last_error()
+                .is_some_and(|e| e.contains("TCP plugin auth failed")),
+            "expected TCP auth failure error, got: {:?}",
+            sup_b.last_error()
+        );
+        let _ = sup_b.stop().await;
+        node_b.shutdown();
+
+        // --------------------------------------------------------------------
+        // (c) Oversized (>4 KiB) auth line rejected immediately without hanging
+        // --------------------------------------------------------------------
+        let big_auth_script = tmp.path().join("oversized_auth.mjs");
+        fs::write(
+            &big_auth_script,
+            r#"
+import net from "node:net";
+const [host, portStr] = process.env.HYPHAE_PLUGIN_ADDR.split(":");
+const sock = net.createConnection({ host, port: Number(portStr) });
+sock.on("error", () => {});
+sock.write("A".repeat(5000));
+setInterval(() => {}, 10_000);
+"#,
+        )
+        .unwrap();
+
+        let node_c = open_test_node("tcp-auth-c", &tmp.path().join("node-c"));
+        let host_c = UnifiedNodeAdapterHost::new(Arc::clone(&node_c));
+        let mut cfg_c = SubprocessConfig::new(
+            "oversized-auth",
+            AdapterKind::Bridge,
+            node_bin.clone(),
+            vec![big_auth_script.to_string_lossy().into_owned()],
+            vec!["ops".to_string()],
+        );
+        cfg_c.transport_mode = PluginTransportMode::LoopbackTcp;
+        cfg_c.initial_backoff = Duration::from_millis(20);
+        cfg_c.max_rapid_crashes = 1;
+        cfg_c.startup_timeout = Duration::from_secs(5);
+
+        let sup_c = SubprocessSupervisor::new(cfg_c);
+        sup_c.start(Arc::clone(&host_c) as _).await.unwrap();
+        let deadline_c = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !sup_c.is_crash_loop_backoff() {
+            assert!(
+                tokio::time::Instant::now() < deadline_c,
+                "expected oversized auth frame to be rejected quickly; health={:?}",
+                sup_c.health()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            sup_c
+                .last_error()
+                .is_some_and(|e| e.contains("4096 byte limit")),
+            "expected 4096 byte limit error, got: {:?}",
+            sup_c.last_error()
+        );
+        let _ = sup_c.stop().await;
+        node_c.shutdown();
+
+        // --------------------------------------------------------------------
+        // (d) Silent TCP connection times out cleanly at `startup_timeout`
+        // --------------------------------------------------------------------
+        let silent_script = tmp.path().join("silent_auth.mjs");
+        fs::write(
+            &silent_script,
+            r#"
+import net from "node:net";
+const [host, portStr] = process.env.HYPHAE_PLUGIN_ADDR.split(":");
+const sock = net.createConnection({ host, port: Number(portStr) });
+sock.on("error", () => {});
+setInterval(() => {}, 10_000);
+"#,
+        )
+        .unwrap();
+
+        let node_d = open_test_node("tcp-auth-d", &tmp.path().join("node-d"));
+        let host_d = UnifiedNodeAdapterHost::new(Arc::clone(&node_d));
+        let mut cfg_d = SubprocessConfig::new(
+            "silent-auth",
+            AdapterKind::Bridge,
+            node_bin,
+            vec![silent_script.to_string_lossy().into_owned()],
+            vec!["ops".to_string()],
+        );
+        cfg_d.transport_mode = PluginTransportMode::LoopbackTcp;
+        cfg_d.initial_backoff = Duration::from_millis(20);
+        cfg_d.max_rapid_crashes = 1;
+        cfg_d.startup_timeout = Duration::from_millis(450);
+
+        let sup_d = SubprocessSupervisor::new(cfg_d);
+        sup_d.start(Arc::clone(&host_d) as _).await.unwrap();
+        let deadline_d = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !sup_d.is_crash_loop_backoff() {
+            assert!(
+                tokio::time::Instant::now() < deadline_d,
+                "expected silent TCP plugin to time out cleanly; health={:?}",
+                sup_d.health()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            sup_d.last_error().is_some_and(|e| e.contains("timed out")),
+            "expected timeout error, got: {:?}",
+            sup_d.last_error()
+        );
+        let _ = sup_d.stop().await;
+        assert_eq!(sup_d.health(), AdapterHealth::Stopped);
+        node_d.shutdown();
     }
 }

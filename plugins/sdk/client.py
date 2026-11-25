@@ -1,4 +1,4 @@
-"""Minimal Python 3 stdlib client for the Hyphae fd-3 plugin channel (protocol v1)."""
+"""Minimal Python 3 stdlib client for the Hyphae plugin channel (Unix fd 3 or authenticated loopback TCP, protocol v1)."""
 from __future__ import annotations
 
 from collections import deque
@@ -12,6 +12,33 @@ import time
 from typing import Any, Callable
 
 MAX_ECHO_ID_CHARS = 256
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _parse_loopback_addr(raw: str) -> tuple[str, int]:
+    trimmed = raw.strip()
+    if trimmed.startswith("["):
+        close_idx = trimmed.find("]")
+        if close_idx < 0 or close_idx + 1 >= len(trimmed) or trimmed[close_idx + 1] != ":":
+            raise ValueError(f"Invalid HYPHAE_PLUGIN_ADDR: {trimmed!r}")
+        host = trimmed[1:close_idx]
+        port_str = trimmed[close_idx + 2:]
+    else:
+        colon_idx = trimmed.rfind(":")
+        if colon_idx <= 0 or trimmed.find(":") != colon_idx:
+            raise ValueError(f"Invalid HYPHAE_PLUGIN_ADDR: {trimmed!r}")
+        host = trimmed[:colon_idx]
+        port_str = trimmed[colon_idx + 1:]
+
+    normalized_host = host.strip().lower()
+    if normalized_host not in _LOOPBACK_HOSTS:
+        raise ValueError(f"Refusing non-loopback HYPHAE_PLUGIN_ADDR host {host!r}")
+    if not port_str.isdigit():
+        raise ValueError(f"Invalid HYPHAE_PLUGIN_ADDR port: {port_str!r}")
+    port = int(port_str)
+    if port < 1 or port > 65535:
+        raise ValueError(f"Invalid HYPHAE_PLUGIN_ADDR port: {port_str!r}")
+    return normalized_host, port
 
 
 def _correlation_id_for_event(event: Any) -> str | None:
@@ -32,9 +59,29 @@ class MeshPluginClient:
         on_post: Callable[[dict[str, Any]], Any] | None = None,
         on_request: Callable[[dict[str, Any]], Any] | None = None,
     ) -> None:
-        raw_fd = fd if fd is not None else int(os.environ.get("HYPHAE_FD") or os.environ.get("AGENTS_MESH_FD") or os.environ.get("T3_MESH_FD") or "3")
         self.plugin = os.environ.get("HYPHAE_PLUGIN") or os.environ.get("AGENTS_MESH_PLUGIN") or os.environ.get("T3_MESH_PLUGIN") or "plugin"
-        self.sock = socket.socket(fileno=raw_fd)
+        plugin_addr = (os.environ.get("HYPHAE_PLUGIN_ADDR") or "").strip() if fd is None else ""
+        if plugin_addr:
+            host, port = _parse_loopback_addr(plugin_addr)
+            token = os.environ.pop("HYPHAE_PLUGIN_TOKEN", "")
+            if not token:
+                raise RuntimeError("HYPHAE_PLUGIN_TOKEN is required when HYPHAE_PLUGIN_ADDR is set")
+            sock = socket.create_connection((host, port), timeout=10.0)
+            try:
+                sock.settimeout(None)
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError:
+                    pass
+                auth_line = (json.dumps({"type": "auth", "token": token}) + "\n").encode("utf-8")
+                sock.sendall(auth_line)
+            except Exception:
+                sock.close()
+                raise
+            self.sock = sock
+        else:
+            raw_fd = fd if fd is not None else int(os.environ.get("HYPHAE_FD") or os.environ.get("AGENTS_MESH_FD") or os.environ.get("T3_MESH_FD") or "3")
+            self.sock = socket.socket(fileno=raw_fd)
         self.reader = self.sock.makefile("rb")
         self._write_lock = threading.Lock()
         self._pending_lock = threading.Lock()
