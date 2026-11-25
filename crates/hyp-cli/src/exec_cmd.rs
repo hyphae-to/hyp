@@ -99,6 +99,8 @@ const RESERVED_EXEC_SECRET_EXACT: &[&str] = &[
     "pair-am2",
     "p2p-offer",
     "staged-join-token",
+    "t3-auth-token",
+    "t3-session-token",
 ];
 
 const RESERVED_EXEC_SECRET_PREFIXES: &[&str] = &[

@@ -1,5 +1,5 @@
 //! `hyp` — Hyphae v2 native CLI (`hook`, `statusline`, `mcp`, `wait`, `watch`, `node`/`daemon`,
-//! `onboard`, `setup`, `plugin`, `inspect`, `session`, `ui`, `status`, `doctor`, `secret`, `gate`, `inbox`,
+//! `onboard`, `setup`, `plugin`, `inspect`, `session`, `ui`, `status`, `doctor`, `secret`, `exec`, `gate`, `inbox`,
 //! `kv`, `emit`, `auth`, `drop`, `relay`, `update`, `deploy`, `pair`, `version`).
 //!
 //! Performance note: `hyp hook` and `hyp statusline` intercept `std::env::args()` BEFORE
@@ -10,6 +10,7 @@ mod config_file;
 mod deploy;
 mod drop_cmd;
 mod emit_cmd;
+mod exec_cmd;
 mod gate_cmd;
 mod herdr_mod;
 mod inspect_cmd;
@@ -47,7 +48,7 @@ use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE};
 #[derive(Parser)]
 #[command(
     name = "hyp",
-    about = "Hyphae v2 native CLI (hook, statusline, mcp, wait, watch, node, onboard, setup, plugin, inspect, session, ui, status, doctor, secret, gate, inbox, kv, emit, auth, drop, relay, update, uninstall, deploy, pair, version)",
+    about = "Hyphae v2 native CLI (hook, statusline, mcp, wait, watch, node, onboard, setup, plugin, inspect, session, ui, status, doctor, secret, exec, gate, inbox, kv, emit, auth, drop, relay, update, uninstall, deploy, pair, version)",
     version
 )]
 struct Cli {
@@ -157,6 +158,8 @@ enum Commands {
         #[command(subcommand)]
         command: secret_cmd::SecretCommand,
     },
+    /// Run a child command with stored secrets injected into env vars and streaming stdout/stderr scrubbing
+    Exec(exec_cmd::ExecArgs),
     /// Local Security Gate configuration, tamper-evident signing (`lock`), quarantine `review`, and `log`
     Gate {
         #[command(subcommand)]
@@ -486,6 +489,7 @@ fn main() -> ExitCode {
         Commands::Status(args) => status_doctor::run_status(args),
         Commands::Doctor(args) => status_doctor::run_doctor(args),
         Commands::Secret { command } => secret_cmd::run_secret(command),
+        Commands::Exec(args) => exec_cmd::run_exec(args),
         Commands::Gate { command } => gate_cmd::run_gate(command),
         Commands::Inbox { command } => gate_cmd::run_inbox(command),
         Commands::Kv { command } => kv_cmd::run_kv(command),
