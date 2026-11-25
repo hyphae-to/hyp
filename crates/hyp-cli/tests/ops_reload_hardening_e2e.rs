@@ -3,14 +3,15 @@
 
 mod common;
 
-use common::{ManagedProcess, hyp_bin, isolated_cmd, parse_json_stdout, repo_plugins_dir};
+#[cfg(unix)]
+use common::{ManagedProcess, run_hyp_in_pty};
+use common::{hyp_bin, isolated_cmd, parse_json_stdout, repo_plugins_dir};
 use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::Full;
 use hyp_crypto::CryptoError;
-use hyp_crypto::human::{
-    HumanAudience, HumanClaimV1, HumanDropKind, SignedHumanRevocationV1, encode_hdrop1,
-    seal_human_drop,
-};
+#[cfg(unix)]
+use hyp_crypto::human::SignedHumanRevocationV1;
+use hyp_crypto::human::{HumanAudience, HumanClaimV1, HumanDropKind, encode_hdrop1, seal_human_drop};
 use hyp_crypto::keys::Ed25519KeyPair;
 use hyp_crypto::keystore::{
     SecretBackend, SecretStore, classify_linux_secret_service_output, classify_mac_keychain_output,
@@ -23,10 +24,15 @@ use hyp_node::adapters::{
     NodeAdapter, NodeAdapterHost, PublishOutcome, PublishStatus, SubprocessConfig,
     SubprocessSupervisor,
 };
+#[cfg(unix)]
 use hyp_node::engine::{NodeConfig, NodeProfile, UnifiedNode};
+#[cfg(unix)]
 use hyp_proto::address::NodeId;
-use hyp_proto::cloudevent::{CloudEvent, TYPE_HUMAN_REVOCATION_V1};
+use hyp_proto::cloudevent::CloudEvent;
+#[cfg(unix)]
+use hyp_proto::cloudevent::TYPE_HUMAN_REVOCATION_V1;
 use hyp_proto::rpc::EventKeyRef;
+#[cfg(unix)]
 use hyp_store::{
     DeliveryMode, HumanAuthorityInput, HumanAuthorityRole, NodeDb, SubscriptionSpec, now_ms,
 };
@@ -48,6 +54,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
+#[cfg(unix)]
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn workspace_root() -> PathBuf {
@@ -178,6 +185,7 @@ fn d10_keystore_backend_errors_and_partial_keys_never_silently_regenerate() {
 // 2. R1 & H4 — `hyp auth` Hot-Reloads Locked Gate + `--broadcast` Revocation
 // ============================================================================
 
+#[cfg(unix)]
 #[test]
 fn r1_auth_mutations_live_reload_locked_gate_and_h4_broadcasts_revocation() {
     let tmp = TempDir::new().unwrap();
@@ -238,25 +246,26 @@ fn r1_auth_mutations_live_reload_locked_gate_and_h4_broadcasts_revocation() {
     )
     .unwrap();
 
-    let lock_out = isolated_cmd(&home)
-        .args(["gate", "lock", "--state-dir", state_str, "--json"])
-        .output()
-        .expect("run gate lock");
-    assert_eq!(
-        lock_out.status.code(),
-        Some(0),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&lock_out.stdout),
-        String::from_utf8_lossy(&lock_out.stderr)
+    let lock_out = run_hyp_in_pty(
+        &home,
+        &["gate", "lock", "--state-dir", state_str, "--json"],
+        None,
+        Some("y\n"),
     );
-    let lock_json = parse_json_stdout(&lock_out);
+    assert_eq!(
+        lock_out.code, 0,
+        "stdout={} tty={}",
+        lock_out.stdout, lock_out.tty
+    );
+    let lock_json = lock_out.parse_json();
     assert_eq!(lock_json["data"]["daemonReloaded"], true);
 
     // 3. Enroll a second human authority (`bob`) while locked daemon is LIVE!
     let bob_kp = Ed25519KeyPair::generate().unwrap();
     let bob_jwk = serde_json::to_string(&bob_kp.to_jwk()).unwrap();
-    let mut add_proc = isolated_cmd(&home)
-        .args([
+    let add_out = run_hyp_in_pty(
+        &home,
+        &[
             "auth",
             "add",
             "--human-id",
@@ -266,26 +275,16 @@ fn r1_auth_mutations_live_reload_locked_gate_and_h4_broadcasts_revocation() {
             "--state-dir",
             state_str,
             "--json",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn auth add");
-    add_proc
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(bob_jwk.as_bytes())
-        .unwrap();
-    let add_out = add_proc.wait_with_output().unwrap();
-    assert_eq!(
-        add_out.status.code(),
-        Some(0),
-        "stderr={}",
-        String::from_utf8_lossy(&add_out.stderr)
+        ],
+        Some(&bob_jwk),
+        Some("y\n"),
     );
-    let add_json = parse_json_stdout(&add_out);
+    assert_eq!(
+        add_out.code, 0,
+        "stdout={} tty={}",
+        add_out.stdout, add_out.tty
+    );
+    let add_json = add_out.parse_json();
     assert_eq!(add_json["ok"], true);
     assert_eq!(add_json["data"]["gatePolicyResigned"], true);
     assert_eq!(
@@ -345,8 +344,9 @@ fn r1_auth_mutations_live_reload_locked_gate_and_h4_broadcasts_revocation() {
     }
 
     // 5. Revoke `bob` with `--bump-epoch --broadcast` while locked daemon is LIVE!
-    let rev_out = isolated_cmd(&home)
-        .args([
+    let rev_out = run_hyp_in_pty(
+        &home,
+        &[
             "auth",
             "revoke",
             &bob_kid,
@@ -357,16 +357,16 @@ fn r1_auth_mutations_live_reload_locked_gate_and_h4_broadcasts_revocation() {
             "--state-dir",
             state_str,
             "--json",
-        ])
-        .output()
-        .expect("run auth revoke --broadcast");
-    assert_eq!(
-        rev_out.status.code(),
-        Some(0),
-        "stderr={}",
-        String::from_utf8_lossy(&rev_out.stderr)
+        ],
+        None,
+        Some("y\n"),
     );
-    let rev_json = parse_json_stdout(&rev_out);
+    assert_eq!(
+        rev_out.code, 0,
+        "stdout={} tty={}",
+        rev_out.stdout, rev_out.tty
+    );
+    let rev_json = rev_out.parse_json();
     assert_eq!(rev_json["ok"], true);
     assert_eq!(rev_json["data"]["gatePolicyResigned"], true);
     assert_eq!(
@@ -479,8 +479,9 @@ fn r1_auth_mutations_live_reload_locked_gate_and_h4_broadcasts_revocation() {
     let _ = daemon.shutdown_gracefully();
     let carol_kp = Ed25519KeyPair::generate().unwrap();
     let carol_jwk = serde_json::to_string(&carol_kp.to_jwk()).unwrap();
-    let mut add2 = isolated_cmd(&home)
-        .args([
+    let add2_out = run_hyp_in_pty(
+        &home,
+        &[
             "auth",
             "add",
             "--human-id",
@@ -490,20 +491,12 @@ fn r1_auth_mutations_live_reload_locked_gate_and_h4_broadcasts_revocation() {
             "--state-dir",
             state_str,
             "--json",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn offline auth add");
-    add2.stdin
-        .take()
-        .unwrap()
-        .write_all(carol_jwk.as_bytes())
-        .unwrap();
-    let add2_out = add2.wait_with_output().unwrap();
-    assert_eq!(add2_out.status.code(), Some(0));
-    let add2_json = parse_json_stdout(&add2_out);
+        ],
+        Some(&carol_jwk),
+        Some("y\n"),
+    );
+    assert_eq!(add2_out.code, 0, "tty={}", add2_out.tty);
+    let add2_json = add2_out.parse_json();
     assert_eq!(add2_json["data"]["gatePolicyResigned"], true);
     assert_eq!(add2_json["data"]["gateReloaded"], false);
     assert!(

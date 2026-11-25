@@ -709,6 +709,18 @@ impl Stage2Config {
                 ))
             })?;
         }
+        if let Some(ref base_override) = self.base_url_override {
+            if self.enabled || !base_override.trim().is_empty() {
+                crate::gates::stage2::validate_classifier_endpoint_url(base_override)
+                    .map_err(GateError::InvalidConfig)?;
+            }
+        }
+        if let LlmProvider::OpenAiCompatible { ref base_url } = self.provider {
+            if self.enabled || !base_url.trim().is_empty() {
+                crate::gates::stage2::validate_classifier_endpoint_url(base_url)
+                    .map_err(GateError::InvalidConfig)?;
+            }
+        }
         Ok(())
     }
 }
@@ -949,14 +961,7 @@ impl FilterAdapterConfig {
                 timeout_ms,
                 min_allow_confidence,
                 api_key_secret,
-                ..
-            }
-            | Self::OpenAiCompat {
-                model,
-                temperature,
-                timeout_ms,
-                min_allow_confidence,
-                api_key_secret,
+                base_url,
                 ..
             }
             | Self::Google {
@@ -965,9 +970,54 @@ impl FilterAdapterConfig {
                 timeout_ms,
                 min_allow_confidence,
                 api_key_secret,
+                base_url,
                 ..
             } => {
                 check_secret(api_key_secret)?;
+                if let Some(url) = base_url {
+                    if enabled || !url.trim().is_empty() {
+                        crate::gates::stage2::validate_classifier_endpoint_url(url).map_err(
+                            |e| GateError::InvalidConfig(format!("filter '{id}' base_url: {e}")),
+                        )?;
+                    }
+                }
+                if !temperature.is_finite() || !(0.0..=2.0).contains(temperature) {
+                    return Err(GateError::InvalidConfig(format!(
+                        "filter '{id}' temperature must be finite in 0.0..=2.0"
+                    )));
+                }
+                if !min_allow_confidence.is_finite() || !(0.0..=1.0).contains(min_allow_confidence)
+                {
+                    return Err(GateError::InvalidConfig(format!(
+                        "filter '{id}' min_allow_confidence must be finite in 0.0..=1.0"
+                    )));
+                }
+                if enabled && model.trim().is_empty() {
+                    return Err(GateError::InvalidConfig(format!(
+                        "filter '{id}' model must be non-empty"
+                    )));
+                }
+                if enabled && *timeout_ms == 0 {
+                    return Err(GateError::InvalidConfig(format!(
+                        "filter '{id}' timeout_ms must be > 0"
+                    )));
+                }
+            }
+            Self::OpenAiCompat {
+                base_url,
+                model,
+                temperature,
+                timeout_ms,
+                min_allow_confidence,
+                api_key_secret,
+                ..
+            } => {
+                check_secret(api_key_secret)?;
+                if enabled || !base_url.trim().is_empty() {
+                    crate::gates::stage2::validate_classifier_endpoint_url(base_url).map_err(
+                        |e| GateError::InvalidConfig(format!("filter '{id}' base_url: {e}")),
+                    )?;
+                }
                 if !temperature.is_finite() || !(0.0..=2.0).contains(temperature) {
                     return Err(GateError::InvalidConfig(format!(
                         "filter '{id}' temperature must be finite in 0.0..=2.0"
@@ -1002,6 +1052,11 @@ impl FilterAdapterConfig {
                         "filter '{id}' lakera base_url must be non-empty"
                     )));
                 }
+                if enabled || !base_url.trim().is_empty() {
+                    crate::gates::stage2::validate_classifier_endpoint_url(base_url).map_err(
+                        |e| GateError::InvalidConfig(format!("filter '{id}' lakera base_url: {e}")),
+                    )?;
+                }
                 if enabled && *timeout_ms == 0 {
                     return Err(GateError::InvalidConfig(format!(
                         "filter '{id}' timeout_ms must be > 0"
@@ -1026,6 +1081,11 @@ impl FilterAdapterConfig {
                     return Err(GateError::InvalidConfig(format!(
                         "filter '{id}' http-classifier url must be non-empty"
                     )));
+                }
+                if enabled || !url.trim().is_empty() {
+                    crate::gates::stage2::validate_classifier_endpoint_url(url).map_err(|e| {
+                        GateError::InvalidConfig(format!("filter '{id}' http-classifier url: {e}"))
+                    })?;
                 }
                 if enabled && score_field.trim().is_empty() {
                     return Err(GateError::InvalidConfig(format!(

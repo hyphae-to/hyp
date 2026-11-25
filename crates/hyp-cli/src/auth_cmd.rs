@@ -12,6 +12,10 @@ use crate::config_file::{
     read_json_object_or_empty, resolve_config_path_for_read, resolve_config_path_for_write,
     resolve_effective_node_id, resolve_state_dir, write_atomic_json,
 };
+use crate::gate_cmd::{
+    ConfirmError, emit_confirm_error, is_interactive_tty, require_controlling_tty_confirmation,
+    require_interactive_tty_confirmation,
+};
 use crate::ui::{
     EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
     print_warnings,
@@ -54,7 +58,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::convert::Infallible;
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, IsTerminal as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -395,6 +399,127 @@ fn load_local_authority_keypair(
         ));
     }
     Ok(kp)
+}
+
+fn is_gate_locked(config_path: &Path) -> bool {
+    if !config_path.exists() {
+        return false;
+    }
+    let Ok(cfg_map) = read_json_object_or_empty(config_path) else {
+        return true;
+    };
+    let Some(gate_val) = cfg_map.get("gate") else {
+        return false;
+    };
+    if gate_val
+        .get("require_signed_policy")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return true;
+    }
+    serde_json::from_value::<SecurityGateConfig>(gate_val.clone())
+        .map(|g| g.require_signed_policy)
+        .unwrap_or(true)
+}
+
+fn format_auth_init_confirm_summary(
+    human_id: &str,
+    label: &str,
+    existing_authorities: usize,
+    gate_locked: bool,
+) -> Vec<String> {
+    let mut lines = vec![
+        "Human Admin Authority Initialization Summary".to_string(),
+        format!("  Human ID:   {human_id}"),
+        format!("  Role:       admin"),
+        format!("  Label:      {label}"),
+        format!("  Existing:   {existing_authorities} authority record(s) already present"),
+    ];
+    if gate_locked {
+        lines.push(
+            "  WARNING:    Security Gate is LOCKED; gate_policy_sig will be re-signed with the updated human_authorities_digest."
+                .to_string(),
+        );
+    }
+    lines
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_auth_add_confirm_summary(
+    human_id: &str,
+    role: HumanAuthorityRole,
+    label: &str,
+    kid: &str,
+    auth_epoch: u64,
+    enc_kid: Option<&str>,
+    has_node_cert: bool,
+    gate_locked: bool,
+) -> Vec<String> {
+    let mut lines = vec![
+        "Human Authority Enrollment Summary".to_string(),
+        format!("  Human ID:   {human_id}"),
+        format!("  Role:       {}", role.as_str()),
+        format!("  Label:      {label}"),
+        format!("  Key ID:     {kid}"),
+        format!("  Auth Epoch: {auth_epoch}"),
+    ];
+    if let Some(ekid) = enc_kid {
+        lines.push(format!("  Enc Key ID: {ekid}"));
+    }
+    if has_node_cert {
+        lines.push("  Node Cert:  verified hcert1_ included".to_string());
+    }
+    if gate_locked {
+        lines.push(
+            "  WARNING:    Security Gate is LOCKED; gate_policy_sig will be re-signed with the updated human_authorities_digest."
+                .to_string(),
+        );
+    }
+    lines
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_auth_revoke_confirm_summary(
+    target: &HumanAuthorityRecord,
+    bump_epoch: bool,
+    current_min: u64,
+    new_min: u64,
+    broadcast: bool,
+    reason: &str,
+    gate_locked: bool,
+) -> Vec<String> {
+    let mut lines = vec![
+        "Human Authority Revocation Summary".to_string(),
+        format!("  Human ID:   {}", target.human_id),
+        format!("  Role:       {}", target.role.as_str()),
+        format!("  Label:      {}", target.label),
+        format!("  Key ID:     {}", target.kid),
+        format!(
+            "  Bump Epoch: {}",
+            if bump_epoch {
+                format!("yes ({current_min} -> {new_min})")
+            } else {
+                format!("no (stays {current_min})")
+            }
+        ),
+        format!(
+            "  Broadcast:  {}",
+            if broadcast {
+                "yes (topic: human.revocations)"
+            } else {
+                "no (local only)"
+            }
+        ),
+        format!("  Reason:     {reason}"),
+    ];
+    if gate_locked {
+        lines.push(
+            "  WARNING:    Security Gate is LOCKED; gate_policy_sig will be re-signed with the updated human_authorities_digest."
+                .to_string(),
+        );
+    }
+    lines
 }
 
 /// If `config_path` exists and `gate.require_signed_policy == true`, updates
@@ -858,6 +983,41 @@ fn run_auth_init(
         None
     };
 
+    // Non-web `auth init` on a node that ALREADY has authorities or a locked Security Gate
+    // requires unskippable interactive TTY confirmation (`#10` / `H1`).
+    // Initial `auth init` on a brand-new unlocked node and `--web` (live Passkey ceremony)
+    // continue seamlessly.
+    if !web {
+        let gate_locked = is_gate_locked(&config_read);
+        let db_path = state_dir.join("node.sqlite");
+        let existing_count = if db_path.exists() {
+            match NodeDb::open(&db_path) {
+                Ok(db) => db
+                    .human()
+                    .list_authorities(true)
+                    .map(|v| v.len())
+                    .unwrap_or(1),
+                Err(_) => 1,
+            }
+        } else {
+            0
+        };
+        if existing_count > 0 || gate_locked {
+            let summary = format_auth_init_confirm_summary(
+                &human_id,
+                trimmed_label,
+                existing_count,
+                gate_locked,
+            );
+            let prompt = format!(
+                "Initialize additional human admin authority '{human_id}' (label: {trimmed_label})? [y/N]: "
+            );
+            if let Err(err) = require_interactive_tty_confirmation(&summary, &prompt) {
+                return emit_confirm_error(cmd, as_json, err);
+            }
+        }
+    }
+
     if let Err(e) = ensure_dir(&state_dir, true) {
         return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
     }
@@ -1178,6 +1338,13 @@ fn run_auth_add(
         );
     }
 
+    // Fail closed immediately when not attached to an interactive human terminal (`#10` / `H1`).
+    // Checking `stderr.is_terminal()` allows `hyp auth add < key.jwk` in a real human terminal
+    // (confirming via `/dev/tty` / `CONIN$`) while blocking non-TTY agent subprocesses before I/O.
+    if !io::stderr().is_terminal() {
+        return emit_confirm_error(cmd, as_json, ConfirmError::NotInteractiveTty);
+    }
+
     let mut raw = String::new();
     if let Err(e) = io::stdin()
         .lock()
@@ -1400,6 +1567,26 @@ fn run_auth_add(
     } else {
         None
     };
+
+    let gate_locked = is_gate_locked(&config_read);
+    let summary = format_auth_add_confirm_summary(
+        &human_id,
+        role.to_store_role(),
+        trimmed_label,
+        &kid,
+        effective_epoch,
+        enc_kid.as_deref(),
+        verified_bundle_cert.is_some(),
+        gate_locked,
+    );
+    let kid8: String = kid.chars().take(8).collect();
+    let prompt = format!(
+        "Enroll human authority '{human_id}' (role: {}, kid: {kid8})? [y/N]: ",
+        role.to_store_role().as_str()
+    );
+    if let Err(err) = require_controlling_tty_confirmation(&summary, &prompt) {
+        return emit_confirm_error(cmd, as_json, err);
+    }
 
     let rec = match db.human().upsert_authority(
         &HumanAuthorityInput {
@@ -1650,6 +1837,9 @@ fn run_auth_revoke(
     if query.is_empty() {
         return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_KID", "kid cannot be empty", None);
     }
+    if !is_interactive_tty() {
+        return emit_confirm_error(cmd, as_json, ConfirmError::NotInteractiveTty);
+    }
 
     let state_dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
     let config_read =
@@ -1736,6 +1926,21 @@ fn run_auth_revoke(
             "Cannot --broadcast revocation without an active local admin Ed25519 signing key to sign SignedHumanRevocationV1",
             Some("Pass --issuer-kid <active-admin-kid> or run `hyp auth init` on an admin node.".to_string()),
         );
+    }
+
+    let gate_locked = is_gate_locked(&config_read);
+    let summary = format_auth_revoke_confirm_summary(
+        &target,
+        bump_epoch,
+        current_min,
+        new_min,
+        broadcast,
+        &reason,
+        gate_locked,
+    );
+    let prompt = format!("Revoke human authority '{}'? [y/N]: ", target.kid);
+    if let Err(err) = require_interactive_tty_confirmation(&summary, &prompt) {
+        return emit_confirm_error(cmd, as_json, err);
     }
 
     let revocation_json = match &signed_revocation {
@@ -2867,4 +3072,76 @@ async fn handle_enroll_callback(
         allowed,
         json!({ "ok": true, "kid": kid }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gate_cmd::confirm_interactive_with;
+
+    #[test]
+    fn auth_add_and_revoke_confirm_summaries_include_key_fields_and_locked_warning() {
+        let add_summary = format_auth_add_confirm_summary(
+            "bob",
+            HumanAuthorityRole::Admin,
+            "yubikey-backup",
+            "kid_1234567890abcdef",
+            3,
+            Some("enc_kid_999"),
+            true,
+            true,
+        )
+        .join("\n");
+        assert!(add_summary.contains("Human ID:   bob"));
+        assert!(add_summary.contains("Role:       admin"));
+        assert!(add_summary.contains("Key ID:     kid_1234567890abcdef"));
+        assert!(add_summary.contains("Enc Key ID: enc_kid_999"));
+        assert!(add_summary.contains("Security Gate is LOCKED"));
+
+        let target = HumanAuthorityRecord {
+            human_id: "bob".to_string(),
+            kid: "kid_1234567890abcdef".to_string(),
+            label: "phone".to_string(),
+            role: HumanAuthorityRole::Signer,
+            jwk_json: "{}".to_string(),
+            enc_jwk_json: None,
+            prf_salt: None,
+            auth_epoch: 1,
+            status: HumanAuthorityStatus::Active,
+            created_at: 1,
+            revoked_at: None,
+            revocation_json: None,
+        };
+        let rev_summary = format_auth_revoke_confirm_summary(
+            &target,
+            true,
+            1,
+            2,
+            true,
+            "lost device",
+            true,
+        )
+        .join("\n");
+        assert!(rev_summary.contains("Human ID:   bob"));
+        assert!(rev_summary.contains("Key ID:     kid_1234567890abcdef"));
+        assert!(rev_summary.contains("Bump Epoch: yes (1 -> 2)"));
+        assert!(rev_summary.contains("Broadcast:  yes (topic: human.revocations)"));
+        assert!(rev_summary.contains("Security Gate is LOCKED"));
+
+        // Verify injectable confirmation works cross-platform (including Windows!)
+        let mut out = Vec::new();
+        let mut yes_in = io::Cursor::new(b"yes\n".to_vec());
+        assert_eq!(
+            confirm_interactive_with(
+                true,
+                &format_auth_init_confirm_summary("alice", "laptop", 1, true),
+                "Initialize additional human admin authority 'alice' (label: laptop)? [y/N]: ",
+                &mut yes_in,
+                &mut out
+            ),
+            Ok(())
+        );
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("Security Gate is LOCKED"));
+    }
 }

@@ -46,6 +46,103 @@ pub(crate) const DEFAULT_GOOGLE_BASE_URL: &str = "https://generativelanguage.goo
 pub(crate) const MAX_GATE_HTTP_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_VERDICT_CATEGORIES: usize = 16;
 
+/// Validates a Stage 2 / guardrail HTTP classifier endpoint URL fail-closed (`G17`).
+///
+/// Decrypted inbound message text may ONLY be transmitted to:
+/// - any remote or local host over `https://`, OR
+/// - `http://` **strictly** on loopback (`localhost`, `127.0.0.1`, `[::1]`, or `::1`)
+///   for local classifiers (e.g. Ollama, local Prompt Guard sidecar, or local test mock servers).
+///
+/// Rejects cleartext non-loopback `http://`, embedded credentials (`user@host`), fragments,
+/// backslashes, control characters, missing hosts, and non-HTTP(S) schemes (`file://`, `ftp://`,
+/// `gopher://`, etc.).
+pub fn validate_classifier_endpoint_url(url: &str) -> Result<(), String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "classifier endpoint URL must not be empty; decrypted inbound message text may only be sent over https:// to remote hosts (or http:// on loopback)"
+                .to_string(),
+        );
+    }
+    if trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
+        || trimmed.contains('#')
+        || trimmed.contains('\\')
+    {
+        return Err(
+            "classifier endpoint URL contains invalid whitespace, control, fragment, or backslash characters"
+                .to_string(),
+        );
+    }
+
+    let uri: http::Uri = trimmed.parse().map_err(|e| {
+        format!(
+            "invalid classifier endpoint URL: {e}; decrypted inbound message text may only be sent over https:// to remote hosts (or http:// on loopback)"
+        )
+    })?;
+
+    let Some(scheme) = uri.scheme_str() else {
+        return Err(
+            "classifier endpoint URL is missing a scheme; decrypted inbound message text may only be sent over https:// to remote hosts (or http:// on loopback)"
+                .to_string(),
+        );
+    };
+
+    let Some(authority) = uri.authority() else {
+        return Err(
+            "classifier endpoint URL is missing a host authority; decrypted inbound message text may only be sent over https:// to remote hosts (or http:// on loopback)"
+                .to_string(),
+        );
+    };
+
+    if authority.as_str().contains('@') {
+        return Err(
+            "classifier endpoint URL must not embed credentials/userinfo ('@'); store API keys in SecretStore instead"
+                .to_string(),
+        );
+    }
+
+    let host = uri.host().unwrap_or("").trim();
+    if host.is_empty() {
+        return Err(
+            "classifier endpoint URL has an empty host; decrypted inbound message text may only be sent over https:// to remote hosts (or http:// on loopback)"
+                .to_string(),
+        );
+    }
+
+    if scheme.eq_ignore_ascii_case("https") {
+        return Ok(());
+    }
+
+    if scheme.eq_ignore_ascii_case("http") {
+        let host_lower = host.to_ascii_lowercase();
+        let is_loopback = matches!(
+            host_lower.as_str(),
+            "localhost" | "127.0.0.1" | "[::1]" | "::1"
+        );
+        if is_loopback {
+            return Ok(());
+        }
+        return Err(format!(
+            "insecure classifier endpoint URL (non-loopback http:// host '{host}'): decrypted inbound message text may only be sent over https:// to remote hosts (or http:// strictly on loopback: localhost, 127.0.0.1, [::1])"
+        ));
+    }
+
+    Err(format!(
+        "unsupported classifier endpoint URL scheme '{scheme}://': decrypted inbound message text may only be sent over https:// to remote hosts (or http:// on loopback)"
+    ))
+}
+
+/// Validates all configured HTTP endpoint URLs on a [`Stage2Config`] fail-closed (`G17`).
+pub fn validate_stage2_endpoint_urls(config: &Stage2Config) -> Result<(), GateError> {
+    if let Some(ref base_override) = config.base_url_override {
+        validate_classifier_endpoint_url(base_override).map_err(GateError::InvalidConfig)?;
+    }
+    if let LlmProvider::OpenAiCompatible { ref base_url } = config.provider {
+        validate_classifier_endpoint_url(base_url).map_err(GateError::InvalidConfig)?;
+    }
+    Ok(())
+}
+
 /// Immutable compiled-in core anti-injection security rubric.
 ///
 /// ALWAYS prepended verbatim to every isolated Stage 2 LLM classifier prompt. Operator configuration
@@ -208,6 +305,7 @@ impl Stage2Guard {
     /// Constructs a new [`Stage2Guard`] with a dedicated TLS-capable `hyper 1` client.
     pub fn new(config: Stage2Config) -> Result<Self, GateError> {
         config.validate()?;
+        validate_stage2_endpoint_urls(&config)?;
         let client = build_gate_http_client()?;
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent));
         Ok(Self {
@@ -351,6 +449,8 @@ impl Stage2Guard {
                 } else {
                     format!("{base}/v1/messages")
                 };
+                validate_classifier_endpoint_url(&url)
+                    .map_err(|_| "gate_insecure_endpoint_url")?;
                 let body = json!({
                     "model": self.config.model,
                     "max_tokens": self.config.max_output_tokens,
@@ -408,6 +508,8 @@ impl Stage2Guard {
                 } else {
                     format!("{base}/v1beta/models/{model}:generateContent")
                 };
+                validate_classifier_endpoint_url(&url)
+                    .map_err(|_| "gate_insecure_endpoint_url")?;
                 let body = json!({
                     "systemInstruction": {
                         "parts": [{ "text": framed.system_prompt }]
@@ -452,6 +554,7 @@ impl Stage2Guard {
         } else {
             format!("{base}/v1/chat/completions")
         };
+        validate_classifier_endpoint_url(&url).map_err(|_| "gate_insecure_endpoint_url")?;
         let body = json!({
             "model": self.config.model,
             "max_tokens": self.config.max_output_tokens,
@@ -542,6 +645,8 @@ pub(crate) async fn send_and_read_bounded(
     client: &Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
     req: Request<Full<Bytes>>,
 ) -> Result<(StatusCode, Bytes), &'static str> {
+    let uri_str = req.uri().to_string();
+    validate_classifier_endpoint_url(&uri_str).map_err(|_| "gate_insecure_endpoint_url")?;
     let resp = client
         .request(req)
         .await

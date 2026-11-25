@@ -17,9 +17,11 @@ use common::{
 };
 use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full};
+#[cfg(unix)]
 use hyp_crypto::e2ee::{DmContext, seal_dm};
 use hyp_crypto::keys::{Ed25519KeyPair, NodeIdentityKeys, X25519KeyPair};
 use hyp_crypto::keystore::{SecretBackend, SecretStore, legacy_connector_key_secret_names};
+#[cfg(unix)]
 use hyp_crypto::rfc3339::now_unix_ms;
 use hyp_proto::scopes::ScopePreset;
 use hyp_store::{
@@ -32,6 +34,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{Value, json};
+#[cfg(unix)]
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write as _;
@@ -52,6 +55,7 @@ fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+#[cfg(unix)]
 fn ed25519_auth_header(
     node_id: &str,
     keys: &NodeIdentityKeys,
@@ -880,6 +884,7 @@ fn two_process_public_node_onboarding_to_live_hyp_wait_github_stream() {
 // 3. Live Tampered Gate Policy Daemon Lockdown & Human Approve Wakeup
 // ============================================================================
 
+#[cfg(unix)]
 #[test]
 fn live_tampered_gate_policy_daemon_lockdown_and_human_approve_wakeup() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -936,8 +941,9 @@ fn live_tampered_gate_policy_daemon_lockdown_and_human_approve_wakeup() {
         .expect("run hyp onboard");
     assert_eq!(onb_out.status.code(), Some(0));
 
-    let gate_init = isolated_cmd(&home)
-        .args([
+    let gate_init = common::run_hyp_in_pty(
+        &home,
+        &[
             "gate",
             "init",
             "--adapter",
@@ -948,11 +954,12 @@ fn live_tampered_gate_policy_daemon_lockdown_and_human_approve_wakeup() {
             state_dir.to_str().unwrap(),
             "--lock",
             "--json",
-        ])
-        .output()
-        .expect("run hyp gate init --lock");
-    assert_eq!(gate_init.status.code(), Some(0));
-    let init_json = parse_json_stdout(&gate_init);
+        ],
+        None,
+        Some("y\n"),
+    );
+    assert_eq!(gate_init.code, 0, "tty={}", gate_init.tty);
+    let init_json = gate_init.parse_json();
     assert_eq!(init_json["data"]["locked"], true);
     assert_eq!(init_json["data"]["gatePolicySig"], "OK");
 
@@ -1258,32 +1265,36 @@ fn live_tampered_gate_policy_daemon_lockdown_and_human_approve_wakeup() {
     assert_eq!(mcp.close(Duration::from_secs(5)), Some(0));
     let _ = daemon.shutdown_gracefully();
 
-    let relock_out = isolated_cmd(&home)
-        .args([
+    let relock_out = common::run_hyp_in_pty(
+        &home,
+        &[
             "gate",
             "lock",
             "--state-dir",
             state_dir.to_str().unwrap(),
             "--json",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(relock_out.status.code(), Some(0));
-    assert_eq!(parse_json_stdout(&relock_out)["data"]["gatePolicySig"], "OK");
+        ],
+        None,
+        Some("y\n"),
+    );
+    assert_eq!(relock_out.code, 0, "tty={}", relock_out.tty);
+    assert_eq!(relock_out.parse_json()["data"]["gatePolicySig"], "OK");
 
-    let approve_out = isolated_cmd(&home)
-        .args([
+    let approve_out = common::run_hyp_in_pty(
+        &home,
+        &[
             "inbox",
             "approve",
             &receipt,
             "--state-dir",
             state_dir.to_str().unwrap(),
             "--json",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(approve_out.status.code(), Some(0));
-    let approve_json = parse_json_stdout(&approve_out);
+        ],
+        None,
+        Some("y\n"),
+    );
+    assert_eq!(approve_out.code, 0, "tty={}", approve_out.tty);
+    let approve_json = approve_out.parse_json();
     assert_eq!(approve_json["ok"], true);
     assert_eq!(approve_json["data"]["gateState"], "pending");
 
