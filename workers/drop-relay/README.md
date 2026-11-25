@@ -143,3 +143,25 @@ Because drop slots have a hard maximum TTL of 15 minutes (`900s`), you can rotat
 node --check src/index.mjs
 node test/worker.test.mjs
 ```
+
+---
+
+## GitHub Actions Auto-Deploy Setup (`drop.hyphae.to`)
+
+The workflow [`.github/workflows/deploy-drop-relay.yml`](../../.github/workflows/deploy-drop-relay.yml) automatically tests and deploys `workers/drop-relay/` to `https://drop.hyphae.to` (`--env production`) on every push to `main` touching `workers/drop-relay/**` (and skips cleanly without failing CI if secrets aren't configured yet).
+
+**One-time operator setup (3 steps):**
+
+1. **Create a minimally scoped Cloudflare Custom API Token** (*Cloudflare Dashboard → Profile → API Tokens → Create Custom Token*):
+   - `Account → Workers Scripts → Edit`
+   - `Account → Account Settings → Read`
+   - `Zone → Workers Routes → Edit` (scoped strictly to zone `hyphae.to`)
+2. **Add 2 GitHub Actions Secrets** (*Repo Settings → Secrets and variables → Actions*, or inside the `production-drop-relay` environment):
+   - `CLOUDFLARE_API_TOKEN` — the scoped token from Step 1
+   - `CLOUDFLARE_ACCOUNT_ID` — your 32-hex Cloudflare Account ID
+3. **Seed `DROP_CAP_HMAC_KEY` once directly on Cloudflare** (NEVER store this key in GitHub Actions or `wrangler.toml`; `wrangler deploy` preserves existing Worker secrets automatically):
+   ```bash
+   cd workers/drop-relay
+   openssl rand -base64 32 | tr '+/' '-_' | tr -d '=' | npx wrangler secret put DROP_CAP_HMAC_KEY --env production
+   ```
+   *(If `hyphae-drop-relay` doesn't exist yet on Cloudflare, trigger the `Deploy Drop Relay (Cloudflare Workers)` workflow once via `workflow_dispatch` first so the Worker is created, then run Step 3 to seed `DROP_CAP_HMAC_KEY` — `/v1/health` works immediately, and `POST /v1/drops` activates the moment `DROP_CAP_HMAC_KEY` is set.)*

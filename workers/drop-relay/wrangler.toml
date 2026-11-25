@@ -60,3 +60,29 @@ CREATES_PER_HOUR_PER_IP = "20"
 #   DROP_CAP_HMAC_KEY        (required, >= 32 bytes; signs stateless hdcap1_ tokens)
 #   DROP_CAP_HMAC_KEY_PREV   (optional; previous key during zero-downtime key rotation)
 #   ALLOWED_NODE_KEYS        (required in "private" mode; JSON map or nodeId=b64url pairs)
+
+# Production public Drop Relay environment (`wrangler deploy --env production`)
+# Used by `.github/workflows/deploy-drop-relay.yml` for https://drop.hyphae.to.
+# Note: `DROP_CAP_HMAC_KEY` must be set once directly on Cloudflare via:
+#   openssl rand -base64 32 | tr '+/' '-_' | tr -d '=' | npx wrangler secret put DROP_CAP_HMAC_KEY --env production
+[env.production]
+name = "hyphae-drop-relay"
+routes = [
+  { pattern = "drop.hyphae.to", custom_domain = true }
+]
+
+[[env.production.durable_objects.bindings]]
+name = "DROP_SLOT"
+class_name = "DropSlotDO"
+
+[env.production.vars]
+DROP_AUTH_MODE = "open"
+ALLOWED_ORIGINS = "https://hyphae.to"
+ALLOW_PRIVATE_NETWORK = "true"
+MAX_PAYLOAD_BYTES = "65536"
+MAX_TTL_SECONDS = "900"
+DEFAULT_TTL_SECONDS = "600"
+MAX_ITEMS_PER_DROP = "16"
+MAX_SSE_STREAMS_PER_DROP = "2"
+CREATES_PER_HOUR_PER_NODE = "10"
+CREATES_PER_HOUR_PER_IP = "20"

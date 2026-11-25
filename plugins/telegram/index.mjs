@@ -7,12 +7,12 @@
  *   TELEGRAM_TARGET                                - Target name (defaults to first target in hello)
  *   TELEGRAM_ALLOWED_CHATS                         - Optional comma-separated numeric chat IDs allowlist
  *   TELEGRAM_ALLOWED_USERS                         - Optional comma-separated numeric user IDs allowlist
- *   TELEGRAM_DEFAULT_CHAT                          - Optional default numeric chat ID for outbound hyp_plugin_post
+ *   TELEGRAM_DEFAULT_CHAT                          - Optional default numeric chat ID for outbound hyp_send replies
  *   TELEGRAM_API_BASE                              - Optional API base URL override (default https://api.telegram.org)
- *   TELEGRAM_STATE_FILE                            - Optional path to persist polling offset JSON
+ *   TELEGRAM_STATE_FILE                            - Optional path to persist polling offset JSON (defaults to $HYPHAE_STATE_DIR/telegram-offset.json when HYPHAE_STATE_DIR is set)
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { MeshPluginClient } from "../sdk/client.mjs";
 
 function readToken() {
@@ -32,7 +32,9 @@ const token = readToken();
 const allowedChats = csvSet("TELEGRAM_ALLOWED_CHATS");
 const allowedUsers = csvSet("TELEGRAM_ALLOWED_USERS");
 const allowAll = process.env.TELEGRAM_ALLOW_ALL === "1";
-const stateFile = process.env.TELEGRAM_STATE_FILE;
+const stateFile =
+  process.env.TELEGRAM_STATE_FILE ||
+  (process.env.HYPHAE_STATE_DIR ? join(process.env.HYPHAE_STATE_DIR, "telegram-offset.json") : "");
 
 function resolveApiBase(raw, fallback) {
   const value = (raw?.trim() || fallback).replace(/\/+$/, "");

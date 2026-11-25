@@ -134,7 +134,7 @@ Compiled directly into `hyp` (`crates/hyp-node/src/engine/local_ingest.rs`) and 
      systemd-run --user --on-active=15m -- hyp emit --label check-ci --note "Verify build"
 
      # Recurring Unix (crontab -e)
-     0 9 * * 1-5 /usr/local/bin/hyp emit --label morning-triage --note "Review open PRs"
+     0 9 * * 1-5 $HOME/.local/bin/hyp emit --label morning-triage --note "Review open PRs"
 
      # Windows Task Scheduler (schtasks)
      schtasks /Create /SC DAILY /TN "HyphaeMorningTriage" /ST 09:00 /TR "hyp emit --label morning-triage --note \"Review open PRs\""
@@ -209,15 +209,58 @@ When local bridges are enabled, the conditional `hyp_bridge` tool is advertised 
 
 ### Included Optional External Scripts (`plugins/`)
 
-All included `.mjs` scripts have zero external npm dependencies (using Node standard APIs only when you choose to run them):
+All included `.mjs` scripts have zero external npm dependencies (**requires Node 24+ on macOS/Linux**; fd-3 subprocess bridges are Unix-only):
 
 | Script | Protocol / Transport | Required Fail-Closed Allowlist / Auth Env Vars |
 | --- | --- | --- |
 | [plugins/slack/index.mjs](../plugins/slack/index.mjs) | Slack Socket Mode (WebSocket, no public port needed) + `chat.postMessage` | `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_ALLOWED_USERS` / `SLACK_ALLOWED_CHANNELS` |
-| [plugins/telegram/index.mjs](../plugins/telegram/index.mjs) | Telegram Bot API long polling + `sendMessage` | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS` / `TELEGRAM_ALLOWED_CHATS` |
+| [plugins/telegram/index.mjs](../plugins/telegram/index.mjs) | Telegram Bot API long polling + `sendMessage` | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS` / `TELEGRAM_ALLOWED_CHATS` *(numeric IDs)* |
 | [plugins/whatsapp/index.mjs](../plugins/whatsapp/index.mjs) | Meta WhatsApp Business Cloud API webhook (`X-Hub-Signature-256`) + Graph API | `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_ALLOWED_NUMBERS` |
 | [plugins/webhook/index.mjs](../plugins/webhook/index.mjs) | Local HTTP webhook receiver (`X-Webhook-Signature-256`) + optional `WEBHOOK_POST_URL` | `WEBHOOK_PORT`, `WEBHOOK_SECRET`, optional `WEBHOOK_POST_URL` |
 | [plugins/prometheus/index.mjs](../plugins/prometheus/index.mjs) | Standalone Alertmanager v4 webhook script (when not using compiled-in Rust adapter) | `PROMETHEUS_PORT`, `PROMETHEUS_BEARER_TOKEN` and/or `PROMETHEUS_WEBHOOK_SECRET` |
+
+### Example `plugins[]` Configuration (`~/.config/hyphae/node.json`)
+
+Store tokens out-of-band first (`hyp secret set telegram-bot-token --web`, `hyp secret set slack-app-token --web`, `hyp secret set slack-bot-token --web`), then add the plugin entries to `node.json`:
+
+```json
+{
+  "plugins": [
+    {
+      "id": "telegram",
+      "command": "node",
+      "args": ["/path/to/hyp/plugins/telegram/index.mjs"],
+      "targets": ["personal"],
+      "env": {
+        "TELEGRAM_BOT_TOKEN": { "secret": "telegram-bot-token" },
+        "TELEGRAM_ALLOWED_USERS": "123456789",
+        "TELEGRAM_DEFAULT_CHAT": "123456789",
+        "TELEGRAM_STATE_FILE": "/Users/you/.config/hyphae/state/telegram-offset.json"
+      }
+    },
+    {
+      "id": "slack",
+      "command": "node",
+      "args": ["/path/to/hyp/plugins/slack/index.mjs"],
+      "targets": ["pm"],
+      "env": {
+        "SLACK_APP_TOKEN": { "secret": "slack-app-token" },
+        "SLACK_BOT_TOKEN": { "secret": "slack-bot-token" },
+        "SLACK_ALLOWED_USERS": "U0123456789"
+      }
+    }
+  ]
+}
+```
+
+After saving `node.json`, restart the daemon and refresh skills so harnesses see `hyp_bridge`:
+
+```sh
+hyp service restart
+hyp setup --refresh-skills
+```
+
+*(A misconfigured bridge logs a startup warning without taking down the local agent mesh daemon.)*
 
 ---
 
