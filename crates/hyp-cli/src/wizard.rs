@@ -3682,6 +3682,32 @@ pub fn build_herdr_attach_command(hc_bin: &Path, terminal_address: &str) -> Comm
     cmd
 }
 
+/// Builds `herdr-app do terminal.keep --terminal <address> --place tab` so a newly spawned `hc`
+/// terminal opens directly as a real focused tab inside a running Herdr desktop app window.
+pub fn build_herdr_app_keep_command(herdr_app_bin: &Path, terminal_address: &str) -> Command {
+    let mut cmd = Command::new(herdr_app_bin);
+    cmd.args([
+        "do",
+        "terminal.keep",
+        "--terminal",
+        terminal_address,
+        "--place",
+        "tab",
+    ]);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd
+}
+
+fn try_open_in_herdr_app_tab(terminal_address: &str) -> bool {
+    let Some(herdr_app_bin) = find_executable_in_path("herdr-app") else {
+        return false;
+    };
+    let mut cmd = build_herdr_app_keep_command(&herdr_app_bin, terminal_address);
+    matches!(output_retrying_busy(&mut cmd), Ok(out) if out.status.success())
+}
+
 /// Builds the filtered main menu containing ONLY options actually detected/available on this machine.
 #[allow(dead_code)]
 pub fn build_main_menu_items(
@@ -4556,10 +4582,13 @@ fn spawn_herdr_template(
         );
     };
 
+    let opened_in_herdr_app = try_open_in_herdr_app_tab(&address);
     let next = vec![format!("hc attach {address}")];
-    let summary = format!(
-        "Launched Herdr template '{template_name}' in terminal {address}"
-    );
+    let summary = if opened_in_herdr_app {
+        format!("Opened Herdr template '{template_name}' in a new Herdr app tab ({address})")
+    } else {
+        format!("Launched Herdr template '{template_name}' in terminal {address}")
+    };
 
     if as_json {
         let envelope = JsonEnvelope {
@@ -4570,6 +4599,7 @@ fn spawn_herdr_template(
                 "mode": "herdr_launch",
                 "template": template_name,
                 "terminal": address,
+                "openedInHerdrApp": opened_in_herdr_app,
             })),
             warnings: Vec::new(),
             next,
@@ -4579,10 +4609,13 @@ fn spawn_herdr_template(
         return ExitCode::from(EXIT_OK);
     }
 
-    if !io::stdout().is_terminal() {
+    if opened_in_herdr_app || !io::stdout().is_terminal() {
         println!("OK    {summary}");
         println!("      Template: {template_name}");
         println!("      Terminal: {address}");
+        if opened_in_herdr_app {
+            println!("      Window:   Herdr app (new tab)");
+        }
         print_next_steps(&next);
         return ExitCode::from(EXIT_OK);
     }
@@ -7724,6 +7757,23 @@ mod tests {
         assert_eq!(attach_cmd.get_program(), OsStr::new("/usr/local/bin/hc"));
         let attach_args: Vec<&OsStr> = attach_cmd.get_args().collect();
         assert_eq!(attach_args, vec![OsStr::new("attach"), OsStr::new("t4h")]);
+
+        // Herdr desktop app tab-promotion builder (`herdr-app do terminal.keep ...`).
+        let app_path = Path::new("/usr/local/bin/herdr-app");
+        let keep_cmd = build_herdr_app_keep_command(app_path, "t4h");
+        assert_eq!(keep_cmd.get_program(), OsStr::new("/usr/local/bin/herdr-app"));
+        let keep_args: Vec<&OsStr> = keep_cmd.get_args().collect();
+        assert_eq!(
+            keep_args,
+            vec![
+                OsStr::new("do"),
+                OsStr::new("terminal.keep"),
+                OsStr::new("--terminal"),
+                OsStr::new("t4h"),
+                OsStr::new("--place"),
+                OsStr::new("tab"),
+            ]
+        );
     }
 
     #[test]
@@ -7946,7 +7996,7 @@ mod tests {
         for idx in 1..=8 {
             items.push(MainMenuItem {
                 label: format!("Template {idx:02}"),
-                tag: "herdr",
+                tag: "via herdr",
                 subtitle: format!("tmpl-{idx:02}"),
                 action: MainMenuAction::LaunchHerdrTemplate {
                     hc_bin: PathBuf::from("/usr/local/bin/hc"),
