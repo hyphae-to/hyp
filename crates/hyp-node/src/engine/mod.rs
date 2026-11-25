@@ -33,8 +33,8 @@ pub use local_ingest::{
 };
 pub use node::{
     AuthenticatedPeer, DiscoveredPeerHandle, IngestedHumanDrop, KvWriteRequest, PeerLinkInfo,
-    SendDmResult, SubscribeRequest, SubscribeResult, TransferSendResult, UnifiedNode,
-    p2p_offer_secret_name,
+    PeerReconcileReport, SendDmResult, SubscribeRequest, SubscribeResult, TransferSendResult,
+    UnifiedNode, p2p_offer_secret_name,
 };
 pub use peer_link::{
     ChannelDirectoryEntry, ChannelJoinResponse, ChannelsResponse, GuestPairProofPayload,

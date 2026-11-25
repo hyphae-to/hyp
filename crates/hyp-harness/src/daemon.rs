@@ -41,7 +41,7 @@ use hyp_node::delivery::{
 use hyp_node::engine::http_util::{HttpClient, SseParser, empty_body, full_body};
 use hyp_node::engine::{
     ChannelMode, CreateDropRequest, CreateDropResponse, DROP_CAP_HEADER, DropSubscriberAuth,
-    KvWriteRequest, SubscribeRequest, UnifiedNode,
+    KvWriteRequest, PeerReconcileReport, SubscribeRequest, UnifiedNode,
 };
 use hyp_node::gates::{
     GateDecision, InboundContext, OutboundContext, SecurityGatePipeline, TrustTier as GateTrustTier,
@@ -102,9 +102,21 @@ const MAX_MUTE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// Default timeout waiting for a live `--claude-channel` `channel.ack`.
 pub const DEFAULT_CHANNEL_DELIVER_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default per-peer connect timeout when reconciling persisted peers during `peers.reload`.
+pub const DEFAULT_PEERS_RELOAD_TIMEOUT: Duration = Duration::from_millis(1_200);
 
-/// Boxed `Send` future alias used by [`BridgePoster`].
+/// Boxed `Send` future alias used by [`BridgePoster`] and [`PeersReloader`].
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Pluggable async callback invoked whenever a `"peers.reload"` IPC RPC arrives on
+/// `connector.sock` / `connector.addr`.
+///
+/// Wired by `hyp node start` to reconcile outbound `PeerLink` supervisors and refresh
+/// `node.status.json`, or overridden in tests. When unset, [`LocalDaemon`] reconciles
+/// persisted peers directly via [`UnifiedNode::reconcile_peers`].
+pub trait PeersReloader: Send + Sync {
+    fn reload_peers<'a>(&'a self) -> BoxFuture<'a, Result<PeerReconcileReport, String>>;
+}
 
 /// Pluggable async outbound handler for local chat/webhook bridges (`<plugin>:<target>`).
 ///
@@ -383,6 +395,8 @@ struct LocalDaemonInner {
     dismissed_receipts: Mutex<HashSet<String>>,
     /// Registered pluggable outbound bridge handlers keyed by lowercase plugin slug.
     bridge_posters: Mutex<HashMap<String, Arc<dyn BridgePoster>>>,
+    /// Optional custom async hook invoked on `"peers.reload"` IPC RPCs.
+    peers_reloader: Mutex<Option<Arc<dyn PeersReloader>>>,
     /// Configured targets per bridge plugin (advertised even before any session links).
     configured_bridge_targets: Mutex<BTreeMap<String, Vec<String>>>,
     /// Tier 3 bounded `Hold` retry state (`session_id -> (attempt, generation)`).
@@ -676,6 +690,36 @@ impl LocalDaemon {
                 .expect("bridge_posters lock poisoned")
                 .insert(key, poster);
         }
+    }
+
+    /// Registers a [`PeersReloader`] callback invoked whenever `"type": "peers.reload"`
+    /// arrives on `connector.sock` / `connector.addr`.
+    pub fn set_peers_reloader(&self, reloader: Arc<dyn PeersReloader>) {
+        *self
+            .inner
+            .peers_reloader
+            .lock()
+            .expect("peers_reloader lock poisoned") = Some(reloader);
+    }
+
+    /// Registers an async closure invoked whenever `"type": "peers.reload"` arrives on
+    /// `connector.sock` / `connector.addr`.
+    pub fn on_peers_reload<F, Fut>(&self, callback: F)
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<PeerReconcileReport, String>> + Send + 'static,
+    {
+        struct FnPeersReloader<F>(F);
+        impl<F, Fut> PeersReloader for FnPeersReloader<F>
+        where
+            F: Fn() -> Fut + Send + Sync + 'static,
+            Fut: Future<Output = Result<PeerReconcileReport, String>> + Send + 'static,
+        {
+            fn reload_peers<'a>(&'a self) -> BoxFuture<'a, Result<PeerReconcileReport, String>> {
+                Box::pin((self.0)())
+            }
+        }
+        self.set_peers_reloader(Arc::new(FnPeersReloader(callback)));
     }
 
     /// Registers a pluggable outbound [`BridgePoster`] together with its configured target list.
@@ -1126,6 +1170,7 @@ impl LocalDaemonInner {
             sub_meta: Mutex::new(HashMap::new()),
             dismissed_receipts: Mutex::new(HashSet::new()),
             bridge_posters: Mutex::new(HashMap::new()),
+            peers_reloader: Mutex::new(None),
             configured_bridge_targets: Mutex::new(BTreeMap::new()),
             hold_retries: Mutex::new(HashMap::new()),
             active_cold_spawns: Mutex::new(HashSet::new()),
@@ -4470,6 +4515,11 @@ async fn handle_connection<R, W>(
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
                         break;
                     }
+                    "peers.reload" => {
+                        let resp = handle_peers_reload(&daemon).await;
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
                     "mute.add" => {
                         let target = packet
                             .get("target")
@@ -5314,6 +5364,49 @@ async fn handle_daemon_status(daemon: &LocalDaemonInner) -> Value {
             "quarantinedCount": total_quarantined,
         }
     })
+}
+
+async fn handle_peers_reload(daemon: &Arc<LocalDaemonInner>) -> Value {
+    let custom = daemon
+        .peers_reloader
+        .lock()
+        .expect("peers_reloader lock poisoned")
+        .clone();
+
+    let outcome = match custom {
+        Some(reloader) => reloader.reload_peers().await,
+        None => Ok(daemon
+            .node
+            .reconcile_peers(DEFAULT_PEERS_RELOAD_TIMEOUT)
+            .await),
+    };
+
+    match outcome {
+        Ok(report) => {
+            daemon.bump_ui_rev();
+            let result = json!({
+                "reloaded": true,
+                "activePeers": report.active_peers,
+                "added": report.added,
+                "removed": report.removed,
+                "connectedPeers": report.connected_peers,
+                "warnings": report.warnings,
+            });
+            json!({
+                "ok": true,
+                "reloaded": true,
+                "activePeers": report.active_peers,
+                "added": report.added,
+                "removed": report.removed,
+                "result": result,
+            })
+        }
+        Err(err) => json!({
+            "ok": false,
+            "reloaded": false,
+            "error": err,
+        }),
+    }
 }
 
 fn parse_rules_arg(args: &Map<String, Value>) -> Result<Vec<DeliveryRule>, (String, String)> {
