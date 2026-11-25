@@ -97,6 +97,18 @@ pub struct SetupArgs {
     /// Restore previously chained statusLine (or remove Hyphae statusLine) and delete the chain backup file
     #[arg(long)]
     pub restore_statusline: bool,
+    /// Install the native Herdr desktop mod (`hyphae-pane` + `hyphae-panel`) into `~/.config/herdr-app`
+    #[arg(long = "mod")]
+    pub install_mod: bool,
+    /// Explicit opt-in for `hyp setup --harness herdr --mod` to edit an active symlinked Herdr layout in place
+    #[arg(long)]
+    pub patch_layout: bool,
+    /// Clone Herdr's shipped `main.json` layout to `<NAME>.json`, wire `hyphae-pane` + `hyphae-panel`, and activate it
+    #[arg(long, value_name = "NAME")]
+    pub clone_layout: Option<String>,
+    /// Explicit opt-in for `hyp setup --harness herdr --mod` to replace a customized `pane.header.content.mod`
+    #[arg(long)]
+    pub force_layout: bool,
     /// Output structured JSON envelope
     #[arg(long)]
     pub json: bool,
@@ -255,6 +267,12 @@ pub fn run_setup(args: SetupArgs) -> ExitCode {
 
     let mut results = Vec::new();
     let mut warnings = Vec::new();
+    let mut extra_next: Vec<String> = Vec::new();
+    let mut herdr_mod_outcome: Option<crate::herdr_mod::HerdrModInstallOutcome> = None;
+    let wants_herdr_mod = args.install_mod
+        || args.patch_layout
+        || args.clone_layout.is_some()
+        || args.force_layout;
 
     if targets.is_empty() {
         warnings.push(format!(
@@ -280,7 +298,46 @@ pub fn run_setup(args: SetupArgs) -> ExitCode {
             configure_harness(kind, &home, &bin_path, &config_path, setup_opts, &skill_ctx)
         };
         match step_res {
-            Ok(outcome) => results.push(outcome),
+            Ok(mut outcome) => {
+                if kind == HarnessKind::Herdr
+                    && wants_herdr_mod
+                    && !args.restore_statusline
+                    && !args.refresh_skills
+                {
+                    let mod_opts = crate::herdr_mod::HerdrModInstallOptions {
+                        patch_layout: args.patch_layout,
+                        force: args.force_layout,
+                        clone_layout: args.clone_layout.clone(),
+                        skip_check: args.dry_run,
+                        dry_run: args.dry_run,
+                        herdr_home_override: if args.home.is_none() {
+                            crate::herdr_mod::detect_herdr_app_dir(&home)
+                        } else {
+                            None
+                        },
+                    };
+                    match crate::herdr_mod::install_herdr_mod(&home, mod_opts) {
+                        Ok(mod_res) => {
+                            outcome.files.extend(mod_res.files.iter().cloned());
+                            outcome.notes.extend(mod_res.notes.iter().cloned());
+                            warnings.extend(mod_res.warnings.iter().cloned());
+                            extra_next.extend(mod_res.next.iter().cloned());
+                            herdr_mod_outcome = Some(mod_res);
+                        }
+                        Err(e) => {
+                            return emit_error(
+                                cmd,
+                                as_json,
+                                EXIT_ERROR,
+                                "HERDR_MOD_FAILED",
+                                format!("Failed to install Herdr mod: {e}"),
+                                None,
+                            );
+                        }
+                    }
+                }
+                results.push(outcome);
+            }
             Err(e) => {
                 return emit_error(
                     cmd,
@@ -294,7 +351,7 @@ pub fn run_setup(args: SetupArgs) -> ExitCode {
         }
     }
 
-    let next = if args.dry_run {
+    let mut next = if args.dry_run {
         vec!["Re-run without --dry-run to apply the planned harness changes.".to_string()]
     } else if results.is_empty() {
         vec!["hyp setup --harness all".to_string()]
@@ -304,6 +361,11 @@ pub fn run_setup(args: SetupArgs) -> ExitCode {
             "hyp node start".to_string(),
         ]
     };
+    for step in extra_next {
+        if !next.contains(&step) {
+            next.push(step);
+        }
+    }
 
     let summary = if args.dry_run {
         format!(
@@ -319,17 +381,20 @@ pub fn run_setup(args: SetupArgs) -> ExitCode {
     };
 
     if as_json {
+        let mut data_map = Map::new();
+        data_map.insert("binary".to_string(), json!(bin_path));
+        data_map.insert("home".to_string(), json!(home.display().to_string()));
+        data_map.insert("dryRun".to_string(), json!(args.dry_run));
+        data_map.insert("configuredCount".to_string(), json!(results.len()));
+        data_map.insert("harnesses".to_string(), json!(results));
+        if let Some(ref hm) = herdr_mod_outcome {
+            data_map.insert("herdrMod".to_string(), json!(hm));
+        }
         let envelope = JsonEnvelope {
             ok: true,
             command: cmd.to_string(),
             summary: Some(summary),
-            data: Some(json!({
-                "binary": bin_path,
-                "home": home.display().to_string(),
-                "dryRun": args.dry_run,
-                "configuredCount": results.len(),
-                "harnesses": results,
-            })),
+            data: Some(Value::Object(data_map)),
             warnings,
             next,
             error: None,

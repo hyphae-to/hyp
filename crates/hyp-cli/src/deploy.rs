@@ -1129,13 +1129,19 @@ WantedBy=multi-user.target
 }
 
 fn render_dockerfile() -> String {
-    r#"# syntax=docker/dockerfile:1
+    concat!(
+        r#"# syntax=docker/dockerfile:1
 # Hyphae v2 standalone runtime image (SHA-256 verified release binary, non-root UID 10001)
 
 FROM debian:bookworm-slim AS downloader
-ARG HYP_VERSION=v0.5.0
+ARG HYP_VERSION=v"#,
+        env!("CARGO_PKG_VERSION"),
+        r#"
 ARG TARGETARCH
-RUN apt-get update \
+RUN apt-get update \"#
+    )
+    .to_string()
+        + r#"
     && apt-get install -y --no-install-recommends ca-certificates curl tar \
     && rm -rf /var/lib/apt/lists/* \
     && ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
@@ -1181,7 +1187,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 ENTRYPOINT ["/usr/local/bin/hyp"]
 CMD ["node", "start", "--config", "/etc/hyphae/node.json", "--no-local-socket"]
 "#
-    .to_string()
 }
 
 fn render_docker_compose(node_id: &str) -> String {

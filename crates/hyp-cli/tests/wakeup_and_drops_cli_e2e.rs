@@ -1073,7 +1073,7 @@ fn cli_deploy_init_drop_relay_and_relay_set_validation() {
     let dockerfile = fs::read_to_string(kit_dir.join("Dockerfile"))
         .unwrap()
         .replace("\r\n", "\n");
-    assert!(dockerfile.contains("ARG HYP_VERSION=v0.5.0"));
+    assert!(dockerfile.contains(&format!("ARG HYP_VERSION=v{}", env!("CARGO_PKG_VERSION"))));
     assert!(dockerfile.contains("sha256sum -c --ignore-missing"));
     assert!(!dockerfile.contains("COPY Cargo.toml"));
 

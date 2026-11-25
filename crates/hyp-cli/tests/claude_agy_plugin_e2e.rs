@@ -821,3 +821,152 @@ fn doctor_warns_on_missing_chain_file_and_setup_rejects_conflicting_flags() {
             .unwrap();
     assert!(claude_after.get("statusLine").is_none());
 }
+
+// ============================================================================
+// 6. Native Herdr Mod (`hyp setup --harness herdr --mod`) & Doctor Detection
+// ============================================================================
+
+#[test]
+fn herdr_mod_setup_respects_symlinks_supports_clone_layout_and_doctor_detection() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let state_dir = tmp.path().join("state");
+    let herdr_app = home.join(".config").join("herdr-app");
+    let layouts_dir = herdr_app.join("layouts");
+    fs::create_dir_all(&layouts_dir).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+
+    // Seed shipped `main.json` so `--clone-layout` works cleanly on every OS.
+    let shipped_main = json!({
+        "pane": {
+            "header": {
+                "content": { "mod": "pane" }
+            }
+        },
+        "panel": {
+            "tabs": ["files", "changes"]
+        }
+    });
+    fs::write(
+        layouts_dir.join("main.json"),
+        serde_json::to_string_pretty(&shipped_main).unwrap(),
+    )
+    .unwrap();
+
+    // On Unix, also exercise strict symlink refusal on a git-backed custom layout.
+    #[cfg(unix)]
+    {
+        let external_repo = tmp.path().join("herdr-custom-ui");
+        fs::create_dir_all(&external_repo).unwrap();
+        let target_layout = external_repo.join("herdr-folders.json");
+        let original_custom = serde_json::to_string_pretty(&json!({
+            "pane": { "header": { "content": { "mod": "folder-pane" } } },
+            "panel": { "tabs": ["files"] }
+        }))
+        .unwrap();
+        fs::write(&target_layout, &original_custom).unwrap();
+        std::os::unix::fs::symlink(&target_layout, layouts_dir.join("herdr-folders.json"))
+            .unwrap();
+        fs::write(
+            herdr_app.join("shared.json"),
+            serde_json::to_string_pretty(&json!({ "layout": "herdr-folders" })).unwrap(),
+        )
+        .unwrap();
+
+        let sym_out = isolated_cmd(&home)
+            .args([
+                "setup",
+                "--harness",
+                "herdr",
+                "--mod",
+                "--home",
+                home.to_str().unwrap(),
+                "--state-dir",
+                state_dir.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            sym_out.status.code(),
+            Some(0),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&sym_out.stdout),
+            String::from_utf8_lossy(&sym_out.stderr)
+        );
+        let sym_json = parse_json_stdout(&sym_out);
+        assert_eq!(sym_json["ok"], true);
+        assert_eq!(sym_json["data"]["herdrMod"]["layoutAction"], "skipped_symlink");
+        assert!(
+            !sym_json["warnings"].as_array().unwrap().is_empty(),
+            "symlink refusal should emit an actionable warning"
+        );
+        // External symlink target MUST remain byte-identical!
+        assert_eq!(fs::read_to_string(&target_layout).unwrap(), original_custom);
+        assert!(herdr_app.join("mods/hyphae-pane/mod.json").is_file());
+        assert!(herdr_app.join("mods/hyphae-panel/mod.json").is_file());
+    }
+
+    // Exercise `--clone-layout herdr-hyphae` (cross-platform: Linux, macOS, Windows).
+    fs::write(
+        herdr_app.join("shared.json"),
+        serde_json::to_string_pretty(&json!({ "layout": "main" })).unwrap(),
+    )
+    .unwrap();
+    let clone_out = isolated_cmd(&home)
+        .args([
+            "setup",
+            "--harness",
+            "herdr",
+            "--mod",
+            "--clone-layout",
+            "herdr-hyphae",
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        clone_out.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&clone_out.stdout),
+        String::from_utf8_lossy(&clone_out.stderr)
+    );
+    let clone_json = parse_json_stdout(&clone_out);
+    assert_eq!(clone_json["ok"], true);
+    assert_eq!(clone_json["data"]["herdrMod"]["layoutAction"], "cloned");
+    assert!(layouts_dir.join("herdr-hyphae.json").is_file());
+    let shared_after: Value =
+        serde_json::from_str(&fs::read_to_string(herdr_app.join("shared.json")).unwrap()).unwrap();
+    assert_eq!(shared_after["layout"], "herdr-hyphae");
+    let keys_after: Value =
+        serde_json::from_str(&fs::read_to_string(herdr_app.join("keys.json")).unwrap()).unwrap();
+    assert_eq!(keys_after["global"]["cmd-shift-h"], "mod.open:hyphae-panel");
+
+    // `hyp doctor --json` should detect and report `herdrMod.installed == true`.
+    let doc_out = isolated_cmd(&home)
+        .args([
+            "doctor",
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let doc_json = parse_json_stdout(&doc_out);
+    assert_eq!(doc_json["data"]["herdrMod"]["detected"], true);
+    assert_eq!(doc_json["data"]["herdrMod"]["installed"], true);
+    let checks = doc_json["data"]["checks"].as_array().unwrap();
+    assert!(
+        checks
+            .iter()
+            .any(|c| c["name"] == "herdr:mod" && c["status"] == "ok"),
+        "expected ok herdr:mod check in {checks:?}"
+    );
+}

@@ -1,9 +1,9 @@
-//! `hyp` — Hyphae v2 native CLI (`hook`, `mcp`, `wait`, `watch`, `node`/`daemon`, `onboard`,
-//! `setup`, `status`, `doctor`, `secret`, `gate`, `inbox`, `kv`, `emit`, `auth`, `drop`,
-//! `relay`, `update`, `deploy`, `pair`, `version`).
+//! `hyp` — Hyphae v2 native CLI (`hook`, `statusline`, `mcp`, `wait`, `watch`, `node`/`daemon`,
+//! `onboard`, `setup`, `inspect`, `session`, `ui`, `status`, `doctor`, `secret`, `gate`, `inbox`,
+//! `kv`, `emit`, `auth`, `drop`, `relay`, `update`, `deploy`, `pair`, `version`).
 //!
-//! Performance note: `hyp hook` intercepts `std::env::args()` BEFORE constructing `clap`
-//! or Tokio so hook invocations pay zero async-runtime startup overhead (1–3 ms cold start).
+//! Performance note: `hyp hook` and `hyp statusline` intercept `std::env::args()` BEFORE
+//! constructing `clap` or Tokio so hot invocations pay zero async-runtime startup overhead (1–5 ms).
 
 mod auth_cmd;
 mod config_file;
@@ -11,6 +11,7 @@ mod deploy;
 mod drop_cmd;
 mod emit_cmd;
 mod gate_cmd;
+mod herdr_mod;
 mod inspect_cmd;
 mod kv_cmd;
 mod node_cmd;
@@ -44,7 +45,7 @@ use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE};
 #[derive(Parser)]
 #[command(
     name = "hyp",
-    about = "Hyphae v2 native CLI (hook, mcp, wait, watch, node, onboard, setup, status, doctor, secret, gate, inbox, kv, emit, auth, drop, relay, update, deploy, pair, version)",
+    about = "Hyphae v2 native CLI (hook, statusline, mcp, wait, watch, node, onboard, setup, inspect, session, ui, status, doctor, secret, gate, inbox, kv, emit, auth, drop, relay, update, deploy, pair, version)",
     version
 )]
 struct Cli {

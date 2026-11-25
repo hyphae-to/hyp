@@ -284,7 +284,7 @@ fn deploy_init_all_six_providers_overwrite_guard_and_config_check() {
             let dockerfile = fs::read_to_string(out_dir.join("Dockerfile"))
                 .unwrap()
                 .replace("\r\n", "\n");
-            assert!(dockerfile.contains("ARG HYP_VERSION=v0.5.0"));
+            assert!(dockerfile.contains(&format!("ARG HYP_VERSION=v{}", env!("CARGO_PKG_VERSION"))));
             assert!(dockerfile.contains("ARG TARGETARCH"));
             assert!(dockerfile.contains("x86_64-unknown-linux-musl"));
             assert!(dockerfile.contains("aarch64-unknown-linux-musl"));

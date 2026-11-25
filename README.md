@@ -159,7 +159,7 @@ hyp relay status --probe
 
 # 3. Create a one-shot drop link (fresh secret OR HPKE-encrypted directive draft prefill)
 hyp drop create --kind secret --secret-name stripe-key
-hyp drop create --kind directive --draft "Approve staging deploy for v0.5.0"
+hyp drop create --kind directive --draft "Approve staging deploy for v0.6.0"
 hyp drop wait
 ```
 
@@ -206,7 +206,11 @@ Every `hyp` command follows an agent-first output contract (`--json` uniform env
 hyp onboard [--profile local|router|p2p] [--node-id <id>] [--join <file|->] [--harness <spec>] [--assist]
 hyp node start [--profile local|router|p2p] [--bind <ip:port>] [--config <path>]   # alias: hyp daemon
 hyp service [install | status | restart | stop]
-hyp setup [--harness auto|all|claude,codex,...] [--refresh-skills | --force-skills] [--dry-run]
+hyp setup [--harness auto|all|claude,codex,herdr,...] [--statusline | --restore-statusline] [--mod] [--refresh-skills]
+hyp inspect [--session <id>] [--all] [--watch] [--json]                             # non-blocking session & stream inspector
+hyp session <focus|mute|unmute|rule|unsubscribe|leave> ...                          # quick thread delivery & subscription controls
+hyp ui [--session <id>]                                                             # pure-Rust interactive terminal inspector (!hyp ui)
+hyp statusline [--harness claude|antigravity] [--chain-file <path>]                 # <5ms live statusLine (chains custom lines)
 hyp pair [guide | invite | inspect | accept | join]
 hyp deploy [providers | init | check]                                               # includes drop-relay & --enable-drop-relay
 hyp emit [--label <label>] [--note <text>] [--topic <t>] [--type <ce>] [--sign]     # writes to 0600 ingest.sock / ingest.addr
@@ -215,12 +219,22 @@ hyp drop [create --kind secret|directive [--secret-name <n>] [--draft <t> | --dr
 hyp relay [set <url> | status]
 hyp status [--json] | hyp doctor [--json]
 hyp secret [set <name> [--web] | list | delete <name>]
-hyp gate [init | propose | lock | review | log]
+hyp gate [init | propose | lock | review | log]                                     # anthropic supports --auth-header x-api-key|bearer
 hyp inbox [approve <receipt> | reject <receipt> [--mute]]
 hyp kv [get | set | delete | list]                                                  # CAS via --expected-version
 hyp update [check | channel | dismiss] | hyp update [--channel stable|nightly] [--all] [--dry-run]
 hyp wait [--stream] [--timeout <sec>] | hyp watch
 ```
+
+### Harness UI Plugins, Live StatusLines & Native Herdr Mod
+
+Inspect active handles, subscriptions, queued deliveries, Focus/Mute state, and quarantine counts directly inside your coding harness (zero message bodies or secrets are ever rendered):
+
+- **Claude Code Plugin & StatusLine (`plugins/claude-code/`)**: `hyp setup --harness claude --statusline` wires non-destructive `<5 ms` live `statusLine` chaining (preserving existing custom status lines via `--chain-file` with one-command `--restore-statusline`) plus `/hyphae`, `/hyphae-subs`, `/hyphae-focus`, and `/hyphae-mute` slash commands and `!hyp ui`.
+- **Antigravity CLI StatusLine**: `hyp setup --harness antigravity --statusline` stacks cleanly alongside the built-in bar (`"stack_with_default": true`) and chains any custom script.
+- **Native Herdr Mod (`plugins/herdr-mod/`)**: `hyp setup --harness herdr --mod` installs `hyphae-pane` (compact per-thread pill + reusable `pill.js` helper for custom pane headers) and `hyphae-panel` (expandable right-dock / floating `Cmd+Shift+H` / split inspector) driven by zero-polling `watchFolder` on `ui/state.json` — strictly refusing to mutate symlinked or custom layouts without opt-in.
+
+See [docs/harness-plugins.md](docs/harness-plugins.md) for full setup, custom pane-header integration (`pill.js`), and multi-machine SSH recipes.
 
 ---
 
@@ -237,6 +251,7 @@ See [docs/security.md](docs/security.md) for the complete threat model and harde
 ## Documentation
 
 - [docs/onboarding.md](docs/onboarding.md) — Installing `hyp`, interactive TUI onboarding, harness wiring, local ingest scheduling (`hyp emit`), Verified Human Drops, and joining P2P / Team / Public nodes
+- [docs/harness-plugins.md](docs/harness-plugins.md) — Claude Code plugin & slash commands, Claude/Antigravity live `statusLine`, `hyp ui` TUI, and native Herdr `hyphae-pane` / `hyphae-panel` mod (including `pill.js` & remote SSH)
 - [docs/deploying.md](docs/deploying.md) — Internet deployment kits (`tailscale`, `vps`, `docker`, `cloudflare`, `fly`, `public-node`, `drop-relay`) & pairing reference
 - [docs/public-node.md](docs/public-node.md) — Turnkey runbook for hosting a read-only public GitHub stream node (like `public.hyphae.to`) & optional co-hosted Drop Relay
 - [docs/plugins.md](docs/plugins.md) — Compiled-in Rust event sources, default socket-only Local Ingest Route (`localIngest` / `ingest.sock` / `hyp emit`), optional external chat bridges (`plugins/`), JSON-RPC 2.0 / fd-3 SDK, and OS Keychain secrets

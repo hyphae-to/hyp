@@ -46,13 +46,14 @@ jobs:
           node workers/drop-relay/test/worker.test.mjs
           while IFS= read -r file; do
             node --check "$file"
-          done < <(find plugins -type f -name '*.mjs' | sort)
+          done < <(find plugins -type f \( -name '*.mjs' -o -name '*.js' \) | sort)
+          node plugins/herdr-mod/test/mod.test.mjs
 
           while IFS= read -r file; do
             python3 -m py_compile "$file"
           done < <(find plugins -type f -name '*.py' | sort)
 
-          sh -n install.sh scripts/install.sh site/install.sh
+          sh -n install.sh scripts/install.sh site/install.sh plugins/herdr-mod/scripts/install.sh
           bash -n scripts/test-installer.sh
           if command -v shellcheck >/dev/null 2>&1; then
             shellcheck -s sh scripts/install.sh

@@ -627,8 +627,10 @@ fn run_status_or_doctor(
     }
 
     // 5. StatusLine diagnostics for Claude Code & Antigravity CLI (non-failing info/warning checks)
-    let status_lines: Vec<StatusLineDiagnostic> = resolve_home_dir(home_arg.as_deref())
-        .map(|h| detect_statusline_statuses(&h))
+    let resolved_home = resolve_home_dir(home_arg.as_deref());
+    let status_lines: Vec<StatusLineDiagnostic> = resolved_home
+        .as_deref()
+        .map(detect_statusline_statuses)
         .unwrap_or_default();
     for sl in &status_lines {
         if sl.configured {
@@ -647,6 +649,46 @@ fn run_status_or_doctor(
             }
         }
     }
+
+    // 6. Native Herdr desktop mod (`hyphae-pane` + `hyphae-panel`) detection
+    let herdr_mod_status: Value = resolved_home
+        .as_deref()
+        .and_then(|h| {
+            let herdr_dir = if home_arg.is_none() {
+                crate::herdr_mod::detect_herdr_app_dir(h)
+            } else {
+                let d = h.join(".config").join("herdr-app");
+                if d.is_dir() { Some(d) } else { None }
+            }?;
+            let pane_installed = herdr_dir
+                .join("mods")
+                .join("hyphae-pane")
+                .join("mod.json")
+                .is_file();
+            let panel_installed = herdr_dir
+                .join("mods")
+                .join("hyphae-panel")
+                .join("mod.json")
+                .is_file();
+            let installed = pane_installed && panel_installed;
+            if installed {
+                checks.push(CliCheck::ok(
+                    "herdr:mod",
+                    format!(
+                        "Native Herdr mods installed in {} (hyphae-pane + hyphae-panel)",
+                        herdr_dir.join("mods").display()
+                    ),
+                ));
+            }
+            Some(json!({
+                "detected": true,
+                "installed": installed,
+                "herdrHome": herdr_dir.display().to_string(),
+                "paneInstalled": pane_installed,
+                "panelInstalled": panel_installed,
+            }))
+        })
+        .unwrap_or(Value::Null);
 
     let fail_count = checks
         .iter()
@@ -719,6 +761,7 @@ fn run_status_or_doctor(
         "update": update_status,
         "harnesses": harnesses,
         "statusLines": status_lines,
+        "herdrMod": herdr_mod_status,
         "checks": checks,
     });
 
