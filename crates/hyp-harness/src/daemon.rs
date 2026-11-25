@@ -15,7 +15,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -34,8 +34,9 @@ use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keystore::validate_secret_name;
 use hyp_crypto::rfc3339::format_rfc3339_millis;
 use hyp_node::delivery::{
-    DeliveryEngine, DeliveryRule, DeliveryUrgency, InboxFilter, InboxQuery, InboxStateFilter,
-    PackableItem, PackedDeliveryBatch, archive_muted_entry, move_pending_to_muted, muted_count,
+    DeliveryEngine, DeliveryError, DeliveryRule, DeliveryUrgency, InboxFilter, InboxItemState,
+    InboxItemView, InboxQuery, InboxQueryResult, InboxStateFilter, PackableItem,
+    PackedDeliveryBatch, archive_muted_entry, move_pending_to_muted, muted_count,
     pack_delivery_batch, query_inbox, record_delivered_receipts,
 };
 use hyp_node::engine::http_util::{HttpClient, SseParser, empty_body, full_body};
@@ -57,7 +58,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::call_registry::{
@@ -99,6 +100,14 @@ const UI_PROJECTOR_DEBOUNCE_MS: u64 = 100;
 const INSPECT_WATCH_DEBOUNCE_MS: u64 = 25;
 /// Maximum allowed TTL (7 days) for temporary `session.mute` rules.
 const MAX_MUTE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+/// Minimum delayed retry interval (ms) for Security Gate `Hold` verdicts (`rate_limited`, `gate_busy`).
+const GATE_HOLD_RETRY_MIN_MS: u64 = 500;
+/// Maximum delayed retry interval (ms) for Security Gate `Hold` verdicts.
+const GATE_HOLD_RETRY_MAX_MS: u64 = 30_000;
+/// Small safety margin (ms) added to `retry_after_ms` so rate-limit token buckets cleanly refill.
+const GATE_HOLD_RETRY_MARGIN_MS: u64 = 25;
+/// Maximum consecutive Security Gate `Hold` retries per session without clearing all held items.
+const GATE_HOLD_RETRY_MAX_ATTEMPTS: u32 = 16;
 
 /// Default timeout waiting for a live `--claude-channel` `channel.ack`.
 pub const DEFAULT_CHANNEL_DELIVER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -410,6 +419,12 @@ struct LocalDaemonInner {
     /// Tier 3 bounded `Hold` retry state (`session_id -> (attempt, generation)`).
     /// Empty when idle — zero background polling.
     hold_retries: Mutex<HashMap<String, (u32, u64)>>,
+    /// Per-session async mutexes serializing `reconcile_session_inbox` so concurrent callers
+    /// NEVER double-classify items or race past Stage 2 awaits (G3).
+    reconcile_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    /// Bounded delayed retry state for Security Gate `Hold` verdicts (`session_id -> (attempt, generation, fire_at_ms)`).
+    /// Separate from Tier 3 transport `hold_retries` so delivering an earlier item never cancels a gate retry (G4).
+    gate_hold_retries: Mutex<HashMap<String, (u32, u64, i64)>>,
     /// Tier 4 per-wakeup concurrency guard (`maxConcurrentSpawns: 1`) for allowlisted Herdr cold spawns.
     active_cold_spawns: Mutex<HashSet<String>>,
     /// Monotonic UI projection revision counter bumped on every session/sub/mailbox/policy/channel change.
@@ -426,6 +441,7 @@ pub struct LocalDaemon {
     inner: Arc<LocalDaemonInner>,
     tcp_addr: Option<SocketAddr>,
     shutdown_tx: watch::Sender<bool>,
+    stopped: AtomicBool,
     accept_task: Mutex<Option<JoinHandle<()>>>,
     inbox_task: Mutex<Option<JoinHandle<()>>>,
     projector_task: Mutex<Option<JoinHandle<()>>>,
@@ -511,6 +527,7 @@ impl LocalDaemon {
             inner,
             tcp_addr: None,
             shutdown_tx,
+            stopped: AtomicBool::new(false),
             accept_task: Mutex::new(Some(accept_task)),
             inbox_task: Mutex::new(Some(inbox_task)),
             projector_task: Mutex::new(Some(projector_task)),
@@ -596,6 +613,7 @@ impl LocalDaemon {
             inner,
             tcp_addr: Some(local_addr),
             shutdown_tx,
+            stopped: AtomicBool::new(false),
             accept_task: Mutex::new(Some(accept_task)),
             inbox_task: Mutex::new(Some(inbox_task)),
             projector_task: Mutex::new(Some(projector_task)),
@@ -891,6 +909,11 @@ impl LocalDaemon {
             .lock()
             .expect("hold_retries lock poisoned")
             .clear();
+        self.inner
+            .gate_hold_retries
+            .lock()
+            .expect("gate_hold_retries lock poisoned")
+            .clear();
         if let Some(h) = self
             .accept_task
             .lock()
@@ -914,6 +937,14 @@ impl LocalDaemon {
             .take()
         {
             h.abort();
+        }
+        // U1 (P1): Write a final atomic offline UI snapshot (`daemon.online == false`) right
+        // before removing the socket so file-based UIs immediately transition to OFFLINE.
+        if !self.stopped.swap(true, Ordering::SeqCst)
+            && self.inner.node.config().state_dir.exists()
+        {
+            let _ = self.inner.bump_ui_rev();
+            let _ = self.inner.write_ui_state_snapshot_with_online(false);
         }
         let _ = std::fs::remove_file(&self.inner.socket_path);
     }
@@ -949,6 +980,12 @@ impl LocalDaemon {
         } = item;
         let now = now_ms();
         let mut gate_downgraded = false;
+        let effective_trust_tier = if kind == MailboxKind::Plugin {
+            GateTrustTier::Bridge
+        } else {
+            trust_tier
+        };
+        let mut gate_approved = false;
 
         if let Some(pipeline) = self.inner.current_gate() {
             let parsed =
@@ -970,7 +1007,7 @@ impl LocalDaemon {
                 session_id: session_id.clone(),
                 origin_node: origin_node.clone(),
                 sender: source.clone(),
-                trust_tier,
+                trust_tier: effective_trust_tier,
                 e2ee_verified: true,
                 identity_verified: true,
                 kind,
@@ -991,17 +1028,27 @@ impl LocalDaemon {
                     downgraded_to_notify,
                 } => {
                     gate_downgraded = downgraded_to_notify;
+                    gate_approved = true;
                     if let Some(receipt) = eval.receipt {
                         // Pipeline already inserted into DB if sharing same DB; check if present in node DB.
-                        let exists = self
-                            .inner
-                            .node
-                            .db()
-                            .local()
-                            .get_mailbox_entry(&receipt)
-                            .ok()
-                            .flatten()
-                            .is_some();
+                        let exists = {
+                            let db = self.inner.node.db();
+                            let found = db
+                                .local()
+                                .get_mailbox_entry(&receipt)
+                                .ok()
+                                .flatten()
+                                .is_some();
+                            if found {
+                                let _ = db.local().mark_mailbox_gate_approved(
+                                    &session_id,
+                                    &receipt,
+                                    gate_downgraded,
+                                    now,
+                                );
+                            }
+                            found
+                        };
                         if exists {
                             let urgency = self
                                 .inner
@@ -1020,9 +1067,30 @@ impl LocalDaemon {
                         }
                     }
                 }
-                GateDecision::Quarantine { .. }
-                | GateDecision::Block { .. }
-                | GateDecision::Hold { .. } => {
+                GateDecision::Hold { retry_after_ms, .. } => {
+                    // G4 (P0): Retain held inbound items unscreened (`reviewed_at = NULL`) so they
+                    // are NEVER lost and schedule a bounded delayed retry to re-reconcile cleanly.
+                    let held_insert = MailboxInsert {
+                        session_id: session_id.clone(),
+                        origin_node,
+                        item_id,
+                        text,
+                        kind,
+                        source,
+                        gate_state: GateState::Pending,
+                        gate_reason: Some(format!("gate_held:{}", effective_trust_tier.as_str())),
+                        traceparent: None,
+                    };
+                    {
+                        let db = self.inner.node.db();
+                        let _ = db.local().put_in_mailbox(&held_insert, now);
+                    }
+                    self.inner
+                        .schedule_gate_hold_retry(&session_id, retry_after_ms);
+                    self.inner.bump_ui_rev();
+                    return Ok(None);
+                }
+                GateDecision::Quarantine { .. } | GateDecision::Block { .. } => {
                     self.inner.bump_ui_rev();
                     return Ok(None);
                 }
@@ -1083,7 +1151,17 @@ impl LocalDaemon {
                 .put_in_mailbox(&insert, now)
                 .map_err(|e| e.to_string())?
             {
-                MailboxPutResult::Stored { receipt } => receipt,
+                MailboxPutResult::Stored { receipt } => {
+                    if gate_approved {
+                        let _ = db.local().mark_mailbox_gate_approved(
+                            &session_id,
+                            &receipt,
+                            gate_downgraded,
+                            now,
+                        );
+                    }
+                    receipt
+                }
                 MailboxPutResult::Duplicate => return Ok(Some(classification.effective_urgency)),
                 MailboxPutResult::QueueFull => return Err("local_inbox_full".to_string()),
             }
@@ -1202,6 +1280,8 @@ impl LocalDaemonInner {
             peers_reloader: Mutex::new(None),
             configured_bridge_targets: Mutex::new(BTreeMap::new()),
             hold_retries: Mutex::new(HashMap::new()),
+            reconcile_locks: Mutex::new(HashMap::new()),
+            gate_hold_retries: Mutex::new(HashMap::new()),
             active_cold_spawns: Mutex::new(HashSet::new()),
             ui_rev: AtomicU64::new(1),
             ui_rev_tx,
@@ -1329,6 +1409,107 @@ impl LocalDaemonInner {
             .lock()
             .expect("hold_retries lock poisoned")
             .remove(session_id);
+    }
+
+    fn reconcile_lock_for(&self, session_id: &str) -> Arc<AsyncMutex<()>> {
+        let mut locks = self
+            .reconcile_locks
+            .lock()
+            .expect("reconcile_locks lock poisoned");
+        Arc::clone(
+            locks
+                .entry(session_id.to_string())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+        )
+    }
+
+    fn cancel_gate_hold_retry(&self, session_id: &str) {
+        self.gate_hold_retries
+            .lock()
+            .expect("gate_hold_retries lock poisoned")
+            .remove(session_id);
+    }
+
+    /// Schedules a bounded delayed retry for Security Gate `Hold` verdicts (`rate_limited` /
+    /// `gate_busy`) so held rows are retained unscreened and automatically reconciled & flushed
+    /// once the rate-limit / concurrency window clears (G4).
+    fn schedule_gate_hold_retry(self: &Arc<Self>, session_id: &str, retry_after_ms: u64) {
+        let delay_ms = retry_after_ms
+            .saturating_add(GATE_HOLD_RETRY_MARGIN_MS)
+            .clamp(GATE_HOLD_RETRY_MIN_MS, GATE_HOLD_RETRY_MAX_MS);
+        let now = now_ms();
+        let fire_at_ms = now.saturating_add(delay_ms as i64);
+
+        let generation = {
+            let mut map = self
+                .gate_hold_retries
+                .lock()
+                .expect("gate_hold_retries lock poisoned");
+            if let Some(&(_, _, existing_fire_at)) = map.get(session_id) {
+                if existing_fire_at > now && existing_fire_at <= fire_at_ms {
+                    // An earlier retry timer is already armed for this session; don't starve it.
+                    return;
+                }
+            }
+            let next_attempt = map
+                .get(session_id)
+                .map(|&(attempt, _, _)| attempt.saturating_add(1))
+                .unwrap_or(1);
+            if next_attempt > GATE_HOLD_RETRY_MAX_ATTEMPTS {
+                map.remove(session_id);
+                return;
+            }
+            let generation = self.next_seq();
+            map.insert(session_id.to_string(), (next_attempt, generation, fire_at_ms));
+            generation
+        };
+
+        let daemon = Arc::clone(self);
+        let sid = session_id.to_string();
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                _ = shutdown_rx.changed() => {
+                    return;
+                }
+            }
+            if *shutdown_rx.borrow() {
+                return;
+            }
+            let still_current = {
+                let mut map = daemon
+                    .gate_hold_retries
+                    .lock()
+                    .expect("gate_hold_retries lock poisoned");
+                match map.get_mut(&sid) {
+                    Some(slot) if slot.1 == generation => {
+                        // Mark timer as fired so a subsequent Hold in reconcile can arm the next timer
+                        // while preserving the consecutive-attempt counter.
+                        slot.2 = 0;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if !still_current {
+                return;
+            }
+            if daemon.reconcile_session_inbox(&sid).await {
+                daemon.flush_session(&sid).await;
+            }
+            daemon.bump_ui_rev();
+        });
+    }
+
+    fn effective_pending_count(&self, db: &hyp_store::NodeDb, session_id: &str) -> usize {
+        if self.current_gate().is_some() {
+            db.local()
+                .pending_count_gate_cleared(session_id)
+                .unwrap_or(0)
+        } else {
+            db.local().pending_count(session_id).unwrap_or(0)
+        }
     }
 
     /// Schedules a single bounded Tier 3 retry task for a transient `Hold` outcome
@@ -1639,159 +1820,233 @@ impl LocalDaemonInner {
 
     /// Reconciles any newly arrived raw `Pending` entries in `NodeDb` for `session_id` through
     /// optional `SecurityGatePipeline` + `DeliveryEngine`:
-    /// - `Quarantine`/`Block` items are removed from `Pending` (never leak to agent).
+    /// - Serialized per `session_id` via an async mutex so concurrent reconciles NEVER double-classify
+    ///   items or race past Stage 2 awaits (G3).
+    /// - `Allow` items are durably promoted (`reviewed_at = now_ms`) before exposure to delivery/inbox.
+    /// - `Quarantine` / `Block` items are transitioned in place to `quarantined` / `rejected` (never
+    ///   leaked as `delivered` or visible to agents).
+    /// - `Hold` items (`rate_limited`, `gate_busy`) are retained untouched (`reviewed_at = NULL`,
+    ///   invisible to agents) and scheduled for a bounded delayed retry (G4).
     /// - `Mute` items are silently archived (`move_pending_to_muted`) and NEVER trigger a wake.
     /// - `Interrupt`/`Queue`/`Notify` items are tagged with their resolved urgency & burst metadata.
     ///
-    /// Returns `true` if at least one non-muted item is eligible for delivery/digest wake.
-    async fn reconcile_session_inbox(&self, session_id: &str) -> bool {
-        let pending = {
-            let db = self.node.db();
-            db.local().peek_inbox(session_id, 500).unwrap_or_default()
-        };
-        if pending.is_empty() {
-            return false;
-        }
+    /// Returns `true` if at least one non-muted gate-cleared item is eligible for delivery/digest wake.
+    async fn reconcile_session_inbox(self: &Arc<Self>, session_id: &str) -> bool {
+        let _reconcile_guard = self.reconcile_lock_for(session_id).lock_owned().await;
 
         let mut wake_needed = false;
-        let now = now_ms();
+        let mut held_in_this_call: HashSet<String> = HashSet::new();
+        let mut held_min_retry_ms: Option<u64> = None;
 
-        for entry in pending {
-            let already_dismissed = self
-                .dismissed_receipts
-                .lock()
-                .expect("dismissed lock poisoned")
-                .contains(&entry.receipt);
-            if already_dismissed {
+        // Loop up to a bounded number of passes so items arriving mid-Stage-2-await are screened
+        // before releasing the per-session reconcile lock (G3).
+        for _pass in 0..8 {
+            let pending = {
                 let db = self.node.db();
-                let _ = db
-                    .local()
-                    .acknowledge_inbox(session_id, &[entry.receipt.as_str()], now);
-                continue;
-            }
-
-            let existing_meta = self
-                .item_meta
-                .lock()
-                .expect("item_meta lock poisoned")
-                .get(session_id)
-                .and_then(|m| m.get(&entry.receipt).cloned());
-            if let Some(meta) = existing_meta {
-                if meta.urgency.triggers_delivery_or_digest() && !meta.notified {
-                    wake_needed = true;
-                }
-                continue;
-            }
-
-            // Newly arrived raw item from `UnifiedNode`!
-            // Skip re-evaluating items that were already explicitly approved by a human operator
-            // via `hyp inbox approve` (`reviewed_at.is_some()`), or verified & gated by
-            // `UnifiedNode::ingest_human_drop` (`mailbox.human_auth_json` present).
-            let already_human_verified = {
-                let db = self.node.db();
-                db.human()
-                    .get_mailbox_human_auth(&entry.receipt)
-                    .ok()
-                    .flatten()
-                    .is_some()
+                db.local().peek_inbox(session_id, 500).unwrap_or_default()
             };
-            let mut gate_downgraded =
-                entry.gate_reason.as_deref() == Some("downgraded_to_notify");
-            if entry.reviewed_at.is_none() && !already_human_verified {
-                if let Some(pipeline) = self.current_gate() {
-                    let parsed = hyp_node::delivery::ParsedMailboxSource::from_entry(&entry);
-                    let effective_origin = self.effective_gate_origin(&entry, &parsed);
-                    let trust_tier = self.resolve_peer_trust_tier(&effective_origin);
-                    let ce = ProtoCloudEvent {
-                        specversion: "1.0".into(),
-                        id: format!("gate:{}", entry.item_id),
-                        source: entry.source.clone(),
-                        event_type: format!("to.hyphae.mailbox.{}", entry.kind.as_str()),
-                        datacontenttype: Some(CONTENT_TYPE_JSON.into()),
-                        dataschema: None,
-                        subject: parsed.channel.clone().or(parsed.topic.clone()),
-                        time: None,
-                        data: Some(json!({ "text": entry.text })),
-                        data_base64: None,
-                        extensions: BTreeMap::new(),
-                    };
-                    let ctx = InboundContext {
-                        session_id: session_id.to_string(),
-                        origin_node: effective_origin,
-                        sender: entry.source.clone(),
-                        trust_tier,
-                        e2ee_verified: true,
-                        identity_verified: true,
-                        kind: entry.kind,
-                        channel: parsed.channel,
-                        topic: parsed.topic,
-                        bridge: parsed.bridge,
-                        event: ce,
-                        transfer_paths: Vec::new(),
-                        rendered_text: Some(entry.text.clone()),
-                        human_auth: None,
-                    };
-                    match pipeline.evaluate_inbound(&ctx, now).await {
-                        Ok(eval) => match eval.decision {
-                            GateDecision::Allow {
-                                downgraded_to_notify,
-                            } => {
-                                gate_downgraded = gate_downgraded || downgraded_to_notify;
-                                // If pipeline shares the same SQLite DB and inserted a duplicate `gate:` row,
-                                // dismiss the duplicate so we keep exactly one row (`entry.receipt`).
-                                if let Some(dup_receipt) = eval.receipt {
-                                    if dup_receipt != entry.receipt {
-                                        self.dismissed_receipts
-                                            .lock()
-                                            .expect("dismissed lock poisoned")
-                                            .insert(dup_receipt.clone());
-                                        let db = self.node.db();
-                                        let _ = db.local().acknowledge_inbox(
-                                            session_id,
-                                            &[dup_receipt.as_str()],
-                                            now,
-                                        );
-                                    }
+            if pending.is_empty() {
+                break;
+            }
+
+            let now = now_ms();
+            let mut processed_any = false;
+
+            for entry in pending {
+                if held_in_this_call.contains(&entry.receipt) {
+                    continue;
+                }
+
+                let already_dismissed = self
+                    .dismissed_receipts
+                    .lock()
+                    .expect("dismissed lock poisoned")
+                    .contains(&entry.receipt);
+                if already_dismissed {
+                    let db = self.node.db();
+                    let _ = db.local().transition_mailbox_gate_state(
+                        session_id,
+                        &entry.receipt,
+                        GateState::Rejected,
+                        Some("gate_dismissed"),
+                        now,
+                    );
+                    processed_any = true;
+                    continue;
+                }
+
+                // Items already explicitly approved by a human operator (`reviewed_at.is_some()`),
+                // previously promoted by `SecurityGatePipeline` (`reviewed_at.is_some()`), or
+                // carrying verified human authority (`mailbox.human_auth_json` present) skip re-gating.
+                let already_human_verified = {
+                    let db = self.node.db();
+                    db.human()
+                        .get_mailbox_human_auth(&entry.receipt)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                };
+                let active_gate = self.current_gate();
+                let needs_gate = active_gate.is_some()
+                    && entry.reviewed_at.is_none()
+                    && !already_human_verified;
+
+                if !needs_gate {
+                    let existing_meta = self
+                        .item_meta
+                        .lock()
+                        .expect("item_meta lock poisoned")
+                        .get(session_id)
+                        .and_then(|m| m.get(&entry.receipt).cloned());
+                    if let Some(meta) = existing_meta {
+                        if meta.urgency.triggers_delivery_or_digest() && !meta.notified {
+                            wake_needed = true;
+                        }
+                        continue;
+                    }
+                }
+
+                processed_any = true;
+                let mut gate_downgraded =
+                    entry.gate_reason.as_deref() == Some("downgraded_to_notify");
+
+                if needs_gate {
+                    if let Some(pipeline) = active_gate {
+                        let parsed = hyp_node::delivery::ParsedMailboxSource::from_entry(&entry);
+                        let effective_origin = self.effective_gate_origin(&entry, &parsed);
+                        let trust_tier = self.resolve_entry_trust_tier(&entry, &effective_origin);
+                        let ce = ProtoCloudEvent {
+                            specversion: "1.0".into(),
+                            id: entry.item_id.clone(),
+                            source: entry.source.clone(),
+                            event_type: format!("to.hyphae.mailbox.{}", entry.kind.as_str()),
+                            datacontenttype: Some(CONTENT_TYPE_JSON.into()),
+                            dataschema: None,
+                            subject: parsed.channel.clone().or(parsed.topic.clone()),
+                            time: None,
+                            data: Some(json!({ "text": entry.text })),
+                            data_base64: None,
+                            extensions: BTreeMap::new(),
+                        };
+                        let ctx = InboundContext {
+                            session_id: session_id.to_string(),
+                            origin_node: effective_origin,
+                            sender: entry.source.clone(),
+                            trust_tier,
+                            e2ee_verified: true,
+                            identity_verified: true,
+                            kind: entry.kind,
+                            channel: parsed.channel,
+                            topic: parsed.topic,
+                            bridge: parsed.bridge,
+                            event: ce,
+                            transfer_paths: Vec::new(),
+                            rendered_text: Some(entry.text.clone()),
+                            human_auth: None,
+                        };
+                        match pipeline
+                            .evaluate_existing_mailbox_entry(&entry.receipt, &ctx, now)
+                            .await
+                        {
+                            Ok(eval) => match eval.decision {
+                                GateDecision::Allow {
+                                    downgraded_to_notify,
+                                } => {
+                                    gate_downgraded = gate_downgraded || downgraded_to_notify;
+                                    // Ensure `self.node.db()` records gate approval even if the
+                                    // pipeline uses a separate `NodeDb` handle.
+                                    let db = self.node.db();
+                                    let _ = db.local().mark_mailbox_gate_approved(
+                                        session_id,
+                                        &entry.receipt,
+                                        gate_downgraded,
+                                        now,
+                                    );
                                 }
-                            }
-                            GateDecision::Quarantine { .. }
-                            | GateDecision::Block { .. }
-                            | GateDecision::Hold { .. } => {
-                                self.dismissed_receipts
-                                    .lock()
-                                    .expect("dismissed lock poisoned")
-                                    .insert(entry.receipt.clone());
+                                GateDecision::Quarantine { reason, .. } => {
+                                    let db = self.node.db();
+                                    let _ = db.local().transition_mailbox_gate_state(
+                                        session_id,
+                                        &entry.receipt,
+                                        GateState::Quarantined,
+                                        Some(&reason),
+                                        now,
+                                    );
+                                    let mut guard =
+                                        self.item_meta.lock().expect("item_meta lock poisoned");
+                                    if let Some(map) = guard.get_mut(session_id) {
+                                        map.remove(&entry.receipt);
+                                    }
+                                    continue;
+                                }
+                                GateDecision::Block { reason } => {
+                                    let db = self.node.db();
+                                    let _ = db.local().transition_mailbox_gate_state(
+                                        session_id,
+                                        &entry.receipt,
+                                        GateState::Rejected,
+                                        Some(&reason),
+                                        now,
+                                    );
+                                    let mut guard =
+                                        self.item_meta.lock().expect("item_meta lock poisoned");
+                                    if let Some(map) = guard.get_mut(session_id) {
+                                        map.remove(&entry.receipt);
+                                    }
+                                    continue;
+                                }
+                                GateDecision::Hold { retry_after_ms, .. } => {
+                                    // G4 (P0): Do NOT acknowledge or delete the mailbox row! Keep it
+                                    // unscreened (`reviewed_at = NULL`, invisible to agents) and
+                                    // schedule a bounded delayed retry after `retry_after_ms`.
+                                    held_in_this_call.insert(entry.receipt.clone());
+                                    held_min_retry_ms = Some(
+                                        held_min_retry_ms
+                                            .map_or(retry_after_ms, |m| m.min(retry_after_ms)),
+                                    );
+                                    continue;
+                                }
+                            },
+                            Err(_) => {
+                                // Fail closed on gate error: quarantine in place (never mark delivered).
                                 let db = self.node.db();
-                                let _ = db
-                                    .local()
-                                    .acknowledge_inbox(session_id, &[entry.receipt.as_str()], now);
+                                let _ = db.local().transition_mailbox_gate_state(
+                                    session_id,
+                                    &entry.receipt,
+                                    GateState::Quarantined,
+                                    Some("gate_evaluation_error"),
+                                    now,
+                                );
+                                let mut guard =
+                                    self.item_meta.lock().expect("item_meta lock poisoned");
+                                if let Some(map) = guard.get_mut(session_id) {
+                                    map.remove(&entry.receipt);
+                                }
                                 continue;
                             }
-                        },
-                        Err(_) => {
-                            // Fail closed on gate error: suppress delivery.
-                            self.dismissed_receipts
-                                .lock()
-                                .expect("dismissed lock poisoned")
-                                .insert(entry.receipt.clone());
-                            let db = self.node.db();
-                            let _ = db
-                                .local()
-                                .acknowledge_inbox(session_id, &[entry.receipt.as_str()], now);
-                            continue;
                         }
+                    }
+                }
+
+                if let Some(u) = self
+                    .classify_and_route_pending_entry(session_id, &entry.receipt, gate_downgraded, now)
+                    .await
+                {
+                    if u.triggers_delivery_or_digest() {
+                        wake_needed = true;
                     }
                 }
             }
 
-            if let Some(u) = self
-                .classify_and_route_pending_entry(session_id, &entry.receipt, gate_downgraded, now)
-                .await
-            {
-                if u.triggers_delivery_or_digest() {
-                    wake_needed = true;
-                }
+            if !processed_any {
+                break;
             }
+        }
+
+        if let Some(retry_ms) = held_min_retry_ms {
+            self.schedule_gate_hold_retry(session_id, retry_ms);
+        } else {
+            self.cancel_gate_hold_retry(session_id);
         }
 
         wake_needed
@@ -1874,13 +2129,64 @@ impl LocalDaemonInner {
         entry.origin_node.clone()
     }
 
-    fn resolve_peer_trust_tier(&self, origin_node: &str) -> GateTrustTier {
-        if origin_node == "local" || origin_node == self.node.node_id().as_str() {
+    /// Resolves the fail-closed [`GateTrustTier`] for an unverified inbound mailbox entry (G2).
+    ///
+    /// Security invariants:
+    /// - `MailboxKind::Plugin` and `bridge:*` origins ALWAYS resolve to `GateTrustTier::Bridge`.
+    /// - Local-origin `MailboxKind::Event` (GitHub/Prometheus/generic webhooks, fd-3 source plugins,
+    ///   bridge stream mirrors, unsigned local ingest) and `MailboxKind::Kv` ALWAYS resolve to
+    ///   `GateTrustTier::ExternalWebhook` — NEVER `SelfHost`, so Stage 2 matchers
+    ///   `[Guest, ExternalWebhook, Peer, Bridge]` and tamper checks always screen them.
+    /// - Only genuine same-node `MailboxKind::Message` DMs/posts resolve to `GateTrustTier::SelfHost`.
+    /// - Remote origins can NEVER escalate to `GateTrustTier::SelfHost`.
+    fn resolve_entry_trust_tier(
+        &self,
+        entry: &MailboxEntry,
+        effective_origin: &str,
+    ) -> GateTrustTier {
+        if entry.kind == MailboxKind::Plugin || effective_origin.starts_with("bridge:") {
+            return GateTrustTier::Bridge;
+        }
+
+        let is_local_origin =
+            effective_origin == "local" || effective_origin == self.node.node_id().as_str();
+
+        // Preserve explicit non-SelfHost trust tier recorded when `ingest_inbound` retained a Hold.
+        if let Some(held_tier) = entry
+            .gate_reason
+            .as_deref()
+            .and_then(|r| r.strip_prefix("gate_held:"))
+            .and_then(parse_gate_trust_tier)
+        {
+            match held_tier {
+                GateTrustTier::SelfHost => {}
+                GateTrustTier::HumanVerified => {}
+                other => return other,
+            }
+        }
+
+        if is_local_origin {
+            return match entry.kind {
+                MailboxKind::Message => GateTrustTier::SelfHost,
+                MailboxKind::Event | MailboxKind::Kv => GateTrustTier::ExternalWebhook,
+                MailboxKind::Transfer => GateTrustTier::Peer,
+                MailboxKind::Plugin => GateTrustTier::Bridge,
+            };
+        }
+
+        self.resolve_peer_trust_tier(effective_origin)
+    }
+
+    fn resolve_peer_trust_tier(&self, peer_node: &str) -> GateTrustTier {
+        if peer_node == "local" || peer_node == self.node.node_id().as_str() {
             return GateTrustTier::SelfHost;
         }
         let db = self.node.db();
-        if let Ok(Some(peer)) = db.peers().get_peer(origin_node) {
-            return GateTrustTier::from(peer.trust_tier);
+        if let Ok(Some(peer)) = db.peers().get_peer(peer_node) {
+            return match GateTrustTier::from(peer.trust_tier) {
+                GateTrustTier::SelfHost => GateTrustTier::Peer,
+                other => other,
+            };
         }
         GateTrustTier::Peer
     }
@@ -1890,13 +2196,23 @@ impl LocalDaemonInner {
     /// - Excludes already-notified `Notify`-tier items when there are NO unnotified items and NO
     ///   `Interrupt`/`Queue` items (prevents re-emitting identical `notify` digests in a loop).
     /// - Strictly returns `None` when zero eligible unread items exist (even if `muted_count > 0`!).
-    async fn build_batch_for_session(&self, session_id: &str) -> Option<PackedDeliveryBatch> {
+    /// - **Security invariant (G3/G4):** When a `SecurityGatePipeline` is active, ONLY gate-cleared
+    ///   rows (`reviewed_at IS NOT NULL OR human_auth_json IS NOT NULL`) are ever packed or delivered.
+    async fn build_batch_for_session(
+        self: &Arc<Self>,
+        session_id: &str,
+    ) -> Option<PackedDeliveryBatch> {
         self.reconcile_session_inbox(session_id).await;
 
+        let gate_active = self.current_gate().is_some();
         let (policy, pending, muted) = {
             let db = self.node.db();
             let policy = self.delivery.policy(&db, session_id).ok()?;
-            let pending = db.local().peek_inbox(session_id, 500).ok()?;
+            let pending = if gate_active {
+                db.local().peek_inbox_gate_cleared(session_id, 500).ok()?
+            } else {
+                db.local().peek_inbox(session_id, 500).ok()?
+            };
             let muted = muted_count(&db, session_id).unwrap_or(0);
             (policy, pending, muted)
         };
@@ -1958,6 +2274,7 @@ impl LocalDaemonInner {
                 text: entry.text,
                 created_at_ms: entry.received_at,
                 burst_demoted,
+                is_system_notice: false,
             });
         }
 
@@ -2855,7 +3172,7 @@ impl LocalDaemonInner {
         let (policy, unread, muted) = {
             let db = self.node.db();
             let p = self.delivery.policy(&db, session_id).unwrap_or_default();
-            let u = db.local().pending_count(session_id).unwrap_or(0);
+            let u = self.effective_pending_count(&db, session_id);
             let m = muted_count(&db, session_id).unwrap_or(0);
             (p, u, m)
         };
@@ -2991,13 +3308,16 @@ impl LocalDaemonInner {
         }))
     }
 
-    async fn tool_capabilities(&self, session_id: &str) -> Result<Value, (String, String)> {
+    async fn tool_capabilities(
+        self: &Arc<Self>,
+        session_id: &str,
+    ) -> Result<Value, (String, String)> {
         self.reconcile_session_inbox(session_id).await;
         let (sess, policy, unread, muted, mutes_len, peers) = {
             let db = self.node.db();
             let sess = db.local().get_session(session_id).ok().flatten();
             let policy = self.delivery.policy(&db, session_id).unwrap_or_default();
-            let unread = db.local().pending_count(session_id).unwrap_or(0);
+            let unread = self.effective_pending_count(&db, session_id);
             let muted = muted_count(&db, session_id).unwrap_or(0);
             let mutes_len = db
                 .local()
@@ -3079,7 +3399,7 @@ impl LocalDaemonInner {
                     let _ = db.local().add_mute(session_id, &rule.target, session_id, now);
                 }
             }
-            let unread = db.local().pending_count(session_id).unwrap_or(0);
+            let unread = self.effective_pending_count(&db, session_id);
             let muted = muted_count(&db, session_id).unwrap_or(0);
             (policy, unread, muted)
         };
@@ -3482,7 +3802,7 @@ impl LocalDaemonInner {
                 let (unread, muted) = {
                     let db = self.node.db();
                     (
-                        db.local().pending_count(session_id).unwrap_or(0),
+                        self.effective_pending_count(&db, session_id),
                         muted_count(&db, session_id).unwrap_or(0),
                     )
                 };
@@ -3546,9 +3866,16 @@ impl LocalDaemonInner {
             ids,
         };
 
+        let gate_active = self.current_gate().is_some();
         let (result, policy) = {
             let db = self.node.db();
-            let res = query_inbox(&db, session_id, &query, now_ms()).map_err(delivery_err_tuple)?;
+            let now = now_ms();
+            let res = if gate_active {
+                query_inbox_gate_cleared(&db, session_id, &query, now)
+                    .map_err(delivery_err_tuple)?
+            } else {
+                query_inbox(&db, session_id, &query, now).map_err(delivery_err_tuple)?
+            };
             let pol = self.delivery.policy(&db, session_id).unwrap_or_default();
             (res, pol)
         };
@@ -5343,7 +5670,10 @@ fn handle_call_start(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> 
     }
 }
 
-async fn handle_mailbox_drain(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> Value {
+async fn handle_mailbox_drain(
+    daemon: &Arc<LocalDaemonInner>,
+    packet: &Map<String, Value>,
+) -> Value {
     let Some(session_id) = packet
         .get("sessionId")
         .and_then(Value::as_str)
@@ -5388,7 +5718,10 @@ async fn handle_mailbox_drain(daemon: &LocalDaemonInner, packet: &Map<String, Va
     }
 }
 
-async fn handle_session_status(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> Value {
+async fn handle_session_status(
+    daemon: &Arc<LocalDaemonInner>,
+    packet: &Map<String, Value>,
+) -> Value {
     let Some(session_id) = packet.get("sessionId").and_then(Value::as_str) else {
         return json!({ "ok": false, "error": "invalid_session" });
     };
@@ -5397,7 +5730,7 @@ async fn handle_session_status(daemon: &LocalDaemonInner, packet: &Map<String, V
     let (sess, pending, muted, policy) = {
         let db = daemon.node.db();
         let sess = db.local().get_session(session_id).ok().flatten();
-        let pending = db.local().pending_count(session_id).unwrap_or(0);
+        let pending = daemon.effective_pending_count(&db, session_id);
         let muted = muted_count(&db, session_id).unwrap_or(0);
         let policy = daemon.delivery.policy(&db, session_id).unwrap_or_default();
         (sess, pending, muted, policy)
@@ -5420,7 +5753,7 @@ async fn handle_session_status(daemon: &LocalDaemonInner, packet: &Map<String, V
     })
 }
 
-async fn handle_daemon_status(daemon: &LocalDaemonInner) -> Value {
+async fn handle_daemon_status(daemon: &Arc<LocalDaemonInner>) -> Value {
     let session_ids: Vec<String> = {
         let db = daemon.node.db();
         db.local()
@@ -5441,7 +5774,7 @@ async fn handle_daemon_status(daemon: &LocalDaemonInner) -> Value {
         let mut sess_arr = Vec::with_capacity(sessions.len());
         for s in sessions {
             let m = muted_count(&db, &s.id).unwrap_or(0);
-            let p = db.local().pending_count(&s.id).unwrap_or(0);
+            let p = daemon.effective_pending_count(&db, &s.id);
             muted_sum += m;
             let transport_kind = daemon.active_transport_kind(&s.id);
             sess_arr.push(json!({
@@ -6434,6 +6767,10 @@ impl LocalDaemonInner {
 
     /// Builds the strictly metadata-only `daemon` status header without blocking or mutating DB state.
     fn build_daemon_summary_json(&self) -> Value {
+        self.build_daemon_summary_json_with_online(true)
+    }
+
+    fn build_daemon_summary_json_with_online(&self, online: bool) -> Value {
         let (peers_online, quarantined_global) = {
             let db = self.node.db();
             let peers = db
@@ -6445,7 +6782,7 @@ impl LocalDaemonInner {
             (peers, quarantined)
         };
         json!({
-            "online": true,
+            "online": online,
             "pid": std::process::id(),
             "nodeId": self.node.node_id().as_str(),
             "version": self.node.config().hyphae_version,
@@ -6474,6 +6811,7 @@ impl LocalDaemonInner {
         let herdr_created_ms = self.session_herdr_created_ms(sess);
         let transport_kind = self.active_transport_kind(&sess.id);
 
+        let gate_active = self.current_gate().is_some();
         let (
             policy,
             digest,
@@ -6487,7 +6825,13 @@ impl LocalDaemonInner {
         ) = {
             let db = self.node.db();
             let policy = self.delivery.policy(&db, &sess.id).unwrap_or_default();
-            let digest = db.local().unread_digest(&sess.id).unwrap_or_default();
+            let digest = if gate_active {
+                db.local()
+                    .unread_digest_gate_cleared(&sess.id)
+                    .unwrap_or_default()
+            } else {
+                db.local().unread_digest(&sess.id).unwrap_or_default()
+            };
             let muted_archived = muted_count(&db, &sess.id).unwrap_or(0);
             let mutes = db.local().list_mutes(Some(&sess.id)).unwrap_or_default();
             let subs = db
@@ -6521,9 +6865,15 @@ impl LocalDaemonInner {
                 .list_active_wakeups_for_session(&sess.id, sess.handle.as_deref())
                 .unwrap_or_default();
             let queued_meta = if detail == SummaryDetail::Full {
-                db.local()
-                    .list_pending_metadata(&sess.id, MAX_SUMMARY_QUEUED_ITEMS)
-                    .unwrap_or_default()
+                if gate_active {
+                    db.local()
+                        .list_pending_metadata_gate_cleared(&sess.id, MAX_SUMMARY_QUEUED_ITEMS)
+                        .unwrap_or_default()
+                } else {
+                    db.local()
+                        .list_pending_metadata(&sess.id, MAX_SUMMARY_QUEUED_ITEMS)
+                        .unwrap_or_default()
+                }
             } else {
                 Vec::new()
             };
@@ -6778,9 +7128,17 @@ impl LocalDaemonInner {
     }
 
     fn build_all_sessions_summary_envelope(&self, detail: SummaryDetail) -> Value {
+        self.build_all_sessions_summary_envelope_with_online(detail, true)
+    }
+
+    fn build_all_sessions_summary_envelope_with_online(
+        &self,
+        detail: SummaryDetail,
+        online: bool,
+    ) -> Value {
         let rev = self.current_ui_rev();
         let updated_at = now_ms();
-        let daemon_block = self.build_daemon_summary_json();
+        let daemon_block = self.build_daemon_summary_json_with_online(online);
         let sessions = {
             let db = self.node.db();
             db.local().list_sessions().unwrap_or_default()
@@ -6821,8 +7179,13 @@ impl LocalDaemonInner {
     }
 
     fn write_ui_state_snapshot(&self) -> io::Result<()> {
+        self.write_ui_state_snapshot_with_online(true)
+    }
+
+    fn write_ui_state_snapshot_with_online(&self, online: bool) -> io::Result<()> {
         let ui_dir = self.node.config().state_dir.join("ui");
-        let snapshot = self.build_all_sessions_summary_envelope(SummaryDetail::Full);
+        let snapshot =
+            self.build_all_sessions_summary_envelope_with_online(SummaryDetail::Full, online);
         let rev = snapshot
             .get("rev")
             .and_then(Value::as_u64)
@@ -6831,6 +7194,167 @@ impl LocalDaemonInner {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         write_ui_state_atomic(&ui_dir, rev, &bytes)
     }
+}
+
+fn parse_gate_trust_tier(raw: &str) -> Option<GateTrustTier> {
+    match raw.trim() {
+        "self" => Some(GateTrustTier::SelfHost),
+        "human-verified" => Some(GateTrustTier::HumanVerified),
+        "org" => Some(GateTrustTier::Org),
+        "peer" => Some(GateTrustTier::Peer),
+        "guest" => Some(GateTrustTier::Guest),
+        "external-webhook" => Some(GateTrustTier::ExternalWebhook),
+        "bridge" => Some(GateTrustTier::Bridge),
+        _ => None,
+    }
+}
+
+/// Gate-cleared wrapper around [`query_inbox`] guaranteeing that unscreened raw arrivals and
+/// `Hold`-retained rows (`reviewed_at IS NULL AND human_auth_json IS NULL`) are NEVER returned
+/// OR acknowledged by `hyp_inbox` while a `SecurityGatePipeline` is active (G3/G4).
+fn query_inbox_gate_cleared(
+    db: &hyp_store::NodeDb,
+    session_id: &str,
+    query: &InboxQuery,
+    now_ms: i64,
+) -> Result<InboxQueryResult, DeliveryError> {
+    let unscreened = db.local().list_unscreened_receipts(session_id, 10_000)?;
+    if unscreened.is_empty() {
+        return query_inbox(db, session_id, query, now_ms);
+    }
+
+    if !query.ids.is_empty() {
+        let safe_ids: Vec<String> = query
+            .ids
+            .iter()
+            .filter(|id| !unscreened.contains(id.as_str()))
+            .cloned()
+            .collect();
+        if safe_ids.is_empty() {
+            return Ok(InboxQueryResult {
+                state: query.state,
+                items: Vec::new(),
+                next_cursor: None,
+                has_more: false,
+                total_matched: 0,
+                unread_count: db.local().pending_count_gate_cleared(session_id)?,
+                muted_count: muted_count(db, session_id)?,
+                acked_count: 0,
+            });
+        }
+        let filtered_query = InboxQuery {
+            ids: safe_ids,
+            ..query.clone()
+        };
+        let mut res = query_inbox(db, session_id, &filtered_query, now_ms)?;
+        res.unread_count = db.local().pending_count_gate_cleared(session_id)?;
+        return Ok(res);
+    }
+
+    // Collect all gate-cleared items matching the filter across pages without acknowledging
+    // anything until unscreened/held items are stripped out.
+    let requested_limit = query.limit.clamp(1, 50);
+    let mut cleared_all: Vec<InboxItemView> = Vec::new();
+    let mut cursor = query.cursor.clone();
+    loop {
+        let page_query = InboxQuery {
+            state: query.state,
+            filter: query.filter.clone(),
+            cursor: cursor.clone(),
+            limit: 50,
+            summary_only: query.summary_only,
+            ack: false,
+            ids: Vec::new(),
+        };
+        let page = query_inbox(db, session_id, &page_query, now_ms)?;
+        for item in page.items {
+            if !unscreened.contains(&item.receipt) {
+                cleared_all.push(item);
+            }
+        }
+        if !page.has_more {
+            break;
+        }
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    // Recompute exact total_matched across all gate-cleared items (if cursor was None,
+    // `cleared_all.len()` is exact; if cursor was set, run one cursorless count only if needed,
+    // or match `cleared_all.len()` when cursor is absent).
+    let total_matched = if query.cursor.is_none() {
+        cleared_all.len()
+    } else {
+        let mut count = 0usize;
+        let mut c: Option<String> = None;
+        loop {
+            let scan_q = InboxQuery {
+                state: query.state,
+                filter: query.filter.clone(),
+                cursor: c.clone(),
+                limit: 50,
+                summary_only: true,
+                ack: false,
+                ids: Vec::new(),
+            };
+            let p = query_inbox(db, session_id, &scan_q, now_ms)?;
+            for it in p.items {
+                if !unscreened.contains(&it.receipt) {
+                    count += 1;
+                }
+            }
+            if !p.has_more {
+                break;
+            }
+            c = p.next_cursor;
+            if c.is_none() {
+                break;
+            }
+        }
+        count
+    };
+
+    let has_more = cleared_all.len() > requested_limit;
+    let page_items: Vec<InboxItemView> = cleared_all.into_iter().take(requested_limit).collect();
+    let next_cursor = if has_more {
+        page_items.last().map(|it| {
+            let payload = json!({ "t": it.received_at, "r": it.receipt });
+            let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+            URL_SAFE_NO_PAD.encode(bytes)
+        })
+    } else {
+        None
+    };
+
+    let mut acked_count = 0usize;
+    if query.ack {
+        let to_ack: Vec<String> = page_items
+            .iter()
+            .filter(|it| it.state == InboxItemState::Unread)
+            .map(|it| it.receipt.clone())
+            .collect();
+        if !to_ack.is_empty() {
+            let refs: Vec<&str> = to_ack.iter().map(String::as_str).collect();
+            acked_count = db.local().acknowledge_inbox(session_id, &refs, now_ms)?;
+            record_delivered_receipts(db, session_id, &to_ack)?;
+        }
+    }
+
+    let unread_count = db.local().pending_count_gate_cleared(session_id)?;
+    let muted_total = muted_count(db, session_id)?;
+
+    Ok(InboxQueryResult {
+        state: query.state,
+        items: page_items,
+        next_cursor,
+        has_more,
+        total_matched,
+        unread_count,
+        muted_count: muted_total,
+        acked_count,
+    })
 }
 
 fn write_ui_state_atomic(ui_dir: &Path, rev: u64, bytes: &[u8]) -> io::Result<()> {
@@ -7163,7 +7687,7 @@ async fn handle_session_focus(
                 return json!({ "ok": false, "code": "delivery_error", "error": e.to_string() });
             }
         };
-        let unread = db.local().pending_count(&sess.id).unwrap_or(0);
+        let unread = daemon.effective_pending_count(&db, &sess.id);
         let muted = muted_count(&db, &sess.id).unwrap_or(0);
         (policy, unread, muted)
     };

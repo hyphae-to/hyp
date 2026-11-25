@@ -783,6 +783,151 @@ impl<'a> LocalStateStore<'a> {
         rows.into_iter().collect()
     }
 
+    /// Peeks up to `limit` **pending AND gate-cleared** mailbox items for `session_id`
+    /// (`reviewed_at IS NOT NULL OR human_auth_json IS NOT NULL`).
+    ///
+    /// **Security invariant (G3/G4):** Unscreened raw arrivals (`reviewed_at IS NULL` and
+    /// `human_auth_json IS NULL`) and `Hold`-retained rows are NEVER returned before
+    /// `SecurityGatePipeline` or human approval promotes them.
+    pub fn peek_inbox_gate_cleared(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<MailboxEntry>> {
+        let mut stmt = self.db.conn().prepare(
+            "SELECT * FROM mailbox
+             WHERE session_id = ?1
+               AND gate_state = 'pending'
+               AND (reviewed_at IS NOT NULL OR human_auth_json IS NOT NULL)
+             ORDER BY received_at ASC, receipt ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id, limit as i64], decode_mailbox_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().collect()
+    }
+
+    /// Returns receipt IDs of `pending` mailbox items for `session_id` that have NOT yet been
+    /// cleared by `SecurityGatePipeline`, human approval, or verified human authority.
+    pub fn list_unscreened_receipts(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> StoreResult<HashSet<String>> {
+        let mut stmt = self.db.conn().prepare(
+            "SELECT receipt FROM mailbox
+             WHERE session_id = ?1
+               AND gate_state = 'pending'
+               AND reviewed_at IS NULL
+               AND human_auth_json IS NULL
+             ORDER BY received_at ASC, receipt ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id, limit as i64], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<HashSet<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Atomically marks a `pending` mailbox row as gate-screened & approved (`reviewed_at = now_ms`),
+    /// optionally recording `"downgraded_to_notify"` in `gate_reason`.
+    ///
+    /// Returns `true` if the row existed in `pending` state and was promoted.
+    pub fn mark_mailbox_gate_approved(
+        &self,
+        session_id: &str,
+        receipt: &str,
+        downgraded_to_notify: bool,
+        now_ms: i64,
+    ) -> StoreResult<bool> {
+        let tx = self.db.immediate_tx()?;
+        let changed = if downgraded_to_notify {
+            tx.conn().execute(
+                "UPDATE mailbox
+                 SET reviewed_at = COALESCE(reviewed_at, ?1),
+                     gate_reason = 'downgraded_to_notify'
+                 WHERE session_id = ?2 AND receipt = ?3 AND gate_state = 'pending'",
+                params![now_ms, session_id, receipt],
+            )?
+        } else {
+            tx.conn().execute(
+                "UPDATE mailbox
+                 SET reviewed_at = COALESCE(reviewed_at, ?1),
+                     gate_reason = CASE
+                         WHEN gate_reason LIKE 'gate_held%' THEN NULL
+                         ELSE gate_reason
+                     END
+                 WHERE session_id = ?2 AND receipt = ?3 AND gate_state = 'pending'",
+                params![now_ms, session_id, receipt],
+            )?
+        };
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
+    /// Atomically transitions an existing `pending` mailbox row in place to `Quarantined` or
+    /// `Rejected` and updates `deliveries` accordingly (zero duplicate rows, zero leaked
+    /// `delivered` plaintext).
+    ///
+    /// Returns `true` if the row existed in `pending` state and was transitioned.
+    pub fn transition_mailbox_gate_state(
+        &self,
+        session_id: &str,
+        receipt: &str,
+        new_state: GateState,
+        reason: Option<&str>,
+        now_ms: i64,
+    ) -> StoreResult<bool> {
+        if !matches!(new_state, GateState::Quarantined | GateState::Rejected) {
+            return Err(StoreError::InvalidInput(format!(
+                "transition_mailbox_gate_state only supports quarantined or rejected, got '{}'",
+                new_state.as_str()
+            )));
+        }
+        let tx = self.db.immediate_tx()?;
+        let origin_item: Option<(String, String)> = tx
+            .conn()
+            .query_row(
+                "SELECT origin_node, item_id FROM mailbox
+                 WHERE session_id = ?1 AND receipt = ?2 AND gate_state = 'pending'",
+                params![session_id, receipt],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((origin_node, item_id)) = origin_item else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        let reviewed_at: Option<i64> = if new_state == GateState::Rejected {
+            Some(now_ms)
+        } else {
+            None
+        };
+        tx.conn().execute(
+            "UPDATE mailbox
+             SET gate_state = ?1,
+                 gate_reason = ?2,
+                 reviewed_at = ?3
+             WHERE session_id = ?4 AND receipt = ?5 AND gate_state = 'pending'",
+            params![new_state.as_str(), reason, reviewed_at, session_id, receipt],
+        )?;
+        let delivery_state = match new_state {
+            GateState::Quarantined => "quarantined",
+            GateState::Rejected => "rejected",
+            _ => unreachable!(),
+        };
+        tx.conn().execute(
+            "INSERT OR REPLACE INTO deliveries (origin_node, item_id, state, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![&origin_node, &item_id, delivery_state, now_ms],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Atomically pops up to `limit` **pending** items for `session_id`, transitioning them to
     /// `gate_state = 'delivered'`. Quarantined items are never touched.
     pub fn drain_inbox(
@@ -846,6 +991,20 @@ impl<'a> LocalStateStore<'a> {
         Ok(n.max(0) as usize)
     }
 
+    /// Count of `pending` AND gate-cleared mailbox entries for `session_id`
+    /// (`reviewed_at IS NOT NULL OR human_auth_json IS NOT NULL`).
+    pub fn pending_count_gate_cleared(&self, session_id: &str) -> StoreResult<usize> {
+        let n: i64 = self.db.conn().query_row(
+            "SELECT COUNT(*) FROM mailbox
+             WHERE session_id = ?1
+               AND gate_state = 'pending'
+               AND (reviewed_at IS NOT NULL OR human_auth_json IS NOT NULL)",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        Ok(n.max(0) as usize)
+    }
+
     /// Count of unnotified `pending` mailbox entries for `session_id`.
     pub fn unnotified_count(&self, session_id: &str) -> StoreResult<usize> {
         let n: i64 = self.db.conn().query_row(
@@ -870,12 +1029,33 @@ impl<'a> LocalStateStore<'a> {
     /// Builds a metadata-only unread digest for `session_id`.
     /// Reports quarantined count separately without exposing quarantined body text or sources.
     pub fn unread_digest(&self, session_id: &str) -> StoreResult<UnreadDigest> {
+        self.unread_digest_inner(session_id, false)
+    }
+
+    /// Builds a metadata-only unread digest for `session_id` counting ONLY gate-cleared pending
+    /// entries (`reviewed_at IS NOT NULL OR human_auth_json IS NOT NULL`).
+    pub fn unread_digest_gate_cleared(&self, session_id: &str) -> StoreResult<UnreadDigest> {
+        self.unread_digest_inner(session_id, true)
+    }
+
+    fn unread_digest_inner(
+        &self,
+        session_id: &str,
+        gate_cleared_only: bool,
+    ) -> StoreResult<UnreadDigest> {
         let mut digest = UnreadDigest::default();
-        let mut stmt = self.db.conn().prepare(
+        let sql = if gate_cleared_only {
+            "SELECT kind, source, notified FROM mailbox
+             WHERE session_id = ?1
+               AND gate_state = 'pending'
+               AND (reviewed_at IS NOT NULL OR human_auth_json IS NOT NULL)
+             ORDER BY received_at DESC"
+        } else {
             "SELECT kind, source, notified FROM mailbox
              WHERE session_id = ?1 AND gate_state = 'pending'
-             ORDER BY received_at DESC",
-        )?;
+             ORDER BY received_at DESC"
+        };
+        let mut stmt = self.db.conn().prepare(sql)?;
         let rows: Vec<(String, String, i64)> = stmt
             .query_map(params![session_id], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -940,6 +1120,28 @@ impl<'a> LocalStateStore<'a> {
             "SELECT receipt, session_id, origin_node, item_id, received_at, kind, source, notified
              FROM mailbox
              WHERE session_id = ?1 AND gate_state = 'pending'
+             ORDER BY received_at DESC, receipt ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id, limit as i64], decode_mailbox_meta_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().collect()
+    }
+
+    /// Lists up to `limit` **pending AND gate-cleared** mailbox item metadata rows for
+    /// `session_id` (`reviewed_at IS NOT NULL OR human_auth_json IS NOT NULL`).
+    pub fn list_pending_metadata_gate_cleared(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<MailboxItemMeta>> {
+        let mut stmt = self.db.conn().prepare(
+            "SELECT receipt, session_id, origin_node, item_id, received_at, kind, source, notified
+             FROM mailbox
+             WHERE session_id = ?1
+               AND gate_state = 'pending'
+               AND (reviewed_at IS NOT NULL OR human_auth_json IS NOT NULL)
              ORDER BY received_at DESC, receipt ASC
              LIMIT ?2",
         )?;

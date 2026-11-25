@@ -194,6 +194,30 @@ impl SecurityGatePipeline {
         ctx: &InboundContext,
         now_ms: i64,
     ) -> Result<InboundEvaluation, GateError> {
+        self.evaluate_inbound_inner(None, ctx, now_ms).await
+    }
+
+    /// Evaluates an existing raw `Pending` mailbox entry in place (`Policy Integrity -> Stage 1 ->
+    /// FilterPlugin Chain`), atomically transitioning `existing_receipt` on `Allow` (setting
+    /// `reviewed_at`), `Quarantine` (`gate_state = 'quarantined'`), or `Block` (`gate_state =
+    /// 'rejected'`), and retaining `existing_receipt` untouched on `Hold` while always writing an
+    /// immutable `gate_audit` row.
+    pub async fn evaluate_existing_mailbox_entry(
+        &self,
+        existing_receipt: &str,
+        ctx: &InboundContext,
+        now_ms: i64,
+    ) -> Result<InboundEvaluation, GateError> {
+        self.evaluate_inbound_inner(Some(existing_receipt), ctx, now_ms)
+            .await
+    }
+
+    async fn evaluate_inbound_inner(
+        &self,
+        existing_receipt: Option<&str>,
+        ctx: &InboundContext,
+        now_ms: i64,
+    ) -> Result<InboundEvaluation, GateError> {
         let payload_text = ctx.payload_text();
         let payload_sha256 = sha256_hex(payload_text.as_bytes());
         let traceparent = ctx.traceparent();
@@ -208,11 +232,11 @@ impl SecurityGatePipeline {
                 "gate.tampered".to_string(),
                 "gate_policy_tampered".to_string(),
             ];
-            let (receipt, duplicate) = self.store_in_mailbox(
+            let (receipt, duplicate) = self.quarantine_or_store(
+                existing_receipt,
                 ctx,
                 &payload_text,
-                GateState::Quarantined,
-                Some(reason.clone()),
+                &reason,
                 traceparent.clone(),
                 now_ms,
             )?;
@@ -261,21 +285,42 @@ impl SecurityGatePipeline {
             GateDecision::Allow {
                 downgraded_to_notify,
             } => downgraded_to_notify,
-            GateDecision::Hold { .. } => {
+            GateDecision::Hold {
+                reason,
+                retry_after_ms,
+            } => {
+                // G4 (P0): Retain held rows untouched and ALWAYS append an immutable `gate_audit` row.
+                let (audit_seq, cats) = self.record_hold_audit(
+                    ctx,
+                    &payload_sha256,
+                    traceparent,
+                    "stage1",
+                    existing_receipt.map(ToString::to_string),
+                    &reason,
+                    retry_after_ms,
+                    &stage1_out.categories,
+                    now_ms,
+                )?;
                 return Ok(InboundEvaluation {
-                    decision: stage1_out.decision,
+                    decision: GateDecision::Hold {
+                        reason,
+                        retry_after_ms,
+                    },
                     stage: "stage1".to_string(),
-                    receipt: None,
+                    receipt: existing_receipt.map(ToString::to_string),
                     duplicate: false,
                     payload_sha256,
-                    audit_seq: None,
+                    audit_seq: Some(audit_seq),
                     confidence: None,
-                    categories: stage1_out.categories,
+                    categories: cats,
                 });
             }
             GateDecision::Block { reason } => {
                 let mut cats = vec!["gate.blocked".to_string()];
                 cats.extend(stage1_out.categories);
+                if let Some(r) = existing_receipt {
+                    let _ = self.reject_existing_in_mailbox(r, ctx, &reason, now_ms)?;
+                }
                 let audit_seq = self.record_audit(
                     &GateAuditInput {
                         direction: GateDirection::Inbound,
@@ -284,7 +329,7 @@ impl SecurityGatePipeline {
                         origin_node: Some(ctx.origin_node.clone()),
                         source: Some(ctx.sender.clone()),
                         session_id: Some(ctx.session_id.clone()),
-                        receipt_id: None,
+                        receipt_id: existing_receipt.map(ToString::to_string),
                         event_type: Some(ctx.event.event_type.clone()),
                         trust_tier: Some(ctx.trust_tier.as_str().to_string()),
                         confidence: Some(1.0),
@@ -310,11 +355,11 @@ impl SecurityGatePipeline {
             GateDecision::Quarantine { reason, notice } => {
                 let mut cats = vec!["gate.quarantined".to_string()];
                 cats.extend(stage1_out.categories);
-                let (receipt, duplicate) = self.store_in_mailbox(
+                let (receipt, duplicate) = self.quarantine_or_store(
+                    existing_receipt,
                     ctx,
                     &payload_text,
-                    GateState::Quarantined,
-                    Some(reason.clone()),
+                    &reason,
                     traceparent.clone(),
                     now_ms,
                 )?;
@@ -356,6 +401,9 @@ impl SecurityGatePipeline {
         // `human_authority` audit record.
         if ctx.trust_tier == TrustTier::HumanVerified {
             let Some(ref auth) = ctx.human_auth else {
+                if let Some(r) = existing_receipt {
+                    let _ = self.reject_existing_in_mailbox(r, ctx, "human_auth_unverified", now_ms)?;
+                }
                 return Ok(InboundEvaluation {
                     decision: GateDecision::Block {
                         reason: "human_auth_unverified".to_string(),
@@ -372,15 +420,27 @@ impl SecurityGatePipeline {
                     ],
                 });
             };
-            let (receipt, duplicate) = self.store_in_mailbox(
+            let (receipt, duplicate) = self.approve_existing_or_store_pending(
+                existing_receipt,
                 ctx,
                 &payload_text,
-                GateState::Pending,
-                downgraded_from_stage1.then(|| "downgraded_to_notify".to_string()),
+                downgraded_from_stage1,
                 traceparent.clone(),
                 now_ms,
             )?;
             if receipt.is_none() && !duplicate {
+                let extra = vec!["local_inbox_full".to_string()];
+                let (audit_seq, cats) = self.record_hold_audit(
+                    ctx,
+                    &payload_sha256,
+                    traceparent,
+                    "mailbox",
+                    None,
+                    "local_inbox_full",
+                    5_000,
+                    &extra,
+                    now_ms,
+                )?;
                 return Ok(InboundEvaluation {
                     decision: GateDecision::Hold {
                         reason: "local_inbox_full".to_string(),
@@ -390,9 +450,9 @@ impl SecurityGatePipeline {
                     receipt: None,
                     duplicate: false,
                     payload_sha256,
-                    audit_seq: None,
+                    audit_seq: Some(audit_seq),
                     confidence: Some(1.0),
-                    categories: vec!["local_inbox_full".to_string()],
+                    categories: cats,
                 });
             }
             if let Some(ref r) = receipt {
@@ -451,6 +511,7 @@ impl SecurityGatePipeline {
         if self.config.stage2.enabled && self.config.stage2.matchers.matches(ctx) {
             let outcome = self.stage2.evaluate(ctx, self.secrets.as_deref()).await;
             if let Some(short_circuit) = self.handle_filter_outcome(
+                existing_receipt,
                 ctx,
                 &payload_text,
                 &payload_sha256,
@@ -477,6 +538,7 @@ impl SecurityGatePipeline {
                 .evaluate(ctx, &ctx.event, self.secrets.as_deref())
                 .await;
             if let Some(short_circuit) = self.handle_filter_outcome(
+                existing_receipt,
                 ctx,
                 &payload_text,
                 &payload_sha256,
@@ -495,6 +557,7 @@ impl SecurityGatePipeline {
         let mut cats = vec!["gate.allowed".to_string()];
         cats.extend(collected_categories);
         self.finalize_allowed(
+            existing_receipt,
             ctx,
             &payload_text,
             &payload_sha256,
@@ -668,16 +731,33 @@ impl SecurityGatePipeline {
             GateDecision::Allow {
                 downgraded_to_notify,
             } => downgraded_to_notify,
-            GateDecision::Hold { .. } => {
+            GateDecision::Hold {
+                reason,
+                retry_after_ms,
+            } => {
+                let (audit_seq, cats) = self.record_hold_audit(
+                    ctx,
+                    &payload_sha256,
+                    traceparent,
+                    "stage1",
+                    None,
+                    &reason,
+                    retry_after_ms,
+                    &stage1_out.categories,
+                    now_ms,
+                )?;
                 return Ok(InboundEvaluation {
-                    decision: stage1_out.decision,
+                    decision: GateDecision::Hold {
+                        reason,
+                        retry_after_ms,
+                    },
                     stage: "stage1".to_string(),
                     receipt: None,
                     duplicate: false,
                     payload_sha256,
-                    audit_seq: None,
+                    audit_seq: Some(audit_seq),
                     confidence: None,
-                    categories: stage1_out.categories,
+                    categories: cats,
                 });
             }
             GateDecision::Block { reason } => {
@@ -766,6 +846,7 @@ impl SecurityGatePipeline {
         if self.config.stage2.enabled && self.config.stage2.matchers.matches(ctx) {
             let outcome = self.stage2.evaluate(ctx, self.secrets.as_deref()).await;
             if let Some(short_circuit) = self.handle_filter_outcome(
+                None,
                 ctx,
                 &payload_text,
                 &payload_sha256,
@@ -792,6 +873,7 @@ impl SecurityGatePipeline {
                 .evaluate(ctx, &ctx.event, self.secrets.as_deref())
                 .await;
             if let Some(short_circuit) = self.handle_filter_outcome(
+                None,
                 ctx,
                 &payload_text,
                 &payload_sha256,
@@ -848,6 +930,7 @@ impl SecurityGatePipeline {
     #[allow(clippy::too_many_arguments)]
     fn handle_filter_outcome(
         &self,
+        existing_receipt: Option<&str>,
         ctx: &InboundContext,
         payload_text: &str,
         payload_sha256: &str,
@@ -866,16 +949,36 @@ impl SecurityGatePipeline {
                 collected_categories.extend(outcome.categories);
                 Ok(None)
             }
-            GateDecision::Hold { .. } => Ok(Some(InboundEvaluation {
-                decision: outcome.decision,
-                stage: stage_label.to_string(),
-                receipt: None,
-                duplicate: false,
-                payload_sha256: payload_sha256.to_string(),
-                audit_seq: None,
-                confidence: outcome.confidence,
-                categories: outcome.categories,
-            })),
+            GateDecision::Hold {
+                reason,
+                retry_after_ms,
+            } => {
+                // G4 (P0): Retain held rows untouched and ALWAYS write an immutable `gate_audit` row.
+                let (audit_seq, cats) = self.record_hold_audit(
+                    ctx,
+                    payload_sha256,
+                    traceparent,
+                    stage_label,
+                    existing_receipt.map(ToString::to_string),
+                    &reason,
+                    retry_after_ms,
+                    &outcome.categories,
+                    now_ms,
+                )?;
+                Ok(Some(InboundEvaluation {
+                    decision: GateDecision::Hold {
+                        reason,
+                        retry_after_ms,
+                    },
+                    stage: stage_label.to_string(),
+                    receipt: existing_receipt.map(ToString::to_string),
+                    duplicate: false,
+                    payload_sha256: payload_sha256.to_string(),
+                    audit_seq: Some(audit_seq),
+                    confidence: outcome.confidence,
+                    categories: cats,
+                }))
+            }
             GateDecision::Quarantine { reason, notice } => {
                 let (store_decision, tag) = if outcome.had_error {
                     (StoreGateDecision::Error, "gate.error")
@@ -884,11 +987,11 @@ impl SecurityGatePipeline {
                 };
                 let mut cats = vec![tag.to_string()];
                 cats.extend(outcome.categories);
-                let (receipt, duplicate) = self.store_in_mailbox(
+                let (receipt, duplicate) = self.quarantine_or_store(
+                    existing_receipt,
                     ctx,
                     payload_text,
-                    GateState::Quarantined,
-                    Some(reason.clone()),
+                    &reason,
                     traceparent.clone(),
                     now_ms,
                 )?;
@@ -931,7 +1034,9 @@ impl SecurityGatePipeline {
                 };
                 let mut cats = vec![tag.to_string()];
                 cats.extend(outcome.categories);
-                {
+                if let Some(r) = existing_receipt {
+                    let _ = self.reject_existing_in_mailbox(r, ctx, &reason, now_ms)?;
+                } else {
                     let db_guard = self.db.lock().map_err(|_| {
                         GateError::LockPoisoned("node_db mutex poisoned".to_string())
                     })?;
@@ -950,7 +1055,7 @@ impl SecurityGatePipeline {
                         origin_node: Some(ctx.origin_node.clone()),
                         source: Some(ctx.sender.clone()),
                         session_id: Some(ctx.session_id.clone()),
-                        receipt_id: None,
+                        receipt_id: existing_receipt.map(ToString::to_string),
                         event_type: Some(ctx.event.event_type.clone()),
                         trust_tier: Some(ctx.trust_tier.as_str().to_string()),
                         confidence: outcome.confidence,
@@ -1129,6 +1234,7 @@ impl SecurityGatePipeline {
     #[allow(clippy::too_many_arguments)]
     fn finalize_allowed(
         &self,
+        existing_receipt: Option<&str>,
         ctx: &InboundContext,
         payload_text: &str,
         payload_sha256: &str,
@@ -1139,47 +1245,41 @@ impl SecurityGatePipeline {
         categories: Vec<String>,
         now_ms: i64,
     ) -> Result<InboundEvaluation, GateError> {
-        let put_res = {
-            let db = self
-                .db
-                .lock()
-                .map_err(|_| GateError::LockPoisoned("node_db mutex poisoned".to_string()))?;
-            db.local().put_in_mailbox(
-                &MailboxInsert {
-                    session_id: ctx.session_id.clone(),
-                    origin_node: ctx.origin_node.clone(),
-                    item_id: ctx.event.id.clone(),
-                    text: payload_text.to_string(),
-                    kind: ctx.kind,
-                    source: ctx.sender.clone(),
-                    gate_state: GateState::Pending,
-                    gate_reason: downgraded_to_notify
-                        .then(|| "downgraded_to_notify".to_string()),
-                    traceparent: traceparent.clone(),
-                },
+        let (receipt, duplicate) = self.approve_existing_or_store_pending(
+            existing_receipt,
+            ctx,
+            payload_text,
+            downgraded_to_notify,
+            traceparent.clone(),
+            now_ms,
+        )?;
+        if receipt.is_none() && !duplicate {
+            let extra = vec!["local_inbox_full".to_string()];
+            let (audit_seq, cats) = self.record_hold_audit(
+                ctx,
+                payload_sha256,
+                traceparent,
+                "mailbox",
+                None,
+                "local_inbox_full",
+                5_000,
+                &extra,
                 now_ms,
-            )?
-        };
-
-        let (receipt, duplicate) = match put_res {
-            MailboxPutResult::Stored { receipt } => (Some(receipt), false),
-            MailboxPutResult::Duplicate => (None, true),
-            MailboxPutResult::QueueFull => {
-                return Ok(InboundEvaluation {
-                    decision: GateDecision::Hold {
-                        reason: "local_inbox_full".to_string(),
-                        retry_after_ms: 5_000,
-                    },
-                    stage: "mailbox".to_string(),
-                    receipt: None,
-                    duplicate: false,
-                    payload_sha256: payload_sha256.to_string(),
-                    audit_seq: None,
-                    confidence,
-                    categories: vec!["local_inbox_full".to_string()],
-                });
-            }
-        };
+            )?;
+            return Ok(InboundEvaluation {
+                decision: GateDecision::Hold {
+                    reason: "local_inbox_full".to_string(),
+                    retry_after_ms: 5_000,
+                },
+                stage: "mailbox".to_string(),
+                receipt: None,
+                duplicate: false,
+                payload_sha256: payload_sha256.to_string(),
+                audit_seq: Some(audit_seq),
+                confidence,
+                categories: cats,
+            });
+        }
 
         let audit_seq = self.record_audit(
             &GateAuditInput {
@@ -1214,6 +1314,164 @@ impl SecurityGatePipeline {
             confidence,
             categories,
         })
+    }
+
+    fn approve_existing_or_store_pending(
+        &self,
+        existing_receipt: Option<&str>,
+        ctx: &InboundContext,
+        payload_text: &str,
+        downgraded_to_notify: bool,
+        traceparent: Option<String>,
+        now_ms: i64,
+    ) -> Result<(Option<String>, bool), GateError> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|_| GateError::LockPoisoned("node_db mutex poisoned".to_string()))?;
+        if let Some(r) = existing_receipt {
+            if db.local().mark_mailbox_gate_approved(
+                &ctx.session_id,
+                r,
+                downgraded_to_notify,
+                now_ms,
+            )? {
+                return Ok((Some(r.to_string()), false));
+            }
+        }
+        let res = db.local().put_in_mailbox(
+            &MailboxInsert {
+                session_id: ctx.session_id.clone(),
+                origin_node: ctx.origin_node.clone(),
+                item_id: ctx.event.id.clone(),
+                text: payload_text.to_string(),
+                kind: ctx.kind,
+                source: ctx.sender.clone(),
+                gate_state: GateState::Pending,
+                gate_reason: downgraded_to_notify.then(|| "downgraded_to_notify".to_string()),
+                traceparent,
+            },
+            now_ms,
+        )?;
+        match res {
+            MailboxPutResult::Stored { receipt } => {
+                let _ = db.local().mark_mailbox_gate_approved(
+                    &ctx.session_id,
+                    &receipt,
+                    downgraded_to_notify,
+                    now_ms,
+                )?;
+                Ok((Some(receipt), false))
+            }
+            MailboxPutResult::Duplicate => Ok((None, true)),
+            MailboxPutResult::QueueFull => Ok((None, false)),
+        }
+    }
+
+    fn quarantine_or_store(
+        &self,
+        existing_receipt: Option<&str>,
+        ctx: &InboundContext,
+        payload_text: &str,
+        reason: &str,
+        traceparent: Option<String>,
+        now_ms: i64,
+    ) -> Result<(Option<String>, bool), GateError> {
+        if let Some(r) = existing_receipt {
+            let transitioned = {
+                let db = self
+                    .db
+                    .lock()
+                    .map_err(|_| GateError::LockPoisoned("node_db mutex poisoned".to_string()))?;
+                db.local().transition_mailbox_gate_state(
+                    &ctx.session_id,
+                    r,
+                    GateState::Quarantined,
+                    Some(reason),
+                    now_ms,
+                )?
+            };
+            if transitioned {
+                return Ok((Some(r.to_string()), false));
+            }
+        }
+        self.store_in_mailbox(
+            ctx,
+            payload_text,
+            GateState::Quarantined,
+            Some(reason.to_string()),
+            traceparent,
+            now_ms,
+        )
+    }
+
+    fn reject_existing_in_mailbox(
+        &self,
+        existing_receipt: &str,
+        ctx: &InboundContext,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<bool, GateError> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|_| GateError::LockPoisoned("node_db mutex poisoned".to_string()))?;
+        let transitioned = db.local().transition_mailbox_gate_state(
+            &ctx.session_id,
+            existing_receipt,
+            GateState::Rejected,
+            Some(reason),
+            now_ms,
+        )?;
+        if !transitioned {
+            let _ = db
+                .local()
+                .record_delivery(&ctx.origin_node, &ctx.event.id, "rejected", now_ms);
+        }
+        Ok(transitioned)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_hold_audit(
+        &self,
+        ctx: &InboundContext,
+        payload_sha256: &str,
+        traceparent: Option<String>,
+        stage: &str,
+        receipt_id: Option<String>,
+        reason: &str,
+        retry_after_ms: u64,
+        extra_categories: &[String],
+        now_ms: i64,
+    ) -> Result<(i64, Vec<String>), GateError> {
+        let mut cats = vec!["gate.held".to_string()];
+        for c in extra_categories {
+            if !cats.iter().any(|existing| existing == c) {
+                cats.push(c.clone());
+            }
+        }
+        let audit_reason = format!("{reason} (retry_after_ms={retry_after_ms})");
+        let seq = self.record_audit(
+            &GateAuditInput {
+                direction: GateDirection::Inbound,
+                stage: stage.to_string(),
+                decision: StoreGateDecision::Error,
+                origin_node: Some(ctx.origin_node.clone()),
+                source: Some(ctx.sender.clone()),
+                session_id: Some(ctx.session_id.clone()),
+                receipt_id,
+                event_type: Some(ctx.event.event_type.clone()),
+                trust_tier: Some(ctx.trust_tier.as_str().to_string()),
+                confidence: None,
+                categories: cats.clone(),
+                reason: Some(audit_reason),
+                traceparent,
+                payload_sha256: payload_sha256.to_string(),
+                reviewer: None,
+            },
+            now_ms,
+        )?;
+        Ok((seq, cats))
     }
 
     fn store_in_mailbox(
