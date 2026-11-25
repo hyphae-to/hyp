@@ -5484,6 +5484,9 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
 .sb-state.slate { background: rgba(244, 241, 232, 0.06); border-color: rgba(244, 241, 232, 0.14); color: #9e9a8d; }
 
 .sb-agent-msg {
+  display: flex;
+  align-items: center;
+  min-height: 46px;
   font-family: var(--mono);
   font-size: 0.66rem;
   line-height: 1.44;
@@ -6156,118 +6159,138 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
   color: var(--olive);
 }
 
-/* 2x2 Cohesive Seamless Obsidian-Brass Specimen Cards */
+/* 2x2 Paired Obsidian Specimen + Braided Mycelial Stem + Warm Cream Card (#how-it-works DNA) */
 .sec-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 20px;
+  gap: 28px 22px;
 }
 
-.sec-card {
-  position: relative;
+.sec-pair {
   display: flex;
   flex-direction: column;
   min-width: 0;
+}
+
+/* Top Compact Dark Obsidian Specimen Card (echoes .hub-core-card) */
+.sec-spec-card {
+  position: relative;
+  z-index: 3;
   border-radius: 22px;
-  background: linear-gradient(180deg, #121712 0%, #121712 64%, #0d110d 100%);
+  background: linear-gradient(180deg, #121712 0%, #121712 70%, #0d110d 100%);
   color: var(--cream);
-  border: 1px solid rgba(244, 241, 232, 0.13);
+  border: 1px solid rgba(183, 217, 86, 0.32);
   box-shadow:
-    0 26px 52px -24px rgba(18, 19, 16, 0.56),
-    0 4px 12px -4px rgba(18, 19, 16, 0.22),
-    inset 0 1px 0 rgba(244, 241, 232, 0.12);
-  overflow: hidden;
+    0 24px 48px -22px rgba(18, 22, 16, 0.56),
+    0 0 0 4px rgba(183, 217, 86, 0.065),
+    inset 0 1px 0 rgba(244, 241, 232, 0.14);
+  overflow: visible;
   transition: transform 0.22s ease, border-color 0.22s ease, box-shadow 0.22s ease;
 }
 
-.sec-card::before {
+.sec-pair.tone-moss .sec-spec-card {
+  border-color: rgba(127, 201, 123, 0.32);
+  box-shadow:
+    0 24px 48px -22px rgba(18, 22, 16, 0.56),
+    0 0 0 4px rgba(127, 201, 123, 0.065),
+    inset 0 1px 0 rgba(244, 241, 232, 0.14);
+}
+
+.sec-pair.tone-amber .sec-spec-card {
+  border-color: rgba(232, 163, 49, 0.34);
+  box-shadow:
+    0 24px 48px -22px rgba(18, 22, 16, 0.56),
+    0 0 0 4px rgba(232, 163, 49, 0.065),
+    inset 0 1px 0 rgba(244, 241, 232, 0.14);
+}
+
+.sec-pair.tone-coral .sec-spec-card {
+  border-color: rgba(255, 122, 92, 0.34);
+  box-shadow:
+    0 24px 48px -22px rgba(18, 22, 16, 0.56),
+    0 0 0 4px rgba(221, 81, 53, 0.065),
+    inset 0 1px 0 rgba(244, 241, 232, 0.14);
+}
+
+.sec-pair:hover .sec-spec-card {
+  transform: translateY(-2px);
+}
+
+.sec-pair.tone-olive:hover .sec-spec-card { border-color: rgba(183, 217, 86, 0.52); }
+.sec-pair.tone-moss:hover .sec-spec-card { border-color: rgba(127, 201, 123, 0.52); }
+.sec-pair.tone-amber:hover .sec-spec-card { border-color: rgba(232, 163, 49, 0.54); }
+.sec-pair.tone-coral:hover .sec-spec-card { border-color: rgba(255, 122, 92, 0.54); }
+
+/* Crisp circular glowing port socket on bottom rim of obsidian specimen card */
+.sec-node-port {
+  position: absolute;
+  bottom: -4.5px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  border: 2px solid #12150f;
+  z-index: 5;
+  pointer-events: none;
+}
+
+.sec-pair.tone-olive .sec-node-port { background: var(--chartreuse); box-shadow: 0 0 10px rgba(183, 217, 86, 0.88); }
+.sec-pair.tone-moss .sec-node-port { background: var(--moss); box-shadow: 0 0 10px rgba(127, 201, 123, 0.88); }
+.sec-pair.tone-amber .sec-node-port { background: var(--amber); box-shadow: 0 0 10px rgba(232, 163, 49, 0.88); }
+.sec-pair.tone-coral .sec-node-port { background: #ff7a5c; box-shadow: 0 0 10px rgba(221, 81, 53, 0.88); }
+
+.sec-spec-inner {
+  position: relative;
+  border-radius: inherit;
+  overflow: hidden;
+  padding: 14px 18px 15px;
+}
+
+.sec-spec-inner::before {
   content: "";
   position: absolute;
   inset: 0;
   pointer-events: none;
   z-index: 0;
-  opacity: 0.9;
 }
 
-.sec-card.tone-olive::before {
-  background: radial-gradient(ellipse 68% 42% at 50% 0%, rgba(183, 217, 86, 0.08) 0%, transparent 66%);
+.sec-pair.tone-olive .sec-spec-inner::before {
+  background: radial-gradient(ellipse 68% 44% at 50% 0%, rgba(183, 217, 86, 0.09) 0%, transparent 68%);
 }
 
-.sec-card.tone-moss::before {
-  background: radial-gradient(ellipse 68% 42% at 50% 0%, rgba(127, 201, 123, 0.08) 0%, transparent 66%);
+.sec-pair.tone-moss .sec-spec-inner::before {
+  background: radial-gradient(ellipse 68% 44% at 50% 0%, rgba(127, 201, 123, 0.09) 0%, transparent 68%);
 }
 
-.sec-card.tone-amber::before {
-  background: radial-gradient(ellipse 68% 42% at 50% 0%, rgba(232, 163, 49, 0.08) 0%, transparent 66%);
+.sec-pair.tone-amber .sec-spec-inner::before {
+  background: radial-gradient(ellipse 68% 44% at 50% 0%, rgba(232, 163, 49, 0.09) 0%, transparent 68%);
 }
 
-.sec-card.tone-coral::before {
-  background: radial-gradient(ellipse 68% 42% at 50% 0%, rgba(221, 81, 53, 0.08) 0%, transparent 66%);
+.sec-pair.tone-coral .sec-spec-inner::before {
+  background: radial-gradient(ellipse 68% 44% at 50% 0%, rgba(221, 81, 53, 0.09) 0%, transparent 68%);
 }
 
-.sec-card:hover {
-  transform: translateY(-2px);
-  box-shadow:
-    0 32px 60px -24px rgba(18, 19, 16, 0.68),
-    0 6px 16px -6px rgba(18, 19, 16, 0.26),
-    inset 0 1px 0 rgba(244, 241, 232, 0.16);
-}
-
-.sec-card.tone-olive:hover { border-color: rgba(183, 217, 86, 0.36); }
-.sec-card.tone-moss:hover { border-color: rgba(127, 201, 123, 0.36); }
-.sec-card.tone-amber:hover { border-color: rgba(232, 163, 49, 0.36); }
-.sec-card.tone-coral:hover { border-color: rgba(255, 122, 92, 0.36); }
-
-/* Delicate botanical corner veins inside each obsidian card */
-.sec-card-botanical {
-  position: absolute;
-  top: 0;
-  right: 0;
-  width: 144px;
-  height: auto;
-  pointer-events: none;
-  z-index: 1;
-  opacity: 0.88;
-}
-
-.sec-card-botanical path {
-  stroke-width: 1.05;
-  stroke-linecap: round;
-}
-
-.sec-card-botanical path.thin {
-  stroke-width: 0.8;
-  opacity: 0.68;
-}
-
-.sec-card.tone-olive .sec-card-botanical path { stroke: rgba(183, 217, 86, 0.24); }
-.sec-card.tone-olive .sec-card-botanical circle { fill: rgba(183, 217, 86, 0.44); }
-.sec-card.tone-moss .sec-card-botanical path { stroke: rgba(127, 201, 123, 0.24); }
-.sec-card.tone-moss .sec-card-botanical circle { fill: rgba(127, 201, 123, 0.44); }
-.sec-card.tone-amber .sec-card-botanical path { stroke: rgba(232, 163, 49, 0.26); }
-.sec-card.tone-amber .sec-card-botanical circle { fill: rgba(232, 163, 49, 0.46); }
-.sec-card.tone-coral .sec-card-botanical path { stroke: rgba(255, 122, 92, 0.26); }
-.sec-card.tone-coral .sec-card-botanical circle { fill: rgba(255, 122, 92, 0.46); }
-
-.sec-card-top {
+.sec-spec-head {
   position: relative;
   z-index: 2;
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 15px 22px 2px;
+  justify-content: center;
+  margin-bottom: 4px;
 }
 
-.sec-kicker {
+/* Pill badge echoing .hub-core-badge */
+.sec-core-badge {
   display: inline-flex;
   align-items: center;
   gap: 7px;
   font-family: var(--mono);
-  font-size: 0.67rem;
-  font-weight: 600;
-  letter-spacing: 0.055em;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.085em;
   text-transform: uppercase;
+  padding: 3.5px 11px;
+  border-radius: 999px;
 }
 
 .sec-dot {
@@ -6277,39 +6300,41 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
   flex-shrink: 0;
 }
 
-.sec-card.tone-olive .sec-kicker { color: var(--chartreuse); }
-.sec-card.tone-olive .sec-dot { background: var(--chartreuse); box-shadow: 0 0 8px rgba(183, 217, 86, 0.8); }
-.sec-card.tone-moss .sec-kicker { color: #9ae896; }
-.sec-card.tone-moss .sec-dot { background: #9ae896; box-shadow: 0 0 8px rgba(127, 201, 123, 0.8); }
-.sec-card.tone-amber .sec-kicker { color: #ffd37d; }
-.sec-card.tone-amber .sec-dot { background: var(--amber); box-shadow: 0 0 8px rgba(232, 163, 49, 0.8); }
-.sec-card.tone-coral .sec-kicker { color: #ff9b85; }
-.sec-card.tone-coral .sec-dot { background: #ff7a5c; box-shadow: 0 0 8px rgba(221, 81, 53, 0.8); }
-
-.sec-spec-tag {
-  font-family: var(--mono);
-  font-size: 0.63rem;
-  font-weight: 500;
-  color: #c2beb2;
-  background: rgba(244, 241, 232, 0.065);
-  border: 1px solid rgba(244, 241, 232, 0.13);
-  padding: 2.5px 9px;
-  border-radius: 999px;
-  white-space: nowrap;
+.sec-pair.tone-olive .sec-core-badge {
+  color: var(--chartreuse);
+  background: rgba(183, 217, 86, 0.13);
+  border: 1px solid rgba(183, 217, 86, 0.36);
 }
+.sec-pair.tone-olive .sec-dot { background: var(--chartreuse); box-shadow: 0 0 8px var(--chartreuse); }
+
+.sec-pair.tone-moss .sec-core-badge {
+  color: #9ae896;
+  background: rgba(127, 201, 123, 0.13);
+  border: 1px solid rgba(127, 201, 123, 0.36);
+}
+.sec-pair.tone-moss .sec-dot { background: #9ae896; box-shadow: 0 0 8px rgba(127, 201, 123, 0.85); }
+
+.sec-pair.tone-amber .sec-core-badge {
+  color: #ffd37d;
+  background: rgba(232, 163, 49, 0.14);
+  border: 1px solid rgba(232, 163, 49, 0.38);
+}
+.sec-pair.tone-amber .sec-dot { background: var(--amber); box-shadow: 0 0 8px rgba(232, 163, 49, 0.85); }
+
+.sec-pair.tone-coral .sec-core-badge {
+  color: #ffa28d;
+  background: rgba(221, 81, 53, 0.15);
+  border: 1px solid rgba(255, 122, 92, 0.38);
+}
+.sec-pair.tone-coral .sec-dot { background: #ff7a5c; box-shadow: 0 0 8px rgba(221, 81, 53, 0.85); }
 
 /* Seamless Illuminated Artwork Stage — melts into #121712 with zero seam */
-.sec-visual {
-  position: relative;
-  z-index: 2;
-  padding: 2px 22px 0;
-}
-
 .sec-stage-frame {
   position: relative;
-  width: min(100%, 416px);
+  z-index: 2;
+  width: min(100%, 386px);
   aspect-ratio: 16 / 9;
-  margin: 0 auto;
+  margin: 0 auto 10px;
   overflow: hidden;
   background: #121712;
 }
@@ -6324,7 +6349,7 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
   transition: transform 0.5s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-.sec-card:hover .sec-stage-frame img {
+.sec-pair:hover .sec-stage-frame img {
   transform: scale(1.022);
 }
 
@@ -6413,73 +6438,185 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
   100% { transform: scale(1.78); opacity: 0; }
 }
 
-.sec-body {
+/* Compact rounded protocol pills inside the dark specimen card (echoes .hub-core-pills) */
+.sec-core-pills {
   position: relative;
   z-index: 2;
   display: flex;
-  flex-direction: column;
-  flex: 1;
-  padding: 6px 24px 20px;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 5px;
 }
 
-.sec-body h3 {
-  margin: 0 0 7px;
+.sec-core-pills span {
+  font-family: var(--mono);
+  font-size: 0.64rem;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.075);
+  border: 1px solid rgba(244, 241, 232, 0.16);
+  color: var(--cream);
+  white-space: nowrap;
+}
+
+/* Braided Glowing Mycelial Stem linking dark specimen card -> warm cream editorial card */
+.sec-stem {
+  position: relative;
+  z-index: 4;
+  height: 28px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  pointer-events: none;
+}
+
+.sec-stem svg {
+  width: 180px;
+  height: 28px;
+  overflow: visible;
+  display: block;
+}
+
+.sec-stem-main {
+  stroke-width: 2.1;
+  stroke-linecap: round;
+}
+
+.sec-stem-weave {
+  stroke-width: 1.1;
+  stroke-linecap: round;
+}
+
+.sec-stem-weave.fine {
+  stroke-width: 0.85;
+  stroke-dasharray: 4 3.5;
+  opacity: 0.78;
+}
+
+.sec-stem-twig {
+  stroke-width: 1;
+  stroke-linecap: round;
+}
+
+.sec-stem-pulse {
+  stroke-width: 2.6;
+  stroke-linecap: round;
+  stroke-dasharray: 24 76;
+  stroke-dashoffset: 124;
+  opacity: 0.92;
+  animation: secStemFlow 3.4s cubic-bezier(0.35, 0, 0.65, 1) infinite;
+}
+
+.sec-stem-pulse.delay1 { animation-delay: -0.9s; }
+.sec-stem-pulse.delay2 { animation-delay: -1.8s; }
+.sec-stem-pulse.delay3 { animation-delay: -2.6s; }
+
+@keyframes secStemFlow {
+  0% { stroke-dashoffset: 124; opacity: 0; }
+  14% { opacity: 0.95; }
+  84% { opacity: 0.95; }
+  100% { stroke-dashoffset: -24; opacity: 0; }
+}
+
+.sec-stem-dot {
+  stroke: #faf8f2;
+  stroke-width: 1.6;
+}
+
+.sec-pair.tone-olive .sec-stem-main { stroke: rgba(65, 89, 29, 0.72); }
+.sec-pair.tone-olive .sec-stem-weave,
+.sec-pair.tone-olive .sec-stem-twig { stroke: rgba(65, 89, 29, 0.36); }
+.sec-pair.tone-olive .sec-stem-pulse { stroke: #9bc434; filter: drop-shadow(0 0 4px rgba(183, 217, 86, 0.85)); }
+.sec-pair.tone-olive .sec-stem-dot { fill: var(--olive); }
+
+.sec-pair.tone-moss .sec-stem-main { stroke: rgba(52, 114, 56, 0.72); }
+.sec-pair.tone-moss .sec-stem-weave,
+.sec-pair.tone-moss .sec-stem-twig { stroke: rgba(52, 114, 56, 0.38); }
+.sec-pair.tone-moss .sec-stem-pulse { stroke: #68bf6a; filter: drop-shadow(0 0 4px rgba(127, 201, 123, 0.85)); }
+.sec-pair.tone-moss .sec-stem-dot { fill: #2e6632; }
+
+.sec-pair.tone-amber .sec-stem-main { stroke: rgba(188, 122, 18, 0.76); }
+.sec-pair.tone-amber .sec-stem-weave,
+.sec-pair.tone-amber .sec-stem-twig { stroke: rgba(196, 132, 22, 0.4); }
+.sec-pair.tone-amber .sec-stem-pulse { stroke: var(--amber); filter: drop-shadow(0 0 4px rgba(232, 163, 49, 0.85)); }
+.sec-pair.tone-amber .sec-stem-dot { fill: #b4730c; }
+
+.sec-pair.tone-coral .sec-stem-main { stroke: rgba(184, 60, 36, 0.72); }
+.sec-pair.tone-coral .sec-stem-weave,
+.sec-pair.tone-coral .sec-stem-twig { stroke: rgba(196, 72, 46, 0.38); }
+.sec-pair.tone-coral .sec-stem-pulse { stroke: #f2684b; filter: drop-shadow(0 0 4px rgba(221, 81, 53, 0.85)); }
+.sec-pair.tone-coral .sec-stem-dot { fill: #b83c24; }
+
+/* Bottom Warm Cream Editorial Card (direct sibling of .hub-card in #how-it-works) */
+.sec-copy-card {
+  position: relative;
+  z-index: 2;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  background: linear-gradient(180deg, #faf8f2 0%, #f1ede2 100%);
+  border: 1px solid rgba(22, 23, 20, 0.12);
+  border-radius: 20px;
+  padding: 20px 22px 20px;
+  box-shadow:
+    0 20px 44px -26px rgba(22, 23, 20, 0.28),
+    0 2px 6px rgba(22, 23, 20, 0.05),
+    inset 0 1px 0 rgba(255, 255, 255, 0.85);
+  overflow: hidden;
+  transition: border-color 0.22s ease, box-shadow 0.22s ease;
+}
+
+.sec-pair.tone-olive .sec-copy-card { border-top-color: rgba(65, 89, 29, 0.32); }
+.sec-pair.tone-moss .sec-copy-card { border-top-color: rgba(65, 118, 63, 0.34); }
+.sec-pair.tone-amber .sec-copy-card { border-top-color: rgba(196, 132, 22, 0.34); }
+.sec-pair.tone-coral .sec-copy-card { border-top-color: rgba(196, 72, 46, 0.34); }
+
+.sec-pair:hover .sec-copy-card {
+  box-shadow:
+    0 24px 48px -24px rgba(22, 23, 20, 0.34),
+    0 3px 8px rgba(22, 23, 20, 0.06),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9);
+}
+
+.card-botanical-accent.coral path { stroke: rgba(196, 72, 46, 0.19); }
+.card-botanical-accent.coral circle { fill: rgba(196, 72, 46, 0.34); }
+.card-kicker.coral { color: #a8341c; }
+
+.sec-copy-card .card-kicker,
+.sec-copy-card h3,
+.sec-copy-card p {
+  position: relative;
+  z-index: 1;
+}
+
+.sec-copy-card .card-kicker {
+  margin-bottom: 5px;
+}
+
+.sec-copy-card h3 {
+  margin: 0 0 8px;
   font-family: var(--serif);
-  font-size: clamp(1.16rem, 1.45vw, 1.3rem);
+  font-size: clamp(1.16rem, 1.4vw, 1.28rem);
   font-weight: 500;
   line-height: 1.2;
   letter-spacing: -0.022em;
-  color: var(--cream);
+  color: var(--ink);
 }
 
-.sec-body p {
-  margin: 0 0 14px;
-  font-size: 0.855rem;
+.sec-copy-card p {
+  margin: 0;
+  font-size: 0.86rem;
   line-height: 1.55;
-  color: #c6c2b6;
+  color: var(--ink-soft);
 }
 
-.sec-body code {
+.sec-copy-card code {
   font-family: var(--mono);
-  font-size: 0.85em;
-  color: var(--chartreuse);
-  background: rgba(183, 217, 86, 0.11);
+  font-size: 0.86em;
+  color: var(--olive);
+  background: rgba(65, 89, 29, 0.09);
   padding: 1px 5px;
   border-radius: 5px;
-}
-
-.sec-inline-link {
-  color: #a6eba2;
-  font-weight: 500;
-  text-decoration: none;
-  border-bottom: 1px solid rgba(127, 201, 123, 0.45);
-  transition: color 0.15s ease, border-color 0.15s ease;
-}
-
-.sec-inline-link:hover {
-  color: #d6fad3;
-  border-color: #d6fad3;
-}
-
-.sec-chips {
-  margin-top: auto;
-  padding-top: 12px;
-  border-top: 1px solid rgba(244, 241, 232, 0.085);
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.sec-chips span {
-  font-family: var(--mono);
-  font-size: 0.64rem;
-  font-weight: 500;
-  color: #bfbba9;
-  background: rgba(244, 241, 232, 0.055);
-  border: 1px solid rgba(244, 241, 232, 0.1);
-  padding: 3px 8px;
-  border-radius: 7px;
-  white-space: nowrap;
 }
 
 @keyframes svSlide {
@@ -6669,11 +6806,13 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
   .uc-flow-wire i,
   .sec-lock-glow,
   .sec-bio-pulse,
-  .sec-seal-pulse {
+  .sec-seal-pulse,
+  .sec-stem-pulse {
     animation: none !important;
   }
   .sb-pulse,
-  .sec-anim-overlay { opacity: 0 !important; }
+  .sec-anim-overlay,
+  .sec-stem-pulse { opacity: 0 !important; }
 }
 
 @media (max-width: 1040px) {
@@ -6687,7 +6826,7 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
 @media (max-width: 860px) {
   .sec-section { padding: 72px 0 76px; }
   .why-section { padding: 72px 0 76px; }
-  .sec-grid { grid-template-columns: minmax(0, 1fr); gap: 18px; }
+  .sec-grid { grid-template-columns: minmax(0, 1fr); gap: 24px; }
 }
 
 @media (max-width: 640px) {
@@ -6705,8 +6844,7 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
   .uc-chips { flex-wrap: wrap; }
   .uc-flow { grid-template-columns: minmax(0, 1fr); gap: 10px; }
   .uc-flow-wire { width: 2px; height: 18px; margin: 0 auto; }
-  .sec-card-top { padding: 14px 16px 2px; }
-  .sec-visual { padding: 4px 12px 0; }
-  .sec-body { padding: 10px 18px 18px; }
+  .sec-spec-inner { padding: 12px 12px 13px; }
+  .sec-copy-card { padding: 18px 18px 18px; }
   .walkthrough-toggle { padding: 14px 16px; }
 }
