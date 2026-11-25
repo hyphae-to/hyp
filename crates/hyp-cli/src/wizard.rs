@@ -978,6 +978,13 @@ impl HerdrTemplate {
         let cmd = self.command.trim();
         if cmd.is_empty() || cmd == self.name {
             self.name.clone()
+        } else if cmd.starts_with(&self.name)
+            && cmd
+                .as_bytes()
+                .get(self.name.len())
+                .is_some_and(|b| b.is_ascii_whitespace())
+        {
+            cmd.to_string()
         } else {
             format!("{} · {}", self.name, cmd)
         }
@@ -3720,7 +3727,7 @@ pub fn build_main_menu_items_with_env(
             for tmpl in herdr_templates {
                 items.push(MainMenuItem {
                     label: tmpl.display_title().to_string(),
-                    tag: "herdr",
+                    tag: "via herdr",
                     subtitle: tmpl.display_subtitle(),
                     action: MainMenuAction::LaunchHerdrTemplate {
                         hc_bin: hc_path.to_path_buf(),
@@ -3731,11 +3738,8 @@ pub fn build_main_menu_items_with_env(
         } else {
             items.push(MainMenuItem {
                 label: "Herdr".to_string(),
-                tag: "templates",
-                subtitle: format!(
-                    "Launch via Herdr templates ({} available) · native tab wakeup",
-                    herdr_templates.len()
-                ),
+                tag: "via herdr",
+                subtitle: format!("{} templates · native tab wakeup", herdr_templates.len()),
                 action: MainMenuAction::HerdrTemplates {
                     hc_bin: hc_path.to_path_buf(),
                     templates: herdr_templates.to_vec(),
@@ -3744,7 +3748,7 @@ pub fn build_main_menu_items_with_env(
         }
     }
 
-    // 2. Detected launchable CLI harnesses on PATH (`auto-launch`).
+    // 2. Detected launchable CLI harnesses on PATH (`in terminal`).
     for &(lh, _) in launchables {
         let configured = find_diag(lh.id()).is_some_and(|d| d.configured);
         let subtitle = if configured {
@@ -3754,36 +3758,27 @@ pub fn build_main_menu_items_with_env(
         };
         items.push(MainMenuItem {
             label: lh.display_name().to_string(),
-            tag: "auto-launch",
+            tag: "in terminal",
             subtitle,
             action: MainMenuAction::LaunchCli(lh),
         });
     }
 
-    // 3. Detected Desktop / IDE / GUI / daemon harnesses (`install skill + guide`).
+    // 3. Detected Desktop / IDE / GUI / daemon harnesses (only real runnable apps; skip uninstalled CLIs).
     if desktop_apps.claude_desktop {
         items.push(MainMenuItem {
             label: ManualGuideHarness::ClaudeDesktop.display_name().to_string(),
-            tag: "install skill + guide",
-            subtitle: "Install skill + configure Claude Desktop MCP".to_string(),
+            tag: "desktop app",
+            subtitle: "open in Claude Desktop".to_string(),
             action: MainMenuAction::ManualGuide(ManualGuideHarness::ClaudeDesktop),
         });
     }
 
-    let codex_diag_detected =
-        find_diag("codex").is_some_and(|d| d.detected || d.configured);
-    let show_codex_desktop =
-        desktop_apps.codex_desktop || (!cli_on_path(LaunchableHarness::Codex) && codex_diag_detected);
-    if show_codex_desktop {
-        let subtitle = if desktop_apps.codex_desktop {
-            "Install skill + configure Codex Desktop MCP".to_string()
-        } else {
-            "CLI 'codex' not on PATH · install skill + configure Codex MCP".to_string()
-        };
+    if desktop_apps.codex_desktop {
         items.push(MainMenuItem {
             label: ManualGuideHarness::CodexDesktop.display_name().to_string(),
-            tag: "install skill + guide",
-            subtitle,
+            tag: "desktop app",
+            subtitle: "open in Codex Desktop".to_string(),
             action: MainMenuAction::ManualGuide(ManualGuideHarness::CodexDesktop),
         });
     }
@@ -3793,36 +3788,30 @@ pub fn build_main_menu_items_with_env(
             label: ManualGuideHarness::OpenCodeDesktop
                 .display_name()
                 .to_string(),
-            tag: "install skill + guide",
-            subtitle: "Install skill + open in OpenCode Desktop".to_string(),
+            tag: "desktop app",
+            subtitle: "open in OpenCode Desktop".to_string(),
             action: MainMenuAction::ManualGuide(ManualGuideHarness::OpenCodeDesktop),
         });
     }
 
-    let cursor_diag_detected =
-        find_diag("cursor").is_some_and(|d| d.detected || d.configured);
-    let show_cursor_ide =
-        !cli_on_path(LaunchableHarness::Cursor) && (desktop_apps.cursor_ide || cursor_diag_detected);
-    if show_cursor_ide {
+    if !cli_on_path(LaunchableHarness::Cursor) && desktop_apps.cursor_ide {
         let configured = find_diag("cursor").is_some_and(|d| d.configured);
         let suffix = if configured { " · configured" } else { "" };
         items.push(MainMenuItem {
             label: ManualGuideHarness::CursorIde.display_name().to_string(),
-            tag: "install skill + guide",
-            subtitle: format!("Install skill + open in Cursor Agent{suffix}"),
+            tag: "desktop app",
+            subtitle: format!("open in Cursor{suffix}"),
             action: MainMenuAction::ManualGuide(ManualGuideHarness::CursorIde),
         });
     }
 
-    for (guide_harness, default_sub) in [
+    for (guide_harness, tag, default_sub) in [
         (
             ManualGuideHarness::Openclaw,
-            "Install skill + paste prompt in OpenClaw",
+            "copy prompt",
+            "paste prompt in OpenClaw",
         ),
-        (
-            ManualGuideHarness::T3,
-            "Install skill for Claude/Codex threads + paste prompt",
-        ),
+        (ManualGuideHarness::T3, "desktop app", "open in T3 Code"),
     ] {
         if let Some(diag) =
             find_diag(guide_harness.id()).filter(|d| d.detected || d.configured)
@@ -3834,42 +3823,21 @@ pub fn build_main_menu_items_with_env(
             };
             items.push(MainMenuItem {
                 label: guide_harness.display_name().to_string(),
-                tag: "install skill + guide",
+                tag,
                 subtitle,
                 action: MainMenuAction::ManualGuide(guide_harness),
             });
         }
     }
 
-    for lh in LaunchableHarness::ALL {
-        if cli_on_path(lh) {
-            continue;
-        }
-        // Codex, Cursor, and OpenCode Desktop cases are surfaced as dedicated Desktop/IDE entries.
-        if matches!(lh, LaunchableHarness::Codex | LaunchableHarness::Cursor)
-            || (lh == LaunchableHarness::Opencode && desktop_apps.opencode_desktop)
-        {
-            continue;
-        }
-        if let Some(diag) = find_diag(lh.id()).filter(|d| d.detected || d.configured) {
-            let suffix = if diag.configured { " · configured" } else { "" };
-            items.push(MainMenuItem {
-                label: lh.display_name().to_string(),
-                tag: "install skill + guide",
-                subtitle: format!("CLI '{}' not on PATH{suffix}", lh.binary_name()),
-                action: MainMenuAction::ManualGuide(ManualGuideHarness::ConfigOnlyCli(lh)),
-            });
-        }
-    }
-
     // 4. Deterministic local CLI setup + background service install right here.
     let local_subtitle = if existing_node_id.is_some() {
-        "Refresh local node, harnesses & background daemon here"
+        "refresh node, harnesses & daemon here"
     } else {
-        "Local node, keys, detected harnesses & background service"
+        "configure node, keys & harnesses here"
     };
     items.push(MainMenuItem {
-        label: "Quick local setup here".to_string(),
+        label: "Local CLI setup".to_string(),
         tag: "local cli",
         subtitle: local_subtitle.to_string(),
         action: MainMenuAction::QuickLocalSetup,
@@ -5179,39 +5147,61 @@ fn build_banner_lines_at_tick(
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
 fn format_menu_row(
     selected: bool,
     label: &str,
     tag: Option<(&str, TagTone)>,
     subtitle: &str,
+    label_col_w: usize,
+    tag_col_w: usize,
     box_width: usize,
     left_pad: &str,
     color_mode: ColorMode,
 ) -> String {
     let inner_w = box_width.saturating_sub(2).max(16);
     let prefix = if selected { " ❯ " } else { "   " };
-    let tag_text = tag.map(|(t, _)| format!("[{t}]")).unwrap_or_default();
-
     let prefix_len = 3usize;
-    let label_max = if tag.is_some() {
-        (inner_w / 2)
-            .clamp(12, 28)
-            .min(inner_w.saturating_sub(4).max(1))
+
+    let raw_tag = tag.map(|(t, _)| t).unwrap_or("");
+    let show_tag = tag_col_w > 0 && inner_w >= prefix_len + 12 + 2 + tag_col_w;
+    let effective_tag_w = if show_tag { tag_col_w } else { 0 };
+    let label_max = if show_tag {
+        label_col_w
+            .min(inner_w.saturating_sub(prefix_len + effective_tag_w + 4).max(8))
+            .max(1)
     } else {
         let sub_reserve = if subtitle.is_empty() {
             0
         } else {
             subtitle.chars().count().min(22) + 4
         };
-        inner_w
-            .saturating_sub(prefix_len + sub_reserve + 1)
-            .max((inner_w / 2).min(inner_w.saturating_sub(prefix_len).max(1)))
+        label_col_w
+            .min(
+                inner_w
+                    .saturating_sub(prefix_len + sub_reserve + 1)
+                    .max((inner_w / 2).min(inner_w.saturating_sub(prefix_len).max(1))),
+            )
+            .max(1)
     };
     let label_str = truncate_chars(label, label_max);
     let label_len = label_str.chars().count();
-    let tag_len = tag_text.chars().count();
-    let used = prefix_len + label_len + if tag_len > 0 { 2 + tag_len } else { 0 };
-    let rem_for_sub = inner_w.saturating_sub(used + 3);
+    let label_pad = " ".repeat(label_max.saturating_sub(label_len));
+
+    let tag_str = if show_tag {
+        truncate_chars(raw_tag, effective_tag_w)
+    } else {
+        String::new()
+    };
+    let tag_len = tag_str.chars().count();
+    let tag_pad = if show_tag {
+        " ".repeat(effective_tag_w.saturating_sub(tag_len))
+    } else {
+        String::new()
+    };
+
+    let used = prefix_len + label_max + if show_tag { 2 + effective_tag_w } else { 0 };
+    let rem_for_sub = inner_w.saturating_sub(used + 2);
     let sub_str = if rem_for_sub >= 6 && !subtitle.is_empty() {
         truncate_chars(subtitle, rem_for_sub)
     } else {
@@ -5224,10 +5214,11 @@ fn format_menu_row(
     if selected {
         match color_mode {
             ColorMode::Plain => {
-                let mut line = format!("{prefix}{label_str}");
-                if !tag_text.is_empty() {
+                let mut line = format!("{prefix}{label_str}{label_pad}");
+                if show_tag {
                     line.push_str("  ");
-                    line.push_str(&tag_text);
+                    line.push_str(&tag_str);
+                    line.push_str(&tag_pad);
                 }
                 if !sub_str.is_empty() {
                     line.push_str("  ");
@@ -5236,10 +5227,11 @@ fn format_menu_row(
                 format!("{left_pad}\x1b[7m{line}{trailing}\x1b[0m")
             }
             ColorMode::Ansi256 => {
-                let mut line = format!("{prefix}{label_str}");
-                if !tag_text.is_empty() {
+                let mut line = format!("{prefix}{label_str}{label_pad}");
+                if show_tag {
                     line.push_str("  ");
-                    line.push_str(&tag_text);
+                    line.push_str(&tag_str);
+                    line.push_str(&tag_pad);
                 }
                 if !sub_str.is_empty() {
                     line.push_str("  ");
@@ -5262,9 +5254,11 @@ fn format_menu_row(
                 };
                 let tag_fg = fg_color(color_mode, tag_rgb);
 
-                let mut row = format!("{left_pad}{bg}{amber}\x1b[1m{prefix}{ivory}{label_str}\x1b[22m");
-                if !tag_text.is_empty() {
-                    row.push_str(&format!("  {tag_fg}{tag_text}"));
+                let mut row = format!(
+                    "{left_pad}{bg}{amber}\x1b[1m{prefix}{ivory}{label_str}{label_pad}\x1b[22m"
+                );
+                if show_tag {
+                    row.push_str(&format!("  {tag_fg}{tag_str}{tag_pad}"));
                 }
                 if !sub_str.is_empty() {
                     row.push_str(&format!("  {sage}{sub_str}"));
@@ -5275,24 +5269,29 @@ fn format_menu_row(
         }
     } else {
         let label_styled = paint_styled_text(color_mode, RGB_PULSE_IVORY, false, &label_str);
-        let tag_styled = match tag {
-            Some((_, TagTone::Launch)) => {
-                paint_styled_text(color_mode, RGB_UI_TAG_LAUNCH, false, &tag_text)
+        let tag_styled = if !show_tag || tag_str.is_empty() {
+            String::new()
+        } else {
+            match tag {
+                Some((_, TagTone::Launch)) => {
+                    paint_styled_text(color_mode, RGB_UI_TAG_LAUNCH, false, &tag_str)
+                }
+                Some((_, TagTone::Guide)) => {
+                    paint_styled_text(color_mode, RGB_UI_TAG_GUIDE, false, &tag_str)
+                }
+                Some((_, TagTone::Local)) => {
+                    paint_styled_text(color_mode, RGB_UI_TAG_LOCAL, false, &tag_str)
+                }
+                None => String::new(),
             }
-            Some((_, TagTone::Guide)) => {
-                paint_styled_text(color_mode, RGB_UI_TAG_GUIDE, false, &tag_text)
-            }
-            Some((_, TagTone::Local)) => {
-                paint_styled_text(color_mode, RGB_UI_TAG_LOCAL, false, &tag_text)
-            }
-            None => String::new(),
         };
         let sub_styled = paint_styled_text(color_mode, RGB_UI_MUTED, false, &sub_str);
 
-        let mut row = format!("{left_pad}{prefix}{label_styled}");
-        if !tag_text.is_empty() {
+        let mut row = format!("{left_pad}{prefix}{label_styled}{label_pad}");
+        if show_tag {
             row.push_str("  ");
             row.push_str(&tag_styled);
+            row.push_str(&tag_pad);
         }
         if !sub_str.is_empty() {
             row.push_str("  ");
@@ -5366,7 +5365,10 @@ pub fn render_main_menu(
         )
     ));
     if let Some(herdr_id) = in_herdr_env.filter(|s| !s.trim().is_empty()) {
-        let note = format!("Herdr ({}) · templates launch & attach directly", herdr_id.trim());
+        let note = format!(
+            "Herdr ({}) · via herdr opens a new tab · in terminal runs here",
+            herdr_id.trim()
+        );
         lines.push(format!(
             "{left_pad}{}",
             paint_styled_text(
@@ -5384,12 +5386,26 @@ pub fn render_main_menu(
             RGB_HYPHAE_SAGE,
             false,
             &truncate_chars(
-                "Select a detected agent harness or run local CLI setup:",
+                "Who should guide setup? (configures your node & all detected agents)",
                 content_w
             )
         )
     ));
     lines.push(String::new());
+
+    // Compute aligned column widths across all menu items so columns stay crisp while scrolling.
+    let label_col_w = items
+        .iter()
+        .map(|i| i.label.chars().count())
+        .max()
+        .unwrap_or(14)
+        .clamp(12, 24);
+    let tag_col_w = items
+        .iter()
+        .map(|i| i.tag.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(14);
 
     // Reserve exact footer height (blank line + keybinding line) so total never overflows `term_rows`.
     let footer_lines = 2usize;
@@ -5415,6 +5431,8 @@ pub fn render_main_menu(
             &item.label,
             Some((item.tag, item.tag_tone())),
             &item.subtitle,
+            label_col_w,
+            tag_col_w,
             content_w,
             &left_pad,
             color_mode,
@@ -5551,6 +5569,13 @@ pub fn render_herdr_templates(
         ));
     }
 
+    let tmpl_label_w = templates
+        .iter()
+        .map(|t| t.display_title().chars().count())
+        .max()
+        .unwrap_or(14)
+        .clamp(12, 26);
+
     for idx in win.start..win.end {
         if let Some(tmpl) = templates.get(idx) {
             lines.push(format_menu_row(
@@ -5558,6 +5583,8 @@ pub fn render_herdr_templates(
                 tmpl.display_title(),
                 None,
                 &tmpl.display_subtitle(),
+                tmpl_label_w,
+                0,
                 content_w,
                 &left_pad,
                 color_mode,
@@ -5568,6 +5595,8 @@ pub fn render_herdr_templates(
                 "← Back",
                 None,
                 "Return to harness list",
+                tmpl_label_w,
+                0,
                 content_w,
                 &left_pad,
                 color_mode,
@@ -5745,12 +5774,19 @@ pub fn render_desktop_mcp_confirm(
         ("Apply MCP config & continue", "merge safely"),
         ("Skip config write (I'll edit manually)", "show snippet"),
     ];
+    let opt_label_w = options
+        .iter()
+        .map(|(l, _)| l.chars().count())
+        .max()
+        .unwrap_or(28);
     for (idx, (label, sub)) in options.iter().enumerate() {
         lines.push(format_menu_row(
             idx == selected_option,
             label,
             None,
             sub,
+            opt_label_w,
+            0,
             content_w,
             &left_pad,
             color_mode,
@@ -6000,12 +6036,19 @@ pub fn render_manual_guide(
     }
     actions.push(("[Enter / q] Done".to_string(), "exit wizard"));
 
+    let act_label_w = actions
+        .iter()
+        .map(|(l, _)| l.chars().count())
+        .max()
+        .unwrap_or(28);
     for (idx, (label, sub)) in actions.iter().enumerate() {
         lines.push(format_menu_row(
             idx == selected_action,
             label,
             None,
             sub,
+            act_label_w,
+            0,
             content_w,
             &left_pad,
             color_mode,
@@ -6895,19 +6938,30 @@ fn run_numbered_fallback_wizard(
         );
     }
 
+    let label_w = main_items
+        .iter()
+        .map(|i| i.label.chars().count())
+        .max()
+        .unwrap_or(14);
+    let tag_w = main_items
+        .iter()
+        .map(|i| i.tag.chars().count())
+        .max()
+        .unwrap_or(9);
+
     loop {
         println!();
-        println!("Choose how to set up Hyphae:");
+        println!("Who should guide setup? (configures your node & all detected agents)");
         for (idx, item) in main_items.iter().enumerate() {
             println!(
-                "  [{}] {} [{}] — {}",
+                "  {:>2}) {:label_w$}  {:tag_w$}  {}",
                 idx + 1,
                 item.label,
                 item.tag,
                 item.subtitle
             );
         }
-        println!("  [q] Quit");
+        println!("   q) Quit");
         println!();
 
         let reply = match read_tty_line("Selection [1]: ") {
@@ -7791,7 +7845,7 @@ mod tests {
                 "Cursor (IDE)",
                 "OpenClaw",
                 "T3 Code",
-                "Quick local setup here",
+                "Local CLI setup",
             ]
         );
         // Undetected harnesses (Codex CLI, Gemini, OpenCode, Antigravity) must NOT clutter the menu.
@@ -7839,7 +7893,7 @@ mod tests {
             },
         ];
 
-        // Inside Herdr (`Some("t1b")`): templates surfaced directly at the top with tag `"herdr"`.
+        // Inside Herdr (`Some("t1b")`): templates surfaced directly at the top with tag `"via herdr"`.
         let inside = build_main_menu_items_with_env(
             &[],
             &launchables,
@@ -7850,19 +7904,22 @@ mod tests {
             Some("t1b"),
         );
         assert_eq!(inside[0].label, "Claude (Gateway)");
-        assert_eq!(inside[0].tag, "herdr");
+        assert_eq!(inside[0].tag, "via herdr");
         assert!(matches!(
             inside[0].action,
             MainMenuAction::LaunchHerdrTemplate { ref template, .. } if template.name == "claude-gateway"
         ));
         assert_eq!(inside[1].label, "Codex (Gateway)");
-        assert_eq!(inside[1].tag, "herdr");
+        assert_eq!(inside[1].tag, "via herdr");
+        assert_eq!(inside[1].subtitle, "codex-gateway --no-daemon");
         assert!(matches!(
             inside[1].action,
             MainMenuAction::LaunchHerdrTemplate { ref template, .. } if template.name == "codex-gateway"
         ));
         assert_eq!(inside[2].label, "Claude Code");
+        assert_eq!(inside[2].tag, "in terminal");
         assert_eq!(inside[3].label, "Codex");
+        assert_eq!(inside[3].tag, "in terminal");
         assert!(inside.iter().all(|i| !matches!(i.action, MainMenuAction::HerdrTemplates { .. })));
 
         // Outside Herdr (`None`): templates stay cleanly grouped under single `"Herdr"` entry.
@@ -7909,21 +7966,21 @@ mod tests {
         ] {
             items.push(MainMenuItem {
                 label: lh.display_name().to_string(),
-                tag: "auto-launch",
+                tag: "in terminal",
                 subtitle: lh.binary_name().to_string(),
                 action: MainMenuAction::LaunchCli(lh),
             });
         }
         items.push(MainMenuItem {
             label: "Claude Desktop".to_string(),
-            tag: "install skill + guide",
-            subtitle: "Install skill + configure Claude Desktop MCP".to_string(),
+            tag: "desktop app",
+            subtitle: "open in Claude Desktop".to_string(),
             action: MainMenuAction::ManualGuide(ManualGuideHarness::ClaudeDesktop),
         });
         items.push(MainMenuItem {
-            label: "Quick local setup here".to_string(),
+            label: "Local CLI setup".to_string(),
             tag: "local cli",
-            subtitle: "Local node, keys, detected harnesses & background service".to_string(),
+            subtitle: "configure node, keys & harnesses here".to_string(),
             action: MainMenuAction::QuickLocalSetup,
         });
         assert_eq!(items.len(), 14);
@@ -8403,7 +8460,7 @@ mod tests {
             None,
         );
         assert_eq!(empty_menu.len(), 1);
-        assert_eq!(empty_menu[0].label, "Quick local setup here");
+        assert_eq!(empty_menu[0].label, "Local CLI setup");
 
         // Create fake macOS Claude.app, Codex.app, and Cursor.app under isolated temp apps_dir.
         std::fs::create_dir_all(apps.join("Claude.app")).unwrap();
@@ -8430,7 +8487,7 @@ mod tests {
                 "Claude Desktop",
                 "Codex Desktop",
                 "Cursor (IDE)",
-                "Quick local setup here",
+                "Local CLI setup",
             ]
         );
 
