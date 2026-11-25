@@ -4585,31 +4585,18 @@ fn resolve_wizard_cli_bin(explicit_bin: Option<&Path>) -> String {
 }
 
 fn resolve_t3_url_from_home(home: &Path, existing_node: Option<&ExistingNodeInfo>) -> Option<String> {
-    let t3_file = home.join(".t3").join("hyphae.json");
-    if let Ok(raw) = fs::read_to_string(&t3_file) {
+    let config_path = existing_node
+        .map(|node| node.config_path.clone())
+        .unwrap_or_else(|| home.join(".config").join("hyphae").join("node.json"));
+    if let Ok(raw) = fs::read_to_string(&config_path) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
             if let Some(url) = val
-                .get("hyphae")
-                .and_then(|h| h.get("url"))
+                .get("t3")
+                .and_then(|t| t.get("url"))
                 .and_then(serde_json::Value::as_str)
             {
                 if let Some(clean) = sanitize_http_url(Some(url)) {
                     return Some(clean);
-                }
-            }
-        }
-    }
-    if let Some(node) = existing_node {
-        if let Ok(raw) = fs::read_to_string(&node.config_path) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
-                if let Some(url) = val
-                    .get("t3")
-                    .and_then(|t| t.get("url"))
-                    .and_then(serde_json::Value::as_str)
-                {
-                    if let Some(clean) = sanitize_http_url(Some(url)) {
-                        return Some(clean);
-                    }
                 }
             }
         }
@@ -6658,7 +6645,10 @@ impl SetupToggleState {
                     }
                 }
                 HarnessKind::Herdr => {
-                    preview.push("herdr: ~/.config/herdr/hyphae.json".to_string());
+                    preview.push(
+                        "herdr: auto-detected via HC_TERMINAL_ID (no config file needed)"
+                            .to_string(),
+                    );
                     if sel.install_skills {
                         preview.push(
                             "  + skill: ~/.config/herdr/skills/hyphae/SKILL.md".to_string(),
@@ -6672,9 +6662,12 @@ impl SetupToggleState {
                     }
                 }
                 HarnessKind::T3 => {
-                    preview.push("t3: ~/.t3/hyphae.json".to_string());
+                    preview.push("t3: ~/.config/hyphae/node.json (\"t3\" block)".to_string());
                     if sel.install_skills {
-                        preview.push("  + skill: ~/.agents/skills/hyphae/SKILL.md".to_string());
+                        preview.push(
+                            "  + skill: ~/.t3/skills/hyphae/SKILL.md (+ ~/.agents/skills/hyphae/SKILL.md)"
+                                .to_string(),
+                        );
                     }
                 }
             }
@@ -10346,5 +10339,58 @@ mod tests {
             apply_setup_toggle_text_input(&mut state, "", true).unwrap(),
             SetupToggleAction::Apply(_)
         ));
+    }
+
+    #[test]
+    fn x9_wizard_ignores_dead_t3_hyphae_json_and_omits_dead_preview_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+
+        // Plant a dead/stale `~/.t3/hyphae.json` AND a real `node.json` `"t3"` block.
+        fs::create_dir_all(home.join(".t3")).unwrap();
+        fs::write(
+            home.join(".t3").join("hyphae.json"),
+            r#"{"hyphae":{"url":"http://127.0.0.1:9999"}}"#,
+        )
+        .unwrap();
+        let node_cfg_path = home.join(".config").join("hyphae").join("node.json");
+        fs::create_dir_all(node_cfg_path.parent().unwrap()).unwrap();
+        fs::write(
+            &node_cfg_path,
+            r#"{"v":2,"nodeId":"alice@mac","t3":{"url":"http://127.0.0.1:3773"}}"#,
+        )
+        .unwrap();
+
+        // Must resolve from `node.json` `"t3"` block, NEVER the removed `~/.t3/hyphae.json`!
+        assert_eq!(
+            resolve_t3_url_from_home(home, None).as_deref(),
+            Some("http://127.0.0.1:3773")
+        );
+
+        // Even when `node.json` is absent, dead `~/.t3/hyphae.json` must NOT be used.
+        fs::remove_file(&node_cfg_path).unwrap();
+        assert_eq!(resolve_t3_url_from_home(home, None), None);
+
+        // Dry-run preview for Herdr and T3 must NEVER list dead `~/.config/herdr/hyphae.json`
+        // or `~/.t3/hyphae.json`.
+        let state = SetupToggleState::from_detection(&[HarnessKind::Herdr, HarnessKind::T3], true);
+        let lines = state.build_dry_run_preview(home, false);
+        let joined = lines.join("\n");
+        assert!(
+            !joined.contains(".config/herdr/hyphae.json"),
+            "Herdr preview must not reference dead ~/.config/herdr/hyphae.json:\n{joined}"
+        );
+        assert!(
+            !joined.contains(".t3/hyphae.json"),
+            "T3 preview must not reference dead ~/.t3/hyphae.json:\n{joined}"
+        );
+        assert!(
+            joined.contains("HC_TERMINAL_ID"),
+            "Herdr preview should note HC_TERMINAL_ID auto-detection:\n{joined}"
+        );
+        assert!(
+            joined.contains("node.json"),
+            "T3 preview should reference node.json t3 block:\n{joined}"
+        );
     }
 }

@@ -10,6 +10,16 @@ on:
         required: false
         default: false
         description: "Force nightly build and release update even if main has no new commits since the last nightly release"
+      dry_run:
+        type: boolean
+        required: false
+        default: false
+        description: "Build and package nightly artifacts without moving the rolling nightly tag or updating the GitHub Release"
+      allow_unsigned_dry_run:
+        type: boolean
+        required: false
+        default: false
+        description: "Allow unsigned release-manifest.json on workflow_dispatch dry_run only (ignored for scheduled or published nightly runs)"
 
 permissions:
   contents: read
@@ -28,6 +38,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       should_build: ${{ steps.meta.outputs.should_build }}
+      dry_run: ${{ steps.meta.outputs.dry_run }}
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
       git_sha: ${{ steps.meta.outputs.git_sha }}
@@ -46,13 +57,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
           FORCE_BUILD: ${{ inputs.force == true }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run == true }}
         run: |
           set -euo pipefail
           HEAD_SHA="$(git rev-parse HEAD)"
           SHORT_SHA="$(git rev-parse --short=7 HEAD)"
           DATE_STAMP="$(date -u +%Y%m%d)"
           PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$INPUT_DRY_RUN" = "true" ]; then
+            DRY_RUN="true"
+          else
+            DRY_RUN="false"
+          fi
 
           RAW_VER="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
           RAW_VER="${RAW_VER:-0.2.0}"
@@ -84,16 +102,17 @@ jobs:
           fi
 
           SHOULD_BUILD="true"
-          if [ -n "$LAST_SHA" ] && [ "$LAST_SHA" = "$HEAD_SHA" ] && [ "$FORCE_BUILD" != "true" ]; then
+          if [ -n "$LAST_SHA" ] && [ "$LAST_SHA" = "$HEAD_SHA" ] && [ "$FORCE_BUILD" != "true" ] && [ "$DRY_RUN" != "true" ]; then
             SHOULD_BUILD="false"
             echo "No new commits on main since last nightly release (${HEAD_SHA}); skipping nightly build."
           else
-            echo "Building nightly release ${NIGHTLY_VER} for commit ${HEAD_SHA} (previous nightly: ${LAST_SHA:-none})."
+            echo "Building nightly release ${NIGHTLY_VER} for commit ${HEAD_SHA} (previous nightly: ${LAST_SHA:-none}, dry_run=${DRY_RUN})."
           fi
 
           SUMMARY="$(git log -1 --pretty=%s | tr '\r\n' ' ' | cut -c1-160)"
 
           echo "should_build=${SHOULD_BUILD}" >> "$GITHUB_OUTPUT"
+          echo "dry_run=${DRY_RUN}" >> "$GITHUB_OUTPUT"
           echo "tag=nightly" >> "$GITHUB_OUTPUT"
           echo "version=${NIGHTLY_VER}" >> "$GITHUB_OUTPUT"
           echo "git_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
@@ -287,6 +306,9 @@ jobs:
           PUBLISHED_AT: ${{ needs.prepare.outputs.published_at }}
           CHANGELOG_SUMMARY: ${{ needs.prepare.outputs.changelog_summary }}
           REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          DRY_RUN: ${{ needs.prepare.outputs.dry_run }}
+          ALLOW_UNSIGNED_DRY_RUN: ${{ inputs.allow_unsigned_dry_run || false }}
           HYPHAE_RELEASE_SIGNING_KEY: ${{ secrets.HYPHAE_RELEASE_SIGNING_KEY }}
         run: |
           set -euo pipefail
@@ -320,6 +342,9 @@ jobs:
 
           const tag = process.env.TAG;
           const repo = process.env.REPO;
+          const isWorkflowDispatch = process.env.EVENT_NAME === "workflow_dispatch";
+          const isDryRun = process.env.DRY_RUN === "true";
+          const allowUnsignedDryRun = process.env.ALLOW_UNSIGNED_DRY_RUN === "true";
           const targets = [
             ["aarch64-apple-darwin", "tar.gz"],
             ["aarch64-unknown-linux-gnu", "tar.gz"],
@@ -380,15 +405,76 @@ jobs:
             ]);
             sig = crypto.sign(null, signingInput, keyObj).toString("base64url");
             console.log("Signed release-manifest.json with HYPHAE_RELEASE_SIGNING_KEY.");
+          } else if (isWorkflowDispatch && isDryRun && allowUnsignedDryRun) {
+            console.warn(
+              "WARNING: HYPHAE_RELEASE_SIGNING_KEY not configured; writing unsigned manifest envelope for explicitly opted-in workflow_dispatch dry-run."
+            );
           } else {
-            console.log("HYPHAE_RELEASE_SIGNING_KEY secret not configured; writing unsigned manifest envelope.");
+            console.error(
+              "ERROR: HYPHAE_RELEASE_SIGNING_KEY secret is required (fail-closed); refusing to publish an unsigned nightly release-manifest.json."
+            );
+            process.exit(1);
           }
 
           const envelope = { payload: canonicalPayload, sig };
           fs.writeFileSync("release-manifest.json", JSON.stringify(envelope, null, 2) + "\n", "utf8");
           EOF
 
+      - name: Verify release-manifest.json signature against pinned public key
+        if: github.event_name != 'workflow_dispatch' || !(needs.prepare.outputs.dry_run == 'true' && inputs.allow_unsigned_dry_run == true)
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'EOF'
+          const crypto = require("node:crypto");
+          const fs = require("node:fs");
+
+          const updateRs = fs.readFileSync("crates/hyp-cli/src/update.rs", "utf8");
+          const match = updateRs.match(/pub const DEFAULT_RELEASE_PUBKEY_B64:\s*&str\s*=\s*"([A-Za-z0-9_-]{43})";/);
+          if (!match) {
+            console.error("ERROR: Could not extract DEFAULT_RELEASE_PUBKEY_B64 from crates/hyp-cli/src/update.rs");
+            process.exit(1);
+          }
+          const rawPub = Buffer.from(match[1], "base64url");
+          if (rawPub.length !== 32) {
+            console.error(`ERROR: Expected 32-byte Ed25519 public key, got ${rawPub.length}`);
+            process.exit(1);
+          }
+          const spkiPrefix = Buffer.from("302a300506032b6570032100", "hex");
+          const pubKeyObj = crypto.createPublicKey({
+            key: Buffer.concat([spkiPrefix, rawPub]),
+            format: "der",
+            type: "spki",
+          });
+
+          const envelope = JSON.parse(fs.readFileSync("dist/release-manifest.json", "utf8"));
+          if (!envelope || typeof envelope.payload !== "string" || typeof envelope.sig !== "string" || !envelope.sig.trim()) {
+            console.error("ERROR: dist/release-manifest.json is missing payload or signature");
+            process.exit(1);
+          }
+          const signingInput = Buffer.concat([
+            Buffer.from("hyphae/v2/release\n", "utf8"),
+            Buffer.from(envelope.payload, "utf8"),
+          ]);
+          const ok = crypto.verify(null, signingInput, pubKeyObj, Buffer.from(envelope.sig, "base64url"));
+          if (!ok) {
+            console.error("ERROR: release-manifest.json signature failed verification against DEFAULT_RELEASE_PUBKEY_B64 in crates/hyp-cli/src/update.rs");
+            process.exit(1);
+          }
+          console.log("Verified dist/release-manifest.json signature against pinned DEFAULT_RELEASE_PUBKEY_B64.");
+          EOF
+
+      - name: Upload dry-run nightly bundle (workflow_dispatch)
+        if: needs.prepare.outputs.dry_run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hyphae-rust-nightly-${{ needs.prepare.outputs.version }}
+          path: dist/*
+          retention-days: 7
+          if-no-files-found: error
+
       - name: Move rolling nightly tag to built commit
+        if: needs.prepare.outputs.dry_run != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -407,6 +493,7 @@ jobs:
           fi
 
       - name: Compose nightly release notes
+        if: needs.prepare.outputs.dry_run != 'true'
         shell: bash
         env:
           GIT_SHA: ${{ needs.prepare.outputs.git_sha }}
@@ -426,6 +513,7 @@ jobs:
           } > dist/nightly-release-notes.md
 
       - name: Update rolling nightly GitHub Release
+        if: needs.prepare.outputs.dry_run != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: nightly

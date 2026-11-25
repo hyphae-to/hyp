@@ -36,6 +36,7 @@ import {
   createCapability,
   verifyCapability,
   verifyHyphaeEd25519Request,
+  normalizeRateLimitIp,
   createWorkerApp,
 } from "../src/index.mjs";
 
@@ -1978,6 +1979,161 @@ test("H3: isolate fallback (no RATE_LIMITER binding) enforces per-IP key-rotatio
   });
   assert.equal(denyResp.status, 403);
   allowlistHarness.dropSlotNs.evictAll();
+});
+
+test("H3: normalizeRateLimitIp buckets IPv6 by /64 prefix, normalizes IPv4-mapped IPv6 to IPv4, and preserves canonical IPv4", () => {
+  // Exact IPv4 preserved
+  assert.equal(normalizeRateLimitIp("1.2.3.4"), "1.2.3.4");
+  assert.equal(normalizeRateLimitIp("  198.51.100.42  "), "198.51.100.42");
+
+  // IPv4-mapped IPv6 normalized to canonical IPv4 (dotted-quad & hex forms)
+  assert.equal(normalizeRateLimitIp("::ffff:1.2.3.4"), "1.2.3.4");
+  assert.equal(normalizeRateLimitIp("::FFFF:198.51.100.42"), "198.51.100.42");
+  assert.equal(normalizeRateLimitIp("0:0:0:0:0:ffff:1.2.3.4"), "1.2.3.4");
+  assert.equal(normalizeRateLimitIp("::ffff:0102:0304"), "1.2.3.4");
+  assert.equal(normalizeRateLimitIp("[::ffff:1.2.3.4]"), "1.2.3.4");
+
+  // Standard IPv6 -> canonical zero-padded 4-group /64 prefix
+  assert.equal(
+    normalizeRateLimitIp("2001:db8:abcd:0012:1111:2222:3333:4444"),
+    "2001:0db8:abcd:0012::/64"
+  );
+  assert.equal(
+    normalizeRateLimitIp("2001:DB8:ABCD:12::1"),
+    "2001:0db8:abcd:0012::/64"
+  );
+  assert.equal(
+    normalizeRateLimitIp("2001:db8:abcd:12:ffff:eeee:dddd:cccc"),
+    "2001:0db8:abcd:0012::/64"
+  );
+  assert.equal(normalizeRateLimitIp("2001:db8::1"), "2001:0db8:0000:0000::/64");
+  assert.equal(normalizeRateLimitIp("::1"), "0000:0000:0000:0000::/64");
+  assert.equal(normalizeRateLimitIp("fe80::1%eth0"), "fe80:0000:0000:0000::/64");
+
+  // Distinct /64 subnets remain distinct
+  assert.notEqual(
+    normalizeRateLimitIp("2001:db8:abcd:0012::1"),
+    normalizeRateLimitIp("2001:db8:abcd:0013::1")
+  );
+
+  // Empty/non-string fallback safely
+  assert.equal(normalizeRateLimitIp(""), "unknown");
+  assert.equal(normalizeRateLimitIp(null), "unknown");
+  assert.equal(normalizeRateLimitIp(undefined), "unknown");
+});
+
+test("H3: IPv6 /64 prefix bucketing shares 5/min burst across host addresses in same /64 and isolates different /64 subnets", async () => {
+  const harness = createTestHarness({
+    DROP_AUTH_MODE: "open",
+    CREATES_PER_HOUR_PER_NODE: "20",
+    CREATES_PER_HOUR_PER_IP: "20",
+    CREATES_PER_MINUTE_PER_IP: "5",
+  });
+
+  // 5 creates from 5 DISTINCT host addresses inside `2001:db8:abcd:0012::/64` succeed (hitting the 5/min limit).
+  const sameSubnetIps = [
+    "2001:db8:abcd:0012:1111:2222:3333:4444",
+    "2001:db8:abcd:12::1",
+    "2001:DB8:ABCD:12:aaaa:bbbb:cccc:dddd",
+    "2001:0db8:abcd:0012::beef",
+    "2001:db8:abcd:12:0:0:0:9999",
+  ];
+  for (let i = 0; i < sameSubnetIps.length; i += 1) {
+    const id = await generateEd25519Identity(`v6-same-${i}@attacker`);
+    const resp = await harness.fetch("/v1/drops", {
+      method: "POST",
+      headers: {
+        ...(await id.signHeaders({
+          method: "POST",
+          pathAndQuery: "/v1/drops",
+          ts: harness.now(),
+          includePublicKeyHeader: true,
+        })),
+        "CF-Connecting-IP": sameSubnetIps[i],
+      },
+    });
+    assert.equal(resp.status, 201, `same-/64 create #${i + 1} should succeed`);
+  }
+
+  // 6th host address in the EXACT same `/64` MUST hit the shared 5/min burst limit -> 429!
+  const id6 = await generateEd25519Identity("v6-same-6@attacker");
+  const blockedSame64 = await harness.fetch("/v1/drops", {
+    method: "POST",
+    headers: {
+      ...(await id6.signHeaders({
+        method: "POST",
+        pathAndQuery: "/v1/drops",
+        ts: harness.now(),
+        includePublicKeyHeader: true,
+      })),
+      "CF-Connecting-IP": "2001:db8:abcd:12:dead:beef:cafe:0006",
+    },
+  });
+  assert.equal(
+    blockedSame64.status,
+    429,
+    "6th distinct IPv6 host in same /64 must share the 5/min RateLimiterDO bucket"
+  );
+  assert.match((await blockedSame64.json()).detail, /per-IP burst/);
+
+  // A different `/64` subnet (`2001:db8:abcd:0013::/64`) MUST be completely isolated -> 201!
+  const otherNet = await generateEd25519Identity("v6-other@user");
+  const allowedOther64 = await harness.fetch("/v1/drops", {
+    method: "POST",
+    headers: {
+      ...(await otherNet.signHeaders({
+        method: "POST",
+        pathAndQuery: "/v1/drops",
+        ts: harness.now(),
+        includePublicKeyHeader: true,
+      })),
+      "CF-Connecting-IP": "2001:db8:abcd:0013::1",
+    },
+  });
+  assert.equal(
+    allowedOther64.status,
+    201,
+    "different IPv6 /64 subnet must have its own isolated rate-limit bucket"
+  );
+
+  // IPv4 and IPv4-mapped IPv6 (`::ffff:198.51.100.99`) share the exact same bucket!
+  for (let i = 0; i < 5; i += 1) {
+    const id = await generateEd25519Identity(`v4-mapped-${i}@user`);
+    const ip = i % 2 === 0 ? "198.51.100.99" : "::ffff:198.51.100.99";
+    const r = await harness.fetch("/v1/drops", {
+      method: "POST",
+      headers: {
+        ...(await id.signHeaders({
+          method: "POST",
+          pathAndQuery: "/v1/drops",
+          ts: harness.now(),
+          includePublicKeyHeader: true,
+        })),
+        "CF-Connecting-IP": ip,
+      },
+    });
+    assert.equal(r.status, 201);
+  }
+  const v4Sixth = await generateEd25519Identity("v4-mapped-6@user");
+  const blockedMapped = await harness.fetch("/v1/drops", {
+    method: "POST",
+    headers: {
+      ...(await v4Sixth.signHeaders({
+        method: "POST",
+        pathAndQuery: "/v1/drops",
+        ts: harness.now(),
+        includePublicKeyHeader: true,
+      })),
+      "CF-Connecting-IP": "::ffff:198.51.100.99",
+    },
+  });
+  assert.equal(
+    blockedMapped.status,
+    429,
+    "IPv4 and ::ffff:IPv4 must share the exact same rate-limit bucket"
+  );
+
+  harness.dropSlotNs.evictAll();
 });
 
 test("static invariants: src/index.mjs never calls console.* and implements alarm-driven storage.deleteAll()", () => {

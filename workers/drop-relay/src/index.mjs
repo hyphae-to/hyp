@@ -1696,16 +1696,142 @@ function safeDecodeSegment(raw) {
 }
 
 /**
- * Extracts normalized client IP for volatile in-RAM sliding-window rate limiting only.
+ * Parses a canonical decimal IPv4 address (`a.b.c.d`, each octet 0..=255).
+ * @param {string} raw
+ * @returns {[number, number, number, number] | null}
+ */
+function parseIpv4Octets(raw) {
+  const parts = raw.split(".");
+  if (parts.length !== 4) return null;
+  /** @type {[number, number, number, number]} */
+  const octets = [0, 0, 0, 0];
+  for (let i = 0; i < 4; i += 1) {
+    const p = parts[i];
+    if (!/^\d{1,3}$/.test(p)) return null;
+    if (p.length > 1 && p.startsWith("0")) return null;
+    const n = Number(p);
+    if (!Number.isInteger(n) || n < 0 || n > 255) return null;
+    octets[i] = n;
+  }
+  return octets;
+}
+
+/**
+ * Expands a valid IPv6 literal (including `::` compression and embedded IPv4 tails such as
+ * `::ffff:1.2.3.4`) into eight 16-bit integer groups.
+ * @param {string} raw
+ * @returns {number[] | null}
+ */
+function expandIpv6Groups(raw) {
+  let addr = raw.toLowerCase();
+  if (!addr.includes(":")) return null;
+
+  // Strip optional zone ID (e.g. `fe80::1%eth0`).
+  const zoneIdx = addr.indexOf("%");
+  if (zoneIdx !== -1) {
+    addr = addr.slice(0, zoneIdx);
+  }
+
+  // Handle embedded dotted-quad IPv4 tail (e.g. `::ffff:192.0.2.128` or `2001:db8::192.0.2.1`).
+  const lastColon = addr.lastIndexOf(":");
+  const tail = addr.slice(lastColon + 1);
+  if (tail.includes(".")) {
+    const octets = parseIpv4Octets(tail);
+    if (!octets) return null;
+    const hi = ((octets[0] << 8) | octets[1]).toString(16);
+    const lo = ((octets[2] << 8) | octets[3]).toString(16);
+    addr = `${addr.slice(0, lastColon + 1)}${hi}:${lo}`;
+  }
+
+  const dblParts = addr.split("::");
+  if (dblParts.length > 2) return null;
+
+  /** @type {string[]} */
+  let groupStrs;
+  if (dblParts.length === 2) {
+    const left = dblParts[0] === "" ? [] : dblParts[0].split(":");
+    const right = dblParts[1] === "" ? [] : dblParts[1].split(":");
+    const missing = 8 - (left.length + right.length);
+    if (missing < 1) return null;
+    groupStrs = [...left, ...new Array(missing).fill("0"), ...right];
+  } else {
+    groupStrs = addr.split(":");
+    if (groupStrs.length !== 8) return null;
+  }
+
+  const groups = new Array(8);
+  for (let i = 0; i < 8; i += 1) {
+    const g = groupStrs[i];
+    if (!/^[0-9a-f]{1,4}$/.test(g)) return null;
+    groups[i] = parseInt(g, 16);
+  }
+  return groups;
+}
+
+/**
+ * Normalizes a client IP address into a canonical rate-limit bucket key (`H3`):
+ * - IPv4 -> exact canonical IPv4 (`1.2.3.4`).
+ * - IPv4-mapped IPv6 (`::ffff:1.2.3.4` or `::ffff:0102:0304`) -> canonical IPv4 (`1.2.3.4`).
+ * - Standard IPv6 -> expanded `/64` prefix (`2001:0db8:abcd:0012::/64`) so rotating host
+ *   interface IDs inside an ISP `/64` allocation share the exact same rate-limit bucket.
+ *
+ * Pure function; never logs or persists IP addresses.
+ * @param {string | null | undefined} ip
+ * @returns {string}
+ */
+export function normalizeRateLimitIp(ip) {
+  if (typeof ip !== "string") return "unknown";
+  let trimmed = ip.trim();
+  if (!trimmed) return "unknown";
+  if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+    trimmed = trimmed.slice(1, -1).trim();
+  }
+  if (!trimmed) return "unknown";
+
+  const ipv4 = parseIpv4Octets(trimmed);
+  if (ipv4) {
+    return `${ipv4[0]}.${ipv4[1]}.${ipv4[2]}.${ipv4[3]}`;
+  }
+
+  const groups = expandIpv6Groups(trimmed);
+  if (groups) {
+    // IPv4-mapped IPv6 (`::ffff:0:0/96`) -> normalize to canonical IPv4.
+    if (
+      groups[0] === 0 &&
+      groups[1] === 0 &&
+      groups[2] === 0 &&
+      groups[3] === 0 &&
+      groups[4] === 0 &&
+      groups[5] === 0xffff
+    ) {
+      const a = (groups[6] >> 8) & 0xff;
+      const b = groups[6] & 0xff;
+      const c = (groups[7] >> 8) & 0xff;
+      const d = groups[7] & 0xff;
+      return `${a}.${b}.${c}.${d}`;
+    }
+
+    const prefix = groups
+      .slice(0, 4)
+      .map((g) => g.toString(16).padStart(4, "0"))
+      .join(":");
+    return `${prefix}::/64`;
+  }
+
+  return trimmed.toLowerCase();
+}
+
+/**
+ * Extracts normalized client IP for rate limiting only (IPv4 exact, IPv6 `/64` bucketed).
  * Never logged or persisted.
  * @param {Request} request
  * @returns {string}
  */
 function extractClientIp(request) {
   const cfIp = request.headers.get("CF-Connecting-IP");
-  if (cfIp && cfIp.trim()) return cfIp.trim();
+  if (cfIp && cfIp.trim()) return normalizeRateLimitIp(cfIp);
   const realIp = request.headers.get("X-Real-IP");
-  if (realIp && realIp.trim()) return realIp.trim();
+  if (realIp && realIp.trim()) return normalizeRateLimitIp(realIp);
   return "unknown";
 }
 

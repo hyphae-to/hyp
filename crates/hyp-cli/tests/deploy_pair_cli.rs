@@ -292,8 +292,16 @@ fn deploy_init_all_six_providers_overwrite_guard_and_config_check() {
             assert!(dockerfile.contains("https://github.com/hyphae-to/hyp/releases/download/${HYP_VERSION}"));
             assert!(dockerfile.contains("SHA256SUMS.txt"));
             assert!(dockerfile.contains("sha256sum -c --ignore-missing"));
-            assert!(dockerfile.contains("USER 10001:10001"));
-            assert!(dockerfile.contains("ENTRYPOINT [\"/usr/local/bin/hyp\"]"));
+            if provider == "fly" {
+                assert!(dockerfile.contains("/usr/local/bin/hyphae-entrypoint.sh"));
+                assert!(dockerfile.contains("chown -R 10001:10001"));
+                assert!(dockerfile.contains("setpriv --reuid=10001 --regid=10001 --init-groups"));
+                assert!(dockerfile.contains("ENTRYPOINT [\"/usr/local/bin/hyphae-entrypoint.sh\"]"));
+                assert!(!dockerfile.contains("USER 10001:10001"));
+            } else {
+                assert!(dockerfile.contains("USER 10001:10001"));
+                assert!(dockerfile.contains("ENTRYPOINT [\"/usr/local/bin/hyp\"]"));
+            }
             assert!(
                 !dockerfile.contains("COPY Cargo.toml") && !dockerfile.contains("COPY crates"),
                 "Dockerfile for {provider} must work standalone without repo source tree"
