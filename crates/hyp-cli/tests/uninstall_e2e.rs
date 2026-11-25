@@ -1471,4 +1471,69 @@ fast_mode = true
             "hermetic guard must protect external CLAUDE_CONFIG_DIR commands outside isolated HOME"
         );
     }
+
+    #[test]
+    fn uninstall_preserves_t3_mesh_launch_agent_while_removing_hyphae_plists() {
+        let root = repo_root();
+        let script = root.join("scripts/uninstall.sh");
+        let script_src = fs::read_to_string(&script).expect("read scripts/uninstall.sh");
+        assert!(
+            !script_src.contains("t3-mesh"),
+            "scripts/uninstall.sh must NOT contain t3-mesh LaunchAgent globs (D13)"
+        );
+
+        let tmp = TempDir::new().expect("temp home");
+        let h = tmp.path();
+
+        let launch_agents = h.join("Library/LaunchAgents");
+        let t3_plist = launch_agents.join("com.t3.t3-mesh.plist");
+        let hyphae_plist = launch_agents.join("to.hyphae.daemon.plist");
+        let legacy_hyphae_plist = launch_agents.join("com.hyphae.legacy.plist");
+        let t3_content = "<?xml version=\"1.0\"?><plist><dict><key>Label</key><string>com.t3.t3-mesh</string></dict></plist>\n";
+
+        write_file(&t3_plist, t3_content);
+        write_file(&hyphae_plist, "<plist><dict><key>Label</key><string>to.hyphae.daemon</string></dict></plist>\n");
+        write_file(&legacy_hyphae_plist, "<plist><dict><key>Label</key><string>com.hyphae.legacy</string></dict></plist>\n");
+
+        // Dry-run must NEVER list com.t3.t3-mesh.plist!
+        let dry = run_script(&script, h, &["--dry-run"]);
+        let dry_stdout = String::from_utf8_lossy(&dry.stdout);
+        assert_eq!(
+            dry.status.code(),
+            Some(0),
+            "dry-run failed: stdout={dry_stdout}\nstderr={}",
+            String::from_utf8_lossy(&dry.stderr)
+        );
+        assert!(
+            !dry_stdout.contains("t3-mesh"),
+            "dry-run plan must never target com.t3.t3-mesh.plist:\n{dry_stdout}"
+        );
+        if cfg!(target_os = "macos") {
+            assert!(dry_stdout.contains("to.hyphae.daemon.plist"));
+            assert!(dry_stdout.contains("com.hyphae.legacy.plist"));
+        }
+
+        // Full uninstall removes Hyphae plists while leaving com.t3.t3-mesh.plist untouched byte-for-byte!
+        let out = run_script(&script, h, &["--yes"]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "uninstall failed: stdout={}\nstderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        assert!(
+            t3_plist.is_file(),
+            "com.t3.t3-mesh.plist MUST remain untouched after Hyphae uninstall"
+        );
+        assert_eq!(
+            fs::read_to_string(&t3_plist).expect("read t3-mesh plist"),
+            t3_content
+        );
+        if cfg!(target_os = "macos") {
+            assert!(!hyphae_plist.exists(), "to.hyphae.daemon.plist must be removed");
+            assert!(!legacy_hyphae_plist.exists(), "com.hyphae.legacy.plist must be removed");
+        }
+    }
 }

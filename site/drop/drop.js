@@ -475,8 +475,18 @@ function formatDirectiveStats(text) {
 // App Entry Point
 // ============================================================================
 
+export function isEmbeddedInFrame(win = typeof window !== "undefined" ? window : null) {
+  if (!win) return false;
+  try {
+    return win.top !== win.self;
+  } catch {
+    // Cross-origin frame access throws SecurityError — fail closed.
+    return true;
+  }
+}
+
 function initBrowserApp() {
-  // 1. Immediately capture and scrub URL #fragment before any other work!
+  // 0. Immediately capture and scrub URL #fragment before any other work!
   const rawHash = window.location.hash;
   if (rawHash) {
     try {
@@ -484,6 +494,42 @@ function initBrowserApp() {
     } catch {
       // Ignore in restricted history contexts.
     }
+  }
+
+  // 1. Fail-closed frame-busting defense against clickjacking:
+  //    `<meta http-equiv="Content-Security-Policy">` cannot enforce `frame-ancestors 'none'`.
+  if (isEmbeddedInFrame(window)) {
+    for (const id of ["viewLanding", "viewDrop", "viewEnroll"]) {
+      const el = $(id);
+      if (el) {
+        el.classList.add("hidden");
+        el.remove();
+      }
+    }
+    const errView = $("viewError");
+    if (errView) {
+      const titleEl = errView.querySelector(".hero-title");
+      if (titleEl) titleEl.textContent = "Embedded Frame Blocked";
+      const strongEl = errView.querySelector(".banner strong");
+      if (strongEl) strongEl.textContent = "Clickjacking Protection";
+      const msgEl = $("errorMessage");
+      if (msgEl) {
+        msgEl.textContent =
+          "For your security, Hyphae Verified Drops cannot be opened inside an embedded frame or iframe. Open this link directly in a top-level browser tab.";
+      }
+      errView.classList.remove("hidden");
+    } else if (document.body) {
+      document.body.textContent =
+        "Security error: Hyphae Verified Drops cannot run inside an embedded frame.";
+    }
+    try {
+      if (window.top && window.top.location) {
+        window.top.location.href = window.location.href;
+      }
+    } catch {
+      // Cross-origin parent frame — stay halted with interactive UI removed.
+    }
+    return;
   }
 
   let parsed;

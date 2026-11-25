@@ -515,6 +515,22 @@ async fn fetch_latest_uninstall_script(
     ))
 }
 
+/// Returns the manual PowerShell uninstall guidance for Windows, matching `scripts/install.ps1`
+/// (`%LOCALAPPDATA%\Programs\hyphae\bin\hyp.exe`) and `hyp service uninstall` (`HyphaeDaemon`).
+#[cfg_attr(unix, allow(dead_code))]
+pub fn windows_uninstall_guidance() -> &'static str {
+    concat!(
+        "Hyphae Windows uninstall steps (PowerShell):\n",
+        "  1. Uninstall service task:  hyp service uninstall  # or: schtasks /Delete /TN HyphaeDaemon /F\n",
+        "  2. Stop running daemons:    Get-Process hyp -ErrorAction SilentlyContinue | Stop-Process\n",
+        "  3. Restore statusLines:     hyp setup --harness claude,antigravity --restore-statusline\n",
+        "  4. Remove Hyphae state:     Remove-Item -Recurse -Force \"$env:USERPROFILE\\.config\\hyphae\", \"$env:LOCALAPPDATA\\hyphae\" -ErrorAction SilentlyContinue\n",
+        "  5. Remove harness skills:   Remove-Item -Recurse -Force \"$env:USERPROFILE\\.claude\\skills\\hyphae*\", \"$env:USERPROFILE\\.codex\\skills\\hyphae*\" -ErrorAction SilentlyContinue\n",
+        "  6. Remove hyp binary:       Remove-Item -Force \"$env:LOCALAPPDATA\\Programs\\hyphae\\bin\\hyp.exe\", \"$env:USERPROFILE\\.local\\bin\\hyp.exe\" -ErrorAction SilentlyContinue\n",
+        "  7. Clean User PATH:         Remove \"%LOCALAPPDATA%\\Programs\\hyphae\\bin\" from your User PATH (System Properties -> Environment Variables -> User variables -> Path)"
+    )
+}
+
 #[cfg(not(unix))]
 fn run_uninstall_windows(args: UninstallArgs) -> ExitCode {
     let _ = (
@@ -527,22 +543,7 @@ fn run_uninstall_windows(args: UninstallArgs) -> ExitCode {
         args.keep_harnesses,
         &args.home,
     );
-    println!("Hyphae Windows uninstall steps (PowerShell):");
-    println!(
-        "  1. Stop running daemons:    Get-Process hyp -ErrorAction SilentlyContinue | Stop-Process"
-    );
-    println!(
-        "  2. Restore statusLines:     hyp setup --harness claude,antigravity --restore-statusline"
-    );
-    println!(
-        "  3. Remove Hyphae state:     Remove-Item -Recurse -Force \"$env:USERPROFILE\\.config\\hyphae\", \"$env:LOCALAPPDATA\\hyphae\" -ErrorAction SilentlyContinue"
-    );
-    println!(
-        "  4. Remove harness skills:   Remove-Item -Recurse -Force \"$env:USERPROFILE\\.claude\\skills\\hyphae*\", \"$env:USERPROFILE\\.codex\\skills\\hyphae*\" -ErrorAction SilentlyContinue"
-    );
-    println!(
-        "  5. Remove hyp binary:       Remove-Item -Force \"$env:LOCALAPPDATA\\Programs\\hyphae\\hyp.exe\", \"$env:USERPROFILE\\.local\\bin\\hyp.exe\" -ErrorAction SilentlyContinue"
-    );
+    println!("{}", windows_uninstall_guidance());
     if args.dry_run {
         ExitCode::from(EXIT_OK)
     } else {
@@ -590,6 +591,27 @@ mod tests {
         assert!(validated.contains("--keep-state"));
         assert!(validated.contains("--keep-keychain"));
         assert!(validated.contains("--keep-harnesses"));
+        assert!(
+            !validated.contains("t3-mesh"),
+            "uninstall.sh must never target T3's t3-mesh LaunchAgent"
+        );
+    }
+
+    #[test]
+    fn windows_uninstall_guidance_matches_install_ps1_and_service_task() {
+        let guidance = windows_uninstall_guidance();
+        assert!(
+            guidance.contains(r"$env:LOCALAPPDATA\Programs\hyphae\bin\hyp.exe"),
+            "Windows guidance must reference install.ps1 binary path: {guidance}"
+        );
+        assert!(
+            guidance.contains(r"%LOCALAPPDATA%\Programs\hyphae\bin"),
+            "Windows guidance must mention removing install dir from User PATH: {guidance}"
+        );
+        assert!(
+            guidance.contains("HyphaeDaemon") && guidance.contains("hyp service uninstall"),
+            "Windows guidance must mention removing scheduled task HyphaeDaemon: {guidance}"
+        );
     }
 
     #[test]
