@@ -24,7 +24,7 @@ use crate::types::now_ms;
 use crate::wakeups::{WakeupLimits, WakeupStore};
 
 /// Current unified schema version stored in `schema_version`.
-pub const CURRENT_SCHEMA_VERSION: i64 = 5;
+pub const CURRENT_SCHEMA_VERSION: i64 = 6;
 /// Maximum number of pre-migration `node.sqlite.v*.bak` backups retained per database directory.
 pub const MAX_MIGRATION_BACKUPS: usize = 3;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -86,7 +86,28 @@ pub const MIGRATIONS: &[Migration] = &[
         disable_foreign_keys: false,
         kind: MigrationKind::Sql(include_str!("../migrations/0005_human_enc_jwk.sql")),
     },
+    Migration {
+        version: 6,
+        name: "0006_muted_sources_expires_at",
+        disable_foreign_keys: false,
+        kind: MigrationKind::Fn(migrate_0006_muted_sources_expires_at),
+    },
 ];
+
+fn migrate_0006_muted_sources_expires_at(conn: &Connection) -> StoreResult<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(muted_sources)")?;
+    let has_expires_at = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|col| col == "expires_at");
+    if !has_expires_at {
+        conn.execute_batch(include_str!(
+            "../migrations/0006_muted_sources_expires_at.sql"
+        ))?;
+    }
+    Ok(())
+}
 
 const _: () = {
     assert!(!MIGRATIONS.is_empty(), "MIGRATIONS must not be empty");

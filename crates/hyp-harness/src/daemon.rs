@@ -47,12 +47,12 @@ use hyp_node::engine::{
 use hyp_node::gates::{
     GateDecision, InboundContext, OutboundContext, SecurityGatePipeline, TrustTier as GateTrustTier,
 };
-use hyp_proto::cloudevent::{CONTENT_TYPE_JSON, CloudEvent as ProtoCloudEvent};
+use hyp_proto::cloudevent::{CONTENT_TYPE_JSON, CloudEvent as ProtoCloudEvent, EXT_TRACEPARENT};
 use hyp_proto::filter::Filter as ProtoFilter;
 use hyp_store::{
-    BridgeLink, DeliveryMode, GateState, MailboxEntry, MailboxInsert, MailboxKind,
-    MailboxPutResult, PluginTargetHandoff, WriteModel, format_address, now_ms, parse_address,
-    sha256_hex, uuid_v4,
+    AckOutcome, BridgeLink, DeliveryMode, GateAuditQuery, GateState, MailboxEntry, MailboxInsert,
+    MailboxKind, MailboxPutResult, PluginTargetHandoff, WriteModel, format_address, now_ms,
+    parse_address, sha256_hex, uuid_v4,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -100,6 +100,12 @@ const UI_PROJECTOR_DEBOUNCE_MS: u64 = 100;
 const INSPECT_WATCH_DEBOUNCE_MS: u64 = 25;
 /// Maximum allowed TTL (7 days) for temporary `session.mute` rules.
 const MAX_MUTE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+/// Default inactivity threshold (7 days) before stale idle sessions are pruned (`U6`).
+pub const DEFAULT_SESSION_PRUNE_AFTER_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+/// Default periodic interval (1 hour) for background session pruning and TTL mute sweeps (`U4`/`U6`).
+pub const DEFAULT_SESSION_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Cap on per-session in-memory metadata-only quarantine notices (`G10`).
+const MAX_QUARANTINE_NOTICES_PER_SESSION: usize = 64;
 /// Minimum delayed retry interval (ms) for Security Gate `Hold` verdicts (`rate_limited`, `gate_busy`).
 const GATE_HOLD_RETRY_MIN_MS: u64 = 500;
 /// Maximum delayed retry interval (ms) for Security Gate `Hold` verdicts.
@@ -224,6 +230,13 @@ pub struct LocalDaemonConfig {
     pub t3_default_url: Option<String>,
     /// Tier 3 bounded `Hold` retry backoff and opt-in Tier 4 cold-revival settings.
     pub delivery_retry: DeliveryRetryConfig,
+    /// Inactivity age threshold (ms) after which idle sessions without quarantined items are pruned
+    /// on startup and periodically (`U6`/`G16`). Set `<= 0` to disable automatic pruning.
+    pub session_prune_after_ms: i64,
+    /// Periodic interval for background stale-session pruning and expired TTL mute sweeping.
+    pub session_prune_interval: Duration,
+    /// Bounded exponential reconnect backoff delays (ms) for external Blind Drop Relay SSE watchers (`H6`).
+    pub drop_watcher_backoff_ms: Vec<u64>,
 }
 
 impl Default for LocalDaemonConfig {
@@ -240,6 +253,9 @@ impl Default for LocalDaemonConfig {
             t3_default_base_dir: None,
             t3_default_url: None,
             delivery_retry: DeliveryRetryConfig::default(),
+            session_prune_after_ms: DEFAULT_SESSION_PRUNE_AFTER_MS,
+            session_prune_interval: DEFAULT_SESSION_PRUNE_INTERVAL,
+            drop_watcher_backoff_ms: vec![500, 1_000, 2_000, 5_000],
         }
     }
 }
@@ -386,6 +402,18 @@ struct SubscriptionRecordMeta {
     urgency: DeliveryUrgency,
 }
 
+/// Strictly metadata-only quarantine notice coalesced per receipt (`G10`).
+/// NEVER stores any unscreened message body text.
+#[derive(Debug, Clone)]
+struct QuarantineNoticeMeta {
+    receipt: String,
+    source: String,
+    trust_tier: String,
+    reason: String,
+    quarantined_at: i64,
+    surfaced_in_batch: bool,
+}
+
 struct LocalDaemonInner {
     node: Arc<UnifiedNode>,
     gate: Arc<RwLock<Option<Arc<SecurityGatePipeline>>>>,
@@ -410,6 +438,8 @@ struct LocalDaemonInner {
     sub_meta: Mutex<HashMap<String, Vec<SubscriptionRecordMeta>>>,
     /// Receipts dismissed by Security Gate (`Block` or `Quarantine` in pipeline) so they never surface.
     dismissed_receipts: Mutex<HashSet<String>>,
+    /// Per-session coalesced metadata-only quarantine notices (`G10`).
+    quarantine_notices: Mutex<HashMap<String, Vec<QuarantineNoticeMeta>>>,
     /// Registered pluggable outbound bridge handlers keyed by lowercase plugin slug.
     bridge_posters: Mutex<HashMap<String, Arc<dyn BridgePoster>>>,
     /// Optional custom async hook invoked on `"peers.reload"` IPC RPCs.
@@ -445,6 +475,7 @@ pub struct LocalDaemon {
     accept_task: Mutex<Option<JoinHandle<()>>>,
     inbox_task: Mutex<Option<JoinHandle<()>>>,
     projector_task: Mutex<Option<JoinHandle<()>>>,
+    maintenance_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Drop for LocalDaemon {
@@ -519,9 +550,12 @@ impl LocalDaemon {
             }
         });
 
+        inner.sweep_expired_mutes_and_policies(now_ms());
+        let _ = inner.prune_stale_sessions_now();
         let inbox_task = spawn_inbox_watcher(Arc::clone(&inner), shutdown_tx.subscribe());
         let _ = inner.write_ui_state_snapshot();
         let projector_task = spawn_ui_state_projector(Arc::clone(&inner), shutdown_tx.subscribe());
+        let maintenance_task = spawn_maintenance_task(Arc::clone(&inner), shutdown_tx.subscribe());
 
         Ok(Self {
             inner,
@@ -531,6 +565,7 @@ impl LocalDaemon {
             accept_task: Mutex::new(Some(accept_task)),
             inbox_task: Mutex::new(Some(inbox_task)),
             projector_task: Mutex::new(Some(projector_task)),
+            maintenance_task: Mutex::new(Some(maintenance_task)),
         })
     }
 
@@ -605,9 +640,12 @@ impl LocalDaemon {
             }
         });
 
+        inner.sweep_expired_mutes_and_policies(now_ms());
+        let _ = inner.prune_stale_sessions_now();
         let inbox_task = spawn_inbox_watcher(Arc::clone(&inner), shutdown_tx.subscribe());
         let _ = inner.write_ui_state_snapshot();
         let projector_task = spawn_ui_state_projector(Arc::clone(&inner), shutdown_tx.subscribe());
+        let maintenance_task = spawn_maintenance_task(Arc::clone(&inner), shutdown_tx.subscribe());
 
         Ok(Self {
             inner,
@@ -617,6 +655,7 @@ impl LocalDaemon {
             accept_task: Mutex::new(Some(accept_task)),
             inbox_task: Mutex::new(Some(inbox_task)),
             projector_task: Mutex::new(Some(projector_task)),
+            maintenance_task: Mutex::new(Some(maintenance_task)),
         })
     }
 
@@ -702,17 +741,7 @@ impl LocalDaemon {
 
     /// Removes any attached native [`PushTransport`] for `session_id`.
     pub fn unregister_session_transport(&self, session_id: &str) -> bool {
-        let removed = self
-            .inner
-            .session_transports
-            .lock()
-            .expect("session_transports lock poisoned")
-            .remove(session_id)
-            .is_some();
-        if removed {
-            self.inner.bump_ui_rev();
-        }
-        removed
+        self.inner.unregister_session_transport(session_id)
     }
 
     /// Returns the active live wakeup transport kind for `session_id`, if any
@@ -938,6 +967,14 @@ impl LocalDaemon {
         {
             h.abort();
         }
+        if let Some(h) = self
+            .maintenance_task
+            .lock()
+            .expect("maintenance_task lock poisoned")
+            .take()
+        {
+            h.abort();
+        }
         // U1 (P1): Write a final atomic offline UI snapshot (`daemon.online == false`) right
         // before removing the socket so file-based UIs immediately transition to OFFLINE.
         if !self.stopped.swap(true, Ordering::SeqCst)
@@ -1090,7 +1127,19 @@ impl LocalDaemon {
                     self.inner.bump_ui_rev();
                     return Ok(None);
                 }
-                GateDecision::Quarantine { .. } | GateDecision::Block { .. } => {
+                GateDecision::Quarantine { reason, .. } => {
+                    self.inner.record_quarantine_notice(
+                        &session_id,
+                        eval.receipt.as_deref(),
+                        &source,
+                        effective_trust_tier,
+                        &reason,
+                        now,
+                    );
+                    self.inner.bump_ui_rev();
+                    return Ok(None);
+                }
+                GateDecision::Block { .. } => {
                     self.inner.bump_ui_rev();
                     return Ok(None);
                 }
@@ -1234,6 +1283,68 @@ fn spawn_inbox_watcher(
     })
 }
 
+/// Periodic background maintenance task handling persisted TTL mute expiration (`U4`) and
+/// safe stale-session pruning (`U6`/`G16`) without idle busy-polling.
+fn spawn_maintenance_task(
+    inner: Arc<LocalDaemonInner>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let prune_interval = inner
+            .config
+            .session_prune_interval
+            .max(Duration::from_millis(250));
+        let mut next_prune_at = tokio::time::Instant::now() + prune_interval;
+
+        loop {
+            if *shutdown_rx.borrow() {
+                break;
+            }
+
+            let now = now_ms();
+            let next_mute_sleep = {
+                let db = inner.node.db();
+                db.local().next_mute_expiry_ms().ok().flatten()
+            }
+            .map(|exp_ms| {
+                let delta = exp_ms.saturating_sub(now);
+                if delta <= 0 {
+                    Duration::from_millis(25)
+                } else {
+                    Duration::from_millis((delta as u64).max(25))
+                }
+            });
+
+            let now_inst = tokio::time::Instant::now();
+            let until_prune = next_prune_at.saturating_duration_since(now_inst);
+            let wait_dur = match next_mute_sleep {
+                Some(mute_dur) => until_prune.min(mute_dur),
+                None => until_prune,
+            };
+
+            tokio::select! {
+                _ = tokio::time::sleep(wait_dur) => {}
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+
+            if *shutdown_rx.borrow() {
+                break;
+            }
+
+            inner.sweep_expired_mutes_and_policies(now_ms());
+            if tokio::time::Instant::now() >= next_prune_at {
+                let _ = inner.prune_stale_sessions_now();
+                next_prune_at = tokio::time::Instant::now() + prune_interval;
+            }
+        }
+    })
+}
+
 impl LocalDaemonInner {
     fn new(
         node: Arc<UnifiedNode>,
@@ -1276,6 +1387,7 @@ impl LocalDaemonInner {
             item_meta: Mutex::new(HashMap::new()),
             sub_meta: Mutex::new(HashMap::new()),
             dismissed_receipts: Mutex::new(HashSet::new()),
+            quarantine_notices: Mutex::new(HashMap::new()),
             bridge_posters: Mutex::new(HashMap::new()),
             peers_reloader: Mutex::new(None),
             configured_bridge_targets: Mutex::new(BTreeMap::new()),
@@ -1703,6 +1815,331 @@ impl LocalDaemonInner {
             .unwrap_or(0)
     }
 
+    fn unregister_session_transport(&self, session_id: &str) -> bool {
+        let removed = self
+            .session_transports
+            .lock()
+            .expect("session_transports lock poisoned")
+            .remove(session_id)
+            .is_some();
+        if removed {
+            self.cancel_hold_retry(session_id);
+            self.bump_ui_rev();
+        }
+        removed
+    }
+
+    /// Detaches the attached push transport ONLY if the exact same `Arc` instance is still
+    /// registered (preventing a stale failing delivery from clobbering a newer replacement).
+    fn unregister_matching_session_transport(
+        &self,
+        session_id: &str,
+        transport: &Arc<dyn PushTransport>,
+    ) -> bool {
+        let should_remove = self
+            .session_transports
+            .lock()
+            .expect("session_transports lock poisoned")
+            .get(session_id)
+            .is_some_and(|attached| Arc::ptr_eq(&attached.transport, transport));
+        if should_remove {
+            return self.unregister_session_transport(session_id);
+        }
+        false
+    }
+
+    fn active_session_ids(&self) -> HashSet<String> {
+        let mut active = HashSet::new();
+        for sid in self.channels.lock().expect("channels lock poisoned").keys() {
+            active.insert(sid.clone());
+        }
+        for sid in self.waiters.lock().expect("waiters lock poisoned").keys() {
+            active.insert(sid.clone());
+        }
+        for sid in self
+            .session_transports
+            .lock()
+            .expect("session_transports lock poisoned")
+            .keys()
+        {
+            active.insert(sid.clone());
+        }
+        active
+    }
+
+    /// Safely prunes idle sessions older than `config.session_prune_after_ms` while skipping
+    /// currently connected sessions and any session holding `gate_state = 'quarantined'` items (`U6`/`G16`).
+    fn prune_stale_sessions_now(&self) -> Vec<String> {
+        let max_age_ms = self.config.session_prune_after_ms;
+        if max_age_ms <= 0 {
+            return Vec::new();
+        }
+        let now = now_ms();
+        let cutoff = now.saturating_sub(max_age_ms);
+        let active = self.active_session_ids();
+        let pruned = {
+            let db = self.node.db();
+            db.local()
+                .prune_sessions(cutoff, &active)
+                .map(|r| r.pruned_sessions)
+                .unwrap_or_default()
+        };
+        if !pruned.is_empty() {
+            {
+                let mut guard = self.item_meta.lock().expect("item_meta lock poisoned");
+                for sid in &pruned {
+                    guard.remove(sid);
+                }
+            }
+            {
+                let mut guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
+                for sid in &pruned {
+                    guard.remove(sid);
+                }
+            }
+            {
+                let mut guard = self
+                    .quarantine_notices
+                    .lock()
+                    .expect("quarantine_notices lock poisoned");
+                for sid in &pruned {
+                    guard.remove(sid);
+                }
+            }
+            {
+                let mut guard = self
+                    .herdr_terminal_index
+                    .lock()
+                    .expect("herdr_terminal_index lock poisoned");
+                let pruned_set: HashSet<&str> = pruned.iter().map(String::as_str).collect();
+                guard.retain(|_, list| {
+                    list.retain(|s| !pruned_set.contains(s.as_str()));
+                    !list.is_empty()
+                });
+            }
+            self.bump_ui_rev();
+        }
+        pruned
+    }
+
+    /// Sweeps expired persistent TTL mutes from SQLite and removes matching session `Mute` rules
+    /// from `DeliveryEngine` (`U4`). Takes zero write lock when nothing has expired.
+    fn sweep_expired_mutes_and_policies(&self, now: i64) -> usize {
+        let expired = {
+            let db = self.node.db();
+            let removed = db.local().sweep_expired_mutes(now).unwrap_or_default();
+            for (scope, pattern) in &removed {
+                if scope != "*" {
+                    let _ = self.delivery.update_policy(&db, scope, |p| {
+                        let is_mute = p.overrides.iter().any(|r| {
+                            r.target.eq_ignore_ascii_case(pattern)
+                                && r.delivery == DeliveryUrgency::Mute
+                        });
+                        if is_mute {
+                            p.remove_rule(pattern);
+                        }
+                    });
+                }
+            }
+            removed
+        };
+        if !expired.is_empty() {
+            self.bump_ui_rev();
+        }
+        expired.len()
+    }
+
+    /// Records a strictly metadata-only quarantine notice coalesced by receipt (`G10`).
+    /// Never stores or logs any unscreened message body text.
+    fn record_quarantine_notice(
+        &self,
+        session_id: &str,
+        receipt: Option<&str>,
+        source: &str,
+        trust_tier: GateTrustTier,
+        reason: &str,
+        now: i64,
+    ) {
+        let Some(rcpt) = receipt.filter(|r| !r.is_empty()) else {
+            return;
+        };
+        let mut guard = self
+            .quarantine_notices
+            .lock()
+            .expect("quarantine_notices lock poisoned");
+        let list = guard.entry(session_id.to_string()).or_default();
+        if list.iter().any(|n| n.receipt == rcpt) {
+            return;
+        }
+        if list.len() >= MAX_QUARANTINE_NOTICES_PER_SESSION {
+            list.remove(0);
+        }
+        list.push(QuarantineNoticeMeta {
+            receipt: rcpt.to_string(),
+            source: sanitize_notice_label(source),
+            trust_tier: trust_tier.as_str().to_string(),
+            reason: sanitize_notice_label(reason),
+            quarantined_at: now,
+            surfaced_in_batch: false,
+        });
+    }
+
+    fn clear_quarantine_notice(&self, session_id: Option<&str>, receipt: &str) {
+        let mut guard = self
+            .quarantine_notices
+            .lock()
+            .expect("quarantine_notices lock poisoned");
+        if let Some(sid) = session_id {
+            if let Some(list) = guard.get_mut(sid) {
+                list.retain(|n| n.receipt != receipt);
+                if list.is_empty() {
+                    guard.remove(sid);
+                }
+            }
+        } else {
+            guard.retain(|_, list| {
+                list.retain(|n| n.receipt != receipt);
+                !list.is_empty()
+            });
+        }
+    }
+
+    /// Returns active (still `gate_state == 'quarantined'` in SQLite) metadata-only notices for
+    /// `session_id`, pruning any receipts already approved or rejected (`G10`).
+    fn live_quarantine_notices_json(&self, session_id: &str) -> Vec<Value> {
+        let snapshot: Vec<QuarantineNoticeMeta> = {
+            let guard = self
+                .quarantine_notices
+                .lock()
+                .expect("quarantine_notices lock poisoned");
+            guard.get(session_id).cloned().unwrap_or_default()
+        };
+        if snapshot.is_empty() {
+            return Vec::new();
+        }
+        let still_quarantined: HashSet<String> = {
+            let db = self.node.db();
+            db.local()
+                .list_quarantined(Some(session_id), MAX_QUARANTINE_NOTICES_PER_SESSION)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|e| e.receipt)
+                .collect()
+        };
+        let mut live = Vec::new();
+        {
+            let mut guard = self
+                .quarantine_notices
+                .lock()
+                .expect("quarantine_notices lock poisoned");
+            if let Some(list) = guard.get_mut(session_id) {
+                list.retain(|n| still_quarantined.contains(&n.receipt));
+                for n in list.iter() {
+                    live.push(json!({
+                        "receipt": n.receipt,
+                        "source": n.source,
+                        "trustTier": n.trust_tier,
+                        "reason": n.reason,
+                        "quarantinedAt": n.quarantined_at,
+                    }));
+                }
+                if list.is_empty() {
+                    guard.remove(session_id);
+                }
+            }
+        }
+        live
+    }
+
+    /// Formats unsurfaced metadata-only quarantine notices for piggybacking onto an
+    /// already-scheduled normal delivery batch (`G10`).
+    ///
+    /// Read-only with respect to `surfaced_in_batch`: notices are marked surfaced only in
+    /// [`Self::commit_delivered_batch`] once the batch is actually delivered or drained, so
+    /// speculative flushes with no live transport never drop a notice before delivery.
+    /// Never leaks message body text and never emits duplicate notices for the same receipt.
+    fn peek_unsurfaced_quarantine_footer(&self, session_id: &str) -> Option<String> {
+        let still_quarantined: HashSet<String> = {
+            let db = self.node.db();
+            db.local()
+                .list_quarantined(Some(session_id), MAX_QUARANTINE_NOTICES_PER_SESSION)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|e| e.receipt)
+                .collect()
+        };
+        let mut lines = Vec::new();
+        {
+            let mut guard = self
+                .quarantine_notices
+                .lock()
+                .expect("quarantine_notices lock poisoned");
+            if let Some(list) = guard.get_mut(session_id) {
+                list.retain(|n| still_quarantined.contains(&n.receipt));
+                for n in list.iter() {
+                    if !n.surfaced_in_batch {
+                        lines.push(format!(
+                            "[hyphae gate · quarantined receipt={} source={} tier={} reason={}; review via `hyp gate review`]",
+                            n.receipt, n.source, n.trust_tier, n.reason
+                        ));
+                    }
+                }
+                if list.is_empty() {
+                    guard.remove(session_id);
+                }
+            }
+        }
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.join("\n"))
+        }
+    }
+
+    /// Enqueues a trusted daemon-generated metadata-only system notice into `session_id`'s
+    /// mailbox (pre-cleared through Security Gate) and wakes any live transport (`H6`).
+    async fn enqueue_system_notice(
+        self: &Arc<Self>,
+        session_id: &str,
+        item_id: String,
+        text: String,
+    ) {
+        let now = now_ms();
+        let stored_receipt = {
+            let db = self.node.db();
+            if db.local().get_session(session_id).ok().flatten().is_none() {
+                return;
+            }
+            let res = db.local().put_in_mailbox(
+                &MailboxInsert {
+                    session_id: session_id.to_string(),
+                    origin_node: self.node.node_id().to_string(),
+                    item_id,
+                    text,
+                    kind: MailboxKind::Message,
+                    source: "hyphae:system".to_string(),
+                    gate_state: GateState::Pending,
+                    gate_reason: Some("system_notice".to_string()),
+                    traceparent: None,
+                },
+                now,
+            );
+            match res {
+                Ok(MailboxPutResult::Stored { receipt }) => {
+                    let _ = db
+                        .local()
+                        .mark_mailbox_gate_approved(session_id, &receipt, false, now);
+                    Some(receipt)
+                }
+                _ => None,
+            }
+        };
+        if stored_receipt.is_some() {
+            self.bump_ui_rev();
+            self.flush_session(session_id).await;
+        }
+    }
+
     fn active_transport_kind(&self, session_id: &str) -> Option<&'static str> {
         if self
             .channels
@@ -1833,6 +2270,7 @@ impl LocalDaemonInner {
     /// Returns `true` if at least one non-muted gate-cleared item is eligible for delivery/digest wake.
     async fn reconcile_session_inbox(self: &Arc<Self>, session_id: &str) -> bool {
         let _reconcile_guard = self.reconcile_lock_for(session_id).lock_owned().await;
+        self.sweep_expired_mutes_and_policies(now_ms());
 
         let mut wake_needed = false;
         let mut held_in_this_call: HashSet<String> = HashSet::new();
@@ -1972,6 +2410,15 @@ impl LocalDaemonInner {
                                         Some(&reason),
                                         now,
                                     );
+                                    drop(db);
+                                    self.record_quarantine_notice(
+                                        session_id,
+                                        Some(&entry.receipt),
+                                        &entry.source,
+                                        trust_tier,
+                                        &reason,
+                                        now,
+                                    );
                                     let mut guard =
                                         self.item_meta.lock().expect("item_meta lock poisoned");
                                     if let Some(map) = guard.get_mut(session_id) {
@@ -2015,6 +2462,15 @@ impl LocalDaemonInner {
                                     &entry.receipt,
                                     GateState::Quarantined,
                                     Some("gate_evaluation_error"),
+                                    now,
+                                );
+                                drop(db);
+                                self.record_quarantine_notice(
+                                    session_id,
+                                    Some(&entry.receipt),
+                                    &entry.source,
+                                    trust_tier,
+                                    "gate_evaluation_error",
                                     now,
                                 );
                                 let mut guard =
@@ -2205,7 +2661,7 @@ impl LocalDaemonInner {
         self.reconcile_session_inbox(session_id).await;
 
         let gate_active = self.current_gate().is_some();
-        let (policy, pending, muted) = {
+        let (policy, pending, muted, human_auth_by_receipt) = {
             let db = self.node.db();
             let policy = self.delivery.policy(&db, session_id).ok()?;
             let pending = if gate_active {
@@ -2214,7 +2670,15 @@ impl LocalDaemonInner {
                 db.local().peek_inbox(session_id, 500).ok()?
             };
             let muted = muted_count(&db, session_id).unwrap_or(0);
-            (policy, pending, muted)
+            let mut auth_map: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+            for entry in &pending {
+                if let Ok(Some(raw)) = db.human().get_mailbox_human_auth(&entry.receipt) {
+                    if let Some(parsed_auth) = parse_human_auth_meta(&raw) {
+                        auth_map.insert(entry.receipt.clone(), parsed_auth);
+                    }
+                }
+            }
+            (policy, pending, muted, auth_map)
         };
 
         if pending.is_empty() {
@@ -2264,11 +2728,18 @@ impl LocalDaemonInner {
                 .map(|m| m.is_announcement)
                 .unwrap_or_else(|| self.is_announcement_channel(channel.as_deref()));
 
+            let display_source = match human_auth_by_receipt.get(&entry.receipt) {
+                Some((hid_opt, kid_opt)) => {
+                    format_human_verified_source(&entry.source, hid_opt.as_deref(), kid_opt.as_deref())
+                }
+                None => entry.source,
+            };
+
             packable.push(PackableItem {
                 id: entry.receipt,
                 urgency: effective_urgency,
                 kind: entry.kind,
-                source: entry.source,
+                source: display_source,
                 channel,
                 is_announcement,
                 text: entry.text,
@@ -2282,7 +2753,12 @@ impl LocalDaemonInner {
             return None;
         }
 
-        pack_delivery_batch(&packable, muted, &policy)
+        let mut batch = pack_delivery_batch(&packable, muted, &policy)?;
+        if let Some(q_footer) = self.peek_unsurfaced_quarantine_footer(session_id) {
+            batch.rendered.push_str("\n\n");
+            batch.rendered.push_str(&q_footer);
+        }
+        Some(batch)
     }
 
     /// Commits a delivered [`PackedDeliveryBatch`]:
@@ -2299,6 +2775,21 @@ impl LocalDaemonInner {
             }
             if !batch.spilled_ids.is_empty() || !batch.truncated_ids.is_empty() {
                 let _ = db.local().mark_mailbox_notified(session_id);
+            }
+        }
+
+        // G10: Mark quarantine notices as surfaced only once their rendered batch actually commits.
+        {
+            let mut guard = self
+                .quarantine_notices
+                .lock()
+                .expect("quarantine_notices lock poisoned");
+            if let Some(list) = guard.get_mut(session_id) {
+                for n in list.iter_mut() {
+                    if !n.surfaced_in_batch && batch.rendered.contains(&n.receipt) {
+                        n.surfaced_in_batch = true;
+                    }
+                }
             }
         }
 
@@ -2472,8 +2963,14 @@ impl LocalDaemonInner {
                             "herdr_target_unavailable"
                                 | "t3_thread_deleted"
                                 | "t3_thread_not_found"
+                                | "t3_auth_missing"
+                                | "t3_auth_failed"
+                                | "t3_invalid_server_url"
                         ) {
                             terminal_error = Some(reason.clone());
+                            if self.unregister_matching_session_transport(session_id, &transport) {
+                                let _ = self.write_ui_state_snapshot();
+                            }
                         }
                         self.cancel_hold_retry(session_id);
                         // Preserve unread in durable SQLite; fall through to any live
@@ -3027,9 +3524,8 @@ impl LocalDaemonInner {
                     let created =
                         create_external_drop(&self.node, &relay_url, ttl_seconds).await?;
                     spawn_external_drop_watcher(
-                        Arc::clone(&self.node),
-                        Arc::clone(&self.gate),
-                        self.shutdown_rx.clone(),
+                        Arc::clone(self),
+                        session_id.to_string(),
                         relay_url.clone(),
                         created.drop_id.clone(),
                         created.sub_cap.clone(),
@@ -3420,7 +3916,7 @@ impl LocalDaemonInner {
     }
 
     async fn tool_mute(
-        &self,
+        self: &Arc<Self>,
         session_id: &str,
         args: &Map<String, Value>,
     ) -> Result<Value, (String, String)> {
@@ -3433,25 +3929,58 @@ impl LocalDaemonInner {
             .ok_or_else(|| ("invalid_request".into(), "Expected mute target".into()))?;
         let scope_arg = args.get("scope").and_then(Value::as_str).unwrap_or("session");
         let db_scope = if scope_arg == "connector" { "*" } else { session_id };
+        let ttl_seconds: Option<u64> = match args.get("ttlSeconds") {
+            None | Some(Value::Null) => None,
+            Some(v) => match v.as_u64() {
+                Some(secs) if (1..=MAX_MUTE_TTL_SECS).contains(&secs) => Some(secs),
+                _ => {
+                    return Err((
+                        "invalid_request".into(),
+                        format!("Expected integer ttlSeconds in 1..={MAX_MUTE_TTL_SECS}"),
+                    ));
+                }
+            },
+        };
         let now = now_ms();
+        let expires_at =
+            ttl_seconds.map(|secs| now.saturating_add((secs as i64).saturating_mul(1_000)));
 
         let rule = {
             let db = self.node.db();
             let added = db
                 .local()
-                .add_mute(db_scope, target, session_id, now)
+                .add_mute_with_expiry(db_scope, target, session_id, now, expires_at)
                 .map_err(store_err_tuple)?;
             let _ = self.delivery.update_policy(&db, session_id, |p| {
                 p.upsert_rule(DeliveryRule::new(target, DeliveryUrgency::Mute));
             });
             added
         };
+        if let Some(ttl) = ttl_seconds {
+            let timer_daemon = Arc::clone(self);
+            let mut shutdown_rx = self.shutdown_rx.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(ttl)) => {}
+                    _ = shutdown_rx.changed() => {
+                        return;
+                    }
+                }
+                if !*shutdown_rx.borrow() {
+                    timer_daemon.sweep_expired_mutes_and_policies(now_ms());
+                }
+            });
+        }
         self.bump_ui_rev();
 
-        Ok(json!({
+        let mut out = json!({
             "muted": rule.pattern,
             "scope": if db_scope == "*" { "connector" } else { "session" },
-        }))
+        });
+        if let Some(exp) = rule.expires_at {
+            out["expiresAt"] = json!(exp);
+        }
+        Ok(out)
     }
 
     async fn tool_unmute(
@@ -3491,21 +4020,27 @@ impl LocalDaemonInner {
     }
 
     async fn tool_mutes(&self, session_id: &str) -> Result<Value, (String, String)> {
+        let now = now_ms();
+        self.sweep_expired_mutes_and_policies(now);
         let rules = {
             let db = self.node.db();
             db.local()
-                .list_mutes(Some(session_id))
+                .list_mutes_at(Some(session_id), now)
                 .map_err(store_err_tuple)?
         };
         let list: Vec<Value> = rules
             .into_iter()
             .map(|r| {
-                json!({
+                let mut item = json!({
                     "pattern": r.pattern,
                     "scope": if r.scope == "*" { "connector" } else { "session" },
                     "mutedAt": r.muted_at,
                     "mutedBy": r.muted_by,
-                })
+                });
+                if let Some(exp) = r.expires_at {
+                    item["expiresAt"] = json!(exp);
+                }
+                item
             })
             .collect();
         Ok(json!({ "mutes": list }))
@@ -3895,7 +4430,8 @@ impl LocalDaemonInner {
             self.bump_ui_rev();
         }
 
-        Ok(json!({
+        let quarantine_notices = self.live_quarantine_notices_json(session_id);
+        let mut out = json!({
             "deliveryMode": policy.default_mode.as_str(),
             "focusMode": policy.focus_mode,
             "state": result.state.as_str(),
@@ -3906,7 +4442,11 @@ impl LocalDaemonInner {
             "hasMore": result.has_more,
             "nextCursor": result.next_cursor,
             "items": result.items,
-        }))
+        });
+        if !quarantine_notices.is_empty() {
+            out["quarantinedNotices"] = Value::Array(quarantine_notices);
+        }
+        Ok(out)
     }
 
     async fn tool_stream(
@@ -4965,12 +5505,50 @@ async fn handle_connection<R, W>(
                             .get("target")
                             .and_then(Value::as_str)
                             .unwrap_or_default();
-                        let resp = match daemon.node.db().local().add_mute("*", target, "cli", now_ms()) {
-                            Ok(rule) => {
-                                daemon.bump_ui_rev();
-                                json!({ "ok": true, "result": { "rule": rule } })
+                        let ttl_res: Result<Option<u64>, String> = match packet.get("ttlSeconds") {
+                            None | Some(Value::Null) => Ok(None),
+                            Some(v) => match v.as_u64() {
+                                Some(secs) if (1..=MAX_MUTE_TTL_SECS).contains(&secs) => {
+                                    Ok(Some(secs))
+                                }
+                                _ => Err(format!(
+                                    "Expected integer ttlSeconds in 1..={MAX_MUTE_TTL_SECS}"
+                                )),
+                            },
+                        };
+                        let resp = match ttl_res {
+                            Err(msg) => json!({ "ok": false, "error": msg }),
+                            Ok(ttl_seconds) => {
+                                let now = now_ms();
+                                let expires_at = ttl_seconds.map(|secs| {
+                                    now.saturating_add((secs as i64).saturating_mul(1_000))
+                                });
+                                match daemon.node.db().local().add_mute_with_expiry(
+                                    "*", target, "cli", now, expires_at,
+                                ) {
+                                    Ok(rule) => {
+                                        if let Some(ttl) = ttl_seconds {
+                                            let timer_daemon = Arc::clone(&daemon);
+                                            let mut shutdown_rx = daemon.shutdown_rx.clone();
+                                            tokio::spawn(async move {
+                                                tokio::select! {
+                                                    _ = tokio::time::sleep(Duration::from_secs(ttl)) => {}
+                                                    _ = shutdown_rx.changed() => {
+                                                        return;
+                                                    }
+                                                }
+                                                if !*shutdown_rx.borrow() {
+                                                    timer_daemon
+                                                        .sweep_expired_mutes_and_policies(now_ms());
+                                                }
+                                            });
+                                        }
+                                        daemon.bump_ui_rev();
+                                        json!({ "ok": true, "result": { "rule": rule } })
+                                    }
+                                    Err(e) => json!({ "ok": false, "error": e.to_string() }),
+                                }
                             }
-                            Err(e) => json!({ "ok": false, "error": e.to_string() }),
                         };
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
                         break;
@@ -4993,11 +5571,13 @@ async fn handle_connection<R, W>(
                         break;
                     }
                     "mute.list" => {
+                        let now = now_ms();
+                        daemon.sweep_expired_mutes_and_policies(now);
                         let mutes = daemon
                             .node
                             .db()
                             .local()
-                            .list_mutes(None)
+                            .list_mutes_at(None, now)
                             .unwrap_or_default();
                         let _ = write_ndjson_line_async(
                             &mut write_half,
@@ -5558,7 +6138,11 @@ fn maybe_spawn_transport_probe(
                     let token = read_t3_secret_for_node(&daemon_arc.node);
                     let probe =
                         probe_t3_server(&origin, token.as_deref(), DEFAULT_PROBE_TIMEOUT).await;
-                    if probe.ok {
+                    // X3 (P1): Attach T3Transport ONLY when a bearer token is present AND the T3
+                    // server confirmed authentication succeeded (`authenticated == Some(true)`).
+                    // Never attach on an unauthenticated 2xx response where delivery would fail
+                    // with `t3_auth_missing` and silently suppress Stop hooks / `hyp wait`.
+                    if token.is_some() && probe.is_authenticated() {
                         let mut target = T3Target::new(thread_id, origin);
                         target.base_dir = Some(t3_base_candidate.clone());
                         target.state_dir = Some(daemon_arc.node.config().state_dir.clone());
@@ -5812,6 +6396,8 @@ async fn handle_daemon_status(daemon: &Arc<LocalDaemonInner>) -> Value {
         "result": {
             "nodeId": daemon.node.node_id().as_str(),
             "version": daemon.node.config().hyphae_version,
+            "binaryVersion": env!("CARGO_PKG_VERSION"),
+            "pid": std::process::id(),
             "profile": daemon.node.config().profile,
             "socketPath": daemon.socket_path.display().to_string(),
             "sessions": sessions_json,
@@ -6157,93 +6743,268 @@ async fn create_external_drop(
         .map_err(|e| ("drop_relay_error".into(), format!("invalid drop relay response: {e}")))
 }
 
+fn sanitize_notice_label(raw: &str) -> String {
+    let clean: String = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| match c {
+            '[' => '(',
+            ']' => ')',
+            other => other,
+        })
+        .take(128)
+        .collect();
+    let trimmed = clean.trim();
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn parse_human_auth_meta(raw: &str) -> Option<(Option<String>, Option<String>)> {
+    let val = serde_json::from_str::<Value>(raw).ok()?;
+    let obj = val.as_object()?;
+    let human_id = obj
+        .get("humanId")
+        .or_else(|| obj.get("human_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    let kid = obj
+        .get("kid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    Some((human_id, kid))
+}
+
+fn format_human_verified_source(
+    source: &str,
+    human_id: Option<&str>,
+    kid: Option<&str>,
+) -> String {
+    let kid8 = kid.map(|k| k.chars().take(8).collect::<String>());
+    match (human_id, kid8) {
+        (Some(hid), Some(k8)) => {
+            if source.starts_with("human:") || source.is_empty() {
+                format!("human-verified · {hid} (kid:{k8})")
+            } else {
+                format!("human-verified · {hid} (kid:{k8}) · {source}")
+            }
+        }
+        (Some(hid), None) => {
+            if source.starts_with("human:") || source.is_empty() {
+                format!("human-verified · {hid}")
+            } else {
+                format!("human-verified · {hid} · {source}")
+            }
+        }
+        (None, Some(k8)) => format!("human-verified · kid:{k8} · {source}"),
+        (None, None) => format!("human-verified · {source}"),
+    }
+}
+
 fn spawn_external_drop_watcher(
-    node: Arc<UnifiedNode>,
-    gate: Arc<RwLock<Option<Arc<SecurityGatePipeline>>>>,
-    mut shutdown_rx: watch::Receiver<bool>,
+    daemon: Arc<LocalDaemonInner>,
+    requesting_session_id: String,
     relay_url: String,
     drop_id: String,
     sub_cap: String,
     deadline_dur: Duration,
 ) {
     tokio::spawn(async move {
-        let sleep = tokio::time::sleep(deadline_dur);
-        tokio::pin!(sleep);
-
+        let mut shutdown_rx = daemon.shutdown_rx.clone();
+        let deadline = tokio::time::Instant::now() + deadline_dur;
         let stream_url = format!("{relay_url}/v1/drops/{drop_id}/stream");
-        let Ok(req) = Request::builder()
-            .method(Method::GET)
-            .uri(&stream_url)
-            .header(DROP_CAP_HEADER, &sub_cap)
-            .header(ACCEPT, "text/event-stream")
-            .body(empty_body())
-        else {
-            return;
+        let backoff_schedule: Vec<u64> = if daemon.config.drop_watcher_backoff_ms.is_empty() {
+            vec![500, 1_000, 2_000, 5_000]
+        } else {
+            daemon.config.drop_watcher_backoff_ms.clone()
         };
+        let mut last_event_id: Option<String> = None;
+        let mut reconnect_attempt: usize = 0;
 
-        let resp_res = tokio::select! {
-            r = node.http_client().request(req) => r,
-            _ = &mut sleep => return,
-            _ = shutdown_rx.changed() => return,
-        };
-        let Ok(mut resp) = resp_res else {
-            return;
-        };
-        if !resp.status().is_success() {
-            return;
-        }
-
-        let mut parser = SseParser::new();
         loop {
-            let frame_opt = tokio::select! {
-                f = resp.body_mut().frame() => f,
-                _ = &mut sleep => break,
+            if *shutdown_rx.borrow() {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                daemon
+                    .enqueue_system_notice(
+                        &requesting_session_id,
+                        format!("drop-expired:{drop_id}"),
+                        format!(
+                            "[hyphae notice] Verified human drop '{drop_id}' expired before a submission was received."
+                        ),
+                    )
+                    .await;
+                return;
+            }
+
+            let mut req_builder = Request::builder()
+                .method(Method::GET)
+                .uri(&stream_url)
+                .header(DROP_CAP_HEADER, &sub_cap)
+                .header(ACCEPT, "text/event-stream");
+            if let Some(ref event_id) = last_event_id {
+                req_builder = req_builder.header("Last-Event-ID", event_id);
+            }
+            let Ok(req) = req_builder.body(empty_body()) else {
+                return;
+            };
+
+            let resp_res = tokio::select! {
+                r = daemon.node.http_client().request(req) => Some(r),
+                _ = tokio::time::sleep_until(deadline) => None,
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
-                        break;
+                        return;
                     }
                     continue;
                 }
             };
-            let Some(Ok(frame)) = frame_opt else {
-                break;
+
+            let Some(resp_result) = resp_res else {
+                daemon
+                    .enqueue_system_notice(
+                        &requesting_session_id,
+                        format!("drop-expired:{drop_id}"),
+                        format!(
+                            "[hyphae notice] Verified human drop '{drop_id}' expired before a submission was received."
+                        ),
+                    )
+                    .await;
+                return;
             };
-            let Some(data) = frame.data_ref() else {
-                continue;
-            };
-            for ev in parser.feed(data) {
-                if ev.data.trim().is_empty() {
-                    continue;
-                }
-                if let Ok(env) = parse_drop_payload_bytes(ev.data.as_bytes()) {
-                    let cur_gate = gate
-                        .read()
-                        .expect("gate lock poisoned")
-                        .as_ref()
-                        .map(Arc::clone);
-                    if node
-                        .ingest_human_drop(&env, cur_gate.as_deref(), false)
-                        .await
-                        .is_ok()
-                    {
-                        if let Some(seq) = ev.id.as_deref().and_then(|s| s.trim().parse::<u64>().ok())
-                        {
-                            let ack_url = format!("{relay_url}/v1/drops/{drop_id}/ack");
-                            let ack_body = serde_json::to_vec(&json!({
-                                "seq": seq,
-                                "burn": true,
-                            }))
-                            .unwrap_or_default();
-                            if let Ok(ack_req) = Request::builder()
-                                .method(Method::POST)
-                                .uri(&ack_url)
-                                .header(DROP_CAP_HEADER, &sub_cap)
-                                .header(CONTENT_TYPE, CONTENT_TYPE_JSON)
-                                .body(full_body(ack_body))
-                            {
-                                let _ = node.http_client().request(ack_req).await;
+
+            if let Ok(mut resp) = resp_result {
+                let status = resp.status();
+                if status.is_success() {
+                    reconnect_attempt = 0;
+                    let mut parser = SseParser::new();
+                    loop {
+                        let frame_opt = tokio::select! {
+                            f = resp.body_mut().frame() => f,
+                            _ = tokio::time::sleep_until(deadline) => {
+                                daemon
+                                    .enqueue_system_notice(
+                                        &requesting_session_id,
+                                        format!("drop-expired:{drop_id}"),
+                                        format!(
+                                            "[hyphae notice] Verified human drop '{drop_id}' expired before a submission was received."
+                                        ),
+                                    )
+                                    .await;
+                                return;
+                            }
+                            _ = shutdown_rx.changed() => {
+                                if *shutdown_rx.borrow() {
+                                    return;
+                                }
+                                continue;
+                            }
+                        };
+                        let Some(Ok(frame)) = frame_opt else {
+                            // Mid-stream disconnect: reconnect with bounded backoff + Last-Event-ID!
+                            break;
+                        };
+                        let Some(data) = frame.data_ref() else {
+                            continue;
+                        };
+                        for ev in parser.feed(data) {
+                            if let Some(ref eid) = ev.id {
+                                let trimmed = eid.trim();
+                                if !trimmed.is_empty() {
+                                    last_event_id = Some(trimmed.to_string());
+                                }
+                            }
+                            if ev.data.trim().is_empty() {
+                                continue;
+                            }
+                            if let Ok(env) = parse_drop_payload_bytes(ev.data.as_bytes()) {
+                                let cur_gate = daemon.current_gate();
+                                match daemon
+                                    .node
+                                    .ingest_human_drop(&env, cur_gate.as_deref(), false)
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        if let Some(seq) = ev
+                                            .id
+                                            .as_deref()
+                                            .and_then(|s| s.trim().parse::<u64>().ok())
+                                        {
+                                            let ack_url =
+                                                format!("{relay_url}/v1/drops/{drop_id}/ack");
+                                            let ack_body = serde_json::to_vec(&json!({
+                                                "seq": seq,
+                                                "burn": true,
+                                            }))
+                                            .unwrap_or_default();
+                                            if let Ok(ack_req) = Request::builder()
+                                                .method(Method::POST)
+                                                .uri(&ack_url)
+                                                .header(DROP_CAP_HEADER, &sub_cap)
+                                                .header(CONTENT_TYPE, CONTENT_TYPE_JSON)
+                                                .body(full_body(ack_body))
+                                            {
+                                                let _ = daemon
+                                                    .node
+                                                    .http_client()
+                                                    .request(ack_req)
+                                                    .await;
+                                            }
+                                        }
+                                        daemon.bump_ui_rev();
+                                        return;
+                                    }
+                                    Err(err) => {
+                                        let (code, _) = node_err_tuple(err);
+                                        let safe_code = sanitize_notice_label(&code);
+                                        daemon
+                                            .enqueue_system_notice(
+                                                &requesting_session_id,
+                                                format!("drop-error:{drop_id}:{safe_code}"),
+                                                format!(
+                                                    "[hyphae notice] Verified human drop '{drop_id}' failed verification ({safe_code}); payload rejected without exposure."
+                                                ),
+                                            )
+                                            .await;
+                                        return;
+                                    }
+                                }
                             }
                         }
+                    }
+                } else if matches!(status.as_u16(), 401 | 403 | 404 | 410) {
+                    daemon
+                        .enqueue_system_notice(
+                            &requesting_session_id,
+                            format!("drop-closed:{drop_id}:{}", status.as_u16()),
+                            format!(
+                                "[hyphae notice] Verified human drop '{drop_id}' closed on relay (HTTP {}).",
+                                status.as_u16()
+                            ),
+                        )
+                        .await;
+                    return;
+                }
+            }
+
+            let delay_ms = backoff_schedule[reconnect_attempt.min(backoff_schedule.len() - 1)];
+            reconnect_attempt = reconnect_attempt.saturating_add(1);
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                continue;
+            }
+            let wait_for = Duration::from_millis(delay_ms).min(remaining);
+            tokio::select! {
+                _ = tokio::time::sleep(wait_for) => {}
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
                         return;
                     }
                 }
@@ -6328,6 +7089,228 @@ fn handle_gate_reload_rpc(daemon: &LocalDaemonInner) -> Value {
     }
 }
 
+/// Re-publishes human-approved `local-ingest:<topic>` mailbox entries onto `local.<topic>`,
+/// delivers matched local EventStore batches directly into subscribed local sessions (marked
+/// gate-approved so they are never re-quarantined), acknowledges the staging rows, and wakes
+/// every matched subscriber (`G8`).
+async fn fanout_approved_local_ingest(
+    daemon: &Arc<LocalDaemonInner>,
+    staging_sid: &str,
+    topic: &str,
+    explicit_receipt: Option<&str>,
+) -> bool {
+    let approved_entries: Vec<MailboxEntry> = {
+        let db = daemon.node.db();
+        if let Some(r) = explicit_receipt {
+            match db.local().get_mailbox_entry(r) {
+                Ok(Some(entry))
+                    if entry.session_id == staging_sid
+                        && entry.gate_state == GateState::Pending
+                        && entry.reviewed_at.is_some() =>
+                {
+                    vec![entry]
+                }
+                _ => Vec::new(),
+            }
+        } else {
+            db.local()
+                .peek_inbox_gate_cleared(staging_sid, 100)
+                .unwrap_or_default()
+        }
+    };
+
+    if approved_entries.is_empty() {
+        return false;
+    }
+
+    let my_id = daemon.node.node_id().to_string();
+    let qualified_topic = format!("local.{topic}");
+    let mut sessions_to_wake: HashSet<String> = HashSet::new();
+
+    for entry in approved_entries {
+        let now = now_ms();
+        let event_type = {
+            let db = daemon.node.db();
+            db.local()
+                .query_gate_audit(&GateAuditQuery {
+                    decision: None,
+                    direction: None,
+                    session_id: Some(staging_sid.to_string()),
+                    since_ms: None,
+                    until_ms: None,
+                    limit: Some(50),
+                })
+                .ok()
+                .and_then(|rows| {
+                    rows.into_iter()
+                        .find(|a| a.receipt_id.as_deref() == Some(entry.receipt.as_str()))
+                        .and_then(|a| a.event_type)
+                })
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| "to.hyphae.local.event.v1".to_string())
+        };
+
+        let ce = if let Ok(parsed_ce) = serde_json::from_str::<ProtoCloudEvent>(&entry.text) {
+            parsed_ce
+        } else {
+            let data_val = match serde_json::from_str::<Value>(&entry.text) {
+                Ok(v @ Value::Object(_)) => v,
+                _ => json!({ "text": entry.text }),
+            };
+            let mut extensions = BTreeMap::new();
+            if let Some(ref tp) = entry.traceparent {
+                extensions.insert(EXT_TRACEPARENT.to_string(), Value::String(tp.clone()));
+            }
+            ProtoCloudEvent {
+                specversion: "1.0".to_string(),
+                id: entry.item_id.clone(),
+                source: if entry.source.trim().is_empty() {
+                    format!("local:{topic}")
+                } else {
+                    entry.source.clone()
+                },
+                event_type,
+                datacontenttype: Some(CONTENT_TYPE_JSON.to_string()),
+                dataschema: None,
+                subject: Some(topic.to_string()),
+                time: Some(format_rfc3339_millis(entry.received_at)),
+                data: Some(data_val),
+                data_base64: None,
+                extensions,
+            }
+        };
+
+        if daemon.node.publish_event(&qualified_topic, ce).await.is_err() {
+            continue;
+        }
+
+        // Flush matched local subscriber batches into their mailboxes and mark them gate-approved
+        // atomically under the DB lock so `reconcile_session_inbox` never re-quarantines them.
+        {
+            let db = daemon.node.db();
+            let _ = db.events().tick(now);
+
+            let remote_peers: HashSet<String> = db
+                .peers()
+                .list_peers(None)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.peer_id)
+                .filter(|pid| pid != &my_id)
+                .collect();
+
+            let local_subscribers: HashSet<String> = db
+                .events()
+                .list_subscriptions(None)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|s| {
+                    (s.origin_node == my_id || s.origin_node == "local")
+                        && s.topic == topic
+                        && !remote_peers.contains(&s.subscriber)
+                })
+                .map(|s| s.subscriber)
+                .collect();
+
+            for subscriber in local_subscribers {
+                let due = db
+                    .events()
+                    .claim_due_batches(&subscriber, now)
+                    .unwrap_or_default();
+                for local_batch in due {
+                    if (local_batch.origin_node != my_id && local_batch.origin_node != "local")
+                        || local_batch.topic != topic
+                    {
+                        continue;
+                    }
+                    let kind = if local_batch.topic == "kv" {
+                        MailboxKind::Kv
+                    } else {
+                        MailboxKind::Event
+                    };
+                    let traceparent = local_batch
+                        .events
+                        .first()
+                        .and_then(|ev| ev.extensions.get(EXT_TRACEPARENT))
+                        .cloned();
+                    let Ok(payload_text) = serde_json::to_string(&json!({
+                        "batchId": local_batch.id,
+                        "originNode": local_batch.origin_node,
+                        "topic": local_batch.topic,
+                        "events": local_batch.events,
+                    })) else {
+                        continue;
+                    };
+                    let put = db.local().put_in_mailbox(
+                        &MailboxInsert {
+                            session_id: subscriber.clone(),
+                            origin_node: my_id.clone(),
+                            item_id: format!("batch:{}", local_batch.id),
+                            text: payload_text,
+                            kind,
+                            source: format!("local.{}", local_batch.topic),
+                            gate_state: GateState::Pending,
+                            gate_reason: None,
+                            traceparent,
+                        },
+                        now,
+                    );
+                    match put {
+                        Ok(MailboxPutResult::Stored { receipt: sub_rcpt }) => {
+                            let _ = db.local().mark_mailbox_gate_approved(
+                                &subscriber,
+                                &sub_rcpt,
+                                false,
+                                now,
+                            );
+                            let _ = db.events().ack_batch(
+                                &subscriber,
+                                &local_batch.id,
+                                &AckOutcome::Delivered,
+                                now,
+                            );
+                            sessions_to_wake.insert(subscriber.clone());
+                        }
+                        Ok(MailboxPutResult::Duplicate) => {
+                            let _ = db.events().ack_batch(
+                                &subscriber,
+                                &local_batch.id,
+                                &AckOutcome::Delivered,
+                                now,
+                            );
+                        }
+                        Ok(MailboxPutResult::QueueFull) => {
+                            let _ = db.events().ack_batch(
+                                &subscriber,
+                                &local_batch.id,
+                                &AckOutcome::Hold {
+                                    reason: "local_inbox_full".to_string(),
+                                    retry_after_ms: Some(5_000),
+                                },
+                                now,
+                            );
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+
+            let _ = db
+                .local()
+                .acknowledge_inbox(staging_sid, &[entry.receipt.as_str()], now);
+        }
+    }
+
+    let mut woken_any = false;
+    for sub_sid in sessions_to_wake {
+        let (_, delivered) = daemon.flush_session_with_report(&sub_sid).await;
+        if delivered {
+            woken_any = true;
+        }
+    }
+    woken_any
+}
+
 async fn handle_inbox_wake_rpc(
     daemon: &Arc<LocalDaemonInner>,
     packet: &Map<String, Value>,
@@ -6364,6 +7347,7 @@ async fn handle_inbox_wake_rpc(
             .lock()
             .expect("dismissed lock poisoned")
             .remove(r);
+        daemon.clear_quarantine_notice(target_sid.as_deref(), r);
         if let Some(ref sid) = target_sid {
             let mut guard = daemon.item_meta.lock().expect("item_meta lock poisoned");
             if let Some(map) = guard.get_mut(sid) {
@@ -6374,13 +7358,19 @@ async fn handle_inbox_wake_rpc(
 
     let mut woken = false;
     if let Some(ref sid) = target_sid {
-        let has_pending = {
-            let db = daemon.node.db();
-            db.local().pending_count(sid).unwrap_or(0) > 0
-        };
-        if has_pending {
-            let (_, delivered) = daemon.flush_session_with_report(sid).await;
-            woken = delivered;
+        if let Some(topic) = sid.strip_prefix("local-ingest:") {
+            if !topic.is_empty() {
+                woken = fanout_approved_local_ingest(daemon, sid, topic, receipt.as_deref()).await;
+            }
+        } else {
+            let has_pending = {
+                let db = daemon.node.db();
+                db.local().pending_count(sid).unwrap_or(0) > 0
+            };
+            if has_pending {
+                let (_, delivered) = daemon.flush_session_with_report(sid).await;
+                woken = delivered;
+            }
         }
     }
 
@@ -6811,6 +7801,8 @@ impl LocalDaemonInner {
         let herdr_created_ms = self.session_herdr_created_ms(sess);
         let transport_kind = self.active_transport_kind(&sess.id);
 
+        let now = now_ms();
+        self.sweep_expired_mutes_and_policies(now);
         let gate_active = self.current_gate().is_some();
         let (
             policy,
@@ -6833,7 +7825,10 @@ impl LocalDaemonInner {
                 db.local().unread_digest(&sess.id).unwrap_or_default()
             };
             let muted_archived = muted_count(&db, &sess.id).unwrap_or(0);
-            let mutes = db.local().list_mutes(Some(&sess.id)).unwrap_or_default();
+            let mutes = db
+                .local()
+                .list_mutes_at(Some(&sess.id), now)
+                .unwrap_or_default();
             let subs = db
                 .events()
                 .list_subscriptions(Some(&sess.id))
@@ -7025,11 +8020,15 @@ impl LocalDaemonInner {
             let mutes_json: Vec<Value> = mutes
                 .into_iter()
                 .map(|m| {
-                    json!({
+                    let mut entry = json!({
                         "pattern": m.pattern,
                         "scope": if m.scope == "*" { "connector" } else { "session" },
                         "mutedAt": m.muted_at,
-                    })
+                    });
+                    if let Some(exp) = m.expires_at {
+                        entry["expiresAt"] = json!(exp);
+                    }
+                    entry
                 })
                 .collect();
 
@@ -7782,10 +8781,15 @@ fn handle_session_mute(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Valu
         .map(|s| s.id.as_str())
         .unwrap_or("cli");
     let now = now_ms();
+    let expires_at =
+        ttl_seconds.map(|secs| now.saturating_add((secs as i64).saturating_mul(1_000)));
 
     let added = {
         let db = daemon.node.db();
-        let added = match db.local().add_mute(db_scope, &pattern, actor, now) {
+        let added = match db
+            .local()
+            .add_mute_with_expiry(db_scope, &pattern, actor, now, expires_at)
+        {
             Ok(rule) => rule,
             Err(e) => {
                 return json!({ "ok": false, "code": "store_error", "error": e.to_string() });
@@ -7809,9 +8813,6 @@ fn handle_session_mute(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Valu
 
     if let Some(ttl) = ttl_seconds {
         let timer_daemon = Arc::clone(daemon);
-        let timer_scope = db_scope.to_string();
-        let timer_sid = resolved.as_ref().map(|s| s.id.clone());
-        let timer_pattern = added.pattern.clone();
         let mut shutdown_rx = daemon.shutdown_rx.clone();
         tokio::spawn(async move {
             tokio::select! {
@@ -7823,34 +8824,24 @@ fn handle_session_mute(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Valu
             if *shutdown_rx.borrow() {
                 return;
             }
-            let db = timer_daemon.node.db();
-            let _ = db.local().remove_mute(&timer_scope, &timer_pattern);
-            if let Some(ref sid) = timer_sid {
-                if timer_scope != "*" {
-                    let _ = timer_daemon.delivery.update_policy(&db, sid, |p| {
-                        let is_mute = p.overrides.iter().any(|r| {
-                            r.target == timer_pattern && r.delivery == DeliveryUrgency::Mute
-                        });
-                        if is_mute {
-                            p.remove_rule(&timer_pattern);
-                        }
-                    });
-                }
-            }
-            timer_daemon.bump_ui_rev();
+            timer_daemon.sweep_expired_mutes_and_policies(now_ms());
         });
     }
 
     let rev = daemon.bump_ui_rev();
+    let mut res = json!({
+        "sessionId": resolved.map(|s| s.id),
+        "pattern": added.pattern,
+        "scope": scope_str,
+        "ttlSeconds": ttl_seconds,
+        "rev": rev,
+    });
+    if let Some(exp) = added.expires_at {
+        res["expiresAt"] = json!(exp);
+    }
     json!({
         "ok": true,
-        "result": {
-            "sessionId": resolved.map(|s| s.id),
-            "pattern": added.pattern,
-            "scope": scope_str,
-            "ttlSeconds": ttl_seconds,
-            "rev": rev,
-        }
+        "result": res,
     })
 }
 

@@ -170,6 +170,16 @@ pub struct T3ProbeResult {
     pub error: Option<String>,
 }
 
+impl T3ProbeResult {
+    /// Returns `true` ONLY when the T3 server responded 2xx AND confirmed authentication
+    /// succeeded (`authenticated == Some(true)`). Unauthenticated 2xx responses MUST NOT be
+    /// treated as live attachable transports because delivery fails with `t3_auth_missing` /
+    /// `t3_auth_failed` and silently drops wakeups.
+    pub fn is_authenticated(&self) -> bool {
+        self.ok && self.authenticated == Some(true)
+    }
+}
+
 /// Selected T3 orchestration v2 `message.dispatch` mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum T3DispatchMode {

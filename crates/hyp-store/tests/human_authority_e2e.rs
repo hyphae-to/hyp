@@ -701,7 +701,7 @@ fn enc_jwk_lifecycle_preferred_lookup_and_revocation_guard() {
 
 #[test]
 fn full_v1_v2_v3_v4_to_v5_migration_parity_backups_and_zero_data_loss() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, 5);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 6);
     let dir = TempDir::new().unwrap();
 
     let v1_path = dir.path().join("from-v1").join("node.sqlite");
@@ -725,25 +725,25 @@ fn full_v1_v2_v3_v4_to_v5_migration_parity_backups_and_zero_data_loss() {
     let fresh_idx = snapshot_indexes(db_fresh.connection());
 
     for (from_ver, db) in [(1i64, &db_v1), (2, &db_v2), (3, &db_v3), (4, &db_v4)] {
-        assert_eq!(db.schema_version().unwrap(), 5);
+        assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
         let applied: Vec<i64> = db
             .applied_migrations()
             .unwrap()
             .into_iter()
             .map(|(v, _)| v)
             .collect();
-        assert_eq!(applied, vec![1, 2, 3, 4, 5]);
+        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6]);
 
-        // Bit-for-bit structural schema parity with fresh v5
+        // Bit-for-bit structural schema parity with fresh latest
         assert_eq!(
             snapshot_tables_and_columns(db.connection()),
             fresh_cols,
-            "v{from_ver}->v5 tables/columns must match fresh v5"
+            "v{from_ver}->v{CURRENT_SCHEMA_VERSION} tables/columns must match fresh"
         );
         assert_eq!(
             snapshot_indexes(db.connection()),
             fresh_idx,
-            "v{from_ver}->v5 indexes must match fresh v5"
+            "v{from_ver}->v{CURRENT_SCHEMA_VERSION} indexes must match fresh"
         );
 
         // Backup exists, 0600 perms, genuine snapshot at `from_ver`
@@ -751,7 +751,7 @@ fn full_v1_v2_v3_v4_to_v5_migration_parity_backups_and_zero_data_loss() {
         assert_eq!(backups.len(), 1);
         let bak_name = backups[0].file_name().unwrap().to_str().unwrap();
         assert!(
-            bak_name.starts_with(&format!("node.sqlite.v{from_ver}-to-v5-"))
+            bak_name.starts_with(&format!("node.sqlite.v{from_ver}-to-v{CURRENT_SCHEMA_VERSION}-"))
                 && bak_name.ends_with(".bak"),
             "unexpected backup name: {bak_name}"
         );

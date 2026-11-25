@@ -33,6 +33,8 @@ pub struct MuteRule {
     pub pattern: String,
     pub muted_at: i64,
     pub muted_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
 }
 
 /// Input for installing a mute rule (e.g. standalone or atomically during quarantine rejection).
@@ -517,7 +519,8 @@ impl<'a> LocalStateStore<'a> {
             .collect())
     }
 
-    /// Removes inactive sessions older than `cutoff_ms` (skipping `active_session_ids`),
+    /// Removes inactive sessions older than `cutoff_ms` (skipping `active_session_ids` and any
+    /// session still holding `gate_state = 'quarantined'` mailbox items awaiting human review),
     /// cleaning up their mailbox, per-session mutes, bridge links, and plugin targets.
     pub fn prune_sessions(
         &self,
@@ -525,9 +528,15 @@ impl<'a> LocalStateStore<'a> {
         active_session_ids: &HashSet<String>,
     ) -> StoreResult<PruneReport> {
         let tx = self.db.immediate_tx()?;
-        let mut stmt = tx
-            .conn()
-            .prepare("SELECT id FROM sessions WHERE last_seen > 0 AND last_seen < ?1")?;
+        let mut stmt = tx.conn().prepare(
+            "SELECT s.id FROM sessions s
+             WHERE s.last_seen > 0
+               AND s.last_seen < ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM mailbox m
+                   WHERE m.session_id = s.id AND m.gate_state = 'quarantined'
+               )",
+        )?;
         let candidates: Vec<String> = stmt
             .query_map(params![cutoff_ms], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -539,8 +548,10 @@ impl<'a> LocalStateStore<'a> {
             .collect();
 
         for id in &stale {
-            tx.conn()
-                .execute("DELETE FROM mailbox WHERE session_id = ?1", params![id])?;
+            tx.conn().execute(
+                "DELETE FROM mailbox WHERE session_id = ?1 AND gate_state != 'quarantined'",
+                params![id],
+            )?;
             tx.conn()
                 .execute("DELETE FROM muted_sources WHERE scope = ?1", params![id])?;
             tx.conn()
@@ -1388,8 +1399,8 @@ impl<'a> LocalStateStore<'a> {
             let normalized = mute.pattern.trim().to_lowercase();
             if !normalized.is_empty() && !mute.scope.is_empty() {
                 tx.conn().execute(
-                    "INSERT OR REPLACE INTO muted_sources (scope, pattern, muted_at, muted_by)
-                     VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT OR REPLACE INTO muted_sources (scope, pattern, muted_at, muted_by, expires_at)
+                     VALUES (?1, ?2, ?3, ?4, NULL)",
                     params![&mute.scope, normalized, now_ms, reviewer],
                 )?;
             }
@@ -1485,22 +1496,42 @@ impl<'a> LocalStateStore<'a> {
         muted_by: &str,
         now_ms: i64,
     ) -> StoreResult<MuteRule> {
+        self.add_mute_with_expiry(scope, pattern, muted_by, now_ms, None)
+    }
+
+    /// Installs or updates a source mute rule with an optional persistent Unix-ms expiry deadline.
+    pub fn add_mute_with_expiry(
+        &self,
+        scope: &str,
+        pattern: &str,
+        muted_by: &str,
+        now_ms: i64,
+        expires_at: Option<i64>,
+    ) -> StoreResult<MuteRule> {
         let normalized = pattern.trim().to_lowercase();
         if scope.is_empty() || normalized.is_empty() {
             return Err(StoreError::InvalidInput(
                 "mute scope and pattern must be non-empty".to_string(),
             ));
         }
+        if let Some(exp) = expires_at {
+            if exp <= 0 {
+                return Err(StoreError::InvalidInput(
+                    "mute expires_at must be a positive Unix millisecond timestamp".to_string(),
+                ));
+            }
+        }
         self.db.conn().execute(
-            "INSERT OR REPLACE INTO muted_sources (scope, pattern, muted_at, muted_by)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![scope, &normalized, now_ms, muted_by],
+            "INSERT OR REPLACE INTO muted_sources (scope, pattern, muted_at, muted_by, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![scope, &normalized, now_ms, muted_by, expires_at],
         )?;
         Ok(MuteRule {
             scope: scope.to_string(),
             pattern: normalized,
             muted_at: now_ms,
             muted_by: muted_by.to_string(),
+            expires_at,
         })
     }
 
@@ -1513,25 +1544,84 @@ impl<'a> LocalStateStore<'a> {
         Ok(changed > 0)
     }
 
+    /// Sweeps all expired mute rules (`expires_at IS NOT NULL AND expires_at <= now_ms`) and
+    /// returns the removed `(scope, pattern)` pairs.
+    ///
+    /// Takes zero write lock when no rules have expired.
+    pub fn sweep_expired_mutes(&self, now_ms: i64) -> StoreResult<Vec<(String, String)>> {
+        let has_expired: bool = self.db.conn().query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM muted_sources
+                 WHERE expires_at IS NOT NULL AND expires_at <= ?1
+             )",
+            params![now_ms],
+            |row| row.get(0),
+        )?;
+        if !has_expired {
+            return Ok(Vec::new());
+        }
+
+        let tx = self.db.immediate_tx()?;
+        let mut stmt = tx.conn().prepare(
+            "SELECT scope, pattern FROM muted_sources
+             WHERE expires_at IS NOT NULL AND expires_at <= ?1
+             ORDER BY scope ASC, pattern ASC",
+        )?;
+        let expired: Vec<(String, String)> = stmt
+            .query_map(params![now_ms], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        if !expired.is_empty() {
+            tx.conn().execute(
+                "DELETE FROM muted_sources WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+                params![now_ms],
+            )?;
+        }
+        tx.commit()?;
+        Ok(expired)
+    }
+
+    /// Returns the earliest `expires_at` among persisted TTL mute rules, or `None` if none exist.
+    pub fn next_mute_expiry_ms(&self) -> StoreResult<Option<i64>> {
+        let next: Option<i64> = self.db.conn().query_row(
+            "SELECT MIN(expires_at) FROM muted_sources WHERE expires_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(next)
+    }
+
     pub fn list_mutes(&self, session_id: Option<&str>) -> StoreResult<Vec<MuteRule>> {
+        self.list_mutes_at(session_id, crate::types::now_ms())
+    }
+
+    /// Lists all active (non-expired at `now_ms`) mute rules for `session_id` (or global `*` only).
+    pub fn list_mutes_at(
+        &self,
+        session_id: Option<&str>,
+        now_ms: i64,
+    ) -> StoreResult<Vec<MuteRule>> {
         if let Some(sid) = session_id {
             let mut stmt = self.db.conn().prepare(
-                "SELECT scope, pattern, muted_at, muted_by FROM muted_sources
-                 WHERE scope = '*' OR scope = ?1
+                "SELECT scope, pattern, muted_at, muted_by, expires_at FROM muted_sources
+                 WHERE (scope = '*' OR scope = ?1)
+                   AND (expires_at IS NULL OR expires_at > ?2)
                  ORDER BY scope ASC, pattern ASC",
             )?;
             let rows = stmt
-                .query_map(params![sid], decode_mute_row)?
+                .query_map(params![sid, now_ms], decode_mute_row)?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         } else {
             let mut stmt = self.db.conn().prepare(
-                "SELECT scope, pattern, muted_at, muted_by FROM muted_sources
+                "SELECT scope, pattern, muted_at, muted_by, expires_at FROM muted_sources
                  WHERE scope = '*'
+                   AND (expires_at IS NULL OR expires_at > ?1)
                  ORDER BY pattern ASC",
             )?;
             let rows = stmt
-                .query_map([], decode_mute_row)?
+                .query_map(params![now_ms], decode_mute_row)?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         }
@@ -1541,10 +1631,20 @@ impl<'a> LocalStateStore<'a> {
     /// mute rule (case-insensitive exact match, plus trailing `*` prefix wildcard support).
     /// Returns the first matching mute pattern if muted.
     pub fn is_muted(&self, session_id: &str, candidates: &[&str]) -> StoreResult<Option<String>> {
+        self.is_muted_at(session_id, candidates, crate::types::now_ms())
+    }
+
+    /// Deterministic variant of [`Self::is_muted`] evaluated against an explicit `now_ms` clock.
+    pub fn is_muted_at(
+        &self,
+        session_id: &str,
+        candidates: &[&str],
+        now_ms: i64,
+    ) -> StoreResult<Option<String>> {
         if candidates.is_empty() {
             return Ok(None);
         }
-        let rules = self.list_mutes(Some(session_id))?;
+        let rules = self.list_mutes_at(Some(session_id), now_ms)?;
         if rules.is_empty() {
             return Ok(None);
         }
@@ -1882,6 +1982,7 @@ fn decode_mute_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MuteRule> {
         pattern: row.get(1)?,
         muted_at: row.get(2)?,
         muted_by: row.get(3)?,
+        expires_at: row.get(4)?,
     })
 }
 
