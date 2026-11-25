@@ -808,6 +808,23 @@ impl<'a> ChannelStore<'a> {
         enrolled_channel_members(self.db.conn(), host_node, channel)
     }
 
+    /// Lists `(host_node, channel)` pairs joined by `address`, ordered deterministically by
+    /// `(host_node ASC, channel ASC)`.
+    pub fn list_channels_for_address(&self, address: &str) -> StoreResult<Vec<(String, String)>> {
+        if address.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.db.conn().prepare(
+            "SELECT host_node, channel FROM channel_members
+             WHERE address = ?1
+             ORDER BY host_node ASC, channel ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![address], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Lists non-empty channels and their enrolled members, optionally filtered by `host_node`.
     pub fn list_channels(&self, host_node: Option<&str>) -> StoreResult<Vec<ChannelInfo>> {
         let rows: Vec<(String, String, String)> = if let Some(host) = host_node {

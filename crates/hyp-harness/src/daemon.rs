@@ -87,6 +87,19 @@ const PRIORITY_HERDR: u8 = 30;
 const PRIORITY_T3: u8 = 25;
 const PRIORITY_CODEX_QUEUE: u8 = 20;
 
+/// Schema version for `session.summary`, `sessions.summary`, `inspect.watch`, and `<state_dir>/ui/state.json`.
+pub const UI_STATE_SCHEMA_VERSION: u32 = 1;
+/// Hard cap on metadata-only `queuedItems` returned in `session.summary` / `ui/state.json`.
+pub const MAX_SUMMARY_QUEUED_ITEMS: usize = 50;
+/// Hard cap on distinct unread sources listed in `unreadBreakdown.sources`.
+const MAX_SUMMARY_SOURCES: usize = 20;
+/// Debounce window coalescing burst mutations before atomically rewriting `<state_dir>/ui/state.json`.
+const UI_PROJECTOR_DEBOUNCE_MS: u64 = 100;
+/// Coalescing window for live `inspect.watch` push frames.
+const INSPECT_WATCH_DEBOUNCE_MS: u64 = 25;
+/// Maximum allowed TTL (7 days) for temporary `session.mute` rules.
+const MAX_MUTE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
 /// Default timeout waiting for a live `--claude-channel` `channel.ack`.
 pub const DEFAULT_CHANNEL_DELIVER_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -213,6 +226,7 @@ struct AttachedPushTransport {
 struct TransportHints {
     harness: Option<HarnessKind>,
     herdr_terminal_id: Option<String>,
+    herdr_created_ms: Option<i64>,
     codex_thread_id: Option<String>,
     codex_home: Option<PathBuf>,
     codex_remote: Option<String>,
@@ -220,6 +234,7 @@ struct TransportHints {
     explicit_codex_queue: bool,
     t3_base_dir: Option<PathBuf>,
     t3_url: Option<String>,
+    cwd: Option<String>,
 }
 
 impl TransportHints {
@@ -239,6 +254,10 @@ impl TransportHints {
         let herdr_terminal_id = non_empty_str("herdrTerminalId")
             .or_else(|| non_empty_str("terminalId"))
             .filter(|tid| is_valid_terminal_id(tid));
+        let herdr_created_ms = packet
+            .get("herdrCreatedMs")
+            .or_else(|| packet.get("herdr_created_ms"))
+            .and_then(Value::as_i64);
         let explicit_thread = non_empty_str("threadId");
         let codex_thread_id = explicit_thread
             .clone()
@@ -250,10 +269,13 @@ impl TransportHints {
             explicit_thread.is_some() || codex_remote.is_some() || codex_resume;
         let t3_base_dir = non_empty_str("t3BaseDir").map(PathBuf::from);
         let t3_url = non_empty_str("t3Url");
+        let cwd = non_empty_str("cwd")
+            .filter(|s| s.len() <= 1024 && !s.chars().any(char::is_control));
 
         Self {
             harness,
             herdr_terminal_id,
+            herdr_created_ms,
             codex_thread_id,
             codex_home,
             codex_remote,
@@ -261,6 +283,7 @@ impl TransportHints {
             explicit_codex_queue,
             t3_base_dir,
             t3_url,
+            cwd,
         }
     }
 
@@ -270,6 +293,26 @@ impl TransportHints {
             || self.t3_url.is_some()
             || self.harness == Some(HarnessKind::T3)
             || (self.explicit_codex_queue && self.codex_thread_id.is_some())
+    }
+
+    fn backend_patch(&self, explicit_harness: Option<HarnessKind>) -> Map<String, Value> {
+        let mut patch = Map::new();
+        if let Some(h) = explicit_harness.or(self.harness) {
+            patch.insert("kind".into(), json!(h.as_str()));
+        }
+        if let Some(ref tid) = self.herdr_terminal_id {
+            patch.insert("herdrTerminalId".into(), json!(tid));
+        }
+        if let Some(created_ms) = self.herdr_created_ms {
+            patch.insert("herdrCreatedMs".into(), json!(created_ms));
+        }
+        if let Some(ref codex_tid) = self.codex_thread_id {
+            patch.insert("codexThreadId".into(), json!(codex_tid));
+        }
+        if let Some(ref cwd) = self.cwd {
+            patch.insert("cwd".into(), json!(cwd));
+        }
+        patch
     }
 }
 
@@ -326,6 +369,9 @@ struct LocalDaemonInner {
     channels: Mutex<HashMap<String, LiveChannel>>,
     /// Attached native external push transports (`Herdr`, `T3`, `CodexQueue`, or test doubles).
     session_transports: Mutex<HashMap<String, AttachedPushTransport>>,
+    /// Live reverse index mapping `herdrTerminalId -> Vec<session_id>` (most-recently-seen first),
+    /// hydrated from SQLite `sessions.backend_json` on startup and updated on hints/calls/transports.
+    herdr_terminal_index: Mutex<HashMap<String, Vec<String>>>,
     /// Active background auto-detection probe watchers keyed by `session_id`.
     pending_probes: Mutex<HashMap<String, watch::Receiver<bool>>>,
     flushing: Mutex<HashSet<String>>,
@@ -344,6 +390,10 @@ struct LocalDaemonInner {
     hold_retries: Mutex<HashMap<String, (u32, u64)>>,
     /// Tier 4 per-wakeup concurrency guard (`maxConcurrentSpawns: 1`) for allowlisted Herdr cold spawns.
     active_cold_spawns: Mutex<HashSet<String>>,
+    /// Monotonic UI projection revision counter bumped on every session/sub/mailbox/policy/channel change.
+    ui_rev: AtomicU64,
+    /// Watch broadcaster notifying `inspect.watch` clients and the debounced `ui/state.json` projector.
+    ui_rev_tx: watch::Sender<u64>,
     /// Daemon shutdown watch receiver shared with bounded retry tasks.
     shutdown_rx: watch::Receiver<bool>,
     next_id: AtomicU64,
@@ -356,6 +406,7 @@ pub struct LocalDaemon {
     shutdown_tx: watch::Sender<bool>,
     accept_task: Mutex<Option<JoinHandle<()>>>,
     inbox_task: Mutex<Option<JoinHandle<()>>>,
+    projector_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Drop for LocalDaemon {
@@ -431,6 +482,8 @@ impl LocalDaemon {
         });
 
         let inbox_task = spawn_inbox_watcher(Arc::clone(&inner), shutdown_tx.subscribe());
+        let _ = inner.write_ui_state_snapshot();
+        let projector_task = spawn_ui_state_projector(Arc::clone(&inner), shutdown_tx.subscribe());
 
         Ok(Self {
             inner,
@@ -438,6 +491,7 @@ impl LocalDaemon {
             shutdown_tx,
             accept_task: Mutex::new(Some(accept_task)),
             inbox_task: Mutex::new(Some(inbox_task)),
+            projector_task: Mutex::new(Some(projector_task)),
         })
     }
 
@@ -513,6 +567,8 @@ impl LocalDaemon {
         });
 
         let inbox_task = spawn_inbox_watcher(Arc::clone(&inner), shutdown_tx.subscribe());
+        let _ = inner.write_ui_state_snapshot();
+        let projector_task = spawn_ui_state_projector(Arc::clone(&inner), shutdown_tx.subscribe());
 
         Ok(Self {
             inner,
@@ -520,11 +576,22 @@ impl LocalDaemon {
             shutdown_tx,
             accept_task: Mutex::new(Some(accept_task)),
             inbox_task: Mutex::new(Some(inbox_task)),
+            projector_task: Mutex::new(Some(projector_task)),
         })
     }
 
     pub fn socket_path(&self) -> &Path {
         &self.inner.socket_path
+    }
+
+    /// Path to the atomic metadata-only UI projection file (`<state_dir>/ui/state.json`).
+    pub fn ui_state_path(&self) -> PathBuf {
+        self.inner.ui_state_path()
+    }
+
+    /// Current monotonic UI projection revision counter.
+    pub fn ui_rev(&self) -> u64 {
+        self.inner.current_ui_rev()
     }
 
     pub fn tcp_addr(&self) -> Option<SocketAddr> {
@@ -575,12 +642,17 @@ impl LocalDaemon {
 
     /// Removes any attached native [`PushTransport`] for `session_id`.
     pub fn unregister_session_transport(&self, session_id: &str) -> bool {
-        self.inner
+        let removed = self
+            .inner
             .session_transports
             .lock()
             .expect("session_transports lock poisoned")
             .remove(session_id)
-            .is_some()
+            .is_some();
+        if removed {
+            self.inner.bump_ui_rev();
+        }
+        removed
     }
 
     /// Returns the active live wakeup transport kind for `session_id`, if any
@@ -763,6 +835,14 @@ impl LocalDaemon {
         {
             h.abort();
         }
+        if let Some(h) = self
+            .projector_task
+            .lock()
+            .expect("projector_task lock poisoned")
+            .take()
+        {
+            h.abort();
+        }
         let _ = std::fs::remove_file(&self.inner.socket_path);
     }
 
@@ -863,6 +943,7 @@ impl LocalDaemon {
                             if urgency.is_some_and(DeliveryUrgency::triggers_delivery_or_digest) {
                                 self.inner.flush_session(&session_id).await;
                             }
+                            self.inner.bump_ui_rev();
                             return Ok(urgency);
                         }
                     }
@@ -870,6 +951,7 @@ impl LocalDaemon {
                 GateDecision::Quarantine { .. }
                 | GateDecision::Block { .. }
                 | GateDecision::Hold { .. } => {
+                    self.inner.bump_ui_rev();
                     return Ok(None);
                 }
             }
@@ -918,6 +1000,7 @@ impl LocalDaemon {
         if classification.effective_urgency == DeliveryUrgency::Mute {
             let db = self.inner.node.db();
             archive_muted_entry(&db, &insert, now).map_err(|e| e.to_string())?;
+            self.inner.bump_ui_rev();
             return Ok(Some(DeliveryUrgency::Mute));
         }
 
@@ -949,6 +1032,7 @@ impl LocalDaemon {
                 notified: false,
             },
         );
+        self.inner.bump_ui_rev();
         self.inner.flush_session(&session_id).await;
         Ok(Some(classification.effective_urgency))
     }
@@ -980,6 +1064,7 @@ fn spawn_inbox_watcher(
                                 inner.flush_session(&sid).await;
                             }
                         }
+                        inner.bump_ui_rev();
                         continue;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -994,6 +1079,7 @@ fn spawn_inbox_watcher(
             if inner.reconcile_session_inbox(&session_id).await {
                 inner.flush_session(&session_id).await;
             }
+            inner.bump_ui_rev();
         }
     })
 }
@@ -1006,6 +1092,23 @@ impl LocalDaemonInner {
         socket_path: PathBuf,
         shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
+        let mut hydrated_herdr_index: HashMap<String, Vec<String>> = HashMap::new();
+        {
+            let db = node.db();
+            if let Ok(sessions) = db.local().list_sessions() {
+                for s in sessions {
+                    if let Some(tid) = extract_backend_str(&s.backend_json, "herdrTerminalId") {
+                        if is_valid_terminal_id(&tid) {
+                            let entry = hydrated_herdr_index.entry(tid).or_default();
+                            if !entry.iter().any(|existing| existing == &s.id) {
+                                entry.push(s.id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let (ui_rev_tx, _) = watch::channel(1u64);
         Self {
             node,
             gate,
@@ -1016,6 +1119,7 @@ impl LocalDaemonInner {
             waiters: Mutex::new(HashMap::new()),
             channels: Mutex::new(HashMap::new()),
             session_transports: Mutex::new(HashMap::new()),
+            herdr_terminal_index: Mutex::new(hydrated_herdr_index),
             pending_probes: Mutex::new(HashMap::new()),
             flushing: Mutex::new(HashSet::new()),
             item_meta: Mutex::new(HashMap::new()),
@@ -1025,9 +1129,59 @@ impl LocalDaemonInner {
             configured_bridge_targets: Mutex::new(BTreeMap::new()),
             hold_retries: Mutex::new(HashMap::new()),
             active_cold_spawns: Mutex::new(HashSet::new()),
+            ui_rev: AtomicU64::new(1),
+            ui_rev_tx,
             shutdown_rx,
             next_id: AtomicU64::new(1),
         }
+    }
+
+    fn current_ui_rev(&self) -> u64 {
+        self.ui_rev.load(Ordering::SeqCst)
+    }
+
+    fn bump_ui_rev(&self) -> u64 {
+        let next = self.ui_rev.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.ui_rev_tx.send(next);
+        next
+    }
+
+    fn subscribe_ui_rev(&self) -> watch::Receiver<u64> {
+        self.ui_rev_tx.subscribe()
+    }
+
+    fn ui_state_path(&self) -> PathBuf {
+        self.node.config().state_dir.join("ui").join("state.json")
+    }
+
+    fn record_herdr_terminal(&self, terminal_id: &str, session_id: &str) {
+        if !is_valid_terminal_id(terminal_id) || session_id.is_empty() {
+            return;
+        }
+        let mut index = self
+            .herdr_terminal_index
+            .lock()
+            .expect("herdr_terminal_index lock poisoned");
+        let list = index.entry(terminal_id.to_string()).or_default();
+        list.retain(|existing| existing != session_id);
+        list.insert(0, session_id.to_string());
+    }
+
+    fn merge_session_backend_and_index(
+        &self,
+        session_id: &str,
+        patch: &Map<String, Value>,
+        now: i64,
+    ) -> Result<hyp_store::Session, hyp_store::StoreError> {
+        let sess = self.node.db().local().merge_session_backend(
+            session_id,
+            &Value::Object(patch.clone()),
+            now,
+        )?;
+        if let Some(tid) = patch.get("herdrTerminalId").and_then(Value::as_str) {
+            self.record_herdr_terminal(tid, session_id);
+        }
+        Ok(sess)
     }
 
     fn cancel_hold_retry(&self, session_id: &str) {
@@ -1184,22 +1338,38 @@ impl LocalDaemonInner {
         transport: Arc<dyn PushTransport>,
         priority: u8,
     ) -> bool {
-        let mut map = self
-            .session_transports
-            .lock()
-            .expect("session_transports lock poisoned");
-        if let Some(existing) = map.get(session_id) {
-            if existing.priority > priority {
-                return false;
+        let herdr_tid = transport.herdr_terminal_id().map(ToString::to_string);
+        let target_meta = transport.target_metadata();
+        {
+            let mut map = self
+                .session_transports
+                .lock()
+                .expect("session_transports lock poisoned");
+            if let Some(existing) = map.get(session_id) {
+                if existing.priority > priority {
+                    return false;
+                }
+            }
+            map.insert(
+                session_id.to_string(),
+                AttachedPushTransport {
+                    transport,
+                    priority,
+                },
+            );
+        }
+        if let Some(ref tid) = herdr_tid {
+            self.record_herdr_terminal(tid, session_id);
+        }
+        if target_meta.is_object() {
+            let db = self.node.db();
+            if db.local().get_session(session_id).ok().flatten().is_some() {
+                let _ = db
+                    .local()
+                    .merge_session_backend(session_id, &target_meta, now_ms());
             }
         }
-        map.insert(
-            session_id.to_string(),
-            AttachedPushTransport {
-                transport,
-                priority,
-            },
-        );
+        self.bump_ui_rev();
         true
     }
 
@@ -1697,6 +1867,7 @@ impl LocalDaemonInner {
         }
         // Any successful delivery or hook drain cancels pending Tier 3 Hold retries immediately.
         self.cancel_hold_retry(session_id);
+        self.bump_ui_rev();
     }
 
     /// Flushes eligible batches to live transports (`claude-channel` > `PushTransport` > `watch` stream > `wait` once).
@@ -2597,6 +2768,7 @@ impl LocalDaemonInner {
                 }
             }
         }
+        self.bump_ui_rev();
         Ok(Value::Object(out))
     }
 
@@ -2620,6 +2792,7 @@ impl LocalDaemonInner {
             }
         };
         self.cancel_hold_retry(session_id);
+        self.bump_ui_rev();
         Ok(json!({ "left": left }))
     }
 
@@ -2753,6 +2926,7 @@ impl LocalDaemonInner {
             (policy, unread, muted)
         };
 
+        self.bump_ui_rev();
         if !focus_mode && unread > 0 {
             self.flush_session(session_id).await;
         }
@@ -2794,6 +2968,7 @@ impl LocalDaemonInner {
             });
             added
         };
+        self.bump_ui_rev();
 
         Ok(json!({
             "muted": rule.pattern,
@@ -2828,6 +3003,7 @@ impl LocalDaemonInner {
             });
             db_removed || policy_removed
         };
+        self.bump_ui_rev();
 
         Ok(json!({
             "pattern": target.to_ascii_lowercase(),
@@ -2888,6 +3064,7 @@ impl LocalDaemonInner {
             .join_channel(ch, &handle)
             .await
             .map_err(node_err_tuple)?;
+        self.bump_ui_rev();
         Ok(serde_json::to_value(resp).unwrap_or_else(|_| json!({})))
     }
 
@@ -2906,6 +3083,7 @@ impl LocalDaemonInner {
             .leave_channel(ch, &handle)
             .await
             .map_err(node_err_tuple)?;
+        self.bump_ui_rev();
         Ok(json!({ "left": left }))
     }
 
@@ -3098,6 +3276,7 @@ impl LocalDaemonInner {
                 }
                 p
             };
+            self.bump_ui_rev();
 
             // If ONLY policy updates were provided (no read/query flags), return updated policy directly.
             let is_query = args.contains_key("state")
@@ -3196,6 +3375,7 @@ impl LocalDaemonInner {
             if result.unread_count == 0 {
                 self.cancel_hold_retry(session_id);
             }
+            self.bump_ui_rev();
         }
 
         Ok(json!({
@@ -3384,6 +3564,8 @@ impl LocalDaemonInner {
             });
         }
 
+        self.bump_ui_rev();
+
         let outcome = if existing_id.is_some() {
             "updated"
         } else {
@@ -3429,7 +3611,7 @@ impl LocalDaemonInner {
             let db_removed = {
                 let db = self.node.db();
                 db.events()
-                    .delete_subscription(&sub_id)
+                    .delete_subscription_for_subscriber(&sub_id, session_id)
                     .map_err(store_err_tuple)?
             };
             let mut guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
@@ -3440,6 +3622,9 @@ impl LocalDaemonInner {
         } else {
             false
         };
+        if removed {
+            self.bump_ui_rev();
+        }
 
         Ok(json!({ "removed": removed }))
     }
@@ -4158,6 +4343,57 @@ async fn handle_connection<R, W>(
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
                         break;
                     }
+                    "session.summary" => {
+                        let resp = handle_session_summary(&daemon, &packet);
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
+                    "sessions.summary" => {
+                        let resp = handle_sessions_summary(&daemon, &packet);
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
+                    "inspect.watch" => {
+                        run_inspect_watch(
+                            &daemon,
+                            &packet,
+                            &mut reader,
+                            &mut write_half,
+                            &mut shutdown_rx,
+                        )
+                        .await;
+                        break;
+                    }
+                    "session.focus" => {
+                        let resp = handle_session_focus(&daemon, &packet).await;
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
+                    "session.mute" => {
+                        let resp = handle_session_mute(&daemon, &packet);
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
+                    "session.unmute" => {
+                        let resp = handle_session_unmute(&daemon, &packet);
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
+                    "session.rule" => {
+                        let resp = handle_session_rule(&daemon, &packet);
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
+                    "session.unsubscribe" => {
+                        let resp = handle_session_unsubscribe(&daemon, &packet);
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
+                    "session.leave_channel" => {
+                        let resp = handle_session_leave_channel(&daemon, &packet).await;
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
                     "daemon.status" => {
                         let resp = handle_daemon_status(&daemon).await;
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
@@ -4169,7 +4405,10 @@ async fn handle_connection<R, W>(
                             .and_then(Value::as_str)
                             .unwrap_or_default();
                         let resp = match daemon.node.db().local().add_mute("*", target, "cli", now_ms()) {
-                            Ok(rule) => json!({ "ok": true, "result": { "rule": rule } }),
+                            Ok(rule) => {
+                                daemon.bump_ui_rev();
+                                json!({ "ok": true, "result": { "rule": rule } })
+                            }
                             Err(e) => json!({ "ok": false, "error": e.to_string() }),
                         };
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
@@ -4181,7 +4420,12 @@ async fn handle_connection<R, W>(
                             .and_then(Value::as_str)
                             .unwrap_or_default();
                         let resp = match daemon.node.db().local().remove_mute("*", target) {
-                            Ok(removed) => json!({ "ok": true, "result": { "removed": removed } }),
+                            Ok(removed) => {
+                                if removed {
+                                    daemon.bump_ui_rev();
+                                }
+                                json!({ "ok": true, "result": { "removed": removed } })
+                            }
                             Err(e) => json!({ "ok": false, "error": e.to_string() }),
                         };
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
@@ -4224,12 +4468,26 @@ async fn handle_connection<R, W>(
                             .filter(|s| is_valid_session_id(s))
                             .map(ToString::to_string);
                         if sid.is_none() {
+                            if let Some(tid) = packet
+                                .get("herdrTerminalId")
+                                .and_then(Value::as_str)
+                                .filter(|t| is_valid_terminal_id(t))
+                            {
+                                let created_ms =
+                                    packet.get("herdrCreatedMs").and_then(Value::as_i64);
+                                sid = daemon
+                                    .resolve_session_by_herdr_terminal(tid, created_ms)
+                                    .map(|s| s.id);
+                            }
+                        }
+                        if sid.is_none() {
                             if let Some(h) = packet.get("handle").and_then(Value::as_str) {
+                                let clean = h.trim().strip_prefix('@').unwrap_or(h.trim());
                                 sid = daemon
                                     .node
                                     .db()
                                     .local()
-                                    .session_by_handle(h)
+                                    .session_by_handle(clean)
                                     .ok()
                                     .flatten()
                                     .map(|s| s.id);
@@ -4258,6 +4516,7 @@ async fn handle_connection<R, W>(
                         }
                         attached_waiter = Some((session_id.clone(), waiter_id));
                         let _ = daemon.node.db().local().touch_session(&session_id, now_ms());
+                        daemon.bump_ui_rev();
 
                         let mode_str = match mode {
                             WaiterKind::Once => "once",
@@ -4311,9 +4570,12 @@ async fn handle_connection<R, W>(
                                     bind_channel(&daemon, conn_id, sid, &chan_tx);
                                 } else if let Some(ref cid) = ctx.ephemeral_client_id.clone() {
                                     let sid = format!("claude:{cid}");
-                                    let _ = daemon.node.register_session(
+                                    let mut patch = ctx.hints.backend_patch(Some(HarnessKind::Claude));
+                                    patch.insert("channel".into(), json!(true));
+                                    let _ = daemon.merge_session_backend_and_index(
                                         &sid,
-                                        "{\"kind\":\"claude\",\"channel\":true}",
+                                        &patch,
+                                        now_ms(),
                                     );
                                     ctx.channel_session_id = Some(sid.clone());
                                     bind_channel(&daemon, conn_id, &sid, &chan_tx);
@@ -4405,10 +4667,15 @@ async fn handle_connection<R, W>(
     }
 
     // Cleanup registered live waiter / channel transport on disconnect.
+    let mut transport_changed = false;
     if let Some((sid, wid)) = attached_waiter {
         let mut map = daemon.waiters.lock().expect("waiters lock poisoned");
         if let Some(list) = map.get_mut(&sid) {
+            let before = list.len();
             list.retain(|w| w.id != wid);
+            if list.len() != before {
+                transport_changed = true;
+            }
             if list.is_empty() {
                 map.remove(&sid);
             }
@@ -4419,8 +4686,12 @@ async fn handle_connection<R, W>(
             let mut map = daemon.channels.lock().expect("channels lock poisoned");
             if map.get(sid).is_some_and(|c| c.conn_id == conn_id) {
                 map.remove(sid);
+                transport_changed = true;
             }
         }
+    }
+    if transport_changed {
+        daemon.bump_ui_rev();
     }
     for (_, tx) in pending_channel_acks.drain() {
         let _ = tx.send(false);
@@ -4443,6 +4714,7 @@ fn bind_channel(
             },
         );
     }
+    daemon.bump_ui_rev();
     let flush_daemon = Arc::clone(daemon);
     let sid = session_id.to_string();
     tokio::spawn(async move {
@@ -4476,10 +4748,16 @@ async fn resolve_tool_caller(
                 harness,
                 ..
             } => {
-                let _ = daemon.node.register_session(
-                    &session_id,
-                    &format!("{{\"kind\":\"{}\"}}", harness.as_str()),
-                );
+                let patch = mcp_ctx
+                    .as_deref()
+                    .map(|ctx| ctx.hints.backend_patch(Some(harness)))
+                    .unwrap_or_else(|| {
+                        let mut m = Map::new();
+                        m.insert("kind".into(), json!(harness.as_str()));
+                        m
+                    });
+                let _ = daemon.merge_session_backend_and_index(&session_id, &patch, now_ms());
+                daemon.bump_ui_rev();
                 if let Some(ctx) = mcp_ctx.as_deref_mut() {
                     if ctx.channel && harness == HarnessKind::Claude {
                         ctx.channel_session_id = Some(session_id.clone());
@@ -4512,10 +4790,9 @@ async fn resolve_tool_caller(
         if let Some(ref cid) = ctx.ephemeral_client_id {
             let harness = ctx.backend.unwrap_or(HarnessKind::Claude);
             let session_id = format!("{}:{cid}", harness.as_str());
-            let _ = daemon.node.register_session(
-                &session_id,
-                &format!("{{\"kind\":\"{}\"}}", harness.as_str()),
-            );
+            let patch = ctx.hints.backend_patch(Some(harness));
+            let _ = daemon.merge_session_backend_and_index(&session_id, &patch, now_ms());
+            daemon.bump_ui_rev();
             if ctx.channel && harness == HarnessKind::Claude {
                 ctx.channel_session_id = Some(session_id.clone());
                 if ctx.channel_ready {
@@ -4534,7 +4811,10 @@ async fn resolve_tool_caller(
     // 3. Optional test-only bypass when `require_verified_caller == false`
     if !daemon.config.require_verified_caller {
         let sid = format!("ephemeral:{}", uuid_v4());
-        let _ = daemon.node.register_session(&sid, "{\"kind\":\"claude\"}");
+        let mut patch = Map::new();
+        patch.insert("kind".into(), json!("claude"));
+        let _ = daemon.merge_session_backend_and_index(&sid, &patch, now_ms());
+        daemon.bump_ui_rev();
         return Ok(sid);
     }
 
@@ -4556,11 +4836,12 @@ fn handle_session_hint(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Valu
         .get("harness")
         .and_then(Value::as_str)
         .and_then(|s| s.parse::<HarnessKind>().ok());
-    if let Some(h) = harness {
-        let backend_json = format!("{{\"kind\":\"{}\"}}", h.as_str());
-        let _ = daemon.node.register_session(session_id, &backend_json);
-    }
     let hints = TransportHints::from_packet(packet, harness);
+    let patch = hints.backend_patch(harness);
+    if !patch.is_empty() {
+        let _ = daemon.merge_session_backend_and_index(session_id, &patch, now_ms());
+        daemon.bump_ui_rev();
+    }
     maybe_spawn_transport_probe(daemon, session_id, hints);
     json!({ "ok": true, "result": {} })
 }
@@ -4660,6 +4941,18 @@ fn maybe_spawn_transport_probe(
                 .as_deref()
                 .unwrap_or(DEFAULT_HERDR_BIN);
             if let Some(target) = probe_herdr_terminal(hc_bin, tid).await {
+                let mut herdr_patch = Map::new();
+                herdr_patch.insert("herdrTerminalId".into(), json!(target.terminal_id));
+                if let Some(created_ms) = target.created_ms {
+                    herdr_patch.insert("herdrCreatedMs".into(), json!(created_ms));
+                }
+                if let Some(pid) = target.pid {
+                    herdr_patch.insert("herdrPid".into(), json!(pid));
+                }
+                if let Some(ref app) = target.app {
+                    herdr_patch.insert("herdrApp".into(), json!(app));
+                }
+                let _ = daemon_arc.merge_session_backend_and_index(&sid, &herdr_patch, now_ms());
                 if daemon_arc.attach_transport_if_higher_priority(
                     &sid,
                     Arc::new(HerdrTransport::new(target)),
@@ -4775,10 +5068,14 @@ fn handle_call_start(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> 
         .filter(|s| !s.is_empty())
         .map(ToString::to_string);
 
-    let backend_json = format!("{{\"kind\":\"{}\"}}", harness.as_str());
-    if let Err(e) = daemon.node.register_session(session_id, &backend_json) {
+    let hints = TransportHints::from_packet(packet, Some(harness));
+    let patch = hints.backend_patch(Some(harness));
+    let backend_json = serde_json::to_string(&Value::Object(patch.clone()))
+        .unwrap_or_else(|_| format!("{{\"kind\":\"{}\"}}", harness.as_str()));
+    if let Err(e) = daemon.merge_session_backend_and_index(session_id, &patch, now_ms()) {
         return json!({ "ok": false, "error": e.to_string() });
     }
+    daemon.bump_ui_rev();
 
     match daemon.calls.start_call(
         StartCallInput {
@@ -5327,7 +5624,1594 @@ async fn handle_drop_ingest_rpc(
     };
 
     match res {
-        Ok(ingested) => json!({ "ok": true, "result": ingested }),
+        Ok(ingested) => {
+            daemon.bump_ui_rev();
+            json!({ "ok": true, "result": ingested })
+        }
+        Err(err) => {
+            let (code, message) = node_err_tuple(err);
+            json!({
+                "ok": false,
+                "code": code,
+                "error": message,
+            })
+        }
+    }
+}
+
+// ============================================================================
+// Fast Read-Only Summaries, Streaming `inspect.watch`, Session Controls &
+// Debounced Atomic `<state_dir>/ui/state.json` Projector (v0.6.0)
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SummaryDetail {
+    Compact,
+    Full,
+}
+
+impl SummaryDetail {
+    fn from_packet(packet: &Map<String, Value>) -> Result<Self, (&'static str, String)> {
+        match packet.get("detail") {
+            None | Some(Value::Null) => Ok(Self::Full),
+            Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+                "compact" => Ok(Self::Compact),
+                "full" => Ok(Self::Full),
+                other => Err((
+                    "invalid_request",
+                    format!("Expected detail 'compact' | 'full', got '{other}'"),
+                )),
+            },
+            Some(_) => Err(("invalid_request", "Expected string 'detail'".to_string())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct SessionSelector {
+    session_id: Option<String>,
+    herdr_terminal_id: Option<String>,
+    herdr_created_ms: Option<i64>,
+    handle: Option<String>,
+    cwd: Option<String>,
+}
+
+impl SessionSelector {
+    fn from_packet(packet: &Map<String, Value>) -> Result<Self, (&'static str, String)> {
+        let session_id = match packet.get("sessionId") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => {
+                let trimmed = s.trim();
+                if !is_valid_session_id(trimmed) {
+                    return Err(("invalid_session", "Invalid sessionId".to_string()));
+                }
+                Some(trimmed.to_string())
+            }
+            Some(_) => return Err(("invalid_session", "Expected string sessionId".to_string())),
+        };
+
+        let herdr_terminal_id = match packet.get("herdrTerminalId") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => {
+                let trimmed = s.trim();
+                if !is_valid_terminal_id(trimmed) {
+                    return Err((
+                        "invalid_herdr_terminal",
+                        "Invalid herdrTerminalId".to_string(),
+                    ));
+                }
+                Some(trimmed.to_string())
+            }
+            Some(_) => {
+                return Err((
+                    "invalid_herdr_terminal",
+                    "Expected string herdrTerminalId".to_string(),
+                ));
+            }
+        };
+
+        let herdr_created_ms = match packet.get("herdrCreatedMs") {
+            None | Some(Value::Null) => None,
+            Some(v) => match v.as_i64() {
+                Some(ms) => Some(ms),
+                None => {
+                    return Err((
+                        "invalid_request",
+                        "Expected integer herdrCreatedMs".to_string(),
+                    ));
+                }
+            },
+        };
+
+        let handle = match packet.get("handle") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => {
+                let clean = s.trim().strip_prefix('@').unwrap_or(s.trim());
+                if clean.is_empty() || clean.chars().any(char::is_control) {
+                    return Err(("invalid_request", "Invalid handle".to_string()));
+                }
+                Some(clean.to_string())
+            }
+            Some(_) => return Err(("invalid_request", "Expected string handle".to_string())),
+        };
+
+        let cwd = match packet.get("cwd") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty()
+                    || trimmed.len() > 1024
+                    || trimmed.chars().any(char::is_control)
+                {
+                    return Err(("invalid_request", "Invalid cwd".to_string()));
+                }
+                Some(trimmed.to_string())
+            }
+            Some(_) => return Err(("invalid_request", "Expected string cwd".to_string())),
+        };
+
+        Ok(Self {
+            session_id,
+            herdr_terminal_id,
+            herdr_created_ms,
+            handle,
+            cwd,
+        })
+    }
+
+    fn has_target(&self) -> bool {
+        self.session_id.is_some()
+            || self.herdr_terminal_id.is_some()
+            || self.handle.is_some()
+            || self.cwd.is_some()
+    }
+}
+
+fn extract_backend_str(backend_json: &str, key: &str) -> Option<String> {
+    serde_json::from_str::<Value>(backend_json)
+        .ok()
+        .and_then(|v| {
+            v.get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+        })
+}
+
+fn extract_backend_i64(backend_json: &str, key: &str) -> Option<i64> {
+    serde_json::from_str::<Value>(backend_json)
+        .ok()
+        .and_then(|v| v.get(key).and_then(Value::as_i64))
+}
+
+fn summarize_filter_node(filter: &hyp_store::Filter) -> String {
+    match filter {
+        hyp_store::Filter::Exact(map) => map
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        hyp_store::Filter::Prefix(map) => map
+            .iter()
+            .map(|(k, v)| format!("{k}^={v}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        hyp_store::Filter::Suffix(map) => map
+            .iter()
+            .map(|(k, v)| format!("{k}$={v}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        hyp_store::Filter::All(list) => list
+            .iter()
+            .map(summarize_filter_node)
+            .collect::<Vec<_>>()
+            .join(" AND "),
+        hyp_store::Filter::Any(list) => {
+            let inner = list
+                .iter()
+                .map(summarize_filter_node)
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            format!("({inner})")
+        }
+        hyp_store::Filter::Not(inner) => format!("!({})", summarize_filter_node(inner)),
+    }
+}
+
+fn summarize_filters(filters: &[hyp_store::Filter]) -> String {
+    if filters.is_empty() {
+        return String::new();
+    }
+    filters
+        .iter()
+        .map(summarize_filter_node)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn validate_control_pattern(raw: &str) -> Result<String, (&'static str, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+        return Err((
+            "invalid_request",
+            "Pattern must be non-empty and contain no control characters".to_string(),
+        ));
+    }
+    let rule = DeliveryRule::new(trimmed, DeliveryUrgency::Mute);
+    rule.validate()
+        .map_err(|e| ("invalid_request", e.to_string()))?;
+    Ok(rule.target)
+}
+
+type HerdrCandidateRank = (bool, i64, bool, bool);
+
+impl LocalDaemonInner {
+    fn session_herdr_terminal_id(&self, sess: &hyp_store::Session) -> Option<String> {
+        let from_transport = self
+            .session_transports
+            .lock()
+            .expect("session_transports lock poisoned")
+            .get(&sess.id)
+            .and_then(|attached| attached.transport.herdr_terminal_id().map(ToString::to_string));
+        from_transport.or_else(|| {
+            extract_backend_str(&sess.backend_json, "herdrTerminalId")
+                .filter(|tid| is_valid_terminal_id(tid))
+        })
+    }
+
+    fn session_herdr_created_ms(&self, sess: &hyp_store::Session) -> Option<i64> {
+        let from_transport = self
+            .session_transports
+            .lock()
+            .expect("session_transports lock poisoned")
+            .get(&sess.id)
+            .and_then(|attached| attached.transport.herdr_created_ms());
+        from_transport.or_else(|| extract_backend_i64(&sess.backend_json, "herdrCreatedMs"))
+    }
+
+    fn rank_herdr_candidate(
+        &self,
+        sess: &hyp_store::Session,
+        expected_created_ms: Option<i64>,
+    ) -> HerdrCandidateRank {
+        let pinned_created = self.session_herdr_created_ms(sess);
+        let exact_created_match = match (expected_created_ms, pinned_created) {
+            (Some(exp), Some(actual)) => exp == actual,
+            _ => false,
+        };
+        let enrolled = sess.handle.is_some();
+        let has_live = self.has_live_transport(&sess.id);
+        (exact_created_match, sess.last_seen, enrolled, has_live)
+    }
+
+    fn resolve_session_by_herdr_terminal(
+        &self,
+        terminal_id: &str,
+        expected_created_ms: Option<i64>,
+    ) -> Option<hyp_store::Session> {
+        if !is_valid_terminal_id(terminal_id) {
+            return None;
+        }
+        let mut candidate_map: HashMap<String, hyp_store::Session> = HashMap::new();
+        {
+            let db = self.node.db();
+            if let Ok(by_tid) = db.local().list_sessions_by_herdr_terminal(terminal_id) {
+                for sess in by_tid {
+                    candidate_map.insert(sess.id.clone(), sess);
+                }
+            }
+            let indexed_ids: Vec<String> = self
+                .herdr_terminal_index
+                .lock()
+                .expect("herdr_terminal_index lock poisoned")
+                .get(terminal_id)
+                .cloned()
+                .unwrap_or_default();
+            let transport_ids: Vec<String> = self
+                .session_transports
+                .lock()
+                .expect("session_transports lock poisoned")
+                .iter()
+                .filter(|(_, attached)| attached.transport.herdr_terminal_id() == Some(terminal_id))
+                .map(|(sid, _)| sid.clone())
+                .collect();
+            for sid in indexed_ids.into_iter().chain(transport_ids.into_iter()) {
+                if !candidate_map.contains_key(&sid) {
+                    if let Ok(Some(sess)) = db.local().get_session(&sid) {
+                        candidate_map.insert(sess.id.clone(), sess);
+                    }
+                }
+            }
+        }
+
+        let mut best: Option<((bool, i64, bool, bool), hyp_store::Session)> = None;
+        for sess in candidate_map.into_values() {
+            if let Some(exp) = expected_created_ms {
+                if let Some(actual) = self.session_herdr_created_ms(&sess) {
+                    if actual != exp {
+                        continue;
+                    }
+                }
+            }
+            let rank = self.rank_herdr_candidate(&sess, expected_created_ms);
+            let is_better = match best {
+                None => true,
+                Some((prev_rank, ref prev_sess)) => {
+                    rank > prev_rank || (rank == prev_rank && sess.id < prev_sess.id)
+                }
+            };
+            if is_better {
+                best = Some((rank, sess));
+            }
+        }
+        best.map(|(_, s)| s)
+    }
+
+    fn resolve_session(&self, sel: &SessionSelector) -> Option<hyp_store::Session> {
+        if let Some(ref sid) = sel.session_id {
+            let db = self.node.db();
+            let sess = db.local().get_session(sid).ok().flatten()?;
+            if let Some(exp) = sel.herdr_created_ms {
+                if let Some(actual) = self.session_herdr_created_ms(&sess) {
+                    if actual != exp {
+                        return None;
+                    }
+                }
+            }
+            return Some(sess);
+        }
+        if let Some(ref tid) = sel.herdr_terminal_id {
+            return self.resolve_session_by_herdr_terminal(tid, sel.herdr_created_ms);
+        }
+        if let Some(ref handle) = sel.handle {
+            let db = self.node.db();
+            return db.local().session_by_handle(handle).ok().flatten();
+        }
+        if let Some(ref cwd) = sel.cwd {
+            let db = self.node.db();
+            let sessions = db.local().list_sessions().unwrap_or_default();
+            let mut best: Option<((i64, bool, bool), hyp_store::Session)> = None;
+            for sess in sessions {
+                if extract_backend_str(&sess.backend_json, "cwd").as_deref() != Some(cwd.as_str()) {
+                    continue;
+                }
+                let rank = (
+                    sess.last_seen,
+                    sess.handle.is_some(),
+                    self.has_live_transport(&sess.id),
+                );
+                let is_better = match best {
+                    None => true,
+                    Some((prev_rank, ref prev_sess)) => {
+                        rank > prev_rank || (rank == prev_rank && sess.id < prev_sess.id)
+                    }
+                };
+                if is_better {
+                    best = Some((rank, sess));
+                }
+            }
+            return best.map(|(_, s)| s);
+        }
+        None
+    }
+
+    /// Builds the strictly metadata-only `daemon` status header without blocking or mutating DB state.
+    fn build_daemon_summary_json(&self) -> Value {
+        let (peers_online, quarantined_global) = {
+            let db = self.node.db();
+            let peers = db
+                .peers()
+                .list_peers(Some(hyp_store::PeerStatus::Active))
+                .map(|v| v.len())
+                .unwrap_or(0);
+            let quarantined = db.local().quarantined_count(None).unwrap_or(0);
+            (peers, quarantined)
+        };
+        json!({
+            "online": true,
+            "pid": std::process::id(),
+            "nodeId": self.node.node_id().as_str(),
+            "version": self.node.config().hyphae_version,
+            "profile": self.node.config().profile,
+            "peersOnline": peers_online,
+            "quarantinedGlobal": quarantined_global,
+        })
+    }
+
+    /// Builds a strictly metadata-only session summary object (ZERO message bodies, ZERO
+    /// CloudEvent `data`, ZERO wakeup `note`s, ZERO quarantined payloads or sources).
+    ///
+    /// Strictly read-only and non-blocking: never awaits `wait_for_pending_probe` and never
+    /// calls `reconcile_session_inbox`.
+    fn build_session_summary_obj(&self, sess: &hyp_store::Session, detail: SummaryDetail) -> Value {
+        let node_id = self.node.node_id().as_str();
+        let harness = extract_backend_str(&sess.backend_json, "kind")
+            .or_else(|| sess.id.split_once(':').map(|(prefix, _)| prefix.to_string()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let enrolled = sess.handle.is_some();
+        let address = sess
+            .handle
+            .as_deref()
+            .map(|h| format_address(node_id, h));
+        let herdr_terminal_id = self.session_herdr_terminal_id(sess);
+        let herdr_created_ms = self.session_herdr_created_ms(sess);
+        let transport_kind = self.active_transport_kind(&sess.id);
+
+        let (policy, digest, muted_archived, mutes, subs, channel_pairs, wakeups, queued_meta) = {
+            let db = self.node.db();
+            let policy = self.delivery.policy(&db, &sess.id).unwrap_or_default();
+            let digest = db.local().unread_digest(&sess.id).unwrap_or_default();
+            let muted_archived = muted_count(&db, &sess.id).unwrap_or(0);
+            let mutes = db.local().list_mutes(Some(&sess.id)).unwrap_or_default();
+            let subs = db
+                .events()
+                .list_subscriptions(Some(&sess.id))
+                .unwrap_or_default();
+            let channel_pairs = match address.as_deref() {
+                Some(addr) => db
+                    .channels()
+                    .list_channels_for_address(addr)
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            let wakeups = db
+                .wakeups()
+                .list_active_wakeups_for_session(&sess.id, sess.handle.as_deref())
+                .unwrap_or_default();
+            let queued_meta = if detail == SummaryDetail::Full {
+                db.local()
+                    .list_pending_metadata(&sess.id, MAX_SUMMARY_QUEUED_ITEMS)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            (
+                policy,
+                digest,
+                muted_archived,
+                mutes,
+                subs,
+                channel_pairs,
+                wakeups,
+                queued_meta,
+            )
+        };
+
+        let muted_all = mutes.iter().any(|m| m.pattern == "*")
+            || policy
+                .overrides
+                .iter()
+                .any(|r| r.is_wildcard() && r.delivery == DeliveryUrgency::Mute);
+
+        let mut sources = digest.sources;
+        sources.truncate(MAX_SUMMARY_SOURCES);
+
+        let mut obj = Map::new();
+        obj.insert("sessionId".into(), json!(sess.id));
+        obj.insert("harness".into(), json!(harness));
+        obj.insert("enrolled".into(), json!(enrolled));
+        obj.insert("handle".into(), json!(sess.handle));
+        obj.insert("address".into(), json!(address));
+        obj.insert("herdrTerminalId".into(), json!(herdr_terminal_id));
+        obj.insert("herdrCreatedMs".into(), json!(herdr_created_ms));
+        obj.insert("lastSeen".into(), json!(sess.last_seen));
+        obj.insert("transportKind".into(), json!(transport_kind));
+        obj.insert("hasLiveTransport".into(), json!(transport_kind.is_some()));
+        obj.insert("deliveryMode".into(), json!(policy.default_mode.as_str()));
+        obj.insert("focusMode".into(), json!(policy.focus_mode));
+        obj.insert(
+            "focusAllowInterruptVips".into(),
+            json!(policy.focus_allow_interrupt_vips),
+        );
+        obj.insert("mutedAll".into(), json!(muted_all));
+        obj.insert(
+            "counts".into(),
+            json!({
+                "subscriptions": subs.len(),
+                "queued": digest.unread,
+                "unnotified": digest.unnotified,
+                "quarantined": digest.quarantined,
+                "mutedRules": mutes.len(),
+                "mutedArchived": muted_archived,
+                "channels": channel_pairs.len(),
+                "wakeups": wakeups.len(),
+            }),
+        );
+        obj.insert(
+            "unreadBreakdown".into(),
+            json!({
+                "messages": digest.messages,
+                "events": digest.events,
+                "plugins": digest.plugins,
+                "transfers": digest.transfers,
+                "kv": digest.kv,
+                "sources": sources,
+            }),
+        );
+
+        if detail == SummaryDetail::Full {
+            let sub_meta_map: HashMap<String, SubscriptionRecordMeta> = self
+                .sub_meta
+                .lock()
+                .expect("sub_meta lock poisoned")
+                .get(&sess.id)
+                .map(|list| list.iter().map(|m| (m.id.clone(), m.clone())).collect())
+                .unwrap_or_default();
+
+            let subs_json: Vec<Value> = subs
+                .into_iter()
+                .map(|s| {
+                    let meta = sub_meta_map.get(&s.id);
+                    let mode_str = meta
+                        .map(|m| m.urgency.as_str())
+                        .unwrap_or_else(|| DeliveryUrgency::from_store_mode(s.mode).as_str());
+                    let filter_summary = summarize_filters(&s.filters);
+                    json!({
+                        "id": s.id,
+                        "key": meta.and_then(|m| m.key.clone()),
+                        "originNode": s.origin_node,
+                        "topic": s.topic,
+                        "mode": mode_str,
+                        "coalesceSeconds": s.coalesce_seconds,
+                        "filters": s.filters,
+                        "filterSummary": filter_summary,
+                    })
+                })
+                .collect();
+
+            let item_meta_map: HashMap<String, ClassifiedItemMeta> = self
+                .item_meta
+                .lock()
+                .expect("item_meta lock poisoned")
+                .get(&sess.id)
+                .cloned()
+                .unwrap_or_default();
+
+            // Strictly metadata-only: `queued_meta` never even selected `mailbox.text` from SQLite!
+            let queued_json: Vec<Value> = queued_meta
+                .into_iter()
+                .map(|item| {
+                    let cached = item_meta_map.get(&item.receipt);
+                    let urgency = match cached {
+                        Some(m) => m.urgency,
+                        None => {
+                            let parsed = hyp_node::delivery::ParsedMailboxSource::parse(
+                                &item.origin_node,
+                                &item.source,
+                                item.kind,
+                            );
+                            let sub_mode = self.lookup_subscription_urgency(
+                                &sess.id,
+                                &item.origin_node,
+                                &item.source,
+                            );
+                            policy.resolve_urgency(&parsed.as_context(), sub_mode, false)
+                        }
+                    };
+                    let notified = item.notified || cached.is_some_and(|m| m.notified);
+                    json!({
+                        "receipt": item.receipt,
+                        "kind": item.kind.as_str(),
+                        "source": item.source,
+                        "originNode": item.origin_node,
+                        "receivedAt": item.received_at,
+                        "notified": notified,
+                        "urgency": urgency.as_str(),
+                    })
+                })
+                .collect();
+
+            let mutes_json: Vec<Value> = mutes
+                .into_iter()
+                .map(|m| {
+                    json!({
+                        "pattern": m.pattern,
+                        "scope": if m.scope == "*" { "connector" } else { "session" },
+                        "mutedAt": m.muted_at,
+                    })
+                })
+                .collect();
+
+            let rules_json: Vec<Value> = policy
+                .overrides
+                .into_iter()
+                .map(|r| {
+                    json!({
+                        "target": r.target,
+                        "delivery": r.delivery.as_str(),
+                    })
+                })
+                .collect();
+
+            let mut channels_list: Vec<String> = Vec::with_capacity(channel_pairs.len());
+            let mut channel_entries: Vec<Value> = Vec::with_capacity(channel_pairs.len());
+            for (host_node, ch) in channel_pairs {
+                let display = if host_node == node_id || host_node == "local" {
+                    ch.clone()
+                } else {
+                    format!("{host_node}/{ch}")
+                };
+                let mode = self.node.get_channel_policy(&ch).mode.as_str();
+                channels_list.push(display);
+                channel_entries.push(json!({
+                    "hostNode": host_node,
+                    "channel": ch,
+                    "mode": mode,
+                }));
+            }
+
+            // Strictly metadata-only: NEVER include `wakeup.note`!
+            let wakeups_json: Vec<Value> = wakeups
+                .into_iter()
+                .map(|w| {
+                    json!({
+                        "id": w.id,
+                        "label": w.label,
+                        "triggerKind": w.trigger_kind.as_str(),
+                        "nextFireAt": w.next_fire_at,
+                        "urgency": w.urgency.as_str(),
+                        "state": w.state.as_str(),
+                    })
+                })
+                .collect();
+
+            obj.insert(
+                "details".into(),
+                json!({
+                    "subscriptions": subs_json,
+                    "queuedItems": queued_json,
+                    "mutes": mutes_json,
+                    "rules": rules_json,
+                    "channels": channels_list,
+                    "channelEntries": channel_entries,
+                    "wakeups": wakeups_json,
+                }),
+            );
+        }
+
+        Value::Object(obj)
+    }
+
+    fn build_single_session_summary_envelope(
+        &self,
+        sel: &SessionSelector,
+        detail: SummaryDetail,
+    ) -> Value {
+        let rev = self.current_ui_rev();
+        let updated_at = now_ms();
+        let daemon_block = self.build_daemon_summary_json();
+        let session_val = match self.resolve_session(sel) {
+            Some(sess) => self.build_session_summary_obj(&sess, detail),
+            None => Value::Null,
+        };
+        json!({
+            "schemaVersion": UI_STATE_SCHEMA_VERSION,
+            "rev": rev,
+            "updatedAt": updated_at,
+            "daemon": daemon_block,
+            "session": session_val,
+        })
+    }
+
+    fn build_all_sessions_summary_envelope(&self, detail: SummaryDetail) -> Value {
+        let rev = self.current_ui_rev();
+        let updated_at = now_ms();
+        let daemon_block = self.build_daemon_summary_json();
+        let sessions = {
+            let db = self.node.db();
+            db.local().list_sessions().unwrap_or_default()
+        };
+
+        let mut sessions_json: Vec<Value> = Vec::with_capacity(sessions.len());
+        let mut terminal_winners: BTreeMap<String, (HerdrCandidateRank, String)> = BTreeMap::new();
+
+        for sess in &sessions {
+            sessions_json.push(self.build_session_summary_obj(sess, detail));
+            if let Some(tid) = self.session_herdr_terminal_id(sess) {
+                let rank = self.rank_herdr_candidate(sess, None);
+                let replace = match terminal_winners.get(&tid) {
+                    None => true,
+                    Some((prev_rank, prev_sid)) => {
+                        rank > *prev_rank || (rank == *prev_rank && sess.id < *prev_sid)
+                    }
+                };
+                if replace {
+                    terminal_winners.insert(tid, (rank, sess.id.clone()));
+                }
+            }
+        }
+
+        let by_herdr_terminal: BTreeMap<String, String> = terminal_winners
+            .into_iter()
+            .map(|(tid, (_, sid))| (tid, sid))
+            .collect();
+
+        json!({
+            "schemaVersion": UI_STATE_SCHEMA_VERSION,
+            "rev": rev,
+            "updatedAt": updated_at,
+            "daemon": daemon_block,
+            "sessions": sessions_json,
+            "byHerdrTerminal": by_herdr_terminal,
+        })
+    }
+
+    fn write_ui_state_snapshot(&self) -> io::Result<()> {
+        let ui_dir = self.node.config().state_dir.join("ui");
+        let snapshot = self.build_all_sessions_summary_envelope(SummaryDetail::Full);
+        let rev = snapshot
+            .get("rev")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| self.current_ui_rev());
+        let bytes = serde_json::to_vec(&snapshot)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        write_ui_state_atomic(&ui_dir, rev, &bytes)
+    }
+}
+
+fn write_ui_state_atomic(ui_dir: &Path, rev: u64, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+
+    std::fs::create_dir_all(ui_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(ui_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    let tmp_name = format!(".state.json.tmp.{}.{rev}", std::process::id());
+    let tmp_path = ui_dir.join(tmp_name);
+    let dest_path = ui_dir.join("state.json");
+
+    let write_res: io::Result<()> = (|| {
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp_path)?
+        };
+        #[cfg(not(unix))]
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+
+        file.write_all(bytes)?;
+        file.flush()?;
+        drop(file);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+
+        #[cfg(unix)]
+        {
+            std::fs::rename(&tmp_path, &dest_path)?;
+        }
+        #[cfg(not(unix))]
+        {
+            if std::fs::rename(&tmp_path, &dest_path).is_err() {
+                let _ = std::fs::remove_file(&dest_path);
+                std::fs::rename(&tmp_path, &dest_path)?;
+            }
+        }
+        Ok(())
+    })();
+
+    if write_res.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    write_res
+}
+
+fn spawn_ui_state_projector(
+    inner: Arc<LocalDaemonInner>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    let mut rev_rx = inner.subscribe_ui_rev();
+    tokio::spawn(async move {
+        let mut last_written = *rev_rx.borrow_and_update();
+        loop {
+            let changed = tokio::select! {
+                res = rev_rx.changed() => res.is_ok(),
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            if !changed {
+                break;
+            }
+            // Coalesce burst mutations cleanly over UI_PROJECTOR_DEBOUNCE_MS (~100 ms).
+            let debounce = tokio::time::sleep(Duration::from_millis(UI_PROJECTOR_DEBOUNCE_MS));
+            tokio::pin!(debounce);
+            let mut stopped = false;
+            loop {
+                tokio::select! {
+                    _ = &mut debounce => break,
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            stopped = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if stopped {
+                break;
+            }
+            let latest = *rev_rx.borrow_and_update();
+            if latest != last_written {
+                let _ = inner.write_ui_state_snapshot();
+                last_written = latest;
+            }
+        }
+    })
+}
+
+fn handle_session_summary(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> Value {
+    let sel = match SessionSelector::from_packet(packet) {
+        Ok(s) => s,
+        Err((code, msg)) => return json!({ "ok": false, "code": code, "error": msg }),
+    };
+    let detail = match SummaryDetail::from_packet(packet) {
+        Ok(d) => d,
+        Err((code, msg)) => return json!({ "ok": false, "code": code, "error": msg }),
+    };
+    let result = daemon.build_single_session_summary_envelope(&sel, detail);
+    json!({ "ok": true, "result": result })
+}
+
+fn handle_sessions_summary(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> Value {
+    let detail = match SummaryDetail::from_packet(packet) {
+        Ok(d) => d,
+        Err((code, msg)) => return json!({ "ok": false, "code": code, "error": msg }),
+    };
+    let result = daemon.build_all_sessions_summary_envelope(detail);
+    json!({ "ok": true, "result": result })
+}
+
+fn build_inspect_snapshot_packet(
+    daemon: &LocalDaemonInner,
+    sel: &SessionSelector,
+    detail: SummaryDetail,
+) -> Value {
+    let mut envelope = if sel.has_target() {
+        daemon.build_single_session_summary_envelope(sel, detail)
+    } else {
+        daemon.build_all_sessions_summary_envelope(detail)
+    };
+    if let Some(obj) = envelope.as_object_mut() {
+        obj.insert("type".into(), json!("inspect.snapshot"));
+    }
+    envelope
+}
+
+async fn run_inspect_watch<R, W>(
+    daemon: &Arc<LocalDaemonInner>,
+    packet: &Map<String, Value>,
+    reader: &mut BufReader<R>,
+    write_half: &mut W,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let sel = match SessionSelector::from_packet(packet) {
+        Ok(s) => s,
+        Err((code, msg)) => {
+            let _ = write_ndjson_line_async(
+                write_half,
+                &json!({ "type": "inspect.error", "code": code, "error": msg }),
+            )
+            .await;
+            return;
+        }
+    };
+    let detail = match SummaryDetail::from_packet(packet) {
+        Ok(d) => d,
+        Err((code, msg)) => {
+            let _ = write_ndjson_line_async(
+                write_half,
+                &json!({ "type": "inspect.error", "code": code, "error": msg }),
+            )
+            .await;
+            return;
+        }
+    };
+
+    let mut rev_rx = daemon.subscribe_ui_rev();
+    let initial = build_inspect_snapshot_packet(daemon, &sel, detail);
+    let mut last_sent_rev = initial
+        .get("rev")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| *rev_rx.borrow_and_update());
+    let _ = rev_rx.borrow_and_update();
+
+    if write_ndjson_line_async(write_half, &initial).await.is_err() {
+        return;
+    }
+
+    loop {
+        enum WatchEv {
+            RevChanged,
+            ClientClosed,
+            Shutdown,
+            IgnoreLine,
+        }
+
+        let ev = tokio::select! {
+            res = rev_rx.changed() => {
+                if res.is_ok() {
+                    WatchEv::RevChanged
+                } else {
+                    WatchEv::Shutdown
+                }
+            }
+            line = read_bounded_line_async(reader, MAX_SOCKET_LINE_BYTES) => {
+                match line {
+                    Ok(None) | Err(_) => WatchEv::ClientClosed,
+                    Ok(Some(_)) => WatchEv::IgnoreLine,
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    WatchEv::Shutdown
+                } else {
+                    WatchEv::IgnoreLine
+                }
+            }
+        };
+
+        match ev {
+            WatchEv::ClientClosed | WatchEv::Shutdown => break,
+            WatchEv::IgnoreLine => continue,
+            WatchEv::RevChanged => {
+                let debounce = tokio::time::sleep(Duration::from_millis(INSPECT_WATCH_DEBOUNCE_MS));
+                tokio::pin!(debounce);
+                let mut exit_now = false;
+                loop {
+                    tokio::select! {
+                        _ = &mut debounce => break,
+                        line = read_bounded_line_async(reader, MAX_SOCKET_LINE_BYTES) => {
+                            if !matches!(line, Ok(Some(_))) {
+                                exit_now = true;
+                                break;
+                            }
+                        }
+                        _ = shutdown_rx.changed() => {
+                            if *shutdown_rx.borrow() {
+                                exit_now = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if exit_now {
+                    break;
+                }
+                let latest = *rev_rx.borrow_and_update();
+                if latest == last_sent_rev {
+                    continue;
+                }
+                let snap = build_inspect_snapshot_packet(daemon, &sel, detail);
+                last_sent_rev = snap.get("rev").and_then(Value::as_u64).unwrap_or(latest);
+                if write_ndjson_line_async(write_half, &snap).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn handle_session_focus(
+    daemon: &Arc<LocalDaemonInner>,
+    packet: &Map<String, Value>,
+) -> Value {
+    let sel = match SessionSelector::from_packet(packet) {
+        Ok(s) => s,
+        Err((code, msg)) => return json!({ "ok": false, "code": code, "error": msg }),
+    };
+    let Some(sess) = daemon.resolve_session(&sel) else {
+        return json!({ "ok": false, "code": "not_found", "error": "Session not found" });
+    };
+    let Some(enabled) = packet
+        .get("enabled")
+        .or_else(|| packet.get("focusMode"))
+        .and_then(Value::as_bool)
+    else {
+        return json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "Expected boolean 'enabled' (or 'focusMode')"
+        });
+    };
+    let allow_vips = match packet
+        .get("allowVips")
+        .or_else(|| packet.get("focusAllowInterruptVips"))
+    {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => {
+            return json!({
+                "ok": false,
+                "code": "invalid_request",
+                "error": "Expected boolean 'allowVips'"
+            });
+        }
+    };
+
+    let now = now_ms();
+    let store_mode = if enabled {
+        DeliveryMode::Notify
+    } else {
+        DeliveryMode::Full
+    };
+    let default_urgency = if enabled {
+        DeliveryUrgency::Notify
+    } else {
+        DeliveryUrgency::Queue
+    };
+
+    let (policy, unread, muted) = {
+        let db = daemon.node.db();
+        let _ = db.local().set_delivery_mode(&sess.id, store_mode, now);
+        let policy = match daemon.delivery.update_policy(&db, &sess.id, |p| {
+            p.focus_mode = enabled;
+            p.default_mode = default_urgency;
+            if let Some(v) = allow_vips {
+                p.focus_allow_interrupt_vips = v;
+            }
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                return json!({ "ok": false, "code": "delivery_error", "error": e.to_string() });
+            }
+        };
+        let unread = db.local().pending_count(&sess.id).unwrap_or(0);
+        let muted = muted_count(&db, &sess.id).unwrap_or(0);
+        (policy, unread, muted)
+    };
+
+    let rev = daemon.bump_ui_rev();
+    if !enabled && unread > 0 {
+        daemon.flush_session(&sess.id).await;
+    }
+
+    json!({
+        "ok": true,
+        "result": {
+            "sessionId": sess.id,
+            "deliveryMode": policy.default_mode.as_str(),
+            "focusMode": policy.focus_mode,
+            "focusAllowInterruptVips": policy.focus_allow_interrupt_vips,
+            "unread": unread,
+            "muted": muted,
+            "rev": rev,
+        }
+    })
+}
+
+fn handle_session_mute(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Value>) -> Value {
+    let sel = match SessionSelector::from_packet(packet) {
+        Ok(s) => s,
+        Err((code, msg)) => return json!({ "ok": false, "code": code, "error": msg }),
+    };
+    let scope_str = match packet.get("scope") {
+        None | Some(Value::Null) => "session",
+        Some(Value::String(s)) => match s.trim() {
+            "session" => "session",
+            "connector" => "connector",
+            other => {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_request",
+                    "error": format!("Expected scope 'session' | 'connector', got '{other}'")
+                });
+            }
+        },
+        Some(_) => {
+            return json!({
+                "ok": false,
+                "code": "invalid_request",
+                "error": "Expected string 'scope'"
+            });
+        }
+    };
+    let resolved = daemon.resolve_session(&sel);
+    if scope_str == "session" && resolved.is_none() {
+        return json!({ "ok": false, "code": "not_found", "error": "Session not found" });
+    }
+    let Some(raw_pattern) = packet
+        .get("pattern")
+        .or_else(|| packet.get("source"))
+        .or_else(|| packet.get("target"))
+        .and_then(Value::as_str)
+    else {
+        return json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "Expected string 'source' or 'pattern'"
+        });
+    };
+    let pattern = match validate_control_pattern(raw_pattern) {
+        Ok(p) => p,
+        Err((code, msg)) => return json!({ "ok": false, "code": code, "error": msg }),
+    };
+
+    let ttl_seconds: Option<u64> = match packet.get("ttlSeconds") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_u64() {
+            Some(secs) if (1..=MAX_MUTE_TTL_SECS).contains(&secs) => Some(secs),
+            _ => {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_request",
+                    "error": format!("Expected integer ttlSeconds in 1..={MAX_MUTE_TTL_SECS}")
+                });
+            }
+        },
+    };
+
+    let db_scope = if scope_str == "connector" {
+        "*"
+    } else {
+        resolved.as_ref().map(|s| s.id.as_str()).unwrap_or("*")
+    };
+    let actor = resolved
+        .as_ref()
+        .map(|s| s.id.as_str())
+        .unwrap_or("cli");
+    let now = now_ms();
+
+    let added = {
+        let db = daemon.node.db();
+        let added = match db.local().add_mute(db_scope, &pattern, actor, now) {
+            Ok(rule) => rule,
+            Err(e) => {
+                return json!({ "ok": false, "code": "store_error", "error": e.to_string() });
+            }
+        };
+        if let Some(ref sess) = resolved {
+            if db_scope != "*" {
+                if let Err(e) = daemon.delivery.update_policy(&db, &sess.id, |p| {
+                    p.upsert_rule(DeliveryRule::new(&pattern, DeliveryUrgency::Mute));
+                }) {
+                    return json!({
+                        "ok": false,
+                        "code": "delivery_error",
+                        "error": e.to_string()
+                    });
+                }
+            }
+        }
+        added
+    };
+
+    if let Some(ttl) = ttl_seconds {
+        let timer_daemon = Arc::clone(daemon);
+        let timer_scope = db_scope.to_string();
+        let timer_sid = resolved.as_ref().map(|s| s.id.clone());
+        let timer_pattern = added.pattern.clone();
+        let mut shutdown_rx = daemon.shutdown_rx.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(ttl)) => {}
+                _ = shutdown_rx.changed() => {
+                    return;
+                }
+            }
+            if *shutdown_rx.borrow() {
+                return;
+            }
+            let db = timer_daemon.node.db();
+            let _ = db.local().remove_mute(&timer_scope, &timer_pattern);
+            if let Some(ref sid) = timer_sid {
+                if timer_scope != "*" {
+                    let _ = timer_daemon.delivery.update_policy(&db, sid, |p| {
+                        let is_mute = p.overrides.iter().any(|r| {
+                            r.target == timer_pattern && r.delivery == DeliveryUrgency::Mute
+                        });
+                        if is_mute {
+                            p.remove_rule(&timer_pattern);
+                        }
+                    });
+                }
+            }
+            timer_daemon.bump_ui_rev();
+        });
+    }
+
+    let rev = daemon.bump_ui_rev();
+    json!({
+        "ok": true,
+        "result": {
+            "sessionId": resolved.map(|s| s.id),
+            "pattern": added.pattern,
+            "scope": scope_str,
+            "ttlSeconds": ttl_seconds,
+            "rev": rev,
+        }
+    })
+}
+
+fn handle_session_unmute(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> Value {
+    let sel = match SessionSelector::from_packet(packet) {
+        Ok(s) => s,
+        Err((code, msg)) => return json!({ "ok": false, "code": code, "error": msg }),
+    };
+    let scope_str = match packet.get("scope") {
+        None | Some(Value::Null) => "session",
+        Some(Value::String(s)) => match s.trim() {
+            "session" => "session",
+            "connector" => "connector",
+            other => {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_request",
+                    "error": format!("Expected scope 'session' | 'connector', got '{other}'")
+                });
+            }
+        },
+        Some(_) => {
+            return json!({
+                "ok": false,
+                "code": "invalid_request",
+                "error": "Expected string 'scope'"
+            });
+        }
+    };
+    let resolved = daemon.resolve_session(&sel);
+    if scope_str == "session" && resolved.is_none() {
+        return json!({ "ok": false, "code": "not_found", "error": "Session not found" });
+    }
+    let Some(raw_pattern) = packet
+        .get("pattern")
+        .or_else(|| packet.get("source"))
+        .or_else(|| packet.get("target"))
+        .and_then(Value::as_str)
+    else {
+        return json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "Expected string 'source' or 'pattern'"
+        });
+    };
+    let pattern = match validate_control_pattern(raw_pattern) {
+        Ok(p) => p,
+        Err((code, msg)) => return json!({ "ok": false, "code": code, "error": msg }),
+    };
+
+    let db_scope = if scope_str == "connector" {
+        "*"
+    } else {
+        resolved.as_ref().map(|s| s.id.as_str()).unwrap_or("*")
+    };
+
+    let removed = {
+        let db = daemon.node.db();
+        let db_removed = match db.local().remove_mute(db_scope, &pattern) {
+            Ok(r) => r,
+            Err(e) => {
+                return json!({ "ok": false, "code": "store_error", "error": e.to_string() });
+            }
+        };
+        let mut policy_removed = false;
+        if let Some(ref sess) = resolved {
+            if db_scope != "*" {
+                let _ = daemon.delivery.update_policy(&db, &sess.id, |p| {
+                    policy_removed = p.remove_rule(&pattern);
+                });
+            }
+        }
+        db_removed || policy_removed
+    };
+
+    let rev = daemon.bump_ui_rev();
+    json!({
+        "ok": true,
+        "result": {
+            "sessionId": resolved.map(|s| s.id),
+            "pattern": pattern,
+            "scope": scope_str,
+            "removed": removed,
+            "rev": rev,
+        }
+    })
+}
+
+fn handle_session_rule(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> Value {
+    let sel = match SessionSelector::from_packet(packet) {
+        Ok(s) => s,
+        Err((code, msg)) => return json!({ "ok": false, "code": code, "error": msg }),
+    };
+    let Some(sess) = daemon.resolve_session(&sel) else {
+        return json!({ "ok": false, "code": "not_found", "error": "Session not found" });
+    };
+    let Some(raw_target) = packet
+        .get("source")
+        .or_else(|| packet.get("target"))
+        .and_then(Value::as_str)
+    else {
+        return json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "Expected string 'source' or 'target'"
+        });
+    };
+    let target = match validate_control_pattern(raw_target) {
+        Ok(t) => t,
+        Err((code, msg)) => return json!({ "ok": false, "code": code, "error": msg }),
+    };
+
+    let remove_flag = packet.get("remove").and_then(Value::as_bool) == Some(true);
+    let raw_delivery = packet
+        .get("delivery")
+        .or_else(|| packet.get("urgency"))
+        .and_then(Value::as_str)
+        .map(str::trim);
+
+    let is_remove =
+        remove_flag || raw_delivery.is_some_and(|d| d.eq_ignore_ascii_case("remove"));
+
+    let now = now_ms();
+    if is_remove {
+        let (removed, rules) = {
+            let db = daemon.node.db();
+            let mut removed_rule = false;
+            let policy = match daemon.delivery.update_policy(&db, &sess.id, |p| {
+                removed_rule = p.remove_rule(&target);
+            }) {
+                Ok(p) => p,
+                Err(e) => {
+                    return json!({
+                        "ok": false,
+                        "code": "delivery_error",
+                        "error": e.to_string()
+                    });
+                }
+            };
+            let mute_removed = db.local().remove_mute(&sess.id, &target).unwrap_or(false);
+            (removed_rule || mute_removed, policy.overrides)
+        };
+        let rev = daemon.bump_ui_rev();
+        return json!({
+            "ok": true,
+            "result": {
+                "sessionId": sess.id,
+                "target": target,
+                "delivery": Value::Null,
+                "removed": removed,
+                "rules": rules,
+                "rev": rev,
+            }
+        });
+    }
+
+    let Some(urgency_raw) = raw_delivery else {
+        return json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "Expected 'delivery' / 'urgency' ('interrupt' | 'queue' | 'notify' | 'mute' | 'remove') or 'remove': true"
+        });
+    };
+    let urgency = match DeliveryUrgency::parse(urgency_raw) {
+        Ok(u) => u,
+        Err(e) => {
+            return json!({ "ok": false, "code": "invalid_request", "error": e.to_string() });
+        }
+    };
+    let rule = DeliveryRule::new(&target, urgency);
+    if let Err(e) = rule.validate() {
+        return json!({ "ok": false, "code": "invalid_request", "error": e.to_string() });
+    }
+
+    let rules = {
+        let db = daemon.node.db();
+        let policy = match daemon.delivery.update_policy(&db, &sess.id, |p| {
+            p.upsert_rule(rule.clone());
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                return json!({ "ok": false, "code": "delivery_error", "error": e.to_string() });
+            }
+        };
+        if urgency == DeliveryUrgency::Mute {
+            let _ = db
+                .local()
+                .add_mute(&sess.id, &rule.target, &sess.id, now);
+        } else {
+            let _ = db.local().remove_mute(&sess.id, &rule.target);
+        }
+        policy.overrides
+    };
+
+    let rev = daemon.bump_ui_rev();
+    json!({
+        "ok": true,
+        "result": {
+            "sessionId": sess.id,
+            "target": rule.target,
+            "delivery": urgency.as_str(),
+            "removed": false,
+            "rules": rules,
+            "rev": rev,
+        }
+    })
+}
+
+fn handle_session_unsubscribe(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> Value {
+    let sel = match SessionSelector::from_packet(packet) {
+        Ok(s) => s,
+        Err((code, msg)) => return json!({ "ok": false, "code": code, "error": msg }),
+    };
+    let Some(sess) = daemon.resolve_session(&sel) else {
+        return json!({ "ok": false, "code": "not_found", "error": "Session not found" });
+    };
+
+    let explicit_id = packet
+        .get("subscriptionId")
+        .or_else(|| packet.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let key_arg = packet
+        .get("key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let sub_id = if let Some(id) = explicit_id {
+        id.to_string()
+    } else if let Some(key) = key_arg {
+        let guard = daemon.sub_meta.lock().expect("sub_meta lock poisoned");
+        guard
+            .get(&sess.id)
+            .and_then(|list| {
+                list.iter()
+                    .find(|m| m.key.as_deref() == Some(key) || m.id == key)
+                    .map(|m| m.id.clone())
+            })
+            .unwrap_or_else(|| key.to_string())
+    } else {
+        return json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "Expected 'subscriptionId', 'id', or 'key'"
+        });
+    };
+
+    let existing = {
+        let db = daemon.node.db();
+        match db.events().get_subscription(&sub_id) {
+            Ok(sub) => sub,
+            Err(e) => {
+                return json!({ "ok": false, "code": "store_error", "error": e.to_string() });
+            }
+        }
+    };
+
+    let Some(sub) = existing else {
+        return json!({ "ok": false, "code": "not_found", "error": "Subscription not found" });
+    };
+    // Fail-closed ownership check: a session may ONLY unsubscribe its own subscriptions!
+    if sub.subscriber != sess.id {
+        return json!({
+            "ok": false,
+            "code": "forbidden",
+            "error": "Subscription belongs to a different session"
+        });
+    }
+
+    let removed = {
+        let db = daemon.node.db();
+        match db
+            .events()
+            .delete_subscription_for_subscriber(&sub_id, &sess.id)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return json!({ "ok": false, "code": "store_error", "error": e.to_string() });
+            }
+        }
+    };
+
+    if removed {
+        {
+            let mut guard = daemon.sub_meta.lock().expect("sub_meta lock poisoned");
+            if let Some(list) = guard.get_mut(&sess.id) {
+                list.retain(|m| m.id != sub_id);
+            }
+        }
+        // Clean up local upstream_pushdowns cache if no remaining local subscribers watch this remote topic.
+        let my_node = daemon.node.node_id().as_str();
+        if sub.origin_node != "local" && sub.origin_node != my_node {
+            let db = daemon.node.db();
+            let remaining = db
+                .events()
+                .list_subscriptions(None)
+                .unwrap_or_default()
+                .into_iter()
+                .any(|s| s.origin_node == sub.origin_node && s.topic == sub.topic);
+            if !remaining {
+                if let Ok(pushdowns) = db.events().list_upstream_pushdowns(Some(&sub.origin_node)) {
+                    for pd in pushdowns {
+                        if pd.topic == sub.topic {
+                            let _ = db.events().delete_upstream_pushdown(&pd.id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let rev = daemon.bump_ui_rev();
+    json!({
+        "ok": true,
+        "result": {
+            "sessionId": sess.id,
+            "subscriptionId": sub_id,
+            "removed": removed,
+            "rev": rev,
+        }
+    })
+}
+
+async fn handle_session_leave_channel(
+    daemon: &LocalDaemonInner,
+    packet: &Map<String, Value>,
+) -> Value {
+    let sel = match SessionSelector::from_packet(packet) {
+        Ok(s) => s,
+        Err((code, msg)) => return json!({ "ok": false, "code": code, "error": msg }),
+    };
+    let Some(sess) = daemon.resolve_session(&sel) else {
+        return json!({ "ok": false, "code": "not_found", "error": "Session not found" });
+    };
+    let Some(handle) = sess.handle else {
+        return json!({
+            "ok": false,
+            "code": "not_enrolled",
+            "error": "Session is not enrolled with a handle"
+        });
+    };
+    let Some(channel) = packet
+        .get("channel")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "Expected non-empty string 'channel'"
+        });
+    };
+
+    match daemon.node.leave_channel(channel, &handle).await {
+        Ok(left) => {
+            let rev = daemon.bump_ui_rev();
+            json!({
+                "ok": true,
+                "result": {
+                    "sessionId": sess.id,
+                    "channel": channel,
+                    "left": left,
+                    "rev": rev,
+                }
+            })
+        }
         Err(err) => {
             let (code, message) = node_err_tuple(err);
             json!({

@@ -647,6 +647,31 @@ impl<'a> EventStore<'a> {
         Ok(changed > 0)
     }
 
+    /// Atomically deletes a single subscription and its batches ONLY when owned by `subscriber`.
+    ///
+    /// Fails closed (returns `Ok(false)` and leaves the row untouched) if the subscription does
+    /// not exist or belongs to a different subscriber.
+    pub fn delete_subscription_for_subscriber(
+        &self,
+        id: &str,
+        subscriber: &str,
+    ) -> StoreResult<bool> {
+        let tx = self.db.immediate_tx()?;
+        let changed = tx.conn().execute(
+            "DELETE FROM subscriptions WHERE id = ?1 AND subscriber = ?2",
+            params![id, subscriber],
+        )?;
+        if changed > 0 {
+            tx.conn()
+                .execute("DELETE FROM batches WHERE subscription_id = ?1", params![id])?;
+        }
+        tx.commit()?;
+        if changed > 0 {
+            self.invalidate_cache();
+        }
+        Ok(changed > 0)
+    }
+
     /// Deletes all subscriptions and batches owned by `subscriber`.
     pub fn remove_subscriber(&self, subscriber: &str) -> StoreResult<usize> {
         let tx = self.db.immediate_tx()?;

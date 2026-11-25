@@ -286,6 +286,32 @@ impl PushTransport for HerdrTransport {
         true
     }
 
+    fn herdr_terminal_id(&self) -> Option<&str> {
+        Some(self.target.terminal_id.as_str())
+    }
+
+    fn herdr_created_ms(&self) -> Option<i64> {
+        self.target.created_ms
+    }
+
+    fn target_metadata(&self) -> Value {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "herdrTerminalId".to_string(),
+            Value::String(self.target.terminal_id.clone()),
+        );
+        if let Some(created_ms) = self.target.created_ms {
+            map.insert("herdrCreatedMs".to_string(), serde_json::json!(created_ms));
+        }
+        if let Some(pid) = self.target.pid {
+            map.insert("herdrPid".to_string(), serde_json::json!(pid));
+        }
+        if let Some(ref app) = self.target.app {
+            map.insert("herdrApp".to_string(), Value::String(app.clone()));
+        }
+        Value::Object(map)
+    }
+
     fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
         Box::pin(async move { self.deliver_with_runner(&ProcessRunner, text, mode).await })
     }
