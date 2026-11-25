@@ -105,14 +105,19 @@ pub fn select_tools_for_caps(caps: McpToolCaps) -> Vec<Value> {
     let mut tools = vec![
         json!({
             "name": "hyp_send",
-            "description": "Send text or E2EE files to peer (<node>/<handle>), #channel, or <bridge>:<target>.",
+            "description": "Send DMs (<node>/<handle>), #channels, <bridge>:<target> messages/reactions, or E2EE file drops.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "to": s,
                     "text": s,
+                    "reaction": {
+                        "type": "string",
+                        "description": "Bridge emoji reaction (e.g. 👍; empty string removes on Telegram)"
+                    },
                     "files": {"type": "array", "items": s},
-                    "replyTo": s
+                    "replyTo": s,
+                    "chatId": s
                 },
                 "required": ["to"]
             }
@@ -1296,7 +1301,12 @@ mod tests {
         assert_eq!(select_tools_for_caps(McpToolCaps::default()), core);
         assert!(!all_names.contains(&"hyp_wakeup"));
 
-        // Verify upgraded `hyp_inbox` & `hyp_stream` schemas
+        // Verify upgraded `hyp_send`, `hyp_inbox`, & `hyp_stream` schemas
+        let send_props = &core[0]["inputSchema"]["properties"];
+        assert_eq!(send_props["reaction"]["type"], json!("string"));
+        assert_eq!(send_props["replyTo"]["type"], json!("string"));
+        assert_eq!(send_props["chatId"]["type"], json!("string"));
+
         let inbox_props = &core[1]["inputSchema"]["properties"];
         assert_eq!(
             inbox_props["state"]["enum"],
@@ -1334,8 +1344,8 @@ mod tests {
         let with_bridge_bytes = serde_json::to_string(&with_bridge).unwrap().len();
         let with_kv_bytes = serde_json::to_string(&with_kv).unwrap().len();
         assert!(
-            core_bytes <= 2450,
-            "Expected lean 4-tool core schema <= 2450 bytes (~480-610 tokens), got {core_bytes} (~{} tokens)",
+            core_bytes <= 2650,
+            "Expected lean 4-tool core schema <= 2650 bytes (~520-660 tokens), got {core_bytes} (~{} tokens)",
             core_bytes / 4
         );
         assert!(with_bridge_bytes > core_bytes);
@@ -1526,7 +1536,7 @@ mod tests {
             json!({"action": "unsubscribe", "id": "550e8400-e29b-41d4-a716-446655440000"})
         );
 
-        // hyp_send maps replyTo -> threadTs for bridge targets
+        // hyp_send maps replyTo -> threadTs for bridge targets and preserves reaction + chatId
         let send_br = translate_tool_call(
             "hyp_send",
             json!({"to": "slack:ops", "text": "ack", "replyTo": "1700.123"})
@@ -1538,6 +1548,25 @@ mod tests {
         assert_eq!(send_br.name, "hyp_send");
         assert_eq!(send_br.args["threadTs"], "1700.123");
         assert_eq!(send_br.args["replyTo"], "1700.123");
+
+        let send_rxn = translate_tool_call(
+            "hyp_send",
+            json!({
+                "to": "telegram:personal",
+                "reaction": "👍",
+                "replyTo": "42",
+                "chatId": "12345"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        )
+        .unwrap();
+        assert_eq!(send_rxn.name, "hyp_send");
+        assert_eq!(send_rxn.args["reaction"], "👍");
+        assert_eq!(send_rxn.args["replyTo"], "42");
+        assert_eq!(send_rxn.args["threadTs"], "42");
+        assert_eq!(send_rxn.args["chatId"], "12345");
     }
 
     #[test]

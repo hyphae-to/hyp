@@ -559,11 +559,14 @@ mod unix_tests {
 
         let sent_messages: Arc<AsyncMutex<Vec<Value>>> = Arc::new(AsyncMutex::new(Vec::new()));
         let sent_srv = Arc::clone(&sent_messages);
+        let sent_reactions: Arc<AsyncMutex<Vec<Value>>> = Arc::new(AsyncMutex::new(Vec::new()));
+        let reactions_srv = Arc::clone(&sent_reactions);
         let delivered_batch = Arc::new(AtomicBool::new(false));
         let delivered_srv = Arc::clone(&delivered_batch);
 
         let mock_tg = MockHttpServer::start(move |req: MockRequest| {
             let sent = Arc::clone(&sent_srv);
+            let reactions = Arc::clone(&reactions_srv);
             let delivered = Arc::clone(&delivered_srv);
             async move {
                 let body_val: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
@@ -608,6 +611,13 @@ mod unix_tests {
                     return MockResponse::json(
                         StatusCode::OK,
                         &json!({ "ok": true, "result": { "message_id": 777 } }),
+                    );
+                }
+                if req.path.ends_with("/setMessageReaction") {
+                    reactions.lock().await.push(body_val);
+                    return MockResponse::json(
+                        StatusCode::OK,
+                        &json!({ "ok": true, "result": true }),
                     );
                 }
                 MockResponse::json(
@@ -716,6 +726,144 @@ mod unix_tests {
         assert_eq!(outbound[0]["chat_id"], json!("12345"));
         assert_eq!(outbound[0]["text"], json!("Reply from Hyphae agent"));
         assert_eq!(outbound[0]["reply_to_message_id"], json!(2));
+        drop(outbound);
+
+        // Reactions:
+        // (1) Explicit `replyTo` reaction-only (no text!) -> calls `setMessageReaction` ONLY.
+        let rxn_explicit = supervisor
+            .post(
+                "telegram",
+                BTreeMap::from([
+                    ("chatId".to_string(), json!("12345")),
+                    ("reaction".to_string(), json!("👍")),
+                    ("replyTo".to_string(), json!("42")),
+                    ("text".to_string(), json!("")),
+                ]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("explicit Telegram reaction must succeed");
+        assert_eq!(rxn_explicit["ok"], json!(true));
+        assert_eq!(rxn_explicit["chatId"], json!("12345"));
+        assert_eq!(rxn_explicit["reacted"], json!(true));
+        assert_eq!(rxn_explicit["reaction"], json!("👍"));
+        assert_eq!(rxn_explicit["reactedMessageId"], json!(42));
+        assert!(rxn_explicit.get("messageId").is_none());
+
+        // (2) Omitted `replyTo` & `chatId` -> falls back cleanly to last inbound chat (12345) & message_id (2)!
+        let rxn_fallback = supervisor
+            .post(
+                "telegram",
+                BTreeMap::from([
+                    ("reaction".to_string(), json!("🔥")),
+                    ("text".to_string(), json!("")),
+                ]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("fallback Telegram reaction must succeed");
+        assert_eq!(rxn_fallback["ok"], json!(true));
+        assert_eq!(rxn_fallback["chatId"], json!("12345"));
+        assert_eq!(rxn_fallback["reacted"], json!(true));
+        assert_eq!(rxn_fallback["reaction"], json!("🔥"));
+        assert_eq!(rxn_fallback["reactedMessageId"], json!(2));
+
+        // (3) Empty `reaction: ""` -> removes reaction (`reaction: []`)!
+        let rxn_clear = supervisor
+            .post(
+                "telegram",
+                BTreeMap::from([
+                    ("chatId".to_string(), json!("12345")),
+                    ("reaction".to_string(), json!("")),
+                    ("replyTo".to_string(), json!("42")),
+                    ("text".to_string(), json!("")),
+                ]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("empty Telegram reaction removal must succeed");
+        assert_eq!(rxn_clear["ok"], json!(true));
+        assert_eq!(rxn_clear["reacted"], json!(true));
+        assert_eq!(rxn_clear["reaction"], json!(""));
+        assert_eq!(rxn_clear["reactedMessageId"], json!(42));
+
+        // (4) Combo `reaction` + `text` -> calls BOTH `setMessageReaction` AND `sendMessage`!
+        let rxn_combo = supervisor
+            .post(
+                "telegram",
+                BTreeMap::from([
+                    ("chatId".to_string(), json!("12345")),
+                    ("reaction".to_string(), json!("🎉")),
+                    ("replyTo".to_string(), json!("2")),
+                    ("text".to_string(), json!("On it!")),
+                ]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("combo Telegram reaction+text must succeed");
+        assert_eq!(rxn_combo["ok"], json!(true));
+        assert_eq!(rxn_combo["reacted"], json!(true));
+        assert_eq!(rxn_combo["reaction"], json!("🎉"));
+        assert_eq!(rxn_combo["reactedMessageId"], json!(2));
+        assert_eq!(rxn_combo["messageId"], json!(777));
+
+        // (5) Disallowed chat reaction -> fails closed & never hits `setMessageReaction`!
+        let rxn_denied = supervisor
+            .post(
+                "telegram",
+                BTreeMap::from([
+                    ("chatId".to_string(), json!("999999")),
+                    ("reaction".to_string(), json!("👍")),
+                    ("replyTo".to_string(), json!("1")),
+                ]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("disallowed Telegram chat reaction must fail closed");
+        assert!(
+            matches!(&rxn_denied, AdapterError::RequestFailed(msg) if msg.contains("TELEGRAM_ALLOWED_CHATS")),
+            "expected TELEGRAM_ALLOWED_CHATS error on reaction, got {rxn_denied:?}"
+        );
+
+        let rxn_calls = sent_reactions.lock().await;
+        assert_eq!(rxn_calls.len(), 4, "expected exactly 4 setMessageReaction calls");
+        assert_eq!(
+            rxn_calls[0],
+            json!({
+                "chat_id": "12345",
+                "message_id": 42,
+                "reaction": [{ "type": "emoji", "emoji": "👍" }]
+            })
+        );
+        assert_eq!(
+            rxn_calls[1],
+            json!({
+                "chat_id": "12345",
+                "message_id": 2,
+                "reaction": [{ "type": "emoji", "emoji": "🔥" }]
+            })
+        );
+        assert_eq!(
+            rxn_calls[2],
+            json!({
+                "chat_id": "12345",
+                "message_id": 42,
+                "reaction": []
+            })
+        );
+        assert_eq!(
+            rxn_calls[3],
+            json!({
+                "chat_id": "12345",
+                "message_id": 2,
+                "reaction": [{ "type": "emoji", "emoji": "🎉" }]
+            })
+        );
+
+        let outbound_after = sent_messages.lock().await;
+        assert_eq!(outbound_after.len(), 2, "only text posts may call sendMessage");
+        assert_eq!(outbound_after[1]["text"], json!("On it!"));
+        assert_eq!(outbound_after[1]["reply_to_message_id"], json!(2));
 
         let _ = supervisor.stop().await;
         node.shutdown();
@@ -789,15 +937,20 @@ mod unix_tests {
         // (c) Connects to loopback mock `SLACK_API_BASE` (`auth.test` / `chat.postMessage`)
         //     and verifies outbound `supervisor.post(...)` + channel allowlist enforcement!
         type SlackPostCapture = Vec<(Option<String>, Value)>;
+        type SlackReactionCapture = Vec<(String, Option<String>, Value)>;
         let auth_tested = Arc::new(AtomicBool::new(false));
         let auth_tested_srv = Arc::clone(&auth_tested);
         let posted_messages: Arc<AsyncMutex<SlackPostCapture>> =
             Arc::new(AsyncMutex::new(Vec::new()));
         let posted_srv = Arc::clone(&posted_messages);
+        let slack_reactions: Arc<AsyncMutex<SlackReactionCapture>> =
+            Arc::new(AsyncMutex::new(Vec::new()));
+        let slack_reactions_srv = Arc::clone(&slack_reactions);
 
         let mock_slack = MockHttpServer::start(move |req: MockRequest| {
             let auth_flag = Arc::clone(&auth_tested_srv);
             let posted = Arc::clone(&posted_srv);
+            let reactions = Arc::clone(&slack_reactions_srv);
             async move {
                 let auth_hdr = req.header_str("authorization").map(ToOwned::to_owned);
                 let body_val: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
@@ -831,6 +984,20 @@ mod unix_tests {
                             "ts": "1764000123.000400"
                         }),
                     );
+                }
+                if req.path.ends_with("/reactions.add") {
+                    reactions
+                        .lock()
+                        .await
+                        .push(("reactions.add".to_string(), auth_hdr, body_val));
+                    return MockResponse::json(StatusCode::OK, &json!({ "ok": true }));
+                }
+                if req.path.ends_with("/reactions.remove") {
+                    reactions
+                        .lock()
+                        .await
+                        .push(("reactions.remove".to_string(), auth_hdr, body_val));
+                    return MockResponse::json(StatusCode::OK, &json!({ "ok": true }));
                 }
                 MockResponse::json(
                     StatusCode::NOT_FOUND,
@@ -917,6 +1084,314 @@ mod unix_tests {
         assert_eq!(sent[0].1["channel"], json!("C_ALLOW"));
         assert_eq!(sent[0].1["text"], json!("Release v2.2.0 complete"));
         assert_eq!(sent[0].1["thread_ts"], json!("1764000000.000100"));
+        drop(sent);
+
+        // Slack reactions: Unicode mapping (`👍` -> `thumbsup`), shortcode (`:rocket:`) + text combo,
+        // `reactions.remove` via `remove: true`, and fail-closed on empty reaction without name.
+        let slack_rxn_add = supervisor
+            .post(
+                "slack",
+                BTreeMap::from([
+                    ("channel".to_string(), json!("C_ALLOW")),
+                    ("reaction".to_string(), json!("👍")),
+                    ("replyTo".to_string(), json!("1764000000.000100")),
+                    ("text".to_string(), json!("")),
+                ]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("Slack Unicode reaction add must succeed");
+        assert_eq!(slack_rxn_add["ok"], json!(true));
+        assert_eq!(slack_rxn_add["reacted"], json!(true));
+        assert_eq!(slack_rxn_add["reaction"], json!("thumbsup"));
+
+        let slack_rxn_combo = supervisor
+            .post(
+                "slack",
+                BTreeMap::from([
+                    ("channel".to_string(), json!("C_ALLOW")),
+                    ("reaction".to_string(), json!(":rocket:")),
+                    ("replyTo".to_string(), json!("1764000000.000200")),
+                    ("text".to_string(), json!("Shipped!")),
+                ]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("Slack combo reaction+text must succeed");
+        assert_eq!(slack_rxn_combo["ok"], json!(true));
+        assert_eq!(slack_rxn_combo["reaction"], json!("rocket"));
+        assert_eq!(slack_rxn_combo["ts"], json!("1764000123.000400"));
+
+        let slack_rxn_rm = supervisor
+            .post(
+                "slack",
+                BTreeMap::from([
+                    ("channel".to_string(), json!("C_ALLOW")),
+                    ("reaction".to_string(), json!("👍")),
+                    ("remove".to_string(), json!(true)),
+                    ("replyTo".to_string(), json!("1764000000.000100")),
+                ]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("Slack reactions.remove must succeed");
+        assert_eq!(slack_rxn_rm["ok"], json!(true));
+        assert_eq!(slack_rxn_rm["removed"], json!(true));
+        assert_eq!(slack_rxn_rm["reaction"], json!("thumbsup"));
+
+        let slack_empty_err = supervisor
+            .post(
+                "slack",
+                BTreeMap::from([
+                    ("channel".to_string(), json!("C_ALLOW")),
+                    ("reaction".to_string(), json!("")),
+                    ("replyTo".to_string(), json!("1764000000.000100")),
+                ]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("Slack empty reaction without emoji name must fail clearly");
+        assert!(
+            matches!(&slack_empty_err, AdapterError::RequestFailed(msg) if msg.contains("reactions.remove")),
+            "expected reactions.remove guidance, got {slack_empty_err:?}"
+        );
+
+        let rxns = slack_reactions.lock().await;
+        assert_eq!(rxns.len(), 3);
+        assert_eq!(rxns[0].0, "reactions.add");
+        assert_eq!(
+            rxns[0].2,
+            json!({ "channel": "C_ALLOW", "timestamp": "1764000000.000100", "name": "thumbsup" })
+        );
+        assert_eq!(rxns[1].0, "reactions.add");
+        assert_eq!(
+            rxns[1].2,
+            json!({ "channel": "C_ALLOW", "timestamp": "1764000000.000200", "name": "rocket" })
+        );
+        assert_eq!(rxns[2].0, "reactions.remove");
+        assert_eq!(
+            rxns[2].2,
+            json!({ "channel": "C_ALLOW", "timestamp": "1764000000.000100", "name": "thumbsup" })
+        );
+
+        let _ = supervisor.stop().await;
+        node.shutdown();
+    }
+
+    // ========================================================================
+    // 4b. `plugins/whatsapp/index.mjs`: signed inbound webhook + outbound text & reaction Cloud API
+    // ========================================================================
+
+    #[tokio::test]
+    async fn real_whatsapp_plugin_webhook_and_reactions_e2e() {
+        let Some(node_bin) = find_binary("node") else {
+            eprintln!("SKIP real_whatsapp_plugin_webhook_and_reactions_e2e: `node` not on PATH");
+            return;
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let plugin_script = repo_root().join("plugins/whatsapp/index.mjs");
+        assert!(plugin_script.exists(), "missing {}", plugin_script.display());
+
+        let app_secret = "wa-test-app-secret-2026";
+        let access_token = "wa-test-bearer-token-2026";
+        let app_secret_file = tmp.path().join("wa.secret");
+        let access_token_file = tmp.path().join("wa.token");
+        fs::write(&app_secret_file, app_secret).unwrap();
+        fs::write(&access_token_file, access_token).unwrap();
+
+        let captured_wa: Arc<AsyncMutex<Vec<Value>>> = Arc::new(AsyncMutex::new(Vec::new()));
+        let captured_wa_srv = Arc::clone(&captured_wa);
+        let mock_wa = MockHttpServer::start(move |req: MockRequest| {
+            let captured = Arc::clone(&captured_wa_srv);
+            async move {
+                let body_val: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                if req.path.ends_with("/987654321/messages") {
+                    captured.lock().await.push(body_val);
+                    return MockResponse::json(
+                        StatusCode::OK,
+                        &json!({ "messaging_product": "whatsapp", "messages": [{ "id": "wamid.OUT_1" }] }),
+                    );
+                }
+                MockResponse::json(
+                    StatusCode::NOT_FOUND,
+                    &json!({ "error": { "message": "unknown path" } }),
+                )
+            }
+        })
+        .await;
+
+        let node = open_test_node("wa-node", tmp.path());
+        let host = UnifiedNodeAdapterHost::new(Arc::clone(&node));
+        let port = pick_free_loopback_port().await;
+
+        let mut cfg = SubprocessConfig::new(
+            "whatsapp-real",
+            AdapterKind::Bridge,
+            node_bin,
+            vec![plugin_script.to_string_lossy().into_owned()],
+            vec!["whatsapp".to_string()],
+        );
+        cfg.hello_mode = HelloMode::Auto;
+        cfg.env.insert("WHATSAPP_HOST".into(), "127.0.0.1".into());
+        cfg.env.insert("WHATSAPP_PORT".into(), port.to_string());
+        cfg.env.insert("WHATSAPP_PATH".into(), "/whatsapp".into());
+        cfg.env.insert("WHATSAPP_TARGET".into(), "whatsapp".into());
+        cfg.env.insert("WHATSAPP_PHONE_NUMBER_ID".into(), "987654321".into());
+        cfg.env.insert("WHATSAPP_ALLOWED_NUMBERS".into(), "+15551234567".into());
+        cfg.env.insert(
+            "WHATSAPP_APP_SECRET_FILE".into(),
+            app_secret_file.to_string_lossy().into_owned(),
+        );
+        cfg.env.insert(
+            "WHATSAPP_ACCESS_TOKEN_FILE".into(),
+            access_token_file.to_string_lossy().into_owned(),
+        );
+        cfg.env.insert("WHATSAPP_API_BASE".into(), mock_wa.base_url());
+
+        let supervisor = SubprocessSupervisor::new(cfg);
+        supervisor.start(Arc::clone(&host) as _).await.unwrap();
+
+        wait_for_http_ready(
+            &format!("http://127.0.0.1:{port}/health"),
+            Duration::from_secs(10),
+        )
+        .await;
+
+        // 1. Deliver signed inbound WhatsApp webhook message (`wamid.IN_42`).
+        let inbound_body = serde_json::to_vec(&json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "metadata": { "phone_number_id": "987654321" },
+                        "contacts": [{ "wa_id": "15551234567", "profile": { "name": "Alex" } }],
+                        "messages": [{
+                            "from": "15551234567",
+                            "id": "wamid.IN_42",
+                            "timestamp": "1764000001",
+                            "type": "text",
+                            "text": { "body": "Ship it?" }
+                        }]
+                    }
+                }]
+            }]
+        }))
+        .unwrap();
+        let sig = compute_hmac_sha256_header(app_secret.as_bytes(), &inbound_body);
+        let client = HttpClient::new().unwrap();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("http://127.0.0.1:{port}/whatsapp"))
+            .header(CONTENT_TYPE, "application/json")
+            .header("x-hub-signature-256", sig)
+            .body(full_body(inbound_body))
+            .unwrap();
+        let resp = client.request(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = host.wait_for_event_count(1, Duration::from_secs(5)).await;
+
+        // 2. Reaction-only omitting `replyTo` -> falls back to `wamid.IN_42`!
+        let rxn_res = supervisor
+            .post(
+                "whatsapp",
+                BTreeMap::from([
+                    ("reaction".to_string(), json!("👍")),
+                    ("text".to_string(), json!("")),
+                ]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("WhatsApp reaction-only must succeed");
+        assert_eq!(rxn_res["ok"], json!(true));
+        assert_eq!(rxn_res["reacted"], json!(true));
+        assert_eq!(rxn_res["reaction"], json!("👍"));
+        assert_eq!(rxn_res["reactedMessageId"], json!("wamid.IN_42"));
+        assert!(rxn_res.get("messageId").is_none());
+
+        // 3. Empty reaction (`""`) removes reaction natively with explicit `replyTo`.
+        let clear_res = supervisor
+            .post(
+                "whatsapp",
+                BTreeMap::from([
+                    ("reaction".to_string(), json!("")),
+                    ("replyTo".to_string(), json!("wamid.EXPLICIT_9")),
+                ]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("WhatsApp reaction removal must succeed");
+        assert_eq!(clear_res["reacted"], json!(true));
+        assert_eq!(clear_res["reaction"], json!(""));
+        assert_eq!(clear_res["reactedMessageId"], json!("wamid.EXPLICIT_9"));
+
+        // 4. Combo reaction + text sends both reaction and text payloads.
+        let combo_res = supervisor
+            .post(
+                "whatsapp",
+                BTreeMap::from([
+                    ("reaction".to_string(), json!("🚀")),
+                    ("replyTo".to_string(), json!("wamid.IN_42")),
+                    ("text".to_string(), json!("Deployed!")),
+                ]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("WhatsApp combo reaction+text must succeed");
+        assert_eq!(combo_res["reacted"], json!(true));
+        assert_eq!(combo_res["messageId"], json!("wamid.OUT_1"));
+
+        // 5. Disallowed recipient fails closed!
+        let denied = supervisor
+            .post(
+                "whatsapp",
+                BTreeMap::from([
+                    ("to".to_string(), json!("15559999999")),
+                    ("reaction".to_string(), json!("👍")),
+                ]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("disallowed WhatsApp recipient must fail closed");
+        assert!(
+            matches!(&denied, AdapterError::RequestFailed(msg) if msg.contains("WHATSAPP_ALLOWED_NUMBERS")),
+            "expected WHATSAPP_ALLOWED_NUMBERS error, got {denied:?}"
+        );
+
+        let calls = captured_wa.lock().await;
+        assert_eq!(calls.len(), 4);
+        assert_eq!(
+            calls[0],
+            json!({
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": "15551234567",
+                "type": "reaction",
+                "reaction": { "message_id": "wamid.IN_42", "emoji": "👍" }
+            })
+        );
+        assert_eq!(
+            calls[1],
+            json!({
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": "15551234567",
+                "type": "reaction",
+                "reaction": { "message_id": "wamid.EXPLICIT_9", "emoji": "" }
+            })
+        );
+        assert_eq!(
+            calls[2],
+            json!({
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": "15551234567",
+                "type": "reaction",
+                "reaction": { "message_id": "wamid.IN_42", "emoji": "🚀" }
+            })
+        );
+        assert_eq!(calls[3]["type"], json!("text"));
+        assert_eq!(calls[3]["text"]["body"], json!("Deployed!"));
+        assert_eq!(calls[3]["context"]["message_id"], json!("wamid.IN_42"));
 
         let _ = supervisor.stop().await;
         node.shutdown();

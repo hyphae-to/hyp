@@ -46,6 +46,42 @@ function resolveApiBase(raw, fallback) {
 const apiBase = resolveApiBase(process.env.SLACK_API_BASE, "https://slack.com/api");
 let lastChannel = process.env.SLACK_DEFAULT_CHANNEL?.trim() || null;
 let lastThreadTs = null;
+let lastTs = null;
+const lastTsByChannel = new Map();
+
+const SLACK_EMOJI_MAP = new Map([
+  ["👍", "thumbsup"],
+  ["👎", "thumbsdown"],
+  ["❤️", "heart"],
+  ["❤", "heart"],
+  ["🔥", "fire"],
+  ["🎉", "tada"],
+  ["👀", "eyes"],
+  ["✅", "white_check_mark"],
+  ["🚀", "rocket"],
+  ["🙏", "pray"],
+  ["😄", "smile"],
+  ["😊", "smile"],
+  ["🤔", "thinking_face"],
+  ["💯", "100"],
+  ["⚡", "zap"],
+  ["⚡️", "zap"],
+  ["⚠️", "warning"],
+  ["⚠", "warning"],
+  ["❌", "x"],
+]);
+
+function normalizeSlackReaction(raw) {
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  const mapped = SLACK_EMOJI_MAP.get(trimmed) ?? SLACK_EMOJI_MAP.get(trimmed.replace(/\uFE0F/g, ""));
+  if (mapped) return mapped;
+  const stripped = trimmed.replace(/^:+|:+$/g, "").toLowerCase();
+  if (/^[a-z0-9_+-]+$/.test(stripped)) return stripped;
+  throw new Error(
+    `Unsupported Slack reaction '${trimmed}'; pass a Slack shortcode (e.g. thumbsup, rocket) or common Unicode emoji`,
+  );
+}
 
 if (!allowedUsers && !allowedChannels && !allowAll) {
   throw new Error("Refusing to start Slack bridge without SLACK_ALLOWED_USERS or SLACK_ALLOWED_CHANNELS (set SLACK_ALLOW_ALL=1 to explicitly allow any workspace member)");
@@ -65,10 +101,13 @@ async function slackApi(method, token, payload) {
 const mesh = new MeshPluginClient({
   onDeliveryFailed: (msg) => console.error(`slack plugin delivery_failed target=${msg.target} reason=${msg.reason}`),
   onPost: async (params) => {
+    const hasReaction = typeof params.reaction === "string";
+    const hasRemoveReaction = typeof params.removeReaction === "string" && params.removeReaction.trim().length > 0;
     const text = typeof params.text === "string" ? params.text.trim() : "";
-    if (!text) throw new Error("text is required");
+    if (!hasReaction && !hasRemoveReaction && !text) throw new Error("text or reaction is required");
     const channel =
       (typeof params.channel === "string" && params.channel.trim()) ||
+      (typeof params.chatId === "string" && params.chatId.trim()) ||
       (typeof params.to === "string" && params.to.trim()) ||
       lastChannel;
     if (!channel) {
@@ -77,16 +116,50 @@ const mesh = new MeshPluginClient({
     if (allowedChannels && !allowedChannels.has(channel)) {
       throw new Error(`Channel '${channel}' is not in SLACK_ALLOWED_CHANNELS`);
     }
-    const threadTs =
-      (typeof params.threadTs === "string" && params.threadTs.trim()) ||
-      (typeof params.replyTo === "string" && params.replyTo.trim()) ||
-      undefined;
-    const res = await slackApi("chat.postMessage", botToken, {
-      channel,
-      text,
-      ...(threadTs ? { thread_ts: threadTs } : {}),
-    });
-    return { ok: true, channel: res.channel ?? channel, ts: res.ts ?? null };
+
+    const replyTo = typeof params.replyTo === "string" && params.replyTo.trim() ? params.replyTo.trim() : undefined;
+    const explicitThreadTs =
+      typeof params.threadTs === "string" && params.threadTs.trim() ? params.threadTs.trim() : undefined;
+    const threadTs = explicitThreadTs || replyTo;
+
+    let didReact = false;
+    let isRemove = false;
+    let reactionName = "";
+    let targetTs;
+    if (hasReaction || hasRemoveReaction) {
+      isRemove = params.remove === true || (hasRemoveReaction && (!hasReaction || !params.reaction.trim()));
+      const rawEmoji = hasReaction && params.reaction.trim() ? params.reaction : hasRemoveReaction ? params.removeReaction : "";
+      reactionName = normalizeSlackReaction(rawEmoji);
+      if (!reactionName) {
+        throw new Error("Slack reactions.remove requires an emoji name (pass reaction with remove: true)");
+      }
+      targetTs = replyTo || explicitThreadTs || lastTsByChannel.get(channel) || lastTs;
+      if (!targetTs) {
+        throw new Error("No message timestamp specified via replyTo/threadTs and no recent inbound message to react to");
+      }
+      await slackApi(isRemove ? "reactions.remove" : "reactions.add", botToken, {
+        channel,
+        timestamp: targetTs,
+        name: reactionName,
+      });
+      didReact = true;
+    }
+
+    let postRes = null;
+    if (text) {
+      postRes = await slackApi("chat.postMessage", botToken, {
+        channel,
+        text,
+        ...(threadTs ? { thread_ts: threadTs } : {}),
+      });
+    }
+
+    return {
+      ok: true,
+      channel: postRes?.channel ?? channel,
+      ...(didReact ? { reacted: !isRemove, removed: isRemove, reaction: reactionName, reactedTs: targetTs } : {}),
+      ...(text ? { ts: postRes?.ts ?? null } : {}),
+    };
   },
 });
 const hello = await mesh.ready;
@@ -133,6 +206,15 @@ async function handleEnvelope(envelope) {
 
   lastChannel = channel;
   lastThreadTs = ev.thread_ts ?? ts;
+  if (ts) {
+    lastTs = ts;
+    if (channel) {
+      lastTsByChannel.set(channel, ts);
+      if (lastTsByChannel.size > 1000) {
+        lastTsByChannel.delete(lastTsByChannel.keys().next().value);
+      }
+    }
+  }
   const text = String(ev.text ?? "").replace(mentionRe, "").trim().slice(0, 4000);
   const event = {
     specversion: "1.0",

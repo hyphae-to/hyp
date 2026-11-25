@@ -1668,6 +1668,7 @@ struct RecordedBridgePost {
     plugin: String,
     target: String,
     text: String,
+    meta: Map<String, Value>,
 }
 
 struct RecordingBridgePoster {
@@ -1680,12 +1681,13 @@ impl BridgePoster for RecordingBridgePoster {
         plugin: &'a str,
         target: &'a str,
         text: &'a str,
-        _meta: &'a Map<String, Value>,
+        meta: &'a Map<String, Value>,
     ) -> BoxFuture<'a, Result<Value, (String, String)>> {
         let posts = Arc::clone(&self.posts);
         let plugin = plugin.to_string();
         let target = target.to_string();
         let text = text.to_string();
+        let meta = meta.clone();
         Box::pin(async move {
             let mut guard = posts.lock().expect("posts lock poisoned");
             let seq = guard.len() + 1;
@@ -1693,6 +1695,7 @@ impl BridgePoster for RecordingBridgePoster {
                 plugin,
                 target,
                 text,
+                meta,
             });
             Ok(json!({ "messageSeq": seq }))
         })
@@ -2053,6 +2056,178 @@ async fn suite_5_bridge_identity_ownership_handoff_and_outbound_dlp_e2e() {
     assert_eq!(second_val["role"], "reader");
     assert_eq!(second_val["claimedPrimary"], false);
     assert_eq!(second_val["primarySessionId"], "claude:br-primary");
+
+    // 7. First-class bridge reactions: reaction-only, empty removal, combo text+reaction,
+    //    fail-closed ownership (`not_target_holder`), Outbound DLP, and input validation!
+    assert!(
+        recorded_posts.lock().unwrap()[0].meta.get("reaction").is_none(),
+        "plain text bridge posts must not populate meta.reaction"
+    );
+
+    // 7a. Primary holder sends reaction-only (no `text`!) with `replyTo` + `chatId`.
+    let (rxn_txt, rxn_err) = mcp
+        .call_verified_claude(
+            &sock,
+            "br-primary",
+            "hyp_send",
+            json!({
+                "to": "telegram:dm-alex",
+                "reaction": "👍",
+                "replyTo": "77",
+                "chatId": "12345"
+            }),
+        )
+        .await;
+    assert!(!rxn_err, "primary reaction-only hyp_send failed: {rxn_txt}");
+    let rxn_val: Value = serde_json::from_str(&rxn_txt).unwrap();
+    assert_eq!(rxn_val["delivered"], true);
+    {
+        let posts = recorded_posts.lock().unwrap();
+        assert_eq!(posts.len(), 4);
+        assert_eq!(posts[3].plugin, "telegram");
+        assert_eq!(posts[3].target, "dm-alex");
+        assert_eq!(posts[3].text, "");
+        assert_eq!(posts[3].meta.get("reaction"), Some(&json!("👍")));
+        assert_eq!(posts[3].meta.get("replyTo"), Some(&json!("77")));
+        assert_eq!(posts[3].meta.get("chatId"), Some(&json!("12345")));
+    }
+
+    // 7b. Primary holder removes reaction via empty string `""` (no `text`!).
+    let (clear_txt, clear_err) = mcp
+        .call_verified_claude(
+            &sock,
+            "br-primary",
+            "hyp_send",
+            json!({
+                "to": "telegram:dm-alex",
+                "reaction": "",
+                "replyTo": "77"
+            }),
+        )
+        .await;
+    assert!(!clear_err, "primary reaction clear failed: {clear_txt}");
+    {
+        let posts = recorded_posts.lock().unwrap();
+        assert_eq!(posts.len(), 5);
+        assert_eq!(posts[4].text, "");
+        assert_eq!(posts[4].meta.get("reaction"), Some(&json!("")));
+        assert_eq!(posts[4].meta.get("replyTo"), Some(&json!("77")));
+    }
+
+    // 7c. Primary holder sends combo reaction + text reply together.
+    let (combo_txt, combo_err) = mcp
+        .call_verified_claude(
+            &sock,
+            "br-primary",
+            "hyp_send",
+            json!({
+                "to": "telegram:dm-alex",
+                "reaction": "🚀",
+                "replyTo": "78",
+                "text": "On it!"
+            }),
+        )
+        .await;
+    assert!(!combo_err, "primary reaction+text combo failed: {combo_txt}");
+    {
+        let posts = recorded_posts.lock().unwrap();
+        assert_eq!(posts.len(), 6);
+        assert_eq!(posts[5].text, "On it!");
+        assert_eq!(posts[5].meta.get("reaction"), Some(&json!("🚀")));
+        assert_eq!(posts[5].meta.get("replyTo"), Some(&json!("78")));
+    }
+
+    // 7d. Unauthorized `reader` and `intruder` attempting reaction MUST fail closed `not_target_holder`!
+    for unauthorized_sess in ["br-reader", "br-intruder"] {
+        let (unauth_txt, unauth_err) = mcp
+            .call_verified_claude(
+                &sock,
+                unauthorized_sess,
+                "hyp_send",
+                json!({
+                    "to": "telegram:dm-alex",
+                    "reaction": "👍",
+                    "replyTo": "77"
+                }),
+            )
+            .await;
+        assert!(
+            unauth_err && unauth_txt.contains("not_target_holder"),
+            "{unauthorized_sess} reaction must fail closed not_target_holder, got: {unauth_txt}"
+        );
+    }
+
+    // 7e. Outbound DLP gate screens non-empty `reaction` as well as `text`!
+    let (rxn_dlp_txt, rxn_dlp_err) = mcp
+        .call_verified_claude(
+            &sock,
+            "br-primary",
+            "hyp_send",
+            json!({
+                "to": "telegram:dm-alex",
+                "reaction": "AKIAIOSFODNN7EXAMPLE"
+            }),
+        )
+        .await;
+    assert!(
+        rxn_dlp_err && rxn_dlp_txt.contains("outbound_dlp_blocked"),
+        "Outbound DLP must block secrets smuggled in reaction: {rxn_dlp_txt}"
+    );
+
+    // 7f. Invalid reactions (control chars, >32 chars, missing both text & reaction, non-bridge DM / #channel)
+    //     MUST all fail closed `invalid_request`!
+    let overlong_reaction = "👍".repeat(33);
+    for (label, payload) in [
+        (
+            "newline control char",
+            json!({ "to": "telegram:dm-alex", "reaction": "👍\n" }),
+        ),
+        (
+            "carriage return control char",
+            json!({ "to": "telegram:dm-alex", "reaction": "👍\r" }),
+        ),
+        (
+            "NUL control char",
+            json!({ "to": "telegram:dm-alex", "reaction": "👍\0" }),
+        ),
+        (
+            "ANSI escape control char",
+            json!({ "to": "telegram:dm-alex", "reaction": "\u{001b}[31m" }),
+        ),
+        (
+            ">32 chars reaction",
+            json!({ "to": "telegram:dm-alex", "reaction": overlong_reaction }),
+        ),
+        (
+            "neither text nor reaction",
+            json!({ "to": "telegram:dm-alex" }),
+        ),
+        (
+            "whitespace-only text without reaction",
+            json!({ "to": "telegram:dm-alex", "text": "   " }),
+        ),
+        (
+            "reaction on non-bridge DM",
+            json!({ "to": "bridge@box/reader", "reaction": "👍" }),
+        ),
+        (
+            "reaction on #channel",
+            json!({ "to": "#general", "reaction": "👍", "text": "hi" }),
+        ),
+    ] {
+        let (inv_txt, inv_err) = mcp
+            .call_verified_claude(&sock, "br-primary", "hyp_send", payload)
+            .await;
+        assert!(
+            inv_err && inv_txt.contains("invalid_request"),
+            "{label} must fail closed invalid_request, got: {inv_txt}"
+        );
+    }
+    assert_eq!(
+        recorded_posts.lock().unwrap().len(),
+        6,
+        "rejected reactions must never reach BridgePoster"
+    );
 
     mcp.close().await;
     daemon.stop().await;
@@ -2674,7 +2849,7 @@ async fn suite_8_handle_descriptions_multihub_peers_and_configured_bridge_target
         .unwrap();
     assert_eq!(tg_linked["configured"], true);
     assert_eq!(tg_linked["callerIsLinked"], true);
-    assert_eq!(tg_linked["callerIsPrimary"], false);
+    assert_eq!(tg_linked["callerIsPrimary"], true);
     assert_eq!(tg_linked["readers"], json!(["claude:alice-s8"]));
 
     // Arm live `run_wait_to_writer` on Alice and deliver inbound bridge message!
