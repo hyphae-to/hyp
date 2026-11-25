@@ -5576,6 +5576,7 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
 .uc-rail {
   display: flex;
   flex-direction: column;
+  justify-content: space-between;
   gap: 8px;
   min-width: 0;
 }
@@ -5708,13 +5709,13 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
   color: #8f5807;
 }
 
-/* Right Obsidian Stage Card — static height across all 5 workflows */
+/* Right Obsidian Stage Card — pixel-locked static height across all 5 workflows */
 .uc-stage {
   display: flex;
   flex-direction: column;
   gap: 16px;
   height: 100%;
-  min-height: 454px;
+  min-height: 492px;
   padding: 24px 24px 22px;
   border-radius: 22px;
   background:
@@ -5766,19 +5767,21 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
 .uc-stage-head h3 {
   margin: 0;
   font-family: var(--serif);
-  font-size: clamp(1.24rem, 1.65vw, 1.44rem);
+  font-size: clamp(1.22rem, 1.55vw, 1.4rem);
   font-weight: 500;
-  line-height: 1.18;
-  min-height: 2.36em;
+  line-height: 1.2;
+  height: 2.45em;
+  overflow: hidden;
   letter-spacing: -0.025em;
   color: var(--cream);
 }
 
 .uc-stage-head p {
   margin: 0;
-  font-size: 0.855rem;
+  font-size: 0.85rem;
   line-height: 1.52;
-  min-height: 3.1em;
+  height: 4.6em;
+  overflow: hidden;
   color: #c7c3b7;
 }
 
@@ -5957,12 +5960,13 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
 .uc-term-pre {
   margin: 0;
   padding: 12px 14px;
-  min-height: 98px;
+  height: 112px;
   font-family: var(--mono);
-  font-size: 0.74rem;
+  font-size: 0.73rem;
   line-height: 1.58;
   color: var(--cream);
   overflow-x: auto;
+  overflow-y: hidden;
   white-space: pre;
 }
 
@@ -5970,28 +5974,32 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
 
 .uc-stage-foot {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+  min-height: 28px;
   padding-top: 4px;
 }
 
 .uc-chips {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 6px;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .uc-chips span {
   font-family: var(--mono);
-  font-size: 0.64rem;
+  font-size: 0.63rem;
   font-weight: 500;
   color: #c2beb2;
   background: rgba(244, 241, 232, 0.06);
   border: 1px solid rgba(244, 241, 232, 0.11);
   padding: 3px 8px;
   border-radius: 7px;
+  white-space: nowrap;
 }
 
 .uc-action-link {
@@ -6417,9 +6425,12 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
   .sb-stage-canvas { padding: 12px; }
   .sb-source { padding: 8px 9px 8px 13px; }
   .sb-agent { padding: 10px; }
-  .uc-stage { padding: 18px 16px; }
+  .uc-stage { padding: 18px 16px; min-height: 0; }
   .uc-stage-head h3,
-  .uc-stage-head p { min-height: 0; }
+  .uc-stage-head p,
+  .uc-term-pre { height: auto; min-height: 0; }
+  .uc-stage-foot,
+  .uc-chips { flex-wrap: wrap; }
   .uc-flow { grid-template-columns: minmax(0, 1fr); gap: 10px; }
   .uc-flow-wire { width: 2px; height: 18px; margin: 0 auto; }
   .sec-strip { grid-template-columns: minmax(0, 1fr); gap: 22px; }
