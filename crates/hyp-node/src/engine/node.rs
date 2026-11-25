@@ -82,11 +82,11 @@ use hyp_proto::problem::ProblemDetails;
 use hyp_proto::scopes::{ScopePreset, ScopeSet, expand_v2_scopes, extract_confined_values};
 use hyp_store::{
     AckOutcome, ChannelEpoch, ChannelEpochInput, DeliveryMode, DueBatch, EnqueueMessage,
-    FiredWakeup, GateAuditInput, GateDecision as StoreGateDecision, GateDirection, GateState,
-    GrantDirection, GrantInput, GrantRecord, HandleRecord, HumanAuthorityRecord,
-    HumanAuthorityRole, HumanClaimKind, HumanNodeCertInput, IngestResult, KeyStatus, KeyUse,
-    KvDeleteInput, KvDeleteResult, KvEntry, KvEpoch, KvEpochInput, KvSetInput, MailboxEntry,
-    MailboxInsert, MailboxKind, MailboxPutResult, ManifestCacheUpdate, MessageRecord, NodeDb,
+    GateAuditInput, GateDecision as StoreGateDecision, GateDirection, GateState, GrantDirection,
+    GrantInput, GrantRecord, HandleRecord, HumanAuthorityRecord, HumanAuthorityRole,
+    HumanClaimKind, HumanNodeCertInput, IngestResult, KeyStatus, KeyUse, KvDeleteInput,
+    KvDeleteResult, KvEntry, KvEpoch, KvEpochInput, KvSetInput, MailboxEntry, MailboxInsert,
+    MailboxKind, MailboxPutOptions, MailboxPutResult, ManifestCacheUpdate, MessageRecord, NodeDb,
     PeerInput, PeerKeyInput, PeerRecord, PeerStatus, PostChannelInput, PostChannelResult, Session,
     Subscription, SubscriptionSpec, TransferRecord, TransferSubmit, TrustTier,
     UpstreamPushdownInput, WriteModel, format_address, now_ms, parse_address, sha256_hex, uuid_v4,
@@ -268,7 +268,6 @@ pub struct UnifiedNode {
     sse_tasks: Mutex<HashMap<String, JoinHandle<()>>>,
     inbox_tx: broadcast::Sender<String>,
     local_inbox_tx: broadcast::Sender<String>,
-    wakeups_tx: broadcast::Sender<FiredWakeup>,
     in_flight_by_peer: Mutex<HashMap<String, HashSet<String>>>,
     scheduler_notify: Arc<Notify>,
     shutdown_tx: watch::Sender<bool>,
@@ -340,7 +339,6 @@ impl UnifiedNode {
         );
         let (inbox_tx, _) = broadcast::channel(256);
         let (local_inbox_tx, _) = broadcast::channel(256);
-        let (wakeups_tx, _) = broadcast::channel(256);
         let (shutdown_tx, _) = watch::channel(false);
 
         let node = Arc::new(Self {
@@ -364,7 +362,6 @@ impl UnifiedNode {
             sse_tasks: Mutex::new(HashMap::new()),
             inbox_tx,
             local_inbox_tx,
-            wakeups_tx,
             in_flight_by_peer: Mutex::new(HashMap::new()),
             scheduler_notify: Arc::new(Notify::new()),
             shutdown_tx,
@@ -398,9 +395,6 @@ impl UnifiedNode {
                 if let (Ok(report), _) = &step {
                     if report.events.batches_closed > 0 {
                         node.notify_all_inbox_subscribers();
-                    }
-                    for fired in &report.wakeups_fired {
-                        let _ = node.wakeups_tx.send(fired.clone());
                     }
                 }
                 node.drop_relay.sweep_expired(now);
@@ -569,11 +563,6 @@ impl UnifiedNode {
     /// Subscribes to zero-polling wakeups when new items land in any local session mailbox.
     pub fn subscribe_local_inbox(&self) -> broadcast::Receiver<String> {
         self.local_inbox_tx.subscribe()
-    }
-
-    /// Subscribes to fired scheduled wakeup events emitted by the zero-polling scheduler loop.
-    pub fn subscribe_fired_wakeups(&self) -> broadcast::Receiver<FiredWakeup> {
-        self.wakeups_tx.subscribe()
     }
 
     /// Immediately wakes the background zero-polling deadline scheduler loop.
@@ -1028,6 +1017,22 @@ impl UnifiedNode {
                         kind: Some("kv".to_string()),
                         description: Some("Built-in Shared KV change stream".to_string()),
                     });
+                }
+                if self.config.local_ingest.enabled {
+                    for ingest_topic in self.config.local_ingest.advertised_topics() {
+                        if !topics.iter().any(|t| t.topic == ingest_topic)
+                            && peer_may_see_topic(&peer.scopes, &ingest_topic)
+                        {
+                            topics.push(AdvertisedTopic {
+                                topic: ingest_topic,
+                                kind: Some("local-ingest".to_string()),
+                                description: Some(
+                                    "Local socket event ingestion stream (cron, scripts, triggers)"
+                                        .to_string(),
+                                ),
+                            });
+                        }
+                    }
                 }
 
                 let mut channel_set: BTreeSet<String> = BTreeSet::new();
@@ -5173,6 +5178,18 @@ impl UnifiedNode {
                 observed: ObservedTopicStats::default(),
             });
         }
+        if self.config.local_ingest.enabled {
+            for ingest_topic in self.config.local_ingest.advertised_topics() {
+                if !catalog.iter().any(|c| c.topic == ingest_topic) {
+                    catalog.push(TopicCatalogEntry {
+                        topic: ingest_topic,
+                        has_provisioned_publisher: true,
+                        metadata: None,
+                        observed: ObservedTopicStats::default(),
+                    });
+                }
+            }
+        }
         catalog
     }
 
@@ -5495,6 +5512,132 @@ impl UnifiedNode {
         self.notify_all_inbox_subscribers();
         self.notify_scheduler();
         Ok(res)
+    }
+
+    /// Flushes due batches for local-session subscribers of local topic `topic` into their
+    /// `mailbox` (applying optional TTL / coalesce metadata and attaching `human_auth_json`
+    /// when cryptographically verified), acknowledges the delivered `EventStore` batches, and
+    /// immediately wakes each matched local session via `local_inbox_tx`.
+    pub(crate) fn deliver_local_topic_batches(
+        &self,
+        topic: &str,
+        put_opts: &MailboxPutOptions,
+        human_auth: Option<&VerifiedHumanClaim>,
+        gate_downgraded: bool,
+        now_ms: i64,
+    ) -> Result<usize, NodeError> {
+        let my_id = self.config.node_id.to_string();
+        let auth_json = match human_auth {
+            Some(claim) => Some(serde_json::to_string(claim)?),
+            None => None,
+        };
+        let mut sessions_to_wake = BTreeSet::new();
+
+        {
+            let db = self.db();
+            let _ = db.events().tick(now_ms);
+
+            let remote_peers: HashSet<String> = db
+                .peers()
+                .list_peers(None)?
+                .into_iter()
+                .map(|p| p.peer_id)
+                .filter(|pid| pid != &my_id)
+                .collect();
+
+            let local_subscribers: BTreeSet<String> = db
+                .events()
+                .list_subscriptions(None)?
+                .into_iter()
+                .filter(|s| {
+                    s.origin_node == my_id
+                        && s.topic == topic
+                        && !remote_peers.contains(&s.subscriber)
+                })
+                .map(|s| s.subscriber)
+                .collect();
+
+            for subscriber in local_subscribers {
+                let due = db.events().claim_due_batches(&subscriber, now_ms)?;
+                for local_batch in due {
+                    if local_batch.origin_node != my_id || local_batch.topic != topic {
+                        continue;
+                    }
+                    let kind = if local_batch.topic == "kv" {
+                        MailboxKind::Kv
+                    } else {
+                        MailboxKind::Event
+                    };
+                    let traceparent = local_batch
+                        .events
+                        .first()
+                        .and_then(|ev| ev.extensions.get(hyp_proto::cloudevent::EXT_TRACEPARENT))
+                        .cloned();
+                    let payload_text = serde_json::to_string(&json!({
+                        "batchId": local_batch.id,
+                        "originNode": local_batch.origin_node,
+                        "topic": local_batch.topic,
+                        "events": local_batch.events,
+                    }))?;
+                    let put = db.local().put_in_mailbox_ex(
+                        &MailboxInsert {
+                            session_id: subscriber.clone(),
+                            origin_node: my_id.clone(),
+                            item_id: format!("batch:{}", local_batch.id),
+                            text: payload_text,
+                            kind,
+                            source: format!("local.{}", local_batch.topic),
+                            gate_state: GateState::Pending,
+                            gate_reason: gate_downgraded
+                                .then(|| "downgraded_to_notify".to_string()),
+                            traceparent,
+                        },
+                        put_opts,
+                        now_ms,
+                    )?;
+                    match put {
+                        MailboxPutResult::Stored { receipt } => {
+                            if let Some(ref json_str) = auth_json {
+                                let _ = db.human().set_mailbox_human_auth(&receipt, json_str)?;
+                            }
+                            db.events().ack_batch(
+                                &subscriber,
+                                &local_batch.id,
+                                &AckOutcome::Delivered,
+                                now_ms,
+                            )?;
+                            sessions_to_wake.insert(subscriber.clone());
+                        }
+                        MailboxPutResult::Duplicate => {
+                            db.events().ack_batch(
+                                &subscriber,
+                                &local_batch.id,
+                                &AckOutcome::Delivered,
+                                now_ms,
+                            )?;
+                        }
+                        MailboxPutResult::QueueFull => {
+                            let _ = db.events().ack_batch(
+                                &subscriber,
+                                &local_batch.id,
+                                &AckOutcome::Hold {
+                                    reason: "local_inbox_full".to_string(),
+                                    retry_after_ms: Some(5_000),
+                                },
+                                now_ms,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let delivered = sessions_to_wake.len();
+        for sid in sessions_to_wake {
+            self.notify_local_session(&sid);
+        }
+        self.notify_scheduler();
+        Ok(delivered)
     }
 
     /// Ingests an inbound `DueBatch` delivered from remote peer `origin_node` inside

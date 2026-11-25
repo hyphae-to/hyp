@@ -3,13 +3,18 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use http::StatusCode;
 use hyp_crypto::{CryptoError, SecretBackend};
-use hyp_proto::address::{AddressError, NodeId};
-use hyp_proto::cloudevent::{CloudEventError, DEFAULT_MAX_HOPS, HARD_MAX_HOPS};
-use hyp_proto::filter::{FilterError, SubscriptionDiagnostic, TopicMetadata};
+use hyp_proto::address::{AddressError, NodeId, is_valid_topic};
+use hyp_proto::cloudevent::{
+    CloudEvent, CloudEventError, DEFAULT_MAX_HOPS, HARD_MAX_HOPS, TYPE_LOCAL_EVENT_V1,
+    TYPE_SCHEDULED_MESSAGE_V1,
+};
+use hyp_proto::filter::{
+    Filter, FilterError, SubscriptionDiagnostic, TopicMetadata, matches_filters,
+};
 use hyp_proto::manifest::{
     CapabilityToken, KvMode, KvWriteModel, ManifestError, NegotiationError, OkpCurve,
     OkpJwk as ProtoOkpJwk, ProtocolRange,
@@ -277,6 +282,242 @@ impl Default for GuestPairingConfig {
     }
 }
 
+/// Default route ID for the built-in socket-only local event ingestion route.
+pub const DEFAULT_LOCAL_INGEST_ROUTE_ID: &str = "default-schedule";
+/// Default target topic for local event ingestion (`local.schedule`).
+pub const DEFAULT_LOCAL_INGEST_TOPIC: &str = "schedule";
+/// Default steady-state rate limit (events/min) for a local ingest route.
+pub const DEFAULT_LOCAL_INGEST_MAX_PER_MINUTE: u32 = 30;
+/// Default burst allowance for a local ingest route.
+pub const DEFAULT_LOCAL_INGEST_BURST: u32 = 10;
+/// Default maximum inbound payload byte ceiling for a local ingest route (32 KiB).
+pub const DEFAULT_LOCAL_INGEST_MAX_PAYLOAD_BYTES: usize = 32 * 1024;
+
+/// Action taken when a local ingest route's token bucket is saturated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LocalIngestLimitAction {
+    /// Reject excess events fail-closed with `{ ok: false, error: "rate_limited", action: "drop", retryAfterMs }`.
+    #[default]
+    Drop,
+    /// Collapse bursty excess events cleanly using a mailbox coalesce slot (`coalesced: true`).
+    Coalesce,
+}
+
+impl LocalIngestLimitAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Drop => "drop",
+            Self::Coalesce => "coalesce",
+        }
+    }
+}
+
+fn default_local_ingest_allowed_types() -> Vec<String> {
+    vec![
+        TYPE_SCHEDULED_MESSAGE_V1.to_string(),
+        TYPE_LOCAL_EVENT_V1.to_string(),
+    ]
+}
+
+fn default_local_ingest_allowed_topics() -> Vec<String> {
+    vec!["schedule".to_string(), "local".to_string()]
+}
+
+const fn default_local_ingest_max_per_minute() -> u32 {
+    DEFAULT_LOCAL_INGEST_MAX_PER_MINUTE
+}
+
+const fn default_local_ingest_burst() -> u32 {
+    DEFAULT_LOCAL_INGEST_BURST
+}
+
+const fn default_local_ingest_max_payload_bytes() -> usize {
+    DEFAULT_LOCAL_INGEST_MAX_PAYLOAD_BYTES
+}
+
+fn default_local_ingest_topic() -> String {
+    DEFAULT_LOCAL_INGEST_TOPIC.to_string()
+}
+
+/// Declarative policy route for the socket-only local event ingestion server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalIngestRoute {
+    /// Unique identifier for this route (e.g. `"default-schedule"`).
+    pub id: String,
+    /// Allowed CloudEvent `type` values (exact match or `"*"` wildcard). Empty denies all.
+    #[serde(default = "default_local_ingest_allowed_types")]
+    pub allowed_types: Vec<String>,
+    /// Allowed local topic names (exact match or `"*"` wildcard). Empty denies all.
+    #[serde(default = "default_local_ingest_allowed_topics")]
+    pub allowed_topics: Vec<String>,
+    /// Optional CloudEvents Subscriptions API Filter AST (non-empty = event must match ALL).
+    #[serde(default)]
+    pub filters: Vec<Filter>,
+    /// Steady-state token refill rate per minute (default: `30`).
+    #[serde(default = "default_local_ingest_max_per_minute")]
+    pub max_per_minute: u32,
+    /// Maximum burst tokens available immediately (default: `10`).
+    #[serde(default = "default_local_ingest_burst")]
+    pub burst: u32,
+    /// Behavior when the route token bucket is saturated (`Drop` default or `Coalesce`).
+    #[serde(default)]
+    pub on_limit: LocalIngestLimitAction,
+    /// Maximum inbound JSON/event byte size accepted by this route (default: `32_768`).
+    #[serde(default = "default_local_ingest_max_payload_bytes")]
+    pub max_payload_bytes: usize,
+    /// Screen inbound events through the attached `SecurityGatePipeline` (default: `true`).
+    #[serde(default = "default_true")]
+    pub gate: bool,
+    /// Require a valid Ed25519 `hyphaesig` extension signed by an active key in
+    /// `human_authorities` (default: `false`; when present, `hyphaesig` is ALWAYS verified fail-closed).
+    #[serde(default)]
+    pub require_signature: bool,
+    /// Optional default mailbox TTL hint in seconds applied to delivered local events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_ttl_seconds: Option<u64>,
+    /// Optional default mailbox coalesce key hint applied to delivered local events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_coalesce_key: Option<String>,
+}
+
+impl LocalIngestRoute {
+    /// Returns the built-in default route accepting `to.hyphae.scheduled.v1` and
+    /// `to.hyphae.local.v1` on `["schedule", "local"]`.
+    pub fn default_schedule_route() -> Self {
+        Self {
+            id: DEFAULT_LOCAL_INGEST_ROUTE_ID.to_string(),
+            allowed_types: default_local_ingest_allowed_types(),
+            allowed_topics: default_local_ingest_allowed_topics(),
+            filters: Vec::new(),
+            max_per_minute: DEFAULT_LOCAL_INGEST_MAX_PER_MINUTE,
+            burst: DEFAULT_LOCAL_INGEST_BURST,
+            on_limit: LocalIngestLimitAction::Drop,
+            max_payload_bytes: DEFAULT_LOCAL_INGEST_MAX_PAYLOAD_BYTES,
+            gate: true,
+            require_signature: false,
+            default_ttl_seconds: None,
+            default_coalesce_key: None,
+        }
+    }
+
+    /// Returns `true` if `event_type` matches this route's `allowed_types` allowlist.
+    pub fn matches_type(&self, event_type: &str) -> bool {
+        self.allowed_types
+            .iter()
+            .any(|pat| pat == "*" || pat == event_type)
+    }
+
+    /// Returns `true` if bare local `topic` matches this route's `allowed_topics` allowlist.
+    pub fn matches_topic(&self, topic: &str) -> bool {
+        self.allowed_topics.iter().any(|pat| {
+            if pat == "*" {
+                return true;
+            }
+            let normalized = pat.strip_prefix("local.").unwrap_or(pat.as_str());
+            normalized == topic
+        })
+    }
+
+    /// Returns `true` if `event` satisfies ALL configured CloudEvents filters on this route.
+    pub fn matches_filters(&self, event: &CloudEvent) -> bool {
+        self.filters.is_empty() || matches_filters(&self.filters, event)
+    }
+}
+
+impl Default for LocalIngestRoute {
+    fn default() -> Self {
+        Self::default_schedule_route()
+    }
+}
+
+/// Configuration for the default-enabled socket-only local event ingestion route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalIngestConfig {
+    /// Enable the socket-only local ingest listener (default: `true`).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Optional explicit socket/address path (defaults to `<state_dir>/ingest.sock` on Unix,
+    /// `<state_dir>/ingest.addr` on Windows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket_path: Option<PathBuf>,
+    /// Default target topic when an inbound event omits `topic` (default: `"schedule"` -> `local.schedule`).
+    #[serde(default = "default_local_ingest_topic")]
+    pub default_topic: String,
+    /// Ordered route policy rules; when empty, `effective_routes()` returns `[LocalIngestRoute::default_schedule_route()]`.
+    #[serde(default)]
+    pub routes: Vec<LocalIngestRoute>,
+}
+
+impl Default for LocalIngestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            socket_path: None,
+            default_topic: default_local_ingest_topic(),
+            routes: Vec::new(),
+        }
+    }
+}
+
+impl LocalIngestConfig {
+    /// Platform-native default local ingest endpoint filename inside `<state_dir>`.
+    #[cfg(unix)]
+    pub const fn default_socket_filename() -> &'static str {
+        "ingest.sock"
+    }
+
+    /// Platform-native default local ingest endpoint filename inside `<state_dir>`.
+    #[cfg(not(unix))]
+    pub const fn default_socket_filename() -> &'static str {
+        "ingest.addr"
+    }
+
+    /// Resolves the socket/address path relative to `state_dir`.
+    pub fn resolved_socket_path(&self, state_dir: &Path) -> PathBuf {
+        self.socket_path
+            .clone()
+            .unwrap_or_else(|| state_dir.join(Self::default_socket_filename()))
+    }
+
+    /// Returns the configured routes, falling back to the single built-in default route when empty.
+    pub fn effective_routes(&self) -> Vec<LocalIngestRoute> {
+        if self.routes.is_empty() {
+            vec![LocalIngestRoute::default_schedule_route()]
+        } else {
+            self.routes.clone()
+        }
+    }
+
+    /// Returns deduplicated concrete local topics advertised by this local ingest configuration
+    /// (excluding `"*"` wildcards), preserving `default_topic` first.
+    pub fn advertised_topics(&self) -> Vec<String> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut push_unique = |raw: &str| {
+            let trimmed = raw.trim();
+            if trimmed == "*" {
+                return;
+            }
+            let bare = trimmed.strip_prefix("local.").unwrap_or(trimmed);
+            if is_valid_topic(bare) && !out.iter().any(|t| t == bare) {
+                out.push(bare.to_string());
+            }
+        };
+        push_unique(&self.default_topic);
+        for route in self.effective_routes() {
+            for topic in &route.allowed_topics {
+                push_unique(topic);
+            }
+        }
+        out
+    }
+}
+
 /// Complete configuration for a Hyphae v2 Unified `Node` (§1.3).
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -296,6 +537,8 @@ pub struct NodeConfig {
     pub drop_relay: crate::engine::drop_relay::DropRelayConfig,
     /// Optional external blind drop relay base URL configured for this node (default: `None`).
     pub drop_relay_url: Option<String>,
+    /// Default-enabled socket-only local event ingestion policy (`<state_dir>/ingest.sock` / `ingest.addr`).
+    pub local_ingest: LocalIngestConfig,
     pub peers: Vec<PeerConfig>,
     pub topics: Vec<TopicConfig>,
     pub kv_namespaces: Vec<KvNamespaceConfig>,
@@ -334,6 +577,7 @@ impl NodeConfig {
             guest_pairing: GuestPairingConfig::default(),
             drop_relay: crate::engine::drop_relay::DropRelayConfig::default(),
             drop_relay_url: None,
+            local_ingest: LocalIngestConfig::default(),
             peers: Vec::new(),
             topics: Vec::new(),
             kv_namespaces: Vec::new(),

@@ -36,10 +36,10 @@ use hyp_proto::address::NodeId;
 use hyp_proto::cloudevent::{CloudEvent, TYPE_DM_V1, TYPE_HUMAN_DROP_V1, TYPE_HUMAN_SECRET_STORED_V1};
 use hyp_proto::manifest::{CapabilityToken, SignedNodeManifest};
 use hyp_store::{
-    CronTimezone, GateAuditQuery, GateDecision as StoreGateDecision, HumanAuthorityInput,
-    HumanAuthorityRole, HumanAuthorityStatus, KeyStatus, KeyUse, MailboxKind, NodeDb, PeerInput,
-    PeerKeyInput, PeerProfile, PeerStatus, TrustTier, WakeupInsert, WakeupLimits,
-    WakeupTriggerKind, WakeupUrgency, now_ms, uuid_v4,
+    GateAuditQuery, GateDecision as StoreGateDecision, GateState, HumanAuthorityInput,
+    HumanAuthorityRole, HumanAuthorityStatus, KeyStatus, KeyUse, MailboxInsert, MailboxKind,
+    MailboxPutOptions, NodeDb, PeerInput, PeerKeyInput, PeerProfile, PeerStatus, TrustTier, now_ms,
+    uuid_v4,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -88,6 +88,7 @@ fn enroll_human_authority(
                 label: label.to_string(),
                 role,
                 jwk_json: serde_json::to_string(&kp.to_jwk()).unwrap(),
+                enc_jwk_json: None,
                 prf_salt: None,
                 auth_epoch,
             },
@@ -1565,11 +1566,11 @@ async fn ingest_human_revocation_enforces_admin_role_and_monotonic_epoch() {
 }
 
 // ============================================================================
-// 7. `UnifiedNode::subscribe_fired_wakeups()` & `wake_scheduler()`
+// 7. `UnifiedNode::wake_scheduler()` Exact-Deadline Mailbox TTL Sweep
 // ============================================================================
 
 #[tokio::test]
-async fn scheduler_broadcasts_fired_wakeups_on_wake_scheduler() {
+async fn scheduler_sweeps_expired_mailbox_ttl_on_wake_scheduler() {
     let dir = TempDir::new().unwrap();
     let node = UnifiedNode::open(make_node_config(
         "wakeups@test",
@@ -1577,50 +1578,48 @@ async fn scheduler_broadcasts_fired_wakeups_on_wake_scheduler() {
         DropRelayConfig::default(),
     ))
     .unwrap();
-    let mut fired_rx = node.subscribe_fired_wakeups();
 
     let now = now_ms();
-    let created = {
+    {
         let db = node.db();
-        db.wakeups()
-            .create_wakeup(
-                &WakeupInsert {
-                    id: Some("wk-sched-e2e".to_string()),
-                    owner_session_id: None,
-                    target_session_id: Some("claude:ops".to_string()),
-                    target_handle: None,
-                    target_topic: None,
-                    label: "Check deploy".to_string(),
-                    note: "Verify canary metrics".to_string(),
-                    trigger_kind: WakeupTriggerKind::Timer,
-                    cron_expr: None,
-                    timezone: CronTimezone::Utc,
-                    exact_timing: true,
-                    urgency: WakeupUrgency::Interrupt,
-                    ttl_ms: 60_000,
-                    coalesce: true,
-                    fire_at: Some(now + 40),
-                    max_iterations: Some(1),
-                    cold_revival_template: None,
+        db.local().register_session("claude:ops", "{}", now).unwrap();
+        db.local()
+            .put_in_mailbox_ex(
+                &MailboxInsert {
+                    session_id: "claude:ops".to_string(),
+                    origin_node: "wakeups@test".to_string(),
+                    item_id: "ttl-sweep-1".to_string(),
+                    text: "ephemeral scheduled alert".to_string(),
+                    kind: MailboxKind::Event,
+                    source: "local.schedule".to_string(),
+                    gate_state: GateState::Pending,
+                    gate_reason: None,
+                    traceparent: None,
                 },
-                &WakeupLimits::default(),
+                &MailboxPutOptions {
+                    coalesce_key: Some("sched:nightly".to_string()),
+                    expires_at: Some(now + 40),
+                },
                 now,
             )
-            .unwrap()
-    };
-    assert_eq!(created.id, "wk-sched-e2e");
+            .unwrap();
+    }
+    assert_eq!(node.peek_local_inbox("claude:ops", 10).unwrap().len(), 1);
 
-    // Wake the zero-polling scheduler immediately so it picks up the newly inserted deadline!
+    // Wake the zero-polling scheduler immediately so it arms the exact `expires_at` deadline!
     node.wake_scheduler();
 
-    let fired = tokio::time::timeout(Duration::from_secs(3), fired_rx.recv())
-        .await
-        .expect("timed out waiting for fired wakeup broadcast")
-        .expect("wakeups_tx closed unexpectedly");
-    assert_eq!(fired.wakeup.id, "wk-sched-e2e");
-    assert_eq!(fired.wakeup.label, "Check deploy");
-    assert_eq!(fired.wakeup.note, "Verify canary metrics");
-    assert!(fired.completed);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if node.peek_local_inbox("claude:ops", 10).unwrap().is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for scheduler TTL sweep to expire mailbox item"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     node.shutdown();
 }
