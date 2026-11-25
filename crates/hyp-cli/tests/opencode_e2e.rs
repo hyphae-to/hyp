@@ -534,7 +534,38 @@ async fn opencode_real_plugin_verifies_caller_drains_messages_and_feeds_tui_agai
         "verified opencode channel join must succeed: {chan_resp}"
     );
 
-    // Step 6: Enqueue DM #1 for `opencode:ses-live-1` and verify `tool.execute.after` drains it!
+    // Step 6: Configure `@reviewer` as `interrupt` so `tool.execute.after` drains Interrupt mid-turn!
+    let before_rule = run_plugin_step(
+        r#"
+        const hooks = await HyphaePlugin({ directory: "/tmp/opencode-repo" });
+        const out = { args: { rules: [{ target: "bob@laptop/reviewer", delivery: "interrupt" }] } };
+        await hooks["tool.execute.before"](
+          { sessionID: "ses-live-1", tool: "hyphae_hyp_inbox", callID: "call-rule-1" },
+          out,
+        );
+        process.stdout.write(JSON.stringify(out));
+        "#,
+    );
+    let rule_token = before_rule["args"]["_meshCall"].as_str().unwrap().to_string();
+    let rule_resp = send_mcp(
+        &mut mcp_stdin,
+        &mcp_proc,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "hyp_inbox",
+                "arguments": {
+                    "rules": [{ "target": "bob@laptop/reviewer", "delivery": "interrupt" }],
+                    "_meshCall": rule_token
+                }
+            }
+        }),
+    );
+    assert!(rule_resp["result"]["isError"].as_bool() != Some(true), "rule setup failed: {rule_resp}");
+
+    // Enqueue Interrupt DM #1 for `opencode:ses-live-1` and verify `tool.execute.after` drains it!
     daemon
         .ingest_inbound(InboundItem {
             session_id: "opencode:ses-live-1".into(),

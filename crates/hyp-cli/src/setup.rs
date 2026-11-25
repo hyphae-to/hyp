@@ -3188,6 +3188,20 @@ fn setup_claude(
                 ),
             );
             hooks.insert(
+                "UserPromptSubmit".to_string(),
+                merge_hook_groups(
+                    hooks.get("UserPromptSubmit"),
+                    json!({
+                        "hooks": [{
+                            "type": "command",
+                            "command": hook_command(bin, "claude", "user-prompt-submit", socket),
+                            "statusMessage": "Hyphae · Inject queued messages",
+                            "timeout": 10
+                        }]
+                    }),
+                ),
+            );
+            hooks.insert(
                 "PreToolUse".to_string(),
                 merge_hook_groups(
                     hooks.get("PreToolUse"),
@@ -3380,6 +3394,20 @@ fn setup_codex(
         ),
     );
     hooks.insert(
+        "UserPromptSubmit".to_string(),
+        merge_hook_groups(
+            hooks.get("UserPromptSubmit"),
+            json!({
+                "hooks": [{
+                    "type": "command",
+                    "command": hook_command(bin, "codex", "user-prompt-submit", socket),
+                    "statusMessage": "Hyphae · Inject queued messages",
+                    "timeout": 10
+                }]
+            }),
+        ),
+    );
+    hooks.insert(
         "PreToolUse".to_string(),
         merge_hook_groups(
             hooks.get("PreToolUse"),
@@ -3490,6 +3518,16 @@ fn setup_cursor(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    hooks.insert(
+        "beforeSubmitPrompt".to_string(),
+        merge_hook_groups(
+            hooks.get("beforeSubmitPrompt"),
+            json!({
+                "command": hook_command(bin, "cursor", "before-submit-prompt", socket),
+                "timeout": 10
+            }),
+        ),
+    );
     hooks.insert(
         "beforeMCPExecution".to_string(),
         merge_hook_groups(
@@ -3680,6 +3718,21 @@ fn setup_gemini(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    hooks.insert(
+        "BeforeAgent".to_string(),
+        merge_hook_groups(
+            hooks.get("BeforeAgent"),
+            json!({
+                "matcher": "*",
+                "hooks": [{
+                    "name": "hyphae-before-agent",
+                    "type": "command",
+                    "command": hook_command(bin, "gemini", "before-agent", socket),
+                    "timeout": 10
+                }]
+            }),
+        ),
+    );
     hooks.insert(
         "BeforeTool".to_string(),
         merge_hook_groups(

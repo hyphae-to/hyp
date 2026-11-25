@@ -189,9 +189,11 @@ test("manifest and plugin export satisfy OpenClaw native plugin contract", () =>
       registered.push({ name, handler });
     },
   });
-  assert.equal(registered.length, 1);
+  assert.equal(registered.length, 2);
   assert.equal(registered[0].name, "before_prompt_build");
   assert.equal(typeof registered[0].handler, "function");
+  assert.equal(registered[1].name, "agent_end");
+  assert.equal(typeof registered[1].handler, "function");
 });
 
 test("resolvePluginConfig and extractOpenClawSessionPayload handle precedence and fallbacks", () => {

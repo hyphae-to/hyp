@@ -375,12 +375,12 @@ async fn x3_unauthenticated_t3_never_attaches_and_t3_auth_missing_detaches_clean
     assert_eq!(st["hasLiveTransport"], false);
     assert_eq!(st["pending"], 1);
 
-    // Fallback PostToolUse hook now delivers the preserved message cleanly!
+    // Fallback TurnEnd (Stop) hook now delivers the preserved Queue message cleanly!
     let post = run_hook(
         &sock,
         HarnessKind::Claude,
-        HookEvent::PostToolUse,
-        json!({ "session_id": "sess-t3-missing-tok", "tool_name": "Bash", "tool_use_id": "tu-x3" }),
+        HookEvent::Stop,
+        json!({ "session_id": "sess-t3-missing-tok" }),
     )
     .await;
     assert!(
@@ -462,13 +462,13 @@ async fn x4_terminal_transport_errors_detach_and_immediately_refresh_ui_state() 
         );
         assert!(sess_entry["transportKind"].is_null());
 
-        // Fallback PostToolUse hook resumes and delivers preserved message!
+        // Fallback TurnEnd (Stop) hook resumes and delivers preserved Queue message!
         let raw_sid = sid.strip_prefix("claude:").unwrap();
         let hook_out = run_hook(
             &sock,
             HarnessKind::Claude,
-            HookEvent::PostToolUse,
-            json!({ "session_id": raw_sid, "tool_name": "Read", "tool_use_id": format!("tu-{kind}") }),
+            HookEvent::Stop,
+            json!({ "session_id": raw_sid }),
         )
         .await;
         assert!(
@@ -973,6 +973,8 @@ async fn h6_drop_watcher_reconnects_with_last_event_id_and_surfaces_unrecoverabl
         )
         .await;
     assert!(!drop_err, "drop_link failed: {drop_txt}");
+    // Mark setup turn idle via Stop so idle PushTransport delivers immediately.
+    let _ = run_hook(&sock, HarnessKind::Claude, HookEvent::Stop, json!({ "session_id": "h6-sess" })).await;
 
     // Wait for reconnect + ingest + live delivery to `claude:h6-sess`!
     let delivered = transport.wait_for_delivered(1, Duration::from_secs(5)).await;
@@ -1059,6 +1061,7 @@ async fn h6_drop_watcher_reconnects_with_last_event_id_and_surfaces_unrecoverabl
         )
         .await;
     assert!(!gone_err);
+    let _ = run_hook(&sock, HarnessKind::Claude, HookEvent::Stop, json!({ "session_id": "h6-sess" })).await;
 
     let delivered_after_gone = transport.wait_for_delivered(2, Duration::from_secs(5)).await;
     assert!(
@@ -2077,6 +2080,8 @@ async fn h18_drop_watcher_ignores_junk_envelope_and_delivers_subsequent_valid_dr
         )
         .await;
     assert!(!drop_err);
+    // Mark setup turn idle via Stop so idle PushTransport delivers immediately.
+    let _ = run_hook(&sock, HarnessKind::Claude, HookEvent::Stop, json!({ "session_id": "h18-sess" })).await;
 
     let delivered = transport.wait_for_delivered(1, Duration::from_secs(5)).await;
     assert!(

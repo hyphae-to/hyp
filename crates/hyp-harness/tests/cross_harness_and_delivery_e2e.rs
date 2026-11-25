@@ -106,6 +106,47 @@ fn extract_drain_text(harness: HarnessKind, hook_out: &Value) -> String {
     }
 }
 
+fn extract_pre_turn_drain_text(harness: HarnessKind, hook_out: &Value) -> String {
+    match harness {
+        HarnessKind::Antigravity => hook_out["injectSteps"][0]["systemMessage"]["systemMessage"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        HarnessKind::Opencode => hook_out["additionalContext"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        HarnessKind::Cursor => {
+            assert_eq!(hook_out["continue"], true);
+            hook_out["additional_context"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        }
+        HarnessKind::Gemini => {
+            assert_eq!(hook_out["hookSpecificOutput"]["hookEventName"], "BeforeAgent");
+            hook_out["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        }
+        HarnessKind::Openclaw => hook_out["prependContext"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        _ => {
+            assert_eq!(
+                hook_out["hookSpecificOutput"]["hookEventName"],
+                "UserPromptSubmit"
+            );
+            hook_out["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        }
+    }
+}
+
 fn extract_stop_reason(harness: HarnessKind, stop_out: &Value) -> String {
     match harness {
         HarnessKind::Antigravity => {
@@ -211,7 +252,8 @@ async fn suite_1_all_nine_harnesses_live_differential_parity() {
         let st_after_join = session_status(&sock, &session_id).await;
         assert_eq!(st_after_join["handle"], handle);
 
-        // 3. Send DM #1 from `sender` -> verify harness-appropriate drain hook!
+        // 3. Send DM #1 from `sender` -> verify mid-turn PostToolUse holds Queue DM cleanly,
+        //    then verify TurnStart (`PreInvocation`) drains Queue DM into harness-specific envelope!
         let msg1 = format!("parity-msg-1-{raw_id}");
         let (dm1_txt, dm1_err) = sender_mcp
             .call_verified_claude(
@@ -224,15 +266,17 @@ async fn suite_1_all_nine_harnesses_live_differential_parity() {
         assert!(!dm1_err, "send msg1 to {raw_id} failed: {dm1_txt}");
         wait_for_pending_count(&sock, &session_id, 1).await;
 
-        let drain_out = if *harness == HarnessKind::Antigravity {
-            // Antigravity PostToolUse must NOT drain; PreInvocation drains into injectSteps!
-            let post = run_hook(&sock, *harness, HookEvent::PostToolUse, hook_payload.clone()).await;
-            assert_eq!(post, json!({}), "Antigravity PostToolUse must return {{}}");
-            run_hook(&sock, *harness, HookEvent::PreInvocation, hook_payload.clone()).await
-        } else {
-            run_hook(&sock, *harness, HookEvent::PostToolUse, hook_payload.clone()).await
-        };
-        let drained_text = extract_drain_text(*harness, &drain_out);
+        let post_held = run_hook(&sock, *harness, HookEvent::PostToolUse, hook_payload.clone()).await;
+        assert_eq!(
+            post_held,
+            json!({}),
+            "PostToolUse must hold default Queue DM until TurnEnd/TurnStart for {:?}",
+            harness
+        );
+
+        let drain_out =
+            run_hook(&sock, *harness, HookEvent::PreInvocation, hook_payload.clone()).await;
+        let drained_text = extract_pre_turn_drain_text(*harness, &drain_out);
 
         let st_after_drain = session_status(&sock, &session_id).await;
 
@@ -265,7 +309,16 @@ async fn suite_1_all_nine_harnesses_live_differential_parity() {
         wait_for_pending_count(&sock, &session_id, 1).await;
 
         let stop_drain = run_hook(&sock, *harness, HookEvent::Stop, hook_payload.clone()).await;
-        let stop_reason = extract_stop_reason(*harness, &stop_drain);
+        let stop_reason = if *harness == HarnessKind::Openclaw {
+            // OpenClaw `agent_end` is observational-only (`{}`) — flips Active -> Idle without
+            // mutating/blocking turn end, preserving DM #2 intact for `before_prompt_build`.
+            assert_eq!(stop_drain, json!({}));
+            let oc_next =
+                run_hook(&sock, *harness, HookEvent::PreInvocation, hook_payload.clone()).await;
+            extract_pre_turn_drain_text(*harness, &oc_next)
+        } else {
+            extract_stop_reason(*harness, &stop_drain)
+        };
 
         // 5. Idle Stop hook (no unread, no live transport):
         //    - Herdr, T3, and OpenClaw rely on native push/ephemeral turn orchestration and
@@ -753,8 +806,8 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
     let burst_drain = run_hook(
         &sock,
         HarnessKind::Claude,
-        HookEvent::PostToolUse,
-        json!({ "session_id": "recv-1", "tool_use_id": "drain-burst-1" }),
+        HookEvent::PreInvocation,
+        json!({ "session_id": "recv-1" }),
     )
     .await;
     let burst_ctx = burst_drain["hookSpecificOutput"]["additionalContext"]
@@ -774,7 +827,7 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
         now_ms()
     ));
 
-    // Independent peer `calm` is NOT in Noisy Mode -> delivers verbatim inline!
+    // Independent peer `calm` is NOT in Noisy Mode -> delivers verbatim inline at TurnStart/TurnEnd!
     let (_, calm_err) = mcp
         .call_verified_claude(
             &sock,
@@ -789,8 +842,8 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
     let calm_drain = run_hook(
         &sock,
         HarnessKind::Claude,
-        HookEvent::PostToolUse,
-        json!({ "session_id": "recv-1", "tool_use_id": "drain-calm-1" }),
+        HookEvent::PreInvocation,
+        json!({ "session_id": "recv-1" }),
     )
     .await;
     let calm_ctx = calm_drain["hookSpecificOutput"]["additionalContext"]
@@ -941,8 +994,8 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
     let giant_drain = run_hook(
         &sock,
         HarnessKind::Claude,
-        HookEvent::PostToolUse,
-        json!({ "session_id": "recv-1", "tool_use_id": "drain-giant-1" }),
+        HookEvent::PreInvocation,
+        json!({ "session_id": "recv-1" }),
     )
     .await;
     let giant_ctx = giant_drain["hookSpecificOutput"]["additionalContext"]
@@ -955,12 +1008,12 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
         "expected hyp_inbox(ids:[...]) hint, got: {giant_ctx}"
     );
 
-    // Second PostToolUse must NOT re-emit the truncated giant preview!
+    // Second TurnStart must NOT re-emit the truncated giant preview!
     let giant_nodup = run_hook(
         &sock,
         HarnessKind::Claude,
-        HookEvent::PostToolUse,
-        json!({ "session_id": "recv-1", "tool_use_id": "drain-giant-nodup" }),
+        HookEvent::PreInvocation,
+        json!({ "session_id": "recv-1" }),
     )
     .await;
     assert_eq!(giant_nodup, json!({}));
@@ -1020,8 +1073,8 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
     let strict_drain = run_hook(
         &sock,
         HarnessKind::Claude,
-        HookEvent::PostToolUse,
-        json!({ "session_id": "recv-1", "tool_use_id": "drain-strict-1" }),
+        HookEvent::PreInvocation,
+        json!({ "session_id": "recv-1" }),
     )
     .await;
     let strict_ctx = strict_drain["hookSpecificOutput"]["additionalContext"]
@@ -1483,17 +1536,17 @@ async fn suite_4_claude_channel_failure_nack_disconnect_and_timeout_fallback_mat
             .unwrap()
             .unwrap();
 
-        // Message MUST NOT be lost/acked; PostToolUse hook drains it intact!
+        // Message MUST NOT be lost/acked; TurnStart (`UserPromptSubmit`) hook drains it intact!
         let drain = run_hook(
             &sock,
             HarnessKind::Claude,
-            HookEvent::PostToolUse,
-            json!({ "session_id": "nack-sess", "tool_use_id": "after-nack" }),
+            HookEvent::PreInvocation,
+            json!({ "session_id": "nack-sess" }),
         )
         .await;
         let ctx = drain["hookSpecificOutput"]["additionalContext"]
             .as_str()
-            .expect("nacked channel message must drain via PostToolUse");
+            .expect("nacked channel message must drain via TurnStart hook");
         assert!(ctx.contains("NACK_PRESERVED_PAYLOAD"));
     }
 
@@ -2315,7 +2368,7 @@ async fn run_transport_parity_scenario(sock: &Path) -> TransportParitySnapshot {
         .unwrap()
         .unwrap();
 
-    // 2. Send msg2 and drain via synchronous `handle_hook_payload` (`PostToolUse`) over `sock`!
+    // 2. Send msg2 and drain via synchronous `handle_hook_payload` (`PreInvocation` TurnStart) over `sock`!
     let (_, s2_err) = mcp
         .call_verified_claude(
             sock,
@@ -2330,8 +2383,8 @@ async fn run_transport_parity_scenario(sock: &Path) -> TransportParitySnapshot {
     let post_out = run_hook(
         sock,
         HarnessKind::Claude,
-        HookEvent::PostToolUse,
-        json!({ "session_id": "xport-b", "tool_use_id": "xport-drain-2" }),
+        HookEvent::PreInvocation,
+        json!({ "session_id": "xport-b" }),
     )
     .await;
     let post_ctx = post_out["hookSpecificOutput"]["additionalContext"]
@@ -2602,8 +2655,8 @@ async fn suite_7_direct_p2p_security_gate_lockdown_and_human_approve_without_req
     let post_approved = run_hook(
         &bob_sock,
         HarnessKind::Claude,
-        HookEvent::PostToolUse,
-        json!({ "session_id": "bob-p2p-gate", "tool_name": "Bash", "tool_use_id": "tu-p2p-3" }),
+        HookEvent::PreInvocation,
+        json!({ "session_id": "bob-p2p-gate" }),
     )
     .await;
     assert!(
@@ -3058,6 +3111,14 @@ async fn suite_9_push_transport_queue_interrupt_stop_silencing_and_hold_fallback
         )
         .await;
     assert!(!rule_err);
+    // End Codex's setup turn so it is Idle and immediately receives the Interrupt push.
+    let _ = run_hook(
+        &sock,
+        HarnessKind::Codex,
+        HookEvent::Stop,
+        json!({ "thread_id": "thr-p9" }),
+    )
+    .await;
 
     let (_, dm2_err) = sender_mcp
         .call_verified_claude(
@@ -3243,7 +3304,7 @@ esac
     }
     assert!(
         log_contents.contains("send --json --if idle t9h")
-            && log_contents.contains("Hyphae mesh: 1 new message(s) queued for @codex-in-herdr. Call hyp_inbox({ ack: true }) to read them."),
+            && log_contents.contains("<hyphae-wake count=\"1\" handle=\"codex-in-herdr\" urgency=\"queue\">1 Hyphae message(s) queued for @codex-in-herdr. Review any injected Hyphae context or call hyp_inbox({ ack: true }) to read them.</hyphae-wake>"),
         "expected fake-hc to receive guarded metadata-only wake nudge, got:\n{log_contents}"
     );
     assert!(

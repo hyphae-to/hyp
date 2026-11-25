@@ -470,25 +470,23 @@ async fn test2_tier3_bounded_hold_retry_queue_and_hook_cancellation() {
         .expect("ingest inbound for hook cancel");
     assert_eq!(transport_cancel.attempts(), 1);
 
-    // Simulate `PostToolUse` hook draining the mailbox BEFORE the 120 ms retry fires.
+    // Simulate `Stop` (TurnEnd) hook draining the queued event BEFORE the 200 ms retry fires.
     let sock2_clone = sock2.clone();
     let hook_out = tokio::task::spawn_blocking(move || {
         handle_hook_payload(
             json!({
-                "session_id": "cancel-session",
-                "tool_name": "Read",
-                "tool_use_id": "toolu_post_1"
+                "session_id": "cancel-session"
             })
             .as_object()
             .unwrap(),
-            &hook_opts(HarnessKind::Claude, HookEvent::PostToolUse, &sock2_clone),
+            &hook_opts(HarnessKind::Claude, HookEvent::Stop, &sock2_clone),
         )
     })
     .await
     .unwrap();
-    let injected = hook_out["hookSpecificOutput"]["additionalContext"]
+    let injected = hook_out["reason"]
         .as_str()
-        .expect("PostToolUse must inject queued event");
+        .expect("Stop TurnEnd hook must inject queued event");
     assert!(injected.contains("Drained by PostToolUse before retry timer fires"));
     assert_eq!(node2.db().local().pending_count(sid_cancel).unwrap(), 0);
 
@@ -1713,4 +1711,378 @@ exit 0
         daemon.stop().await;
         node.shutdown();
     }
+}
+
+// =========================================================================
+// Test 7: Unified Hook State Machine (Interrupt MidTurn + Grace Fallback,
+//         Queue TurnEnd + Lease Fallback, OpenClaw agent_end, Notify Passive)
+// =========================================================================
+
+struct NudgeRecordingTransport {
+    kind: &'static str,
+    supports_interrupt: bool,
+    nudges: Arc<Mutex<Vec<(PushMode, String)>>>,
+}
+
+impl NudgeRecordingTransport {
+    fn new(kind: &'static str, supports_interrupt: bool) -> Self {
+        Self {
+            kind,
+            supports_interrupt,
+            nudges: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn take(&self) -> Vec<(PushMode, String)> {
+        std::mem::take(&mut *self.nudges.lock().unwrap())
+    }
+}
+
+impl PushTransport for NudgeRecordingTransport {
+    fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    fn supports_interrupt(&self) -> bool {
+        self.supports_interrupt
+    }
+
+    fn is_nudge_only(&self) -> bool {
+        true
+    }
+
+    fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
+        let nudges = Arc::clone(&self.nudges);
+        let msg = text.to_string();
+        Box::pin(async move {
+            nudges.lock().unwrap().push((mode, msg));
+            PushOutcome::delivered()
+        })
+    }
+
+    fn deliver_nudge<'a>(
+        &'a self,
+        message_count: usize,
+        handle: Option<&'a str>,
+        _batch_id: &'a str,
+        mode: PushMode,
+    ) -> TransportFuture<'a, PushOutcome> {
+        let nudges = Arc::clone(&self.nudges);
+        let msg = hyp_harness::transport::format_push_wake_nudge(message_count, handle, mode);
+        Box::pin(async move {
+            nudges.lock().unwrap().push((mode, msg));
+            PushOutcome::delivered()
+        })
+    }
+}
+
+#[tokio::test]
+async fn test7_unified_hook_state_machine_interrupt_queue_notify_and_activity_leases() {
+    let dir = TempDir::new().unwrap();
+    let node = open_local_node("fsm@box", dir.path());
+    let cfg = LocalDaemonConfig {
+        interrupt_hook_grace: Duration::from_millis(90),
+        queue_activity_lease: Duration::from_millis(180),
+        ..Default::default()
+    };
+    let daemon = LocalDaemon::start(Arc::clone(&node), None, cfg)
+        .await
+        .expect("start daemon");
+    let sock = daemon.socket_path().to_path_buf();
+
+    let run_h = |harness: HarnessKind, event: HookEvent, payload: Value| {
+        let sock_c = sock.clone();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                handle_hook_payload(
+                    payload.as_object().unwrap(),
+                    &hook_opts(harness, event, &sock_c),
+                )
+            })
+            .await
+            .unwrap()
+        }
+    };
+
+    // Register Claude session `@worker` with VIP `@vip` -> interrupt, `@fyi` -> notify.
+    let sid = "claude:fsm-1";
+    node.register_session(sid, "{\"kind\":\"claude\"}").unwrap();
+    node.db()
+        .local()
+        .set_session_handle(sid, Some("worker"), now_ms())
+        .unwrap();
+    {
+        let db = node.db();
+        let mut pol = daemon.delivery().policy(&db, sid).unwrap();
+        pol.overrides = vec![
+            hyp_node::delivery::DeliveryRule {
+                target: "peer@net/vip".into(),
+                delivery: hyp_node::delivery::DeliveryUrgency::Interrupt,
+            },
+            hyp_node::delivery::DeliveryRule {
+                target: "peer@net/fyi".into(),
+                delivery: hyp_node::delivery::DeliveryUrgency::Notify,
+            },
+        ];
+        daemon.delivery().set_policy(&db, sid, pol).unwrap();
+    }
+
+    let nudge_xport = Arc::new(NudgeRecordingTransport::new("herdr", true));
+    daemon.register_session_transport(sid, Arc::clone(&nudge_xport) as Arc<dyn PushTransport>);
+
+    // 1. ACTIVE + INTERRUPT drained by PostToolUse within 90ms grace -> ZERO L2 nudges!
+    let _ = run_h(
+        HarnessKind::Claude,
+        HookEvent::PreInvocation,
+        json!({ "session_id": "fsm-1" }),
+    )
+    .await;
+    daemon
+        .ingest_inbound(InboundItem {
+            session_id: sid.into(),
+            origin_node: "peer@net".into(),
+            item_id: "fsm-int-hook".into(),
+            source: "peer@net/vip".into(),
+            text: "URGENT_VIA_POST_TOOL".into(),
+            kind: MailboxKind::Message,
+            trust_tier: GateTrustTier::Peer,
+        })
+        .await
+        .unwrap();
+    assert!(
+        nudge_xport.take().is_empty(),
+        "Active session must defer Interrupt nudge during tool-hook grace"
+    );
+    let post_int = run_h(
+        HarnessKind::Claude,
+        HookEvent::PostToolUse,
+        json!({ "session_id": "fsm-1", "tool_name": "Bash", "tool_use_id": "t1" }),
+    )
+    .await;
+    assert!(
+        post_int.to_string().contains("URGENT_VIA_POST_TOOL"),
+        "PostToolUse must drain Interrupt mid-turn: {post_int}"
+    );
+    tokio::time::sleep(Duration::from_millis(130)).await;
+    assert!(
+        nudge_xport.take().is_empty(),
+        "PostToolUse drain must cancel Interrupt grace fallback (0 nudges)"
+    );
+
+    // 2. ACTIVE + INTERRUPT with NO PostToolUse -> grace expires (90ms) -> falls back to XML Interrupt nudge!
+    let _ = run_h(
+        HarnessKind::Claude,
+        HookEvent::PreInvocation,
+        json!({ "session_id": "fsm-1" }),
+    )
+    .await;
+    daemon
+        .ingest_inbound(InboundItem {
+            session_id: sid.into(),
+            origin_node: "peer@net".into(),
+            item_id: "fsm-int-fallback".into(),
+            source: "peer@net/vip".into(),
+            text: "URGENT_FALLBACK_BODY".into(),
+            kind: MailboxKind::Message,
+            trust_tier: GateTrustTier::Peer,
+        })
+        .await
+        .unwrap();
+    assert!(nudge_xport.take().is_empty());
+    tokio::time::sleep(Duration::from_millis(140)).await;
+    let int_nudges = nudge_xport.take();
+    assert_eq!(int_nudges.len(), 1, "Interrupt grace expiry must fire L2 fallback");
+    assert_eq!(int_nudges[0].0, PushMode::Interrupt);
+    assert!(int_nudges[0].1.starts_with("<hyphae-wake count=\"1\" handle=\"worker\" urgency=\"interrupt\">"));
+    assert!(!int_nudges[0].1.contains("URGENT_FALLBACK_BODY"));
+
+    // TurnStart (`UserPromptSubmit`) drains the `NudgePending` Interrupt cleanly -> 0 unread!
+    let pre_nudge = run_h(
+        HarnessKind::Claude,
+        HookEvent::PreInvocation,
+        json!({ "session_id": "fsm-1" }),
+    )
+    .await;
+    assert!(
+        pre_nudge.to_string().contains("URGENT_FALLBACK_BODY"),
+        "TurnStart must drain NudgePending item: {pre_nudge}"
+    );
+    assert_eq!(node.db().local().pending_count(sid).unwrap(), 0);
+
+    // 3. ACTIVE + QUEUE held across PostToolUse -> drained cleanly by TurnEnd (`Stop`) with 0 nudges!
+    daemon
+        .ingest_inbound(InboundItem {
+            session_id: sid.into(),
+            origin_node: "peer@net".into(),
+            item_id: "fsm-q-stop".into(),
+            source: "peer@net/dev".into(),
+            text: "QUEUED_FOR_TURN_END".into(),
+            kind: MailboxKind::Message,
+            trust_tier: GateTrustTier::Peer,
+        })
+        .await
+        .unwrap();
+    let post_q = run_h(
+        HarnessKind::Claude,
+        HookEvent::PostToolUse,
+        json!({ "session_id": "fsm-1", "tool_name": "Read", "tool_use_id": "t2" }),
+    )
+    .await;
+    assert_eq!(post_q, json!({}), "PostToolUse must hold Queue DM mid-turn");
+    assert!(nudge_xport.take().is_empty(), "Active lease must defer Queue nudge");
+    let stop_q = run_h(
+        HarnessKind::Claude,
+        HookEvent::Stop,
+        json!({ "session_id": "fsm-1" }),
+    )
+    .await;
+    assert!(
+        stop_q.to_string().contains("QUEUED_FOR_TURN_END"),
+        "Stop TurnEnd must drain held Queue DM: {stop_q}"
+    );
+    assert_eq!(node.db().local().pending_count(sid).unwrap(), 0);
+    tokio::time::sleep(Duration::from_millis(220)).await;
+    assert!(nudge_xport.take().is_empty(), "Stop drain must leave 0 nudges");
+
+    // 4. ACTIVE + QUEUE with missed Stop -> activity lease expires (180ms) -> fires XML Queue nudge!
+    let _ = run_h(
+        HarnessKind::Claude,
+        HookEvent::PreInvocation,
+        json!({ "session_id": "fsm-1" }),
+    )
+    .await;
+    daemon
+        .ingest_inbound(InboundItem {
+            session_id: sid.into(),
+            origin_node: "peer@net".into(),
+            item_id: "fsm-q-lease".into(),
+            source: "peer@net/dev".into(),
+            text: "QUEUED_LEASE_FALLBACK".into(),
+            kind: MailboxKind::Message,
+            trust_tier: GateTrustTier::Peer,
+        })
+        .await
+        .unwrap();
+    assert!(nudge_xport.take().is_empty());
+    tokio::time::sleep(Duration::from_millis(240)).await;
+    let q_nudges = nudge_xport.take();
+    assert_eq!(q_nudges.len(), 1, "Activity lease expiry must fire Queue fallback nudge");
+    assert_eq!(q_nudges[0].0, PushMode::Queue);
+    assert!(q_nudges[0].1.starts_with("<hyphae-wake count=\"1\" handle=\"worker\" urgency=\"queue\">"));
+    // Drain it via TurnStart so inbox is clean for Notify test.
+    let pre_q = run_h(
+        HarnessKind::Claude,
+        HookEvent::PreInvocation,
+        json!({ "session_id": "fsm-1" }),
+    )
+    .await;
+    assert!(pre_q.to_string().contains("QUEUED_LEASE_FALLBACK"));
+    // End turn cleanly -> Idle.
+    assert_eq!(
+        run_h(HarnessKind::Claude, HookEvent::Stop, json!({ "session_id": "fsm-1" })).await,
+        json!({})
+    );
+
+    // 5. NOTIFY -> NEVER fires L2 nudge (even while Idle!), NEVER drains on PostToolUse,
+    //    NEVER blocks Stop, surfaces 1-line digest on TurnStart (`UserPromptSubmit`)!
+    daemon
+        .ingest_inbound(InboundItem {
+            session_id: sid.into(),
+            origin_node: "peer@net".into(),
+            item_id: "fsm-notify-1".into(),
+            source: "peer@net/fyi".into(),
+            text: "FYI_LOW_PRIORITY_SECRET_BODY".into(),
+            kind: MailboxKind::Message,
+            trust_tier: GateTrustTier::Peer,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(
+        nudge_xport.take().is_empty(),
+        "Notify-only FYI MUST NEVER wake idle L2 transport"
+    );
+    assert_eq!(
+        run_h(
+            HarnessKind::Claude,
+            HookEvent::PostToolUse,
+            json!({ "session_id": "fsm-1", "tool_name": "Read", "tool_use_id": "t3" })
+        )
+        .await,
+        json!({}),
+        "PostToolUse must stay silent on Notify"
+    );
+    assert_eq!(
+        run_h(HarnessKind::Claude, HookEvent::Stop, json!({ "session_id": "fsm-1" })).await,
+        json!({}),
+        "Stop must NEVER force a continuation turn for a Notify-only digest"
+    );
+    let pre_notify = run_h(
+        HarnessKind::Claude,
+        HookEvent::PreInvocation,
+        json!({ "session_id": "fsm-1" }),
+    )
+    .await;
+    let notify_ctx = pre_notify["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("TurnStart must emit 1-line Notify digest");
+    assert!(notify_ctx.contains("hyphae notify · 1 unread"));
+    assert!(!notify_ctx.contains("FYI_LOW_PRIORITY_SECRET_BODY"));
+
+    // 6. OpenClaw observational `agent_end` flips Active -> Idle immediately and flushes held Queue nudge!
+    let oc_sid = "openclaw:oc-fsm";
+    node.register_session(oc_sid, "{\"kind\":\"openclaw\"}").unwrap();
+    node.db()
+        .local()
+        .set_session_handle(oc_sid, Some("claw"), now_ms())
+        .unwrap();
+    let oc_xport = Arc::new(NudgeRecordingTransport::new("openclaw", false));
+    daemon.register_session_transport(oc_sid, Arc::clone(&oc_xport) as Arc<dyn PushTransport>);
+
+    // TurnStart marks OpenClaw Active (180ms lease)
+    let _ = run_h(
+        HarnessKind::Openclaw,
+        HookEvent::PreInvocation,
+        json!({ "session_id": "oc-fsm" }),
+    )
+    .await;
+    daemon
+        .ingest_inbound(InboundItem {
+            session_id: oc_sid.into(),
+            origin_node: "peer@net".into(),
+            item_id: "oc-q-1".into(),
+            source: "peer@net/dev".into(),
+            text: "OPENCLAW_HELD_UNTIL_AGENT_END".into(),
+            kind: MailboxKind::Message,
+            trust_tier: GateTrustTier::Peer,
+        })
+        .await
+        .unwrap();
+    assert!(oc_xport.take().is_empty(), "Active OpenClaw defers Queue during turn");
+
+    // Observational `agent_end` flips Idle immediately (well before 180ms lease) and flushes!
+    let end_res = run_h(
+        HarnessKind::Openclaw,
+        HookEvent::Stop,
+        json!({ "session_id": "oc-fsm" }),
+    )
+    .await;
+    assert_eq!(end_res, json!({}));
+    let mut oc_nudges = Vec::new();
+    for _ in 0..20 {
+        oc_nudges = oc_xport.take();
+        if !oc_nudges.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        oc_nudges.len(),
+        1,
+        "OpenClaw agent_end must immediately flush deferred Queue wake nudge"
+    );
+    assert!(oc_nudges[0].1.starts_with("<hyphae-wake count=\"1\" handle=\"claw\" urgency=\"queue\">"));
+
+    daemon.stop().await;
+    node.shutdown();
 }

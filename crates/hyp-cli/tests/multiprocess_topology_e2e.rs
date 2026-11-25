@@ -3135,7 +3135,8 @@ fn zero_flag_default_home_onboard_daemon_mcp_hook_wait_roundtrip() {
     assert!(!jb_err, "zero-flag join beta failed: {jb_txt}");
     assert!(jb_txt.contains(&format!("{node_id}/beta")), "{jb_txt}");
 
-    // 5. Send DM #1 (`alpha` -> `beta`) and drain via zero-flag `hyp hook claude post-tool-use`!
+    // 5. Send DM #1 (`alpha` -> `beta`): `post-tool-use` holds Queue mid-turn cleanly,
+    //    and zero-flag `user-prompt-submit` (TurnStart) drains DM #1 from default daemon socket!
     let dm1 = "ZERO_FLAG_HOOK_DELIVERY_SENTINEL_111";
     let (s1_txt, s1_err) = call_verified(
         "zero-a",
@@ -3144,7 +3145,7 @@ fn zero_flag_default_home_onboard_daemon_mcp_hook_wait_roundtrip() {
     );
     assert!(!s1_err, "zero-flag hyp_send #1 failed: {s1_txt}");
 
-    let post_out = run_zero_flag_hook(
+    let mid_out = run_zero_flag_hook(
         "post-tool-use",
         json!({
             "session_id": "zero-b",
@@ -3152,12 +3153,22 @@ fn zero_flag_default_home_onboard_daemon_mcp_hook_wait_roundtrip() {
             "tool_use_id": "tu-zero-drain-1"
         }),
     );
-    let drained_ctx = post_out["hookSpecificOutput"]["additionalContext"]
+    assert_eq!(
+        mid_out,
+        json!({}),
+        "zero-flag post-tool-use must hold Queue DM until turn boundary: {mid_out}"
+    );
+
+    let pre_turn_out = run_zero_flag_hook(
+        "user-prompt-submit",
+        json!({ "session_id": "zero-b" }),
+    );
+    let drained_ctx = pre_turn_out["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap_or_default();
     assert!(
         drained_ctx.contains(dm1),
-        "zero-flag post-tool-use must drain DM #1 from default daemon socket: {post_out}"
+        "zero-flag user-prompt-submit must drain DM #1 from default daemon socket: {pre_turn_out}"
     );
 
     // 6. Spawn `hyp wait` with ZERO `--socket` flag and wake it via DM #2!

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -135,6 +135,12 @@ const GATE_HOLD_RETRY_MAX_ATTEMPTS: u32 = 16;
 pub const DEFAULT_CHANNEL_DELIVER_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default per-peer connect timeout when reconciling persisted peers during `peers.reload`.
 pub const DEFAULT_PEERS_RELOAD_TIMEOUT: Duration = Duration::from_millis(1_200);
+/// Default grace window waiting for a mid-turn tool hook (`PostToolUse`) to drain an `Interrupt`
+/// on an `Active` hooked session before falling back to an external L2 `PushTransport`.
+pub const DEFAULT_INTERRUPT_HOOK_GRACE: Duration = Duration::from_secs(2);
+/// Default sliding activity lease duration after the last hook call before a hooked session
+/// without a TurnEnd (`Stop` / `agent_end`) event decays to `Idle` and flushes held `Queue` batches.
+pub const DEFAULT_QUEUE_ACTIVITY_LEASE: Duration = Duration::from_secs(15);
 
 /// Boxed `Send` future alias used by [`BridgePoster`] and [`PeersReloader`].
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -253,6 +259,12 @@ pub struct LocalDaemonConfig {
     pub session_prune_interval: Duration,
     /// Bounded exponential reconnect backoff delays (ms) for external Blind Drop Relay SSE watchers (`H6`).
     pub drop_watcher_backoff_ms: Vec<u64>,
+    /// Grace window waiting for a mid-turn tool hook (`PostToolUse`) to drain an `Interrupt`
+    /// while a hooked session is `Active` before falling back to L2 `PushTransport`.
+    pub interrupt_hook_grace: Duration,
+    /// Sliding activity lease duration after the last hook call before an active hooked session
+    /// without TurnEnd (`Stop` / `agent_end`) decays to `Idle` and flushes held `Queue` batches to L2.
+    pub queue_activity_lease: Duration,
 }
 
 impl Default for LocalDaemonConfig {
@@ -272,6 +284,8 @@ impl Default for LocalDaemonConfig {
             session_prune_after_ms: DEFAULT_SESSION_PRUNE_AFTER_MS,
             session_prune_interval: DEFAULT_SESSION_PRUNE_INTERVAL,
             drop_watcher_backoff_ms: vec![500, 1_000, 2_000, 5_000],
+            interrupt_hook_grace: DEFAULT_INTERRUPT_HOOK_GRACE,
+            queue_activity_lease: DEFAULT_QUEUE_ACTIVITY_LEASE,
         }
     }
 }
@@ -441,6 +455,48 @@ struct QuarantineNoticeMeta {
     surfaced_in_batch: bool,
 }
 
+/// Delivery drain scope requested by `mailbox.drain`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainScope {
+    /// Default / backwards-compatible full drain (raw `mailbox.drain` callers omitting `scope`).
+    All,
+    /// Mid-turn tool hook (`PostToolUse` / `AfterTool` / `afterMCPExecution` / `tool.execute.after`):
+    /// drains `Interrupt` items ONLY; `Queue` and `Notify` stay held cleanly until TurnEnd / TurnStart.
+    MidTurn,
+    /// TurnEnd hook (`Stop` / `AfterAgent` / `session.idle`):
+    /// drains `Interrupt` + `Queue`; ignores `notify_only` batches so TurnEnd never forces an extra turn for an FYI.
+    TurnBoundary,
+    /// TurnStart hook (`UserPromptSubmit` / `BeforeAgent` / `beforeSubmitPrompt` / `PreInvocation` / `before_prompt_build`):
+    /// drains `Interrupt` + `Queue` + `NudgePending` + 1-line `Notify` digests.
+    PreTurn,
+}
+
+impl DrainScope {
+    fn from_packet(packet: &Map<String, Value>) -> Self {
+        match packet.get("scope").and_then(Value::as_str) {
+            Some("mid_turn") => Self::MidTurn,
+            Some("turn_boundary") => Self::TurnBoundary,
+            Some("pre_turn") => Self::PreTurn,
+            _ => Self::All,
+        }
+    }
+}
+
+/// Sliding hook-observed activity lease for a session (`Active` until `active_until`,
+/// immediately cleared to `Idle` on TurnEnd `Stop` / `agent_end` / `wait.subscribe`).
+#[derive(Debug, Clone, Copy)]
+struct SessionActivity {
+    harness: HarnessKind,
+    active_until: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActivityGraceTimer {
+    generation: u64,
+    fire_at: Instant,
+    bypass_grace: bool,
+}
+
 struct LocalDaemonInner {
     node: Arc<UnifiedNode>,
     gate: Arc<RwLock<Option<Arc<SecurityGatePipeline>>>>,
@@ -487,6 +543,12 @@ struct LocalDaemonInner {
     /// Tier 3 bounded `Hold` retry state (`session_id -> (attempt, generation)`).
     /// Empty when idle — zero background polling.
     hold_retries: Mutex<HashMap<String, (u32, u64)>>,
+    /// Sliding hook-observed `Active` activity leases (`session_id -> SessionActivity`).
+    /// Only populated by real hook activity (`PreToolUse`, `PostToolUse`, `PreInvocation`, continuation `Stop`).
+    session_activity: Mutex<HashMap<String, SessionActivity>>,
+    /// One-shot grace/lease-expiry timers deferring L2 `PushTransport` nudges while a hooked session
+    /// is actively running tools (`session_id -> ActivityGraceTimer`). Empty when idle.
+    activity_grace_timers: Mutex<HashMap<String, ActivityGraceTimer>>,
     /// Per-session async mutexes serializing `reconcile_session_inbox` so concurrent callers
     /// NEVER double-classify items or race past Stage 2 awaits (G3).
     reconcile_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
@@ -1459,6 +1521,8 @@ impl LocalDaemonInner {
             peers_reloader: Mutex::new(None),
             configured_bridge_targets: Mutex::new(BTreeMap::new()),
             hold_retries: Mutex::new(HashMap::new()),
+            session_activity: Mutex::new(HashMap::new()),
+            activity_grace_timers: Mutex::new(HashMap::new()),
             reconcile_locks: Mutex::new(HashMap::new()),
             gate_hold_retries: Mutex::new(HashMap::new()),
             active_cold_spawns: Mutex::new(HashSet::new()),
@@ -1588,6 +1652,169 @@ impl LocalDaemonInner {
             .lock()
             .expect("hold_retries lock poisoned")
             .remove(session_id);
+    }
+
+    fn cancel_activity_grace(&self, session_id: &str) {
+        self.activity_grace_timers
+            .lock()
+            .expect("activity_grace_timers lock poisoned")
+            .remove(session_id);
+    }
+
+    fn infer_session_harness(session_id: &str, explicit: Option<HarnessKind>) -> Option<HarnessKind> {
+        if explicit.is_some() {
+            return explicit;
+        }
+        let prefix = session_id.split(':').next()?;
+        prefix.parse::<HarnessKind>().ok()
+    }
+
+    fn can_drain_mid_turn(harness: HarnessKind) -> bool {
+        matches!(
+            harness,
+            HarnessKind::Claude
+                | HarnessKind::Codex
+                | HarnessKind::Cursor
+                | HarnessKind::Gemini
+                | HarnessKind::Opencode
+                | HarnessKind::Antigravity
+        )
+    }
+
+    fn can_drain_turn_end(harness: HarnessKind) -> bool {
+        matches!(
+            harness,
+            HarnessKind::Claude
+                | HarnessKind::Codex
+                | HarnessKind::Cursor
+                | HarnessKind::Gemini
+                | HarnessKind::Opencode
+                | HarnessKind::Antigravity
+                | HarnessKind::Openclaw
+        )
+    }
+
+    /// Marks `session_id` as `Active` (turn in flight) for a sliding lease window.
+    fn mark_session_active(&self, session_id: &str, harness: HarnessKind) {
+        if self.config.queue_activity_lease.is_zero() {
+            return;
+        }
+        let active_until = Instant::now() + self.config.queue_activity_lease;
+        self.session_activity
+            .lock()
+            .expect("session_activity lock poisoned")
+            .insert(
+                session_id.to_string(),
+                SessionActivity {
+                    harness,
+                    active_until,
+                },
+            );
+    }
+
+    /// Immediately transitions `session_id` to `Idle` and cancels any pending activity grace timer.
+    fn mark_session_idle(&self, session_id: &str) {
+        self.session_activity
+            .lock()
+            .expect("session_activity lock poisoned")
+            .remove(session_id);
+        self.cancel_activity_grace(session_id);
+    }
+
+    /// Returns the active hook activity lease for `session_id`, pruning it if already expired.
+    fn active_session_lease(&self, session_id: &str) -> Option<(HarnessKind, Duration)> {
+        let now = Instant::now();
+        let mut map = self
+            .session_activity
+            .lock()
+            .expect("session_activity lock poisoned");
+        match map.get(session_id).copied() {
+            Some(act) if act.active_until > now => {
+                Some((act.harness, act.active_until.saturating_duration_since(now)))
+            }
+            Some(_) => {
+                map.remove(session_id);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Schedules a single one-shot fallback flush timer when an L2 `PushTransport` nudge is
+    /// deferred because a hooked session is currently `Active`.
+    ///
+    /// - An earlier timer (e.g., 2s `Interrupt` grace) is NEVER starved by a later timer (15s `Queue` lease).
+    /// - `bypass_grace == true` (`Interrupt` fallback) forces L2 delivery even if the activity lease was
+    ///   still live when the short tool-boundary grace expired.
+    /// - `bypass_grace == false` (`Queue` lease expiry) re-checks the lease on wake: if new tool calls
+    ///   extended `active_until`, it slides cleanly until `Stop` fires or the agent actually goes quiet.
+    fn schedule_activity_grace_flush(
+        self: &Arc<Self>,
+        session_id: &str,
+        delay: Duration,
+        bypass_grace: bool,
+    ) {
+        let delay = delay.max(Duration::from_millis(1));
+        let now = Instant::now();
+        let fire_at = now + delay;
+
+        let generation = {
+            let mut map = self
+                .activity_grace_timers
+                .lock()
+                .expect("activity_grace_timers lock poisoned");
+            if let Some(existing) = map.get(session_id).copied() {
+                if existing.fire_at > now
+                    && (existing.fire_at <= fire_at || (existing.bypass_grace && !bypass_grace))
+                {
+                    return;
+                }
+            }
+            let generation = self.next_seq();
+            map.insert(
+                session_id.to_string(),
+                ActivityGraceTimer {
+                    generation,
+                    fire_at,
+                    bypass_grace,
+                },
+            );
+            generation
+        };
+
+        let daemon = Arc::clone(self);
+        let sid = session_id.to_string();
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = shutdown_rx.changed() => {
+                    return;
+                }
+            }
+            if *shutdown_rx.borrow() {
+                return;
+            }
+            let still_current = {
+                let mut map = daemon
+                    .activity_grace_timers
+                    .lock()
+                    .expect("activity_grace_timers lock poisoned");
+                match map.get(&sid).copied() {
+                    Some(slot) if slot.generation == generation => {
+                        map.remove(&sid);
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if !still_current {
+                return;
+            }
+            let _ = daemon
+                .flush_session_inner(&sid, bypass_grace)
+                .await;
+        });
     }
 
     fn reconcile_lock_for(&self, session_id: &str) -> Arc<AsyncMutex<()>> {
@@ -2803,20 +3030,28 @@ impl LocalDaemonInner {
         self: &Arc<Self>,
         session_id: &str,
     ) -> Option<PackedDeliveryBatch> {
-        self.build_batch_for_session_with_options(session_id, false)
+        self.build_batch_for_session_scoped(session_id, false, DrainScope::All)
             .await
     }
 
-    /// Builds a token-budgeted [`PackedDeliveryBatch`] for `session_id`, optionally including
-    /// `nudge_pending` items that were previously announced via a metadata-only wake nudge
-    /// (e.g. OpenClaw Gateway `/hooks/agent`) and are now being drained by a turn-start hook
-    /// (`before_prompt_build`). Genuine Focus Mode `Notify` digests and already-spilled/truncated
-    /// previews (`notified == true && !nudge_pending`) stay in the footer band and are NEVER
-    /// re-dumped even when `include_nudged == true`.
-    async fn build_batch_for_session_with_options(
+    /// Builds a token-budgeted [`PackedDeliveryBatch`] for `session_id` filtered by `scope`,
+    /// optionally including `nudge_pending` items that were previously announced via a
+    /// metadata-only wake nudge (`include_nudged == true`).
+    ///
+    /// Scope semantics:
+    /// - `DrainScope::MidTurn` (`PostToolUse`): ONLY packs deliverable `Interrupt` items inline
+    ///   (holding `Queue` and `Notify` untouched in SQLite until TurnEnd / TurnStart).
+    /// - `DrainScope::TurnBoundary` (`Stop`): packs `Interrupt` + `Queue` (plus piggybacked
+    ///   footers); returns `None` if `batch.notify_only` so TurnEnd never forces an extra turn
+    ///   just for a `Notify` FYI digest.
+    /// - `DrainScope::PreTurn` / `DrainScope::All`: packs `Interrupt` + `Queue` + slim 1-line
+    ///   `Notify` digests. Genuine Focus Mode `Notify` digests (`notified && !nudge_pending`)
+    ///   never re-dump even when `include_nudged == true`.
+    async fn build_batch_for_session_scoped(
         self: &Arc<Self>,
         session_id: &str,
         include_nudged: bool,
+        scope: DrainScope,
     ) -> Option<PackedDeliveryBatch> {
         self.reconcile_session_inbox(session_id).await;
 
@@ -2854,7 +3089,9 @@ impl LocalDaemonInner {
             .unwrap_or_default();
 
         let mut packable: Vec<PackableItem> = Vec::with_capacity(pending.len());
-        let mut any_unnotified = false;
+        let mut any_deliverable = false;
+        let mut any_deliverable_interrupt = false;
+        let mut any_deliverable_non_notify = false;
 
         for entry in pending {
             let meta = meta_snapshot.get(&entry.receipt);
@@ -2869,19 +3106,31 @@ impl LocalDaemonInner {
             let already_notified = entry.notified || meta.is_some_and(|m| m.notified);
             let treat_as_deliverable = !already_notified || (include_nudged && is_nudge_pending);
 
-            if treat_as_deliverable {
-                any_unnotified = true;
-            }
-
-            // Items already notified in an earlier digest or truncated preview stay in the unread
-            // footer band (Notify) when a newer unnotified item arrives so they are never re-dumped
-            // or re-truncated in a loop. Nudge-pending items drained with `include_nudged = true`
-            // retain their original classified urgency.
             let effective_urgency = if treat_as_deliverable {
                 urgency
             } else {
                 DeliveryUrgency::Notify
             };
+
+            if scope == DrainScope::MidTurn {
+                // Mid-turn tool hooks drain ONLY deliverable Interrupt items inline, holding Queue
+                // items untouched in SQLite until TurnEnd (`Stop`). Low-priority `Notify` items
+                // may still piggyback cleanly onto an Interrupt batch's unread footer (`+N more unread`)
+                // because `MidTurn` returns `None` whenever zero deliverable Interrupt items exist.
+                if effective_urgency == DeliveryUrgency::Queue {
+                    continue;
+                }
+            }
+
+            if treat_as_deliverable {
+                any_deliverable = true;
+                if effective_urgency == DeliveryUrgency::Interrupt {
+                    any_deliverable_interrupt = true;
+                }
+                if effective_urgency != DeliveryUrgency::Notify {
+                    any_deliverable_non_notify = true;
+                }
+            }
 
             let parsed = hyp_node::delivery::ParsedMailboxSource::from_entry(&entry);
             let channel = meta
@@ -2912,11 +3161,20 @@ impl LocalDaemonInner {
             });
         }
 
-        if packable.is_empty() || !any_unnotified {
+        if packable.is_empty() || !any_deliverable {
+            return None;
+        }
+        if scope == DrainScope::MidTurn && !any_deliverable_interrupt {
+            return None;
+        }
+        if scope == DrainScope::TurnBoundary && !any_deliverable_non_notify {
             return None;
         }
 
         let mut batch = pack_delivery_batch(&packable, muted, &policy)?;
+        if scope == DrainScope::TurnBoundary && batch.notify_only {
+            return None;
+        }
         if let Some(q_footer) = self.peek_unsurfaced_quarantine_footer(session_id) {
             batch.rendered.push_str("\n\n");
             batch.rendered.push_str(&q_footer);
@@ -2985,6 +3243,7 @@ impl LocalDaemonInner {
         }
         // Any successful delivery or hook drain cancels pending Tier 3 Hold retries immediately.
         self.cancel_hold_retry(session_id);
+        self.cancel_activity_grace(session_id);
         self.bump_ui_rev();
     }
 
@@ -3163,6 +3422,14 @@ impl LocalDaemonInner {
         self: &Arc<Self>,
         session_id: &str,
     ) -> (Option<String>, bool) {
+        self.flush_session_inner(session_id, false).await
+    }
+
+    async fn flush_session_inner(
+        self: &Arc<Self>,
+        session_id: &str,
+        bypass_activity_grace: bool,
+    ) -> (Option<String>, bool) {
         {
             let mut f = self.flushing.lock().expect("flushing lock poisoned");
             if !f.insert(session_id.to_string()) {
@@ -3251,92 +3518,126 @@ impl LocalDaemonInner {
                 .get(session_id)
                 .map(|a| Arc::clone(&a.transport));
             if let Some(transport) = push_transport {
-                let push_mode = if batch.max_urgency == DeliveryUrgency::Interrupt
-                    && transport.supports_interrupt()
-                {
-                    PushMode::Interrupt
-                } else {
-                    PushMode::Queue
-                };
-                let is_nudge_only = transport.is_nudge_only();
-                let outcome = if is_nudge_only {
-                    let msg_count = batch
-                        .inline_ids
-                        .len()
-                        .saturating_add(batch.spilled_ids.len())
-                        .saturating_add(batch.truncated_ids.len())
-                        .max(1);
-                    let handle = {
-                        let db = self.node.db();
-                        db.local()
-                            .get_session(session_id)
-                            .ok()
-                            .flatten()
-                            .and_then(|s| s.handle)
-                    };
-                    let batch_id = compute_batch_idempotency_id(session_id, &batch);
-                    transport
-                        .deliver_nudge(msg_count, handle.as_deref(), &batch_id, push_mode)
-                        .await
-                } else {
-                    transport.deliver(&batch.rendered, push_mode).await
-                };
-                match outcome {
-                    PushOutcome::Delivered => {
-                        if is_nudge_only {
-                            self.mark_batch_notified(session_id, &batch);
-                        } else {
-                            self.commit_delivered_batch(session_id, &batch);
-                        }
-                        delivered_any = true;
-                        continue;
-                    }
-                    PushOutcome::Hold { ref reason, .. }
-                        if matches!(
-                            reason.as_str(),
-                            "herdr_working" | "herdr_send_guard_refused" | "herdr_agent_not_ready"
-                        ) =>
-                    {
-                        // Target is actively working or has an in-progress user draft;
-                        // preserve unread in durable SQLite and schedule bounded Tier 3 retry.
-                        self.schedule_hold_retry(session_id);
-                        break;
-                    }
-                    PushOutcome::Hold { ref reason, .. }
-                        if matches!(
-                            reason.as_str(),
-                            "t3_server_unreachable"
-                                | "codex_queue_unavailable"
-                                | REASON_OPENCLAW_GATEWAY_UNAVAILABLE
-                                | REASON_OPENCLAW_RATE_LIMITED
-                        ) =>
-                    {
-                        // Transient transport unavailability: fall through to any live waiter;
-                        // if none delivers, schedule bounded Tier 3 retry before exiting.
-                        deferred_transient_hold = true;
-                    }
-                    PushOutcome::Hold { ref reason, .. } | PushOutcome::Reject { ref reason, .. } => {
-                        if matches!(
-                            reason.as_str(),
-                            "herdr_target_unavailable"
-                                | "t3_thread_deleted"
-                                | "t3_thread_not_found"
-                                | "t3_auth_missing"
-                                | "t3_auth_failed"
-                                | "t3_invalid_server_url"
-                                | REASON_OPENCLAW_AUTH_FAILED
-                                | REASON_OPENCLAW_HOOKS_DISABLED
-                                | REASON_OPENCLAW_INVALID_URL
-                                | REASON_OPENCLAW_TOKEN_MISSING
-                        ) {
-                            terminal_error = Some(reason.clone());
-                            if self.unregister_matching_session_transport(session_id, &transport) {
-                                let _ = self.write_ui_state_snapshot();
+                // Notify-only FYI batches NEVER wake an idle agent via an external L2 push
+                // transport (no wasted LLM turn for Focus Mode / burst-demoted chatter).
+                // They remain cleanly unread for TurnStart (`pre_turn`) digests and passive UIs,
+                // while L3 streams (`--claude-channel`, `watch`, `wait`) still receive them below.
+                if !batch.notify_only {
+                    // Unified Active-Turn Hook Grace / Activity Lease Deferral:
+                    // When a hook-capable session is actively running a turn (`Active`), let
+                    // in-turn hooks drain first instead of nudging the input box immediately:
+                    //   - `Interrupt`: short grace window (`interrupt_hook_grace`) for `PostToolUse`
+                    //     to drain mid-turn; if no tool hook drains in time, falls back to L2!
+                    //   - `Queue`: wait for TurnEnd (`Stop` / `agent_end`) or `queue_activity_lease`
+                    //     expiry with no more tool calls before firing L2 wake nudge!
+                    if !bypass_activity_grace {
+                        if let Some((act_harness, remaining)) = self.active_session_lease(session_id) {
+                            if batch.max_urgency == DeliveryUrgency::Interrupt {
+                                if Self::can_drain_mid_turn(act_harness)
+                                    && !self.config.interrupt_hook_grace.is_zero()
+                                {
+                                    let delay = self.config.interrupt_hook_grace.min(remaining);
+                                    self.schedule_activity_grace_flush(session_id, delay, true);
+                                    break;
+                                }
+                            } else if batch.max_urgency == DeliveryUrgency::Queue
+                                && Self::can_drain_turn_end(act_harness)
+                                && !self.config.queue_activity_lease.is_zero()
+                            {
+                                self.schedule_activity_grace_flush(session_id, remaining, false);
+                                break;
                             }
                         }
-                        self.cancel_hold_retry(session_id);
-                        // Preserve unread in durable SQLite; fall through to any live
-                        // `watch`/`wait` waiter if one is attached, else exit flush loop.
+                    }
+
+                    let push_mode = if batch.max_urgency == DeliveryUrgency::Interrupt
+                        && (transport.supports_interrupt() || transport.is_nudge_only())
+                    {
+                        PushMode::Interrupt
+                    } else {
+                        PushMode::Queue
+                    };
+                    let is_nudge_only = transport.is_nudge_only();
+                    let outcome = if is_nudge_only {
+                        let msg_count = batch
+                            .inline_ids
+                            .len()
+                            .saturating_add(batch.spilled_ids.len())
+                            .saturating_add(batch.truncated_ids.len())
+                            .max(1);
+                        let handle = {
+                            let db = self.node.db();
+                            db.local()
+                                .get_session(session_id)
+                                .ok()
+                                .flatten()
+                                .and_then(|s| s.handle)
+                        };
+                        let batch_id = compute_batch_idempotency_id(session_id, &batch);
+                        transport
+                            .deliver_nudge(msg_count, handle.as_deref(), &batch_id, push_mode)
+                            .await
+                    } else {
+                        transport.deliver(&batch.rendered, push_mode).await
+                    };
+                    match outcome {
+                        PushOutcome::Delivered => {
+                            if is_nudge_only {
+                                self.mark_batch_notified(session_id, &batch);
+                            } else {
+                                self.commit_delivered_batch(session_id, &batch);
+                            }
+                            self.cancel_activity_grace(session_id);
+                            delivered_any = true;
+                            continue;
+                        }
+                        PushOutcome::Hold { ref reason, .. }
+                            if matches!(
+                                reason.as_str(),
+                                "herdr_working" | "herdr_send_guard_refused" | "herdr_agent_not_ready"
+                            ) =>
+                        {
+                            // Target is actively working or has an in-progress user draft;
+                            // preserve unread in durable SQLite and schedule bounded Tier 3 retry.
+                            self.schedule_hold_retry(session_id);
+                            break;
+                        }
+                        PushOutcome::Hold { ref reason, .. }
+                            if matches!(
+                                reason.as_str(),
+                                "t3_server_unreachable"
+                                    | "codex_queue_unavailable"
+                                    | REASON_OPENCLAW_GATEWAY_UNAVAILABLE
+                                    | REASON_OPENCLAW_RATE_LIMITED
+                            ) =>
+                        {
+                            // Transient transport unavailability: fall through to any live waiter;
+                            // if none delivers, schedule bounded Tier 3 retry before exiting.
+                            deferred_transient_hold = true;
+                        }
+                        PushOutcome::Hold { ref reason, .. } | PushOutcome::Reject { ref reason, .. } => {
+                            if matches!(
+                                reason.as_str(),
+                                "herdr_target_unavailable"
+                                    | "t3_thread_deleted"
+                                    | "t3_thread_not_found"
+                                    | "t3_auth_missing"
+                                    | "t3_auth_failed"
+                                    | "t3_invalid_server_url"
+                                    | REASON_OPENCLAW_AUTH_FAILED
+                                    | REASON_OPENCLAW_HOOKS_DISABLED
+                                    | REASON_OPENCLAW_INVALID_URL
+                                    | REASON_OPENCLAW_TOKEN_MISSING
+                            ) {
+                                terminal_error = Some(reason.clone());
+                                if self.unregister_matching_session_transport(session_id, &transport) {
+                                    let _ = self.write_ui_state_snapshot();
+                                }
+                            }
+                            self.cancel_hold_retry(session_id);
+                            // Preserve unread in durable SQLite; fall through to any live
+                            // `watch`/`wait` waiter if one is attached, else exit flush loop.
+                        }
                     }
                 }
             }
@@ -5872,6 +6173,11 @@ async fn handle_connection<R, W>(
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
                         break;
                     }
+                    "session.idle" => {
+                        let resp = handle_session_idle(&daemon, &packet).await;
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
                     "session.summary" => {
                         let resp = handle_session_summary(&daemon, &packet);
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
@@ -6112,6 +6418,7 @@ async fn handle_connection<R, W>(
                             });
                         }
                         attached_waiter = Some((session_id.clone(), waiter_id));
+                        daemon.mark_session_idle(&session_id);
                         let _ = daemon.node.db().local().touch_session(&session_id, now_ms());
                         daemon.bump_ui_rev();
 
@@ -7127,6 +7434,7 @@ fn handle_call_start(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> 
         .lock()
         .expect("hook_registered_sessions lock poisoned")
         .insert(session_id.to_string());
+    daemon.mark_session_active(session_id, harness);
     daemon.bump_ui_rev();
 
     match daemon.calls.start_call(
@@ -7245,6 +7553,39 @@ fn resolve_openclaw_drain_session(
     None
 }
 
+async fn handle_session_idle(
+    daemon: &Arc<LocalDaemonInner>,
+    packet: &Map<String, Value>,
+) -> Value {
+    let Some(session_id) = packet
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|s| is_valid_session_id(s))
+    else {
+        return json!({ "ok": false, "error": "invalid_session" });
+    };
+
+    let Some(target_session_id) = resolve_openclaw_drain_session(daemon, session_id, packet) else {
+        if let Err(err) = daemon.verify_optional_session_token(session_id, packet) {
+            return json!({ "ok": false, "error": err });
+        }
+        return json!({ "ok": true, "result": {} });
+    };
+
+    if let Err(err) = daemon.verify_optional_session_token(&target_session_id, packet) {
+        return json!({ "ok": false, "error": err });
+    }
+
+    daemon.mark_session_idle(&target_session_id);
+    // Any Queue batch deferred while the session was Active can now flush immediately to L2!
+    let flush_daemon = Arc::clone(daemon);
+    let flush_sid = target_session_id.clone();
+    tokio::spawn(async move {
+        let _ = flush_daemon.flush_session(&flush_sid).await;
+    });
+    json!({ "ok": true, "result": { "sessionId": target_session_id, "idle": true } })
+}
+
 async fn handle_mailbox_drain(
     daemon: &Arc<LocalDaemonInner>,
     packet: &Map<String, Value>,
@@ -7273,17 +7614,44 @@ async fn handle_mailbox_drain(
         .get("includeNudged")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let scope = DrainScope::from_packet(packet);
+    let mark_idle_if_empty = packet
+        .get("markIdleIfEmpty")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let explicit_harness = packet
+        .get("harness")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<HarnessKind>().ok());
+    let inferred_harness =
+        LocalDaemonInner::infer_session_harness(&target_session_id, explicit_harness);
+
+    if matches!(scope, DrainScope::MidTurn | DrainScope::PreTurn) {
+        if let Some(h) = inferred_harness {
+            daemon.mark_session_active(&target_session_id, h);
+        }
+    }
 
     match daemon
-        .build_batch_for_session_with_options(&target_session_id, include_nudged)
+        .build_batch_for_session_scoped(&target_session_id, include_nudged, scope)
         .await
     {
         None => {
-            daemon.cancel_hold_retry(&target_session_id);
+            if scope != DrainScope::MidTurn {
+                daemon.cancel_hold_retry(&target_session_id);
+            }
+            if mark_idle_if_empty {
+                daemon.mark_session_idle(&target_session_id);
+            }
             json!({ "ok": true, "result": { "items": [] } })
         }
         Some(batch) => {
             daemon.commit_delivered_batch(&target_session_id, &batch);
+            if scope == DrainScope::TurnBoundary {
+                if let Some(h) = inferred_harness {
+                    daemon.mark_session_active(&target_session_id, h);
+                }
+            }
             json!({
                 "ok": true,
                 "result": {
@@ -8376,7 +8744,9 @@ async fn fanout_approved_local_ingest(
 
     let mut woken_any = false;
     for sub_sid in sessions_to_wake {
-        let (_, delivered) = daemon.flush_session_with_report(&sub_sid).await;
+        // Explicit human approval (`hyp inbox approve` -> `inbox.wake`) bypasses active-turn
+        // grace deferral so approved items wake subscribed sessions immediately.
+        let (_, delivered) = daemon.flush_session_inner(&sub_sid, true).await;
         if delivered {
             woken_any = true;
         }
@@ -8459,7 +8829,7 @@ async fn handle_inbox_wake_rpc(
                 db.local().pending_count(sid).unwrap_or(0) > 0
             };
             if has_pending {
-                let (_, delivered) = daemon.flush_session_with_report(sid).await;
+                let (_, delivered) = daemon.flush_session_inner(sid, true).await;
                 woken = delivered;
             }
         }

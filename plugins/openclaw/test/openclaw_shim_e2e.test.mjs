@@ -553,7 +553,9 @@ test("Real OpenClaw + Shim API (Prompt Injection ON): Gateway wake nudge -> befo
     await waitForCondition(() => ctx.gateway.nudges.length >= 1, 5_000, "OpenClaw Gateway wake nudge");
     assert.equal(ctx.gateway.nudges.length, 1, "expected exactly 1 wake nudge (zero loop)");
     assert.ok(
-      ctx.gateway.nudges[0].body.message.includes("1 new message(s) queued for @claw"),
+      ctx.gateway.nudges[0].body.message.includes(
+        '<hyphae-wake count="1" handle="claw" urgency="queue">1 Hyphae message(s) queued for @claw.',
+      ),
       `unexpected nudge text: ${ctx.gateway.nudges[0].raw}`,
     );
     assert.equal(

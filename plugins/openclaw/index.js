@@ -136,6 +136,15 @@ export function createHyphaePlugin() {
         }
         return undefined;
       });
+
+      // Observational TurnEnd hook: notifies LocalDaemon immediately that the turn ended
+      // (flips Active -> Idle so any held Queue wakeup flushes with zero lease delay).
+      // Never mutates prompts and stays active regardless of `promptInjection`.
+      api.on("agent_end", async (_event, ctx) => {
+        const payload = extractOpenClawSessionPayload(ctx);
+        await runMeshHook("agent-end", payload, cfg);
+        return undefined;
+      });
     },
   };
 }

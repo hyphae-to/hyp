@@ -591,16 +591,16 @@ async fn two_native_rust_daemons_over_rust_hub_hooks_mcp_delivery_wait_watch_kv_
         .insert("repo".into(), json!("hyphae-to/hyp"));
     hub.publish_event("local.github", gh_ev).await.unwrap();
 
-    // Bob's synchronous `PostToolUse` hook drains the slim 1-line `hyphae notify` digest!
+    // Bob's synchronous TurnStart (`UserPromptSubmit` / `PreInvocation`) hook drains the slim 1-line `hyphae notify` digest!
     let mut post_out = json!({});
     for _ in 0..60 {
         let sock_c = bob_sock.clone();
         post_out = tokio::task::spawn_blocking(move || {
             handle_hook_payload(
-                json!({ "session_id": "bob-sess-1", "tool_use_id": "after-ev" })
+                json!({ "session_id": "bob-sess-1" })
                     .as_object()
                     .unwrap(),
-                &hook_opts(HarnessKind::Claude, HookEvent::PostToolUse, &sock_c),
+                &hook_opts(HarnessKind::Claude, HookEvent::PreInvocation, &sock_c),
             )
         })
         .await
@@ -612,7 +612,7 @@ async fn two_native_rust_daemons_over_rust_hub_hooks_mcp_delivery_wait_watch_kv_
     }
     let ctx = post_out["hookSpecificOutput"]["additionalContext"]
         .as_str()
-        .expect("PostToolUse hook should inject 1-line notify digest");
+        .expect("TurnStart hook should inject 1-line notify digest");
     assert!(
         ctx.contains("hyphae notify · 1 unread"),
         "expected slim notify digest, got: {ctx}"

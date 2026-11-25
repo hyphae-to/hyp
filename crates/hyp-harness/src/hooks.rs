@@ -47,8 +47,13 @@ impl FromStr for HookEvent {
             | "before-mcp-execution" => Ok(HookEvent::PreToolUse),
             "post-tool-use" | "PostToolUse" | "AfterTool" => Ok(HookEvent::PostToolUse),
             "pre-invocation" | "PreInvocation" | "before-prompt-build" | "before_prompt_build"
-            | "BeforePromptBuild" => Ok(HookEvent::PreInvocation),
-            "stop" | "Stop" | "AfterAgent" => Ok(HookEvent::Stop),
+            | "BeforePromptBuild" | "user-prompt-submit" | "UserPromptSubmit"
+            | "before-agent" | "BeforeAgent" | "before-submit-prompt" | "beforeSubmitPrompt" => {
+                Ok(HookEvent::PreInvocation)
+            }
+            "stop" | "Stop" | "AfterAgent" | "agent-end" | "agent_end" | "AgentEnd" => {
+                Ok(HookEvent::Stop)
+            }
             "session-start" | "SessionStart" => Ok(HookEvent::SessionStart),
             other => Err(format!("Unknown hook event '{other}'")),
         }
@@ -427,6 +432,37 @@ fn attach_session_token(pkt: &mut Map<String, Value>, session_token: Option<&str
     }
 }
 
+fn attach_openclaw_session_hints(pkt: &mut Map<String, Value>, payload: &Map<String, Value>) {
+    if let Some(sk) = payload
+        .get("session_key")
+        .or_else(|| payload.get("sessionKey"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.len() <= 200)
+    {
+        let qualified = if sk.starts_with("openclaw:") {
+            sk.to_string()
+        } else {
+            format!("openclaw:{sk}")
+        };
+        if is_valid_session_id(&qualified) {
+            pkt.insert("sessionKey".into(), json!(sk));
+        }
+    }
+    if let Some(aid) = payload
+        .get("agent_id")
+        .or_else(|| payload.get("agentId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.len() <= 128)
+    {
+        let qualified = format!("openclaw:{aid}");
+        if is_valid_session_id(&qualified) {
+            pkt.insert("agentId".into(), json!(aid));
+        }
+    }
+}
+
 /// Validates `session_id` strictly against [`is_valid_session_id`] (ASCII `[A-Za-z0-9:._-]`
 /// only — zero quotes, newlines, or shell metacharacters) and appends
 /// `export HYPHAE_SESSION_ID='<session_id>'\n` to `env_file` (Claude Code's `$CLAUDE_ENV_FILE`).
@@ -670,6 +706,8 @@ where
             let mut drain_pkt = Map::new();
             drain_pkt.insert("type".into(), json!("mailbox.drain"));
             drain_pkt.insert("sessionId".into(), json!(session_id));
+            drain_pkt.insert("harness".into(), json!(options.harness.as_str()));
+            drain_pkt.insert("scope".into(), json!("mid_turn"));
             drain_pkt.insert("limit".into(), json!(5));
             attach_session_token(&mut drain_pkt, session_token);
             let drained = rpc(&options.socket_path, &Value::Object(drain_pkt));
@@ -708,38 +746,12 @@ where
             let mut drain_pkt = Map::new();
             drain_pkt.insert("type".into(), json!("mailbox.drain"));
             drain_pkt.insert("sessionId".into(), json!(session_id));
+            drain_pkt.insert("harness".into(), json!(options.harness.as_str()));
+            drain_pkt.insert("scope".into(), json!("pre_turn"));
+            drain_pkt.insert("includeNudged".into(), json!(true));
             drain_pkt.insert("limit".into(), json!(5));
             if options.harness == HarnessKind::Openclaw {
-                drain_pkt.insert("harness".into(), json!("openclaw"));
-                drain_pkt.insert("includeNudged".into(), json!(true));
-                if let Some(sk) = payload
-                    .get("session_key")
-                    .or_else(|| payload.get("sessionKey"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty() && s.len() <= 200)
-                {
-                    let qualified = if sk.starts_with("openclaw:") {
-                        sk.to_string()
-                    } else {
-                        format!("openclaw:{sk}")
-                    };
-                    if is_valid_session_id(&qualified) {
-                        drain_pkt.insert("sessionKey".into(), json!(sk));
-                    }
-                }
-                if let Some(aid) = payload
-                    .get("agent_id")
-                    .or_else(|| payload.get("agentId"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty() && s.len() <= 128)
-                {
-                    let qualified = format!("openclaw:{aid}");
-                    if is_valid_session_id(&qualified) {
-                        drain_pkt.insert("agentId".into(), json!(aid));
-                    }
-                }
+                attach_openclaw_session_hints(&mut drain_pkt, payload);
             }
             attach_session_token(&mut drain_pkt, session_token);
             let drained = rpc(&options.socket_path, &Value::Object(drain_pkt));
@@ -753,15 +765,36 @@ where
                 })
                 .unwrap_or_default();
             if items.is_empty() {
-                return json!({});
+                return match options.harness {
+                    HarnessKind::Cursor => json!({ "continue": true }),
+                    _ => json!({}),
+                };
             }
             let text = format_drained_messages(&items);
+            let ctx = format!("Incoming hyphae message(s):\n\n{text}");
             match options.harness {
                 HarnessKind::Antigravity => json!({
                     "injectSteps": [
-                        { "systemMessage": { "systemMessage": format!("Incoming hyphae message(s):\n\n{text}") } }
+                        { "systemMessage": { "systemMessage": ctx } }
                     ]
                 }),
+                HarnessKind::Claude | HarnessKind::Codex => json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": ctx
+                    }
+                }),
+                HarnessKind::Gemini => json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "BeforeAgent",
+                        "additionalContext": ctx
+                    }
+                }),
+                HarnessKind::Cursor => json!({
+                    "continue": true,
+                    "additional_context": ctx
+                }),
+                HarnessKind::Opencode => json!({ "additionalContext": ctx }),
                 HarnessKind::Openclaw => {
                     let framed = if text.contains(UNTRUSTED_PROVENANCE) {
                         text
@@ -772,13 +805,34 @@ where
                         "prependContext": format!("Incoming hyphae message(s):\n\n{framed}")
                     })
                 }
-                _ => json!({}),
+                _ => json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": ctx
+                    }
+                }),
             }
         }
         HookEvent::Stop => {
+            // Observational TurnEnd (OpenClaw `agent_end`): notify daemon that the turn ended
+            // so any deferred Queue wakeup flushes immediately; never return a continuation block.
+            if options.harness == HarnessKind::Openclaw {
+                let mut idle_pkt = Map::new();
+                idle_pkt.insert("type".into(), json!("session.idle"));
+                idle_pkt.insert("sessionId".into(), json!(session_id));
+                idle_pkt.insert("harness".into(), json!("openclaw"));
+                attach_openclaw_session_hints(&mut idle_pkt, payload);
+                attach_session_token(&mut idle_pkt, session_token);
+                let _ = rpc(&options.socket_path, &Value::Object(idle_pkt));
+                return json!({});
+            }
+
             let mut drain_pkt = Map::new();
             drain_pkt.insert("type".into(), json!("mailbox.drain"));
             drain_pkt.insert("sessionId".into(), json!(session_id));
+            drain_pkt.insert("harness".into(), json!(options.harness.as_str()));
+            drain_pkt.insert("scope".into(), json!("turn_boundary"));
+            drain_pkt.insert("markIdleIfEmpty".into(), json!(true));
             drain_pkt.insert("limit".into(), json!(5));
             attach_session_token(&mut drain_pkt, session_token);
             let drained = rpc(&options.socket_path, &Value::Object(drain_pkt));
@@ -1529,5 +1583,103 @@ mod tests {
             },
         );
         assert_eq!(empty, json!({}));
+
+        // OpenClaw observational TurnEnd (`agent-end`) sends `session.idle` and returns `{}`
+        assert_eq!("agent-end".parse::<HookEvent>().unwrap(), HookEvent::Stop);
+        assert_eq!("agent_end".parse::<HookEvent>().unwrap(), HookEvent::Stop);
+        let idle_pkts = RefCell::new(Vec::<Value>::new());
+        let idle_res = handle_hook_payload_with(
+            json!({"session_id": "oc-sess-1", "agentId": "main"}).as_object().unwrap(),
+            &opts(HarnessKind::Openclaw, HookEvent::Stop),
+            |_sock, pkt| {
+                idle_pkts.borrow_mut().push(pkt.clone());
+                DaemonRpcResult::ok(json!({"idle": true}).as_object().unwrap().clone())
+            },
+        );
+        assert_eq!(idle_res, json!({}));
+        let idle_pkts = idle_pkts.borrow();
+        assert_eq!(idle_pkts.len(), 1);
+        assert_eq!(idle_pkts[0]["type"], "session.idle");
+        assert_eq!(idle_pkts[0]["harness"], "openclaw");
+        assert_eq!(idle_pkts[0]["sessionId"], "openclaw:oc-sess-1");
+    }
+
+    #[test]
+    fn turn_start_hooks_format_for_claude_codex_gemini_and_cursor_with_scopes() {
+        for alias in [
+            "user-prompt-submit",
+            "UserPromptSubmit",
+            "before-agent",
+            "BeforeAgent",
+            "before-submit-prompt",
+            "beforeSubmitPrompt",
+        ] {
+            assert_eq!(alias.parse::<HookEvent>().unwrap(), HookEvent::PreInvocation);
+        }
+
+        let item_rpc = |_sock: &Path, pkt: &Value| {
+            assert_eq!(pkt["type"], "mailbox.drain");
+            assert_eq!(pkt["scope"], "pre_turn");
+            assert_eq!(pkt["includeNudged"], true);
+            DaemonRpcResult::ok(
+                json!({"items": [{"text": "queued hello"}]}).as_object().unwrap().clone(),
+            )
+        };
+
+        let claude = handle_hook_payload_with(
+            json!({"session_id": "c1"}).as_object().unwrap(),
+            &opts(HarnessKind::Claude, HookEvent::PreInvocation),
+            item_rpc,
+        );
+        assert_eq!(
+            claude["hookSpecificOutput"]["hookEventName"],
+            "UserPromptSubmit"
+        );
+        assert!(
+            claude["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("queued hello")
+        );
+
+        let codex = handle_hook_payload_with(
+            json!({"thread_id": "t1"}).as_object().unwrap(),
+            &opts(HarnessKind::Codex, HookEvent::PreInvocation),
+            item_rpc,
+        );
+        assert_eq!(
+            codex["hookSpecificOutput"]["hookEventName"],
+            "UserPromptSubmit"
+        );
+
+        let gemini = handle_hook_payload_with(
+            json!({"session_id": "g1"}).as_object().unwrap(),
+            &opts(HarnessKind::Gemini, HookEvent::PreInvocation),
+            item_rpc,
+        );
+        assert_eq!(
+            gemini["hookSpecificOutput"]["hookEventName"],
+            "BeforeAgent"
+        );
+
+        let cursor = handle_hook_payload_with(
+            json!({"conversation_id": "cur1"}).as_object().unwrap(),
+            &opts(HarnessKind::Cursor, HookEvent::PreInvocation),
+            item_rpc,
+        );
+        assert_eq!(cursor["continue"], true);
+        assert!(
+            cursor["additional_context"]
+                .as_str()
+                .unwrap()
+                .contains("queued hello")
+        );
+
+        let cursor_empty = handle_hook_payload_with(
+            json!({"conversation_id": "cur1"}).as_object().unwrap(),
+            &opts(HarnessKind::Cursor, HookEvent::PreInvocation),
+            |_sock, _| DaemonRpcResult::ok(json!({"items": []}).as_object().unwrap().clone()),
+        );
+        assert_eq!(cursor_empty, json!({ "continue": true }));
     }
 }

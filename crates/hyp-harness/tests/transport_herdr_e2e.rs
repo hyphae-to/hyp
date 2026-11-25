@@ -865,7 +865,7 @@ esac
                 "--if",
                 "idle",
                 "t3",
-                "Hyphae mesh: 2 new message(s) queued for @concierge. Call hyp_inbox({ ack: true }) to read them.",
+                "<hyphae-wake count=\"2\" handle=\"concierge\" urgency=\"queue\">2 Hyphae message(s) queued for @concierge. Review any injected Hyphae context or call hyp_inbox({ ack: true }) to read them.</hyphae-wake>",
             ]
         );
 
@@ -891,7 +891,7 @@ esac
                 "--if",
                 "idle",
                 "t3",
-                "Hyphae mesh (urgent): 1 new message(s) queued. Call hyp_inbox({ ack: true }) to read them.",
+                "<hyphae-wake count=\"1\" urgency=\"interrupt\">1 urgent Hyphae message(s) queued. Review any injected Hyphae context or call hyp_inbox({ ack: true }) to read them.</hyphae-wake>",
             ]
         );
     }

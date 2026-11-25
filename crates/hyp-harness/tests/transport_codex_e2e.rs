@@ -645,7 +645,7 @@ mod unix_subprocess_e2e {
         );
         let recorded = std::fs::read_to_string(&argv_file).expect("argv.txt");
         assert!(recorded.contains(
-            "Hyphae mesh: 3 new message(s) queued. Call hyp_inbox({ ack: true }) to read them."
+            "<hyphae-wake count=\"3\" urgency=\"queue\">3 Hyphae message(s) queued. Review any injected Hyphae context or call hyp_inbox({ ack: true }) to read them.</hyphae-wake>"
         ));
         assert!(!recorded.contains("drop prod"));
         assert!(!recorded.contains("human-verified"));

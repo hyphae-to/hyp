@@ -514,6 +514,7 @@ function Remove-FromUserPath {
 # ---------------------------------------------------------------------------
 
 $HyphaeHookNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+[void]$HyphaeHookNames.Add("hyphae-before-agent")
 [void]$HyphaeHookNames.Add("hyphae-before-tool")
 [void]$HyphaeHookNames.Add("hyphae-after-tool")
 [void]$HyphaeHookNames.Add("hyphae-after-agent")

@@ -386,7 +386,7 @@ async fn x2_openclaw_transport_delivers_metadata_nudge_enforces_auth_and_detache
         let parsed: Value = serde_json::from_str(&req.body).unwrap();
         assert_eq!(
             parsed["message"],
-            "Hyphae mesh: 1 new message(s) queued for @claw. Call hyp_inbox to read them."
+            "<hyphae-wake count=\"1\" handle=\"claw\" urgency=\"queue\">1 Hyphae message(s) queued for @claw. Review any injected Hyphae context or call hyp_inbox({ ack: true }) to read them.</hyphae-wake>"
         );
         assert_eq!(parsed["name"], "Hyphae");
         assert_eq!(parsed["agentId"], "coder-main");
@@ -418,7 +418,7 @@ async fn x2_openclaw_transport_delivers_metadata_nudge_enforces_auth_and_detache
         let parsed: Value = serde_json::from_str(&req.body).unwrap();
         assert_eq!(
             parsed["text"],
-            "Hyphae mesh: 3 new message(s) queued for @claw. Call hyp_inbox to read them."
+            "<hyphae-wake count=\"3\" handle=\"claw\" urgency=\"queue\">3 Hyphae message(s) queued for @claw. Review any injected Hyphae context or call hyp_inbox({ ack: true }) to read them.</hyphae-wake>"
         );
         assert_eq!(parsed["mode"], "now");
     }
@@ -590,7 +590,7 @@ async fn x2_openclaw_transport_delivers_metadata_nudge_enforces_auth_and_detache
         let body_json: Value = serde_json::from_str(&reqs[0].body).unwrap();
         assert_eq!(
             body_json["message"],
-            "Hyphae mesh: 1 new message(s) queued for @claw. Call hyp_inbox to read them."
+            "<hyphae-wake count=\"1\" handle=\"claw\" urgency=\"queue\">1 Hyphae message(s) queued for @claw. Review any injected Hyphae context or call hyp_inbox({ ack: true }) to read them.</hyphae-wake>"
         );
         assert_eq!(body_json["agentId"], "gw-main");
     }
@@ -898,7 +898,7 @@ async fn x8_codex_uuid_session_auto_attaches_queue_transport_when_rollout_exists
     }
     assert!(
         logged.contains(&format!(
-            "queue --thread {live_uuid} --message Hyphae mesh: 1 new message(s) queued for @live-cx. Call hyp_inbox({{ ack: true }}) to read them."
+            "queue --thread {live_uuid} --message <hyphae-wake count=\"1\" handle=\"live-cx\" urgency=\"queue\">1 Hyphae message(s) queued for @live-cx. Review any injected Hyphae context or call hyp_inbox({{ ack: true }}) to read them.</hyphae-wake>"
         )),
         "expected fake-codex queue metadata-only nudge, got:\n{logged}"
     );
@@ -1585,7 +1585,7 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
             .contains("TOP_SECRET_VICTIM_DM_X5")
     );
 
-    // Real Claude Code `PostToolUse` hook OMITTING `sessionToken` drains cleanly too!
+    // Real Claude Code `UserPromptSubmit` (PreInvocation) hook OMITTING `sessionToken` drains Queue DM cleanly too!
     let _ = daemon2
         .ingest_inbound(InboundItem {
             session_id: victim_sid.into(),
@@ -1600,7 +1600,7 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
         .unwrap();
     let hook_opts = HandleHookOptions {
         harness: HarnessKind::Claude,
-        event: HookEvent::PostToolUse,
+        event: HookEvent::PreInvocation,
         socket_path: sock2.clone(),
         cli_path: Some("hyp".into()),
         explicit_socket: None,
@@ -1608,7 +1608,7 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
     };
     let post_no_tok = tokio::task::spawn_blocking(move || {
         handle_hook_payload_with_session_token(
-            json!({ "session_id": "victim-x5", "tool_name": "Bash", "tool_use_id": "tu-ok" })
+            json!({ "session_id": "victim-x5" })
                 .as_object()
                 .unwrap(),
             &hook_opts,
@@ -1620,7 +1620,7 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
     .unwrap();
     assert!(
         post_no_tok.to_string().contains("SECOND_VICTIM_DM_X5"),
-        "Claude PostToolUse hook omitting sessionToken MUST drain cleanly: {post_no_tok}"
+        "Claude UserPromptSubmit hook omitting sessionToken MUST drain cleanly: {post_no_tok}"
     );
 
     // ---- Part B (X6): `--ephemeral` MUST NEVER bypass an invalid/replayed `_meshCall` token,

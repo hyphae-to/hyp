@@ -231,6 +231,7 @@ claude_config_dir = os.environ.get("HYPHAE_CLAUDE_CONFIG_DIR", "").strip()
 os_name = os.environ["HYPHAE_OS_NAME"]
 
 HYPHAE_HOOK_NAMES = {
+    "hyphae-before-agent",
     "hyphae-before-tool",
     "hyphae-after-tool",
     "hyphae-after-agent",
@@ -774,6 +775,7 @@ const claudeConfigDir = (process.env.HYPHAE_CLAUDE_CONFIG_DIR || "").trim();
 const osName = process.env.HYPHAE_OS_NAME;
 
 const HYPHAE_HOOK_NAMES = new Set([
+  "hyphae-before-agent",
   "hyphae-before-tool",
   "hyphae-after-tool",
   "hyphae-after-agent",
