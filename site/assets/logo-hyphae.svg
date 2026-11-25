@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <clipPath id="hypCapClip">
+      <path d="M 15 61 C 15 24, 36 10, 64 10 C 92 10, 113 24, 113 61 C 103 49, 85 45, 64 45 C 43 45, 25 49, 15 61 Z"/>
+    </clipPath>
+  </defs>
+
+  <!-- Underside cavity + stylized radial gills -->
+  <ellipse cx="64" cy="59" rx="46.5" ry="15.5" fill="#241E15" stroke="#16130E" stroke-width="4"/>
+  <g stroke="#9E7949" stroke-width="2.4" stroke-linecap="round" opacity="0.9">
+    <path d="M 27 59 Q 36 53 44 53"/>
+    <path d="M 35 65 Q 43 58 49 56"/>
+    <path d="M 101 59 Q 92 53 84 53"/>
+    <path d="M 93 65 Q 85 58 79 56"/>
+  </g>
+  <!-- Warm parchment-tan underside rim -->
+  <path d="M 18 61 C 22 73, 40 74, 46 72" fill="none" stroke="#D8C294" stroke-width="3.6" stroke-linecap="round"/>
+  <path d="M 110 61 C 106 73, 88 74, 82 72" fill="none" stroke="#D8C294" stroke-width="3.6" stroke-linecap="round"/>
+
+  <!-- Mushroom cap dome: warm parchment + flat lower shade + terracotta spots -->
+  <path d="M 15 61 C 15 24, 36 10, 64 10 C 92 10, 113 24, 113 61 C 103 49, 85 45, 64 45 C 43 45, 25 49, 15 61 Z" fill="#F0E5C8"/>
+  <g clip-path="url(#hypCapClip)">
+    <path d="M 12 46 C 34 39, 94 39, 116 46 L 116 70 L 12 70 Z" fill="#E0CFAA" opacity="0.58"/>
+    <ellipse cx="36" cy="32" rx="8.6" ry="6.1" transform="rotate(-24 36 32)" fill="#BC6C3A"/>
+    <ellipse cx="65" cy="20.5" rx="9.8" ry="6.2" fill="#BC6C3A"/>
+    <ellipse cx="93" cy="33.5" rx="8.2" ry="5.8" transform="rotate(24 93 33.5)" fill="#BC6C3A"/>
+    <circle cx="51" cy="36.5" r="4.0" fill="#BC6C3A"/>
+    <circle cx="79" cy="36" r="3.5" fill="#BC6C3A"/>
+  </g>
+  <path d="M 15 61 C 15 24, 36 10, 64 10 C 92 10, 113 24, 113 61 C 103 49, 85 45, 64 45 C 43 45, 25 49, 15 61 Z" fill="none" stroke="#16130E" stroke-width="4.2" stroke-linejoin="round"/>
+
+  <!-- Dark sepia ink casing under tendrils for crispness on dark & light backgrounds -->
+  <g fill="none" stroke="#16130E" stroke-width="8.6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 46 56 L 46 69 C 46 81, 37 88, 22 90"/>
+    <path d="M 82 56 L 82 69 C 82 81, 91 88, 106 90"/>
+    <path d="M 55 53 L 55 70 C 55 86, 48 97, 36 107"/>
+    <path d="M 73 53 L 73 70 C 73 86, 80 97, 92 107"/>
+    <path d="M 64 52 L 64 115"/>
+  </g>
+  <g fill="#16130E">
+    <circle cx="20" cy="90" r="9.0"/>
+    <circle cx="108" cy="90" r="9.0"/>
+    <circle cx="35" cy="108" r="9.0"/>
+    <circle cx="93" cy="108" r="9.0"/>
+    <circle cx="64" cy="116" r="9.0"/>
+  </g>
+
+  <!-- Outer pair + center: warm Hyphae chartreuse -->
+  <g fill="none" stroke="#B7D956" stroke-width="5.2" stroke-linecap="round">
+    <path d="M 46 56 L 46 69 C 46 81, 37 88, 22 90"/>
+    <path d="M 82 56 L 82 69 C 82 81, 91 88, 106 90"/>
+    <path d="M 64 52 L 64 115"/>
+  </g>
+  <!-- Inner pair: warm antique brass -->
+  <g fill="none" stroke="#E2A842" stroke-width="5.2" stroke-linecap="round">
+    <path d="M 55 53 L 55 70 C 55 86, 48 97, 36 107"/>
+    <path d="M 73 53 L 73 70 C 73 86, 80 97, 92 107"/>
+  </g>
+
+  <!-- Node terminals -->
+  <g fill="#B7D956">
+    <circle cx="20" cy="90" r="6.8"/>
+    <circle cx="108" cy="90" r="6.8"/>
+    <circle cx="64" cy="116" r="6.8"/>
+  </g>
+  <g fill="#E2A842">
+    <circle cx="35" cy="108" r="6.8"/>
+    <circle cx="93" cy="108" r="6.8"/>
+  </g>
+</svg>
