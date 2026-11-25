@@ -1762,3 +1762,256 @@ fn edge_cases_session_pruning_set_subscriptions_and_staged_transfer_rollback() {
     assert_eq!(db.transfers().remove_node("bob@lap", t0 + 100).unwrap(), 1);
     assert!(!db.transfers_dir().join("tx-rev").exists());
 }
+
+#[test]
+fn v060_backend_merge_and_metadata_read_helpers() {
+    let db = NodeDb::open_in_memory().unwrap();
+    let t0 = 1_700_000_000_000i64;
+
+    // 1. merge_session_backend + register_session preserve persisted Herdr & thread metadata.
+    let s1 = db
+        .local()
+        .merge_session_backend(
+            "claude:s1",
+            &serde_json::json!({
+                "kind": "claude",
+                "herdrTerminalId": "t4g",
+                "herdrCreatedMs": 1_700_000_111_000i64,
+                "cwd": "/work/repo"
+            }),
+            t0,
+        )
+        .unwrap();
+    let parsed1: serde_json::Value = serde_json::from_str(&s1.backend_json).unwrap();
+    assert_eq!(parsed1["herdrTerminalId"], "t4g");
+    assert_eq!(parsed1["herdrCreatedMs"], 1_700_000_111_000i64);
+
+    // Subsequent bare register_session must NOT clobber persisted herdrTerminalId / herdrCreatedMs / cwd.
+    let s1_after = db
+        .local()
+        .register_session("claude:s1", r#"{"kind":"claude"}"#, t0 + 500)
+        .unwrap();
+    let parsed_after: serde_json::Value = serde_json::from_str(&s1_after.backend_json).unwrap();
+    assert_eq!(parsed_after["kind"], "claude");
+    assert_eq!(parsed_after["herdrTerminalId"], "t4g");
+    assert_eq!(parsed_after["herdrCreatedMs"], 1_700_000_111_000i64);
+    assert_eq!(parsed_after["cwd"], "/work/repo");
+
+    // Null fields in merge_session_backend never wipe existing keys; non-objects fail closed.
+    let s1_merged = db
+        .local()
+        .merge_session_backend(
+            "claude:s1",
+            &serde_json::json!({ "herdrTerminalId": null, "codexThreadId": "thr-9" }),
+            t0 + 600,
+        )
+        .unwrap();
+    let parsed_merged: serde_json::Value = serde_json::from_str(&s1_merged.backend_json).unwrap();
+    assert_eq!(parsed_merged["herdrTerminalId"], "t4g");
+    assert_eq!(parsed_merged["codexThreadId"], "thr-9");
+
+    assert!(matches!(
+        db.local()
+            .merge_session_backend("claude:s1", &serde_json::json!("not-an-object"), t0),
+        Err(StoreError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        db.local()
+            .merge_session_backend("", &serde_json::json!({}), t0),
+        Err(StoreError::InvalidInput(_))
+    ));
+
+    // 2. list_sessions_by_herdr_terminal filters cleanly and orders by last_seen DESC.
+    db.local()
+        .merge_session_backend(
+            "codex:s2",
+            &serde_json::json!({ "kind": "codex", "herdrTerminalId": "t4g" }),
+            t0 + 900,
+        )
+        .unwrap();
+    db.local()
+        .merge_session_backend(
+            "claude:other",
+            &serde_json::json!({ "kind": "claude", "herdrTerminalId": "t9z" }),
+            t0 + 950,
+        )
+        .unwrap();
+    let on_t4g = db.local().list_sessions_by_herdr_terminal("t4g").unwrap();
+    let ids: Vec<&str> = on_t4g.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, vec!["codex:s2", "claude:s1"]);
+    assert!(db.local().list_sessions_by_herdr_terminal("").unwrap().is_empty());
+
+    // 3. list_pending_metadata & quarantined_count never include quarantined or delivered items.
+    db.local()
+        .put_in_mailbox(
+            &MailboxInsert {
+                session_id: "claude:s1".into(),
+                origin_node: "bob@lap".into(),
+                item_id: "dm-1".into(),
+                text: "SECRET_PENDING_BODY".into(),
+                kind: MailboxKind::Message,
+                source: "bob@lap/reviewer".into(),
+                gate_state: GateState::Pending,
+                gate_reason: None,
+                traceparent: None,
+            },
+            t0 + 1_000,
+        )
+        .unwrap();
+    db.local()
+        .put_in_mailbox(
+            &MailboxInsert {
+                session_id: "claude:s1".into(),
+                origin_node: "local".into(),
+                item_id: "ev-2".into(),
+                text: "SECRET_EVENT_BODY".into(),
+                kind: MailboxKind::Event,
+                source: "local.github".into(),
+                gate_state: GateState::Pending,
+                gate_reason: None,
+                traceparent: None,
+            },
+            t0 + 2_000,
+        )
+        .unwrap();
+    db.local()
+        .put_in_mailbox(
+            &MailboxInsert {
+                session_id: "claude:s1".into(),
+                origin_node: "evil@host".into(),
+                item_id: "q-1".into(),
+                text: "SECRET_QUARANTINED_BODY".into(),
+                kind: MailboxKind::Message,
+                source: "evil@host/attacker".into(),
+                gate_state: GateState::Quarantined,
+                gate_reason: Some("prompt_injection".into()),
+                traceparent: None,
+            },
+            t0 + 3_000,
+        )
+        .unwrap();
+
+    let meta = db.local().list_pending_metadata("claude:s1", 10).unwrap();
+    assert_eq!(meta.len(), 2);
+    assert_eq!(meta[0].item_id, "ev-2");
+    assert_eq!(meta[1].item_id, "dm-1");
+    assert_eq!(db.local().quarantined_count(Some("claude:s1")).unwrap(), 1);
+    assert_eq!(db.local().quarantined_count(Some("codex:s2")).unwrap(), 0);
+    assert_eq!(db.local().quarantined_count(None).unwrap(), 1);
+
+    // 4. list_channels_for_address returns sorted channel memberships for an address.
+    db.messages()
+        .register_handle("alice@mac", "alice", Some("claude:s1"), t0)
+        .unwrap();
+    db.channels()
+        .join("alice@mac", "#release", "alice@mac", "alice", t0)
+        .unwrap();
+    db.channels()
+        .join("alice@mac", "#ops", "alice@mac", "alice", t0)
+        .unwrap();
+    let joined = db
+        .channels()
+        .list_channels_for_address("alice@mac/alice")
+        .unwrap();
+    assert_eq!(
+        joined,
+        vec![
+            ("alice@mac".to_string(), "#ops".to_string()),
+            ("alice@mac".to_string(), "#release".to_string()),
+        ]
+    );
+
+    // 5. delete_subscription_for_subscriber fails closed on wrong subscriber!
+    db.events()
+        .upsert_subscription(
+            &SubscriptionSpec {
+                id: "sub-owned-by-s1".into(),
+                origin_node: "local".into(),
+                topic: "github".into(),
+                subscriber: "claude:s1".into(),
+                filters: vec![Filter::exact("type", "pr.opened")],
+                coalesce_seconds: 15,
+                max_batch_age_ms: None,
+                max_wakes_per_hour: None,
+                mode: DeliveryMode::Full,
+            },
+            t0,
+        )
+        .unwrap();
+    assert!(
+        !db.events()
+            .delete_subscription_for_subscriber("sub-owned-by-s1", "codex:s2")
+            .unwrap()
+    );
+    assert!(db.events().get_subscription("sub-owned-by-s1").unwrap().is_some());
+    assert!(
+        db.events()
+            .delete_subscription_for_subscriber("sub-owned-by-s1", "claude:s1")
+            .unwrap()
+    );
+    assert!(db.events().get_subscription("sub-owned-by-s1").unwrap().is_none());
+
+    // 6. list_active_wakeups_for_session includes active/paused and excludes cancelled.
+    let limits = hyp_store::WakeupLimits::default();
+    let wk1 = db
+        .wakeups()
+        .create_wakeup(
+            &hyp_store::WakeupInsert {
+                id: Some("wk-active".into()),
+                owner_session_id: Some("claude:s1".into()),
+                target_session_id: Some("claude:s1".into()),
+                target_handle: None,
+                target_topic: None,
+                label: "check-ci".into(),
+                note: "SECRET_WAKEUP_NOTE".into(),
+                trigger_kind: hyp_store::WakeupTriggerKind::Timer,
+                cron_expr: None,
+                timezone: hyp_store::CronTimezone::Utc,
+                exact_timing: false,
+                urgency: hyp_store::WakeupUrgency::Queue,
+                ttl_ms: 60_000,
+                coalesce: true,
+                fire_at: Some(t0 + 60_000),
+                max_iterations: None,
+                cold_revival_template: None,
+            },
+            &limits,
+            t0,
+        )
+        .unwrap();
+    let wk2 = db
+        .wakeups()
+        .create_wakeup(
+            &hyp_store::WakeupInsert {
+                id: Some("wk-cancelled".into()),
+                owner_session_id: Some("claude:s1".into()),
+                target_session_id: Some("claude:s1".into()),
+                target_handle: None,
+                target_topic: None,
+                label: "cancelled-job".into(),
+                note: "old".into(),
+                trigger_kind: hyp_store::WakeupTriggerKind::Timer,
+                cron_expr: None,
+                timezone: hyp_store::CronTimezone::Utc,
+                exact_timing: false,
+                urgency: hyp_store::WakeupUrgency::Queue,
+                ttl_ms: 60_000,
+                coalesce: true,
+                fire_at: Some(t0 + 120_000),
+                max_iterations: None,
+                cold_revival_template: None,
+            },
+            &limits,
+            t0,
+        )
+        .unwrap();
+    db.wakeups()
+        .cancel_wakeup(&wk2.id, Some("claude:s1"), t0 + 10)
+        .unwrap();
+    let active_wks = db
+        .wakeups()
+        .list_active_wakeups_for_session("claude:s1", Some("alice"))
+        .unwrap();
+    assert_eq!(active_wks.len(), 1);
+    assert_eq!(active_wks[0].id, wk1.id);
+}

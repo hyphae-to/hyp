@@ -6,6 +6,7 @@
 //! across all 9 harnesses (`antigravity`, `claude`, `codex`, `cursor`, `opencode`, `gemini`,
 //! `openclaw`, `herdr`, `t3`).
 
+use crate::call_registry::is_valid_session_id;
 use crate::protocol::{
     HarnessKind, UNTRUSTED_PROVENANCE, normalize_mesh_tool_name, resolve_v1_daemon_tool,
 };
@@ -326,6 +327,22 @@ fn insert_transport_hints(
         pkt.insert("herdrTerminalId".into(), json!(tid));
         added = true;
     }
+    if let Some(created_ms) = payload
+        .get("herdr_created_ms")
+        .or_else(|| payload.get("herdrCreatedMs"))
+        .and_then(Value::as_i64)
+    {
+        pkt.insert("herdrCreatedMs".into(), json!(created_ms));
+        added = true;
+    }
+    if let Some(cwd) = payload
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.len() <= 1024 && !s.chars().any(char::is_control))
+    {
+        pkt.insert("cwd".into(), json!(cwd));
+    }
 
     if harness == HarnessKind::Codex {
         let raw_tid = payload
@@ -361,6 +378,40 @@ fn insert_transport_hints(
     added
 }
 
+/// Validates `session_id` strictly against [`is_valid_session_id`] (ASCII `[A-Za-z0-9:._-]`
+/// only — zero quotes, newlines, or shell metacharacters) and appends
+/// `export HYPHAE_SESSION_ID='<session_id>'\n` to `env_file` (Claude Code's `$CLAUDE_ENV_FILE`).
+///
+/// Fails closed on invalid IDs (returning `false` without touching disk) and never panics or
+/// propagates I/O errors so hooks never fail if `env_file` is unwritable.
+pub fn export_claude_session_env_file(env_file: &Path, session_id: &str) -> bool {
+    if !is_valid_session_id(session_id)
+        || session_id
+            .strip_prefix("claude:")
+            .is_none_or(str::is_empty)
+    {
+        return false;
+    }
+    if env_file.as_os_str().is_empty() {
+        return false;
+    }
+    let export_line = format!("export HYPHAE_SESSION_ID='{session_id}'\n");
+    if let Ok(existing) = std::fs::read_to_string(env_file) {
+        let normalized = existing.replace("\r\n", "\n");
+        if normalized.lines().any(|l| l == export_line.trim_end()) {
+            return true;
+        }
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(env_file)
+    else {
+        return false;
+    };
+    file.write_all(export_line.as_bytes()).is_ok() && file.flush().is_ok()
+}
+
 /// Pure hook decision engine with injectable RPC callback (easily unit-tested without sockets).
 pub fn handle_hook_payload_with<F>(
     payload: &Map<String, Value>,
@@ -375,6 +426,13 @@ where
     };
 
     if options.event == HookEvent::SessionStart {
+        if options.harness == HarnessKind::Claude {
+            if let Some(env_file) = std::env::var_os("CLAUDE_ENV_FILE") {
+                if !env_file.is_empty() {
+                    let _ = export_claude_session_env_file(Path::new(&env_file), &session_id);
+                }
+            }
+        }
         let mut pkt = Map::new();
         pkt.insert("type".into(), json!("session.hint"));
         pkt.insert("harness".into(), json!(options.harness.as_str()));
@@ -1121,5 +1179,59 @@ mod tests {
             |_, _| DaemonRpcResult::fail(),
         );
         assert_eq!(ag_res, json!({"decision": "allow"}));
+    }
+
+    #[test]
+    fn claude_env_file_export_validates_strictly_and_blocks_shell_injection() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("claude_env.sh");
+
+        // Valid Claude session ID writes exact shell-safe export line and is idempotent.
+        assert!(export_claude_session_env_file(
+            &env_path,
+            "claude:9d7c2b10-abc_1.2"
+        ));
+        assert!(export_claude_session_env_file(
+            &env_path,
+            "claude:9d7c2b10-abc_1.2"
+        ));
+        let contents = std::fs::read_to_string(&env_path)
+            .unwrap()
+            .replace("\r\n", "\n");
+        assert_eq!(
+            contents,
+            "export HYPHAE_SESSION_ID='claude:9d7c2b10-abc_1.2'\n"
+        );
+
+        // Shell-injection & malformed session IDs MUST fail closed and write NOTHING!
+        let bad_path = dir.path().join("must_not_exist.sh");
+        for bad_id in [
+            "claude:$(whoami)",
+            "claude:;rm -rf /",
+            "claude:abc'$(id)'",
+            "claude:abc\nexport PWNED=1",
+            "claude:abc def",
+            "claude:`id`",
+            "claude:abc|cat",
+            "claude:",
+            "codex:valid-id",
+            "",
+        ] {
+            assert!(
+                !export_claude_session_env_file(&bad_path, bad_id),
+                "expected shell-unsafe or non-claude session_id to be rejected: {bad_id:?}"
+            );
+            assert!(
+                !bad_path.exists(),
+                "rejected session_id {bad_id:?} must not create env file"
+            );
+        }
+
+        // Unwritable / nonexistent parent path returns false without panicking.
+        let missing_dir_file = dir.path().join("no_such_dir").join("env.sh");
+        assert!(!export_claude_session_env_file(
+            &missing_dir_file,
+            "claude:ok-1"
+        ));
     }
 }

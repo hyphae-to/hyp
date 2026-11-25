@@ -14,15 +14,27 @@ use hyp_harness::transport::{PushMode, PushOutcome, PushTransport};
 
 #[test]
 fn herdr_transport_metadata_and_trait_object_dispatch() {
-    let target = HerdrTarget::new("t1");
+    let mut target = HerdrTarget::new("t1");
+    target.created_ms = Some(1_700_000_000_000);
+    target.pid = Some(9876);
+    target.app = Some("claude-code".into());
     let transport = HerdrTransport::new(target.clone());
     assert_eq!(transport.kind(), "herdr");
     assert!(transport.supports_interrupt());
     assert_eq!(transport.target(), &target);
+    assert_eq!(transport.herdr_terminal_id(), Some("t1"));
+    assert_eq!(transport.herdr_created_ms(), Some(1_700_000_000_000));
 
     let boxed: Box<dyn PushTransport> = Box::new(transport);
     assert_eq!(boxed.kind(), "herdr");
     assert!(boxed.supports_interrupt());
+    assert_eq!(boxed.herdr_terminal_id(), Some("t1"));
+    assert_eq!(boxed.herdr_created_ms(), Some(1_700_000_000_000));
+    let meta = boxed.target_metadata();
+    assert_eq!(meta["herdrTerminalId"], "t1");
+    assert_eq!(meta["herdrCreatedMs"], 1_700_000_000_000i64);
+    assert_eq!(meta["herdrPid"], 9876);
+    assert_eq!(meta["herdrApp"], "claude-code");
 }
 
 #[test]

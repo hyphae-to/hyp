@@ -507,6 +507,32 @@ impl<'a> WakeupStore<'a> {
         rows.into_iter().collect()
     }
 
+    /// Lists active or paused wakeups owned by or targeting `session_id` (and optionally `handle`),
+    /// ordered deterministically by `(next_fire_at ASC, id ASC)`.
+    pub fn list_active_wakeups_for_session(
+        &self,
+        session_id: &str,
+        handle: Option<&str>,
+    ) -> StoreResult<Vec<WakeupRecord>> {
+        let mut sql = String::from(
+            "SELECT * FROM wakeups
+             WHERE state IN ('active', 'paused')
+               AND (owner_session_id = ?1 OR target_session_id = ?1",
+        );
+        let mut bind: Vec<SqlValue> = vec![SqlValue::Text(session_id.to_string())];
+        if let Some(h) = handle.filter(|s| !s.is_empty()) {
+            sql.push_str(" OR target_handle = ?2");
+            bind.push(SqlValue::Text(h.to_string()));
+        }
+        sql.push_str(") ORDER BY next_fire_at ASC, id ASC");
+
+        let mut stmt = self.db.conn().prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_from_iter(bind), decode_wakeup_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().collect()
+    }
+
     /// Cancels a wakeup atomically, enforcing session ownership whenever `caller_session_opt` is `Some`.
     pub fn cancel_wakeup(
         &self,

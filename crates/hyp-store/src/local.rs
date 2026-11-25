@@ -119,6 +119,23 @@ pub struct UnreadDigest {
     pub sources: Vec<String>,
 }
 
+/// Metadata-only pending mailbox item projection.
+///
+/// **Security invariant:** Queries producing this struct NEVER select `mailbox.text`,
+/// `gate_reason`, or quarantined rows, ensuring untrusted payload bodies never cross the
+/// storage boundary into status bars, summaries, or UI projections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailboxItemMeta {
+    pub receipt: String,
+    pub session_id: String,
+    pub origin_node: String,
+    pub item_id: String,
+    pub received_at: i64,
+    pub kind: MailboxKind,
+    pub source: String,
+    pub notified: bool,
+}
+
 /// Active plugin target handoff mapping `(plugin, target) -> session_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginTargetHandoff {
@@ -260,6 +277,12 @@ impl<'a> LocalStateStore<'a> {
     // ---- Sessions ----
 
     /// Registers or updates a harness session.
+    ///
+    /// When a session already exists and both the existing `backend_json` and the incoming
+    /// `backend_json` parse as JSON objects, keys from the incoming object are merged into
+    /// the existing object so partial updates like `{"kind":"claude"}` NEVER clobber
+    /// previously persisted metadata such as `herdrTerminalId`, `herdrCreatedMs`,
+    /// `codexThreadId`, `t3ThreadId`, or `cwd`.
     pub fn register_session(
         &self,
         id: &str,
@@ -270,17 +293,95 @@ impl<'a> LocalStateStore<'a> {
             return Err(StoreError::InvalidInput("session id must be non-empty".to_string()));
         }
         let tx = self.db.immediate_tx()?;
+        let existing_backend: Option<String> = tx
+            .conn()
+            .query_row(
+                "SELECT backend_json FROM sessions WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let merged_backend = match existing_backend {
+            Some(ref prev_raw) => merge_backend_json_strings(prev_raw, backend_json),
+            None => backend_json.to_string(),
+        };
         tx.conn().execute(
             "INSERT INTO sessions (id, backend_json, last_seen, delivery_mode, created_at)
              VALUES (?1, ?2, ?3, 'full', ?3)
              ON CONFLICT(id) DO UPDATE SET
                backend_json = excluded.backend_json,
                last_seen = excluded.last_seen",
-            params![id, backend_json, now_ms],
+            params![id, &merged_backend, now_ms],
         )?;
         let sess = tx.conn().query_row(
             "SELECT * FROM sessions WHERE id = ?1",
             params![id],
+            decode_session_row,
+        )??;
+        tx.commit()?;
+        Ok(sess)
+    }
+
+    /// Atomically merges non-null keys from `patch` (must be a JSON object) into
+    /// `sessions.backend_json` for `session_id` inside a `BEGIN IMMEDIATE` transaction,
+    /// creating the session row if it does not yet exist.
+    ///
+    /// Monotonically preserves existing metadata keys (`herdrTerminalId`, `herdrCreatedMs`,
+    /// `herdrPid`, `codexThreadId`, `t3ThreadId`, `cwd`, etc.) that are absent or `null` in
+    /// `patch`.
+    pub fn merge_session_backend(
+        &self,
+        session_id: &str,
+        patch: &serde_json::Value,
+        now_ms: i64,
+    ) -> StoreResult<Session> {
+        if session_id.is_empty() {
+            return Err(StoreError::InvalidInput(
+                "session id must be non-empty".to_string(),
+            ));
+        }
+        let Some(patch_obj) = patch.as_object() else {
+            return Err(StoreError::InvalidInput(
+                "session backend patch must be a JSON object".to_string(),
+            ));
+        };
+        let tx = self.db.immediate_tx()?;
+        let existing_backend: Option<String> = tx
+            .conn()
+            .query_row(
+                "SELECT backend_json FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let mut merged = existing_backend
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|v| match v {
+                serde_json::Value::Object(map) => Some(map),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        for (k, v) in patch_obj {
+            if !v.is_null() {
+                merged.insert(k.clone(), v.clone());
+            }
+        }
+        let serialized = serde_json::to_string(&serde_json::Value::Object(merged))?;
+
+        tx.conn().execute(
+            "INSERT INTO sessions (id, backend_json, last_seen, delivery_mode, created_at)
+             VALUES (?1, ?2, ?3, 'full', ?3)
+             ON CONFLICT(id) DO UPDATE SET
+               backend_json = excluded.backend_json,
+               last_seen = excluded.last_seen",
+            params![session_id, &serialized, now_ms],
+        )?;
+        let sess = tx.conn().query_row(
+            "SELECT * FROM sessions WHERE id = ?1",
+            params![session_id],
             decode_session_row,
         )??;
         tx.commit()?;
@@ -392,6 +493,28 @@ impl<'a> LocalStateStore<'a> {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Lists sessions whose persisted `backend_json` binds `herdrTerminalId == terminal_id`,
+    /// ordered deterministically by `(last_seen DESC, id ASC)`.
+    pub fn list_sessions_by_herdr_terminal(&self, terminal_id: &str) -> StoreResult<Vec<Session>> {
+        if terminal_id.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sessions = self.list_sessions()?;
+        Ok(sessions
+            .into_iter()
+            .filter(|s| {
+                serde_json::from_str::<serde_json::Value>(&s.backend_json)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("herdrTerminalId")
+                            .and_then(serde_json::Value::as_str)
+                            .map(|tid| tid == terminal_id)
+                    })
+                    .unwrap_or(false)
+            })
+            .collect())
     }
 
     /// Removes inactive sessions older than `cutoff_ms` (skipping `active_session_ids`),
@@ -783,6 +906,47 @@ impl<'a> LocalStateStore<'a> {
         )?;
         digest.quarantined = quarantined.max(0) as usize;
         Ok(digest)
+    }
+
+    /// Count of quarantined mailbox entries globally (`session_id == None`) or for a specific
+    /// session (`session_id == Some(sid)`). Never reads quarantined body text or sources.
+    pub fn quarantined_count(&self, session_id: Option<&str>) -> StoreResult<usize> {
+        let n: i64 = if let Some(sid) = session_id {
+            self.db.conn().query_row(
+                "SELECT COUNT(*) FROM mailbox WHERE session_id = ?1 AND gate_state = 'quarantined'",
+                params![sid],
+                |row| row.get(0),
+            )?
+        } else {
+            self.db.conn().query_row(
+                "SELECT COUNT(*) FROM mailbox WHERE gate_state = 'quarantined'",
+                [],
+                |row| row.get(0),
+            )?
+        };
+        Ok(n.max(0) as usize)
+    }
+
+    /// Lists up to `limit` **pending** (gate-allowed) mailbox item metadata rows for `session_id`,
+    /// ordered newest-first (`received_at DESC, receipt ASC`).
+    ///
+    /// **Security invariant:** Never selects `text`, `gate_reason`, or quarantined rows.
+    pub fn list_pending_metadata(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<MailboxItemMeta>> {
+        let mut stmt = self.db.conn().prepare(
+            "SELECT receipt, session_id, origin_node, item_id, received_at, kind, source, notified
+             FROM mailbox
+             WHERE session_id = ?1 AND gate_state = 'pending'
+             ORDER BY received_at DESC, receipt ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id, limit as i64], decode_mailbox_meta_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().collect()
     }
 
     /// Lists quarantined items awaiting human review (`hyp gate review`).
@@ -1398,6 +1562,48 @@ fn insert_gate_audit_in_tx(
         |row| row.get(0),
     )?;
     Ok(seq)
+}
+
+fn merge_backend_json_strings(existing_raw: &str, incoming_raw: &str) -> String {
+    let existing_val = serde_json::from_str::<serde_json::Value>(existing_raw).ok();
+    let incoming_val = serde_json::from_str::<serde_json::Value>(incoming_raw).ok();
+    if let (Some(serde_json::Value::Object(mut base)), Some(serde_json::Value::Object(patch))) =
+        (existing_val, incoming_val)
+    {
+        for (k, v) in patch {
+            if !v.is_null() {
+                base.insert(k, v);
+            }
+        }
+        if let Ok(serialized) = serde_json::to_string(&serde_json::Value::Object(base)) {
+            return serialized;
+        }
+    }
+    incoming_raw.to_string()
+}
+
+fn decode_mailbox_meta_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoreResult<MailboxItemMeta>> {
+    let receipt: String = row.get(0)?;
+    let session_id: String = row.get(1)?;
+    let origin_node: String = row.get(2)?;
+    let item_id: String = row.get(3)?;
+    let received_at: i64 = row.get(4)?;
+    let kind_str: String = row.get(5)?;
+    let source: String = row.get(6)?;
+    let notified: i64 = row.get(7)?;
+
+    Ok(MailboxKind::parse(&kind_str).map(|kind| MailboxItemMeta {
+        receipt,
+        session_id,
+        origin_node,
+        item_id,
+        received_at,
+        kind,
+        source,
+        notified: notified != 0,
+    }))
 }
 
 fn decode_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Session>> {

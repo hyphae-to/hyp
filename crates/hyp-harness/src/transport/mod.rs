@@ -7,6 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub mod codex;
 pub mod herdr;
@@ -88,6 +89,22 @@ pub trait PushTransport: Send + Sync {
     /// Whether this transport supports [`PushMode::Interrupt`] in addition to [`PushMode::Queue`].
     fn supports_interrupt(&self) -> bool {
         false
+    }
+
+    /// Returns the bound Herdr terminal ID when this transport targets a Herdr terminal.
+    fn herdr_terminal_id(&self) -> Option<&str> {
+        None
+    }
+
+    /// Returns the pinned Herdr terminal creation timestamp (`created_ms`) when known.
+    fn herdr_created_ms(&self) -> Option<i64> {
+        None
+    }
+
+    /// Returns metadata-only JSON attributes describing the transport target
+    /// (persisted into `sessions.backend_json`; MUST NEVER contain secrets).
+    fn target_metadata(&self) -> Value {
+        Value::Null
     }
 
     /// Attempts to deliver `text` to the session bound to this transport.

@@ -92,17 +92,29 @@ pub enum WaitError {
 }
 
 /// Resolves the session ID automatically from harness environment variables:
-/// 1. `ANTIGRAVITY_SOURCE_METADATA` (`tool.conversationId` -> `antigravity:<id>`)
-/// 2. `CLAUDE_SESSION_ID` (`claude:<id>`)
-/// 3. `CODEX_THREAD_ID` (`codex:<id>`)
+/// 1. `HYPHAE_SESSION_ID` (validated qualified session ID, e.g. `claude:<id>` exported via `CLAUDE_ENV_FILE`)
+/// 2. `ANTIGRAVITY_SOURCE_METADATA` (`tool.conversationId` -> `antigravity:<id>`)
+/// 3. `CLAUDE_SESSION_ID` (`claude:<id>`)
+/// 4. `CODEX_THREAD_ID` (`codex:<id>`)
 pub fn infer_session_id_from_env() -> Option<String> {
     infer_session_id_with(|k| std::env::var(k).ok())
+}
+
+/// Resolves a validated Herdr terminal ID from `HC_TERMINAL_ID`, if present.
+pub fn infer_herdr_terminal_from_env() -> Option<String> {
+    crate::transport::herdr::detect_env_terminal_id()
 }
 
 pub fn infer_session_id_with<F>(get_env: F) -> Option<String>
 where
     F: Fn(&str) -> Option<String>,
 {
+    if let Some(raw) = get_env("HYPHAE_SESSION_ID") {
+        let trimmed = raw.trim();
+        if crate::call_registry::is_valid_session_id(trimmed) {
+            return Some(trimmed.to_string());
+        }
+    }
     if let Some(raw) = get_env("ANTIGRAVITY_SOURCE_METADATA").filter(|v| !v.is_empty()) {
         if let Ok(Value::Object(parsed)) = serde_json::from_str::<Value>(&raw) {
             if let Some(conv_id) = parsed
@@ -185,7 +197,12 @@ pub async fn run_wait_to_writer<W: Write>(
         (None, Some(_)) => None,
         (None, None) => infer_session_id_from_env(),
     };
-    if session_id.is_none() && options.handle.is_none() {
+    let herdr_terminal_id = if session_id.is_none() && options.handle.is_none() {
+        infer_herdr_terminal_from_env()
+    } else {
+        None
+    };
+    if session_id.is_none() && options.handle.is_none() && herdr_terminal_id.is_none() {
         return Err(WaitError::MissingSession);
     }
 
@@ -202,6 +219,9 @@ pub async fn run_wait_to_writer<W: Write>(
     sub.insert("mode".into(), json!(options.mode.as_str()));
     if let Some(sid) = session_id {
         sub.insert("sessionId".into(), json!(sid));
+    }
+    if let Some(tid) = herdr_terminal_id {
+        sub.insert("herdrTerminalId".into(), json!(tid));
     }
     if let Some(handle) = options.handle {
         sub.insert("handle".into(), json!(handle));
@@ -308,6 +328,23 @@ mod tests {
         );
 
         assert_eq!(infer_session_id_from_map(&HashMap::new()), None);
+
+        // HYPHAE_SESSION_ID takes precedence when valid and rejects shell-unsafe values fail-closed.
+        let mut explicit = HashMap::new();
+        explicit.insert("HYPHAE_SESSION_ID".into(), "claude:from-env-file".into());
+        explicit.insert("CLAUDE_SESSION_ID".into(), "other".into());
+        assert_eq!(
+            infer_session_id_from_map(&explicit).as_deref(),
+            Some("claude:from-env-file")
+        );
+
+        let mut bad_explicit = HashMap::new();
+        bad_explicit.insert("HYPHAE_SESSION_ID".into(), "claude:$(whoami)".into());
+        bad_explicit.insert("CLAUDE_SESSION_ID".into(), "fallback-ok".into());
+        assert_eq!(
+            infer_session_id_from_map(&bad_explicit).as_deref(),
+            Some("claude:fallback-ok")
+        );
     }
 
     #[test]
