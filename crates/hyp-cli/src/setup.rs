@@ -2776,7 +2776,7 @@ fn setup_antigravity(
         &sidecar_json,
         &json!({
             "command": bin,
-            "args": ["node", "start"],
+            "args": ["node", "start", "--if-not-running"],
             "restart_policy": "on-failure"
         }),
         false,
