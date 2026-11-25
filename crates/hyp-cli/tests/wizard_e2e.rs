@@ -105,9 +105,16 @@ fn preview_anim_renders_settled_dot_matrix_in_plain_and_truecolor_modes() {
             "row {idx} must be exactly 54 columns wide"
         );
     }
-    assert!(plain_text.contains('●'), "missing agent node glyphs");
-    assert!(plain_text.contains('▪'), "missing hyphae dot glyphs");
-    assert!(plain_text.contains('·'), "missing ambient halo dot glyphs");
+    assert!(
+        plain_text
+            .chars()
+            .any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
+        "expected Unicode Braille characters in settled canvas"
+    );
+    assert!(
+        !plain_text.contains('╭') && !plain_text.contains('╰'),
+        "borderless Braille canvas must not draw an outer box border"
+    );
 
     let tc_out = isolated_cmd(tmp.path())
         .env_remove("NO_COLOR")
