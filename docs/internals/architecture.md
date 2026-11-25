@@ -12,7 +12,7 @@ flowchart LR
     direction TB
     Harnesses["Harnesses (MCP + ~2.7ms hooks via connector.sock / connector.addr)"]
     Sources["Compiled-In Sources (localIngest ingest.sock, github-public, github-webhook, prometheus-webhook, webhook-stream)"]
-    Bridges["Optional External Bridges (fd-3 SubprocessSupervisor, Unix/WSL)"]
+    Bridges["Optional External Bridges (SubprocessSupervisor · fd-3 / loopback TCP)"]
 
     subgraph Core["UnifiedNode + node.sqlite (WAL, schema v5)"]
       Bus["CloudEvents v1.0 Bus"]
@@ -48,7 +48,7 @@ flowchart LR
 3. **Composable Adapters (`NodeAdapter` in `crates/hyp-node` & `crates/hyp-harness`):**
    - **Harnesses & LocalDaemon:** Private `0600` Unix socket (`connector.sock`) or Windows loopback TCP + bearer token (`connector.addr`), `CallRegistry` + per-session HMAC `sessionToken`, zero-Tokio ~2.7 ms `hyp hook` fast path, ~2.8 MB RSS stateless `hyp mcp` multiplexer, and live hot-reload IPC RPCs (`peers.reload`, `gate.reload`, `inbox.wake`).
    - **Compiled-in Event Sources & Local Ingest:** Pure-Rust `github-public`, `github-webhook`, `prometheus-webhook`, `webhook-stream`, and default socket-only `localIngest` (`ingest.sock` / `ingest.addr`).
-   - **External Subprocess Bridges:** `SubprocessSupervisor` over duplex Unix fd 3 (JSON-RPC 2.0 v2 + legacy v1 auto-detect), scrubbed env, `CrashLoopBackOff` circuit breaker, `0600` redacted logs, local-only bridge topics by default.
+   - **External Subprocess Bridges:** Cross-platform `SubprocessSupervisor` over duplex Unix fd 3 (macOS/Linux) or authenticated loopback TCP with per-spawn 256-bit CSPRNG token (Windows), speaking JSON-RPC 2.0 v2 + legacy v1 auto-detect, with scrubbed env, `CrashLoopBackOff` circuit breaker, `0600` redacted logs, and local-only bridge topics by default.
    - **Symmetric `PeerLink`s:** Bidirectional `hyper 1` HTTPS + WHATWG SSE links with RFC 9457 Problem Details, ETag caching, and aggregated filter pushdown (sharding merged CloudEvents filter ASTs when exceeding 4 KiB / depth 8).
 4. **Configuration Profiles:** `local` (workstation, no listener by default), `p2p` (workstation + peer listener), and `router` (Team Hub or Public Node).
 
@@ -71,7 +71,7 @@ flowchart LR
 | Signing & Keys | RFC 8785 JCS + RFC 8032 Ed25519 + RFC 7517/8037 OKP JWK + RFC 7638 | `crates/hyp-proto`, `crates/hyp-crypto` |
 | File Drops | POSIX `tar` + `gzip` + OCI `sha256` + 64 KiB chunked AEAD | `crates/hyp-crypto/src/transfer.rs` |
 | HTTP & Errors | RFC 9457 Problem Details + RFC 9110 (`ETag`/`If-Match`/`Retry-After`) + WHATWG SSE | `crates/hyp-node` (`hyper 1`) |
-| Plugin IPC | JSON-RPC 2.0 over NDJSON (duplex Unix fd 3, v1 fallback) | `crates/hyp-proto/src/rpc.rs` |
+| Plugin IPC | JSON-RPC 2.0 over NDJSON (Unix fd 3 / Windows authenticated loopback TCP, v1 fallback) | `crates/hyp-proto/src/rpc.rs` |
 | Permissions | RFC 6749-style scope tokens + Signed `GET /v1/manifest` | `crates/hyp-proto/src/{scopes,manifest}.rs` |
 
 See [Scopes & Capabilities](../reference/scopes.md) for active vs. reserved/planned endpoints (`POST /v1/bridges/post`, `POST /v1/node/update`, `directory.checkpoint.v1`), [Delivery Engine](delivery.md) for packing and wakeup rules, and [Testing Strategy](testing.md) for verification.

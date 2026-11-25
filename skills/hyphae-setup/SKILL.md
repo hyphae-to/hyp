@@ -435,7 +435,7 @@ hyp deploy check --url https://<hostname> --json
        ]
      }
      ```
-   - Supervised over fd-3 JSON-RPC 2.0 by `hyp daemon`; bridge topics stay local-only by default (`"exposeTopic": true` opt-in). Always configure explicit allowlists (`SLACK_ALLOWED_USERS` / `SLACK_ALLOWED_CHANNELS`, `TELEGRAM_ALLOWED_USERS` / `TELEGRAM_ALLOWED_CHATS`, etc.) and reference tokens via `{ "secret": "<name>" }`. Use `hyp plugin remove <name> --json` when retiring a bridge (automatically removes matching `plugins[]` entries from `node.json`; pass `--keep-config` to preserve them).
+   - Supervised natively by `hyp daemon` (Unix fd 3 on macOS/Linux, authenticated loopback TCP on Windows); bridge topics stay local-only by default (`"exposeTopic": true` opt-in). Always configure explicit allowlists (`SLACK_ALLOWED_USERS` / `SLACK_ALLOWED_CHANNELS`, `TELEGRAM_ALLOWED_USERS` / `TELEGRAM_ALLOWED_CHATS`, etc.) and reference tokens via `{ "secret": "<name>" }`. Use `hyp plugin remove <name> --json` when retiring a bridge (automatically removes matching `plugins[]` entries from `node.json`; pass `--keep-config` to preserve them).
 5. Restart the background daemon after editing `node.json` (`hyp service restart --json`), then verify with `hyp doctor --json`.
 
 ### G. Propose & Lock a Local Security Gate

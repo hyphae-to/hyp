@@ -4,7 +4,7 @@
 
 Hyphae unifies event sources and chat bridges onto the single Rust `Node` CloudEvents v1.0 bus (`node.sqlite`) via `NodeAdapter` (`crates/hyp-node/src/adapters/`), separating **compiled-in pure-Rust event source adapters** from **optional external chat bridge scripts** in `plugins/`.
 
-> **Zero runtime dependency for core `hyp`:** The self-contained Rust `hyp` binary requires **no** Node.js or Python runtime. Scripts under `plugins/` are **optional external subprocesses** (Node or Python) supervised over duplex Unix fd 3 — you only need Node or Python installed if you opt in to running those specific external bridge scripts.
+> **Zero runtime dependency for core `hyp`:** The self-contained Rust `hyp` binary requires **no** Node.js or Python runtime. Scripts under `plugins/` are **optional external subprocesses** (Node or Python) supervised natively over duplex Unix fd 3 (macOS/Linux) or authenticated loopback TCP (Windows) — you only need Node or Python installed if you opt in to running those specific external bridge scripts.
 
 ---
 
@@ -13,7 +13,7 @@ Hyphae unifies event sources and chat bridges onto the single Rust `Node` CloudE
 | Layer | Implementation | Routing Model | Secrets Location | Best For |
 | --- | --- | --- | --- | --- |
 | **Compiled-In Rust Event Sources & Local Ingest** (`crates/hyp-node/src/adapters/`, `engine/local_ingest.rs`) | Pure Rust wired directly into `hyp node start` (`github-public`, `github-webhook`, `prometheus-webhook`, `webhook-stream`, plus default-enabled socket-only `localIngest` on `ingest.sock` / `ingest.addr`) — zero Node/Python needed | **1-to-many Pub/Sub** via standard `hyp_stream` with server-side CloudEvents filter pushdown (including `local.schedule` / `local.<topic>` triggered via `hyp emit` or raw NDJSON) | Node's `SecretStore` (`{ "secret": "<name>" }` in `node.json`) | Public or org **GitHub** streams (`github-public` ETag poller + `github-webhook` / GitHub App push), **Prometheus Alertmanager v4**, signed **HTTP webhooks**, and OS-scheduled **Local Ingest & Cron triggers** |
-| **External Subprocess Bridges & Custom Sources** (`plugins/`) | Optional self-contained scripts (`plugins/slack`, `plugins/telegram`, `plugins/whatsapp`, `plugins/webhook`, `plugins/prometheus`, or custom executables) supervised by `SubprocessSupervisor` over fd 3 | **Thread-owned + multi-thread fan-in + outbound replies** via `hyp_bridge` and `hyp_send({ to: "<plugin>:<target>", text })`; bridge topics stay **local-only by default** (`exposeTopic: true` opt-in) | Local machine's `SecretStore` — scrubbed subprocess env, never sent to remote hubs | Personal **Slack / Telegram / WhatsApp** bridges, local callbacks, and custom scripts in any language |
+| **External Subprocess Bridges & Custom Sources** (`plugins/`) | Optional self-contained scripts (`plugins/slack`, `plugins/telegram`, `plugins/whatsapp`, `plugins/webhook`, `plugins/prometheus`, or custom executables) supervised by `SubprocessSupervisor` (Unix fd 3 / Windows loopback TCP) | **Thread-owned + multi-thread fan-in + outbound replies** via `hyp_bridge` and `hyp_send({ to: "<plugin>:<target>", text })`; bridge topics stay **local-only by default** (`exposeTopic: true` opt-in) | Local machine's `SecretStore` — scrubbed subprocess env, never sent to remote hubs | Personal **Slack / Telegram / WhatsApp** bridges, local callbacks, and custom scripts in any language |
 
 ---
 
@@ -247,9 +247,9 @@ hyp_stream({
 
 ## 4. Optional External Chat Bridges (`plugins/`)
 
-External scripts under `plugins/` run as optional child processes managed by the unified Rust `SubprocessSupervisor` (`crates/hyp-node/src/adapters/supervisor.rs`) over an anonymous duplex Unix socketpair duped onto **fd 3**:
+External scripts under `plugins/` run as optional child processes managed by the unified cross-platform Rust `SubprocessSupervisor` (`crates/hyp-node/src/adapters/supervisor.rs`) over an anonymous duplex Unix socketpair duped onto **fd 3** (macOS/Linux) or an authenticated single-accept loopback TCP channel (`127.0.0.1:0` + per-spawn 256-bit CSPRNG token on Windows):
 
-- **Scrubbed environment**: Inherits only `PATH`, `HOME`, `TMPDIR`, `LANG`, `XDG_RUNTIME_DIR`, and `DBUS_SESSION_BUS_ADDRESS` plus explicitly configured env vars/secrets and protocol headers (`HYPHAE_FD=3`, `HYPHAE_PLUGIN=<id>`, `HYPHAE_PROTOCOL=2`). Plaintext secret-like values in `plugins[].env` (instead of `{ "secret": "<name>" }`) emit a startup warning without logging the secret.
+- **Scrubbed environment**: Inherits only safe OS runtime paths (`PATH`, `HOME`, `TMPDIR`, `LANG`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`, plus Windows OS/temp/profile paths on Windows) plus explicitly configured env vars/secrets and protocol headers (`HYPHAE_FD=3` on Unix or `HYPHAE_PLUGIN_TRANSPORT=tcp` / `HYPHAE_PLUGIN_ADDR` / `HYPHAE_PLUGIN_TOKEN` on Windows, along with `HYPHAE_PLUGIN=<id>` and `HYPHAE_PROTOCOL=2`). Plaintext secret-like values in `plugins[].env` (instead of `{ "secret": "<name>" }`) emit a startup warning without logging the secret.
 - **Local-only bridge topics by default (`exposeTopic: true` opt-in)**: Topics emitted by local chat bridges (`slack`, `telegram`, `whatsapp`, `webhook`) are kept strictly local by default — paired remote peers (even holding `stream:subscribe=*`) never see them in `/v1/manifest` and cannot subscribe to them unless the operator explicitly sets **`"exposeTopic": true`** on that entry in `plugins[]` (or lists the topic explicitly in `topics[]`).
 - **Bounded framing, crash-loop circuit breaker & secret-redacted logs**: Enforces a strict 64 KiB `LineSplitter`, exponential restart backoff (`1s -> 60s`), and clean `SIGTERM -> SIGKILL` shutdown. After **5 consecutive rapid crashes**, the circuit breaker trips into **`CrashLoopBackOff`** (`status: "crash_loop_backoff"` in `node.status.json` and `hyp doctor`), stopping runaway respawns while keeping the rest of the daemon up. Subprocess stderr is captured into **`<state_dir>/logs/plugin-<id>.log`** with user-only **`0600`** permissions and automatic secret redaction (`[REDACTED]`).
 - **Dual wire protocol auto-detection**: Speaks **JSON-RPC 2.0 v2** (`hyphae/hello`, `hyphae/publish`, `hyphae/post`, `hyphae/status`, `hyphae/deliveryFailed`) and automatically detects unmodified **legacy fd-3 v1** plugins (`hello`, `event`, `ack`, `nack`, `request`, `response`, `status`, `delivery_failed`).
@@ -327,7 +327,7 @@ hyp plugin remove all --json
 
 ### Included Optional External Scripts (`plugins/`)
 
-All included `.mjs` scripts have zero external npm dependencies (**requires Node 24+ on macOS/Linux**; fd-3 subprocess bridges are Unix-only):
+All included `.mjs` scripts have zero external npm dependencies (**requires Node 24+ on macOS, Linux, or Windows**):
 
 | Script | Kind | Protocol / Transport | Required Fail-Closed Allowlist / Auth Env Vars |
 | --- | --- | --- | --- |
@@ -384,21 +384,21 @@ hyp setup --refresh-skills
 
 ---
 
-## 5. Writing a Custom Subprocess Plugin (JSON-RPC 2.0 v2 or fd-3 v1)
+## 5. Writing a Custom Subprocess Plugin (JSON-RPC 2.0 v2 or v1 SDK)
 
-Any language that can read/write newline-delimited JSON (≤ 64 KiB/line) on fd 3 works directly.
+Any language that can read/write newline-delimited JSON (≤ 64 KiB/line) over Unix fd 3 (or authenticated loopback TCP via `HYPHAE_PLUGIN_ADDR` + `HYPHAE_PLUGIN_TOKEN` on Windows) works directly.
 
-### Option A: JSON-RPC 2.0 over fd 3 (`HYPHAE_PROTOCOL=2`, recommended for new plugins)
+### Option A: JSON-RPC 2.0 (`HYPHAE_PROTOCOL=2`, recommended for new plugins)
 
-- Host <-> Plugin notifications & requests on fd 3:
+- Host <-> Plugin notifications & requests on the IPC channel:
   - `hyphae/hello` (notification: `{ protocol: 2, plugin, targets }`)
   - `hyphae/publish` (request from plugin: `{ target, event: <CloudEvent v1.0> }` -> JSON-RPC result `{ status: "stored" | "duplicate" }`)
   - `hyphae/post` (request from host to plugin: `{ target, params: { text, replyTo?, ... } }` -> JSON-RPC result `{ ... }`)
   - `hyphae/status` & `hyphae/deliveryFailed` (notifications)
 
-### Option B: Bundled Zero-Dependency fd-3 v1 SDKs
+### Option B: Bundled Zero-Dependency v1 SDKs
 
-Use [plugins/sdk/client.mjs](../plugins/sdk/client.mjs) (Node) or [plugins/sdk/client.py](../plugins/sdk/client.py) (Python 3 stdlib) — `SubprocessSupervisor` auto-detects v1 framing automatically:
+Use [plugins/sdk/client.mjs](../plugins/sdk/client.mjs) (Node) or [plugins/sdk/client.py](../plugins/sdk/client.py) (Python 3 stdlib) — both automatically handle Unix fd 3 and Windows loopback TCP, and `SubprocessSupervisor` auto-detects v1 framing automatically:
 
 ```js
 #!/usr/bin/env node
@@ -422,4 +422,4 @@ await mesh.send(targets[0], {
 });
 ```
 
-Exit cleanly when fd 3 reaches EOF.
+Exit cleanly when the IPC channel reaches EOF.

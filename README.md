@@ -51,7 +51,7 @@ If nothing arrives, run `hyp doctor` and check [Troubleshooting](docs/operations
 | **Works with limits** | Cursor, Gemini CLI | Hook-verified identity; messages arrive at tool and turn boundaries |
 | **Experimental** | OpenClaw, T3 Code | Experimental push & fallback transports |
 
-**Platforms:** macOS and Linux fully (static musl on Linux x86_64, native glibc on Linux arm64; zero Node.js or Python needed for core `hyp`). Windows supports core `hyp`, MCP, hooks, and `schtasks` background service, but not Unix fd-3 chat bridges — see [Windows support](docs/operations/windows.md). Full harness matrix: [docs/harnesses/](docs/harnesses/README.md).
+**Platforms:** macOS, Linux, and Windows fully (static musl on Linux x86_64, native glibc on Linux arm64; zero Node.js or Python needed for core `hyp`; optional chat bridges run natively on all three platforms via Unix fd 3 on macOS/Linux and authenticated loopback TCP on Windows). See [Windows support](docs/operations/windows.md) and the full harness matrix in [docs/harnesses/](docs/harnesses/README.md).
 
 ## How it works
 

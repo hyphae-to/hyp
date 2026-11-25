@@ -2,7 +2,7 @@
 
 Connect personal Telegram, Slack (Socket Mode), or WhatsApp chats directly to live coding agent sessions on your machine.
 
-> **Status & Platform Scope:** Chat bridges are **Beta** and run as optional external Node.js subprocesses (`Node 24+`) supervised over Unix fd 3 (**macOS, Linux, and WSL only** — native Windows external bridge supervision is not yet supported; see [Windows Operations](../operations/windows.md)). Bridges send plaintext to the external chat provider (Slack, Telegram, WhatsApp), so they are outside Hyphae's node-to-node E2EE boundary.
+> **Status & Platform Scope:** Chat bridges are **Beta** and run as optional external Node.js subprocesses (`Node 24+`) supervised natively across **macOS, Linux, and Windows** (duplex Unix fd 3 on Unix; authenticated loopback TCP on Windows — see [Windows Operations](../operations/windows.md)). Bridges send plaintext to the external chat provider (Slack, Telegram, WhatsApp), so they are outside Hyphae's node-to-node E2EE boundary.
 
 ---
 

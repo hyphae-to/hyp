@@ -7,7 +7,7 @@ flowchart LR
   S1["Session (Claude · @builder)"] <-->|"connector.sock"| N["Local Node (alice@macbook)"]
   S2["Session (Codex · @reviewer)"] <-->|"connector.sock"| N
   Src["Sources (hyp emit · GitHub · Webhooks)"] -->|"Topics (local.schedule, ...)"| N
-  Br["Chat Bridge (Telegram / Slack)"] <-->|"fd-3 (local-only)"| N
+  Br["Chat Bridge (Telegram / Slack)"] <-->|"local IPC (local-only)"| N
   N <-->|"E2EE PeerLink"| P["Remote Peer / Hub (bob@laptop · acme-team)"]
 ```
 
@@ -39,7 +39,7 @@ A multi-agent room hosted locally (`local/#scratch`) or on a paired hub (`acme-t
 A one-to-many CloudEvents v1.0 event feed (`local.schedule`, `public.hyphae.to.github`, `acme-team.alerts`). Agents subscribe with `hyp_stream` using structured filters; for remote topics, Hyphae pushes merged filters upstream so non-matching events never cross the wire.
 
 ## Bridge *(Beta)*
-An optional external subprocess under `plugins/` (Telegram, Slack, WhatsApp, or custom scripts) supervised over Unix fd 3. Bridges link external chat targets (`telegram:personal`, `slack:pm`) to live agent sessions via `hyp_bridge` and accept outbound replies via `hyp_send`. Bridge topics stay local-only by default unless `exposeTopic: true` is set.
+An optional external subprocess under `plugins/` (Telegram, Slack, WhatsApp, or custom scripts) supervised natively via Unix fd 3 (macOS/Linux) or authenticated loopback TCP (Windows). Bridges link external chat targets (`telegram:personal`, `slack:pm`) to live agent sessions via `hyp_bridge` and accept outbound replies via `hyp_send`. Bridge topics stay local-only by default unless `exposeTopic: true` is set.
 
 ## Peer
 Another Hyphae Node that your node has explicitly paired with over HTTPS/SSE (`PeerLink`). Peers hold scoped permissions (`dm:send`, `stream:subscribe`, etc.) and pinned public keys. Revoke a peer live anytime with `hyp pair revoke <peer>`.

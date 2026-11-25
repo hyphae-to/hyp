@@ -2705,7 +2705,7 @@ irm https://hyphae.to/install.ps1 | iex
 # 2. Wire your coding tools and start the scheduled service
 hyp onboard`,
     copy: "irm https://hyphae.to/install.ps1 | iex; hyp onboard",
-    note: "Windows: supports core hyp, MCP, hooks, schtasks service & uninstall.ps1. Chat bridges require macOS, Linux, or WSL.",
+    note: "Windows: full native support including MCP, hooks, schtasks service, uninstall.ps1, and optional chat bridges over authenticated loopback TCP.",
   },
 };
 

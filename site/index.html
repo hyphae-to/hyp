@@ -377,7 +377,7 @@ hyp exec --env STRIPE_KEY=stripe-key -- ./deploy.sh</code></pre>
             </p>
             <pre class="uc-code"><code>hyp plugin install telegram
 hyp secret set telegram-bot-token --web</code></pre>
-            <div class="uc-works">Works with: macOS · Linux · WSL (Node.js bridge plugin)</div>
+            <div class="uc-works">Works with: macOS · Linux · Windows (Node.js bridge plugin)</div>
           </article>
         </div>
       </div>
@@ -400,7 +400,7 @@ hyp secret set telegram-bot-token --web</code></pre>
         <div class="harness-tier-shell" aria-label="Harness support tiers">
           <div class="ht-header">
             <h3>Supported harnesses</h3>
-            <span class="ht-platform-note">macOS &amp; Linux full · Windows core (no chat bridges)</span>
+            <span class="ht-platform-note">macOS · Linux · Windows</span>
           </div>
           <div class="ht-grid">
             <div class="ht-row ht-full">
@@ -1742,7 +1742,7 @@ hyp onboard</pre>
             </ol>
 
             <div class="qs-win-callout">
-              <strong>On Windows?</strong> Supports core <code>hyp</code>, MCP, hooks, <code>schtasks</code> service &amp; <code>uninstall.ps1</code>. Chat bridges require macOS, Linux, or WSL.
+              <strong>On Windows?</strong> Full native support: core <code>hyp</code>, MCP, hooks, <code>schtasks</code> service, <code>uninstall.ps1</code>, and optional chat bridges over authenticated loopback TCP.
             </div>
 
             <div class="qs-cta-box">

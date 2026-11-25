@@ -1,20 +1,22 @@
-# Custom Plugin SDK (JSON-RPC 2.0 / fd 3)
+# Custom Plugin SDK (JSON-RPC 2.0 / Cross-Platform IPC)
 
-Write custom chat bridges or event sources in any language that can read and write newline-delimited JSON (`<= 64 KiB` per line) on **file descriptor 3** (supported on **macOS, Linux, and WSL**).
+Write custom chat bridges or event sources in any language that can read and write newline-delimited JSON (`<= 64 KiB` per line) over Hyphae's private subprocess IPC channel — supported natively on **macOS, Linux, and Windows**.
 
 ---
 
 ## 1. Supervisor Contract (`SubprocessSupervisor`)
 
-- **Transport:** Anonymous duplex Unix socketpair duped onto **fd 3** (`HYPHAE_FD=3`, `HYPHAE_PLUGIN=<id>`, `HYPHAE_PROTOCOL=2`). Exit cleanly with code `0` when fd 3 reaches EOF.
-- **Scrubbed environment:** Inherits only `PATH`, `HOME`, `TMPDIR`, `LANG`, `XDG_RUNTIME_DIR`, and `DBUS_SESSION_BUS_ADDRESS` plus entries explicitly listed in `plugins[].env` (resolved from `SecretStore` when using `{ "secret": "<name>" }`).
-- **Framing & Resilience:** Strict 64 KiB `LineSplitter`, exponential restart backoff (`1s -> 60s`), clean `SIGTERM -> SIGKILL` shutdown, and a **`CrashLoopBackOff`** circuit breaker tripping after 5 consecutive rapid crashes.
-- **Redacted stderr logs:** Captured into `<state_dir>/logs/plugin-<id>.log` (`0600`) with configured secret values automatically scrubbed to `[REDACTED]`.
+- **Cross-platform transport:** Both transports carry the exact same NDJSON framing and protocol loop:
+  - **macOS & Linux (`UnixFd3`):** Anonymous duplex Unix socketpair duped onto **fd 3** (`HYPHAE_FD=3`, `HYPHAE_PLUGIN=<id>`, `HYPHAE_PROTOCOL=2`). Exit cleanly with code `0` when fd 3 reaches EOF.
+  - **Windows (`LoopbackTcp`):** Single-accept loopback-only TCP listener on `127.0.0.1:0` with a per-spawn 256-bit CSPRNG token passed in the scrubbed child env (`HYPHAE_PLUGIN_TRANSPORT=tcp`, `HYPHAE_PLUGIN_ADDR=127.0.0.1:<port>`, `HYPHAE_PLUGIN_TOKEN=<hex>`, `HYPHAE_PLUGIN=<id>`, `HYPHAE_PROTOCOL=2`). The child connects, sends one bounded (`<= 4 KiB`) auth line `{"type":"auth","token":"<hex>"}\n`, clears `HYPHAE_PLUGIN_TOKEN` from its environment, and exits cleanly with code `0` when the socket reaches EOF.
+- **Scrubbed environment:** Inherits only safe OS runtime variables (`PATH`, `HOME`, `TMPDIR`, `LANG`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`, plus Windows OS/temp/profile paths on Windows) and entries explicitly listed in `plugins[].env` (resolved from `SecretStore` when using `{ "secret": "<name>" }`).
+- **Framing & Resilience:** Strict 64 KiB `LineSplitter`, exponential restart backoff (`1s -> 60s`), clean shutdown, and a **`CrashLoopBackOff`** circuit breaker tripping after 5 consecutive rapid crashes.
+- **Redacted stderr logs:** Captured into `<state_dir>/logs/plugin-<id>.log` (`0600`) with configured secret values and per-spawn loopback tokens automatically scrubbed to `[REDACTED]`.
 - **Topic isolation:** Bridge topics stay local-only by default unless `"exposeTopic": true` is explicitly configured in `node.json`.
 
 ---
 
-## 2. Option A: JSON-RPC 2.0 over fd 3 (`HYPHAE_PROTOCOL=2`, Recommended)
+## 2. Option A: JSON-RPC 2.0 (`HYPHAE_PROTOCOL=2`, Recommended)
 
 - **`hyphae/hello`** *(notification, host -> plugin)*: `{ "protocol": 2, "plugin": "<id>", "targets": ["..."] }`
 - **`hyphae/publish`** *(request, plugin -> host)*: `{ "target": "<target>", "event": <CloudEvent v1.0> }` -> result `{ "status": "stored" | "duplicate" }`
@@ -23,9 +25,9 @@ Write custom chat bridges or event sources in any language that can read and wri
 
 ---
 
-## 3. Option B: Zero-Dependency fd-3 v1 SDKs (Node & Python)
+## 3. Option B: Zero-Dependency v1 SDKs (Node & Python)
 
-`SubprocessSupervisor` auto-detects legacy fd-3 v1 framing seamlessly. Use [plugins/sdk/client.mjs](../../plugins/sdk/client.mjs) (Node 24+) or [plugins/sdk/client.py](../../plugins/sdk/client.py) (Python 3 stdlib):
+`SubprocessSupervisor` auto-detects legacy v1 framing seamlessly. Use [plugins/sdk/client.mjs](../../plugins/sdk/client.mjs) (Node 24+) or [plugins/sdk/client.py](../../plugins/sdk/client.py) (Python 3 stdlib) — both automatically handle Unix fd 3 and Windows authenticated loopback TCP with zero platform-specific code in your plugin:
 
 ```js
 #!/usr/bin/env node
