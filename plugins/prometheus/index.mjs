@@ -4,12 +4,14 @@
  * Turns Alertmanager webhook POST payloads into filterable CloudEvents 1.0 on fd 3.
  *
  * Configuration via env:
- *   PROMETHEUS_HOST                                         - Bind host (default 127.0.0.1)
- *   PROMETHEUS_PORT                                         - Bind port (default 8793)
- *   PROMETHEUS_PATH                                         - Webhook path (default /alerts)
- *   PROMETHEUS_TOPIC                                        - Target topic (default "alerts" or AGENTS_MESH_TOPIC)
- *   PROMETHEUS_BEARER_TOKEN_FILE or PROMETHEUS_BEARER_TOKEN - Optional Bearer token for Authorization header
- *   PROMETHEUS_WEBHOOK_SECRET_FILE or PROMETHEUS_WEBHOOK_SECRET - Optional HMAC-SHA256 secret for X-Webhook-Signature-256
+ *   PROMETHEUS_HOST                                                 - Bind host (default 127.0.0.1)
+ *   PROMETHEUS_PORT                                                 - Bind port (default 8793)
+ *   PROMETHEUS_PATH                                                 - Webhook path (default /alerts)
+ *   PROMETHEUS_TOPIC                                                - Target topic (default "alerts" or AGENTS_MESH_TOPIC)
+ *   PROMETHEUS_BEARER_TOKEN_FILE or PROMETHEUS_BEARER_TOKEN         - Bearer token for Authorization header
+ *   PROMETHEUS_BASIC_AUTH_FILE or PROMETHEUS_BASIC_AUTH             - Basic auth credentials ("user:pass") for Authorization header
+ *   PROMETHEUS_WEBHOOK_SECRET_FILE or PROMETHEUS_WEBHOOK_SECRET     - HMAC-SHA256 secret for X-Webhook-Signature-256
+ *   PROMETHEUS_ALLOW_UNSIGNED                                       - Set to "1" to explicitly allow unsigned loopback-only webhooks (NEVER permitted on non-loopback binds)
  */
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -19,6 +21,11 @@ import { MeshPluginClient } from "../sdk/client.mjs";
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_SAFE_DATA_BYTES = 7_500;
 const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+
+function isLoopbackHost(h) {
+  const normalized = String(h ?? "").trim().toLowerCase().replace(/^\[|\]$/g, "");
+  return normalized === "127.0.0.1" || normalized === "localhost" || normalized === "::1";
+}
 
 function readOptionalSecret(fileEnv, valEnv) {
   const file = process.env[fileEnv]?.trim();
@@ -112,7 +119,24 @@ const rawPath = process.env.PROMETHEUS_PATH?.trim() || "/alerts";
 const expectedPath = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
 
 const bearerToken = readOptionalSecret("PROMETHEUS_BEARER_TOKEN_FILE", "PROMETHEUS_BEARER_TOKEN");
+const basicAuth = readOptionalSecret("PROMETHEUS_BASIC_AUTH_FILE", "PROMETHEUS_BASIC_AUTH");
 const webhookSecret = readOptionalSecret("PROMETHEUS_WEBHOOK_SECRET_FILE", "PROMETHEUS_WEBHOOK_SECRET");
+const allowUnsigned = process.env.PROMETHEUS_ALLOW_UNSIGNED === "1";
+
+if (!bearerToken && !basicAuth && !webhookSecret) {
+  if (!isLoopbackHost(host)) {
+    throw new Error(
+      `Refusing to start Prometheus plugin on non-loopback host '${host}' without PROMETHEUS_BEARER_TOKEN, PROMETHEUS_BASIC_AUTH, or PROMETHEUS_WEBHOOK_SECRET (unsigned mode is never permitted on non-loopback interfaces)`,
+    );
+  }
+  if (!allowUnsigned) {
+    throw new Error(
+      "Refusing to start Prometheus plugin without PROMETHEUS_BEARER_TOKEN, PROMETHEUS_BASIC_AUTH, or PROMETHEUS_WEBHOOK_SECRET (set PROMETHEUS_ALLOW_UNSIGNED=1 to explicitly allow unsigned loopback-only webhooks)",
+    );
+  }
+}
+
+const expectedBasicB64 = basicAuth ? Buffer.from(basicAuth, "utf8").toString("base64") : null;
 
 const mesh = new MeshPluginClient({
   onDeliveryFailed: (msg) =>
@@ -149,6 +173,15 @@ const server = createServer(async (req, res) => {
     const authHeader = req.headers["authorization"];
     const match = typeof authHeader === "string" ? /^Bearer\s+(.+)$/i.exec(authHeader) : null;
     if (!match || !safeEqual(match[1], bearerToken)) {
+      sendJson(res, 401, { error: "unauthorized" });
+      return;
+    }
+  }
+
+  if (expectedBasicB64) {
+    const authHeader = req.headers["authorization"];
+    const match = typeof authHeader === "string" ? /^Basic\s+(.+)$/i.exec(authHeader) : null;
+    if (!match || !safeEqual(match[1].trim(), expectedBasicB64)) {
       sendJson(res, 401, { error: "unauthorized" });
       return;
     }

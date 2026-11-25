@@ -44,9 +44,26 @@ function resolveApiBase(raw, fallback) {
 }
 
 const apiBase = resolveApiBase(process.env.SLACK_API_BASE, "https://slack.com/api");
-let lastChannel = process.env.SLACK_DEFAULT_CHANNEL?.trim() || null;
-let lastThreadTs = null;
-let lastTs = null;
+const pickNonEmpty = (...values) => {
+  for (const v of values) {
+    if (v !== undefined && v !== null) {
+      const s = String(v).trim();
+      if (s) return s;
+    }
+  }
+  return "";
+};
+const defaultChannel = pickNonEmpty(process.env.SLACK_DEFAULT_CHANNEL, process.env.SLACK_CHANNEL_ID) || null;
+const seenAllowedChannels = new Set();
+for (const envChannel of [process.env.SLACK_DEFAULT_CHANNEL, process.env.SLACK_CHANNEL_ID]) {
+  const clean = pickNonEmpty(envChannel);
+  if (clean) seenAllowedChannels.add(clean);
+}
+if (allowedChannels) {
+  for (const ch of allowedChannels) {
+    seenAllowedChannels.add(ch);
+  }
+}
 const lastTsByChannel = new Map();
 
 const SLACK_EMOJI_MAP = new Map([
@@ -92,6 +109,7 @@ async function slackApi(method, token, payload) {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
     ...(payload ? { body: JSON.stringify(payload) } : {}),
+    signal: AbortSignal.timeout(15_000),
   });
   const body = await res.json();
   if (!body.ok) throw new Error(`Slack ${method} failed: ${body.error ?? res.status}`);
@@ -105,16 +123,30 @@ const mesh = new MeshPluginClient({
     const hasRemoveReaction = typeof params.removeReaction === "string" && params.removeReaction.trim().length > 0;
     const text = typeof params.text === "string" ? params.text.trim() : "";
     if (!hasReaction && !hasRemoveReaction && !text) throw new Error("text or reaction is required");
-    const channel =
-      (typeof params.channel === "string" && params.channel.trim()) ||
-      (typeof params.chatId === "string" && params.chatId.trim()) ||
-      (typeof params.to === "string" && params.to.trim()) ||
-      lastChannel;
+    const explicitChannel = pickNonEmpty(params.channel, params.chatId, params.to);
+    let channel = explicitChannel;
     if (!channel) {
-      throw new Error("No Slack channel specified and no recent inbound channel to reply to (pass channel or set SLACK_DEFAULT_CHANNEL)");
+      if (defaultChannel) {
+        channel = defaultChannel;
+      } else if (seenAllowedChannels.size > 1) {
+        throw new Error(
+          "Multiple Slack channels have been seen/configured; specify an explicit channel or set SLACK_DEFAULT_CHANNEL / SLACK_CHANNEL_ID",
+        );
+      } else if (seenAllowedChannels.size === 1) {
+        channel = seenAllowedChannels.values().next().value;
+      } else {
+        throw new Error(
+          "No Slack channel specified and no recent inbound channel to reply to (pass channel or set SLACK_DEFAULT_CHANNEL)",
+        );
+      }
     }
     if (allowedChannels && !allowedChannels.has(channel)) {
       throw new Error(`Channel '${channel}' is not in SLACK_ALLOWED_CHANNELS`);
+    }
+    if (!seenAllowedChannels.has(channel)) {
+      throw new Error(
+        `Channel '${channel}' is not an allowed or previously seen Slack channel (configure SLACK_ALLOWED_CHANNELS or SLACK_DEFAULT_CHANNEL)`,
+      );
     }
 
     const replyTo = typeof params.replyTo === "string" && params.replyTo.trim() ? params.replyTo.trim() : undefined;
@@ -133,9 +165,9 @@ const mesh = new MeshPluginClient({
       if (!reactionName) {
         throw new Error("Slack reactions.remove requires an emoji name (pass reaction with remove: true)");
       }
-      targetTs = replyTo || explicitThreadTs || lastTsByChannel.get(channel) || lastTs;
+      targetTs = replyTo || explicitThreadTs || lastTsByChannel.get(channel);
       if (!targetTs) {
-        throw new Error("No message timestamp specified via replyTo/threadTs and no recent inbound message to react to");
+        throw new Error(`No message timestamp specified via replyTo/threadTs and no recent inbound message in channel '${channel}' to react to`);
       }
       await slackApi(isRemove ? "reactions.remove" : "reactions.add", botToken, {
         channel,
@@ -204,15 +236,13 @@ async function handleEnvelope(envelope) {
   }
   if (!via) return;
 
-  lastChannel = channel;
-  lastThreadTs = ev.thread_ts ?? ts;
-  if (ts) {
-    lastTs = ts;
-    if (channel) {
-      lastTsByChannel.set(channel, ts);
-      if (lastTsByChannel.size > 1000) {
-        lastTsByChannel.delete(lastTsByChannel.keys().next().value);
-      }
+  if (channel) {
+    seenAllowedChannels.add(channel);
+  }
+  if (ts && channel) {
+    lastTsByChannel.set(channel, ts);
+    if (lastTsByChannel.size > 1000) {
+      lastTsByChannel.delete(lastTsByChannel.keys().next().value);
     }
   }
   const text = String(ev.text ?? "").replace(mentionRe, "").trim().slice(0, 4000);

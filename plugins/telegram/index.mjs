@@ -7,7 +7,7 @@
  *   TELEGRAM_TARGET                                - Target name (defaults to first target in hello)
  *   TELEGRAM_ALLOWED_CHATS                         - Optional comma-separated numeric chat IDs allowlist
  *   TELEGRAM_ALLOWED_USERS                         - Optional comma-separated numeric user IDs allowlist
- *   TELEGRAM_DEFAULT_CHAT                          - Optional default numeric chat ID for outbound hyp_send replies
+ *   TELEGRAM_DEFAULT_CHAT / TELEGRAM_CHAT_ID       - Optional default numeric chat ID for outbound hyp_send replies
  *   TELEGRAM_API_BASE                              - Optional API base URL override (default https://api.telegram.org)
  *   TELEGRAM_STATE_FILE                            - Optional path to persist polling offset JSON (defaults to $HYPHAE_STATE_DIR/telegram-offset.json when HYPHAE_STATE_DIR is set)
  */
@@ -46,11 +46,6 @@ function resolveApiBase(raw, fallback) {
   return value;
 }
 
-const apiBase = resolveApiBase(process.env.TELEGRAM_API_BASE, "https://api.telegram.org");
-let lastChatId = process.env.TELEGRAM_DEFAULT_CHAT?.trim() || null;
-let lastMessageId = null;
-const lastMessageIdByChat = new Map();
-
 function pickNonEmpty(...values) {
   for (const v of values) {
     if (v !== undefined && v !== null) {
@@ -60,6 +55,20 @@ function pickNonEmpty(...values) {
   }
   return "";
 }
+
+const apiBase = resolveApiBase(process.env.TELEGRAM_API_BASE, "https://api.telegram.org");
+const defaultChatId = pickNonEmpty(process.env.TELEGRAM_DEFAULT_CHAT, process.env.TELEGRAM_CHAT_ID) || null;
+const seenAllowedChats = new Set();
+for (const envChat of [process.env.TELEGRAM_DEFAULT_CHAT, process.env.TELEGRAM_CHAT_ID]) {
+  const clean = pickNonEmpty(envChat);
+  if (clean) seenAllowedChats.add(clean);
+}
+if (allowedChats) {
+  for (const chatId of allowedChats) {
+    seenAllowedChats.add(chatId);
+  }
+}
+const lastMessageIdByChat = new Map();
 
 if (!allowedChats && !allowedUsers && !allowAll) {
   throw new Error("Refusing to start Telegram bridge without TELEGRAM_ALLOWED_USERS or TELEGRAM_ALLOWED_CHATS (set TELEGRAM_ALLOW_ALL=1 to explicitly allow any Telegram user)");
@@ -72,12 +81,30 @@ const mesh = new MeshPluginClient({
     const reaction = hasReaction ? params.reaction.trim() : "";
     const text = typeof params.text === "string" ? params.text.trim() : "";
     if (!hasReaction && !text) throw new Error("text or reaction is required");
-    const chatId = pickNonEmpty(params.chatId, params.to, params.channel, lastChatId);
+    const explicitChatId = pickNonEmpty(params.chatId, params.to, params.channel);
+    let chatId = explicitChatId;
     if (!chatId) {
-      throw new Error("No Telegram chatId specified and no recent inbound chat to reply to (pass chatId or set TELEGRAM_DEFAULT_CHAT)");
+      if (defaultChatId) {
+        chatId = defaultChatId;
+      } else if (seenAllowedChats.size > 1) {
+        throw new Error(
+          "Multiple Telegram chats have been seen/configured; specify an explicit chatId or set TELEGRAM_DEFAULT_CHAT / TELEGRAM_CHAT_ID",
+        );
+      } else if (seenAllowedChats.size === 1) {
+        chatId = seenAllowedChats.values().next().value;
+      } else {
+        throw new Error(
+          "No Telegram chatId specified and no recent inbound chat to reply to (pass chatId or set TELEGRAM_DEFAULT_CHAT)",
+        );
+      }
     }
     if (allowedChats && !allowedChats.has(chatId)) {
       throw new Error(`Chat '${chatId}' is not in TELEGRAM_ALLOWED_CHATS`);
+    }
+    if (!seenAllowedChats.has(chatId)) {
+      throw new Error(
+        `Chat '${chatId}' is not an allowed or previously seen Telegram chat (configure TELEGRAM_ALLOWED_CHATS or TELEGRAM_DEFAULT_CHAT)`,
+      );
     }
     const rawReplyTo = params.replyTo !== undefined && params.replyTo !== null ? String(params.replyTo).trim() : "";
     const parsedReplyTo = rawReplyTo && /^\d+$/.test(rawReplyTo) ? Number(rawReplyTo) : undefined;
@@ -91,9 +118,9 @@ const mesh = new MeshPluginClient({
 
     let targetMessageId;
     if (hasReaction) {
-      targetMessageId = replyToMessageId ?? lastMessageIdByChat.get(chatId) ?? lastMessageId;
+      targetMessageId = replyToMessageId ?? lastMessageIdByChat.get(chatId);
       if (targetMessageId === undefined || targetMessageId === null) {
-        throw new Error("No message_id specified via replyTo and no recent inbound message to react to");
+        throw new Error(`No message_id specified via replyTo and no recent inbound message in chat '${chatId}' to react to`);
       }
       const res = await fetch(`${apiBase}/bot${token}/setMessageReaction`, {
         method: "POST",
@@ -186,9 +213,10 @@ while (true) {
         const chatId = String(msg.chat?.id ?? "");
         const userId = String(msg.from?.id ?? "");
         if ((!allowedChats || allowedChats.has(chatId)) && (!allowedUsers || allowedUsers.has(userId))) {
-          if (chatId) lastChatId = chatId;
+          if (chatId) {
+            seenAllowedChats.add(chatId);
+          }
           if (typeof msg.message_id === "number" && Number.isSafeInteger(msg.message_id) && msg.message_id > 0) {
-            lastMessageId = msg.message_id;
             if (chatId) {
               lastMessageIdByChat.set(chatId, msg.message_id);
               if (lastMessageIdByChat.size > 1000) {

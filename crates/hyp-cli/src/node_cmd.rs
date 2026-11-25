@@ -22,6 +22,7 @@ use hyp_harness::daemon::{
 };
 use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync};
 use hyp_node::adapters::github_public::normalize_repo_token_pattern;
+use hyp_node::adapters::supervisor::is_secret_like_env_key;
 use hyp_node::adapters::{
     AdapterKind, GitHubPublicAdapter, GitHubPublicConfig, HelloMode, SubprocessConfig,
 };
@@ -305,7 +306,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
     let mut startup_warnings: Vec<String> = Vec::new();
     let mut github_public_cfg: Option<GitHubPublicConfig> = None;
     let mut delivery_retry_cfg = DeliveryRetryConfig::default();
-    let mut parsed_plugins: Vec<SubprocessConfig> = Vec::new();
+    let mut parsed_plugins: Vec<ParsedPlugin> = Vec::new();
     let mut skipped_plugin_statuses: Vec<Value> = Vec::new();
 
     if let Some(ref cfg) = loaded {
@@ -575,71 +576,66 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             }
         }
 
+        // Collect any explicitly configured top-level `topics[]` names from `node.json`.
+        // Bridge plugins are kept strictly local-only unless explicitly listed here or opted in
+        // via `plugins[].exposeTopic: true`, so paired remote peers with `stream:subscribe=*`
+        // never silently read private local Telegram/Slack/WhatsApp DMs.
+        let explicit_topics = parse_explicit_topic_names(cfg.raw.get("topics"));
+
         // Parse optional `plugins[]` external bridge/source subprocess entries.
-        // Fault isolation: if a single plugin references a missing secret, emit a warning and
-        // skip that plugin instead of aborting the entire daemon.
+        // Fault isolation: individual malformed/misconfigured plugin entries or missing secrets
+        // emit startup warnings and record their status without aborting `hyp node start`.
         if let Some(plugins_val) = cfg.raw.get("plugins") {
             if !plugins_val.is_null() {
-                match parse_plugins_config(
+                let plugins = parse_plugins_config(
                     plugins_val,
                     cfg.path.parent(),
+                    &state_dir,
+                    &explicit_topics,
                     &secrets,
                     &mut startup_warnings,
                     &mut skipped_plugin_statuses,
-                ) {
-                    Ok(plugins) => {
-                        for p in &plugins {
-                            match p.kind {
-                                AdapterKind::Bridge => {
-                                    if !node_cfg.topics.iter().any(|t| t.topic == p.id) {
-                                        node_cfg.topics.push(TopicConfig {
-                                            topic: p.id.clone(),
-                                            kind: Some("bridge".to_string()),
-                                            description: Some(format!(
-                                                "External bridge plugin '{}'",
-                                                p.id
-                                            )),
-                                            metadata: None,
-                                            has_provisioned_publisher: true,
-                                        });
-                                    }
-                                }
-                                AdapterKind::Source => {
-                                    for target in &p.targets {
-                                        if is_valid_topic(target)
-                                            && !node_cfg.topics.iter().any(|t| t.topic == *target)
-                                        {
-                                            node_cfg.topics.push(TopicConfig {
-                                                topic: target.clone(),
-                                                kind: Some("source".to_string()),
-                                                description: Some(format!(
-                                                    "External source plugin '{}'",
-                                                    p.id
-                                                )),
-                                                metadata: None,
-                                                has_provisioned_publisher: true,
-                                            });
-                                        }
-                                    }
-                                }
-                                _ => {}
+                );
+                for p in &plugins {
+                    match p.config.kind {
+                        AdapterKind::Bridge => {
+                            if p.expose_topic
+                                && !node_cfg.topics.iter().any(|t| t.topic == p.config.id)
+                            {
+                                node_cfg.topics.push(TopicConfig {
+                                    topic: p.config.id.clone(),
+                                    kind: Some("bridge".to_string()),
+                                    description: Some(format!(
+                                        "External bridge plugin '{}'",
+                                        p.config.id
+                                    )),
+                                    metadata: None,
+                                    has_provisioned_publisher: true,
+                                });
                             }
                         }
-                        parsed_plugins = plugins;
-                    }
-                    Err(e) => {
-                        return emit_error(
-                            cmd,
-                            as_json,
-                            EXIT_ERROR,
-                            "CONFIG_ERROR",
-                            format!("Invalid plugins config in {}: {e}", cfg.path.display()),
-                            Some(
-                                "Verify plugins[] schema in node.json.".to_string(),
-                            ),
-                        );
+                        AdapterKind::Source => {
+                            for target in &p.config.targets {
+                                if is_valid_topic(target)
+                                    && !node_cfg.topics.iter().any(|t| t.topic == *target)
+                                {
+                                    node_cfg.topics.push(TopicConfig {
+                                        topic: target.clone(),
+                                        kind: Some("source".to_string()),
+                                        description: Some(format!(
+                                            "External source plugin '{}'",
+                                            p.config.id
+                                        )),
+                                        metadata: None,
+                                        has_provisioned_publisher: true,
+                                    });
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
+                parsed_plugins = plugins;
             }
         }
     }
@@ -817,34 +813,43 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         // + outbound BridgePosters into `LocalDaemon`. On non-Unix platforms (e.g. Windows),
         // warn cleanly without breaking compilation or startup.
         #[cfg(unix)]
-        let (running_plugins, mut plugin_statuses) = plugin_runtime::start_plugins(
+        let (running_plugins, plugin_registry) = plugin_runtime::start_plugins(
             parsed_plugins,
+            skipped_plugin_statuses,
+            Arc::clone(&status_doc_state),
             &node,
             local_daemon.as_ref(),
             &mut startup_warnings,
         )
         .await;
 
+        #[cfg(unix)]
+        let plugin_statuses = plugin_registry.snapshot();
+
         #[cfg(not(unix))]
         let mut plugin_statuses: Vec<Value> = {
             let mut statuses = Vec::with_capacity(parsed_plugins.len());
             if !parsed_plugins.is_empty() {
-                let ids: Vec<String> = parsed_plugins.iter().map(|p| p.id.clone()).collect();
+                let ids: Vec<String> = parsed_plugins
+                    .iter()
+                    .map(|p| p.config.id.clone())
+                    .collect();
                 startup_warnings.push(format!(
                     "External fd-3 plugins require Unix; skipping configured plugin(s): {}",
                     ids.join(", ")
                 ));
                 for p in &parsed_plugins {
                     statuses.push(json!({
-                        "id": p.id,
-                        "kind": plugin_kind_str(p.kind),
-                        "targets": p.targets,
+                        "id": p.config.id,
+                        "kind": plugin_kind_str(p.config.kind),
+                        "targets": p.config.targets,
                         "status": "unsupported_platform",
                     }));
                 }
             }
             statuses
         };
+        #[cfg(not(unix))]
         if !skipped_plugin_statuses.is_empty() {
             skipped_plugin_statuses.extend(plugin_statuses);
             plugin_statuses = skipped_plugin_statuses;
@@ -913,6 +918,8 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             let mut guard = status_doc_state.lock().expect("status_doc lock poisoned");
             *guard = Some((status_path.clone(), status_doc.clone()));
         }
+        #[cfg(unix)]
+        plugin_registry.flush_to_status_doc();
 
         let mut warnings = startup_warnings;
         if let Some(w) = legacy_warning {
@@ -1624,189 +1631,403 @@ const fn plugin_kind_str(kind: AdapterKind) -> &'static str {
     }
 }
 
-/// Parses and validates `plugins[]` from `node.json`, resolving any `{ "secret": "<name>" }`
-/// references in `env` via `SecretStore` (isolating per-plugin missing secrets to warnings so a
-/// single misconfigured chat bridge never aborts the entire daemon, and never exposing resolved
-/// secret values in error messages).
+struct ParsedPlugin {
+    config: SubprocessConfig,
+    expose_topic: bool,
+    has_webhook_post_url: bool,
+}
+
+fn parse_explicit_topic_names(topics_val: Option<&Value>) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let Some(arr) = topics_val.and_then(Value::as_array) else {
+        return out;
+    };
+    for item in arr {
+        if let Some(s) = item.as_str() {
+            let trimmed = s.trim().to_ascii_lowercase();
+            if !trimmed.is_empty() {
+                out.insert(trimmed);
+            }
+        } else if let Some(s) = item
+            .as_object()
+            .and_then(|o| o.get("topic"))
+            .and_then(Value::as_str)
+        {
+            let trimmed = s.trim().to_ascii_lowercase();
+            if !trimmed.is_empty() {
+                out.insert(trimmed);
+            }
+        }
+    }
+    out
+}
+
+fn push_plugin_error(
+    id: &str,
+    kind: Option<AdapterKind>,
+    targets: Option<&[String]>,
+    reason: String,
+    warnings: &mut Vec<String>,
+    skipped_statuses: &mut Vec<Value>,
+) {
+    warnings.push(format!(
+        "Skipping misconfigured plugin '{id}' (daemon continuing): {reason}"
+    ));
+    let mut entry = serde_json::Map::new();
+    entry.insert("id".to_string(), json!(id));
+    if let Some(k) = kind {
+        entry.insert("kind".to_string(), json!(plugin_kind_str(k)));
+    }
+    if let Some(t) = targets {
+        entry.insert("targets".to_string(), json!(t));
+    }
+    entry.insert("status".to_string(), json!("error"));
+    entry.insert("error".to_string(), json!(reason));
+    entry.insert("lastError".to_string(), json!(reason));
+    skipped_statuses.push(Value::Object(entry));
+}
+
+/// Parses and validates `plugins[]` from `node.json`, accepting both `"exec"` and `"command"`,
+/// resolving `{ "secret": "<name>" }` references via `SecretStore`, warning on plaintext
+/// secret-like env values, and isolating individual malformed/misconfigured plugin entries into
+/// startup warnings + error/skipped statuses so a single bad plugin never aborts `hyp node start`.
 fn parse_plugins_config(
     plugins_val: &Value,
     config_dir: Option<&Path>,
+    state_dir: &Path,
+    explicit_topics: &HashSet<String>,
     secrets: &hyp_crypto::SecretStore,
     warnings: &mut Vec<String>,
     skipped_statuses: &mut Vec<Value>,
-) -> Result<Vec<SubprocessConfig>, String> {
-    let arr = plugins_val
-        .as_array()
-        .ok_or_else(|| "plugins must be a JSON array".to_string())?;
+) -> Vec<ParsedPlugin> {
+    let Some(arr) = plugins_val.as_array() else {
+        let reason = "plugins must be a JSON array".to_string();
+        warnings.push(format!(
+            "Skipping 'plugins' configuration (daemon continuing): {reason}"
+        ));
+        skipped_statuses.push(json!({
+            "id": "plugins",
+            "status": "error",
+            "error": reason,
+            "lastError": reason,
+        }));
+        return Vec::new();
+    };
 
     let mut seen_ids: HashSet<String> = HashSet::new();
-    let mut configs: Vec<SubprocessConfig> = Vec::new();
+    let mut configs: Vec<ParsedPlugin> = Vec::new();
 
     for (idx, entry) in arr.iter().enumerate() {
-        let obj = entry
-            .as_object()
-            .ok_or_else(|| format!("plugins[{idx}] must be a JSON object"))?;
+        let fallback_id = format!("plugins[{idx}]");
+        let Some(obj) = entry.as_object() else {
+            push_plugin_error(
+                &fallback_id,
+                None,
+                None,
+                format!("plugins[{idx}] must be a JSON object"),
+                warnings,
+                skipped_statuses,
+            );
+            continue;
+        };
 
         if obj.get("enabled").and_then(Value::as_bool) == Some(false) {
             continue;
         }
 
-        let raw_id = obj
+        let Some(raw_id) = obj
             .get("id")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| format!("plugins[{idx}].id must be a non-empty string"))?;
+        else {
+            push_plugin_error(
+                &fallback_id,
+                None,
+                None,
+                format!("plugins[{idx}].id must be a non-empty string"),
+                warnings,
+                skipped_statuses,
+            );
+            continue;
+        };
         let id = raw_id.to_ascii_lowercase();
         if !is_valid_handle(&id) {
-            return Err(format!(
-                "plugins[{idx}].id '{raw_id}' is not a valid identifier (expected /^[a-z0-9][a-z0-9._-]{{0,63}}$/)"
-            ));
+            push_plugin_error(
+                raw_id,
+                None,
+                None,
+                format!(
+                    "plugins[{idx}].id '{raw_id}' is not a valid identifier (expected /^[a-z0-9][a-z0-9._-]{{0,63}}$/)"
+                ),
+                warnings,
+                skipped_statuses,
+            );
+            continue;
         }
         if !seen_ids.insert(id.clone()) {
-            return Err(format!("duplicate plugin id '{id}' in plugins[]"));
+            push_plugin_error(
+                &id,
+                None,
+                None,
+                format!("duplicate plugin id '{id}' in plugins[]"),
+                warnings,
+                skipped_statuses,
+            );
+            continue;
         }
 
-        let kind = match obj.get("kind").and_then(Value::as_str) {
-            None | Some("bridge") => AdapterKind::Bridge,
-            Some("source") => AdapterKind::Source,
+        let explicit_kind = match obj.get("kind") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) if s == "bridge" => Some(AdapterKind::Bridge),
+            Some(Value::String(s)) if s == "source" => Some(AdapterKind::Source),
             Some(other) => {
-                return Err(format!(
-                    "plugins[{id}].kind '{other}' is invalid (expected 'bridge' or 'source')"
-                ));
+                push_plugin_error(
+                    &id,
+                    None,
+                    None,
+                    format!(
+                        "plugins[{id}].kind {other} is invalid (expected 'bridge' or 'source')"
+                    ),
+                    warnings,
+                    skipped_statuses,
+                );
+                continue;
             }
         };
 
-        let exec = obj
-            .get("exec")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| format!("plugins[{id}].exec must be a non-empty string"))?
-            .to_string();
+        let exec_opt = match obj.get("exec") {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
+            Some(_) => Err(format!("plugins[{id}].exec must be a non-empty string")),
+        };
+        let command_opt = match obj.get("command") {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
+            Some(_) => Err(format!("plugins[{id}].command must be a non-empty string")),
+        };
+        let exec = match (exec_opt, command_opt) {
+            (Ok(Some(e)), Ok(Some(c))) => {
+                if e != c {
+                    warnings.push(format!(
+                        "plugins[{id}] defines both 'exec' and 'command' with different values; preferring 'exec'."
+                    ));
+                }
+                e
+            }
+            (Ok(Some(e)), Ok(None)) => e,
+            (Ok(None), Ok(Some(c))) => c,
+            (Err(e), _) | (_, Err(e)) => {
+                push_plugin_error(&id, explicit_kind, None, e, warnings, skipped_statuses);
+                continue;
+            }
+            (Ok(None), Ok(None)) => {
+                push_plugin_error(
+                    &id,
+                    explicit_kind,
+                    None,
+                    format!("plugins[{id}] must specify a non-empty 'exec' or 'command' string"),
+                    warnings,
+                    skipped_statuses,
+                );
+                continue;
+            }
+        };
 
         let args = match obj.get("args") {
-            None | Some(Value::Null) => Vec::new(),
-            Some(val) => {
-                let raw_args = val
-                    .as_array()
-                    .ok_or_else(|| format!("plugins[{id}].args must be an array of strings"))?;
-                let mut out = Vec::with_capacity(raw_args.len());
-                for (aidx, item) in raw_args.iter().enumerate() {
-                    let s = item.as_str().ok_or_else(|| {
-                        format!("plugins[{id}].args[{aidx}] must be a string")
-                    })?;
-                    out.push(s.to_string());
+            None | Some(Value::Null) => Ok(Vec::new()),
+            Some(val) => match val.as_array() {
+                Some(raw_args) => {
+                    let mut out = Vec::with_capacity(raw_args.len());
+                    let mut err = None;
+                    for (aidx, item) in raw_args.iter().enumerate() {
+                        if let Some(s) = item.as_str() {
+                            out.push(s.to_string());
+                        } else {
+                            err = Some(format!("plugins[{id}].args[{aidx}] must be a string"));
+                            break;
+                        }
+                    }
+                    match err {
+                        Some(e) => Err(e),
+                        None => Ok(out),
+                    }
                 }
-                out
+                None => Err(format!("plugins[{id}].args must be an array of strings")),
+            },
+        };
+        let args = match args {
+            Ok(v) => v,
+            Err(e) => {
+                push_plugin_error(&id, explicit_kind, None, e, warnings, skipped_statuses);
+                continue;
             }
         };
 
         let cwd = match obj.get("cwd") {
-            None | Some(Value::Null) => None,
-            Some(val) => {
-                let raw_cwd = val
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| format!("plugins[{id}].cwd must be a non-empty string"))?;
-                let path = PathBuf::from(raw_cwd);
-                if path.is_absolute() {
-                    Some(path)
-                } else if let Some(base) = config_dir {
-                    Some(base.join(path))
-                } else {
-                    Some(path)
+            None | Some(Value::Null) => Ok(None),
+            Some(val) => match val.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(raw_cwd) => {
+                    let path = PathBuf::from(raw_cwd);
+                    if path.is_absolute() {
+                        Ok(Some(path))
+                    } else if let Some(base) = config_dir {
+                        Ok(Some(base.join(path)))
+                    } else {
+                        Ok(Some(path))
+                    }
                 }
+                None => Err(format!("plugins[{id}].cwd must be a non-empty string")),
+            },
+        };
+        let cwd = match cwd {
+            Ok(v) => v,
+            Err(e) => {
+                push_plugin_error(&id, explicit_kind, None, e, warnings, skipped_statuses);
+                continue;
             }
         };
 
-        let targets = {
-            let raw_targets = obj
-                .get("targets")
-                .and_then(Value::as_array)
-                .ok_or_else(|| {
-                    format!("plugins[{id}].targets must be a non-empty array of strings")
-                })?;
-            let mut out = Vec::with_capacity(raw_targets.len());
-            for (tidx, item) in raw_targets.iter().enumerate() {
-                let s = item
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|t| !t.is_empty())
-                    .ok_or_else(|| {
-                        format!("plugins[{id}].targets[{tidx}] must be a non-empty string")
-                    })?;
-                if !out.iter().any(|existing: &String| existing == s) {
-                    out.push(s.to_string());
+        let targets = match obj.get("targets").and_then(Value::as_array) {
+            Some(raw_targets) => {
+                let mut out = Vec::with_capacity(raw_targets.len());
+                let mut err = None;
+                for (tidx, item) in raw_targets.iter().enumerate() {
+                    if let Some(s) = item.as_str().map(str::trim).filter(|t| !t.is_empty()) {
+                        if !out.iter().any(|existing: &String| existing == s) {
+                            out.push(s.to_string());
+                        }
+                    } else {
+                        err = Some(format!(
+                            "plugins[{id}].targets[{tidx}] must be a non-empty string"
+                        ));
+                        break;
+                    }
+                }
+                match err {
+                    Some(e) => Err(e),
+                    None if out.is_empty() => Err(format!(
+                        "plugins[{id}].targets must contain at least one target"
+                    )),
+                    None => Ok(out),
                 }
             }
-            if out.is_empty() {
-                return Err(format!(
-                    "plugins[{id}].targets must contain at least one target"
-                ));
+            None => Err(format!(
+                "plugins[{id}].targets must be a non-empty array of strings"
+            )),
+        };
+        let targets = match targets {
+            Ok(v) => v,
+            Err(e) => {
+                push_plugin_error(&id, explicit_kind, None, e, warnings, skipped_statuses);
+                continue;
             }
-            out
         };
 
         let mut env_map: BTreeMap<String, String> = BTreeMap::new();
+        let mut redacted_values: Vec<String> = Vec::new();
         let mut secret_skip_reason: Option<String> = None;
+        let mut config_error_reason: Option<String> = None;
+        let mut plaintext_warnings: Vec<String> = Vec::new();
+
         if let Some(env_val) = obj.get("env") {
             if !env_val.is_null() {
-                let env_obj = env_val
-                    .as_object()
-                    .ok_or_else(|| format!("plugins[{id}].env must be a JSON object"))?;
-                for (env_key, val) in env_obj {
-                    if env_key.trim().is_empty() {
-                        return Err(format!(
-                            "plugins[{id}].env contains an empty variable name"
-                        ));
+                match env_val.as_object() {
+                    None => {
+                        config_error_reason =
+                            Some(format!("plugins[{id}].env must be a JSON object"));
                     }
-                    match val {
-                        Value::String(s) => {
-                            env_map.insert(env_key.clone(), s.clone());
-                        }
-                        Value::Object(ref_obj) => {
-                            let secret_name = ref_obj
-                                .get("secret")
-                                .and_then(Value::as_str)
-                                .filter(|_| ref_obj.len() == 1)
-                                .ok_or_else(|| {
-                                    format!(
+                    Some(env_obj) => {
+                        for (env_key, val) in env_obj {
+                            if env_key.trim().is_empty() {
+                                config_error_reason = Some(format!(
+                                    "plugins[{id}].env contains an empty variable name"
+                                ));
+                                break;
+                            }
+                            match val {
+                                Value::String(s) => {
+                                    if !s.trim().is_empty() && is_secret_like_env_key(env_key) {
+                                        plaintext_warnings.push(format!(
+                                            "plugins[{id}].env.{env_key} uses a plaintext secret value in node.json; store it with `hyp secret set <name>` and reference {{ \"secret\": \"<name>\" }} instead."
+                                        ));
+                                        redacted_values.push(s.clone());
+                                    }
+                                    env_map.insert(env_key.clone(), s.clone());
+                                }
+                                Value::Object(ref_obj) => {
+                                    let Some(secret_name) = ref_obj
+                                        .get("secret")
+                                        .and_then(Value::as_str)
+                                        .filter(|_| ref_obj.len() == 1)
+                                    else {
+                                        config_error_reason = Some(format!(
+                                            "plugins[{id}].env.{env_key} must be a string or {{ \"secret\": \"<name>\" }}"
+                                        ));
+                                        break;
+                                    };
+                                    if let Err(e) = validate_secret_name(secret_name) {
+                                        config_error_reason = Some(format!(
+                                            "invalid secret name '{secret_name}' in plugins[{id}].env.{env_key}: {e}"
+                                        ));
+                                        break;
+                                    }
+                                    match secrets.get(secret_name) {
+                                        Ok(secret) => {
+                                            redacted_values.push((*secret).clone());
+                                            env_map.insert(env_key.clone(), (*secret).clone());
+                                        }
+                                        Err(CryptoError::SecretNotFound(_)) => {
+                                            secret_skip_reason = Some(format!(
+                                                "plugins[{id}].env.{env_key} references missing secret '{secret_name}'; run `hyp secret set {secret_name}`"
+                                            ));
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            secret_skip_reason = Some(format!(
+                                                "failed to load secret '{secret_name}' for plugins[{id}].env.{env_key}: {e}"
+                                            ));
+                                            break;
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    config_error_reason = Some(format!(
                                         "plugins[{id}].env.{env_key} must be a string or {{ \"secret\": \"<name>\" }}"
-                                    )
-                                })?;
-                            validate_secret_name(secret_name).map_err(|e| {
-                                format!(
-                                    "invalid secret name '{secret_name}' in plugins[{id}].env.{env_key}: {e}"
-                                )
-                            })?;
-                            match secrets.get(secret_name) {
-                                Ok(secret) => {
-                                    env_map.insert(env_key.clone(), (*secret).clone());
-                                }
-                                Err(CryptoError::SecretNotFound(_)) => {
-                                    secret_skip_reason = Some(format!(
-                                        "plugins[{id}].env.{env_key} references missing secret '{secret_name}'; run `hyp secret set {secret_name}`"
-                                    ));
-                                    break;
-                                }
-                                Err(e) => {
-                                    secret_skip_reason = Some(format!(
-                                        "failed to load secret '{secret_name}' for plugins[{id}].env.{env_key}: {e}"
                                     ));
                                     break;
                                 }
                             }
                         }
-                        _ => {
-                            return Err(format!(
-                                "plugins[{id}].env.{env_key} must be a string or {{ \"secret\": \"<name>\" }}"
-                            ));
-                        }
                     }
                 }
             }
+        }
+
+        let has_webhook_post_url = env_map
+            .get("WEBHOOK_POST_URL")
+            .is_some_and(|v| !v.trim().is_empty());
+        let kind = match explicit_kind {
+            Some(k) => k,
+            None => {
+                if id == "prometheus" || (id == "webhook" && !has_webhook_post_url) {
+                    AdapterKind::Source
+                } else {
+                    AdapterKind::Bridge
+                }
+            }
+        };
+
+        if let Some(reason) = config_error_reason {
+            push_plugin_error(
+                &id,
+                Some(kind),
+                Some(&targets),
+                reason,
+                warnings,
+                skipped_statuses,
+            );
+            continue;
         }
 
         if let Some(reason) = secret_skip_reason {
@@ -1819,45 +2040,210 @@ fn parse_plugins_config(
                 "targets": targets,
                 "status": "skipped",
                 "error": reason,
+                "lastError": reason,
             }));
             continue;
         }
 
-        let mut cfg = SubprocessConfig::new(id, kind, exec, args, targets);
+        warnings.extend(plaintext_warnings);
+
+        let explicit_expose = obj
+            .get("exposeTopic")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let expose_topic = match kind {
+            AdapterKind::Source => true,
+            AdapterKind::Bridge => explicit_expose || explicit_topics.contains(&id),
+            _ => false,
+        };
+
+        let mut cfg = SubprocessConfig::new(id.clone(), kind, exec, args, targets);
         cfg.cwd = cwd;
         cfg.env = env_map;
         cfg.hello_mode = HelloMode::Auto;
-        configs.push(cfg);
+        cfg.stderr_log_path = Some(state_dir.join("logs").join(format!("plugin-{id}.log")));
+        cfg.redacted_values = redacted_values;
+        configs.push(ParsedPlugin {
+            config: cfg,
+            expose_topic,
+            has_webhook_post_url,
+        });
     }
 
-    Ok(configs)
+    configs
 }
 
 #[cfg(unix)]
 mod plugin_runtime {
-    use super::plugin_kind_str;
+    use super::{ParsedPlugin, plugin_kind_str};
+    use crate::config_file::write_atomic_json;
     use hyp_harness::daemon::{BoxFuture as DaemonBoxFuture, BridgePoster, LocalDaemon};
     use hyp_node::adapters::{
         AdapterError, AdapterHealth, AdapterKind, BoxFuture as AdapterBoxFuture, NodeAdapter,
-        NodeAdapterHost, PublishErrorCode, PublishOutcome, PublishStatus, SubprocessConfig,
-        SubprocessSupervisor,
+        NodeAdapterHost, PublishErrorCode, PublishOutcome, PublishStatus, SubprocessSupervisor,
     };
     use hyp_node::engine::{NodeError, UnifiedNode};
     use hyp_proto::address::{LOCAL_NODE_ID, is_valid_topic};
     use hyp_proto::cloudevent::CloudEvent as ProtoCloudEvent;
     use hyp_proto::rpc::EventKeyRef;
     use serde_json::{Map, Value, json};
-    use std::collections::BTreeMap;
-    use std::sync::{Arc, Weak};
+    use std::collections::{BTreeMap, HashSet, VecDeque};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex, Weak};
     use std::time::Duration;
 
     const DEFAULT_PLUGIN_POST_TIMEOUT: Duration = Duration::from_secs(15);
+    const LOCAL_BRIDGE_DEDUP_CAPACITY: usize = 4096;
+
+    /// Bounded local `(source, id)` deduplicator used for local-only bridge plugins so duplicate
+    /// inbound bridge deliveries return `PublishStatus::Duplicate` without publishing private
+    /// messages onto remote-subscribable `EventStore` topics.
+    struct LocalEventDedup {
+        order: VecDeque<(String, String)>,
+        seen: HashSet<(String, String)>,
+    }
+
+    impl LocalEventDedup {
+        fn new() -> Self {
+            Self {
+                order: VecDeque::new(),
+                seen: HashSet::new(),
+            }
+        }
+
+        /// Returns `true` if `(source, id)` is newly inserted; `false` if already seen.
+        fn insert(&mut self, source: String, id: String) -> bool {
+            let key = (source, id);
+            if !self.seen.insert(key.clone()) {
+                return false;
+            }
+            self.order.push_back(key);
+            while self.order.len() > LOCAL_BRIDGE_DEDUP_CAPACITY {
+                if let Some(evicted) = self.order.pop_front() {
+                    self.seen.remove(&evicted);
+                }
+            }
+            true
+        }
+    }
+
+    /// Shared live plugin status registry wired into `NodePluginHost::update_status` so health
+    /// transitions, restart counts, crash loops, and redacted `lastError` values immediately
+    /// update `node.status.json` for `hyp status` and `hyp doctor`.
+    pub(super) struct PluginStatusRegistry {
+        entries: Mutex<Vec<Value>>,
+        status_doc: Arc<Mutex<Option<(PathBuf, Value)>>>,
+    }
+
+    struct PluginHealthUpdate<'a> {
+        plugin_id: &'a str,
+        kind: AdapterKind,
+        targets: &'a [String],
+        health: &'a AdapterHealth,
+        restarts: u64,
+        crash_loop_backoff: bool,
+        log_path: Option<&'a PathBuf>,
+    }
+
+    impl PluginStatusRegistry {
+        fn new(
+            initial_entries: Vec<Value>,
+            status_doc: Arc<Mutex<Option<(PathBuf, Value)>>>,
+        ) -> Self {
+            Self {
+                entries: Mutex::new(initial_entries),
+                status_doc,
+            }
+        }
+
+        pub(super) fn snapshot(&self) -> Vec<Value> {
+            self.entries
+                .lock()
+                .expect("plugin status registry lock poisoned")
+                .clone()
+        }
+
+        pub(super) fn flush_to_status_doc(&self) {
+            let latest = self.snapshot();
+            let mut guard = self
+                .status_doc
+                .lock()
+                .expect("status_doc lock poisoned");
+            if let Some((ref path, ref mut doc)) = *guard {
+                if let Some(obj) = doc.as_object_mut() {
+                    obj.insert("plugins".to_string(), Value::Array(latest));
+                }
+                let _ = write_atomic_json(path, doc, true);
+            }
+        }
+
+        fn upsert_entry(&self, entry: Value) {
+            let entry_id = entry
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            {
+                let mut entries = self
+                    .entries
+                    .lock()
+                    .expect("plugin status registry lock poisoned");
+                if let Some(ref id) = entry_id {
+                    if let Some(existing) = entries
+                        .iter_mut()
+                        .find(|e| e.get("id").and_then(Value::as_str) == Some(id.as_str()))
+                    {
+                        *existing = entry;
+                    } else {
+                        entries.push(entry);
+                    }
+                } else {
+                    entries.push(entry);
+                }
+            }
+            self.flush_to_status_doc();
+        }
+
+        fn update_health(&self, update: PluginHealthUpdate<'_>) {
+            let (status_str, last_error) = match update.health {
+                AdapterHealth::Starting => ("starting", None),
+                AdapterHealth::Healthy => ("running", None),
+                AdapterHealth::Degraded(reason) => (
+                    if update.crash_loop_backoff {
+                        "crash_loop_backoff"
+                    } else {
+                        "degraded"
+                    },
+                    Some(reason.as_str()),
+                ),
+                AdapterHealth::Stopped => ("stopped", None),
+            };
+            let mut map = serde_json::Map::new();
+            map.insert("id".to_string(), json!(update.plugin_id));
+            map.insert("kind".to_string(), json!(plugin_kind_str(update.kind)));
+            map.insert("targets".to_string(), json!(update.targets));
+            map.insert("status".to_string(), json!(status_str));
+            map.insert("restarts".to_string(), json!(update.restarts));
+            if let Some(err) = last_error {
+                map.insert("lastError".to_string(), json!(err));
+                map.insert("error".to_string(), json!(err));
+            }
+            if let Some(lp) = update.log_path {
+                map.insert("logPath".to_string(), json!(lp.display().to_string()));
+            }
+            self.upsert_entry(Value::Object(map));
+        }
+    }
 
     struct NodePluginHost {
         plugin_id: String,
         kind: AdapterKind,
+        targets: Vec<String>,
+        expose_topic: bool,
         node: Weak<UnifiedNode>,
         daemon: Option<Weak<LocalDaemon>>,
+        supervisor: Weak<SubprocessSupervisor>,
+        registry: Arc<PluginStatusRegistry>,
+        local_dedup: Mutex<LocalEventDedup>,
     }
 
     impl NodeAdapterHost for NodePluginHost {
@@ -1867,6 +2253,36 @@ mod plugin_runtime {
             event: ProtoCloudEvent,
         ) -> AdapterBoxFuture<'a, Result<PublishOutcome, AdapterError>> {
             Box::pin(async move {
+                // Keep private local chat bridge messages strictly local-only unless the user
+                // explicitly exposed the bridge topic in `node.json` (`topics[]` or `exposeTopic: true`).
+                if self.kind == AdapterKind::Bridge && !self.expose_topic {
+                    let is_new = self
+                        .local_dedup
+                        .lock()
+                        .expect("local bridge dedup lock poisoned")
+                        .insert(event.source.clone(), event.id.clone());
+                    if !is_new {
+                        return Ok(PublishOutcome {
+                            status: PublishStatus::Duplicate,
+                            matched: 0,
+                        });
+                    }
+                    let mut matched = 0usize;
+                    if let Some(daemon) = self.daemon.as_ref().and_then(Weak::upgrade) {
+                        let rendered = render_bridge_cloudevent(&event);
+                        if let Ok(delivered) = daemon
+                            .deliver_bridge_inbound(&self.plugin_id, to, &event.id, &rendered)
+                            .await
+                        {
+                            matched = delivered;
+                        }
+                    }
+                    return Ok(PublishOutcome {
+                        status: PublishStatus::Stored,
+                        matched,
+                    });
+                }
+
                 let Some(node) = self.node.upgrade() else {
                     return Err(AdapterError::NotRunning("unified-node".to_string()));
                 };
@@ -1925,19 +2341,42 @@ mod plugin_runtime {
         fn update_status<'a>(
             &'a self,
             _adapter_id: &'a str,
-            _health: AdapterHealth,
+            health: AdapterHealth,
         ) -> AdapterBoxFuture<'a, ()> {
-            Box::pin(async {})
+            Box::pin(async move {
+                let (restarts, crash_loop_backoff, log_path) = match self.supervisor.upgrade() {
+                    Some(sup) => (
+                        sup.restart_count(),
+                        sup.is_crash_loop_backoff(),
+                        sup.stderr_log_path(),
+                    ),
+                    None => (0, false, None),
+                };
+                self.registry.update_health(PluginHealthUpdate {
+                    plugin_id: &self.plugin_id,
+                    kind: self.kind,
+                    targets: &self.targets,
+                    health: &health,
+                    restarts,
+                    crash_loop_backoff,
+                    log_path: log_path.as_ref(),
+                });
+            })
         }
 
         fn report_delivery_failed<'a>(
             &'a self,
-            _adapter_id: &'a str,
-            _target: &'a str,
-            _events: Vec<EventKeyRef>,
-            _reason: &'a str,
+            adapter_id: &'a str,
+            target: &'a str,
+            events: Vec<EventKeyRef>,
+            reason: &'a str,
         ) -> AdapterBoxFuture<'a, ()> {
-            Box::pin(async {})
+            Box::pin(async move {
+                eprintln!(
+                    "WARN  plugin '{adapter_id}' delivery_failed target={target} count={} reason={reason}",
+                    events.len()
+                );
+            })
         }
     }
 
@@ -2048,41 +2487,55 @@ mod plugin_runtime {
     }
 
     pub(super) async fn start_plugins(
-        configs: Vec<SubprocessConfig>,
+        plugins: Vec<ParsedPlugin>,
+        skipped_statuses: Vec<Value>,
+        status_doc: Arc<Mutex<Option<(PathBuf, Value)>>>,
         node: &Arc<UnifiedNode>,
         local_daemon: Option<&Arc<LocalDaemon>>,
         startup_warnings: &mut Vec<String>,
-    ) -> (Vec<Arc<SubprocessSupervisor>>, Vec<Value>) {
-        let mut started: Vec<Arc<SubprocessSupervisor>> = Vec::with_capacity(configs.len());
-        let mut statuses: Vec<Value> = Vec::with_capacity(configs.len());
+    ) -> (Vec<Arc<SubprocessSupervisor>>, Arc<PluginStatusRegistry>) {
+        let registry = Arc::new(PluginStatusRegistry::new(skipped_statuses, status_doc));
+        let mut started: Vec<Arc<SubprocessSupervisor>> = Vec::with_capacity(plugins.len());
 
-        for cfg in configs {
+        for parsed in plugins {
+            let cfg = parsed.config;
             let plugin_id = cfg.id.clone();
             let kind = cfg.kind;
             let targets = cfg.targets.clone();
+            let log_path = cfg.stderr_log_path.clone();
             let sup = Arc::new(SubprocessSupervisor::new(cfg));
             let host: Arc<dyn NodeAdapterHost> = Arc::new(NodePluginHost {
                 plugin_id: plugin_id.clone(),
                 kind,
+                targets: targets.clone(),
+                expose_topic: parsed.expose_topic,
                 node: Arc::downgrade(node),
                 daemon: local_daemon.map(Arc::downgrade),
+                supervisor: Arc::downgrade(&sup),
+                registry: Arc::clone(&registry),
+                local_dedup: Mutex::new(LocalEventDedup::new()),
             });
 
             if let Err(err) = sup.start(host).await {
                 startup_warnings.push(format!(
                     "Plugin '{plugin_id}' failed to start and was skipped (daemon continuing): {err}"
                 ));
-                statuses.push(json!({
+                registry.upsert_entry(json!({
                     "id": plugin_id,
                     "kind": plugin_kind_str(kind),
                     "targets": targets,
                     "status": "failed",
+                    "restarts": 0,
                     "error": err.to_string(),
+                    "lastError": err.to_string(),
+                    "logPath": log_path.map(|p| p.display().to_string()),
                 }));
                 continue;
             }
 
-            if kind == AdapterKind::Bridge {
+            let register_poster = kind == AdapterKind::Bridge
+                || (plugin_id == "webhook" && parsed.has_webhook_post_url);
+            if register_poster {
                 if let Some(daemon) = local_daemon {
                     daemon.register_bridge_poster_with_targets(
                         &plugin_id,
@@ -2098,16 +2551,21 @@ mod plugin_runtime {
                 }
             }
 
-            statuses.push(json!({
-                "id": plugin_id,
-                "kind": plugin_kind_str(kind),
-                "targets": targets,
-                "status": "running",
-            }));
+            let live_health = sup.health();
+            let live_log = sup.stderr_log_path();
+            registry.update_health(PluginHealthUpdate {
+                plugin_id: &plugin_id,
+                kind,
+                targets: &targets,
+                health: &live_health,
+                restarts: sup.restart_count(),
+                crash_loop_backoff: sup.is_crash_loop_backoff(),
+                log_path: live_log.as_ref(),
+            });
             started.push(sup);
         }
 
-        (started, statuses)
+        (started, registry)
     }
 
     pub(super) async fn stop_plugins(plugins: Vec<Arc<SubprocessSupervisor>>) {
@@ -2244,5 +2702,216 @@ mod tests {
             }
         ]);
         assert!(parse_github_public_source(&bad_cap, &secrets, false, &mut warnings).is_err());
+    }
+
+    fn extract_json_fences_with_plugins(markdown: &str) -> Vec<Value> {
+        let mut out = Vec::new();
+        let mut in_json = false;
+        let mut buf = String::new();
+        for line in markdown.lines() {
+            let trimmed = line.trim();
+            if !in_json {
+                if trimmed == "```json" {
+                    in_json = true;
+                    buf.clear();
+                }
+            } else if trimmed == "```" {
+                in_json = false;
+                if let Ok(val) = serde_json::from_str::<Value>(&buf) {
+                    if val.get("plugins").is_some() {
+                        out.push(val);
+                    }
+                }
+            } else {
+                buf.push_str(line);
+                buf.push('\n');
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn parse_plugins_config_accepts_command_alias_isolates_errors_warns_plaintext_and_infers_webhook_kind() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let secrets = SecretStore::new(tmp.path(), SecretBackend::File);
+        secrets.set("tg-secret", "123456:REAL_BOT_SECRET_VAL").unwrap();
+
+        let plugins = json!([
+            // 1. Documented "command" alias (no "exec")
+            {
+                "id": "telegram",
+                "command": "/usr/bin/env",
+                "args": ["node", "/tmp/tg.mjs"],
+                "targets": ["personal"],
+                "env": {
+                    "TELEGRAM_BOT_TOKEN": { "secret": "tg-secret" },
+                    "TELEGRAM_ALLOWED_USERS": "12345"
+                }
+            },
+            // 2. Both "exec" and "command" differing -> warn & prefer "exec"
+            {
+                "id": "slack",
+                "exec": "/usr/local/bin/node",
+                "command": "/opt/homebrew/bin/node",
+                "args": ["/tmp/slack.mjs"],
+                "targets": ["pm"],
+                "env": {
+                    "SLACK_BOT_TOKEN": "xoxb-plaintext-should-warn-9999",
+                    "SLACK_APP_TOKEN_FILE": "/tmp/app.token"
+                }
+            },
+            // 3. Webhook with omitted kind + WEBHOOK_POST_URL -> Bridge; without -> Source
+            {
+                "id": "webhook",
+                "command": "node",
+                "args": ["/tmp/wh.mjs"],
+                "targets": ["ops"],
+                "env": {
+                    "WEBHOOK_POST_URL": "http://127.0.0.1:9999/cb"
+                }
+            },
+            // 4. Malformed entry (missing exec & command) -> isolated as status: "error"
+            {
+                "id": "broken-no-cmd",
+                "targets": ["ops"]
+            },
+            // 5. Malformed entry (invalid id) -> isolated as status: "error"
+            {
+                "id": "../escape",
+                "command": "node",
+                "targets": ["ops"]
+            },
+            // 6. Malformed entry (bad env ref) -> isolated as status: "error"
+            {
+                "id": "broken-env",
+                "command": "node",
+                "targets": ["ops"],
+                "env": { "BAD_VAR": 42 }
+            },
+            // 7. Missing secret -> isolated as status: "skipped"
+            {
+                "id": "missing-sec",
+                "command": "node",
+                "targets": ["ops"],
+                "env": { "MY_TOKEN": { "secret": "does-not-exist" } }
+            },
+            // 8. Non-object entry -> isolated as status: "error"
+            "not-an-object"
+        ]);
+
+        let mut warnings = Vec::new();
+        let mut skipped = Vec::new();
+        let explicit_topics = HashSet::new();
+        let parsed = parse_plugins_config(
+            &plugins,
+            None,
+            tmp.path(),
+            &explicit_topics,
+            &secrets,
+            &mut warnings,
+            &mut skipped,
+        );
+
+        assert_eq!(parsed.len(), 3, "expected 3 valid plugins, got {}", parsed.len());
+        assert_eq!(parsed[0].config.id, "telegram");
+        assert_eq!(parsed[0].config.exec, "/usr/bin/env");
+        assert_eq!(parsed[0].config.kind, AdapterKind::Bridge);
+        assert!(!parsed[0].expose_topic, "bridge topics must default local-only");
+        assert!(
+            parsed[0]
+                .config
+                .redacted_values
+                .iter()
+                .any(|v| v == "123456:REAL_BOT_SECRET_VAL")
+        );
+
+        assert_eq!(parsed[1].config.id, "slack");
+        assert_eq!(parsed[1].config.exec, "/usr/local/bin/node");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("both 'exec' and 'command'") && w.contains("preferring 'exec'")),
+            "expected warning when exec & command differ: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("SLACK_BOT_TOKEN") && w.contains("plaintext") && w.contains("secret")),
+            "expected plaintext secret warning for SLACK_BOT_TOKEN: {warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("SLACK_APP_TOKEN_FILE")),
+            "*_FILE env var must NOT trigger plaintext warning: {warnings:?}"
+        );
+        for w in &warnings {
+            assert!(
+                !w.contains("xoxb-plaintext-should-warn-9999")
+                    && !w.contains("123456:REAL_BOT_SECRET_VAL"),
+                "warning leaked secret value: {w}"
+            );
+        }
+
+        assert_eq!(parsed[2].config.id, "webhook");
+        assert_eq!(parsed[2].config.kind, AdapterKind::Bridge);
+        assert!(parsed[2].has_webhook_post_url);
+
+        // Verify isolated errors vs skipped missing secret
+        assert_eq!(skipped.len(), 5, "expected 5 skipped/error entries: {skipped:?}");
+        let by_id = |id: &str| {
+            skipped
+                .iter()
+                .find(|v| v.get("id").and_then(Value::as_str) == Some(id))
+                .cloned()
+        };
+        assert_eq!(by_id("broken-no-cmd").unwrap()["status"], "error");
+        assert_eq!(by_id("../escape").unwrap()["status"], "error");
+        assert_eq!(by_id("broken-env").unwrap()["status"], "error");
+        assert_eq!(by_id("missing-sec").unwrap()["status"], "skipped");
+        assert_eq!(by_id("plugins[7]").unwrap()["status"], "error");
+    }
+
+    #[test]
+    fn parse_plugins_config_parses_actual_documented_snippets_from_docs_and_skill() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repo root");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let secrets = SecretStore::new(tmp.path(), SecretBackend::File);
+        for name in ["telegram-bot-token", "slack-app-token", "slack-bot-token"] {
+            secrets.set(name, &format!("test-val-{name}")).unwrap();
+        }
+
+        let explicit_topics = HashSet::new();
+        for rel in ["docs/plugins.md", "skills/hyphae-setup/SKILL.md"] {
+            let content = fs::read_to_string(repo_root.join(rel))
+                .unwrap_or_else(|e| panic!("failed reading {rel}: {e}"));
+            let snippets = extract_json_fences_with_plugins(&content);
+            assert!(
+                !snippets.is_empty(),
+                "expected at least one plugins[] JSON snippet in {rel}"
+            );
+            for (idx, snippet) in snippets.iter().enumerate() {
+                let mut warnings = Vec::new();
+                let mut skipped = Vec::new();
+                let parsed = parse_plugins_config(
+                    &snippet["plugins"],
+                    None,
+                    tmp.path(),
+                    &explicit_topics,
+                    &secrets,
+                    &mut warnings,
+                    &mut skipped,
+                );
+                assert!(
+                    skipped.is_empty(),
+                    "{rel} snippet #{idx} had skipped/errored plugins: {skipped:?} warnings={warnings:?}"
+                );
+                assert!(
+                    !parsed.is_empty(),
+                    "{rel} snippet #{idx} parsed zero plugins"
+                );
+            }
+        }
     }
 }
