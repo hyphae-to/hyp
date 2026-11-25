@@ -1,4 +1,5 @@
 import { createReadStream, createWriteStream } from "node:fs";
+import net from "node:net";
 import { createInterface } from "node:readline";
 
 const DEFAULT_ACK_TIMEOUT_MS = 60_000;
@@ -9,8 +10,42 @@ function correlationIdForEvent(event) {
   return Array.from(event.id).slice(0, MAX_ECHO_ID_CHARS).join("");
 }
 
+function parseLoopbackAddr(raw) {
+  const trimmed = String(raw ?? "").trim();
+  let host = "";
+  let portStr = "";
+  if (trimmed.startsWith("[")) {
+    const closeIdx = trimmed.indexOf("]");
+    if (closeIdx < 0 || trimmed[closeIdx + 1] !== ":") {
+      throw new Error(`Invalid HYPHAE_PLUGIN_ADDR: ${trimmed}`);
+    }
+    host = trimmed.slice(1, closeIdx);
+    portStr = trimmed.slice(closeIdx + 2);
+  } else {
+    const colonIdx = trimmed.lastIndexOf(":");
+    if (colonIdx <= 0 || trimmed.indexOf(":") !== colonIdx) {
+      throw new Error(`Invalid HYPHAE_PLUGIN_ADDR: ${trimmed}`);
+    }
+    host = trimmed.slice(0, colonIdx);
+    portStr = trimmed.slice(colonIdx + 1);
+  }
+  const normalizedHost = host.trim().toLowerCase();
+  if (normalizedHost !== "127.0.0.1" && normalizedHost !== "::1" && normalizedHost !== "localhost") {
+    throw new Error(`Refusing non-loopback HYPHAE_PLUGIN_ADDR host '${host}'`);
+  }
+  if (!/^\d+$/.test(portStr)) {
+    throw new Error(`Invalid HYPHAE_PLUGIN_ADDR port: ${portStr}`);
+  }
+  const port = Number(portStr);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid HYPHAE_PLUGIN_ADDR port: ${portStr}`);
+  }
+  return { host: normalizedHost, port };
+}
+
 /**
- * Minimal Node 24 client for the Hyphae local plugin channel (fd 3, protocol v1).
+ * Minimal Node 24 client for the Hyphae local plugin channel
+ * (Unix fd 3 or authenticated loopback TCP via HYPHAE_PLUGIN_ADDR, protocol v1).
  */
 export class MeshPluginClient {
   plugin;
@@ -23,7 +58,7 @@ export class MeshPluginClient {
   #onError;
 
   constructor({
-    fd = Number(process.env.HYPHAE_FD ?? process.env.AGENTS_MESH_FD ?? process.env.T3_MESH_FD ?? 3),
+    fd,
     onStatus,
     onDeliveryFailed,
     onPost,
@@ -32,13 +67,48 @@ export class MeshPluginClient {
     this.plugin = process.env.HYPHAE_PLUGIN ?? process.env.AGENTS_MESH_PLUGIN ?? process.env.T3_MESH_PLUGIN ?? "plugin";
     this.#onPost = onPost;
     this.#onError = onError;
-    this.#out = createWriteStream("", { fd, autoClose: false });
-    const input = createReadStream("", { fd, autoClose: false });
+
+    const pluginAddr = fd === undefined ? process.env.HYPHAE_PLUGIN_ADDR?.trim() : "";
+    let input;
+    let tcpSock = null;
+    if (pluginAddr) {
+      const { host, port } = parseLoopbackAddr(pluginAddr);
+      const token = process.env.HYPHAE_PLUGIN_TOKEN ?? "";
+      delete process.env.HYPHAE_PLUGIN_TOKEN;
+      if (!token) {
+        throw new Error("HYPHAE_PLUGIN_TOKEN is required when HYPHAE_PLUGIN_ADDR is set");
+      }
+      tcpSock = net.createConnection({ host, port });
+      tcpSock.setNoDelay(true);
+      tcpSock.write(JSON.stringify({ type: "auth", token }) + "\n");
+      this.#out = tcpSock;
+      input = tcpSock;
+    } else {
+      const resolvedFd = fd ?? Number(process.env.HYPHAE_FD ?? process.env.AGENTS_MESH_FD ?? process.env.T3_MESH_FD ?? 3);
+      this.#out = createWriteStream("", { fd: resolvedFd, autoClose: false });
+      input = createReadStream("", { fd: resolvedFd, autoClose: false });
+    }
+
     const rl = createInterface({ input });
     rl.on("error", () => {});
 
     this.ready = new Promise((resolve, reject) => {
       let greeted = false;
+      let settled = false;
+      const failReady = (err) => {
+        if (!settled) {
+          settled = true;
+          reject(err);
+        }
+      };
+      if (tcpSock) {
+        tcpSock.on("error", (err) => {
+          this.#closed = true;
+          if (!greeted) {
+            failReady(err);
+          }
+        });
+      }
       rl.on("line", (line) => {
         if (!line.trim()) return;
         let msg;
@@ -46,10 +116,11 @@ export class MeshPluginClient {
         if (!greeted) {
           greeted = true;
           if (msg.type !== "hello" || msg.protocol !== 1 || !Array.isArray(msg.targets)) {
-            reject(new Error(`Unexpected mesh plugin hello: ${line}`));
+            failReady(new Error(`Unexpected mesh plugin hello: ${line}`));
             return;
           }
           this.targets = msg.targets;
+          settled = true;
           resolve(msg);
           return;
         }
@@ -65,7 +136,7 @@ export class MeshPluginClient {
       });
       rl.on("close", () => {
         this.#closed = true;
-        if (!greeted) reject(new Error("Mesh plugin channel closed before hello"));
+        if (!greeted) failReady(new Error("Mesh plugin channel closed before hello"));
         const closedErr = new Error("Mesh plugin channel closed");
         for (const bucket of this.#pending.values()) {
           while (bucket.length > 0) {
@@ -80,7 +151,9 @@ export class MeshPluginClient {
           clearTimeout(entry.timer);
           entry.reject(closedErr);
         }
-        process.exit(0);
+        if (greeted) {
+          process.exit(0);
+        }
       });
     });
   }

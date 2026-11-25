@@ -923,10 +923,9 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             None
         };
 
-        // Start configured external fd-3 bridge/source plugins on Unix and wire bridge targets
-        // + outbound BridgePosters into `LocalDaemon`. On non-Unix platforms (e.g. Windows),
-        // warn cleanly without breaking compilation or startup.
-        #[cfg(unix)]
+        // Start configured external bridge/source plugins (Unix fd-3 on Unix, authenticated
+        // loopback-TCP on Windows) and wire bridge targets + outbound BridgePosters into
+        // `LocalDaemon`.
         let (running_plugins, plugin_registry) = plugin_runtime::start_plugins(
             parsed_plugins,
             skipped_plugin_statuses,
@@ -937,37 +936,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         )
         .await;
 
-        #[cfg(unix)]
         let plugin_statuses = plugin_registry.snapshot();
-
-        #[cfg(not(unix))]
-        let mut plugin_statuses: Vec<Value> = {
-            let mut statuses = Vec::with_capacity(parsed_plugins.len());
-            if !parsed_plugins.is_empty() {
-                let ids: Vec<String> = parsed_plugins
-                    .iter()
-                    .map(|p| p.config.id.clone())
-                    .collect();
-                startup_warnings.push(format!(
-                    "External fd-3 plugins require Unix; skipping configured plugin(s): {}",
-                    ids.join(", ")
-                ));
-                for p in &parsed_plugins {
-                    statuses.push(json!({
-                        "id": p.config.id,
-                        "kind": plugin_kind_str(p.config.kind),
-                        "targets": p.config.targets,
-                        "status": "unsupported_platform",
-                    }));
-                }
-            }
-            statuses
-        };
-        #[cfg(not(unix))]
-        if !skipped_plugin_statuses.is_empty() {
-            skipped_plugin_statuses.extend(plugin_statuses);
-            plugin_statuses = skipped_plugin_statuses;
-        }
 
         let mut bound_addr: Option<SocketAddr> = None;
         let mut server_handle = None;
@@ -1032,7 +1001,6 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             let mut guard = status_doc_state.lock().expect("status_doc lock poisoned");
             *guard = Some((status_path.clone(), status_doc.clone()));
         }
-        #[cfg(unix)]
         plugin_registry.flush_to_status_doc();
 
         let mut warnings = startup_warnings;
@@ -1139,7 +1107,6 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
 
         wait_for_shutdown_signal().await;
 
-        #[cfg(unix)]
         plugin_runtime::stop_plugins(running_plugins).await;
 
         if let Some(ingest_srv) = local_ingest_server {
@@ -2704,7 +2671,6 @@ fn parse_plugins_config(
     configs
 }
 
-#[cfg(unix)]
 mod plugin_runtime {
     use super::{ParsedPlugin, plugin_kind_str};
     use crate::config_file::write_atomic_json;

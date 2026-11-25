@@ -2,10 +2,10 @@
 //! plaintext secret warnings, doc snippet parity, CrashLoopBackOff `node.status.json`
 //! observability, and local-only bridge topics).
 //!
-//! Spawns the real compiled `hyp` binary in isolated temp dirs with `HYPHAE_SECRET_BACKEND=file`.
+//! Spawns the real compiled `hyp` binary in isolated temp dirs with `HYPHAE_SECRET_BACKEND=file`
+//! on BOTH Unix (fd-3) and Windows (authenticated loopback-TCP).
 
-#[cfg(unix)]
-mod unix_plugin_config_e2e {
+mod plugin_config_e2e {
     use http::{Method, Request, StatusCode, header};
     use http_body_util::{BodyExt, Full};
     use hyp_crypto::keystore::{SecretBackend, SecretStore};
@@ -16,6 +16,7 @@ mod unix_plugin_config_e2e {
     use serde_json::{Value, json};
     use std::fs;
     use std::io::{BufRead, BufReader};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
@@ -44,9 +45,42 @@ mod unix_plugin_config_e2e {
         }
     }
 
+    fn find_python3_binary() -> Option<String> {
+        for candidate in ["python3", "python"] {
+            let Ok(out) = Command::new(candidate)
+                .args(["-c", "import sys; print(sys.version_info[0])"])
+                .output()
+            else {
+                continue;
+            };
+            if out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "3" {
+                return Some(candidate.to_string());
+            }
+        }
+        None
+    }
+
+    /// Minimal cross-platform Python noop plugin supporting both Unix fd-3 and Windows loopback-TCP.
+    const CROSS_PLATFORM_NOOP_PLUGIN_PY: &str = r#"import json, os, socket, sys
+addr = (os.environ.get("HYPHAE_PLUGIN_ADDR") or "").strip()
+if addr:
+    host, port_s = addr.rsplit(":", 1)
+    token = os.environ.pop("HYPHAE_PLUGIN_TOKEN", "")
+    s = socket.create_connection((host.strip("[]"), int(port_s)), timeout=10.0)
+    s.settimeout(None)
+    s.sendall((json.dumps({"type": "auth", "token": token}) + "\n").encode("utf-8"))
+else:
+    s = socket.socket(fileno=3)
+while True:
+    data = s.recv(1024)
+    if not data:
+        sys.exit(0)
+"#;
+
     fn isolated_cmd(home: &Path) -> Command {
         let mut cmd = Command::new(hyp_bin());
         cmd.env("HOME", home)
+            .env("USERPROFILE", home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("HYPHAE_SECRET_BACKEND", "file")
             .env_remove("HYPHAE_CONFIG")
@@ -98,19 +132,22 @@ mod unix_plugin_config_e2e {
         }
 
         fn shutdown(&mut self) {
-            let pid = self.child.id() as i32;
-            unsafe {
-                unsafe extern "C" {
-                    fn kill(pid: i32, sig: i32) -> i32;
+            #[cfg(unix)]
+            {
+                let pid = self.child.id() as i32;
+                unsafe {
+                    unsafe extern "C" {
+                        fn kill(pid: i32, sig: i32) -> i32;
+                    }
+                    let _ = kill(pid, 15);
                 }
-                let _ = kill(pid, 15);
-            }
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline {
-                if let Ok(Some(_)) = self.child.try_wait() {
-                    return;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < deadline {
+                    if let Ok(Some(_)) = self.child.try_wait() {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(25));
                 }
-                thread::sleep(Duration::from_millis(25));
             }
             let _ = self.child.kill();
             let _ = self.child.wait();
@@ -151,7 +188,7 @@ mod unix_plugin_config_e2e {
 
     #[test]
     fn documented_plugins_json_snippets_boot_real_hyp_daemon() {
-        let Some(python_bin) = find_binary("python3") else {
+        let Some(python_bin) = find_python3_binary() else {
             eprintln!("SKIP documented_plugins_json_snippets_boot_real_hyp_daemon: python3 missing");
             return;
         };
@@ -159,11 +196,7 @@ mod unix_plugin_config_e2e {
         let root = repo_root();
         let tmp = TempDir::new().unwrap();
         let noop_plugin = tmp.path().join("noop_plugin.py");
-        fs::write(
-            &noop_plugin,
-            "import socket, sys, time\ns = socket.socket(fileno=3)\nwhile True:\n    data = s.recv(1024)\n    if not data:\n        sys.exit(0)\n",
-        )
-        .unwrap();
+        fs::write(&noop_plugin, CROSS_PLATFORM_NOOP_PLUGIN_PY).unwrap();
 
         // Extract the REAL documented JSON snippets from BOTH docs/plugins.md and
         // skills/hyphae-setup/SKILL.md and boot `hyp daemon` using their exact schema (including `"command"`)!
@@ -250,7 +283,7 @@ mod unix_plugin_config_e2e {
 
     #[test]
     fn command_and_exec_isolation_plaintext_warning_and_crash_loop_status_e2e() {
-        let Some(python_bin) = find_binary("python3") else {
+        let Some(python_bin) = find_python3_binary() else {
             eprintln!("SKIP command_and_exec_isolation_plaintext_warning_and_crash_loop_status_e2e: python3 missing");
             return;
         };
@@ -262,11 +295,7 @@ mod unix_plugin_config_e2e {
         fs::create_dir_all(&state_dir).unwrap();
 
         let good_plugin = tmp.path().join("good_plugin.py");
-        fs::write(
-            &good_plugin,
-            "import socket, sys\ns = socket.socket(fileno=3)\nwhile True:\n    if not s.recv(1024):\n        sys.exit(0)\n",
-        )
-        .unwrap();
+        fs::write(&good_plugin, CROSS_PLATFORM_NOOP_PLUGIN_PY).unwrap();
 
         let crash_plugin = tmp.path().join("crash_plugin.py");
         fs::write(
@@ -419,14 +448,17 @@ mod unix_plugin_config_e2e {
         );
         assert!(!last_err.contains(stored_crash_secret));
 
-        // Verify per-plugin stderr log file exists with 0600 permissions and redacted content!
+        // Verify per-plugin stderr log file exists with 0600 permissions (on Unix) and redacted content!
         let log_path = state_dir.join("logs").join("plugin-crasher.log");
         assert!(log_path.is_file(), "expected {}", log_path.display());
         let log_raw = fs::read_to_string(&log_path).unwrap();
         assert!(log_raw.contains("boot error with key=[REDACTED]"));
         assert!(!log_raw.contains(stored_crash_secret));
-        let mode = fs::metadata(&log_path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "plugin stderr log must be 0600");
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(&log_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "plugin stderr log must be 0600");
+        }
 
         daemon.shutdown();
     }
