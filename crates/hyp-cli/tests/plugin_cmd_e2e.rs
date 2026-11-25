@@ -785,7 +785,8 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
     assert!(offline_home.join(".claude.json").is_file());
     assert!(offline_home.join(".claude/settings.json").is_file());
     assert!(offline_home.join(".claude/commands/hyphae.md").is_file());
-    assert!(offline_home.join(".config/herdr/hyphae.json").is_file());
+    assert!(!offline_home.join(".config/herdr/hyphae.json").exists());
+    assert!(offline_home.join(".config/herdr/skills/hyphae/SKILL.md").is_file());
     // Non-Rust UI mods were skipped gracefully with actionable next commands!
     let next_steps: Vec<String> = offline_json["next"]
         .as_array()
