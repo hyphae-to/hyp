@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -117,6 +117,13 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub trait PeersReloader: Send + Sync {
     fn reload_peers<'a>(&'a self) -> BoxFuture<'a, Result<PeerReconcileReport, String>>;
 }
+
+/// Pluggable callback invoked by the live `gate.reload` IPC RPC to re-read, validate, and
+/// signature-verify a fresh [`SecurityGatePipeline`] without restarting [`LocalDaemon`].
+///
+/// Returning `Err(...)` fails closed and preserves the previously active pipeline intact.
+pub type GateReloader =
+    Arc<dyn Fn() -> Result<Option<Arc<SecurityGatePipeline>>, String> + Send + Sync>;
 
 /// Pluggable async outbound handler for local chat/webhook bridges (`<plugin>:<target>`).
 ///
@@ -372,7 +379,8 @@ struct SubscriptionRecordMeta {
 
 struct LocalDaemonInner {
     node: Arc<UnifiedNode>,
-    gate: Option<Arc<SecurityGatePipeline>>,
+    gate: Arc<RwLock<Option<Arc<SecurityGatePipeline>>>>,
+    gate_reloader: RwLock<Option<GateReloader>>,
     delivery: Arc<DeliveryEngine>,
     calls: Arc<CallRegistry>,
     config: LocalDaemonConfig,
@@ -622,6 +630,26 @@ impl LocalDaemon {
 
     pub fn calls(&self) -> &Arc<CallRegistry> {
         &self.inner.calls
+    }
+
+    /// Returns the shared hot-reloadable [`SecurityGatePipeline`] slot (e.g. so `LocalIngestServer`
+    /// atomically observes `gate.reload` updates alongside `LocalDaemon`).
+    pub fn gate_slot(&self) -> Arc<RwLock<Option<Arc<SecurityGatePipeline>>>> {
+        Arc::clone(&self.inner.gate)
+    }
+
+    /// Returns a snapshot of the currently active [`SecurityGatePipeline`], if any.
+    pub fn gate(&self) -> Option<Arc<SecurityGatePipeline>> {
+        self.inner.current_gate()
+    }
+
+    /// Registers a live [`GateReloader`] callback invoked by the `gate.reload` IPC RPC.
+    pub fn set_gate_reloader(&self, reloader: GateReloader) {
+        *self
+            .inner
+            .gate_reloader
+            .write()
+            .expect("gate_reloader lock poisoned") = Some(reloader);
     }
 
     /// Registers an explicit native [`PushTransport`] (e.g. `HerdrTransport`, `T3Transport`,
@@ -922,7 +950,7 @@ impl LocalDaemon {
         let now = now_ms();
         let mut gate_downgraded = false;
 
-        if let Some(ref pipeline) = self.inner.gate {
+        if let Some(pipeline) = self.inner.current_gate() {
             let parsed =
                 hyp_node::delivery::ParsedMailboxSource::parse(&origin_node, &source, kind);
             let ce = ProtoCloudEvent {
@@ -1155,7 +1183,8 @@ impl LocalDaemonInner {
         let (ui_rev_tx, _) = watch::channel(1u64);
         Self {
             node,
-            gate,
+            gate: Arc::new(RwLock::new(gate)),
+            gate_reloader: RwLock::new(None),
             delivery: Arc::new(DeliveryEngine::new()),
             calls: Arc::new(CallRegistry::new()),
             config,
@@ -1179,6 +1208,72 @@ impl LocalDaemonInner {
             shutdown_rx,
             next_id: AtomicU64::new(1),
         }
+    }
+
+    fn current_gate(&self) -> Option<Arc<SecurityGatePipeline>> {
+        self.gate
+            .read()
+            .expect("gate lock poisoned")
+            .as_ref()
+            .map(Arc::clone)
+    }
+
+    fn reload_gate(&self) -> Result<(bool, usize, bool, u64), String> {
+        let reloader = self
+            .gate_reloader
+            .read()
+            .expect("gate_reloader lock poisoned")
+            .as_ref()
+            .map(Arc::clone);
+        let Some(reloader) = reloader else {
+            return Err(
+                "gate_reload_not_configured: no gate policy reloader registered on this daemon"
+                    .to_string(),
+            );
+        };
+
+        let candidate = reloader()?;
+        if let Some(ref pipeline) = candidate {
+            pipeline
+                .verify_policy_integrity()
+                .map_err(|e| format!("gate_policy_tampered: {e}"))?;
+            if pipeline.is_policy_tampered() {
+                return Err(
+                    "gate_policy_tampered: gate policy signature verification failed".to_string(),
+                );
+            }
+        }
+
+        let (enabled, filter_count, require_signed_policy) = {
+            let mut guard = self.gate.write().expect("gate lock poisoned");
+            let prev_locked = guard
+                .as_ref()
+                .is_some_and(|p| p.config().require_signed_policy);
+            if prev_locked {
+                let next_locked = candidate
+                    .as_ref()
+                    .is_some_and(|p| p.config().require_signed_policy);
+                if !next_locked {
+                    return Err(
+                        "gate_policy_tampered: refusing to downgrade a locked Security Gate policy to unsigned or disabled via live reload"
+                            .to_string(),
+                    );
+                }
+            }
+            let enabled = candidate.is_some();
+            let filter_count = candidate
+                .as_ref()
+                .map(|p| p.active_filter_count())
+                .unwrap_or(0);
+            let require_signed_policy = candidate
+                .as_ref()
+                .is_some_and(|p| p.config().require_signed_policy);
+            *guard = candidate;
+            (enabled, filter_count, require_signed_policy)
+        };
+
+        let rev = self.bump_ui_rev();
+        Ok((enabled, filter_count, require_signed_policy, rev))
     }
 
     fn current_ui_rev(&self) -> u64 {
@@ -1603,7 +1698,7 @@ impl LocalDaemonInner {
             let mut gate_downgraded =
                 entry.gate_reason.as_deref() == Some("downgraded_to_notify");
             if entry.reviewed_at.is_none() && !already_human_verified {
-                if let Some(ref pipeline) = self.gate {
+                if let Some(pipeline) = self.current_gate() {
                     let parsed = hyp_node::delivery::ParsedMailboxSource::from_entry(&entry);
                     let effective_origin = self.effective_gate_origin(&entry, &parsed);
                     let trust_tier = self.resolve_peer_trust_tier(&effective_origin);
@@ -1924,10 +2019,18 @@ impl LocalDaemonInner {
     /// Returns `Some(terminal_reason)` if a transport reported terminal target unavailability
     /// (`herdr_target_unavailable`, `t3_thread_deleted`, `t3_thread_not_found`).
     async fn flush_session(self: &Arc<Self>, session_id: &str) -> Option<String> {
+        self.flush_session_with_report(session_id).await.0
+    }
+
+    /// Flushes eligible batches and returns `(terminal_error, delivered_any)`.
+    async fn flush_session_with_report(
+        self: &Arc<Self>,
+        session_id: &str,
+    ) -> (Option<String>, bool) {
         {
             let mut f = self.flushing.lock().expect("flushing lock poisoned");
             if !f.insert(session_id.to_string()) {
-                return None;
+                return (None, false);
             }
         }
 
@@ -1949,6 +2052,7 @@ impl LocalDaemonInner {
         };
 
         let mut terminal_error: Option<String> = None;
+        let mut delivered_any = false;
 
         loop {
             let Some(batch) = self.build_batch_for_session(session_id).await else {
@@ -1982,6 +2086,7 @@ impl LocalDaemonInner {
                             .unwrap_or(false);
                     if submitted {
                         self.commit_delivered_batch(session_id, &batch);
+                        delivered_any = true;
                         // Stop loop if notify-only (already marked notified so next iteration would break).
                         continue;
                     }
@@ -2020,6 +2125,7 @@ impl LocalDaemonInner {
                 match transport.deliver(&batch.rendered, push_mode).await {
                     PushOutcome::Delivered => {
                         self.commit_delivered_batch(session_id, &batch);
+                        delivered_any = true;
                         continue;
                     }
                     PushOutcome::Hold { ref reason, .. }
@@ -2083,6 +2189,7 @@ impl LocalDaemonInner {
                 });
                 if tx.send(pkt).is_ok() {
                     self.commit_delivered_batch(session_id, &batch);
+                    delivered_any = true;
                     continue;
                 }
             }
@@ -2113,6 +2220,7 @@ impl LocalDaemonInner {
                 });
                 if waiter.tx.send(pkt).is_ok() {
                     self.commit_delivered_batch(session_id, &batch);
+                    delivered_any = true;
                     continue;
                 }
             }
@@ -2123,7 +2231,7 @@ impl LocalDaemonInner {
             break;
         }
 
-        terminal_error
+        (terminal_error, delivered_any)
     }
 
     async fn default_peer_id(&self) -> Option<String> {
@@ -2544,7 +2652,7 @@ impl LocalDaemonInner {
                         .map_err(|e| ("drop_relay_error".into(), e.to_string()))?;
 
                     let task_node = Arc::clone(&self.node);
-                    let task_gate = self.gate.clone();
+                    let task_gate = Arc::clone(&self.gate);
                     let task_relay = Arc::clone(&local_relay);
                     let mut task_shutdown = self.shutdown_rx.clone();
                     let drop_id_bg = created.drop_id.clone();
@@ -2569,8 +2677,13 @@ impl LocalDaemonInner {
                                 break;
                             };
                             if let Ok(env) = parse_drop_payload_bytes(item.payload.as_slice()) {
+                                let cur_gate = task_gate
+                                    .read()
+                                    .expect("gate lock poisoned")
+                                    .as_ref()
+                                    .map(Arc::clone);
                                 if task_node
-                                    .ingest_human_drop(&env, task_gate.as_deref(), false)
+                                    .ingest_human_drop(&env, cur_gate.as_deref(), false)
                                     .await
                                     .is_ok()
                                 {
@@ -2598,7 +2711,7 @@ impl LocalDaemonInner {
                         create_external_drop(&self.node, &relay_url, ttl_seconds).await?;
                     spawn_external_drop_watcher(
                         Arc::clone(&self.node),
-                        self.gate.clone(),
+                        Arc::clone(&self.gate),
                         self.shutdown_rx.clone(),
                         relay_url.clone(),
                         created.drop_id.clone(),
@@ -4284,7 +4397,7 @@ impl LocalDaemonInner {
         event_type: &str,
         payload: &str,
     ) -> Result<(), (String, String)> {
-        let Some(ref pipeline) = self.gate else {
+        let Some(pipeline) = self.current_gate() else {
             return Ok(());
         };
         let dest_node = parse_address(destination).map(|(n, _)| n.to_string());
@@ -4568,6 +4681,16 @@ async fn handle_connection<R, W>(
                     }
                     "drop.ingest" => {
                         let resp = handle_drop_ingest_rpc(&daemon, &packet).await;
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
+                    "gate.reload" => {
+                        let resp = handle_gate_reload_rpc(&daemon);
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
+                    "inbox.wake" => {
+                        let resp = handle_inbox_wake_rpc(&daemon, &packet).await;
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
                         break;
                     }
@@ -5703,7 +5826,7 @@ async fn create_external_drop(
 
 fn spawn_external_drop_watcher(
     node: Arc<UnifiedNode>,
-    gate: Option<Arc<SecurityGatePipeline>>,
+    gate: Arc<RwLock<Option<Arc<SecurityGatePipeline>>>>,
     mut shutdown_rx: watch::Receiver<bool>,
     relay_url: String,
     drop_id: String,
@@ -5760,8 +5883,13 @@ fn spawn_external_drop_watcher(
                     continue;
                 }
                 if let Ok(env) = parse_drop_payload_bytes(ev.data.as_bytes()) {
+                    let cur_gate = gate
+                        .read()
+                        .expect("gate lock poisoned")
+                        .as_ref()
+                        .map(Arc::clone);
                     if node
-                        .ingest_human_drop(&env, gate.as_deref(), false)
+                        .ingest_human_drop(&env, cur_gate.as_deref(), false)
                         .await
                         .is_ok()
                     {
@@ -5799,6 +5927,7 @@ async fn handle_drop_ingest_rpc(
         .get("overwrite")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let current_gate = daemon.current_gate();
 
     let res = if let Some(token) = packet
         .get("token")
@@ -5808,7 +5937,7 @@ async fn handle_drop_ingest_rpc(
     {
         daemon
             .node
-            .ingest_human_drop_token(token, daemon.gate.as_deref(), overwrite)
+            .ingest_human_drop_token(token, current_gate.as_deref(), overwrite)
             .await
     } else if let Some(env_val) = packet.get("envelope") {
         let env = match serde_json::from_value::<HumanDropEnvelopeV1>(env_val.clone()) {
@@ -5822,7 +5951,7 @@ async fn handle_drop_ingest_rpc(
         };
         daemon
             .node
-            .ingest_human_drop(&env, daemon.gate.as_deref(), overwrite)
+            .ingest_human_drop(&env, current_gate.as_deref(), overwrite)
             .await
     } else {
         return json!({
@@ -5845,6 +5974,104 @@ async fn handle_drop_ingest_rpc(
             })
         }
     }
+}
+
+fn handle_gate_reload_rpc(daemon: &LocalDaemonInner) -> Value {
+    match daemon.reload_gate() {
+        Ok((enabled, filter_count, require_signed_policy, rev)) => json!({
+            "ok": true,
+            "result": {
+                "reloaded": true,
+                "enabled": enabled,
+                "filterCount": filter_count,
+                "requireSignedPolicy": require_signed_policy,
+                "rev": rev,
+            }
+        }),
+        Err(err) => json!({
+            "ok": false,
+            "error": err,
+        }),
+    }
+}
+
+async fn handle_inbox_wake_rpc(
+    daemon: &Arc<LocalDaemonInner>,
+    packet: &Map<String, Value>,
+) -> Value {
+    let explicit_sid = packet
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| is_valid_session_id(s))
+        .map(ToString::to_string);
+    let receipt = packet
+        .get("receipt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+
+    let target_sid = if explicit_sid.is_some() {
+        explicit_sid
+    } else if let Some(ref r) = receipt {
+        let db = daemon.node.db();
+        db.local()
+            .get_mailbox_entry(r)
+            .ok()
+            .flatten()
+            .map(|e| e.session_id)
+    } else {
+        None
+    };
+
+    if let Some(ref r) = receipt {
+        daemon
+            .dismissed_receipts
+            .lock()
+            .expect("dismissed lock poisoned")
+            .remove(r);
+        if let Some(ref sid) = target_sid {
+            let mut guard = daemon.item_meta.lock().expect("item_meta lock poisoned");
+            if let Some(map) = guard.get_mut(sid) {
+                map.remove(r);
+            }
+        }
+    }
+
+    let mut woken = false;
+    if let Some(ref sid) = target_sid {
+        let has_pending = {
+            let db = daemon.node.db();
+            db.local().pending_count(sid).unwrap_or(0) > 0
+        };
+        if has_pending {
+            let (_, delivered) = daemon.flush_session_with_report(sid).await;
+            woken = delivered;
+        }
+    }
+
+    let rev = daemon.bump_ui_rev();
+    let (quarantined_remaining, quarantined_global) = {
+        let db = daemon.node.db();
+        let rem = db
+            .local()
+            .quarantined_count(target_sid.as_deref())
+            .unwrap_or(0);
+        let global = db.local().quarantined_count(None).unwrap_or(0);
+        (rem, global)
+    };
+
+    json!({
+        "ok": true,
+        "result": {
+            "woken": woken,
+            "sessionId": target_sid,
+            "quarantinedRemaining": quarantined_remaining,
+            "quarantinedGlobal": quarantined_global,
+            "rev": rev,
+        }
+    })
 }
 
 // ============================================================================
@@ -6673,20 +6900,22 @@ fn spawn_ui_state_projector(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     let mut rev_rx = inner.subscribe_ui_rev();
+    let mut last_written = *rev_rx.borrow_and_update();
     tokio::spawn(async move {
-        let mut last_written = *rev_rx.borrow_and_update();
         loop {
-            let changed = tokio::select! {
-                res = rev_rx.changed() => res.is_ok(),
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        break;
+            if *rev_rx.borrow_and_update() == last_written {
+                let changed = tokio::select! {
+                    res = rev_rx.changed() => res.is_ok(),
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                        continue;
                     }
-                    continue;
+                };
+                if !changed {
+                    break;
                 }
-            };
-            if !changed {
-                break;
             }
             // Coalesce burst mutations cleanly over UI_PROJECTOR_DEBOUNCE_MS (~100 ms).
             let debounce = tokio::time::sleep(Duration::from_millis(UI_PROJECTOR_DEBOUNCE_MS));

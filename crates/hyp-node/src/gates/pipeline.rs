@@ -126,8 +126,45 @@ impl SecurityGatePipeline {
         &self.config
     }
 
+    /// Returns the number of active runtime filter plugins loaded in this pipeline.
+    pub fn active_filter_count(&self) -> usize {
+        self.filters.len()
+    }
+
     pub fn db(&self) -> Arc<Mutex<NodeDb>> {
         Arc::clone(&self.db)
+    }
+
+    /// Verifies tamper-evident policy signature & `human_authorities_digest` fail-closed
+    /// whenever `require_signed_policy` is `true` OR `policy_signature` is present.
+    pub fn verify_policy_integrity(&self) -> Result<(), GateError> {
+        if !self.config.require_signed_policy && self.config.policy_signature.is_none() {
+            return Ok(());
+        }
+        let sig = self.config.policy_signature.as_deref().ok_or_else(|| {
+            GateError::PolicySignature(
+                "require_signed_policy is true but policy_signature is missing".to_string(),
+            )
+        })?;
+        let store = self.secrets.as_deref().ok_or_else(|| {
+            GateError::PolicySignature("policy signing SecretStore unavailable".to_string())
+        })?;
+        verify_gate_policy_sig(&self.config, sig, store)?;
+        if let Some(ref expected_digest) = self.config.human_authorities_digest {
+            let actual = {
+                let db = self
+                    .db
+                    .lock()
+                    .map_err(|_| GateError::LockPoisoned("node_db mutex poisoned".to_string()))?;
+                db.human().authorities_digest()?
+            };
+            if actual != *expected_digest {
+                return Err(GateError::PolicySignature(
+                    "human_authorities_digest mismatch with node.sqlite".to_string(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Returns `true` if `require_signed_policy` is active and either the policy signature is
@@ -136,28 +173,7 @@ impl SecurityGatePipeline {
         if !self.config.require_signed_policy {
             return false;
         }
-        let Some(sig) = self.config.policy_signature.as_deref() else {
-            return true;
-        };
-        let Some(store) = self.secrets.as_deref() else {
-            return true;
-        };
-        if verify_gate_policy_sig(&self.config, sig, store).is_err() {
-            return true;
-        }
-        if let Some(ref expected_digest) = self.config.human_authorities_digest {
-            let actual = {
-                let Ok(db) = self.db.lock() else {
-                    return true;
-                };
-                db.human().authorities_digest()
-            };
-            match actual {
-                Ok(digest) if digest == *expected_digest => {}
-                _ => return true,
-            }
-        }
-        false
+        self.verify_policy_integrity().is_err()
     }
 
     /// Evaluates a single transfer archive relative path against Stage 1 attachment safety rules.
