@@ -1,0 +1,10 @@
+{
+  "place": "none",
+  "title": "Hyphae",
+  "focusable": true,
+  "overlay": {
+    "kind": "window",
+    "width": 380,
+    "height": 560
+  }
+}
