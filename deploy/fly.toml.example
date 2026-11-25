@@ -1,13 +1,21 @@
 # Fly.io configuration example for a Hyphae v2 Node
 #
-# Quick start:
-#   1. Copy to fly.toml (or run `hyp deploy init fly --node-id my-hub --domain my-hub.fly.dev`)
+# Recommended quick start (standalone release-binary kit with node.json baked into image):
+#   hyp deploy init fly --node-id my-hub --domain my-hub.fly.dev --out ./deploy-fly
+#   cd ./deploy-fly && flyctl apps create my-hub && flyctl volumes create hyphae_data --size 1 && flyctl deploy
+#
+# Source-build quick start (from repo root using deploy/Dockerfile):
+#   1. Copy this file to fly.toml and create deploy/node.json (mode 0644, zero plaintext secrets,
+#      listen.bind = "0.0.0.0:8790", listen.behindReverseProxy = true).
 #   2. Create app & persistent state volume:
 #        flyctl apps create hyphae-node
 #        flyctl volumes create hyphae_data --size 1 --region iad
-#   3. Deploy:
+#   3. Deploy (Fly injects deploy/node.json at /etc/hyphae/node.json via [[files]] below):
 #        flyctl deploy
-#   4. Verify manifest & anti-recon posture:
+#   4. For Team Hubs, provision the public Admin-CA JWK (private key stays on admin laptop):
+#        flyctl ssh console -a hyphae-node -C "sh -c 'cat | hyp secret set hyphae-admin-pubkey'" <<< '<public adminJwk JSON>'
+#        flyctl apps restart hyphae-node
+#   5. Verify manifest & anti-recon posture:
 #        hyp deploy check --url https://hyphae-node.fly.dev
 
 app = "hyphae-node"
@@ -20,6 +28,12 @@ primary_region = "iad"
   HYPHAE_SECRET_BACKEND = "file"
   HYPHAE_STATE_DIR = "/var/lib/hyphae"
   HYPHAE_CONFIG = "/etc/hyphae/node.json"
+
+# Inject non-secret node.json (references only via SecretStore) into /etc/hyphae/node.json
+# so deploy/Dockerfile's CMD finds /etc/hyphae/node.json on first boot and binds 0.0.0.0:8790.
+[[files]]
+  guest_path = "/etc/hyphae/node.json"
+  local_path = "deploy/node.json"
 
 [http_service]
   internal_port = 8790

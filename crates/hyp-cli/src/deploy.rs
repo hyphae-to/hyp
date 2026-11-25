@@ -94,15 +94,13 @@ impl DeployProvider {
 
     pub const fn default_bind(self) -> &'static str {
         match self {
-            Self::Docker | Self::Fly => "0.0.0.0:8790",
-            Self::Tailscale | Self::Vps | Self::Cloudflare | Self::PublicNode | Self::DropRelay => {
-                "127.0.0.1:8790"
-            }
+            Self::Docker | Self::Fly | Self::DropRelay => "0.0.0.0:8790",
+            Self::Tailscale | Self::Vps | Self::Cloudflare | Self::PublicNode => "127.0.0.1:8790",
         }
     }
 
     pub const fn uses_container_proxy_bind(self) -> bool {
-        matches!(self, Self::Docker | Self::Fly)
+        matches!(self, Self::Docker | Self::Fly | Self::DropRelay)
     }
 }
 
@@ -151,7 +149,7 @@ pub enum DeployCommand {
         /// Public or tailnet HTTPS hostname (without scheme, e.g. mesh.example.com)
         #[arg(long)]
         domain: Option<String>,
-        /// Listen address (default 127.0.0.1:8790; 0.0.0.0:8790 inside isolated Docker/Fly containers)
+        /// Listen address (default 127.0.0.1:8790; 0.0.0.0:8790 inside isolated Docker/Fly/Drop-Relay containers)
         #[arg(long)]
         bind: Option<String>,
         /// Node profile (router, p2p, or public)
@@ -440,7 +438,7 @@ fn build_provider_catalog(tools: &[DetectedTool]) -> Vec<ProviderInfo> {
             summary: "60-second privacy-hardened RAM-only blind Drop Relay for Verified Human Drops (https://hyphae.to/drop).",
             default_profile: "router",
             tls_method: "Caddy automatic HTTPS (zero /v1/drops access logs, flush_interval -1) + Fly.io & Docker Compose",
-            nat_firewall: "Public HTTPS 80/443 via Caddy/Fly; hyphae binds loopback 127.0.0.1:8790 with zero disk persistence for drops",
+            nat_firewall: "Public HTTPS 80/443 via Caddy/Fly; container bind 0.0.0.0:8790 (loopback 127.0.0.1:8790 on systemd) with zero disk persistence for drops",
             best_for: "Self-hosting a zero-knowledge, RAM-only blind Drop Relay for your own phone-to-agent secret & directive drops",
             pros: &[
                 "100% RAM-only opaque HPKE ciphertexts — zero disk or SQLite persistence for drops",
@@ -842,7 +840,11 @@ fn write_artifact_file(path: &Path, content: &[u8], executable: bool) -> std::io
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = if executable { 0o750 } else { 0o640 };
+        // Generated deployment kit files (including `node.json`) contain ZERO plaintext secrets —
+        // all credentials live strictly in `SecretStore` (0600) or secret env/mounts, never in
+        // `node.json`. Mode `0644` (non-world-writable) guarantees bind-mounted `:ro` configs such
+        // as `./node.json:/etc/hyphae/node.json:ro` are readable by container `USER 10001:10001`.
+        let mode = if executable { 0o750 } else { 0o644 };
         fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     }
     #[cfg(not(unix))]
@@ -1128,26 +1130,28 @@ WantedBy=multi-user.target
     )
 }
 
-fn render_dockerfile() -> String {
-    concat!(
-        r#"# syntax=docker/dockerfile:1
+fn uses_team_admin_ca(provider: DeployProvider, profile: DeployProfile) -> bool {
+    provider != DeployProvider::DropRelay
+        && provider != DeployProvider::PublicNode
+        && profile == DeployProfile::Router
+}
+
+fn render_dockerfile(port: u16) -> String {
+    r#"# syntax=docker/dockerfile:1
 # Hyphae v2 standalone runtime image (SHA-256 verified release binary, non-root UID 10001)
+# Uses debian:bookworm-slim (glibc + ca-certificates) so both x86_64-unknown-linux-musl
+# and aarch64-unknown-linux-gnu official release binaries execute cleanly.
 
 FROM debian:bookworm-slim AS downloader
-ARG HYP_VERSION=v"#,
-        env!("CARGO_PKG_VERSION"),
-        r#"
+ARG HYP_VERSION=v__HYP_VERSION__
 ARG TARGETARCH
-RUN apt-get update \"#
-    )
-    .to_string()
-        + r#"
+RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl tar \
     && rm -rf /var/lib/apt/lists/* \
     && ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
     && case "${ARCH}" in \
          amd64) HYP_TARGET="x86_64-unknown-linux-musl" ;; \
-         arm64) HYP_TARGET="aarch64-unknown-linux-musl" ;; \
+         arm64) HYP_TARGET="aarch64-unknown-linux-gnu" ;; \
          *) echo "Unsupported TARGETARCH: ${ARCH}" >&2; exit 1 ;; \
        esac \
     && ARCHIVE="hyp-${HYP_VERSION}-${HYP_TARGET}.tar.gz" \
@@ -1172,6 +1176,12 @@ RUN apt-get update \
     && chmod 0700 /var/lib/hyphae
 
 COPY --from=downloader /usr/local/bin/hyp /usr/local/bin/hyp
+# node.json holds ZERO plaintext secrets (references only via SecretStore); bake it into
+# /etc/hyphae/node.json owned by UID 10001 so Fly.io and standalone container runs start
+# immediately without CONFIG_NOT_FOUND. Docker Compose may still bind-mount ./node.json:ro
+# (mode 0644) to update config without rebuilding.
+COPY --chown=10001:10001 node.json /etc/hyphae/node.json
+RUN chmod 0640 /etc/hyphae/node.json
 
 ENV HYPHAE_SECRET_BACKEND=file \
     HYPHAE_STATE_DIR=/var/lib/hyphae \
@@ -1179,17 +1189,31 @@ ENV HYPHAE_SECRET_BACKEND=file \
 
 USER 10001:10001
 WORKDIR /var/lib/hyphae
-EXPOSE 8790
+EXPOSE __PORT__
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["/usr/local/bin/hyp", "deploy", "check", "--url", "http://127.0.0.1:8790", "--json"]
+    CMD ["/usr/local/bin/hyp", "deploy", "check", "--url", "http://127.0.0.1:__PORT__", "--json"]
 
 ENTRYPOINT ["/usr/local/bin/hyp"]
 CMD ["node", "start", "--config", "/etc/hyphae/node.json", "--no-local-socket"]
 "#
+    .replace("__HYP_VERSION__", env!("CARGO_PKG_VERSION"))
+    .replace("__PORT__", &port.to_string())
 }
 
-fn render_docker_compose(node_id: &str) -> String {
+fn render_docker_compose(
+    node_id: &str,
+    port: u16,
+    override_bind: bool,
+    caddyfile_rel: &str,
+) -> String {
+    let command_block = if override_bind {
+        format!(
+            "    command:\n      - node\n      - start\n      - --config\n      - /etc/hyphae/node.json\n      - --bind\n      - 0.0.0.0:{port}\n      - --no-local-socket\n"
+        )
+    } else {
+        String::new()
+    };
     format!(
         r#"# Hyphae v2 Docker Compose stack ({node_id}) — hyphae-node + Caddy auto-TLS
 # hyphae-node is reachable ONLY on the internal Docker bridge network; Caddy terminates HTTPS.
@@ -1203,7 +1227,7 @@ services:
     restart: unless-stopped
     read_only: true
     tmpfs:
-      - /tmp:size=32M,noexec,nosuid
+      - /tmp:size=32M,noexec,nosuid,uid=10001,gid=10001,mode=1777
     cap_drop:
       - ALL
     security_opt:
@@ -1212,8 +1236,11 @@ services:
       HYPHAE_SECRET_BACKEND: file
       HYPHAE_STATE_DIR: /var/lib/hyphae
       HYPHAE_CONFIG: /etc/hyphae/node.json
-    volumes:
+{command_block}    volumes:
+      # node.json holds zero plaintext secrets (mode 0644, readable by UID 10001:10001);
+      # secrets live strictly in /var/lib/hyphae/secrets inside the hyphae_state volume.
       - ./node.json:/etc/hyphae/node.json:ro
+      # Named volume inherits UID 10001:10001 mode 0700 from /var/lib/hyphae in the image.
       - hyphae_state:/var/lib/hyphae
     networks:
       - hyphae_internal
@@ -1229,7 +1256,7 @@ services:
       - "443:443"
       - "443:443/udp"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - {caddyfile_rel}:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
     networks:
@@ -1361,6 +1388,41 @@ fn render_kit_readme(
     for (idx, step) in next.iter().enumerate() {
         out.push_str(&format!("{}. `{step}`\n", idx + 1));
     }
+    if uses_team_admin_ca(provider, profile) {
+        let app_name = sanitize_fly_app_name(node_id, domain);
+        let hub_set_cmd = match provider {
+            DeployProvider::Docker => {
+                "printf '%s\\n' \"$ADMIN_JWK\" | docker compose exec -T hyphae-node hyp secret set hyphae-admin-pubkey\ndocker compose restart hyphae-node".to_string()
+            }
+            DeployProvider::Fly => format!(
+                "printf '%s\\n' \"$ADMIN_JWK\" | flyctl ssh console -a {app_name} -C \"sh -c 'cat | hyp secret set hyphae-admin-pubkey'\"\nflyctl apps restart {app_name}"
+            ),
+            DeployProvider::Vps => {
+                "printf '%s\\n' \"$ADMIN_JWK\" | sudo -u hyphae env HYPHAE_SECRET_BACKEND=file /usr/local/bin/hyp secret set hyphae-admin-pubkey --state-dir /var/lib/hyphae".to_string()
+            }
+            _ => {
+                "printf '%s\\n' \"$ADMIN_JWK\" | hyp secret set hyphae-admin-pubkey --state-dir /var/lib/hyphae".to_string()
+            }
+        };
+        out.push_str(&format!(
+            "\n## Provisioning the Team Hub Admin-CA Public Key (`hyphae-admin-pubkey`)\n\n\
+             `node.json` references `\"pairing\": {{ \"adminKey\": {{ \"secret\": \"hyphae-admin-pubkey\" }} }}`\n\
+             so this hub can verify offline-signed `am2_` teammate invites while the Admin-CA **private** key\n\
+             stays strictly on the admin laptop (never stored on the hub). Until `hyphae-admin-pubkey` is\n\
+             provisioned, the hub boots with `am2_` pairing disabled.\n\n\
+             1. **On the admin laptop** — mint your first invite and capture ONLY the public Ed25519 JWK\n\
+                (`.data.adminJwk`, containing `kty`/`crv`/`x` and never the private key):\n\n\
+             ```sh\n\
+             ADMIN_JWK=$(hyp pair invite --mode team --node-id {node_id} --endpoint https://{domain} --peer alice@laptop --preset member --json | jq -c '.data.adminJwk')\n\
+             ```\n\n\
+             2. **On this Team Hub** — store the public JWK via stdin (`hyp secret set hyphae-admin-pubkey`)\n\
+                so `am2_` pairing is active on first boot (or restart the hub after loading it):\n\n\
+             ```sh\n\
+             {hub_set_cmd}\n\
+             ```\n\n\
+             *(Alternative: because `adminJwk` is a public key, you may also replace `{{ \"secret\": \"hyphae-admin-pubkey\" }}` in `node.json` directly with the public OKP Ed25519 JWK object `{{ \"kty\": \"OKP\", \"crv\": \"Ed25519\", \"x\": \"...\" }}` — never include a private `\"d\"` field.)*\n"
+        ));
+    }
     if provider == DeployProvider::DropRelay {
         out.push_str(
             "\n## Cloudflare Workers + RAM-Only Durable Object (30-Second Edge Deploy)\n\n\
@@ -1431,7 +1493,7 @@ fn render_drop_relay_caddyfile(domain: &str, upstream: &str) -> String {
     )
 }
 
-fn render_drop_relay_docker_compose(node_id: &str, max_memory_mb: usize) -> String {
+fn render_drop_relay_docker_compose(node_id: &str, port: u16, max_memory_mb: usize) -> String {
     let mem_limit_mb = max_memory_mb.saturating_add(128);
     format!(
         r#"# Hyphae v2 Blind Drop Relay Docker Compose stack ({node_id})
@@ -1447,8 +1509,8 @@ services:
     read_only: true
     mem_limit: {mem_limit_mb}m
     tmpfs:
-      - /tmp:size=32M,noexec,nosuid
-      - /var/lib/hyphae:size=64M,mode=0700
+      - /tmp:size=32M,noexec,nosuid,uid=10001,gid=10001,mode=1777
+      - /var/lib/hyphae:size=64M,uid=10001,gid=10001,mode=0700
     cap_drop:
       - ALL
     security_opt:
@@ -1463,12 +1525,13 @@ services:
       - --config
       - /etc/hyphae/node.json
       - --bind
-      - 0.0.0.0:8790
+      - 0.0.0.0:{port}
       - --no-local-socket
       - --enable-drop-relay
       - --drop-max-memory-mb
       - "{max_memory_mb}"
     volumes:
+      # node.json holds zero plaintext secrets (mode 0644, readable by UID 10001:10001).
       - ./node.json:/etc/hyphae/node.json:ro
     networks:
       - hyphae_drop_internal
@@ -1548,6 +1611,14 @@ primary_region = "iad"
 
 fn render_drop_relay_systemd_unit(node_id: &str, bind: &str, max_memory_mb: usize) -> String {
     let memory_max_mb = max_memory_mb.saturating_add(128);
+    let port = bind_port(bind);
+    // Keep bare-metal VPS systemd units bound strictly to loopback even though node.json
+    // defaults to 0.0.0.0:8790 for Fly.io and Docker Compose container proxies.
+    let systemd_bind = if is_wildcard_bind(bind) {
+        format!("127.0.0.1:{port}")
+    } else {
+        bind.to_string()
+    };
     format!(
         r#"[Unit]
 Description=Hyphae v2 Blind Drop Relay ({node_id})
@@ -1567,8 +1638,8 @@ WorkingDirectory=/var/lib/hyphae
 Environment=HYPHAE_SECRET_BACKEND=file
 Environment=HYPHAE_STATE_DIR=/var/lib/hyphae
 Environment=HYPHAE_CONFIG=/etc/hyphae/node.json
-Environment=HYPHAE_BIND={bind}
-ExecStart=/usr/local/bin/hyp node start --config /etc/hyphae/node.json --no-local-socket --enable-drop-relay --drop-max-memory-mb {max_memory_mb}
+Environment=HYPHAE_BIND={systemd_bind}
+ExecStart=/usr/local/bin/hyp node start --config /etc/hyphae/node.json --bind {systemd_bind} --no-local-socket --enable-drop-relay --drop-max-memory-mb {max_memory_mb}
 Restart=on-failure
 RestartSec=3s
 TimeoutStopSec=15s
@@ -1683,14 +1754,14 @@ fn build_provider_artifacts(
                 },
                 GeneratedArtifact {
                     rel_path: "Dockerfile",
-                    description: "Multi-stage static Rust build (non-root UID 10001, manifest healthcheck)",
-                    content: render_dockerfile(),
+                    description: "Standalone release-binary image (non-root UID 10001, baked node.json, manifest healthcheck)",
+                    content: render_dockerfile(port),
                     executable: false,
                 },
                 GeneratedArtifact {
                     rel_path: "docker-compose.yml",
                     description: "Docker Compose stack pairing hyphae-node with Caddy auto-TLS",
-                    content: render_docker_compose(node_id),
+                    content: render_docker_compose(node_id, port, false, "./Caddyfile"),
                     executable: false,
                 },
                 GeneratedArtifact {
@@ -1743,7 +1814,7 @@ fn build_provider_artifacts(
             vec![
                 GeneratedArtifact {
                     rel_path: "node.json",
-                    description: "Fly.io Hyphae v2 node config (/var/lib/hyphae volume, secret refs only)",
+                    description: "Fly.io Hyphae v2 node config (/var/lib/hyphae volume, 0.0.0.0 bind, secret refs only)",
                     content: node_json,
                     executable: false,
                 },
@@ -1755,8 +1826,8 @@ fn build_provider_artifacts(
                 },
                 GeneratedArtifact {
                     rel_path: "Dockerfile",
-                    description: "Multi-stage static Rust build (non-root UID 10001, manifest healthcheck)",
-                    content: render_dockerfile(),
+                    description: "Standalone release-binary image (non-root UID 10001, baked node.json, manifest healthcheck)",
+                    content: render_dockerfile(port),
                     executable: false,
                 },
                 GeneratedArtifact {
@@ -1778,8 +1849,14 @@ fn build_provider_artifacts(
                 },
                 GeneratedArtifact {
                     rel_path: "Caddyfile",
-                    description: "Hardened Caddy auto-TLS reverse proxy (flush_interval -1, 1MB body cap)",
+                    description: "Hardened Caddy auto-TLS reverse proxy for bare-metal systemd (flush_interval -1, 1MB body cap)",
                     content: render_caddyfile(domain, bind, true),
+                    executable: false,
+                },
+                GeneratedArtifact {
+                    rel_path: "Caddyfile.docker",
+                    description: "Hardened Caddy auto-TLS reverse proxy for Docker Compose targeting hyphae-node",
+                    content: render_caddyfile(domain, &format!("hyphae-node:{port}"), true),
                     executable: false,
                 },
                 GeneratedArtifact {
@@ -1790,17 +1867,14 @@ fn build_provider_artifacts(
                 },
                 GeneratedArtifact {
                     rel_path: "Dockerfile",
-                    description: "Multi-stage static Rust build (non-root UID 10001, manifest healthcheck)",
-                    content: render_dockerfile(),
+                    description: "Standalone release-binary image (non-root UID 10001, baked node.json, manifest healthcheck)",
+                    content: render_dockerfile(port),
                     executable: false,
                 },
                 GeneratedArtifact {
                     rel_path: "docker-compose.yml",
                     description: "Optional Docker Compose stack pairing public hyphae-node with Caddy",
-                    content: render_docker_compose(node_id).replace(
-                        "./Caddyfile:/etc/caddy/Caddyfile:ro",
-                        &format!("./Caddyfile:/etc/caddy/Caddyfile:ro # update upstream to hyphae-node:{port} when using Docker"),
-                    ),
+                    content: render_docker_compose(node_id, port, true, "./Caddyfile.docker"),
                     executable: false,
                 },
                 GeneratedArtifact {
@@ -1817,26 +1891,29 @@ fn build_provider_artifacts(
             vec![
                 GeneratedArtifact {
                     rel_path: "node.json",
-                    description: "Hardened Blind Drop Relay node.json (RAM-only drops, strict https://hyphae.to CORS)",
+                    description: "Hardened Blind Drop Relay node.json (RAM-only drops, 0.0.0.0 bind for Fly/Docker, strict https://hyphae.to CORS)",
                     content: node_json,
                     executable: false,
                 },
                 GeneratedArtifact {
                     rel_path: "Caddyfile",
-                    description: "Privacy-hardened Caddy auto-TLS reverse proxy (zero /v1/drops logs, flush_interval -1)",
-                    content: render_drop_relay_caddyfile(domain, bind),
+                    description: "Privacy-hardened Caddy auto-TLS reverse proxy targeting hyphae-drop-relay (zero /v1/drops logs, flush_interval -1)",
+                    content: render_drop_relay_caddyfile(
+                        domain,
+                        &format!("hyphae-drop-relay:{port}"),
+                    ),
                     executable: false,
                 },
                 GeneratedArtifact {
                     rel_path: "Dockerfile",
-                    description: "Multi-stage static Rust build (non-root UID 10001)",
-                    content: render_dockerfile(),
+                    description: "Standalone release-binary image (non-root UID 10001, baked node.json)",
+                    content: render_dockerfile(port),
                     executable: false,
                 },
                 GeneratedArtifact {
                     rel_path: "docker-compose.yml",
-                    description: "Read-only Docker Compose stack with zero disk volumes for drops",
-                    content: render_drop_relay_docker_compose(node_id, drop_max_memory_mb),
+                    description: "Read-only Docker Compose stack with UID 10001 tmpfs and zero disk volumes for drops",
+                    content: render_drop_relay_docker_compose(node_id, port, drop_max_memory_mb),
                     executable: false,
                 },
                 GeneratedArtifact {
@@ -1847,7 +1924,7 @@ fn build_provider_artifacts(
                 },
                 GeneratedArtifact {
                     rel_path: "hyphae-drop-relay.service",
-                    description: "Hardened systemd unit (ProtectSystem=strict, NoNewPrivileges, MemoryMax)",
+                    description: "Hardened systemd unit (loopback bind, ProtectSystem=strict, NoNewPrivileges, MemoryMax)",
                     content: render_drop_relay_systemd_unit(node_id, bind, drop_max_memory_mb),
                     executable: false,
                 },
@@ -1881,44 +1958,105 @@ fn build_init_next_steps(
         ),
     };
 
+    let team_admin_ca = uses_team_admin_ca(provider, profile);
+
     match provider {
-        DeployProvider::Tailscale => vec![
-            format!("hyp deploy check --config {dir}/node.json"),
-            format!("bash {dir}/tailscale-serve.sh  # exposes http://{bind} as https://{domain}"),
-            format!("hyp deploy check --url https://{domain} --config {dir}/node.json"),
-            pair_cmd,
-        ],
-        DeployProvider::Vps => vec![
-            "sudo useradd -r -s /usr/sbin/nologin hyphae || true".to_string(),
-            "sudo install -m 0755 \"$(command -v hyp)\" /usr/local/bin/hyp".to_string(),
-            "sudo mkdir -p /var/lib/hyphae /etc/hyphae && sudo chown -R hyphae:hyphae /var/lib/hyphae /etc/hyphae && sudo chmod 0700 /var/lib/hyphae".to_string(),
-            format!("sudo install -m 0640 -o hyphae -g hyphae {dir}/node.json /etc/hyphae/node.json"),
-            format!("sudo cp {dir}/hyphae-node.service /etc/systemd/system/ && sudo cp {dir}/Caddyfile /etc/caddy/Caddyfile"),
-            "sudo systemctl daemon-reload && sudo systemctl enable --now hyphae-node caddy".to_string(),
-            format!("hyp deploy check --url https://{domain} --config /etc/hyphae/node.json"),
-            pair_cmd,
-        ],
-        DeployProvider::Docker => vec![
-            format!("hyp deploy check --config {dir}/node.json"),
-            format!("cd {dir} && docker compose up -d --build"),
-            format!("hyp deploy check --url https://{domain} --config {dir}/node.json"),
-            pair_cmd,
-        ],
-        DeployProvider::Cloudflare => vec![
-            format!("cloudflared tunnel create {node_id} && cloudflared tunnel route dns {node_id} {domain}"),
-            format!("Edit {dir}/cloudflared.yml with your tunnel UUID, then run: cloudflared tunnel --config {dir}/cloudflared.yml run"),
-            format!("hyp deploy check --url https://{domain} --config {dir}/node.json"),
-            pair_cmd,
-        ],
+        DeployProvider::Tailscale => {
+            let mut steps = vec![format!("hyp deploy check --config {dir}/node.json")];
+            if team_admin_ca {
+                steps.push(
+                    "hyp secret set hyphae-admin-pubkey --state-dir /var/lib/hyphae <<< '<public adminJwk JSON from admin laptop>'  # enables am2_ pairing on first boot (private Admin-CA key stays on laptop)".to_string(),
+                );
+            }
+            steps.push(format!(
+                "bash {dir}/tailscale-serve.sh  # exposes http://{bind} as https://{domain}"
+            ));
+            steps.push(format!(
+                "hyp deploy check --url https://{domain} --config {dir}/node.json"
+            ));
+            steps.push(pair_cmd);
+            steps
+        }
+        DeployProvider::Vps => {
+            let mut steps = vec![
+                "sudo useradd -r -s /usr/sbin/nologin hyphae || true".to_string(),
+                "sudo install -m 0755 \"$(command -v hyp)\" /usr/local/bin/hyp".to_string(),
+                "sudo mkdir -p /var/lib/hyphae /etc/hyphae && sudo chown -R hyphae:hyphae /var/lib/hyphae /etc/hyphae && sudo chmod 0700 /var/lib/hyphae".to_string(),
+                format!("sudo install -m 0640 -o hyphae -g hyphae {dir}/node.json /etc/hyphae/node.json"),
+            ];
+            if team_admin_ca {
+                steps.push(
+                    "sudo -u hyphae env HYPHAE_SECRET_BACKEND=file /usr/local/bin/hyp secret set hyphae-admin-pubkey --state-dir /var/lib/hyphae <<< '<public adminJwk JSON from admin laptop>'  # enables am2_ pairing on first boot (private Admin-CA key stays on laptop)".to_string(),
+                );
+            }
+            steps.push(format!(
+                "sudo cp {dir}/hyphae-node.service /etc/systemd/system/ && sudo cp {dir}/Caddyfile /etc/caddy/Caddyfile"
+            ));
+            steps.push(
+                "sudo systemctl daemon-reload && sudo systemctl enable --now hyphae-node caddy"
+                    .to_string(),
+            );
+            steps.push(format!(
+                "hyp deploy check --url https://{domain} --config /etc/hyphae/node.json"
+            ));
+            steps.push(pair_cmd);
+            steps
+        }
+        DeployProvider::Docker => {
+            let mut steps = vec![
+                format!("hyp deploy check --config {dir}/node.json"),
+                format!("cd {dir} && docker compose up -d --build"),
+            ];
+            if team_admin_ca {
+                steps.push(format!(
+                    "cd {dir} && docker compose exec -T hyphae-node hyp secret set hyphae-admin-pubkey <<< '<public adminJwk JSON from admin laptop>' && docker compose restart hyphae-node  # enables am2_ pairing (private Admin-CA key stays on laptop)"
+                ));
+            }
+            steps.push(format!(
+                "hyp deploy check --url https://{domain} --config {dir}/node.json"
+            ));
+            steps.push(pair_cmd);
+            steps
+        }
+        DeployProvider::Cloudflare => {
+            let mut steps = vec![
+                format!(
+                    "cloudflared tunnel create {node_id} && cloudflared tunnel route dns {node_id} {domain}"
+                ),
+            ];
+            if team_admin_ca {
+                steps.push(
+                    "hyp secret set hyphae-admin-pubkey --state-dir /var/lib/hyphae <<< '<public adminJwk JSON from admin laptop>'  # enables am2_ pairing on first boot (private Admin-CA key stays on laptop)".to_string(),
+                );
+            }
+            steps.push(format!(
+                "Edit {dir}/cloudflared.yml with your tunnel UUID, then run: cloudflared tunnel --config {dir}/cloudflared.yml run"
+            ));
+            steps.push(format!(
+                "hyp deploy check --url https://{domain} --config {dir}/node.json"
+            ));
+            steps.push(pair_cmd);
+            steps
+        }
         DeployProvider::Fly => {
             let app_name = sanitize_fly_app_name(node_id, domain);
-            vec![
+            let mut steps = vec![
                 format!("hyp deploy check --config {dir}/node.json"),
-                format!("cd {dir} && flyctl apps create {app_name} && flyctl volumes create hyphae_data --size 1"),
+                format!(
+                    "cd {dir} && flyctl apps create {app_name} && flyctl volumes create hyphae_data --size 1"
+                ),
                 format!("cd {dir} && flyctl deploy"),
-                format!("hyp deploy check --url https://{domain} --config {dir}/node.json"),
-                pair_cmd,
-            ]
+            ];
+            if team_admin_ca {
+                steps.push(format!(
+                    "flyctl ssh console -a {app_name} -C \"sh -c 'cat | hyp secret set hyphae-admin-pubkey'\" <<< '<public adminJwk JSON from admin laptop>' && flyctl apps restart {app_name}  # enables am2_ pairing (private Admin-CA key stays on laptop)"
+                ));
+            }
+            steps.push(format!(
+                "hyp deploy check --url https://{domain} --config {dir}/node.json"
+            ));
+            steps.push(pair_cmd);
+            steps
         }
         DeployProvider::PublicNode => vec![
             "hyp secret set github-public-token  # optional GitHub PAT for higher public ETag rate limits (never in node.json!)".to_string(),
@@ -2945,5 +3083,101 @@ fn run_check(url: Option<String>, config: Option<PathBuf>, as_json: bool) -> Exi
         ExitCode::from(EXIT_OK)
     } else {
         ExitCode::from(EXIT_ERROR)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config_file::load_node_or_legacy_config;
+
+    const ALL_PROVIDERS: &[DeployProvider] = &[
+        DeployProvider::Tailscale,
+        DeployProvider::Vps,
+        DeployProvider::Docker,
+        DeployProvider::Cloudflare,
+        DeployProvider::Fly,
+        DeployProvider::PublicNode,
+        DeployProvider::DropRelay,
+    ];
+
+    #[test]
+    fn every_provider_node_json_parses_with_load_node_or_legacy_config_and_is_uid_10001_readable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for &provider in ALL_PROVIDERS {
+            let profile = provider.default_profile();
+            let node_id = provider.default_node_id();
+            let domain = provider.default_domain();
+            let bind = provider.default_bind();
+            let enable_drop_relay = provider == DeployProvider::DropRelay;
+            let out_dir = tmp.path().join(provider.as_str());
+            fs::create_dir_all(&out_dir).expect("create out dir");
+
+            let artifacts = build_provider_artifacts(
+                provider,
+                profile,
+                node_id,
+                domain,
+                bind,
+                enable_drop_relay,
+                DEFAULT_DROP_RELAY_MEMORY_MB,
+            );
+            for a in &artifacts {
+                write_artifact_file(&out_dir.join(a.rel_path), a.content.as_bytes(), a.executable)
+                    .expect("write artifact");
+            }
+
+            let node_path = out_dir.join("node.json");
+            let loaded = load_node_or_legacy_config(&node_path).unwrap_or_else(|e| {
+                panic!(
+                    "load_node_or_legacy_config failed for provider {}: {e}",
+                    provider.as_str()
+                )
+            });
+            assert!(!loaded.is_legacy_v1);
+            assert_eq!(loaded.node_id.as_deref(), Some(node_id));
+            assert_eq!(
+                loaded.bind_addr.expect("bind_addr present").to_string(),
+                bind
+            );
+            assert_eq!(
+                loaded.public_url.as_deref(),
+                Some(format!("https://{domain}").as_str())
+            );
+            assert_eq!(
+                loaded.state_dir.as_deref(),
+                Some(Path::new("/var/lib/hyphae"))
+            );
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(&node_path).unwrap().permissions().mode() & 0o777;
+                assert_ne!(
+                    mode & 0o004,
+                    0,
+                    "node.json for {} must be readable by container UID 10001 (got mode {:04o})",
+                    provider.as_str(),
+                    mode
+                );
+                assert_eq!(
+                    mode & 0o002,
+                    0,
+                    "node.json for {} must not be world-writable (got mode {:04o})",
+                    provider.as_str(),
+                    mode
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fly_and_drop_relay_default_bind_allows_fly_proxy_reachability() {
+        assert_eq!(DeployProvider::Fly.default_bind(), "0.0.0.0:8790");
+        assert_eq!(DeployProvider::DropRelay.default_bind(), "0.0.0.0:8790");
+        assert_eq!(DeployProvider::Docker.default_bind(), "0.0.0.0:8790");
+        assert!(DeployProvider::Fly.uses_container_proxy_bind());
+        assert!(DeployProvider::DropRelay.uses_container_proxy_bind());
+        assert!(DeployProvider::Docker.uses_container_proxy_bind());
     }
 }
