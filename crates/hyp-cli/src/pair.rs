@@ -905,7 +905,7 @@ fn run_invite(
                 }
             };
 
-            let offer = match create_p2p_offer(
+            let mut offer = match create_p2p_offer(
                 &offer_id,
                 &node_id,
                 &endpoint,
@@ -926,6 +926,7 @@ fn run_invite(
                     );
                 }
             };
+            offer.peer_id = peer.clone();
 
             let token = match encode_hp2p1_with_metadata(
                 &offer,
@@ -964,7 +965,10 @@ fn run_invite(
                     );
                 }
             };
-            let sentinel_json = match serde_json::to_string(&json!({ "offerId": offer_id })) {
+            let sentinel_json = match serde_json::to_string(&json!({
+                "offerId": offer_id,
+                "peerId": peer,
+            })) {
                 Ok(s) => s,
                 Err(e) => {
                     return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None);
@@ -1089,11 +1093,16 @@ fn run_invite(
             let target_peer = match peer {
                 Some(p) => p,
                 None => {
-                    let fallback = "member@peer".to_string();
-                    warnings.push(format!(
-                        "No --peer specified; issued Org Admin-CA grant for default peer ID '{fallback}'. Pass --peer <user@host> for a named device."
-                    ));
-                    fallback
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_USAGE,
+                        "MISSING_PEER",
+                        "Missing required --peer <user@host> for --mode team (Org Admin-CA grants are bound to an exact peer nodeId).",
+                        Some(format!(
+                            "Pass the invited teammate's nodeId, e.g.: hyp pair invite --mode team --node-id {node_id} --endpoint {endpoint} --peer alice@laptop --preset member"
+                        )),
+                    );
                 }
             };
 
@@ -1146,8 +1155,10 @@ fn run_invite(
                 }
             };
 
-            // Also sign a canonical v2 GrantV2 carrying the one-time `pairingKey` and full v2 scopes
-            // and persist it into `node.sqlite` so the running hub can claim `POST /v1/pair`!
+            // Sign a canonical v2 GrantV2 carrying the one-time `pairingKey` and full v2 scopes
+            // and embed it inside the `am2_` bundle (`signedGrantV2`) so `hyp pair accept` can
+            // submit it inline to `POST /v1/pair` — enabling 100% offline Admin-CA minting with
+            // ZERO Admin-CA private key or pre-inserted grant row required on the Team Hub!
             let grant_v2 = GrantV2 {
                 v: 2,
                 id: issued_v1.grant.id.clone(),
@@ -1175,54 +1186,62 @@ fn run_invite(
                 }
             };
 
-            let db_path = effective_state_dir.join("node.sqlite");
-            let db = match NodeDb::open(&db_path) {
-                Ok(d) => d,
-                Err(e) => {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
-                        "DB_ERROR",
-                        format!("Failed to open {}: {e}", db_path.display()),
-                        None,
-                    );
+            // Only mirror the grant into local `node.sqlite` when this state-dir actually hosts a
+            // local router/hub (best-effort, non-fatal when running offline on an admin laptop!).
+            let local_cfg_path =
+                resolve_config_path_for_read(None, Some(&effective_state_dir), None);
+            let is_local_router_hub = local_cfg_path.exists()
+                && load_node_or_legacy_config(&local_cfg_path)
+                    .ok()
+                    .and_then(|c| c.profile)
+                    == Some(ProtoNodeProfile::Router);
+            if is_local_router_hub {
+                let db_path = effective_state_dir.join("node.sqlite");
+                match (NodeDb::open(&db_path), serde_json::to_string(&signed_grant_v2)) {
+                    (Ok(db), Ok(signed_grant_json)) => {
+                        if let Err(e) = db.peers().add_grant(
+                            &GrantInput {
+                                id: issued_v1.grant.id.clone(),
+                                peer_id: target_peer.clone(),
+                                direction: GrantDirection::Inbound,
+                                signed_json: signed_grant_json,
+                                scopes: offered_scopes.clone(),
+                                trust_tier: parse_store_trust_tier(trust_tier, StoreTrustTier::Org),
+                                issued_at: now_ms,
+                                pair_by: Some(now_ms + ttl_ms),
+                                expires_at: None,
+                            },
+                            now_ms,
+                        ) {
+                            warnings.push(format!(
+                                "Best-effort local hub DB grant mirror skipped ({e}); am2_ bundle still carries signedGrantV2 for offline Admin-CA pairing."
+                            ));
+                        }
+                    }
+                    (Err(e), _) => {
+                        warnings.push(format!(
+                            "Could not open local hub DB {} ({e}); am2_ bundle still carries signedGrantV2 for offline Admin-CA pairing.",
+                            db_path.display()
+                        ));
+                    }
+                    (_, Err(e)) => {
+                        warnings.push(format!(
+                            "Could not serialize grant for local hub DB ({e}); am2_ bundle still carries signedGrantV2."
+                        ));
+                    }
                 }
-            };
-            let signed_grant_json = match serde_json::to_string(&signed_grant_v2) {
-                Ok(s) => s,
-                Err(e) => {
-                    return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None);
-                }
-            };
-            if let Err(e) = db.peers().add_grant(
-                &GrantInput {
-                    id: issued_v1.grant.id.clone(),
-                    peer_id: target_peer.clone(),
-                    direction: GrantDirection::Inbound,
-                    signed_json: signed_grant_json,
-                    scopes: offered_scopes.clone(),
-                    trust_tier: parse_store_trust_tier(trust_tier, StoreTrustTier::Org),
-                    issued_at: now_ms,
-                    pair_by: Some(now_ms + ttl_ms),
-                    expires_at: None,
-                },
-                now_ms,
-            ) {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    "DB_ERROR",
-                    format!("Failed to persist Admin-CA grant in SQLite: {e}"),
-                    None,
-                );
             }
+
+            let admin_jwk = admin_key.to_jwk();
+            let admin_pubkey = admin_jwk.x.clone();
+            let admin_jwk_compact = serde_json::to_string(&admin_jwk).unwrap_or_default();
+            let hub_provision_hint =
+                format!("printf '%s' '{admin_pubkey}' | hyp secret set hyphae-admin-pubkey");
 
             let invite = AdminInviteV2 {
                 v: 2,
                 router: endpoint.clone(),
-                admin_jwk: admin_key.to_jwk(),
+                admin_jwk: admin_jwk.clone(),
                 pairing_code: issued_v1.code.clone(),
                 require_e2ee: Some(true),
             };
@@ -1253,6 +1272,9 @@ fn run_invite(
             let kid = admin_key.kid();
             let fingerprint = admin_key.fingerprint();
             let next = vec![
+                format!(
+                    "Provision the hub once with the Admin-CA public key (keep private key offline on admin machine): {hub_provision_hint}"
+                ),
                 "Send this one-shot am2_ bundle to the invited teammate over an out-of-band channel.".to_string(),
                 "Peer inspects first (stdin-safe): hyp pair inspect <<< '<token>'".to_string(),
                 "Peer accepts (stdin-safe):        hyp pair accept <<< '<token>'".to_string(),
@@ -1276,8 +1298,10 @@ fn run_invite(
                         "endpoint": endpoint,
                         "endpointAutoDetected": endpoint_auto_detected,
                         "kid": kid,
-                        "adminJwk": admin_key.to_jwk(),
+                        "adminJwk": admin_jwk,
+                        "adminPubkey": admin_pubkey,
                         "adminFingerprint": fingerprint,
+                        "hubAdminKeyCommand": hub_provision_hint,
                         "requireE2ee": true,
                         "trustTier": trust_tier,
                         "offeredScopes": offered_scopes,
@@ -1294,21 +1318,23 @@ fn run_invite(
                 print_json(&envelope);
             } else {
                 println!("OK    Generated Org Admin-CA Team invite (am2_)");
-                println!("      Node ID:     {node_id}");
-                println!("      Target Peer: {target_peer}");
+                println!("      Node ID:      {node_id}");
+                println!("      Target Peer:  {target_peer}");
                 if endpoint_auto_detected {
-                    println!("      Endpoint:    {endpoint} (auto-detected via Tailscale MagicDNS)");
+                    println!("      Endpoint:     {endpoint} (auto-detected via Tailscale MagicDNS)");
                 } else {
-                    println!("      Endpoint:    {endpoint}");
+                    println!("      Endpoint:     {endpoint}");
                 }
-                println!("      Grant ID:    {}", issued_v1.grant.id);
-                println!("      Admin kid:   {kid}");
-                println!("      Fingerprint: {fingerprint}");
-                println!("      Trust Tier:  {trust_tier}");
-                println!("      Expires At:  {expires_at}");
-                println!("      Scopes:      {}", offered_scopes.join(" "));
+                println!("      Grant ID:     {}", issued_v1.grant.id);
+                println!("      Admin kid:    {kid}");
+                println!("      Fingerprint:  {fingerprint}");
+                println!("      Admin Pubkey: {admin_pubkey}");
+                println!("      Admin JWK:    {admin_jwk_compact}");
+                println!("      Trust Tier:   {trust_tier}");
+                println!("      Expires At:   {expires_at}");
+                println!("      Scopes:       {}", offered_scopes.join(" "));
                 if let Some(ref note) = sanitized_escalation {
-                    println!("      Escalation:  {}", note.as_str());
+                    println!("      Escalation:   {}", note.as_str());
                 }
                 println!();
                 println!("Invite Bundle (share out-of-band; never pass as a CLI argv flag):");
@@ -1746,45 +1772,59 @@ fn inspect_am2(token: &str, mut warnings: Vec<String>, as_json: bool) -> ExitCod
     };
 
     let raw_map = extract_raw_json_object(AM2_PREFIX, token);
-    if let Err((code, msg)) = verify_optional_am2_signed_grant(
+    let verified_grant_pair = match verify_optional_am2_signed_grant(
         &admin_pk,
         parsed_v1.as_ref().map(|p| p.grant_id.as_str()),
         raw_map.as_ref(),
     ) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            code,
-            msg,
-            Some("Ask your organization administrator for a fresh am2_ invite bundle.".to_string()),
-        );
-    }
+        Ok(v) => v,
+        Err((code, msg)) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                code,
+                msg,
+                Some("Ask your organization administrator for a fresh am2_ invite bundle.".to_string()),
+            );
+        }
+    };
     let node_id = raw_map
         .as_ref()
         .and_then(|m| m.get("nodeId"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    let peer_id = raw_map
+    let peer_id = verified_grant_pair
         .as_ref()
-        .and_then(|m| m.get("peerId"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    let scopes: Vec<String> = raw_map
-        .as_ref()
-        .and_then(|m| m.get("scopes"))
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
+        .map(|(_, g)| g.node_id.clone())
+        .or_else(|| {
+            raw_map
+                .as_ref()
+                .and_then(|m| m.get("peerId"))
+                .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
-    let trust_tier = raw_map
+        });
+    let scopes: Vec<String> = verified_grant_pair
         .as_ref()
-        .and_then(|m| m.get("trustTier"))
-        .and_then(Value::as_str)
+        .map(|(_, g)| g.scopes.clone())
+        .unwrap_or_else(|| {
+            raw_map
+                .as_ref()
+                .and_then(|m| m.get("scopes"))
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+    // P1-9: derive trust tier strictly from the Admin-CA-signed grant (never unsigned raw_map or "self").
+    let trust_tier = verified_grant_pair
+        .as_ref()
+        .and_then(|(_, g)| g.trust_tier.as_deref())
+        .map(|t| parse_store_trust_tier(t, StoreTrustTier::Org).as_str())
         .unwrap_or("org")
         .to_string();
     let expires_at = raw_map
@@ -2064,11 +2104,11 @@ fn verify_optional_am2_signed_grant(
 }
 
 fn parse_store_trust_tier(raw: &str, default: StoreTrustTier) -> StoreTrustTier {
+    // P1-9: NEVER map remote/token input `"self"` to `StoreTrustTier::SelfNode`.
     match raw.trim().to_ascii_lowercase().as_str() {
         "org" => StoreTrustTier::Org,
         "peer" => StoreTrustTier::Peer,
         "guest" => StoreTrustTier::Guest,
-        "self" => StoreTrustTier::SelfNode,
         _ => default,
     }
 }
@@ -2578,6 +2618,7 @@ fn execute_live_p2p_handshake(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_live_am2_handshake(
     invite: &AdminInviteV2,
     parsed_v1: &PairingCodeV1,
@@ -2585,6 +2626,7 @@ fn execute_live_am2_handshake(
     expected_hub_id: Option<&str>,
     local_node_id: &str,
     local_keys: &NodeIdentityKeys,
+    inline_signed_grant: Option<&SignedPayload>,
 ) -> Result<LiveAm2HandshakeResult, LiveHandshakeError> {
     let pair_kp =
         derive_pairing_key_v1(&parsed_v1.secret, &parsed_v1.grant_id).map_err(|e| {
@@ -2617,7 +2659,20 @@ fn execute_live_am2_handshake(
         pairing_sig,
         self_sig,
     };
-    let req_bytes = serde_json::to_vec(&pair_req).map_err(|e| LiveHandshakeError::Rejected {
+    let mut req_val = serde_json::to_value(&pair_req).map_err(|e| LiveHandshakeError::Rejected {
+        code: "ENCODE_ERROR",
+        message: format!("Failed to serialize PairRequestV2: {e}"),
+    })?;
+    if let Some(sg) = inline_signed_grant {
+        if let Some(obj) = req_val.as_object_mut() {
+            let sg_val = serde_json::to_value(sg).map_err(|e| LiveHandshakeError::Rejected {
+                code: "ENCODE_ERROR",
+                message: format!("Failed to serialize inline signedGrant: {e}"),
+            })?;
+            obj.insert("signedGrant".to_string(), sg_val);
+        }
+    }
+    let req_bytes = serde_json::to_vec(&req_val).map_err(|e| LiveHandshakeError::Rejected {
         code: "ENCODE_ERROR",
         message: format!("Failed to serialize PairRequestV2: {e}"),
     })?;
@@ -3059,11 +3114,8 @@ fn accept_hp2p1(
         ScopePreset::Member.expand()
     };
 
-    let trust_tier_raw = raw_map
-        .as_ref()
-        .and_then(|m| m.get("trustTier"))
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| infer_trust_tier(InviteMode::P2p, None, &expanded_offered));
+    // P1-9: Never trust unsigned `trustTier` metadata in P2P offers; infer strictly as Peer/Guest.
+    let trust_tier_raw = infer_trust_tier(InviteMode::P2p, None, &expanded_offered);
     let trust_tier = parse_store_trust_tier(trust_tier_raw, StoreTrustTier::Peer);
     let untrusted_note = extract_untrusted_escalation(raw_map.as_ref(), &offer.node_id);
 
@@ -3735,17 +3787,13 @@ fn accept_am2(
         );
     }
 
-    let trust_tier_raw = verified_grant_pair
+    // P1-9: NEVER fall back to unsigned `raw_map["trustTier"]` and NEVER map remote input
+    // `"self"` to `StoreTrustTier::SelfNode`. Always derive strictly from the Admin-CA-signed grant.
+    let mut trust_tier = verified_grant_pair
         .as_ref()
         .and_then(|(_, g)| g.trust_tier.as_deref())
-        .or_else(|| {
-            raw_map
-                .as_ref()
-                .and_then(|m| m.get("trustTier"))
-                .and_then(Value::as_str)
-        })
-        .unwrap_or("org");
-    let trust_tier = parse_store_trust_tier(trust_tier_raw, StoreTrustTier::Org);
+        .map(|t| parse_store_trust_tier(t, StoreTrustTier::Org))
+        .unwrap_or(StoreTrustTier::Org);
 
     let explicit_state = state_dir_arg.is_some();
     let state_dir = resolve_state_dir(state_dir_arg.as_deref(), None, None);
@@ -3821,6 +3869,7 @@ fn accept_am2(
             raw_hub_node_id,
             &local_node_id,
             &local_keys,
+            verified_grant_pair.as_ref().map(|(sg, _)| sg),
         ) {
             Ok(res) => Some(res),
             Err(LiveHandshakeError::Unreachable(msg)) => {
@@ -3867,6 +3916,12 @@ fn accept_am2(
 
     if let Some(ref live) = live_res {
         scopes = live.verified_grant.scopes.clone();
+        trust_tier = live
+            .verified_grant
+            .trust_tier
+            .as_deref()
+            .map(|t| parse_store_trust_tier(t, StoreTrustTier::Org))
+            .unwrap_or(StoreTrustTier::Org);
         if let Some(ref db) = existing_db {
             if let Err((code, msg)) =
                 check_existing_signing_pin(db, &peer_id, &live.hub_signing_pk.kid())
@@ -4271,11 +4326,8 @@ pub(crate) fn live_pair_hp2p1_for_onboard(
     } else {
         ScopePreset::Member.expand()
     };
-    let trust_tier_raw = raw_map
-        .as_ref()
-        .and_then(|m| m.get("trustTier"))
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| infer_trust_tier(InviteMode::P2p, None, &expanded_offered));
+    // P1-9: Never trust unsigned `trustTier` metadata in P2P offers; infer strictly as Peer/Guest.
+    let trust_tier_raw = infer_trust_tier(InviteMode::P2p, None, &expanded_offered);
     let trust_tier = parse_store_trust_tier(trust_tier_raw, StoreTrustTier::Peer);
     let local_endpoint = load_local_public_endpoint(state_dir);
 
@@ -4473,8 +4525,9 @@ pub(crate) fn live_pair_am2_for_onboard(
         }
     })?;
     let raw_map = extract_raw_json_object(AM2_PREFIX, token);
-    verify_optional_am2_signed_grant(&admin_pk, Some(&parsed_v1.grant_id), raw_map.as_ref())
-        .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
+    let verified_grant_pair =
+        verify_optional_am2_signed_grant(&admin_pk, Some(&parsed_v1.grant_id), raw_map.as_ref())
+            .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
     let raw_hub_node_id = raw_map
         .as_ref()
         .and_then(|m| m.get("nodeId"))
@@ -4487,6 +4540,7 @@ pub(crate) fn live_pair_am2_for_onboard(
         raw_hub_node_id,
         local_node_id,
         local_keys,
+        verified_grant_pair.as_ref().map(|(sg, _)| sg),
     )?;
 
     check_existing_signing_pin(db, &live.hub_node_id, &live.hub_signing_pk.kid())

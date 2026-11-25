@@ -283,6 +283,67 @@ pub fn decode_am2(token: &str) -> Result<AdminInviteV2, CryptoError> {
     Ok(invite)
 }
 
+/// Encodes a validated `AdminInviteV2` carrying a compact Admin-CA-signed `GrantV2`
+/// (`signedGrantV2`) for true offline Admin-CA pairing (no Admin-CA private key or
+/// pre-inserted grant row required on the Team Hub).
+pub fn encode_am2_with_signed_grant(
+    invite: &AdminInviteV2,
+    signed_grant: &SignedPayload,
+) -> Result<String, CryptoError> {
+    validate_admin_invite(invite)?;
+    let admin_pk = invite.admin_jwk.to_ed25519()?;
+    let grant = verify_grant_v2(signed_grant, &admin_pk)?;
+    if invite.pairing_code.starts_with("t3mp1_") {
+        let parsed = parse_pairing_code_v1(&invite.pairing_code)?;
+        if parsed.grant_id != grant.id {
+            return Err(CryptoError::InvalidPairing(format!(
+                "pairingCode grantId '{}' does not match signedGrantV2 id '{}'",
+                parsed.grant_id, grant.id
+            )));
+        }
+    }
+    let mut map = match serde_json::to_value(invite)? {
+        serde_json::Value::Object(m) => m,
+        _ => {
+            return Err(CryptoError::InvalidPairing(
+                "unexpected am2_ invite serialization".into(),
+            ));
+        }
+    };
+    map.insert(
+        "signedGrantV2".to_string(),
+        serde_json::to_value(signed_grant)?,
+    );
+    let canon = to_canonical_json(&serde_json::Value::Object(map))?;
+    Ok(format!(
+        "{AM2_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(canon.as_bytes())
+    ))
+}
+
+/// Extracts an optional inline Admin-CA-signed `GrantV2` (`signedGrantV2` / `signedGrant`)
+/// embedded in an `am2_<base64url>` invite bundle.
+pub fn extract_am2_signed_grant(token: &str) -> Result<Option<SignedPayload>, CryptoError> {
+    let trimmed = token.trim();
+    let encoded = trimmed
+        .strip_prefix(AM2_PREFIX)
+        .ok_or_else(|| CryptoError::InvalidPairing("expected 'am2_' prefix".into()))?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|e| CryptoError::InvalidPairing(format!("invalid am2_ base64url: {e}")))?;
+    let val: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let Some(obj) = val.as_object() else {
+        return Err(CryptoError::InvalidPairing(
+            "am2_ payload must be a JSON object".into(),
+        ));
+    };
+    let Some(sg_val) = obj.get("signedGrantV2").or_else(|| obj.get("signedGrant")) else {
+        return Ok(None);
+    };
+    let signed: SignedPayload = serde_json::from_value(sg_val.clone())?;
+    Ok(Some(signed))
+}
+
 // ============================================================================
 // v2 Direct P2P Mutual Pairing (`hp2p1_`)
 // ============================================================================
@@ -309,6 +370,9 @@ pub struct P2pOfferToken {
     pub requested_scopes: Vec<String>,
     #[serde(rename = "expiresAt")]
     pub expires_at: String,
+    /// Optional explicit target peer `nodeId` bound to this P2P offer (required for idempotent re-pair).
+    #[serde(rename = "peerId", default, skip_serializing_if = "Option::is_none")]
+    pub peer_id: Option<String>,
 }
 
 /// Bob's pairing response payload sent to `POST /v1/p2p/pair/<offerId>`.
@@ -399,6 +463,13 @@ fn validate_p2p_offer(offer: &P2pOfferToken) -> Result<(), CryptoError> {
     let _ = offer.encryption_jwk.to_x25519()?;
     let _ = decode_p2p_secret(&offer.secret)?;
     let _ = parse_rfc3339(&offer.expires_at)?;
+    if let Some(ref target_peer) = offer.peer_id {
+        if target_peer == "local" || !is_valid_node_id(target_peer) {
+            return Err(CryptoError::InvalidPairing(format!(
+                "invalid peerId '{target_peer}'"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -467,6 +538,7 @@ pub fn create_p2p_offer(
         offered_scopes,
         requested_scopes,
         expires_at: expires_at.to_string(),
+        peer_id: None,
     };
     validate_p2p_offer(&offer)?;
     Ok(offer)

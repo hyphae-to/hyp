@@ -41,6 +41,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use hyp_crypto::SignedPayload;
 use hyp_crypto::pairing::P2pPairResponse;
 use hyp_proto::address::Channel;
 use hyp_proto::problem::ProblemDetails;
@@ -79,6 +80,28 @@ struct AckDropBody {
     seq: u64,
     #[serde(default = "default_true")]
     burn: bool,
+}
+
+/// Wire envelope for `POST /v1/pair` supporting both Hub-local grants and inline
+/// offline Admin-CA-signed `GrantV2` (`signedGrant` / `signedGrantV2`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminPairRequestEnvelope {
+    #[serde(flatten)]
+    base: PairRequestV2,
+    #[serde(default, alias = "signedGrantV2")]
+    signed_grant: Option<SignedPayload>,
+}
+
+/// Wire envelope for `PUT /v1/keys` supporting both single-proof rotation (signed by the
+/// currently pinned key or Admin-CA) and dual-proof rotation (`rotationProof` + `proof`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PutKeyRequestEnvelope {
+    #[serde(flatten)]
+    base: PutKeyRequest,
+    #[serde(default, alias = "authorityProof")]
+    rotation_proof: Option<SignedPayload>,
 }
 
 fn default_true() -> bool {
@@ -283,8 +306,9 @@ async fn route_request(
     }
 
     if method == Method::POST && path == "/v1/pair" {
-        let pair_req: PairRequestV2 = serde_json::from_slice(&body_bytes)?;
-        let reply = node.handle_admin_pair_request(&pair_req)?;
+        let pair_env: AdminPairRequestEnvelope = serde_json::from_slice(&body_bytes)?;
+        let reply = node
+            .handle_admin_pair_request_with_grant(&pair_env.base, pair_env.signed_grant.as_ref())?;
         return Ok(json_response(StatusCode::OK, &reply));
     }
 
@@ -362,13 +386,17 @@ async fn route_request(
     if path == "/v1/keys" {
         return match method {
             Method::PUT => {
-                let put_req: PutKeyRequest = serde_json::from_slice(&body_bytes)?;
-                node.register_peer_key_proof(&caller.peer_id, &put_req)?;
+                let put_env: PutKeyRequestEnvelope = serde_json::from_slice(&body_bytes)?;
+                node.register_peer_key_proof_authorized(
+                    &caller,
+                    &put_env.base,
+                    put_env.rotation_proof.as_ref(),
+                )?;
                 Ok(json_response(StatusCode::OK, &json!({ "ok": true })))
             }
             Method::GET => {
                 let filter_node = query.get("nodeId").map(String::as_str);
-                let keys = node.list_directory_keys(filter_node)?;
+                let keys = node.list_directory_keys_for_caller(&caller, filter_node)?;
                 Ok(json_response(StatusCode::OK, &PeerKeysResponse { keys }))
             }
             _ => Err(NodeError::BadRequest("method not allowed".into())),
@@ -394,10 +422,7 @@ async fn route_request(
             }
             Method::GET => {
                 let filter_node = query.get("nodeId").map(String::as_str);
-                let handles = {
-                    let db = node.db();
-                    db.messages().list_handles(filter_node)?
-                };
+                let handles = node.list_directory_handles_for_caller(&caller, filter_node)?;
                 Ok(json_response(StatusCode::OK, &HandlesResponse { handles }))
             }
             _ => Err(NodeError::BadRequest("method not allowed".into())),

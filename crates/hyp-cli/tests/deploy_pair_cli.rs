@@ -2810,3 +2810,355 @@ fn pair_invite_p2p_tailscale_magicdns_autodetect_and_missing_endpoint_guidance()
         assert_eq!(stopped_env["error"]["code"], "MISSING_ENDPOINT");
     }
 }
+
+#[test]
+fn p1_3_p1_12_p1_9_offline_admin_ca_e2e_missing_peer_and_unsigned_trust_tier() {
+    let admin_dir = tempfile::tempdir().unwrap();
+    let hub_dir = tempfile::tempdir().unwrap();
+    let client_dir = tempfile::tempdir().unwrap();
+    let p1_9_dir = tempfile::tempdir().unwrap();
+
+    // 1. P1-12: `--mode team` WITHOUT `--peer` MUST fail with EXIT_USAGE (2) and MISSING_PEER!
+    let missing_peer = isolated_cmd(admin_dir.path())
+        .args([
+            "pair",
+            "invite",
+            "--mode",
+            "team",
+            "--node-id",
+            "acme-offline-hub",
+            "--endpoint",
+            "https://mesh.acme.internal",
+            "--state-dir",
+            admin_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run team invite without --peer");
+    assert_eq!(
+        missing_peer.status.code(),
+        Some(2),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&missing_peer.stdout),
+        String::from_utf8_lossy(&missing_peer.stderr)
+    );
+    let mp_env: Value = serde_json::from_slice(&missing_peer.stdout).unwrap();
+    assert_eq!(mp_env["ok"], false);
+    assert_eq!(mp_env["error"]["code"], "MISSING_PEER");
+    assert!(
+        mp_env["error"]["fix"]
+            .as_str()
+            .unwrap_or("")
+            .contains("--peer"),
+        "fix hint must tell operator to pass --peer: {mp_env}"
+    );
+
+    // 2. P1-3: True Offline Admin-CA E2E!
+    //    Step 2a: On the admin's isolated laptop (`admin_dir`), mint a bootstrap invite to obtain
+    //    the Admin-CA public key (`adminPubkey` / `adminJwk`), with ZERO shared files with `hub_dir`.
+    let probe_inv = isolated_cmd(admin_dir.path())
+        .args([
+            "pair",
+            "invite",
+            "--mode",
+            "team",
+            "--node-id",
+            "acme-offline-hub",
+            "--endpoint",
+            "http://127.0.0.1:1",
+            "--peer",
+            "probe@laptop",
+            "--preset",
+            "member",
+            "--state-dir",
+            admin_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("mint probe invite on admin laptop");
+    assert_eq!(probe_inv.status.code(), Some(0));
+    let probe_env: Value = serde_json::from_slice(&probe_inv.stdout).unwrap();
+    let admin_pubkey = probe_env["data"]["adminPubkey"]
+        .as_str()
+        .expect("adminPubkey in JSON data")
+        .to_string();
+    assert_eq!(admin_pubkey.len(), 43);
+    assert!(
+        probe_env["data"]["hubAdminKeyCommand"]
+            .as_str()
+            .unwrap_or("")
+            .contains("hyp secret set hyphae-admin-pubkey"),
+        "expected D8 provisioning hint: {probe_env}"
+    );
+    // Offline admin laptop MUST NOT require or create a local hub `node.sqlite`!
+    assert!(
+        !admin_dir.path().join("node.sqlite").exists(),
+        "offline admin laptop must not create node.sqlite when not running a router hub"
+    );
+
+    //    Step 2b: Provision `hub_dir` ONLY with the public `hyphae-admin-pubkey` secret
+    //    (ZERO Admin-CA private key on Hub, ZERO pre-inserted grant rows in Hub's SQLite!).
+    let mut set_pub = isolated_cmd(hub_dir.path())
+        .args([
+            "secret",
+            "set",
+            "hyphae-admin-pubkey",
+            "--state-dir",
+            hub_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hyp secret set hyphae-admin-pubkey");
+    set_pub
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(admin_pubkey.as_bytes())
+        .unwrap();
+    let set_pub_out = set_pub.wait_with_output().unwrap();
+    assert_eq!(
+        set_pub_out.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&set_pub_out.stdout),
+        String::from_utf8_lossy(&set_pub_out.stderr)
+    );
+
+    let hub_cfg_path = hub_dir.path().join("node.json");
+    fs::write(
+        &hub_cfg_path,
+        serde_json::to_string_pretty(&json!({
+            "v": 2,
+            "nodeId": "acme-offline-hub",
+            "profile": "router",
+            "stateDir": hub_dir.path().to_str().unwrap(),
+            "listen": { "bind": "127.0.0.1:0" },
+            "pairing": {
+                "adminCa": true,
+                "adminKey": { "secret": "hyphae-admin-pubkey" }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut hub_cmd = isolated_cmd(hub_dir.path());
+    hub_cmd
+        .args([
+            "node",
+            "start",
+            "--config",
+            hub_cfg_path.to_str().unwrap(),
+            "--no-local-socket",
+            "--json",
+        ])
+        .stdin(Stdio::null());
+    let mut hub_proc = ManagedProcess::spawn("acme-offline-hub", &mut hub_cmd);
+    let hub_startup = hub_proc.read_json_line(Duration::from_secs(10));
+    assert_eq!(hub_startup["ok"], true, "hub startup: {hub_startup}");
+    let hub_endpoint = hub_startup["data"]["endpoint"]
+        .as_str()
+        .expect("hub endpoint")
+        .to_string();
+
+    // Confirm Hub has ZERO grants in its SQLite DB!
+    {
+        let hub_db = NodeDb::open(hub_dir.path().join("node.sqlite")).unwrap();
+        assert!(hub_db.peers().list_grants(None).unwrap().is_empty());
+    }
+
+    //    Step 2c: Offline Admin mints `am2_` for `bob@laptop` in `admin_dir` (completely separate
+    //    from `hub_dir`!).
+    let offline_inv = isolated_cmd(admin_dir.path())
+        .args([
+            "pair",
+            "invite",
+            "--mode",
+            "team",
+            "--node-id",
+            "acme-offline-hub",
+            "--endpoint",
+            &hub_endpoint,
+            "--peer",
+            "bob@laptop",
+            "--preset",
+            "member",
+            "--state-dir",
+            admin_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("mint offline am2_ invite");
+    assert_eq!(offline_inv.status.code(), Some(0));
+    let offline_inv_env: Value = serde_json::from_slice(&offline_inv.stdout).unwrap();
+    let am2_token = offline_inv_env["data"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(offline_inv_env["data"]["signedGrantV2"].is_object());
+
+    //    Step 2d: Client `bob@laptop` accepts offline `am2_` via live `POST /v1/pair` -> SUCCEEDS!
+    let am2_file = client_dir.path().join("offline.token");
+    fs::write(&am2_file, format!("{am2_token}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&am2_file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let accept_ok = isolated_cmd(client_dir.path())
+        .args([
+            "pair",
+            "accept",
+            "--token-file",
+            am2_file.to_str().unwrap(),
+            "--node-id",
+            "bob@laptop",
+            "--state-dir",
+            client_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run live offline am2_ pair accept");
+    assert_eq!(
+        accept_ok.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&accept_ok.stdout),
+        String::from_utf8_lossy(&accept_ok.stderr)
+    );
+    let accept_env: Value = serde_json::from_slice(&accept_ok.stdout).unwrap();
+    assert_eq!(accept_env["ok"], true);
+    assert_eq!(accept_env["data"]["handshakeCompleted"], true);
+    assert_eq!(accept_env["data"]["peerId"], "acme-offline-hub");
+    assert_eq!(accept_env["data"]["trustTier"], "org");
+
+    //    Step 2e: Replaying the exact same offline `am2_` token MUST fail closed with 409!
+    let replay_out = isolated_cmd(client_dir.path())
+        .args([
+            "pair",
+            "accept",
+            "--token-file",
+            am2_file.to_str().unwrap(),
+            "--node-id",
+            "bob@laptop",
+            "--state-dir",
+            client_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("replay offline am2_");
+    assert_eq!(replay_out.status.code(), Some(1));
+    let replay_env: Value = serde_json::from_slice(&replay_out.stdout).unwrap();
+    assert_eq!(replay_env["error"]["code"], "GRANT_ALREADY_CLAIMED");
+
+    //    Step 2f: 1-bit flip in `signedGrantV2.sig` inside the `am2_` bundle MUST fail closed!
+    let raw_bytes = URL_SAFE_NO_PAD
+        .decode(am2_token.strip_prefix("am2_").unwrap())
+        .unwrap();
+    let mut raw_obj: Value = serde_json::from_slice(&raw_bytes).unwrap();
+    let orig_sig = raw_obj["signedGrantV2"]["sig"].as_str().unwrap();
+    let mut sig_raw = URL_SAFE_NO_PAD.decode(orig_sig).unwrap();
+    sig_raw[0] ^= 0x01;
+    raw_obj["signedGrantV2"]["sig"] = json!(URL_SAFE_NO_PAD.encode(sig_raw));
+    let tampered_am2 = format!(
+        "am2_{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&raw_obj).unwrap())
+    );
+    let tampered_file = client_dir.path().join("tampered.token");
+    fs::write(&tampered_file, format!("{tampered_am2}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tampered_file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let tampered_out = isolated_cmd(client_dir.path())
+        .args([
+            "pair",
+            "accept",
+            "--token-file",
+            tampered_file.to_str().unwrap(),
+            "--node-id",
+            "bob@laptop",
+            "--state-dir",
+            client_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("accept tampered am2_");
+    assert_eq!(tampered_out.status.code(), Some(1));
+    let tampered_env: Value = serde_json::from_slice(&tampered_out.stdout).unwrap();
+    assert_eq!(tampered_env["error"]["code"], "INVALID_SIGNATURE");
+
+    let _ = hub_proc.shutdown_gracefully();
+
+    // 3. P1-9: Unsigned `"trustTier": "self"` in `am2_` (even WITHOUT `signedGrantV2`) MUST be
+    //    ignored and NEVER stored as `TrustTier::SelfNode`!
+    let p1_9_admin = Ed25519KeyPair::generate().unwrap();
+    let p1_9_issued =
+        issue_grant_v1(&p1_9_admin, "bob@laptop", &["*"], 300_000, now_unix_ms()).unwrap();
+    let forged_tier_obj = json!({
+        "v": 2,
+        "router": "https://mesh.acme.internal",
+        "nodeId": "acme-tier-hub",
+        "peerId": "bob@laptop",
+        "adminJwk": p1_9_admin.to_jwk(),
+        "pairingCode": p1_9_issued.code,
+        "requireE2ee": true,
+        "trustTier": "self",
+        "scopes": ["dm:send", "dm:receive"]
+    });
+    let forged_tier_am2 = format!(
+        "am2_{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&forged_tier_obj).unwrap())
+    );
+    let mut p1_9_proc = isolated_cmd(p1_9_dir.path())
+        .args([
+            "pair",
+            "accept",
+            "--offline",
+            "--node-id",
+            "bob@laptop",
+            "--state-dir",
+            p1_9_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    p1_9_proc
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{forged_tier_am2}\n").as_bytes())
+        .unwrap();
+    let p1_9_out = p1_9_proc.wait_with_output().unwrap();
+    assert_eq!(
+        p1_9_out.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&p1_9_out.stdout),
+        String::from_utf8_lossy(&p1_9_out.stderr)
+    );
+    let p1_9_env: Value = serde_json::from_slice(&p1_9_out.stdout).unwrap();
+    assert_eq!(
+        p1_9_env["data"]["trustTier"], "org",
+        "unsigned trustTier='self' MUST be ignored and default to 'org'"
+    );
+    let p1_9_db = NodeDb::open(p1_9_dir.path().join("node.sqlite")).unwrap();
+    let p1_9_peer = p1_9_db
+        .peers()
+        .get_peer("acme-tier-hub")
+        .unwrap()
+        .expect("hub peer stored");
+    assert_eq!(
+        p1_9_peer.trust_tier,
+        TrustTier::Org,
+        "DB trust_tier MUST NEVER become TrustTier::SelfNode from unsigned am2_ metadata"
+    );
+}

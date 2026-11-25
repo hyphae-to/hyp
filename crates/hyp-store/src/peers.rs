@@ -521,6 +521,11 @@ impl<'a> PeerStore<'a> {
                 )));
             }
         }
+        if let Some(expires_at) = grant.expires_at {
+            if expires_at <= now_ms {
+                return Err(StoreError::Expired(format!("grant '{id}' has expired")));
+            }
+        }
         let changed = tx.conn().execute(
             "UPDATE grants SET entry_json = ?1, paired_at = ?2 WHERE id = ?3 AND entry_json IS NULL",
             params![entry_json, now_ms, id],
@@ -533,6 +538,142 @@ impl<'a> PeerStore<'a> {
         let updated = tx.conn().query_row(
             "SELECT * FROM grants WHERE id = ?1",
             params![id],
+            decode_grant_row,
+        )??;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Atomically claims an existing single-use grant OR inserts and claims an offline
+    /// Admin-CA-signed grant in a single `BEGIN IMMEDIATE` transaction.
+    ///
+    /// Replay of an already-claimed grant ID fails closed with [`StoreError::AlreadyPaired`].
+    /// Conflicting content for the same grant ID fails closed with [`StoreError::IdConflict`].
+    pub fn claim_or_insert_grant(
+        &self,
+        input: &GrantInput,
+        entry_json: &str,
+        now_ms: i64,
+    ) -> StoreResult<GrantRecord> {
+        if input.id.is_empty() {
+            return Err(StoreError::InvalidInput(
+                "grant id must be non-empty".to_string(),
+            ));
+        }
+        if !is_node_id(&input.peer_id) {
+            return Err(StoreError::InvalidInput(format!(
+                "invalid peer_id '{}'",
+                input.peer_id
+            )));
+        }
+        let scopes_json = serde_json::to_string(&input.scopes)?;
+
+        let tx = self.db.immediate_tx()?;
+        let revoked: Option<i64> = tx
+            .conn()
+            .query_row(
+                "SELECT 1 FROM revocations WHERE grant_id = ?1",
+                params![&input.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if revoked.is_some() {
+            return Err(StoreError::Unauthorized(format!(
+                "grant '{}' has been revoked",
+                input.id
+            )));
+        }
+
+        let existing: Option<GrantRecord> = tx
+            .conn()
+            .query_row(
+                "SELECT * FROM grants WHERE id = ?1",
+                params![&input.id],
+                decode_grant_row,
+            )
+            .optional()?
+            .transpose()?;
+
+        if let Some(prev) = existing {
+            if prev.entry_json.is_some() {
+                return Err(StoreError::AlreadyPaired(format!(
+                    "grant '{}' has already been used",
+                    input.id
+                )));
+            }
+            if prev.signed_json != input.signed_json {
+                return Err(StoreError::IdConflict(format!(
+                    "grant '{}' already exists with different content",
+                    input.id
+                )));
+            }
+            if let Some(pair_by) = prev.pair_by {
+                if pair_by <= now_ms {
+                    return Err(StoreError::Expired(format!(
+                        "grant '{}' pairing window has ended",
+                        input.id
+                    )));
+                }
+            }
+            if let Some(expires_at) = prev.expires_at {
+                if expires_at <= now_ms {
+                    return Err(StoreError::Expired(format!(
+                        "grant '{}' has expired",
+                        input.id
+                    )));
+                }
+            }
+            let changed = tx.conn().execute(
+                "UPDATE grants SET entry_json = ?1, paired_at = ?2 WHERE id = ?3 AND entry_json IS NULL",
+                params![entry_json, now_ms, &input.id],
+            )?;
+            if changed == 0 {
+                return Err(StoreError::AlreadyPaired(format!(
+                    "grant '{}' has already been used",
+                    input.id
+                )));
+            }
+        } else {
+            if let Some(pair_by) = input.pair_by {
+                if pair_by <= now_ms {
+                    return Err(StoreError::Expired(format!(
+                        "grant '{}' pairing window has ended",
+                        input.id
+                    )));
+                }
+            }
+            if let Some(expires_at) = input.expires_at {
+                if expires_at <= now_ms {
+                    return Err(StoreError::Expired(format!(
+                        "grant '{}' has expired",
+                        input.id
+                    )));
+                }
+            }
+            tx.conn().execute(
+                "INSERT INTO grants
+                 (id, peer_id, direction, signed_json, scopes_json, trust_tier, issued_at,
+                  pair_by, expires_at, entry_json, paired_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    &input.id,
+                    &input.peer_id,
+                    input.direction.as_str(),
+                    &input.signed_json,
+                    &scopes_json,
+                    input.trust_tier.as_str(),
+                    input.issued_at,
+                    input.pair_by,
+                    input.expires_at,
+                    entry_json,
+                    now_ms
+                ],
+            )?;
+        }
+
+        let updated = tx.conn().query_row(
+            "SELECT * FROM grants WHERE id = ?1",
+            params![&input.id],
             decode_grant_row,
         )??;
         tx.commit()?;
@@ -603,6 +744,14 @@ impl<'a> PeerStore<'a> {
 
     // ---- Peer Keys (RFC 7517 OKP JWKs + RFC 7638 kid) ----
 
+    /// Pins a peer JWK in `peer_keys`.
+    ///
+    /// Fail-closed security invariants:
+    /// - Refuses to overwrite an existing `(peer_id, kid)` with differing `jwk_json`.
+    /// - Refuses to reactivate a previously `Revoked` key.
+    /// - For `KeyUse::Signing` and `KeyUse::Encryption`, refuses to silently insert a second
+    ///   `Active` key when an `Active` key with a different `kid` already exists; callers
+    ///   performing authorized key rotation must use [`PeerStore::rotate_peer_key`].
     pub fn upsert_peer_key(
         &self,
         input: &PeerKeyInput,
@@ -614,6 +763,53 @@ impl<'a> PeerStore<'a> {
             ));
         }
         let tx = self.db.immediate_tx()?;
+        let existing_same: Option<PeerKeyRecord> = tx
+            .conn()
+            .query_row(
+                "SELECT * FROM peer_keys WHERE peer_id = ?1 AND kid = ?2",
+                params![&input.peer_id, &input.kid],
+                decode_peer_key_row,
+            )
+            .optional()?
+            .transpose()?;
+        if let Some(prev) = existing_same {
+            if prev.jwk_json != input.jwk_json {
+                return Err(StoreError::IdConflict(format!(
+                    "peer '{}' key '{}' already exists with different JWK material",
+                    input.peer_id, input.kid
+                )));
+            }
+            if prev.status == KeyStatus::Revoked && input.status == KeyStatus::Active {
+                return Err(StoreError::InvalidState(format!(
+                    "cannot reactivate revoked key '{}' for peer '{}'",
+                    input.kid, input.peer_id
+                )));
+            }
+        }
+        if input.status == KeyStatus::Active
+            && matches!(input.key_use, KeyUse::Signing | KeyUse::Encryption)
+        {
+            let conflicting_kid: Option<String> = tx
+                .conn()
+                .query_row(
+                    "SELECT kid FROM peer_keys
+                     WHERE peer_id = ?1 AND key_use = ?2 AND status = 'active' AND kid != ?3
+                     LIMIT 1",
+                    params![&input.peer_id, input.key_use.as_str(), &input.kid],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(existing_kid) = conflicting_kid {
+                return Err(StoreError::IdConflict(format!(
+                    "peer '{}' already has active {} key '{}'; refusing silent key replacement with '{}'",
+                    input.peer_id,
+                    input.key_use.as_str(),
+                    existing_kid,
+                    input.kid
+                )));
+            }
+        }
+
         tx.conn().execute(
             "INSERT INTO peer_keys
              (peer_id, kid, key_use, jwk_json, status, registered_at, expires_at)
@@ -629,6 +825,89 @@ impl<'a> PeerStore<'a> {
                 input.key_use.as_str(),
                 &input.jwk_json,
                 input.status.as_str(),
+                now_ms,
+                input.expires_at
+            ],
+        )?;
+        let rec = tx.conn().query_row(
+            "SELECT * FROM peer_keys WHERE peer_id = ?1 AND kid = ?2",
+            params![&input.peer_id, &input.kid],
+            decode_peer_key_row,
+        )??;
+        tx.commit()?;
+        Ok(rec)
+    }
+
+    /// Explicitly rotates a peer's active key for `(peer_id, key_use)`, atomically marking all
+    /// prior active keys for that `key_use` with differing `kid` as [`KeyStatus::Retired`] so
+    /// no ambiguous duplicate active keys remain.
+    pub fn rotate_peer_key(
+        &self,
+        input: &PeerKeyInput,
+        now_ms: i64,
+    ) -> StoreResult<PeerKeyRecord> {
+        if !is_node_id(&input.peer_id) || input.kid.is_empty() {
+            return Err(StoreError::InvalidInput(
+                "invalid peer_id or kid".to_string(),
+            ));
+        }
+        if input.status != KeyStatus::Active {
+            return Err(StoreError::InvalidInput(
+                "rotate_peer_key requires KeyStatus::Active".to_string(),
+            ));
+        }
+        let tx = self.db.immediate_tx()?;
+        let existing_same: Option<PeerKeyRecord> = tx
+            .conn()
+            .query_row(
+                "SELECT * FROM peer_keys WHERE peer_id = ?1 AND kid = ?2",
+                params![&input.peer_id, &input.kid],
+                decode_peer_key_row,
+            )
+            .optional()?
+            .transpose()?;
+        if let Some(prev) = existing_same {
+            if prev.jwk_json != input.jwk_json {
+                return Err(StoreError::IdConflict(format!(
+                    "peer '{}' key '{}' already exists with different JWK material",
+                    input.peer_id, input.kid
+                )));
+            }
+            if prev.status == KeyStatus::Revoked {
+                return Err(StoreError::InvalidState(format!(
+                    "cannot reactivate revoked key '{}' for peer '{}'",
+                    input.kid, input.peer_id
+                )));
+            }
+        }
+
+        tx.conn().execute(
+            "UPDATE peer_keys
+             SET status = ?1
+             WHERE peer_id = ?2 AND key_use = ?3 AND status = 'active' AND kid != ?4",
+            params![
+                KeyStatus::Retired.as_str(),
+                &input.peer_id,
+                input.key_use.as_str(),
+                &input.kid
+            ],
+        )?;
+
+        tx.conn().execute(
+            "INSERT INTO peer_keys
+             (peer_id, kid, key_use, jwk_json, status, registered_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(peer_id, kid) DO UPDATE SET
+               key_use = excluded.key_use,
+               jwk_json = excluded.jwk_json,
+               status = excluded.status,
+               expires_at = excluded.expires_at",
+            params![
+                &input.peer_id,
+                &input.kid,
+                input.key_use.as_str(),
+                &input.jwk_json,
+                KeyStatus::Active.as_str(),
                 now_ms,
                 input.expires_at
             ],

@@ -49,8 +49,8 @@ use hyp_crypto::keystore::validate_secret_name;
 use hyp_crypto::pairing::{
     AdminInviteV2, GrantV2, P2P_SECRET_BYTES, P2pOfferToken, P2pPairConfirmation, P2pPairResponse,
     create_p2p_confirmation, create_p2p_offer, create_p2p_response, decode_am2, decode_hp2p1,
-    encode_am2, encode_hp2p1, sign_grant_v2, verify_grant_v2, verify_p2p_confirmation,
-    verify_p2p_response,
+    encode_am2_with_signed_grant, encode_hp2p1, extract_am2_signed_grant, sign_grant_v2,
+    verify_grant_v2, verify_p2p_confirmation, verify_p2p_response,
 };
 use hyp_crypto::rfc3339::{format_rfc3339_millis, parse_rfc3339_millis};
 use hyp_crypto::transfer::{
@@ -88,7 +88,7 @@ use hyp_store::{
     KvDeleteResult, KvEntry, KvEpoch, KvEpochInput, KvSetInput, MailboxEntry, MailboxInsert,
     MailboxKind, MailboxPutOptions, MailboxPutResult, ManifestCacheUpdate, MessageRecord, NodeDb,
     PeerInput, PeerKeyInput, PeerRecord, PeerStatus, PostChannelInput, PostChannelResult, Session,
-    Subscription, SubscriptionSpec, TransferRecord, TransferSubmit, TrustTier,
+    StoreError, Subscription, SubscriptionSpec, TransferRecord, TransferSubmit, TrustTier,
     UpstreamPushdownInput, WriteModel, format_address, now_ms, parse_address, sha256_hex, uuid_v4,
 };
 
@@ -1561,6 +1561,11 @@ impl UnifiedNode {
         Ok(name)
     }
 
+    fn clear_peer_auth_credential(&self, peer_id: &str) {
+        let name = Self::peer_auth_secret_name(peer_id);
+        let _ = self.secrets.delete(&name);
+    }
+
     fn load_peer_auth(&self, peer_id: &str) -> PeerAuth {
         let name = Self::peer_auth_secret_name(peer_id);
         match self.secrets.get(&name) {
@@ -1646,25 +1651,35 @@ impl UnifiedNode {
             pairing_code,
             require_e2ee: Some(self.config.e2ee_policy == E2eePolicy::Required),
         };
-        let token = encode_am2(&invite)?;
+        let token = encode_am2_with_signed_grant(&invite, &signed)?;
         Ok((token, record))
     }
 
-    /// Server-side handler for `POST /v1/pair` (Org Admin-CA `am2_` single-use binding claim).
+    /// Server-side handler for `POST /v1/pair` (Org Admin-CA `am2_` single-use binding claim)
+    /// when the signed grant is already persisted in Hub SQLite.
     pub fn handle_admin_pair_request(
         &self,
         req: &PairRequestV2,
+    ) -> Result<PairServerReply, NodeError> {
+        self.handle_admin_pair_request_with_grant(req, None)
+    }
+
+    /// Server-side handler for `POST /v1/pair` supporting BOTH:
+    /// 1. True Offline Admin-CA pairing: client presents an inline `signed_grant` (`GrantV2`
+    ///    signed by the offline Org Admin-CA key), verified purely against `config.admin_jwk`
+    ///    and atomically recorded as claimed in `node.sqlite` (`claim_or_insert_grant`) so
+    ///    zero Admin-CA private key or pre-inserted DB row is ever required on the Hub.
+    /// 2. Legacy / Hub-local DB pairing: `inline_signed_grant` is `None` and the grant row
+    ///    already exists in Hub SQLite (`claim_grant`).
+    pub fn handle_admin_pair_request_with_grant(
+        &self,
+        req: &PairRequestV2,
+        inline_signed_grant: Option<&SignedPayload>,
     ) -> Result<PairServerReply, NodeError> {
         let admin_proto_jwk = self.config.admin_jwk.as_ref().ok_or_else(|| {
             NodeError::BadRequest("this node has no configured adminJwk for am2_ pairing".into())
         })?;
         let admin_pk = proto_jwk_to_crypto(admin_proto_jwk).to_ed25519()?;
-
-        let grant_rec = {
-            let db = self.db();
-            db.peers().get_grant(&req.grant_id)?
-        }
-        .ok_or_else(|| NodeError::NotFound(format!("grant '{}' not found", req.grant_id)))?;
 
         let is_revoked = {
             let db = self.db();
@@ -1674,37 +1689,157 @@ impl UnifiedNode {
             return Err(NodeError::Unauthorized("grant has been revoked".into()));
         }
 
-        let signed_grant: SignedPayload = serde_json::from_str(&grant_rec.signed_json)?;
-        let grant = verify_grant_v2(&signed_grant, &admin_pk)?;
+        let now = now_ms();
+        let (signed_grant, grant, used_inline_grant) = match inline_signed_grant {
+            Some(sg) => {
+                let verified = verify_grant_v2(sg, &admin_pk).map_err(|e| {
+                    NodeError::Unauthorized(format!(
+                        "Admin-CA signature verification failed for signedGrant: {e}"
+                    ))
+                })?;
+                if verified.id != req.grant_id {
+                    return Err(NodeError::BadRequest(
+                        "request grantId does not match signedGrant.id".into(),
+                    ));
+                }
+                (sg.clone(), verified, true)
+            }
+            None => {
+                let grant_rec = {
+                    let db = self.db();
+                    db.peers().get_grant(&req.grant_id)?
+                }
+                .ok_or_else(|| {
+                    NodeError::NotFound(format!("grant '{}' not found", req.grant_id))
+                })?;
+                let sg: SignedPayload = serde_json::from_str(&grant_rec.signed_json)?;
+                let verified = verify_grant_v2(&sg, &admin_pk).map_err(|e| {
+                    NodeError::Unauthorized(format!(
+                        "Admin-CA signature verification failed for stored grant: {e}"
+                    ))
+                })?;
+                (sg, verified, false)
+            }
+        };
+
+        let issued_at_ms = parse_rfc3339_millis(&grant.issued_at)?;
+        let pair_by_ms = match grant.pair_by.as_deref() {
+            Some(ts) => {
+                let ms = parse_rfc3339_millis(ts)?;
+                if now >= ms {
+                    return Err(NodeError::Store(StoreError::Expired(format!(
+                        "grant '{}' pairing window has ended",
+                        grant.id
+                    ))));
+                }
+                Some(ms)
+            }
+            None => None,
+        };
+        let expires_at_ms = match grant.expires_at.as_deref() {
+            Some(ts) => {
+                let ms = parse_rfc3339_millis(ts)?;
+                if now >= ms {
+                    return Err(NodeError::Store(StoreError::Expired(format!(
+                        "grant '{}' has expired",
+                        grant.id
+                    ))));
+                }
+                Some(ms)
+            }
+            None => None,
+        };
+
+        let expanded_scopes = expand_v2_scopes(&grant.scopes)
+            .map_err(|e| NodeError::BadRequest(format!("invalid grant scopes: {e}")))?;
+
         let pairing_jwk = grant.pairing_key.as_ref().ok_or_else(|| {
             NodeError::BadRequest("grant does not carry a one-time pairingKey".into())
         })?;
         let pairing_pk = pairing_jwk.to_ed25519()?;
 
         // Verify pairingSig (possession of OOB secret) & selfSig (possession of node signing key).
-        pairing_pk.verify_domain_b64("binding", req.payload.as_bytes(), &req.pairing_sig)?;
+        pairing_pk
+            .verify_domain_b64("binding", req.payload.as_bytes(), &req.pairing_sig)
+            .map_err(|_| NodeError::Unauthorized("invalid pairingSig proof".into()))?;
         let binding: PairBindingV2 = serde_json::from_str(&req.payload)?;
         if binding.v != 2 || binding.grant_id != grant.id || binding.node_id != grant.node_id {
             return Err(NodeError::BadRequest(
                 "pairing binding grantId or nodeId mismatch".into(),
             ));
         }
+        if binding.node_id == self.config.node_id.as_str() || binding.node_id == LOCAL_NODE_ID {
+            return Err(NodeError::Conflict(format!(
+                "PEER_ID_CONFLICT: peer nodeId '{}' conflicts with local hub identity",
+                binding.node_id
+            )));
+        }
         let client_sign_pk = binding.signing_jwk.to_ed25519()?;
         let client_enc_pk = binding.encryption_jwk.to_x25519()?;
-        client_sign_pk.verify_domain_b64("binding-self", req.payload.as_bytes(), &req.self_sig)?;
+        client_sign_pk
+            .verify_domain_b64("binding-self", req.payload.as_bytes(), &req.self_sig)
+            .map_err(|_| NodeError::Unauthorized("invalid selfSig proof".into()))?;
+        if let Some(ref pinned_subj_sign) = grant.subject_signing_jwk {
+            if pinned_subj_sign.to_ed25519()? != client_sign_pk {
+                return Err(NodeError::PeerKeyMismatch(
+                    "binding signingJwk does not match grant subjectSigningJwk".into(),
+                ));
+            }
+        }
+        if let Some(ref pinned_subj_enc) = grant.subject_encryption_jwk {
+            if pinned_subj_enc.to_x25519()? != client_enc_pk {
+                return Err(NodeError::PeerKeyMismatch(
+                    "binding encryptionJwk does not match grant subjectEncryptionJwk".into(),
+                ));
+            }
+        }
 
-        let now = now_ms();
         let entry_json = serde_json::to_string(req)?;
         let trust_tier = match grant.trust_tier.as_deref() {
             Some("org") => TrustTier::Org,
             Some("guest") => TrustTier::Guest,
-            _ => TrustTier::Peer,
+            Some("peer") => TrustTier::Peer,
+            _ => TrustTier::Org,
         };
+        let signed_grant_json = serde_json::to_string(&signed_grant)?;
+        let sign_kid = client_sign_pk.kid();
+        let enc_kid = client_enc_pk.kid();
 
-        // Atomically claim the single-use grant inside BEGIN IMMEDIATE!
-        {
+        // Atomically claim (or insert-as-claimed for offline Admin-CA) inside BEGIN IMMEDIATE!
+        let keys_rotated = {
             let db = self.db();
-            db.peers().claim_grant(&grant.id, &entry_json, now)?;
+            let prev_sign_kid = db
+                .peers()
+                .list_peer_keys(&binding.node_id, Some(KeyUse::Signing), true)?
+                .into_iter()
+                .next()
+                .map(|k| k.kid);
+            let prev_enc_kid = db
+                .peers()
+                .list_peer_keys(&binding.node_id, Some(KeyUse::Encryption), true)?
+                .into_iter()
+                .next()
+                .map(|k| k.kid);
+
+            if used_inline_grant {
+                db.peers().claim_or_insert_grant(
+                    &GrantInput {
+                        id: grant.id.clone(),
+                        peer_id: binding.node_id.clone(),
+                        direction: GrantDirection::Inbound,
+                        signed_json: signed_grant_json,
+                        scopes: expanded_scopes.clone(),
+                        trust_tier,
+                        issued_at: issued_at_ms,
+                        pair_by: pair_by_ms,
+                        expires_at: expires_at_ms,
+                    },
+                    &entry_json,
+                    now,
+                )?;
+            } else {
+                db.peers().claim_grant(&grant.id, &entry_json, now)?;
+            }
             db.peers().upsert_peer(
                 &PeerInput {
                     peer_id: binding.node_id.clone(),
@@ -1712,15 +1847,15 @@ impl UnifiedNode {
                     profile: hyp_store::PeerProfile::Local,
                     trust_tier,
                     status: PeerStatus::Active,
-                    scopes: grant.scopes.clone(),
+                    scopes: expanded_scopes.clone(),
                     auth_credential_ref: None,
                 },
                 now,
             )?;
-            db.peers().upsert_peer_key(
+            db.peers().rotate_peer_key(
                 &PeerKeyInput {
                     peer_id: binding.node_id.clone(),
-                    kid: client_sign_pk.kid(),
+                    kid: sign_kid.clone(),
                     key_use: KeyUse::Signing,
                     jwk_json: serde_json::to_string(&binding.signing_jwk)?,
                     status: KeyStatus::Active,
@@ -1728,10 +1863,10 @@ impl UnifiedNode {
                 },
                 now,
             )?;
-            db.peers().upsert_peer_key(
+            db.peers().rotate_peer_key(
                 &PeerKeyInput {
                     peer_id: binding.node_id.clone(),
-                    kid: client_enc_pk.kid(),
+                    kid: enc_kid.clone(),
                     key_use: KeyUse::Encryption,
                     jwk_json: serde_json::to_string(&binding.encryption_jwk)?,
                     status: KeyStatus::Active,
@@ -1739,12 +1874,18 @@ impl UnifiedNode {
                 },
                 now,
             )?;
+
+            prev_sign_kid.is_some_and(|k| k != sign_kid)
+                || prev_enc_kid.is_some_and(|k| k != enc_kid)
+        };
+        if keys_rotated {
+            self.clear_peer_auth_credential(&binding.node_id);
         }
 
         let auth_credential = self.issue_peer_bearer_token(&binding.node_id)?;
         let caller = AuthenticatedPeer {
             peer_id: binding.node_id,
-            scopes: ScopeSet::from_strings(&grant.scopes),
+            scopes: ScopeSet::from_strings(&expanded_scopes),
             trust_tier,
         };
         let (signed_manifest, _, _) = self.build_signed_manifest(Some(&caller))?;
@@ -1950,6 +2091,7 @@ impl UnifiedNode {
         am2_token: &str,
     ) -> Result<PeerLinkInfo, NodeError> {
         let invite = decode_am2(am2_token)?;
+        let inline_signed_grant = extract_am2_signed_grant(am2_token)?;
         let parsed_code = parse_pairing_code_v1(&invite.pairing_code)?;
         let pair_kp = derive_pairing_key_v1(&parsed_code.secret, &parsed_code.grant_id)?;
 
@@ -1974,12 +2116,18 @@ impl UnifiedNode {
             pairing_sig,
             self_sig,
         };
+        let mut req_val = serde_json::to_value(&pair_req)?;
+        if let Some(ref sg) = inline_signed_grant {
+            if let Some(obj) = req_val.as_object_mut() {
+                obj.insert("signedGrant".to_string(), serde_json::to_value(sg)?);
+            }
+        }
         let url = format!("{}/v1/pair", invite.router.trim_end_matches('/'));
         let http_req = Request::builder()
             .method(Method::POST)
             .uri(&url)
             .header(http::header::CONTENT_TYPE, "application/json")
-            .body(full_body(serde_json::to_vec(&pair_req)?))
+            .body(full_body(serde_json::to_vec(&req_val)?))
             .map_err(|e| NodeError::Http(e.to_string()))?;
         let resp = self.http_client.request(http_req).await?;
         let (status, _headers, body) =
@@ -2057,6 +2205,26 @@ impl UnifiedNode {
         requested_scopes: Vec<String>,
         ttl_ms: i64,
     ) -> Result<(String, P2pOfferToken), NodeError> {
+        self.create_p2p_invite_for_peer(None, offered_scopes, requested_scopes, ttl_ms)
+    }
+
+    /// Creates a Direct P2P mutual pairing invite (`hp2p1_` token) optionally bound to a
+    /// specific `target_peer_id` (required for idempotent re-pair with an already paired P2P peer).
+    pub fn create_p2p_invite_for_peer(
+        &self,
+        target_peer_id: Option<&str>,
+        offered_scopes: Vec<String>,
+        requested_scopes: Vec<String>,
+        ttl_ms: i64,
+    ) -> Result<(String, P2pOfferToken), NodeError> {
+        if let Some(pid) = target_peer_id {
+            if pid == LOCAL_NODE_ID || pid == self.config.node_id.as_str() {
+                return Err(NodeError::BadRequest(format!(
+                    "target peer_id '{pid}' cannot be 'local' or self node_id"
+                )));
+            }
+            let _ = NodeId::new(pid)?;
+        }
         let expanded_offered = expand_v2_scopes(&offered_scopes)
             .map_err(|e| NodeError::BadRequest(format!("invalid offered scopes: {e}")))?;
         let expanded_requested = if requested_scopes.is_empty() {
@@ -2069,7 +2237,7 @@ impl UnifiedNode {
         let now = now_ms();
         let offer_id = uuid_v4();
         let expires_at = format_rfc3339_millis(now + ttl_ms);
-        let offer = create_p2p_offer(
+        let mut offer = create_p2p_offer(
             &offer_id,
             self.config.node_id.as_str(),
             &self.endpoint_url(),
@@ -2078,6 +2246,7 @@ impl UnifiedNode {
             expanded_requested,
             &expires_at,
         )?;
+        offer.peer_id = target_peer_id.map(ToOwned::to_owned);
 
         // Persist a single-use offer sentinel grant in `PeerStore` so `claim_grant` enforces
         // atomic single-use semantics across concurrent pairing requests!
@@ -2088,7 +2257,10 @@ impl UnifiedNode {
                     id: format!("p2p-offer:{offer_id}"),
                     peer_id: self.config.node_id.to_string(),
                     direction: GrantDirection::Inbound,
-                    signed_json: serde_json::to_string(&json!({ "offerId": offer_id }))?,
+                    signed_json: serde_json::to_string(&json!({
+                        "offerId": offer_id,
+                        "peerId": target_peer_id,
+                    }))?,
                     scopes: expanded_offered,
                     trust_tier: TrustTier::Peer,
                     issued_at: now,
@@ -2116,8 +2288,9 @@ impl UnifiedNode {
     }
 
     /// Server-side handler for `POST /v1/p2p/pair/<offerId>`: verifies 160-bit HKDF binding MAC,
-    /// Bob's Ed25519 self-sig, Bob's signed grant, atomically claims the single-use offer, pins
-    /// Bob's OKP JWKs, mints Bob's `authCredential`, and returns Alice's signed grant + manifest.
+    /// Bob's Ed25519 self-sig, Bob's signed grant, anti-takeover peer-id & key-pin checks,
+    /// atomically claims the single-use offer, pins Bob's OKP JWKs, mints Bob's `authCredential`,
+    /// and returns Alice's signed grant + manifest.
     pub fn handle_p2p_pair_request(
         &self,
         offer_id: &str,
@@ -2159,7 +2332,28 @@ impl UnifiedNode {
         let now = now_ms();
         let verified = verify_p2p_response(&offer, response, now)?;
 
-        // Atomically claim the single-use offer inside SQLite BEGIN IMMEDIATE!
+        // P1-1 anti-takeover check #1 (BEFORE claiming or upserting):
+        // Refuse claiming our own node_id or reserved 'local'.
+        if verified.bob_node_id == self.config.node_id.as_str()
+            || verified.bob_node_id == LOCAL_NODE_ID
+        {
+            return Err(NodeError::Conflict(format!(
+                "PEER_ID_CONFLICT: peer nodeId '{}' conflicts with local node identity",
+                verified.bob_node_id
+            )));
+        }
+
+        // If the offer explicitly bound a target `peerId`, reject mismatched claimants with 409.
+        if let Some(ref expected_peer) = offer.peer_id {
+            if verified.bob_node_id != *expected_peer {
+                return Err(NodeError::Conflict(format!(
+                    "PEER_ID_CONFLICT: P2P offer '{offer_id}' targets '{expected_peer}', not '{}'",
+                    verified.bob_node_id
+                )));
+            }
+        }
+
+        // Atomically check existing peer/pins AND claim the single-use offer inside the DB lock!
         let grant_key = format!("p2p-offer:{offer_id}");
         let claim_entry = serde_json::to_string(response)?;
         let alice_grant_id = uuid_v4();
@@ -2178,8 +2372,83 @@ impl UnifiedNode {
         };
         let conf = create_p2p_confirmation(&offer.offer_id, &alice_grant, &self.identity.signing)?;
 
+        let bob_sign_kid = verified.bob_signing_pk.kid();
+        let bob_enc_kid = verified.bob_encryption_pk.kid();
+
         {
             let db = self.db();
+
+            // P1-1 anti-takeover check #2 (BEFORE claiming or upserting):
+            // Never allow a P2P invitee to overwrite an existing peer (especially any Router/Hub
+            // or peer with different pinned keys). Only permit idempotent re-pair when:
+            //   1. The offer explicitly targeted this `peer_id`, AND
+            //   2. Existing peer is an Active P2P peer, AND
+            //   3. Existing pinned signing & encryption JWKs are identical to Bob's presented JWKs.
+            let existing_peer = db.peers().get_peer(&verified.bob_node_id)?;
+            let existing_sign_keys = db.peers().list_peer_keys(
+                &verified.bob_node_id,
+                Some(KeyUse::Signing),
+                true,
+            )?;
+            let existing_enc_keys = db.peers().list_peer_keys(
+                &verified.bob_node_id,
+                Some(KeyUse::Encryption),
+                true,
+            )?;
+
+            if existing_peer.is_some()
+                || !existing_sign_keys.is_empty()
+                || !existing_enc_keys.is_empty()
+            {
+                let sign_matches = !existing_sign_keys.is_empty()
+                    && existing_sign_keys.iter().all(|k| {
+                        k.kid == bob_sign_kid
+                            && serde_json::from_str::<CryptoOkpJwk>(&k.jwk_json)
+                                .ok()
+                                .and_then(|j| j.to_ed25519().ok())
+                                == Some(verified.bob_signing_pk)
+                    });
+                let enc_matches = !existing_enc_keys.is_empty()
+                    && existing_enc_keys.iter().all(|k| {
+                        k.kid == bob_enc_kid
+                            && serde_json::from_str::<CryptoOkpJwk>(&k.jwk_json)
+                                .ok()
+                                .and_then(|j| j.to_x25519().ok())
+                                == Some(verified.bob_encryption_pk)
+                    });
+
+                if let Some(ref peer_row) = existing_peer {
+                    let profile_ok = peer_row.profile == hyp_store::PeerProfile::P2p
+                        && peer_row.status == PeerStatus::Active;
+                    let explicitly_targeted =
+                        offer.peer_id.as_deref() == Some(verified.bob_node_id.as_str());
+
+                    if !sign_matches || !enc_matches || !profile_ok {
+                        return Err(NodeError::PeerKeyMismatch(format!(
+                            "PEER_KEY_MISMATCH: peer '{}' already exists with different pinned keys or profile; refusing P2P takeover",
+                            verified.bob_node_id
+                        )));
+                    }
+                    if !explicitly_targeted {
+                        return Err(NodeError::Conflict(format!(
+                            "PEER_ALREADY_EXISTS: peer '{}' is already paired; explicit targeted --peer offer is required for idempotent re-pair",
+                            verified.bob_node_id
+                        )));
+                    }
+                } else {
+                    // Peer is not paired yet, only has directory-cached keys in `peer_keys`:
+                    // allow upgrading to a direct P2P peer ONLY if every cached key matches!
+                    let sign_ok = existing_sign_keys.is_empty() || sign_matches;
+                    let enc_ok = existing_enc_keys.is_empty() || enc_matches;
+                    if !sign_ok || !enc_ok {
+                        return Err(NodeError::PeerKeyMismatch(format!(
+                            "PEER_KEY_MISMATCH: node '{}' already has different pinned keys cached; refusing P2P key takeover",
+                            verified.bob_node_id
+                        )));
+                    }
+                }
+            }
+
             db.peers().claim_grant(&grant_key, &claim_entry, now)?;
             db.peers().upsert_peer(
                 &PeerInput {
@@ -2210,7 +2479,7 @@ impl UnifiedNode {
             db.peers().upsert_peer_key(
                 &PeerKeyInput {
                     peer_id: verified.bob_node_id.clone(),
-                    kid: verified.bob_signing_pk.kid(),
+                    kid: bob_sign_kid,
                     key_use: KeyUse::Signing,
                     jwk_json: serde_json::to_string(&verified.bob_signing_pk.to_jwk())?,
                     status: KeyStatus::Active,
@@ -2221,7 +2490,7 @@ impl UnifiedNode {
             db.peers().upsert_peer_key(
                 &PeerKeyInput {
                     peer_id: verified.bob_node_id.clone(),
-                    kid: verified.bob_encryption_pk.kid(),
+                    kid: bob_enc_kid,
                     key_use: KeyUse::Encryption,
                     jwk_json: serde_json::to_string(&verified.bob_encryption_pk.to_jwk())?,
                     status: KeyStatus::Active,
@@ -2264,6 +2533,64 @@ impl UnifiedNode {
         bob_grants_to_alice: Vec<String>,
     ) -> Result<PeerLinkInfo, NodeError> {
         let offer = decode_hp2p1(hp2p1_token)?;
+        if offer.node_id == self.config.node_id.as_str() || offer.node_id == LOCAL_NODE_ID {
+            return Err(NodeError::Conflict(format!(
+                "PEER_ID_CONFLICT: offer nodeId '{}' conflicts with local node identity",
+                offer.node_id
+            )));
+        }
+        let offer_sign_pk = offer.signing_jwk.to_ed25519()?;
+        let offer_enc_pk = offer.encryption_jwk.to_x25519()?;
+        {
+            let db = self.db();
+            let existing_peer = db.peers().get_peer(&offer.node_id)?;
+            let existing_sign_keys =
+                db.peers()
+                    .list_peer_keys(&offer.node_id, Some(KeyUse::Signing), true)?;
+            let existing_enc_keys =
+                db.peers()
+                    .list_peer_keys(&offer.node_id, Some(KeyUse::Encryption), true)?;
+            if existing_peer.is_some()
+                || !existing_sign_keys.is_empty()
+                || !existing_enc_keys.is_empty()
+            {
+                let sign_matches = !existing_sign_keys.is_empty()
+                    && existing_sign_keys.iter().all(|k| {
+                        k.kid == offer_sign_pk.kid()
+                            && serde_json::from_str::<CryptoOkpJwk>(&k.jwk_json)
+                                .ok()
+                                .and_then(|j| j.to_ed25519().ok())
+                                == Some(offer_sign_pk)
+                    });
+                let enc_matches = !existing_enc_keys.is_empty()
+                    && existing_enc_keys.iter().all(|k| {
+                        k.kid == offer_enc_pk.kid()
+                            && serde_json::from_str::<CryptoOkpJwk>(&k.jwk_json)
+                                .ok()
+                                .and_then(|j| j.to_x25519().ok())
+                                == Some(offer_enc_pk)
+                    });
+                if let Some(ref peer_row) = existing_peer {
+                    let profile_ok = peer_row.profile == hyp_store::PeerProfile::P2p
+                        && peer_row.status == PeerStatus::Active;
+                    if !sign_matches || !enc_matches || !profile_ok {
+                        return Err(NodeError::PeerKeyMismatch(format!(
+                            "PEER_KEY_MISMATCH: peer '{}' already exists with different pinned keys or profile; refusing P2P overwrite",
+                            offer.node_id
+                        )));
+                    }
+                } else {
+                    let sign_ok = existing_sign_keys.is_empty() || sign_matches;
+                    let enc_ok = existing_enc_keys.is_empty() || enc_matches;
+                    if !sign_ok || !enc_ok {
+                        return Err(NodeError::PeerKeyMismatch(format!(
+                            "PEER_KEY_MISMATCH: node '{}' already has different pinned keys cached; refusing P2P overwrite",
+                            offer.node_id
+                        )));
+                    }
+                }
+            }
+        }
         let expanded_to_alice = expand_v2_scopes(&bob_grants_to_alice)
             .map_err(|e| NodeError::BadRequest(format!("invalid granted scopes: {e}")))?;
 
@@ -2988,49 +3315,269 @@ impl UnifiedNode {
         Ok(out)
     }
 
-    /// Registers a peer's self-signed `PutKeyRequest` (`PUT /v1/keys`).
+    /// Lists active key directory entries visible to `caller` (P1-11 anti-recon scope gate).
+    ///
+    /// Guests (`TrustTier::Guest`) and peers lacking directory/DM/channel read scopes MUST NOT
+    /// enumerate private org/peer nodes or keys; guests may only fetch this node's own public
+    /// key (`?nodeId=<hub>`), their own key (`?nodeId=<self>`), or a co-member's key for a
+    /// channel they are authorized to join and belong to (required for E2EE channel verification),
+    /// and receive `403 not_granted` on unfiltered or unrelated peer enumeration.
+    pub fn list_directory_keys_for_caller(
+        &self,
+        caller: &AuthenticatedPeer,
+        filter_node: Option<&str>,
+    ) -> Result<Vec<PeerKeyDirectoryEntry>, NodeError> {
+        if caller_has_broad_directory_read(caller) {
+            return self.list_directory_keys(filter_node);
+        }
+        if let Some(target) = filter_node {
+            let is_self_or_hub =
+                target == caller.peer_id || target == self.config.node_id.as_str();
+            let scoped_peer_lookup = caller.trust_tier != TrustTier::Guest
+                && (caller.scopes.may_dm_send(target)
+                    || caller.scopes.may_send_files(target, None));
+            let shared_channel_member =
+                !is_self_or_hub && !scoped_peer_lookup && self.peers_share_authorized_channel(caller, target)?;
+            if is_self_or_hub || scoped_peer_lookup || shared_channel_member {
+                return self.list_directory_keys(Some(target));
+            }
+        }
+        self.require_scope(caller, false, "directory:read")?;
+        unreachable!()
+    }
+
+    fn peers_share_authorized_channel(
+        &self,
+        caller: &AuthenticatedPeer,
+        target_node: &str,
+    ) -> Result<bool, NodeError> {
+        let db = self.db();
+        let channels = db
+            .channels()
+            .list_channels(Some(self.config.node_id.as_str()))?;
+        for ch in channels {
+            if !caller.scopes.may_channel_join(&ch.channel) {
+                continue;
+            }
+            let has_caller = ch
+                .members
+                .iter()
+                .any(|m| parse_address(m).is_some_and(|(nid, _)| nid == caller.peer_id));
+            if !has_caller {
+                continue;
+            }
+            let has_target = ch
+                .members
+                .iter()
+                .any(|m| parse_address(m).is_some_and(|(nid, _)| nid == target_node));
+            if has_target {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Lists handles visible to `caller` (P1-11 anti-recon scope gate).
+    ///
+    /// Guests (`TrustTier::Guest`) and peers lacking directory/DM/channel read scopes MUST NOT
+    /// enumerate private org/peer handles; they may only inspect their own `?nodeId=<self>`
+    /// handles (or DM-targeted peer handles for non-guests), and receive `403 not_granted`
+    /// otherwise.
+    pub fn list_directory_handles_for_caller(
+        &self,
+        caller: &AuthenticatedPeer,
+        filter_node: Option<&str>,
+    ) -> Result<Vec<HandleRecord>, NodeError> {
+        if caller_has_broad_directory_read(caller) {
+            let db = self.db();
+            return Ok(db.messages().list_handles(filter_node)?);
+        }
+        if let Some(target) = filter_node {
+            let is_self = target == caller.peer_id;
+            let scoped_peer_lookup =
+                caller.trust_tier != TrustTier::Guest && caller.scopes.may_dm_send(target);
+            if is_self || scoped_peer_lookup {
+                let db = self.db();
+                return Ok(db.messages().list_handles(Some(target))?);
+            }
+        }
+        self.require_scope(caller, false, "directory:read")?;
+        unreachable!()
+    }
+
+    /// Registers an authorized key rotation for `caller_node` (`PUT /v1/keys`), loading
+    /// the caller's peer record and enforcing P1-2 fail-closed authorization.
     pub fn register_peer_key_proof(
         &self,
         caller_node: &str,
         req: &PutKeyRequest,
     ) -> Result<(), NodeError> {
-        let sign_pk = req.signing_jwk.to_ed25519()?;
-        let enc_pk = req.encryption_jwk.to_x25519()?;
-        let payload: KeyRegPayloadV2 = sign_pk.verify_signed("key-reg", &req.proof)?;
-        if payload.v != 2
-            || payload.node_id != caller_node
-            || payload.signing_jwk != req.signing_jwk
-            || payload.encryption_jwk != req.encryption_jwk
-        {
-            return Err(NodeError::BadRequest(
-                "key registration proof does not match caller and keys".into(),
-            ));
+        let caller = if caller_node == self.config.node_id.as_str() {
+            AuthenticatedPeer {
+                peer_id: self.config.node_id.to_string(),
+                scopes: ScopeSet::from_strings(&["*"]),
+                trust_tier: TrustTier::SelfNode,
+            }
+        } else {
+            let db = self.db();
+            load_active_authenticated_peer(&db, caller_node).map_err(|_| {
+                NodeError::Store(StoreError::Unauthorized(format!(
+                    "peer '{caller_node}' is not an active authorized peer for key rotation"
+                )))
+            })?
+        };
+        self.register_peer_key_proof_authorized(&caller, req, None)
+    }
+
+    /// Registers an authorized key rotation (`PUT /v1/keys`) fail-closed (P1-2).
+    ///
+    /// Security invariants:
+    /// - `TrustTier::Guest` callers are unconditionally rejected with `403 Forbidden`.
+    /// - Unpinned callers (no currently pinned signing key) are rejected with `403 Forbidden`
+    ///   unless presenting a valid proof signed by the configured `admin_jwk` Admin-CA key.
+    /// - NEVER accepts a self-signed proof from a new attacker key alone: authorization proof
+    ///   MUST verify under the currently pinned signing key OR the configured `admin_jwk`.
+    /// - If `rotation_proof` is supplied, `rotation_proof` is verified under the pinned key or
+    ///   `admin_jwk` AND `req.proof` is additionally verified under `req.signing_jwk` (dual PoP).
+    /// - Clean rotation atomically marks prior active keys `KeyStatus::Retired` and clears any
+    ///   stale `peer-auth-*` secret when keys change.
+    pub fn register_peer_key_proof_authorized(
+        &self,
+        caller: &AuthenticatedPeer,
+        req: &PutKeyRequest,
+        rotation_proof: Option<&SignedPayload>,
+    ) -> Result<(), NodeError> {
+        if caller.trust_tier == TrustTier::Guest {
+            return Err(NodeError::Store(StoreError::Unauthorized(
+                "guest peers are not allowed to rotate directory keys".into(),
+            )));
+        }
+        let caller_node = caller.peer_id.as_str();
+        if caller_node != self.config.node_id.as_str() {
+            let db = self.db();
+            let peer_rec = db.peers().get_peer(caller_node)?.ok_or_else(|| {
+                NodeError::Store(StoreError::Unauthorized(format!(
+                    "unknown peer '{caller_node}' cannot rotate directory keys"
+                )))
+            })?;
+            if peer_rec.status != PeerStatus::Active || peer_rec.trust_tier == TrustTier::Guest {
+                return Err(NodeError::Store(StoreError::Unauthorized(format!(
+                    "peer '{caller_node}' is not permitted to rotate directory keys"
+                ))));
+            }
+        }
+
+        let new_sign_pk = req.signing_jwk.to_ed25519()?;
+        let new_enc_pk = req.encryption_jwk.to_x25519()?;
+
+        let pinned_sign_pk = self.lookup_peer_signing_key(caller_node)?;
+        let admin_pk = self
+            .config
+            .admin_jwk
+            .as_ref()
+            .map(|j| proto_jwk_to_crypto(j).to_ed25519())
+            .transpose()?;
+
+        if pinned_sign_pk.is_none() && admin_pk.is_none() {
+            return Err(NodeError::Store(StoreError::Unauthorized(format!(
+                "peer '{caller_node}' has no pinned signing key; refusing unpinned key registration"
+            ))));
+        }
+
+        let verify_payload_matches = |payload: &KeyRegPayloadV2| -> Result<(), NodeError> {
+            if payload.v != 2
+                || payload.node_id != caller_node
+                || payload.signing_jwk != req.signing_jwk
+                || payload.encryption_jwk != req.encryption_jwk
+            {
+                return Err(NodeError::BadRequest(
+                    "key registration proof does not match caller and keys".into(),
+                ));
+            }
+            Ok(())
+        };
+
+        let verify_by_pinned_or_admin =
+            |proof: &SignedPayload| -> Result<KeyRegPayloadV2, NodeError> {
+                if let Some(ref cur_pk) = pinned_sign_pk {
+                    if let Ok(payload) = cur_pk.verify_signed::<KeyRegPayloadV2>("key-reg", proof) {
+                        return Ok(payload);
+                    }
+                }
+                if let Some(ref apk) = admin_pk {
+                    if let Ok(payload) = apk.verify_signed::<KeyRegPayloadV2>("key-reg", proof) {
+                        return Ok(payload);
+                    }
+                }
+                Err(NodeError::Store(StoreError::Unauthorized(
+                    "key rotation requires a valid proof signed by the currently pinned signing key or configured Admin-CA key".into(),
+                )))
+            };
+
+        if let Some(auth_proof) = rotation_proof {
+            let auth_payload = verify_by_pinned_or_admin(auth_proof)?;
+            verify_payload_matches(&auth_payload)?;
+            // In dual-proof mode, also verify proof-of-possession of the new signing key.
+            let new_payload: KeyRegPayloadV2 = new_sign_pk
+                .verify_signed("key-reg", &req.proof)
+                .map_err(|_| {
+                    NodeError::Store(StoreError::Unauthorized(
+                        "new signing key proof-of-possession failed".into(),
+                    ))
+                })?;
+            verify_payload_matches(&new_payload)?;
+        } else {
+            let auth_payload = verify_by_pinned_or_admin(&req.proof)?;
+            verify_payload_matches(&auth_payload)?;
         }
 
         let now = now_ms();
-        let db = self.db();
-        db.peers().upsert_peer_key(
-            &PeerKeyInput {
-                peer_id: caller_node.to_string(),
-                kid: sign_pk.kid(),
-                key_use: KeyUse::Signing,
-                jwk_json: serde_json::to_string(&req.signing_jwk)?,
-                status: KeyStatus::Active,
-                expires_at: None,
-            },
-            now,
-        )?;
-        db.peers().upsert_peer_key(
-            &PeerKeyInput {
-                peer_id: caller_node.to_string(),
-                kid: enc_pk.kid(),
-                key_use: KeyUse::Encryption,
-                jwk_json: serde_json::to_string(&req.encryption_jwk)?,
-                status: KeyStatus::Active,
-                expires_at: None,
-            },
-            now,
-        )?;
+        let new_sign_kid = new_sign_pk.kid();
+        let new_enc_kid = new_enc_pk.kid();
+        let keys_changed = {
+            let db = self.db();
+            let prev_sign_kid = db
+                .peers()
+                .list_peer_keys(caller_node, Some(KeyUse::Signing), true)?
+                .into_iter()
+                .next()
+                .map(|k| k.kid);
+            let prev_enc_kid = db
+                .peers()
+                .list_peer_keys(caller_node, Some(KeyUse::Encryption), true)?
+                .into_iter()
+                .next()
+                .map(|k| k.kid);
+
+            db.peers().rotate_peer_key(
+                &PeerKeyInput {
+                    peer_id: caller_node.to_string(),
+                    kid: new_sign_kid.clone(),
+                    key_use: KeyUse::Signing,
+                    jwk_json: serde_json::to_string(&req.signing_jwk)?,
+                    status: KeyStatus::Active,
+                    expires_at: None,
+                },
+                now,
+            )?;
+            db.peers().rotate_peer_key(
+                &PeerKeyInput {
+                    peer_id: caller_node.to_string(),
+                    kid: new_enc_kid.clone(),
+                    key_use: KeyUse::Encryption,
+                    jwk_json: serde_json::to_string(&req.encryption_jwk)?,
+                    status: KeyStatus::Active,
+                    expires_at: None,
+                },
+                now,
+            )?;
+
+            prev_sign_kid.is_some_and(|k| k != new_sign_kid)
+                || prev_enc_kid.is_some_and(|k| k != new_enc_kid)
+        };
+        if keys_changed {
+            self.clear_peer_auth_credential(caller_node);
+        }
         Ok(())
     }
 
@@ -6590,6 +7137,30 @@ fn map_provenance_err(err: ProvenanceError) -> NodeError {
         }
         ProvenanceError::InvalidAttribute(msg) => NodeError::BadRequest(msg),
     }
+}
+
+fn caller_has_broad_directory_read(caller: &AuthenticatedPeer) -> bool {
+    if caller.trust_tier == TrustTier::Guest {
+        return false;
+    }
+    if caller.trust_tier == TrustTier::SelfNode {
+        return true;
+    }
+    if caller.scopes.may_dm_send_any() {
+        return true;
+    }
+    caller.scopes.raw_scopes().iter().any(|raw| {
+        raw == "*"
+            || raw == "directory:read"
+            || raw == "dm:send"
+            || raw == "dm:send=*"
+            || raw == "dm:*"
+            || raw == "messages:send"
+            || raw == "messages:*"
+            || raw == "channel:join"
+            || raw.starts_with("channel:join=")
+            || raw == "channel:*"
+    })
 }
 
 fn peer_may_see_topic(scopes: &ScopeSet, topic: &str) -> bool {
