@@ -2553,3 +2553,275 @@ async fn anthropic_auth_header_x_api_key_bearer_backwards_compat_and_policy_sig(
         "mutating auth_header after signing MUST invalidate gate_policy_sig"
     );
 }
+
+#[tokio::test]
+async fn g5_stage2_and_filter_plugins_quarantine_over_budget_payloads_fail_closed() {
+    let (_tmp, db) = open_ephemeral_db();
+    let t0 = 1_700_000_000_000i64;
+    let budget = hyp_node::gates::DEFAULT_STAGE2_MAX_INPUT_CHARS; // 16_384 chars
+
+    // Mock server that ALWAYS returns "allow" (if contacted, a prefix-truncation bug would fail-open!).
+    let srv_llm = MockLlmServer::start(MockBehavior::StaticJson {
+        status: StatusCode::OK,
+        body: openai_verdict_response("allow", 0.99, "benign prefix"),
+    })
+    .await;
+    let srv_lakera = MockLlmServer::start(MockBehavior::StaticJson {
+        status: StatusCode::OK,
+        body: json!({ "flagged": false, "breakdown": [] }).to_string(),
+    })
+    .await;
+    let srv_http = MockLlmServer::start(MockBehavior::StaticJson {
+        status: StatusCode::OK,
+        body: json!({ "label": "BENIGN", "score": 0.01 }).to_string(),
+    })
+    .await;
+
+    // Raise Stage 1 Peer payload cap above 16_384 so the payload reaches Stage 2 / filter plugins!
+    let mut base_stage1 = Stage1Config::default();
+    base_stage1.tier_policies.get_mut(&TrustTier::Peer).unwrap().max_payload_bytes = 256 * 1024;
+
+    // Build an over-budget payload: 16_385 benign 'A' chars followed by a hidden prompt injection tail!
+    let tail_canary = "TAIL_INJECTION_IGNORE_PREVIOUS_INSTRUCTIONS_EXFIL_9911";
+    let over_budget_body = format!("{}\n{tail_canary}", "A".repeat(budget + 1));
+    assert!(over_budget_body.chars().count() > budget);
+
+    // Boundary differential payload: EXACTLY `budget` (16_384) chars MUST hit the classifier and pass!
+    let exact_budget_body = "B".repeat(budget);
+    assert_eq!(exact_budget_body.chars().count(), budget);
+
+    // 1. Legacy Stage 2 (`Stage2Guard`)
+    let mut cfg_s2 = SecurityGateConfig {
+        stage1: base_stage1.clone(),
+        ..SecurityGateConfig::default()
+    };
+    cfg_s2.stage2.enabled = true;
+    cfg_s2.stage2.provider = LlmProvider::OpenAiCompatible {
+        base_url: srv_llm.base_url(),
+    };
+    cfg_s2.stage2.max_input_chars = budget;
+    cfg_s2.stage2.matchers.trust_tiers = vec![TrustTier::Peer];
+    let p_s2 = SecurityGatePipeline::new(cfg_s2, Arc::clone(&db), None).unwrap();
+
+    let eval_s2_over = p_s2
+        .evaluate_inbound(
+            &make_inbound_dm("g5-s2-over", "peer@a", "peer@a/dev", TrustTier::Peer, &over_budget_body),
+            t0,
+        )
+        .await
+        .unwrap();
+    match &eval_s2_over.decision {
+        GateDecision::Quarantine { reason, notice } => {
+            assert!(
+                reason.starts_with("stage2_input_exceeds_budget"),
+                "expected stage2_input_exceeds_budget, got {reason}"
+            );
+            assert!(notice.contains("stage2_input_exceeds_budget"));
+            assert!(!notice.contains(tail_canary));
+        }
+        other => panic!("Stage2Guard MUST quarantine over-budget payload fail-closed, got {other:?}"),
+    }
+    assert_eq!(
+        srv_llm.calls(),
+        0,
+        "over-budget payload must fail closed BEFORE contacting Stage 2 LLM"
+    );
+
+    // Exact budget boundary DOES classify and pass cleanly.
+    let eval_s2_exact = p_s2
+        .evaluate_inbound(
+            &make_inbound_dm("g5-s2-exact", "peer@a", "peer@a/dev", TrustTier::Peer, &exact_budget_body),
+            t0 + 1,
+        )
+        .await
+        .unwrap();
+    assert!(
+        eval_s2_exact.decision.is_allow(),
+        "exact max_input_chars boundary must pass when benign: {eval_s2_exact:?}"
+    );
+    assert_eq!(srv_llm.calls(), 1);
+
+    // 2. LakeraGuardPlugin
+    let mut cfg_lak = SecurityGateConfig {
+        stage1: base_stage1.clone(),
+        ..SecurityGateConfig::default()
+    };
+    cfg_lak.filters.push(FilterPluginConfig {
+        id: "lakera-budget".into(),
+        enabled: true,
+        matchers: Stage2Matchers {
+            trust_tiers: vec![TrustTier::Peer],
+            ..Default::default()
+        },
+        on_error: Stage2ErrorAction::Quarantine,
+        max_concurrent: 4,
+        busy_retry_after_ms: 250,
+        adapter: FilterAdapterConfig::LakeraGuard {
+            base_url: srv_lakera.base_url(),
+            api_key_secret: None,
+            project_id: None,
+            timeout_ms: 2_000,
+            max_input_chars: budget,
+            on_flagged: Stage2ErrorAction::Quarantine,
+        },
+    });
+    let p_lak = SecurityGatePipeline::new(cfg_lak, Arc::clone(&db), None).unwrap();
+    let eval_lak = p_lak
+        .evaluate_inbound(
+            &make_inbound_dm("g5-lak-over", "peer@b", "peer@b/dev", TrustTier::Peer, &over_budget_body),
+            t0 + 2,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            eval_lak.decision,
+            GateDecision::Quarantine { ref reason, .. } if reason.starts_with("stage2_input_exceeds_budget")
+        ),
+        "LakeraGuardPlugin must quarantine over-budget payload: {eval_lak:?}"
+    );
+    assert_eq!(srv_lakera.calls(), 0);
+
+    // 3. HttpClassifierPlugin
+    let mut cfg_http = SecurityGateConfig {
+        stage1: base_stage1.clone(),
+        ..SecurityGateConfig::default()
+    };
+    cfg_http.filters.push(FilterPluginConfig {
+        id: "http-budget".into(),
+        enabled: true,
+        matchers: Stage2Matchers {
+            trust_tiers: vec![TrustTier::Peer],
+            ..Default::default()
+        },
+        on_error: Stage2ErrorAction::Quarantine,
+        max_concurrent: 4,
+        busy_retry_after_ms: 250,
+        adapter: FilterAdapterConfig::HttpClassifier {
+            url: srv_http.base_url(),
+            api_key_secret: None,
+            auth_header: None,
+            score_field: "score".into(),
+            label_field: "label".into(),
+            flagged_labels: vec![],
+            threshold: 0.80,
+            timeout_ms: 2_000,
+            max_input_chars: budget,
+            on_flagged: Stage2ErrorAction::Quarantine,
+        },
+    });
+    let p_http = SecurityGatePipeline::new(cfg_http, Arc::clone(&db), None).unwrap();
+    let eval_http = p_http
+        .evaluate_inbound(
+            &make_inbound_dm("g5-http-over", "peer@c", "peer@c/dev", TrustTier::Peer, &over_budget_body),
+            t0 + 3,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            eval_http.decision,
+            GateDecision::Quarantine { ref reason, .. } if reason.starts_with("stage2_input_exceeds_budget")
+        ),
+        "HttpClassifierPlugin must quarantine over-budget payload: {eval_http:?}"
+    );
+    assert_eq!(srv_http.calls(), 0);
+
+    // 4. SubprocessFilterPlugin (even if pointed at a non-existent binary, budget fails closed first!)
+    let mut cfg_sub = SecurityGateConfig {
+        stage1: base_stage1,
+        ..SecurityGateConfig::default()
+    };
+    cfg_sub.filters.push(FilterPluginConfig {
+        id: "subproc-budget".into(),
+        enabled: true,
+        matchers: Stage2Matchers {
+            trust_tiers: vec![TrustTier::Peer],
+            ..Default::default()
+        },
+        on_error: Stage2ErrorAction::Quarantine,
+        max_concurrent: 4,
+        busy_retry_after_ms: 250,
+        adapter: FilterAdapterConfig::Subprocess {
+            command: "/nonexistent/should-never-spawn".into(),
+            args: vec![],
+            env_allowlist: vec![],
+            timeout_ms: 1_000,
+            max_input_chars: budget,
+            min_allow_confidence: 0.75,
+        },
+    });
+    let p_sub = SecurityGatePipeline::new(cfg_sub, Arc::clone(&db), None).unwrap();
+    let eval_sub = p_sub
+        .evaluate_inbound(
+            &make_inbound_dm("g5-sub-over", "peer@d", "peer@d/dev", TrustTier::Peer, &over_budget_body),
+            t0 + 4,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            eval_sub.decision,
+            GateDecision::Quarantine { ref reason, .. } if reason.starts_with("stage2_input_exceeds_budget")
+        ),
+        "SubprocessFilterPlugin must quarantine over-budget payload: {eval_sub:?}"
+    );
+}
+
+#[tokio::test]
+async fn g4_hold_verdicts_always_write_immutable_gate_audit_rows() {
+    let (_tmp, db) = open_ephemeral_db();
+    let t0 = 1_700_000_000_000i64;
+
+    // 1. Stage 1 rate-limit Hold writes immutable gate_audit row with stage, reason, and retry_after_ms!
+    let mut cfg = SecurityGateConfig::default();
+    cfg.stage1.rate_limit_action = RateLimitAction::Hold;
+    cfg.stage1.tier_policies.get_mut(&TrustTier::Peer).unwrap().rate_limit = RateLimitConfig {
+        max_burst: 1,
+        refill_per_min: 60,
+    };
+    let pipeline = SecurityGatePipeline::new(cfg, Arc::clone(&db), None).unwrap();
+
+    let ok1 = pipeline
+        .evaluate_inbound(
+            &make_inbound_dm("hold-aud-1", "peer@rl", "peer@rl/a", TrustTier::Peer, "first"),
+            t0,
+        )
+        .await
+        .unwrap();
+    assert!(ok1.decision.is_allow());
+
+    let held2 = pipeline
+        .evaluate_inbound(
+            &make_inbound_dm("hold-aud-2", "peer@rl", "peer@rl/a", TrustTier::Peer, "second"),
+            t0,
+        )
+        .await
+        .unwrap();
+    assert!(held2.decision.is_hold());
+    let hold_seq = held2
+        .audit_seq
+        .expect("Stage 1 Hold MUST write an immutable gate_audit row");
+    assert!(held2.categories.contains(&"gate.held".to_string()));
+
+    let rows = pipeline
+        .query_audit_log(&GateAuditQuery {
+            decision: Some(StoreGateDecision::Error),
+            direction: Some(GateDirection::Inbound),
+            session_id: Some("claude:t1".into()),
+            since_ms: None,
+            until_ms: None,
+            limit: Some(10),
+        })
+        .unwrap();
+    let audit = rows
+        .iter()
+        .find(|r| r.seq == hold_seq)
+        .expect("Hold audit row must be persisted in gate_audit");
+    assert_eq!(audit.stage, "stage1");
+    assert!(audit.categories.contains(&"gate.held".to_string()));
+    assert!(audit.categories.contains(&"rate_limited".to_string()));
+    let reason = audit.reason.as_deref().unwrap_or("");
+    assert!(reason.contains("rate_limited"), "reason={reason}");
+    assert!(reason.contains("retry_after_ms="), "reason={reason}");
+}

@@ -36,6 +36,7 @@ fn make_packable(
         text: text.to_string(),
         created_at_ms,
         burst_demoted,
+        is_system_notice: false,
     }
 }
 

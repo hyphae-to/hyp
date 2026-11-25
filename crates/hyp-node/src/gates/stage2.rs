@@ -139,6 +139,21 @@ impl FilterOutcome {
         }
     }
 
+    pub fn over_budget(actual_chars: usize, max_input_chars: usize) -> Self {
+        let code = "stage2_input_exceeds_budget".to_string();
+        let reason = format!("{code}:{actual_chars}>{max_input_chars}");
+        Self {
+            decision: GateDecision::Quarantine {
+                reason,
+                notice: format_quarantine_notice(&code),
+            },
+            confidence: Some(1.0),
+            categories: vec![code],
+            had_error: false,
+            plugin_id: None,
+        }
+    }
+
     pub fn with_plugin_id(mut self, id: impl Into<String>) -> Self {
         self.plugin_id = Some(id.into());
         self
@@ -221,6 +236,13 @@ impl Stage2Guard {
         let Ok(_permit) = self.semaphore.clone().try_acquire_owned() else {
             return FilterOutcome::hold("gate_busy", self.config.busy_retry_after_ms);
         };
+
+        // G5 (P1): Fail closed when payload exceeds Stage 2 input budget instead of silently
+        // classifying only a prefix and passing an unscreened tail.
+        let payload_chars = ctx.payload_text().chars().count();
+        if payload_chars > self.config.max_input_chars {
+            return FilterOutcome::over_budget(payload_chars, self.config.max_input_chars);
+        }
 
         // Resolve API key strictly from SecretStore (never plaintext config).
         let api_key: Option<Zeroizing<String>> = match &self.config.api_key_secret {

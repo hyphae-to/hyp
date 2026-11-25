@@ -351,6 +351,12 @@ impl LakeraGuardPlugin {
             return FilterOutcome::hold("gate_busy", self.busy_retry_after_ms);
         };
 
+        let raw_content = ctx.payload_text();
+        let content_chars = raw_content.chars().count();
+        if content_chars > self.max_input_chars {
+            return FilterOutcome::over_budget(content_chars, self.max_input_chars);
+        }
+
         let api_key = match resolve_optional_secret(
             &self.api_key_secret,
             secrets,
@@ -367,10 +373,9 @@ impl LakeraGuardPlugin {
             format!("{base}/v2/guard")
         };
 
-        let content: String = ctx.payload_text().chars().take(self.max_input_chars).collect();
         let mut payload = json!({
             "messages": [
-                { "role": "user", "content": content }
+                { "role": "user", "content": raw_content }
             ],
             "breakdown": true
         });
@@ -528,12 +533,17 @@ impl HttpClassifierPlugin {
             return FilterOutcome::hold("gate_busy", self.busy_retry_after_ms);
         };
 
+        let text = ctx.payload_text();
+        let text_chars = text.chars().count();
+        if text_chars > self.max_input_chars {
+            return FilterOutcome::over_budget(text_chars, self.max_input_chars);
+        }
+
         let api_key = match resolve_optional_secret(&self.api_key_secret, secrets, false) {
             Ok(key) => key,
             Err(code) => return FilterOutcome::from_error(self.on_error, code),
         };
 
-        let text: String = ctx.payload_text().chars().take(self.max_input_chars).collect();
         let Ok(body_vec) = serde_json::to_vec(&json!({ "text": text })) else {
             return FilterOutcome::from_error(self.on_error, "gate_request_serialize_error");
         };
@@ -697,7 +707,11 @@ impl SubprocessFilterPlugin {
             return FilterOutcome::hold("gate_busy", self.busy_retry_after_ms);
         };
 
-        let body_text: String = ctx.payload_text().chars().take(self.max_input_chars).collect();
+        let body_text = ctx.payload_text();
+        let body_chars = body_text.chars().count();
+        if body_chars > self.max_input_chars {
+            return FilterOutcome::over_budget(body_chars, self.max_input_chars);
+        }
         let rpc_req = json!({
             "jsonrpc": "2.0",
             "id": 1,
