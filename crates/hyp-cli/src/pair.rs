@@ -42,10 +42,11 @@ use hyp_node::engine::{
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
 use hyp_proto::manifest::{NodeManifestPayload, NodeProfile as ProtoNodeProfile, SignedNodeManifest};
 use hyp_proto::problem::ProblemDetails;
-use hyp_proto::scopes::{EscalationNote, ScopePreset, ScopeSet, expand_v2_scopes};
+use hyp_proto::scopes::{EscalationNote, ScopePreset, ScopeSet, V2_STAR_EXPANSION, expand_v2_scopes};
 use hyp_store::{
     GrantDirection, GrantInput, KeyStatus, KeyUse, ManifestCacheUpdate, NodeDb, PeerInput,
-    PeerKeyInput, PeerProfile, PeerStatus, StoreError, TrustTier as StoreTrustTier, now_ms,
+    PeerKeyInput, PeerProfile, PeerStatus, RevocationInput, StoreError,
+    TrustTier as StoreTrustTier, now_ms,
 };
 use hyper::body::Bytes;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -166,6 +167,9 @@ pub enum PairCommand {
         /// Explicit state/config directory for SecretStore (uses isolated file backend by default)
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        /// Allow --node-id to differ from local node.json nodeId when minting a P2P invite
+        #[arg(long)]
+        force_node_id: bool,
         /// Output structured JSON envelope
         #[arg(long)]
         json: bool,
@@ -223,6 +227,26 @@ pub enum PairCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Revoke a paired peer, clear stored bearer credentials, and immediately drop its live link
+    Revoke {
+        /// Canonical peer nodeId to revoke (e.g. bob@laptop, acme-team)
+        peer_id: String,
+        /// Optional human-readable revocation reason recorded in the revocation log
+        #[arg(long)]
+        reason: Option<String>,
+        /// Explicit state directory containing node.sqlite and secrets/
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Explicit node.json path
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Explicit daemon IPC socket/addr path for live peers.reload
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Output structured JSON envelope
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run_pair(command: PairCommand) -> ExitCode {
@@ -239,6 +263,7 @@ pub fn run_pair(command: PairCommand) -> ExitCode {
             expires_hours,
             escalation,
             state_dir,
+            force_node_id,
             json,
         } => run_invite(
             mode,
@@ -251,6 +276,7 @@ pub fn run_pair(command: PairCommand) -> ExitCode {
             expires_hours,
             escalation,
             state_dir,
+            force_node_id,
             json,
         ),
         PairCommand::Inspect { token_file, json } => run_inspect(token_file, json),
@@ -271,6 +297,14 @@ pub fn run_pair(command: PairCommand) -> ExitCode {
             offline,
             json,
         } => run_join(url, state_dir, node_id, node_name, preset, offline, json),
+        PairCommand::Revoke {
+            peer_id,
+            reason,
+            state_dir,
+            config,
+            socket,
+            json,
+        } => run_revoke(peer_id, reason, state_dir, config, socket, json),
     }
 }
 
@@ -614,6 +648,86 @@ fn infer_trust_tier(mode: InviteMode, preset: Option<CliScopePreset>, scopes: &[
     }
 }
 
+/// Returns `true` for high-privilege opt-in scopes (`bridge:post` / `forward:via`) that MUST
+/// NEVER be auto-granted in default counter-grants without explicit `--grant` opt-in (`P1-8`).
+fn is_privileged_opt_in_scope(scope: &str) -> bool {
+    let s = scope.trim();
+    s == "bridge:post"
+        || s.starts_with("bridge:post=")
+        || s == "forward:via"
+        || s.starts_with("forward:via=")
+}
+
+/// Strips `bridge:post` and `forward:via` from default counter-grants, recording a clear warning
+/// whenever any privileged scope was removed (`P1-8`).
+fn strip_privileged_default_scopes(
+    scopes: Vec<String>,
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    let mut safe = Vec::with_capacity(scopes.len());
+    let mut stripped = Vec::new();
+    for s in scopes {
+        if is_privileged_opt_in_scope(&s) {
+            stripped.push(s);
+        } else {
+            safe.push(s);
+        }
+    }
+    if !stripped.is_empty() {
+        warnings.push(format!(
+            "Stripped privileged opt-in scope(s) from default counter-grant ({}); pass --grant explicitly to opt in.",
+            stripped.join(", ")
+        ));
+    }
+    if safe.is_empty() {
+        safe = vec!["dm:send".to_string(), "dm:receive".to_string()];
+    }
+    safe
+}
+
+/// Emits explicit security warnings in `hyp pair inspect` when a token offers or requests `*`,
+/// `bridge:post`, or `forward:via` (`P1-8`).
+fn warn_privileged_token_scopes(label: &str, scopes: &[String], warnings: &mut Vec<String>) {
+    let has_literal_star = scopes.iter().any(|s| s.trim() == "*");
+    let has_full_star_expansion = !scopes.is_empty()
+        && V2_STAR_EXPANSION
+            .iter()
+            .all(|star_tok| scopes.iter().any(|s| s.trim() == *star_tok));
+    if has_literal_star || has_full_star_expansion {
+        warnings.push(format!(
+            "Token {label} wildcard '*' (full standard permissions across DMs, channels, streams, files, and KV); review carefully before accepting."
+        ));
+    }
+    let bridge_scopes: Vec<&str> = scopes
+        .iter()
+        .map(String::as_str)
+        .filter(|s| {
+            let t = s.trim();
+            t == "bridge:post" || t.starts_with("bridge:post=")
+        })
+        .collect();
+    if !bridge_scopes.is_empty() {
+        warnings.push(format!(
+            "Token {label} privileged scope 'bridge:post' ({}) — allows posting to external chat bridges (stripped by default unless explicitly opted in via --grant).",
+            bridge_scopes.join(", ")
+        ));
+    }
+    let forward_scopes: Vec<&str> = scopes
+        .iter()
+        .map(String::as_str)
+        .filter(|s| {
+            let t = s.trim();
+            t == "forward:via" || t.starts_with("forward:via=")
+        })
+        .collect();
+    if !forward_scopes.is_empty() {
+        warnings.push(format!(
+            "Token {label} privileged scope 'forward:via' ({}) — allows multi-hop transit forwarding (stripped by default unless explicitly opted in via --grant).",
+            forward_scopes.join(", ")
+        ));
+    }
+}
+
 /// Pure parser for `tailscale status --json` output -> `https://<magicdns_host>`.
 ///
 /// Fails closed (returns `None`) unless:
@@ -737,6 +851,7 @@ fn run_invite(
     expires_hours: u64,
     escalation: Option<String>,
     state_dir: Option<PathBuf>,
+    force_node_id: bool,
     as_json: bool,
 ) -> ExitCode {
     let cmd = "pair invite";
@@ -885,6 +1000,37 @@ fn run_invite(
 
     match mode {
         InviteMode::P2p => {
+            // P1-14: Guard against minting a P2P invite under a mismatched --node-id when a local
+            // node.json already declares a different nodeId (fail closed unless --force-node-id).
+            let local_cfg_path =
+                resolve_config_path_for_read(None, Some(&effective_state_dir), None);
+            if local_cfg_path.exists() {
+                if let Ok(loaded) = load_node_or_legacy_config(&local_cfg_path) {
+                    if let Some(configured_node_id) = loaded.node_id.as_deref() {
+                        if configured_node_id != node_id {
+                            if !force_node_id {
+                                return emit_error(
+                                    cmd,
+                                    as_json,
+                                    EXIT_USAGE,
+                                    "NODE_ID_MISMATCH",
+                                    format!(
+                                        "--node-id '{node_id}' does not match local node.json nodeId '{configured_node_id}' ({})",
+                                        local_cfg_path.display()
+                                    ),
+                                    Some(format!(
+                                        "Use --node-id {configured_node_id} to match your local node, or pass --force-node-id to override intentionally."
+                                    )),
+                                );
+                            }
+                            warnings.push(format!(
+                                "Overriding local node.json nodeId '{configured_node_id}' with --node-id '{node_id}' (--force-node-id)."
+                            ));
+                        }
+                    }
+                }
+            }
+
             let keys = match store.load_or_create_node_keys(&node_id) {
                 Ok(k) => k,
                 Err(e) => {
@@ -1085,6 +1231,7 @@ fn run_invite(
                 println!();
                 println!("Pairing Token (share out-of-band; never pass as a CLI argv flag):");
                 println!("{token}");
+                print_warnings(&warnings);
                 print_next_steps(&next);
             }
             ExitCode::from(EXIT_OK)
@@ -1170,7 +1317,7 @@ fn run_invite(
                 subject_encryption_jwk: None,
                 issued_at: issued_v1.grant.issued_at.clone(),
                 pair_by: Some(expires_at.clone()),
-                expires_at: Some(expires_at.clone()),
+                expires_at: None,
             };
             let signed_grant_v2 = match sign_grant_v2(&grant_v2, &admin_key) {
                 Ok(sg) => sg,
@@ -1643,6 +1790,8 @@ fn inspect_hp2p1(token: &str, mut warnings: Vec<String>, as_json: bool) -> ExitC
     if expired {
         warnings.push(format!("Pairing offer expired at {}.", offer.expires_at));
     }
+    warn_privileged_token_scopes("requests", &offer.requested_scopes, &mut warnings);
+    warn_privileged_token_scopes("offers", &offer.offered_scopes, &mut warnings);
 
     let ok = !expired;
     let next = if ok {
@@ -1856,6 +2005,7 @@ fn inspect_am2(token: &str, mut warnings: Vec<String>, as_json: bool) -> ExitCod
             warnings.push(format!("Invite bundle expired at {ts}."));
         }
     }
+    warn_privileged_token_scopes("grants", &scopes, &mut warnings);
 
     let remote_label = node_id.as_deref().unwrap_or(&invite.router);
     let untrusted_note = extract_untrusted_escalation(raw_map.as_ref(), remote_label);
@@ -2797,11 +2947,15 @@ fn resolve_pair_daemon_socket(state_dir: &Path, explicit_state: bool) -> PathBuf
 /// `connector.sock` / Windows loopback `connector.addr`.
 ///
 /// Always fail-safe: returns `reloaded: false` without error if the daemon is stopped,
-/// unreachable, or timed out so an already-committed pairing never fails.
+/// unreachable, or timed out so an already-committed pairing/revocation never fails.
 fn try_reload_live_daemon(state_dir: &Path, explicit_state: bool) -> DaemonReloadOutcome {
     let socket_path = resolve_pair_daemon_socket(state_dir, explicit_state);
+    try_reload_live_daemon_at_socket(&socket_path)
+}
+
+fn try_reload_live_daemon_at_socket(socket_path: &Path) -> DaemonReloadOutcome {
     let resp = hyp_harness::sock::daemon_rpc_sync(
-        &socket_path,
+        socket_path,
         &json!({ "type": "peers.reload" }),
         LIVE_DAEMON_RELOAD_TIMEOUT,
     );
@@ -3107,9 +3261,10 @@ fn accept_hp2p1(
     let granted_scopes = if let Some(explicit) = explicit_grant_scopes {
         explicit
     } else if !expanded_requested.is_empty() {
-        expanded_requested.clone()
+        // P1-8: Never auto-grant `bridge:post` or `forward:via` without explicit `--grant`.
+        strip_privileged_default_scopes(expanded_requested.clone(), &mut warnings)
     } else if !expanded_offered.is_empty() {
-        expanded_offered.clone()
+        strip_privileged_default_scopes(expanded_offered.clone(), &mut warnings)
     } else {
         ScopePreset::Member.expand()
     };
@@ -3384,8 +3539,9 @@ fn accept_hp2p1(
                 scopes: granted_scopes.clone(),
                 trust_tier,
                 issued_at: now_db,
-                pair_by: Some(exp_ms),
-                expires_at: Some(exp_ms),
+                // P1-18: Do NOT stamp the short invite pairing window onto an accepted long-lived peer grant.
+                pair_by: None,
+                expires_at: None,
             },
             now_db,
         ) {
@@ -3436,7 +3592,7 @@ fn accept_hp2p1(
             subject_encryption_jwk: Some(offer.encryption_jwk.clone()),
             issued_at: format_rfc3339_millis(now_db),
             pair_by: Some(offer.expires_at.clone()),
-            expires_at: Some(offer.expires_at.clone()),
+            expires_at: None,
         };
         let signed_counter = match sign_grant_v2(&counter_grant, &local_keys.signing) {
             Ok(sg) => sg,
@@ -3468,7 +3624,8 @@ fn accept_hp2p1(
                 trust_tier,
                 issued_at: now_db,
                 pair_by: Some(exp_ms),
-                expires_at: Some(exp_ms),
+                // P1-18: Keep accepted/staged long-lived peer grant unbounded unless explicitly bounded.
+                expires_at: None,
             },
             now_db,
         ) {
@@ -3981,6 +4138,14 @@ fn accept_am2(
     let now_db = now_ms();
     let _ = db.local().ensure_metadata("node_id", &local_node_id);
 
+    // P1-8: Never auto-grant `bridge:post` or `forward:via` on accepted am2_ invites without
+    // explicit `--grant` opt-in.
+    let effective_peer_scopes = if explicit_grant_scopes.is_some() {
+        scopes.clone()
+    } else {
+        strip_privileged_default_scopes(scopes.clone(), &mut warnings)
+    };
+
     if let Err(e) = db.peers().upsert_peer(
         &PeerInput {
             peer_id: peer_id.clone(),
@@ -3988,7 +4153,7 @@ fn accept_am2(
             profile: PeerProfile::Router,
             trust_tier,
             status: PeerStatus::Active,
-            scopes: scopes.clone(),
+            scopes: effective_peer_scopes.clone(),
             auth_credential_ref: Some(cred_ref.clone()),
         },
         now_db,
@@ -4149,11 +4314,12 @@ fn accept_am2(
             peer_id: peer_id.clone(),
             direction: GrantDirection::Outbound,
             signed_json: stored_grant_json,
-            scopes: scopes.clone(),
+            scopes: effective_peer_scopes.clone(),
             trust_tier,
             issued_at: now_db,
-            pair_by: expires_at_ms,
-            expires_at: expires_at_ms,
+            // P1-18: Do NOT stamp the short invite pairing window onto an accepted long-lived peer grant.
+            pair_by: if offline { expires_at_ms } else { None },
+            expires_at: None,
         },
         now_db,
     ) {
@@ -4191,7 +4357,7 @@ fn accept_am2(
         "adminFingerprint": admin_fingerprint,
         "requireE2ee": invite.require_e2ee.unwrap_or(true),
         "trustTier": trust_tier.as_str(),
-        "scopes": scopes,
+        "scopes": effective_peer_scopes,
         "expiresAt": expires_at_str,
         "escalationNote": untrusted_note,
         "offline": offline,
@@ -4228,7 +4394,7 @@ fn accept_am2(
         println!("      Admin kid:   {kid}");
         println!("      Fingerprint: {admin_fingerprint}");
         println!("      Trust Tier:  {}", trust_tier.as_str());
-        println!("      Scopes:      {}", scopes.join(" "));
+        println!("      Scopes:      {}", effective_peer_scopes.join(" "));
         if daemon_reloaded {
             println!("      Daemon:      Live daemon reloaded — peer connected immediately (no restart needed).");
         }
@@ -4319,13 +4485,16 @@ pub(crate) fn live_pair_hp2p1_for_onboard(
             message: format!("Invalid requestedScopes in hp2p1_ token: {e}"),
         })?
     };
-    let granted_scopes = if !expanded_requested.is_empty() {
+    let raw_default_scopes = if !expanded_requested.is_empty() {
         expanded_requested
     } else if !expanded_offered.is_empty() {
         expanded_offered.clone()
     } else {
         ScopePreset::Member.expand()
     };
+    // P1-8: Never auto-grant `bridge:post` or `forward:via` during `onboard --join`.
+    let mut _strip_warnings = Vec::new();
+    let granted_scopes = strip_privileged_default_scopes(raw_default_scopes, &mut _strip_warnings);
     // P1-9: Never trust unsigned `trustTier` metadata in P2P offers; infer strictly as Peer/Guest.
     let trust_tier_raw = infer_trust_tier(InviteMode::P2p, None, &expanded_offered);
     let trust_tier = parse_store_trust_tier(trust_tier_raw, StoreTrustTier::Peer);
@@ -4448,8 +4617,9 @@ pub(crate) fn live_pair_hp2p1_for_onboard(
             scopes: granted_scopes.clone(),
             trust_tier,
             issued_at: now_db,
-            pair_by: Some(exp_ms),
-            expires_at: Some(exp_ms),
+            // P1-18: Do NOT stamp the short invite pairing window onto an accepted long-lived peer grant.
+            pair_by: None,
+            expires_at: None,
         },
         now_db,
     )
@@ -4561,6 +4731,10 @@ pub(crate) fn live_pair_am2_for_onboard(
         .map(|t| parse_store_trust_tier(t, StoreTrustTier::Org))
         .unwrap_or(StoreTrustTier::Org);
     let now_db = now_ms();
+    // P1-8: Never auto-grant `bridge:post` or `forward:via` during `onboard --join`.
+    let mut _strip_warnings = Vec::new();
+    let effective_scopes =
+        strip_privileged_default_scopes(live.verified_grant.scopes.clone(), &mut _strip_warnings);
     db.peers()
         .upsert_peer(
             &PeerInput {
@@ -4569,7 +4743,7 @@ pub(crate) fn live_pair_am2_for_onboard(
                 profile: PeerProfile::Router,
                 trust_tier,
                 status: PeerStatus::Active,
-                scopes: live.verified_grant.scopes.clone(),
+                scopes: effective_scopes.clone(),
                 auth_credential_ref: Some(cred_ref),
             },
             now_db,
@@ -4700,7 +4874,7 @@ pub(crate) fn live_pair_am2_for_onboard(
         peer_id: live.hub_node_id,
         endpoint: invite.router,
         kid: Some(admin_pk.kid()),
-        scopes: live.verified_grant.scopes,
+        scopes: effective_scopes,
         enrolled: true,
     })
 }
@@ -5765,6 +5939,276 @@ fn run_join(
     ExitCode::from(EXIT_OK)
 }
 
+// ============================================================================
+// `pair revoke` (P1-4)
+// ============================================================================
+
+fn run_revoke(
+    peer_id: String,
+    reason: Option<String>,
+    state_dir_arg: Option<PathBuf>,
+    config_arg: Option<PathBuf>,
+    socket_arg: Option<PathBuf>,
+    as_json: bool,
+) -> ExitCode {
+    let cmd = "pair revoke";
+
+    if peer_id == LOCAL_NODE_ID || !is_valid_node_id(&peer_id) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "INVALID_PEER_ID",
+            format!(
+                "Invalid peer '{peer_id}': must match /^[a-z0-9][a-z0-9@._-]{{0,63}}$/ and cannot be 'local'"
+            ),
+            Some("Example: hyp pair revoke bob@laptop".to_string()),
+        );
+    }
+
+    let explicit_state = state_dir_arg.is_some() || config_arg.is_some();
+    let state_dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
+    let db_path = state_dir.join("node.sqlite");
+    if !db_path.exists() {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "PEER_NOT_FOUND",
+            format!(
+                "Peer '{peer_id}' is not paired (state database {} does not exist)",
+                db_path.display()
+            ),
+            Some(format!("Check paired peers with `hyp status --state-dir {}`.", state_dir.display())),
+        );
+    }
+
+    let db = match NodeDb::open(&db_path) {
+        Ok(d) => d,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "DB_ERROR",
+                format!("Failed to open {}: {e}", db_path.display()),
+                None,
+            );
+        }
+    };
+
+    let existing_peer = match db.peers().get_peer(&peer_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "PEER_NOT_FOUND",
+                format!("Peer '{peer_id}' is not paired in {}", db_path.display()),
+                Some(format!("List known peers with `hyp status --state-dir {}`.", state_dir.display())),
+            );
+        }
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "DB_ERROR",
+                format!("Failed to look up peer '{peer_id}': {e}"),
+                None,
+            );
+        }
+    };
+
+    let mut warnings = Vec::new();
+    let previous_status = existing_peer.status;
+    let already_revoked = previous_status == PeerStatus::Revoked;
+    if already_revoked {
+        warnings.push(format!("Peer '{peer_id}' was already revoked."));
+    }
+
+    let now_db = now_ms();
+    if let Err(e) = db.peers().set_peer_status(&peer_id, PeerStatus::Revoked, now_db) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "DB_ERROR",
+            format!("Failed to revoke peer '{peer_id}': {e}"),
+            None,
+        );
+    }
+
+    let grants = match db.peers().list_grants(Some(&peer_id)) {
+        Ok(list) => list,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "DB_ERROR",
+                format!("Failed to list grants for peer '{peer_id}': {e}"),
+                None,
+            );
+        }
+    };
+
+    let clean_reason = reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    let rev_json = json!({
+        "peerId": peer_id,
+        "revokedAt": format_rfc3339_millis(now_db),
+        "reason": clean_reason,
+        "source": "cli:pair-revoke",
+    })
+    .to_string();
+
+    let mut revoked_grants: Vec<String> = Vec::new();
+    for g in &grants {
+        if let Err(e) = db.peers().add_revocation(
+            &RevocationInput {
+                grant_id: g.id.clone(),
+                peer_id: peer_id.clone(),
+                signed_json: rev_json.clone(),
+            },
+            now_db,
+        ) {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "DB_ERROR",
+                format!("Failed to record grant revocation '{}': {e}", g.id),
+                None,
+            );
+        }
+        revoked_grants.push(g.id.clone());
+    }
+    if revoked_grants.is_empty() {
+        let synthetic_id = format!("peer-revoke:{peer_id}");
+        if let Err(e) = db.peers().add_revocation(
+            &RevocationInput {
+                grant_id: synthetic_id.clone(),
+                peer_id: peer_id.clone(),
+                signed_json: rev_json,
+            },
+            now_db,
+        ) {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "DB_ERROR",
+                format!("Failed to record peer revocation for '{peer_id}': {e}"),
+                None,
+            );
+        }
+        revoked_grants.push(synthetic_id);
+    }
+
+    drop(db);
+
+    // Best-effort clear stored peer bearer/pairing credentials from SecretStore.
+    let secrets = crate::config_file::open_secret_store(&state_dir, explicit_state);
+    let mut candidate_keys = vec![
+        credential_secret_name("peer-auth", &peer_id),
+        credential_secret_name("pair-p2p", &peer_id),
+        credential_secret_name("pair-am2", &peer_id),
+    ];
+    if let Some(ref cred_ref) = existing_peer.auth_credential_ref {
+        if !candidate_keys.contains(cred_ref) {
+            candidate_keys.push(cred_ref.clone());
+        }
+    }
+    let literal_peer_auth = format!("peer-auth-{peer_id}");
+    if hyp_crypto::keystore::validate_secret_name(&literal_peer_auth).is_ok()
+        && !candidate_keys.contains(&literal_peer_auth)
+    {
+        candidate_keys.push(literal_peer_auth);
+    }
+
+    let mut credentials_cleared = 0usize;
+    for key_name in candidate_keys {
+        match secrets.delete(&key_name) {
+            Ok(true) => credentials_cleared += 1,
+            Ok(false) | Err(hyp_crypto::CryptoError::SecretNotFound(_)) => {}
+            Err(e) => {
+                warnings.push(format!(
+                    "Best-effort SecretStore cleanup for '{key_name}' skipped: {e}"
+                ));
+            }
+        }
+    }
+
+    let socket_path = socket_arg
+        .unwrap_or_else(|| resolve_pair_daemon_socket(&state_dir, explicit_state));
+    let reload = try_reload_live_daemon_at_socket(&socket_path);
+    warnings.extend(reload.warnings);
+    let daemon_reloaded = reload.reloaded;
+
+    let next = if daemon_reloaded {
+        vec![format!("hyp status --state-dir {}", state_dir.display())]
+    } else {
+        vec![
+            "hyp service restart".to_string(),
+            format!("hyp status --state-dir {}", state_dir.display()),
+        ]
+    };
+
+    let data = json!({
+        "peerId": peer_id,
+        "previousStatus": previous_status.as_str(),
+        "status": PeerStatus::Revoked.as_str(),
+        "alreadyRevoked": already_revoked,
+        "revokedGrants": revoked_grants,
+        "reason": clean_reason,
+        "credentialsCleared": credentials_cleared,
+        "daemonReloaded": daemon_reloaded,
+        "socketPath": socket_path.display().to_string(),
+        "stateDir": state_dir.display().to_string(),
+    });
+
+    if as_json {
+        let envelope = JsonEnvelope {
+            ok: true,
+            command: cmd.to_string(),
+            summary: Some(if already_revoked {
+                format!("Peer '{peer_id}' is already revoked")
+            } else {
+                format!("Revoked peer '{peer_id}' and cleared stored credentials")
+            }),
+            data: Some(data),
+            warnings,
+            next,
+            error: None,
+        };
+        print_json(&envelope);
+    } else {
+        let tag = if already_revoked { "WARN" } else { "OK" };
+        println!("{tag:<4}  Revoked paired peer '{peer_id}'");
+        println!("      Previous:    {}", previous_status.as_str());
+        println!("      Status:      revoked");
+        if let Some(ref r) = clean_reason {
+            println!("      Reason:      {r}");
+        }
+        println!("      Grants:      {} revocation(s) recorded", revoked_grants.len());
+        println!("      Secrets:     {credentials_cleared} credential(s) cleared");
+        if daemon_reloaded {
+            println!("      Daemon:      Live daemon reloaded — outbound link dropped immediately.");
+        } else {
+            println!("      Daemon:      Live daemon not reachable — run `hyp service restart` to apply if running.");
+        }
+        print_warnings(&warnings);
+        print_next_steps(&next);
+    }
+
+    ExitCode::from(EXIT_OK)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5905,5 +6349,174 @@ mod tests {
             detect_tailscale_magicdns_endpoint_with_bin("", Duration::from_millis(50)),
             None
         );
+    }
+
+    #[test]
+    fn p1_8_strip_privileged_default_scopes_and_inspect_warnings() {
+        let mut warnings = Vec::new();
+        let safe = strip_privileged_default_scopes(
+            vec![
+                "dm:send".to_string(),
+                "bridge:post=slack:#general".to_string(),
+                "forward:via=acme-hub".to_string(),
+                "kv:read=pair/*".to_string(),
+            ],
+            &mut warnings,
+        );
+        assert_eq!(safe, vec!["dm:send", "kv:read=pair/*"]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("bridge:post=slack:#general"));
+        assert!(warnings[0].contains("forward:via=acme-hub"));
+
+        // Only privileged scopes requested -> falls back to minimal DM pair
+        let mut only_priv_warnings = Vec::new();
+        let fallback = strip_privileged_default_scopes(
+            vec!["bridge:post=telegram:*".to_string()],
+            &mut only_priv_warnings,
+        );
+        assert_eq!(fallback, vec!["dm:send", "dm:receive"]);
+        assert_eq!(only_priv_warnings.len(), 1);
+
+        // `warn_privileged_token_scopes` warns on `*`, `bridge:post`, and `forward:via`
+        let mut insp_warnings = Vec::new();
+        warn_privileged_token_scopes(
+            "requests",
+            &[
+                "*".to_string(),
+                "bridge:post=slack:#ops".to_string(),
+                "forward:via=*".to_string(),
+            ],
+            &mut insp_warnings,
+        );
+        assert_eq!(insp_warnings.len(), 3);
+        assert!(insp_warnings.iter().any(|w| w.contains("wildcard '*'")));
+        assert!(insp_warnings.iter().any(|w| w.contains("bridge:post")));
+        assert!(insp_warnings.iter().any(|w| w.contains("forward:via")));
+
+        // Normal `member` scopes emit zero warnings
+        let mut normal_warnings = Vec::new();
+        warn_privileged_token_scopes("offers", &ScopePreset::Member.expand(), &mut normal_warnings);
+        assert!(normal_warnings.is_empty());
+    }
+
+    #[test]
+    fn p1_4_and_p1_14_revoke_and_invite_node_id_mismatch_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+
+        // 1. P1-4: revoking an absent peer fails cleanly with EXIT_ERROR (`PEER_NOT_FOUND`).
+        let missing_code = run_revoke(
+            "ghost@box".to_string(),
+            None,
+            Some(state.to_path_buf()),
+            None,
+            None,
+            true,
+        );
+        assert_eq!(missing_code, ExitCode::from(EXIT_ERROR));
+
+        // Seed a paired peer + grant + bearer credential in SecretStore.
+        let db = NodeDb::open(state.join("node.sqlite")).unwrap();
+        let now = now_ms();
+        let cred_ref = credential_secret_name("peer-auth", "bob@laptop");
+        let secrets = crate::config_file::open_secret_store(state, true);
+        secrets.set(&cred_ref, "secret-bearer-token-val").unwrap();
+        db.peers()
+            .upsert_peer(
+                &PeerInput {
+                    peer_id: "bob@laptop".to_string(),
+                    endpoint: Some("https://bob.tailnet.ts.net".to_string()),
+                    profile: PeerProfile::P2p,
+                    trust_tier: StoreTrustTier::Peer,
+                    status: PeerStatus::Active,
+                    scopes: vec!["dm:*".to_string()],
+                    auth_credential_ref: Some(cred_ref.clone()),
+                },
+                now,
+            )
+            .unwrap();
+        db.peers()
+            .add_grant(
+                &GrantInput {
+                    id: "grant-bob-1".to_string(),
+                    peer_id: "bob@laptop".to_string(),
+                    direction: GrantDirection::Inbound,
+                    signed_json: "{}".to_string(),
+                    scopes: vec!["dm:*".to_string()],
+                    trust_tier: StoreTrustTier::Peer,
+                    issued_at: now,
+                    pair_by: None,
+                    expires_at: None,
+                },
+                now,
+            )
+            .unwrap();
+        drop(db);
+
+        let revoke_ok = run_revoke(
+            "bob@laptop".to_string(),
+            Some("device lost".to_string()),
+            Some(state.to_path_buf()),
+            None,
+            Some(state.join("missing.sock")),
+            true,
+        );
+        assert_eq!(revoke_ok, ExitCode::from(EXIT_OK));
+
+        let db_after = NodeDb::open(state.join("node.sqlite")).unwrap();
+        let peer_after = db_after.peers().get_peer("bob@laptop").unwrap().unwrap();
+        assert_eq!(peer_after.status, PeerStatus::Revoked);
+        assert!(db_after.peers().is_grant_revoked("grant-bob-1").unwrap());
+        assert!(secrets.get(&cred_ref).is_err());
+
+        // Idempotent second revoke returns EXIT_OK cleanly.
+        let revoke_again = run_revoke(
+            "bob@laptop".to_string(),
+            None,
+            Some(state.to_path_buf()),
+            None,
+            Some(state.join("missing.sock")),
+            true,
+        );
+        assert_eq!(revoke_again, ExitCode::from(EXIT_OK));
+
+        // 2. P1-14: `pair invite --mode p2p` rejects mismatched --node-id when node.json exists
+        //    unless `--force-node-id` is passed.
+        fs::write(
+            state.join("node.json"),
+            r#"{"v":2,"nodeId":"alice@macbook","profile":"p2p"}"#,
+        )
+        .unwrap();
+        let mismatch = run_invite(
+            InviteMode::P2p,
+            "wrong@host".to_string(),
+            Some("https://alice.tailnet.ts.net".to_string()),
+            None,
+            None,
+            vec![],
+            vec![],
+            24,
+            None,
+            Some(state.to_path_buf()),
+            false,
+            true,
+        );
+        assert_eq!(mismatch, ExitCode::from(EXIT_USAGE));
+
+        let forced = run_invite(
+            InviteMode::P2p,
+            "wrong@host".to_string(),
+            Some("https://alice.tailnet.ts.net".to_string()),
+            None,
+            None,
+            vec![],
+            vec![],
+            24,
+            None,
+            Some(state.to_path_buf()),
+            true,
+            true,
+        );
+        assert_eq!(forced, ExitCode::from(EXIT_OK));
     }
 }

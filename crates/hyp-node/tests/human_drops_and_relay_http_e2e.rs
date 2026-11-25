@@ -1071,9 +1071,41 @@ async fn full_http_sse_drop_roundtrip_secret_sink_directive_gate_replay_and_burn
         secret_canary
     );
 
-    // Overwrite allowed when `overwrite_secret = true`
-    let overwritten = target
+    // H15: Local `overwrite_secret = true` MUST NOT override a human's signed `overwrite: false`!
+    let conflict_err_forced = target
         .ingest_human_drop(&secret_env_v2, Some(&gate), true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(conflict_err_forced, NodeError::Conflict(_)),
+        "H15: local overwrite_secret=true must fail closed when signed spec.overwrite=false, got {conflict_err_forced:?}"
+    );
+    assert_eq!(
+        target.secret_store().get("stripe-live-key").unwrap().as_str(),
+        secret_canary
+    );
+
+    // Overwrite succeeds ONLY when the human explicitly signs `overwrite: true`!
+    let secret_claim_v3 = build_secret_claim(
+        "bogdan",
+        &human_kp,
+        1,
+        "",
+        target.node_id().as_str(),
+        &target.identity().encryption.public_key(),
+        Some("ops"),
+        "stripe-live-key",
+        true,
+        "hyphae_zk_rotated_value_42",
+    );
+    let secret_env_v3 = seal_human_drop(
+        &secret_claim_v3,
+        &human_kp,
+        &target.identity().encryption.public_key(),
+    )
+    .unwrap();
+    let overwritten = target
+        .ingest_human_drop(&secret_env_v3, Some(&gate), false)
         .await
         .unwrap();
     assert_eq!(overwritten.secret_name.as_deref(), Some("stripe-live-key"));
@@ -1546,10 +1578,37 @@ async fn ingest_human_revocation_enforces_admin_role_and_monotonic_epoch() {
         Err(NodeError::Unauthorized(_))
     ));
 
-    // Drop from active admin with epoch 2 succeeds
-    let c_fresh = build_directive_claim(
+    // H5: Old epoch-1 key claiming a spoofed higher `claim.auth_epoch = 2` MUST fail closed!
+    let c_spoofed = build_directive_claim(
         "bogdan",
         &admin_kp,
+        2,
+        "",
+        node.node_id().as_str(),
+        &node.identity().encryption.public_key(),
+        Some("ops"),
+        "Spoofed epoch 2 from epoch-1 key",
+    );
+    let e_spoofed =
+        seal_human_drop(&c_spoofed, &admin_kp, &node.identity().encryption.public_key()).unwrap();
+    assert!(matches!(
+        node.ingest_human_drop(&e_spoofed, None, false).await,
+        Err(NodeError::Unauthorized(_))
+    ));
+
+    // Enrolling a genuine epoch-2 key succeeds for claims at epoch 2!
+    let admin_ep2_kp = Ed25519KeyPair::generate().unwrap();
+    enroll_human_authority(
+        &node,
+        "bogdan",
+        &admin_ep2_kp,
+        HumanAuthorityRole::Admin,
+        "Admin Root Epoch 2",
+        2,
+    );
+    let c_fresh = build_directive_claim(
+        "bogdan",
+        &admin_ep2_kp,
         2,
         "",
         node.node_id().as_str(),
@@ -1558,7 +1617,7 @@ async fn ingest_human_revocation_enforces_admin_role_and_monotonic_epoch() {
         "Fresh epoch 2 directive",
     );
     let e_fresh =
-        seal_human_drop(&c_fresh, &admin_kp, &node.identity().encryption.public_key()).unwrap();
+        seal_human_drop(&c_fresh, &admin_ep2_kp, &node.identity().encryption.public_key()).unwrap();
     let ok = node.ingest_human_drop(&e_fresh, None, false).await.unwrap();
     assert_eq!(ok.claim_id, c_fresh.claim_id);
 
