@@ -32,6 +32,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+#[cfg(unix)]
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{Value, json};
 #[cfg(unix)]
