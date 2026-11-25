@@ -16,6 +16,7 @@ use crate::ui::{
 };
 use clap::{Args, Subcommand, ValueEnum};
 use hyp_crypto::keystore::{SecretStore, validate_secret_name};
+use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, DaemonRpcResult, daemon_rpc_sync};
 use hyp_node::engine::NodeProfile;
 use hyp_node::gates::policy::{
     AnthropicAuthHeader, DEFAULT_HTTP_CLASSIFIER_THRESHOLD, DEFAULT_STAGE2_BUSY_RETRY_MS,
@@ -31,6 +32,55 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
+
+const LIVE_DAEMON_RPC_TIMEOUT: Duration = Duration::from_millis(1_500);
+
+fn resolve_daemon_socket_for_cli(
+    explicit_state_dir: bool,
+    explicit_config: bool,
+    resolved_state_dir: &std::path::Path,
+) -> PathBuf {
+    if !explicit_state_dir && !explicit_config {
+        for key in ["HYPHAE_SOCKET", "AGENTS_MESH_SOCKET"] {
+            if let Ok(sock) = std::env::var(key) {
+                let trimmed = sock.trim();
+                if !trimmed.is_empty() {
+                    return PathBuf::from(trimmed);
+                }
+            }
+        }
+    }
+    resolved_state_dir.join(DEFAULT_SOCKET_FILENAME)
+}
+
+fn try_live_gate_reload(
+    explicit_state_dir: bool,
+    explicit_config: bool,
+    resolved_state_dir: &std::path::Path,
+) -> DaemonRpcResult {
+    let sock =
+        resolve_daemon_socket_for_cli(explicit_state_dir, explicit_config, resolved_state_dir);
+    daemon_rpc_sync(&sock, &json!({ "type": "gate.reload" }), LIVE_DAEMON_RPC_TIMEOUT)
+}
+
+fn try_live_inbox_wake(
+    explicit_state_dir: bool,
+    resolved_state_dir: &std::path::Path,
+    session_id: &str,
+    receipt: &str,
+) -> DaemonRpcResult {
+    let sock = resolve_daemon_socket_for_cli(explicit_state_dir, false, resolved_state_dir);
+    daemon_rpc_sync(
+        &sock,
+        &json!({
+            "type": "inbox.wake",
+            "sessionId": session_id,
+            "receipt": receipt,
+        }),
+        LIVE_DAEMON_RPC_TIMEOUT,
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CliGateAdapter {
@@ -799,6 +849,27 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
         return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
     }
 
+    let mut daemon_reloaded = false;
+    let mut daemon_reload_error: Option<String> = None;
+    let mut warnings: Vec<String> = Vec::new();
+    if locked {
+        let reload_res =
+            try_live_gate_reload(args.state_dir.is_some(), args.config.is_some(), &state_dir);
+        daemon_reloaded = reload_res.ok
+            && reload_res
+                .result
+                .as_ref()
+                .and_then(|r| r.get("reloaded"))
+                .and_then(Value::as_bool)
+                == Some(true);
+        if !daemon_reloaded {
+            if let Some(err) = reload_res.error {
+                warnings.push(format!("Live daemon gate.reload failed: {err}"));
+                daemon_reload_error = Some(err);
+            }
+        }
+    }
+
     let summary_filter = summarize_filter_plugin(&plugin);
     let mut next = Vec::new();
     if let Some(ref secret_ref) = summary_filter.api_key_secret {
@@ -820,6 +891,19 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
     ));
 
     if as_json {
+        let mut data = json!({
+            "configPath": config_path.display().to_string(),
+            "stateDir": state_dir.display().to_string(),
+            "filter": summary_filter,
+            "locked": locked,
+            "requireSignedPolicy": gate_cfg.require_signed_policy,
+            "gatePolicySig": if locked { "OK" } else { "UNSIGNED" },
+            "policySigningSecret": gate_cfg.policy_signing_secret,
+            "daemonReloaded": daemon_reloaded,
+        });
+        if let Some(ref err) = daemon_reload_error {
+            data["daemonReloadError"] = json!(err);
+        }
         let envelope = JsonEnvelope {
             ok: true,
             command: cmd.to_string(),
@@ -830,16 +914,8 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
                 config_path.display(),
                 if locked { " [LOCKED]" } else { "" }
             )),
-            data: Some(json!({
-                "configPath": config_path.display().to_string(),
-                "stateDir": state_dir.display().to_string(),
-                "filter": summary_filter,
-                "locked": locked,
-                "requireSignedPolicy": gate_cfg.require_signed_policy,
-                "gatePolicySig": if locked { "OK" } else { "UNSIGNED" },
-                "policySigningSecret": gate_cfg.policy_signing_secret,
-            })),
-            warnings: Vec::new(),
+            data: Some(data),
+            warnings,
             next,
             error: None,
         };
@@ -854,6 +930,21 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
         println!("      Config: {}", config_path.display());
         if let Some(ref sec) = summary_filter.api_key_secret {
             println!("      Secret: {{ \"secret\": \"{sec}\" }} (never plaintext)");
+        }
+        if locked {
+            if daemon_reloaded {
+                println!(
+                    "      Live daemon reloaded — new Security Gate policy active immediately (no restart needed)."
+                );
+            } else if let Some(ref err) = daemon_reload_error {
+                println!(
+                    "WARN  Live daemon reload failed ({err}); run `hyp service restart` or `hyp node start` to apply."
+                );
+            } else {
+                println!(
+                    "      Daemon offline — run `hyp service restart` or `hyp node start` to apply."
+                );
+            }
         }
         print_next_steps(&next);
     }
@@ -1033,15 +1124,51 @@ fn run_gate_lock(
         let _ = std::fs::remove_file(&proposal_path);
     }
 
-    let next = vec![
-        "hyp service restart".to_string(),
-        format!(
-            "hyp doctor --config {} --state-dir {}",
-            config_path.display(),
-            dir.display()
-        ),
-    ];
+    let reload_res = try_live_gate_reload(state_dir.is_some(), config.is_some(), &dir);
+    let daemon_reloaded = reload_res.ok
+        && reload_res
+            .result
+            .as_ref()
+            .and_then(|r| r.get("reloaded"))
+            .and_then(Value::as_bool)
+            == Some(true);
+    let mut warnings: Vec<String> = Vec::new();
+    let daemon_reload_error = if !daemon_reloaded {
+        if let Some(err) = reload_res.error {
+            warnings.push(format!("Live daemon gate.reload failed: {err}"));
+            Some(err)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut next = Vec::new();
+    if !daemon_reloaded {
+        next.push("hyp service restart".to_string());
+    }
+    next.push(format!(
+        "hyp doctor --config {} --state-dir {}",
+        config_path.display(),
+        dir.display()
+    ));
+
     if as_json {
+        let mut data = json!({
+            "configPath": config_path.display().to_string(),
+            "stateDir": dir.display().to_string(),
+            "gatePolicySig": "OK",
+            "requireSignedPolicy": true,
+            "mergedProposal": merged_proposal,
+            "filterCount": gate_cfg.filters.len(),
+            "policySigningSecret": gate_cfg.policy_signing_secret,
+            "humanAuthoritiesDigest": gate_cfg.human_authorities_digest,
+            "daemonReloaded": daemon_reloaded,
+        });
+        if let Some(ref err) = daemon_reload_error {
+            data["daemonReloadError"] = json!(err);
+        }
         let envelope = JsonEnvelope {
             ok: true,
             command: cmd.to_string(),
@@ -1055,17 +1182,8 @@ fn run_gate_lock(
                     ""
                 }
             )),
-            data: Some(json!({
-                "configPath": config_path.display().to_string(),
-                "stateDir": dir.display().to_string(),
-                "gatePolicySig": "OK",
-                "requireSignedPolicy": true,
-                "mergedProposal": merged_proposal,
-                "filterCount": gate_cfg.filters.len(),
-                "policySigningSecret": gate_cfg.policy_signing_secret,
-                "humanAuthoritiesDigest": gate_cfg.human_authorities_digest,
-            })),
-            warnings: Vec::new(),
+            data: Some(data),
+            warnings,
             next,
             error: None,
         };
@@ -1078,6 +1196,19 @@ fn run_gate_lock(
         );
         if merged_proposal {
             println!("      Merged & removed staged proposal {}", proposal_path.display());
+        }
+        if daemon_reloaded {
+            println!(
+                "      Live daemon reloaded — new Security Gate policy active immediately (no restart needed)."
+            );
+        } else if let Some(ref err) = daemon_reload_error {
+            println!(
+                "WARN  Live daemon reload failed ({err}); run `hyp service restart` or `hyp node start` to apply."
+            );
+        } else {
+            println!(
+                "      Daemon offline — run `hyp service restart` or `hyp node start` to apply."
+            );
         }
         print_next_steps(&next);
     }
@@ -1287,7 +1418,35 @@ fn run_inbox_approve(
 
     match db.local().approve_quarantined(&receipt, &reviewer, now_ms()) {
         Ok(entry) => {
+            drop(db);
+            let wake_res =
+                try_live_inbox_wake(state_dir.is_some(), &dir, &entry.session_id, &entry.receipt);
+            let daemon_notified = wake_res.ok;
+            let daemon_woken = wake_res
+                .result
+                .as_ref()
+                .and_then(|r| r.get("woken"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let quarantined_remaining = wake_res
+                .result
+                .as_ref()
+                .and_then(|r| r.get("quarantinedRemaining"))
+                .and_then(Value::as_u64);
+
             if as_json {
+                let mut data = json!({
+                    "receipt": entry.receipt,
+                    "sessionId": entry.session_id,
+                    "gateState": entry.gate_state.as_str(),
+                    "reviewer": reviewer,
+                    "reviewedAt": entry.reviewed_at,
+                    "daemonNotified": daemon_notified,
+                    "daemonWoken": daemon_woken,
+                });
+                if let Some(rem) = quarantined_remaining {
+                    data["quarantinedRemaining"] = json!(rem);
+                }
                 let envelope = JsonEnvelope {
                     ok: true,
                     command: cmd.to_string(),
@@ -1295,13 +1454,7 @@ fn run_inbox_approve(
                         "Approved quarantined receipt '{}' -> pending for session '{}'",
                         entry.receipt, entry.session_id
                     )),
-                    data: Some(json!({
-                        "receipt": entry.receipt,
-                        "sessionId": entry.session_id,
-                        "gateState": entry.gate_state.as_str(),
-                        "reviewer": reviewer,
-                        "reviewedAt": entry.reviewed_at,
-                    })),
+                    data: Some(data),
                     warnings: Vec::new(),
                     next: Vec::new(),
                     error: None,
@@ -1312,6 +1465,21 @@ fn run_inbox_approve(
                     "OK    Approved receipt '{}' -> released to session '{}' (reviewer: {})",
                     entry.receipt, entry.session_id, reviewer
                 );
+                if daemon_notified && daemon_woken {
+                    println!(
+                        "      Live daemon notified — session '{}' woken immediately.",
+                        entry.session_id
+                    );
+                } else if daemon_notified {
+                    println!(
+                        "      Live daemon notified — quarantine badge cleared (queued for session '{}').",
+                        entry.session_id
+                    );
+                } else {
+                    println!(
+                        "      Daemon offline — released item will be delivered when `hyp node start` runs."
+                    );
+                }
             }
             ExitCode::from(EXIT_OK)
         }
@@ -1375,8 +1543,31 @@ fn run_inbox_reject(
         .reject_quarantined(&receipt, &reviewer, &reason, mute_rule.as_ref(), now_ms())
     {
         Ok(entry) => {
+            drop(db);
+            let wake_res =
+                try_live_inbox_wake(state_dir.is_some(), &dir, &entry.session_id, &entry.receipt);
+            let daemon_notified = wake_res.ok;
+            let quarantined_remaining = wake_res
+                .result
+                .as_ref()
+                .and_then(|r| r.get("quarantinedRemaining"))
+                .and_then(Value::as_u64);
             let muted_pattern = mute_rule.as_ref().map(|m| m.pattern.clone());
             if as_json {
+                let mut data = json!({
+                    "receipt": entry.receipt,
+                    "sessionId": entry.session_id,
+                    "gateState": entry.gate_state.as_str(),
+                    "reason": reason,
+                    "reviewer": reviewer,
+                    "muted": muted_pattern.is_some(),
+                    "mutedPattern": muted_pattern,
+                    "reviewedAt": entry.reviewed_at,
+                    "daemonNotified": daemon_notified,
+                });
+                if let Some(rem) = quarantined_remaining {
+                    data["quarantinedRemaining"] = json!(rem);
+                }
                 let envelope = JsonEnvelope {
                     ok: true,
                     command: cmd.to_string(),
@@ -1388,16 +1579,7 @@ fn run_inbox_reject(
                             .map(|p| format!(" and muted '{p}'"))
                             .unwrap_or_default()
                     )),
-                    data: Some(json!({
-                        "receipt": entry.receipt,
-                        "sessionId": entry.session_id,
-                        "gateState": entry.gate_state.as_str(),
-                        "reason": reason,
-                        "reviewer": reviewer,
-                        "muted": muted_pattern.is_some(),
-                        "mutedPattern": muted_pattern,
-                        "reviewedAt": entry.reviewed_at,
-                    })),
+                    data: Some(data),
                     warnings: Vec::new(),
                     next: Vec::new(),
                     error: None,
@@ -1412,6 +1594,13 @@ fn run_inbox_reject(
                         .map(|p| format!(" + installed global mute rule for '{p}'"))
                         .unwrap_or_default()
                 );
+                if daemon_notified {
+                    println!(
+                        "      Live daemon notified — quarantine badge cleared immediately."
+                    );
+                } else {
+                    println!("      Daemon offline — rejection recorded in SQLite.");
+                }
             }
             ExitCode::from(EXIT_OK)
         }

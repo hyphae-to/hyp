@@ -25,7 +25,7 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -357,7 +357,7 @@ struct NormalizedLocalEvent {
 
 struct LocalIngestState {
     node: Arc<UnifiedNode>,
-    gate: Option<Arc<SecurityGatePipeline>>,
+    gate: Arc<RwLock<Option<Arc<SecurityGatePipeline>>>>,
     config: LocalIngestConfig,
     routes: Vec<LocalIngestRoute>,
     buckets: Mutex<HashMap<usize, TokenBucket>>,
@@ -366,7 +366,7 @@ struct LocalIngestState {
 impl LocalIngestState {
     fn new(
         node: Arc<UnifiedNode>,
-        gate: Option<Arc<SecurityGatePipeline>>,
+        gate: Arc<RwLock<Option<Arc<SecurityGatePipeline>>>>,
         config: LocalIngestConfig,
     ) -> Self {
         let routes = config.effective_routes();
@@ -377,6 +377,14 @@ impl LocalIngestState {
             routes,
             buckets: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn current_gate(&self) -> Option<Arc<SecurityGatePipeline>> {
+        self.gate
+            .read()
+            .expect("local_ingest gate lock poisoned")
+            .as_ref()
+            .map(Arc::clone)
     }
 
     fn consume_route_bucket(
@@ -744,6 +752,15 @@ impl LocalIngestServer {
     pub async fn start(
         node: Arc<UnifiedNode>,
         gate: Option<Arc<SecurityGatePipeline>>,
+        config: LocalIngestConfig,
+    ) -> Result<Self, NodeError> {
+        Self::start_with_shared_gate(node, Arc::new(RwLock::new(gate)), config).await
+    }
+
+    /// Starts the local ingest server sharing a live hot-reloadable [`SecurityGatePipeline`] slot.
+    pub async fn start_with_shared_gate(
+        node: Arc<UnifiedNode>,
+        gate: Arc<RwLock<Option<Arc<SecurityGatePipeline>>>>,
         config: LocalIngestConfig,
     ) -> Result<Self, NodeError> {
         if !config.enabled {
@@ -1165,8 +1182,9 @@ async fn handle_connection<S>(
             }
         }
 
+        let current_gate = state.current_gate();
         let receipt = match state
-            .ingest_local_event(&val, state.gate.as_deref(), now_ms())
+            .ingest_local_event(&val, current_gate.as_deref(), now_ms())
             .await
         {
             Ok(outcome) => outcome.to_json_receipt(),

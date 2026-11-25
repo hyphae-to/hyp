@@ -112,6 +112,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
     let cmd = "node start";
     let as_json = args.json;
     let explicit_config = args.config.or(args.config_pos);
+    let has_explicit_config = explicit_config.is_some();
     let config_path =
         resolve_config_path_for_read(explicit_config.as_deref(), args.state_dir.as_deref(), None);
 
@@ -638,7 +639,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             };
         let guest_pairing_enabled = node.config().guest_pairing.enabled;
 
-        let gate_pipeline = if start_local_daemon || start_local_ingest {
+        let (gate_pipeline, gate_db_shared) = if start_local_daemon || start_local_ingest {
             let gate_cfg: SecurityGateConfig = match loaded.as_ref().and_then(|c| c.raw.get("gate"))
             {
                 Some(gate_val) => serde_json::from_value(gate_val.clone())
@@ -651,7 +652,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             ));
             let gate_secrets = Arc::new(open_secret_store(&state_dir, explicit_state));
             let pipeline = Arc::new(
-                SecurityGatePipeline::new(gate_cfg, gate_db, Some(gate_secrets))
+                SecurityGatePipeline::new(gate_cfg, Arc::clone(&gate_db), Some(gate_secrets))
                     .map_err(|e| format!("Failed to initialize SecurityGatePipeline: {e}"))?,
             );
             if pipeline.is_policy_tampered() {
@@ -660,9 +661,9 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                         .to_string(),
                 );
             }
-            Some(pipeline)
+            (Some(pipeline), Some(gate_db))
         } else {
-            None
+            (None, None)
         };
 
         let local_daemon = if start_local_daemon {
@@ -675,19 +676,43 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             let daemon = LocalDaemon::start(Arc::clone(&node), gate_pipeline.clone(), local_cfg)
                 .await
                 .map_err(|e| format!("Failed to start local harness IPC daemon: {e}"))?;
+            if let Some(ref gate_db) = gate_db_shared {
+                let reload_config_path = config_path.clone();
+                let reload_state_dir = state_dir.clone();
+                let reload_db = Arc::clone(gate_db);
+                daemon.set_gate_reloader(Arc::new(move || {
+                    reload_gate_pipeline_from_disk(
+                        &reload_config_path,
+                        has_explicit_config,
+                        &reload_state_dir,
+                        explicit_state,
+                        Arc::clone(&reload_db),
+                    )
+                }));
+            }
             Some(Arc::new(daemon))
         } else {
             None
         };
 
         let local_ingest_server = if start_local_ingest {
-            let srv = LocalIngestServer::start(
-                Arc::clone(&node),
-                gate_pipeline.clone(),
-                node.config().local_ingest.clone(),
-            )
-            .await
-            .map_err(|e| format!("Failed to start local ingest server: {e}"))?;
+            let srv = if let Some(ref daemon) = local_daemon {
+                LocalIngestServer::start_with_shared_gate(
+                    Arc::clone(&node),
+                    daemon.gate_slot(),
+                    node.config().local_ingest.clone(),
+                )
+                .await
+                .map_err(|e| format!("Failed to start local ingest server: {e}"))?
+            } else {
+                LocalIngestServer::start(
+                    Arc::clone(&node),
+                    gate_pipeline.clone(),
+                    node.config().local_ingest.clone(),
+                )
+                .await
+                .map_err(|e| format!("Failed to start local ingest server: {e}"))?
+            };
             Some(srv)
         } else {
             None
@@ -963,6 +988,59 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         Ok(()) => ExitCode::from(EXIT_OK),
         Err(e) => emit_error(cmd, as_json, EXIT_ERROR, "NODE_START_FAILED", e, None),
     }
+}
+
+/// Re-reads `node.json` (or legacy `connector.json`), opens a fresh `SecretStore`, validates all
+/// Stage 1/Stage 2/filter rules, and verifies `gate_policy_sig` + `human_authorities_digest`
+/// fail-closed for the live `gate.reload` IPC RPC.
+fn reload_gate_pipeline_from_disk(
+    config_path: &Path,
+    has_explicit_config: bool,
+    state_dir: &Path,
+    explicit_state: bool,
+    gate_db: Arc<Mutex<NodeDb>>,
+) -> Result<Option<Arc<SecurityGatePipeline>>, String> {
+    let target_path = if has_explicit_config {
+        config_path.to_path_buf()
+    } else {
+        let v2 = state_dir.join("node.json");
+        if v2.exists() {
+            v2
+        } else {
+            config_path.to_path_buf()
+        }
+    };
+
+    let gate_cfg: SecurityGateConfig = if target_path.exists() {
+        let loaded = load_node_or_legacy_config(&target_path).map_err(|e| {
+            format!(
+                "Failed to reload gate config from {}: {e}",
+                target_path.display()
+            )
+        })?;
+        match loaded.raw.get("gate") {
+            Some(gate_val) => serde_json::from_value(gate_val.clone()).map_err(|e| {
+                format!(
+                    "Invalid gate configuration in {}: {e}",
+                    target_path.display()
+                )
+            })?,
+            None => SecurityGateConfig::default(),
+        }
+    } else {
+        SecurityGateConfig::default()
+    };
+
+    let gate_secrets = Arc::new(open_secret_store(state_dir, explicit_state));
+    let pipeline = SecurityGatePipeline::new(gate_cfg, gate_db, Some(gate_secrets))
+        .map_err(|e| format!("Failed to initialize SecurityGatePipeline: {e}"))?;
+    pipeline
+        .verify_policy_integrity()
+        .map_err(|e| format!("gate_policy_tampered: {e}"))?;
+    if pipeline.is_policy_tampered() {
+        return Err("gate_policy_tampered: gate policy signature verification failed".to_string());
+    }
+    Ok(Some(Arc::new(pipeline)))
 }
 
 async fn wait_for_shutdown_signal() {
