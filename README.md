@@ -2,9 +2,9 @@
 
 **One wire under *every* agent.**
 
-Hyphae lets your coding agents message and wake each other — across Claude Code, Codex, and whatever else you run, on one laptop or many. One ~8 MiB binary. No polling loops. End-to-end encrypted between machines.
+Hyphae lets your agents message and wake each other — across Claude Code, Codex, and whatever else you run, on one laptop or many. One ~8 MiB binary. No polling loops. End-to-end encrypted between machines.
 
-If you run more than one coding agent, you are the message bus — copying stack traces between sessions, telling one agent another's PR is ready, checking if CI finished. Hyphae gives every session an address and an inbox so agents message each other, subscribe to events, and wake on arrival without burning tokens in polling loops.
+If you run more than one agent, you are the message bus — copying stack traces between sessions, telling one agent another's PR is ready, checking if CI finished. Hyphae gives every session an address and an inbox so agents message each other, subscribe to events, and wake on arrival without burning tokens in polling loops.
 
 ## What you can do with it
 
@@ -66,7 +66,7 @@ flowchart LR
 
 Hyphae treats everything arriving from the network — peer messages, channels, webhooks, and bridged chats — as untrusted external data and screens it before your agent sees it. Between nodes, DMs, channels, KV, and file transfers are end-to-end encrypted; hubs relay ciphertext only *(chat bridges send plaintext to external providers like Slack/Telegram, remote Stage 2 classifiers receive decrypted text over HTTPS, and Team Hub directory keys use pin-on-first-use until signed checkpoints ship)*.
 
-Hyphae protects against untrusted network input. It does **not** create an OS sandbox against a coding agent running with arbitrary shell access as the same OS user — interactive TTY prompts (`hyp gate lock`, `hyp inbox approve`/`reject`, `hyp auth revoke`) stop accidental, scripted, and MCP-driven use until hardware Passkey confirmation ships (`#2`, `#10`). For hard isolation against shell-capable agents today, run untrusted agents under a separate OS user or container without access to `~/.config/hyphae`.
+Hyphae protects against untrusted network input. It does **not** create an OS sandbox against an agent running with arbitrary shell access as the same OS user — interactive TTY prompts (`hyp gate lock`, `hyp inbox approve`/`reject`, `hyp auth revoke`) stop accidental, scripted, and MCP-driven use until hardware Passkey confirmation ships (`#2`, `#10`). For hard isolation against shell-capable agents today, run untrusted agents under a separate OS user or container without access to `~/.config/hyphae`.
 
 Read the [Threat Model](docs/security/threat-model.md) and [Hardening Guide](docs/security/hardening.md). To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
@@ -83,7 +83,7 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 - [Documentation Index](docs/README.md) — paths for Developers, Operators, and Security Reviewers
 - [Getting Started](docs/getting-started.md) — install, onboard, and run your first two-agent exchange
 - [Concepts](docs/concepts.md) — node, handle, session, inbox, delivery tiers, streams, and peers
-- [Harnesses](docs/harnesses/README.md) — setup, limits, and status UI for each coding harness
+- [Harnesses](docs/harnesses/README.md) — setup, limits, and status UI for each agent harness
 - [Security & Threat Model](docs/security/threat-model.md) — trust boundaries, gates, E2EE, and hardening
 - [Reference](docs/reference/cli.md) — CLI commands, `node.json`, MCP tools, scopes, and plugin SDK
 
