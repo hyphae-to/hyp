@@ -1,0 +1,55 @@
+{
+  "description": "Hyphae v2 Claude Code lifecycle hooks: export HYPHAE_SESSION_ID on SessionStart, verify MCP callers on PreToolUse, and drain queued mesh messages on PostToolUse and Stop.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "hyp hook claude session-start",
+            "statusMessage": "Hyphae · Register session",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "mcp__hyphae__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "hyp hook claude pre-tool-use",
+            "statusMessage": "Hyphae · Verify MCP caller",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "hyp hook claude post-tool-use",
+            "statusMessage": "Hyphae · Deliver inbox messages",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "hyp hook claude stop",
+            "statusMessage": "Hyphae · Check inbox on turn end",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

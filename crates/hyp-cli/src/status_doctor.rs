@@ -8,7 +8,9 @@ use crate::config_file::{
 };
 use crate::drop_cmd::validate_relay_url;
 use crate::gate_cmd::inspect_gate_status;
-use crate::setup::{HarnessDiagnostic, detect_harness_statuses};
+use crate::setup::{
+    HarnessDiagnostic, StatusLineDiagnostic, detect_harness_statuses, detect_statusline_statuses,
+};
 use crate::ui::{
     CheckStatus, CliCheck, CliError, EXIT_ERROR, EXIT_OK, JsonEnvelope, emit_error, print_checks,
     print_json, print_next_steps, print_warnings,
@@ -624,6 +626,28 @@ fn run_status_or_doctor(
         }
     }
 
+    // 5. StatusLine diagnostics for Claude Code & Antigravity CLI (non-failing info/warning checks)
+    let status_lines: Vec<StatusLineDiagnostic> = resolve_home_dir(home_arg.as_deref())
+        .map(|h| detect_statusline_statuses(&h))
+        .unwrap_or_default();
+    for sl in &status_lines {
+        if sl.configured {
+            let check_name = format!("statusline:{}", sl.harness);
+            if sl.chained && sl.chain_file_exists == Some(false) {
+                checks.push(CliCheck::warn(
+                    check_name,
+                    sl.detail.clone(),
+                    Some(format!(
+                        "hyp setup --harness {} --restore-statusline",
+                        sl.harness
+                    )),
+                ));
+            } else {
+                checks.push(CliCheck::ok(check_name, sl.detail.clone()));
+            }
+        }
+    }
+
     let fail_count = checks
         .iter()
         .filter(|c| c.status == CheckStatus::Fail)
@@ -694,6 +718,7 @@ fn run_status_or_doctor(
         "humanDrops": human_drops_summary,
         "update": update_status,
         "harnesses": harnesses,
+        "statusLines": status_lines,
         "checks": checks,
     });
 

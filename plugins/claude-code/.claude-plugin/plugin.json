@@ -1,0 +1,20 @@
+{
+  "name": "hyphae",
+  "version": "0.6.0",
+  "description": "Hyphae v2 cross-harness agent mesh for Claude Code — E2EE DMs, #channels, CloudEvents streams, live session inspector, and non-destructive statusLine integration.",
+  "author": {
+    "name": "Hyphae",
+    "url": "https://hyphae.to"
+  },
+  "homepage": "https://hyphae.to",
+  "repository": "https://github.com/hyphae-to/hyp",
+  "license": "MIT",
+  "keywords": [
+    "hyphae",
+    "agent-mesh",
+    "mcp",
+    "e2ee",
+    "cloudevents",
+    "multi-agent"
+  ]
+}
