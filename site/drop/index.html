@@ -176,15 +176,15 @@
           <div class="auth-grid">
             <div class="field">
               <label class="field-label-sm" for="inputHumanId">Human ID</label>
-              <input id="inputHumanId" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="e.g. bogdan" />
+              <input id="inputHumanId" type="text" autocomplete="off" aria-autocomplete="none" autocapitalize="none" spellcheck="false" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" data-protonpass-ignore="true" data-form-type="other" placeholder="e.g. bogdan" />
             </div>
             <div class="field">
               <label class="field-label-sm" for="inputAuthEpoch">Epoch</label>
-              <input id="inputAuthEpoch" type="number" min="1" step="1" value="1" />
+              <input id="inputAuthEpoch" type="number" min="1" step="1" value="1" autocomplete="off" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" data-form-type="other" />
             </div>
             <div class="field span-2">
               <label class="field-label-sm" for="inputPrfSalt">PRF Salt (base64url)</label>
-              <input id="inputPrfSalt" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Saved at enrollment or embedded in link" />
+              <input id="inputPrfSalt" type="text" autocomplete="off" aria-autocomplete="none" autocapitalize="none" spellcheck="false" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" data-protonpass-ignore="true" data-form-type="other" placeholder="Saved at enrollment or embedded in link" />
             </div>
           </div>
         </div>
@@ -279,11 +279,18 @@
           <div class="input-row">
             <input
               id="inputSecretValue"
-              type="password"
+              class="secret-masked"
+              type="text"
               autocomplete="off"
+              aria-autocomplete="none"
               autocorrect="off"
               autocapitalize="off"
               spellcheck="false"
+              data-1p-ignore="true"
+              data-lpignore="true"
+              data-bwignore="true"
+              data-protonpass-ignore="true"
+              data-form-type="other"
               placeholder="Paste secret value…"
               disabled
             />

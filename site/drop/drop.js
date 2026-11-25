@@ -930,6 +930,27 @@ async function initDropMode(fragment) {
     updateStepper(stage);
   }
 
+  function supportsCssSecretMask() {
+    return (
+      typeof CSS !== "undefined" &&
+      typeof CSS.supports === "function" &&
+      CSS.supports("-webkit-text-security", "disc")
+    );
+  }
+
+  function setSecretInputMasked(masked) {
+    const inp = $("inputSecretValue");
+    if (supportsCssSecretMask()) {
+      inp.type = "text";
+      inp.classList.toggle("secret-masked", masked);
+    } else {
+      inp.classList.remove("secret-masked");
+      inp.type = masked ? "password" : "text";
+    }
+    inp.dataset.masked = masked ? "1" : "0";
+    $("btnToggleReveal").textContent = masked ? "Reveal" : "Hide";
+  }
+
   function wipeSecretRam({ clearDraft = false, clearSealed = false } = {}) {
     if (state.unlockedEdSeed) {
       zeroize(state.unlockedEdSeed);
@@ -947,8 +968,7 @@ async function initDropMode(fragment) {
     $("inputSecretValue").value = "";
     $("inputDirectiveValue").value = "";
     $("inputDirectiveValue").style.height = "";
-    $("inputSecretValue").type = "password";
-    $("btnToggleReveal").textContent = "Reveal";
+    setSecretInputMasked(true);
     $("draftApproveCheck").checked = false;
     $("chkManualSasConfirm").checked = false;
     $("draftWarningBanner").classList.add("hidden");
@@ -1081,9 +1101,8 @@ async function initDropMode(fragment) {
 
   $("btnToggleReveal").addEventListener("click", () => {
     const inp = $("inputSecretValue");
-    const showing = inp.type === "text";
-    inp.type = showing ? "password" : "text";
-    $("btnToggleReveal").textContent = showing ? "Reveal" : "Hide";
+    const currentlyMasked = inp.dataset.masked !== "0";
+    setSecretInputMasked(!currentlyMasked);
   });
 
   $("btnLockClear").addEventListener("click", () => {

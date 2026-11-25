@@ -766,6 +766,9 @@ input[type="password"]:focus, input[type="text"]:focus {
   border-color: var(--border-strong);
   box-shadow: 0 0 0 3px rgba(229, 185, 92, 0.14);
 }
+input.secret-masked {
+  -webkit-text-security: disc;
+}
 .btn-toggle {
   background: var(--surface-2);
   color: var(--text);
@@ -884,14 +887,14 @@ fn render_web_capture_form_html(
         </div>
         <span class="backend-chip">{backend_pretty}</span>
       </div>
-      <form method="POST" action="{expected_path}" autocomplete="off">
+      <form method="POST" action="{expected_path}" autocomplete="off" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" data-protonpass-ignore="true" data-form-type="other">
         <input type="hidden" name="csrf" value="{csrf_nonce}" />
         <div class="field-head">
           <label for="secretValue">Secret Value</label>
           <span id="lenHint" class="hint">0 chars</span>
         </div>
         <div class="input-row">
-          <input id="secretValue" type="password" name="value" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Paste secret value…" autofocus required />
+          <input id="secretValue" class="secret-masked" type="text" name="value" autocomplete="off" aria-autocomplete="none" autocorrect="off" autocapitalize="off" spellcheck="false" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" data-protonpass-ignore="true" data-form-type="other" placeholder="Paste secret value…" autofocus required />
           <button id="toggleBtn" class="btn-toggle" type="button">Show</button>
         </div>
         <button id="submitBtn" class="btn-primary" type="submit">Save Secret &amp; Finish</button>
@@ -905,15 +908,27 @@ fn render_web_capture_form_html(
       var toggle = document.getElementById("toggleBtn");
       var hint = document.getElementById("lenHint");
       var btn = document.getElementById("submitBtn");
+      var supportsCssMask = typeof CSS !== "undefined" && CSS.supports && CSS.supports("-webkit-text-security", "disc");
+      var masked = true;
+      function syncMask() {{
+        if (supportsCssMask) {{
+          input.type = "text";
+          input.classList.toggle("secret-masked", masked);
+        }} else {{
+          input.classList.remove("secret-masked");
+          input.type = masked ? "password" : "text";
+        }}
+        toggle.textContent = masked ? "Show" : "Hide";
+      }}
+      syncMask();
       function updateLen() {{
         var n = input.value.trim().length;
         hint.textContent = n === 1 ? "1 char" : n + " chars";
       }}
       input.addEventListener("input", updateLen);
       toggle.addEventListener("click", function () {{
-        var isPwd = input.type === "password";
-        input.type = isPwd ? "text" : "password";
-        toggle.textContent = isPwd ? "Hide" : "Show";
+        masked = !masked;
+        syncMask();
         input.focus();
       }});
       input.form.addEventListener("submit", function () {{
@@ -1192,5 +1207,27 @@ async fn handle_web_capture_request(
             }
         }
         _ => text_response(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_web_capture_form_html;
+
+    #[test]
+    fn web_capture_form_disables_password_manager_autofill_prompts() {
+        let html = render_web_capture_form_html("telegram-bot-token", "keychain", "/s/abc", "n1");
+        assert!(html.contains(r#"class="secret-masked" type="text""#));
+        assert!(html.contains(r#"data-1p-ignore="true""#));
+        assert!(html.contains(r#"data-lpignore="true""#));
+        assert!(html.contains(r#"data-bwignore="true""#));
+        assert!(html.contains(r#"data-form-type="other""#));
+        assert!(html.contains("-webkit-text-security: disc;"));
+        // Initial <form> markup must not declare type="password" so password managers
+        // (1Password, iCloud Passwords, etc.) do not show a "Sign in" overlay on 127.0.0.1.
+        let form_start = html.find("<form ").expect("form tag");
+        let form_end = html.find("</form>").expect("closing form tag");
+        let form_html = &html[form_start..form_end];
+        assert!(!form_html.contains(r#"type="password""#));
     }
 }

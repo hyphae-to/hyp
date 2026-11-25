@@ -853,6 +853,10 @@ textarea {
   border-radius: var(--radius-sm);
 }
 
+input.secret-masked {
+  -webkit-text-security: disc;
+}
+
 textarea {
   font-family: var(--sans);
   min-height: 108px;
