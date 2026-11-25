@@ -9,7 +9,9 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use common::{TestMcpClient, run_hook, run_hook_with_hints, session_status};
 use hyp_crypto::{SecretBackend, SecretStore};
