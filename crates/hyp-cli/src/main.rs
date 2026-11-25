@@ -1,5 +1,5 @@
 //! `hyp` — Hyphae v2 native CLI (`hook`, `statusline`, `mcp`, `wait`, `watch`, `node`/`daemon`,
-//! `onboard`, `setup`, `inspect`, `session`, `ui`, `status`, `doctor`, `secret`, `gate`, `inbox`,
+//! `onboard`, `setup`, `plugin`, `inspect`, `session`, `ui`, `status`, `doctor`, `secret`, `gate`, `inbox`,
 //! `kv`, `emit`, `auth`, `drop`, `relay`, `update`, `deploy`, `pair`, `version`).
 //!
 //! Performance note: `hyp hook` and `hyp statusline` intercept `std::env::args()` BEFORE
@@ -16,6 +16,7 @@ mod inspect_cmd;
 mod kv_cmd;
 mod node_cmd;
 mod pair;
+mod plugin_cmd;
 mod secret_cmd;
 mod service;
 mod session_cmd;
@@ -46,7 +47,7 @@ use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE};
 #[derive(Parser)]
 #[command(
     name = "hyp",
-    about = "Hyphae v2 native CLI (hook, statusline, mcp, wait, watch, node, onboard, setup, inspect, session, ui, status, doctor, secret, gate, inbox, kv, emit, auth, drop, relay, update, uninstall, deploy, pair, version)",
+    about = "Hyphae v2 native CLI (hook, statusline, mcp, wait, watch, node, onboard, setup, plugin, inspect, session, ui, status, doctor, secret, gate, inbox, kv, emit, auth, drop, relay, update, uninstall, deploy, pair, version)",
     version
 )]
 struct Cli {
@@ -201,6 +202,11 @@ enum Commands {
     Pair {
         #[command(subcommand)]
         command: pair::PairCommand,
+    },
+    /// Manage verified external chat & webhook bridge plugins (`list`, `install`, `verify`, `remove`)
+    Plugin {
+        #[command(subcommand)]
+        command: plugin_cmd::PluginCommand,
     },
     /// Ultra-fast status bar pill for Claude Code, Antigravity & generic harnesses (<5 ms cold start)
     Statusline(statusline_cmd::StatuslineArgs),
@@ -491,6 +497,7 @@ fn main() -> ExitCode {
         Commands::Uninstall(args) => uninstall_cmd::run_uninstall(args),
         Commands::Deploy { command } => deploy::run_deploy(command),
         Commands::Pair { command } => pair::run_pair(command),
+        Commands::Plugin { command } => plugin_cmd::run_plugin(command),
         Commands::Statusline(args) => statusline_cmd::run_statusline(&args),
         Commands::Inspect(args) => inspect_cmd::run_inspect(&args),
         Commands::Session(args) => session_cmd::run_session(&args),
