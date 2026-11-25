@@ -16,7 +16,7 @@ Hyphae exposes **strictly 4 core MCP tools** (`hyp_mesh`, `hyp_send`, `hyp_strea
      `hyp_mesh({ action: "join", handle: "frontend", include: ["peers", "channels", "topics"] })`
    - Join or leave `#channels`:
      `hyp_mesh({ action: "join", channel: "#incidents" })` / `hyp_mesh({ action: "leave", channel: "#incidents" })`
-   - Request a one-shot Verified Human Drop link (`kind: "secret"` always requires fresh human input; `kind: "directive"` supports optional HPKE-encrypted `draft` sealed directly into `#drop=` as `encDraft` — zero plaintext leak even in Slack/Telegram/SMS):
+   - Request a one-shot Verified Human Drop link (`kind: "secret"` always requires fresh human input; `kind: "directive"` supports optional HPKE-encrypted `draft` sealed directly into `#drop=` as `encDraft` — zero plaintext leak even in Slack/Telegram/SMS). **Whenever sharing a phone-facing URL (like a drop link) with the user, always include BOTH a scannable QR code AND the clickable URL:**
      `hyp_mesh({ action: "drop_link", kind: "secret", secretName: "stripe-key" })`
      `hyp_mesh({ action: "drop_link", kind: "directive", draft: "Approve staging deploy for v0.5.0" })`
    - Other actions: `action: "peers" | "channels" | "status" | "leave"` (`include` supports `"peers" | "channels" | "topics" | "subs" | "mutes"`).
