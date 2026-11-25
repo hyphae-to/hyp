@@ -152,13 +152,15 @@ Approve sensitive actions or hand off API keys from your phone or laptop without
 # 1. Pair a phone Passkey via https://hyphae.to/drop (derives Ed25519 + companion X25519 keys in 1 prompt)
 hyp auth init --web
 
-# 2. Create a one-shot drop link (fresh secret OR HPKE-encrypted directive draft prefill)
+# 2. Point at Hyphae's public RAM-only Blind Drop Relay (`https://spore.hyphae.to`)
+#    (or self-host your own private relay via `workers/drop-relay/` or `hyp deploy init drop-relay`)
+hyp relay set https://spore.hyphae.to
+hyp relay status --probe
+
+# 3. Create a one-shot drop link (fresh secret OR HPKE-encrypted directive draft prefill)
 hyp drop create --kind secret --secret-name stripe-key
 hyp drop create --kind directive --draft "Approve staging deploy for v0.5.0"
-
-# 3. Host your own 256 MiB RAM-only Blind Drop Relay in 60 seconds
-hyp deploy init drop-relay --domain drop.example.com --max-memory-mb 256
-hyp relay set https://drop.example.com
+hyp drop wait
 ```
 
 ---

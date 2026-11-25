@@ -138,9 +138,14 @@ What this turnkey kit configures:
 
 ### 2.7 60-Second Self-Hostable Blind Drop Relay (`drop-relay`)
 
-Stand up a dedicated, zero-disk, RAM-only Blind Drop Relay for **Verified Human Drops** (`hdrop1_`) — ideal for phone Passkey (`https://hyphae.to/drop`) and CLI secret/directive handoffs behind NAT:
+Use Hyphae's official public RAM-only Blind Drop Relay (**`https://spore.hyphae.to`** — zero-dependency Cloudflare Worker + RAM-only `DropSlotDO`), deploy a private Cloudflare Workers relay in 30 seconds from [`workers/drop-relay/`](../workers/drop-relay/README.md), or stand up a dedicated Rust `drop-relay` host behind Caddy/Docker/Fly for **Verified Human Drops** (`hdrop1_`):
 
 ```sh
+# Quickest — use the hosted public blind relay (100% RAM-only, E2EE ciphertext only):
+hyp relay set https://spore.hyphae.to
+hyp relay status --probe
+
+# Or self-host a dedicated 256 MiB Rust Drop Relay:
 hyp deploy init drop-relay \
   --domain drop.example.com \
   --max-memory-mb 256 \
@@ -150,9 +155,9 @@ hyp deploy check --config ./deploy-drop-relay/node.json
 # Deploy with Docker Compose, systemd + Caddy, or Fly.io, then verify live:
 hyp deploy check --url https://drop.example.com --config ./deploy-drop-relay/node.json
 
-# Point client workstations at your relay:
+# Point client workstations at your self-hosted relay:
 hyp relay set https://drop.example.com
-hyp relay status
+hyp relay status --probe
 ```
 
 What `drop-relay` (and `--enable-drop-relay` on `public-node`, `vps`, `docker`, `tailscale`, `fly`) configures:

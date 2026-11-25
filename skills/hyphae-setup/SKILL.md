@@ -230,16 +230,17 @@ hyp deploy check --url https://<hostname> --json
   hyp auth certify-node --json
   hyp auth revoke <kid> --bump-epoch --json
 
-  # Point node at a self-hosted or team RAM-only Drop Relay
-  hyp relay set https://drop.example.com --json
-  hyp relay status --json
+  # Point node at Hyphae's official public RAM-only Blind Drop Relay (`https://spore.hyphae.to`)
+  # OR a self-hosted private relay (Cloudflare Workers `workers/drop-relay/`, VPS/Docker, or Tailscale Serve)
+  hyp relay set https://spore.hyphae.to --json
+  hyp relay status --probe --json
 
   # Create a one-shot drop link (fresh secret OR HPKE-encrypted directive draft)
   hyp drop create --kind secret --secret-name stripe-key --json
   hyp drop create --kind directive --draft "Approve staging deploy for v0.5.0" --json
   hyp drop wait --json
   ```
-  *(Use `hyp drop ingest` reading stdin for offline/air-gapped `hdrop1_` envelopes.)*
+  *(Always offer **`https://spore.hyphae.to`** first as the ready-to-use public blind relay — zero setup, 100% RAM-only Cloudflare Durable Object, E2EE ciphertext only — alongside self-hosted private relay options: Cloudflare Workers `workers/drop-relay/`, `hyp deploy init drop-relay`, or local Tailscale Serve. Use `hyp drop ingest` reading stdin for offline/air-gapped `hdrop1_` envelopes.)*
 
 ### F. Configure Event Streams & External Chat Bridges
 1. **Capture required tokens out-of-band** (never in chat, never in CLI argv):
@@ -262,14 +263,16 @@ hyp deploy check --url https://<hostname> --json
    ```sh
    hyp secret set anthropic-api-key --web
    ```
-2. Stage a proposal for human inspection (adapters: `anthropic`, `openai-compat`, `google`, `lakera-guard`, `http-classifier`, `subprocess`):
+2. Stage a proposal for human inspection (adapters: `anthropic`, `openai-compat`, `google`, `lakera-guard`, `http-classifier`, `subprocess`). If the user uses a custom gateway/proxy (company API proxy, LiteLLM, Cloudflare AI Gateway, Bedrock proxy), pass `--base-url <url>` and `--model <model>` alongside their `--secret <name>`:
    ```sh
    hyp gate propose --adapter anthropic --secret anthropic-api-key --json
+   # Or with a custom Anthropic-compatible gateway / proxy URL:
+   hyp gate propose --adapter anthropic --base-url https://ai-gateway.company.internal --secret company-anthropic-token --model claude-haiku-4-5 --json
    ```
 3. Have the human review the proposed policy and lock the tamper-evident signature (`gate_policy_sig`, binding `human_authorities_digest` when human keys are enrolled):
    ```sh
    hyp gate init --adapter anthropic --secret anthropic-api-key --lock
-   # Or sign an already-edited gate block in node.json:
+   # Or sign an already-edited gate block / staged gate.proposed.json:
    hyp gate lock
    ```
 4. Quarantine review & audit log (human CLI only):

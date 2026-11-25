@@ -172,6 +172,8 @@ To enable post-decrypt prompt-injection screening and tamper-evident policy sign
 
 ```sh
 hyp gate init --adapter anthropic --secret anthropic-api-key --lock
+# Or with a custom Anthropic-compatible gateway/proxy URL:
+hyp gate init --adapter anthropic --base-url https://ai-gateway.company.internal --secret company-anthropic-token --lock
 hyp doctor
 ```
 
@@ -221,9 +223,10 @@ Verified Human Drops let you send zero-knowledge OS Keychain secrets and `TrustT
 hyp auth init --web
 hyp auth list
 
-# 2. Point your node at a self-hosted (or team) RAM-only Drop Relay
-hyp relay set https://drop.example.com
-hyp relay status
+# 2. Point your node at Hyphae's public RAM-only Drop Relay (`https://spore.hyphae.to`)
+#    or your own private relay (`workers/drop-relay/` / `hyp deploy init drop-relay`)
+hyp relay set https://spore.hyphae.to
+hyp relay status --probe
 
 # 3. Mint a one-shot drop link (fresh secret OR HPKE-encrypted directive prefill) and wait
 hyp drop create --kind secret --secret-name stripe-key
