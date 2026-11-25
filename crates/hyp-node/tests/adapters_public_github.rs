@@ -1290,9 +1290,8 @@ lines.on("line", (line) => {
 
 #[cfg(not(unix))]
 #[tokio::test]
-async fn supervisor_returns_unsupported_platform_on_non_unix() {
-    use hyp_node::adapters::{SubprocessConfig, SubprocessSupervisor};
-    let host = RecordingHost::new();
+async fn supervisor_defaults_to_loopback_tcp_on_non_unix() {
+    use hyp_node::adapters::{PluginTransportMode, SubprocessConfig};
     let cfg = SubprocessConfig::new(
         "win-test",
         AdapterKind::Bridge,
@@ -1300,11 +1299,7 @@ async fn supervisor_returns_unsupported_platform_on_non_unix() {
         vec![],
         vec!["ops".to_string()],
     );
-    let sup = SubprocessSupervisor::new(cfg);
-    assert!(matches!(
-        sup.start(host).await,
-        Err(AdapterError::UnsupportedPlatform(_))
-    ));
+    assert_eq!(cfg.transport_mode, PluginTransportMode::LoopbackTcp);
 }
 
 // ============================================================================
