@@ -23,10 +23,12 @@ use clap::Subcommand;
 use http::{Method, Request, header};
 use http_body_util::{BodyExt, Full};
 use hyp_crypto::human::{
-    HumanDropEnvelopeV1, SignedNodeCertV1, decode_hdrop1, encode_hcert1, is_reserved_secret_name,
+    EncryptedHumanDraftV1, HumanDraftPayloadV1, HumanDropEnvelopeV1,
+    MAX_HUMAN_DRAFT_CONTEXT_CHARS, SignedNodeCertV1, decode_hdrop1, encode_hcert1,
+    is_reserved_secret_name, seal_human_draft, validate_draft_text,
 };
 use hyp_crypto::jcs::to_canonical_json;
-use hyp_crypto::keys::NodeIdentityKeys;
+use hyp_crypto::keys::{NodeIdentityKeys, OkpJwk};
 use hyp_crypto::keystore::validate_secret_name;
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
 use hyp_node::engine::http_util::{SseParser, percent_encode};
@@ -48,7 +50,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const DROP_PORTAL_BASE_URL: &str = "https://hyphae.to/drop";
+const LAST_DROP_FILENAME: &str = "last_drop.json";
 const MAX_HDROP1_STDIN_BYTES: u64 = 64 * 1024;
+const MAX_DRAFT_STDIN_BYTES: u64 = 8 * 1024;
 const MAX_SUBCAP_STDIN_BYTES: u64 = 4 * 1024;
 const MAX_RELAY_JSON_BYTES: usize = 64 * 1024;
 const MAX_DROP_TTL_SECS: u64 = 900;
@@ -57,7 +61,7 @@ const RELAY_PROBE_TIMEOUT_SECS: u64 = 4;
 
 #[derive(Subcommand)]
 pub enum DropCommand {
-    /// Allocate a blind drop slot (or offline invite) and emit a phone-ready https://hyphae.to/drop#<fragment> URL
+    /// Allocate a blind drop slot (or offline invite) and emit a phone-ready https://hyphae.to/drop#drop=<fragment> URL
     Create {
         /// Drop kind (secret or directive)
         #[arg(long, value_enum)]
@@ -68,13 +72,22 @@ pub enum DropCommand {
         /// Optional target local agent handle
         #[arg(long)]
         handle: Option<String>,
+        /// Optional short directive draft prefill (HPKE-encrypted via encDraft; forbidden for --kind secret)
+        #[arg(long)]
+        draft: Option<String>,
+        /// Read directive draft prefill from stdin (HPKE-encrypted via encDraft; forbidden for --kind secret)
+        #[arg(long)]
+        draft_stdin: bool,
+        /// Optional context label (<= 160 chars) for encrypted directive draft (requires --draft or --draft-stdin)
+        #[arg(long)]
+        context: Option<String>,
         /// Explicit Drop Relay base URL (overrides node.json dropRelayUrl)
         #[arg(long)]
         relay: Option<String>,
         /// Drop slot TTL in seconds (1..=900, default: 600)
         #[arg(long, default_value_t = 600)]
         ttl: u64,
-        /// Generate an offline https://hyphae.to/drop#<fragment> invite (no Drop Relay contact)
+        /// Generate an offline https://hyphae.to/drop#drop=<fragment> invite (no Drop Relay contact)
         #[arg(long)]
         offline: bool,
         /// Explicit state directory containing node.sqlite and secrets/
@@ -89,12 +102,12 @@ pub enum DropCommand {
     },
     /// Stream a Drop Relay slot over SSE, verify & ingest the sealed drop, and burn it from relay RAM
     Wait {
-        /// Drop Relay base URL (defaults to node.json dropRelayUrl)
+        /// Drop Relay base URL (defaults to last_drop.json or node.json dropRelayUrl)
         #[arg(long)]
         relay: Option<String>,
-        /// Drop slot ID to watch
+        /// Drop slot ID to watch (defaults to most recent online `hyp drop create` saved in last_drop.json)
         #[arg(long, allow_hyphen_values = true)]
-        drop_id: String,
+        drop_id: Option<String>,
         /// Allow overwriting an existing secret of the same name
         #[arg(long)]
         overwrite: bool,
@@ -170,6 +183,9 @@ pub fn run_drop(command: DropCommand) -> ExitCode {
             kind,
             secret_name,
             handle,
+            draft,
+            draft_stdin,
+            context,
             relay,
             ttl,
             offline,
@@ -180,6 +196,9 @@ pub fn run_drop(command: DropCommand) -> ExitCode {
             kind,
             secret_name,
             handle,
+            draft,
+            draft_stdin,
+            context,
             relay,
             ttl,
             offline,
@@ -352,6 +371,9 @@ fn run_drop_create(
     kind: CliDropKind,
     secret_name_arg: Option<String>,
     handle_arg: Option<String>,
+    draft_arg: Option<String>,
+    draft_stdin: bool,
+    context_arg: Option<String>,
     relay_arg: Option<String>,
     ttl_secs: u64,
     offline: bool,
@@ -369,6 +391,104 @@ fn run_drop_create(
             format!("--ttl must be in 1..={MAX_DROP_TTL_SECS} seconds"),
             None,
         );
+    }
+
+    if draft_arg.is_some() && draft_stdin {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "CONFLICTING_FLAGS",
+            "Specify at most one of --draft or --draft-stdin",
+            None,
+        );
+    }
+
+    // Fail-closed security invariant #1: secrets MUST NEVER carry draft or context prefill.
+    if kind == CliDropKind::Secret
+        && (draft_arg.is_some() || draft_stdin || context_arg.is_some())
+    {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "DRAFT_FORBIDDEN_FOR_SECRET",
+            "Draft prefill is forbidden for secret drops; secrets must be entered fresh by the human",
+            None,
+        );
+    }
+
+    let draft_text: Option<String> = if draft_stdin {
+        let mut raw = String::new();
+        if let Err(e) = io::stdin()
+            .lock()
+            .take(MAX_DRAFT_STDIN_BYTES + 1)
+            .read_to_string(&mut raw)
+        {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "STDIN_ERROR",
+                format!("Failed to read draft from stdin: {e}"),
+                None,
+            );
+        }
+        if raw.len() as u64 > MAX_DRAFT_STDIN_BYTES {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "DRAFT_TOO_LARGE",
+                format!("Draft input exceeds {MAX_DRAFT_STDIN_BYTES} byte safety cap"),
+                None,
+            );
+        }
+        Some(raw.trim_end_matches(['\r', '\n']).to_string())
+    } else {
+        draft_arg
+    };
+
+    if draft_text.is_none() && context_arg.is_some() {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "CONTEXT_WITHOUT_DRAFT",
+            "Optional --context requires --draft or --draft-stdin",
+            None,
+        );
+    }
+
+    if let Some(ref text) = draft_text {
+        if let Err(e) = validate_draft_text(text) {
+            return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_DRAFT", e.to_string(), None);
+        }
+        if let Some(ref ctx) = context_arg {
+            if let Err(e) = validate_draft_text(ctx) {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_USAGE,
+                    "INVALID_DRAFT_CONTEXT",
+                    e.to_string(),
+                    None,
+                );
+            }
+            let ctx_chars = ctx.chars().count();
+            if ctx_chars > MAX_HUMAN_DRAFT_CONTEXT_CHARS {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_USAGE,
+                    "INVALID_DRAFT_CONTEXT",
+                    format!(
+                        "human draft context length {ctx_chars} exceeds maximum {MAX_HUMAN_DRAFT_CONTEXT_CHARS} chars"
+                    ),
+                    None,
+                );
+            }
+        }
     }
 
     if let Some(ref h) = handle_arg {
@@ -491,29 +611,117 @@ fn run_drop_create(
     };
     let enc_jwk = identity.encryption_jwk();
 
-    let (node_cert_hcert1, hint_human_id, hint_prf_salt, hint_auth_epoch) = if let Some(ref d) = db {
-        let cert_token = d
-            .human()
-            .get_latest_node_cert(&node_id)
-            .ok()
-            .flatten()
-            .and_then(|rec| serde_json::from_str::<SignedNodeCertV1>(&rec.signed_json).ok())
-            .and_then(|signed| encode_hcert1(&signed).ok());
-        let active_auths = d.human().list_authorities(false).unwrap_or_default();
-        // Prefer an authority with a prf_salt (Passkey signer), else first active authority.
-        let best_hint = active_auths
-            .iter()
-            .find(|a| a.prf_salt.is_some())
-            .or_else(|| active_auths.first());
-        let min_ep = d.human().min_auth_epoch().unwrap_or(1);
-        (
-            cert_token,
-            best_hint.map(|a| a.human_id.clone()),
-            best_hint.and_then(|a| a.prf_salt.clone()),
-            best_hint.map(|a| a.auth_epoch.max(min_ep)),
-        )
+    let (node_cert_hcert1, mut hint_human_id, mut hint_prf_salt, mut hint_auth_epoch, min_ep) =
+        if let Some(ref d) = db {
+            let cert_token = d
+                .human()
+                .get_latest_node_cert(&node_id)
+                .ok()
+                .flatten()
+                .and_then(|rec| serde_json::from_str::<SignedNodeCertV1>(&rec.signed_json).ok())
+                .and_then(|signed| encode_hcert1(&signed).ok());
+            let active_auths = d.human().list_authorities(false).unwrap_or_default();
+            // Prefer an authority with a prf_salt (Passkey signer), else first active authority.
+            let best_hint = active_auths
+                .iter()
+                .find(|a| a.prf_salt.is_some())
+                .or_else(|| active_auths.first());
+            let min_ep = d.human().min_auth_epoch().unwrap_or(1);
+            (
+                cert_token,
+                best_hint.map(|a| a.human_id.clone()),
+                best_hint.and_then(|a| a.prf_salt.clone()),
+                best_hint.map(|a| a.auth_epoch.max(min_ep)),
+                min_ep,
+            )
+        } else {
+            (None, None, None, None, 1)
+        };
+
+    let now = now_unix_ms();
+
+    // Fail-closed security invariant #2: encrypt directive draft to the human's Passkey X25519 key
+    // (`encDraft` ONLY — NEVER downgrade to plaintext `draft` or `proposedText`!).
+    let encrypted_draft: Option<EncryptedHumanDraftV1> = if let Some(ref text) = draft_text {
+        let enc_authority = db
+            .as_ref()
+            .and_then(|d| d.human().get_preferred_human_enc_jwk(None).ok().flatten());
+        let Some(auth_rec) = enc_authority else {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "NO_HUMAN_ENC_KEY",
+                "No human X25519 encryption key enrolled for encrypted directive draft prefill; refusing plaintext downgrade",
+                Some("hyp auth init --web".to_string()),
+            );
+        };
+        let Some(ref raw_enc_jwk) = auth_rec.enc_jwk_json else {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "NO_HUMAN_ENC_KEY",
+                "No human X25519 encryption key enrolled for encrypted directive draft prefill; refusing plaintext downgrade",
+                Some("hyp auth init --web".to_string()),
+            );
+        };
+        let parsed_enc_jwk: OkpJwk = match serde_json::from_str(raw_enc_jwk) {
+            Ok(j) => j,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "INVALID_HUMAN_ENC_KEY",
+                    format!("Stored human encryption JWK is invalid: {e}"),
+                    Some("hyp auth init --web".to_string()),
+                );
+            }
+        };
+        let human_enc_pk = match parsed_enc_jwk.to_x25519() {
+            Ok(pk) => pk,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "INVALID_HUMAN_ENC_KEY",
+                    format!("Stored human encryption JWK is not a valid X25519 public key: {e}"),
+                    Some("hyp auth init --web".to_string()),
+                );
+            }
+        };
+
+        // Keep Passkey PRF hints aligned with the authority whose X25519 key sealed `encDraft`.
+        hint_human_id = Some(auth_rec.human_id.clone());
+        if auth_rec.prf_salt.is_some() {
+            hint_prf_salt = auth_rec.prf_salt.clone();
+        }
+        hint_auth_epoch = Some(auth_rec.auth_epoch.max(min_ep));
+
+        let payload = HumanDraftPayloadV1 {
+            v: 1,
+            node_id: node_id.clone(),
+            text: text.clone(),
+            context: context_arg.clone(),
+            created_at: format_rfc3339_millis(now),
+        };
+        match seal_human_draft(&payload, &human_enc_pk) {
+            Ok(sealed) => Some(sealed),
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_USAGE,
+                    "DRAFT_SEAL_FAILED",
+                    format!("Failed to seal encrypted directive draft: {e}"),
+                    None,
+                );
+            }
+        }
     } else {
-        (None, None, None, None)
+        None
     };
 
     let mut warnings = Vec::new();
@@ -524,7 +732,6 @@ fn run_drop_create(
         );
     }
 
-    let now = now_unix_ms();
     let (mode, drop_id, post_cap, expires_at_ms) = if let Some(ref base_url) = relay_url {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -560,6 +767,19 @@ fn run_drop_create(
                 );
             }
         };
+        let last_drop_doc = json!({
+            "dropId": created.drop_id,
+            "relay": base_url,
+            "subCap": created.sub_cap,
+            "expiresAtMs": created.expires_at_ms,
+        });
+        let last_drop_path = state_dir.join(LAST_DROP_FILENAME);
+        if let Err(e) = write_atomic_json(&last_drop_path, &last_drop_doc, true) {
+            warnings.push(format!(
+                "Could not save {} for zero-flag `hyp drop wait`: {e}",
+                last_drop_path.display()
+            ));
+        }
         (
             "relay",
             Some(created.drop_id),
@@ -578,7 +798,7 @@ fn run_drop_create(
     let expires_at = format_rfc3339_millis(expires_at_ms);
 
     // Construct exact `DropInviteFragmentV1` expected by `site/drop/drop.js` (`parseFragmentString`).
-    // SECURITY: NEVER include `proposedText` or `body`!
+    // SECURITY: NEVER include plaintext `proposedText`, `draft`, or `body` — ONLY HPKE `encDraft`!
     let mut frag = Map::new();
     frag.insert("v".to_string(), json!(1));
     frag.insert("nodeId".to_string(), json!(node_id));
@@ -619,19 +839,26 @@ fn run_drop_create(
     if let Some(ep) = hint_auth_epoch {
         frag.insert("authEpoch".to_string(), json!(ep));
     }
+    if let Some(ref sealed_draft) = encrypted_draft {
+        let draft_val = match serde_json::to_value(sealed_draft) {
+            Ok(v) => v,
+            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
+        };
+        frag.insert("encDraft".to_string(), draft_val);
+    }
 
     let canon = match to_canonical_json(&Value::Object(frag)) {
         Ok(s) => s,
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
     };
     let drop_url = format!(
-        "{DROP_PORTAL_BASE_URL}#{}",
+        "{DROP_PORTAL_BASE_URL}#drop={}",
         URL_SAFE_NO_PAD.encode(canon.as_bytes())
     );
 
-    let next = if let (Some(rurl), Some(did)) = (relay_url.as_deref(), drop_id.as_deref()) {
+    let next = if relay_url.is_some() && drop_id.is_some() {
         vec![format!(
-            "hyp drop wait --relay {rurl} --drop-id {did} --state-dir {}",
+            "hyp drop wait --state-dir {}",
             state_dir.display()
         )]
     } else {
@@ -660,6 +887,7 @@ fn run_drop_create(
                 "relay": relay_url,
                 "nodeCert": node_cert_hcert1,
                 "hasNodeCert": node_cert_hcert1.is_some(),
+                "hasEncDraft": encrypted_draft.is_some(),
                 "expiresAt": expires_at,
             })),
             warnings,
@@ -676,6 +904,9 @@ fn run_drop_create(
         println!("      Expires: {expires_at}");
         if let Some(ref did) = drop_id {
             println!("      Drop ID: {did}");
+        }
+        if encrypted_draft.is_some() {
+            println!("      Draft:   HPKE-encrypted (human.draft.v1; zero plaintext in URL)");
         }
         print_next_steps(&next);
     }
@@ -706,6 +937,7 @@ async fn create_relay_drop_slot(
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::AUTHORIZATION, auth)
         .header("x-hyphae-node", node_id)
+        .header("X-Hyphae-Public-Key", identity.signing_jwk().x)
         .body(Full::new(Bytes::from(body_bytes)))
         .map_err(|e| format!("failed to build POST /v1/drops request: {e}"))?;
 
@@ -728,10 +960,48 @@ async fn create_relay_drop_slot(
         .map_err(|e| format!("invalid CreateDropResponse JSON from relay: {e}"))
 }
 
+struct SavedLastDrop {
+    drop_id: String,
+    relay: Option<String>,
+    sub_cap: Option<String>,
+    expires_at_ms: Option<i64>,
+}
+
+fn load_saved_last_drop(path: &Path) -> Option<SavedLastDrop> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let val: Value = serde_json::from_str(&raw).ok()?;
+    let obj = val.as_object()?;
+    let drop_id = obj
+        .get("dropId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let relay = obj
+        .get("relay")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    let sub_cap = obj
+        .get("subCap")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    let expires_at_ms = obj.get("expiresAtMs").and_then(Value::as_i64);
+    Some(SavedLastDrop {
+        drop_id,
+        relay,
+        sub_cap,
+        expires_at_ms,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_drop_wait(
     relay_arg: Option<String>,
-    drop_id: String,
+    drop_id_arg: Option<String>,
     overwrite: bool,
     timeout_secs: u64,
     state_dir_arg: Option<PathBuf>,
@@ -739,17 +1009,6 @@ fn run_drop_wait(
     as_json: bool,
 ) -> ExitCode {
     let cmd = "drop wait";
-    let trimmed_drop_id = drop_id.trim();
-    if trimmed_drop_id.is_empty() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
-            "INVALID_DROP_ID",
-            "--drop-id cannot be empty",
-            None,
-        );
-    }
 
     let state_dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
     let config_read =
@@ -760,13 +1019,85 @@ fn run_drop_wait(
         None
     };
 
-    let relay_raw = relay_arg.or_else(|| {
-        loaded
-            .as_ref()
-            .and_then(|c| c.raw.get("dropRelayUrl"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-    });
+    let last_drop_path = state_dir.join(LAST_DROP_FILENAME);
+    let saved_last = load_saved_last_drop(&last_drop_path);
+
+    let (effective_drop_id, used_saved_last) = match drop_id_arg {
+        Some(raw) => {
+            let trimmed = raw.trim().to_string();
+            if trimmed.is_empty() {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_USAGE,
+                    "INVALID_DROP_ID",
+                    "--drop-id cannot be empty",
+                    None,
+                );
+            }
+            let matched = saved_last
+                .as_ref()
+                .is_some_and(|s| s.drop_id == trimmed);
+            (trimmed, matched)
+        }
+        None => match saved_last {
+            Some(ref saved) => {
+                if let Some(exp) = saved.expires_at_ms {
+                    if exp <= now_unix_ms() {
+                        let _ = std::fs::remove_file(&last_drop_path);
+                        return emit_error(
+                            cmd,
+                            as_json,
+                            EXIT_ERROR,
+                            "LAST_DROP_EXPIRED",
+                            format!(
+                                "Most recent drop slot '{}' in {} has expired; create a fresh drop link",
+                                saved.drop_id,
+                                last_drop_path.display()
+                            ),
+                            Some(format!(
+                                "hyp drop create --kind directive --state-dir {}",
+                                state_dir.display()
+                            )),
+                        );
+                    }
+                }
+                (saved.drop_id.clone(), true)
+            }
+            None => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_USAGE,
+                    "MISSING_DROP_ID",
+                    format!(
+                        "No --drop-id specified and no pending drop found in {}",
+                        last_drop_path.display()
+                    ),
+                    Some(format!(
+                        "Run `hyp drop create --kind directive --state-dir {}` first, or pass --drop-id <id>.",
+                        state_dir.display()
+                    )),
+                );
+            }
+        },
+    };
+
+    let relay_raw = relay_arg
+        .or_else(|| {
+            if used_saved_last {
+                saved_last.as_ref().and_then(|s| s.relay.clone())
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            loaded
+                .as_ref()
+                .and_then(|c| c.raw.get("dropRelayUrl"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        });
     let Some(relay_raw) = relay_raw else {
         return emit_error(
             cmd,
@@ -782,8 +1113,8 @@ fn run_drop_wait(
         Err(e) => return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_RELAY_URL", e, None),
     };
 
-    // Optionally read `subCap` from piped stdin (NEVER argv!).
-    let sub_cap: Option<String> = if !io::stdin().is_terminal() {
+    // Optionally read `subCap` from piped stdin (NEVER argv!), falling back to `last_drop.json`.
+    let stdin_sub_cap: Option<String> = if !io::stdin().is_terminal() {
         let mut raw = String::new();
         if io::stdin()
             .lock()
@@ -800,6 +1131,13 @@ fn run_drop_wait(
     } else {
         None
     };
+    let sub_cap = stdin_sub_cap.or_else(|| {
+        if used_saved_last {
+            saved_last.as_ref().and_then(|s| s.sub_cap.clone())
+        } else {
+            None
+        }
+    });
 
     let (node, gate) =
         match open_node_and_optional_gate(&state_dir, &config_read, state_dir_arg.is_some()) {
@@ -826,7 +1164,7 @@ fn run_drop_wait(
 
     match rt.block_on(wait_and_ingest_drop(
         &relay_url,
-        trimmed_drop_id,
+        &effective_drop_id,
         sub_cap.as_deref(),
         &node,
         gate.as_ref(),
@@ -834,7 +1172,17 @@ fn run_drop_wait(
         timeout_secs,
     )) {
         Ok((ingested, ack_resp)) => {
-            emit_ingested_drop_ok(cmd, as_json, &ingested, Some(&relay_url), Some(trimmed_drop_id), ack_resp.as_ref())
+            if used_saved_last {
+                let _ = std::fs::remove_file(&last_drop_path);
+            }
+            emit_ingested_drop_ok(
+                cmd,
+                as_json,
+                &ingested,
+                Some(&relay_url),
+                Some(&effective_drop_id),
+                ack_resp.as_ref(),
+            )
         }
         Err(e) => emit_error(cmd, as_json, EXIT_ERROR, "DROP_WAIT_FAILED", e, None),
     }
@@ -870,7 +1218,8 @@ async fn wait_and_ingest_drop(
         )?;
         req_builder = req_builder
             .header(header::AUTHORIZATION, auth)
-            .header("x-hyphae-node", node.node_id().as_str());
+            .header("x-hyphae-node", node.node_id().as_str())
+            .header("X-Hyphae-Public-Key", node.identity().signing_jwk().x);
     }
     let req = req_builder
         .body(Full::new(Bytes::new()))
@@ -959,7 +1308,8 @@ async fn wait_and_ingest_drop(
         )?;
         ack_builder = ack_builder
             .header(header::AUTHORIZATION, auth)
-            .header("x-hyphae-node", node.node_id().as_str());
+            .header("x-hyphae-node", node.node_id().as_str())
+            .header("X-Hyphae-Public-Key", node.identity().signing_jwk().x);
     }
     let ack_resp = if let Ok(ack_req) = ack_builder.body(Full::new(Bytes::from(ack_body))) {
         match tokio::time::timeout(

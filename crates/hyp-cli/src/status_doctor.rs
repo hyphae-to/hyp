@@ -15,12 +15,14 @@ use crate::ui::{
 };
 use crate::update::read_cached_update_status;
 use clap::Args;
-use hyp_node::engine::{DEFAULT_HYPHAE_VERSION, DropRelayConfig, NodeProfile};
+use hyp_node::engine::{
+    DEFAULT_HYPHAE_VERSION, DropRelayConfig, LocalIngestConfig, NodeProfile,
+};
 use hyp_proto::manifest::{
     CapabilityToken, NodeManifestPayload, ProtocolRange, SignedNodeManifest,
 };
 use hyp_proto::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
-use hyp_store::{CURRENT_SCHEMA_VERSION, NodeDb, PeerRecord, TrustTier, WakeupState, now_ms};
+use hyp_store::{CURRENT_SCHEMA_VERSION, NodeDb, PeerRecord, TrustTier, now_ms};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -458,62 +460,73 @@ fn run_status_or_doctor(
         ));
     }
 
-    // 3. Wakeup scheduler summary
-    let (wakeup_enabled, wakeup_mcp_tool) = loaded_cfg
+    // 3. Local event ingest socket summary (`localIngest`, default enabled)
+    let local_ingest_cfg: LocalIngestConfig = loaded_cfg
         .as_ref()
-        .and_then(|c| c.raw.get("sources"))
-        .and_then(Value::as_array)
-        .and_then(|arr| {
-            arr.iter().find_map(|entry| {
-                let obj = entry.as_object()?;
-                if obj.get("kind").and_then(Value::as_str) != Some("wakeup") {
-                    return None;
-                }
-                let en = obj.get("enabled").and_then(Value::as_bool).unwrap_or(true);
-                let tool = obj
-                    .get("mcpTool")
-                    .and_then(Value::as_str)
-                    .unwrap_or("auto")
-                    .to_string();
-                Some((en, tool))
-            })
-        })
-        .unwrap_or_else(|| (false, "auto".to_string()));
-    let active_wakeups = db
-        .as_ref()
-        .and_then(|d| d.wakeups().list_wakeups(None, Some(WakeupState::Active)).ok())
-        .map(|v| v.len())
-        .unwrap_or(0);
-    let paused_wakeups = db
-        .as_ref()
-        .and_then(|d| d.wakeups().list_wakeups(None, Some(WakeupState::Paused)).ok())
-        .map(|v| v.len())
-        .unwrap_or(0);
-    if paused_wakeups > 0 {
-        checks.push(CliCheck::warn(
-            "wakeup.paused",
-            format!("{paused_wakeups} wakeup(s) auto-paused after repeated delivery failures"),
-            Some(format!("hyp wakeup list --all --state-dir {}", state_dir.display())),
-        ));
-    } else if wakeup_enabled {
-        checks.push(CliCheck::ok(
-            "wakeup",
-            format!("enabled (mcpTool={wakeup_mcp_tool}, active={active_wakeups}, paused={paused_wakeups})"),
-        ));
+        .and_then(|c| c.raw.get("localIngest"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let recorded_ingest_socket: Option<PathBuf> = fs::read_to_string(&status_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| {
+            v.get("localIngestSocket")
+                .and_then(serde_json::Value::as_str)
+                .map(PathBuf::from)
+        });
+    let ingest_socket_path = recorded_ingest_socket
+        .unwrap_or_else(|| local_ingest_cfg.resolved_socket_path(&state_dir));
+    let ingest_socket_exists = ingest_socket_path.exists();
+    let ingest_routes_count = local_ingest_cfg.effective_routes().len();
+    if local_ingest_cfg.enabled {
+        if ingest_socket_exists {
+            checks.push(CliCheck::ok(
+                "local_ingest",
+                format!(
+                    "ready at {} (defaultTopic={}, routes={ingest_routes_count})",
+                    ingest_socket_path.display(),
+                    local_ingest_cfg.default_topic
+                ),
+            ));
+        } else if running_pid.is_some() {
+            checks.push(CliCheck::warn(
+                "local_ingest",
+                format!(
+                    "enabled in config but ingest socket missing at {}",
+                    ingest_socket_path.display()
+                ),
+                Some("Restart `hyp node start` to recreate the local ingest socket.".to_string()),
+            ));
+        } else {
+            checks.push(CliCheck::ok(
+                "local_ingest",
+                format!(
+                    "enabled (defaultTopic={}, routes={ingest_routes_count}; starts with `hyp node start`)",
+                    local_ingest_cfg.default_topic
+                ),
+            ));
+        }
+    } else {
+        checks.push(CliCheck::ok("local_ingest", "disabled in node.json"));
     }
-    let wakeup_summary = json!({
-        "enabled": wakeup_enabled,
-        "mcpTool": wakeup_mcp_tool,
-        "active": active_wakeups,
-        "paused": paused_wakeups,
+    let local_ingest_summary = json!({
+        "enabled": local_ingest_cfg.enabled,
+        "socketPath": ingest_socket_path.display().to_string(),
+        "socketExists": ingest_socket_exists,
+        "defaultTopic": local_ingest_cfg.default_topic,
+        "routesCount": ingest_routes_count,
     });
 
     // 4. Verified Human Drops & Drop Relay summary
-    let active_authorities = db
+    let active_authority_rows = db
         .as_ref()
         .and_then(|d| d.human().list_authorities(false).ok())
-        .map(|v| v.len())
-        .unwrap_or(0);
+        .unwrap_or_default();
+    let active_authorities = active_authority_rows.len();
+    let has_enc_jwk_count = active_authority_rows
+        .iter()
+        .filter(|a| a.enc_jwk_json.is_some())
+        .count();
     let min_auth_epoch = db
         .as_ref()
         .and_then(|d| d.human().min_auth_epoch().ok())
@@ -557,7 +570,7 @@ fn run_status_or_doctor(
         checks.push(CliCheck::ok(
             "drops",
             format!(
-                "authorities={active_authorities}, minAuthEpoch={min_auth_epoch}, nodeCert={}, dropRelay={}, url={}",
+                "authorities={active_authorities}, encKeys={has_enc_jwk_count}, minAuthEpoch={min_auth_epoch}, nodeCert={}, dropRelay={}, url={}",
                 if has_node_cert { "yes" } else { "no" },
                 if drop_relay_cfg.enabled { "enabled" } else { "disabled" },
                 drop_relay_url.as_deref().unwrap_or("-")
@@ -566,6 +579,7 @@ fn run_status_or_doctor(
     }
     let human_drops_summary = json!({
         "activeAuthorities": active_authorities,
+        "hasEncJwkCount": has_enc_jwk_count,
         "minAuthEpoch": min_auth_epoch,
         "hasNodeCert": has_node_cert,
         "dropRelayEnabled": drop_relay_cfg.enabled,
@@ -676,7 +690,7 @@ fn run_status_or_doctor(
         "storage": storage_status,
         "peers": skew_rows,
         "gate": gate_status,
-        "wakeup": wakeup_summary,
+        "localIngest": local_ingest_summary,
         "humanDrops": human_drops_summary,
         "update": update_status,
         "harnesses": harnesses,
@@ -746,15 +760,17 @@ fn run_status_or_doctor(
             gate_status.quarantined_count
         );
         println!(
-            "  Wakeup:   {} (mcpTool={}, active={}, paused={})",
-            if wakeup_enabled { "enabled" } else { "disabled" },
-            wakeup_mcp_tool,
-            active_wakeups,
-            paused_wakeups
+            "  Ingest:   {} (topic=local.{}, routes={}, socket={}{})",
+            if local_ingest_cfg.enabled { "enabled" } else { "disabled" },
+            local_ingest_cfg.default_topic,
+            ingest_routes_count,
+            ingest_socket_path.display(),
+            if ingest_socket_exists { " [ready]" } else { "" }
         );
         println!(
-            "  Drops:    authorities={} (minEpoch={}, cert={}, relay={}{})",
+            "  Drops:    authorities={} (encKeys={}, minEpoch={}, cert={}, relay={}{})",
             active_authorities,
+            has_enc_jwk_count,
             min_auth_epoch,
             if has_node_cert { "yes" } else { "no" },
             if drop_relay_cfg.enabled { "enabled" } else { "disabled" },
