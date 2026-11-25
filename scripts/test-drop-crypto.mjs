@@ -20,6 +20,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import vm from "node:vm";
 
 import {
   AEAD_AES_128_GCM,
@@ -76,6 +77,8 @@ import {
 } from "../site/drop/crypto.js";
 
 import {
+  coerceBytes,
+  extractPrfFirst,
   isAllowedRelayUrl,
   isLoopbackCallbackUrl,
   parseFragmentString,
@@ -1017,6 +1020,51 @@ await test("parseFragmentString accepts valid encDraft ONLY on directive & ignor
   };
   const parsedBad = parseFragmentString("#" + base64urlEncode(utf8Bytes(toCanonicalJson(badDraftFrag))));
   assert.equal(parsedBad.fragment.encDraft, null);
+});
+
+// ----------------------------------------------------------------------------
+// 15. WebAuthn PRF Result Coercion Across Native & Browser Extension Realms
+// ----------------------------------------------------------------------------
+await test("extractPrfFirst handles native, cross-realm ArrayBuffer, TypedArray, Array, indexed object & base64url shims", async () => {
+  const expected = Uint8Array.from({ length: 32 }, (_, i) => (i * 7 + 11) & 0xff);
+  const wrapCred = (first) => ({
+    getClientExtensionResults: () => ({ prf: { results: { first } } }),
+  });
+
+  // 1) Native ArrayBuffer
+  assert.deepEqual(extractPrfFirst(wrapCred(expected.buffer.slice(0))), expected);
+
+  // 2) Cross-realm ArrayBuffer (`instanceof ArrayBuffer === false`, `.buffer === undefined`!)
+  const crossRealmBuf = vm.runInNewContext(`
+    const b = new ArrayBuffer(32);
+    const u = new Uint8Array(b);
+    for (let i = 0; i < 32; i++) u[i] = (i * 7 + 11) & 0xff;
+    b;
+  `);
+  assert.equal(crossRealmBuf instanceof ArrayBuffer, false);
+  assert.deepEqual(extractPrfFirst(wrapCred(crossRealmBuf)), expected);
+
+  // 3) Subarray with non-zero byteOffset (DataView / Uint8Array view)
+  const padded = new Uint8Array(48);
+  padded.set(expected, 8);
+  const sub = new DataView(padded.buffer, 8, 32);
+  assert.deepEqual(extractPrfFirst(wrapCred(sub)), expected);
+
+  // 4) Plain JS byte Array (common in password-manager extension shims)
+  assert.deepEqual(extractPrfFirst(wrapCred(Array.from(expected))), expected);
+
+  // 5) JSON-serialized Uint8Array (`{ "0": ..., "1": ..., ... }`)
+  const objShim = Object.fromEntries(Array.from(expected, (v, i) => [String(i), v]));
+  assert.deepEqual(extractPrfFirst(wrapCred(objShim)), expected);
+
+  // 6) Base64url string
+  assert.deepEqual(extractPrfFirst(wrapCred(base64urlEncode(expected))), expected);
+
+  // 7) Broken/empty extension object (`{}`) returns null cleanly instead of throwing!
+  assert.equal(extractPrfFirst(wrapCred({})), null);
+  assert.equal(extractPrfFirst(wrapCred({ weird: true })), null);
+  assert.equal(extractPrfFirst(wrapCred(new Uint8Array(16))), null);
+  assert.equal(coerceBytes(null), null);
 });
 
 console.log(`\nAll ${passed} test groups passed!`);

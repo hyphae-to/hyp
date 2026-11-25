@@ -36,7 +36,7 @@ import {
   validateSecretName,
   verifyNodeCert,
   zeroize,
-} from "./crypto.js";
+} from "./crypto.js?v=2";
 
 const HINT_STORAGE_PREFIX = "hyphae.drop.hint.v1:";
 const MAX_DROP_TTL_MS = 10 * 60 * 1000;
@@ -238,14 +238,59 @@ function getRpId() {
   return host;
 }
 
-function extractPrfFirst(cred) {
+export function coerceBytes(val) {
+  if (!val) return null;
+  if (val instanceof Uint8Array) return new Uint8Array(val);
+  if (ArrayBuffer.isView(val)) {
+    return new Uint8Array(val.buffer.slice(val.byteOffset, val.byteOffset + val.byteLength));
+  }
+  const tag = Object.prototype.toString.call(val);
+  if (
+    val instanceof ArrayBuffer ||
+    tag === "[object ArrayBuffer]" ||
+    tag === "[object SharedArrayBuffer]"
+  ) {
+    return new Uint8Array(val).slice();
+  }
+  if (Array.isArray(val) && val.every((n) => Number.isInteger(n) && n >= 0 && n <= 255)) {
+    return Uint8Array.from(val);
+  }
+  if (typeof val === "string" && val.length > 0) {
+    try {
+      return base64urlDecode(val.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, ""));
+    } catch {
+      return null;
+    }
+  }
+  if (typeof val === "object") {
+    // Handle cross-realm buffers and extension-serialized byte maps (`{ "0": 12, "1": 34, ... }`).
+    if (typeof val.byteLength === "number" && val.byteLength > 0) {
+      try {
+        const view = new Uint8Array(val);
+        if (view.length === val.byteLength) return view.slice();
+      } catch {
+        // Fall through to indexed object check.
+      }
+    }
+    const keys = Object.keys(val);
+    if (
+      keys.length > 0 &&
+      keys.every((k, idx) => k === String(idx) && Number.isInteger(val[k]) && val[k] >= 0 && val[k] <= 255)
+    ) {
+      return Uint8Array.from(keys.map((k) => val[k]));
+    }
+  }
+  return null;
+}
+
+export function extractPrfFirst(cred) {
   const ext = typeof cred?.getClientExtensionResults === "function"
     ? cred.getClientExtensionResults()
     : null;
   const first = ext?.prf?.results?.first;
   if (!first) return null;
-  const bytes = new Uint8Array(first instanceof ArrayBuffer ? first : first.buffer.slice(first.byteOffset, first.byteOffset + first.byteLength));
-  return bytes.length === 32 ? bytes : null;
+  const bytes = coerceBytes(first);
+  return bytes && bytes.length === 32 ? bytes : null;
 }
 
 async function evaluatePasskeyPrf(humanId, prfSalt, credentialIdB64 = "") {
@@ -284,8 +329,9 @@ async function evaluatePasskeyPrf(humanId, prfSalt, credentialIdB64 = "") {
       "Your authenticator did not return a WebAuthn PRF secret. Use Safari 18+, Chrome, or Edge with a PRF-capable Passkey (iCloud Keychain / Google Password Manager)."
     );
   }
-  const rawId = new Uint8Array(assertion.rawId);
-  return { prfOut, credentialId: base64urlEncode(rawId) };
+  const rawId = coerceBytes(assertion.rawId);
+  const credentialId = rawId ? base64urlEncode(rawId) : (typeof assertion.id === "string" ? assertion.id : "");
+  return { prfOut, credentialId };
 }
 
 async function enrollPasskeyWithPrf(humanId, prfSalt) {
@@ -326,7 +372,8 @@ async function enrollPasskeyWithPrf(humanId, prfSalt) {
   if (!created) {
     throw new Error("Passkey creation was cancelled");
   }
-  const credId = base64urlEncode(new Uint8Array(created.rawId));
+  const rawId = coerceBytes(created.rawId);
+  const credId = rawId ? base64urlEncode(rawId) : (typeof created.id === "string" ? created.id : "");
   const ext = typeof created.getClientExtensionResults === "function"
     ? created.getClientExtensionResults()
     : null;
