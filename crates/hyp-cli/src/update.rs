@@ -45,7 +45,7 @@ use std::time::Duration;
 pub const RELEASE_SIGNING_DOMAIN: &str = "release";
 
 /// Pinned release Ed25519 public key (43-char base64url; overridable via `--pubkey` or `HYPHAE_RELEASE_PUBKEY`).
-pub const DEFAULT_RELEASE_PUBKEY_B64: &str = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
+pub const DEFAULT_RELEASE_PUBKEY_B64: &str = "UJMRGSIIT65-5w2IvGTt5bBsp9SsoCHFTyxMryxLf3U";
 
 pub const DEFAULT_STABLE_MANIFEST_URL: &str =
     "https://github.com/hyphae-to/hyp/releases/latest/download/release-manifest.json";
