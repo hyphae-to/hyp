@@ -1623,7 +1623,7 @@ pub fn run_ui(args: &UiArgs) -> ExitCode {
 
     #[cfg(not(unix))]
     {
-        return fallback_to_inspect(args);
+        fallback_to_inspect(args)
     }
 
     #[cfg(unix)]

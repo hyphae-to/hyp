@@ -6278,14 +6278,17 @@ impl SetupToggleState {
             .is_some_and(|idx| self.selected_harnesses[idx])
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn selected_harness_count(&self) -> usize {
         self.selected_harnesses.iter().filter(|&&b| b).count()
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn move_up(&mut self) {
         self.cursor = (self.cursor + Self::TOTAL_ITEMS - 1) % Self::TOTAL_ITEMS;
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn move_down(&mut self) {
         self.cursor = (self.cursor + 1) % Self::TOTAL_ITEMS;
     }
@@ -6304,6 +6307,7 @@ impl SetupToggleState {
         }
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn toggle_current(&mut self) {
         self.toggle_index(self.cursor);
     }
@@ -6478,6 +6482,7 @@ impl SetupToggleState {
 }
 
 /// Pure key event dispatcher for the interactive harness & component toggle screen.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn handle_setup_toggle_key(
     state: &mut SetupToggleState,
     key: KeyEvent,
@@ -6608,6 +6613,7 @@ fn component_toggle_display(idx: usize) -> (&'static str, &'static str) {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(unix), allow(dead_code))]
 fn format_toggle_row(
     selected: bool,
     checked: bool,
@@ -6793,6 +6799,7 @@ fn format_toggle_row(
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 enum ToggleDisplayRow {
     SectionHeader(&'static str),
     Spacer,
@@ -6805,6 +6812,7 @@ enum ToggleDisplayRow {
 /// Guarantees `lines.len() <= term_rows` and every visible line fits cleanly within `term_cols`,
 /// with optional inline dry-run preview (`d`) and bounded viewport scrolling on narrow terminals.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn render_setup_toggle_screen(
     state: &SetupToggleState,
     home: &Path,
