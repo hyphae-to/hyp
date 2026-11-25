@@ -19,9 +19,31 @@ mod common;
 
 use common::{isolated_cmd, parse_json_stdout};
 use std::fs;
+#[cfg(unix)]
+use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::{Command, Output};
 use std::process::Stdio;
+#[cfg(unix)]
+use std::thread;
+#[cfg(unix)]
+use std::time::Duration;
 use tempfile::TempDir;
+
+#[cfg(unix)]
+fn output_retrying_busy(cmd: &mut Command) -> Output {
+    for attempt in 0..5 {
+        match cmd.output() {
+            Ok(out) => return out,
+            Err(e) if e.kind() == io::ErrorKind::ExecutableFileBusy && attempt < 4 => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("failed running test command: {e}"),
+        }
+    }
+    cmd.output().expect("run test command")
+}
 
 fn repo_setup_skill_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -284,8 +306,8 @@ fn assist_installs_skill_before_launch_and_invokes_all_six_verified_clis() {
         write_executable_shim(&bin_dir, bin_name, &expected_skill, &capture, shim_exit);
 
         let isolated_path = format!("{}:/usr/bin:/bin", bin_dir.display());
-        let out = isolated_cmd(&home)
-            .env("PATH", &isolated_path)
+        let mut cmd = isolated_cmd(&home);
+        cmd.env("PATH", &isolated_path)
             .args([
                 "onboard",
                 "--assist",
@@ -294,9 +316,8 @@ fn assist_installs_skill_before_launch_and_invokes_all_six_verified_clis() {
                 home.to_str().unwrap(),
                 "--no-anim",
             ])
-            .stdin(Stdio::null())
-            .output()
-            .unwrap_or_else(|e| panic!("failed running --assist {assist_arg}: {e}"));
+            .stdin(Stdio::null());
+        let out = output_retrying_busy(&mut cmd);
 
         assert_eq!(
             out.status.code(),
@@ -372,7 +393,8 @@ fn assist_on_existing_node_adapts_prompt_for_ongoing_configuration() {
     write_executable_shim(&bin_dir, "claude", &expected_skill, &capture, 0);
 
     let isolated_path = format!("{}:/usr/bin:/bin", bin_dir.display());
-    let assist_out = isolated_cmd(&home)
+    let mut assist_cmd = isolated_cmd(&home);
+    assist_cmd
         .env("PATH", &isolated_path)
         .args([
             "onboard",
@@ -382,9 +404,8 @@ fn assist_on_existing_node_adapts_prompt_for_ongoing_configuration() {
             home.to_str().unwrap(),
             "--no-anim",
         ])
-        .stdin(Stdio::null())
-        .output()
-        .expect("run assist on existing node");
+        .stdin(Stdio::null());
+    let assist_out = output_retrying_busy(&mut assist_cmd);
     assert_eq!(assist_out.status.code(), Some(0));
 
     let captured = fs::read_to_string(&capture).expect("read capture");
@@ -571,22 +592,9 @@ fn assist_herdr_template_installs_skill_and_invokes_hc_run() {
 
     let canonical = fs::read_to_string(repo_setup_skill_path()).expect("read repo SKILL.md");
 
-    let cases: &[(&str, &str, Option<&str>, i32)] = &[
-        (
-            "claude-gateway",
-            ".claude/skills/hyphae-setup/SKILL.md",
-            None,
-            0,
-        ),
-        (
-            "codex-gateway",
-            ".codex/skills/hyphae-setup/SKILL.md",
-            Some(".agents/skills/hyphae-setup/SKILL.md"),
-            5,
-        ),
-    ];
-
-    for &(template_name, primary_skill_rel, extra_skill_rel, shim_exit) in cases {
+    // 1. `--assist herdr:claude-gateway --json`: invokes `hc run --bg --outlive-parent --label app=hyphae --json`
+    //    and returns parsed terminal address `t4h` + `next: ["hc attach t4h"]` without hanging.
+    {
         let tmp = TempDir::new().expect("tempdir");
         let home = tmp.path().join("home");
         let bin_dir = tmp.path().join("bin");
@@ -594,7 +602,7 @@ fn assist_herdr_template_installs_skill_and_invokes_hc_run() {
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&bin_dir).unwrap();
 
-        let primary_skill = home.join(primary_skill_rel);
+        let primary_skill = home.join(".claude/skills/hyphae-setup/SKILL.md");
         let hc_script = bin_dir.join("hc");
         let script = format!(
             "#!/bin/sh\n\
@@ -612,7 +620,9 @@ fn assist_herdr_template_installs_skill_and_invokes_hc_run() {
              for arg in \"$@\"; do\n\
                printf 'ARG=%s\\n' \"$arg\" >> '{cap}'\n\
              done\n\
-             exit {shim_exit}\n",
+             printf '%s\\n' '[hc] launching background terminal'\n\
+             printf '%s\\n' '{{\"address\":\"t4h\",\"template\":\"claude-gateway\"}}'\n\
+             exit 0\n",
             skill = primary_skill.display(),
             cap = capture.display(),
         );
@@ -620,36 +630,37 @@ fn assist_herdr_template_installs_skill_and_invokes_hc_run() {
         fs::set_permissions(&hc_script, fs::Permissions::from_mode(0o755)).expect("chmod hc");
 
         let isolated_path = format!("{}:/usr/bin:/bin", bin_dir.display());
-        let assist_arg = format!("herdr:{template_name}");
-        let out = isolated_cmd(&home)
-            .env("PATH", &isolated_path)
+        let mut cmd = isolated_cmd(&home);
+        cmd.env("PATH", &isolated_path)
             .args([
                 "onboard",
                 "--assist",
-                &assist_arg,
+                "herdr:claude-gateway",
                 "--home",
                 home.to_str().unwrap(),
-                "--no-anim",
+                "--json",
             ])
-            .stdin(Stdio::null())
-            .output()
-            .expect("run onboard --assist herdr:<template>");
+            .stdin(Stdio::null());
+        let out = output_retrying_busy(&mut cmd);
 
         assert_eq!(
             out.status.code(),
-            Some(shim_exit),
-            "template {template_name}: stderr={}",
+            Some(0),
+            "stderr={}",
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(
             fs::read_to_string(&primary_skill).expect("primary skill installed"),
             canonical
         );
-        if let Some(extra_rel) = extra_skill_rel {
-            let extra_path = home.join(extra_rel);
-            assert!(extra_path.is_file(), "missing extra skill {}", extra_path.display());
-            assert_eq!(fs::read_to_string(&extra_path).unwrap(), canonical);
-        }
+
+        let payload = parse_json_stdout(&out);
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["command"], "onboard");
+        assert_eq!(payload["data"]["mode"], "herdr_launch");
+        assert_eq!(payload["data"]["template"], "claude-gateway");
+        assert_eq!(payload["data"]["terminal"], "t4h");
+        assert_eq!(payload["next"], serde_json::json!(["hc attach t4h"]));
 
         let captured = fs::read_to_string(&capture).expect("read fake hc capture");
         let lines: Vec<&str> = captured.lines().collect();
@@ -658,18 +669,137 @@ fn assist_herdr_template_installs_skill_and_invokes_hc_run() {
             Some("SKILL_PREEXISTED=1"),
             "hyphae-setup/SKILL.md must be installed BEFORE `hc run` executes"
         );
-        assert_eq!(lines.get(1).copied(), Some("ARGC=3"), "captured:\n{captured}");
+        assert_eq!(lines.get(1).copied(), Some("ARGC=8"), "captured:\n{captured}");
         assert_eq!(lines.get(2).copied(), Some("ARG=run"), "captured:\n{captured}");
+        assert_eq!(lines.get(3).copied(), Some("ARG=--bg"), "captured:\n{captured}");
         assert_eq!(
-            lines.get(3).copied(),
-            Some(format!("ARG={template_name}").as_str()),
+            lines.get(4).copied(),
+            Some("ARG=--outlive-parent"),
             "captured:\n{captured}"
         );
-        let prompt_line = lines.get(4).copied().unwrap_or("");
+        assert_eq!(
+            lines.get(5).copied(),
+            Some("ARG=--label"),
+            "captured:\n{captured}"
+        );
+        assert_eq!(
+            lines.get(6).copied(),
+            Some("ARG=app=hyphae"),
+            "captured:\n{captured}"
+        );
+        assert_eq!(
+            lines.get(7).copied(),
+            Some("ARG=--json"),
+            "captured:\n{captured}"
+        );
+        assert_eq!(
+            lines.get(8).copied(),
+            Some("ARG=claude-gateway"),
+            "captured:\n{captured}"
+        );
+        let prompt_line = lines.get(9).copied().unwrap_or("");
         assert!(
             prompt_line.contains("hyphae-setup")
                 && prompt_line.contains(&primary_skill.display().to_string()),
             "prompt missing skill reference: {prompt_line}"
+        );
+    }
+
+    // 2. Plain non-TTY `--assist herdr:codex-gateway`: installs primary + `.agents` skill and
+    //    prints attach instructions cleanly without hanging.
+    {
+        let tmp = TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        let bin_dir = tmp.path().join("bin");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+
+        let hc_script = bin_dir.join("hc");
+        let script = "#!/bin/sh\n\
+             set -eu\n\
+             if [ \"$1\" = 'templates' ]; then\n\
+               printf '%s\\n' '{\"templates\":[{\"name\":\"codex-gateway\",\"description\":\"Codex (Gateway)\",\"command\":\"codex-gateway --no-daemon\"}]}'\n\
+               exit 0\n\
+             fi\n\
+             printf '%s\\n' '{\"address\":\"t9m\"}'\n\
+             exit 0\n";
+        fs::write(&hc_script, script).expect("write fake hc");
+        fs::set_permissions(&hc_script, fs::Permissions::from_mode(0o755)).expect("chmod hc");
+
+        let isolated_path = format!("{}:/usr/bin:/bin", bin_dir.display());
+        let mut cmd = isolated_cmd(&home);
+        cmd.env("PATH", &isolated_path)
+            .args([
+                "onboard",
+                "--assist",
+                "herdr:codex-gateway",
+                "--home",
+                home.to_str().unwrap(),
+                "--no-anim",
+            ])
+            .stdin(Stdio::null());
+        let out = output_retrying_busy(&mut cmd);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("t9m"), "stdout={stdout}");
+        assert!(stdout.contains("hc attach t9m"), "stdout={stdout}");
+
+        for rel in [
+            ".codex/skills/hyphae-setup/SKILL.md",
+            ".agents/skills/hyphae-setup/SKILL.md",
+        ] {
+            let p = home.join(rel);
+            assert!(p.is_file(), "missing {}", p.display());
+            assert_eq!(fs::read_to_string(&p).unwrap(), canonical);
+        }
+    }
+
+    // 3. Failing `hc run` emits structured `HERDR_LAUNCH_FAILED` including stderr snippet.
+    {
+        let tmp = TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        let bin_dir = tmp.path().join("bin");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+
+        let hc_script = bin_dir.join("hc");
+        let script = "#!/bin/sh\n\
+             if [ \"$1\" = 'templates' ]; then\n\
+               printf '%s\\n' '{\"templates\":[{\"name\":\"claude-gateway\",\"description\":\"Claude (Gateway)\",\"command\":\"claude-gateway\"}]}'\n\
+               exit 0\n\
+             fi\n\
+             echo 'herdr daemon offline' >&2\n\
+             exit 5\n";
+        fs::write(&hc_script, script).expect("write fake hc fail");
+        fs::set_permissions(&hc_script, fs::Permissions::from_mode(0o755)).expect("chmod hc");
+
+        let isolated_path = format!("{}:/usr/bin:/bin", bin_dir.display());
+        let mut cmd = isolated_cmd(&home);
+        cmd.env("PATH", &isolated_path)
+            .args([
+                "onboard",
+                "--assist",
+                "herdr:claude-gateway",
+                "--home",
+                home.to_str().unwrap(),
+                "--json",
+            ])
+            .stdin(Stdio::null());
+        let out = output_retrying_busy(&mut cmd);
+        assert_eq!(out.status.code(), Some(1));
+        let err_json = parse_json_stdout(&out);
+        assert_eq!(err_json["ok"], false);
+        assert_eq!(err_json["error"]["code"], "HERDR_LAUNCH_FAILED");
+        assert!(
+            err_json["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("herdr daemon offline")),
+            "expected stderr snippet in error: {err_json}"
         );
     }
 }
@@ -885,4 +1015,121 @@ fn assist_claude_desktop_codex_desktop_and_cursor_ide_emit_manual_guides() {
     let cu_skill = home_cu.join(".cursor/skills/hyphae-setup/SKILL.md");
     assert!(cu_skill.is_file());
     assert_eq!(fs::read_to_string(&cu_skill).unwrap(), canonical);
+    assert!(
+        cu_json["data"]["deeplink"]
+            .as_str()
+            .is_some_and(|u| u.starts_with("cursor://")),
+        "expected cursor deeplink: {cu_json}"
+    );
+
+    // 4. OpenCode Desktop (`--assist opencode-desktop --json`): installs both `.config/opencode`
+    //    and `.agents` skill paths and emits an `opencode://new-session` deep link.
+    let tmp_ocd = TempDir::new().expect("tempdir");
+    let home_ocd = tmp_ocd.path();
+    let ocd_out = isolated_cmd(home_ocd)
+        .args([
+            "onboard",
+            "--assist",
+            "opencode-desktop",
+            "--home",
+            home_ocd.to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run onboard --assist opencode-desktop --json");
+    assert_eq!(
+        ocd_out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&ocd_out.stderr)
+    );
+    let ocd_json = parse_json_stdout(&ocd_out);
+    assert_eq!(ocd_json["ok"], true);
+    assert_eq!(ocd_json["data"]["mode"], "manual_guide");
+    assert_eq!(ocd_json["data"]["harness"], "opencode-desktop");
+    assert_eq!(ocd_json["data"]["displayName"], "OpenCode Desktop");
+    assert!(
+        ocd_json["data"]["deeplink"]
+            .as_str()
+            .is_some_and(|u| u.starts_with("opencode://new-session?")),
+        "expected opencode deeplink: {ocd_json}"
+    );
+    for rel in [
+        ".config/opencode/skills/hyphae-setup/SKILL.md",
+        ".agents/skills/hyphae-setup/SKILL.md",
+    ] {
+        let p = home_ocd.join(rel);
+        assert!(p.is_file(), "missing {}", p.display());
+        assert_eq!(fs::read_to_string(&p).unwrap(), canonical);
+    }
+
+    // 5. Desktop MCP confirm-before-write E2E check:
+    //    Non-TTY `--assist claude-desktop --json` NEVER silently writes `claude_desktop_config.json`,
+    //    reports `mcpAlreadyConfigured: false` before config exists, and `true` once configured
+    //    (and same for Codex Desktop `~/.codex/config.toml`).
+    assert_eq!(cd_json["data"]["mcpAlreadyConfigured"], false);
+    assert!(
+        cd_json["data"]["deeplink"]
+            .as_str()
+            .is_some_and(|u| u.starts_with("claude://claude.ai/new?q=")),
+        "expected claude desktop deeplink: {cd_json}"
+    );
+    let cd_cfg_path = PathBuf::from(cd_json["data"]["mcpConfigPath"].as_str().unwrap());
+    assert!(
+        !cd_cfg_path.exists(),
+        "non-TTY --assist claude-desktop must never silently write config without confirmation"
+    );
+    fs::create_dir_all(cd_cfg_path.parent().unwrap()).unwrap();
+    fs::write(
+        &cd_cfg_path,
+        r#"{"mcpServers":{"hyphae":{"command":"/usr/local/bin/hyp","args":["mcp"]}}}"#,
+    )
+    .unwrap();
+    let cd_out2 = isolated_cmd(home_cd)
+        .args([
+            "onboard",
+            "--assist",
+            "claude-desktop",
+            "--home",
+            home_cd.to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("re-run assist claude-desktop --json");
+    assert_eq!(cd_out2.status.code(), Some(0));
+    let cd_json2 = parse_json_stdout(&cd_out2);
+    assert_eq!(cd_json2["data"]["mcpAlreadyConfigured"], true);
+
+    assert_eq!(cx_json["data"]["mcpAlreadyConfigured"], false);
+    assert!(
+        cx_json["data"]["deeplink"]
+            .as_str()
+            .is_some_and(|u| u.starts_with("codex://threads/new?prompt=")),
+        "expected codex desktop deeplink: {cx_json}"
+    );
+    let cx_cfg_path = home_cx.join(".codex/config.toml");
+    assert!(!cx_cfg_path.exists());
+    fs::create_dir_all(cx_cfg_path.parent().unwrap()).unwrap();
+    fs::write(
+        &cx_cfg_path,
+        "model = \"gpt-5\"\n\n[mcp_servers.hyphae]\ncommand = \"hyp\"\nargs = [\"mcp\"]\n",
+    )
+    .unwrap();
+    let cx_out2 = isolated_cmd(home_cx)
+        .args([
+            "onboard",
+            "--assist",
+            "codex-desktop",
+            "--home",
+            home_cx.to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("re-run assist codex-desktop --json");
+    assert_eq!(cx_out2.status.code(), Some(0));
+    let cx_json2 = parse_json_stdout(&cx_out2);
+    assert_eq!(cx_json2["data"]["mcpAlreadyConfigured"], true);
 }
