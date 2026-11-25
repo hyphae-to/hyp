@@ -537,6 +537,9 @@ pub struct NodeConfig {
     pub drop_relay: crate::engine::drop_relay::DropRelayConfig,
     /// Optional external blind drop relay base URL configured for this node (default: `None`).
     pub drop_relay_url: Option<String>,
+    /// Optional self-hosted static Drop Portal UI base URL (default: `https://hyphae.to/drop`).
+    /// Overridable via `node.json` (`dropPortalUrl`) or `HYPHAE_DROP_PORTAL_URL`.
+    pub drop_portal_url: Option<String>,
     /// Default-enabled socket-only local event ingestion policy (`<state_dir>/ingest.sock` / `ingest.addr`).
     pub local_ingest: LocalIngestConfig,
     pub peers: Vec<PeerConfig>,
@@ -577,6 +580,7 @@ impl NodeConfig {
             guest_pairing: GuestPairingConfig::default(),
             drop_relay: crate::engine::drop_relay::DropRelayConfig::default(),
             drop_relay_url: None,
+            drop_portal_url: None,
             local_ingest: LocalIngestConfig::default(),
             peers: Vec::new(),
             topics: Vec::new(),
@@ -1112,11 +1116,112 @@ pub(crate) fn profile_to_store(p: NodeProfile) -> PeerProfile {
     }
 }
 
+/// Default official static Verified Human Drops portal URL.
+pub const DEFAULT_DROP_PORTAL_URL: &str = "https://hyphae.to/drop";
+
+/// Environment variable overriding the Drop Portal base URL for self-hosted UIs.
+pub const ENV_DROP_PORTAL_URL: &str = "HYPHAE_DROP_PORTAL_URL";
+
+/// Validates and normalizes a Drop Portal base URL (must be `https://...` or loopback
+/// `http://127.0.0.1` / `http://localhost`, with no `#fragment`, `?query`, whitespace, or control chars).
+pub fn normalize_drop_portal_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("dropPortalUrl must not be empty".to_string());
+    }
+    if trimmed
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err("dropPortalUrl must not contain whitespace or control characters".to_string());
+    }
+    if trimmed.contains('#') || trimmed.contains('?') {
+        return Err("dropPortalUrl must not include a query string or URL fragment".to_string());
+    }
+    let normalized = trimmed.trim_end_matches('/');
+    let is_https = normalized.starts_with("https://") && normalized.len() > "https://".len();
+    let is_loopback_http = normalized == "http://127.0.0.1"
+        || normalized.starts_with("http://127.0.0.1:")
+        || normalized.starts_with("http://127.0.0.1/")
+        || normalized == "http://localhost"
+        || normalized.starts_with("http://localhost:")
+        || normalized.starts_with("http://localhost/");
+    if !is_https && !is_loopback_http {
+        return Err(
+            "dropPortalUrl must use https:// (or loopback http://127.0.0.1 / http://localhost)"
+                .to_string(),
+        );
+    }
+    Ok(normalized.to_string())
+}
+
+/// Resolves the effective Drop Portal base URL from:
+/// 1. `HYPHAE_DROP_PORTAL_URL` environment variable (if set and non-empty),
+/// 2. Explicit `configured` (`node.json` `dropPortalUrl`),
+/// 3. Default `https://hyphae.to/drop`.
+///
+/// Fails closed if an explicitly supplied URL is invalid.
+pub fn resolve_drop_portal_url(configured: Option<&str>) -> Result<String, String> {
+    if let Ok(env_val) = std::env::var(ENV_DROP_PORTAL_URL) {
+        let trimmed = env_val.trim();
+        if !trimmed.is_empty() {
+            return normalize_drop_portal_url(trimmed);
+        }
+    }
+    if let Some(cfg) = configured.map(str::trim).filter(|s| !s.is_empty()) {
+        return normalize_drop_portal_url(cfg);
+    }
+    Ok(DEFAULT_DROP_PORTAL_URL.to_string())
+}
+
 #[allow(dead_code)]
 pub(crate) fn store_to_profile(p: PeerProfile) -> NodeProfile {
     match p {
         PeerProfile::Local => NodeProfile::Local,
         PeerProfile::Router => NodeProfile::Router,
         PeerProfile::P2p => NodeProfile::P2p,
+    }
+}
+
+#[cfg(test)]
+mod drop_portal_url_tests {
+    use super::*;
+
+    #[test]
+    fn normalize_drop_portal_url_accepts_https_and_loopback_and_fails_closed() {
+        assert_eq!(
+            normalize_drop_portal_url("https://drop.acme.com/").unwrap(),
+            "https://drop.acme.com"
+        );
+        assert_eq!(
+            normalize_drop_portal_url("https://acme.com/hyphae/drop///").unwrap(),
+            "https://acme.com/hyphae/drop"
+        );
+        assert_eq!(
+            normalize_drop_portal_url("http://127.0.0.1:8080/drop/").unwrap(),
+            "http://127.0.0.1:8080/drop"
+        );
+        assert_eq!(
+            normalize_drop_portal_url("http://localhost:3000").unwrap(),
+            "http://localhost:3000"
+        );
+
+        for bad in [
+            "",
+            "   ",
+            "http://drop.acme.com",
+            "http://localhost.evil.com/drop",
+            "http://127.0.0.1.evil.com/drop",
+            "javascript:alert(1)",
+            "https://drop.acme.com#frag",
+            "https://drop.acme.com?foo=bar",
+            "https://drop.acme.com/ bad",
+            "https://",
+        ] {
+            assert!(
+                normalize_drop_portal_url(bad).is_err(),
+                "expected '{bad}' to be rejected"
+            );
+        }
     }
 }

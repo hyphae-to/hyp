@@ -13,12 +13,13 @@ pub mod peer_link;
 pub mod server;
 
 pub use config::{
-    ChannelMode, ChannelPolicy, DEFAULT_HYPHAE_VERSION, DEFAULT_LOCAL_INGEST_BURST,
-    DEFAULT_LOCAL_INGEST_MAX_PAYLOAD_BYTES, DEFAULT_LOCAL_INGEST_MAX_PER_MINUTE,
-    DEFAULT_LOCAL_INGEST_ROUTE_ID, DEFAULT_LOCAL_INGEST_TOPIC, E2eePolicy, EscalationConfig,
-    ForwardingMode, ForwardingPolicy, ForwardingRule, GuestPairingConfig, KvNamespaceConfig,
-    LocalIngestConfig, LocalIngestLimitAction, LocalIngestRoute, NodeConfig, NodeError,
-    NodeProfile, PeerConfig, TopicConfig,
+    ChannelMode, ChannelPolicy, DEFAULT_DROP_PORTAL_URL, DEFAULT_HYPHAE_VERSION,
+    DEFAULT_LOCAL_INGEST_BURST, DEFAULT_LOCAL_INGEST_MAX_PAYLOAD_BYTES,
+    DEFAULT_LOCAL_INGEST_MAX_PER_MINUTE, DEFAULT_LOCAL_INGEST_ROUTE_ID, DEFAULT_LOCAL_INGEST_TOPIC,
+    ENV_DROP_PORTAL_URL, E2eePolicy, EscalationConfig, ForwardingMode, ForwardingPolicy,
+    ForwardingRule, GuestPairingConfig, KvNamespaceConfig, LocalIngestConfig,
+    LocalIngestLimitAction, LocalIngestRoute, NodeConfig, NodeError, NodeProfile, PeerConfig,
+    TopicConfig, normalize_drop_portal_url, resolve_drop_portal_url,
 };
 pub use drop_relay::{
     AckDropResponse, CreateDropRequest, CreateDropResponse, DROP_CAP_HEADER, DropCapRole, DropItem,
@@ -33,6 +34,7 @@ pub use local_ingest::{
 pub use node::{
     AuthenticatedPeer, DiscoveredPeerHandle, IngestedHumanDrop, KvWriteRequest, PeerLinkInfo,
     SendDmResult, SubscribeRequest, SubscribeResult, TransferSendResult, UnifiedNode,
+    p2p_offer_secret_name,
 };
 pub use peer_link::{
     ChannelDirectoryEntry, ChannelJoinResponse, ChannelsResponse, GuestPairProofPayload,

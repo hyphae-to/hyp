@@ -2452,7 +2452,11 @@ impl LocalDaemonInner {
         let frag_canon = to_canonical_json(&Value::Object(frag))
             .map_err(|e| ("internal_error".into(), format!("canonicalize drop fragment: {e}")))?;
         let frag_encoded = URL_SAFE_NO_PAD.encode(frag_canon.as_bytes());
-        let url = format!("https://hyphae.to/drop#drop={frag_encoded}");
+        let portal_base = hyp_node::engine::resolve_drop_portal_url(
+            self.node.config().drop_portal_url.as_deref(),
+        )
+        .map_err(|e| ("invalid_config".into(), e))?;
+        let url = format!("{portal_base}#drop={frag_encoded}");
 
         let mut out = Map::new();
         out.insert("ok".into(), json!(true));

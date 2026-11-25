@@ -64,6 +64,8 @@ cd workers/drop-relay
    hyp relay status --probe
    ```
 
+   *(Optional — self-host your own `/drop` UI & Passkey domain: upload the 4 static files in [`site/drop/`](../../site/drop/) to e.g. `https://drop.acme.com`, set `ALLOWED_ORIGINS = "https://drop.acme.com"` in `wrangler.toml`, and set `"dropPortalUrl": "https://drop.acme.com"` in `node.json` or `HYPHAE_DROP_PORTAL_URL=https://drop.acme.com`. Passkeys automatically bind to your own domain!)*
+
 ---
 
 ### Option B — Public Drop Relay (e.g. `spore.hyphae.to`)

@@ -246,6 +246,16 @@ struct ManifestWindow {
     issued_at_ms: i64,
 }
 
+/// Deterministic `SecretStore` key for a pending single-use Direct P2P offer (`hp2p1_`).
+///
+/// Shared between `UnifiedNode` and `hyp pair invite --mode p2p` so out-of-process CLI invites
+/// can be verified and atomically claimed by a running node daemon without writing pairing nonces
+/// to plaintext files.
+pub fn p2p_offer_secret_name(offer_id: &str) -> String {
+    let hash = sha256_hex(offer_id.as_bytes());
+    format!("p2p-offer-{}", &hash[..16])
+}
+
 /// Composable Hyphae v2 Unified Rust `Node` engine.
 pub struct UnifiedNode {
     config: NodeConfig,
@@ -2071,6 +2081,13 @@ impl UnifiedNode {
             )?;
         }
 
+        // Persist the full offer in SecretStore (zero plaintext pairing nonce on disk!) so
+        // `POST /v1/p2p/pair/<offerId>` also succeeds across daemon restarts or when the offer
+        // was minted out-of-process by `hyp pair invite --mode p2p`.
+        let offer_secret_key = p2p_offer_secret_name(&offer_id);
+        let offer_json = serde_json::to_string(&offer)?;
+        self.secrets.set(&offer_secret_key, &offer_json)?;
+
         self.pending_p2p_offers
             .lock()
             .expect("pending_p2p_offers lock poisoned")
@@ -2088,15 +2105,38 @@ impl UnifiedNode {
         offer_id: &str,
         response: &P2pPairResponse,
     ) -> Result<P2pPairServerReply, NodeError> {
-        let offer = self
+        let offer_secret_key = p2p_offer_secret_name(offer_id);
+        let offer = match self
             .pending_p2p_offers
             .lock()
             .expect("pending_p2p_offers lock poisoned")
             .get(offer_id)
             .cloned()
-            .ok_or_else(|| {
-                NodeError::NotFound(format!("P2P pairing offer '{offer_id}' not found"))
-            })?;
+        {
+            Some(found) => found,
+            None => {
+                // Fall back to SecretStore for offers created out-of-process (`hyp pair invite`)
+                // or prior to a daemon restart.
+                let raw = match self.secrets.get(&offer_secret_key) {
+                    Ok(v) => v,
+                    Err(hyp_crypto::CryptoError::SecretNotFound(_)) => {
+                        return Err(NodeError::NotFound(format!(
+                            "P2P pairing offer '{offer_id}' not found"
+                        )));
+                    }
+                    Err(e) => return Err(NodeError::Crypto(e)),
+                };
+                let parsed: P2pOfferToken = serde_json::from_str(&raw).map_err(|e| {
+                    NodeError::BadRequest(format!("corrupt persisted P2P offer: {e}"))
+                })?;
+                if parsed.offer_id != offer_id {
+                    return Err(NodeError::NotFound(format!(
+                        "P2P pairing offer '{offer_id}' not found"
+                    )));
+                }
+                parsed
+            }
+        };
 
         let now = now_ms();
         let verified = verify_p2p_response(&offer, response, now)?;
@@ -2173,11 +2213,12 @@ impl UnifiedNode {
             )?;
         }
 
-        // Remove offer from memory after single-use claim.
+        // Remove offer from memory and SecretStore after single-use claim.
         self.pending_p2p_offers
             .lock()
             .expect("pending_p2p_offers lock poisoned")
             .remove(offer_id);
+        let _ = self.secrets.delete(&offer_secret_key);
 
         let auth_credential = self.issue_peer_bearer_token(&verified.bob_node_id)?;
         let caller = AuthenticatedPeer {
