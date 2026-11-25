@@ -234,29 +234,59 @@ When local bridges are enabled, the conditional `hyp_bridge` tool is advertised 
 - **Live primary handoff**: `hyp_bridge({ action: "handoff", plugin: "slack", target: "pm", handle: "codex-pm" })`
 - **Outbound reply**: `hyp_send({ to: "slack:pm", text: "Fix PR #412 is green.", replyTo: "1732435200.000100" })`
 
+### Installing & Verifying Official Plugins (`hyp plugin`)
+
+You do **not** need to clone the Hyphae git repository to run official external bridges or sources. Every tagged GitHub Release publishes a clean archive of the 6 official runtime files (`sdk/client.mjs`, `telegram/index.mjs`, `slack/index.mjs`, `whatsapp/index.mjs`, `webhook/index.mjs`, `prometheus/index.mjs`) as **`hyp-vX.Y.Z-plugins.tar.gz`** (and **`hyp-nightly-plugins.tar.gz`** on the rolling `nightly` release), included in `SHA256SUMS.txt` and covered by the Ed25519-signed `release-manifest.json`.
+
+The `hyp` binary itself pins only the LF-normalized SHA-256 digest of each file at compile time (`crates/hyp-cli/build.rs`) without bloating the binary with embedded JS sources. `hyp plugin install` downloads the matching release archive over HTTPS (or reads a local `--archive <path>` / `--from-dir <dir>`), unpacks into a private temporary staging directory (`unpack_tar_gz` rejecting symlinks, path traversal, and > 4 MiB bombs), and verifies every file in constant time against its compile-time pinned digest **before writing a single byte** to `~/.config/hyphae/plugins/`:
+
+```sh
+# List all 5 official plugins, install state, SHA-256 verification status, and detected Node path
+hyp plugin list --json
+
+# Download, verify, and atomically install one plugin (or `all`) into ~/.config/hyphae/plugins/
+hyp plugin install telegram --json
+hyp plugin install slack --json
+hyp plugin install all --json
+
+# Air-gapped / offline verification from a downloaded release tarball or local checkout
+hyp plugin install telegram --archive ./hyp-v0.6.1-plugins.tar.gz --json
+hyp plugin install telegram --from-dir ./plugins --json
+
+# Re-verify every installed official plugin file against compile-time pinned SHA-256 digests
+# (exits 1 if any file was tampered with or corrupted)
+hyp plugin verify --json
+
+# Remove one installed plugin (automatically removes sdk/ when the last plugin is removed) or `all`
+hyp plugin remove telegram --json
+hyp plugin remove all --json
+```
+
+> **Never point `node.json` `plugins[]` at a local git checkout.** Always run `hyp plugin install <name> --json` and wire `node.json` using the returned `data.nodePath` and `data.plugins[0].scriptPath` (`~/.config/hyphae/plugins/<name>/index.mjs`).
+
 ### Included Optional External Scripts (`plugins/`)
 
 All included `.mjs` scripts have zero external npm dependencies (**requires Node 24+ on macOS/Linux**; fd-3 subprocess bridges are Unix-only):
 
-| Script | Protocol / Transport | Required Fail-Closed Allowlist / Auth Env Vars |
-| --- | --- | --- |
-| [plugins/slack/index.mjs](../plugins/slack/index.mjs) | Slack Socket Mode (WebSocket, no public port needed) + `chat.postMessage` | `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_ALLOWED_USERS` / `SLACK_ALLOWED_CHANNELS` |
-| [plugins/telegram/index.mjs](../plugins/telegram/index.mjs) | Telegram Bot API long polling + `sendMessage` | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS` / `TELEGRAM_ALLOWED_CHATS` *(numeric IDs)* |
-| [plugins/whatsapp/index.mjs](../plugins/whatsapp/index.mjs) | Meta WhatsApp Business Cloud API webhook (`X-Hub-Signature-256`) + Graph API | `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_ALLOWED_NUMBERS` |
-| [plugins/webhook/index.mjs](../plugins/webhook/index.mjs) | Local HTTP webhook receiver (`X-Webhook-Signature-256`) + optional `WEBHOOK_POST_URL` | `WEBHOOK_PORT`, `WEBHOOK_SECRET`, optional `WEBHOOK_POST_URL` |
-| [plugins/prometheus/index.mjs](../plugins/prometheus/index.mjs) | Standalone Alertmanager v4 webhook script (when not using compiled-in Rust adapter) | `PROMETHEUS_PORT`, `PROMETHEUS_BEARER_TOKEN` and/or `PROMETHEUS_WEBHOOK_SECRET` |
+| Script | Kind | Protocol / Transport | Required Fail-Closed Allowlist / Auth Env Vars |
+| --- | --- | --- | --- |
+| [plugins/slack/index.mjs](../plugins/slack/index.mjs) | `bridge` | Slack Socket Mode (WebSocket, no public port needed) + `chat.postMessage` | `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_ALLOWED_USERS` / `SLACK_ALLOWED_CHANNELS` |
+| [plugins/telegram/index.mjs](../plugins/telegram/index.mjs) | `bridge` | Telegram Bot API long polling + `sendMessage` | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS` / `TELEGRAM_ALLOWED_CHATS` *(numeric IDs)* |
+| [plugins/whatsapp/index.mjs](../plugins/whatsapp/index.mjs) | `bridge` | Meta WhatsApp Business Cloud API webhook (`X-Hub-Signature-256`) + Graph API | `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_ALLOWED_NUMBERS` |
+| [plugins/webhook/index.mjs](../plugins/webhook/index.mjs) | `source` | Local HTTP webhook receiver (`X-Webhook-Signature-256`) + optional `WEBHOOK_POST_URL` | `WEBHOOK_PORT`, `WEBHOOK_SECRET`, optional `WEBHOOK_POST_URL` |
+| [plugins/prometheus/index.mjs](../plugins/prometheus/index.mjs) | `source` | Standalone Alertmanager v4 webhook script (when not using compiled-in Rust adapter) | `PROMETHEUS_PORT`, `PROMETHEUS_BEARER_TOKEN` and/or `PROMETHEUS_WEBHOOK_SECRET` |
 
 ### Example `plugins[]` Configuration (`~/.config/hyphae/node.json`)
 
-Store tokens out-of-band first (`hyp secret set telegram-bot-token --web`, `hyp secret set slack-app-token --web`, `hyp secret set slack-bot-token --web`), then add the plugin entries to `node.json`:
+Install the verified plugins first (`hyp plugin install telegram --json`, `hyp plugin install slack --json`), store tokens out-of-band (`hyp secret set telegram-bot-token --web`, `hyp secret set slack-app-token --web`, `hyp secret set slack-bot-token --web`), then wire `node.json` using the returned `data.nodePath` and `data.plugins[0].scriptPath`:
 
 ```json
 {
   "plugins": [
     {
       "id": "telegram",
-      "command": "node",
-      "args": ["/path/to/hyp/plugins/telegram/index.mjs"],
+      "command": "/opt/homebrew/bin/node",
+      "args": ["/Users/you/.config/hyphae/plugins/telegram/index.mjs"],
       "targets": ["personal"],
       "env": {
         "TELEGRAM_BOT_TOKEN": { "secret": "telegram-bot-token" },
@@ -267,8 +297,8 @@ Store tokens out-of-band first (`hyp secret set telegram-bot-token --web`, `hyp 
     },
     {
       "id": "slack",
-      "command": "node",
-      "args": ["/path/to/hyp/plugins/slack/index.mjs"],
+      "command": "/opt/homebrew/bin/node",
+      "args": ["/Users/you/.config/hyphae/plugins/slack/index.mjs"],
       "targets": ["pm"],
       "env": {
         "SLACK_APP_TOKEN": { "secret": "slack-app-token" },
