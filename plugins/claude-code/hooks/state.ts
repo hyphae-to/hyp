@@ -1,0 +1,728 @@
+// Pure, metadata-only Hyphae UI state helpers for the Claude Code side-panel mod.
+//
+// Security invariants:
+//   - Consumes strictly metadata-only snapshots (`<state_dir>/ui/state.json`).
+//   - Strips forbidden body/payload/note/secret fields recursively as defense-in-depth.
+//   - Strips ANSI escape sequences (OSC/CSI/DCS/ESC), C0/C1 control characters,
+//     zero-width characters, and Unicode BiDi override/isolate characters from all
+//     untrusted external strings before rendering.
+//   - Builds strict argv arrays (never shell strings) for `hyp session` quick controls,
+//     inserting `--` before any positional argument starting with `-`.
+
+export type PanelTab = 'subs' | 'queue' | 'rules' | 'mesh';
+
+export interface DaemonSummary {
+  online: boolean;
+  pid: number;
+  nodeId: string;
+  version: string;
+  profile: string;
+  peersOnline: number;
+  quarantinedGlobal: number;
+}
+
+export interface SessionCounts {
+  subscriptions: number;
+  queued: number;
+  unnotified: number;
+  quarantined: number;
+  mutedRules: number;
+  mutedArchived: number;
+  channels: number;
+  wakeups: number;
+}
+
+export interface UnreadBreakdown {
+  messages: number;
+  events: number;
+  plugins: number;
+  transfers: number;
+  kv: number;
+  sources: string[];
+}
+
+export interface SubscriptionSummary {
+  id: string;
+  key: string | null;
+  originNode: string;
+  topic: string;
+  mode: string;
+  coalesceSeconds: number;
+  filterSummary: string;
+}
+
+export interface QueuedItemMeta {
+  receipt: string;
+  kind: string;
+  source: string;
+  originNode: string;
+  receivedAt: number;
+  notified: boolean;
+  urgency: string;
+}
+
+export interface MuteSummary {
+  pattern: string;
+  scope: 'session' | 'connector';
+  mutedAt: number;
+}
+
+export interface DeliveryRuleSummary {
+  target: string;
+  delivery: string;
+}
+
+export interface ChannelEntrySummary {
+  hostNode: string;
+  channel: string;
+  mode: string;
+}
+
+export interface WakeupSummary {
+  id: string;
+  label: string;
+  triggerKind: string;
+  nextFireAt: number;
+  urgency: string;
+  state: string;
+}
+
+export interface SessionDetails {
+  subscriptions: SubscriptionSummary[];
+  queuedItems: QueuedItemMeta[];
+  mutes: MuteSummary[];
+  rules: DeliveryRuleSummary[];
+  channels: string[];
+  channelEntries: ChannelEntrySummary[];
+  wakeups: WakeupSummary[];
+}
+
+export interface SessionSummary {
+  sessionId: string;
+  harness: string;
+  enrolled: boolean;
+  handle: string | null;
+  address: string | null;
+  lastSeen: number;
+  transportKind: string | null;
+  hasLiveTransport: boolean;
+  deliveryMode: string;
+  focusMode: boolean;
+  focusAllowInterruptVips: boolean;
+  mutedAll: boolean;
+  counts: SessionCounts;
+  unreadBreakdown: UnreadBreakdown;
+  details: SessionDetails;
+}
+
+export interface HyphaeSnapshot {
+  schemaVersion: number;
+  rev: number;
+  updatedAt: number;
+  daemon: DaemonSummary | null;
+  sessions: SessionSummary[];
+}
+
+export interface ResolvedSessionResult {
+  active: SessionSummary | null;
+  matchedBy: 'selected' | 'env' | 'claude' | 'none';
+  sessions: SessionSummary[];
+}
+
+export type SessionControlAction =
+  | { kind: 'focus'; enabled: boolean }
+  | { kind: 'unsubscribe'; id: string }
+  | { kind: 'mute'; pattern: string; scope?: 'session' | 'connector' }
+  | { kind: 'unmute'; pattern: string; scope?: 'session' | 'connector' }
+  | { kind: 'leave'; channel: string }
+  | { kind: 'rule'; target: string; delivery: 'interrupt' | 'queue' | 'notify' | 'mute' };
+
+export interface SessionControlTarget {
+  sessionId?: string | null;
+  handle?: string | null;
+}
+
+const FORBIDDEN_BODY_KEYS = new Set([
+  'body',
+  'text',
+  'note',
+  'payload',
+  'data',
+  'content',
+  'message',
+  'raw',
+  'ciphertext',
+  'plaintext',
+  'secret',
+  'token',
+  'quarantinedText',
+  'quarantinedItems',
+]);
+
+/**
+ * Strips ANSI escape sequences (OSC, CSI, DCS/APC/PM/SOS, ESC), C0/C1 control
+ * characters, zero-width joiners/marks, and Unicode BiDi override/isolate
+ * characters from untrusted external strings before rendering.
+ */
+export function sanitizeUiText(raw: unknown, maxLen = 120): string {
+  if (raw === null || raw === undefined) return '';
+  const cleaned = String(raw)
+    // OSC sequences: ESC ] ... (BEL | ST)
+    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, '')
+    // DCS / SOS / PM / APC strings: ESC [PX^_] ... ST
+    .replace(/\u001b[PX^_][^\u001b]*(?:\u001b\\)?/g, '')
+    // CSI sequences: ESC [ params intermediates final
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    // Remaining 2-byte ESC sequences
+    .replace(/\u001b[@-Z\\-_]/g, '')
+    // C0 / DEL / C1 control characters (includes remaining bare ESC)
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
+    // Unicode BiDi overrides/isolates/marks + zero-width / BOM characters
+    .replace(/[\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '')
+    .trim();
+
+  if (cleaned.length <= maxLen) return cleaned;
+  return `${cleaned.slice(0, Math.max(0, maxLen - 1))}…`;
+}
+
+/**
+ * Recursively removes any forbidden body, CloudEvent `data`, wakeup `note`, or
+ * secret/token fields as defense-in-depth before any UI code inspects the data.
+ */
+export function stripMetadataOnly(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(stripMetadataOnly);
+  }
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (FORBIDDEN_BODY_KEYS.has(k)) continue;
+    out[k] = stripMetadataOnly(v);
+  }
+  return out;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function asNum(value: unknown, fallback = 0): number {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function asCount(value: unknown): number {
+  return Math.max(0, Math.floor(asNum(value, 0)));
+}
+
+function asStr(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+function expandStateDir(rawDir: string, baseHome: string, cfgDir: string): string {
+  const sd = rawDir.trim();
+  if (!sd) return '';
+  if (sd === '~') return baseHome;
+  if (sd.startsWith('~/') || sd.startsWith('~\\')) {
+    return `${baseHome}/${sd.slice(2)}`;
+  }
+  if (sd.startsWith('/') || /^[A-Za-z]:[\\/]/.test(sd)) {
+    return sd;
+  }
+  return `${cfgDir}/${sd}`;
+}
+
+/**
+ * Resolves ordered candidate `<state_dir>/ui` directories and `state.json` paths,
+ * matching `crates/hyp-cli/src/config_file.rs` and `plugins/herdr-mod/mods/hyphae-pane/shared-client.js`.
+ *
+ * Precedence:
+ *   1. `HYPHAE_STATE_DIR` environment variable (`<HYPHAE_STATE_DIR>/ui/state.json`)
+ *   2. `stateDir` in `~/.config/hyphae/node.json` (or legacy `connector.json`)
+ *   3. `~/.config/hyphae/ui/state.json`
+ *   4. `~/.config/hyphae/state/ui/state.json`
+ */
+export function resolveUiStateCandidates(
+  homeDir: string,
+  envStateDir?: string | null,
+  nodeJsonText?: string | null,
+): { dirs: string[]; files: string[] } {
+  const baseHome = homeDir.replace(/[\\/]+$/, '');
+  const cfgDir = baseHome ? `${baseHome}/.config/hyphae` : '.config/hyphae';
+  const dirs: string[] = [];
+
+  const pushDir = (dir: string): void => {
+    const normalized = dir.replace(/[\\/]+$/, '');
+    if (normalized && !dirs.includes(normalized)) {
+      dirs.push(normalized);
+    }
+  };
+
+  if (typeof envStateDir === 'string' && envStateDir.trim()) {
+    const resolved = expandStateDir(envStateDir, baseHome, cfgDir);
+    if (resolved) pushDir(`${resolved.replace(/[\\/]+$/, '')}/ui`);
+  }
+
+  if (typeof nodeJsonText === 'string' && nodeJsonText.trim()) {
+    try {
+      const parsed = asRecord(JSON.parse(nodeJsonText));
+      const sd = parsed && typeof parsed.stateDir === 'string' ? parsed.stateDir.trim() : '';
+      if (sd) {
+        const resolved = expandStateDir(sd, baseHome, cfgDir);
+        if (resolved) pushDir(`${resolved.replace(/[\\/]+$/, '')}/ui`);
+      }
+    } catch {
+      // Ignore malformed config and fall back to default paths.
+    }
+  }
+
+  if (baseHome) {
+    pushDir(`${cfgDir}/ui`);
+    pushDir(`${cfgDir}/state/ui`);
+  }
+
+  return {
+    dirs,
+    files: dirs.map((d) => `${d}/state.json`),
+  };
+}
+
+function parseSessionSummary(raw: unknown): SessionSummary | null {
+  const obj = asRecord(raw);
+  if (!obj) return null;
+  const sessionId = sanitizeUiText(obj.sessionId, 128);
+  if (!sessionId) return null;
+
+  const countsObj = asRecord(obj.counts);
+  const unreadObj = asRecord(obj.unreadBreakdown);
+  const detailsObj = asRecord(obj.details);
+
+  const rawSubs = Array.isArray(detailsObj?.subscriptions) ? detailsObj.subscriptions : [];
+  const subscriptions: SubscriptionSummary[] = [];
+  for (const item of rawSubs) {
+    const s = asRecord(item);
+    if (!s) continue;
+    const id = sanitizeUiText(s.id, 128);
+    const topic = sanitizeUiText(s.topic, 120);
+    if (!id && !topic) continue;
+    subscriptions.push({
+      id: id || topic,
+      key: typeof s.key === 'string' && s.key.trim() ? sanitizeUiText(s.key, 80) : null,
+      originNode: sanitizeUiText(s.originNode, 64) || 'local',
+      topic: topic || id,
+      mode: sanitizeUiText(s.mode, 24) || 'queue',
+      coalesceSeconds: asCount(s.coalesceSeconds),
+      filterSummary: sanitizeUiText(s.filterSummary, 140),
+    });
+  }
+
+  const rawQueued = Array.isArray(detailsObj?.queuedItems) ? detailsObj.queuedItems : [];
+  const queuedItems: QueuedItemMeta[] = [];
+  for (const item of rawQueued) {
+    const q = asRecord(item);
+    if (!q) continue;
+    queuedItems.push({
+      receipt: sanitizeUiText(q.receipt, 64),
+      kind: sanitizeUiText(q.kind, 24) || 'message',
+      source: sanitizeUiText(q.source, 96) || 'unknown',
+      originNode: sanitizeUiText(q.originNode, 64),
+      receivedAt: asNum(q.receivedAt, 0),
+      notified: Boolean(q.notified),
+      urgency: sanitizeUiText(q.urgency, 24) || 'queue',
+    });
+  }
+
+  const rawMutes = Array.isArray(detailsObj?.mutes) ? detailsObj.mutes : [];
+  const mutes: MuteSummary[] = [];
+  for (const item of rawMutes) {
+    const m = asRecord(item);
+    if (!m) continue;
+    const pattern = sanitizeUiText(m.pattern, 120);
+    if (!pattern) continue;
+    mutes.push({
+      pattern,
+      scope: m.scope === 'connector' ? 'connector' : 'session',
+      mutedAt: asNum(m.mutedAt, 0),
+    });
+  }
+
+  const rawRules = Array.isArray(detailsObj?.rules) ? detailsObj.rules : [];
+  const rules: DeliveryRuleSummary[] = [];
+  for (const item of rawRules) {
+    const r = asRecord(item);
+    if (!r) continue;
+    const target = sanitizeUiText(r.target, 120);
+    if (!target) continue;
+    rules.push({
+      target,
+      delivery: sanitizeUiText(r.delivery, 24) || 'queue',
+    });
+  }
+
+  const rawChannels = Array.isArray(detailsObj?.channels) ? detailsObj.channels : [];
+  const channels = rawChannels
+    .map((c) => sanitizeUiText(c, 96))
+    .filter((c) => c.length > 0);
+
+  const rawChanEntries = Array.isArray(detailsObj?.channelEntries) ? detailsObj.channelEntries : [];
+  const channelEntries: ChannelEntrySummary[] = [];
+  for (const item of rawChanEntries) {
+    const c = asRecord(item);
+    if (!c) continue;
+    const channel = sanitizeUiText(c.channel, 96);
+    if (!channel) continue;
+    channelEntries.push({
+      hostNode: sanitizeUiText(c.hostNode, 64) || 'local',
+      channel,
+      mode: sanitizeUiText(c.mode, 24) || 'open',
+    });
+  }
+
+  const rawWakeups = Array.isArray(detailsObj?.wakeups) ? detailsObj.wakeups : [];
+  const wakeups: WakeupSummary[] = [];
+  for (const item of rawWakeups) {
+    const w = asRecord(item);
+    if (!w) continue;
+    const id = sanitizeUiText(w.id, 64);
+    const label = sanitizeUiText(w.label, 96);
+    if (!id && !label) continue;
+    wakeups.push({
+      id: id || label,
+      label: label || id,
+      triggerKind: sanitizeUiText(w.triggerKind, 24) || 'once',
+      nextFireAt: asNum(w.nextFireAt, 0),
+      urgency: sanitizeUiText(w.urgency, 24) || 'notify',
+      state: sanitizeUiText(w.state, 24) || 'armed',
+    });
+  }
+
+  const rawSources = Array.isArray(unreadObj?.sources) ? unreadObj.sources : [];
+  const sources = rawSources.map((s) => sanitizeUiText(s, 80)).filter((s) => s.length > 0);
+
+  const handleRaw = typeof obj.handle === 'string' && obj.handle.trim() ? sanitizeUiText(obj.handle, 48) : null;
+  const addressRaw = typeof obj.address === 'string' && obj.address.trim() ? sanitizeUiText(obj.address, 96) : null;
+  const transportRaw =
+    typeof obj.transportKind === 'string' && obj.transportKind.trim()
+      ? sanitizeUiText(obj.transportKind, 32)
+      : null;
+
+  return {
+    sessionId,
+    harness: sanitizeUiText(obj.harness, 32) || 'unknown',
+    enrolled: Boolean(obj.enrolled),
+    handle: handleRaw,
+    address: addressRaw,
+    lastSeen: asNum(obj.lastSeen, 0),
+    transportKind: transportRaw,
+    hasLiveTransport: Boolean(obj.hasLiveTransport),
+    deliveryMode: sanitizeUiText(obj.deliveryMode, 24) || 'queue',
+    focusMode: Boolean(obj.focusMode),
+    focusAllowInterruptVips: Boolean(obj.focusAllowInterruptVips),
+    mutedAll: Boolean(obj.mutedAll),
+    counts: {
+      subscriptions: asCount(countsObj?.subscriptions ?? subscriptions.length),
+      queued: asCount(countsObj?.queued ?? queuedItems.length),
+      unnotified: asCount(countsObj?.unnotified ?? 0),
+      quarantined: asCount(countsObj?.quarantined ?? 0),
+      mutedRules: asCount(countsObj?.mutedRules ?? mutes.length),
+      mutedArchived: asCount(countsObj?.mutedArchived ?? 0),
+      channels: asCount(countsObj?.channels ?? (channelEntries.length || channels.length)),
+      wakeups: asCount(countsObj?.wakeups ?? wakeups.length),
+    },
+    unreadBreakdown: {
+      messages: asCount(unreadObj?.messages ?? 0),
+      events: asCount(unreadObj?.events ?? 0),
+      plugins: asCount(unreadObj?.plugins ?? 0),
+      transfers: asCount(unreadObj?.transfers ?? 0),
+      kv: asCount(unreadObj?.kv ?? 0),
+      sources,
+    },
+    details: {
+      subscriptions,
+      queuedItems,
+      mutes,
+      rules,
+      channels,
+      channelEntries,
+      wakeups,
+    },
+  };
+}
+
+/**
+ * Parses either raw `<state_dir>/ui/state.json` or a `hyp inspect --all --json`
+ * CLI envelope into a strictly sanitized, metadata-only `HyphaeSnapshot`.
+ */
+export function parseSnapshotJson(rawText: string): HyphaeSnapshot | null {
+  if (!rawText || !rawText.trim()) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch {
+    return null;
+  }
+
+  const stripped = asRecord(stripMetadataOnly(parsed));
+  if (!stripped) return null;
+
+  let root: Record<string, unknown> = stripped;
+  if ('ok' in stripped) {
+    if (stripped.ok === false) return null;
+    const envelopeData = asRecord(stripped.data) ?? asRecord(stripped.result);
+    if (envelopeData) root = envelopeData;
+  }
+
+  const daemonObj = asRecord(root.daemon);
+  const daemon: DaemonSummary | null = daemonObj
+    ? {
+        online: Boolean(daemonObj.online),
+        pid: asCount(daemonObj.pid),
+        nodeId: sanitizeUiText(daemonObj.nodeId, 64) || 'local',
+        version: sanitizeUiText(daemonObj.version, 32),
+        profile: sanitizeUiText(daemonObj.profile, 32),
+        peersOnline: asCount(daemonObj.peersOnline),
+        quarantinedGlobal: asCount(daemonObj.quarantinedGlobal),
+      }
+    : null;
+
+  const rawSessions = Array.isArray(root.sessions)
+    ? root.sessions
+    : root.session
+      ? [root.session]
+      : [];
+  const sessions: SessionSummary[] = [];
+  for (const item of rawSessions) {
+    const s = parseSessionSummary(item);
+    if (s) sessions.push(s);
+  }
+
+  return {
+    schemaVersion: asCount(root.schemaVersion) || 1,
+    rev: asCount(root.rev),
+    updatedAt: asNum(root.updatedAt, 0),
+    daemon,
+    sessions,
+  };
+}
+
+/**
+ * Matches the active Claude Code session against the snapshot:
+ *   1. User-selected session ID override (when inspecting another session in multi-session view)
+ *   2. Exact `$HYPHAE_SESSION_ID` match (e.g. `claude:<id>`)
+ *   3. `claude:<claudeSessionId>` or raw `<claudeSessionId>` match
+ *   4. Otherwise returns `active: null` so the UI degrades cleanly to all-sessions summary.
+ */
+export function resolveActiveSession(
+  snapshot: HyphaeSnapshot | null,
+  claudeSessionId: string | null | undefined,
+  envHyphaeSessionId?: string | null,
+  selectedSessionId?: string | null,
+): ResolvedSessionResult {
+  const sessions = snapshot?.sessions ?? [];
+  if (sessions.length === 0) {
+    return { active: null, matchedBy: 'none', sessions };
+  }
+
+  if (selectedSessionId) {
+    const sel = sessions.find((s) => s.sessionId === selectedSessionId);
+    if (sel) return { active: sel, matchedBy: 'selected', sessions };
+  }
+
+  const envId = typeof envHyphaeSessionId === 'string' ? envHyphaeSessionId.trim() : '';
+  if (envId) {
+    const envMatch = sessions.find((s) => s.sessionId === envId);
+    if (envMatch) return { active: envMatch, matchedBy: 'env', sessions };
+  }
+
+  const rawClaude = typeof claudeSessionId === 'string' ? claudeSessionId.trim() : '';
+  if (rawClaude) {
+    const prefixed = rawClaude.startsWith('claude:') ? rawClaude : `claude:${rawClaude}`;
+    const exactPrefixed = sessions.find((s) => s.sessionId === prefixed);
+    if (exactPrefixed) return { active: exactPrefixed, matchedBy: 'claude', sessions };
+
+    const exactRaw = sessions.find((s) => s.sessionId === rawClaude);
+    if (exactRaw) return { active: exactRaw, matchedBy: 'claude', sessions };
+  }
+
+  return { active: null, matchedBy: 'none', sessions };
+}
+
+/**
+ * Computes total visible quarantined count (never exposes quarantined payloads or sources).
+ */
+export function getQuarantinedCount(
+  snapshot: HyphaeSnapshot | null,
+  active: SessionSummary | null,
+): number {
+  const globalCount = snapshot?.daemon?.quarantinedGlobal ?? 0;
+  const sessionCount = active?.counts.quarantined ?? 0;
+  const maxSession = (snapshot?.sessions ?? []).reduce(
+    (acc, s) => Math.max(acc, s.counts.quarantined),
+    0,
+  );
+  return Math.max(globalCount, sessionCount, maxSession);
+}
+
+/**
+ * Formats a past epoch millisecond timestamp as a short relative age (`now`, `12s`, `4m`, `2h`, `3d`).
+ */
+export function formatRelativeAge(tsMs: number, nowMs: number): string {
+  if (!Number.isFinite(tsMs) || tsMs <= 0) return '';
+  const deltaSec = Math.max(0, Math.floor((nowMs - tsMs) / 1000));
+  if (deltaSec < 5) return 'now';
+  if (deltaSec < 60) return `${deltaSec}s`;
+  const mins = Math.floor(deltaSec / 60);
+  if (mins < 60) return `${mins}m`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 48) return `${hrs}h`;
+  return `${Math.floor(hrs / 24)}d`;
+}
+
+/**
+ * Formats a future epoch millisecond timestamp (`in 45s`, `in 12m`, `due`).
+ */
+export function formatNextFire(tsMs: number, nowMs: number): string {
+  if (!Number.isFinite(tsMs) || tsMs <= 0) return '—';
+  const deltaSec = Math.floor((tsMs - nowMs) / 1000);
+  if (deltaSec <= 0) return 'due';
+  if (deltaSec < 60) return `in ${deltaSec}s`;
+  const mins = Math.floor(deltaSec / 60);
+  if (mins < 60) return `in ${mins}m`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 48) return `in ${hrs}h`;
+  return `in ${Math.floor(hrs / 24)}d`;
+}
+
+function assertSafeArgValue(raw: string, label: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    throw new Error(`Empty ${label} argument`);
+  }
+  if (/[\u0000-\u001f\u007f]/.test(trimmed)) {
+    throw new Error(`Control characters not allowed in ${label}`);
+  }
+  return trimmed;
+}
+
+function pushPositional(args: string[], value: string, label: string): void {
+  const clean = assertSafeArgValue(value, label);
+  if (clean.startsWith('-')) {
+    args.push('--', clean);
+  } else {
+    args.push(clean);
+  }
+}
+
+/**
+ * Builds deterministic `['hyp', 'session', ...]` argv arrays for quick controls.
+ * NEVER uses shell string interpolation and guards flag-like positional arguments with `--`.
+ */
+export function buildSessionControlArgs(
+  action: SessionControlAction,
+  target: SessionControlTarget,
+): string[] {
+  const targetArgs: string[] = [];
+  if (target.sessionId && target.sessionId.trim()) {
+    targetArgs.push('--session', assertSafeArgValue(target.sessionId, 'sessionId'));
+  } else if (target.handle && target.handle.trim()) {
+    targetArgs.push('--handle', assertSafeArgValue(target.handle, 'handle'));
+  }
+
+  switch (action.kind) {
+    case 'focus':
+      return ['hyp', 'session', 'focus', ...targetArgs, action.enabled ? 'on' : 'off', '--json'];
+    case 'unsubscribe': {
+      const args = ['hyp', 'session', 'unsubscribe', ...targetArgs, '--json'];
+      pushPositional(args, action.id, 'subscription id');
+      return args;
+    }
+    case 'mute': {
+      const args = ['hyp', 'session', 'mute', ...targetArgs];
+      if (action.scope === 'connector') args.push('--scope', 'connector');
+      args.push('--json');
+      pushPositional(args, action.pattern, 'mute pattern');
+      return args;
+    }
+    case 'unmute': {
+      const args = ['hyp', 'session', 'unmute', ...targetArgs];
+      if (action.scope === 'connector') args.push('--scope', 'connector');
+      args.push('--json');
+      pushPositional(args, action.pattern, 'unmute pattern');
+      return args;
+    }
+    case 'leave': {
+      const args = ['hyp', 'session', 'leave', ...targetArgs, '--json'];
+      pushPositional(args, action.channel, 'channel');
+      return args;
+    }
+    case 'rule': {
+      const args = ['hyp', 'session', 'rule', ...targetArgs, '--json'];
+      pushPositional(args, action.target, 'rule target');
+      args.push(assertSafeArgValue(action.delivery, 'delivery urgency'));
+      return args;
+    }
+  }
+}
+
+/**
+ * Parses a `hyp --json` command result into a concise, sanitized status message.
+ */
+export function parseControlCommandResult(
+  exitCode: number,
+  stdout: string,
+  stderr: string,
+  actionLabel: string,
+): { ok: boolean; message: string } {
+  let parsed: Record<string, unknown> | null = null;
+  try {
+    parsed = asRecord(JSON.parse(stdout || 'null'));
+  } catch {
+    parsed = null;
+  }
+
+  if (exitCode !== 0 || (parsed && parsed.ok === false)) {
+    const errObj = asRecord(parsed?.error);
+    const errText =
+      asStr(errObj?.message) ||
+      (typeof parsed?.error === 'string' ? parsed.error : '') ||
+      stderr.trim() ||
+      `${actionLabel} failed (exit ${exitCode})`;
+    return { ok: false, message: sanitizeUiText(errText, 140) };
+  }
+
+  const summary = asStr(parsed?.summary);
+  return {
+    ok: true,
+    message: sanitizeUiText(summary || `${actionLabel} applied`, 140),
+  };
+}
+
+/**
+ * Parses optional `/hyphae-panel` command arguments.
+ */
+export function parsePanelCommandArgs(
+  rawArgs: string,
+):
+  | { action: 'open'; tab?: PanelTab }
+  | { action: 'close' }
+  | { action: 'strip'; enabled: boolean } {
+  const tokens = rawArgs.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return { action: 'open' };
+  const first = tokens[0];
+  if (first === 'close' || first === 'hide') {
+    return { action: 'close' };
+  }
+  if (first === 'strip' || first === 'badge') {
+    const second = tokens[1];
+    return { action: 'strip', enabled: second !== 'off' && second !== 'false' && second !== '0' };
+  }
+  if (first === 'subs' || first === 'subscriptions') return { action: 'open', tab: 'subs' };
+  if (first === 'queue' || first === 'inbox') return { action: 'open', tab: 'queue' };
+  if (first === 'rules' || first === 'mutes') return { action: 'open', tab: 'rules' };
+  if (first === 'mesh' || first === 'channels') return { action: 'open', tab: 'mesh' };
+  return { action: 'open' };
+}

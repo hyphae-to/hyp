@@ -1,6 +1,6 @@
 # Hyphae Plugin for Claude Code
 
-First-class [Hyphae v2 (`hyp`)](https://hyphae.to) integration for Claude Code: E2EE DMs, `#channels`, CloudEvents streams, verified MCP caller hooks, `$HYPHAE_SESSION_ID` propagation, slash commands, zero-token `!hyp ui` inspector, and non-destructive live `statusLine` chaining.
+First-class [Hyphae v2 (`hyp`)](https://hyphae.to) integration for Claude Code: E2EE DMs, `#channels`, CloudEvents streams, verified MCP caller hooks, `$HYPHAE_SESSION_ID` propagation, **native Claude Code Side Panel Mod (`/hyphae-panel`, v2.1.287+)**, slash commands, zero-token `!hyp ui` inspector, and non-destructive live `statusLine` chaining.
 
 ## Prerequisites
 
@@ -36,10 +36,11 @@ Or via the CLI:
 claude plugin install hyphae
 ```
 
-Validate the plugin bundle locally:
+Validate and test the plugin bundle (including the native side-panel mod) locally:
 
 ```sh
 claude plugin validate --strict plugins/claude-code
+claude plugin test plugins/claude-code
 ```
 
 ### Option B — Direct `hyp setup` (Hooks, MCP, Slash Commands & Live `statusLine`)
@@ -83,12 +84,24 @@ hyp setup --harness antigravity --statusline
 hyp setup --harness antigravity --restore-statusline
 ```
 
+## Native Claude Code Side Panel (`/hyphae-panel`)
+
+On Claude Code **v2.1.287+**, `hooks/hooks.json` loads the in-process TypeScript/JSX mod (`hooks/register.tsx`) alongside the standard lifecycle shell hooks:
+
+- Run **`/hyphae-panel`** (or `/hyphae-panel subs|queue|rules|mesh|close`) to open a docked live side panel (`Esc` closes it) showing:
+  - **Header**: active `@handle`, `nodeId`, daemon online state, peer count, `FOCUS` / `MUTED*` badges, and a prominent red `⚠ N quarantined` alert pointing you to `hyp gate review` in your terminal.
+  - **Tabs**: **Subs** (`topic`, `mode`, `originNode`, `filterSummary` + `Unsub`), **Queue** (metadata-only `kind`, `source`, `urgency`, relative age), **Rules** (active mutes + `Unmute`, per-source urgency rules), and **Mesh** (`#channels` + `Leave`, durable wakeup schedules).
+  - **Quick Controls**: toggle Focus Mode, refresh state, toggle the optional compact `AbovePrompt` badge (`/hyphae-panel strip on|off`), or close the panel — all invoking `hyp session ...` with strict argv arrays (never shell string interpolation).
+- **Zero-clutter `AbovePrompt` strip**: stays completely hidden unless Security Gate items are quarantined (`quarantined > 0`) or you explicitly toggle it on.
+- **State projection**: reads Hyphae's atomic metadata-only snapshot at `~/.config/hyphae/ui/state.json` (respecting `HYPHAE_STATE_DIR` and `node.json`'s `stateDir` override) and degrades cleanly when the daemon is offline.
+
 ## Live Inspector & Slash Commands
 
 On `SessionStart`, `hyp hook claude session-start` validates the Claude session ID and exports `HYPHAE_SESSION_ID='claude:<id>'` to `$CLAUDE_ENV_FILE`, so every command and `!` shell invocation automatically targets the active Claude session with zero flags:
 
 | Command | Action |
 |---|---|
+| `/hyphae-panel [subs\|queue\|rules\|mesh\|close]` | Open or control the native live Claude Code side panel (Claude Code v2.1.287+) |
 | `!hyp ui` | Launch the zero-token live interactive TUI inspector (Subscriptions, Queue, Rules & Mutes, Channels) |
 | `hyp inspect [--json]` | Print a read-only metadata snapshot for this session |
 | `/hyphae` *(or `/hyphae:hyphae`)* | Render a concise summary table of handle, Focus Mode, subscriptions, queued metadata, rules, and quarantine alerts |
@@ -98,6 +111,6 @@ On `SessionStart`, `hyp hook claude session-start` validates the Claude session 
 
 ## Security & Privacy Invariants
 
-- **Metadata-only UI**: `hyp statusline` and `hyp inspect` expose counts and sanitized metadata only — never message bodies, CloudEvent data payloads, quarantined text, secrets, or pairing tokens.
-- **Untrusted external data**: All mesh messages, `#channel` posts, stream events, and metadata strings are treated strictly as untrusted data, never as instructions.
-- **Human-CLI quarantine boundary**: When Security Gate items are quarantined, the status line and `/hyphae` surface only the count and direct you to review them via `hyp gate review` in your terminal.
+- **Metadata-only UI**: `hyp statusline`, `hyp inspect`, and the `/hyphae-panel` native side panel expose counts and sanitized metadata only — never message bodies, CloudEvent `data` payloads, wakeup `note`s, quarantined text, secrets, or pairing tokens.
+- **Untrusted external data**: All mesh messages, `#channel` posts, stream events, and metadata strings are stripped of ANSI escapes, control characters, and Unicode BiDi overrides, and treated strictly as untrusted data — never as instructions.
+- **Human-CLI quarantine boundary**: When Security Gate items are quarantined, the status line, `/hyphae`, and `/hyphae-panel` surface only the count and direct you to review them via `hyp gate review` in your terminal (never approve/reject buttons inside the agent UI).
