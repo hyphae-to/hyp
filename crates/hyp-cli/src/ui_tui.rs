@@ -51,8 +51,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 #[cfg(unix)]
 use std::thread;
-#[cfg(unix)]
 use std::time::Duration;
+
+/// Bounded reconnect backoff schedule for `inspect.watch`: 500ms -> 1s -> 2s -> 5s.
+pub const WATCH_BACKOFF_SCHEDULE_MS: [u64; 4] = [500, 1_000, 2_000, 5_000];
+
+/// Returns bounded reconnect delay for 1-based retry attempt `attempt`.
+pub fn watch_reconnect_backoff(attempt: u32) -> Duration {
+    let idx = (attempt.saturating_sub(1) as usize).min(WATCH_BACKOFF_SCHEDULE_MS.len() - 1);
+    Duration::from_millis(WATCH_BACKOFF_SCHEDULE_MS[idx])
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WatchStatus {
+    #[default]
+    Connecting,
+    Live,
+    Reconnecting {
+        attempt: u32,
+    },
+}
 
 #[cfg(unix)]
 const ACTION_RPC_TIMEOUT: Duration = Duration::from_secs(2);
@@ -148,6 +166,12 @@ pub struct DaemonView {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct BridgeRow {
+    pub label: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct SubRow {
     pub id: String,
     pub origin_node: String,
@@ -207,11 +231,14 @@ pub struct SessionView {
     pub focus_mode: bool,
     pub muted_all: bool,
     pub count_subs: u64,
+    pub count_bridges: u64,
     pub count_queued: u64,
     pub count_quarantined: u64,
     pub count_muted_rules: u64,
     pub count_muted_archived: u64,
     pub count_wakeups: u64,
+    pub bridge_labels: Vec<String>,
+    pub bridges: Vec<BridgeRow>,
     pub subscriptions: Vec<SubRow>,
     pub queued_items: Vec<QueuedRow>,
     pub rules_and_mutes: Vec<RuleOrMuteRow>,
@@ -229,6 +256,7 @@ pub struct UiState {
     pub scroll_offset: usize,
     pub rev: u64,
     pub updated_at: i64,
+    pub watch_status: WatchStatus,
     pub status_message: Option<(String, bool)>,
     pub color_mode: ColorMode,
 }
@@ -244,10 +272,28 @@ impl Default for UiState {
             scroll_offset: 0,
             rev: 0,
             updated_at: 0,
+            watch_status: WatchStatus::Connecting,
             status_message: None,
             color_mode: ColorMode::Plain,
         }
     }
+}
+
+/// Qualifies a channel target as `<hostNode>/<channel>` so leaving a local channel
+/// never resolves to a connected remote Hub (`resolve_channel_coord`).
+pub fn qualify_channel_target(host_node: &str, channel: &str, local_node_id: &str) -> String {
+    let ch = channel.trim();
+    if ch.contains('/') {
+        return ch.to_string();
+    }
+    let host = host_node.trim();
+    let chosen_host = if !host.is_empty() {
+        host
+    } else {
+        let local = local_node_id.trim();
+        if !local.is_empty() { local } else { "local" }
+    };
+    format!("{chosen_host}/{ch}")
 }
 
 fn clean_opt_str(v: Option<&Value>) -> Option<String> {
@@ -264,6 +310,59 @@ fn clean_str_or(v: Option<&Value>, fallback: &str) -> String {
 fn parse_session_view(val: &Value) -> SessionView {
     let counts = val.get("counts").and_then(Value::as_object);
     let details = val.get("details").and_then(Value::as_object);
+
+    let mut bridges: Vec<BridgeRow> = details
+        .and_then(|d| d.get("bridges"))
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|b| {
+                    let plugin = clean_str_or(b.get("plugin"), "");
+                    let target = clean_str_or(b.get("target"), "");
+                    let label = clean_opt_str(b.get("label")).unwrap_or_else(|| {
+                        if !plugin.is_empty() && !target.is_empty() {
+                            format!("{plugin}:{target}")
+                        } else if !plugin.is_empty() {
+                            plugin.clone()
+                        } else {
+                            target.clone()
+                        }
+                    });
+                    if label.is_empty() {
+                        return None;
+                    }
+                    let role = clean_str_or(b.get("role"), "reader");
+                    Some(BridgeRow { label, role })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let compact_bridge_labels: Vec<String> = val
+        .get("bridges")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|b| clean_opt_str(Some(b)))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if bridges.is_empty() && !compact_bridge_labels.is_empty() {
+        bridges = compact_bridge_labels
+            .iter()
+            .map(|lbl| BridgeRow {
+                label: lbl.clone(),
+                role: "reader".to_string(),
+            })
+            .collect();
+    }
+
+    let bridge_labels = if !compact_bridge_labels.is_empty() {
+        compact_bridge_labels
+    } else {
+        bridges.iter().map(|b| b.label.clone()).collect()
+    };
 
     let subscriptions = details
         .and_then(|d| d.get("subscriptions"))
@@ -390,6 +489,10 @@ fn parse_session_view(val: &Value) -> SessionView {
             .and_then(|c| c.get("subscriptions"))
             .and_then(Value::as_u64)
             .unwrap_or(0),
+        count_bridges: counts
+            .and_then(|c| c.get("bridges"))
+            .and_then(Value::as_u64)
+            .unwrap_or(bridges.len().max(bridge_labels.len()) as u64),
         count_queued: counts
             .and_then(|c| c.get("queued"))
             .and_then(Value::as_u64)
@@ -410,6 +513,8 @@ fn parse_session_view(val: &Value) -> SessionView {
             .and_then(|c| c.get("wakeups"))
             .and_then(Value::as_u64)
             .unwrap_or(0),
+        bridge_labels,
+        bridges,
         subscriptions,
         queued_items,
         rules_and_mutes,
@@ -447,6 +552,11 @@ impl UiState {
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
             };
+            if self.daemon.online {
+                self.watch_status = WatchStatus::Live;
+            } else if !matches!(self.watch_status, WatchStatus::Reconnecting { .. }) {
+                self.watch_status = WatchStatus::Reconnecting { attempt: 1 };
+            }
         }
 
         let mut parsed_sessions = Vec::new();
@@ -487,6 +597,18 @@ impl UiState {
 
     pub fn active_session(&self) -> Option<&SessionView> {
         self.sessions.get(self.active_session_idx)
+    }
+
+    /// Consistently computes `max(session.counts.quarantined, daemon.quarantinedGlobal)`.
+    pub fn effective_quarantined(&self) -> u64 {
+        self.active_session()
+            .map(|s| s.count_quarantined)
+            .unwrap_or(0)
+            .max(self.daemon.quarantined_global)
+    }
+
+    pub fn is_offline(&self) -> bool {
+        !self.daemon.online || matches!(self.watch_status, WatchStatus::Reconnecting { .. })
     }
 
     pub fn current_row_count(&self) -> usize {
@@ -701,6 +823,12 @@ fn render_header_line(state: &UiState, cols: usize, use_color: bool) -> String {
     let mut parts: Vec<String> = Vec::new();
     parts.push("⟁ HYPHAE".to_string());
 
+    let offline = state.is_offline();
+    if offline {
+        parts.push("OFFLINE (reconnecting…)".to_string());
+    }
+
+    let q = state.effective_quarantined();
     if let Some(sess) = state.active_session() {
         let id_label = match &sess.handle {
             Some(h) => format!("@{h}"),
@@ -715,6 +843,23 @@ fn render_header_line(state: &UiState, cols: usize, use_color: bool) -> String {
         } else {
             parts.push(id_label);
         }
+        if !sess.bridge_labels.is_empty() {
+            if sess.bridge_labels.len() == 1 {
+                parts.push(sess.bridge_labels[0].clone());
+            } else {
+                parts.push(format!(
+                    "{} +{}",
+                    sess.bridge_labels[0],
+                    sess.bridge_labels.len() - 1
+                ));
+            }
+        } else if sess.count_bridges > 0 {
+            parts.push(if sess.count_bridges == 1 {
+                "1 bridge".to_string()
+            } else {
+                format!("{} bridges", sess.count_bridges)
+            });
+        }
         parts.push(if sess.focus_mode {
             "focus ON".to_string()
         } else {
@@ -727,19 +872,21 @@ fn render_header_line(state: &UiState, cols: usize, use_color: bool) -> String {
         } else if sess.count_muted_rules > 0 {
             parts.push(format!("{} muted", sess.count_muted_rules));
         }
-        let q = sess.count_quarantined.max(state.daemon.quarantined_global);
         if q > 0 {
             parts.push(format!("⚠ {q} held"));
         }
-    } else if !state.daemon.online {
-        parts.push("daemon offline".to_string());
-    } else {
+    } else if !offline {
         parts.push(format!("{} (no sessions)", state.daemon.node_id));
+        if q > 0 {
+            parts.push(format!("⚠ {q} held"));
+        }
+    } else if q > 0 {
+        parts.push(format!("⚠ {q} held"));
     }
 
     let raw = parts.join(" · ");
     let fitted = truncate_plain(&raw, cols);
-    style_wrap(&fitted, "1;32", use_color)
+    style_wrap(&fitted, if offline { "1;31" } else { "1;32" }, use_color)
 }
 
 fn render_tab_bar(state: &UiState, cols: usize, use_color: bool) -> String {
@@ -864,6 +1011,54 @@ fn render_subs_tab(
     use_color: bool,
 ) -> Vec<String> {
     let mut out = Vec::new();
+    if sess.bridges.is_empty() && sess.subscriptions.is_empty() {
+        out.push(style_wrap(
+            &truncate_plain("No linked bridges or active stream subscriptions.", cols),
+            "2",
+            use_color,
+        ));
+        return out;
+    }
+
+    let narrow = cols < 60;
+
+    if !sess.bridges.is_empty() && out.len() < budget {
+        let reserve_for_subs = if sess.subscriptions.is_empty() {
+            0
+        } else {
+            3.min(budget.saturating_sub(2))
+        };
+        let bridge_budget = budget.saturating_sub(reserve_for_subs);
+        if bridge_budget > 0 {
+            out.push(style_wrap(
+                &truncate_plain(&format!("Bridges ({}):", sess.bridges.len()), cols),
+                "1;36",
+                use_color,
+            ));
+            let rows_for_bridges = bridge_budget.saturating_sub(1);
+            for bridge in sess.bridges.iter().take(rows_for_bridges) {
+                let line = if narrow {
+                    format!("  ● {} ({})", bridge.label, bridge.role)
+                } else {
+                    format!(
+                        "  ● {} {} bridge",
+                        pad_or_truncate(&bridge.label, 24),
+                        pad_or_truncate(&bridge.role, 10)
+                    )
+                };
+                out.push(style_wrap(
+                    &truncate_plain(&line, cols),
+                    if bridge.role == "primary" { "36" } else { "2" },
+                    use_color,
+                ));
+            }
+        }
+    }
+
+    if out.len() >= budget {
+        return out;
+    }
+
     if sess.subscriptions.is_empty() {
         out.push(style_wrap(
             &truncate_plain("No active stream subscriptions.", cols),
@@ -873,7 +1068,6 @@ fn render_subs_tab(
         return out;
     }
 
-    let narrow = cols < 60;
     let header = if narrow {
         format!("  {:<12} {:<12} {}", "TOPIC", "MODE", "ID")
     } else {
@@ -884,7 +1078,7 @@ fn render_subs_tab(
     };
     out.push(style_wrap(&truncate_plain(&header, cols), "2", use_color));
 
-    let list_budget = budget.saturating_sub(1);
+    let list_budget = budget.saturating_sub(out.len());
     let (start, end) = compute_window(selected, sess.subscriptions.len(), list_budget);
     for (idx, sub) in sess.subscriptions[start..end].iter().enumerate() {
         let abs_idx = start + idx;
@@ -1147,6 +1341,21 @@ fn render_mesh_tab(
 }
 
 fn render_status_line(state: &UiState, cols: usize, use_color: bool) -> String {
+    if state.is_offline() {
+        let offline_tag = match state.watch_status {
+            WatchStatus::Reconnecting { attempt } if attempt > 1 => {
+                format!("OFFLINE (reconnecting… attempt #{attempt})")
+            }
+            _ => "OFFLINE (reconnecting…)".to_string(),
+        };
+        let msg = match &state.status_message {
+            Some((m, _)) if m.contains("OFFLINE") => m.clone(),
+            Some((m, _)) => format!("{offline_tag} · {m}"),
+            None => format!("rev {} · {offline_tag}", state.rev),
+        };
+        return style_wrap(&truncate_plain(&msg, cols), "1;31", use_color);
+    }
+
     if let Some((ref msg, is_err)) = state.status_message {
         let fitted = truncate_plain(msg, cols);
         return if is_err {
@@ -1156,20 +1365,17 @@ fn render_status_line(state: &UiState, cols: usize, use_color: bool) -> String {
         };
     }
 
-    let q = state
-        .active_session()
-        .map(|s| s.count_quarantined)
-        .unwrap_or(0)
-        .max(state.daemon.quarantined_global);
+    let q = state.effective_quarantined();
     if q > 0 {
         let msg = format!("⚠ {q} item(s) quarantined by Local Security Gate — run `hyp gate review`");
         return style_wrap(&truncate_plain(&msg, cols), "1;31", use_color);
     }
 
-    let meta = format!(
-        "rev {} · live inspect.watch (zero polling)",
-        state.rev
-    );
+    let meta = match state.watch_status {
+        WatchStatus::Live => format!("rev {} · live inspect.watch (zero polling)", state.rev),
+        WatchStatus::Connecting => format!("rev {} · connecting inspect.watch…", state.rev),
+        WatchStatus::Reconnecting { .. } => format!("rev {} · OFFLINE (reconnecting…)", state.rev),
+    };
     style_wrap(&truncate_plain(&meta, cols), "2", use_color)
 }
 
@@ -1371,7 +1577,21 @@ impl Drop for RawTtyGuard {
 #[cfg(unix)]
 enum WatchEvent {
     Snapshot(Value),
-    Disconnected(String),
+    Disconnected { reason: String, attempt: u32 },
+}
+
+#[cfg(unix)]
+async fn sleep_interruptible(dur: Duration, stop: &AtomicBool) -> bool {
+    let deadline = tokio::time::Instant::now() + dur;
+    while !stop.load(Ordering::Relaxed) {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        let step = (deadline - now).min(Duration::from_millis(50));
+        tokio::time::sleep(step).await;
+    }
+    false
 }
 
 #[cfg(unix)]
@@ -1385,54 +1605,103 @@ fn spawn_watch_thread(
             .enable_all()
             .build()
         else {
-            let _ = tx.send(WatchEvent::Disconnected(
-                "Failed to build watch runtime".into(),
-            ));
+            let _ = tx.send(WatchEvent::Disconnected {
+                reason: "Failed to build watch runtime".into(),
+                attempt: 1,
+            });
             return;
         };
 
         rt.block_on(async move {
-            let (read_half, mut write_half) = match connect_daemon_async(&socket_path).await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    let _ = tx.send(WatchEvent::Disconnected(format!("Daemon offline: {e}")));
-                    return;
-                }
-            };
-            if let Err(e) = write_ndjson_line_async(
-                &mut write_half,
-                &json!({ "type": "inspect.watch", "detail": "full" }),
-            )
-            .await
-            {
-                let _ = tx.send(WatchEvent::Disconnected(format!("Watch error: {e}")));
-                return;
-            }
+            let mut attempt: u32 = 0;
 
-            let mut reader = tokio::io::BufReader::new(read_half);
             while !stop.load(Ordering::Relaxed) {
-                let line = tokio::time::timeout(
-                    Duration::from_millis(250),
-                    read_bounded_line_async(&mut reader, MAX_SOCKET_LINE_BYTES),
+                let (read_half, mut write_half) = match connect_daemon_async(&socket_path).await {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        attempt = attempt.saturating_add(1);
+                        if tx
+                            .send(WatchEvent::Disconnected {
+                                reason: format!("Daemon offline: {e}"),
+                                attempt,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                        if !sleep_interruptible(watch_reconnect_backoff(attempt), &stop).await {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+
+                if let Err(e) = write_ndjson_line_async(
+                    &mut write_half,
+                    &json!({ "type": "inspect.watch", "detail": "full" }),
                 )
-                .await;
-                match line {
-                    Err(_) => continue, // wake periodically to observe stop flag cleanly
-                    Ok(Ok(Some(raw))) => {
-                        if let Ok(val) = serde_json::from_str::<Value>(&raw) {
-                            if tx.send(WatchEvent::Snapshot(val)).is_err() {
-                                break;
+                .await
+                {
+                    attempt = attempt.saturating_add(1);
+                    if tx
+                        .send(WatchEvent::Disconnected {
+                            reason: format!("Watch error: {e}"),
+                            attempt,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    if !sleep_interruptible(watch_reconnect_backoff(attempt), &stop).await {
+                        break;
+                    }
+                    continue;
+                }
+
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut saw_snapshot = false;
+                let disconnect_reason = loop {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let line = tokio::time::timeout(
+                        Duration::from_millis(250),
+                        read_bounded_line_async(&mut reader, MAX_SOCKET_LINE_BYTES),
+                    )
+                    .await;
+                    match line {
+                        Err(_) => continue, // wake periodically to observe stop flag cleanly
+                        Ok(Ok(Some(raw))) => {
+                            if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+                                if !saw_snapshot {
+                                    saw_snapshot = true;
+                                    attempt = 0;
+                                }
+                                if tx.send(WatchEvent::Snapshot(val)).is_err() {
+                                    return;
+                                }
                             }
                         }
+                        Ok(Ok(None)) => break "Daemon disconnected".to_string(),
+                        Ok(Err(e)) => break format!("Watch error: {e}"),
                     }
-                    Ok(Ok(None)) => {
-                        let _ = tx.send(WatchEvent::Disconnected("Daemon disconnected".into()));
-                        break;
-                    }
-                    Ok(Err(e)) => {
-                        let _ = tx.send(WatchEvent::Disconnected(format!("Watch error: {e}")));
-                        break;
-                    }
+                };
+
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                attempt = attempt.saturating_add(1);
+                if tx
+                    .send(WatchEvent::Disconnected {
+                        reason: disconnect_reason,
+                        attempt,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                if !sleep_interruptible(watch_reconnect_backoff(attempt), &stop).await {
+                    break;
                 }
             }
         });
@@ -1456,14 +1725,16 @@ fn draw_frame_sync(lines: &[String]) {
     let _ = out.flush();
 }
 
-#[cfg(unix)]
-fn perform_action_rpc(socket_path: &Path, state: &mut UiState, key: TuiKey) {
-    let Some(sess) = state.active_session().cloned() else {
-        state.status_message = Some(("No active session selected".into(), true));
-        return;
+#[cfg(any(unix, test))]
+fn build_action_rpc_packet(
+    state: &UiState,
+    key: TuiKey,
+) -> Option<Result<(Value, String), (String, bool)>> {
+    let Some(sess) = state.active_session() else {
+        return Some(Err(("No active session selected".into(), true)));
     };
 
-    let (pkt, ok_label): (Value, String) = match key {
+    let pair = match key {
         TuiKey::Focus => {
             let next_on = !sess.focus_mode;
             (
@@ -1488,17 +1759,16 @@ fn perform_action_rpc(socket_path: &Path, state: &mut UiState, key: TuiKey) {
                         format!("Muted source '{}'", item.source),
                     )
                 } else {
-                    toggle_mute_all_packet(&sess)
+                    toggle_mute_all_packet(sess)
                 }
             } else {
-                toggle_mute_all_packet(&sess)
+                toggle_mute_all_packet(sess)
             }
         }
         TuiKey::Remove => match state.active_tab {
             UiTab::Subscriptions => {
                 let Some(sub) = sess.subscriptions.get(state.selected_row) else {
-                    state.status_message = Some(("No subscription selected".into(), true));
-                    return;
+                    return Some(Err(("No subscription selected".into(), true)));
                 };
                 (
                     json!({
@@ -1511,8 +1781,7 @@ fn perform_action_rpc(socket_path: &Path, state: &mut UiState, key: TuiKey) {
             }
             UiTab::RulesAndMutes => {
                 let Some(row) = sess.rules_and_mutes.get(state.selected_row) else {
-                    state.status_message = Some(("No rule or mute selected".into(), true));
-                    return;
+                    return Some(Err(("No rule or mute selected".into(), true)));
                 };
                 match row {
                     RuleOrMuteRow::Mute { pattern, scope, .. } => (
@@ -1538,24 +1807,40 @@ fn perform_action_rpc(socket_path: &Path, state: &mut UiState, key: TuiKey) {
             }
             UiTab::MeshAndChannels => {
                 let Some(ch) = sess.channels.get(state.selected_row) else {
-                    state.status_message = Some(("No channel selected".into(), true));
-                    return;
+                    return Some(Err(("No channel selected".into(), true)));
                 };
+                let qualified =
+                    qualify_channel_target(&ch.host_node, &ch.channel, &state.daemon.node_id);
                 (
                     json!({
                         "type": "session.leave_channel",
                         "sessionId": sess.session_id,
-                        "channel": ch.channel
+                        "channel": qualified
                     }),
-                    format!("Left channel '{}'", ch.channel),
+                    format!("Left channel '{qualified}'"),
                 )
             }
             UiTab::Queue => {
-                state.status_message = Some(("Use `m` to mute the selected source".into(), false));
-                return;
+                return Some(Err(("Use `m` to mute the selected source".into(), false)));
             }
         },
-        _ => return,
+        _ => return None,
+    };
+
+    Some(Ok(pair))
+}
+
+#[cfg(unix)]
+fn perform_action_rpc(socket_path: &Path, state: &mut UiState, key: TuiKey) {
+    let Some(built) = build_action_rpc_packet(state, key) else {
+        return;
+    };
+    let (pkt, ok_label) = match built {
+        Ok(pair) => pair,
+        Err(msg) => {
+            state.status_message = Some(msg);
+            return;
+        }
     };
 
     let res = daemon_rpc_sync(socket_path, &pkt, ACTION_RPC_TIMEOUT);
@@ -1567,7 +1852,7 @@ fn perform_action_rpc(socket_path: &Path, state: &mut UiState, key: TuiKey) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 fn toggle_mute_all_packet(sess: &SessionView) -> (Value, String) {
     if sess.muted_all {
         let scope = sess
@@ -1663,16 +1948,17 @@ pub fn run_ui(args: &UiArgs) -> ExitCode {
             }
         } else {
             state.daemon.online = false;
+            state.watch_status = WatchStatus::Reconnecting { attempt: 1 };
             state.status_message = Some((
                 format!(
-                    "Daemon offline at {} — start with `hyp daemon`",
+                    "OFFLINE (reconnecting…) · Daemon offline at {} — start with `hyp daemon`",
                     socket_path.display()
                 ),
                 true,
             ));
         }
 
-        // Start zero-polling `inspect.watch` background listener.
+        // Start zero-polling `inspect.watch` background listener with bounded reconnect backoff.
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let watch_handle = spawn_watch_thread(socket_path.clone(), tx, Arc::clone(&stop));
@@ -1686,17 +1972,25 @@ pub fn run_ui(args: &UiArgs) -> ExitCode {
             while let Ok(ev) = rx.try_recv() {
                 match ev {
                     WatchEvent::Snapshot(snap) => {
+                        let was_offline = state.is_offline();
                         state.apply_snapshot(
                             &snap,
                             prefer_session.as_deref(),
                             prefer_herdr.as_deref(),
                             prefer_handle.as_deref(),
                         );
+                        if was_offline && state.daemon.online {
+                            state.status_message = Some(("Reconnected to daemon".into(), false));
+                        }
                         dirty = true;
                     }
-                    WatchEvent::Disconnected(reason) => {
+                    WatchEvent::Disconnected { reason, attempt } => {
                         state.daemon.online = false;
-                        state.status_message = Some((reason, true));
+                        state.watch_status = WatchStatus::Reconnecting { attempt };
+                        state.status_message = Some((
+                            format!("OFFLINE (reconnecting…) · {reason}"),
+                            true,
+                        ));
                         dirty = true;
                     }
                 }
@@ -1754,8 +2048,14 @@ pub fn run_ui(args: &UiArgs) -> ExitCode {
                                 }
                             } else {
                                 state.daemon.online = false;
-                                state.status_message =
-                                    Some(("Refresh failed: daemon offline".into(), true));
+                                if !matches!(state.watch_status, WatchStatus::Reconnecting { .. }) {
+                                    state.watch_status = WatchStatus::Reconnecting { attempt: 1 };
+                                }
+                                state.status_message = Some((
+                                    "OFFLINE (reconnecting…) · Refresh failed: daemon offline"
+                                        .into(),
+                                    true,
+                                ));
                             }
                         }
                         TuiKey::Focus | TuiKey::Mute | TuiKey::Remove => {
@@ -2039,5 +2339,243 @@ mod tests {
         assert_eq!(st.active_session().unwrap().session_id, "claude:a");
         st.cycle_session();
         assert_eq!(st.active_session().unwrap().session_id, "codex:b");
+    }
+
+    #[test]
+    fn watch_reconnect_backoff_schedule_is_bounded() {
+        assert_eq!(watch_reconnect_backoff(1), Duration::from_millis(500));
+        assert_eq!(watch_reconnect_backoff(2), Duration::from_millis(1_000));
+        assert_eq!(watch_reconnect_backoff(3), Duration::from_millis(2_000));
+        assert_eq!(watch_reconnect_backoff(4), Duration::from_millis(5_000));
+        assert_eq!(watch_reconnect_backoff(10), Duration::from_millis(5_000));
+        assert_eq!(watch_reconnect_backoff(u32::MAX), Duration::from_millis(5_000));
+    }
+
+    #[test]
+    fn offline_state_shows_persistent_reconnecting_banner_never_claims_live() {
+        let mut st = sample_state_with_ansi_traps();
+        st.color_mode = ColorMode::Plain;
+        // Simulate disconnect AFTER a live snapshot populated active_session()
+        st.daemon.online = false;
+        st.watch_status = WatchStatus::Reconnecting { attempt: 2 };
+        st.status_message = None;
+
+        let frame = render_ui_frame(&st, 24, 80);
+        let joined = frame.join("\n");
+        assert!(
+            frame[0].contains("OFFLINE (reconnecting…)"),
+            "header must display persistent offline indicator even with stale session: {:?}",
+            frame[0]
+        );
+        assert!(
+            joined.contains("OFFLINE (reconnecting…"),
+            "status bar must show offline reconnecting status: {joined}"
+        );
+        assert!(
+            !joined.contains("live inspect.watch"),
+            "offline frame must NEVER claim live inspect.watch: {joined}"
+        );
+
+        // Even if a transient non-offline status_message was set, offline remains clearly visible!
+        st.status_message = Some(("Switched to @alice".into(), false));
+        let frame2 = render_ui_frame(&st, 24, 80);
+        assert!(frame2[0].contains("OFFLINE (reconnecting…)"));
+        assert!(!frame2.join("\n").contains("live inspect.watch"));
+    }
+
+    #[test]
+    fn bridges_surface_in_subs_tab_and_header_within_viewport_bounds() {
+        let mut st = UiState {
+            color_mode: ColorMode::Plain,
+            ..Default::default()
+        };
+        let snap = json!({
+            "rev": 4,
+            "daemon": { "online": true, "nodeId": "alice@macbook", "quarantinedGlobal": 0 },
+            "sessions": [{
+                "sessionId": "claude:b1",
+                "harness": "claude",
+                "enrolled": true,
+                "handle": "alice",
+                "bridges": ["telegram:\x1b[31mpersonal\x1b]0;pwn\x07"],
+                "counts": { "bridges": 1, "subscriptions": 1, "queued": 0, "quarantined": 0 },
+                "details": {
+                    "bridges": [
+                        {
+                            "plugin": "telegram",
+                            "target": "personal",
+                            "label": "telegram:\x1b[31mpersonal\x1b]0;pwn\x07",
+                            "role": "primary"
+                        }
+                    ],
+                    "subscriptions": [
+                        {
+                            "id": "sub-ci-1",
+                            "originNode": "alice@macbook",
+                            "topic": "ci.builds",
+                            "mode": "queue",
+                            "coalesceSeconds": 10,
+                            "filterSummary": "branch=main"
+                        }
+                    ]
+                }
+            }]
+        });
+        st.apply_snapshot(&snap, None, None, None);
+
+        for (rows, cols) in [(24usize, 80usize), (18, 40), (10, 32)] {
+            for mode in [ColorMode::Plain, ColorMode::TrueColor] {
+                st.color_mode = mode;
+                let frame = render_ui_frame(&st, rows, cols);
+                assert_eq!(frame.len(), rows);
+                for line in &frame {
+                    assert!(visible_width(line) <= cols, "overflow at {rows}x{cols}: {line:?}");
+                }
+                let joined = frame.join("\n");
+                assert!(!joined.contains("pwn"));
+                assert!(!joined.contains("\x1b]0;"));
+                if rows == 24 && cols == 80 && mode == ColorMode::Plain {
+                    assert!(frame[0].contains("telegram:personal"));
+                    assert!(joined.contains("Bridges (1):"));
+                    assert!(joined.contains("telegram:personal"));
+                    assert!(joined.contains("primary"));
+                    assert!(joined.contains("ci.builds"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn leave_channel_action_always_sends_qualified_host_node_channel() {
+        assert_eq!(
+            qualify_channel_target("alice@macbook", "#ops", "alice@macbook"),
+            "alice@macbook/#ops"
+        );
+        assert_eq!(
+            qualify_channel_target("", "#ops", "alice@macbook"),
+            "alice@macbook/#ops"
+        );
+        assert_eq!(qualify_channel_target("", "#ops", ""), "local/#ops");
+        assert_eq!(
+            qualify_channel_target("acme-hub", "#release", "alice@macbook"),
+            "acme-hub/#release"
+        );
+        assert_eq!(
+            qualify_channel_target("local", "acme-hub/#release", "alice@macbook"),
+            "acme-hub/#release"
+        );
+
+        let mut st = sample_state_with_ansi_traps();
+        st.select_tab(UiTab::MeshAndChannels);
+        // Row 0: local channel `#ops` hosted on `alice@macbook`
+        st.selected_row = 0;
+        let (pkt0, _) = build_action_rpc_packet(&st, TuiKey::Remove)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pkt0["type"], "session.leave_channel");
+        assert_eq!(pkt0["channel"], "alice@macbook/#ops");
+
+        // Row 1: remote channel `#release` hosted on `acme-hub`
+        st.selected_row = 1;
+        let (pkt1, _) = build_action_rpc_packet(&st, TuiKey::Remove)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pkt1["type"], "session.leave_channel");
+        assert_eq!(pkt1["channel"], "acme-hub/#release");
+    }
+
+    #[test]
+    fn effective_quarantined_uses_max_of_session_and_global() {
+        let mut st = UiState {
+            color_mode: ColorMode::Plain,
+            ..Default::default()
+        };
+        let snap = json!({
+            "rev": 2,
+            "daemon": { "online": true, "nodeId": "alice@mac", "quarantinedGlobal": 3 },
+            "sessions": [{
+                "sessionId": "claude:q0",
+                "enrolled": true,
+                "handle": "alice",
+                "counts": { "quarantined": 0 }
+            }]
+        });
+        st.apply_snapshot(&snap, None, None, None);
+        assert_eq!(st.effective_quarantined(), 3);
+        let frame = render_ui_frame(&st, 24, 80);
+        assert!(frame[0].contains("⚠ 3 held"));
+        assert!(frame.join("\n").contains("3 item(s) quarantined"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_thread_reconnects_after_disconnect_over_tcp_loopback() {
+        use std::io::{BufRead, BufReader, Write as _};
+        use std::net::TcpListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let addr_file = dir.path().join("reconnect.addr");
+        std::fs::write(&addr_file, format!("{addr}\n")).unwrap();
+
+        let server = thread::spawn(move || {
+            // Connection 1: read inspect.watch, send rev=1, then close abruptly to simulate daemon restart.
+            let (stream1, _) = listener.accept().unwrap();
+            let mut r1 = BufReader::new(stream1.try_clone().unwrap());
+            let mut req1 = String::new();
+            let _ = r1.read_line(&mut req1);
+            let mut w1 = stream1;
+            let _ = writeln!(
+                w1,
+                "{}",
+                json!({ "type": "inspect.snapshot", "rev": 1, "daemon": { "online": true, "nodeId": "local" }, "sessions": [] })
+            );
+            let _ = w1.flush();
+            drop(w1);
+            drop(r1);
+
+            // Connection 2: watch thread must reconnect automatically and receive rev=2!
+            let (stream2, _) = listener.accept().unwrap();
+            let mut r2 = BufReader::new(stream2.try_clone().unwrap());
+            let mut req2 = String::new();
+            let _ = r2.read_line(&mut req2);
+            let mut w2 = stream2;
+            let _ = writeln!(
+                w2,
+                "{}",
+                json!({ "type": "inspect.snapshot", "rev": 2, "daemon": { "online": true, "nodeId": "local" }, "sessions": [] })
+            );
+            let _ = w2.flush();
+            // Keep connection alive briefly until client stops.
+            thread::sleep(Duration::from_millis(300));
+        });
+
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = spawn_watch_thread(addr_file, tx, Arc::clone(&stop));
+
+        // Expect Snapshot(rev=1), then Disconnected(attempt=1), then Snapshot(rev=2)!
+        let ev1 = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        match ev1 {
+            WatchEvent::Snapshot(v) => assert_eq!(v["rev"], 1),
+            WatchEvent::Disconnected { reason, .. } => panic!("unexpected early disconnect: {reason}"),
+        }
+
+        let ev2 = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        match ev2 {
+            WatchEvent::Disconnected { attempt, .. } => assert_eq!(attempt, 1),
+            WatchEvent::Snapshot(v) => panic!("expected disconnect before reconnect, got {v}"),
+        }
+
+        let ev3 = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        match ev3 {
+            WatchEvent::Snapshot(v) => assert_eq!(v["rev"], 2),
+            WatchEvent::Disconnected { reason, .. } => panic!("expected reconnected snapshot, got disconnect: {reason}"),
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        server.join().unwrap();
     }
 }

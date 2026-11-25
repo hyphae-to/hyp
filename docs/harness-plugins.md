@@ -6,7 +6,7 @@ Hyphae `v0.6.0` gives you live visibility and quick session controls directly in
 
 | Harness | Live Status Bar | Inspector / Quick Controls | Thread Binding |
 |---|---|---|---|
-| **Claude Code** | Native `statusLine` (`hyp statusline --harness claude`, `< 5 ms`, non-destructive chaining) | Plugin commands (`/hyphae`, `/hyphae:subs`, `/hyphae:focus`, `/hyphae:mute`) + `!hyp ui` | `session_id` + `$HYPHAE_SESSION_ID` via `CLAUDE_ENV_FILE` |
+| **Claude Code** | Native `statusLine` (`hyp statusline --harness claude`, `< 5 ms`, non-destructive chaining) | Plugin commands (`/hyphae`, `/hyphae-subs`, `/hyphae-focus`, `/hyphae-mute`, `/hyphae-panel`) + `!hyp ui` | `session_id` + `$HYPHAE_SESSION_ID` via `CLAUDE_ENV_FILE` |
 | **Herdr Desktop App** | Native GPUI per-pane top-bar pill (`mods/hyphae-pane`) | Native GPUI `mods/hyphae-panel` (right dock, `cmd-shift-h` floating window, or split/tab) — works across **local & remote SSH spaces** for every harness inside Herdr | Per-pane `herdrTerminalId` + `herdrCreatedMs` anti-recycle pin |
 | **Antigravity CLI (`agy`)** | Native `statusLine` with `"stack_with_default": true` | `hyp inspect` / `hyp ui` | `conversation_id` / `session_id` |
 | **Codex / OpenCode / Gemini / Shells** | Automatic when running inside **Herdr**, or split terminal | Standalone `hyp inspect [--watch]` and interactive `hyp ui` | `$HYPHAE_SESSION_ID`, `$CODEX_THREAD_ID`, `$HC_TERMINAL_ID` |
@@ -18,15 +18,15 @@ Hyphae `v0.6.0` gives you live visibility and quick session controls directly in
 ### Install
 
 ```sh
-# Install Claude Code hooks, MCP server, plugin commands, and composable statusLine
-hyp setup --harness claude --plugin --statusline
+# Install Claude Code hooks, MCP server, slash commands, and composable statusLine
+hyp setup --harness claude --statusline
 ```
 
-- **Non-destructive `statusLine` chaining:** If `~/.claude/settings.json` already defines a custom `statusLine.command` (model, git branch, context bar), `hyp setup` backs up your original config to `~/.claude/settings.json.hyp.bak`, stores the existing command in `~/.config/hyphae/claude-statusline-chain.json` (`0600`), and runs both concurrently so Hyphae appends cleanly on the next row (or inline with `--inline`).
+- **Non-destructive `statusLine` chaining:** If `~/.claude/settings.json` already defines a custom `statusLine.command` (model, git branch, context bar), `hyp setup` backs up your original config to `~/.claude/settings.json.hyp.bak`, stores the existing command in `~/.config/hyphae/claude-statusline-chain.json` (`0600`), and chains it so Hyphae appends cleanly on the next row.
 - Remove cleanly at any time while restoring your original `statusLine`:
 
 ```sh
-hyp setup --harness claude --remove-statusline
+hyp setup --harness claude --restore-statusline
 ```
 
 ### Visual States (`hyp statusline` & Claude native plugin)
@@ -46,10 +46,10 @@ hyp setup --harness claude --remove-statusline
 On `SessionStart`, Hyphae writes `export HYPHAE_SESSION_ID='claude:<validated-id>'` to `$CLAUDE_ENV_FILE` so commands target the exact Claude thread automatically:
 
 - `/hyphae` — compact snapshot of subscriptions, queue, mutes, focus, channels, and wakeups
-- `/hyphae:subs` — list/manage active stream subscriptions
-- `/hyphae:focus [on|off]` — toggle Focus Mode
-- `/hyphae:mute <target>` — mute/unmute a source or pattern
-- `/hyphae:setup-statusline` — guided opt-in setup for `statusLine`
+- `/hyphae-subs` — list/manage active stream subscriptions
+- `/hyphae-focus [on|off]` — toggle Focus Mode
+- `/hyphae-mute <target>` — mute/unmute a source or pattern
+- `/hyphae-panel` — open the native Claude Code Hyphae side panel
 - `!hyp ui` — open the interactive zero-token terminal inspector inside Claude Code
 
 ---
@@ -85,7 +85,7 @@ Running Claude Code, Codex, OpenCode, Antigravity CLI, Gemini, or plain shells i
 ### Zero-Polling Architecture
 
 - **Local panes:** The local Hyphae daemon atomically writes a metadata-only projection to `<state_dir>/ui/state.json` (`~/.config/hyphae/ui/state.json` by default, `0600` inside `0700` `ui/`). Both mods watch that directory with Herdr's native `watchFolder` + `readTextFile` — **0 polling and 0 subprocess spawns**.
-- **Remote SSH spaces (`solace/t4g`):** Panes sharing a remote host deduplicate fetches through `shared("hyphae.remoteCache")` and invoke `hyp inspect --all --json` via `exec(..., { on: machine })` with backoff.
+- **Remote SSH spaces (`solace/t4g`):** Panes sharing a remote host deduplicate in-flight and cached fetches through `shared("hyphae.remoteInFlight")` + `shared("hyphae.remoteCache")` and invoke `hyp inspect --all --json` via `exec(..., { on: machine })` with backoff.
 
 ### Safe Installation
 
@@ -103,7 +103,7 @@ Safety guarantees enforced by both `hyp` and `scripts/install.sh`:
 2. **Non-clobbering `keys.json`:** Adds `"cmd-shift-h": "mod.open:hyphae-panel"` under `"global"` only when `cmd-shift-h` is not already bound.
 3. **Shipped layout preservation:** Never modifies Herdr's shipped `main`, `terminals`, or `win98` layouts (which Herdr overwrites on startup). Press `cmd-shift-h` immediately for the floating inspector, or pass `--clone-layout herdr-hyphae` to clone `main.json` into a personal layout with both `hyphae-pane` and the docked `hyphae-panel`.
 4. **Symlink safety:** If your active layout JSON is a symlink (for example, `herdr-folders.json -> ~/Workspace/herdr-custom-ui/...`), the installer **refuses to edit it** unless you explicitly pass `--patch-layout`, and prints the exact 2-line layout snippet instead.
-5. **Custom pane header safety:** If `pane.header.content.mod` is already customized (neither `"pane"` nor `"hyphae-pane"`), the installer **never clobbers it** without `--force`.
+5. **Custom pane header safety:** If `pane.header.content.mod` is already customized (neither `"pane"` nor `"hyphae-pane"`), the installer **never clobbers it** without `--force-layout`.
 
 ### Composing `pill.js` Into a Custom Pane Header
 
@@ -157,7 +157,7 @@ hyp inspect
 hyp inspect --all --json
 hyp inspect --herdr-terminal t4g --watch   # zero-polling live stream over connector.sock
 
-# Interactive terminal UI (keys: 1-4 tabs, j/k navigate, f focus, u unsub, m/x mute, r rule, q quit)
+# Interactive terminal UI (keys: 1-4/Tab tabs, j/k navigate, f focus, m mute, u/x remove/unsub/leave, s switch session, r refresh, q quit)
 hyp ui
 
 # Scriptable session quick controls
@@ -166,7 +166,7 @@ hyp session mute '#noisy-ci' --herdr-terminal t4g --json
 hyp session unmute '#noisy-ci' --herdr-terminal t4g --json
 hyp session rule bob/rev interrupt --herdr-terminal t4g --json
 hyp session unsubscribe sub_01J... --herdr-terminal t4g --json
-hyp session leave '#ops' --herdr-terminal t4g --json
+hyp session leave 'local/#ops' --herdr-terminal t4g --json
 ```
 
 ---

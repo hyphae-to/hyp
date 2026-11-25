@@ -80,11 +80,13 @@ export function renderHyphaePill({
   paneId,
   terminal,
   entry,
+  daemon = null,
+  snapshot = null,
   compact = false,
   iconPath = "mods/hyphae-pane/hyphae.svg",
   onClick,
 }) {
-  const m = formatPillMetrics(entry);
+  const m = formatPillMetrics(entry, daemon ?? snapshot);
   if (!m.visible) return null;
 
   const mode =

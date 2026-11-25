@@ -2945,13 +2945,26 @@ fn setup_claude(
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();
-            servers.insert(
-                "hyphae".to_string(),
-                json!({
-                    "command": bin,
-                    "args": mcp_args(socket, &[])
-                }),
-            );
+            let mut hyphae_entry = servers
+                .get("hyphae")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let preserve_claude_channel = hyphae_entry
+                .get("args")
+                .and_then(Value::as_array)
+                .is_some_and(|args| {
+                    args.iter()
+                        .any(|a| a.as_str() == Some("--claude-channel"))
+                });
+            let claude_mcp_args = if preserve_claude_channel {
+                mcp_args(socket, &["--claude-channel"])
+            } else {
+                mcp_args(socket, &[])
+            };
+            hyphae_entry.insert("command".to_string(), json!(bin));
+            hyphae_entry.insert("args".to_string(), Value::Array(claude_mcp_args));
+            servers.insert("hyphae".to_string(), Value::Object(hyphae_entry));
             mcp_doc.insert("mcpServers".to_string(), Value::Object(servers));
             maybe_write_json(&profile.mcp_file, &Value::Object(mcp_doc), false, dry_run)?;
             files.push(profile.mcp_file.display().to_string());

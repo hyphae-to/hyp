@@ -298,7 +298,10 @@ async fn statusline_e2e_hot_path_latency_pill_json_and_quarantine() {
     )
     .await;
     assert_eq!(agy_out.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&agy_out.stdout).trim(), "hyphae @agybot");
+    assert_eq!(
+        String::from_utf8_lossy(&agy_out.stdout).trim(),
+        "hyphae @agybot · ⚠ 1 held"
+    );
 
     daemon.stop().await;
 }
@@ -1091,4 +1094,217 @@ async fn ui_non_tty_fallback_tcp_loopback_parity_and_help_flags() {
     }
 
     daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn statusline_surfaces_global_quarantine_and_qualified_leave_targets_local_channel() {
+    let dir = TempDir::new().unwrap();
+    let node = make_test_node("alice@macbook", &dir);
+    let daemon = LocalDaemon::start(Arc::clone(&node), None, LocalDaemonConfig::default())
+        .await
+        .unwrap();
+    let sock = daemon.socket_path().to_path_buf();
+    let sock_str = sock.to_str().unwrap().to_string();
+
+    let sid_a = "claude:sess-a";
+    let sid_b = "claude:sess-b";
+    node.register_session(sid_a, r#"{"kind":"claude"}"#).unwrap();
+    node.register_handle(sid_a, "alice").await.unwrap();
+    node.register_session(sid_b, r#"{"kind":"claude"}"#).unwrap();
+    node.register_handle(sid_b, "bob").await.unwrap();
+
+    // U3: Put a quarantined item in session B ONLY -> session A's `hyp statusline` must STILL alert!
+    node.db()
+        .local()
+        .put_in_mailbox(
+            &MailboxInsert {
+                session_id: sid_b.into(),
+                origin_node: "untrusted@net".into(),
+                item_id: "q-other-sess-1".into(),
+                text: "SENTINEL_OTHER_SESSION_QUARANTINE".into(),
+                kind: MailboxKind::Message,
+                source: "mallory@net/spam".into(),
+                gate_state: GateState::Quarantined,
+                gate_reason: Some("prompt_injection".into()),
+                traceparent: None,
+            },
+            now_ms(),
+        )
+        .unwrap();
+
+    let out_a = run_hyp_with_stdin(
+        dir.path(),
+        &["statusline", "--socket", &sock_str, "--plain"],
+        br#"{"session_id":"sess-a"}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(out_a.status.code(), Some(0));
+    let line_a = String::from_utf8_lossy(&out_a.stdout);
+    assert!(
+        line_a.contains("⚠ 1 held"),
+        "U3: statusline must surface daemon.quarantinedGlobal even when session A count is 0: {line_a:?}"
+    );
+    assert!(!line_a.contains("SENTINEL_OTHER_SESSION_QUARANTINE"));
+
+    // U2: Qualified `alice@macbook/#ops` and `local/#release` leave local memberships cleanly!
+    node.join_channel("#ops", "alice").await.unwrap();
+    node.join_channel("#release", "alice").await.unwrap();
+
+    for qualified in ["alice@macbook/#ops", "local/#release"] {
+        let leave = run_hyp_with_stdin(
+            dir.path(),
+            &[
+                "session",
+                "leave",
+                qualified,
+                "--session",
+                sid_a,
+                "--socket",
+                &sock_str,
+                "--json",
+            ],
+            b"",
+            &[],
+        )
+        .await;
+        assert_eq!(
+            leave.status.code(),
+            Some(0),
+            "leave {qualified} failed: {}",
+            String::from_utf8_lossy(&leave.stderr)
+        );
+        let env = parse_json_stdout(&leave);
+        assert_eq!(env["ok"], true);
+        assert_eq!(env["data"]["left"], true);
+    }
+
+    let inspect_after = run_hyp_with_stdin(
+        dir.path(),
+        &["inspect", "--session", sid_a, "--socket", &sock_str, "--json"],
+        b"",
+        &[],
+    )
+    .await;
+    assert_eq!(inspect_after.status.code(), Some(0));
+    let after_env = parse_json_stdout(&inspect_after);
+    assert_eq!(after_env["data"]["session"]["counts"]["channels"], 0);
+
+    daemon.stop().await;
+}
+
+#[test]
+fn claude_setup_preserves_existing_claude_channel_flag_x7() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let state_dir = tmp.path().join("state");
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+
+    // 1. Pre-populate `.claude.json` with `--claude-channel`, custom env, and an unrelated server.
+    let claude_json_path = home.join(".claude.json");
+    std::fs::write(
+        &claude_json_path,
+        serde_json::to_string_pretty(&json!({
+            "mcpServers": {
+                "hyphae": {
+                    "command": "/old/path/hyp",
+                    "args": ["mcp", "--claude-channel"],
+                    "env": { "RUST_LOG": "info" }
+                },
+                "other-mcp": {
+                    "command": "other-bin",
+                    "args": ["serve"]
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let fake_bin = "/opt/hyphae/bin/hyp";
+    let run1 = isolated_cmd(&home)
+        .args([
+            "setup",
+            "--harness",
+            "claude",
+            "--bin",
+            fake_bin,
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        run1.status.code(),
+        Some(0),
+        "setup run1 failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run1.stdout),
+        String::from_utf8_lossy(&run1.stderr)
+    );
+
+    let after1: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&claude_json_path).unwrap()).unwrap();
+    assert_eq!(after1["mcpServers"]["hyphae"]["command"], fake_bin);
+    assert_eq!(
+        after1["mcpServers"]["hyphae"]["args"],
+        json!(["mcp", "--claude-channel"]),
+        "X7: re-running `hyp setup --harness claude` must preserve existing --claude-channel"
+    );
+    assert_eq!(after1["mcpServers"]["hyphae"]["env"]["RUST_LOG"], "info");
+    assert_eq!(after1["mcpServers"]["other-mcp"]["command"], "other-bin");
+
+    // 2. Re-running with explicit `--socket` STILL preserves `--claude-channel`!
+    let custom_sock = tmp.path().join("custom.sock");
+    let run2 = isolated_cmd(&home)
+        .args([
+            "setup",
+            "--harness",
+            "claude",
+            "--bin",
+            fake_bin,
+            "--socket",
+            custom_sock.to_str().unwrap(),
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(run2.status.code(), Some(0));
+
+    let after2: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&claude_json_path).unwrap()).unwrap();
+    assert_eq!(
+        after2["mcpServers"]["hyphae"]["args"],
+        json!(["mcp", custom_sock.display().to_string(), "--claude-channel"])
+    );
+
+    // 3. Fresh home without `--claude-channel` must NOT spuriously inject `--claude-channel`.
+    let fresh_home = tmp.path().join("fresh-home");
+    std::fs::create_dir_all(fresh_home.join(".claude")).unwrap();
+    let fresh_run = isolated_cmd(&fresh_home)
+        .args([
+            "setup",
+            "--harness",
+            "claude",
+            "--bin",
+            fake_bin,
+            "--home",
+            fresh_home.to_str().unwrap(),
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(fresh_run.status.code(), Some(0));
+    let fresh_doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(fresh_home.join(".claude.json")).unwrap())
+            .unwrap();
+    assert_eq!(fresh_doc["mcpServers"]["hyphae"]["args"], json!(["mcp"]));
 }

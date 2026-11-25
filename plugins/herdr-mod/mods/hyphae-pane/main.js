@@ -136,9 +136,9 @@ export default class HyphaePane extends View {
     const bottom = paneFrame(layout())?.header?.position === "bottom";
 
     const terminalAddr = p.terminal ?? props()?.terminal ?? null;
-    const { machine, entry } = this.client
+    const { machine, entry, snapshot } = this.client
       ? this.client.resolveTerminal(terminalAddr)
-      : { machine: null, entry: null };
+      : { machine: null, entry: null, snapshot: null };
 
     if (!checking() && this.client) {
       if (machine) {
@@ -154,6 +154,7 @@ export default class HyphaePane extends View {
       paneId: pane,
       terminal: terminalAddr,
       entry,
+      daemon: snapshot?.daemon ?? null,
       compact: density,
     });
 

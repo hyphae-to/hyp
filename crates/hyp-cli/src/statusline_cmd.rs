@@ -566,8 +566,33 @@ pub fn format_statusline_pill(
         };
     };
 
+    let quarantined_global = envelope
+        .get("daemon")
+        .and_then(Value::as_object)
+        .and_then(|d| d.get("quarantinedGlobal"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
     let sess = envelope.get("session").and_then(Value::as_object);
     let Some(sess) = sess else {
+        if quarantined_global > 0 {
+            let id_seg = if use_color {
+                "\x1b[32mhyphae\x1b[0m".to_string()
+            } else {
+                "hyphae".to_string()
+            };
+            let q_seg = if use_color {
+                format!("\x1b[1;31m⚠ {quarantined_global} held\x1b[0m")
+            } else {
+                format!("⚠ {quarantined_global} held")
+            };
+            let sep = if use_color {
+                "\x1b[2m · \x1b[0m"
+            } else {
+                " · "
+            };
+            return Some(format!("{id_seg}{sep}{q_seg}"));
+        }
         return match when_unenrolled {
             WhenUnenrolled::Hide => None,
             WhenUnenrolled::Dim => {
@@ -609,10 +634,11 @@ pub fn format_statusline_pill(
         .and_then(|c| c.get("queued"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let quarantined = counts
+    let session_quarantined = counts
         .and_then(|c| c.get("quarantined"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let quarantined = session_quarantined.max(quarantined_global);
     let muted_rules = counts
         .and_then(|c| c.get("mutedRules"))
         .and_then(Value::as_u64)
@@ -982,6 +1008,31 @@ mod tests {
         assert_eq!(
             format_statusline_pill(bridged.as_object(), WhenUnenrolled::Hide, false).as_deref(),
             Some("hyphae @integration-tests · telegram:personal")
+        );
+
+        // Global quarantine warning appears even when this session's own quarantine count is 0 (U3)
+        let global_q = json!({
+            "daemon": { "online": true, "nodeId": "alice@mac", "quarantinedGlobal": 3 },
+            "session": {
+                "enrolled": true,
+                "handle": "alice",
+                "counts": { "subscriptions": 1, "queued": 0, "quarantined": 0, "mutedRules": 0 }
+            }
+        });
+        assert_eq!(
+            format_statusline_pill(global_q.as_object(), WhenUnenrolled::Hide, false).as_deref(),
+            Some("hyphae @alice · 1 sub · ⚠ 3 held")
+        );
+
+        // Global quarantine warning still surfaces when session is null or unenrolled
+        let global_q_no_sess = json!({
+            "daemon": { "online": true, "nodeId": "alice@mac", "quarantinedGlobal": 2 },
+            "session": null
+        });
+        assert_eq!(
+            format_statusline_pill(global_q_no_sess.as_object(), WhenUnenrolled::Hide, false)
+                .as_deref(),
+            Some("hyphae · ⚠ 2 held")
         );
     }
 

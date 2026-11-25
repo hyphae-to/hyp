@@ -34,9 +34,12 @@ import {
   findLayoutNode,
   formatNextFire,
   formatRelativeAge,
+  getEffectiveQuarantinedCount,
   parseTerminalAddress,
+  qualifyChannelTarget,
   resolveSessionById,
   sanitizeUiText,
+  stripControlChars,
   withAlpha,
 } from "./shared-client.js";
 
@@ -462,9 +465,7 @@ export default class HyphaePanel extends View {
     const focusTint = t.accent || t.ansi4;
     const muteTint = t.blocked || t.ansi3 || t.muted;
 
-    const quarantinedLocal = Number(entry?.counts?.quarantined) || 0;
-    const quarantinedGlobal = Number(target.snapshot?.daemon?.quarantinedGlobal) || 0;
-    const quarantinedTotal = Math.max(quarantinedLocal, quarantinedGlobal);
+    const quarantinedTotal = getEffectiveQuarantinedCount(entry, target.snapshot);
 
     return v_flex()
       .id("hyphae-controls")
@@ -776,7 +777,10 @@ export default class HyphaePanel extends View {
                 .on_click((_e, clickCx) =>
                   this.runAction(
                     "unsubscribe",
-                    { id: sub.id, key: sub.key },
+                    {
+                      id: stripControlChars(sub.id || ""),
+                      key: sub.key ? stripControlChars(sub.key) : undefined,
+                    },
                     `Unsubscribed ${topic}`,
                     clickCx
                   )
@@ -867,6 +871,7 @@ export default class HyphaePanel extends View {
 
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
+      const rawSource = stripControlChars(item.source || "");
       const source = sanitizeUiText(item.source || "(unknown)", 64);
       const kind = sanitizeUiText(item.kind || "item", 16);
       const urgency = sanitizeUiText(item.urgency || "queue", 16);
@@ -936,7 +941,7 @@ export default class HyphaePanel extends View {
               .on_click((_e, clickCx) =>
                 this.runAction(
                   "mute",
-                  { pattern: source, scope: "session" },
+                  { pattern: rawSource || source, scope: "session" },
                   `Muted ${source}`,
                   clickCx
                 )
@@ -1018,6 +1023,7 @@ export default class HyphaePanel extends View {
     } else {
       for (let i = 0; i < mutes.length; i++) {
         const m = mutes[i];
+        const rawPattern = stripControlChars(m.pattern || "");
         const pattern = sanitizeUiText(m.pattern || "", 64);
         const scope = m.scope === "connector" ? "connector" : "session";
         rows.push(
@@ -1069,7 +1075,7 @@ export default class HyphaePanel extends View {
                 .on_click((_e, clickCx) =>
                   this.runAction(
                     "unmute",
-                    { pattern, scope },
+                    { pattern: rawPattern || pattern, scope },
                     `Unmuted ${pattern}`,
                     clickCx
                   )
@@ -1104,6 +1110,7 @@ export default class HyphaePanel extends View {
     } else {
       for (let i = 0; i < rules.length; i++) {
         const r = rules[i];
+        const rawRuleTarget = stripControlChars(r.target || "");
         const ruleTarget = sanitizeUiText(r.target || "", 64);
         const delivery = sanitizeUiText(r.delivery || "queue", 16);
         const next = nextUrgency(delivery);
@@ -1148,7 +1155,7 @@ export default class HyphaePanel extends View {
                 .on_click((_e, clickCx) =>
                   this.runAction(
                     "rule",
-                    { target: ruleTarget, delivery: next },
+                    { target: rawRuleTarget || ruleTarget, delivery: next },
                     `Rule ${ruleTarget} -> ${next}`,
                     clickCx
                   )
@@ -1209,10 +1216,11 @@ export default class HyphaePanel extends View {
         )
     );
 
+    const fallbackHostNode = stripControlChars(daemon?.nodeId || "") || "local";
     const channelEntries = Array.isArray(entry?.details?.channelEntries)
       ? entry.details.channelEntries
       : Array.isArray(entry?.details?.channels)
-        ? entry.details.channels.map((ch) => ({ channel: ch, hostNode: "local", mode: "open" }))
+        ? entry.details.channels.map((ch) => ({ channel: ch, hostNode: fallbackHostNode, mode: "open" }))
         : [];
 
     rows.push(
@@ -1240,6 +1248,13 @@ export default class HyphaePanel extends View {
       for (let i = 0; i < channelEntries.length; i++) {
         const ch = channelEntries[i];
         const chName = sanitizeUiText(ch.channel || "", 48);
+        const hostDisp = sanitizeUiText(ch.hostNode || "", 32);
+        const localDisp = sanitizeUiText(daemon?.nodeId || "", 32);
+        const displayChannel =
+          hostDisp && hostDisp !== "local" && hostDisp !== localDisp
+            ? `${hostDisp}/${chName}`
+            : chName;
+        const leaveTarget = qualifyChannelTarget(ch.hostNode, ch.channel, fallbackHostNode);
         const mode = sanitizeUiText(ch.mode || "open", 16);
         rows.push(
           h_flex()
@@ -1261,7 +1276,7 @@ export default class HyphaePanel extends View {
                 .font_medium()
                 .text_size(11.5)
                 .text_color(t.foreground)
-                .child(chName)
+                .child(displayChannel)
             )
             .child(
               div()
@@ -1289,7 +1304,7 @@ export default class HyphaePanel extends View {
                 .hover((s) => s.bg(withAlpha(t.ansi1 || t.blocked, "22")).text_color(t.ansi1 || t.blocked))
                 .on_mouse_down("left", (_e, mCx) => mCx.stop_propagation())
                 .on_click((_e, clickCx) =>
-                  this.runAction("leave", { channel: chName }, `Left ${chName}`, clickCx)
+                  this.runAction("leave", { channel: leaveTarget }, `Left ${displayChannel}`, clickCx)
                 )
                 .child("Leave")
             )
