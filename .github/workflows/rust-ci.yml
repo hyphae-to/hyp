@@ -81,11 +81,12 @@ jobs:
           cmp -s scripts/install.ps1 site/install.ps1
           cmp -s scripts/uninstall.sh site/uninstall.sh
           cmp -s scripts/uninstall.sh uninstall.sh
+          cmp -s scripts/uninstall.ps1 site/uninstall.ps1
 
           if command -v pwsh >/dev/null 2>&1; then
             pwsh -NoProfile -Command '
               $ErrorActionPreference = "Stop"
-              foreach ($path in @("scripts/install.ps1", "site/install.ps1")) {
+              foreach ($path in @("scripts/install.ps1", "site/install.ps1", "scripts/uninstall.ps1", "site/uninstall.ps1")) {
                 $tokens = $null
                 $errors = $null
                 $resolved = (Resolve-Path $path).Path
@@ -248,12 +249,12 @@ jobs:
             throw "Unexpected hyp.exe version --json output: $out"
           }
 
-      - name: Verify Windows PowerShell installer (AST, parity & dry-run)
+      - name: Verify Windows PowerShell installer & uninstaller (AST, parity & dry-run)
         if: runner.os == 'Windows' && needs.lint-site-and-plugins.outputs.skip_release_build != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          foreach ($path in @("scripts/install.ps1", "site/install.ps1")) {
+          foreach ($path in @("scripts/install.ps1", "site/install.ps1", "scripts/uninstall.ps1", "site/uninstall.ps1")) {
             $tokens = $null
             $errors = $null
             $resolved = (Resolve-Path $path).Path
@@ -263,14 +264,19 @@ jobs:
               throw "PowerShell syntax error(s) in ${path}:`n$msg"
             }
           }
-          $a = [System.IO.File]::ReadAllBytes((Resolve-Path "scripts/install.ps1").Path)
-          $b = [System.IO.File]::ReadAllBytes((Resolve-Path "site/install.ps1").Path)
-          if ($a.Length -ne $b.Length) {
-            throw "scripts/install.ps1 and site/install.ps1 differ in length ($($a.Length) vs $($b.Length))."
-          }
-          for ($i = 0; $i -lt $a.Length; $i++) {
-            if ($a[$i] -ne $b[$i]) {
-              throw "scripts/install.ps1 and site/install.ps1 differ at byte offset $i."
+          foreach ($pair in @(
+            @("scripts/install.ps1", "site/install.ps1"),
+            @("scripts/uninstall.ps1", "site/uninstall.ps1")
+          )) {
+            $a = [System.IO.File]::ReadAllBytes((Resolve-Path $pair[0]).Path)
+            $b = [System.IO.File]::ReadAllBytes((Resolve-Path $pair[1]).Path)
+            if ($a.Length -ne $b.Length) {
+              throw "$($pair[0]) and $($pair[1]) differ in length ($($a.Length) vs $($b.Length))."
+            }
+            for ($i = 0; $i -lt $a.Length; $i++) {
+              if ($a[$i] -ne $b[$i]) {
+                throw "$($pair[0]) and $($pair[1]) differ at byte offset $i."
+              }
             }
           }
           $dryOut = (& .\scripts\install.ps1 -Version v0.2.0-test -BaseUrl "http://127.0.0.1:1/test" -DryRun) | Out-String
@@ -278,4 +284,40 @@ jobs:
           if ($dryOut -notmatch "hyp-v0\.2\.0-test-x86_64-pc-windows-msvc\.zip") {
             throw "Unexpected Windows installer -DryRun output: $dryOut"
           }
-          Write-Host "PowerShell AST parse, byte-identical mirror parity & dry-run verified."
+          $tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("hyphae-ps1-ci-" + [System.Guid]::NewGuid().ToString("N"))
+          $tmpBin = Join-Path $tmpRoot "bin"
+          $tmpState = Join-Path $tmpRoot "state"
+          try {
+            New-Item -ItemType Directory -Force -Path $tmpBin, $tmpState | Out-Null
+            Set-Content -LiteralPath (Join-Path $tmpBin "hyp.exe") -Value "stub" -NoNewline
+            Set-Content -LiteralPath (Join-Path $tmpBin "hyp.exe.old") -Value "old" -NoNewline
+            Set-Content -LiteralPath (Join-Path $tmpState "node.json") -Value "{}" -NoNewline
+            $uDry = (& .\scripts\uninstall.ps1 -DryRun -InstallDir $tmpBin -StateDir $tmpState -KeepHarnesses) | Out-String
+            Write-Output $uDry
+            if ($uDry -notmatch "\[dry-run\]") {
+              throw "Unexpected Windows uninstaller -DryRun output: $uDry"
+            }
+            if (-not (Test-Path -LiteralPath (Join-Path $tmpBin "hyp.exe")) -or -not (Test-Path -LiteralPath (Join-Path $tmpState "node.json"))) {
+              throw "Windows uninstaller -DryRun modified files!"
+            }
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            & pwsh -NoProfile -File .\scripts\uninstall.ps1 -InstallDir $tmpBin -StateDir $tmpState -KeepHarnesses
+            $nonInteractiveRc = $LASTEXITCODE
+            $ErrorActionPreference = $prevEap
+            if ($nonInteractiveRc -ne 2) {
+              throw "Expected non-interactive uninstall.ps1 without -Yes to exit 2, got $nonInteractiveRc"
+            }
+            & pwsh -NoProfile -File .\scripts\uninstall.ps1 -Yes -InstallDir $tmpBin -StateDir $tmpState -KeepHarnesses
+            if ($LASTEXITCODE -ne 0) {
+              throw "Expected uninstall.ps1 -Yes to exit 0, got $LASTEXITCODE"
+            }
+            if ((Test-Path -LiteralPath $tmpBin) -or (Test-Path -LiteralPath $tmpState)) {
+              throw "Windows uninstaller -Yes failed to remove isolated test targets!"
+            }
+          } finally {
+            if (Test-Path -LiteralPath $tmpRoot) {
+              Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+          Write-Host "PowerShell AST parse, byte-identical mirror parity, dry-run & isolated uninstall verified."
