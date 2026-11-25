@@ -6063,60 +6063,69 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
   color: #cfcbc0;
 }
 
-/* ================= COMPACT SECURITY STUDIO GALLERY (#security) ================= */
-.sec-gallery {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+/* ================= BORDERLESS 4-COLUMN EDITORIAL SECURITY ROW (#security) ================= */
+.sec-intro-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
   gap: 16px;
+  margin-bottom: 28px;
 }
 
-.sec-plate-card {
+.sec-intro-row h2 {
+  margin-bottom: 0;
+}
+
+.sec-intro-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  padding-bottom: 4px;
+}
+
+.sec-strip {
   display: grid;
-  grid-template-columns: 238px minmax(0, 1fr);
-  align-items: stretch;
-  border-radius: 18px;
-  overflow: hidden;
-  background: linear-gradient(180deg, #faf8f2 0%, #f3efe4 100%);
-  border: 1px solid rgba(22, 23, 20, 0.13);
-  box-shadow: 0 18px 38px -28px rgba(18, 19, 16, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.85);
-  transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 20px;
+}
+
+.sec-item {
+  display: flex;
+  flex-direction: column;
   min-width: 0;
 }
 
-.sec-plate-card:hover {
-  transform: translateY(-2px);
-  border-color: rgba(65, 89, 29, 0.34);
-  box-shadow: 0 24px 44px -28px rgba(18, 19, 16, 0.36);
-}
-
-.sec-plate-media {
+.sec-plate {
   position: relative;
   width: 100%;
-  min-height: 152px;
-  background: #121510;
+  aspect-ratio: 16 / 9;
+  border-radius: 14px;
   overflow: hidden;
-  border-right: 1px solid rgba(22, 23, 20, 0.12);
+  background: #121510;
+  border: 1px solid rgba(22, 23, 20, 0.14);
+  box-shadow: 0 16px 32px -22px rgba(18, 19, 16, 0.42);
+  margin-bottom: 14px;
+  transition: transform 0.22s ease, box-shadow 0.22s ease, border-color 0.22s ease;
 }
 
-.sec-plate-media img {
+.sec-item:hover .sec-plate {
+  transform: translateY(-2px);
+  border-color: rgba(65, 89, 29, 0.36);
+  box-shadow: 0 22px 38px -22px rgba(18, 19, 16, 0.5);
+}
+
+.sec-plate img {
   width: 100%;
   height: 100%;
-  object-fit: contain;
-  object-position: center;
+  object-fit: cover;
   display: block;
-  transition: transform 0.42s cubic-bezier(0.22, 1, 0.36, 1);
+  transition: transform 0.4s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-.sec-plate-card:hover .sec-plate-media img {
-  transform: scale(1.035);
-}
-
-.sec-plate-media::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(180deg, rgba(16, 19, 14, 0.34) 0%, transparent 38%, transparent 80%, rgba(16, 19, 14, 0.26) 100%);
-  pointer-events: none;
+.sec-item:hover .sec-plate img {
+  transform: scale(1.03);
 }
 
 .sec-anim-overlay {
@@ -6178,89 +6187,30 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
   100% { transform: scale(1.75); opacity: 0; }
 }
 
-.sec-plate-pill {
-  position: absolute;
-  top: 9px;
-  left: 9px;
-  z-index: 3;
-  font-family: var(--mono);
-  font-size: 0.58rem;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  padding: 2.5px 8px;
-  border-radius: 999px;
-  background: rgba(14, 17, 12, 0.84);
-  backdrop-filter: blur(8px);
-  border: 1px solid rgba(244, 241, 232, 0.2);
-  color: var(--cream);
-}
-
-.sec-plate-pill.olive { border-color: rgba(183, 217, 86, 0.5); color: var(--chartreuse); }
-.sec-plate-pill.moss { border-color: rgba(127, 201, 123, 0.52); color: #a1e59d; }
-.sec-plate-pill.amber { border-color: rgba(232, 163, 49, 0.54); color: #ffd37d; }
-.sec-plate-pill.coral { border-color: rgba(255, 122, 92, 0.54); color: #ffb4a3; }
-
-.sec-plate-body {
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-  padding: 16px 18px 15px;
-  min-width: 0;
-}
-
-.sec-plate-body h3 {
-  margin: 0;
+.sec-item h3 {
+  margin: 0 0 6px;
   font-family: var(--serif);
-  font-size: 1.12rem;
+  font-size: 1.05rem;
   font-weight: 500;
-  line-height: 1.18;
+  line-height: 1.22;
   letter-spacing: -0.02em;
   color: var(--ink);
 }
 
-.sec-plate-body p {
+.sec-item p {
   margin: 0;
-  font-size: 0.81rem;
-  line-height: 1.48;
+  font-size: 0.82rem;
+  line-height: 1.52;
   color: var(--ink-soft);
 }
 
-.sec-plate-body code {
+.sec-item code {
   font-family: var(--mono);
-  font-size: 0.86em;
+  font-size: 0.85em;
   color: var(--olive);
-  background: rgba(65, 89, 29, 0.09);
+  background: rgba(65, 89, 29, 0.08);
   padding: 0.5px 4px;
   border-radius: 4px;
-}
-
-.sec-plate-chips {
-  margin-top: auto;
-  padding-top: 4px;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px;
-}
-
-.sec-plate-chips span {
-  font-family: var(--mono);
-  font-size: 0.61rem;
-  font-weight: 600;
-  color: var(--ink-soft);
-  background: rgba(22, 23, 20, 0.055);
-  border: 1px solid rgba(22, 23, 20, 0.1);
-  padding: 2px 7px;
-  border-radius: 6px;
-}
-
-.sec-foot-cta {
-  margin-top: 22px;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: center;
-  gap: 16px;
 }
 
 @keyframes svSlide {
@@ -6269,7 +6219,7 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
 }
 
 .compare-block {
-  margin-top: 56px;
+  margin-top: 64px;
 }
 
 /* ================= TOPO BETA TAG & WALKTHROUGH BOX ================= */
@@ -6454,7 +6404,7 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
 @media (max-width: 1040px) {
   .uc-showcase { grid-template-columns: minmax(0, 1fr); gap: 16px; }
   .uc-stage { min-height: 0; }
-  .sec-gallery { grid-template-columns: minmax(0, 1fr); }
+  .sec-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 22px; }
   .sb-grid { grid-template-columns: minmax(0, 1fr); gap: 14px; }
   .sb-wire-layer { display: none; }
   .sb-col-head.center { text-align: left; }
@@ -6472,8 +6422,6 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
   .uc-stage-head p { min-height: 0; }
   .uc-flow { grid-template-columns: minmax(0, 1fr); gap: 10px; }
   .uc-flow-wire { width: 2px; height: 18px; margin: 0 auto; }
-  .sec-plate-card { grid-template-columns: minmax(0, 1fr); }
-  .sec-plate-media { aspect-ratio: 16 / 9; min-height: 0; border-right: none; border-bottom: 1px solid rgba(22, 23, 20, 0.12); }
-  .sec-plate-body { padding: 16px; }
+  .sec-strip { grid-template-columns: minmax(0, 1fr); gap: 22px; }
   .walkthrough-toggle { padding: 14px 16px; }
 }
