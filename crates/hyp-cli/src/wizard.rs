@@ -3700,12 +3700,21 @@ pub fn build_herdr_app_keep_command(herdr_app_bin: &Path, terminal_address: &str
     cmd
 }
 
-fn try_open_in_herdr_app_tab(terminal_address: &str) -> bool {
+fn try_open_in_herdr_app_tab(terminal_address: &str, raise_window: bool) -> bool {
     let Some(herdr_app_bin) = find_executable_in_path("herdr-app") else {
         return false;
     };
     let mut cmd = build_herdr_app_keep_command(&herdr_app_bin, terminal_address);
-    matches!(output_retrying_busy(&mut cmd), Ok(out) if out.status.success())
+    let kept = matches!(output_retrying_busy(&mut cmd), Ok(out) if out.status.success());
+    if kept && raise_window {
+        // Bare `herdr-app` raises/focuses the running Herdr window without blocking our CLI.
+        let _ = Command::new(&herdr_app_bin)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+    kept
 }
 
 /// Builds the filtered main menu containing ONLY options actually detected/available on this machine.
@@ -4582,8 +4591,13 @@ fn spawn_herdr_template(
         );
     };
 
-    let opened_in_herdr_app = try_open_in_herdr_app_tab(&address);
-    let next = vec![format!("hc attach {address}")];
+    let raise_window = !as_json && io::stdout().is_terminal();
+    let opened_in_herdr_app = try_open_in_herdr_app_tab(&address, raise_window);
+    let next = if opened_in_herdr_app {
+        Vec::new()
+    } else {
+        vec![format!("hc attach {address}")]
+    };
     let summary = if opened_in_herdr_app {
         format!("Opened Herdr template '{template_name}' in a new Herdr app tab ({address})")
     } else {
@@ -4614,7 +4628,7 @@ fn spawn_herdr_template(
         println!("      Template: {template_name}");
         println!("      Terminal: {address}");
         if opened_in_herdr_app {
-            println!("      Window:   Herdr app (new tab)");
+            println!("      Window:   Herdr app (focused tab)");
         }
         print_next_steps(&next);
         return ExitCode::from(EXIT_OK);
