@@ -18,7 +18,7 @@
   <meta name="twitter:title" content="Hyphae (hyp) — One wire under every agent" />
   <meta name="twitter:description" content="A standardized real-time event and messaging bus for coding agents. Unify CI/GitHub events, alerts, cron triggers, Passkey secrets, and cross-machine team messages over one encrypted wire with per-agent exposure control." />
   <meta name="twitter:image" content="https://hyphae.to/assets/social-card.jpg" />
-  <link rel="stylesheet" href="./styles.css?v=20" />
+  <link rel="stylesheet" href="./styles.css?v=21" />
 </head>
 <body>
   <header id="siteHeader" class="header-dark">
@@ -84,11 +84,11 @@
               <code id="heroInstallCmd">curl -fsSL https://hyphae.to/install.sh | sh</code>
             </div>
             <div class="install-foot">
-              <span>Then run <code>hyp onboard</code> — wires your tools and starts the local daemon.</span>
+              <span>Checksum-verified · launches <code>hyp onboard</code> automatically.</span>
             </div>
             <noscript>
               <div class="install-noscript">
-                Windows (PowerShell): <code>irm https://hyphae.to/install.ps1 | iex</code> then <code>hyp onboard</code>
+                Windows (PowerShell): <code>irm https://hyphae.to/install.ps1 | iex</code>
               </div>
             </noscript>
           </div>
@@ -273,7 +273,7 @@
 
           <div class="ta-foot sb-foot">
             <p class="ta-caption" id="sbCaption">
-              <strong>Standardized event:</strong> GitHub CI failure wakes <code>Claude Code · laptop</code> immediately while teammate gets a 1-line digest.
+              <strong>CI event:</strong> Wakes laptop Claude; teammate gets 1-line digest.
             </p>
             <div class="ta-controls">
               <div class="ta-beats" id="sbBeats" role="group" aria-label="Signal examples">
@@ -340,7 +340,7 @@
             <button class="uc-tab" type="button" role="tab" aria-selected="false" data-uc="bridges">
               <span class="uc-tab-num">05</span>
               <span class="uc-tab-copy">
-                <span class="uc-tab-title"><strong>Personal chat bridges</strong><span class="uc-pill beta">Beta</span></span>
+                <span class="uc-tab-title"><strong>Personal chat bridges</strong><span class="uc-pill solid">Plugin</span></span>
                 <span class="uc-tab-sub">Wire private Slack, Telegram, or WhatsApp threads to live sessions on macOS, Linux &amp; Windows.</span>
               </span>
             </button>
@@ -404,7 +404,7 @@ hyp deploy init tailscale</pre>
     </section>
 
     <!-- =================================================================== -->
-    <!-- HOW IT WORKS: 3-Tier Harness Support + Unified Node Architecture    -->
+    <!-- HOW IT WORKS: Unified Node Architecture & Tool Support              -->
     <!-- =================================================================== -->
     <section id="how-it-works" class="arch-section">
       <div class="wrap arch-wrap">
@@ -412,53 +412,8 @@ hyp deploy init tailscale</pre>
           <span class="spec-num">How it works</span>
           <h2>Works with your tools.</h2>
           <p>
-            One ~8 MiB binary runs as a local daemon, wires each coding tool through native hooks and 4 MCP tools, and routes standardized signals through an inbox with delivery rules — locally on one laptop or encrypted across servers and teams.
+            One ~8 MiB binary runs natively on macOS, Linux, and Windows — wiring your coding tools through native hooks and 4 MCP tools onto one inbox locally or across machines.
           </p>
-        </div>
-
-        <!-- 3-Tier Harness Support Matrix -->
-        <div class="harness-tier-shell" aria-label="Harness support tiers">
-          <div class="ht-header">
-            <h3>Supported harnesses</h3>
-            <span class="ht-platform-note">macOS · Linux · Windows</span>
-          </div>
-          <div class="ht-grid">
-            <div class="ht-row ht-full">
-              <div class="ht-tier">
-                <span class="ht-pill full">Full</span>
-                <p>Identity, push wakeups, and status UI out of the box</p>
-              </div>
-              <div class="ht-tools">
-                <span class="ht-chip"><img src="./assets/icons/claude.svg" alt="" />Claude Code</span>
-                <span class="ht-chip"><img src="./assets/icons/antigravity.svg" alt="" />Antigravity</span>
-                <span class="ht-chip app"><img src="./assets/icons/herdr.png" alt="" />Herdr</span>
-                <span class="ht-chip"><img src="./assets/icons/openai.svg" alt="" />Codex</span>
-                <span class="ht-chip"><img src="./assets/icons/opencode.svg" alt="" />OpenCode</span>
-              </div>
-            </div>
-
-            <div class="ht-row ht-limits">
-              <div class="ht-tier">
-                <span class="ht-pill limits">Hook / Turn-Boundary</span>
-                <p>Signals deliver cleanly at tool and turn boundaries</p>
-              </div>
-              <div class="ht-tools">
-                <span class="ht-chip"><img src="./assets/icons/cursor.svg" alt="" />Cursor</span>
-                <span class="ht-chip"><img src="./assets/icons/gemini.svg" alt="" />Gemini CLI</span>
-              </div>
-            </div>
-
-            <div class="ht-row ht-exp">
-              <div class="ht-tier">
-                <span class="ht-pill exp">Experimental</span>
-                <p>MCP tools + skill ready; push hook integration evolving</p>
-              </div>
-              <div class="ht-tools">
-                <span class="ht-chip"><img src="./assets/icons/openclaw.svg" alt="" />OpenClaw</span>
-                <span class="ht-chip app"><img src="./assets/icons/t3code.png" alt="" />T3 Code</span>
-              </div>
-            </div>
-          </div>
         </div>
 
         <!-- Unified Node Visual Architecture Hub -->
@@ -565,7 +520,7 @@ hyp deploy init tailscale</pre>
                     <span>OpenClaw</span>
                   </span>
                   <span class="orch-nested">
-                    <em class="orch-etc">Experimental</em>
+                    <em class="orch-beta">Beta</em>
                   </span>
                 </div>
                 <div class="orch-row">
@@ -574,7 +529,7 @@ hyp deploy init tailscale</pre>
                     <span>T3 Code</span>
                   </span>
                   <span class="orch-nested">
-                    <em class="orch-etc">Experimental</em>
+                    <em class="orch-beta">Beta</em>
                   </span>
                 </div>
               </div>
@@ -776,7 +731,7 @@ hyp deploy init tailscale</pre>
                   </div>
                 </header>
                 <p class="card-lead">
-                  Send Passkey-signed approvals and Keychain secrets via <a class="card-inline-link" href="./drop/">Verified Human Drops ↗</a>, screen inbound text with guards, or add Slack, Telegram &amp; WhatsApp bridges (Beta).
+                  Send Passkey-signed approvals and Keychain secrets via <a class="card-inline-link" href="./drop/">Verified Human Drops ↗</a>, screen inbound text with guards, or add Slack, Telegram &amp; WhatsApp bridges.
                 </p>
 
                 <div class="hub-tile-grid rich">
@@ -784,21 +739,21 @@ hyp deploy init tailscale</pre>
                     <span class="tile-icon"><img src="./assets/icons/slack.svg" alt="" /></span>
                     <span class="tile-copy">
                       <strong>Slack</strong>
-                      <small>Bridge · Beta</small>
+                      <small>Socket Mode</small>
                     </span>
                   </div>
                   <div class="hub-tile rich">
                     <span class="tile-icon"><img src="./assets/icons/telegram.svg" alt="" /></span>
                     <span class="tile-copy">
                       <strong>Telegram</strong>
-                      <small>Bridge · Beta</small>
+                      <small>Bot bridge</small>
                     </span>
                   </div>
                   <div class="hub-tile rich">
                     <span class="tile-icon"><img src="./assets/icons/whatsapp.svg" alt="" /></span>
                     <span class="tile-copy">
                       <strong>WhatsApp</strong>
-                      <small>Bridge · Beta</small>
+                      <small>Cloud API</small>
                     </span>
                   </div>
                   <div class="hub-tile rich custom">
@@ -1364,11 +1319,11 @@ hyp deploy init tailscale</pre>
           </article>
         </div>
 
-        <!-- Collapsible 7-Step Multi-Machine Team Incident Walkthrough (Beta) -->
+        <!-- Collapsible 7-Step Multi-Machine Team Incident Walkthrough -->
         <div id="walkthrough" class="walkthrough-box">
           <button class="walkthrough-toggle" id="walkthroughToggle" type="button" aria-expanded="false" aria-controls="walkthroughBody">
             <span class="wt-left">
-              <span class="tc-tag beta">Beta Walkthrough</span>
+              <span class="tc-tag">Interactive Walkthrough</span>
               <strong>See the multi-machine team incident walkthrough</strong>
               <span class="wt-sub">7-step animated flow: Team Hub, Prometheus, GitHub PRs &amp; Slack bridge</span>
             </span>
@@ -1448,7 +1403,7 @@ hyp deploy init tailscale</pre>
                     </div>
 
                     <div class="entity" id="ent-node" style="left:47.1%; top:43.5%;">
-                      <span class="hub-badge">Team Node (Beta)</span>
+                      <span class="hub-badge">Team Node</span>
                       <div class="avatar-wrap">
                         <div class="ping-ripple" id="rip-node" style="width:186px; height:186px;"></div>
                         <div class="avatar-ring hub-ring"><img src="./assets/node-hub.webp?v=1" alt="Hyphae Team Node switchboard" /></div>
@@ -1626,13 +1581,10 @@ hyp deploy init tailscale</pre>
               </div>
               <button class="install-copy" id="qsCopyBtn" type="button">Copy</button>
             </div>
-            <pre class="qs-pre" id="qsPre"><span class="qs-comment"># 1. Install the binary (checksum verified)</span>
-curl -fsSL https://hyphae.to/install.sh | sh
-
-<span class="qs-comment"># 2. Wire your coding tools and start the local daemon</span>
-hyp onboard</pre>
+            <pre class="qs-pre" id="qsPre"><span class="qs-comment"># Checksum-verified install — launches hyp onboard automatically</span>
+curl -fsSL https://hyphae.to/install.sh | sh</pre>
             <p class="qs-os-note" id="qsOsNote">
-              macOS &amp; Linux: full support including native daemon, OS Keychain / Secret Service, and optional chat bridges.
+              macOS &amp; Linux: native daemon, OS Keychain / Secret Service, and optional chat bridges. Pass <code>--no-onboard</code> to skip the interactive wizard.
             </p>
             <div class="qs-term-foot">
               <span>One ~8 MiB binary · no Node or Python for core</span>
@@ -1644,15 +1596,15 @@ hyp onboard</pre>
           <div class="qs-facts">
             <div class="qs-next-head">
               <span class="spec-num">What happens next</span>
-              <h3>From install to two agents talking</h3>
+              <h3>From install to agents connected</h3>
             </div>
 
             <ol class="qs-steps">
               <li class="qs-step">
                 <span class="qs-step-num">1</span>
                 <div class="qs-step-body">
-                  <strong><code>hyp onboard</code> wires your tools</strong>
-                  <p>Detects your installed harnesses, registers native hooks and 4 MCP tools, and starts your local background daemon (or <code>schtasks</code> service on Windows).</p>
+                  <strong>Installer runs <code>hyp onboard</code> automatically</strong>
+                  <p>Detects your installed harnesses, registers native hooks and 4 MCP tools, and starts your local background service across macOS, Linux, and Windows.</p>
                 </div>
               </li>
               <li class="qs-step">
@@ -1665,15 +1617,11 @@ hyp onboard</pre>
               <li class="qs-step">
                 <span class="qs-step-num">3</span>
                 <div class="qs-step-body">
-                  <strong>Open two agents and say &ldquo;join the Hyphae mesh&rdquo;</strong>
-                  <p>Ask one session to message or assign a review to the other. Run <code>hyp doctor</code> any time to verify wiring.</p>
+                  <strong>Open your agents and say &ldquo;join the Hyphae mesh&rdquo;</strong>
+                  <p>Message across sessions, subscribe to streams, or pair another machine. Run <code>hyp doctor</code> any time to verify wiring.</p>
                 </div>
               </li>
             </ol>
-
-            <div class="qs-win-callout">
-              <strong>On Windows?</strong> Full native support: core <code>hyp</code>, MCP, hooks, <code>schtasks</code> service, <code>uninstall.ps1</code>, and optional chat bridges over authenticated loopback TCP.
-            </div>
 
             <div class="qs-cta-box">
               <a class="qs-gh-cta" href="https://github.com/hyphae-to/hyp/blob/main/docs/getting-started.md" target="_blank" rel="noreferrer">
@@ -1722,6 +1670,6 @@ hyp onboard</pre>
     <p class="cmp-pop-body" id="cmpPopBody"></p>
   </div>
 
-  <script type="module" src="./app.js?v=21"></script>
+  <script type="module" src="./app.js?v=22"></script>
 </body>
 </html>

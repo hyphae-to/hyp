@@ -92,7 +92,7 @@ renderHeroInstall();
       tone: "coral",
       rule: "github.ci → claude@laptop · zero polling",
       caption:
-        "<strong>Standardized event:</strong> GitHub CI failure wakes <code>Claude Code · laptop</code> immediately while teammate gets a 1-line digest.",
+        "<strong>CI event:</strong> Wakes laptop Claude; teammate gets 1-line digest.",
       out: [
         { cls: "coral", state: "lit" },
         { cls: "", state: "off" },
@@ -125,7 +125,7 @@ renderHeroInstall();
       tone: "olive",
       rule: "alex@macbook → codex@linux-ci · HPKE E2EE",
       caption:
-        "<strong>Messaging is a signal too:</strong> Encrypted team DMs wake idle agents across laptops &amp; build servers — zero polling loops.",
+        "<strong>Team DM:</strong> Wakes build-server Codex over E2EE.",
       out: [
         { cls: "", state: "off" },
         { cls: "olive", state: "lit" },
@@ -158,7 +158,7 @@ renderHeroInstall();
       tone: "moss",
       rule: "passkey.drop → OS Keychain · hyp exec --env",
       caption:
-        "<strong>Human approvals &amp; secrets:</strong> Face ID Passkey drop seals into OS Keychain and injects via <code>hyp exec</code> — never in LLM context.",
+        "<strong>Passkey drop:</strong> Lands in OS Keychain — never in prompts.",
       out: [
         { cls: "moss", state: "lit" },
         { cls: "", state: "off" },
@@ -191,7 +191,7 @@ renderHeroInstall();
       tone: "amber",
       rule: "hyp.emit → antigravity@team · 09:00 cron",
       caption:
-        "<strong>Scheduled &amp; noisy feeds:</strong> OS cron triggers and alerts normalize onto the same bus — waking only subscribed threads.",
+        "<strong>Cron / alerts:</strong> Wakes subscribed agent; others stay quiet.",
       out: [
         { cls: "amber", state: "soft" },
         { cls: "", state: "off" },
@@ -399,8 +399,8 @@ renderHeroInstall();
       link: { text: "See supported harnesses ↓", href: "#how-it-works" },
     },
     bridges: {
-      tone: "amber",
-      badge: "Beta · External Bridges",
+      tone: "olive",
+      badge: "Verified Bridge Plugins",
       title: "Message live coding sessions from Slack, Telegram, or WhatsApp",
       lead: "Install SHA-256 verified bridges with <code>hyp plugin install</code> on macOS, Linux, or Windows. Bot tokens stay in your OS Keychain, sender allowlists fail closed, and topics stay local-only by default.",
       from: { kind: "icon", src: "./assets/icons/telegram.svg", title: "Slack · Telegram · WhatsApp", sub: "Allowlisted private chat" },
@@ -2857,22 +2857,16 @@ document.querySelectorAll("[data-copy-topo]").forEach((btn) => {
 // ============================================================================
 const QS = {
   unix: {
-    code: `# 1. Install the binary (checksum verified)
-curl -fsSL https://hyphae.to/install.sh | sh
-
-# 2. Wire your coding tools and start the local daemon
-hyp onboard`,
-    copy: "curl -fsSL https://hyphae.to/install.sh | sh && hyp onboard",
-    note: "macOS & Linux: full support including native daemon, OS Keychain / Secret Service, and optional chat bridges.",
+    code: `# Checksum-verified install — launches hyp onboard automatically
+curl -fsSL https://hyphae.to/install.sh | sh`,
+    copy: "curl -fsSL https://hyphae.to/install.sh | sh",
+    note: "macOS & Linux: native daemon, OS Keychain / Secret Service, and optional chat bridges. Pass --no-onboard to skip the interactive wizard.",
   },
   win: {
-    code: `# 1. Install the binary (checksum verified, PowerShell)
-irm https://hyphae.to/install.ps1 | iex
-
-# 2. Wire your coding tools and start the scheduled service
-hyp onboard`,
-    copy: "irm https://hyphae.to/install.ps1 | iex; hyp onboard",
-    note: "Windows: full native support including MCP, hooks, schtasks service, uninstall.ps1, and optional chat bridges over authenticated loopback TCP.",
+    code: `# Checksum-verified PowerShell install — launches hyp onboard automatically
+irm https://hyphae.to/install.ps1 | iex`,
+    copy: "irm https://hyphae.to/install.ps1 | iex",
+    note: "Windows: native MCP, hooks, schtasks service, uninstall.ps1, and optional chat bridges over authenticated loopback TCP.",
   },
 };
 

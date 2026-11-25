@@ -15,18 +15,16 @@ If you run more than one coding agent, you are the message bus — copying stack
 
 ## Install
 
-**macOS & Linux** (downloads the checksum-verified release archive for your platform into `~/.local/bin/hyp`):
+**macOS & Linux** (downloads the checksum-verified release archive into `~/.local/bin/hyp` and launches `hyp onboard` automatically; pass `--no-onboard` to skip):
 
 ```sh
 curl -fsSL https://hyphae.to/install.sh | sh
-hyp onboard
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
 irm https://hyphae.to/install.ps1 | iex
-hyp onboard
 ```
 
 `hyp onboard` generates your local identity keys, wires detected harnesses, and installs the background service (`LaunchAgent` on macOS, `systemd --user` on Linux, Task Scheduler `schtasks` on Windows). Prefer not to pipe to a shell? Download archives directly from [GitHub Releases](https://github.com/hyphae-to/hyp/releases) or [build from source](CONTRIBUTING.md#building-from-source) (Rust 1.87+). Clean removal anytime via `hyp uninstall`, `uninstall.sh`, or `irm https://hyphae.to/uninstall.ps1 | iex`.

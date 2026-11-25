@@ -451,12 +451,12 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
 .story-bg {
   position: absolute;
   inset: 0;
-  background-image: url("./assets/hero-mycelium.jpg");
-  background-size: cover;
-  background-position: center center;
+  background-image: url("./assets/hero-mycelium.webp?v=2");
+  background-size: max(100%, 1440px) auto;
+  background-position: center top;
   background-repeat: no-repeat;
-  opacity: 0.62;
-  filter: saturate(0.95) contrast(1.04);
+  opacity: 0.78;
+  filter: saturate(1.04) contrast(1.06);
   pointer-events: none;
 }
 
@@ -465,8 +465,8 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   position: absolute;
   inset: 0;
   background:
-    radial-gradient(ellipse 68% 58% at 50% 34%, rgba(17, 20, 15, 0.28) 0%, rgba(17, 20, 15, 0.04) 58%, rgba(13, 16, 11, 0.72) 100%),
-    linear-gradient(180deg, rgba(14, 17, 13, 0.25) 0%, rgba(17, 20, 15, 0.04) 22%, rgba(14, 17, 13, 0.25) 75%, rgba(13, 16, 11, 0.88) 100%);
+    radial-gradient(ellipse 68% 58% at 50% 34%, rgba(17, 20, 15, 0.22) 0%, rgba(17, 20, 15, 0.04) 56%, rgba(13, 16, 11, 0.7) 100%),
+    linear-gradient(180deg, rgba(14, 17, 13, 0.24) 0%, rgba(17, 20, 15, 0.04) 22%, rgba(14, 17, 13, 0.28) 76%, rgba(13, 16, 11, 0.92) 100%);
 }
 
 .story-canvas {
@@ -2034,10 +2034,10 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   position: absolute;
   inset: 0;
   border-radius: inherit;
-  background-image: url("./assets/hero-mycelium.jpg");
+  background-image: url("./assets/hero-mycelium.webp?v=2");
   background-size: cover;
   background-position: center;
-  opacity: 0.28;
+  opacity: 0.32;
   mix-blend-mode: screen;
   pointer-events: none;
   z-index: 0;
@@ -2535,8 +2535,8 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
 .dark-band {
   position: relative;
   background-color: var(--obsidian);
-  background-image: url("./assets/streams-plate.jpg");
-  background-size: cover;
+  background-image: url("./assets/streams-plate.webp?v=2");
+  background-size: max(100%, 1440px) auto;
   background-position: center top;
   background-repeat: no-repeat;
   color: var(--cream);
@@ -2549,24 +2549,22 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
   content: "";
   position: absolute;
   inset: 0;
-  background: linear-gradient(180deg, rgba(16, 18, 14, 0.86) 0%, rgba(16, 18, 14, 0.78) 50%, rgba(16, 18, 14, 0.92) 100%);
+  background: linear-gradient(180deg, rgba(16, 18, 14, 0.74) 0%, rgba(16, 18, 14, 0.56) 46%, rgba(16, 18, 14, 0.88) 100%);
   pointer-events: none;
 }
 
-/* Rock-solid non-shifting backdrop for the permanently open #streams simulator */
+/* Crisp un-zoomed botanical oscilloscope plate behind permanently open #streams simulator */
 .streams-band {
-  background-image:
-    radial-gradient(ellipse 64% 48% at 50% 18%, rgba(183, 217, 86, 0.09) 0%, rgba(232, 163, 49, 0.04) 48%, transparent 76%),
-    linear-gradient(180deg, #121510 0%, #0f120d 100%);
-  background-size: 100% 100%, 100% 100%;
-  background-position: center top;
+  background-image: url("./assets/streams-plate.webp?v=2");
+  background-size: max(100%, 1440px) auto;
+  background-position: center 14%;
+  background-repeat: no-repeat;
 }
 
 .streams-band::before {
   background:
-    radial-gradient(rgba(183, 217, 86, 0.065) 1px, transparent 1px),
-    linear-gradient(180deg, rgba(14, 17, 12, 0.25) 0%, rgba(14, 17, 12, 0.08) 50%, rgba(14, 17, 12, 0.35) 100%);
-  background-size: 28px 28px, 100% 100%;
+    radial-gradient(ellipse 68% 54% at 50% 42%, rgba(16, 18, 14, 0.34) 0%, rgba(16, 18, 14, 0.74) 100%),
+    linear-gradient(180deg, rgba(16, 18, 14, 0.76) 0%, rgba(16, 18, 14, 0.52) 48%, rgba(16, 18, 14, 0.9) 100%);
 }
 
 .dark-band .wrap { position: relative; z-index: 2; }
@@ -4073,18 +4071,18 @@ header.header-light .btn-cta:hover { background: var(--olive-hover); }
 /* ================= COMPACT DARK TOPOLOGIES BAND (#topologies) ================= */
 .topo-band {
   padding: 64px 0 70px;
-  background-color: var(--obsidian);
+  background-color: #11140f;
   background-image:
-    radial-gradient(ellipse 58% 60% at 18% 50%, rgba(127, 201, 123, 0.095) 0%, transparent 62%),
-    radial-gradient(ellipse 50% 56% at 86% 62%, rgba(232, 163, 49, 0.085) 0%, transparent 64%),
-    linear-gradient(180deg, #131611 0%, #10130e 100%);
+    radial-gradient(ellipse 56% 52% at 16% 24%, rgba(127, 201, 123, 0.1) 0%, transparent 62%),
+    radial-gradient(ellipse 50% 48% at 86% 32%, rgba(232, 163, 49, 0.09) 0%, transparent 64%),
+    url("./assets/hero-mycelium.webp?v=2");
+  background-size: 100% 720px, 100% 720px, max(100%, 1440px) auto;
+  background-position: left top, right top, center top;
+  background-repeat: no-repeat, no-repeat, no-repeat;
 }
 
 .topo-band::before {
-  background:
-    radial-gradient(rgba(183, 217, 86, 0.07) 1px, transparent 1px),
-    linear-gradient(180deg, rgba(16, 19, 14, 0.5) 0%, rgba(16, 19, 14, 0.3) 50%, rgba(16, 19, 14, 0.58) 100%);
-  background-size: 26px 26px, 100% 100%;
+  background: linear-gradient(180deg, rgba(16, 19, 14, 0.32) 0%, rgba(16, 19, 14, 0.22) 48%, rgba(15, 18, 13, 0.72) 100%);
 }
 
 .topo-intro {
@@ -6006,133 +6004,12 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
   border-color: #d7f284;
 }
 
-/* ================= 3-TIER HARNESS SUPPORT MATRIX ================= */
-.harness-tier-shell {
-  position: relative;
-  z-index: 2;
-  background: #fdfcf8;
-  border: 1px solid rgba(22, 23, 20, 0.12);
-  border-radius: 18px;
-  padding: 16px 20px;
-  margin-bottom: 32px;
-  box-shadow: 0 16px 36px -28px rgba(18, 19, 16, 0.22);
-}
-
-.ht-header {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 12px;
-  padding-bottom: 10px;
-  border-bottom: 1px solid rgba(22, 23, 20, 0.08);
-}
-
-.ht-header h3 {
-  margin: 0;
-  font-family: var(--serif);
-  font-size: 1.08rem;
-  font-weight: 500;
-  color: var(--ink);
-}
-
-.ht-platform-note {
-  font-family: var(--mono);
-  font-size: 0.7rem;
-  color: var(--ink-muted);
-}
-
-.ht-grid {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.ht-row {
-  display: grid;
-  grid-template-columns: minmax(220px, 0.88fr) minmax(0, 1.52fr);
-  gap: 14px;
-  align-items: center;
-  padding: 9px 12px;
-  border-radius: 12px;
-  background: #f5f2e9;
-  border: 1px solid rgba(22, 23, 20, 0.075);
-}
-
-.ht-tier {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 3px;
-}
-
-.ht-tier p {
-  margin: 0;
-  font-size: 0.77rem;
-  color: var(--ink-soft);
-  line-height: 1.38;
-}
-
-.ht-pill {
-  font-family: var(--mono);
-  font-size: 0.65rem;
-  font-weight: 700;
-  padding: 2px 9px;
-  border-radius: 999px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.ht-pill.full {
-  background: rgba(65, 89, 29, 0.13);
-  border: 1px solid rgba(65, 89, 29, 0.32);
-  color: var(--olive);
-}
-
-.ht-pill.limits {
-  background: rgba(232, 163, 49, 0.16);
-  border: 1px solid rgba(196, 132, 22, 0.36);
+/* Crisp Beta badge inside #how-it-works orchestrator rows (OpenClaw, T3 Code) */
+.orch-nested em.orch-beta {
   color: #8f5807;
-}
-
-.ht-pill.exp {
-  background: rgba(22, 23, 20, 0.06);
-  border: 1px solid rgba(22, 23, 20, 0.16);
-  color: var(--ink-soft);
-}
-
-.ht-tools {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 7px;
-}
-
-.ht-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  padding: 5px 10px;
-  border-radius: 9px;
-  background: #ffffff;
-  border: 1px solid rgba(22, 23, 20, 0.09);
-  font-size: 0.79rem;
+  background: rgba(232, 163, 49, 0.16);
+  border-color: rgba(196, 132, 22, 0.38);
   font-weight: 600;
-  color: var(--ink);
-}
-
-.ht-chip img {
-  width: 15px;
-  height: 15px;
-  object-fit: contain;
-  display: block;
-}
-
-.ht-chip.app img {
-  width: 17px;
-  height: 17px;
-  border-radius: 4px;
-  object-fit: cover;
 }
 
 .arch-doc-foot {
