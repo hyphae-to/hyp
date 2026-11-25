@@ -12,7 +12,7 @@ flowchart LR
     direction TB
     subgraph AdaptersIn["Local Adapters"]
       Harnesses["Harness Adapters (9 harnesses via connector.sock / connector.addr + ~2.7ms hooks + wait/watch)"]
-      Sources["Event Source Adapters (github-public, github-webhook, prometheus-webhook, webhook-stream, fd-3)"]
+      Sources["Event Source Adapters (localIngest ingest.sock / hyp emit, github-public, github-webhook, prometheus-webhook, webhook-stream, fd-3)"]
       Bridges["Optional External Chat Bridges (plugins/slack, telegram, whatsapp via JSON-RPC 2.0 / fd-3 v1)"]
     end
 
@@ -75,15 +75,14 @@ Every `Node` bundles four cleanly separated layers:
    - Published as standard **RFC 7517 / RFC 8037 OKP JWKs** (`Ed25519` + `X25519`) with **RFC 7638 SHA-256 JWK Thumbprints** (`kid`).
    - Optional offline Org Root Admin-CA keypair (`admin-ca-<hash12>`) used by admins to issue `am2_` grants without ever placing the Admin private key on the Team Hub host.
 
-2. **Single Unified SQLite WAL Store (`node.sqlite` in `crates/hyp-store`, schema v4):**
+2. **Single Unified SQLite WAL Store (`node.sqlite` in `crates/hyp-store`, schema v5):**
    - One WAL-mode SQLite database (`rusqlite` bundled SQLite, `PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;`), driven by an exact deadline scheduler (`next_deadline_ms()`) with zero polling loops.
-   - Logical table groups migrated atomically in one `BEGIN IMMEDIATE` transaction (through `CURRENT_SCHEMA_VERSION = 4`):
+   - Logical table groups migrated atomically in one `BEGIN IMMEDIATE` transaction (through `CURRENT_SCHEMA_VERSION = 5`):
      - **Universal Event & Messaging Bus (`events.rs`, `messages.rs`, `transfers.rs`):** `handles`, `events`, `subscriptions`, `batches`, `batch_events`, `upstream_pushdowns`, `channel_members`, `channel_epochs`, `transfers`
      - **Shared State (`kv.rs`):** `kv_entries`, `kv_epochs`
      - **Federation & Trust (`peers.rs`):** `peers`, `grants`, `revocations`, `peer_keys`, `directory_checkpoints`
      - **Local Runtime & Security (`local.rs`):** `metadata`, `sessions`, `mailbox` (with `gate_state`), `deliveries`, `muted_sources`, `plugin_targets`, `bridge_links`, `gate_audit` (protected by SQLite immutability triggers)
-     - **Schema v3 — Opt-In Local Wakeups (`wakeups.rs`):** `wakeups` (durable one-shot timers and 5-field local/UTC crons claimed atomically by `next_deadline_ms()` with zero write-lock overhead when idle)
-     - **Schema v4 — Verified Human Authority (`human.rs`):** `human_authorities` (enrolled Tier 1 Ed25519 phone Passkey+PRF & CLI keys + revocation epoch), `human_nonces` (single-use `claim_id` replay protection pruned by deadline scheduler), and `human_node_certs` (`NodeCertV1` anti-phishing node bindings)
+     - **Schema v4–v5 — Verified Human Authority (`human.rs`, `0005_human_enc_jwk.sql`):** `human_authorities` (enrolled Tier 1 Ed25519 phone Passkey+PRF & CLI keys, revocation epoch, and additive schema v5 `enc_jwk_json` storing the companion Passkey-PRF X25519 public key for HPKE-encrypted directive draft prefills `encDraft`, bound into `human_authorities_digest` / `gate_policy_sig`), `human_nonces` (single-use `claim_id` replay protection pruned by deadline scheduler), and `human_node_certs` (`NodeCertV1` anti-phishing node bindings)
 
 3. **Uniform Composable Adapter Trait (`NodeAdapter` in `crates/hyp-node/src/adapters/trait_def.rs`):**
    Every external integration attaches to `UnifiedNode` through one narrow trait (`AdapterKind::{Harness, Source, Bridge, PeerLink}`):
@@ -91,7 +90,7 @@ Every `Node` bundles four cleanly separated layers:
 | Adapter Class | Concrete Implementations | Architectural Benefit |
 | --- | --- | --- |
 | **(a) Harness Adapters** (`crates/hyp-harness`, `crates/hyp-cli/src/skill_render.rs`) | Unix socket server (`connector.sock`, `0600`) / Windows loopback TCP (`connector.addr`), `CallRegistry` hooks (`PreToolUse`/`PostToolUse`/`PreInvocation`/`Stop`), Claude native channel, `hyp wait`/`hyp watch`, Codex rollout/queue, T3 Code (`statev2.sqlite`), Herdr (`hc`), Cursor, OpenCode, Gemini CLI, OpenClaw; orchestrator-aware tailored `hyphae/SKILL.md` rendering (`hyp setup --refresh-skills` / `--force-skills`) + dynamic backend-aware MCP `initialize.instructions`. | Calls `UnifiedNode` in-process with zero loopback HTTP overhead, ~2.7 ms hook latency, and zero duplicate messaging/scheduling instructions on OpenClaw or Antigravity. |
-| **(b) Compiled-In Event Source Adapters** (`crates/hyp-node/src/adapters/`) | Pure-Rust in-process `github-public`, `github-webhook`, `prometheus-webhook`, `webhook-stream`, and opt-in `wakeup` calling `host.publish_event()` directly + demand-driven `on_subscriptions_changed()` / `validate_subscription()` hooks. | Zero Node/Python runtime needed for core streams or local timer/cron/OS wakeups; no extra loopback webhook hop. |
+| **(b) Compiled-In Event Source Adapters & Local Ingest** (`crates/hyp-node/src/adapters/`, `engine/local_ingest.rs`) | Pure-Rust in-process `github-public`, `github-webhook`, `prometheus-webhook`, `webhook-stream`, plus the default-enabled socket-only Local Ingest Route (`localIngest` on `0600` `ingest.sock` / Windows `ingest.addr`, `hyp emit` -> `local.schedule` / `local.<topic>`) calling `host.publish_event()` directly + demand-driven `on_subscriptions_changed()` / `validate_subscription()` hooks. | Zero Node/Python runtime and zero extra MCP tools needed for core streams or OS-scheduled triggers (`systemd-run`, `crontab`, `launchd`, `schtasks`); no extra loopback webhook hop. |
 | **(c) Optional External Bridges & Custom Sources** (`plugins/` + `SubprocessSupervisor`) | Optional external scripts (`plugins/slack`, `plugins/telegram`, `plugins/whatsapp`, `plugins/webhook`, `plugins/prometheus`, or custom binaries) supervised over duplex Unix fd 3 (JSON-RPC 2.0 v2 + auto-detected legacy fd-3 v1). | One bounded 64 KiB supervisor with scrubbed `ALLOWED_PARENT_ENV`, `bridge_links`, live `handoff`, and outbound `hyp_send({ to: "<plugin>:<target>" })`. |
 | **(d) Peer Node Links** (`PeerLink` in `crates/hyp-node/src/engine/peer_link.rs`) | Bidirectional `hyper 1` HTTPS + WHATWG SSE link to any remote Hyphae `Node`. | Eliminates `"primary"` hegemony: Team Hubs, public read-only nodes, and Direct P2P laptops are all symmetric `PeerLink`s. |
 
@@ -118,7 +117,7 @@ Both `NodeId` (`/^[a-z0-9][a-z0-9@._-]{0,63}$/`) and `Topic` (`/^[a-z0-9][a-z0-9
 
 | Entity | Canonical Qualified Form | Shorthand | Deterministic Resolution Rule |
 | --- | --- | --- | --- |
-| **Local event topic** | `local.<topic>` (e.g. `local.github`, `local.kv`) | `<topic>` (when targeting local) | Exact prefix `local.` always targets this Node's local `EventStore`. |
+| **Local event topic** | `local.<topic>` (e.g. `local.schedule`, `local.github`, `local.kv`) | `<topic>` (when targeting local) | Exact prefix `local.` always targets this Node's local `EventStore` (including default `localIngest` routes on `local.schedule` / `local.local`). |
 | **Remote event topic** | `<node-id>.<topic>` (e.g. `acme-team.github`, `public.hyphae.to.github`) | `<topic>` + explicit router | Match longest known paired `<peer-id>` followed by `.` (so `public.hyphae.to.github` resolves `peer = "public.hyphae.to"`, `topic = "github"`). |
 | **Direct agent peer** | `<node-id>/<handle>` (e.g. `alice@macbook/claude`, `local/codex`) | `<handle>` -> `local/<handle>` | `local/<h>` expands to `<self.nodeId>/<h>`. Remote `<nodeId>/<h>` resolves via direct `PeerLink`, else hub `PeerLink` advertising `<nodeId>`. |
 | **Room / `#channel`** | `<node-id>/#channel` (e.g. `acme-team/#incidents`, `local/#scratch`) | `#channel` | Bare `#channel` targets the default active hub peer, or `local` if standalone. |
@@ -237,7 +236,7 @@ Every v2 `Node` serves a signed **Node Capability Manifest** (`crates/hyp-proto/
 | `p2p.direct.v1` / `p2p.relay.v1` | Direct node-to-node peer links / optional blind relay |
 | `keys.prekey.v1` / `directory.checkpoint.v1` | Rotating prekeys / signed anti-rollback directory checkpoints |
 | `node.self-update.v1` | Signed remote fleet update orchestration (`hyp update --all`, requires `node:update` scope) |
-| `human.auth.v1` (`HumanAuthV1`) | Tier 1 Ed25519 Verified Human Drops (`hdrop1_`, `hcert1_`, `TrustTier::HumanVerified`, zero-knowledge `SecretStore` drops) |
+| `human.auth.v1` (`HumanAuthV1`) | Tier 1 Ed25519 + companion X25519 (`enc_jwk_json`, schema v5) Verified Human Drops (`hdrop1_`, `hcert1_`, HPKE `human.draft.v1` `encDraft` directive prefills, `TrustTier::HumanVerified`, zero-knowledge `SecretStore` drops, and `hyphaesig` signed local ingest events) |
 | `drop.relay.v1` (`DropRelayV1`) | RAM-only zeroized ciphertext Blind Drop Relay (`POST /v1/drops`, stateless `hdcap1_` caps, burn-after-read SSE catch-up) |
 
 ### 3.2 Capability Negotiation & Fail-Closed Skew Diagnostics
@@ -330,9 +329,9 @@ flowchart LR
 
 ### 5.2 Stage 1 (Deterministic) & Stage 2 (Pluggable `FilterPlugin` Chain)
 
-- **Stage 1 (`stage1.rs`):** Identity/E2EE verification, trust-tier tagging (`self`, `human-verified`, `org`, `peer`, `guest`, `external-webhook`, `bridge`), mutes, CloudEvents Filter AST allow/denylists, per-sender token-bucket rate limits, payload size caps, inbound regex denylists, **outbound secret DLP scanner**, **streaming `tar.gz` attachment guard**, and automatic `guest`/`external-webhook` downgrade to `notify`/quarantine. Cryptographically verified human directives (`TrustTier::HumanVerified`) bypass Stage 2 untrusted-peer filters while recording immutable `human_authority` rows in `gate_audit`.
+- **Stage 1 (`stage1.rs`):** Identity/E2EE verification, trust-tier tagging (`self`, `human-verified`, `org`, `peer`, `guest`, `external-webhook`, `bridge`), mutes, CloudEvents Filter AST allow/denylists, per-sender token-bucket rate limits, payload size caps, inbound regex denylists, **outbound secret DLP scanner**, **streaming `tar.gz` attachment guard**, and automatic `guest`/`external-webhook` downgrade to `notify`/quarantine. Socket-only `localIngest` routes (`gate: true`) screen inbound local events here too: verified `hyphaesig` events (`ed25519:<kid>:<b64url>`) and Verified Human Directives receive `TrustTier::HumanVerified`, bypassing Stage 2 untrusted-peer filters while recording immutable `human_authority` / `local_ingest` rows in `gate_audit` (`requireSignature: true` fails closed on unsigned events).
 - **Stage 2 (`stage2.rs`, `plugins.rs`):** Composable chain of 6 adapters (`anthropic`, `openai-compat`/Ollama, `google`, `lakera-guard`, `http-classifier`, JSON-RPC 2.0 `subprocess`), all isolated with zero tools/workspace/secrets, compiled-in immutable core rubric + additive `policy_notes`, randomized 64-bit untrusted payload fences, `max_input_chars = 16,384`, `max_output_tokens = 160`, `timeout_ms = 4,000`, `max_concurrent = 4` (`Hold("gate_busy")`), `min_allow_confidence = 0.75`, and fail-closed `on_error: quarantine | block`.
-- **Tamper-Evident Policy Signature (`gate_policy_sig`):** Domain-separated HMAC-SHA256 over canonical JCS of `gate` config (binding `human_authorities_digest` against `node.sqlite`'s `human_authorities`) keyed from `SecretStore` (`gate-policy-hmac-key`), locked via `hyp gate init --adapter ... --lock` or `hyp gate lock`.
+- **Tamper-Evident Policy Signature (`gate_policy_sig`):** Domain-separated HMAC-SHA256 over canonical JCS of `gate` config (binding `human_authorities_digest` — including schema v5 `enc_jwk_json` — against `node.sqlite`'s `human_authorities`) keyed from `SecretStore` (`gate-policy-hmac-key`), locked via `hyp gate init --adapter ... --lock` or `hyp gate lock`.
 - **Audit & Human Review CLI:**
   - `hyp gate log [--decision all|quarantined|blocked|allowed|error] [--limit 50] [--session <id>] [--json]`
   - `hyp gate review [--session <id>] [--limit 50] [--json]`
@@ -369,10 +368,10 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-  Cli["crates/hyp-cli (Single static 'hyp' binary, clap, agent-first --json/TTY UI, deploy, pair, gate, kv, secret, update)"]
+  Cli["crates/hyp-cli (Single static 'hyp' binary, clap, Braille mycelium wizard, agent-first --json/TTY UI, deploy, pair, emit, auth, drop, gate, kv, secret, update)"]
   Harness["crates/hyp-harness (9 harness adapters, CallRegistry, stateless MCP stdio shim, ~2.7ms sync hooks, LocalDaemon, wait/watch)"]
-  Node["crates/hyp-node (UnifiedNode, hyper 1 HTTP/SSE server & PeerLink, Pushdown, github-public & webhooks, fd-3 Supervisor, Security Gates, DeliveryEngine)"]
-  Store["crates/hyp-store (Unified rusqlite bundled WAL node.sqlite, atomic migrations, Event/Message/Channel/Kv/Transfer/Local/Peer stores, exact deadline scheduler)"]
+  Node["crates/hyp-node (UnifiedNode, hyper 1 HTTP/SSE server & PeerLink, LocalIngestServer, Pushdown, github-public & webhooks, fd-3 Supervisor, Security Gates, DeliveryEngine)"]
+  Store["crates/hyp-store (Unified rusqlite bundled WAL node.sqlite schema v5, atomic migrations, Event/Message/Channel/Kv/Transfer/Local/Peer/Human stores, exact deadline scheduler)"]
   Crypto["crates/hyp-crypto (ring Ed25519/X25519/AES-GCM/HMAC, RFC 9180 HPKE, JCS, OKP JWK, zeroize, am2_/hp2p1_/v1 compat, tar.gz streaming AEAD, SecretStore)"]
   Proto["crates/hyp-proto (CloudEvents v1.0 + traceparent, Address parser, Filter AST, Scopes v2, Signed Manifest + A2A, RFC 9457 Problem Details, JSON-RPC 2.0)"]
 

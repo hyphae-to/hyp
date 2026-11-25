@@ -33,7 +33,11 @@ cargo install --path crates/hyp-cli
 
 ## 2. Bootstrap Your Local Node
 
-Run `hyp onboard` in an interactive terminal to launch the fullscreen arrow-key **Mycelium onboarding TUI wizard** (automatically falling back to prompts/flags on non-TTY pipes, or pass `--assist` to let your coding agent run setup). To bootstrap non-interactively in one command:
+Run `hyp onboard` in an interactive terminal to launch the borderless high-resolution 2×4 Unicode Braille organic mycelium & continuously glowing **`HYPHAE`** interactive onboarding TUI wizard (automatically falling back to prompts/flags on non-TTY pipes, or pass `--assist` to let your coding agent run setup):
+- **Inside Herdr (`HC_TERMINAL_ID` set)**: discovered Herdr launch templates appear directly on the main menu; launching any template runs `hc run --bg --outlive-parent` and immediately attaches your interactive TTY (`hc attach <address>`).
+- **Claude Desktop & Codex Desktop**: previews and confirms an atomic non-destructive MCP config merge (`claude_desktop_config.json` / `~/.codex/config.toml`), shows a restart reminder, and offers **`[o] Open in App`** verified deep links (`claude://claude.ai/new?q=...`, `codex://threads/new?prompt=...`, `opencode://new-session?...`, `t3code://`, `cursor://`) with automatic clipboard fallback.
+
+To bootstrap non-interactively in one command:
 
 ```sh
 hyp onboard --profile local --node-id alice@macbook --harness auto
@@ -173,29 +177,47 @@ hyp doctor
 
 ---
 
-## 5. Opt-In Wakeups & Verified Human Drops
+## 5. Local Ingest Scheduling (`hyp emit`) & Verified Human Drops
 
-### A. Enable Local Wakeups & OS Cron Triggers
+### A. Schedule Local Wakeups via `ingest.sock` / `hyp emit` & `hyp_stream`
 
-Add the compiled-in `wakeup` event source once (writes a `kind: "wakeup"` entry in `node.json`; default `--mcp-tool auto` exposes `hyp_wakeup` on Herdr/Codex/Claude/T3/Cursor/OpenCode/Gemini while keeping 0 extra tokens on OpenClaw & Antigravity):
+Hyphae's **socket-only Local Ingest Route** (`~/.config/hyphae/state/ingest.sock` `0600` on Unix / `<state_dir>/ingest.addr` loopback TCP + constant-time bearer token on Windows) is **enabled by default** under `localIngest` in `node.json` — zero extra MCP tools and zero separate enable command required:
 
-```sh
-hyp wakeup enable
-hyp wakeup set --in 15m --label check-ci --note "Verify CI build"
-hyp wakeup set --cron "0 9 * * 1-5" --timezone local --label morning-triage --to dev
+1. **Subscribe with standard `hyp_stream`:**
+   ```json
+   hyp_stream({
+     "action": "subscribe",
+     "topic": "local.schedule",
+     "filters": [{ "exact": { "label": "check-ci" } }],
+     "urgency": "interrupt"
+   })
+   ```
+2. **Schedule an OS trigger calling `hyp emit` (or writing NDJSON directly to `ingest.sock`):**
+   ```sh
+   # One-shot Linux timer
+   systemd-run --user --on-active=15m -- hyp emit --label check-ci --note "Verify build"
 
-# One-liner for crontab / systemd --user / launchd:
-hyp wakeup fire --to dev --label nightly-audit --note "Check advisories"
-```
+   # Recurring cron (crontab -e)
+   # 0 9 * * 1-5 /usr/local/bin/hyp emit --label morning-triage --note "Review open PRs"
 
-See [skills/hyphae-wakeup/SKILL.md](../skills/hyphae-wakeup/SKILL.md) and [docs/plugins.md](plugins.md) for OS scheduler examples and the Tier 1–4 delivery ladder.
+   # Raw Unix socket NDJSON
+   printf '{"type":"to.hyphae.scheduled.v1","label":"check-ci","note":"Done"}\n' \
+     | nc -U ~/.config/hyphae/state/ingest.sock
+
+   # Optional signed high-trust trigger (attaches Ed25519 hyphaesig -> TrustTier::HumanVerified)
+   hyp emit --sign --label prod-rollout --note "Start canary"
+   ```
+
+See [skills/hyphae-schedule/SKILL.md](../skills/hyphae-schedule/SKILL.md) and [docs/plugins.md](plugins.md) for macOS `launchd` / Windows `schtasks` recipes, declarative `localIngest` route policy (`allowedTypes`, `allowedTopics`, `filters`, `maxPerMinute`, `burst`, `onLimit`, `gate`, `requireSignature`), and the Tier 1–3 delivery ladder + opt-in Tier 4 revival.
 
 ### B. Enroll a Phone Passkey & Configure a Drop Relay
 
 Verified Human Drops let you send zero-knowledge OS Keychain secrets and `TrustTier::HumanVerified` directives straight from your phone (`https://hyphae.to/drop`) or laptop CLI:
 
 ```sh
-# 1. Pair your phone's WebAuthn Passkey+PRF (or omit --web for a local CLI Ed25519 key in Keychain)
+# 1. Pair your phone's WebAuthn Passkey+PRF — 1 prompt derives BOTH Ed25519 signing
+#    and companion X25519 draft-encryption keys (`enc_jwk_json`, schema v5)
+#    (omit --web for a local CLI Ed25519 key in Keychain)
 hyp auth init --web
 hyp auth list
 
@@ -203,12 +225,13 @@ hyp auth list
 hyp relay set https://drop.example.com
 hyp relay status
 
-# 3. Mint a one-shot drop link (zero-knowledge secret or verified directive) and wait for it
+# 3. Mint a one-shot drop link (fresh secret OR HPKE-encrypted directive prefill) and wait
 hyp drop create --kind secret --secret-name stripe-key
+hyp drop create --kind directive --draft "Approve staging deploy for v0.5.0"
 hyp drop wait
 ```
 
-*(Agents can also request a fresh human drop link via `hyp_mesh({ action: "drop_link", kind: "secret", secretName: "stripe-key" })` — never pre-filling directive text and never seeing secret bytes.)*
+*(Agents can also request a drop link via `hyp_mesh({ action: "drop_link", kind: "secret", secretName: "stripe-key" })` or `hyp_mesh({ action: "drop_link", kind: "directive", draft: "..." })` — directive drafts are HPKE-encrypted (`human.draft.v1`) directly into `#drop=` (`encDraft`) with zero plaintext leak even when pasted into Slack/Telegram/WhatsApp/SMS, and are strictly forbidden for `kind: "secret"`. On `https://hyphae.to/drop`, 1 Face ID / Touch ID tap unlocks & decrypts the draft in RAM with an amber untrusted-draft banner, auto-expanded BiDi-safe review box, and mandatory confirmation checkbox before signing and wiping RAM.)*
 
 ---
 

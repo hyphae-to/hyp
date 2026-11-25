@@ -156,7 +156,7 @@ hyp relay status
 ```
 
 What `drop-relay` (and `--enable-drop-relay` on `public-node`, `vps`, `docker`, `tailscale`, `fly`) configures:
-- **RAM-Only Bounded Zeroized Buffer**: Holds encrypted `hdrop1_` ciphertext strictly in bounded RAM (`maxMemoryMb: 256` default), zeroized on burn-after-read ack or TTL expiry — zero disk writes and zero plaintext ever in relay RAM.
+- **RAM-Only Bounded Zeroized Buffer**: Holds encrypted `hdrop1_` ciphertext strictly in bounded RAM (`maxMemoryMb: 256` default), zeroized on burn-after-read ack or TTL expiry — zero disk writes and zero plaintext ever in relay RAM. Also seamlessly supports v0.5.0 HPKE-encrypted directive prefills (`encDraft` / `human.draft.v1`), which remain encrypted inside `#drop=` until unlocked in RAM via 1-tap Face ID / Touch ID on `https://hyphae.to/drop`.
 - **Stateless `hdcap1_` Capabilities**: Upload and claim requests carry HMAC-SHA256 stateless capability tokens (`hdcap1_`) verified **before** reading the HTTP request body, preventing unauthenticated memory exhaustion.
 - **Authenticated Slot Creation (`drop:create`)**: Only authorized paired peers holding `drop:create` can allocate ephemeral slots via `POST /v1/drops`.
 - **Burn-After-Read SSE Catch-Up**: Target nodes catch up over `GET /v1/drops/{id}/stream` (Caddy `flush_interval -1`) and atomically erase ciphertext via `POST /v1/drops/{id}/ack`.

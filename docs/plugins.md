@@ -10,7 +10,7 @@ Hyphae v2 unifies event sources and chat bridges onto the single Rust `Node` Clo
 
 | Layer | Implementation | Routing Model | Secrets Location | Best For |
 | --- | --- | --- | --- | --- |
-| **Compiled-In Rust Event Sources** (`crates/hyp-node/src/adapters/`) | Pure Rust in-process (`github-public`, `github-webhook`, `prometheus-webhook`, `webhook-stream`, opt-in `wakeup`) — zero Node/Python needed | **1-to-many Pub/Sub** via `hyp_stream` with server-side CloudEvents filter pushdown (and local scheduled wakeups via `hyp_wakeup` / `hyp wakeup`) | Node's `SecretStore` (`{ "secret": "<name>" }` in `node.json`) | Public or org **GitHub** streams (`github-public` ETag poller + GitHub App webhooks), **Prometheus Alertmanager v4**, signed **HTTP webhooks**, and opt-in local **Wakeups & OS Cron triggers** |
+| **Compiled-In Rust Event Sources & Local Ingest** (`crates/hyp-node/src/adapters/`, `engine/local_ingest.rs`) | Pure Rust in-process (`github-public`, `github-webhook`, `prometheus-webhook`, `webhook-stream`, plus default-enabled socket-only `localIngest` on `ingest.sock` / `ingest.addr`) — zero Node/Python needed | **1-to-many Pub/Sub** via standard `hyp_stream` with server-side CloudEvents filter pushdown (including `local.schedule` / `local.<topic>` triggered via `hyp emit` or raw NDJSON) | Node's `SecretStore` (`{ "secret": "<name>" }` in `node.json`) | Public or org **GitHub** streams (`github-public` ETag poller + GitHub App webhooks), **Prometheus Alertmanager v4**, signed **HTTP webhooks**, and OS-scheduled **Local Ingest & Cron triggers** |
 | **External Subprocess Bridges & Custom Sources** (`plugins/`) | Optional self-contained scripts (`plugins/slack`, `plugins/telegram`, `plugins/whatsapp`, `plugins/webhook`, `plugins/prometheus`, or custom executables) supervised by `SubprocessSupervisor` over fd 3 | **Thread-owned + multi-thread fan-in + outbound replies** via `hyp_bridge` and `hyp_send({ to: "<plugin>:<target>", text })` | Local machine's `SecretStore` — scrubbed subprocess env, never sent to remote hubs | Personal **Slack / Telegram / WhatsApp** bridges, local callbacks, and custom scripts in any language |
 
 ---
@@ -76,61 +76,96 @@ Pure-Rust normalizers verify HMAC-SHA256 / bearer tokens in constant time (`ring
 - **Prometheus Alertmanager v4**: Emits one CloudEvent per alert (`io.prometheus.alert.firing` / `io.prometheus.alert.resolved`) with `alertname`, `severity`, `service`, and `subject: "severity=<severity>/<alertname>"`.
 - **Generic Webhook**: Optional constant-time HMAC-SHA256 verification and CloudEvents v1.0 pass-through/wrapping.
 
-### C. `wakeup` — Opt-In Local Timer, Cron & OS Scheduler Source
+### C. `localIngest` — Default Socket-Only Local Event Ingest Route (`ingest.sock` & `hyp emit`)
 
-Compiled directly into `hyp`, the opt-in `wakeup` source provides durable one-shot timers, 5-field local/UTC crons (stored in `node.sqlite`'s `wakeups` table and driven by `next_deadline_ms()` with zero polling loops), and direct local OS scheduler ingestion (`crontab`, `systemd --user`, `launchd`). See [skills/hyphae-wakeup/SKILL.md](../skills/hyphae-wakeup/SKILL.md) for agent recipes.
+Compiled directly into `hyp` (`crates/hyp-node/src/engine/local_ingest.rs`) and **enabled by default** with zero extra MCP tools, the socket-only Local Ingest Route lets local scripts and OS schedulers (`systemd-run --user`, `crontab`, `launchd`, `schtasks`) push structured CloudEvents v1.0 (or compact JSON shorthand) onto `local.schedule` (default) or any configured `local.<topic>` — with **zero FIFO pipes**, strict local permissions, declarative route filters, rate limiting, Security Gate screening, and optional Ed25519 signature verification. See [skills/hyphae-schedule/SKILL.md](../skills/hyphae-schedule/SKILL.md) for agent recipes.
 
-Enable once via CLI (writes a `kind: "wakeup"` entry into `sources[]` in `node.json`):
-
-```sh
-hyp wakeup enable                         # default --mcp-tool auto
-hyp wakeup enable --mcp-tool always       # force hyp_wakeup on every harness
-hyp wakeup enable --mcp-tool never        # CLI & OS triggers only (0 MCP tool tokens)
-hyp wakeup disable                        # cleanly disable the wakeup source
-```
+- **Socket-only transport & DoS bounds**: Listens on `~/.config/hyphae/state/ingest.sock` (`0600` Unix domain socket inside `0700` dir) on macOS/Linux, or loopback `127.0.0.1` TCP + `0600` `<state_dir>/ingest.addr` protected by a constant-time 32-byte CSPRNG bearer token on Windows. Enforces 64 KiB max NDJSON lines, 5 s read timeout, and 64 max concurrent connections.
+- **Declarative policy (`localIngest` in `node.json`)**: If omitted, Hyphae activates a built-in default route accepting `to.hyphae.scheduled.v1` and `to.hyphae.local.v1` on `["schedule", "local"]` (`maxPerMinute: 30`, `burst: 10`, `onLimit: "drop"`, `maxPayloadBytes: 32768`, `gate: true`, `requireSignature: false`). Override or add stricter routes declaratively:
 
 ```json
 {
-  "sources": [
-    {
-      "id": "wakeup",
-      "kind": "wakeup",
-      "enabled": true,
-      "mcpTool": "auto"
-    }
-  ]
+  "localIngest": {
+    "enabled": true,
+    "defaultTopic": "schedule",
+    "routes": [
+      {
+        "id": "signed-ops",
+        "allowedTypes": ["to.hyphae.scheduled.v1"],
+        "allowedTopics": ["schedule"],
+        "filters": [{ "prefix": { "label": "prod-" } }],
+        "maxPerMinute": 10,
+        "burst": 3,
+        "onLimit": "coalesce",
+        "maxPayloadBytes": 32768,
+        "gate": true,
+        "requireSignature": true
+      },
+      {
+        "id": "default-schedule",
+        "allowedTypes": ["to.hyphae.scheduled.v1", "to.hyphae.local.v1"],
+        "allowedTopics": ["schedule", "local"],
+        "filters": [],
+        "maxPerMinute": 30,
+        "burst": 10,
+        "onLimit": "drop",
+        "maxPayloadBytes": 32768,
+        "gate": true,
+        "requireSignature": false
+      }
+    ]
+  }
 }
 ```
 
-- **Orchestrator-aware MCP exposure (`mcpTool: "auto"`)**: Exposes `hyp_wakeup` on harnesses without native scheduling (**Herdr**, **Codex**, **Claude**, **T3 Code**, **Cursor**, **OpenCode**, **Gemini CLI**) while keeping **0 extra MCP tokens** on orchestrators with built-in schedulers (**OpenClaw** and **Antigravity**). Agent-created recurring crons enforce `maxIterations <= 50` so background loops stay bounded.
-- **CLI & OS triggers (`crontab`, `systemd --user`, `launchd`)**: Speaks directly over the user-only `0600` local daemon IPC socket (`connector.sock` / Windows `connector.addr`):
-  ```sh
-  # One-shot timers & recurring crons (machine local timezone by default; pass --timezone UTC for UTC)
-  hyp wakeup set --in 15m --label check-ci --note "Check macOS shard"
-  hyp wakeup set --at 2026-11-25T16:00:00Z --label release-cut --to release
-  hyp wakeup set --cron "0 9 * * 1-5" --timezone local --label morning-triage --to dev
+- **2-step scheduling flow for agents & OS triggers**:
+  1. Subscribe using the standard **`hyp_stream`** MCP tool:
+     ```json
+     hyp_stream({
+       "action": "subscribe",
+       "topic": "local.schedule",
+       "filters": [{ "exact": { "label": "check-ci" } }],
+       "urgency": "interrupt"
+     })
+     ```
+  2. Emit via **`hyp emit`** from any OS scheduler or write NDJSON directly to `ingest.sock`:
+     ```sh
+     # One-shot Linux (systemd-run --user)
+     systemd-run --user --on-active=15m -- hyp emit --label check-ci --note "Verify build"
 
-  # Manage active schedules
-  hyp wakeup list
-  hyp wakeup cancel <id>
+     # Recurring Unix (crontab -e)
+     0 9 * * 1-5 /usr/local/bin/hyp emit --label morning-triage --note "Review open PRs"
 
-  # Immediate trigger one-liner for crontab / systemd --user / launchd
-  hyp wakeup fire --to dev --label nightly-audit --note "Review dependency advisories"
+     # Windows Task Scheduler (schtasks)
+     schtasks /Create /SC DAILY /TN "HyphaeMorningTriage" /ST 09:00 /TR "hyp emit --label morning-triage --note \"Review open PRs\""
 
-  # Pipe compact JSON or CloudEvents v1.0 over stdin (safe for scripts & hooks)
-  printf '{"label":"backup-done","to":"ops","note":"Snapshot verified"}' | hyp wakeup emit
-  ```
-- **Best-effort Tier 1–4 delivery ladder**:
+     # Raw Unix socket NDJSON (zero CLI spawn)
+     printf '{"type":"to.hyphae.scheduled.v1","label":"check-ci","note":"Done"}\n' \
+       | nc -U ~/.config/hyphae/state/ingest.sock
+
+     # Optional Ed25519-signed trigger (attaches hyphaesig -> TrustTier::HumanVerified)
+     hyp emit --sign --label prod-rollout --note "Start canary"
+     ```
+- **Signature verification & Security Gate**: Whenever an inbound event carries the `hyphaesig` CloudEvents extension (`ed25519:<kid>:<b64url>`), it is **always** verified fail-closed against active `human_authorities` and upgrades the event to `TrustTier::HumanVerified` (writing an immutable `gate_audit` row). Routes with `requireSignature: true` reject unsigned events fail-closed. With `gate: true`, all matching events pass through `SecurityGatePipeline` before publishing onto `local.<topic>`.
+- **Rate limiting (`onLimit`)**: `"drop"` rejects excess bursts (`rate_limited`); `"coalesce"` collapses saturated bursts under a shared mailbox coalesce key.
+- **Inherited Tier 1–3 delivery ladder (+ opt-in Tier 4 revival)**:
   1. **Tier 1 / 2 (Native push)**: Delivers immediately to live sessions via `hc send`/`hc interrupt`, T3 RPC, `codex queue`, hooks, `--claude-channel`, or `hyp wait`.
   2. **Tier 3 (Busy `Hold` backoff & durable mailbox)**: Busy turns enter bounded retry backoff (`5s -> 15s -> 30s -> 60s`), cancelled immediately if a hook drains first, and coalesce cleanly in the durable local mailbox with TTL.
   3. **Tier 4 (Strictly opt-in cold revival)**: Offline sessions are never spawned unexpectedly unless explicitly opted in via `node.json` (`codexResume` or allowlisted `herdrSpawnAllowlist`).
 
 ### Subscribing from Any Agent (`hyp_stream`)
 
-Agents inspect topics and subscribe with CloudEvents Subscriptions API v1.0 filters (pushed down to upstream nodes so non-matching events never cross the wire):
+Agents inspect topics and subscribe with CloudEvents Subscriptions API v1.0 filters (pushed down to upstream nodes so non-matching events never cross the wire, and evaluated locally for `local.schedule` / `local.<topic>`):
 
 ```json
 hyp_stream({ "action": "topics" })
+
+hyp_stream({
+  "action": "subscribe",
+  "topic": "local.schedule",
+  "filters": [{ "exact": { "label": "check-ci" } }],
+  "urgency": "interrupt"
+})
 
 hyp_stream({
   "action": "subscribe",

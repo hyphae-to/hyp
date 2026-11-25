@@ -72,13 +72,15 @@ Implemented in `crates/hyp-node/src/gates/` and controlled strictly via the huma
 
 Verified Human Drops provide a cryptographic out-of-band channel from an enrolled human (phone or laptop) directly to a target Hyphae Node without exposing secrets to relays, logs, SQLite, or agent LLM contexts:
 
-- **Tier 1 Ed25519-Only Human Authority**:
-  - **Phone WebAuthn Passkey+PRF** (`https://hyphae.to/drop` — self-contained static page, zero CDN, strict CSP; Face ID / Touch ID PRF output -> HKDF-SHA256 -> Ed25519 signing keypair).
+- **Tier 1 Ed25519 + Companion X25519 Human Authority**:
+  - **Phone WebAuthn Passkey+PRF** (`https://hyphae.to/drop` — self-contained static page, zero CDN, strict CSP): during `hyp auth init --web`, a single Face ID / Touch ID PRF prompt derives **both** the Ed25519 signing keypair and a companion X25519 draft-encryption keypair (`human_authorities.enc_jwk_json`, schema v5). Both public keys are bound into `human_authorities_digest` / `gate_policy_sig`.
   - **Laptop CLI Ed25519 keys** stored strictly in `SecretStore` (macOS Keychain / Linux Secret Service / `0600` file).
   - Managed strictly via human CLI: `hyp auth init [--web]`, `hyp auth add`, `hyp auth list`, `hyp auth revoke <kid> [--bump-epoch]`, `hyp auth certify-node`, and `hyp auth sign --kind directive|secret` (reading stdin).
-- **Anti-Phishing `NodeCertV1` (`hcert1_`) & Fresh-Input-Only Invariant**:
+- **Anti-Phishing `NodeCertV1` (`hcert1_`) & Encrypted Directive Prefill (`encDraft`-Only)**:
   - Target nodes carry human-signed `NodeCertV1` certificates (`human_node_certs`) binding `nodeId` and X25519 encryption JWK so the portal verifies the recipient node before sealing.
-  - Drop links (`hyp drop create` or `hyp_mesh({ action: "drop_link", kind, secretName? })`) **never** carry agent-prefilled `proposedText` — defeating tap-to-approve phishing by requiring fresh human input for every directive or secret.
+  - Plaintext prefill fields in drop URLs remain strictly forbidden. For **`kind: "directive"` ONLY**, `hyp drop create --kind directive --draft "..."` (or `--draft-stdin`) and `hyp_mesh({ action: "drop_link", kind: "directive", draft: "..." })` HPKE-encrypt the proposed draft (`human.draft.v1`, AAD-bound to `nodeId` + `recipientKid`, bucket-padded, validated ≤ 512 chars with C0/C1 control, zero-width, and BiDi override characters rejected fail-closed) to the human's Passkey-PRF X25519 public key directly inside `#drop=` (`encDraft`) — **zero plaintext leak even if the link is pasted into Slack, Telegram, WhatsApp, or SMS**.
+  - Draft prefills are **strictly forbidden for `kind: "secret"`** (secrets are always typed fresh).
+  - On `https://hyphae.to/drop`, **1 Face ID / Touch ID tap** unlocks & decrypts the draft in RAM -> amber *"Draft proposed by agent (untrusted)"* banner -> auto-expanded no-scroll BiDi-safe review box -> mandatory confirmation checkbox (*"I have read and approve every line above"*) -> Sign & Send -> immediate RAM wipe.
 - **Sealed Drops (`hdrop1_`) & Replay Protection**:
   - Sealed with RFC 9180 HPKE (`DHKEM(X25519, HKDF-SHA256)` + `AES-256-GCM`) and Ed25519-signed over RFC 8785 JCS.
   - Every drop embeds a single-use `claim_id` recorded atomically in `human_nonces` (and pruned after expiry by the exact deadline scheduler) so replayed envelopes fail closed.
@@ -112,7 +114,8 @@ Verified Human Drops provide a cryptographic out-of-band channel from an enrolle
 
 ## 7. Untrusted External Framing & Chat Bridge Guards
 
-- **Untrusted external data**: All peer messages, `#channel` posts, webhooks, wakeup `note`/`data` trigger payloads, bridged chat texts, and remote `403 not_granted` escalation notes (capped at `512` UTF-8 bytes, stripped of control characters, wrapped as `{ untrusted: true, provenance, text }`) are strictly delimited as untrusted data — never instructions.
+- **Untrusted external data**: All peer messages, `#channel` posts, webhooks, unsigned local ingest (`ingest.sock` / `hyp emit`) event payloads, bridged chat texts, and remote `403 not_granted` escalation notes (capped at `512` UTF-8 bytes, stripped of control characters, wrapped as `{ untrusted: true, provenance, text }`) are strictly delimited as untrusted data — never instructions.
+- **Socket-only Local Event Ingest (`localIngest` / `ingest.sock`)**: Listens strictly on a user-only `0600` Unix domain socket (`~/.config/hyphae/state/ingest.sock` inside a `0700` directory; loopback TCP + `0600` constant-time 32-byte bearer token `ingest.addr` on Windows — never FIFO pipes), enforcing 64 KiB max NDJSON lines, 5 s read timeout, 64 max concurrent connections, per-route CloudEvents allowlists (`allowedTypes`, `allowedTopics`, Filter AST), `maxPayloadBytes`, token-bucket rate/burst caps (`onLimit: "drop" | "coalesce"`), and `SecurityGatePipeline` screening (`gate: true`). Optional attached Ed25519 `hyphaesig` extensions (`ed25519:<kid>:<b64url>`) are **always** verified fail-closed against active `human_authorities` when present (upgrading verified events to `TrustTier::HumanVerified` with an immutable `gate_audit` row); routes setting `requireSignature: true` reject unsigned events fail-closed.
 - **Fail-closed chat bridge allowlists**: Optional external scripts `plugins/slack/index.mjs`, `plugins/telegram/index.mjs`, and `plugins/whatsapp/index.mjs` drop unauthorized senders unless explicit allowlists (`SLACK_ALLOWED_USERS`/`SLACK_ALLOWED_CHANNELS`, `TELEGRAM_ALLOWED_USERS`/`TELEGRAM_ALLOWED_CHATS`, `WHATSAPP_ALLOWED_NUMBERS`) are configured.
 - **Constant-time signed webhooks**: Compiled-in `GitHubWebhookAdapter`, `GitHubPublicAdapter` (`POST /v1/webhooks/github-app`), `PrometheusWebhookAdapter`, and `GenericWebhookAdapter` verify `X-Hub-Signature-256` / bearer tokens / HMAC-SHA256 in constant time (`ring::hmac`).
 
@@ -120,6 +123,6 @@ Verified Human Drops provide a cryptographic out-of-band channel from an enrolle
 
 ## 8. Network, Transport & Self-Update Hardening
 
-- **Loopback-only binding & private IPC**: Remote-capable profiles bind `127.0.0.1:8790` behind TLS termination (Tailscale Serve, Caddy, Cloudflare Tunnel, or Fly Proxy); `deploy check` fails closed on unprotected wildcard binds. Local IPC uses a `0600` Unix domain socket (`connector.sock`) on macOS/Linux or loopback `127.0.0.1` TCP (`connector.addr`) on Windows.
+- **Loopback-only binding & private IPC**: Remote-capable profiles bind `127.0.0.1:8790` behind TLS termination (Tailscale Serve, Caddy, Cloudflare Tunnel, or Fly Proxy); `deploy check` fails closed on unprotected wildcard binds. Local IPC and default local event ingestion use user-only `0600` Unix domain sockets (`connector.sock`, `ingest.sock`) on macOS/Linux or loopback `127.0.0.1` TCP (`connector.addr`, `ingest.addr` with constant-time bearer token) on Windows.
 - **No implicit open relay**: `forwarding.mode` defaults to `"deny"` (only `"deny"` or explicit `"allowlist"` is accepted), backed by `hyphaevia`/`hyphaehops` cycle and hop-limit checks (hard cap `4`).
 - **Signed self-update (`hyp update`)**: Release manifests are RFC 8785 JCS canonicalized and Ed25519-signed under `"hyphae/v2/release\n"`, checked for version & `publishedAt` anti-rollback, verified against constant-time archive SHA-256 before extraction, and smoke-tested (`hyp version --json`) with automatic rollback (`hyp.prev` / `hyp.old.exe`) on failure.

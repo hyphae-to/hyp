@@ -210,5 +210,5 @@ hyp deploy init public-node \
 ```
 
 - **Strict `drop:create` isolation**: Default self-service `guest-ro` grants strictly **exclude** `drop:create`, so anonymous public-node guests cannot allocate relay slots. Operators grant `drop:create` explicitly only to trusted/paired nodes (or issue dedicated `am2_` grants).
-- **Zero-disk ciphertext & health telemetry**: Relay slots hold only bounded RAM-only ciphertext verified via stateless HMAC-SHA256 `hdcap1_` tokens before reading request bodies, burned on `POST /v1/drops/{id}/ack` or TTL expiry. `GET /v1/health` reports only aggregate `dropRelay` counters (zero slot IDs or payloads).
+- **Zero-disk ciphertext & health telemetry**: Relay slots hold only bounded RAM-only ciphertext verified via stateless HMAC-SHA256 `hdcap1_` tokens before reading request bodies, burned on `POST /v1/drops/{id}/ack` or TTL expiry. Works seamlessly with both zero-knowledge secret drops and v0.5.0 HPKE-encrypted directive prefills (`encDraft` / `human.draft.v1` sealed in `#drop=`). `GET /v1/health` reports only aggregate `dropRelay` counters (zero slot IDs or payloads).
 - Want a dedicated relay-only host without public GitHub streams? Use `hyp deploy init drop-relay --domain drop.example.com --max-memory-mb 256` (see [docs/deploying.md](deploying.md)).

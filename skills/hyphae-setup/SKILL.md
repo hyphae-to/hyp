@@ -3,8 +3,9 @@ name: hyphae-setup
 description: >-
   Interactive setup, first-time onboarding, and ongoing configuration concierge for Hyphae (`hyp`) —
   local node, 9 coding harnesses with orchestrator-aware skills, native wakeup transports (Herdr `hc`,
-  Codex Queue, `--claude-channel`, T3 Code, OpenClaw), opt-in local wakeups & OS cron triggers,
-  Verified Human Drops & Blind Drop Relay, Direct P2P (`hp2p1_`), Team Hubs (`am2_`),
+  Codex Queue, `--claude-channel`, T3 Code, OpenClaw), default socket-only Local Ingest Route
+  (`ingest.sock` / `hyp emit`) & OS cron triggers, Verified Human Drops (with HPKE-encrypted
+  directive prefills) & Blind Drop Relay, Direct P2P (`hp2p1_`), Team Hubs (`am2_`),
   Public Nodes, GitHub/Prometheus/webhook streams, Slack/Telegram bridges, and Local Security Gates.
 ---
 
@@ -27,7 +28,7 @@ command -v hc >/dev/null && hc templates --json || true
 
 Use the results to pick the right mode automatically:
 - **Mode 1 — First-Time Onboarding**: no `~/.config/hyphae/node.json` (or legacy `connector.json`) exists yet, or identity keys / harnesses have not been configured.
-- **Mode 2 — Ongoing Configuration Changes**: a node already exists (`nodeId`, keys, and `node.sqlite` present) and the user wants to add/remove harnesses, refresh tailored skills (`--refresh-skills`), configure native wakeup transports or opt-in local wakeups (`hyp wakeup enable`), enroll Verified Human Drops (`hyp auth init --web`, `hyp drop`, `hyp relay`), pair a laptop/server, deploy a Team Hub / Public Node / Drop Relay, wire streams/bridges, configure a Security Gate, or fix `hyp doctor` warnings.
+- **Mode 2 — Ongoing Configuration Changes**: a node already exists (`nodeId`, keys, and `node.sqlite` present) and the user wants to add/remove harnesses, refresh tailored skills (`--refresh-skills`), configure native wakeup transports or customize `localIngest` routes (`ingest.sock` / `hyp emit` -> `local.schedule`), enroll Verified Human Drops (`hyp auth init --web`, `hyp drop`, `hyp relay`), pair a laptop/server, deploy a Team Hub / Public Node / Drop Relay, wire streams/bridges, configure a Security Gate, or fix `hyp doctor` warnings.
 
 ---
 
@@ -55,11 +56,11 @@ Start with **2–3 concise questions** (adapt based on what `hyp doctor --json` 
    - **Direct P2P** (`--profile p2p`, `hp2p1_`) — pair directly with another laptop/server (zero central hub).
    - **Team Hub** (`--profile router`, `am2_`) — join an org's blind E2EE Team Hub or deploy a new one.
    - **Public Read-Only Node** (`guest-ro`) — subscribe to read-only GitHub event streams (e.g., `https://public.hyphae.to` or self-hosted `public-node`).
-3. **Optional integrations**: Do they want opt-in local wakeups & OS cron triggers (`hyp wakeup enable`), Verified Human Drops (`hyp auth init --web` + Drop Relay), event streams (GitHub `github-public`, webhooks, Prometheus Alertmanager v4), external local chat bridges (`plugins/slack`, `plugins/telegram`, `plugins/whatsapp`, `plugins/webhook`), or a Local Security Gate prompt-injection guard?
+3. **Optional integrations**: Do they want custom `localIngest` route policy / OS cron triggers (`ingest.sock` / `hyp emit` is enabled by default on `local.schedule`), Verified Human Drops (`hyp auth init --web` + Drop Relay + encrypted directive prefills), event streams (GitHub `github-public`, webhooks, Prometheus Alertmanager v4), external local chat bridges (`plugins/slack`, `plugins/telegram`, `plugins/whatsapp`, `plugins/webhook`), or a Local Security Gate prompt-injection guard?
 
 ### Step 1.1 — Bootstrap Node, Keys & Harnesses
 
-Running `hyp onboard` interactively opens the fullscreen arrow-key Mycelium TUI wizard; when driving setup as an agent, pass `--yes` so `hyp onboard` runs non-interactively:
+Running `hyp onboard` interactively opens the borderless high-res 2×4 Unicode Braille organic mycelium & glowing **`HYPHAE`** interactive TUI wizard (when `HC_TERMINAL_ID` is set inside Herdr, discovered Herdr launch templates appear directly on the main menu and launch via `hc run --bg --outlive-parent` + immediate TTY `hc attach <address>`); when driving setup as an agent, pass `--yes` so `hyp onboard` runs non-interactively:
 
 ```sh
 # Local workstation node (default profile: local)
@@ -81,12 +82,12 @@ hyp setup --harness claude,codex,antigravity --json
 
 Check which orchestrators and native push transports are present on this machine and wire them cleanly so idle agents wake automatically without polling:
 
-- **Herdr (`hc`)**: Terminal orchestrator with reusable launch templates (`hc templates --json`, `hc run <template> <task>`). When agents run inside Herdr tabs, Hyphae verifies terminal identity and pushes wakeups (both queued and urgent interrupts) directly into live tabs. Wire with `hyp setup --harness herdr --json`.
+- **Herdr (`hc`)**: Terminal orchestrator with reusable launch templates (`hc templates --json`, `hc run --bg --outlive-parent <template> <task>` + `hc attach <address>`). When `HC_TERMINAL_ID` is set, `hyp onboard` surfaces discovered Herdr launch templates right on the main menu, launches them detached with `--outlive-parent`, and immediately attaches the user's interactive TTY. When agents run inside Herdr tabs, Hyphae verifies terminal identity and pushes wakeups (both queued and urgent interrupts) directly into live tabs. Wire with `hyp setup --harness herdr --json`.
 - **Codex Queue**: Native push transport for Codex CLI sessions (`hyp mcp --backend codex`, plus `--thread <uuid>`, `--resume`, or `--remote <addr>` for standalone threads). Delivers mesh messages directly into idle Codex threads via `codex queue` alongside hooks (`hyp setup --harness codex --json`).
 - **Claude Native Push Channel (`--claude-channel`)**: Opt-in MCP push channel for Claude Code (`hyp mcp --claude-channel`) emitting `notifications/claude/channel` directly into live sessions in addition to `PreToolUse`/`PostToolUse`/`Stop` hooks (`hyp setup --harness claude --json`).
 - **T3 Code (`t3`)**: Desktop/web orchestrator that spawns Claude and Codex threads. Hyphae resolves active threads via read-only `statev2.sqlite` and pushes wakeups over authenticated WebSocket RPC. Wire with `hyp setup --harness t3 --json`, store any T3 session token out-of-band via `hyp secret set t3-session-token --web` (never plaintext), and install `hyphae-setup` via `hyp onboard --assist t3` so T3-spawned Claude/Codex threads discover it.
 - **OpenClaw (`openclaw`)**: Daemon/GUI orchestrator configured in `~/.openclaw/openclaw.json` (`hyp mcp --backend openclaw --ephemeral`) with its orchestrator skill at `~/.openclaw/skills/hyphae/SKILL.md`. Wire with `hyp setup --harness openclaw --json`; for guided onboarding inside OpenClaw, run `hyp onboard --assist openclaw` to install `hyphae-setup` and paste the printed prompt in a new thread.
-- **Desktop & IDE Apps (`claude-desktop`, `codex-desktop`, `cursor`)**: GUI apps without a direct CLI session launcher use the guide-only handoff (`hyp onboard --assist claude-desktop`, `--assist codex-desktop`, `--assist cursor`) to install `hyphae-setup` into their skill directory (`~/.claude/skills`, `~/.codex/skills`, `~/.cursor/skills`) and provide the `claude_desktop_config.json` MCP snippet or copy-paste prompt.
+- **Desktop & IDE Apps (`claude-desktop`, `codex-desktop`, `opencode`, `t3`, `cursor`)**: In `hyp onboard`, **Claude Desktop** and **Codex Desktop** show a preview -> confirm -> atomic non-destructive MCP config merge (`claude_desktop_config.json` / `~/.codex/config.toml`), print a restart reminder, and provide **`[o] Open in App`** verified deep links (`claude://claude.ai/new?q=...`, `codex://threads/new?prompt=...`, `opencode://new-session?...`, `t3code://`, `cursor://`) with automatic clipboard fallback. You can also run `hyp onboard --assist claude-desktop` / `--assist codex-desktop` / `--assist cursor` to install `hyphae-setup` directly into their skill directory (`~/.claude/skills`, `~/.codex/skills`, `~/.cursor/skills`).
 
 ### Step 1.2 — Connect Chosen Topology (If Beyond Local-Only)
 
@@ -193,22 +194,34 @@ hyp deploy check --config ./deploy-kit/node.json --json
 hyp deploy check --url https://<hostname> --json
 ```
 
-### D. Enable Opt-In Local Wakeups & OS Cron Triggers
-- Enable the compiled-in `wakeup` source once (`--mcp-tool auto` exposes `hyp_wakeup` on Herdr/Codex/Claude/T3/Cursor/OpenCode/Gemini and keeps 0 extra tokens on OpenClaw & Antigravity). See `skills/hyphae-wakeup/SKILL.md` for full timer/cron & `crontab`/`systemd --user`/`launchd` recipes:
-  ```sh
-  hyp wakeup enable --mcp-tool auto --json
-  hyp wakeup set --in 15m --label check-ci --note "Check build status" --json
-  hyp wakeup set --cron "0 9 * * 1-5" --timezone local --label morning-triage --to dev --json
-  hyp wakeup list --json
-  hyp wakeup cancel <id> --json
-  hyp wakeup fire --to dev --label morning-triage --note "Run daily check" --json
-  hyp wakeup disable --json
-  ```
+### D. Configure Local Ingest Route (`localIngest`), `hyp emit` & OS Cron Triggers
+- Hyphae's **socket-only Local Ingest Route** (`~/.config/hyphae/state/ingest.sock` `0600` on Unix / `<state_dir>/ingest.addr` loopback TCP + constant-time bearer token on Windows) is **enabled by default** — zero extra MCP tools and zero separate scheduler enable step!
+- Agents schedule future wakeups in two steps (see `skills/hyphae-schedule/SKILL.md` for Linux `systemd-run`, `crontab`, macOS `launchd`, Windows `schtasks`, and raw socket recipes):
+  1. Subscribe with standard **`hyp_stream`**:
+     `hyp_stream({ action: "subscribe", topic: "local.schedule", filters: [{ exact: { label: "check-ci" } }], urgency: "interrupt" })`
+  2. Emit from an OS scheduler via **`hyp emit`** (or raw NDJSON to `ingest.sock`):
+     ```sh
+     # One-shot Linux timer
+     systemd-run --user --on-active=15m -- hyp emit --label check-ci --note "Verify build"
+
+     # Recurring cron (crontab -e)
+     # 0 9 * * 1-5 /usr/local/bin/hyp emit --label morning-triage --note "Review open PRs"
+
+     # Raw Unix socket NDJSON (zero CLI spawn)
+     printf '{"type":"to.hyphae.scheduled.v1","label":"check-ci","note":"Done"}\n' \
+       | nc -U ~/.config/hyphae/state/ingest.sock
+
+     # Optional Ed25519-signed trigger (attaches hyphaesig -> TrustTier::HumanVerified)
+     hyp emit --sign --label prod-rollout --note "Start canary"
+     ```
+- Customize declarative `localIngest` route policy in `~/.config/hyphae/node.json` (`allowedTypes`, `allowedTopics`, Filter AST `filters`, `maxPerMinute`, `burst`, `onLimit: "drop" | "coalesce"`, `gate: true`, and `requireSignature: true` to fail closed on unsigned local events), then run `hyp service restart --json`.
 
 ### E. Verified Human Drops & Blind Drop Relay
-- Never ask the human to paste secrets in chat; use `hyp auth init --web` (phone WebAuthn Passkey+PRF via `https://hyphae.to/drop` or local Keychain Ed25519 key) and `hyp drop create` (or MCP `hyp_mesh({ action: "drop_link", kind: "secret", secretName: "<name>" })` — fresh human input only, zero secret bytes ever enter SQLite, logs, relay plaintext RAM, or LLM context):
+- Never ask the human to paste secrets in chat; use `hyp auth init --web` (a single phone WebAuthn Passkey+PRF prompt at `https://hyphae.to/drop` derives **both** Ed25519 signing and companion X25519 draft-encryption keys stored in `human_authorities.enc_jwk_json`, schema v5, bound into `human_authorities_digest` / `gate_policy_sig`, or omit `--web` for a local Keychain Ed25519 key) and `hyp drop create` (or MCP `hyp_mesh({ action: "drop_link", ... })`):
+  - **Zero-Knowledge Secret Drops (`kind: "secret"`)**: Prefilled drafts are **strictly forbidden** (secrets are always typed fresh); zero secret bytes ever enter SQLite, logs, relay plaintext RAM, or LLM context.
+  - **Encrypted Directive Prefill (`kind: "directive"`, `encDraft`-only)**: Optionally pass `--draft "..."` / `--draft-stdin` or MCP `draft: "..."` — HPKE-encrypted (`human.draft.v1`) directly into `#drop=` (`encDraft`) with **zero plaintext leak** even if pasted into Slack, Telegram, WhatsApp, or SMS. On `https://hyphae.to/drop`, **1 Face ID / Touch ID tap** unlocks & decrypts in RAM -> amber *"Draft proposed by agent (untrusted)"* banner -> auto-expanded no-scroll BiDi-safe review box -> mandatory confirmation checkbox -> Sign & Send -> immediate RAM wipe.
   ```sh
-  # Human runs locally to pair phone Passkey+PRF (or omit --web for CLI Keychain key)
+  # Human runs locally to pair phone Passkey+PRF (derives Ed25519 + companion X25519 keys in 1 prompt)
   hyp auth init --web
   hyp auth list --json
   hyp auth certify-node --json
@@ -218,9 +231,9 @@ hyp deploy check --url https://<hostname> --json
   hyp relay set https://drop.example.com --json
   hyp relay status --json
 
-  # Create a one-shot drop link (zero-knowledge Keychain secret or TrustTier::HumanVerified directive)
+  # Create a one-shot drop link (fresh secret OR HPKE-encrypted directive draft)
   hyp drop create --kind secret --secret-name stripe-key --json
-  hyp drop create --kind directive --json
+  hyp drop create --kind directive --draft "Approve staging deploy for v0.5.0" --json
   hyp drop wait --json
   ```
   *(Use `hyp drop ingest` reading stdin for offline/air-gapped `hdrop1_` envelopes.)*
