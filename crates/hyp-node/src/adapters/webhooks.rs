@@ -9,8 +9,10 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use http::HeaderMap;
-use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
+use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms, parse_rfc3339_millis};
 use hyp_proto::cloudevent::{
     CloudEvent, MAX_ATTRIBUTE_CHARS, MAX_DATA_BYTES, check_cloudevent_v2, is_valid_rfc3339_strict,
 };
@@ -40,6 +42,8 @@ const MAX_MENTIONS: usize = 20;
 const MAX_LIST_ITEMS: usize = 50;
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_PROMETHEUS_SAFE_DATA_BYTES: usize = 7_500;
+/// Maximum allowed clock skew for signed `X-Webhook-Timestamp` headers (5 minutes).
+pub const WEBHOOK_TIMESTAMP_MAX_SKEW_SECS: i64 = 300;
 
 /// Computes `sha256=<64 lowercase hex>` HMAC-SHA256 signature header using `ring::hmac`.
 pub fn compute_hmac_sha256_header(secret: &[u8], body: &[u8]) -> String {
@@ -106,16 +110,54 @@ fn now_rfc3339_seconds() -> String {
     }
 }
 
-fn random_uuid_v4() -> String {
-    let mut b = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut b);
-    b[6] = (b[6] & 0x0f) | 0x40;
-    b[8] = (b[8] & 0x3f) | 0x80;
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13],
-        b[14], b[15]
-    )
+fn parse_webhook_timestamp_ms(raw: &str) -> Option<i64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        let v = trimmed.parse::<i64>().ok()?;
+        if trimmed.len() >= 13 {
+            return Some(v);
+        }
+        if trimmed.len() >= 9 {
+            return v.checked_mul(1_000);
+        }
+        return None;
+    }
+    parse_rfc3339_millis(trimmed).ok()
+}
+
+fn verify_basic_auth_header(
+    header: Option<&str>,
+    expected_user: &str,
+    expected_pass: &str,
+) -> bool {
+    if expected_user.is_empty() || expected_pass.is_empty() {
+        return false;
+    }
+    let Some(auth) = header else {
+        return false;
+    };
+    let encoded = match auth
+        .strip_prefix("Basic ")
+        .or_else(|| auth.strip_prefix("basic "))
+    {
+        Some(rest) if !rest.trim().is_empty() => rest.trim(),
+        _ => return false,
+    };
+    let Ok(decoded) = BASE64_STANDARD.decode(encoded) else {
+        return false;
+    };
+    let Ok(creds) = std::str::from_utf8(&decoded) else {
+        return false;
+    };
+    let Some((user, pass)) = creds.split_once(':') else {
+        return false;
+    };
+    let user_ok = constant_time_str_eq(user, expected_user);
+    let pass_ok = constant_time_str_eq(pass, expected_pass);
+    user_ok && pass_ok
 }
 
 /// Outcome of ingesting a webhook delivery into an adapter.
@@ -715,6 +757,14 @@ impl GitHubWebhookAdapter {
         }
     }
 
+    pub fn topic(&self) -> &str {
+        &self.config.topic
+    }
+
+    pub fn config(&self) -> &GitHubWebhookConfig {
+        &self.config
+    }
+
     /// Verifies `X-Hub-Signature-256`, normalizes the webhook delivery into a CloudEvent v1.0,
     /// enforces optional repo/org allowlists, and publishes it to the attached `NodeAdapterHost`.
     pub async fn ingest_webhook(
@@ -912,6 +962,7 @@ pub struct PrometheusWebhookConfig {
     pub topic: String,
     pub webhook_secret: Option<Zeroizing<String>>,
     pub bearer_token: Option<Zeroizing<String>>,
+    pub basic_auth: Option<(String, Zeroizing<String>)>,
     pub max_body_bytes: usize,
 }
 
@@ -922,8 +973,22 @@ impl PrometheusWebhookConfig {
             topic: topic.into(),
             webhook_secret: None,
             bearer_token: None,
+            basic_auth: None,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
         }
+    }
+
+    /// Returns `true` iff at least one non-empty authentication credential is configured.
+    pub fn has_auth_configured(&self) -> bool {
+        self.bearer_token.as_deref().is_some_and(|t| !t.is_empty())
+            || self
+                .webhook_secret
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+            || self
+                .basic_auth
+                .as_ref()
+                .is_some_and(|(u, p)| !u.is_empty() && !p.is_empty())
     }
 }
 
@@ -1173,8 +1238,16 @@ impl PrometheusWebhookAdapter {
         }
     }
 
-    /// Verifies optional Bearer token and HMAC-SHA256 signature, normalizes all alerts in the
-    /// Alertmanager v4 payload, and publishes each as a CloudEvent v1.0.
+    pub fn topic(&self) -> &str {
+        &self.config.topic
+    }
+
+    pub fn config(&self) -> &PrometheusWebhookConfig {
+        &self.config
+    }
+
+    /// Verifies Bearer token, Basic auth, and/or HMAC-SHA256 signature fail-closed, normalizes
+    /// all alerts in the Alertmanager v4 payload, and publishes each as a CloudEvent v1.0.
     pub async fn ingest_webhook(
         &self,
         headers: &HeaderMap,
@@ -1188,7 +1261,18 @@ impl PrometheusWebhookAdapter {
             )));
         }
 
+        if !self.config.has_auth_configured() {
+            return Err(AdapterError::Unauthorized(
+                "Prometheus webhook authentication is not configured".into(),
+            ));
+        }
+
         if let Some(ref expected_token) = self.config.bearer_token {
+            if expected_token.is_empty() {
+                return Err(AdapterError::Unauthorized(
+                    "invalid or missing Bearer authorization".into(),
+                ));
+            }
             let auth = header_str(headers, "authorization").unwrap_or("");
             let provided = auth
                 .strip_prefix("Bearer ")
@@ -1197,6 +1281,18 @@ impl PrometheusWebhookAdapter {
             if provided.is_empty() || !constant_time_str_eq(provided, expected_token.as_str()) {
                 return Err(AdapterError::Unauthorized(
                     "invalid or missing Bearer authorization".into(),
+                ));
+            }
+        }
+
+        if let Some((ref expected_user, ref expected_pass)) = self.config.basic_auth {
+            if !verify_basic_auth_header(
+                header_str(headers, "authorization"),
+                expected_user,
+                expected_pass.as_str(),
+            ) {
+                return Err(AdapterError::Unauthorized(
+                    "invalid or missing Basic authorization".into(),
                 ));
             }
         }
@@ -1256,6 +1352,12 @@ impl NodeAdapter for PrometheusWebhookAdapter {
         host: Arc<dyn NodeAdapterHost>,
     ) -> BoxFuture<'a, Result<(), AdapterError>> {
         Box::pin(async move {
+            if !self.config.has_auth_configured() {
+                return Err(AdapterError::Config(
+                    "Prometheus webhook requires bearer_token, basic_auth, or webhook_secret"
+                        .to_string(),
+                ));
+            }
             *self.host.write().expect("host lock") = Some(Arc::clone(&host));
             *self.health.write().expect("health lock") = AdapterHealth::Healthy;
             host.update_status(&self.config.id, AdapterHealth::Healthy)
@@ -1308,6 +1410,11 @@ impl GenericWebhookConfig {
             default_type: "com.webhook.received".to_string(),
             max_body_bytes: 64 * 1024,
         }
+    }
+
+    /// Returns `true` iff a non-empty HMAC-SHA256 secret is configured.
+    pub fn has_auth_configured(&self) -> bool {
+        self.secret.as_deref().is_some_and(|s| !s.is_empty())
     }
 }
 
@@ -1386,7 +1493,15 @@ pub fn normalize_generic_webhook(
         .or_else(|| obj.get("id").and_then(Value::as_str))
         .filter(|s| !s.trim().is_empty())
         .map(ToString::to_string)
-        .unwrap_or_else(random_uuid_v4)
+        .unwrap_or_else(|| {
+            let mut hasher = Sha256::new();
+            if let Some(ts) = header_str(headers, "x-webhook-timestamp") {
+                hasher.update(ts.as_bytes());
+                hasher.update(b".");
+            }
+            hasher.update(body);
+            format!("wh-{}", hex::encode(hasher.finalize()))
+        })
         .chars()
         .take(128)
         .collect();
@@ -1423,8 +1538,17 @@ impl GenericWebhookAdapter {
         }
     }
 
-    /// Verifies optional HMAC-SHA256 signature, normalizes (pass-through or wrap), and publishes
-    /// the resulting CloudEvent v1.0 onto the host bus.
+    pub fn topic(&self) -> &str {
+        &self.config.topic
+    }
+
+    pub fn config(&self) -> &GenericWebhookConfig {
+        &self.config
+    }
+
+    /// Verifies HMAC-SHA256 signature fail-closed (binding `X-Webhook-Timestamp` within a 5-minute
+    /// skew window when supplied), normalizes (pass-through or wrap), and publishes the resulting
+    /// CloudEvent v1.0 onto the host bus.
     pub async fn ingest_webhook(
         &self,
         headers: &HeaderMap,
@@ -1438,14 +1562,45 @@ impl GenericWebhookAdapter {
             )));
         }
 
-        if let Some(ref secret) = self.config.secret {
-            let sig = header_str(headers, &self.config.signature_header);
-            if !verify_hmac_sha256_header(secret.as_bytes(), body, sig, false) {
+        let Some(ref secret) = self.config.secret else {
+            return Err(AdapterError::Unauthorized(
+                "generic webhook secret is not configured".into(),
+            ));
+        };
+        if secret.is_empty() {
+            return Err(AdapterError::Unauthorized(
+                "generic webhook secret is not configured".into(),
+            ));
+        }
+
+        let sig = header_str(headers, &self.config.signature_header);
+        if let Some(raw_ts) = header_str(headers, "x-webhook-timestamp") {
+            let Some(ts_ms) = parse_webhook_timestamp_ms(raw_ts) else {
+                return Err(AdapterError::Unauthorized(
+                    "malformed X-Webhook-Timestamp header".into(),
+                ));
+            };
+            let skew_ms = (now_unix_ms() - ts_ms).abs();
+            if skew_ms > WEBHOOK_TIMESTAMP_MAX_SKEW_SECS * 1_000 {
+                return Err(AdapterError::Unauthorized(
+                    "X-Webhook-Timestamp outside allowed replay window".into(),
+                ));
+            }
+            let mut signed = Vec::with_capacity(raw_ts.len() + 1 + body.len());
+            signed.extend_from_slice(raw_ts.as_bytes());
+            signed.push(b'.');
+            signed.extend_from_slice(body);
+            if !verify_hmac_sha256_header(secret.as_bytes(), &signed, sig, false) {
                 return Err(AdapterError::Unauthorized(format!(
                     "invalid or missing {}",
                     self.config.signature_header
                 )));
             }
+        } else if !verify_hmac_sha256_header(secret.as_bytes(), body, sig, false) {
+            return Err(AdapterError::Unauthorized(format!(
+                "invalid or missing {}",
+                self.config.signature_header
+            )));
         }
 
         let ce = normalize_generic_webhook(
@@ -1483,6 +1638,11 @@ impl NodeAdapter for GenericWebhookAdapter {
         host: Arc<dyn NodeAdapterHost>,
     ) -> BoxFuture<'a, Result<(), AdapterError>> {
         Box::pin(async move {
+            if !self.config.has_auth_configured() {
+                return Err(AdapterError::Config(
+                    "Generic webhook secret must not be empty".to_string(),
+                ));
+            }
             *self.host.write().expect("host lock") = Some(Arc::clone(&host));
             *self.health.write().expect("health lock") = AdapterHealth::Healthy;
             host.update_status(&self.config.id, AdapterHealth::Healthy)
@@ -1581,5 +1741,32 @@ mod tests {
         assert_eq!(ev.data.as_ref().unwrap()["mentions"], json!(["agent:reviewer"]));
         let val = serde_json::to_value(&ev).unwrap();
         assert!(check_cloudevent_v2(&val).is_ok());
+    }
+
+    #[test]
+    fn basic_auth_and_timestamp_replay_guards() {
+        let valid_basic = format!("Basic {}", BASE64_STANDARD.encode("prom:s3cr3t"));
+        assert!(verify_basic_auth_header(Some(&valid_basic), "prom", "s3cr3t"));
+        assert!(!verify_basic_auth_header(Some(&valid_basic), "prom", "wrong"));
+        assert!(!verify_basic_auth_header(Some(&valid_basic), "other", "s3cr3t"));
+        assert!(!verify_basic_auth_header(None, "prom", "s3cr3t"));
+        assert!(!verify_basic_auth_header(Some("Bearer tok"), "prom", "s3cr3t"));
+
+        let now_sec = (now_unix_ms() / 1_000).to_string();
+        let parsed = parse_webhook_timestamp_ms(&now_sec).unwrap();
+        assert!((parsed - now_unix_ms()).abs() < 2_000);
+        assert!(parse_webhook_timestamp_ms("2026-11-25T12:00:00Z").is_some());
+        assert!(parse_webhook_timestamp_ms("not-a-timestamp").is_none());
+
+        // Deterministic body-hash dedup when delivery/request/id are absent.
+        let mut h = HeaderMap::new();
+        h.insert("x-webhook-timestamp", now_sec.parse().unwrap());
+        let body = br#"{"event":"deploy","env":"prod"}"#;
+        let ev1 = normalize_generic_webhook(&h, body, "ci/hook", "ci.deploy", "2026-11-25T12:00:00Z")
+            .unwrap();
+        let ev2 = normalize_generic_webhook(&h, body, "ci/hook", "ci.deploy", "2026-11-25T12:00:00Z")
+            .unwrap();
+        assert_eq!(ev1.id, ev2.id);
+        assert!(ev1.id.starts_with("wh-"));
     }
 }

@@ -61,12 +61,12 @@ use crate::engine::http_util::{
 };
 use crate::engine::node::{AuthenticatedPeer, UnifiedNode};
 use crate::engine::peer_link::{
-    ChannelEpochResponse, ChannelJoinRequest, ChannelJoinResponse, ChannelLeaveRequest,
-    ChannelPostRequest, ChannelsResponse, GuestPairRequest, HandlesResponse, InboxAckRequest,
-    InboxAckResponse, KvDeleteBody, KvEpochResponse, KvListResponse, KvSetBody, PairRequestV2,
-    PeerKeysResponse, PostMessageRequest, PostMessageResponse, PublishEventRequest,
-    PutChannelEpochRequest, PutHandlesRequest, PutKeyRequest, PutKvEpochRequest,
-    PutSubscriptionsRequest, PutSubscriptionsResponse, SubscriptionsResponse,
+    BridgePostRequest, ChannelEpochResponse, ChannelJoinRequest, ChannelJoinResponse,
+    ChannelLeaveRequest, ChannelPostRequest, ChannelsResponse, GuestPairRequest, HandlesResponse,
+    InboxAckRequest, InboxAckResponse, KvDeleteBody, KvEpochResponse, KvListResponse, KvSetBody,
+    NodeUpdateRequest, PairRequestV2, PeerKeysResponse, PostMessageRequest, PostMessageResponse,
+    PublishEventRequest, PutChannelEpochRequest, PutHandlesRequest, PutKeyRequest,
+    PutKvEpochRequest, PutSubscriptionsRequest, PutSubscriptionsResponse, SubscriptionsResponse,
     TransferUploadResponse,
 };
 
@@ -332,41 +332,88 @@ async fn route_request(
                 "github-app webhook endpoint is disabled on this node".into(),
             ));
         };
-        let outcome = adapter
-            .handle_app_webhook(&headers, &body_bytes)
-            .await
-            .map_err(|err| match err {
-                AdapterError::Unauthorized(m) => NodeError::Unauthorized(m),
-                AdapterError::InvalidInput(m) => NodeError::BadRequest(m),
-                AdapterError::PayloadTooLarge(m) => NodeError::PayloadTooLarge(m),
-                other => NodeError::Http(other.to_string()),
-            })?;
-        let payload = match outcome {
-            WebhookIngestOutcome::Published { event_id, outcome } => json!({
-                "ok": true,
-                "status": "published",
-                "eventId": event_id,
-                "publishStatus": outcome.status,
-                "matched": outcome.matched,
-            }),
-            WebhookIngestOutcome::PublishedMany {
-                event_ids,
-                stored,
-                duplicates,
-            } => json!({
-                "ok": true,
-                "status": "published_many",
-                "eventIds": event_ids,
-                "stored": stored,
-                "duplicates": duplicates,
-            }),
-            WebhookIngestOutcome::Ignored { reason } => json!({
-                "ok": true,
-                "status": "ignored",
-                "reason": reason,
-            }),
+        let outcome = adapter.handle_app_webhook(&headers, &body_bytes).await;
+        return webhook_outcome_response(outcome);
+    }
+
+    if method == Method::POST && path == "/v1/webhooks/github" {
+        let Some(adapter) = node.github_webhook_adapter(None) else {
+            return Err(NodeError::NotFound(
+                "github webhook endpoint is disabled on this node".into(),
+            ));
         };
-        return Ok(json_response(StatusCode::OK, &payload));
+        let outcome = adapter.ingest_webhook(&headers, &body_bytes).await;
+        return webhook_outcome_response(outcome);
+    }
+
+    if method == Method::POST {
+        if let Some(raw_id) = path.strip_prefix("/v1/webhooks/github/") {
+            if !raw_id.is_empty() && !raw_id.contains('/') {
+                let id = percent_decode(raw_id);
+                let Some(adapter) = node.github_webhook_adapter(Some(&id)) else {
+                    return Err(NodeError::NotFound(format!(
+                        "github webhook '{id}' is not configured on this node"
+                    )));
+                };
+                let outcome = adapter.ingest_webhook(&headers, &body_bytes).await;
+                return webhook_outcome_response(outcome);
+            }
+        }
+    }
+
+    if method == Method::POST && path == "/v1/webhooks/prometheus" {
+        let Some(adapter) = node.prometheus_webhook_adapter(None) else {
+            return Err(NodeError::NotFound(
+                "prometheus webhook endpoint is disabled on this node".into(),
+            ));
+        };
+        let outcome = adapter.ingest_webhook(&headers, &body_bytes).await;
+        return webhook_outcome_response(outcome);
+    }
+
+    if method == Method::POST {
+        if let Some(raw_id) = path.strip_prefix("/v1/webhooks/prometheus/") {
+            if !raw_id.is_empty() && !raw_id.contains('/') {
+                let id = percent_decode(raw_id);
+                let Some(adapter) = node.prometheus_webhook_adapter(Some(&id)) else {
+                    return Err(NodeError::NotFound(format!(
+                        "prometheus webhook '{id}' is not configured on this node"
+                    )));
+                };
+                let outcome = adapter.ingest_webhook(&headers, &body_bytes).await;
+                return webhook_outcome_response(outcome);
+            }
+        }
+    }
+
+    if method == Method::POST {
+        if let Some(raw_id) = path.strip_prefix("/v1/webhooks/stream/") {
+            if !raw_id.is_empty() && !raw_id.contains('/') {
+                let id = percent_decode(raw_id);
+                let Some(adapter) = node.generic_webhook_adapter(&id) else {
+                    return Err(NodeError::NotFound(format!(
+                        "webhook stream '{id}' is not configured on this node"
+                    )));
+                };
+                let outcome = adapter.ingest_webhook(&headers, &body_bytes).await;
+                return webhook_outcome_response(outcome);
+            }
+        }
+    }
+
+    if method == Method::POST {
+        if let Some(raw_id) = path.strip_prefix("/v1/webhooks/") {
+            if !raw_id.is_empty() && !raw_id.contains('/') {
+                let id = percent_decode(raw_id);
+                let Some(adapter) = node.generic_webhook_adapter(&id) else {
+                    return Err(NodeError::NotFound(format!(
+                        "webhook '{id}' is not configured on this node"
+                    )));
+                };
+                let outcome = adapter.ingest_webhook(&headers, &body_bytes).await;
+                return webhook_outcome_response(outcome);
+            }
+        }
     }
 
     if method == Method::POST {
@@ -596,8 +643,22 @@ async fn route_request(
             caller.scopes.may_stream_publish(&pub_req.topic),
             &format!("stream:publish={}", pub_req.topic),
         )?;
-        let res = node.ingest_inbound_event(&caller.peer_id, &pub_req.topic, &pub_req.event)?;
+        let res = node.ingest_inbound_event_for_caller(&caller, &pub_req.topic, &pub_req.event)?;
         return Ok(json_response(StatusCode::OK, &res));
+    }
+
+    // /v1/bridges/post
+    if method == Method::POST && path == "/v1/bridges/post" {
+        let post_req: BridgePostRequest = serde_json::from_slice(&body_bytes)?;
+        let resp = node.handle_server_bridge_post(&caller, post_req).await?;
+        return Ok(json_response(StatusCode::OK, &resp));
+    }
+
+    // /v1/node/update
+    if method == Method::POST && path == "/v1/node/update" {
+        let update_req: NodeUpdateRequest = serde_json::from_slice(&body_bytes)?;
+        let resp = node.handle_server_node_update(&caller, update_req).await?;
+        return Ok(json_response(StatusCode::ACCEPTED, &resp));
     }
 
     // /v1/subscriptions
@@ -915,6 +976,43 @@ async fn route_request(
     }
 
     Err(NodeError::NotFound(format!("route '{method} {path}' not found")))
+}
+
+fn webhook_outcome_response(
+    outcome: Result<WebhookIngestOutcome, AdapterError>,
+) -> Result<Response<BoxedBody>, NodeError> {
+    let outcome = outcome.map_err(|err| match err {
+        AdapterError::Unauthorized(m) => NodeError::Unauthorized(m),
+        AdapterError::InvalidInput(m) => NodeError::BadRequest(m),
+        AdapterError::PayloadTooLarge(m) => NodeError::PayloadTooLarge(m),
+        other => NodeError::Http(other.to_string()),
+    })?;
+    let payload = match outcome {
+        WebhookIngestOutcome::Published { event_id, outcome } => json!({
+            "ok": true,
+            "status": "published",
+            "eventId": event_id,
+            "publishStatus": outcome.status,
+            "matched": outcome.matched,
+        }),
+        WebhookIngestOutcome::PublishedMany {
+            event_ids,
+            stored,
+            duplicates,
+        } => json!({
+            "ok": true,
+            "status": "published_many",
+            "eventIds": event_ids,
+            "stored": stored,
+            "duplicates": duplicates,
+        }),
+        WebhookIngestOutcome::Ignored { reason } => json!({
+            "ok": true,
+            "status": "ignored",
+            "reason": reason,
+        }),
+    };
+    Ok(json_response(StatusCode::OK, &payload))
 }
 
 fn require_auth(
