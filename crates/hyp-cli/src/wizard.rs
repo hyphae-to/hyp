@@ -1001,7 +1001,19 @@ pub struct LaunchSpec {
 /// Outcome returned by the interactive wizard so `setup::run_onboard` can fall through to local setup.
 pub enum WizardOutcome {
     Finished(ExitCode),
+    #[allow(dead_code)]
     RunLocalCliSetup,
+    RunLocalCliSetupWithSelection(SetupSelection),
+}
+
+/// User-confirmed harness and optional component selections from the interactive toggle screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupSelection {
+    pub harnesses: Vec<HarnessKind>,
+    pub install_skills: bool,
+    pub install_statusline: bool,
+    pub install_claude_commands: bool,
+    pub install_herdr_mod: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -5099,6 +5111,10 @@ enum WizardScreen {
     Main {
         selected: usize,
     },
+    LocalSetupConfig {
+        state: SetupToggleState,
+        main_selected: usize,
+    },
     HerdrTemplates {
         hc_bin: PathBuf,
         templates: Vec<HerdrTemplate>,
@@ -5135,7 +5151,9 @@ enum WizardScreen {
 #[cfg(unix)]
 enum TuiResolution {
     Cancel,
+    #[allow(dead_code)]
     RunLocalCliSetup,
+    RunLocalCliSetupWithSelection(SetupSelection),
     LaunchCli(LaunchableHarness),
     LaunchHerdr {
         hc_bin: PathBuf,
@@ -6164,6 +6182,1064 @@ fn render_manual_guide_screen(
     flush_screen_lines(&lines, term_rows);
 }
 
+// ============================================================================
+// Pure-Rust Interactive Harness & Component Toggle Screen
+// ============================================================================
+
+/// Mutable state for the pure-Rust interactive harness & component toggle checklist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupToggleState {
+    pub detected_harnesses: Vec<HarnessKind>,
+    pub selected_harnesses: [bool; 9],
+    pub install_skills: bool,
+    pub install_statusline: bool,
+    pub install_claude_commands: bool,
+    pub install_herdr_mod: bool,
+    pub herdr_app_detected: bool,
+    pub cursor: usize,
+    pub show_dry_run_preview: bool,
+}
+
+/// Pure result of processing a single keyboard or text command on [`SetupToggleState`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetupToggleAction {
+    Continue,
+    Apply(SetupSelection),
+    Back,
+    Cancel,
+}
+
+impl SetupToggleState {
+    pub const HARNESS_COUNT: usize = 9;
+    pub const COMPONENT_COUNT: usize = 4;
+    pub const TOTAL_ITEMS: usize = Self::HARNESS_COUNT + Self::COMPONENT_COUNT;
+
+    /// Builds default toggle state from explicit detection results (pure & unit-testable).
+    pub fn from_detection(detected: &[HarnessKind], herdr_app_detected: bool) -> Self {
+        let mut selected_harnesses = [false; 9];
+        let mut normalized_detected = Vec::new();
+        for (idx, &kind) in HarnessKind::ALL.iter().enumerate() {
+            if detected.contains(&kind) {
+                selected_harnesses[idx] = true;
+                normalized_detected.push(kind);
+            }
+        }
+        let herdr_checked = normalized_detected.contains(&HarnessKind::Herdr);
+        Self {
+            detected_harnesses: normalized_detected,
+            selected_harnesses,
+            install_skills: true,
+            install_statusline: true,
+            install_claude_commands: true,
+            install_herdr_mod: herdr_app_detected && herdr_checked,
+            herdr_app_detected,
+            cursor: 0,
+            show_dry_run_preview: false,
+        }
+    }
+
+    /// Detects installed harnesses and `~/.config/herdr-app` under `home` to build default state.
+    pub fn from_home(home: &Path, explicit_home: bool) -> Self {
+        let diagnostics = detect_harness_statuses(home, None);
+        let mut detected = Vec::new();
+        for kind in HarnessKind::ALL {
+            if diagnostics
+                .iter()
+                .any(|d| d.harness == kind.as_str() && (d.detected || d.configured))
+            {
+                detected.push(kind);
+            }
+        }
+        let herdr_app_detected = if explicit_home {
+            home.join(".config").join("herdr-app").is_dir()
+        } else {
+            crate::herdr_mod::detect_herdr_app_dir(home).is_some()
+        };
+        Self::from_detection(&detected, herdr_app_detected)
+    }
+
+    /// Overrides the checked harness checkboxes (e.g. from `--harness` pre-selection in `hyp setup -i`).
+    pub fn set_selected_harnesses(&mut self, harnesses: &[HarnessKind]) {
+        for (idx, &kind) in HarnessKind::ALL.iter().enumerate() {
+            self.selected_harnesses[idx] = harnesses.contains(&kind);
+        }
+        let herdr_checked = self.is_harness_selected(HarnessKind::Herdr);
+        self.install_herdr_mod = self.herdr_app_detected && herdr_checked;
+    }
+
+    pub fn is_harness_detected(&self, kind: HarnessKind) -> bool {
+        self.detected_harnesses.contains(&kind)
+    }
+
+    pub fn is_harness_selected(&self, kind: HarnessKind) -> bool {
+        HarnessKind::ALL
+            .iter()
+            .position(|&k| k == kind)
+            .is_some_and(|idx| self.selected_harnesses[idx])
+    }
+
+    pub fn selected_harness_count(&self) -> usize {
+        self.selected_harnesses.iter().filter(|&&b| b).count()
+    }
+
+    pub fn move_up(&mut self) {
+        self.cursor = (self.cursor + Self::TOTAL_ITEMS - 1) % Self::TOTAL_ITEMS;
+    }
+
+    pub fn move_down(&mut self) {
+        self.cursor = (self.cursor + 1) % Self::TOTAL_ITEMS;
+    }
+
+    pub fn toggle_index(&mut self, idx: usize) {
+        if idx < Self::HARNESS_COUNT {
+            self.selected_harnesses[idx] = !self.selected_harnesses[idx];
+        } else {
+            match idx {
+                9 => self.install_skills = !self.install_skills,
+                10 => self.install_statusline = !self.install_statusline,
+                11 => self.install_claude_commands = !self.install_claude_commands,
+                12 => self.install_herdr_mod = !self.install_herdr_mod,
+                _ => {}
+            }
+        }
+    }
+
+    pub fn toggle_current(&mut self) {
+        self.toggle_index(self.cursor);
+    }
+
+    /// Cycles harness checkboxes cleanly: all detected -> all 9 -> none -> all detected.
+    pub fn cycle_harness_selection(&mut self) {
+        let all_selected = self.selected_harnesses.iter().all(|&b| b);
+        let has_partial_detected = !self.detected_harnesses.is_empty()
+            && self.detected_harnesses.len() < Self::HARNESS_COUNT;
+        let matches_detected = HarnessKind::ALL
+            .iter()
+            .enumerate()
+            .all(|(i, &k)| self.selected_harnesses[i] == self.detected_harnesses.contains(&k));
+
+        if has_partial_detected {
+            if matches_detected {
+                self.selected_harnesses = [true; 9];
+            } else if all_selected {
+                self.selected_harnesses = [false; 9];
+            } else {
+                for (i, &k) in HarnessKind::ALL.iter().enumerate() {
+                    self.selected_harnesses[i] = self.detected_harnesses.contains(&k);
+                }
+            }
+        } else if all_selected {
+            self.selected_harnesses = [false; 9];
+        } else {
+            self.selected_harnesses = [true; 9];
+        }
+    }
+
+    pub fn toggle_dry_run_preview(&mut self) {
+        self.show_dry_run_preview = !self.show_dry_run_preview;
+    }
+
+    pub fn to_selection(&self) -> SetupSelection {
+        let harnesses = HarnessKind::ALL
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &kind)| self.selected_harnesses[idx].then_some(kind))
+            .collect();
+        SetupSelection {
+            harnesses,
+            install_skills: self.install_skills,
+            install_statusline: self.install_statusline,
+            install_claude_commands: self.install_claude_commands,
+            install_herdr_mod: self.install_herdr_mod,
+        }
+    }
+
+    /// Generates an exact dry-run preview of files & actions for the current selection.
+    pub fn build_dry_run_preview(&self, home: &Path, include_node_bootstrap: bool) -> Vec<String> {
+        let mut preview = Vec::new();
+        if include_node_bootstrap {
+            let cfg_dir = display_compact_path(&home.join(".config").join("hyphae"), home);
+            preview.push(format!(
+                "Node: {cfg_dir}/{{node.json, state/node.sqlite}} + Ed25519/X25519 keys"
+            ));
+        }
+
+        let sel = self.to_selection();
+        if sel.harnesses.is_empty() {
+            if include_node_bootstrap {
+                preview.push("Harnesses: none selected (only node bootstrap will run)".to_string());
+            } else {
+                preview.push("Harnesses: none selected (no files will be written)".to_string());
+            }
+            return preview;
+        }
+
+        for kind in &sel.harnesses {
+            match kind {
+                HarnessKind::Antigravity => {
+                    preview.push(
+                        "antigravity: ~/.gemini/config/plugins/hyphae/{plugin,mcp_config,hooks}.json + sidecar + rules"
+                            .to_string(),
+                    );
+                    if sel.install_skills {
+                        preview.push(
+                            "  + skill: ~/.gemini/config/plugins/hyphae/skills/hyphae/SKILL.md"
+                                .to_string(),
+                        );
+                    }
+                    if sel.install_statusline {
+                        preview.push(
+                            "  + statusLine: ~/.gemini/antigravity-cli/settings.json (chains existing)"
+                                .to_string(),
+                        );
+                    }
+                }
+                HarnessKind::Claude => {
+                    let sl = if sel.install_statusline {
+                        " + statusLine (chains existing)"
+                    } else {
+                        ""
+                    };
+                    preview.push(format!(
+                        "claude: ~/.claude.json, ~/.claude/settings.json (hooks{sl})"
+                    ));
+                    if sel.install_claude_commands {
+                        preview.push(
+                            "  + commands: ~/.claude/commands/hyphae{,-subs,-focus,-mute}.md"
+                                .to_string(),
+                        );
+                    }
+                    if sel.install_skills {
+                        preview.push("  + skill: ~/.claude/skills/hyphae/SKILL.md".to_string());
+                    }
+                }
+                HarnessKind::Codex => {
+                    preview.push("codex: ~/.codex/{config.toml,hooks.json}".to_string());
+                    if sel.install_skills {
+                        preview.push(
+                            "  + skill: ~/.codex/skills/hyphae/SKILL.md (+ ~/.agents/skills/hyphae/SKILL.md)"
+                                .to_string(),
+                        );
+                    }
+                }
+                HarnessKind::Cursor => {
+                    preview.push("cursor: ~/.cursor/{mcp.json,hooks.json}".to_string());
+                    if sel.install_skills {
+                        preview.push("  + skill: ~/.cursor/skills/hyphae/SKILL.md".to_string());
+                    }
+                }
+                HarnessKind::Opencode => {
+                    preview.push(
+                        "opencode: ~/.config/opencode/{opencode.json,plugins/hyphae.ts}"
+                            .to_string(),
+                    );
+                    if sel.install_skills {
+                        preview.push(
+                            "  + skill: ~/.config/opencode/skills/hyphae/SKILL.md".to_string(),
+                        );
+                    }
+                }
+                HarnessKind::Gemini => {
+                    preview.push("gemini: ~/.gemini/settings.json (MCP + hooks)".to_string());
+                    if sel.install_skills {
+                        preview.push("  + skill: ~/.gemini/skills/hyphae/SKILL.md".to_string());
+                    }
+                }
+                HarnessKind::Openclaw => {
+                    preview.push("openclaw: ~/.openclaw/openclaw.json".to_string());
+                    if sel.install_skills {
+                        preview.push("  + skill: ~/.openclaw/skills/hyphae/SKILL.md".to_string());
+                    }
+                }
+                HarnessKind::Herdr => {
+                    preview.push("herdr: ~/.config/herdr/hyphae.json".to_string());
+                    if sel.install_skills {
+                        preview.push(
+                            "  + skill: ~/.config/herdr/skills/hyphae/SKILL.md".to_string(),
+                        );
+                    }
+                    if sel.install_herdr_mod {
+                        preview.push(
+                            "  + herdr-mod: ~/.config/herdr-app/{mods/hyphae-pane,mods/hyphae-panel,keys.json} (symlink-safe)"
+                                .to_string(),
+                        );
+                    }
+                }
+                HarnessKind::T3 => {
+                    preview.push("t3: ~/.t3/hyphae.json".to_string());
+                    if sel.install_skills {
+                        preview.push("  + skill: ~/.agents/skills/hyphae/SKILL.md".to_string());
+                    }
+                }
+            }
+        }
+        preview
+    }
+}
+
+/// Pure key event dispatcher for the interactive harness & component toggle screen.
+pub fn handle_setup_toggle_key(
+    state: &mut SetupToggleState,
+    key: KeyEvent,
+    allow_back: bool,
+) -> SetupToggleAction {
+    match key {
+        KeyEvent::Up => {
+            state.move_up();
+            SetupToggleAction::Continue
+        }
+        KeyEvent::Down => {
+            state.move_down();
+            SetupToggleAction::Continue
+        }
+        KeyEvent::Char(' ') => {
+            state.toggle_current();
+            SetupToggleAction::Continue
+        }
+        KeyEvent::Char('a') | KeyEvent::Char('A') => {
+            state.cycle_harness_selection();
+            SetupToggleAction::Continue
+        }
+        KeyEvent::Char('d') | KeyEvent::Char('D') => {
+            state.toggle_dry_run_preview();
+            SetupToggleAction::Continue
+        }
+        KeyEvent::Enter => SetupToggleAction::Apply(state.to_selection()),
+        KeyEvent::Back | KeyEvent::Left | KeyEvent::Char('b') | KeyEvent::Char('B') => {
+            if allow_back {
+                SetupToggleAction::Back
+            } else {
+                SetupToggleAction::Cancel
+            }
+        }
+        KeyEvent::Cancel => SetupToggleAction::Cancel,
+        _ => SetupToggleAction::Continue,
+    }
+}
+
+/// Pure parser for the numbered/text fallback prompt (non-Unix and non-raw terminals).
+pub fn apply_setup_toggle_text_input(
+    state: &mut SetupToggleState,
+    raw_input: &str,
+    allow_back: bool,
+) -> Result<SetupToggleAction, String> {
+    let trimmed = raw_input.trim();
+    if trimmed.is_empty() {
+        return Ok(SetupToggleAction::Apply(state.to_selection()));
+    }
+    let low = trimmed.to_ascii_lowercase();
+    if matches!(low.as_str(), "q" | "quit" | "cancel") {
+        return Ok(SetupToggleAction::Cancel);
+    }
+    if matches!(low.as_str(), "b" | "back") {
+        return Ok(if allow_back {
+            SetupToggleAction::Back
+        } else {
+            SetupToggleAction::Cancel
+        });
+    }
+    if matches!(low.as_str(), "a" | "all") {
+        state.cycle_harness_selection();
+        return Ok(SetupToggleAction::Continue);
+    }
+    if matches!(low.as_str(), "d" | "dry-run" | "preview") {
+        state.toggle_dry_run_preview();
+        return Ok(SetupToggleAction::Continue);
+    }
+
+    let mut toggled = Vec::new();
+    for token in trimmed.split(|c: char| c == ',' || c.is_whitespace()) {
+        if token.is_empty() {
+            continue;
+        }
+        let Ok(num) = token.parse::<usize>() else {
+            return Err(format!(
+                "Invalid input '{token}'. Enter 1-{}, 'a', 'd', 'b', 'q', or Enter to apply.",
+                SetupToggleState::TOTAL_ITEMS
+            ));
+        };
+        if !(1..=SetupToggleState::TOTAL_ITEMS).contains(&num) {
+            return Err(format!(
+                "Choice '{num}' out of range (1-{}).",
+                SetupToggleState::TOTAL_ITEMS
+            ));
+        }
+        toggled.push(num - 1);
+    }
+    if toggled.is_empty() {
+        return Ok(SetupToggleAction::Apply(state.to_selection()));
+    }
+    for idx in toggled {
+        state.toggle_index(idx);
+    }
+    Ok(SetupToggleAction::Continue)
+}
+
+fn harness_toggle_display(kind: HarnessKind) -> (&'static str, &'static str) {
+    match kind {
+        HarnessKind::Antigravity => ("Antigravity", "~/.gemini/config/plugins/hyphae"),
+        HarnessKind::Claude => ("Claude Code", "~/.claude"),
+        HarnessKind::Codex => ("Codex", "~/.codex"),
+        HarnessKind::Cursor => ("Cursor", "~/.cursor"),
+        HarnessKind::Opencode => ("OpenCode", "~/.config/opencode"),
+        HarnessKind::Gemini => ("Gemini CLI", "~/.gemini/settings.json"),
+        HarnessKind::Openclaw => ("OpenClaw", "~/.openclaw"),
+        HarnessKind::Herdr => ("Herdr", "~/.config/herdr"),
+        HarnessKind::T3 => ("T3 Code", "~/.t3"),
+    }
+}
+
+fn component_toggle_display(idx: usize) -> (&'static str, &'static str) {
+    match idx {
+        9 => ("Runtime skills", "(hyphae/SKILL.md)"),
+        10 => (
+            "Live statusLine",
+            "(Claude Code / Antigravity — chains existing)",
+        ),
+        11 => (
+            "Claude slash commands",
+            "(/hyphae, /hyphae-subs, /hyphae-focus, /hyphae-mute)",
+        ),
+        _ => (
+            "Native Herdr mod",
+            "(hyphae-pane + hyphae-panel, symlink-safe)",
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_toggle_row(
+    selected: bool,
+    checked: bool,
+    label: &str,
+    badge: Option<&str>,
+    detail: &str,
+    label_col_w: usize,
+    badge_col_w: usize,
+    content_w: usize,
+    left_pad: &str,
+    color_mode: ColorMode,
+) -> String {
+    let inner_w = content_w.max(1);
+    let prefix = if selected { " ❯ " } else { "   " };
+    let check_str = if checked { "[x] " } else { "[ ] " };
+    let lead_w = 7usize; // " ❯ " (3) + "[x] " (4)
+
+    if inner_w <= lead_w {
+        let clipped = truncate_chars(&format!("{prefix}{check_str}{label}"), inner_w);
+        return if selected {
+            match color_mode {
+                ColorMode::Plain => format!("{left_pad}\x1b[7m{clipped}\x1b[0m"),
+                ColorMode::Ansi256 => format!("{left_pad}\x1b[7m\x1b[1m{clipped}\x1b[0m"),
+                ColorMode::TrueColor => {
+                    let bg = format!(
+                        "\x1b[48;2;{};{};{}m",
+                        RGB_UI_HIGHLIGHT_BG.0, RGB_UI_HIGHLIGHT_BG.1, RGB_UI_HIGHLIGHT_BG.2
+                    );
+                    let ivory = fg_color(color_mode, RGB_PULSE_IVORY);
+                    format!("{left_pad}{bg}{ivory}{clipped}\x1b[0m")
+                }
+            }
+        } else {
+            format!("{left_pad}{clipped}")
+        };
+    }
+
+    let show_badge = badge_col_w > 0 && inner_w >= lead_w + 10 + 1 + badge_col_w;
+    let effective_badge_w = if show_badge { badge_col_w } else { 0 };
+    let label_budget = if show_badge {
+        label_col_w
+            .min(inner_w.saturating_sub(lead_w + effective_badge_w + 1).max(1))
+            .max(1)
+    } else {
+        inner_w.saturating_sub(lead_w).max(1)
+    };
+
+    let label_clip = truncate_chars(label, label_budget);
+    let label_len = label_clip.chars().count();
+    let label_pad_len = if show_badge {
+        label_budget.saturating_sub(label_len)
+    } else {
+        0
+    };
+    let label_pad = " ".repeat(label_pad_len);
+
+    let badge_raw = badge.unwrap_or("");
+    let badge_clip = if show_badge {
+        truncate_chars(badge_raw, effective_badge_w)
+    } else {
+        String::new()
+    };
+    let badge_len = badge_clip.chars().count();
+    let badge_pad_len = if show_badge {
+        effective_badge_w.saturating_sub(badge_len)
+    } else {
+        0
+    };
+    let badge_pad = " ".repeat(badge_pad_len);
+
+    let used =
+        lead_w + label_len + label_pad_len + if show_badge { 1 + effective_badge_w } else { 0 };
+    let rem_for_detail = inner_w.saturating_sub(used + 1);
+    let detail_clip = if rem_for_detail >= 4 && !detail.is_empty() {
+        truncate_chars(detail, rem_for_detail)
+    } else {
+        String::new()
+    };
+    let detail_len = detail_clip.chars().count();
+    let total_visible = used + if detail_len > 0 { 1 + detail_len } else { 0 };
+    let trailing = " ".repeat(inner_w.saturating_sub(total_visible));
+
+    if selected {
+        match color_mode {
+            ColorMode::Plain => {
+                let mut line = format!("{prefix}{check_str}{label_clip}{label_pad}");
+                if show_badge {
+                    line.push(' ');
+                    line.push_str(&badge_clip);
+                    line.push_str(&badge_pad);
+                }
+                if !detail_clip.is_empty() {
+                    line.push(' ');
+                    line.push_str(&detail_clip);
+                }
+                format!("{left_pad}\x1b[7m{line}{trailing}\x1b[0m")
+            }
+            ColorMode::Ansi256 => {
+                let mut line = format!("{prefix}{check_str}{label_clip}{label_pad}");
+                if show_badge {
+                    line.push(' ');
+                    line.push_str(&badge_clip);
+                    line.push_str(&badge_pad);
+                }
+                if !detail_clip.is_empty() {
+                    line.push(' ');
+                    line.push_str(&detail_clip);
+                }
+                format!("{left_pad}\x1b[7m\x1b[1m{line}{trailing}\x1b[0m")
+            }
+            ColorMode::TrueColor => {
+                let bg = format!(
+                    "\x1b[48;2;{};{};{}m",
+                    RGB_UI_HIGHLIGHT_BG.0, RGB_UI_HIGHLIGHT_BG.1, RGB_UI_HIGHLIGHT_BG.2
+                );
+                let amber = fg_color(color_mode, RGB_NODE_AMBER);
+                let ivory = fg_color(color_mode, RGB_PULSE_IVORY);
+                let check_fg = fg_color(
+                    color_mode,
+                    if checked {
+                        RGB_UI_TAG_LAUNCH
+                    } else {
+                        RGB_UI_MUTED
+                    },
+                );
+                let badge_fg = fg_color(color_mode, RGB_UI_TAG_LAUNCH);
+                let detail_fg = fg_color(color_mode, RGB_HYPHAE_SAGE);
+                let mut row = format!(
+                    "{left_pad}{bg}{amber}\x1b[1m{prefix}{check_fg}{check_str}{ivory}{label_clip}{label_pad}\x1b[22m"
+                );
+                if show_badge {
+                    row.push_str(&format!(" {badge_fg}{badge_clip}{badge_pad}"));
+                }
+                if !detail_clip.is_empty() {
+                    row.push_str(&format!(" {detail_fg}{detail_clip}"));
+                }
+                row.push_str(&format!("{trailing}\x1b[0m"));
+                row
+            }
+        }
+    } else {
+        let check_styled = paint_styled_text(
+            color_mode,
+            if checked {
+                RGB_UI_TAG_LAUNCH
+            } else {
+                RGB_UI_MUTED
+            },
+            checked,
+            check_str,
+        );
+        let label_styled = paint_styled_text(
+            color_mode,
+            if checked {
+                RGB_PULSE_IVORY
+            } else {
+                RGB_UI_MUTED
+            },
+            false,
+            &label_clip,
+        );
+        let badge_styled = if show_badge && !badge_clip.is_empty() {
+            paint_styled_text(color_mode, RGB_UI_TAG_LAUNCH, false, &badge_clip)
+        } else {
+            String::new()
+        };
+        let detail_styled = if !detail_clip.is_empty() {
+            paint_styled_text(color_mode, RGB_UI_MUTED, false, &detail_clip)
+        } else {
+            String::new()
+        };
+        let mut row = format!("{left_pad}{prefix}{check_styled}{label_styled}{label_pad}");
+        if show_badge {
+            row.push(' ');
+            row.push_str(&badge_styled);
+            row.push_str(&badge_pad);
+        }
+        if !detail_clip.is_empty() {
+            row.push(' ');
+            row.push_str(&detail_styled);
+        }
+        row
+    }
+}
+
+enum ToggleDisplayRow {
+    SectionHeader(&'static str),
+    Spacer,
+    Harness(usize),
+    Component(usize),
+}
+
+/// Pure, cross-platform renderer for the interactive harness & component toggle checklist.
+///
+/// Guarantees `lines.len() <= term_rows` and every visible line fits cleanly within `term_cols`,
+/// with optional inline dry-run preview (`d`) and bounded viewport scrolling on narrow terminals.
+#[allow(clippy::too_many_arguments)]
+pub fn render_setup_toggle_screen(
+    state: &SetupToggleState,
+    home: &Path,
+    include_node_bootstrap: bool,
+    allow_back: bool,
+    term_rows: usize,
+    term_cols: usize,
+    color_mode: ColorMode,
+    anim_tick: usize,
+) -> Vec<String> {
+    if term_rows == 0 {
+        return Vec::new();
+    }
+    let content_w = safe_content_width(term_cols, 84);
+    let left_pad = " ".repeat(term_cols.saturating_sub(content_w) / 2);
+    let mut lines = Vec::new();
+
+    if term_rows >= 33 && !state.show_dry_run_preview {
+        lines.extend(build_banner_lines_at_tick(
+            term_rows.min(27),
+            term_cols,
+            content_w,
+            color_mode,
+            anim_tick,
+        ));
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+    }
+
+    let version = env!("CARGO_PKG_VERSION");
+    let title = if include_node_bootstrap {
+        format!("hyphae v{version} · local CLI setup — choose harnesses & components")
+    } else {
+        format!("hyphae v{version} · interactive setup — choose harnesses & components")
+    };
+    lines.push(format!(
+        "{left_pad}{}",
+        paint_styled_text(
+            color_mode,
+            RGB_PULSE_IVORY,
+            true,
+            &truncate_chars(&title, content_w)
+        )
+    ));
+
+    let yn = |b: bool| if b { "on" } else { "off" };
+    let summary = format!(
+        "{}/9 harnesses · skills {} · statusLine {} · commands {} · herdr-mod {}",
+        state.selected_harness_count(),
+        yn(state.install_skills),
+        yn(state.install_statusline),
+        yn(state.install_claude_commands),
+        yn(state.install_herdr_mod),
+    );
+    lines.push(format!(
+        "{left_pad}{}",
+        paint_styled_text(
+            color_mode,
+            RGB_HYPHAE_SAGE,
+            false,
+            &truncate_chars(&summary, content_w)
+        )
+    ));
+    if term_rows >= 14 {
+        lines.push(String::new());
+    }
+
+    let mut display_rows = Vec::with_capacity(16);
+    display_rows.push(ToggleDisplayRow::SectionHeader("Harnesses"));
+    for idx in 0..SetupToggleState::HARNESS_COUNT {
+        display_rows.push(ToggleDisplayRow::Harness(idx));
+    }
+    display_rows.push(ToggleDisplayRow::Spacer);
+    display_rows.push(ToggleDisplayRow::SectionHeader("Components & UI Plugins"));
+    for idx in SetupToggleState::HARNESS_COUNT..SetupToggleState::TOTAL_ITEMS {
+        display_rows.push(ToggleDisplayRow::Component(idx));
+    }
+
+    let selected_display_row = if state.cursor < SetupToggleState::HARNESS_COUNT {
+        1 + state.cursor
+    } else {
+        12 + (state.cursor - SetupToggleState::HARNESS_COUNT)
+    };
+
+    let footer_rows = if term_rows >= 10 { 2usize } else { 1usize };
+    let body_budget = term_rows.saturating_sub(lines.len() + footer_rows).max(1);
+
+    let (toggle_budget, preview_budget) = if state.show_dry_run_preview {
+        if body_budget >= 22 {
+            let t_rows = display_rows.len();
+            let p_rows = body_budget.saturating_sub(t_rows + 1);
+            (t_rows, p_rows)
+        } else if body_budget >= 10 {
+            let t_rows = (body_budget / 2).max(4);
+            let p_rows = body_budget.saturating_sub(t_rows + 1);
+            (t_rows, p_rows)
+        } else {
+            (body_budget.saturating_sub(4).max(1), body_budget.min(4))
+        }
+    } else {
+        (body_budget, 0)
+    };
+
+    let win = compute_scroll_window(display_rows.len(), selected_display_row, toggle_budget);
+    if win.above > 0 {
+        let hint = format!("   ↑ {} more", win.above);
+        lines.push(format!(
+            "{left_pad}{}",
+            paint_styled_text(
+                color_mode,
+                RGB_UI_MUTED,
+                false,
+                &truncate_chars(&hint, content_w)
+            )
+        ));
+    }
+
+    let harness_label_w = 12usize;
+    let badge_w = 10usize; // "(detected)"
+    for row in display_rows.iter().take(win.end).skip(win.start) {
+        match row {
+            ToggleDisplayRow::SectionHeader(hdr) => {
+                lines.push(format!(
+                    "{left_pad}{}",
+                    paint_styled_text(
+                        color_mode,
+                        RGB_NODE_AMBER,
+                        true,
+                        &truncate_chars(hdr, content_w)
+                    )
+                ));
+            }
+            ToggleDisplayRow::Spacer => {
+                lines.push(String::new());
+            }
+            ToggleDisplayRow::Harness(idx) => {
+                let kind = HarnessKind::ALL[*idx];
+                let (name, path_hint) = harness_toggle_display(kind);
+                let detected = state.is_harness_detected(kind);
+                let badge = if detected { Some("(detected)") } else { None };
+                lines.push(format_toggle_row(
+                    state.cursor == *idx,
+                    state.selected_harnesses[*idx],
+                    name,
+                    badge,
+                    path_hint,
+                    harness_label_w,
+                    badge_w,
+                    content_w,
+                    &left_pad,
+                    color_mode,
+                ));
+            }
+            ToggleDisplayRow::Component(idx) => {
+                let (name, desc) = component_toggle_display(*idx);
+                let checked = match *idx {
+                    9 => state.install_skills,
+                    10 => state.install_statusline,
+                    11 => state.install_claude_commands,
+                    _ => state.install_herdr_mod,
+                };
+                lines.push(format_toggle_row(
+                    state.cursor == *idx,
+                    checked,
+                    name,
+                    None,
+                    desc,
+                    name.chars().count(),
+                    0,
+                    content_w,
+                    &left_pad,
+                    color_mode,
+                ));
+            }
+        }
+    }
+
+    if win.below > 0 {
+        let hint = format!("   ↓ {} more", win.below);
+        lines.push(format!(
+            "{left_pad}{}",
+            paint_styled_text(
+                color_mode,
+                RGB_UI_MUTED,
+                false,
+                &truncate_chars(&hint, content_w)
+            )
+        ));
+    }
+
+    if state.show_dry_run_preview && preview_budget >= 3 && content_w >= 8 {
+        if lines.len() + preview_budget + footer_rows < term_rows {
+            lines.push(String::new());
+        }
+        let inner_card_w = content_w.saturating_sub(4).max(4);
+        let border_fg = fg_color(color_mode, RGB_UI_BORDER);
+        let reset = style_reset(color_mode);
+        let hdr_text = " Dry-Run Preview (zero files written) ";
+        let hdr_clipped = truncate_chars(hdr_text, inner_card_w);
+        let dash_fill = (inner_card_w + 2).saturating_sub(hdr_clipped.chars().count() + 1);
+        let top_border = format!(
+            "{left_pad}{border_fg}╭─{}{reset}{border_fg}{}╮{reset}",
+            paint_styled_text(color_mode, RGB_NODE_AMBER, true, &hdr_clipped),
+            "─".repeat(dash_fill)
+        );
+        lines.push(top_border);
+
+        let preview_items = state.build_dry_run_preview(home, include_node_bootstrap);
+        let max_preview_rows = preview_budget.saturating_sub(2).max(1);
+        let card_row = |plain_text: &str, rgb: (u8, u8, u8)| -> String {
+            let clipped = truncate_chars(plain_text, inner_card_w);
+            let pad_r = " ".repeat(inner_card_w.saturating_sub(clipped.chars().count()));
+            let styled = paint_styled_text(color_mode, rgb, false, &clipped);
+            format!("{left_pad}{border_fg}│{reset} {styled}{pad_r} {border_fg}│{reset}")
+        };
+
+        if preview_items.len() <= max_preview_rows {
+            for item in &preview_items {
+                lines.push(card_row(item, RGB_PULSE_IVORY));
+            }
+        } else {
+            let visible = max_preview_rows.saturating_sub(1);
+            for item in preview_items.iter().take(visible) {
+                lines.push(card_row(item, RGB_PULSE_IVORY));
+            }
+            let remaining = preview_items.len().saturating_sub(visible);
+            lines.push(card_row(
+                &format!("… +{remaining} more action(s)"),
+                RGB_UI_MUTED,
+            ));
+        }
+        let horiz = "─".repeat(inner_card_w + 2);
+        lines.push(format!("{left_pad}{border_fg}╰{horiz}╯{reset}"));
+    }
+
+    if footer_rows >= 2 {
+        lines.push(String::new());
+    }
+    let preview_hint = if state.show_dry_run_preview {
+        "d hide preview"
+    } else {
+        "d preview"
+    };
+    let back_hint = if allow_back {
+        "Esc/b back · q quit"
+    } else {
+        "Esc/b/q cancel"
+    };
+    let footer = format!(
+        "↑/↓ move · Space toggle · a all/det/none · {preview_hint} · Enter apply · {back_hint}"
+    );
+    lines.push(format!(
+        "{left_pad}{}",
+        paint_styled_text(
+            color_mode,
+            RGB_UI_MUTED,
+            false,
+            &truncate_chars(&footer, content_w)
+        )
+    ));
+
+    if lines.len() > term_rows {
+        lines.truncate(term_rows);
+    }
+
+    let top_pad = term_rows.saturating_sub(lines.len()) / 3;
+    let mut padded = vec![String::new(); top_pad];
+    padded.extend(lines);
+    padded
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn render_setup_toggle_fullscreen(
+    state: &SetupToggleState,
+    home: &Path,
+    include_node_bootstrap: bool,
+    allow_back: bool,
+    term_rows: usize,
+    term_cols: usize,
+    color_mode: ColorMode,
+    anim_tick: usize,
+) {
+    let lines = render_setup_toggle_screen(
+        state,
+        home,
+        include_node_bootstrap,
+        allow_back,
+        term_rows,
+        term_cols,
+        color_mode,
+        anim_tick,
+    );
+    flush_screen_lines(&lines, term_rows);
+}
+
+fn run_plain_tty_setup_toggle(
+    state: &mut SetupToggleState,
+    home: &Path,
+    include_node_bootstrap: bool,
+    allow_back: bool,
+) -> Result<SetupToggleAction, String> {
+    loop {
+        println!();
+        if include_node_bootstrap {
+            println!("Local CLI Setup · Choose Harnesses & Components");
+        } else {
+            println!("hyp setup --interactive · Choose Harnesses & Components");
+        }
+        println!();
+        println!("Harnesses:");
+        for (idx, &kind) in HarnessKind::ALL.iter().enumerate() {
+            let (name, _) = harness_toggle_display(kind);
+            let mark = if state.selected_harnesses[idx] {
+                "x"
+            } else {
+                " "
+            };
+            let badge = if state.is_harness_detected(kind) {
+                " (detected)"
+            } else {
+                ""
+            };
+            println!("  [{:>2}] [{mark}] {name}{badge}", idx + 1);
+        }
+        println!();
+        println!("Components & UI Plugins:");
+        for idx in SetupToggleState::HARNESS_COUNT..SetupToggleState::TOTAL_ITEMS {
+            let (name, desc) = component_toggle_display(idx);
+            let checked = match idx {
+                9 => state.install_skills,
+                10 => state.install_statusline,
+                11 => state.install_claude_commands,
+                _ => state.install_herdr_mod,
+            };
+            let mark = if checked { "x" } else { " " };
+            println!("  [{:>2}] [{mark}] {name} {desc}", idx + 1);
+        }
+        if state.show_dry_run_preview {
+            println!();
+            println!("Dry-Run Preview (zero files written):");
+            for line in state.build_dry_run_preview(home, include_node_bootstrap) {
+                println!("  • {line}");
+            }
+        }
+        println!();
+        let back_str = if allow_back {
+            "[b] back, [q] quit"
+        } else {
+            "[b/q] cancel"
+        };
+        println!(
+            "Commands: number(s) to toggle (e.g. 1,11), [a] all/det/none, [d] preview, [Enter] apply, {back_str}"
+        );
+
+        let reply = match read_tty_line("Toggle or Enter to apply: ") {
+            Ok(Some(line)) => line,
+            Ok(None) => return Ok(SetupToggleAction::Cancel),
+            Err(e) => return Err(format!("Failed reading interactive selection: {e}")),
+        };
+        match apply_setup_toggle_text_input(state, &reply, allow_back) {
+            Ok(SetupToggleAction::Continue) => {}
+            Ok(action) => return Ok(action),
+            Err(msg) => println!("{msg}"),
+        }
+    }
+}
+
+/// Standalone interactive harness & component toggle screen entrypoint for `hyp setup --interactive`.
+///
+/// Returns `Ok(Some(selection))` when confirmed with `Enter`, or `Ok(None)` when cancelled with
+/// `Esc`/`b`/`q` (guaranteed zero files written).
+pub fn run_setup_toggle_interactive(
+    mut state: SetupToggleState,
+    home: &Path,
+) -> Result<Option<SetupSelection>, String> {
+    #[cfg(unix)]
+    {
+        if io::stdout().is_terminal() {
+            let color_mode = detect_color_mode();
+            let mut alt = AltScreenGuard::enter_if(true);
+            if let Ok(mut raw) = RawTtyGuard::enter(false) {
+                let live_anim = !wizard_anim_disabled(false) && color_mode != ColorMode::Plain;
+                let mut anim_tick: usize = 0;
+                let outcome = loop {
+                    let (term_rows, term_cols) = detect_terminal_size();
+                    let has_live_banner = term_rows >= 33 && !state.show_dry_run_preview;
+                    render_setup_toggle_fullscreen(
+                        &state,
+                        home,
+                        false,
+                        false,
+                        term_rows,
+                        term_cols,
+                        color_mode,
+                        anim_tick,
+                    );
+                    let key = if live_anim && has_live_banner {
+                        match raw.read_key_timeout() {
+                            Ok(Some(k)) => k,
+                            Ok(None) => {
+                                anim_tick = anim_tick.wrapping_add(1);
+                                continue;
+                            }
+                            Err(e) => break Err(format!("Failed reading TTY input: {e}")),
+                        }
+                    } else {
+                        match raw.read_key() {
+                            Ok(k) => k,
+                            Err(e) => break Err(format!("Failed reading TTY input: {e}")),
+                        }
+                    };
+                    match handle_setup_toggle_key(&mut state, key, false) {
+                        SetupToggleAction::Continue => {}
+                        SetupToggleAction::Apply(sel) => break Ok(Some(sel)),
+                        SetupToggleAction::Back | SetupToggleAction::Cancel => break Ok(None),
+                    }
+                };
+                raw.restore();
+                alt.leave();
+                return outcome;
+            }
+            alt.leave();
+        }
+    }
+
+    match run_plain_tty_setup_toggle(&mut state, home, false, false)? {
+        SetupToggleAction::Apply(sel) => Ok(Some(sel)),
+        SetupToggleAction::Back | SetupToggleAction::Cancel | SetupToggleAction::Continue => {
+            Ok(None)
+        }
+    }
+}
+
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn build_initial_manual_guide_screen(
@@ -6282,6 +7358,19 @@ fn run_fullscreen_tui_loop(
                     anim_tick,
                 );
                 true
+            }
+            WizardScreen::LocalSetupConfig { state, .. } => {
+                render_setup_toggle_fullscreen(
+                    state,
+                    home,
+                    true,
+                    true,
+                    term_rows,
+                    term_cols,
+                    color_mode,
+                    anim_tick,
+                );
+                term_rows >= 33 && !state.show_dry_run_preview
             }
             WizardScreen::HerdrTemplates {
                 templates,
@@ -6430,13 +7519,33 @@ fn run_fullscreen_tui_loop(
                                 }
                             }
                             MainMenuAction::QuickLocalSetup => {
-                                break TuiResolution::RunLocalCliSetup;
+                                let state = SetupToggleState::from_home(home, explicit_home);
+                                screen = WizardScreen::LocalSetupConfig {
+                                    state,
+                                    main_selected: idx,
+                                };
                             }
                         }
                     }
                     _ => {}
                 }
             }
+            WizardScreen::LocalSetupConfig {
+                state,
+                main_selected,
+            } => match handle_setup_toggle_key(state, key, true) {
+                SetupToggleAction::Continue => {}
+                SetupToggleAction::Apply(selection) => {
+                    break TuiResolution::RunLocalCliSetupWithSelection(selection);
+                }
+                SetupToggleAction::Back => {
+                    let prev = *main_selected;
+                    screen = WizardScreen::Main { selected: prev };
+                }
+                SetupToggleAction::Cancel => {
+                    break TuiResolution::Cancel;
+                }
+            },
             WizardScreen::HerdrTemplates {
                 hc_bin,
                 templates,
@@ -6675,6 +7784,9 @@ fn execute_tui_resolution(
     match resolution {
         TuiResolution::Cancel => WizardOutcome::Finished(ExitCode::from(EXIT_OK)),
         TuiResolution::RunLocalCliSetup => WizardOutcome::RunLocalCliSetup,
+        TuiResolution::RunLocalCliSetupWithSelection(selection) => {
+            WizardOutcome::RunLocalCliSetupWithSelection(selection)
+        }
         TuiResolution::LaunchCli(lh) => {
             let code =
                 install_and_handoff_cli(lh, home, explicit_home, existing_node, cli_bin, false);
@@ -7095,7 +8207,32 @@ fn run_numbered_fallback_wizard(
                     return outcome;
                 }
             }
-            MainMenuAction::QuickLocalSetup => return WizardOutcome::RunLocalCliSetup,
+            MainMenuAction::QuickLocalSetup => {
+                let mut toggle_state = SetupToggleState::from_home(home, args.home.is_some());
+                match run_plain_tty_setup_toggle(&mut toggle_state, home, true, true) {
+                    Ok(SetupToggleAction::Apply(selection)) => {
+                        return WizardOutcome::RunLocalCliSetupWithSelection(selection);
+                    }
+                    Ok(SetupToggleAction::Back) => {}
+                    Ok(SetupToggleAction::Cancel) | Ok(SetupToggleAction::Continue) => {
+                        println!("Cancelled.");
+                        return WizardOutcome::Finished(ExitCode::from(EXIT_OK));
+                    }
+                    Err(e) => {
+                        return WizardOutcome::Finished(emit_error(
+                            "onboard",
+                            false,
+                            EXIT_ERROR,
+                            "TTY_READ_ERROR",
+                            e,
+                            Some(
+                                "Re-run with `hyp onboard --yes` for non-interactive setup."
+                                    .to_string(),
+                            ),
+                        ));
+                    }
+                }
+            }
         }
     }
 }
@@ -7120,6 +8257,10 @@ pub fn should_launch_interactive_wizard(args: &OnboardArgs, stdout_is_tty: bool)
         || args.home.is_some()
         || args.bin.is_some()
         || args.harness.is_some()
+        || args.statusline
+        || args.install_mod
+        || args.no_skills
+        || args.no_commands
         || args.profile != crate::node_cmd::CliNodeProfile::Local
     {
         return false;
@@ -8654,5 +9795,284 @@ mod tests {
         assert!(HYPHAE_SETUP_SKILL_MD.contains("--claude-channel"));
         assert!(HYPHAE_SETUP_SKILL_MD.contains("T3 Code"));
         assert!(HYPHAE_SETUP_SKILL_MD.contains("OpenClaw"));
+        assert!(HYPHAE_SETUP_SKILL_MD.contains("--no-skills"));
+        assert!(HYPHAE_SETUP_SKILL_MD.contains("--no-commands"));
+        assert!(HYPHAE_SETUP_SKILL_MD.contains("--statusline"));
+        assert!(HYPHAE_SETUP_SKILL_MD.contains("--restore-statusline"));
+        assert!(HYPHAE_SETUP_SKILL_MD.contains("--interactive"));
+        assert!(HYPHAE_SETUP_SKILL_MD.contains("hyp uninstall"));
+        assert!(HYPHAE_SETUP_SKILL_MD.contains("pill.js"));
+    }
+
+    #[test]
+    fn setup_toggle_defaults_respect_detected_harnesses_and_herdr_app_dir() {
+        // 1. Detected claude + codex, NO herdr-app -> herdr mod unchecked.
+        let s1 = SetupToggleState::from_detection(&[HarnessKind::Claude, HarnessKind::Codex], false);
+        assert!(s1.is_harness_selected(HarnessKind::Claude));
+        assert!(s1.is_harness_selected(HarnessKind::Codex));
+        assert!(!s1.is_harness_selected(HarnessKind::Herdr));
+        assert!(!s1.is_harness_selected(HarnessKind::Cursor));
+        assert!(s1.install_skills);
+        assert!(s1.install_statusline);
+        assert!(s1.install_claude_commands);
+        assert!(!s1.install_herdr_mod);
+
+        // 2. herdr-app exists, but Herdr harness NOT detected -> herdr mod stays unchecked.
+        let s2 = SetupToggleState::from_detection(&[HarnessKind::Claude], true);
+        assert!(!s2.install_herdr_mod);
+
+        // 3. BOTH Herdr detected AND ~/.config/herdr-app exists -> herdr mod pre-checked!
+        let s3 = SetupToggleState::from_detection(&[HarnessKind::Claude, HarnessKind::Herdr], true);
+        assert!(s3.is_harness_selected(HarnessKind::Herdr));
+        assert!(s3.install_herdr_mod);
+
+        // 4. Hermetic from_home detection reads temp dir without touching host config.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::create_dir_all(home.join(".config/herdr")).unwrap();
+        fs::create_dir_all(home.join(".config/herdr-app")).unwrap();
+
+        let from_fs = SetupToggleState::from_home(&home, true);
+        assert_eq!(
+            from_fs.detected_harnesses,
+            vec![HarnessKind::Claude, HarnessKind::Herdr]
+        );
+        assert!(from_fs.install_herdr_mod);
+        assert_eq!(
+            from_fs.to_selection(),
+            SetupSelection {
+                harnesses: vec![HarnessKind::Claude, HarnessKind::Herdr],
+                install_skills: true,
+                install_statusline: true,
+                install_claude_commands: true,
+                install_herdr_mod: true,
+            }
+        );
+    }
+
+    #[test]
+    fn setup_toggle_keys_toggle_items_cycle_all_preview_and_cancel_cleanly() {
+        let mut state = SetupToggleState::from_detection(&[HarnessKind::Claude], false);
+        assert_eq!(state.cursor, 0);
+
+        // Move down to Claude (index 1 in HarnessKind::ALL) and uncheck it with Space.
+        assert_eq!(
+            handle_setup_toggle_key(&mut state, KeyEvent::Down, true),
+            SetupToggleAction::Continue
+        );
+        assert_eq!(state.cursor, 1);
+        assert!(state.is_harness_selected(HarnessKind::Claude));
+        handle_setup_toggle_key(&mut state, KeyEvent::Char(' '), true);
+        assert!(!state.is_harness_selected(HarnessKind::Claude));
+
+        // Toggle back on with Space.
+        handle_setup_toggle_key(&mut state, KeyEvent::Char(' '), true);
+        assert!(state.is_harness_selected(HarnessKind::Claude));
+
+        // Press `a`: matches_detected (Claude only) -> all 9 -> none -> back to detected (Claude only).
+        handle_setup_toggle_key(&mut state, KeyEvent::Char('a'), true);
+        assert_eq!(state.selected_harness_count(), 9);
+        handle_setup_toggle_key(&mut state, KeyEvent::Char('a'), true);
+        assert_eq!(state.selected_harness_count(), 0);
+        handle_setup_toggle_key(&mut state, KeyEvent::Char('a'), true);
+        assert_eq!(state.selected_harness_count(), 1);
+        assert!(state.is_harness_selected(HarnessKind::Claude));
+
+        // Jump up from cursor 1 -> 0 -> wraps to 12 (Native Herdr mod), then toggle components.
+        handle_setup_toggle_key(&mut state, KeyEvent::Up, true);
+        assert_eq!(state.cursor, 0);
+        handle_setup_toggle_key(&mut state, KeyEvent::Up, true);
+        assert_eq!(state.cursor, 12);
+        assert!(!state.install_herdr_mod);
+        handle_setup_toggle_key(&mut state, KeyEvent::Char(' '), true);
+        assert!(state.install_herdr_mod);
+
+        // Toggle Runtime skills (index 9) off.
+        state.cursor = 9;
+        handle_setup_toggle_key(&mut state, KeyEvent::Char(' '), true);
+        assert!(!state.install_skills);
+
+        // Toggle dry-run preview on & off with `d`.
+        assert!(!state.show_dry_run_preview);
+        handle_setup_toggle_key(&mut state, KeyEvent::Char('d'), true);
+        assert!(state.show_dry_run_preview);
+        handle_setup_toggle_key(&mut state, KeyEvent::Char('D'), true);
+        assert!(!state.show_dry_run_preview);
+
+        // Esc & b return Back when allow_back=true, and Cancel when allow_back=false.
+        assert_eq!(
+            handle_setup_toggle_key(&mut state, KeyEvent::Back, true),
+            SetupToggleAction::Back
+        );
+        assert_eq!(
+            handle_setup_toggle_key(&mut state, KeyEvent::Char('b'), true),
+            SetupToggleAction::Back
+        );
+        assert_eq!(
+            handle_setup_toggle_key(&mut state, KeyEvent::Back, false),
+            SetupToggleAction::Cancel
+        );
+        assert_eq!(
+            handle_setup_toggle_key(&mut state, KeyEvent::Char('b'), false),
+            SetupToggleAction::Cancel
+        );
+        assert_eq!(
+            handle_setup_toggle_key(&mut state, KeyEvent::Cancel, true),
+            SetupToggleAction::Cancel
+        );
+
+        // Enter applies exact checked selection.
+        assert_eq!(
+            handle_setup_toggle_key(&mut state, KeyEvent::Enter, true),
+            SetupToggleAction::Apply(SetupSelection {
+                harnesses: vec![HarnessKind::Claude],
+                install_skills: false,
+                install_statusline: true,
+                install_claude_commands: true,
+                install_herdr_mod: true,
+            })
+        );
+    }
+
+    #[test]
+    fn render_setup_toggle_screen_fits_narrow_tiny_and_wide_viewports_with_ansi_parity() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let mut state = SetupToggleState::from_detection(
+            &[HarnessKind::Claude, HarnessKind::Antigravity, HarnessKind::Herdr],
+            true,
+        );
+        state.cursor = 1; // Claude Code
+
+        for (rows, cols) in [(24usize, 80usize), (18, 60), (40, 120)] {
+            for preview in [false, true] {
+                state.show_dry_run_preview = preview;
+                let plain = render_setup_toggle_screen(
+                    &state,
+                    &home,
+                    true,
+                    true,
+                    rows,
+                    cols,
+                    ColorMode::Plain,
+                    0,
+                );
+                let ansi256 = render_setup_toggle_screen(
+                    &state,
+                    &home,
+                    true,
+                    true,
+                    rows,
+                    cols,
+                    ColorMode::Ansi256,
+                    0,
+                );
+                let tc = render_setup_toggle_screen(
+                    &state,
+                    &home,
+                    true,
+                    true,
+                    rows,
+                    cols,
+                    ColorMode::TrueColor,
+                    0,
+                );
+
+                assert!(
+                    plain.len() <= rows,
+                    "overflowed {rows} rows (preview={preview}): got {}",
+                    plain.len()
+                );
+                assert_eq!(plain.len(), ansi256.len());
+                assert_eq!(plain.len(), tc.len());
+
+                for (idx, ((p, a), t)) in plain
+                    .iter()
+                    .zip(ansi256.iter())
+                    .zip(tc.iter())
+                    .enumerate()
+                {
+                    let sp = strip_ansi(p);
+                    let sa = strip_ansi(a);
+                    let st = strip_ansi(t);
+                    assert_eq!(
+                        sp, sa,
+                        "Plain vs Ansi256 mismatch at row {idx} ({cols}x{rows}, preview={preview})"
+                    );
+                    assert_eq!(
+                        sp, st,
+                        "Plain vs TrueColor mismatch at row {idx} ({cols}x{rows}, preview={preview})"
+                    );
+                    assert!(
+                        sp.chars().count() <= cols,
+                        "row {idx} overflowed {cols} cols (preview={preview}): len={} text={sp:?}",
+                        sp.chars().count()
+                    );
+                }
+
+                let text = plain
+                    .iter()
+                    .map(|l| strip_ansi(l))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !preview && rows >= 24 {
+                    assert!(text.contains("Harnesses"));
+                    assert!(text.contains("Components & UI Plugins"));
+                    assert!(text.contains("[x] Claude Code"));
+                    assert!(text.contains("(detected)"));
+                    assert!(text.contains("[ ] Codex"));
+                    assert!(text.contains("[x] Runtime skills"));
+                    assert!(text.contains("[x] Live statusLine"));
+                    assert!(text.contains("[x] Claude slash commands"));
+                    assert!(text.contains("[x] Native Herdr mod"));
+                }
+                if preview {
+                    assert!(
+                        text.contains("Dry-Run Preview"),
+                        "expected Dry-Run Preview box at {cols}x{rows}:\n{text}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn setup_toggle_text_fallback_handles_multi_toggles_preview_back_and_apply() {
+        let mut state = SetupToggleState::from_detection(&[HarnessKind::Claude], false);
+        assert_eq!(
+            apply_setup_toggle_text_input(&mut state, "2,10,11", true).unwrap(),
+            SetupToggleAction::Continue
+        );
+        // 2 -> index 1 (Claude toggled off), 10 -> index 9 (skills off), 11 -> index 10 (statusline off).
+        assert!(!state.is_harness_selected(HarnessKind::Claude));
+        assert!(!state.install_skills);
+        assert!(!state.install_statusline);
+
+        assert_eq!(
+            apply_setup_toggle_text_input(&mut state, "d", true).unwrap(),
+            SetupToggleAction::Continue
+        );
+        assert!(state.show_dry_run_preview);
+
+        assert_eq!(
+            apply_setup_toggle_text_input(&mut state, "b", true).unwrap(),
+            SetupToggleAction::Back
+        );
+        assert_eq!(
+            apply_setup_toggle_text_input(&mut state, "b", false).unwrap(),
+            SetupToggleAction::Cancel
+        );
+        assert_eq!(
+            apply_setup_toggle_text_input(&mut state, "q", true).unwrap(),
+            SetupToggleAction::Cancel
+        );
+        assert!(apply_setup_toggle_text_input(&mut state, "99", true).is_err());
+
+        // Empty input applies.
+        assert!(matches!(
+            apply_setup_toggle_text_input(&mut state, "", true).unwrap(),
+            SetupToggleAction::Apply(_)
+        ));
     }
 }
