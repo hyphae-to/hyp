@@ -37,7 +37,8 @@ fn uninstall_script_mirrors_are_byte_identical_and_non_empty() {
         "site/uninstall.sh must be byte-identical to scripts/uninstall.sh"
     );
     assert!(
-        canonical.starts_with(b"#!/usr/bin/env bash\n"),
+        canonical.starts_with(b"#!/usr/bin/env bash\n")
+            || canonical.starts_with(b"#!/usr/bin/env bash\r\n"),
         "scripts/uninstall.sh must start with #!/usr/bin/env bash"
     );
 }

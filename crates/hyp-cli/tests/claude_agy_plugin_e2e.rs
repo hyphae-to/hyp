@@ -97,7 +97,8 @@ fn claude_code_plugin_bundle_conforms_to_schema_and_security_invariants() {
     for (file, needle_a, needle_b) in expected_commands {
         let path = plugin_dir.join("commands").join(file);
         let content = fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("missing command {}: {e}", path.display()));
+            .unwrap_or_else(|e| panic!("missing command {}: {e}", path.display()))
+            .replace("\r\n", "\n");
         assert!(
             content.starts_with("---\n"),
             "{file} must start with YAML frontmatter"
@@ -136,7 +137,8 @@ fn claude_code_plugin_bundle_conforms_to_schema_and_security_invariants() {
     assert!(readme.contains("--chain-file"));
 
     let skill = fs::read_to_string(plugin_dir.join("skills/hyphae/SKILL.md"))
-        .expect("read plugin SKILL.md");
+        .expect("read plugin SKILL.md")
+        .replace("\r\n", "\n");
     assert!(skill.starts_with("---\nname: hyphae\n"));
     assert!(skill.to_ascii_lowercase().contains("untrusted"));
 

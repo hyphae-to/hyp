@@ -584,7 +584,7 @@ mod tests {
         );
         let validated = validate_uninstall_script_body(EMBEDDED_UNINSTALL_SH.as_bytes())
             .expect("embedded script must pass header validation");
-        assert!(validated.starts_with("#!/usr/bin/env bash\n"));
+        assert_eq!(validated.lines().next(), Some("#!/usr/bin/env bash"));
         assert!(validated.contains("Proceed with uninstall? [y/N]:"));
         assert!(validated.contains("--keep-binary"));
         assert!(validated.contains("--keep-state"));
