@@ -1,0 +1,40 @@
+# Human Authority & Blind Drop Relay
+
+Verified Human Drops (`human.auth.v1` / `drop.relay.v1`) provide a cryptographic out-of-band channel from an enrolled human (phone or laptop) to a Hyphae node without exposing secret bytes to relays, logs, SQLite, or agent LLM contexts.
+
+---
+
+## 1. Tier 1 Ed25519 + Companion X25519 Human Authority
+
+- **Phone WebAuthn Passkey+PRF (`https://hyphae.to/drop`):** Self-contained static page (zero CDN, strict CSP). During first-time `hyp auth init --web`, a single Face ID / Touch ID PRF prompt derives **both** an Ed25519 signing keypair and a companion X25519 draft-encryption keypair (`human_authorities.enc_jwk_json`, schema v5). Both public keys bind into `human_authorities_digest` / `gate_policy_sig`.
+- **Laptop CLI Ed25519 keys:** Stored in `SecretStore` (macOS Keychain / Linux Secret Service / `0600` file).
+- **Interactive TTY confirmation:** Mutating/signing CLI operations (`hyp auth add`, `hyp auth revoke`, `hyp auth sign`, `hyp emit --sign`, and re-running `hyp auth init --web` on an already-initialized node) enforce interactive TTY confirmation.
+
+---
+
+## 2. Anti-Phishing `NodeCertV1` & Encrypted Directive Prefills
+
+- **Node certificates (`hcert1_`):** Target nodes hold human-signed `NodeCertV1` records (`human_node_certs`) binding `nodeId` and X25519 encryption JWK so the Drop Portal verifies the recipient before sealing.
+- **Zero plaintext prefills:** Plaintext prefill fields in drop URLs are forbidden. For **`kind: "directive"` ONLY**, `--draft` / `--draft-stdin` or `hyp_mesh({ action: "drop_link", kind: "directive", draft: "..." })` HPKE-encrypts the draft (`human.draft.v1`, AAD-bound to `nodeId` + `recipientKid`, bucket-padded, ≤ 512 chars, rejecting C0/C1/zero-width/BiDi override chars fail-closed) into `#drop=` (`encDraft`). Draft prefills are **strictly forbidden for `kind: "secret"`**.
+- On `https://hyphae.to/drop`, 1 Face ID / Touch ID tap decrypts the draft in RAM -> amber *"Draft proposed by agent (untrusted)"* banner -> auto-expanded BiDi-safe review box -> mandatory confirmation checkbox -> Sign & Send -> immediate RAM wipe.
+
+---
+
+## 3. Sealed Drops (`hdrop1_`), Replay Protection & Secret Sink
+
+- Sealed with RFC 9180 HPKE (`DHKEM(X25519, HKDF-SHA256)` + `AES-256-GCM`) and Ed25519-signed over RFC 8785 JCS.
+- Single-use `claim_id` nonces record atomically in `human_nonces` (pruned on expiry) so replays fail closed. Revoking a key (`hyp auth revoke <kid> --bump-epoch`) advances the node's monotonic revocation epoch.
+- **Zero-knowledge secret sink:** `kind: "secret"` drops decrypt in memory and write straight into `SecretStore` (blocking reserved system secret names `node-sign-*`, `node-enc-*`, `id-sign-*`, `id-enc-*`, `admin-ca*`, `gate-policy*`, `human-admin*`, `human-authority*`, `auth-token*` fail-closed). Agents receive only metadata confirmation.
+- **Verified directives (`TrustTier::HumanVerified`):** Authenticated directives bypass Stage 2 untrusted-peer prompt-injection filters while recording immutable `gate_audit` rows.
+
+---
+
+## 4. Blind Drop Relay: `spore.hyphae.to` vs. Self-Hosted Rust Relay
+
+| Deployment | Storage Model | Retention & Wipe | Auth Mode |
+| --- | --- | --- | --- |
+| **Hosted public relay (`https://spore.hyphae.to`)** (`workers/drop-relay`) | Ephemeral Cloudflare Durable Object storage (`DropSlotDO`) persisting blind encrypted `hdrop1_` ciphertext envelopes **plus slot creator node ID and Ed25519 public key metadata** so drops survive isolate eviction. **Zero drop plaintext or decryption keys ever touch the relay.** | Hard **15-minute (`900s`)** Durable Object alarm unconditionally runs `storage.deleteAll()` (or immediate wipe + RAM zeroization on burn-after-read ack). | `DROP_AUTH_MODE = "open"` with Ed25519 request signatures (`X-Hyphae-Public-Key`) + durable per-IP & per-pubkey `RateLimiterDO` quotas. |
+| **Self-hosted Cloudflare Worker** (`workers/drop-relay`) | Same ephemeral DO storage + 15-min alarm `storage.deleteAll()`. | Hard 15-min alarm or immediate burn-after-read wipe. | Defaults fail-closed to `DROP_AUTH_MODE = "private"` (`ALLOWED_NODE_KEYS`). |
+| **Self-hosted in-node Rust Drop Relay** (`hyp deploy init drop-relay` / `--enable-drop-relay`) | **Strictly RAM-only** bounded zeroized buffer (`256 MiB` default, zero disk writes). | Zeroized immediately on burn-after-read ack or TTL expiry. | Authenticated paired peers holding explicit `drop:create` scope (excluded from `guest-ro`). |
+
+All relay implementations verify stateless HMAC-SHA256 `hdcap1_` upload and claim capability tokens in constant time **before** reading the HTTP request body, deliver over burn-after-read SSE (`GET /v1/drops/{id}/stream` + `POST /v1/drops/{id}/ack`), and enforce explicit CORS + Chrome Private Network Access (PNA) headers.

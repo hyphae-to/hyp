@@ -25,64 +25,8 @@ function esc(s) {
   window.addEventListener("resize", syncHeaderTheme, { passive: true });
 })();
 
-// Proportional 1200x590 stage scaling driven by real rendered container geometry:
-// - Mobile (<= 760px): natural vertical flow
-// - Mode A (Laptop / Standard Desktop, > 760px and < 990px tall or < 1100px wide):
-//   Header + Hero #1 = exact 100svh; animation stays <= 1.0x centered in .hero-stage-center
-// - Mode B (Big / Tall Desktop, >= 1100px wide and >= 990px tall):
-//   Header + Hero #1 + Divider + Hero #2 = exact 100svh; animation scales smoothly up to 1.28x
-(function initResponsiveStage() {
-  const header = document.getElementById("siteHeader");
-  const stageCenter = document.getElementById("heroStageCenter");
-  const controlsDock = document.getElementById("heroControlsDock");
-  const ctaStrip = document.getElementById("cta-install");
-  const viewport = document.getElementById("storyViewport");
-  const stage = document.getElementById("storyStage");
-  if (!viewport || !stage) return;
-
-  const LOGICAL_W = 1200;
-  const LOGICAL_H = 590;
-
-  function fitStage() {
-    const vw = window.innerWidth || 1280;
-    const vh = window.innerHeight || 900;
-    const headerH = header ? header.offsetHeight : 68;
-    document.documentElement.style.setProperty("--header-h", `${headerH}px`);
-
-    const availW = (stageCenter ? stageCenter.clientWidth : viewport.clientWidth) || LOGICAL_W;
-    const isMobile = vw <= 760;
-    const isBigScreen = vw >= 1100 && vh >= 990;
-
-    let scale;
-    if (isMobile) {
-      scale = Math.min(1, availW / LOGICAL_W);
-    } else {
-      const dockH = controlsDock ? controlsDock.offsetHeight : 112;
-      const ctaH = isBigScreen && ctaStrip ? ctaStrip.offsetHeight : 0;
-      const stagePadY = 28; // 12px top + 12px bottom + 4px safety margin
-      const availH = Math.max(240, vh - headerH - dockH - ctaH - stagePadY);
-      const maxScale = isBigScreen ? 1.28 : 1.0;
-      scale = Math.min(maxScale, availW / LOGICAL_W, availH / LOGICAL_H);
-    }
-
-    const offsetX = Math.max(0, (availW - LOGICAL_W * scale) / 2);
-    stage.style.transform = `translateX(${offsetX.toFixed(1)}px) scale(${scale.toFixed(4)})`;
-    viewport.style.height = `${Math.round(LOGICAL_H * scale)}px`;
-  }
-
-  fitStage();
-  if (typeof ResizeObserver !== "undefined") {
-    const ro = new ResizeObserver(fitStage);
-    if (stageCenter) ro.observe(stageCenter);
-    else ro.observe(viewport);
-    if (controlsDock) ro.observe(controlsDock);
-    if (ctaStrip) ro.observe(ctaStrip);
-  }
-  window.addEventListener("resize", fitStage, { passive: true });
-})();
-
 // ============================================================================
-// 1. HERO INSTALL SWITCHER
+// 1. HERO INSTALL SWITCHER (Pre-rendered in HTML; JS enhances tabs & copy)
 // ============================================================================
 const HERO_CMDS = {
   unix: "curl -fsSL https://hyphae.to/install.sh | sh",
@@ -92,10 +36,13 @@ const HERO_CMDS = {
 
 let activeHeroInstall = "unix";
 function renderHeroInstall() {
-  document.getElementById("heroInstallCmd").textContent = HERO_CMDS[activeHeroInstall];
-  document.querySelectorAll("#heroInstallTabs .it-btn").forEach((b) =>
-    b.classList.toggle("active", b.dataset.hi === activeHeroInstall)
-  );
+  const cmdEl = document.getElementById("heroInstallCmd");
+  if (cmdEl) cmdEl.textContent = HERO_CMDS[activeHeroInstall];
+  document.querySelectorAll("#heroInstallTabs .it-btn").forEach((b) => {
+    const active = b.dataset.hi === activeHeroInstall;
+    b.classList.toggle("active", active);
+    b.setAttribute("aria-selected", active ? "true" : "false");
+  });
 }
 document.querySelectorAll("#heroInstallTabs .it-btn").forEach((b) => {
   b.addEventListener("click", () => {
@@ -103,7 +50,7 @@ document.querySelectorAll("#heroInstallTabs .it-btn").forEach((b) => {
     renderHeroInstall();
   });
 });
-document.getElementById("heroCopyBtn").addEventListener("click", (e) => {
+document.getElementById("heroCopyBtn")?.addEventListener("click", (e) => {
   navigator.clipboard?.writeText(HERO_CMDS[activeHeroInstall]).catch(() => {});
   const btn = e.currentTarget;
   btn.textContent = "Copied";
@@ -112,13 +59,542 @@ document.getElementById("heroCopyBtn").addEventListener("click", (e) => {
 renderHeroInstall();
 
 // ============================================================================
-// 2. PANORAMIC 7-CHAPTER HERO STORY DIORAMA (Causal staged reveals + living mycelium)
+// 1B. HERO SIGNAL BUS (Multi-Source -> Hyphae Wire -> Multi-Machine Agents)
+// ============================================================================
+(function initSignalBus() {
+  const stage = document.getElementById("signalBusStage");
+  if (!stage) return;
+
+  const sources = [0, 1, 2, 3].map((i) => document.getElementById(`sbSrc${i}`));
+  const inLines = [0, 1, 2, 3].map((i) => document.getElementById(`sbIn${i}`));
+  const inPulses = [0, 1, 2, 3].map((i) => document.getElementById(`sbInPulse${i}`));
+  const outLines = [0, 1, 2].map((i) => document.getElementById(`sbOut${i}`));
+  const outPulses = [0, 1, 2].map((i) => document.getElementById(`sbOutPulse${i}`));
+
+  const core = document.getElementById("sbCore");
+  const canvasEl = document.getElementById("sbStageCanvas");
+  const wireSvg = document.getElementById("sbWireSvg");
+  const wireWeaves = document.getElementById("sbWireWeaves");
+  const wireBg = document.getElementById("sbWireBg");
+  const hubVisual = document.getElementById("sbHubVisual");
+  const valveRing = document.getElementById("sbValveRing");
+  const ruleEl = document.getElementById("sbRouteRule");
+  const captionEl = document.getElementById("sbCaption");
+  const playBtn = document.getElementById("sbPlayBtn");
+  const beatBtns = Array.from(document.querySelectorAll("#sbBeats [data-sb-beat]"));
+  const allTriggerBtns = Array.from(stage.querySelectorAll("[data-sb-beat]"));
+
+  const agents = [0, 1, 2].map((i) => ({
+    card: document.getElementById(`sbAgent${i}`),
+    state: document.getElementById(`sbAgentState${i}`),
+    msg: document.getElementById(`sbAgentMsg${i}`),
+  }));
+
+  function layoutHeroWires() {
+    if (!canvasEl || !wireSvg || !hubVisual) return;
+    const cRect = canvasEl.getBoundingClientRect();
+    if (cRect.width < 100 || window.innerWidth <= 1040) return;
+
+    const w = Math.round(cRect.width);
+    const h = Math.round(cRect.height);
+    wireSvg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+
+    const hRect = hubVisual.getBoundingClientRect();
+    const hubCx = hRect.left + hRect.width / 2 - cRect.left;
+    const hubCy = hRect.top + hRect.height / 2 - cRect.top;
+    const r = Math.max(40, hRect.width / 2 - 4);
+
+    const NS = "http://www.w3.org/2000/svg";
+    if (wireWeaves) wireWeaves.innerHTML = "";
+    if (wireBg) wireBg.innerHTML = "";
+
+    const addPath = (parent, cls, d) => {
+      if (!parent) return;
+      const p = document.createElementNS(NS, "path");
+      p.setAttribute("class", cls);
+      p.setAttribute("d", d);
+      parent.appendChild(p);
+    };
+
+    // Left sources -> brass Hyphae Node rim (tucked 6px inside glowing circle so wires never float)
+    const inSpread = [-18, -6, 6, 18];
+    sources.forEach((el, i) => {
+      if (!el) return;
+      const sr = el.getBoundingClientRect();
+      const x1 = sr.right - cRect.left - 2;
+      const y1 = sr.top + sr.height / 2 - cRect.top;
+      const dy = inSpread[i] || 0;
+      const dxRim = Math.sqrt(Math.max(1, r * r - dy * dy));
+      const x2 = hubCx - dxRim + 6;
+      const y2 = hubCy + dy;
+      const span = Math.max(30, x2 - x1);
+      const d = `M ${x1.toFixed(1)} ${y1.toFixed(1)} C ${(x1 + span * 0.44).toFixed(1)} ${y1.toFixed(1)}, ${(x2 - span * 0.42).toFixed(1)} ${y2.toFixed(1)}, ${x2.toFixed(1)} ${y2.toFixed(1)}`;
+      const dw = `M ${x1.toFixed(1)} ${(y1 - 4).toFixed(1)} C ${(x1 + span * 0.36).toFixed(1)} ${(y1 - 10).toFixed(1)}, ${(x2 - span * 0.36).toFixed(1)} ${(y2 + 6).toFixed(1)}, ${x2.toFixed(1)} ${(y2 - 2).toFixed(1)}`;
+      addPath(wireWeaves, "sb-weave", dw);
+      addPath(wireBg, "sb-path-bg", d);
+      if (inLines[i]) inLines[i].setAttribute("d", d);
+      if (inPulses[i]) inPulses[i].setAttribute("d", d);
+    });
+
+    // Brass Hyphae Node rim -> right agent cards
+    const outSpread = [-14, 0, 14];
+    agents.forEach((a, i) => {
+      if (!a.card) return;
+      const ar = a.card.getBoundingClientRect();
+      const dy = outSpread[i] || 0;
+      const dxRim = Math.sqrt(Math.max(1, r * r - dy * dy));
+      const x1 = hubCx + dxRim - 6;
+      const y1 = hubCy + dy;
+      const x2 = ar.left - cRect.left + 2;
+      const y2 = ar.top + ar.height / 2 - cRect.top;
+      const span = Math.max(30, x2 - x1);
+      const d = `M ${x1.toFixed(1)} ${y1.toFixed(1)} C ${(x1 + span * 0.42).toFixed(1)} ${y1.toFixed(1)}, ${(x2 - span * 0.44).toFixed(1)} ${y2.toFixed(1)}, ${x2.toFixed(1)} ${y2.toFixed(1)}`;
+      const dw = `M ${x1.toFixed(1)} ${(y1 + 2).toFixed(1)} C ${(x1 + span * 0.36).toFixed(1)} ${(y1 - 6).toFixed(1)}, ${(x2 - span * 0.38).toFixed(1)} ${(y2 + 9).toFixed(1)}, ${x2.toFixed(1)} ${(y2 + 3).toFixed(1)}`;
+      addPath(wireWeaves, "sb-weave", dw);
+      addPath(wireBg, "sb-path-bg", d);
+      if (outLines[i]) outLines[i].setAttribute("d", d);
+      if (outPulses[i]) outPulses[i].setAttribute("d", d);
+    });
+  }
+
+  if (typeof ResizeObserver !== "undefined" && canvasEl) {
+    new ResizeObserver(() => requestAnimationFrame(layoutHeroWires)).observe(canvasEl);
+  }
+  window.addEventListener("resize", () => requestAnimationFrame(layoutHeroWires), { passive: true });
+  document.fonts?.ready?.then(() => requestAnimationFrame(layoutHeroWires));
+
+  const BEATS = [
+    {
+      dur: 5000,
+      srcIdx: 0,
+      tone: "coral",
+      rule: "github.ci → claude@laptop",
+      caption:
+        "<strong>CI event:</strong> Wakes laptop Claude; teammate gets 1-line digest.",
+      out: [
+        { cls: "coral", state: "lit" },
+        { cls: "", state: "off" },
+        { cls: "amber", state: "soft" },
+      ],
+      agents: [
+        {
+          cardCls: "is-coral",
+          stateCls: "coral",
+          state: "⚡ Woken",
+          msg: "PR #412 failing check in auth.rs · pushed immediately",
+        },
+        {
+          cardCls: "is-muted",
+          stateCls: "slate",
+          state: "0 wakes",
+          msg: "Not subscribed to checkout-api · 0 tokens spent",
+        },
+        {
+          cardCls: "is-amber",
+          stateCls: "amber",
+          state: "1-line digest",
+          msg: "Summary queued for next turn · active work undisturbed",
+        },
+      ],
+    },
+    {
+      dur: 5000,
+      srcIdx: 1,
+      tone: "olive",
+      rule: "e2ee.dm → codex@linux-ci",
+      caption:
+        "<strong>Team DM:</strong> Wakes build-server Codex over E2EE.",
+      out: [
+        { cls: "", state: "off" },
+        { cls: "olive", state: "lit" },
+        { cls: "olive", state: "soft" },
+      ],
+      agents: [
+        {
+          cardCls: "is-idle",
+          stateCls: "slate",
+          state: "Idle · 0 polling",
+          msg: "Unrelated session · untouched",
+        },
+        {
+          cardCls: "is-olive",
+          stateCls: "olive",
+          state: "⚡ Woken",
+          msg: "@alex: review auth.rs diff & run cargo test on linux-ci",
+        },
+        {
+          cardCls: "is-olive-soft",
+          stateCls: "olive",
+          state: "Synced · E2EE",
+          msg: "Patch thread relayed via blind Team Hub (ciphertext only)",
+        },
+      ],
+    },
+    {
+      dur: 5000,
+      srcIdx: 2,
+      tone: "moss",
+      rule: "passkey → OS Keychain",
+      caption:
+        "<strong>Passkey drop:</strong> Lands in OS Keychain — never in prompts.",
+      out: [
+        { cls: "moss", state: "lit" },
+        { cls: "", state: "off" },
+        { cls: "", state: "off" },
+      ],
+      agents: [
+        {
+          cardCls: "is-moss",
+          stateCls: "moss",
+          state: "✓ Keychain ready",
+          msg: "STRIPE_KEY stored in OS Keychain · hyp exec redacts output",
+        },
+        {
+          cardCls: "is-idle",
+          stateCls: "slate",
+          state: "Scoped",
+          msg: "Pinned to laptop node only · zero relay plaintext",
+        },
+        {
+          cardCls: "is-idle",
+          stateCls: "slate",
+          state: "Untouched",
+          msg: "Blind relay auto-wipes ciphertext within 15 min",
+        },
+      ],
+    },
+    {
+      dur: 5200,
+      srcIdx: 3,
+      tone: "amber",
+      rule: "hyp emit → antigravity@team",
+      caption:
+        "<strong>Cron / alerts:</strong> Wakes subscribed agent; others stay quiet.",
+      out: [
+        { cls: "amber", state: "soft" },
+        { cls: "", state: "off" },
+        { cls: "amber", state: "lit" },
+      ],
+      agents: [
+        {
+          cardCls: "is-amber",
+          stateCls: "amber",
+          state: "1-line digest",
+          msg: "09:00 triage digest attached to next turn",
+        },
+        {
+          cardCls: "is-muted",
+          stateCls: "slate",
+          state: "0 wakes",
+          msg: "Archived silently · active build uninterrupted",
+        },
+        {
+          cardCls: "is-amber",
+          stateCls: "amber",
+          state: "⚡ Ready",
+          msg: "Morning cron delivered · 3 open PRs ready in hyp_inbox",
+        },
+      ],
+    },
+  ];
+
+  const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  let beatIdx = 0;
+  let playing = !reduced;
+  let timer = null;
+
+  function renderBeat(idx) {
+    const b = BEATS[idx] || BEATS[0];
+
+    sources.forEach((el, i) => {
+      if (!el) return;
+      el.classList.toggle("is-active", i === b.srcIdx);
+      el.setAttribute("aria-pressed", i === b.srcIdx ? "true" : "false");
+    });
+
+    inLines.forEach((el, i) => {
+      if (!el) return;
+      el.classList.toggle("is-lit", i === b.srcIdx);
+    });
+    inPulses.forEach((el, i) => {
+      if (!el) return;
+      el.classList.toggle("is-lit", !reduced && i === b.srcIdx);
+    });
+
+    outLines.forEach((el, i) => {
+      if (!el) return;
+      const spec = b.out[i];
+      el.setAttribute("class", `sb-path-live ${spec.cls} ${spec.state === "lit" ? "is-lit" : spec.state === "soft" ? "is-soft" : ""}`.trim());
+    });
+    outPulses.forEach((el, i) => {
+      if (!el) return;
+      const spec = b.out[i];
+      const activeCls = !reduced && spec.state === "lit" ? "is-lit" : !reduced && spec.state === "soft" ? "is-soft" : "";
+      el.setAttribute("class", `sb-pulse ${spec.cls} ${activeCls}`.trim());
+    });
+
+    if (core) core.className = `sb-hub-medallion tone-${b.tone}`;
+    if (valveRing) valveRing.className = `sb-valve-ring tone-${b.tone}`;
+
+    if (ruleEl) {
+      ruleEl.textContent = b.rule;
+      ruleEl.className = `sb-rule-readout ${b.tone}`;
+    }
+
+    agents.forEach((a, i) => {
+      const spec = b.agents[i];
+      if (!spec) return;
+      if (a.card) a.card.className = `sb-agent ${spec.cardCls}`.trim();
+      if (a.state) {
+        a.state.textContent = spec.state;
+        a.state.className = `sb-state ${spec.stateCls}`.trim();
+      }
+      if (a.msg) a.msg.textContent = spec.msg;
+    });
+
+    if (captionEl) captionEl.innerHTML = b.caption;
+
+    beatBtns.forEach((btn, i) => {
+      btn.classList.toggle("active", i === idx);
+      btn.classList.toggle("passed", i < idx);
+    });
+
+    requestAnimationFrame(layoutHeroWires);
+  }
+
+  function schedule() {
+    if (timer) clearTimeout(timer);
+    if (!playing) return;
+    timer = setTimeout(() => {
+      beatIdx = (beatIdx + 1) % BEATS.length;
+      renderBeat(beatIdx);
+      schedule();
+    }, BEATS[beatIdx].dur);
+  }
+
+  allTriggerBtns.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      beatIdx = Number(btn.dataset.sbBeat) || 0;
+      renderBeat(beatIdx);
+      schedule();
+    });
+  });
+
+  if (playBtn) {
+    playBtn.textContent = playing ? "Pause" : "Play";
+    playBtn.addEventListener("click", () => {
+      playing = !playing;
+      playBtn.textContent = playing ? "Pause" : "Play";
+      if (playing) {
+        renderBeat(beatIdx);
+        schedule();
+      } else if (timer) {
+        clearTimeout(timer);
+      }
+    });
+  }
+
+  layoutHeroWires();
+  requestAnimationFrame(layoutHeroWires);
+  renderBeat(beatIdx);
+  schedule();
+})();
+
+// ============================================================================
+// 1C. INTERACTIVE USE CASE SHOWCASE (#use-cases)
+// ============================================================================
+(function initUseCaseShowcase() {
+  const root = document.getElementById("ucShowcase");
+  if (!root) return;
+
+  const tabs = Array.from(root.querySelectorAll(".uc-tab[data-uc]"));
+  const card = document.getElementById("ucStageCard");
+  const badgeEl = document.getElementById("ucStageBadge");
+  const titleEl = document.getElementById("ucStageTitle");
+  const leadEl = document.getElementById("ucStageLead");
+  const fromEl = document.getElementById("ucFlowFrom");
+  const midLabelEl = document.getElementById("ucFlowMidLabel");
+  const toEl = document.getElementById("ucFlowTo");
+  const termLabelEl = document.getElementById("ucTermLabel");
+  const termCodeEl = document.getElementById("ucTermCode");
+  const copyBtn = document.getElementById("ucCopyBtn");
+  const chipsEl = document.getElementById("ucChips");
+  const actionLinkEl = document.getElementById("ucActionLink");
+
+  const KEY_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8.5" cy="14.5" r="4"/><path d="M11.5 11.5 20 3"/><path d="m17 6 2.5 2.5"/><path d="m14.5 8.5 2 2"/></svg>`;
+
+  const WORKFLOWS = {
+    team: {
+      tone: "olive",
+      badge: "Direct P2P · Team Hub (Beta)",
+      title: "Coordinate agents across laptops and build servers",
+      lead: "Pair machines directly over Tailscale or LAN with zero server, or run a blind Team Hub for <code>#channels</code> and shared KV.",
+      from: { kind: "avatar", src: "./assets/sprite-alex.jpg?v=2", title: "alex@macbook", sub: "Claude · sends E2EE DM" },
+      mid: "HPKE E2EE",
+      to: { kind: "avatar", src: "./assets/sprite-alice.jpg?v=2", title: "codex@linux-ci", sub: "Wakes · audits & replies" },
+      termLabel: "Pair directly or spin up a hub",
+      code: `# Direct P2P pairing (zero server)\nhyp onboard\n# Or self-host a blind Team Hub:\nhyp deploy init tailscale`,
+      copy: "hyp onboard",
+      chips: ["Tailscale / LAN", "HPKE E2EE", "#channels & KV"],
+      link: { text: "See 7-step team walkthrough ↓", href: "#walkthrough", openWalkthrough: true },
+    },
+    events: {
+      tone: "amber",
+      badge: "Standardized Event Streams",
+      title: "Wake only the right agent from CI, alerts, or OS cron",
+      lead: "GitHub PRs, Prometheus webhooks, and <code>hyp emit</code> schedules normalize onto one CloudEvents bus with burst caps — zero polling.",
+      from: { kind: "icon", src: "./assets/icons/github.svg", title: "GitHub / Cron / Alerts", sub: "Normalized CloudEvents" },
+      mid: "Filter + Tier",
+      to: { kind: "icon", src: "./assets/icons/claude.svg", title: "Subscribed session", sub: "Wakes or queues 1-line digest" },
+      termLabel: "Emit a scheduled wake from cron, launchd, systemd, or schtasks",
+      code: `# Emit a structured event to local.schedule\nhyp emit --label morning-triage \\\n  --note "Review open PRs"\n# Wakes only matching subscribers`,
+      copy: 'hyp emit --label morning-triage --note "Review open PRs"',
+      chips: ["GitHub & Prometheus", "OS cron triggers", "Zero polling"],
+      link: { text: "Try the live delivery simulator ↓", href: "#streams" },
+    },
+    drops: {
+      tone: "moss",
+      badge: "Passkey + Keychain + hyp exec",
+      title: "Send secrets or signed approvals from your phone",
+      lead: "Seal credentials or signed directives on <a class=\"card-inline-link\" href=\"./drop/\">hyphae.to/drop ↗</a> with Face ID — secrets land in Keychain and inject via <code>hyp exec</code>.",
+      from: { kind: "glyph", svg: KEY_SVG, title: "Phone · Face ID", sub: "WebAuthn Passkey + PRF" },
+      mid: "Blind Relay ≤15m",
+      to: { kind: "icon", src: "./assets/icons/openai.svg", title: "OS Keychain → hyp exec", sub: "Child env only · stdout redacted" },
+      termLabel: "Request a secret drop and inject it safely",
+      code: `# Request a Passkey-sealed secret drop\nhyp drop create --kind secret --secret-name api-key\n# Inject into child env with live stdout redaction\nhyp exec --env API_KEY=api-key -- ./deploy.sh`,
+      copy: "hyp drop create --kind secret --secret-name api-key",
+      chips: ["OS Keychain", "Passkey Signed", "Live Redaction"],
+      link: { text: "Open Drop Portal ↗", href: "./drop/" },
+    },
+    local: {
+      tone: "olive",
+      badge: "Zero Setup · Local Daemon",
+      title: "Let Claude Code, Codex, and OpenCode work together",
+      lead: "Every harness on your laptop shares one local SQLite inbox over 4 MCP tools and 2.7 ms hooks — idle sessions wake automatically.",
+      from: { kind: "icon", src: "./assets/icons/claude.svg", title: "Claude Code · @builder", sub: "Asks @reviewer to check diff" },
+      mid: "Local IPC",
+      to: { kind: "icon", src: "./assets/icons/openai.svg", title: "Codex · @reviewer", sub: "Wakes · audits · wakes builder" },
+      termLabel: "Prompt in Claude Code after install",
+      code: `# In Claude Code:\n"Join the Hyphae mesh as builder, then ask codex\n to review my last commit and reply when done."\n# Idle Codex wakes, audits, and replies`,
+      copy: "Join the Hyphae mesh as builder, then ask codex to review my last commit and reply when done.",
+      chips: ["Claude Code", "Codex", "OpenCode"],
+      link: { text: "See supported harnesses ↓", href: "#how-it-works" },
+    },
+    bridges: {
+      tone: "olive",
+      badge: "Verified Bridge Plugins",
+      title: "Message live sessions from Slack, Telegram, or WhatsApp",
+      lead: "Install SHA-256 verified bridges on macOS, Linux, or Windows. Bot tokens stay in Keychain, allowlists fail closed, and topics stay local.",
+      from: { kind: "icon", src: "./assets/icons/telegram.svg", title: "Slack · Telegram · WhatsApp", sub: "Allowlisted private chat" },
+      mid: "Local Bridge",
+      to: { kind: "icon", src: "./assets/icons/herdr.png", title: "Linked agent session", sub: "Replies & emoji reactions" },
+      termLabel: "Install a verified bridge and store its token out-of-band",
+      code: `# Install checksum-pinned bridge plugin\nhyp plugin install telegram\n# Store bot token directly into OS Keychain\nhyp secret set telegram-bot-token --web`,
+      copy: "hyp plugin install telegram && hyp secret set telegram-bot-token --web",
+      chips: ["macOS · Linux · Windows", "SHA-256 pinned", "Local-only topics"],
+      link: { text: "Read chat bridges guide ↗", href: "https://github.com/hyphae-to/hyp/blob/main/docs/guides/chat-bridges.md", external: true },
+    },
+  };
+
+  function renderNode(el, spec) {
+    if (!el || !spec) return;
+    let icoHtml = "";
+    if (spec.kind === "glyph") {
+      icoHtml = `<span class="uc-flow-ico glyph" aria-hidden="true">${spec.svg}</span>`;
+    } else if (spec.kind === "avatar") {
+      icoHtml = `<span class="uc-flow-ico avatar"><img src="${esc(spec.src)}" alt="" /></span>`;
+    } else {
+      icoHtml = `<span class="uc-flow-ico"><img src="${esc(spec.src)}" alt="" /></span>`;
+    }
+    el.innerHTML = `${icoHtml}<span class="uc-flow-copy"><strong>${esc(spec.title)}</strong><small>${esc(spec.sub)}</small></span>`;
+  }
+
+  function formatCode(raw) {
+    return raw
+      .split("\n")
+      .map((line) => (line.trimStart().startsWith("#") ? `<span class="uc-c">${esc(line)}</span>` : esc(line)))
+      .join("\n");
+  }
+
+  let activeKey = "team";
+
+  function selectWorkflow(key) {
+    const wf = WORKFLOWS[key] || WORKFLOWS.team;
+    activeKey = key in WORKFLOWS ? key : "team";
+
+    tabs.forEach((btn) => {
+      const isAct = btn.dataset.uc === activeKey;
+      btn.classList.toggle("is-active", isAct);
+      btn.setAttribute("aria-selected", isAct ? "true" : "false");
+    });
+
+    if (card) card.className = `uc-stage tone-${wf.tone}`;
+    if (badgeEl) badgeEl.textContent = wf.badge;
+    if (titleEl) titleEl.textContent = wf.title;
+    if (leadEl) leadEl.innerHTML = wf.lead;
+    renderNode(fromEl, wf.from);
+    if (midLabelEl) midLabelEl.textContent = wf.mid;
+    renderNode(toEl, wf.to);
+    if (termLabelEl) termLabelEl.textContent = wf.termLabel;
+    if (termCodeEl) termCodeEl.innerHTML = formatCode(wf.code);
+    if (chipsEl) chipsEl.innerHTML = wf.chips.map((c) => `<span>${esc(c)}</span>`).join("");
+
+    if (actionLinkEl && wf.link) {
+      actionLinkEl.textContent = wf.link.text;
+      actionLinkEl.setAttribute("href", wf.link.href);
+      if (wf.link.external) {
+        actionLinkEl.setAttribute("target", "_blank");
+        actionLinkEl.setAttribute("rel", "noreferrer");
+      } else {
+        actionLinkEl.removeAttribute("target");
+        actionLinkEl.removeAttribute("rel");
+      }
+      actionLinkEl.dataset.openWalkthrough = wf.link.openWalkthrough ? "1" : "";
+    }
+  }
+
+  tabs.forEach((btn, idx) => {
+    btn.addEventListener("click", () => selectWorkflow(btn.dataset.uc));
+    btn.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown" || e.key === "ArrowRight") {
+        e.preventDefault();
+        const next = tabs[(idx + 1) % tabs.length];
+        next.focus();
+        selectWorkflow(next.dataset.uc);
+      } else if (e.key === "ArrowUp" || e.key === "ArrowLeft") {
+        e.preventDefault();
+        const prev = tabs[(idx - 1 + tabs.length) % tabs.length];
+        prev.focus();
+        selectWorkflow(prev.dataset.uc);
+      }
+    });
+  });
+
+  copyBtn?.addEventListener("click", () => {
+    const wf = WORKFLOWS[activeKey];
+    if (!wf) return;
+    navigator.clipboard?.writeText(wf.copy).catch(() => {});
+    copyBtn.textContent = "Copied";
+    setTimeout(() => { copyBtn.textContent = "Copy"; }, 1300);
+  });
+
+  actionLinkEl?.addEventListener("click", () => {
+    if (actionLinkEl.dataset.openWalkthrough === "1" && !walkthroughOpen) {
+      setWalkthroughOpen(true);
+    }
+  });
+
+  selectWorkflow("team");
+})();
+
+// ============================================================================
+// 2. PANORAMIC 7-CHAPTER INCIDENT WALKTHROUGH (Collapsible Beta Diorama)
 // ============================================================================
 const CHAPTERS = [
   {
     durationMs: 5800,
     tip: "1 · Alex joins Team Node -> peers bloom one by one",
-    caption: "<strong>1/7</strong> · <strong>Alex</strong> (Claude in Herdr) joins the <strong>Team Node</strong> — immediately unlocking <code>#channels</code>, streams, <strong>Alice's Codex</strong> (OpenClaw), and <strong>Jack's ops &amp; release mgr</strong> (T3 Code).",
+    caption: "<strong>1/7</strong> · <strong>Alex</strong> (Claude in Herdr) joins the <strong>Team Node</strong> — immediately unlocking <code>#channels</code>, streams, <strong>Alice's Codex</strong>, and <strong>Jack's ops &amp; release mgr</strong>.",
     visible: ["ent-alex", "ent-node"],
     dim: [],
     spotlight: ["ent-alex"],
@@ -541,12 +1017,14 @@ const CHAPTERS = [
   },
 ];
 
-// Procedurally weave companion hyphal strands + forked lateral rootlets around every main strand
 const SVG_NS = "http://www.w3.org/2000/svg";
 const strandLengths = new Map();
 const hyphaBundleMap = new Map();
+let bundlesBuilt = false;
 
 function buildOrganicHyphaBundles() {
+  if (bundlesBuilt) return;
+  bundlesBuilt = true;
   const host = document.getElementById("hyphaBundles");
   document.querySelectorAll(".myc-strand").forEach((path, idx) => {
     const len = path.getTotalLength();
@@ -599,7 +1077,6 @@ function buildOrganicHyphaBundles() {
       subPaths.push(w);
     }
 
-    // Add 2-4 delicate forked lateral rootlets + spore tips along the strand
     const twigFracs = len > 240 ? [0.24, 0.48, 0.72, 0.86] : [0.34, 0.68];
     twigFracs.forEach((f, ti) => {
       const d = f * len;
@@ -641,7 +1118,6 @@ function buildOrganicHyphaBundles() {
     hyphaBundleMap.set(path.id, { group: g, subPaths: meta });
   });
 }
-buildOrganicHyphaBundles();
 
 function setStrandState(id, state) {
   const path = document.getElementById(id);
@@ -661,18 +1137,46 @@ function setStrandState(id, state) {
   }
 }
 
-const vineMain = document.getElementById("tlVineMain");
-const vineSub = document.getElementById("tlVineSub");
-const vineMainLen = vineMain ? vineMain.getTotalLength() : 1000;
-const vineSubLen = vineSub ? vineSub.getTotalLength() : 1000;
-if (vineMain) { vineMain.style.strokeDasharray = `${vineMainLen}`; vineMain.style.strokeDashoffset = `${vineMainLen}`; }
-if (vineSub) { vineSub.style.strokeDasharray = `${vineSubLen}`; vineSub.style.strokeDashoffset = `${vineSubLen}`; }
+function fitWalkthroughStage() {
+  const stageCenter = document.getElementById("heroStageCenter");
+  const viewport = document.getElementById("storyViewport");
+  const stage = document.getElementById("storyStage");
+  if (!viewport || !stage) return;
+  const availW = (stageCenter ? stageCenter.clientWidth : viewport.clientWidth) || 0;
+  if (availW <= 0) return;
 
+  const LOGICAL_W = 1200;
+  const LOGICAL_H = 590;
+  const scale = Math.min(1, availW / LOGICAL_W);
+  const offsetX = Math.max(0, (availW - LOGICAL_W * scale) / 2);
+  stage.style.transform = `translateX(${offsetX.toFixed(1)}px) scale(${scale.toFixed(4)})`;
+  viewport.style.height = `${Math.round(LOGICAL_H * scale)}px`;
+}
+
+let vineMainLen = 1000;
+let vineSubLen = 1000;
 let chapterIdx = 0;
-let storyPlaying = true;
+let storyPlaying = false;
 let storyTimer = null;
 let pktRaf = null;
 let stagedTimers = [];
+let walkthroughOpen = false;
+let forceSettled = new URLSearchParams(window.location.search).get("settled") === "1";
+
+function initVineLengths() {
+  const vineMain = document.getElementById("tlVineMain");
+  const vineSub = document.getElementById("tlVineSub");
+  if (vineMain) {
+    vineMainLen = vineMain.getTotalLength() || 1000;
+    vineMain.style.strokeDasharray = `${vineMainLen}`;
+    vineMain.style.strokeDashoffset = `${vineMainLen}`;
+  }
+  if (vineSub) {
+    vineSubLen = vineSub.getTotalLength() || 1000;
+    vineSub.style.strokeDasharray = `${vineSubLen}`;
+    vineSub.style.strokeDashoffset = `${vineSubLen}`;
+  }
+}
 
 function clearStagedTimers() {
   for (const t of stagedTimers) clearTimeout(t);
@@ -683,11 +1187,6 @@ function easeInOutQuad(t) {
   return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
 }
 
-/**
- * Plays ONE-SHOT sequential labeled message packets along the exact SVG paths.
- * Stays fully visible all the way to the destination (0..100% of strand), then
- * absorbs right at the target with a crisp arrival pulse.
- */
 function playWirePackets(specs) {
   if (pktRaf) cancelAnimationFrame(pktRaf);
   const host = document.getElementById("wirePackets");
@@ -710,6 +1209,7 @@ function playWirePackets(specs) {
 
   const startTime = performance.now();
   function tick(now) {
+    if (!walkthroughOpen) return;
     const elapsed = now - startTime;
     let anyPending = false;
 
@@ -723,7 +1223,6 @@ function playWirePackets(specs) {
       const raw = Math.min(1, local / item.dur);
       if (raw < 1) anyPending = true;
 
-      // Emerge cleanly from sender's rim and land squarely at receiver's rim (full visible travel)
       const inset = Math.min(0.14, 34 / item.len);
       const travel = inset + easeInOutQuad(raw) * (1 - inset * 2);
       const t = item.reverse ? 1 - travel : travel;
@@ -766,28 +1265,18 @@ function playWirePackets(specs) {
 
 function applyStage(st) {
   if (st.addVisible) {
-    st.addVisible.forEach((id) => {
-      const el = document.getElementById(id);
-      if (el) el.classList.add("visible");
-    });
+    st.addVisible.forEach((id) => document.getElementById(id)?.classList.add("visible"));
   }
   if (st.undim) {
-    st.undim.forEach((id) => {
-      const el = document.getElementById(id);
-      if (el) el.classList.remove("dim");
-    });
+    st.undim.forEach((id) => document.getElementById(id)?.classList.remove("dim"));
   }
   if (st.spotlight) {
     ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release"].forEach((id) => {
-      const el = document.getElementById(id);
-      if (el) el.classList.toggle("spotlight", st.spotlight.includes(id));
+      document.getElementById(id)?.classList.toggle("spotlight", st.spotlight.includes(id));
     });
   }
   if (st.alertHit) {
-    st.alertHit.forEach((id) => {
-      const el = document.getElementById(id);
-      if (el) el.classList.add("alert-hit");
-    });
+    st.alertHit.forEach((id) => document.getElementById(id)?.classList.add("alert-hit"));
   }
   if (st.hideStrands) {
     st.hideStrands.forEach((id) => setStrandState(id, "hidden"));
@@ -797,43 +1286,41 @@ function applyStage(st) {
   }
   if (st.caps) {
     ["cap-ch", "cap-dep", "cap-gh", "cap-pr"].forEach((id) => {
-      const el = document.getElementById(id);
-      if (el) el.classList.toggle("lit", st.caps.includes(id));
+      document.getElementById(id)?.classList.toggle("lit", st.caps.includes(id));
     });
   }
   if (st.coralCaps) {
     ["cap-ch", "cap-dep", "cap-gh", "cap-pr"].forEach((id) => {
-      const el = document.getElementById(id);
-      if (el) el.classList.toggle("lit-coral", st.coralCaps.includes(id));
+      document.getElementById(id)?.classList.toggle("lit-coral", st.coralCaps.includes(id));
     });
   }
   if (st.subs) {
     ["sub-alex-pr", "sub-alex-dep", "sub-alice-pr", "sub-alice-dep", "sub-ops-dep", "sub-rel-pr"].forEach((id) => {
-      const el = document.getElementById(id);
-      if (el) el.classList.toggle("show", st.subs.includes(id));
+      document.getElementById(id)?.classList.toggle("show", st.subs.includes(id));
     });
   }
   if (st.addSubs) {
-    st.addSubs.forEach((id) => {
-      const el = document.getElementById(id);
-      if (el) el.classList.add("show");
-    });
+    st.addSubs.forEach((id) => document.getElementById(id)?.classList.add("show"));
   }
   if (st.filterTag !== undefined) {
     document.getElementById("filterTag")?.classList.toggle("show", Boolean(st.filterTag));
   }
   if (st.ghActive !== undefined) {
     const ghEl = document.getElementById("ent-gh");
-    ghEl.classList.toggle("active-amber", st.ghActive === "amber");
-    ghEl.classList.toggle("active-coral", st.ghActive === "coral");
-    ghEl.classList.toggle("active-green", st.ghActive === "green");
+    if (ghEl) {
+      ghEl.classList.toggle("active-amber", st.ghActive === "amber");
+      ghEl.classList.toggle("active-coral", st.ghActive === "coral");
+      ghEl.classList.toggle("active-green", st.ghActive === "green");
+    }
   }
   if (st.ghTitle) document.getElementById("ghTitle").textContent = st.ghTitle;
   if (st.ghSub) document.getElementById("ghSub").textContent = st.ghSub;
   if (st.promState !== undefined) {
     const promEl = document.getElementById("ent-prom");
-    promEl.classList.toggle("active-coral", st.promState === "coral");
-    promEl.classList.toggle("active-green", st.promState === "green");
+    if (promEl) {
+      promEl.classList.toggle("active-coral", st.promState === "coral");
+      promEl.classList.toggle("active-green", st.promState === "green");
+    }
   }
   if (st.promSub) document.getElementById("promSub").textContent = st.promSub;
   if (st.subagentText) document.getElementById("subagentText").textContent = st.subagentText;
@@ -861,12 +1348,12 @@ function applyStage(st) {
 }
 
 function updateVineProgress() {
+  const vineMain = document.getElementById("tlVineMain");
+  const vineSub = document.getElementById("tlVineSub");
   const frac = CHAPTERS.length > 1 ? chapterIdx / (CHAPTERS.length - 1) : 1;
   if (vineMain) vineMain.style.strokeDashoffset = `${(vineMainLen * (1 - frac)).toFixed(1)}`;
   if (vineSub) vineSub.style.strokeDashoffset = `${(vineSubLen * (1 - frac)).toFixed(1)}`;
 }
-
-let forceSettled = new URLSearchParams(window.location.search).get("settled") === "1";
 
 function renderChapter() {
   clearStagedTimers();
@@ -886,30 +1373,33 @@ function renderChapter() {
   });
 
   const ghEl = document.getElementById("ent-gh");
-  ghEl.classList.toggle("active-amber", ch.ghActive === "amber");
-  ghEl.classList.toggle("active-coral", ch.ghActive === "coral");
-  ghEl.classList.toggle("active-green", ch.ghActive === "green");
+  if (ghEl) {
+    ghEl.classList.toggle("active-amber", ch.ghActive === "amber");
+    ghEl.classList.toggle("active-coral", ch.ghActive === "coral");
+    ghEl.classList.toggle("active-green", ch.ghActive === "green");
+  }
   document.getElementById("ghTitle").textContent = ch.ghTitle;
   document.getElementById("ghSub").textContent = ch.ghSub;
   if (ch.ccAction) document.getElementById("ccAction").textContent = ch.ccAction;
 
   const promEl = document.getElementById("ent-prom");
-  promEl.classList.toggle("active-coral", ch.promState === "coral");
-  promEl.classList.toggle("active-green", ch.promState === "green");
+  if (promEl) {
+    promEl.classList.toggle("active-coral", ch.promState === "coral");
+    promEl.classList.toggle("active-green", ch.promState === "green");
+  }
   document.getElementById("promSub").textContent = ch.promSub;
-  document.getElementById("filterTag").classList.toggle("show", Boolean(ch.filterTag));
+  document.getElementById("filterTag")?.classList.toggle("show", Boolean(ch.filterTag));
 
   if (ch.subagentText) document.getElementById("subagentText").textContent = ch.subagentText;
   if (ch.slackMsg) document.getElementById("slackDmMsg").innerHTML = ch.slackMsg;
 
-  // Dynamic subscription & #deploys channel badges under each agent
   ["sub-alex-pr", "sub-alex-dep", "sub-alice-pr", "sub-alice-dep", "sub-ops-dep", "sub-rel-pr"].forEach((id) => {
-    const el = document.getElementById(id);
-    if (el) el.classList.toggle("show", (ch.subs || []).includes(id));
+    document.getElementById(id)?.classList.toggle("show", (ch.subs || []).includes(id));
   });
 
   ["cap-ch", "cap-dep", "cap-gh", "cap-pr"].forEach((id) => {
     const el = document.getElementById(id);
+    if (!el) return;
     el.classList.toggle("lit", (ch.caps || []).includes(id));
     el.classList.toggle("lit-coral", (ch.coralCaps || []).includes(id));
   });
@@ -922,6 +1412,7 @@ function renderChapter() {
 
   ["bub-alex", "bub-alice", "bub-ops", "bub-release"].forEach((id) => {
     const el = document.getElementById(id);
+    if (!el) return;
     const spec = ch.bubbles[id];
     if (spec) {
       el.textContent = spec.text;
@@ -934,6 +1425,7 @@ function renderChapter() {
 
   ["rip-alex", "rip-node", "rip-alice", "rip-ops", "rip-release"].forEach((id) => {
     const el = document.getElementById(id);
+    if (!el) return;
     el.classList.remove("fire");
     if (ch.ripples.includes(id)) {
       void el.offsetWidth;
@@ -941,7 +1433,6 @@ function renderChapter() {
     }
   });
 
-  // In-scene subtitle + single-line mycelial timeline
   document.getElementById("storyCaption").innerHTML = ch.caption;
   updateVineProgress();
 
@@ -981,10 +1472,9 @@ function renderChapter() {
 
 function resetStoryTimer() {
   if (storyTimer) clearTimeout(storyTimer);
-  if (!storyPlaying) return;
+  if (!storyPlaying || !walkthroughOpen) return;
   const isLast = chapterIdx >= CHAPTERS.length - 1;
   if (isLast) {
-    // Stop cleanly at the end instead of auto-looping; show Play again CTA
     storyTimer = setTimeout(() => {
       storyPlaying = false;
       const playBtn = document.getElementById("storyPlayBtn");
@@ -1004,14 +1494,63 @@ function resetStoryTimer() {
 function replayStory() {
   chapterIdx = 0;
   storyPlaying = true;
-  document.getElementById("storyPlayBtn").textContent = "Pause";
+  const playBtn = document.getElementById("storyPlayBtn");
+  if (playBtn) playBtn.textContent = "Pause";
   renderChapter();
   resetStoryTimer();
 }
 
+function setWalkthroughOpen(open) {
+  const body = document.getElementById("walkthroughBody");
+  const toggle = document.getElementById("walkthroughToggle");
+  const label = document.getElementById("walkthroughToggleLabel");
+  if (!body || !toggle) return;
+
+  walkthroughOpen = open;
+  body.hidden = !open;
+  toggle.setAttribute("aria-expanded", open ? "true" : "false");
+  toggle.classList.toggle("is-open", open);
+  if (label) label.textContent = open ? "Hide 7-step story" : "Expand 7-step story";
+
+  if (open) {
+    requestAnimationFrame(() => {
+      fitWalkthroughStage();
+      buildOrganicHyphaBundles();
+      initVineLengths();
+      const urlChapter = new URLSearchParams(window.location.search).get("chapter");
+      const hasUrlCh = urlChapter !== null && Number.isInteger(Number(urlChapter)) && Number(urlChapter) >= 0 && Number(urlChapter) < CHAPTERS.length;
+      if (hasUrlCh) {
+        chapterIdx = Number(urlChapter);
+        storyPlaying = false;
+        const playBtn = document.getElementById("storyPlayBtn");
+        if (playBtn) playBtn.textContent = "Play";
+      } else {
+        storyPlaying = !window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+        const playBtn = document.getElementById("storyPlayBtn");
+        if (playBtn) playBtn.textContent = storyPlaying ? "Pause" : "Play";
+      }
+      renderChapter();
+      resetStoryTimer();
+    });
+  } else {
+    storyPlaying = false;
+    clearStagedTimers();
+    if (storyTimer) clearTimeout(storyTimer);
+    if (pktRaf) cancelAnimationFrame(pktRaf);
+  }
+}
+
+document.getElementById("walkthroughToggle")?.addEventListener("click", () => {
+  setWalkthroughOpen(!walkthroughOpen);
+});
+
+document.getElementById("jumpWalkthroughBtn")?.addEventListener("click", () => {
+  if (!walkthroughOpen) setWalkthroughOpen(true);
+});
+
 document.getElementById("storyReplayBtn")?.addEventListener("click", replayStory);
 
-document.getElementById("storyPlayBtn").addEventListener("click", (e) => {
+document.getElementById("storyPlayBtn")?.addEventListener("click", (e) => {
   if (!storyPlaying && chapterIdx === CHAPTERS.length - 1) {
     replayStory();
     return;
@@ -1021,24 +1560,33 @@ document.getElementById("storyPlayBtn").addEventListener("click", (e) => {
   resetStoryTimer();
 });
 
-document.getElementById("storyPrevBtn").addEventListener("click", () => {
+document.getElementById("storyPrevBtn")?.addEventListener("click", () => {
   chapterIdx = (chapterIdx - 1 + CHAPTERS.length) % CHAPTERS.length;
   renderChapter();
   resetStoryTimer();
 });
 
-document.getElementById("storyNextBtn").addEventListener("click", () => {
+document.getElementById("storyNextBtn")?.addEventListener("click", () => {
   chapterIdx = (chapterIdx + 1) % CHAPTERS.length;
   renderChapter();
   resetStoryTimer();
 });
 
+window.addEventListener("resize", () => {
+  if (walkthroughOpen) fitWalkthroughStage();
+}, { passive: true });
+
+if (new URLSearchParams(window.location.search).get("chapter") !== null) {
+  setWalkthroughOpen(true);
+}
+
+// Floating organic spore canvas behind hero
 (function initSporeCanvas() {
   const canvas = document.getElementById("sporeCanvas");
   if (!canvas || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
   const ctx = canvas.getContext("2d");
   let w = 0, h = 0;
-  const motes = Array.from({ length: 30 }, () => ({
+  const motes = Array.from({ length: 28 }, () => ({
     x: Math.random(),
     y: Math.random(),
     r: 1 + Math.random() * 1.6,
@@ -1073,40 +1621,37 @@ document.getElementById("storyNextBtn").addEventListener("click", () => {
   requestAnimationFrame(draw);
 })();
 
-const urlChapter = new URLSearchParams(window.location.search).get("chapter");
-if (urlChapter !== null && Number.isInteger(Number(urlChapter)) && Number(urlChapter) >= 0 && Number(urlChapter) < CHAPTERS.length) {
-  chapterIdx = Number(urlChapter);
-  storyPlaying = false;
-  document.getElementById("storyPlayBtn").textContent = "Play";
-}
-renderChapter();
-resetStoryTimer();
-
 // ============================================================================
-// 3. INTERACTIVE LOCAL NODE CONTROL CENTER (#streams)
+// 3. INTERACTIVE LOCAL NODE DELIVERY SIMULATOR (#streams — always visible)
 // ============================================================================
 (function initControlGate() {
+  const shell = document.getElementById("gateShell");
   const viewport = document.getElementById("gateViewport");
   const stage = document.getElementById("gateStage");
   const packetsHost = document.getElementById("gatePackets");
   const mobileHost = document.getElementById("gateMobile");
   const shieldArc = document.getElementById("gateShieldArc");
-  if (!viewport || !stage) return;
+  if (!shell || !viewport || !stage) return;
 
   const LOGICAL_W = 1120;
   const LOGICAL_H = 488;
   const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  let simInView = true;
+  let gateBundlesBuilt = false;
 
   function fitGateStage() {
-    if (window.innerWidth <= 760) return;
-    const availW = viewport.clientWidth || LOGICAL_W;
-    const scale = Math.min(1.06, availW / LOGICAL_W);
+    if (window.innerWidth <= 760) {
+      viewport.style.height = "";
+      return;
+    }
+    const availW = viewport.clientWidth || 0;
+    if (availW <= 0) return;
+    const scale = Math.min(1, availW / LOGICAL_W);
     const offsetX = Math.max(0, (availW - LOGICAL_W * scale) / 2);
     stage.style.transform = `translateX(${offsetX.toFixed(1)}px) scale(${scale.toFixed(4)})`;
     viewport.style.height = `${Math.round(LOGICAL_H * scale)}px`;
   }
 
-  fitGateStage();
   if (typeof ResizeObserver !== "undefined") {
     new ResizeObserver(fitGateStage).observe(viewport);
   }
@@ -1117,86 +1662,89 @@ resetStoryTimer();
     { name: "OSS PRs", sub: "anthropics/claude-code", linkedSub: "anthropics/claude-code", cls: "amber" },
     { name: "CI Burst (×12)", sub: "flaky retries", cls: "amber-muted" },
     { name: "#deploys", sub: "build room", cls: "olive" },
-    { name: "Direct P2P · bob@laptop", sub: "HPKE · diff.patch", cls: "moss" },
+    { name: "Direct P2P · bob@laptop", sub: "E2EE · diff.patch", cls: "moss" },
   ];
 
-  // Build braided companion hyphae once (tight hugging weave on unified #g-out)
   const gateBundles = new Map();
-  const gateHost = document.getElementById("gateBundles");
-  document.querySelectorAll(".gate-strand").forEach((path, idx) => {
-    if (!gateHost) return;
-    const isUnified = path.id === "g-out";
-    const len = path.getTotalLength();
-    const g = document.createElementNS(SVG_NS, "g");
-    const cls = ["amber-muted", "amber", "coral", "olive", "moss", "peer"].find((c) => path.classList.contains(c)) || "";
-    g.setAttribute("class", `gate-bundle ${cls}`.trim());
+  function ensureGateBundles() {
+    if (gateBundlesBuilt) return;
+    gateBundlesBuilt = true;
+    const gateHost = document.getElementById("gateBundles");
+    document.querySelectorAll(".gate-strand").forEach((path, idx) => {
+      if (!gateHost) return;
+      const isUnified = path.id === "g-out";
+      const len = path.getTotalLength();
+      const g = document.createElementNS(SVG_NS, "g");
+      const cls = ["amber-muted", "amber", "coral", "olive", "moss", "peer"].find((c) => path.classList.contains(c)) || "";
+      g.setAttribute("class", `gate-bundle ${cls}`.trim());
 
-    const steps = Math.max(10, Math.min(24, Math.round(len / 18)));
-    const amp = isUnified ? 2.8 : Math.min(6.4, Math.max(3.6, len * 0.022));
-    const seed = (idx + 2) * 1.43;
-    const ptsA = [];
-    const ptsB = [];
-    for (let i = 0; i <= steps; i++) {
-      const f = i / steps;
-      const d = f * len;
-      const p = path.getPointAtLength(d);
-      const pN = path.getPointAtLength(Math.min(len, d + 2));
-      const pP = path.getPointAtLength(Math.max(0, d - 2));
-      const dx = pN.x - pP.x;
-      const dy = pN.y - pP.y;
-      const mag = Math.hypot(dx, dy) || 1;
-      const nx = -dy / mag;
-      const ny = dx / mag;
-      const env = Math.sin(f * Math.PI);
-      const offA = env * Math.sin(f * Math.PI * (isUnified ? 4.2 : 3) + seed) * amp;
-      const offB = env * Math.cos(f * Math.PI * (isUnified ? 5.2 : 4.1) - seed) * (amp * 0.58);
-      ptsA.push(`${(p.x + nx * offA).toFixed(1)} ${(p.y + ny * offA).toFixed(1)}`);
-      ptsB.push(`${(p.x + nx * offB).toFixed(1)} ${(p.y + ny * offB).toFixed(1)}`);
-    }
-
-    for (const [pts, wcls] of [[ptsA, "gb-weave"], [ptsB, "gb-weave fine"]]) {
-      const w = document.createElementNS(SVG_NS, "path");
-      w.setAttribute("class", wcls);
-      w.setAttribute("d", `M ${pts[0]} L ${pts.slice(1).join(" L ")}`);
-      g.appendChild(w);
-    }
-
-    if (!isUnified) {
-      [0.34, 0.68].forEach((f, ti) => {
+      const steps = Math.max(10, Math.min(24, Math.round(len / 18)));
+      const amp = isUnified ? 2.8 : Math.min(6.4, Math.max(3.6, len * 0.022));
+      const seed = (idx + 2) * 1.43;
+      const ptsA = [];
+      const ptsB = [];
+      for (let i = 0; i <= steps; i++) {
+        const f = i / steps;
         const d = f * len;
         const p = path.getPointAtLength(d);
-        const pN = path.getPointAtLength(Math.min(len, d + 3));
-        const dx = pN.x - p.x;
-        const dy = pN.y - p.y;
+        const pN = path.getPointAtLength(Math.min(len, d + 2));
+        const pP = path.getPointAtLength(Math.max(0, d - 2));
+        const dx = pN.x - pP.x;
+        const dy = pN.y - pP.y;
         const mag = Math.hypot(dx, dy) || 1;
-        const tx = dx / mag;
-        const ty = dy / mag;
-        const side = (ti + idx) % 2 === 0 ? 1 : -1;
-        const nx = -ty * side;
-        const ny = tx * side;
-        const reach = 14;
-        const c1x = p.x + tx * 6 + nx * 7;
-        const c1y = p.y + ty * 6 + ny * 7;
-        const ex = p.x + tx * 11 + nx * reach;
-        const ey = p.y + ty * 11 + ny * reach;
-        const twig = document.createElementNS(SVG_NS, "path");
-        twig.setAttribute("class", "gb-twig");
-        twig.setAttribute("d", `M ${p.x.toFixed(1)} ${p.y.toFixed(1)} Q ${c1x.toFixed(1)} ${c1y.toFixed(1)}, ${ex.toFixed(1)} ${ey.toFixed(1)}`);
-        g.appendChild(twig);
-      });
-    }
+        const nx = -dy / mag;
+        const ny = dx / mag;
+        const env = Math.sin(f * Math.PI);
+        const offA = env * Math.sin(f * Math.PI * (isUnified ? 4.2 : 3) + seed) * amp;
+        const offB = env * Math.cos(f * Math.PI * (isUnified ? 5.2 : 4.1) - seed) * (amp * 0.58);
+        ptsA.push(`${(p.x + nx * offA).toFixed(1)} ${(p.y + ny * offA).toFixed(1)}`);
+        ptsB.push(`${(p.x + nx * offB).toFixed(1)} ${(p.y + ny * offB).toFixed(1)}`);
+      }
 
-    gateHost.appendChild(g);
-    gateBundles.set(path.id, g);
-  });
+      for (const [pts, wcls] of [[ptsA, "gb-weave"], [ptsB, "gb-weave fine"]]) {
+        const w = document.createElementNS(SVG_NS, "path");
+        w.setAttribute("class", wcls);
+        w.setAttribute("d", `M ${pts[0]} L ${pts.slice(1).join(" L ")}`);
+        g.appendChild(w);
+      }
+
+      if (!isUnified) {
+        [0.34, 0.68].forEach((f, ti) => {
+          const d = f * len;
+          const p = path.getPointAtLength(d);
+          const pN = path.getPointAtLength(Math.min(len, d + 3));
+          const dx = pN.x - p.x;
+          const dy = pN.y - p.y;
+          const mag = Math.hypot(dx, dy) || 1;
+          const tx = dx / mag;
+          const ty = dy / mag;
+          const side = (ti + idx) % 2 === 0 ? 1 : -1;
+          const nx = -ty * side;
+          const ny = tx * side;
+          const reach = 14;
+          const c1x = p.x + tx * 6 + nx * 7;
+          const c1y = p.y + ty * 6 + ny * 7;
+          const ex = p.x + tx * 11 + nx * reach;
+          const ey = p.y + ty * 11 + ny * reach;
+          const twig = document.createElementNS(SVG_NS, "path");
+          twig.setAttribute("class", "gb-twig");
+          twig.setAttribute("d", `M ${p.x.toFixed(1)} ${p.y.toFixed(1)} Q ${c1x.toFixed(1)} ${c1y.toFixed(1)}, ${ex.toFixed(1)} ${ey.toFixed(1)}`);
+          g.appendChild(twig);
+        });
+      }
+
+      gateHost.appendChild(g);
+      gateBundles.set(path.id, g);
+    });
+  }
 
   const DEFAULT_STATE = {
-    publicLinked: false, // Multi-node pairing: Private Team Node (acme-team) active by default; click to link public.hyphae.to!
-    ciMode: "burst",     // "burst" (Burst cap: noisy -> notify) -> "unsub" (0 wire!) -> "all" (unthrottled flood)
-    aliceMode: "queue",  // 3-tier delivery urgency: "queue" (idle) -> "interrupt" (urgent VIP) -> "notify" (inbox) -> "mute"
-    deploysMode: "mute", // "mute" (deflect at shield) -> "notify" (inbox) -> "queue" (idle)
-    guard: true,         // Pluggable prompt-injection guard ON <-> OFF
-    focus: false,        // Focus Mode (* -> notify): holds all non-VIP sources in local inbox
+    publicLinked: false,
+    ciMode: "burst",
+    aliceMode: "queue",
+    deploysMode: "mute",
+    guard: true,
+    focus: false,
   };
 
   const params = new URLSearchParams(window.location.search);
@@ -1245,11 +1793,10 @@ resetStoryTimer();
     let leakedInject = false;
     let noisyFlood = false;
 
-    // Row 0: Team Node (acme) · DM @alice (queue | interrupt | notify | mute)
     const aliceEff = st.aliceMode === "mute"
       ? "mute"
       : st.aliceMode === "interrupt"
-      ? "interrupt" // VIP interrupt breaks through Focus Mode!
+      ? "interrupt"
       : st.focus
       ? "notify"
       : st.aliceMode;
@@ -1283,7 +1830,6 @@ resetStoryTimer();
       packets.push({ path: "g-in-0", cls: "", label: "DM @alice", phase: 0.02, dur: 1160, startT: 0.14, endT: 0.78, rippleNode: "green" });
     }
 
-    // Row 1: public.hyphae.to · GitHub OSS (starts UNLINKED -> 0 wire! Click "Public Node" to light up!)
     let src1;
     if (!st.publicLinked) {
       unsubOrUnlinked += 1;
@@ -1320,7 +1866,6 @@ resetStoryTimer();
       }
     }
 
-    // Row 2: CI Burst (x12) ("burst" = Burst cap: noisy -> notify | "unsub" = 0 wire! | "all" = flood)
     let src2;
     if (st.ciMode === "unsub") {
       unsubOrUnlinked += 1;
@@ -1352,7 +1897,6 @@ resetStoryTimer();
       packets.push({ path: "g-in-2", cls: "amber", label: "CI burst ×12", phase: 0.08, dur: 1120, startT: 0.14, endT: 0.78 });
     }
 
-    // Row 3: #deploys · chatter ("mute" | "notify" | "queue")
     const deploysEff = st.deploysMode === "mute" ? "mute" : st.focus ? "notify" : st.deploysMode;
     let src3;
     if (deploysEff === "mute") {
@@ -1379,16 +1923,12 @@ resetStoryTimer();
       packets.push({ path: "g-in-3", cls: "moss", label: "#deploys ok", phase: 0.16, dur: 1180, startT: 0.14, endT: 0.78 });
     }
 
-    // Row 4: Direct P2P · bob@laptop (saved directly to disk outside LLM prompt)
     const src4 = { state: "pass", badge: "→ disk", strand: "active" };
     if (st.focus) notifyItems.push("diff.patch");
     else queuedItems.push("P2P diff");
     packets.push({ path: "g-in-4", cls: "moss", label: "🔒 P2P diff.patch", phase: 0.04, dur: 1180, startT: 0.14, endT: 0.78 });
-
-    // Subtle personal Slack/Telegram bridge pulse on #g-in-5
     packets.push({ path: "g-in-5", cls: "moss", label: "Slack · writer", phase: 0.48, dur: 1320, startT: 0.16, endT: 0.76 });
 
-    // Compute ONE single unified right-hand strand (#g-out) output reflecting 3-tier urgency!
     const hasInterrupt = interruptItems.length > 0;
     const hasQueued = queuedItems.length > 0;
     const hasNotify = notifyItems.length > 0;
@@ -1398,7 +1938,6 @@ resetStoryTimer();
     if (hasInterrupt || leakedInject) outTone = "urgent";
     else if (st.focus || (!hasQueued && hasNotify)) outTone = "notify-mode";
 
-    // Merge chip above Local Node
     const firstPassIn = packets.find((p) => !p.deflect);
     if (firstPassIn) {
       if (st.focus && hasInterrupt) {
@@ -1478,7 +2017,6 @@ resetStoryTimer();
       }
     }
 
-    // Center Local Node subtitle & rule pill
     const nodeSubText = st.publicLinked
       ? "acme-team + public.hyphae.to"
       : "acme-team · Keychain";
@@ -1501,7 +2039,7 @@ resetStoryTimer();
       rulePillCls = "amber";
     }
 
-    // Dynamic telemetry calculations (kept concise so #gateMeter never wraps or overflows)
+    // Deterministic simulation counts (no synthetic percentage)
     let deliveredLabel = "Delivery";
     let deliveredText = "quiet · 0 wakes";
     let blockedLabel = "Stopped";
@@ -1511,8 +2049,10 @@ resetStoryTimer();
     if (unsubOrUnlinked > 0 && stopParts.length < 2) stopParts.push(`${unsubOrUnlinked} off`);
     let blockedText = stopParts.length ? stopParts.join(" · ") : "0 stopped";
     let blockedCls = burstCapped > 0 || droppedCount > 0 ? "amber" : "";
-    let savedLabel = "Context saved";
-    let barPct = 94;
+
+    let savedLabel = "Simulation";
+    let savedValue = "11 of 12 held back";
+    let barPct = 92;
     let barDanger = false;
     let foot = "Delivers on idle · P2P → disk";
 
@@ -1521,15 +2061,18 @@ resetStoryTimer();
       blockedLabel = "Guard";
       blockedText = "1 inject leaked!";
       blockedCls = "coral";
-      savedLabel = "Prompt safety";
-      barPct = 26;
+      savedLabel = "Simulation";
+      savedValue = "1 inject leaked";
+      barPct = 24;
       barDanger = true;
-      foot = "Enable Guard to block injections";
+      foot = "Enable Guard to screen inbound text";
     } else if (st.focus) {
       deliveredText = hasInterrupt ? "⚡ 1 VIP + 1 digest" : `1-line digest (${notifyItems.length})`;
       blockedLabel = "Held";
       blockedText = `${notifyItems.length} notify · ${burstCapped + droppedCount} stopped`;
-      barPct = Math.min(99, 95 + (st.ciMode !== "all" ? 2 : 0) + (st.deploysMode === "mute" ? 1 : 0));
+      const heldTotal = st.ciMode === "unsub" ? 12 : st.ciMode === "burst" ? 11 : 12;
+      savedValue = `${heldTotal} of 12 held back`;
+      barPct = Math.round((heldTotal / 12) * 100);
       foot = hasInterrupt
         ? "VIP @alice breaks through Focus"
         : "Held in inbox · 1-line digest";
@@ -1544,16 +2087,17 @@ resetStoryTimer();
         deliveredText = `notify (${notifyItems.length} digest)`;
       }
 
-      let score = 50;
-      if (st.ciMode === "burst") score += 26;
-      if (st.ciMode === "unsub") score += 29;
-      if (st.deploysMode === "mute") score += 11;
-      if (st.deploysMode === "notify") score += 8;
-      if (st.aliceMode === "notify" || st.aliceMode === "mute") score += 4;
-      if (st.guard) score += 4;
-      if (!st.publicLinked) score += 3;
-      if (noisyFlood) score = Math.min(score, 40);
-      barPct = Math.max(24, Math.min(99, score));
+      if (st.ciMode === "burst") {
+        savedValue = "11 of 12 held back";
+        barPct = 92;
+      } else if (st.ciMode === "unsub") {
+        savedValue = "12 of 12 unsubscribed";
+        barPct = 100;
+      } else if (noisyFlood) {
+        savedValue = "0 of 12 held back";
+        barPct = 18;
+        barDanger = true;
+      }
 
       foot = hasInterrupt
         ? "Urgent interrupt wakes now"
@@ -1584,6 +2128,7 @@ resetStoryTimer();
       blockedText,
       blockedCls,
       savedLabel,
+      savedValue,
       barPct,
       barDanger,
       foot,
@@ -1694,7 +2239,7 @@ resetStoryTimer();
       </div>
       <div class="gm-mob-node" style="flex-direction:column; align-items:stretch;">
         <div style="display:flex; align-items:center; gap:11px;">
-          <img class="gate-local-node-img" src="./assets/node-hub.png?v=7" alt="Local Hyphae Node" />
+          <img class="gate-local-node-img" src="./assets/node-hub.webp?v=1" alt="Local Hyphae Node" />
           <div class="gm-mob-node-body">
             <strong>Your Local Node</strong>
             <span>${esc(sc.rulePillText)}</span>
@@ -1755,7 +2300,7 @@ resetStoryTimer();
         <div class="gm-row"><span>${esc(sc.deliveredLabel)}</span><strong class="${sc.leakedInject || sc.hasInterrupt ? "coral" : ""}">${esc(sc.deliveredText)}</strong></div>
         <div class="gm-row"><span>${esc(sc.blockedLabel)}</span><strong class="${esc(sc.blockedCls)}">${esc(sc.blockedText)}</strong></div>
         <div class="gm-bar-wrap">
-          <div class="gm-bar-head"><span>${esc(sc.savedLabel)}</span><strong>${sc.barPct}%</strong></div>
+          <div class="gm-bar-head"><span>${esc(sc.savedLabel)}</span><strong>${esc(sc.savedValue)}</strong></div>
           <div class="gm-bar"><span class="${sc.barDanger ? "danger" : ""}" style="width:${sc.barPct}%"></span></div>
         </div>
       </div>
@@ -1764,9 +2309,11 @@ resetStoryTimer();
 
   let pausedElapsed = 0;
   let cycleStart = performance.now();
+  let lastRenderFrame = null;
 
   function startGatePackets(sc) {
     if (gateRaf) cancelAnimationFrame(gateRaf);
+    gateRaf = null;
     if (!packetsHost) return;
     packetsHost.innerHTML = "";
     shieldArc?.classList.remove("hit-amber", "hit-coral");
@@ -1781,7 +2328,6 @@ resetStoryTimer();
       return { ...spec, el, path, len: path.getTotalLength(), lastCycle: -1 };
     }).filter(Boolean);
 
-    // Strictly ONE reusable drop chip & ONE merge chip — prevents ghost/overlapping double text!
     const dropTagEl = document.createElement("div");
     dropTagEl.className = "gate-drop-tag";
     dropTagEl.style.opacity = "0";
@@ -1940,12 +2486,20 @@ resetStoryTimer();
       }
     }
 
+    lastRenderFrame = renderFrame;
     if (fixedPhase !== null || !gatePlaying) {
       renderFrame(fixedPhase !== null ? fixedPhase * CYCLE_MS : pausedElapsed || 0.48 * CYCLE_MS);
       return;
     }
 
+    renderFrame(pausedElapsed);
+    if (!simInView) return;
+
     function tick(now) {
+      if (!simInView) {
+        gateRaf = null;
+        return;
+      }
       pausedElapsed = now - cycleStart;
       renderFrame(pausedElapsed);
       gateRaf = requestAnimationFrame(tick);
@@ -1965,7 +2519,6 @@ resetStoryTimer();
       valveEl.className = `gate-valve-ring ${modeCls}`.trim();
     }
 
-    // Sync macOS Control Center tiles directly under Local Node
     const pubBtn = document.getElementById("ctlPublicLink");
     const pubState = document.getElementById("ctlPublicState");
     if (pubBtn) {
@@ -2009,7 +2562,6 @@ resetStoryTimer();
       if (depState) depState.textContent = cur.txt;
     }
 
-    // Sync macOS Slider-Style CI Burst Cap Bar
     const ciCard = document.getElementById("ctlCiCard");
     const ciState = document.getElementById("ctlCiState");
     const ciFill = document.getElementById("ctlCiFill");
@@ -2031,7 +2583,6 @@ resetStoryTimer();
       });
     }
 
-    // Sync Right macOS Focus Tile
     const focusBtn = document.getElementById("gateFocusBtn");
     const focusState = document.getElementById("gateFocusState");
     if (focusBtn) {
@@ -2040,7 +2591,6 @@ resetStoryTimer();
     }
     if (focusState) focusState.textContent = gateState.focus ? "All → notify" : "Off · normal delivery";
 
-    // Sync Right Telemetry Meter
     const gmDelLbl = document.getElementById("gmDeliveredLabel");
     const gmDel = document.getElementById("gmDelivered");
     const gmBlkLbl = document.getElementById("gmBlockedLabel");
@@ -2060,14 +2610,13 @@ resetStoryTimer();
       gmBlk.className = sc.blockedCls || "";
     }
     if (gmSavLbl) gmSavLbl.textContent = sc.savedLabel;
-    if (gmSav) gmSav.textContent = `${sc.barPct}%`;
+    if (gmSav) gmSav.textContent = sc.savedValue;
     if (gmBar) {
       gmBar.style.width = `${sc.barPct}%`;
       gmBar.classList.toggle("danger", sc.barDanger);
     }
     if (gmFt) gmFt.textContent = sc.foot;
 
-    // Sync Left Nested Parent-Node Groups & Status Monitors (by data-src index!)
     document.querySelectorAll("#gateSources .gate-src[data-src]").forEach((el) => {
       const idx = Number(el.dataset.src);
       const st = sc.sources[idx];
@@ -2082,7 +2631,6 @@ resetStoryTimer();
       }
     });
 
-    // Sync Public Node nested group shell + #hyp-releases read-only feed row
     const pubGroup = document.getElementById("gatePublicGroup");
     const pubGroupStatus = document.getElementById("ggPubStatus");
     const relRow = document.getElementById("gateRelRow");
@@ -2098,7 +2646,6 @@ resetStoryTimer();
     }
     if (relBadge) relBadge.textContent = gateState.publicLinked ? "notify" : "unlinked";
 
-    // Sync SVG strands & companion weaves
     Object.entries(sc.strands).forEach(([id, state]) => {
       const p = document.getElementById(id);
       if (p) {
@@ -2166,8 +2713,8 @@ resetStoryTimer();
     switch (key) {
       case "publicLinked":
         lastCmd = gateState.publicLinked
-          ? "hyp pair join public.hyphae.to"
-          : "hyp pair leave public.hyphae.to";
+          ? "hyp pair join https://public.hyphae.to"
+          : "hyp pair revoke public.hyphae.to";
         break;
       case "guard":
         lastCmd = gateState.guard
@@ -2183,7 +2730,22 @@ resetStoryTimer();
     renderControlCenter();
   }
 
-  document.getElementById("gateShell")?.addEventListener("click", (e) => {
+  function resumeGateLoop() {
+    if (!gatePlaying || fixedPhase !== null || gateRaf || !lastRenderFrame || !simInView) return;
+    cycleStart = performance.now() - pausedElapsed;
+    function tick(now) {
+      if (!simInView) {
+        gateRaf = null;
+        return;
+      }
+      pausedElapsed = now - cycleStart;
+      lastRenderFrame(pausedElapsed);
+      gateRaf = requestAnimationFrame(tick);
+    }
+    gateRaf = requestAnimationFrame(tick);
+  }
+
+  shell.addEventListener("click", (e) => {
     const ciStep = e.target.closest("[data-ci]");
     if (ciStep) {
       const val = ciStep.dataset.ci;
@@ -2211,7 +2773,7 @@ resetStoryTimer();
     handleToggle(btn.dataset.toggle);
   });
 
-  document.getElementById("gateShell")?.addEventListener("keydown", (e) => {
+  shell.addEventListener("keydown", (e) => {
     if (e.key !== "Enter" && e.key !== " ") return;
     const roleBtn = e.target.closest('[data-toggle][role="button"]');
     if (!roleBtn) return;
@@ -2225,6 +2787,26 @@ resetStoryTimer();
     renderControlCenter();
   });
 
+  if (typeof IntersectionObserver !== "undefined") {
+    const io = new IntersectionObserver(
+      (entries) => {
+        const visible = entries.some((entry) => entry.isIntersecting);
+        simInView = visible;
+        if (visible) {
+          fitGateStage();
+          resumeGateLoop();
+        } else if (gateRaf) {
+          cancelAnimationFrame(gateRaf);
+          gateRaf = null;
+        }
+      },
+      { rootMargin: "160px 0px" }
+    );
+    io.observe(shell);
+  }
+
+  ensureGateBundles();
+  fitGateStage();
   renderControlCenter();
 })();
 
@@ -2232,7 +2814,7 @@ resetStoryTimer();
 // 4. TOPOLOGY CARD COPY BUTTONS (#topologies)
 // ============================================================================
 const TOPO_SNIPPETS = {
-  p2p: "hyp pair invite --mode p2p",
+  p2p: "hyp onboard",
   team: "hyp deploy init tailscale",
   public: "hyp pair join https://public.hyphae.to",
 };
@@ -2353,32 +2935,21 @@ document.querySelectorAll("[data-copy-topo]").forEach((btn) => {
 })();
 
 // ============================================================================
-// 5. QUICK START TABS
+// 5. INSTALL TABS (OS-only: macOS / Linux and Windows)
 // ============================================================================
 const QS = {
-  unix: `# Install ~8 MiB verified Rust binary & launch onboarding
+  unix: {
+    code: `# Checksum-verified install — launches hyp onboard automatically
 curl -fsSL https://hyphae.to/install.sh | sh`,
-  win: `# Install ~8 MiB verified Rust binary & launch onboarding (PowerShell)
+    copy: "curl -fsSL https://hyphae.to/install.sh | sh",
+    note: "macOS & Linux: native daemon, OS Keychain / Secret Service, and optional chat bridges. Pass --no-onboard to skip the interactive wizard.",
+  },
+  win: {
+    code: `# Checksum-verified PowerShell install — launches hyp onboard automatically
 irm https://hyphae.to/install.ps1 | iex`,
-  deploy: `# Generate a Hub kit (tailscale/docker/fly)
-hyp deploy init tailscale
-
-# Create a P2P invite or inspect scopes
-hyp pair invite --mode p2p
-hyp pair inspect <<< "$TOKEN"
-
-# Enable a prompt-injection guard
-hyp gate init --adapter anthropic`,
-  drops: `# Pair phone Passkey & send an HPKE-encrypted directive draft
-hyp auth init --web
-hyp relay set https://spore.hyphae.to
-hyp drop create --kind directive --draft "Approve canary rollout"
-
-# Or self-host your own 256 MiB RAM-only Drop Relay in 60s
-hyp deploy init drop-relay --domain drop.example.com
-
-# Trigger local.schedule from cron / systemd / launchd
-hyp emit --label morning-triage --note "Review open PRs"`,
+    copy: "irm https://hyphae.to/install.ps1 | iex",
+    note: "Windows: native MCP, hooks, schtasks service, uninstall.ps1, and optional chat bridges over authenticated loopback TCP.",
+  },
 };
 
 function formatQsHtml(raw) {
@@ -2399,16 +2970,26 @@ function formatQsHtml(raw) {
 
 let activeQs = "unix";
 function renderQs() {
-  document.getElementById("qsPre").innerHTML = formatQsHtml(QS[activeQs]);
-  document.querySelectorAll("#qsTabs .it-btn").forEach((b) =>
-    b.classList.toggle("active", b.dataset.qs === activeQs)
-  );
+  const item = QS[activeQs] || QS.unix;
+  const pre = document.getElementById("qsPre");
+  const note = document.getElementById("qsOsNote");
+  if (pre) pre.innerHTML = formatQsHtml(item.code);
+  if (note) note.textContent = item.note;
+  document.querySelectorAll("#qsTabs .it-btn").forEach((b) => {
+    const active = b.dataset.qs === activeQs;
+    b.classList.toggle("active", active);
+    b.setAttribute("aria-selected", active ? "true" : "false");
+  });
 }
 document.querySelectorAll("#qsTabs .it-btn").forEach((b) => {
-  b.addEventListener("click", () => { activeQs = b.dataset.qs; renderQs(); });
+  b.addEventListener("click", () => {
+    activeQs = b.dataset.qs;
+    renderQs();
+  });
 });
-document.getElementById("qsCopyBtn").addEventListener("click", (e) => {
-  navigator.clipboard?.writeText(QS[activeQs]).catch(() => {});
+document.getElementById("qsCopyBtn")?.addEventListener("click", (e) => {
+  const item = QS[activeQs] || QS.unix;
+  navigator.clipboard?.writeText(item.copy).catch(() => {});
   const btn = e.currentTarget;
   btn.textContent = "Copied";
   setTimeout(() => { btn.textContent = "Copy"; }, 1300);

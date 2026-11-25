@@ -1,3 +1,5 @@
+> **Historical RFC (2026) — Archived.** This proposal used earlier working names (such as "cutout"). **Superseded by the shipped implementation** documented in [Human Authority & Drop Relay](../security/human-authority.md) and [Phone Drops & `hyp exec`](../guides/phone-drops.md).
+
 # RFC: Human-Authenticated Directives, Zero-Knowledge Secret Passing ("Cutout"), and Blind Ephemeral Relay for Hyphae v2 (`hyp`)
 
 - **Status:** Draft Proposal

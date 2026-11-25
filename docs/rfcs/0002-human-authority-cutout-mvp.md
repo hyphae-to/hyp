@@ -1,3 +1,5 @@
+> **Historical RFC (2026) — Implemented & Archived.** **Superseded by the shipped implementation** documented in [Human Authority & Drop Relay](../security/human-authority.md) and [Phone Drops & `hyp exec`](../guides/phone-drops.md).
+
 # RFC (MVP): Human Authority, Zero-Knowledge Cutout Drops & Self-Hostable Blind Relay
 
 - **Status:** MVP Implementation Spec (streamlined from [RFC-human-authority-cutout-relay.md](RFC-human-authority-cutout-relay.md))

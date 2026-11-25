@@ -1,3 +1,5 @@
+> **Historical RFC (2026) — Partially Superseded & Archived.** Orchestrator-aware skills and the delivery ladder shipped, while the proposed `hyp_wakeup` MCP tool was **rejected** in favor of the default socket-only Local Ingest Route (`ingest.sock` / `hyp emit` + standard `hyp_stream`). **See current docs:** [Events & OS Cron](../guides/events-and-cron.md), [Delivery Engine](../internals/delivery.md), and [Harnesses](../harnesses/README.md).
+
 # RFC: Orchestrator-Specific Skill Architecture & Opt-In Wakeup / Scheduler Source
 
 - **Status**: Draft (Design Ready for Implementation)
