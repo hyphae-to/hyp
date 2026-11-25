@@ -491,6 +491,344 @@ impl SecurityGatePipeline {
         )
     }
 
+    /// Evaluates an inbound local-ingest event (`Policy Integrity -> HumanVerified / Stage 1 ->
+    /// FilterPlugin Chain`) and records an immutable `gate_audit` row WITHOUT writing a pending
+    /// row into `mailbox` on `Allow` (the caller publishes allowed events onto `local.<topic>` so
+    /// matched subscribers receive them cleanly).
+    ///
+    /// - Enforces `is_policy_tampered()` fail-closed for ALL trust tiers (including `HumanVerified`).
+    /// - For `TrustTier::HumanVerified`: bypasses untrusted Stage 1 regexes and Stage 2 / `filters[]`,
+    ///   and writes an immutable `gate_audit` row (`stage = "local_ingest"`,
+    ///   `trust_tier = "human-verified"`, `reviewer = Some("human:<human_id>:<kid8>")`).
+    /// - For unsigned events (`TrustTier::ExternalWebhook` etc.): runs full Stage 1 deterministic
+    ///   checks and matched Stage 2 / `filters[]` plugins, parking `Quarantine` verdicts into
+    ///   `GateState::Quarantined` and failing closed on `Block`/`Quarantine`/`Hold`.
+    pub async fn screen_local_ingest(
+        &self,
+        ctx: &InboundContext,
+        now_ms: i64,
+    ) -> Result<InboundEvaluation, GateError> {
+        let payload_text = ctx.payload_text();
+        let payload_sha256 = sha256_hex(payload_text.as_bytes());
+        let traceparent = ctx.traceparent();
+
+        // Step 0: Anti-tamper guard policy integrity verification (fail-closed even for HumanVerified!).
+        if self.is_policy_tampered() {
+            let reason = "gate_policy_tampered".to_string();
+            let notice = format_quarantine_notice(&reason);
+            let cats = vec![
+                "gate.tampered".to_string(),
+                "gate_policy_tampered".to_string(),
+            ];
+            let (receipt, duplicate) = self.store_in_mailbox(
+                ctx,
+                &payload_text,
+                GateState::Quarantined,
+                Some(reason.clone()),
+                traceparent.clone(),
+                now_ms,
+            )?;
+            let audit_seq = self.record_audit(
+                &GateAuditInput {
+                    direction: GateDirection::Inbound,
+                    stage: "policy_integrity".to_string(),
+                    decision: StoreGateDecision::Quarantine,
+                    origin_node: Some(ctx.origin_node.clone()),
+                    source: Some(ctx.sender.clone()),
+                    session_id: Some(ctx.session_id.clone()),
+                    receipt_id: receipt.clone(),
+                    event_type: Some(ctx.event.event_type.clone()),
+                    trust_tier: Some(ctx.trust_tier.as_str().to_string()),
+                    confidence: Some(1.0),
+                    categories: cats.clone(),
+                    reason: Some(reason.clone()),
+                    traceparent,
+                    payload_sha256: payload_sha256.clone(),
+                    reviewer: None,
+                },
+                now_ms,
+            )?;
+            return Ok(InboundEvaluation {
+                decision: GateDecision::Quarantine { reason, notice },
+                stage: "policy_integrity".to_string(),
+                receipt,
+                duplicate,
+                payload_sha256,
+                audit_seq: Some(audit_seq),
+                confidence: Some(1.0),
+                categories: cats,
+            });
+        }
+
+        // Step 1: Cryptographically verified human-signed local ingest event (`hyphaesig`).
+        if ctx.trust_tier == TrustTier::HumanVerified {
+            let Some(ref auth) = ctx.human_auth else {
+                let reason = "human_auth_unverified".to_string();
+                let cats = vec![
+                    "gate.blocked".to_string(),
+                    "human_auth_unverified".to_string(),
+                ];
+                let audit_seq = self.record_audit(
+                    &GateAuditInput {
+                        direction: GateDirection::Inbound,
+                        stage: "local_ingest".to_string(),
+                        decision: StoreGateDecision::Block,
+                        origin_node: Some(ctx.origin_node.clone()),
+                        source: Some(ctx.sender.clone()),
+                        session_id: Some(ctx.session_id.clone()),
+                        receipt_id: None,
+                        event_type: Some(ctx.event.event_type.clone()),
+                        trust_tier: Some("human-verified".to_string()),
+                        confidence: Some(1.0),
+                        categories: cats.clone(),
+                        reason: Some(reason.clone()),
+                        traceparent,
+                        payload_sha256: payload_sha256.clone(),
+                        reviewer: None,
+                    },
+                    now_ms,
+                )?;
+                return Ok(InboundEvaluation {
+                    decision: GateDecision::Block { reason },
+                    stage: "local_ingest".to_string(),
+                    receipt: None,
+                    duplicate: false,
+                    payload_sha256,
+                    audit_seq: Some(audit_seq),
+                    confidence: Some(1.0),
+                    categories: cats,
+                });
+            };
+            let kid8: String = auth.kid.chars().take(8).collect();
+            let cats = vec![
+                "gate.allowed".to_string(),
+                "human.verified".to_string(),
+                "local_ingest".to_string(),
+            ];
+            let audit_seq = self.record_audit(
+                &GateAuditInput {
+                    direction: GateDirection::Inbound,
+                    stage: "local_ingest".to_string(),
+                    decision: StoreGateDecision::Allow,
+                    origin_node: Some(ctx.origin_node.clone()),
+                    source: Some(ctx.sender.clone()),
+                    session_id: Some(ctx.session_id.clone()),
+                    receipt_id: None,
+                    event_type: Some(ctx.event.event_type.clone()),
+                    trust_tier: Some("human-verified".to_string()),
+                    confidence: Some(1.0),
+                    categories: cats.clone(),
+                    reason: None,
+                    traceparent,
+                    payload_sha256: payload_sha256.clone(),
+                    reviewer: Some(format!("human:{}:{}", auth.human_id, kid8)),
+                },
+                now_ms,
+            )?;
+            return Ok(InboundEvaluation {
+                decision: GateDecision::Allow {
+                    downgraded_to_notify: false,
+                },
+                stage: "local_ingest".to_string(),
+                receipt: None,
+                duplicate: false,
+                payload_sha256,
+                audit_seq: Some(audit_seq),
+                confidence: Some(1.0),
+                categories: cats,
+            });
+        }
+
+        // Step 2: Deterministic Stage 1 screening (mutex dropped before any .await!).
+        let stage1_out = {
+            let db_guard = self
+                .db
+                .lock()
+                .map_err(|_| GateError::LockPoisoned("node_db mutex poisoned".to_string()))?;
+            self.stage1.evaluate_inbound(ctx, Some(&db_guard), now_ms)
+        };
+
+        let downgraded_from_stage1 = match stage1_out.decision {
+            GateDecision::Allow {
+                downgraded_to_notify,
+            } => downgraded_to_notify,
+            GateDecision::Hold { .. } => {
+                return Ok(InboundEvaluation {
+                    decision: stage1_out.decision,
+                    stage: "stage1".to_string(),
+                    receipt: None,
+                    duplicate: false,
+                    payload_sha256,
+                    audit_seq: None,
+                    confidence: None,
+                    categories: stage1_out.categories,
+                });
+            }
+            GateDecision::Block { reason } => {
+                let mut cats = vec!["gate.blocked".to_string()];
+                cats.extend(stage1_out.categories);
+                let audit_seq = self.record_audit(
+                    &GateAuditInput {
+                        direction: GateDirection::Inbound,
+                        stage: "stage1".to_string(),
+                        decision: StoreGateDecision::Block,
+                        origin_node: Some(ctx.origin_node.clone()),
+                        source: Some(ctx.sender.clone()),
+                        session_id: Some(ctx.session_id.clone()),
+                        receipt_id: None,
+                        event_type: Some(ctx.event.event_type.clone()),
+                        trust_tier: Some(ctx.trust_tier.as_str().to_string()),
+                        confidence: Some(1.0),
+                        categories: cats.clone(),
+                        reason: Some(reason.clone()),
+                        traceparent,
+                        payload_sha256: payload_sha256.clone(),
+                        reviewer: None,
+                    },
+                    now_ms,
+                )?;
+                return Ok(InboundEvaluation {
+                    decision: GateDecision::Block { reason },
+                    stage: "stage1".to_string(),
+                    receipt: None,
+                    duplicate: false,
+                    payload_sha256,
+                    audit_seq: Some(audit_seq),
+                    confidence: Some(1.0),
+                    categories: cats,
+                });
+            }
+            GateDecision::Quarantine { reason, notice } => {
+                let mut cats = vec!["gate.quarantined".to_string()];
+                cats.extend(stage1_out.categories);
+                let (receipt, duplicate) = self.store_in_mailbox(
+                    ctx,
+                    &payload_text,
+                    GateState::Quarantined,
+                    Some(reason.clone()),
+                    traceparent.clone(),
+                    now_ms,
+                )?;
+                let audit_seq = self.record_audit(
+                    &GateAuditInput {
+                        direction: GateDirection::Inbound,
+                        stage: "stage1".to_string(),
+                        decision: StoreGateDecision::Quarantine,
+                        origin_node: Some(ctx.origin_node.clone()),
+                        source: Some(ctx.sender.clone()),
+                        session_id: Some(ctx.session_id.clone()),
+                        receipt_id: receipt.clone(),
+                        event_type: Some(ctx.event.event_type.clone()),
+                        trust_tier: Some(ctx.trust_tier.as_str().to_string()),
+                        confidence: Some(1.0),
+                        categories: cats.clone(),
+                        reason: Some(reason.clone()),
+                        traceparent,
+                        payload_sha256: payload_sha256.clone(),
+                        reviewer: None,
+                    },
+                    now_ms,
+                )?;
+                return Ok(InboundEvaluation {
+                    decision: GateDecision::Quarantine { reason, notice },
+                    stage: "stage1".to_string(),
+                    receipt,
+                    duplicate,
+                    payload_sha256,
+                    audit_seq: Some(audit_seq),
+                    confidence: Some(1.0),
+                    categories: cats,
+                });
+            }
+        };
+
+        // Step 3: Stage 2 + ordered FilterPlugin chain.
+        let mut last_stage = "stage1".to_string();
+        let mut last_confidence: Option<f64> = Some(1.0);
+        let mut collected_categories = stage1_out.categories;
+
+        if self.config.stage2.enabled && self.config.stage2.matchers.matches(ctx) {
+            let outcome = self.stage2.evaluate(ctx, self.secrets.as_deref()).await;
+            if let Some(short_circuit) = self.handle_filter_outcome(
+                ctx,
+                &payload_text,
+                &payload_sha256,
+                traceparent.clone(),
+                "stage2",
+                outcome,
+                &mut last_stage,
+                &mut last_confidence,
+                &mut collected_categories,
+                now_ms,
+            )? {
+                return Ok(short_circuit);
+            }
+        }
+
+        for plugin in &self.filters {
+            if let Some(matchers) = plugin.matchers() {
+                if !matchers.matches(ctx) {
+                    continue;
+                }
+            }
+            let stage_label = format!("filter:{}", plugin.id());
+            let outcome = plugin
+                .evaluate(ctx, &ctx.event, self.secrets.as_deref())
+                .await;
+            if let Some(short_circuit) = self.handle_filter_outcome(
+                ctx,
+                &payload_text,
+                &payload_sha256,
+                traceparent.clone(),
+                &stage_label,
+                outcome,
+                &mut last_stage,
+                &mut last_confidence,
+                &mut collected_categories,
+                now_ms,
+            )? {
+                return Ok(short_circuit);
+            }
+        }
+
+        // Step 4: Record immutable `gate_audit` allow entry without creating a stray pending mailbox row.
+        let mut cats = vec!["gate.allowed".to_string(), "local_ingest".to_string()];
+        cats.extend(collected_categories);
+        let audit_seq = self.record_audit(
+            &GateAuditInput {
+                direction: GateDirection::Inbound,
+                stage: last_stage.clone(),
+                decision: StoreGateDecision::Allow,
+                origin_node: Some(ctx.origin_node.clone()),
+                source: Some(ctx.sender.clone()),
+                session_id: Some(ctx.session_id.clone()),
+                receipt_id: None,
+                event_type: Some(ctx.event.event_type.clone()),
+                trust_tier: Some(ctx.trust_tier.as_str().to_string()),
+                confidence: last_confidence,
+                categories: cats.clone(),
+                reason: downgraded_from_stage1.then(|| "downgraded_to_notify".to_string()),
+                traceparent,
+                payload_sha256: payload_sha256.clone(),
+                reviewer: None,
+            },
+            now_ms,
+        )?;
+
+        Ok(InboundEvaluation {
+            decision: GateDecision::Allow {
+                downgraded_to_notify: downgraded_from_stage1,
+            },
+            stage: last_stage,
+            receipt: None,
+            duplicate: false,
+            payload_sha256,
+            audit_seq: Some(audit_seq),
+            confidence: last_confidence,
+            categories: cats,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn handle_filter_outcome(
         &self,
