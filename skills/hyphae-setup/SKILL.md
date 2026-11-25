@@ -131,11 +131,13 @@ Inspect `herdrMod`, `harnesses`, and `warnings` from the `--json` output and tur
 In Turn 2 (right after bootstrapping the core node/harnesses and connecting any chosen topology below), **ALWAYS ask directly** (never relegate to *"Later you can..."*):
 
 > **"Which optional capabilities do you want to set up now?"**
-> 1. **Event Streams** — GitHub (Webhook on a Hub node vs. Multi-owner `repoTokens` Poll on a Local node), Prometheus Alertmanager, or custom OS cron / `local.schedule` routes (`hyp emit` / `ingest.sock` is already enabled by default)
+> 1. **Event Streams** — GitHub (always explain **Local Polling vs. Webhook** first — even on a Local node — before asking for any PAT) or Prometheus Alertmanager
 > 2. **Chat Bridges** — Telegram (`@BotFather`), Slack (Socket Mode), WhatsApp, or generic Webhook *(always install via `hyp plugin install <name> --json` into `~/.config/hyphae/plugins/` and wire `data.nodePath` + `data.plugins[0].scriptPath` — NEVER point `node.json` at a local git checkout)*
 > 3. **Verified Human Drops** — Phone WebAuthn Passkey (`https://hyphae.to/drop`, QR + URL) + `https://spore.hyphae.to` Blind Drop Relay for zero-leak secret handoffs & signed directives
 > 4. **Local Security Gate** — Prompt-injection filter (`anthropic` [supports `--base-url` + `--auth-header bearer|x-api-key`], `openai-compat`, `google`, `lakera-guard`, `http-classifier`) + `hyp gate lock`
 > 5. **None for now** — skip straight to final `hyp doctor` check
+
+*(Do **NOT** ask the user to set up `hyp emit`, `ingest.sock`, or OS cron triggers during onboarding — the socket-only Local Ingest Route (`local.schedule`) is already enabled by default with zero `node.json` config. Just mention it in 1 line during Wrap-Up; custom `localIngest` policies belong in Mode 2 Section D.)*
 
 #### Native Wakeup Transports & Orchestrators
 
@@ -321,16 +323,17 @@ hyp deploy check --url https://<hostname> --json
   *(Always offer **`https://spore.hyphae.to`** first as the ready-to-use public blind relay — zero setup, 100% RAM-only Cloudflare Durable Object, E2EE ciphertext only — alongside self-hosted private relay options: Cloudflare Workers `workers/drop-relay/`, `hyp deploy init drop-relay`, or local Tailscale Serve. Use `hyp drop ingest` reading stdin for offline/air-gapped `hdrop1_` envelopes.)*
 
 ### F. Configure Event Streams & External Chat Bridges
-1. **GitHub Event Streams — Choose Webhook (Hub Node) vs. Poll (Local Node) BEFORE minting any token**:
-   - Always explain the topology distinction and material trade-offs clearly before asking for any GitHub secret:
-     - **Hub / Server Node (`profile: router` — VPS, Fly.io, Docker + Caddy, Cloudflare Tunnel, or Tailscale Funnel) -> Webhook (`github-webhook`) — RECOMMENDED whenever possible**:
+1. **GitHub Event Streams — ALWAYS explain Webhook vs. Local Polling BEFORE minting any token (even in Local mode!)**:
+   - **Never silently assume "Local mode = polling"** without stating the trade-offs first — even a laptop user can expose a webhook via Tailscale Funnel / Cloudflare Tunnel or a Team Hub if they need real-time CI alerts:
+     - **Webhook (Hub node, or Local node behind Tailscale Funnel / Cloudflare Tunnel) — via `hyp plugin install webhook` or GitHub App (`/v1/webhooks/github-app`)**:
        - Real-time (`<1–2s` latency), delivers **every** event type including live GitHub Actions CI pass/fail (`workflow_run`, `check_run`) and rich payloads.
        - **Zero GitHub PAT required** (uses a shared HMAC-SHA256 webhook signing secret only, stored via `hyp secret set github-webhook-secret --web`).
        - Hub Nodes are the natural place to terminate GitHub webhooks once and fan normalized CloudEvents out over E2EE streams to paired developer laptops.
-     - **Local Node (`profile: local` — laptop behind NAT) -> Polling (`github-public` + `repoTokens`) — zero-infra fallback**:
+     - **Local Polling (`github-public` + `repoTokens`) — zero-infra fallback behind NAT**:
        - Works directly on a laptop behind NAT with **zero public URL** or hub required.
        - ~30s average / 60s max delay; conditional ETag `304 Not Modified` consumes **0** quota (5,000 req/hr per owner token via `repoTokens`; 60 req/hr unauthenticated for public repos).
-       - **Important trade-off**: GitHub's REST `/events` API does **NOT** emit GitHub Actions CI events (`workflow_run` / `check_run`) — only repository activity (pushes, PRs, issues, comments, reviews, releases).
+       - **Important trade-off**: GitHub's REST `/events` API does **NOT** emit GitHub Actions CI events (`workflow_run` / `check_run`) — only repository activity (pushes, PRs, issues, comments, reviews, releases) — and private repos / higher rate limits require a fine-grained PAT per resource owner.
+   - Ask the user directly which mode they want (**Local Polling** vs **Webhook**) before walking through PAT or webhook secret creation.
    - **If the user picks Polling (`github-public`)**, explicitly ask WHICH repos/accounts they want to watch BEFORE creating tokens:
      1. **Public repos only** (works unauthenticated up to 60 req/hr; optional PAT raises quota to 5,000 req/hr),
      2. Their **personal GitHub account** (`<user>/*`), and/or
@@ -383,7 +386,7 @@ hyp deploy check --url https://<hostname> --json
    hyp secret list --json
    ```
 3. **Compiled-in pure-Rust event sources** (`sources[]` in `~/.config/hyphae/node.json` — zero Node/Python needed):
-   - `github-public` (deduplicated ETag poller with multi-owner `repoTokens` + optional GitHub App webhook), `github-webhook`, `prometheus-webhook`, `webhook-stream`.
+   - `github-public` (deduplicated ETag poller with multi-owner `repoTokens` + optional GitHub App webhook at `/v1/webhooks/github-app`). For generic HMAC webhooks or Prometheus Alertmanager webhooks, install the verified `webhook` / `prometheus` plugins via `hyp plugin install`.
    - Reference secrets strictly as `{ "secret": "<name>" }`.
 4. **Optional external chat bridges & harness UI mods (`telegram`, `slack`, `whatsapp`, `webhook`, `prometheus`, `claude-panel`, `claude-code`, `herdr-mod`) — ALWAYS manage via `hyp plugin`**:
    - **NEVER** point `node.json` `plugins[]` at a local git checkout (e.g., `plugins/telegram/index.mjs` inside a workspace repository — checkouts move, get deleted, and are not SHA-256 verified against the installed `hyp` binary).
@@ -468,4 +471,4 @@ Before finishing, always confirm:
 2. `hyp doctor --json` passes (or clearly explain any intentional warnings, e.g. Desktop app needing a restart).
 3. `hyp status --json` shows the expected `nodeId`, `profile`, `kid`, peers, and Security Gate status.
 4. No secrets or pairing tokens were printed, committed, or written in plaintext to `node.json`.
-5. Give the user 1–3 concise next steps (e.g. restarting their Desktop harness if needed, or trying `hyp_mesh` in a fresh session).
+5. Give the user 1–3 concise next steps (e.g. restarting their Desktop harness if needed, trying `hyp_mesh` in a fresh session, and noting that `hyp emit` / `ingest.sock` on `local.schedule` is already active out of the box for OS cron/script wakeups with zero extra setup).
