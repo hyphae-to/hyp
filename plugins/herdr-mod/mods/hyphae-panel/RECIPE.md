@@ -12,7 +12,7 @@ Live per-pane Hyphae mesh status pills in every Herdr terminal header paired wit
   - Security Gate quarantine pending: warm alert badge `⚠ N`.
 - **Thread Inspector (`hyphae-panel`, 380×560 floating window or 368 px right dock panel):**
   - **Header bar (40 px):** Mycelium glyph, `@handle` (or `Unenrolled`), terminal address badge (`t4g` / `solace/t4g`), transport badge (`herdr` / `claude_channel`), Refresh (`↻`), and Close (`×`).
-  - **Target bar (shown when multiple sessions exist or pinned):** `Following focus` / `Pinned · Follow` toggle plus quick session switcher chips.
+  - **Contextual focus tracking:** Automatically follows the currently focused Herdr pane (`focused()?.terminal`) with zero multi-agent switcher clutter.
   - **Quick-control strip:** `Focus ON/OFF` toggle, `Mute All` (`*`) toggle, and a metadata-only Quarantine banner (`⚠ N quarantined · Run hyp gate review in terminal`) when quarantined items exist.
   - **4 segmented tabs (`Subs`, `Queue`, `Rules`, `Mesh`):**
     - `Subs (N)`: topic, origin node, urgency badge, coalesce seconds, filter summary, and `[×]` Unsubscribe button.

@@ -71,9 +71,9 @@ function urgencyColor(t, urgency) {
 export default class HyphaePanel extends View {
   init(initialProps, cx) {
     this.tab = "subs";
-    this.followFocus = !initialProps?.terminal;
-    this.lockedTerminal = initialProps?.terminal ?? null;
-    this.lockedSessionId = null;
+    this.overrideTerminal = initialProps?.terminal ?? null;
+    this.overrideSessionId = null;
+    this.lastFocusedTerminal = checking() ? null : focused()?.terminal ?? null;
     this.lastSelectedAt = 0;
     this.busy = false;
     this.statusNote = null;
@@ -170,21 +170,25 @@ export default class HyphaePanel extends View {
     const at = Number(sel.at) || 0;
     if (at <= this.lastSelectedAt) return;
     this.lastSelectedAt = at;
+    this.lastFocusedTerminal = focused()?.terminal ?? null;
     if (sel.terminal) {
-      this.lockedTerminal = sel.terminal;
-      this.lockedSessionId = sel.sessionId ?? null;
-      this.followFocus = false;
+      this.overrideTerminal = sel.terminal;
+      this.overrideSessionId = sel.sessionId ?? null;
     } else if (sel.sessionId) {
-      this.lockedTerminal = null;
-      this.lockedSessionId = sel.sessionId;
-      this.followFocus = false;
+      this.overrideTerminal = null;
+      this.overrideSessionId = sel.sessionId;
     }
   }
 
   resolveTarget() {
     const f = focused();
     const activeTerminal = f?.terminal ?? null;
-    const chosenTerminal = this.followFocus ? activeTerminal : this.lockedTerminal ?? activeTerminal;
+    if (activeTerminal && activeTerminal !== this.lastFocusedTerminal) {
+      this.lastFocusedTerminal = activeTerminal;
+      this.overrideTerminal = null;
+      this.overrideSessionId = null;
+    }
+    const chosenTerminal = this.overrideTerminal ?? activeTerminal;
 
     if (chosenTerminal) {
       const resolved = this.client.resolveTerminal(chosenTerminal);
@@ -198,8 +202,8 @@ export default class HyphaePanel extends View {
           snapshot: resolved.snapshot,
         };
       }
-      if (!this.followFocus && this.lockedSessionId && resolved.snapshot) {
-        const byId = resolveSessionById(resolved.snapshot, this.lockedSessionId);
+      if (this.overrideSessionId && resolved.snapshot) {
+        const byId = resolveSessionById(resolved.snapshot, this.overrideSessionId);
         if (byId) {
           return {
             terminal: resolved.address,
@@ -222,8 +226,8 @@ export default class HyphaePanel extends View {
     }
 
     const localSnap = this.client.getSnapshot(null);
-    if (!this.followFocus && this.lockedSessionId) {
-      const byId = resolveSessionById(localSnap, this.lockedSessionId);
+    if (this.overrideSessionId) {
+      const byId = resolveSessionById(localSnap, this.overrideSessionId);
       if (byId) {
         return {
           terminal: byId.herdrTerminalId ?? null,
@@ -449,89 +453,6 @@ export default class HyphaePanel extends View {
             .on_click(() => this.closePanel())
             .child(svg("mods/pane/close.svg").size(12))
         )
-      );
-  }
-
-  renderTargetBar(t, target) {
-    const sessions = Array.isArray(target.snapshot?.sessions) ? target.snapshot.sessions : [];
-    const showSwitcher = sessions.length > 1 || !this.followFocus;
-    if (!showSwitcher) return null;
-
-    return h_flex()
-      .id("hyphae-target-bar")
-      .flex_none()
-      .px(10)
-      .py(6)
-      .gap(6)
-      .flex_wrap()
-      .items_center()
-      .border_b(1)
-      .border_color(t.border)
-      .bg(t.surface || t.background)
-      .child(
-        h_flex()
-          .id("hyphae-follow-toggle")
-          .flex_none()
-          .h(20)
-          .px(6)
-          .rounded(4)
-          .items_center()
-          .border_1()
-          .border_color(this.followFocus ? withAlpha(t.accent, "66") : t.border)
-          .bg(this.followFocus ? withAlpha(t.accent, "1e") : t.background)
-          .text_size(10)
-          .text_color(this.followFocus ? t.accent : t.muted)
-          .cursor_pointer()
-          .hover((s) => s.bg(t.hover))
-          .on_mouse_down("left", (_e, mCx) => mCx.stop_propagation())
-          .on_click((_e, clickCx) => {
-            this.followFocus = !this.followFocus;
-            if (this.followFocus) {
-              this.lockedTerminal = null;
-              this.lockedSessionId = null;
-            } else {
-              this.lockedTerminal = target.terminal;
-              this.lockedSessionId = target.sessionId;
-            }
-            clickCx.notify();
-          })
-          .child(this.followFocus ? "Following focus" : "Pinned · Follow")
-      )
-      .children(
-        sessions.slice(0, 6).map((s) => {
-          const isCurrent = target.entry?.sessionId === s.sessionId;
-          const label = s.handle
-            ? `@${sanitizeUiText(s.handle, 18)}`
-            : sanitizeUiText(s.herdrTerminalId || s.harness || s.sessionId, 16);
-          const q = Number(s.counts?.queued) || 0;
-          return h_flex()
-            .id(`hyphae-sess-${s.sessionId}`)
-            .flex_none()
-            .h(20)
-            .px(6)
-            .gap(4)
-            .rounded(4)
-            .items_center()
-            .border_1()
-            .border_color(isCurrent ? t.accent : t.border)
-            .bg(isCurrent ? t.selected : t.background)
-            .text_size(10)
-            .text_color(isCurrent ? t.foreground : t.muted)
-            .cursor_pointer()
-            .hover((st) => st.bg(t.hover))
-            .on_mouse_down("left", (_e, mCx) => mCx.stop_propagation())
-            .on_click((_e, clickCx) => {
-              this.followFocus = false;
-              const prefix = target.machine ? `${target.machine}/` : "";
-              this.lockedTerminal = s.herdrTerminalId ? `${prefix}${s.herdrTerminalId}` : null;
-              this.lockedSessionId = s.sessionId;
-              clickCx.notify();
-            })
-            .child(label)
-            .when(q > 0, (el) =>
-              el.child(div().text_size(9.5).font_semibold().text_color(t.blocked || t.ansi3).child(String(q)))
-            );
-        })
       );
   }
 
@@ -1483,7 +1404,6 @@ export default class HyphaePanel extends View {
     }
 
     const entry = target.entry;
-    const targetBar = this.renderTargetBar(t, target);
     const showMuteInput = Boolean(entry) && this.tab === "rules";
     const canSubmitMute = Boolean(this.muteText.trim()) && !this.busy;
 
@@ -1535,7 +1455,6 @@ export default class HyphaePanel extends View {
         else if (e.key === "r") { this.refresh(keyCx); }
       })
       .child(this.renderHeader(t, target, cx))
-      .when(Boolean(targetBar), (el) => el.child(targetBar))
       .child(this.renderQuickControls(t, target))
       .child(this.renderTabBar(t, entry))
       .child(
