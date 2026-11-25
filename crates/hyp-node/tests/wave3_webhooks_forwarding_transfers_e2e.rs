@@ -17,18 +17,16 @@ use hyp_crypto::rfc3339::now_unix_ms;
 use hyp_crypto::transfer::TarInputEntry;
 use hyp_crypto::{Ed25519KeyPair, SecretBackend};
 use hyp_node::adapters::{
-    BoxFuture, GenericWebhookAdapter, GenericWebhookConfig, GitHubWebhookAdapter,
-    GitHubWebhookConfig, PrometheusWebhookAdapter, PrometheusWebhookConfig,
-    compute_hmac_sha256_header,
+    GenericWebhookAdapter, GenericWebhookConfig, GitHubWebhookAdapter, GitHubWebhookConfig,
+    PrometheusWebhookAdapter, PrometheusWebhookConfig, compute_hmac_sha256_header,
 };
 use hyp_node::engine::config::{ForwardingMode, ForwardingPolicy, ForwardingRule};
 use hyp_node::engine::http_util::{HttpClient, full_body};
-use hyp_node::engine::node::{BridgePostHandler, RemoteUpdateHandler, SubscribeRequest};
+use hyp_node::engine::node::SubscribeRequest;
 use hyp_node::engine::peer_link::{
-    BridgePostRequest, NodeUpdateRequest, PostMessageRequest, PublishEventRequest,
-    http_auth_signing_input,
+    PostMessageRequest, PublishEventRequest, http_auth_signing_input,
 };
-use hyp_node::engine::{NodeConfig, NodeError, NodeProfile, UnifiedNode};
+use hyp_node::engine::{NodeConfig, NodeProfile, UnifiedNode};
 use hyp_node::gates::{SecurityGateConfig, SecurityGatePipeline, Stage1DenyAction};
 use hyp_proto::address::NodeId;
 use hyp_proto::cloudevent::CloudEvent;
@@ -306,20 +304,40 @@ async fn wave3d_5b_compiled_in_webhooks_fail_closed_and_publish_cloudevents() {
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 
     // Valid GitHub webhook publishes & delivers to BOTH local session and remote SSE peer!
+    let expected_gh_id = format!("gh-{}", hex::encode(Sha256::digest(&gh_body)));
     let (st, val) = send_raw_http(
+        &client,
+        Method::POST,
+        &format!("{base}/v1/webhooks/github"),
+        &[
+            ("x-hub-signature-256", good_gh_sig.clone()),
+            ("x-github-event", "pull_request".to_string()),
+            ("x-github-delivery", "deliv-1".to_string()),
+        ],
+        Bytes::from(gh_body.clone()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "github webhook failed: {val}");
+    assert_eq!(val["status"], "published");
+    assert_eq!(val["eventId"], expected_gh_id);
+
+    // B8: Replaying the exact same signed GitHub body with a spoofed `X-GitHub-Delivery` MUST
+    // derive the exact same SHA-256 event ID and deduplicate (`duplicate`)!
+    let (st, val_dup) = send_raw_http(
         &client,
         Method::POST,
         &format!("{base}/v1/webhooks/github"),
         &[
             ("x-hub-signature-256", good_gh_sig),
             ("x-github-event", "pull_request".to_string()),
-            ("x-github-delivery", "deliv-1".to_string()),
+            ("x-github-delivery", "spoofed-unsigned-delivery-id".to_string()),
         ],
         Bytes::from(gh_body),
     )
     .await;
-    assert_eq!(st, StatusCode::OK, "github webhook failed: {val}");
-    assert_eq!(val["status"], "published");
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(val_dup["eventId"], expected_gh_id);
+    assert_eq!(val_dup["publishStatus"], "duplicate");
 
     // Named second GitHub webhook route `/v1/webhooks/github/:id`.
     let gh_sec_body = serde_json::to_vec(&json!({
@@ -484,6 +502,7 @@ async fn wave3d_5b_compiled_in_webhooks_fail_closed_and_publish_cloudevents() {
         &[
             ("x-webhook-timestamp", now_ts),
             ("x-ci-sig-256", bound_sig),
+            ("x-delivery-id", "spoofed-unsigned-x-delivery-id".to_string()),
         ],
         Bytes::from_static(gen_body),
     )
@@ -491,6 +510,101 @@ async fn wave3d_5b_compiled_in_webhooks_fail_closed_and_publish_cloudevents() {
     assert_eq!(st, StatusCode::OK);
     assert_eq!(val2["publishStatus"], "duplicate");
     assert_eq!(val1["eventId"], val2["eventId"]);
+
+    // Pre-auth Content-Length guard rejects oversized declared Content-Length immediately with 413!
+    let (st, _) = send_raw_http(
+        &client,
+        Method::POST,
+        &format!("{base}/v1/pair"),
+        &[("content-length", (1024 * 1024).to_string())],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
+
+    // Dual-auth Prometheus webhook (BOTH bearer_token AND basic_auth configured) accepts EITHER!
+    let mut prom_dual_cfg = PrometheusWebhookConfig::new("prom-dual", "alerts-dual");
+    prom_dual_cfg.bearer_token = Some(Zeroizing::new("dual-bearer-tok".to_string()));
+    prom_dual_cfg.basic_auth = Some((
+        "alertmanager".to_string(),
+        Zeroizing::new("dual-basic-pass".to_string()),
+    ));
+    hub.attach_prometheus_webhook(Arc::new(PrometheusWebhookAdapter::new(prom_dual_cfg)))
+        .await
+        .unwrap();
+    let dual_body = serde_json::to_vec(&json!({
+        "receiver": "dual",
+        "alerts": [{
+            "status": "firing",
+            "fingerprint": "fp-dual-1",
+            "startsAt": "2026-11-25T12:00:00Z",
+            "labels": { "alertname": "DualAuthAlert", "severity": "warning", "service": "api" }
+        }]
+    }))
+    .unwrap();
+    let (st, _) = send_raw_http(
+        &client,
+        Method::POST,
+        &format!("{base}/v1/webhooks/prometheus/prom-dual"),
+        &[("authorization", "Bearer wrong-dual".to_string())],
+        Bytes::from(dual_body.clone()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, dual_b) = send_raw_http(
+        &client,
+        Method::POST,
+        &format!("{base}/v1/webhooks/prometheus/prom-dual"),
+        &[("authorization", "Bearer dual-bearer-tok".to_string())],
+        Bytes::from(dual_body.clone()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "dual-auth bearer failed: {dual_b}");
+    let dual_basic = format!(
+        "Basic {}",
+        BASE64_STANDARD.encode("alertmanager:dual-basic-pass")
+    );
+    let (st, dual_ba) = send_raw_http(
+        &client,
+        Method::POST,
+        &format!("{base}/v1/webhooks/prometheus/prom-dual"),
+        &[("authorization", dual_basic)],
+        Bytes::from(dual_body),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "dual-auth basic failed: {dual_ba}");
+
+    // Adapter-owned topic protection: remote peer holding `stream:publish=*` MUST be rejected
+    // with 403 `not_granted` when attempting `POST /v1/events` onto an adapter-owned webhook topic!
+    let pub_peer_dir = TempDir::new().unwrap();
+    let pub_peer = UnifiedNode::open(make_node_cfg(
+        "spoofer@laptop",
+        NodeProfile::Local,
+        &pub_peer_dir,
+    ))
+    .unwrap();
+    pair_admin_peer(&hub, &admin_key, &pub_peer, &["stream:publish=*"]).await;
+    let pub_link = pub_peer.peer_link("webhook-hub").await.unwrap();
+    for owned_topic in ["github", "alerts", "ci"] {
+        let spoof_ev = CloudEvent::new(
+            format!("spoof-{owned_topic}"),
+            "spoofer@laptop/src",
+            "com.example.spoof",
+            json!({ "forged": true }),
+        );
+        let err = pub_link
+            .publish_event(&PublishEventRequest {
+                topic: owned_topic.to_string(),
+                event: spoof_ev,
+            })
+            .await
+            .expect_err("remote POST /v1/events onto adapter-owned webhook topic must fail closed");
+        assert!(
+            err.to_string().contains("403") || err.to_string().contains("not_granted"),
+            "expected 403 not_granted on adapter-owned topic '{owned_topic}', got: {err}"
+        );
+    }
+    pub_peer.shutdown();
 
     // Unconfigured webhook id returns 404.
     let (st, _) = send_raw_http(
@@ -503,13 +617,26 @@ async fn wave3d_5b_compiled_in_webhooks_fail_closed_and_publish_cloudevents() {
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 
-    // Local watcher receives all 3 filtered streams (github PR, ONLY critical Prometheus alert, CI event).
+    // Local watcher receives all 3 filtered streams (github PR, ONLY critical Prometheus alert, CI event),
+    // and EVERY emitted webhook CloudEvent is stamped with `hyphaesourcekind = "external-webhook"`!
     let local_items = wait_for_mailbox_count(&hub, "local-watcher", 3).await;
     assert_eq!(local_items.len(), 3, "expected 3 local webhook batches");
     assert!(
         local_items.iter().any(|m| m.text.contains("DiskFull") && !m.text.contains("LowNoise")),
         "filter pushdown should deliver critical DiskFull and exclude info LowNoise"
     );
+    for item in &local_items {
+        let parsed: Value = serde_json::from_str(&item.text).unwrap();
+        let events = parsed["events"].as_array().expect("events array");
+        assert!(!events.is_empty());
+        for ev in events {
+            assert_eq!(
+                ev["hyphaesourcekind"].as_str(),
+                Some("external-webhook"),
+                "webhook CloudEvent missing hyphaesourcekind=external-webhook: {ev}"
+            );
+        }
+    }
 
     // Remote SSE peer receives the filtered GitHub webhook event!
     let remote_items = wait_for_mailbox_count(&reader, "reader-sess", 1).await;
@@ -570,15 +697,20 @@ async fn wave3d_5c_router_dm_works_and_relay_enforces_forwarding_plus_forward_vi
     // Peer with dm:send=* ONLY (NO dm:receive!).
     pair_admin_peer(&hub, &admin_key, &no_recv, &["dm:send=*"]).await;
 
-    // Laptop -> Team Hub -> Server E2EE DM succeeds with zero forward:via!
+    // Laptop -> Team Hub -> Server E2EE DM succeeds with zero forward:via AND attributes
+    // mailbox `origin_node` to the verified sender (`alice@laptop`), NEVER the relaying hub!
     laptop
         .send_dm("dev", "bob@server/ops", "hello via team hub")
         .await
         .expect("Laptop <-> Team Hub <-> Server DM must succeed");
     let bob_items = wait_for_mailbox_count(&server, "s-bob", 1).await;
-    assert!(
-        bob_items.iter().any(|m| m.text.contains("hello via team hub")),
-        "bob@server should receive decrypted DM"
+    let dm_item = bob_items
+        .iter()
+        .find(|m| m.text.contains("hello via team hub"))
+        .expect("bob@server should receive decrypted DM");
+    assert_eq!(
+        dm_item.origin_node, "alice@laptop",
+        "hub-relayed DM must attribute mailbox origin_node to verified sender, NOT relaying hub"
     );
 
     // Sending to a peer lacking `dm:receive` fails closed with 403 not_granted!
@@ -748,6 +880,30 @@ async fn wave3d_5c_router_dm_works_and_relay_enforces_forwarding_plus_forward_vi
         .expect("foreign transit event succeeds with allowlist + forward:via=origin@ext");
     assert!(!ingest.deduplicated);
 
+    // Missing `hyphaeorigin` WITH `hyphaevia` indicating transit MUST NOT bypass foreign-origin checks!
+    let mut via_only_ev = CloudEvent::new(
+        "transit-via-only-1",
+        "origin@ext/src",
+        "com.example.ping",
+        json!({ "ok": true }),
+    );
+    via_only_ev.set_extension("hyphaevia", "origin@ext");
+    let err = star_allow_link
+        .publish_event(&PublishEventRequest {
+            topic: "ops".to_string(),
+            event: via_only_ev,
+        })
+        .await
+        .expect_err("omitted hyphaeorigin with foreign hyphaevia must fail closed without forward:via");
+    assert!(err.to_string().contains("403"), "got: {err}");
+
+    // `ForwardingPolicy { max_hops: 0, .. }` clamps effective_max_hops() to 1 so ingest never breaks.
+    let zero_hops_policy = ForwardingPolicy {
+        max_hops: 0,
+        ..ForwardingPolicy::default()
+    };
+    assert_eq!(zero_hops_policy.effective_max_hops(), 1);
+
     caller_star.shutdown();
     caller_fwd.shutdown();
     relay_deny.shutdown();
@@ -757,343 +913,81 @@ async fn wave3d_5c_router_dm_works_and_relay_enforces_forwarding_plus_forward_vi
 }
 
 // ============================================================================
-// 5c (B20): Remote POST /v1/bridges/post enforces explicit bridge:post + DLP
+// Wave 4A Cut: `POST /v1/node/update` & `POST /v1/bridges/post` Return 404
 // ============================================================================
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RecordedBridgeCall {
-    plugin: String,
-    target: String,
-    text: String,
-    reply_to: Option<String>,
-}
-
-struct RecordingBridgeHandler {
-    calls: Mutex<Vec<RecordedBridgeCall>>,
-}
-
-impl BridgePostHandler for RecordingBridgeHandler {
-    fn post_bridge<'a>(
-        &'a self,
-        plugin: &'a str,
-        target: &'a str,
-        text: &'a str,
-        reply_to: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<Option<String>, NodeError>> {
-        Box::pin(async move {
-            self.calls.lock().unwrap().push(RecordedBridgeCall {
-                plugin: plugin.to_string(),
-                target: target.to_string(),
-                text: text.to_string(),
-                reply_to: reply_to.map(ToString::to_string),
-            });
-            Ok(Some("msg-777".to_string()))
-        })
-    }
-}
-
 #[tokio::test]
-async fn wave3d_5c_remote_bridge_post_rejects_wildcard_and_dlp_and_allows_explicit_scope() {
+async fn wave4a_cut_remote_node_update_and_bridges_post_return_404_and_no_capability() {
     let hub_dir = TempDir::new().unwrap();
-    let star_dir = TempDir::new().unwrap();
-    let scoped_dir = TempDir::new().unwrap();
+    let peer_dir = TempDir::new().unwrap();
     let admin_key = Ed25519KeyPair::generate().unwrap();
 
-    let mut hub_cfg = make_node_cfg("bridge-hub", NodeProfile::Router, &hub_dir);
+    let mut hub_cfg = make_node_cfg("cut-hub", NodeProfile::Router, &hub_dir);
     hub_cfg.admin_jwk = Some(admin_proto_jwk(&admin_key));
     let hub = UnifiedNode::open(hub_cfg).unwrap();
-    let recorder = Arc::new(RecordingBridgeHandler {
-        calls: Mutex::new(Vec::new()),
-    });
-    hub.set_bridge_post_handler(Some(Arc::clone(&recorder) as Arc<dyn BridgePostHandler>));
 
-    let (_addr, task) = Arc::clone(&hub)
-        .serve("127.0.0.1:0".parse().unwrap())
-        .await
-        .unwrap();
-
-    let star = UnifiedNode::open(make_node_cfg("star@laptop", NodeProfile::Local, &star_dir))
-        .unwrap();
-    let scoped = UnifiedNode::open(make_node_cfg("scoped@laptop", NodeProfile::Local, &scoped_dir))
-        .unwrap();
-
-    pair_admin_peer(&hub, &admin_key, &star, &["*"]).await;
-    pair_admin_peer(
-        &hub,
-        &admin_key,
-        &scoped,
-        &["bridge:post=telegram:personal"],
-    )
-    .await;
-
-    let star_link = star.peer_link("bridge-hub").await.unwrap();
-    let scoped_link = scoped.peer_link("bridge-hub").await.unwrap();
-
-    // 1. `*` / `full` MUST NEVER grant `bridge:post`!
-    let err = star_link
-        .post_bridge(&BridgePostRequest {
-            plugin: "telegram".to_string(),
-            target: "personal".to_string(),
-            text: "hi".to_string(),
-            reply_to: None,
-        })
-        .await
-        .expect_err("`*` must never grant bridge:post");
+    // Manifest MUST NOT advertise `node.self-update.v1`!
+    let (_signed, manifest, _etag) = hub.build_signed_manifest(None).unwrap();
     assert!(
-        err.to_string().contains("403") && err.to_string().contains("bridge:post"),
-        "expected 403 bridge:post denial, got: {err}"
-    );
-
-    // 2. Wrong target fails closed with 403.
-    let err = scoped_link
-        .post_bridge(&BridgePostRequest {
-            plugin: "telegram".to_string(),
-            target: "other-chat".to_string(),
-            text: "hi".to_string(),
-            reply_to: None,
-        })
-        .await
-        .expect_err("ungranted bridge target must fail closed");
-    assert!(err.to_string().contains("403"), "got: {err}");
-
-    // 3. Outbound DLP blocks secret exfiltration before handler executes!
-    let dlp_err = scoped_link
-        .post_bridge(&BridgePostRequest {
-            plugin: "telegram".to_string(),
-            target: "personal".to_string(),
-            text: "leaking key AKIAIOSFODNN7EXAMPLE right now".to_string(),
-            reply_to: None,
-        })
-        .await
-        .expect_err("outbound DLP must block AWS key leak on bridge post");
-    assert!(
-        dlp_err.to_string().contains("outbound_dlp_blocked"),
-        "expected outbound_dlp_blocked, got: {dlp_err}"
-    );
-    assert!(recorder.calls.lock().unwrap().is_empty());
-
-    // 4. Explicit `bridge:post=telegram:personal` + clean payload succeeds!
-    let resp = scoped_link
-        .post_bridge(&BridgePostRequest {
-            plugin: "telegram".to_string(),
-            target: "personal".to_string(),
-            text: "Deploy v2.3.0 green".to_string(),
-            reply_to: Some("42".to_string()),
-        })
-        .await
-        .expect("explicit bridge:post grant must succeed");
-    assert!(resp.ok);
-    assert_eq!(resp.message_id.as_deref(), Some("msg-777"));
-    let calls = recorder.calls.lock().unwrap().clone();
-    assert_eq!(
-        calls,
-        vec![RecordedBridgeCall {
-            plugin: "telegram".to_string(),
-            target: "personal".to_string(),
-            text: "Deploy v2.3.0 green".to_string(),
-            reply_to: Some("42".to_string()),
-        }]
-    );
-
-    star.shutdown();
-    scoped.shutdown();
-    hub.shutdown();
-    task.abort();
-}
-
-// ============================================================================
-// 5a (D6): Authenticated POST /v1/node/update + node.self-update.v1 capability
-// ============================================================================
-
-struct RecordingUpdateHandler {
-    requests: Mutex<Vec<NodeUpdateRequest>>,
-}
-
-impl RemoteUpdateHandler for RecordingUpdateHandler {
-    fn trigger_update<'a>(
-        &'a self,
-        req: NodeUpdateRequest,
-    ) -> BoxFuture<'a, Result<(), NodeError>> {
-        Box::pin(async move {
-            self.requests.lock().unwrap().push(req);
-            Ok(())
-        })
-    }
-}
-
-#[tokio::test]
-async fn wave3d_5a_remote_node_update_enforces_explicit_scope_and_signed_ed25519_auth() {
-    let disabled_dir = TempDir::new().unwrap();
-    let target_dir = TempDir::new().unwrap();
-    let star_dir = TempDir::new().unwrap();
-    let updater_dir = TempDir::new().unwrap();
-    let admin_key = Ed25519KeyPair::generate().unwrap();
-    let admin_proto = admin_proto_jwk(&admin_key);
-
-    // Disabled by default -> manifest does NOT advertise `node.self-update.v1`.
-    let disabled = UnifiedNode::open(make_node_cfg(
-        "disabled-node",
-        NodeProfile::Router,
-        &disabled_dir,
-    ))
-    .unwrap();
-    let (_signed, disabled_manifest, _etag) = disabled.build_signed_manifest(None).unwrap();
-    assert!(
-        !disabled_manifest
+        !manifest
             .capabilities
             .iter()
             .any(|c| c.as_str() == "node.self-update.v1"),
-        "disabled node must not advertise node.self-update.v1"
-    );
-    disabled.shutdown();
-
-    // Opt-in enabled node -> manifest advertises `node.self-update.v1`.
-    let mut target_cfg = make_node_cfg("updatable-node", NodeProfile::Router, &target_dir);
-    target_cfg.admin_jwk = Some(admin_proto);
-    target_cfg.allow_remote_update = true;
-    let target = UnifiedNode::open(target_cfg).unwrap();
-    let recorder = Arc::new(RecordingUpdateHandler {
-        requests: Mutex::new(Vec::new()),
-    });
-    target.set_remote_update_handler(Some(Arc::clone(&recorder) as Arc<dyn RemoteUpdateHandler>));
-
-    let (_signed, enabled_manifest, _etag) = target.build_signed_manifest(None).unwrap();
-    assert!(
-        enabled_manifest
-            .capabilities
-            .iter()
-            .any(|c| c.as_str() == "node.self-update.v1"),
-        "opt-in node must advertise node.self-update.v1"
+        "v0.7.0 manifest must never advertise node.self-update.v1"
     );
 
-    let (addr, task) = Arc::clone(&target)
+    let (addr, task) = Arc::clone(&hub)
         .serve("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
     let base = format!("http://{addr}");
 
-    let star = UnifiedNode::open(make_node_cfg("star@laptop", NodeProfile::Local, &star_dir))
+    let peer = UnifiedNode::open(make_node_cfg("admin@laptop", NodeProfile::Local, &peer_dir))
         .unwrap();
-    let updater = UnifiedNode::open(make_node_cfg(
-        "updater@laptop",
-        NodeProfile::Local,
-        &updater_dir,
-    ))
-    .unwrap();
-
-    pair_admin_peer(&target, &admin_key, &star, &["*"]).await;
-    pair_admin_peer(&target, &admin_key, &updater, &["*", "node:update"]).await;
+    pair_admin_peer(&hub, &admin_key, &peer, &["*", "bridge:post=telegram:personal"]).await;
 
     let client = HttpClient::new().unwrap();
+    for (path, body) in [
+        (
+            "/v1/node/update",
+            br#"{"channel":"stable","targetVersion":"2.3.0"}"#.as_slice(),
+        ),
+        (
+            "/v1/bridges/post",
+            br#"{"plugin":"telegram","target":"personal","text":"hi"}"#.as_slice(),
+        ),
+    ] {
+        let body_sha = hex::encode(Sha256::digest(body));
+        let ts = now_ms();
+        let nonce = format!("cut-nonce-{}", path.trim_start_matches('/'));
+        let sign_input = http_auth_signing_input("POST", path, ts, &nonce, &body_sha);
+        let sig = peer
+            .identity()
+            .signing
+            .sign_domain_b64("http-auth", &sign_input);
+        let (st, _) = send_raw_http(
+            &client,
+            Method::POST,
+            &format!("{base}{path}"),
+            &[
+                ("content-type", "application/json".to_string()),
+                ("x-hyphae-node", "admin@laptop".to_string()),
+                ("x-hyphae-timestamp", ts.to_string()),
+                ("x-hyphae-nonce", nonce),
+                ("x-hyphae-sig", sig),
+            ],
+            Bytes::copy_from_slice(body),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "cut endpoint POST {path} must return 404 Not Found"
+        );
+    }
 
-    // 1. Unauthenticated POST /v1/node/update -> 401 Unauthorized.
-    let (st, _) = send_raw_http(
-        &client,
-        Method::POST,
-        &format!("{base}/v1/node/update"),
-        &[("content-type", "application/json".to_string())],
-        Bytes::from_static(br#"{"channel":"stable","targetVersion":"2.3.0"}"#),
-    )
-    .await;
-    assert_eq!(st, StatusCode::UNAUTHORIZED);
-
-    // 2. `*` peer without explicit `node:update` -> 403 not_granted!
-    let star_link = star.peer_link("updatable-node").await.unwrap();
-    let err = star_link
-        .request_node_update(&NodeUpdateRequest {
-            target_version: Some("2.3.0".to_string()),
-            channel: Some("stable".to_string()),
-            manifest_url: None,
-            from: None,
-        })
-        .await
-        .expect_err("`*` alone must never grant node:update");
-    assert!(
-        err.to_string().contains("403") && err.to_string().contains("node:update"),
-        "expected 403 node:update denial, got: {err}"
-    );
-
-    // 3. Shell-metacharacter targetVersion & invalid channel fail closed with 400!
-    let updater_link = updater.peer_link("updatable-node").await.unwrap();
-    let bad_ver = updater_link
-        .request_node_update(&NodeUpdateRequest {
-            target_version: Some("2.3.0; rm -rf /".to_string()),
-            channel: Some("stable".to_string()),
-            manifest_url: None,
-            from: None,
-        })
-        .await
-        .expect_err("shell metacharacters in targetVersion must fail closed");
-    assert!(bad_ver.to_string().contains("400"), "got: {bad_ver}");
-
-    let bad_ch = updater_link
-        .request_node_update(&NodeUpdateRequest {
-            target_version: Some("2.3.0".to_string()),
-            channel: Some("canary".to_string()),
-            manifest_url: None,
-            from: None,
-        })
-        .await
-        .expect_err("unknown channel must fail closed");
-    assert!(bad_ch.to_string().contains("400"), "got: {bad_ch}");
-    assert!(recorder.requests.lock().unwrap().is_empty());
-
-    // 4. Standalone Ed25519 X-Hyphae-* signed POST /v1/node/update returns 202 Accepted!
-    let body_bytes = serde_json::to_vec(&json!({
-        "channel": "stable",
-        "targetVersion": "2.3.0"
-    }))
-    .unwrap();
-    let body_sha = hex::encode(Sha256::digest(&body_bytes));
-    let ts = now_ms();
-    let nonce = "a1b2c3d4e5f60708090a0b0c";
-    let sign_input = http_auth_signing_input("POST", "/v1/node/update", ts, nonce, &body_sha);
-    let sig = updater
-        .identity()
-        .signing
-        .sign_domain_b64("http-auth", &sign_input);
-    let signed_headers = vec![
-        ("content-type", "application/json".to_string()),
-        ("x-hyphae-node", "updater@laptop".to_string()),
-        ("x-hyphae-timestamp", ts.to_string()),
-        ("x-hyphae-nonce", nonce.to_string()),
-        ("x-hyphae-sig", sig),
-    ];
-
-    let (st, val) = send_raw_http(
-        &client,
-        Method::POST,
-        &format!("{base}/v1/node/update"),
-        &signed_headers,
-        Bytes::from(body_bytes.clone()),
-    )
-    .await;
-    assert_eq!(st, StatusCode::ACCEPTED, "expected 202 Accepted: {val}");
-    assert_eq!(val["ok"], true);
-    assert_eq!(val["scheduled"], true);
-    assert_eq!(val["nodeId"], "updatable-node");
-    assert_eq!(val["targetVersion"], "2.3.0");
-    assert_eq!(val["channel"], "stable");
-
-    // Replay of identical signed request MUST fail closed (401 replayed nonce)!
-    let (st, _) = send_raw_http(
-        &client,
-        Method::POST,
-        &format!("{base}/v1/node/update"),
-        &signed_headers,
-        Bytes::from(body_bytes),
-    )
-    .await;
-    assert_eq!(st, StatusCode::UNAUTHORIZED);
-
-    let recorded = recorder.requests.lock().unwrap().clone();
-    assert_eq!(recorded.len(), 1);
-    assert_eq!(recorded[0].from.as_deref(), Some("updater@laptop"));
-    assert_eq!(recorded[0].target_version.as_deref(), Some("2.3.0"));
-
-    star.shutdown();
-    updater.shutdown();
-    target.shutdown();
+    peer.shutdown();
+    hub.shutdown();
     task.abort();
 }
 
@@ -1295,4 +1189,16 @@ async fn wave3d_6a_transfer_stage_before_unpack_blocks_quarantines_and_allows() 
     sender.shutdown();
     receiver.shutdown();
     r_task.abort();
+
+    // 5. G9 startup sweep: stale `.staging/<id>` leftovers from a prior crash are cleaned up on open!
+    let stale_dir = staging_root.join("stale-crash-leftover");
+    fs::create_dir_all(&stale_dir).unwrap();
+    fs::write(stale_dir.join("halfway.tmp"), b"stale").unwrap();
+    let reopened = UnifiedNode::open(make_node_cfg("recv@server", NodeProfile::P2p, &recv_dir))
+        .unwrap();
+    assert!(
+        !stale_dir.exists(),
+        "G9: UnifiedNode::open must sweep stale .staging/ leftovers on startup"
+    );
+    reopened.shutdown();
 }

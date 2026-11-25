@@ -2,7 +2,7 @@
 //! for the Hyphae v2 Unified Rust `Node`.
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use http::StatusCode;
@@ -88,9 +88,10 @@ impl Default for ForwardingPolicy {
 }
 
 impl ForwardingPolicy {
-    /// Returns the effective hop limit clamped to the hard protocol cap (`4`).
+    /// Returns the effective hop limit clamped to `[1, HARD_MAX_HOPS]` (`1..=4`) so an explicit
+    /// `maxHops: 0` never breaks normal ingest.
     pub fn effective_max_hops(&self) -> u8 {
-        self.max_hops.min(HARD_MAX_HOPS)
+        self.max_hops.clamp(1, HARD_MAX_HOPS)
     }
 
     /// Returns `true` if transit forwarding from `from_peer` to `to_peer` on `topic`
@@ -555,13 +556,10 @@ pub struct NodeConfig {
     pub channel_policies: BTreeMap<String, ChannelPolicy>,
     /// Opt-in A2A Agent Card projection at `GET /.well-known/agent.json` (default: `false` -> 404).
     pub expose_a2a_card: bool,
-    /// Trust `X-Forwarded-For` / `X-Real-Ip` from loopback or private (RFC1918/ULA) TCP peers
-    /// for Drop Relay per-IP rate limiting (`node.json`: `behindReverseProxy`, default: `false`).
-    pub behind_reverse_proxy: bool,
-    /// Opt-in authenticated remote self-update via `POST /v1/node/update` (`node.json`:
-    /// `allowRemoteUpdate`, default: `false`). Advertises `"node.self-update.v1"` in signed
-    /// manifests ONLY when enabled.
-    pub allow_remote_update: bool,
+    /// Explicit trusted reverse-proxy IP / CIDR allowlist (e.g. `["127.0.0.1/32", "::1/128"]`)
+    /// authorized to supply `X-Forwarded-For` for Drop Relay per-IP rate limiting (`H7`).
+    /// Defaults to empty (= NEVER trust `X-Forwarded-For`).
+    pub trusted_proxies: Vec<String>,
     pub require_pairing: bool,
     /// Optional Org Admin-CA Ed25519 root public key for verifying `am2_` grants.
     pub admin_jwk: Option<ProtoOkpJwk>,
@@ -600,8 +598,7 @@ impl NodeConfig {
             kv_namespaces: Vec::new(),
             channel_policies: BTreeMap::new(),
             expose_a2a_card: false,
-            behind_reverse_proxy: false,
-            allow_remote_update: false,
+            trusted_proxies: Vec::new(),
             require_pairing: true,
             admin_jwk: None,
             secret_backend: None,
@@ -627,7 +624,7 @@ impl NodeConfig {
         if let Some(ref custom) = self.capabilities_override {
             return custom.clone();
         }
-        let mut caps = vec![
+        vec![
             CapabilityToken::ManifestV1,
             CapabilityToken::EnvelopeCeV1,
             CapabilityToken::DmV1,
@@ -644,12 +641,135 @@ impl NodeConfig {
             CapabilityToken::PairingAdminCaV1,
             CapabilityToken::PairingP2pMutualV1,
             CapabilityToken::P2pDirectV1,
-        ];
-        if self.allow_remote_update {
-            caps.push(CapabilityToken::Other("node.self-update.v1".to_string()));
-        }
-        caps
+        ]
     }
+}
+
+/// Normalizes IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) into plain `IpAddr::V4`.
+pub fn normalize_ip_addr(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    }
+}
+
+/// Pure-stdlib parsed IPv4 or IPv6 CIDR entry for `trusted_proxies` matching (`H7`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustedProxyCidr {
+    V4 { network: u32, mask: u32 },
+    V6 { network: u128, mask: u128 },
+}
+
+impl TrustedProxyCidr {
+    /// Parses a single IP (`"127.0.0.1"`, `"::1"`) or CIDR (`"10.0.0.1/32"`, `"fd00::/8"`).
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err("trusted proxy CIDR must not be empty".to_string());
+        }
+        let (addr_str, prefix_opt) = match trimmed.split_once('/') {
+            Some((a, p)) => (a.trim(), Some(p.trim())),
+            None => (trimmed, None),
+        };
+        let parsed_ip: IpAddr = addr_str
+            .parse()
+            .map_err(|_| format!("invalid IP address '{addr_str}' in trustedProxies '{raw}'"))?;
+        match parsed_ip {
+            IpAddr::V4(v4) => {
+                let prefix: u32 = match prefix_opt {
+                    Some(p) => p.parse().map_err(|_| {
+                        format!("invalid IPv4 prefix length '{p}' in trustedProxies '{raw}'")
+                    })?,
+                    None => 32,
+                };
+                if prefix > 32 {
+                    return Err(format!(
+                        "IPv4 prefix length /{prefix} exceeds 32 in trustedProxies '{raw}'"
+                    ));
+                }
+                let mask = if prefix == 0 {
+                    0u32
+                } else {
+                    !0u32 << (32 - prefix)
+                };
+                Ok(Self::V4 {
+                    network: u32::from(v4) & mask,
+                    mask,
+                })
+            }
+            IpAddr::V6(v6) => {
+                if let Some(mapped_v4) = v6.to_ipv4_mapped() {
+                    let prefix: u32 = match prefix_opt {
+                        Some(p) => {
+                            let p6: u32 = p.parse().map_err(|_| {
+                                format!("invalid IPv6 prefix length '{p}' in trustedProxies '{raw}'")
+                            })?;
+                            if !(96..=128).contains(&p6) {
+                                return Err(format!(
+                                    "IPv4-mapped IPv6 prefix /{p6} must be in 96..=128 in trustedProxies '{raw}'"
+                                ));
+                            }
+                            p6 - 96
+                        }
+                        None => 32,
+                    };
+                    let mask = if prefix == 0 {
+                        0u32
+                    } else {
+                        !0u32 << (32 - prefix)
+                    };
+                    return Ok(Self::V4 {
+                        network: u32::from(mapped_v4) & mask,
+                        mask,
+                    });
+                }
+                let prefix: u32 = match prefix_opt {
+                    Some(p) => p.parse().map_err(|_| {
+                        format!("invalid IPv6 prefix length '{p}' in trustedProxies '{raw}'")
+                    })?,
+                    None => 128,
+                };
+                if prefix > 128 {
+                    return Err(format!(
+                        "IPv6 prefix length /{prefix} exceeds 128 in trustedProxies '{raw}'"
+                    ));
+                }
+                let mask = if prefix == 0 {
+                    0u128
+                } else {
+                    !0u128 << (128 - prefix)
+                };
+                Ok(Self::V6 {
+                    network: u128::from(v6) & mask,
+                    mask,
+                })
+            }
+        }
+    }
+
+    /// Returns `true` iff `ip` falls inside this CIDR (normalizing IPv4-mapped IPv6 addresses).
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self, normalize_ip_addr(ip)) {
+            (Self::V4 { network, mask }, IpAddr::V4(v4)) => (u32::from(v4) & *mask) == *network,
+            (Self::V6 { network, mask }, IpAddr::V6(v6)) => (u128::from(v6) & *mask) == *network,
+            _ => false,
+        }
+    }
+}
+
+/// Validates a `trustedProxies` CIDR entry string.
+pub fn validate_trusted_proxy_cidr(raw: &str) -> Result<TrustedProxyCidr, String> {
+    TrustedProxyCidr::parse(raw)
+}
+
+/// Returns `true` iff `ip` matches ANY valid CIDR/IP entry in `trusted_proxies`.
+/// Invalid entries are ignored fail-closed.
+pub fn ip_matches_trusted_proxies(ip: IpAddr, trusted_proxies: &[String]) -> bool {
+    let norm = normalize_ip_addr(ip);
+    trusted_proxies
+        .iter()
+        .filter_map(|raw| TrustedProxyCidr::parse(raw).ok())
+        .any(|cidr| cidr.contains(norm))
 }
 
 /// Unified error type returned by `UnifiedNode`, `PeerLink`, and HTTP server handlers.

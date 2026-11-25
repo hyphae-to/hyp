@@ -404,52 +404,6 @@ pub struct TransferUploadResponse {
     pub deduplicated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BridgePostRequest {
-    pub plugin: String,
-    pub target: String,
-    pub text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reply_to: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BridgePostResponse {
-    pub ok: bool,
-    pub plugin: String,
-    pub target: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NodeUpdateRequest {
-    #[serde(default, alias = "version", skip_serializing_if = "Option::is_none")]
-    pub target_version: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub channel: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub manifest_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub from: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NodeUpdateResponse {
-    pub ok: bool,
-    pub scheduled: bool,
-    pub node_id: String,
-    pub current_version: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_version: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub channel: Option<String>,
-}
-
 /// Outcome of fetching `GET /v1/manifest` from a peer.
 #[derive(Debug, Clone)]
 pub enum ManifestFetchOutcome {
@@ -987,22 +941,6 @@ impl PeerLink {
             .send_json(Method::POST, "/v1/inbox/ack", Some(req), &[])
             .await?;
         Ok(resp.acked)
-    }
-
-    pub async fn post_bridge(
-        &self,
-        req: &BridgePostRequest,
-    ) -> Result<BridgePostResponse, NodeError> {
-        self.send_json(Method::POST, "/v1/bridges/post", Some(req), &[])
-            .await
-    }
-
-    pub async fn request_node_update(
-        &self,
-        req: &NodeUpdateRequest,
-    ) -> Result<NodeUpdateResponse, NodeError> {
-        self.send_json(Method::POST, "/v1/node/update", Some(req), &[])
-            .await
     }
 
     pub async fn open_inbox_sse(

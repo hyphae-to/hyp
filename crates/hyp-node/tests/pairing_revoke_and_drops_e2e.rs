@@ -10,11 +10,15 @@
 //!   and HTTP authentication.
 //! - `P1-20`: SSE worker stops polling on permanent HTTP `403` revoked/`not_granted` denials
 //!   (zero tight-loop retries) and skips/reject-acks malformed SSE items without stalling.
-//! - `H4`: Inbound `to.hyphae.human.revocation.v1` events automatically revoke keys and bump
-//!   `min_auth_epoch` monotonically & idempotently (fail-closed on forged revocations).
+//! - `H4` / `N3` / `N4`: Inbound `to.hyphae.human.revocation.v1` events are handled per-event
+//!   (invalid revocations are audited & skipped without poisoning the rest of the batch),
+//!   automatically revoke keys and bump `min_auth_epoch` monotonically without bricking a locked
+//!   `SecurityGatePipeline`.
 //! - `H5`: Old-epoch authority key claiming a forged higher `claim.auth_epoch` fails closed.
-//! - `H7`: `X-Forwarded-For` / `X-Real-Ip` are honored ONLY when `behind_reverse_proxy == true`
-//!   from a loopback or RFC1918/ULA private peer IP, taking the rightmost non-loopback entry.
+//! - `H7`: `X-Forwarded-For` is honored ONLY when the TCP peer IP matches `trusted_proxies`
+//!   CIDRs, walking right-to-left skipping trusted hops (`X-Real-Ip` is never trusted).
+//! - `N1`: Peer bearer tokens are bound to peer/grant/signing-kid and immediately invalidated on
+//!   revoke, re-pair, and `PUT /v1/keys` key rotation.
 //! - `H11` & `H15`: Every rejected/expired/revoked/epoch-stale/replayed drop claim writes an
 //!   immutable `gate_audit` (`gate.human_drop_rejected`) row with zero secret plaintext;
 //!   local `overwrite_secret = true` NEVER overrides human-signed `spec.overwrite = false`.
@@ -46,15 +50,17 @@ use hyp_crypto::human::{
 };
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::rfc3339::format_rfc3339_millis;
-use hyp_crypto::{Ed25519KeyPair, SecretBackend, X25519PublicKey};
-use hyp_node::engine::http_util::{BoxedBody, HttpClient, full_body, sse_response};
+use hyp_crypto::{Ed25519KeyPair, NodeIdentityKeys, SecretBackend, X25519PublicKey};
+use hyp_node::engine::http_util::{BoxedBody, HttpClient, empty_body, full_body, sse_response};
 use hyp_node::engine::node::PeerAction;
-use hyp_node::engine::peer_link::{PeerAuth, PeerLink, spawn_sse_worker};
+use hyp_node::engine::peer_link::{
+    KeyRegPayloadV2, PeerAuth, PeerLink, PutKeyRequest, spawn_sse_worker,
+};
 use hyp_node::engine::server::extract_drop_relay_client_ip;
 use hyp_node::engine::{
     DropRelayConfig, E2eePolicy, NodeConfig, NodeError, SubscribeRequest, UnifiedNode,
 };
-use hyp_node::gates::{SecurityGateConfig, SecurityGatePipeline};
+use hyp_node::gates::{SecurityGateConfig, SecurityGatePipeline, sign_gate_policy};
 use hyp_proto::address::NodeId;
 use hyp_proto::cloudevent::{CloudEvent as ProtoCloudEvent, TYPE_HUMAN_REVOCATION_V1};
 use hyp_proto::scopes::ScopePreset;
@@ -1005,6 +1011,27 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
     enroll_human(&worker, "bogdan", &lost_phone, HumanAuthorityRole::Signer, 1);
     assert_eq!(worker.db().human().min_auth_epoch().unwrap(), 1);
 
+    // N3: Lock a signed SecurityGatePipeline on `worker@box` anchored to `authorities_digest`
+    // BEFORE any revocation arrives.
+    let initial_digest = worker.db().human().authorities_digest().unwrap();
+    let mut gate_cfg = SecurityGateConfig {
+        require_signed_policy: true,
+        human_authorities_digest: Some(initial_digest),
+        ..SecurityGateConfig::default()
+    };
+    gate_cfg.policy_signature =
+        Some(sign_gate_policy(&gate_cfg, worker.secret_store()).unwrap());
+    let gate_db = Arc::new(Mutex::new(
+        NodeDb::open(worker_dir.path().join("node.sqlite")).unwrap(),
+    ));
+    let worker_gate = SecurityGatePipeline::new(
+        gate_cfg,
+        gate_db,
+        Some(Arc::new(worker.secret_store().clone())),
+    )
+    .unwrap();
+    assert!(!worker_gate.is_policy_tampered());
+
     // Subscribe `worker@box` to `acme-hub.security`.
     worker
         .subscribe_local_or_remote(SubscribeRequest {
@@ -1018,7 +1045,9 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
         .await
         .unwrap();
 
-    // 1. Forged revocation signed by non-admin signer fails closed in `handle_inbound_peer_batch`!
+    // 1. N4: Mixed batch containing a forged revocation (non-admin signer), a malformed
+    //    revocation event, AND a valid normal event MUST handle revocations per-event:
+    //    log + audit the bad revocation events and STILL deliver the valid normal event!
     let forged_rev = sign_human_revocation(
         &HumanRevocationPayloadV1 {
             v: 1,
@@ -1032,35 +1061,98 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
         &lost_phone,
     )
     .unwrap();
-    let forged_batch = DueBatch {
+    let mixed_batch = DueBatch {
         id: uuid_v4(),
         subscription_id: "sub-revocations".to_string(),
         origin_node: "acme-hub".to_string(),
         subscriber: "worker@box".to_string(),
         topic: "security".to_string(),
         mode: DeliveryMode::Full,
-        events: vec![StoreCloudEvent {
-            specversion: "1.0".to_string(),
-            id: uuid_v4(),
-            source: "acme-hub".to_string(),
-            event_type: TYPE_HUMAN_REVOCATION_V1.to_string(),
-            datacontenttype: "application/json".to_string(),
-            subject: None,
-            time: Some(format_rfc3339_millis(now_ms())),
-            dataschema: None,
-            data: serde_json::to_value(&forged_rev).unwrap(),
-            extensions: Default::default(),
-        }],
+        events: vec![
+            StoreCloudEvent {
+                specversion: "1.0".to_string(),
+                id: "forged-rev-1".to_string(),
+                source: "acme-hub".to_string(),
+                event_type: TYPE_HUMAN_REVOCATION_V1.to_string(),
+                datacontenttype: "application/json".to_string(),
+                subject: None,
+                time: Some(format_rfc3339_millis(now_ms())),
+                dataschema: None,
+                data: serde_json::to_value(&forged_rev).unwrap(),
+                extensions: Default::default(),
+            },
+            StoreCloudEvent {
+                specversion: "1.0".to_string(),
+                id: "malformed-rev-2".to_string(),
+                source: "acme-hub".to_string(),
+                event_type: TYPE_HUMAN_REVOCATION_V1.to_string(),
+                datacontenttype: "application/json".to_string(),
+                subject: None,
+                time: Some(format_rfc3339_millis(now_ms())),
+                dataschema: None,
+                data: json!({"garbage": true}),
+                extensions: Default::default(),
+            },
+            StoreCloudEvent {
+                specversion: "1.0".to_string(),
+                id: "good-security-ping".to_string(),
+                source: "acme-hub".to_string(),
+                event_type: "to.hyphae.security.notice".to_string(),
+                datacontenttype: "application/json".to_string(),
+                subject: None,
+                time: Some(format_rfc3339_millis(now_ms())),
+                dataschema: None,
+                data: json!({"status": "batch-survived"}),
+                extensions: Default::default(),
+            },
+        ],
         opened_at: now_ms(),
         closed_at: now_ms(),
     };
-    assert!(matches!(
-        worker
-            .handle_inbound_peer_batch("acme-hub", forged_batch)
-            .await,
-        Err(NodeError::Unauthorized(_))
-    ));
+    worker
+        .handle_inbound_peer_batch("acme-hub", mixed_batch)
+        .await
+        .expect("N4: junk revocation events must not poison valid siblings in the same batch");
     assert_eq!(worker.db().human().min_auth_epoch().unwrap(), 1);
+    assert_eq!(
+        worker
+            .db()
+            .human()
+            .get_authority("bogdan", &human_admin.kid())
+            .unwrap()
+            .unwrap()
+            .status,
+        HumanAuthorityStatus::Active
+    );
+    // Both invalid revocations were audited as `human.revocation_rejected`.
+    let rejected_rev_audits: Vec<_> = worker
+        .db()
+        .local()
+        .query_gate_audit(&GateAuditQuery {
+            decision: Some(GateDecision::Block),
+            limit: Some(20),
+            ..GateAuditQuery::default()
+        })
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.categories.iter().any(|c| c == "human.revocation_rejected"))
+        .collect();
+    assert!(
+        rejected_rev_audits.len() >= 2,
+        "N4: expected >= 2 human.revocation_rejected audit rows, got {}",
+        rejected_rev_audits.len()
+    );
+    // Valid sibling event in the same batch was delivered cleanly to `sess-worker`!
+    let delivered = wait_for_mailbox_item(&worker, "sess-worker", |item| {
+        let raw = serde_json::to_string(item).unwrap_or_default();
+        raw.contains("good-security-ping") && raw.contains("batch-survived")
+    })
+    .await;
+    let delivered_raw = serde_json::to_string(&delivered).unwrap();
+    assert!(
+        !delivered_raw.contains("forged-rev-1") && !delivered_raw.contains("malformed-rev-2"),
+        "N4: rejected revocation events must not be delivered into mailbox"
+    );
 
     // 2. Authentic Admin-signed `to.hyphae.human.revocation.v1` published on `acme-hub.security`
     //    flows over real SSE into `worker@box` and automatically revokes `lost_phone` + bumps epoch -> 3!
@@ -1105,6 +1197,44 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
+    // N3: Applying a cryptographically verified mesh revocation MUST NOT brick the locked gate!
+    assert!(
+        !worker_gate.is_policy_tampered(),
+        "N3: valid mesh revocation must not trigger gate_policy_tampered"
+    );
+    worker_gate
+        .verify_policy_integrity()
+        .expect("N3: locked gate policy integrity must stay valid after monotonic revocation");
+
+    // Simultaneously, any claim signed by the revoked `lost_phone` key MUST immediately fail closed!
+    let now = now_ms();
+    let revoked_claim = build_directive_claim(
+        "bogdan",
+        &lost_phone,
+        1,
+        worker.node_id().as_str(),
+        &worker.identity().encryption.public_key(),
+        Some("ops"),
+        "claim from revoked phone",
+        now,
+        now + 300_000,
+    );
+    let revoked_env = seal_human_drop(
+        &revoked_claim,
+        &lost_phone,
+        &worker.identity().encryption.public_key(),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            worker
+                .ingest_human_drop(&revoked_env, Some(&worker_gate), false)
+                .await,
+            Err(NodeError::Unauthorized(_))
+        ),
+        "N3: revoked key must be rejected fail-closed immediately"
+    );
+
     // 3. Re-delivering the exact same revocation batch is idempotent & monotonic!
     let replay_rev_batch = DueBatch {
         id: uuid_v4(),
@@ -1133,6 +1263,22 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
         .await
         .unwrap();
     assert_eq!(worker.db().human().min_auth_epoch().unwrap(), 3);
+    assert!(!worker_gate.is_policy_tampered());
+
+    // 4. N3 tamper check: enrolling an unauthorized new authority row directly in SQLite STILL
+    //    flips the locked gate immediately to tampered!
+    let rogue_authority = Ed25519KeyPair::generate().unwrap();
+    enroll_human(
+        &worker,
+        "rogue",
+        &rogue_authority,
+        HumanAuthorityRole::Admin,
+        3,
+    );
+    assert!(
+        worker_gate.is_policy_tampered(),
+        "N3: unauthorized human_authorities insertion must still trigger gate_policy_tampered"
+    );
 
     worker.shutdown();
     hub.shutdown();
@@ -1257,54 +1403,101 @@ async fn h5_old_epoch_key_spoofing_higher_claim_epoch_is_rejected() {
 
 #[tokio::test]
 async fn h7_drop_relay_xff_honored_only_when_behind_trusted_reverse_proxy() {
-    // 1. Pure extraction matrix: loopback, RFC1918, ULA, public peer, right-to-left XFF, X-Real-Ip.
+    // 1. Pure extraction matrix: empty list, loopback-only, explicit IPv4/IPv6 CIDRs,
+    //    right-to-left skipping of trusted hops, and strict ignoring of `X-Real-Ip`.
     let mut xff_hdrs = HeaderMap::new();
     xff_hdrs.insert(
         "x-forwarded-for",
-        HeaderValue::from_static("198.51.100.1, 203.0.113.9, 127.0.0.1"),
+        HeaderValue::from_static("198.51.100.1, 203.0.113.9, 10.0.0.5, 127.0.0.1"),
     );
 
-    // behind_reverse_proxy = false -> ALWAYS uses TCP peer IP (even from 127.0.0.1!)
+    let none_trusted: Vec<String> = Vec::new();
+    let loopback_trusted = vec!["127.0.0.1/32".to_string(), "::1/128".to_string()];
+    let vpc_and_loopback_trusted = vec![
+        "127.0.0.1/32".to_string(),
+        "10.0.0.0/24".to_string(),
+        "fd00::/64".to_string(),
+    ];
+
+    // Empty trusted_proxies -> ALWAYS uses TCP peer IP (even from 127.0.0.1!)
     assert_eq!(
-        extract_drop_relay_client_ip(IpAddr::V4(Ipv4Addr::LOCALHOST), &xff_hdrs, false),
+        extract_drop_relay_client_ip(IpAddr::V4(Ipv4Addr::LOCALHOST), &xff_hdrs, &none_trusted),
         "127.0.0.1"
     );
-    // Public internet peer IP -> NEVER trusts X-Forwarded-For even when behind_reverse_proxy = true!
+    // Public internet peer IP -> NEVER trusts X-Forwarded-For even when proxies are configured!
     assert_eq!(
-        extract_drop_relay_client_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)), &xff_hdrs, true),
+        extract_drop_relay_client_ip(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
+            &xff_hdrs,
+            &vpc_and_loopback_trusted
+        ),
         "203.0.113.5"
     );
-    // Loopback / RFC1918 / ULA proxy with behind_reverse_proxy = true -> rightmost non-loopback IP!
+    // Loopback-only list MUST NOT trust an unconfigured RFC1918 VPC/Fly neighbor (10.0.0.5)!
     assert_eq!(
-        extract_drop_relay_client_ip(IpAddr::V4(Ipv4Addr::LOCALHOST), &xff_hdrs, true),
+        extract_drop_relay_client_ip(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            &xff_hdrs,
+            &loopback_trusted
+        ),
+        "10.0.0.5"
+    );
+    // Loopback proxy with loopback-only list stops at rightmost non-trusted entry (10.0.0.5).
+    assert_eq!(
+        extract_drop_relay_client_ip(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            &xff_hdrs,
+            &loopback_trusted
+        ),
+        "10.0.0.5"
+    );
+    // Explicit CIDR list walks right-to-left skipping BOTH 127.0.0.1 and 10.0.0.5 -> 203.0.113.9!
+    assert_eq!(
+        extract_drop_relay_client_ip(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            &xff_hdrs,
+            &vpc_and_loopback_trusted
+        ),
         "203.0.113.9"
     );
     assert_eq!(
-        extract_drop_relay_client_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), &xff_hdrs, true),
+        extract_drop_relay_client_ip(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            &xff_hdrs,
+            &vpc_and_loopback_trusted
+        ),
         "203.0.113.9"
     );
     assert_eq!(
         extract_drop_relay_client_ip(
             IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)),
             &xff_hdrs,
-            true
+            &vpc_and_loopback_trusted
         ),
         "203.0.113.9"
     );
-    // X-Real-Ip fallback when XFF absent
+    // H7: `X-Real-Ip` is NEVER trusted even from a trusted loopback proxy!
     let mut real_ip_hdrs = HeaderMap::new();
     real_ip_hdrs.insert("x-real-ip", HeaderValue::from_static("198.51.100.42"));
     assert_eq!(
-        extract_drop_relay_client_ip(IpAddr::V4(Ipv4Addr::LOCALHOST), &real_ip_hdrs, true),
-        "198.51.100.42"
+        extract_drop_relay_client_ip(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            &real_ip_hdrs,
+            &loopback_trusted
+        ),
+        "127.0.0.1"
     );
     assert_eq!(
-        extract_drop_relay_client_ip(IpAddr::V4(Ipv4Addr::LOCALHOST), &real_ip_hdrs, false),
+        extract_drop_relay_client_ip(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            &real_ip_hdrs,
+            &none_trusted
+        ),
         "127.0.0.1"
     );
 
-    // 2. Real HTTP E2E test proving per-IP rate limiting ignores XFF when `behind_reverse_proxy == false`
-    //    and enforces rightmost non-loopback XFF when `behind_reverse_proxy == true`!
+    // 2. Real HTTP E2E test proving per-IP rate limiting ignores XFF when `trusted_proxies` is
+    //    empty and enforces rightmost non-trusted XFF when `trusted_proxies` matches the proxy!
     let relay_cfg = DropRelayConfig {
         enabled: true,
         creates_per_hour_per_ip: 1,
@@ -1341,11 +1534,11 @@ async fn h7_drop_relay_xff_honored_only_when_behind_trusted_reverse_proxy() {
 
     let client = HttpClient::new().unwrap();
 
-    // Case A: `behind_reverse_proxy = false` -> XFF ignored -> 2nd request rate-limited (429)!
+    // Case A: empty `trusted_proxies` -> XFF ignored -> 2nd request rate-limited (429)!
     let dir_direct = TempDir::new().unwrap();
     let mut cfg_direct = make_p2p_config("relay-direct", &dir_direct);
     cfg_direct.drop_relay = relay_cfg.clone();
-    cfg_direct.behind_reverse_proxy = false;
+    cfg_direct.trusted_proxies = Vec::new();
     let node_direct = UnifiedNode::open(cfg_direct).unwrap();
     let (addr_direct, _srv_direct) = Arc::clone(&node_direct)
         .serve(loopback_zero())
@@ -1364,15 +1557,15 @@ async fn h7_drop_relay_xff_honored_only_when_behind_trusted_reverse_proxy() {
     assert_eq!(
         r2.status(),
         StatusCode::TOO_MANY_REQUESTS,
-        "when behind_reverse_proxy=false, XFF must be ignored so 2nd loopback request hits 429"
+        "when trusted_proxies is empty, XFF must be ignored so 2nd loopback request hits 429"
     );
     node_direct.shutdown();
 
-    // Case B: `behind_reverse_proxy = true` -> honors rightmost non-loopback XFF from loopback proxy!
+    // Case B: `trusted_proxies = ["127.0.0.1/32", "::1/128"]` -> honors rightmost non-trusted XFF!
     let dir_proxied = TempDir::new().unwrap();
     let mut cfg_proxied = make_p2p_config("relay-proxied", &dir_proxied);
     cfg_proxied.drop_relay = relay_cfg;
-    cfg_proxied.behind_reverse_proxy = true;
+    cfg_proxied.trusted_proxies = loopback_trusted;
     let node_proxied = UnifiedNode::open(cfg_proxied).unwrap();
     let (addr_proxied, _srv_proxied) = Arc::clone(&node_proxied)
         .serve(loopback_zero())
@@ -1393,7 +1586,7 @@ async fn h7_drop_relay_xff_honored_only_when_behind_trusted_reverse_proxy() {
         StatusCode::CREATED,
         "distinct client IPs behind trusted reverse proxy must have separate rate-limit buckets"
     );
-    // Spoofing left-side IP while rightmost non-loopback remains `198.51.100.10` MUST hit 429!
+    // Spoofing left-side IP while rightmost non-trusted remains `198.51.100.10` MUST hit 429!
     let p3 = client
         .request(make_signed_post_drop(
             &node_proxied,
@@ -1405,7 +1598,7 @@ async fn h7_drop_relay_xff_honored_only_when_behind_trusted_reverse_proxy() {
     assert_eq!(
         p3.status(),
         StatusCode::TOO_MANY_REQUESTS,
-        "rightmost non-loopback XFF entry must defeat left-side spoofing"
+        "rightmost non-trusted XFF entry must defeat left-side spoofing"
     );
     node_proxied.shutdown();
 }
@@ -1660,4 +1853,133 @@ async fn h16_reserved_secret_names_rejected_in_crypto_and_engine() {
     );
 
     node.shutdown();
+}
+
+// ============================================================================
+// 11. N1: Bearer Token Invalidation on Peer Revoke, Re-Pair & Key Rotation
+// ============================================================================
+
+#[tokio::test]
+async fn n1_bearer_token_invalidated_on_revoke_repair_and_key_rotation() {
+    let hub_dir = TempDir::new().unwrap();
+    let alice_dir = TempDir::new().unwrap();
+    let admin_ca = Ed25519KeyPair::generate().unwrap();
+
+    let hub = UnifiedNode::open(make_router_config("acme-hub", &hub_dir, &admin_ca)).unwrap();
+    let (hub_addr, _hub_srv) = Arc::clone(&hub).serve(loopback_zero()).await.unwrap();
+
+    let alice = UnifiedNode::open(make_p2p_config("alice@laptop", &alice_dir)).unwrap();
+    let scopes = ScopePreset::Member.expand();
+    let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
+
+    // 1. Initial pairing issues Bearer token #1.
+    let (am2_first, _) = hub
+        .create_admin_invite(&admin_ca, "alice@laptop", &scope_refs, TrustTier::Org, 300_000)
+        .unwrap();
+    alice.accept_am2_invite(&am2_first).await.unwrap();
+
+    let read_hub_bearer = |peer_node: &UnifiedNode| -> String {
+        let rec = peer_node
+            .db()
+            .peers()
+            .get_peer("acme-hub")
+            .unwrap()
+            .expect("alice should have acme-hub peer record");
+        let secret_ref = rec
+            .auth_credential_ref
+            .expect("paired peer must store auth_credential_ref");
+        peer_node
+            .secret_store()
+            .get(&secret_ref)
+            .unwrap()
+            .as_str()
+            .to_string()
+    };
+
+    let bearer_1 = read_hub_bearer(&alice);
+    let client = HttpClient::new().unwrap();
+    let probe_bearer = |token: &str| {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("http://{hub_addr}/v1/handles"))
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(empty_body())
+            .unwrap();
+        client.request(req)
+    };
+
+    // Bearer #1 works while active.
+    assert_eq!(probe_bearer(&bearer_1).await.unwrap().status(), StatusCode::OK);
+
+    // 2. Revoke `alice@laptop` on `hub` -> Bearer #1 is immediately rejected (401).
+    hub.db()
+        .peers()
+        .set_peer_status("alice@laptop", PeerStatus::Revoked, now_ms())
+        .unwrap();
+    hub.reconcile_peers(Duration::from_secs(5)).await;
+    assert_eq!(
+        probe_bearer(&bearer_1).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+        "N1: revoked peer bearer token must be rejected immediately"
+    );
+
+    // 3. Re-pair `alice@laptop` with a fresh invite -> Bearer #2 works, Bearer #1 stays dead!
+    let (am2_second, _) = hub
+        .create_admin_invite(&admin_ca, "alice@laptop", &scope_refs, TrustTier::Org, 300_000)
+        .unwrap();
+    alice.accept_am2_invite(&am2_second).await.unwrap();
+    let bearer_2 = read_hub_bearer(&alice);
+    assert_ne!(bearer_1, bearer_2);
+    assert_eq!(
+        probe_bearer(&bearer_1).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+        "N1: old bearer token must stay dead even after re-pairing the same peer_id"
+    );
+    assert_eq!(
+        probe_bearer(&bearer_2).await.unwrap().status(),
+        StatusCode::OK,
+        "N1: newly issued bearer token after re-pair must succeed"
+    );
+
+    // 4. Rotate `alice@laptop`'s signing & encryption keys via `PUT /v1/keys` -> Bearer #2
+    //    is immediately invalidated!
+    let rotated_ids = NodeIdentityKeys::generate().unwrap();
+    let new_sign_jwk = rotated_ids.signing.to_jwk();
+    let new_enc_jwk = rotated_ids.encryption.to_jwk();
+    let payload = KeyRegPayloadV2 {
+        v: 2,
+        node_id: "alice@laptop".to_string(),
+        signing_jwk: new_sign_jwk.clone(),
+        encryption_jwk: new_enc_jwk.clone(),
+    };
+    let proof = alice.identity().signing.sign_jcs("key-reg", &payload).unwrap();
+    let put_req_body = serde_json::to_vec(&PutKeyRequest {
+        signing_jwk: new_sign_jwk,
+        encryption_jwk: new_enc_jwk,
+        proof,
+    })
+    .unwrap();
+    let put_req = Request::builder()
+        .method(Method::PUT)
+        .uri(format!("http://{hub_addr}/v1/keys"))
+        .header(AUTHORIZATION, format!("Bearer {bearer_2}"))
+        .header(CONTENT_TYPE, "application/json")
+        .body(full_body(put_req_body))
+        .unwrap();
+    let put_resp = client.request(put_req).await.unwrap();
+    assert_eq!(
+        put_resp.status(),
+        StatusCode::OK,
+        "key rotation PUT /v1/keys signed by pinned key must succeed"
+    );
+
+    // Bearer #2 was bound to the pre-rotation signing kid and deleted on rotation -> 401!
+    assert_eq!(
+        probe_bearer(&bearer_2).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+        "N1: pre-rotation bearer token must be rejected immediately after PUT /v1/keys"
+    );
+
+    alice.shutdown();
+    hub.shutdown();
 }

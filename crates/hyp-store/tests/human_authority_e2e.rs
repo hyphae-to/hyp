@@ -409,29 +409,46 @@ fn authorities_digest_is_order_independent_and_detects_every_mutation() {
     assert_ne!(d_epoch, prev, "auth_epoch tamper must change digest");
     prev = d_epoch;
 
-    // 4. Mutate status via revocation (also advances min_auth_epoch)
-    db_a.human()
+    // 4. N3: Revoking an existing key (and advancing min_auth_epoch) MUST preserve the
+    //    enrolled-identity digest so a cryptographically verified mesh revocation does NOT
+    //    brick a locked Security Gate — while immediately marking the key revoked & inactive
+    //    and refusing resurrection!
+    let new_min = db_a
+        .human()
         .revoke_authority_monotonic("bogdan", "kid_a", 3, r#"{"r":1}"#, T0 + 10)
         .unwrap();
-    let d_revoked = db_a.human().authorities_digest().unwrap();
-    assert_ne!(d_revoked, prev, "status/min_auth_epoch change must change digest");
-    prev = d_revoked;
-
-    // 5. Mutate min_auth_epoch directly in metadata
-    db_a.connection()
-        .execute(
-            "UPDATE metadata SET value = '1' WHERE key = 'human.min_auth_epoch'",
-            [],
-        )
-        .unwrap();
-    let d_min_tamper = db_a.human().authorities_digest().unwrap();
-    assert_ne!(
-        d_min_tamper, prev,
-        "min_auth_epoch rollback tamper in metadata must change digest"
+    assert_eq!(new_min, 3);
+    assert_eq!(db_a.human().min_auth_epoch().unwrap(), 3);
+    assert_eq!(
+        db_a.human().get_active_authority_by_kid("kid_a").unwrap(),
+        None,
+        "revoked key must immediately be excluded from active lookups"
     );
-    prev = d_min_tamper;
+    let d_revoked = db_a.human().authorities_digest().unwrap();
+    assert_eq!(
+        d_revoked, prev,
+        "N3: monotonic revocation must preserve enrolled-identity digest"
+    );
+    // Attempting to resurrect the revoked key fails closed!
+    assert!(matches!(
+        db_a.human().upsert_authority(
+            &sample_authority("bogdan", "kid_a", HumanAuthorityRole::Admin, 100),
+            T0 + 15,
+        ),
+        Err(StoreError::InvalidState(_))
+    ));
 
-    // 6. Delete a row via raw SQLite tampering
+    // 5. Enrolling any unauthorized new authority key MUST change digest!
+    let k_rogue = sample_authority("rogue", "kid_rogue", HumanAuthorityRole::Admin, 1);
+    db_a.human().upsert_authority(&k_rogue, T0 + 20).unwrap();
+    let d_injected = db_a.human().authorities_digest().unwrap();
+    assert_ne!(
+        d_injected, prev,
+        "unauthorized key insertion must change digest"
+    );
+    prev = d_injected;
+
+    // 6. Delete a row via raw SQLite tampering MUST change digest!
     db_a.connection()
         .execute("DELETE FROM human_authorities WHERE kid = 'kid_a'", [])
         .unwrap();

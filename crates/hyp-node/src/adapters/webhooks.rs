@@ -37,6 +37,11 @@ use crate::adapters::trait_def::{
 
 pub const MAX_TITLE_CHARS: usize = 200;
 pub const MAX_TEXT_CHARS: usize = 1000;
+/// CloudEvent extension attribute marking events emitted by external webhook adapters so
+/// downstream receivers always cap their trust tier to `ExternalWebhook`.
+pub const EXT_SOURCE_KIND: &str = "hyphaesourcekind";
+/// Value stamped on [`EXT_SOURCE_KIND`] for all compiled-in webhook adapters.
+pub const SOURCE_KIND_EXTERNAL_WEBHOOK: &str = "external-webhook";
 const CUT_SUFFIX: &str = "[...]";
 const MAX_MENTIONS: usize = 20;
 const MAX_LIST_ITEMS: usize = 50;
@@ -267,12 +272,6 @@ fn is_valid_subject(subject: &str) -> bool {
         Regex::new(r"^[A-Za-z0-9._/-]{1,128}$").expect("valid subject regex")
     });
     re.is_match(subject)
-}
-
-fn is_valid_delivery_id(id: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"^[A-Za-z0-9._:-]{1,128}$").expect("valid delivery re"));
-    re.is_match(id)
 }
 
 fn is_valid_github_event_name(name: &str) -> bool {
@@ -713,6 +712,7 @@ pub fn normalize_github_webhook(
             ce.set_extension("actor", actor);
         }
     }
+    ce.set_extension(EXT_SOURCE_KIND, SOURCE_KIND_EXTERNAL_WEBHOOK);
 
     GitHubNormalizeOutcome::Publish(Box::new(ce))
 }
@@ -789,21 +789,23 @@ impl GitHubWebhookAdapter {
 
         let event_name = header_str(headers, "x-github-event")
             .ok_or_else(|| AdapterError::InvalidInput("missing X-GitHub-Event header".into()))?;
-        let delivery_id = header_str(headers, "x-github-delivery")
-            .ok_or_else(|| AdapterError::InvalidInput("missing X-GitHub-Delivery header".into()))?;
 
-        if !is_valid_github_event_name(event_name) || !is_valid_delivery_id(delivery_id) {
+        if !is_valid_github_event_name(event_name) {
             return Err(AdapterError::InvalidInput(
-                "malformed X-GitHub-Event or X-GitHub-Delivery header".into(),
+                "malformed X-GitHub-Event header".into(),
             ));
         }
+
+        // B8: ALWAYS derive deterministic event ID from SHA-256 of the raw HMAC-verified body
+        // rather than trusting the unsigned `X-GitHub-Delivery` header.
+        let deterministic_id = format!("gh-{}", hex::encode(Sha256::digest(body)));
 
         let payload: Value = serde_json::from_slice(body)
             .map_err(|e| AdapterError::InvalidInput(format!("invalid JSON body: {e}")))?;
 
         let ce = match normalize_github_webhook(
             event_name,
-            delivery_id,
+            &deterministic_id,
             &payload,
             &now_rfc3339_seconds(),
         ) {
@@ -1211,6 +1213,7 @@ pub fn normalize_prometheus_webhook(
                 ce.set_extension("service", svc);
             }
         }
+        ce.set_extension(EXT_SOURCE_KIND, SOURCE_KIND_EXTERNAL_WEBHOOK);
 
         let ce_val = serde_json::to_value(&ce)
             .map_err(|e| AdapterError::Internal(format!("CloudEvent serialization failed: {e}")))?;
@@ -1267,32 +1270,32 @@ impl PrometheusWebhookAdapter {
             ));
         }
 
-        if let Some(ref expected_token) = self.config.bearer_token {
-            if expected_token.is_empty() {
+        // When both `bearer_token` and `basic_auth` are configured, both read the single HTTP
+        // `Authorization` header — accept if EITHER configured scheme matches in constant time!
+        let has_bearer_cfg = self.config.bearer_token.is_some();
+        let has_basic_cfg = self.config.basic_auth.is_some();
+        if has_bearer_cfg || has_basic_cfg {
+            let auth_hdr = header_str(headers, "authorization");
+            let bearer_ok = match self.config.bearer_token.as_ref() {
+                Some(expected_token) if !expected_token.is_empty() => {
+                    let raw = auth_hdr.unwrap_or("");
+                    let provided = raw
+                        .strip_prefix("Bearer ")
+                        .or_else(|| raw.strip_prefix("bearer "))
+                        .unwrap_or("");
+                    !provided.is_empty() && constant_time_str_eq(provided, expected_token.as_str())
+                }
+                _ => false,
+            };
+            let basic_ok = match self.config.basic_auth.as_ref() {
+                Some((expected_user, expected_pass)) => {
+                    verify_basic_auth_header(auth_hdr, expected_user, expected_pass.as_str())
+                }
+                None => false,
+            };
+            if !bearer_ok && !basic_ok {
                 return Err(AdapterError::Unauthorized(
-                    "invalid or missing Bearer authorization".into(),
-                ));
-            }
-            let auth = header_str(headers, "authorization").unwrap_or("");
-            let provided = auth
-                .strip_prefix("Bearer ")
-                .or_else(|| auth.strip_prefix("bearer "))
-                .unwrap_or("");
-            if provided.is_empty() || !constant_time_str_eq(provided, expected_token.as_str()) {
-                return Err(AdapterError::Unauthorized(
-                    "invalid or missing Bearer authorization".into(),
-                ));
-            }
-        }
-
-        if let Some((ref expected_user, ref expected_pass)) = self.config.basic_auth {
-            if !verify_basic_auth_header(
-                header_str(headers, "authorization"),
-                expected_user,
-                expected_pass.as_str(),
-            ) {
-                return Err(AdapterError::Unauthorized(
-                    "invalid or missing Basic authorization".into(),
+                    "invalid or missing Bearer or Basic authorization".into(),
                 ));
             }
         }
@@ -1435,7 +1438,21 @@ pub fn normalize_generic_webhook(
         }
     };
 
-    // Pass-through when the caller already sent a valid CloudEvents v1.0 object.
+    // B8: ALWAYS derive deterministic event ID from SHA-256 of the raw verified payload body
+    // (plus signed `X-Webhook-Timestamp` when present) instead of trusting unsigned headers
+    // such as `X-Delivery-Id` or `X-Request-Id`.
+    let deterministic_id = {
+        let mut hasher = Sha256::new();
+        if let Some(ts) = header_str(headers, "x-webhook-timestamp") {
+            hasher.update(ts.as_bytes());
+            hasher.update(b".");
+        }
+        hasher.update(body);
+        format!("wh-{}", hex::encode(hasher.finalize()))
+    };
+
+    // Pass-through when the caller already sent a valid CloudEvents v1.0 object, overriding `id`
+    // with the deterministic verified-body digest and forcing `hyphaesourcekind = external-webhook`.
     if let Some(map) = parsed.as_object() {
         let is_ce_v1 = map.get("specversion").and_then(Value::as_str) == Some("1.0")
             && map
@@ -1452,6 +1469,11 @@ pub fn normalize_generic_webhook(
                 .is_some_and(|s| !s.is_empty());
         if is_ce_v1 {
             let mut ce_obj = map.clone();
+            ce_obj.insert("id".to_string(), Value::String(deterministic_id));
+            ce_obj.insert(
+                EXT_SOURCE_KIND.to_string(),
+                Value::String(SOURCE_KIND_EXTERNAL_WEBHOOK.to_string()),
+            );
             if !ce_obj.contains_key("time") {
                 ce_obj.insert("time".to_string(), Value::String(now_rfc3339.to_string()));
             }
@@ -1488,32 +1510,15 @@ pub fn normalize_generic_webhook(
         .filter(|s| !s.is_empty() && s.len() <= MAX_ATTRIBUTE_CHARS)
         .map(ToString::to_string);
 
-    let id: String = header_str(headers, "x-delivery-id")
-        .or_else(|| header_str(headers, "x-request-id"))
-        .or_else(|| obj.get("id").and_then(Value::as_str))
-        .filter(|s| !s.trim().is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| {
-            let mut hasher = Sha256::new();
-            if let Some(ts) = header_str(headers, "x-webhook-timestamp") {
-                hasher.update(ts.as_bytes());
-                hasher.update(b".");
-            }
-            hasher.update(body);
-            format!("wh-{}", hex::encode(hasher.finalize()))
-        })
-        .chars()
-        .take(128)
-        .collect();
-
     let data = match obj.get("data") {
         Some(v) if v.is_object() => v.clone(),
         _ => Value::Object(obj),
     };
 
-    let mut ce = CloudEvent::new(id, event_source, event_type, data);
+    let mut ce = CloudEvent::new(deterministic_id, event_source, event_type, data);
     ce.subject = event_subject;
     ce.time = Some(now_rfc3339.to_string());
+    ce.set_extension(EXT_SOURCE_KIND, SOURCE_KIND_EXTERNAL_WEBHOOK);
 
     let ce_val = serde_json::to_value(&ce)
         .map_err(|e| AdapterError::Internal(format!("CloudEvent serialization failed: {e}")))?;

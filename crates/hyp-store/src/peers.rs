@@ -209,6 +209,7 @@ impl<'a> PeerStore<'a> {
                 "DELETE FROM peer_routes WHERE via_peer = ?1",
                 params![&input.peer_id],
             )?;
+            let _ = delete_peer_bearer_tokens_in_conn(tx.conn(), &input.peer_id)?;
         }
         let record = tx.conn().query_row(
             "SELECT * FROM peers WHERE peer_id = ?1",
@@ -269,6 +270,7 @@ impl<'a> PeerStore<'a> {
                 "DELETE FROM peer_routes WHERE via_peer = ?1",
                 params![peer_id],
             )?;
+            let _ = delete_peer_bearer_tokens_in_conn(tx.conn(), peer_id)?;
         }
         tx.commit()?;
         Ok(changed > 0)
@@ -280,11 +282,22 @@ impl<'a> PeerStore<'a> {
             "DELETE FROM peer_routes WHERE via_peer = ?1",
             params![peer_id],
         )?;
+        let _ = delete_peer_bearer_tokens_in_conn(tx.conn(), peer_id)?;
         let changed = tx
             .conn()
             .execute("DELETE FROM peers WHERE peer_id = ?1", params![peer_id])?;
         tx.commit()?;
         Ok(changed > 0)
+    }
+
+    /// Atomically deletes all stored `auth_token:*` bearer token metadata records bound to
+    /// `peer_id` (supporting both structured JSON `{ "peerId": ... }` and legacy plain
+    /// `"<peer_id>"` metadata values). Returns the number of deleted tokens (`N1`).
+    pub fn delete_bearer_tokens_for_peer(&self, peer_id: &str) -> StoreResult<usize> {
+        let tx = self.db.immediate_tx()?;
+        let deleted = delete_peer_bearer_tokens_in_conn(tx.conn(), peer_id)?;
+        tx.commit()?;
+        Ok(deleted)
     }
 
     /// Caches a verified signed Node Capability Manifest for `peer_id`.
@@ -1285,4 +1298,41 @@ fn decode_peer_route_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PeerRoute>
         via_peer: row.get("via_peer")?,
         updated_at: row.get("updated_at")?,
     })
+}
+
+fn bearer_metadata_matches_peer(raw_value: &str, peer_id: &str) -> bool {
+    if raw_value == peer_id {
+        return true;
+    }
+    if raw_value.starts_with('{') {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw_value) {
+            if val.get("peerId").and_then(serde_json::Value::as_str) == Some(peer_id) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn delete_peer_bearer_tokens_in_conn(
+    conn: &rusqlite::Connection,
+    peer_id: &str,
+) -> StoreResult<usize> {
+    let mut stmt = conn.prepare("SELECT key, value FROM metadata WHERE key LIKE 'auth_token:%'")?;
+    let matching_keys: Vec<String> = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|(_, val)| bearer_metadata_matches_peer(val, peer_id))
+        .map(|(k, _)| k)
+        .collect();
+    drop(stmt);
+
+    let mut deleted = 0usize;
+    for key in matching_keys {
+        deleted += conn.execute("DELETE FROM metadata WHERE key = ?1", params![key])?;
+    }
+    Ok(deleted)
 }

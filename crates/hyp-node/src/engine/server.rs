@@ -20,14 +20,18 @@
 use std::convert::Infallible;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::Bytes;
 use http::header::{
-    ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_MAX_AGE, ORIGIN,
+    ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_MAX_AGE,
+    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HeaderValue, ORIGIN,
 };
 use http::{HeaderMap, Method, Request, Response, StatusCode};
 use hyper::body::{Frame, Incoming};
@@ -37,7 +41,8 @@ use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -48,7 +53,7 @@ use hyp_proto::problem::ProblemDetails;
 use hyp_store::{KvDeleteInput, KvSetInput, StoreError, now_ms};
 
 use crate::adapters::{AdapterError, WebhookIngestOutcome};
-use crate::engine::config::NodeError;
+use crate::engine::config::{NodeError, ip_matches_trusted_proxies, normalize_ip_addr};
 use crate::engine::drop_relay::{
     CreateDropRequest, DROP_CAP_HEADER, DROP_SSE_KEEPALIVE_SECONDS, DropCapRole, DropRelay,
     DropRelayError, DropSubscriberAuth, DropSubscription,
@@ -61,18 +66,139 @@ use crate::engine::http_util::{
 };
 use crate::engine::node::{AuthenticatedPeer, UnifiedNode};
 use crate::engine::peer_link::{
-    BridgePostRequest, ChannelEpochResponse, ChannelJoinRequest, ChannelJoinResponse,
-    ChannelLeaveRequest, ChannelPostRequest, ChannelsResponse, GuestPairRequest, HandlesResponse,
-    InboxAckRequest, InboxAckResponse, KvDeleteBody, KvEpochResponse, KvListResponse, KvSetBody,
-    NodeUpdateRequest, PairRequestV2, PeerKeysResponse, PostMessageRequest, PostMessageResponse,
-    PublishEventRequest, PutChannelEpochRequest, PutHandlesRequest, PutKeyRequest,
-    PutKvEpochRequest, PutSubscriptionsRequest, PutSubscriptionsResponse, SubscriptionsResponse,
+    ChannelEpochResponse, ChannelJoinRequest, ChannelJoinResponse, ChannelLeaveRequest,
+    ChannelPostRequest, ChannelsResponse, GuestPairRequest, HandlesResponse, InboxAckRequest,
+    InboxAckResponse, KvDeleteBody, KvEpochResponse, KvListResponse, KvSetBody, PairRequestV2,
+    PeerKeysResponse, PostMessageRequest, PostMessageResponse, PublishEventRequest,
+    PutChannelEpochRequest, PutHandlesRequest, PutKeyRequest, PutKvEpochRequest,
+    PutSubscriptionsRequest, PutSubscriptionsResponse, SubscriptionsResponse,
     TransferUploadResponse,
 };
 
 const MAX_JSON_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_UNAUTH_CONTROL_BODY_BYTES: usize = 64 * 1024;
+const MAX_GITHUB_APP_WEBHOOK_BODY_BYTES: usize = 1024 * 1024;
 const MAX_DROP_CONTROL_BODY_BYTES: usize = 16 * 1024;
 const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(25);
+const MAX_CONCURRENT_LINGERING_CLOSES: usize = 64;
+const LINGERING_CLOSE_TIMEOUT: Duration = Duration::from_millis(200);
+const LINGERING_CLOSE_MAX_DISCARD_BYTES: usize = 512 * 1024;
+
+static ACTIVE_LINGERING_CLOSES: AtomicUsize = AtomicUsize::new(0);
+
+/// RFC 9112 §9.6 lingering-close `TcpStream` wrapper.
+///
+/// When an HTTP/1.1 handler rejects an oversized request early (e.g. `413 Payload Too Large`
+/// from `Content-Length` before buffering any request body bytes), closing a `TcpStream` while
+/// unread request bytes sit in the kernel receive buffer triggers a TCP `RST` on BSD/macOS/Linux,
+/// wiping out the `413` response before the client can read it. Performing a bounded `SHUT_WR`
+/// half-close + zero-allocation stack drain avoids the TCP reset problem without DoS risk.
+struct LingeringTcpStream {
+    stream: Option<TcpStream>,
+    peer_eof: bool,
+    wrote_bytes: bool,
+}
+
+impl LingeringTcpStream {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            stream: Some(stream),
+            peer_eof: false,
+            wrote_bytes: false,
+        }
+    }
+}
+
+impl AsyncRead for LingeringTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let Some(ref mut stream) = self.stream else {
+            return Poll::Ready(Ok(()));
+        };
+        let before = buf.filled().len();
+        let res = Pin::new(stream).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &res {
+            if buf.filled().len() == before {
+                self.peer_eof = true;
+            }
+        }
+        res
+    }
+}
+
+impl AsyncWrite for LingeringTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let Some(ref mut stream) = self.stream else {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "connection closed",
+            )));
+        };
+        let res = Pin::new(stream).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &res {
+            if *n > 0 {
+                self.wrote_bytes = true;
+            }
+        }
+        res
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Some(ref mut stream) = self.stream else {
+            return Poll::Ready(Ok(()));
+        };
+        Pin::new(stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Some(ref mut stream) = self.stream else {
+            return Poll::Ready(Ok(()));
+        };
+        Pin::new(stream).poll_shutdown(cx)
+    }
+}
+
+impl Drop for LingeringTcpStream {
+    fn drop(&mut self) {
+        if !self.wrote_bytes || self.peer_eof {
+            return;
+        }
+        let Some(mut stream) = self.stream.take() else {
+            return;
+        };
+        let prev = ACTIVE_LINGERING_CLOSES.fetch_add(1, Ordering::AcqRel);
+        if prev >= MAX_CONCURRENT_LINGERING_CLOSES {
+            ACTIVE_LINGERING_CLOSES.fetch_sub(1, Ordering::AcqRel);
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            ACTIVE_LINGERING_CLOSES.fetch_sub(1, Ordering::AcqRel);
+            return;
+        };
+        handle.spawn(async move {
+            let _ = stream.shutdown().await;
+            let _ = tokio::time::timeout(LINGERING_CLOSE_TIMEOUT, async {
+                let mut discard = [0u8; 4096];
+                let mut total = 0usize;
+                while total < LINGERING_CLOSE_MAX_DISCARD_BYTES {
+                    match stream.read(&mut discard).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => total = total.saturating_add(n),
+                    }
+                }
+            })
+            .await;
+            ACTIVE_LINGERING_CLOSES.fetch_sub(1, Ordering::AcqRel);
+        });
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -142,7 +268,7 @@ impl UnifiedNode {
                     if *conn_shutdown.borrow() {
                         return;
                     }
-                    let io = TokioIo::new(stream);
+                    let io = TokioIo::new(LingeringTcpStream::new(stream));
                     let service = service_fn(move |req: Request<Incoming>| {
                         let n = Arc::clone(&conn_node);
                         async move {
@@ -184,7 +310,11 @@ async fn handle_http_request(
                 NodeError::DropRelay(e) => e.retry_after_secs(),
                 _ => None,
             };
-            let resp = problem_response(&err.to_problem_details());
+            let mut resp = problem_response(&err.to_problem_details());
+            if resp.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                resp.headers_mut()
+                    .insert(CONNECTION, HeaderValue::from_static("close"));
+            }
             match retry_after {
                 Some(secs) => with_retry_after(resp, secs),
                 None => resp,
@@ -232,17 +362,10 @@ async fn route_request(
         .await;
     }
 
-    // Determine max body cap (transfers permit up to configured `max_bytes`).
-    let is_transfer_put = method == Method::PUT && path.starts_with("/v1/transfers/");
-    let max_body = if is_transfer_put {
-        node.config()
-            .store_config
-            .transfer_limits
-            .max_bytes
-            .min(usize::MAX as u64) as usize
-    } else {
-        MAX_JSON_BODY_BYTES
-    };
+    // Pre-auth route-appropriate body size guard: check route limits & `Content-Length` BEFORE
+    // buffering request body bytes (preventing pre-auth memory amplification).
+    let max_body = resolve_pre_read_body_limit(&node, &method, &path, &headers)?;
+    check_content_length(&headers, max_body)?;
 
     let body_bytes = read_body_bytes(req.into_body(), max_body).await?;
     let body_sha = hex::encode(Sha256::digest(&body_bytes));
@@ -647,20 +770,6 @@ async fn route_request(
         return Ok(json_response(StatusCode::OK, &res));
     }
 
-    // /v1/bridges/post
-    if method == Method::POST && path == "/v1/bridges/post" {
-        let post_req: BridgePostRequest = serde_json::from_slice(&body_bytes)?;
-        let resp = node.handle_server_bridge_post(&caller, post_req).await?;
-        return Ok(json_response(StatusCode::OK, &resp));
-    }
-
-    // /v1/node/update
-    if method == Method::POST && path == "/v1/node/update" {
-        let update_req: NodeUpdateRequest = serde_json::from_slice(&body_bytes)?;
-        let resp = node.handle_server_node_update(&caller, update_req).await?;
-        return Ok(json_response(StatusCode::ACCEPTED, &resp));
-    }
-
     // /v1/subscriptions
     if path == "/v1/subscriptions" {
         return match method {
@@ -1054,41 +1163,184 @@ fn drop_relay_error_response(
     resp
 }
 
-fn normalize_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
-        v4 => v4,
-    }
+fn has_any_auth_header(headers: &HeaderMap) -> bool {
+    headers.contains_key(AUTHORIZATION)
+        || headers.contains_key("x-hyphae-sig")
+        || headers.contains_key("x-hyphae-timestamp")
+        || headers.contains_key("x-hyphae-nonce")
 }
 
-fn is_loopback_ip(ip: IpAddr) -> bool {
-    match normalize_ip(ip) {
-        IpAddr::V4(v4) => v4.is_loopback(),
-        IpAddr::V6(v6) => v6.is_loopback(),
+fn check_content_length(headers: &HeaderMap, max_bytes: usize) -> Result<(), NodeError> {
+    let Some(raw_val) = headers.get(CONTENT_LENGTH) else {
+        return Ok(());
+    };
+    let raw_str = raw_val
+        .to_str()
+        .map_err(|_| NodeError::BadRequest("invalid Content-Length header".into()))?
+        .trim();
+    let declared: usize = raw_str
+        .parse()
+        .map_err(|_| NodeError::BadRequest("invalid Content-Length header".into()))?;
+    if declared > max_bytes {
+        return Err(NodeError::PayloadTooLarge(format!(
+            "declared Content-Length {declared} exceeds limit of {max_bytes} bytes"
+        )));
     }
+    Ok(())
 }
 
-fn is_trusted_proxy_ip(ip: IpAddr) -> bool {
-    match normalize_ip(ip) {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
-        IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00,
+fn resolve_pre_read_body_limit(
+    node: &UnifiedNode,
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+) -> Result<usize, NodeError> {
+    if method == Method::GET
+        && matches!(
+            path,
+            "/v1/health" | "/v1/manifest" | "/.well-known/agent.json"
+        )
+    {
+        if path == "/.well-known/agent.json" && !node.config().expose_a2a_card {
+            return Err(NodeError::NotFound(
+                "A2A agent card projection is disabled on this node".into(),
+            ));
+        }
+        return Ok(MAX_UNAUTH_CONTROL_BODY_BYTES);
     }
+
+    if method == Method::POST
+        && (path == "/v1/pair" || path == "/v1/guest/pair" || path.starts_with("/v1/p2p/pair/"))
+    {
+        if path == "/v1/guest/pair" && !node.config().guest_pairing.enabled {
+            return Err(NodeError::NotFound(
+                "guest pairing is disabled on this node".into(),
+            ));
+        }
+        return Ok(MAX_UNAUTH_CONTROL_BODY_BYTES);
+    }
+
+    if method == Method::POST && path == "/v1/webhooks/github-app" {
+        if node
+            .github_public_adapter()
+            .filter(|a| a.has_app_webhook_secret())
+            .is_none()
+        {
+            return Err(NodeError::NotFound(
+                "github-app webhook endpoint is disabled on this node".into(),
+            ));
+        }
+        return Ok(MAX_GITHUB_APP_WEBHOOK_BODY_BYTES);
+    }
+
+    if method == Method::POST && path == "/v1/webhooks/github" {
+        let Some(adapter) = node.github_webhook_adapter(None) else {
+            return Err(NodeError::NotFound(
+                "github webhook endpoint is disabled on this node".into(),
+            ));
+        };
+        return Ok(adapter.config().max_body_bytes);
+    }
+
+    if method == Method::POST {
+        if let Some(raw_id) = path.strip_prefix("/v1/webhooks/github/") {
+            if !raw_id.is_empty() && !raw_id.contains('/') {
+                let id = percent_decode(raw_id);
+                let Some(adapter) = node.github_webhook_adapter(Some(&id)) else {
+                    return Err(NodeError::NotFound(format!(
+                        "github webhook '{id}' is not configured on this node"
+                    )));
+                };
+                return Ok(adapter.config().max_body_bytes);
+            }
+        }
+    }
+
+    if method == Method::POST && path == "/v1/webhooks/prometheus" {
+        let Some(adapter) = node.prometheus_webhook_adapter(None) else {
+            return Err(NodeError::NotFound(
+                "prometheus webhook endpoint is disabled on this node".into(),
+            ));
+        };
+        return Ok(adapter.config().max_body_bytes);
+    }
+
+    if method == Method::POST {
+        if let Some(raw_id) = path.strip_prefix("/v1/webhooks/prometheus/") {
+            if !raw_id.is_empty() && !raw_id.contains('/') {
+                let id = percent_decode(raw_id);
+                let Some(adapter) = node.prometheus_webhook_adapter(Some(&id)) else {
+                    return Err(NodeError::NotFound(format!(
+                        "prometheus webhook '{id}' is not configured on this node"
+                    )));
+                };
+                return Ok(adapter.config().max_body_bytes);
+            }
+        }
+    }
+
+    if method == Method::POST {
+        if let Some(raw_id) = path.strip_prefix("/v1/webhooks/stream/") {
+            if !raw_id.is_empty() && !raw_id.contains('/') {
+                let id = percent_decode(raw_id);
+                let Some(adapter) = node.generic_webhook_adapter(&id) else {
+                    return Err(NodeError::NotFound(format!(
+                        "webhook stream '{id}' is not configured on this node"
+                    )));
+                };
+                return Ok(adapter.config().max_body_bytes);
+            }
+        }
+    }
+
+    if method == Method::POST {
+        if let Some(raw_id) = path.strip_prefix("/v1/webhooks/") {
+            if !raw_id.is_empty() && !raw_id.contains('/') {
+                let id = percent_decode(raw_id);
+                let Some(adapter) = node.generic_webhook_adapter(&id) else {
+                    return Err(NodeError::NotFound(format!(
+                        "webhook '{id}' is not configured on this node"
+                    )));
+                };
+                return Ok(adapter.config().max_body_bytes);
+            }
+        }
+    }
+
+    if method == Method::PUT && path.starts_with("/v1/transfers/") {
+        if !has_any_auth_header(headers) {
+            return Err(NodeError::Unauthorized(
+                "missing Authorization header".into(),
+            ));
+        }
+        return Ok(node
+            .config()
+            .store_config
+            .transfer_limits
+            .max_bytes
+            .min(usize::MAX as u64) as usize);
+    }
+
+    Ok(MAX_JSON_BODY_BYTES)
 }
 
-/// Extracts the effective client IP for Drop Relay per-IP rate limiting (H7).
+/// Extracts the effective client IP for Drop Relay per-IP rate limiting (`H7`).
 ///
 /// Security invariant:
-/// - ONLY inspects `X-Forwarded-For` / `X-Real-Ip` when `behind_reverse_proxy == true` AND
-///   `peer_ip` is loopback or RFC1918/ULA private (trusted reverse proxy).
-/// - Picks the **rightmost non-loopback** valid IP from `X-Forwarded-For` (preventing left-side
-///   client header spoofing), falling back to `X-Real-Ip`, then `peer_ip`.
+/// - ONLY inspects `X-Forwarded-For` when `trusted_proxies` is non-empty AND `peer_ip` matches a
+///   configured CIDR/IP in `trusted_proxies`.
+/// - Walks `X-Forwarded-For` from **right to left** and returns the **rightmost valid IP NOT
+///   matching `trusted_proxies`** (preventing left-side client header spoofing and intermediate
+///   trusted hop confusion).
+/// - Never falls back to `X-Real-Ip` (dropped to prevent intermediate proxy header spoofing).
 pub fn extract_drop_relay_client_ip(
     peer_ip: IpAddr,
     headers: &HeaderMap,
-    behind_reverse_proxy: bool,
+    trusted_proxies: &[String],
 ) -> String {
-    if !behind_reverse_proxy || !is_trusted_proxy_ip(peer_ip) {
-        return peer_ip.to_string();
+    let norm_peer = normalize_ip_addr(peer_ip);
+    if trusted_proxies.is_empty() || !ip_matches_trusted_proxies(norm_peer, trusted_proxies) {
+        return norm_peer.to_string();
     }
 
     let mut xff_ips: Vec<IpAddr> = Vec::new();
@@ -1097,25 +1349,20 @@ pub fn extract_drop_relay_client_ip(
             for part in raw.split(',') {
                 let candidate = part.trim();
                 if let Ok(parsed) = candidate.parse::<IpAddr>() {
-                    xff_ips.push(normalize_ip(parsed));
+                    xff_ips.push(normalize_ip_addr(parsed));
                 }
             }
         }
     }
-    if let Some(ip) = xff_ips.into_iter().rev().find(|ip| !is_loopback_ip(*ip)) {
+    if let Some(ip) = xff_ips
+        .into_iter()
+        .rev()
+        .find(|ip| !ip_matches_trusted_proxies(*ip, trusted_proxies))
+    {
         return ip.to_string();
     }
 
-    if let Some(raw_real) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        if let Ok(parsed) = raw_real.trim().parse::<IpAddr>() {
-            let norm = normalize_ip(parsed);
-            if !is_loopback_ip(norm) {
-                return norm.to_string();
-            }
-        }
-    }
-
-    peer_ip.to_string()
+    norm_peer.to_string()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1155,13 +1402,14 @@ async fn handle_drop_relay_request(
     }
 
     let client_ip =
-        extract_drop_relay_client_ip(peer_addr.ip(), headers, node.config().behind_reverse_proxy);
+        extract_drop_relay_client_ip(peer_addr.ip(), headers, &node.config().trusted_proxies);
 
     // POST /v1/drops
     if path == "/v1/drops" {
         if method != Method::POST {
             return Err(NodeError::BadRequest("method not allowed".into()));
         }
+        check_content_length(headers, MAX_DROP_CONTROL_BODY_BYTES)?;
         let body_bytes = read_body_bytes(body, MAX_DROP_CONTROL_BODY_BYTES).await?;
         let body_sha = hex::encode(Sha256::digest(&body_bytes));
         let caller = require_auth(&node, headers, "POST", path_and_query, &body_sha)?;
@@ -1245,6 +1493,7 @@ async fn handle_drop_relay_request(
             return Err(NodeError::BadRequest("method not allowed".into()));
         }
         let drop_id = percent_decode(raw_id);
+        check_content_length(headers, MAX_DROP_CONTROL_BODY_BYTES)?;
         let body_bytes = read_body_bytes(body, MAX_DROP_CONTROL_BODY_BYTES).await?;
         let body_sha = hex::encode(Sha256::digest(&body_bytes));
         let cap_opt = drop_cap_header(headers);
@@ -1283,6 +1532,22 @@ async fn handle_drop_relay_request(
         }
 
         let max_payload = relay.config().max_payload_bytes;
+        if let Err(err) = check_content_length(headers, max_payload) {
+            return match err {
+                NodeError::PayloadTooLarge(_) => {
+                    let derr = DropRelayError::PayloadTooLarge {
+                        size: max_payload.saturating_add(1),
+                        max_bytes: max_payload,
+                    };
+                    Ok(drop_relay_error_response(&relay, headers, &derr, true))
+                }
+                other => {
+                    let mut resp = problem_response(&other.to_problem_details());
+                    relay.apply_cors_headers(request_origin(headers), resp.headers_mut());
+                    Ok(resp)
+                }
+            };
+        }
         let body_bytes = match read_body_bytes(body, max_payload).await {
             Ok(bytes) => bytes,
             Err(NodeError::PayloadTooLarge(_)) => {
