@@ -1992,6 +1992,68 @@ async fn suite_5_bridge_identity_ownership_handoff_and_outbound_dlp_e2e() {
         true
     );
 
+    // 6. Auto-primary claim on `link` for an unowned target (+ `readOnly: true` opt-out + anti-hijack):
+    // 6a. `readOnly: true` on unowned target links as reader without claiming primary.
+    let (ro_txt, ro_err) = mcp
+        .call_verified_claude(
+            &sock,
+            "br-intruder",
+            "hyp_bridge",
+            json!({
+                "action": "link",
+                "plugin": "telegram",
+                "target": "dm-alex",
+                "readOnly": true
+            }),
+        )
+        .await;
+    assert!(!ro_err, "readOnly link failed: {ro_txt}");
+    let ro_val: Value = serde_json::from_str(&ro_txt).unwrap();
+    assert_eq!(ro_val["role"], "reader");
+    assert_eq!(ro_val["claimedPrimary"], false);
+    assert!(ro_val["primarySessionId"].is_null());
+
+    // 6b. First normal `link` on unowned target automatically claims primary ownership and can send immediately!
+    let (auto_txt, auto_err) = mcp
+        .call_verified_claude(
+            &sock,
+            "br-primary",
+            "hyp_bridge",
+            json!({ "action": "link", "plugin": "telegram", "target": "dm-alex" }),
+        )
+        .await;
+    assert!(!auto_err, "auto-primary link failed: {auto_txt}");
+    let auto_val: Value = serde_json::from_str(&auto_txt).unwrap();
+    assert_eq!(auto_val["role"], "primary");
+    assert_eq!(auto_val["claimedPrimary"], true);
+    assert_eq!(auto_val["primarySessionId"], "claude:br-primary");
+
+    let (auto_send_txt, auto_send_err) = mcp
+        .call_verified_claude(
+            &sock,
+            "br-primary",
+            "hyp_send",
+            json!({ "to": "telegram:dm-alex", "text": "immediate reply after link" }),
+        )
+        .await;
+    assert!(!auto_send_err, "auto-claimed primary must be able to send immediately: {auto_send_txt}");
+    assert_eq!(recorded_posts.lock().unwrap().len(), 3);
+
+    // 6c. A subsequent `link` by another session MUST stay strictly `reader` (never hijacks primary!).
+    let (second_txt, second_err) = mcp
+        .call_verified_claude(
+            &sock,
+            "br-reader",
+            "hyp_bridge",
+            json!({ "action": "link", "plugin": "telegram", "target": "dm-alex" }),
+        )
+        .await;
+    assert!(!second_err, "second link failed: {second_txt}");
+    let second_val: Value = serde_json::from_str(&second_txt).unwrap();
+    assert_eq!(second_val["role"], "reader");
+    assert_eq!(second_val["claimedPrimary"], false);
+    assert_eq!(second_val["primarySessionId"], "claude:br-primary");
+
     mcp.close().await;
     daemon.stop().await;
     node.shutdown();

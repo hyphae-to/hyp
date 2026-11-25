@@ -200,7 +200,7 @@ pub fn select_tools_for_caps(caps: McpToolCaps) -> Vec<Value> {
     if caps.has_plugins {
         tools.push(json!({
             "name": "hyp_bridge",
-            "description": "List, link, unlink, or hand off local chat/webhook bridge targets.",
+            "description": "List, link (auto-claims primary if unowned unless readOnly:true), unlink, or hand off local chat/webhook bridge targets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -208,7 +208,8 @@ pub fn select_tools_for_caps(caps: McpToolCaps) -> Vec<Value> {
                     "plugin": s,
                     "target": s,
                     "handle": s,
-                    "all": {"type": "boolean"}
+                    "all": {"type": "boolean"},
+                    "readOnly": {"type": "boolean"}
                 },
                 "required": ["action"]
             }

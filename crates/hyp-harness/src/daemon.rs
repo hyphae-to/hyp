@@ -3888,20 +3888,38 @@ impl LocalDaemonInner {
         args: &Map<String, Value>,
     ) -> Result<Value, (String, String)> {
         let (plugin, target) = parse_bridge_plugin_target(args)?;
+        let read_only = args.get("readOnly").and_then(Value::as_bool) == Some(true);
+        let now = now_ms();
         let link = BridgeLink {
             plugin: plugin.clone(),
             target: target.clone(),
             session_id: session_id.to_string(),
-            linked_at: now_ms(),
+            linked_at: now,
             linked_by: session_id.to_string(),
         };
-        let primary_session = {
+        let (primary_session, claimed_primary) = {
             let db = self.node.db();
             db.local().add_bridge_link(&link).map_err(store_err_tuple)?;
-            db.local()
+            let existing = db
+                .local()
                 .get_plugin_target(&plugin, &target)
                 .map_err(store_err_tuple)?
-                .map(|h| h.session_id)
+                .map(|h| h.session_id);
+            if existing.is_none() && !read_only {
+                let handoff = PluginTargetHandoff {
+                    plugin: plugin.clone(),
+                    target: target.clone(),
+                    session_id: session_id.to_string(),
+                    set_at: now,
+                    set_by: session_id.to_string(),
+                };
+                db.local()
+                    .set_plugin_target(&handoff)
+                    .map_err(store_err_tuple)?;
+                (Some(session_id.to_string()), true)
+            } else {
+                (existing, false)
+            }
         };
         let role = if primary_session.as_deref() == Some(session_id) {
             "primary"
@@ -3913,6 +3931,7 @@ impl LocalDaemonInner {
             "plugin": plugin,
             "target": target,
             "role": role,
+            "claimedPrimary": claimed_primary,
             "primarySessionId": primary_session,
         }))
     }
