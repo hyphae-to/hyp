@@ -39,8 +39,10 @@ systemd-run --user --on-active=15m -- hyp emit --label check-ci --note "Verify b
 #### Recurring Unix (`crontab -e`)
 
 ```cron
-0 9 * * 1-5 /usr/local/bin/hyp emit --label morning-triage --note "Review open PRs"
+0 9 * * 1-5 $HOME/.local/bin/hyp emit --label morning-triage --note "Review open PRs"
 ```
+
+*(Adjust the path if `command -v hyp` installed elsewhere; on headless Linux using `systemd --user` timers, run `loginctl enable-linger "$USER"` once so user timers fire after logout.)*
 
 #### macOS (`launchd` — `~/Library/LaunchAgents/to.hyphae.morning-triage.plist`)
 
@@ -52,7 +54,7 @@ systemd-run --user --on-active=15m -- hyp emit --label check-ci --note "Verify b
   <key>Label</key><string>to.hyphae.morning-triage</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/hyp</string>
+    <string>/Users/YOU/.local/bin/hyp</string>
     <string>emit</string>
     <string>--label</string><string>morning-triage</string>
     <string>--note</string><string>Review open PRs</string>
@@ -68,7 +70,7 @@ Load once with `launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/to.hyp
 #### Windows (`schtasks`)
 
 ```powershell
-schtasks /Create /SC DAILY /TN "HyphaeMorningTriage" /ST 09:00 /TR "hyp emit --label morning-triage --note \"Review open PRs\""
+schtasks /Create /SC DAILY /TN "HyphaeMorningTriage" /ST 09:00 /TR "powershell -NoProfile -WindowStyle Hidden -Command \"& $env:LOCALAPPDATA\Hyphae\bin\hyp.exe emit --label morning-triage --note 'Review open PRs'\""
 ```
 
 #### Raw Unix Socket NDJSON (zero CLI spawn)

@@ -362,8 +362,7 @@ impl ManualGuideHarness {
         match self {
             Self::ClaudeDesktop => {
                 let path = claude_desktop_config_path(home);
-                let snippet =
-                    r#"{ "mcpServers": { "hyphae": { "command": "hyp", "args": ["mcp"] } } }"#;
+                let snippet = r#"{ "mcpServers": { "hyphae": { "command": "hyp", "args": ["mcp", "--backend", "claude", "--ephemeral"] } } }"#;
                 Some((path, snippet))
             }
             Self::CodexDesktop => {
@@ -612,7 +611,9 @@ pub fn inspect_desktop_mcp_plan(
                 "Merge mcpServers.hyphae (preserves existing servers):".to_string(),
                 "{".to_string(),
                 "  \"mcpServers\": {".to_string(),
-                format!("    \"hyphae\": {{ \"command\": {cmd_json}, \"args\": [\"mcp\"] }}"),
+                format!(
+                    "    \"hyphae\": {{ \"command\": {cmd_json}, \"args\": [\"mcp\", \"--backend\", \"claude\", \"--ephemeral\"] }}"
+                ),
                 "  }".to_string(),
                 "}".to_string(),
             ];
@@ -701,7 +702,7 @@ pub fn apply_desktop_mcp_config(
                 "hyphae".to_string(),
                 json!({
                     "command": cli_bin,
-                    "args": ["mcp"]
+                    "args": ["mcp", "--backend", "claude", "--ephemeral"]
                 }),
             );
             doc.insert(
@@ -8087,7 +8088,10 @@ mod tests {
         assert_eq!(updated["globalShortcut"], "Cmd+Space");
         assert_eq!(updated["mcpServers"]["filesystem"]["command"], "npx");
         assert_eq!(updated["mcpServers"]["hyphae"]["command"], cli_bin);
-        assert_eq!(updated["mcpServers"]["hyphae"]["args"], json!(["mcp"]));
+        assert_eq!(
+            updated["mcpServers"]["hyphae"]["args"],
+            json!(["mcp", "--backend", "claude", "--ephemeral"])
+        );
 
         // 3. Second inspection detects `already_configured == true`.
         let plan1 = inspect_desktop_mcp_plan(ManualGuideHarness::ClaudeDesktop, home, cli_bin)

@@ -29,6 +29,7 @@ import {
   randomBytes,
   sasFingerprint,
   sealHumanDrop,
+  signNodeCert,
   toCanonicalJson,
   utf8Bytes,
   utf8String,
@@ -457,6 +458,28 @@ function initEnrollMode(payload) {
         credentialId: enrolled.credentialId,
       });
 
+      let nodeCert = null;
+      const enrollNodeId = typeof payload.nodeId === "string" ? payload.nodeId.trim() : "";
+      const enrollSignJwk = payload.nodeSignJwk || payload.signingJwk || null;
+      const enrollEncJwk = payload.nodeEncJwk || payload.encryptionJwk || null;
+      if (enrollNodeId && enrollSignJwk && enrollEncJwk) {
+        const nowMs = Date.now();
+        const certRes = await signNodeCert(
+          {
+            nodeId: enrollNodeId,
+            signingJwk: enrollSignJwk,
+            encryptionJwk: enrollEncJwk,
+            humanId,
+            humanKid: kid,
+            authEpoch,
+            issuedAt: new Date(nowMs).toISOString(),
+            expiresAt: new Date(nowMs + 365 * 24 * 60 * 60 * 1000).toISOString(),
+          },
+          seed
+        );
+        nodeCert = certRes.hcert1;
+      }
+
       const bundle = {
         v: 1,
         humanId,
@@ -468,6 +491,7 @@ function initEnrollMode(payload) {
         encKid: encKp.kid,
         credentialId: enrolled.credentialId,
         rpId: enrolled.rpId,
+        ...(nodeCert ? { nodeCert } : {}),
       };
       lastBundleJson = JSON.stringify(bundle, null, 2);
 
