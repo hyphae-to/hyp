@@ -37,7 +37,8 @@ use crate::gates::policy::{
 };
 use crate::gates::stage2::{
     ClassifierVerdict, FilterOutcome, Stage2Guard, apply_verdict_with_threshold,
-    build_gate_http_client, send_and_read_bounded, validate_verdict,
+    build_gate_http_client, send_and_read_bounded, validate_classifier_endpoint_url,
+    validate_verdict,
 };
 
 const DEFAULT_LAKERA_HOST: &str = "https://api.lakera.ai";
@@ -66,9 +67,32 @@ pub trait FilterPlugin: Send + Sync {
     ) -> BoxFuture<'a, FilterOutcome>;
 }
 
+/// Validates the configured HTTP classifier endpoint URL on a [`FilterPluginConfig`] fail-closed (`G17`).
+pub fn validate_filter_plugin_endpoint_url(config: &FilterPluginConfig) -> Result<(), GateError> {
+    match &config.adapter {
+        FilterAdapterConfig::Anthropic {
+            base_url: Some(u), ..
+        }
+        | FilterAdapterConfig::Google {
+            base_url: Some(u), ..
+        } => validate_classifier_endpoint_url(u).map_err(GateError::InvalidConfig),
+        FilterAdapterConfig::OpenAiCompat { base_url, .. }
+        | FilterAdapterConfig::LakeraGuard { base_url, .. } => {
+            validate_classifier_endpoint_url(base_url).map_err(GateError::InvalidConfig)
+        }
+        FilterAdapterConfig::HttpClassifier { url, .. } => {
+            validate_classifier_endpoint_url(url).map_err(GateError::InvalidConfig)
+        }
+        FilterAdapterConfig::Anthropic { base_url: None, .. }
+        | FilterAdapterConfig::Google { base_url: None, .. }
+        | FilterAdapterConfig::Subprocess { .. } => Ok(()),
+    }
+}
+
 /// Instantiates a built-in [`FilterPlugin`] from a validated [`FilterPluginConfig`].
 pub fn build_filter_plugin(config: &FilterPluginConfig) -> Result<Arc<dyn FilterPlugin>, GateError> {
     config.validate()?;
+    validate_filter_plugin_endpoint_url(config)?;
     match &config.adapter {
         FilterAdapterConfig::Anthropic {
             model,
@@ -372,6 +396,9 @@ impl LakeraGuardPlugin {
         } else {
             format!("{base}/v2/guard")
         };
+        if validate_classifier_endpoint_url(&url).is_err() {
+            return FilterOutcome::from_error(self.on_error, "gate_insecure_endpoint_url");
+        }
 
         let mut payload = json!({
             "messages": [
@@ -543,6 +570,10 @@ impl HttpClassifierPlugin {
             Ok(key) => key,
             Err(code) => return FilterOutcome::from_error(self.on_error, code),
         };
+
+        if validate_classifier_endpoint_url(&self.url).is_err() {
+            return FilterOutcome::from_error(self.on_error, "gate_insecure_endpoint_url");
+        }
 
         let Ok(body_vec) = serde_json::to_vec(&json!({ "text": text })) else {
             return FilterOutcome::from_error(self.on_error, "gate_request_serialize_error");

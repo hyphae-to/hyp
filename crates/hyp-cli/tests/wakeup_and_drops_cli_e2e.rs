@@ -14,20 +14,26 @@ mod common;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+#[cfg(unix)]
+use common::run_hyp_in_pty;
 use common::{ManagedProcess, isolated_cmd, parse_json_stdout};
-use hyp_crypto::human::{
-    NodeCertPayloadV1, derive_prf_ed25519_keypair, derive_prf_x25519_keypair, encode_hcert1,
-    sign_node_cert,
-};
+#[cfg(unix)]
+use hyp_crypto::human::{derive_prf_ed25519_keypair, derive_prf_x25519_keypair};
+use hyp_crypto::human::{NodeCertPayloadV1, encode_hcert1, sign_node_cert};
 use hyp_crypto::keys::{Ed25519KeyPair, OkpJwk, X25519KeyPair};
 use hyp_crypto::keystore::{SecretBackend, SecretStore};
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
+#[cfg(unix)]
 use hyp_store::{GateAuditQuery, NodeDb};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
+#[cfg(unix)]
+use std::process::Command;
+use std::process::{Output, Stdio};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -48,6 +54,7 @@ fn run_hyp_with_stdin(home: &Path, args: &[&str], stdin_data: &str) -> Output {
     child.wait_with_output().expect("wait for hyp output")
 }
 
+#[cfg(unix)]
 fn find_node_v20_plus() -> Option<PathBuf> {
     let candidates: Vec<PathBuf> = vec![
         PathBuf::from("node"),
@@ -261,6 +268,7 @@ fn cli_emit_to_live_node_local_ingest_socket_unsigned_and_signed() {
 // 1b. `hyp drop create --draft` (HPKE `encDraft`) & Cross-Language Rust -> JS Open
 // ============================================================================
 
+#[cfg(unix)]
 #[test]
 fn cli_drop_create_encrypted_draft_and_cross_language_rust_to_js_open() {
     let tmp = TempDir::new().unwrap();
@@ -334,7 +342,7 @@ fn cli_drop_create_encrypted_draft_and_cross_language_rust_to_js_open() {
         "authEpoch": auth_epoch,
     }))
     .unwrap();
-    let add_out = run_hyp_with_stdin(
+    let add_out = run_hyp_in_pty(
         home,
         &[
             "auth",
@@ -349,16 +357,15 @@ fn cli_drop_create_encrypted_draft_and_cross_language_rust_to_js_open() {
             state_str,
             "--json",
         ],
-        &bundle_json,
+        Some(&bundle_json),
+        Some("y\n"),
     );
     assert_eq!(
-        add_out.status.code(),
-        Some(0),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&add_out.stdout),
-        String::from_utf8_lossy(&add_out.stderr)
+        add_out.code, 0,
+        "stdout={} tty={}",
+        add_out.stdout, add_out.tty
     );
-    let add_json = parse_json_stdout(&add_out);
+    let add_json = add_out.parse_json();
     assert_eq!(add_json["ok"], true);
     assert_eq!(add_json["data"]["encKey"], true);
     assert_eq!(add_json["data"]["encKid"], passkey_x.kid());
@@ -736,6 +743,7 @@ fn cli_auth_init_certify_sign_and_drop_ingest_secret_zero_leak() {
 // 3. Directive + `gate lock` digest binding + replay block + revocation fail-closed
 // ============================================================================
 
+#[cfg(unix)]
 #[test]
 fn cli_auth_directive_gate_lock_replay_and_revocation_fail_closed() {
     let tmp = TempDir::new().unwrap();
@@ -783,8 +791,9 @@ fn cli_auth_directive_gate_lock_replay_and_revocation_fail_closed() {
         .expect("run gate init");
     assert_eq!(gate_init.status.code(), Some(0));
 
-    let gate_lock = isolated_cmd(home)
-        .args([
+    let gate_lock = run_hyp_in_pty(
+        home,
+        &[
             "gate",
             "lock",
             "--config",
@@ -792,11 +801,12 @@ fn cli_auth_directive_gate_lock_replay_and_revocation_fail_closed() {
             "--state-dir",
             state_str,
             "--json",
-        ])
-        .output()
-        .expect("run gate lock");
-    assert_eq!(gate_lock.status.code(), Some(0));
-    let lock_json = parse_json_stdout(&gate_lock);
+        ],
+        None,
+        Some("y\n"),
+    );
+    assert_eq!(gate_lock.code, 0, "tty={}", gate_lock.tty);
+    let lock_json = gate_lock.parse_json();
     assert_eq!(lock_json["ok"], true);
     assert_eq!(lock_json["data"]["gatePolicySig"], "OK");
     let locked_digest = lock_json["data"]["humanAuthoritiesDigest"]
@@ -925,8 +935,9 @@ fn cli_auth_directive_gate_lock_replay_and_revocation_fail_closed() {
         .unwrap()
         .to_string();
 
-    let revoke_out = isolated_cmd(home)
-        .args([
+    let revoke_out = run_hyp_in_pty(
+        home,
+        &[
             "auth",
             "revoke",
             &admin_kid,
@@ -936,11 +947,12 @@ fn cli_auth_directive_gate_lock_replay_and_revocation_fail_closed() {
             "--config",
             cfg_str,
             "--json",
-        ])
-        .output()
-        .expect("run auth revoke");
-    assert_eq!(revoke_out.status.code(), Some(0));
-    let revoke_json = parse_json_stdout(&revoke_out);
+        ],
+        None,
+        Some("y\n"),
+    );
+    assert_eq!(revoke_out.code, 0, "tty={}", revoke_out.tty);
+    let revoke_json = revoke_out.parse_json();
     assert_eq!(revoke_json["ok"], true);
     assert_eq!(revoke_json["data"]["minAuthEpoch"], 2);
     assert_eq!(revoke_json["data"]["gatePolicyResigned"], true);
@@ -1196,6 +1208,7 @@ fn cli_deploy_init_drop_relay_and_relay_set_validation() {
 // 5. `drop create --offline` + Cross-language `site/drop/crypto.js` -> Rust `drop ingest`
 // ============================================================================
 
+#[cfg(unix)]
 #[test]
 fn cli_drop_create_offline_and_cross_language_browser_js_to_rust_ingest() {
     let tmp = TempDir::new().unwrap();
@@ -1335,8 +1348,8 @@ process.stdout.write(JSON.stringify({{ publicJwk, kid, hdrop1: sealed.hdrop1 }})
     let js_hdrop1 = js_json["hdrop1"].as_str().unwrap();
     assert!(js_hdrop1.starts_with("hdrop1_"));
 
-    // Enroll JS-derived Passkey+PRF public JWK via `hyp auth add` (stdin!)
-    let add_out = run_hyp_with_stdin(
+    // Enroll JS-derived Passkey+PRF public JWK via `hyp auth add` (stdin + controlling /dev/tty!)
+    let add_out = run_hyp_in_pty(
         home,
         &[
             "auth",
@@ -1351,15 +1364,11 @@ process.stdout.write(JSON.stringify({{ publicJwk, kid, hdrop1: sealed.hdrop1 }})
             state_str,
             "--json",
         ],
-        &pub_jwk_str,
+        Some(&pub_jwk_str),
+        Some("y\n"),
     );
-    assert_eq!(
-        add_out.status.code(),
-        Some(0),
-        "stderr={}",
-        String::from_utf8_lossy(&add_out.stderr)
-    );
-    let add_json = parse_json_stdout(&add_out);
+    assert_eq!(add_out.code, 0, "tty={}", add_out.tty);
+    let add_json = add_out.parse_json();
     assert_eq!(add_json["data"]["kid"], js_json["kid"]);
 
     // Pipe JS-sealed `hdrop1_` into compiled Rust `hyp drop ingest --json`!
@@ -1723,6 +1732,7 @@ fn cli_auth_init_web_callback_csrf_cors_and_live_relay_drop_wait() {
 // 7. `hyp gate propose` -> `hyp gate lock` merges `gate.proposed.json` & cleans up
 // ============================================================================
 
+#[cfg(unix)]
 #[test]
 fn cli_gate_propose_then_lock_merges_and_cleans_proposal() {
     let tmp = TempDir::new().unwrap();
@@ -1754,8 +1764,9 @@ fn cli_gate_propose_then_lock_merges_and_cleans_proposal() {
     assert!(proposal_path.exists(), "gate.proposed.json must exist after propose");
 
     // 2. Lock via `hyp gate lock` -> merges `gate.proposed.json` into `node.json`, signs, and removes proposal!
-    let lock_out = isolated_cmd(home)
-        .args([
+    let lock_out = run_hyp_in_pty(
+        home,
+        &[
             "gate",
             "lock",
             "--config",
@@ -1763,17 +1774,16 @@ fn cli_gate_propose_then_lock_merges_and_cleans_proposal() {
             "--state-dir",
             state_str,
             "--json",
-        ])
-        .output()
-        .expect("run gate lock");
-    assert_eq!(
-        lock_out.status.code(),
-        Some(0),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&lock_out.stdout),
-        String::from_utf8_lossy(&lock_out.stderr)
+        ],
+        None,
+        Some("y\n"),
     );
-    let lock_json = parse_json_stdout(&lock_out);
+    assert_eq!(
+        lock_out.code, 0,
+        "stdout={} tty={}",
+        lock_out.stdout, lock_out.tty
+    );
+    let lock_json = lock_out.parse_json();
     assert_eq!(lock_json["ok"], true);
     assert_eq!(lock_json["data"]["mergedProposal"], true);
     assert_eq!(lock_json["data"]["filterCount"], 1);

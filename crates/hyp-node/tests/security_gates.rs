@@ -2825,3 +2825,234 @@ async fn g4_hold_verdicts_always_write_immutable_gate_audit_rows() {
     assert!(reason.contains("rate_limited"), "reason={reason}");
     assert!(reason.contains("retry_after_ms="), "reason={reason}");
 }
+
+// ============================================================================
+// 5. G17 — Fail-Closed HTTPS-Only Remote Stage 2 / Classifier URL Enforcement
+// ============================================================================
+
+#[test]
+fn g17_validate_classifier_endpoint_url_enforces_https_or_loopback_http() {
+    use hyp_node::gates::stage2::validate_classifier_endpoint_url;
+
+    // Accepted: remote/local https:// and strict loopback http://
+    for allowed in [
+        "http://127.0.0.1:11434/v1/chat/completions",
+        "http://127.0.0.1:11434/v1",
+        "http://localhost:8080/classify",
+        "http://LOCALHOST:8080/classify",
+        "http://[::1]:8080/classify",
+        "http://[::1]/v2/guard",
+        "https://api.anthropic.com/v1/messages",
+        "https://api.openai.com/v1",
+        "https://generativelanguage.googleapis.com",
+        "https://api.lakera.ai/v2/guard",
+        "https://ai-gateway.company.internal:8443/v1",
+        "https://127.0.0.1:8443/classify",
+    ] {
+        assert!(
+            validate_classifier_endpoint_url(allowed).is_ok(),
+            "expected URL to be allowed: {allowed}"
+        );
+    }
+
+    // Rejected fail-closed: remote cleartext http://, spoofing tricks, userinfo, non-HTTP(S) schemes
+    for rejected in [
+        "http://evil.example.com/v1/messages",
+        "http://api.anthropic.com/v1/messages",
+        "http://api.lakera.ai/v2/guard",
+        "http://localhost.evil.com/classify",
+        "http://127.0.0.1.evil.com/v1",
+        "http://localhost@evil.example.com/v1",
+        "http://127.0.0.1@evil.example.com/v1",
+        "http://user:pass@127.0.0.1:8080/classify",
+        "https://user:pass@api.anthropic.com/v1/messages",
+        "http://0.0.0.0:8080/classify",
+        "http://169.254.169.254/latest/meta-data",
+        "http://192.168.1.50:11434/v1",
+        "http://10.0.0.5:8080/classify",
+        "http://[::ffff:127.0.0.1]:8080/classify",
+        "file:///etc/passwd",
+        "ftp://127.0.0.1/model",
+        "gopher://127.0.0.1:70/_GET",
+        "ws://127.0.0.1:8080/classify",
+        "https:///v1/messages",
+        "http://127.0.0.1:8080/classify#frag",
+        "http://127.0.0.1\\@evil.example.com/v1",
+        "",
+        "   ",
+    ] {
+        let err = validate_classifier_endpoint_url(rejected)
+            .expect_err(&format!("expected URL to be rejected fail-closed: {rejected}"));
+        assert!(
+            !err.is_empty(),
+            "rejection error for {rejected} must be explanatory"
+        );
+    }
+}
+
+#[test]
+fn g17_stage2_guard_and_filter_plugins_reject_non_loopback_http_fail_closed() {
+    use hyp_node::gates::{Stage2Guard, build_filter_plugin};
+
+    // 1. Stage2Guard::new rejects non-loopback http:// across all provider shapes.
+    let bad_anthropic = Stage2Config {
+        enabled: true,
+        provider: LlmProvider::Anthropic,
+        base_url_override: Some("http://evil.example.com/v1/messages".to_string()),
+        model: "claude-haiku-4-5".to_string(),
+        ..Stage2Config::default()
+    };
+    assert!(bad_anthropic.validate().is_err());
+    let err = Stage2Guard::new(bad_anthropic)
+        .expect_err("Anthropic non-loopback http:// override must fail closed");
+    assert!(err.to_string().contains("https://"), "err={err}");
+
+    let bad_openai_compat = Stage2Config {
+        enabled: true,
+        provider: LlmProvider::OpenAiCompatible {
+            base_url: "http://evil.example.com/v1".to_string(),
+        },
+        model: "qwen2.5:3b".to_string(),
+        ..Stage2Config::default()
+    };
+    assert!(bad_openai_compat.validate().is_err());
+    assert!(Stage2Guard::new(bad_openai_compat).is_err());
+
+    let bad_google = Stage2Config {
+        enabled: true,
+        provider: LlmProvider::Google,
+        base_url_override: Some("ftp://evil.example.com/v1beta".to_string()),
+        model: "gemini-2.5-flash-lite".to_string(),
+        ..Stage2Config::default()
+    };
+    assert!(Stage2Guard::new(bad_google).is_err());
+
+    // Loopback http:// and remote https:// succeed for Stage2Guard::new.
+    for good_url in [
+        "http://127.0.0.1:11434/v1",
+        "http://localhost:8080/v1",
+        "http://[::1]:8080/v1",
+        "https://api.anthropic.com",
+    ] {
+        let cfg = Stage2Config {
+            enabled: true,
+            provider: LlmProvider::OpenAiCompatible {
+                base_url: good_url.to_string(),
+            },
+            model: "qwen2.5:3b".to_string(),
+            ..Stage2Config::default()
+        };
+        assert!(
+            Stage2Guard::new(cfg).is_ok(),
+            "Stage2Guard::new should allow {good_url}"
+        );
+    }
+
+    // 2. LakeraGuardPlugin rejects remote http:// and non-http schemes; accepts loopback & https://.
+    let bad_lakera = FilterPluginConfig {
+        id: "lakera-bad".into(),
+        enabled: true,
+        matchers: Stage2Matchers {
+            trust_tiers: vec![TrustTier::Guest],
+            ..Stage2Matchers::default()
+        },
+        on_error: Stage2ErrorAction::Quarantine,
+        max_concurrent: 2,
+        busy_retry_after_ms: 250,
+        adapter: FilterAdapterConfig::LakeraGuard {
+            base_url: "http://evil.example.com/v2/guard".into(),
+            api_key_secret: Some("lakera-api-key".into()),
+            project_id: None,
+            timeout_ms: 2_000,
+            max_input_chars: 16_384,
+            on_flagged: Stage2ErrorAction::Quarantine,
+        },
+    };
+    assert!(bad_lakera.validate().is_err());
+    assert!(build_filter_plugin(&bad_lakera).is_err());
+
+    for ok_url in [
+        "https://api.lakera.ai",
+        "http://127.0.0.1:8080",
+        "http://localhost:8080",
+        "http://[::1]:8080",
+    ] {
+        let good_lakera = FilterPluginConfig {
+            adapter: FilterAdapterConfig::LakeraGuard {
+                base_url: ok_url.into(),
+                api_key_secret: Some("lakera-api-key".into()),
+                project_id: None,
+                timeout_ms: 2_000,
+                max_input_chars: 16_384,
+                on_flagged: Stage2ErrorAction::Quarantine,
+            },
+            ..bad_lakera.clone()
+        };
+        assert!(
+            build_filter_plugin(&good_lakera).is_ok(),
+            "LakeraGuardPlugin should allow {ok_url}"
+        );
+    }
+
+    // 3. HttpClassifierPlugin rejects remote http:// and file://; accepts loopback & https://.
+    let bad_http_cls = FilterPluginConfig {
+        id: "cls-bad".into(),
+        enabled: true,
+        matchers: Stage2Matchers {
+            trust_tiers: vec![TrustTier::Guest],
+            ..Stage2Matchers::default()
+        },
+        on_error: Stage2ErrorAction::Quarantine,
+        max_concurrent: 2,
+        busy_retry_after_ms: 250,
+        adapter: FilterAdapterConfig::HttpClassifier {
+            url: "http://evil.example.com/classify".into(),
+            api_key_secret: None,
+            auth_header: None,
+            score_field: "score".into(),
+            label_field: "label".into(),
+            flagged_labels: vec!["INJECTION".into()],
+            threshold: 0.80,
+            timeout_ms: 2_000,
+            max_input_chars: 16_384,
+            on_flagged: Stage2ErrorAction::Quarantine,
+        },
+    };
+    assert!(bad_http_cls.validate().is_err());
+    assert!(build_filter_plugin(&bad_http_cls).is_err());
+
+    let (_tmp, db) = open_ephemeral_db();
+    let mut bad_pipeline_cfg = SecurityGateConfig::default();
+    bad_pipeline_cfg.filters.push(bad_http_cls.clone());
+    assert!(
+        SecurityGatePipeline::new(bad_pipeline_cfg, Arc::clone(&db), None).is_err(),
+        "SecurityGatePipeline::new must reject non-loopback http:// classifier fail-closed"
+    );
+
+    for ok_url in [
+        "https://guard.internal.example/classify",
+        "http://127.0.0.1:8080/classify",
+        "http://localhost:8080/classify",
+        "http://[::1]:8080/classify",
+    ] {
+        let good_cls = FilterPluginConfig {
+            adapter: FilterAdapterConfig::HttpClassifier {
+                url: ok_url.into(),
+                api_key_secret: None,
+                auth_header: None,
+                score_field: "score".into(),
+                label_field: "label".into(),
+                flagged_labels: vec!["INJECTION".into()],
+                threshold: 0.80,
+                timeout_ms: 2_000,
+                max_input_chars: 16_384,
+                on_flagged: Stage2ErrorAction::Quarantine,
+            },
+            ..bad_http_cls.clone()
+        };
+        assert!(
+            build_filter_plugin(&good_cls).is_ok(),
+            "HttpClassifierPlugin should allow {ok_url}"
+        );
+    }
+}

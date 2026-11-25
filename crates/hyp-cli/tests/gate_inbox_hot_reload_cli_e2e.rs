@@ -1,9 +1,14 @@
 //! Subprocess E2E tests for live CLI -> Daemon Hot-Reload (`hyp gate lock` -> `gate.reload`
 //! and `hyp inbox approve` / `hyp inbox reject` -> `inbox.wake`) plus offline degradation.
+//!
+//! Uses a real POSIX PTY (`#[cfg(unix)]`) because `hyp gate lock`, `hyp gate init --lock`,
+//! `hyp inbox approve`, and `hyp inbox reject` enforce unskippable interactive TTY confirmation.
+
+#![cfg(unix)]
 
 mod common;
 
-use common::{ManagedProcess, isolated_cmd, parse_json_stdout};
+use common::{ManagedProcess, isolated_cmd, run_hyp_in_pty};
 use hyp_harness::sock::daemon_rpc_sync;
 use hyp_store::{GateState, MailboxInsert, MailboxKind, MailboxPutResult, NodeDb, now_ms};
 use serde_json::{Value, json};
@@ -59,17 +64,18 @@ fn cli_gate_lock_and_inbox_approve_live_hot_reload_without_restart() {
         .expect("run gate init");
     assert_eq!(init_out.status.code(), Some(0));
 
-    let lock_out = isolated_cmd(&home)
-        .args(["gate", "lock", "--state-dir", state_str, "--json"])
-        .output()
-        .expect("run gate lock --json");
-    assert_eq!(
-        lock_out.status.code(),
-        Some(0),
-        "stderr={}",
-        String::from_utf8_lossy(&lock_out.stderr)
+    let lock_out = run_hyp_in_pty(
+        &home,
+        &["gate", "lock", "--state-dir", state_str, "--json"],
+        None,
+        Some("y\n"),
     );
-    let lock_json = parse_json_stdout(&lock_out);
+    assert_eq!(
+        lock_out.code, 0,
+        "stdout={} tty={}",
+        lock_out.stdout, lock_out.tty
+    );
+    let lock_json = lock_out.parse_json();
     assert_eq!(lock_json["ok"], true);
     assert_eq!(lock_json["data"]["gatePolicySig"], "OK");
     assert_eq!(
@@ -86,17 +92,19 @@ fn cli_gate_lock_and_inbox_approve_live_hot_reload_without_restart() {
     );
 
     // 3. Verify TTY output explicitly confirms live reload with no restart needed.
-    let lock_tty = isolated_cmd(&home)
-        .args(["gate", "lock", "--state-dir", state_str])
-        .output()
-        .expect("run gate lock tty");
-    assert_eq!(lock_tty.status.code(), Some(0));
-    let tty_stdout = String::from_utf8_lossy(&lock_tty.stdout);
+    let lock_tty = run_hyp_in_pty(
+        &home,
+        &["gate", "lock", "--state-dir", state_str],
+        None,
+        Some("y\n"),
+    );
+    assert_eq!(lock_tty.code, 0, "tty={}", lock_tty.tty);
     assert!(
-        tty_stdout.contains(
+        lock_tty.stdout.contains(
             "Live daemon reloaded — new Security Gate policy active immediately (no restart needed)."
         ),
-        "unexpected TTY output: {tty_stdout}"
+        "unexpected TTY output: {}",
+        lock_tty.stdout
     );
 
     // 4. Tamper `node.json` on disk (simulate prompt-injected agent flipping filter) and verify
@@ -129,15 +137,14 @@ fn cli_gate_lock_and_inbox_approve_live_hot_reload_without_restart() {
     );
 
     // 5. Re-lock cleanly via `hyp gate lock` -> live daemon heals immediately!
-    let relock_out = isolated_cmd(&home)
-        .args(["gate", "lock", "--state-dir", state_str, "--json"])
-        .output()
-        .expect("re-lock");
-    assert_eq!(relock_out.status.code(), Some(0));
-    assert_eq!(
-        parse_json_stdout(&relock_out)["data"]["daemonReloaded"],
-        true
+    let relock_out = run_hyp_in_pty(
+        &home,
+        &["gate", "lock", "--state-dir", state_str, "--json"],
+        None,
+        Some("y\n"),
     );
+    assert_eq!(relock_out.code, 0, "tty={}", relock_out.tty);
+    assert_eq!(relock_out.parse_json()["data"]["daemonReloaded"], true);
 
     // 6. Register session + seed 2 quarantined items in `node.sqlite`, then start live `hyp wait`!
     let (r_approve, r_reject) = {
@@ -230,19 +237,21 @@ fn cli_gate_lock_and_inbox_approve_live_hot_reload_without_restart() {
     }
 
     // 7. Run `hyp inbox approve <r_approve> --json` while daemon + `hyp wait` are live (NO restart!).
-    let app_out = isolated_cmd(&home)
-        .args([
+    let app_out = run_hyp_in_pty(
+        &home,
+        &[
             "inbox",
             "approve",
             &r_approve,
             "--state-dir",
             state_str,
             "--json",
-        ])
-        .output()
-        .expect("run inbox approve");
-    assert_eq!(app_out.status.code(), Some(0));
-    let app_json = parse_json_stdout(&app_out);
+        ],
+        None,
+        Some("y\n"),
+    );
+    assert_eq!(app_out.code, 0, "tty={}", app_out.tty);
+    let app_json = app_out.parse_json();
     assert_eq!(app_json["ok"], true);
     assert_eq!(app_json["data"]["gateState"], "pending");
     assert_eq!(app_json["data"]["daemonNotified"], true);
@@ -262,8 +271,9 @@ fn cli_gate_lock_and_inbox_approve_live_hot_reload_without_restart() {
     assert_eq!(wait_status.code(), Some(0));
 
     // 8. Run `hyp inbox reject <r_reject> --mute --json` -> notifies live daemon & clears badge!
-    let rej_out = isolated_cmd(&home)
-        .args([
+    let rej_out = run_hyp_in_pty(
+        &home,
+        &[
             "inbox",
             "reject",
             &r_reject,
@@ -271,11 +281,12 @@ fn cli_gate_lock_and_inbox_approve_live_hot_reload_without_restart() {
             "--state-dir",
             state_str,
             "--json",
-        ])
-        .output()
-        .expect("run inbox reject");
-    assert_eq!(rej_out.status.code(), Some(0));
-    let rej_json = parse_json_stdout(&rej_out);
+        ],
+        None,
+        Some("y\n"),
+    );
+    assert_eq!(rej_out.code, 0, "tty={}", rej_out.tty);
+    let rej_json = rej_out.parse_json();
     assert_eq!(rej_json["ok"], true);
     assert_eq!(rej_json["data"]["gateState"], "rejected");
     assert_eq!(rej_json["data"]["daemonNotified"], true);
@@ -303,8 +314,9 @@ fn cli_offline_daemon_degradation_for_gate_lock_and_inbox_approve_reject() {
     let state_str = state_dir.to_str().unwrap();
 
     // 1. `hyp gate init --lock` with NO daemon running: exits 0, `daemonReloaded: false`.
-    let init_out = isolated_cmd(home)
-        .args([
+    let init_out = run_hyp_in_pty(
+        home,
+        &[
             "gate",
             "init",
             "--adapter",
@@ -313,22 +325,25 @@ fn cli_offline_daemon_degradation_for_gate_lock_and_inbox_approve_reject() {
             state_str,
             "--lock",
             "--json",
-        ])
-        .output()
-        .expect("gate init --lock offline");
-    assert_eq!(init_out.status.code(), Some(0));
-    let init_json = parse_json_stdout(&init_out);
+        ],
+        None,
+        Some("y\n"),
+    );
+    assert_eq!(init_out.code, 0, "tty={}", init_out.tty);
+    let init_json = init_out.parse_json();
     assert_eq!(init_json["ok"], true);
     assert_eq!(init_json["data"]["locked"], true);
     assert_eq!(init_json["data"]["daemonReloaded"], false);
 
     // 2. `hyp gate lock --json` offline: exits 0, `daemonReloaded: false`, recommends restart.
-    let lock_out = isolated_cmd(home)
-        .args(["gate", "lock", "--state-dir", state_str, "--json"])
-        .output()
-        .expect("gate lock offline");
-    assert_eq!(lock_out.status.code(), Some(0));
-    let lock_json = parse_json_stdout(&lock_out);
+    let lock_out = run_hyp_in_pty(
+        home,
+        &["gate", "lock", "--state-dir", state_str, "--json"],
+        None,
+        Some("y\n"),
+    );
+    assert_eq!(lock_out.code, 0, "tty={}", lock_out.tty);
+    let lock_json = lock_out.parse_json();
     assert_eq!(lock_json["ok"], true);
     assert_eq!(lock_json["data"]["gatePolicySig"], "OK");
     assert_eq!(lock_json["data"]["daemonReloaded"], false);
@@ -341,15 +356,18 @@ fn cli_offline_daemon_degradation_for_gate_lock_and_inbox_approve_reject() {
     );
 
     // 3. `hyp gate lock` TTY offline cleanly notes `hyp service restart` / `hyp node start`.
-    let lock_tty = isolated_cmd(home)
-        .args(["gate", "lock", "--state-dir", state_str])
-        .output()
-        .expect("gate lock tty offline");
-    assert_eq!(lock_tty.status.code(), Some(0));
-    let lock_tty_out = String::from_utf8_lossy(&lock_tty.stdout);
+    let lock_tty = run_hyp_in_pty(
+        home,
+        &["gate", "lock", "--state-dir", state_str],
+        None,
+        Some("y\n"),
+    );
+    assert_eq!(lock_tty.code, 0, "tty={}", lock_tty.tty);
     assert!(
-        lock_tty_out.contains("hyp service restart") && lock_tty_out.contains("hyp node start"),
-        "expected offline restart note in TTY stdout: {lock_tty_out}"
+        lock_tty.stdout.contains("hyp service restart")
+            && lock_tty.stdout.contains("hyp node start"),
+        "expected offline restart note in TTY stdout: {}",
+        lock_tty.stdout
     );
 
     // 4. Seed 2 quarantined items and run `hyp inbox approve` + `hyp inbox reject` offline!
@@ -401,37 +419,41 @@ fn cli_offline_daemon_degradation_for_gate_lock_and_inbox_approve_reject() {
         (r1, r2)
     };
 
-    let app_out = isolated_cmd(home)
-        .args([
+    let app_out = run_hyp_in_pty(
+        home,
+        &[
             "inbox",
             "approve",
             &r1,
             "--state-dir",
             state_str,
             "--json",
-        ])
-        .output()
-        .expect("inbox approve offline");
-    assert_eq!(app_out.status.code(), Some(0));
-    let app_json = parse_json_stdout(&app_out);
+        ],
+        None,
+        Some("y\n"),
+    );
+    assert_eq!(app_out.code, 0, "tty={}", app_out.tty);
+    let app_json = app_out.parse_json();
     assert_eq!(app_json["ok"], true);
     assert_eq!(app_json["data"]["gateState"], "pending");
     assert_eq!(app_json["data"]["daemonNotified"], false);
     assert_eq!(app_json["data"]["daemonWoken"], false);
 
-    let rej_out = isolated_cmd(home)
-        .args([
+    let rej_out = run_hyp_in_pty(
+        home,
+        &[
             "inbox",
             "reject",
             &r2,
             "--state-dir",
             state_str,
             "--json",
-        ])
-        .output()
-        .expect("inbox reject offline");
-    assert_eq!(rej_out.status.code(), Some(0));
-    let rej_json = parse_json_stdout(&rej_out);
+        ],
+        None,
+        Some("y\n"),
+    );
+    assert_eq!(rej_out.code, 0, "tty={}", rej_out.tty);
+    let rej_json = rej_out.parse_json();
     assert_eq!(rej_json["ok"], true);
     assert_eq!(rej_json["data"]["gateState"], "rejected");
     assert_eq!(rej_json["data"]["daemonNotified"], false);

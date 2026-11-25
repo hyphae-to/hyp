@@ -528,3 +528,241 @@ pub fn wait_for_session_live(socket_path: &Path, session_id: &str, timeout: Dura
         socket_path.display()
     );
 }
+
+/// Output captured from running the compiled `hyp` binary attached to a real POSIX PTY (`#[cfg(unix)]`).
+///
+/// `stdout` is captured via a dedicated pipe (keeping `--json` output 100% pure), while `tty`
+/// captures everything written to the interactive terminal (`stderr` / `/dev/tty`), including
+/// confirmation summaries, diffs, warnings, and `[y/N]:` prompts.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub struct PtyRunOutput {
+    pub code: i32,
+    pub stdout: String,
+    pub tty: String,
+}
+
+#[cfg(unix)]
+impl PtyRunOutput {
+    pub fn parse_json(&self) -> Value {
+        serde_json::from_str(self.stdout.trim()).unwrap_or_else(|e| {
+            panic!(
+                "expected valid JSON stdout from PTY run ({e}):\ncode={}\nstdout={}\ntty={}",
+                self.code, self.stdout, self.tty
+            )
+        })
+    }
+}
+
+/// Runs the compiled `hyp` binary inside a real POSIX PTY (via Python 3 stdlib `pty` + `setsid`
+/// + `TIOCSCTTY`) with full `isolated_cmd(home)` environment isolation.
+///
+/// - When `piped_stdin` is `None`: `stdin` and `stderr` are attached to the PTY slave (so both
+///   `stdin.is_terminal()` and `stderr.is_terminal()` are `true`).
+/// - When `piped_stdin` is `Some(data)`: `stdin` receives `data` + EOF via a pipe while `stderr`
+///   and the process's controlling terminal (`/dev/tty`) are attached to the PTY slave (matching
+///   a human running `hyp auth add ... < key.jwk` in a real terminal!).
+/// - Once `[y/N]:` appears on the PTY, writes `tty_reply` (e.g. `Some("y\n")`, `Some("n\n")`,
+///   `Some("\n")`) or sends Ctrl-D EOF (`None`) to the PTY master.
+#[cfg(unix)]
+pub fn run_hyp_in_pty(
+    home: &Path,
+    args: &[&str],
+    piped_stdin: Option<&str>,
+    tty_reply: Option<&str>,
+) -> PtyRunOutput {
+    const PY_PTY_DRIVER: &str = r#"
+import errno, fcntl, json, os, pty, select, subprocess, sys, termios, time
+
+cfg = json.loads(sys.stdin.read())
+argv = cfg["argv"]
+stdin_data = cfg.get("stdinData")
+tty_reply = cfg.get("ttyReply")
+timeout = float(cfg.get("timeoutSecs", 20.0))
+
+master_fd, slave_fd = pty.openpty()
+
+def setup_child():
+    os.setsid()
+    fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+
+stdin_pipe_r = None
+stdin_pipe_w = None
+if stdin_data is not None:
+    stdin_pipe_r, stdin_pipe_w = os.pipe()
+    child_stdin = stdin_pipe_r
+else:
+    child_stdin = slave_fd
+
+stdout_r, stdout_w = os.pipe()
+
+proc = subprocess.Popen(
+    argv,
+    stdin=child_stdin,
+    stdout=stdout_w,
+    stderr=slave_fd,
+    preexec_fn=setup_child,
+    close_fds=True,
+)
+os.close(slave_fd)
+os.close(stdout_w)
+if stdin_pipe_r is not None:
+    os.close(stdin_pipe_r)
+if stdin_pipe_w is not None:
+    raw = stdin_data.encode("utf-8")
+    view = memoryview(raw)
+    while view:
+        written = os.write(stdin_pipe_w, view)
+        view = view[written:]
+    os.close(stdin_pipe_w)
+
+os.set_blocking(master_fd, False)
+os.set_blocking(stdout_r, False)
+
+tty_buf = bytearray()
+stdout_buf = bytearray()
+replied = False
+deadline = time.monotonic() + timeout
+stdout_open = True
+tty_open = True
+
+def drain_fd(fd, target):
+    try:
+        while True:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                return False
+            target.extend(chunk)
+    except OSError as e:
+        if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+            return True
+        if e.errno == errno.EIO:
+            return False
+        raise
+
+while stdout_open or tty_open or proc.poll() is None:
+    now = time.monotonic()
+    if now >= deadline:
+        proc.kill()
+        proc.wait()
+        sys.stderr.write(
+            f"PTY driver timed out after {timeout}s; tty={tty_buf.decode('utf-8', 'replace')!r}\n"
+        )
+        sys.exit(124)
+
+    watch = []
+    if tty_open:
+        watch.append(master_fd)
+    if stdout_open:
+        watch.append(stdout_r)
+
+    if watch:
+        rlist, _, _ = select.select(watch, [], [], min(0.05, max(0.005, deadline - now)))
+    else:
+        rlist = []
+        time.sleep(0.01)
+
+    if master_fd in rlist:
+        tty_open = drain_fd(master_fd, tty_buf)
+    if stdout_r in rlist:
+        stdout_open = drain_fd(stdout_r, stdout_buf)
+
+    if not replied and b"[y/N]:" in tty_buf:
+        replied = True
+        if tty_reply is not None:
+            os.write(master_fd, tty_reply.encode("utf-8"))
+        else:
+            os.write(master_fd, b"\x04")
+
+    if proc.poll() is not None and not rlist:
+        if tty_open:
+            tty_open = drain_fd(master_fd, tty_buf)
+        if stdout_open:
+            stdout_open = drain_fd(stdout_r, stdout_buf)
+        if not tty_open and not stdout_open:
+            break
+        # Give the kernel a brief tick to surface EOF after child exit
+        time.sleep(0.01)
+        if tty_open:
+            tty_open = drain_fd(master_fd, tty_buf)
+        if stdout_open:
+            stdout_open = drain_fd(stdout_r, stdout_buf)
+        break
+
+exit_code = proc.wait()
+os.close(master_fd)
+os.close(stdout_r)
+sys.stdout.write(json.dumps({
+    "code": exit_code,
+    "stdout": stdout_buf.decode("utf-8", errors="replace"),
+    "tty": tty_buf.decode("utf-8", errors="replace"),
+}))
+"#;
+
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(hyp_bin().to_string());
+    for a in args {
+        argv.push((*a).to_string());
+    }
+    let payload = json!({
+        "argv": argv,
+        "stdinData": piped_stdin,
+        "ttyReply": tty_reply,
+        "timeoutSecs": 20.0,
+    })
+    .to_string();
+
+    let mut py = Command::new("python3");
+    py.args(["-c", PY_PTY_DRIVER])
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .env("HYPHAE_NO_OPEN", "1")
+        .env("HYPHAE_PLUGINS_DIR", repo_plugins_dir())
+        .env_remove("HYPHAE_PLUGINS_ARCHIVE")
+        .env_remove("HYPHAE_PLUGINS_URL")
+        .env_remove("HYPHAE_CONFIG")
+        .env_remove("HYPHAE_STATE_DIR")
+        .env_remove("HYPHAE_CONFIG_DIR")
+        .env_remove("HYPHAE_SOCKET")
+        .env_remove("AGENTS_MESH_SOCKET")
+        .env_remove("HYPHAE_RELEASE_PUBKEY")
+        .env_remove("HYPHAE_DISABLE_AUTO_UPDATE")
+        .env_remove("HYPHAE_DROP_PORTAL_URL")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = py
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn python3 PTY driver for hyp {args:?}: {e}"));
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .expect("write PTY driver config");
+    let out = child
+        .wait_with_output()
+        .expect("wait for python3 PTY driver");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "python3 PTY driver failed for hyp {args:?}:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "invalid JSON from python3 PTY driver ({e}): stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    PtyRunOutput {
+        code: parsed["code"].as_i64().expect("pty exit code") as i32,
+        stdout: parsed["stdout"].as_str().unwrap_or_default().to_string(),
+        tty: parsed["tty"].as_str().unwrap_or_default().to_string(),
+    }
+}
