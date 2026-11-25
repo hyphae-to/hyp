@@ -91,6 +91,15 @@ pub struct SetupArgs {
     /// Overwrite runtime SKILL.md files even when they contain <!-- hyphae:unmanaged -->
     #[arg(long)]
     pub force_skills: bool,
+    /// Skip writing/updating runtime hyphae/SKILL.md files (keep MCP & hooks only)
+    #[arg(long)]
+    pub no_skills: bool,
+    /// Skip installing Claude Code slash commands (~/.claude/commands/hyphae*.md)
+    #[arg(long)]
+    pub no_commands: bool,
+    /// Open the interactive harness & component toggle checklist before writing any files (requires a TTY)
+    #[arg(long, short = 'i')]
+    pub interactive: bool,
     /// Configure non-destructive live statusLine for Claude Code / Antigravity CLI (chains any existing custom statusLine)
     #[arg(long)]
     pub statusline: bool,
@@ -155,6 +164,18 @@ pub struct OnboardArgs {
     /// Do not automatically install/start the background daemon service after local onboarding
     #[arg(long)]
     pub no_start: bool,
+    /// Enable non-destructive live statusLine chaining for Claude Code / Antigravity during deterministic onboarding
+    #[arg(long)]
+    pub statusline: bool,
+    /// Install native Herdr desktop mod (`hyphae-pane` + `hyphae-panel`, symlink-safe) when Herdr is selected
+    #[arg(long = "mod")]
+    pub install_mod: bool,
+    /// Skip writing/updating runtime hyphae/SKILL.md files during onboarding
+    #[arg(long)]
+    pub no_skills: bool,
+    /// Skip installing Claude Code slash commands (~/.claude/commands/hyphae*.md) during onboarding
+    #[arg(long)]
+    pub no_commands: bool,
     /// Output structured JSON envelope
     #[arg(long)]
     pub json: bool,
@@ -195,7 +216,7 @@ pub struct StatusLineDiagnostic {
     pub detail: String,
 }
 
-pub fn run_setup(args: SetupArgs) -> ExitCode {
+pub fn run_setup(mut args: SetupArgs) -> ExitCode {
     let cmd = "setup";
     let as_json = args.json;
     if args.statusline && args.restore_statusline {
@@ -210,6 +231,54 @@ pub fn run_setup(args: SetupArgs) -> ExitCode {
                     .to_string(),
             ),
         );
+    }
+    if args.no_skills && args.refresh_skills {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "CONFLICTING_FLAGS",
+            "`--no-skills` and `--refresh-skills` are mutually exclusive",
+            Some("Pass either `--no-skills` to skip skills or `--refresh-skills` to update them.".to_string()),
+        );
+    }
+    if args.interactive {
+        if as_json {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "INTERACTIVE_WITH_JSON",
+                "`--interactive` cannot be combined with `--json`",
+                Some(
+                    "Use explicit flags for machine-readable output: `hyp setup --harness <list> [--statusline] [--mod] [--no-skills] [--no-commands] --json`."
+                        .to_string(),
+                ),
+            );
+        }
+        if args.restore_statusline || args.refresh_skills {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "CONFLICTING_FLAGS",
+                "`--interactive` cannot be combined with `--restore-statusline` or `--refresh-skills`",
+                Some("Run `hyp setup --interactive` to pick harnesses and components interactively.".to_string()),
+            );
+        }
+        if !io::stdout().is_terminal() {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "INTERACTIVE_REQUIRES_TTY",
+                "`--interactive` requires an interactive terminal (TTY)",
+                Some(
+                    "Run in a TTY or pass explicit flags: `hyp setup --harness <list> [--statusline] [--mod] [--no-skills] [--no-commands]`."
+                        .to_string(),
+                ),
+            );
+        }
     }
 
     let Some(home) = resolve_home_dir(args.home.as_deref()) else {
@@ -228,7 +297,7 @@ pub fn run_setup(args: SetupArgs) -> ExitCode {
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "BIN_PATH_ERROR", e, None),
     };
 
-    let targets = match parse_harness_selection(&args.harness, &home) {
+    let mut targets = match parse_harness_selection(&args.harness, &home) {
         Ok(t) => t,
         Err(e) => {
             return emit_error(
@@ -244,6 +313,45 @@ pub fn run_setup(args: SetupArgs) -> ExitCode {
             );
         }
     };
+
+    let mut wants_herdr_mod = args.install_mod
+        || args.patch_layout
+        || args.clone_layout.is_some()
+        || args.force_layout;
+
+    if args.interactive {
+        let mut toggle_state = wizard::SetupToggleState::from_home(&home, args.home.is_some());
+        let trimmed_spec = args.harness.trim();
+        if !trimmed_spec.is_empty() && !trimmed_spec.eq_ignore_ascii_case("auto") {
+            toggle_state.set_selected_harnesses(&targets);
+        }
+        if args.no_skills {
+            toggle_state.install_skills = false;
+        }
+        if args.no_commands {
+            toggle_state.install_claude_commands = false;
+        }
+        if wants_herdr_mod {
+            toggle_state.install_herdr_mod = true;
+        }
+        match wizard::run_setup_toggle_interactive(toggle_state, &home) {
+            Ok(Some(selection)) => {
+                targets = selection.harnesses;
+                args.no_skills = !selection.install_skills;
+                args.no_commands = !selection.install_claude_commands;
+                args.statusline = selection.install_statusline;
+                args.install_mod = selection.install_herdr_mod;
+                wants_herdr_mod = selection.install_herdr_mod;
+            }
+            Ok(None) => {
+                println!("Cancelled — no files were written.");
+                return ExitCode::from(EXIT_OK);
+            }
+            Err(e) => {
+                return emit_error(cmd, as_json, EXIT_ERROR, "INTERACTIVE_ERROR", e, None);
+            }
+        }
+    }
 
     let config_path = resolve_config_path_for_write(
         args.config.as_deref(),
@@ -269,10 +377,6 @@ pub fn run_setup(args: SetupArgs) -> ExitCode {
     let mut warnings = Vec::new();
     let mut extra_next: Vec<String> = Vec::new();
     let mut herdr_mod_outcome: Option<crate::herdr_mod::HerdrModInstallOutcome> = None;
-    let wants_herdr_mod = args.install_mod
-        || args.patch_layout
-        || args.clone_layout.is_some()
-        || args.force_layout;
 
     if targets.is_empty() {
         warnings.push(format!(
@@ -286,6 +390,8 @@ pub fn run_setup(args: SetupArgs) -> ExitCode {
         socket: socket_str.as_deref(),
         state_dir: &state_dir,
         statusline: args.statusline,
+        no_skills: args.no_skills,
+        no_commands: args.no_commands,
         dry_run: args.dry_run,
     };
 
@@ -447,22 +553,33 @@ pub fn run_onboard(args: OnboardArgs) -> ExitCode {
         );
     }
 
+    let mut selection_override: Option<wizard::SetupSelection> = None;
     if let Some(ref assist_target) = args.assist {
         match wizard::run_assist(&args, &home, assist_target) {
             wizard::WizardOutcome::Finished(code) => return code,
             wizard::WizardOutcome::RunLocalCliSetup => {}
+            wizard::WizardOutcome::RunLocalCliSetupWithSelection(sel) => {
+                selection_override = Some(sel);
+            }
         }
     } else if wizard::should_launch_interactive_wizard(&args, io::stdout().is_terminal()) {
         match wizard::run_interactive_wizard(&args, &home) {
             wizard::WizardOutcome::Finished(code) => return code,
             wizard::WizardOutcome::RunLocalCliSetup => {}
+            wizard::WizardOutcome::RunLocalCliSetupWithSelection(sel) => {
+                selection_override = Some(sel);
+            }
         }
     }
 
-    run_onboard_deterministic(args, home)
+    run_onboard_deterministic(args, home, selection_override)
 }
 
-fn run_onboard_deterministic(args: OnboardArgs, home: PathBuf) -> ExitCode {
+fn run_onboard_deterministic(
+    args: OnboardArgs,
+    home: PathBuf,
+    selection_override: Option<wizard::SetupSelection>,
+) -> ExitCode {
     let cmd = "onboard";
     let as_json = args.json;
 
@@ -703,16 +820,34 @@ fn run_onboard_deterministic(args: OnboardArgs, home: PathBuf) -> ExitCode {
         }
     }
 
-    // 5. Run harness setup for detected (or requested) harnesses under --home.
+    // 5. Run harness setup for detected (or requested/interactively selected) harnesses under --home.
     let bin_path = match resolve_binary_path(args.bin.as_deref()) {
         Ok(p) => p,
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "BIN_PATH_ERROR", e, None),
     };
-    let harness_spec = args.harness.as_deref().unwrap_or("auto");
-    let targets = match parse_harness_selection(harness_spec, &home) {
-        Ok(t) => t,
-        Err(e) => return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_HARNESS", e, None),
-    };
+    let (targets, opt_statusline, opt_install_mod, opt_no_skills, opt_no_commands) =
+        if let Some(sel) = selection_override {
+            (
+                sel.harnesses,
+                sel.install_statusline,
+                sel.install_herdr_mod,
+                !sel.install_skills,
+                !sel.install_claude_commands,
+            )
+        } else {
+            let harness_spec = args.harness.as_deref().unwrap_or("auto");
+            let targets = match parse_harness_selection(harness_spec, &home) {
+                Ok(t) => t,
+                Err(e) => return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_HARNESS", e, None),
+            };
+            (
+                targets,
+                args.statusline,
+                args.install_mod,
+                args.no_skills,
+                args.no_commands,
+            )
+        };
     let skill_ctx = SetupSkillContext::detect(
         &home,
         &config_path,
@@ -723,10 +858,14 @@ fn run_onboard_deterministic(args: OnboardArgs, home: PathBuf) -> ExitCode {
     let onboard_setup_opts = SetupOptions {
         socket: None,
         state_dir: &state_dir,
-        statusline: false,
+        statusline: opt_statusline,
+        no_skills: opt_no_skills,
+        no_commands: opt_no_commands,
         dry_run: false,
     };
     let mut configured_harnesses = Vec::new();
+    let mut herdr_mod_outcome: Option<crate::herdr_mod::HerdrModInstallOutcome> = None;
+    let mut extra_next: Vec<String> = Vec::new();
     for kind in targets {
         match configure_harness(
             kind,
@@ -736,7 +875,35 @@ fn run_onboard_deterministic(args: OnboardArgs, home: PathBuf) -> ExitCode {
             onboard_setup_opts,
             &skill_ctx,
         ) {
-            Ok(outcome) => configured_harnesses.push(outcome),
+            Ok(mut outcome) => {
+                if kind == HarnessKind::Herdr && opt_install_mod {
+                    let mod_opts = crate::herdr_mod::HerdrModInstallOptions {
+                        patch_layout: false,
+                        force: false,
+                        clone_layout: None,
+                        skip_check: false,
+                        dry_run: false,
+                        herdr_home_override: if args.home.is_none() {
+                            crate::herdr_mod::detect_herdr_app_dir(&home)
+                        } else {
+                            None
+                        },
+                    };
+                    match crate::herdr_mod::install_herdr_mod(&home, mod_opts) {
+                        Ok(mod_res) => {
+                            outcome.files.extend(mod_res.files.iter().cloned());
+                            outcome.notes.extend(mod_res.notes.iter().cloned());
+                            warnings.extend(mod_res.warnings.iter().cloned());
+                            extra_next.extend(mod_res.next.iter().cloned());
+                            herdr_mod_outcome = Some(mod_res);
+                        }
+                        Err(e) => {
+                            warnings.push(format!("Skipped Herdr mod install: {e}"));
+                        }
+                    }
+                }
+                configured_harnesses.push(outcome);
+            }
             Err(e) => {
                 warnings.push(format!("Skipped harness '{}' setup: {e}", kind.as_str()));
             }
@@ -792,6 +959,11 @@ fn run_onboard_deterministic(args: OnboardArgs, home: PathBuf) -> ExitCode {
             ));
         }
     }
+    for step in extra_next {
+        if !next.contains(&step) {
+            next.push(step);
+        }
+    }
     if let Some(ref retry_cmd) = deferred_join_cmd {
         next.insert(0, retry_cmd.clone());
     }
@@ -833,6 +1005,32 @@ fn run_onboard_deterministic(args: OnboardArgs, home: PathBuf) -> ExitCode {
     });
 
     if as_json {
+        let mut data_map = Map::new();
+        data_map.insert("nodeId".to_string(), json!(node_id));
+        data_map.insert("profile".to_string(), json!(profile_as_str(profile)));
+        data_map.insert("kid".to_string(), json!(kid));
+        data_map.insert("encryptionKid".to_string(), json!(enc_kid));
+        data_map.insert("fingerprint".to_string(), json!(fingerprint));
+        data_map.insert(
+            "secretBackend".to_string(),
+            json!(secrets.backend().as_str()),
+        );
+        data_map.insert(
+            "configPath".to_string(),
+            json!(config_path.display().to_string()),
+        );
+        data_map.insert(
+            "stateDir".to_string(),
+            json!(state_dir.display().to_string()),
+        );
+        data_map.insert("dbPath".to_string(), json!(db_path.display().to_string()));
+        data_map.insert("binary".to_string(), json!(bin_path));
+        data_map.insert("stagedJoin".to_string(), json!(staged_json));
+        data_map.insert("daemon".to_string(), json!(daemon_json));
+        data_map.insert("harnesses".to_string(), json!(configured_harnesses));
+        if let Some(ref hm) = herdr_mod_outcome {
+            data_map.insert("herdrMod".to_string(), json!(hm));
+        }
         let envelope = JsonEnvelope {
             ok: true,
             command: cmd.to_string(),
@@ -842,21 +1040,7 @@ fn run_onboard_deterministic(args: OnboardArgs, home: PathBuf) -> ExitCode {
                 profile_as_str(profile),
                 kid
             )),
-            data: Some(json!({
-                "nodeId": node_id,
-                "profile": profile_as_str(profile),
-                "kid": kid,
-                "encryptionKid": enc_kid,
-                "fingerprint": fingerprint,
-                "secretBackend": secrets.backend().as_str(),
-                "configPath": config_path.display().to_string(),
-                "stateDir": state_dir.display().to_string(),
-                "dbPath": db_path.display().to_string(),
-                "binary": bin_path,
-                "stagedJoin": staged_json,
-                "daemon": daemon_json,
-                "harnesses": configured_harnesses,
-            })),
+            data: Some(Value::Object(data_map)),
             warnings,
             next,
             error: None,
@@ -1559,7 +1743,24 @@ struct SetupOptions<'a> {
     socket: Option<&'a str>,
     state_dir: &'a Path,
     statusline: bool,
+    no_skills: bool,
+    no_commands: bool,
     dry_run: bool,
+}
+
+fn maybe_install_harness_runtime_skills(
+    kind: HarnessKind,
+    home: &Path,
+    opts: SetupOptions<'_>,
+    ctx: &SetupSkillContext,
+    files: &mut Vec<String>,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
+    if opts.no_skills {
+        notes.push("Skipped runtime skills (--no-skills).".to_string());
+        return Ok(());
+    }
+    install_harness_runtime_skills(kind, home, ctx, opts.dry_run, files, notes)
 }
 
 #[derive(Clone, Copy)]
@@ -2047,13 +2248,13 @@ fn configure_harness(
     match kind {
         HarnessKind::Antigravity => setup_antigravity(home, bin, opts, skill_ctx),
         HarnessKind::Claude => setup_claude(home, bin, opts, skill_ctx),
-        HarnessKind::Codex => setup_codex(home, bin, opts.socket, skill_ctx, opts.dry_run),
-        HarnessKind::Cursor => setup_cursor(home, bin, opts.socket, skill_ctx, opts.dry_run),
-        HarnessKind::Opencode => setup_opencode(home, bin, opts.socket, skill_ctx, opts.dry_run),
-        HarnessKind::Gemini => setup_gemini(home, bin, opts.socket, skill_ctx, opts.dry_run),
-        HarnessKind::Openclaw => setup_openclaw(home, bin, opts.socket, skill_ctx, opts.dry_run),
-        HarnessKind::Herdr => setup_herdr(home, bin, opts.socket, skill_ctx, opts.dry_run),
-        HarnessKind::T3 => setup_t3(home, bin, config_path, opts.socket, skill_ctx, opts.dry_run),
+        HarnessKind::Codex => setup_codex(home, bin, opts, skill_ctx),
+        HarnessKind::Cursor => setup_cursor(home, bin, opts, skill_ctx),
+        HarnessKind::Opencode => setup_opencode(home, bin, opts, skill_ctx),
+        HarnessKind::Gemini => setup_gemini(home, bin, opts, skill_ctx),
+        HarnessKind::Openclaw => setup_openclaw(home, bin, opts, skill_ctx),
+        HarnessKind::Herdr => setup_herdr(home, bin, opts, skill_ctx),
+        HarnessKind::T3 => setup_t3(home, bin, config_path, opts, skill_ctx),
     }
 }
 
@@ -2168,11 +2369,11 @@ fn setup_antigravity(
         "Antigravity plugin and tailored runtime skill configured directly against static Rust binary."
             .to_string(),
     ];
-    install_harness_runtime_skills(
+    maybe_install_harness_runtime_skills(
         HarnessKind::Antigravity,
         home,
+        opts,
         skill_ctx,
-        dry_run,
         &mut files,
         &mut notes,
     )?;
@@ -2302,10 +2503,12 @@ fn setup_claude(
         mcp_file.display().to_string(),
         settings_file.display().to_string(),
     ];
-    let mut notes = vec![
+    let claude_summary_note = if opts.no_skills || opts.no_commands {
+        "Claude MCP and hooks configured (existing settings preserved)."
+    } else {
         "Claude MCP, hooks, slash commands, and tailored runtime skill configured (existing settings preserved)."
-            .to_string(),
-    ];
+    };
+    let mut notes = vec![claude_summary_note.to_string()];
 
     if opts.statusline {
         configure_statusline_in_doc(
@@ -2320,18 +2523,22 @@ fn setup_claude(
 
     maybe_write_json(&settings_file, &Value::Object(settings_doc), false, dry_run)?;
 
-    let commands_dir = home.join(".claude").join("commands");
-    for (filename, content) in CLAUDE_SLASH_COMMANDS {
-        let cmd_path = commands_dir.join(filename);
-        maybe_write_text(&cmd_path, content, false, dry_run)?;
-        files.push(cmd_path.display().to_string());
+    if opts.no_commands {
+        notes.push("Skipped Claude slash commands (--no-commands).".to_string());
+    } else {
+        let commands_dir = home.join(".claude").join("commands");
+        for (filename, content) in CLAUDE_SLASH_COMMANDS {
+            let cmd_path = commands_dir.join(filename);
+            maybe_write_text(&cmd_path, content, false, dry_run)?;
+            files.push(cmd_path.display().to_string());
+        }
     }
 
-    install_harness_runtime_skills(
+    maybe_install_harness_runtime_skills(
         HarnessKind::Claude,
         home,
+        opts,
         skill_ctx,
-        dry_run,
         &mut files,
         &mut notes,
     )?;
@@ -2347,10 +2554,11 @@ fn setup_claude(
 fn setup_codex(
     home: &Path,
     bin: &str,
-    socket: Option<&str>,
+    opts: SetupOptions<'_>,
     skill_ctx: &SetupSkillContext,
-    dry_run: bool,
 ) -> Result<HarnessSetupOutcome, String> {
+    let socket = opts.socket;
+    let dry_run = opts.dry_run;
     let base_dir = home.join(".codex");
     let config_toml = base_dir.join("config.toml");
     let hooks_file = base_dir.join("hooks.json");
@@ -2448,11 +2656,11 @@ fn setup_codex(
         "Codex config.toml block, hooks.json, and tailored runtime skill configured idempotently."
             .to_string(),
     ];
-    install_harness_runtime_skills(
+    maybe_install_harness_runtime_skills(
         HarnessKind::Codex,
         home,
+        opts,
         skill_ctx,
-        dry_run,
         &mut files,
         &mut notes,
     )?;
@@ -2468,10 +2676,11 @@ fn setup_codex(
 fn setup_cursor(
     home: &Path,
     bin: &str,
-    socket: Option<&str>,
+    opts: SetupOptions<'_>,
     skill_ctx: &SetupSkillContext,
-    dry_run: bool,
 ) -> Result<HarnessSetupOutcome, String> {
+    let socket = opts.socket;
+    let dry_run = opts.dry_run;
     let base_dir = home.join(".cursor");
     let mcp_file = base_dir.join("mcp.json");
     let hooks_file = base_dir.join("hooks.json");
@@ -2544,11 +2753,11 @@ fn setup_cursor(
         "Cursor mcp.json, hooks.json, and tailored runtime skill configured (existing settings preserved)."
             .to_string(),
     ];
-    install_harness_runtime_skills(
+    maybe_install_harness_runtime_skills(
         HarnessKind::Cursor,
         home,
+        opts,
         skill_ctx,
-        dry_run,
         &mut files,
         &mut notes,
     )?;
@@ -2564,10 +2773,11 @@ fn setup_cursor(
 fn setup_opencode(
     home: &Path,
     bin: &str,
-    socket: Option<&str>,
+    opts: SetupOptions<'_>,
     skill_ctx: &SetupSkillContext,
-    dry_run: bool,
 ) -> Result<HarnessSetupOutcome, String> {
+    let socket = opts.socket;
+    let dry_run = opts.dry_run;
     let config_root = home.join(".config").join("opencode");
     let config_file = config_root.join("opencode.json");
     let plugin_file = config_root.join("plugins").join("hyphae.ts");
@@ -2623,11 +2833,11 @@ fn setup_opencode(
         "OpenCode opencode.json, plugins/hyphae.ts, and tailored runtime skill configured."
             .to_string(),
     ];
-    install_harness_runtime_skills(
+    maybe_install_harness_runtime_skills(
         HarnessKind::Opencode,
         home,
+        opts,
         skill_ctx,
-        dry_run,
         &mut files,
         &mut notes,
     )?;
@@ -2643,10 +2853,11 @@ fn setup_opencode(
 fn setup_gemini(
     home: &Path,
     bin: &str,
-    socket: Option<&str>,
+    opts: SetupOptions<'_>,
     skill_ctx: &SetupSkillContext,
-    dry_run: bool,
 ) -> Result<HarnessSetupOutcome, String> {
+    let socket = opts.socket;
+    let dry_run = opts.dry_run;
     let settings_file = home.join(".gemini").join("settings.json");
     let mut settings = read_json_object_or_empty(&settings_file)?;
 
@@ -2730,11 +2941,11 @@ fn setup_gemini(
         "Gemini CLI settings.json and tailored runtime skill configured (zero collision with Antigravity)."
             .to_string(),
     ];
-    install_harness_runtime_skills(
+    maybe_install_harness_runtime_skills(
         HarnessKind::Gemini,
         home,
+        opts,
         skill_ctx,
-        dry_run,
         &mut files,
         &mut notes,
     )?;
@@ -2750,10 +2961,11 @@ fn setup_gemini(
 fn setup_openclaw(
     home: &Path,
     bin: &str,
-    socket: Option<&str>,
+    opts: SetupOptions<'_>,
     skill_ctx: &SetupSkillContext,
-    dry_run: bool,
 ) -> Result<HarnessSetupOutcome, String> {
+    let socket = opts.socket;
+    let dry_run = opts.dry_run;
     let base_dir = home.join(".openclaw");
     let config_file = base_dir.join("openclaw.json");
 
@@ -2781,11 +2993,11 @@ fn setup_openclaw(
 
     let mut files = vec![config_file.display().to_string()];
     let mut notes = vec!["OpenClaw openclaw.json and tailored orchestrator skill configured.".to_string()];
-    install_harness_runtime_skills(
+    maybe_install_harness_runtime_skills(
         HarnessKind::Openclaw,
         home,
+        opts,
         skill_ctx,
-        dry_run,
         &mut files,
         &mut notes,
     )?;
@@ -2801,10 +3013,11 @@ fn setup_openclaw(
 fn setup_herdr(
     home: &Path,
     bin: &str,
-    socket: Option<&str>,
+    opts: SetupOptions<'_>,
     skill_ctx: &SetupSkillContext,
-    dry_run: bool,
 ) -> Result<HarnessSetupOutcome, String> {
+    let socket = opts.socket;
+    let dry_run = opts.dry_run;
     let cfg_file = home.join(".config").join("herdr").join("hyphae.json");
     let mut doc = read_json_object_or_empty(&cfg_file)?;
     doc.insert(
@@ -2829,11 +3042,11 @@ fn setup_herdr(
         "Herdr Hyphae adapter configuration and tailored runtime skill written (existing keys preserved)."
             .to_string(),
     ];
-    install_harness_runtime_skills(
+    maybe_install_harness_runtime_skills(
         HarnessKind::Herdr,
         home,
+        opts,
         skill_ctx,
-        dry_run,
         &mut files,
         &mut notes,
     )?;
@@ -2850,10 +3063,11 @@ fn setup_t3(
     home: &Path,
     bin: &str,
     config_path: &Path,
-    socket: Option<&str>,
+    opts: SetupOptions<'_>,
     skill_ctx: &SetupSkillContext,
-    dry_run: bool,
 ) -> Result<HarnessSetupOutcome, String> {
+    let socket = opts.socket;
+    let dry_run = opts.dry_run;
     let t3_base_dir = home.join(".t3");
     let t3_file = t3_base_dir.join("hyphae.json");
     let mut files = Vec::new();
@@ -2890,11 +3104,11 @@ fn setup_t3(
         files.push(config_path.display().to_string());
     }
 
-    install_harness_runtime_skills(
+    maybe_install_harness_runtime_skills(
         HarnessKind::T3,
         home,
+        opts,
         skill_ctx,
-        dry_run,
         &mut files,
         &mut notes,
     )?;

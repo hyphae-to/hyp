@@ -55,7 +55,12 @@ Use the results to pick the right mode automatically:
 
 Start with **2–3 concise questions** (adapt based on what `hyp doctor --json` already detected):
 
-1. **Coding harnesses to wire**: Which detected harnesses should Hyphae configure? (`auto` for all detected, `all` for all 9, or a comma-separated subset of `antigravity,claude,codex,cursor,opencode,gemini,openclaw,herdr,t3`.)
+1. **Coding harnesses & optional components / UI plugins to install** *(ask explicitly before running `hyp onboard --yes` or `hyp setup` so nothing unwanted is written)*:
+   - **Harnesses**: Which detected harnesses should Hyphae wire? (`auto` for all detected, `all` for all 9, or a comma-separated subset of `antigravity,claude,codex,cursor,opencode,gemini,openclaw,herdr,t3`.)
+   - **Runtime skills (`hyphae/SKILL.md`)**: On by default (tailored per harness/orchestrator); pass `--no-skills` to keep MCP & hooks only.
+   - **Live `statusLine`** (`--statusline` for **Claude Code** & **Antigravity CLI**): Shows live unread/focus/mesh badge in the CLI status bar, **non-destructively chaining** any existing custom `statusLine` into a `0600` backup (reversible anytime with `--restore-statusline`).
+   - **Claude Code slash commands & native side-panel plugin**: Standalone slash commands (`/hyphae`, `/hyphae-subs`, `/hyphae-focus`, `/hyphae-mute`, plus `!hyp ui` live terminal inspector) install under `~/.claude/commands/` by default (pass `--no-commands` to skip); for the native Claude Code side panel (`/hyphae-panel`), mention the bundled `plugins/claude-code` plugin.
+   - **Native Herdr desktop mod** (`--mod` when Herdr is selected): Installs `hyphae-pane` + `hyphae-panel` into `~/.config/herdr-app` (symlink-safe; respects git-tracked layouts and custom pane headers — use `--clone-layout <name>` for a ready-made layout or import reusable `pill.js` into custom pane headers).
 2. **Mesh topology**:
    - **Local only** (`--profile local`) — connect coding agents on this machine.
    - **Direct P2P** (`--profile p2p`, `hp2p1_`) — pair directly with another laptop/server (zero central hub).
@@ -65,22 +70,29 @@ Start with **2–3 concise questions** (adapt based on what `hyp doctor --json` 
 
 ### Step 1.1 — Bootstrap Node, Keys & Harnesses
 
-Running `hyp onboard` interactively opens the borderless high-res 2×4 Unicode Braille organic mycelium & glowing **`HYPHAE`** interactive TUI wizard (when `HC_TERMINAL_ID` is set inside Herdr, discovered Herdr launch templates appear directly on the main menu and launch via `hc run --bg --outlive-parent` + immediate TTY `hc attach <address>`); when driving setup as an agent, pass `--yes` so `hyp onboard` runs non-interactively:
+Running `hyp onboard` interactively opens the borderless high-res 2×4 Unicode Braille organic mycelium & glowing **`HYPHAE`** interactive TUI wizard (picking **Local CLI setup** opens an interactive harness & component toggle checklist before writing any files; when `HC_TERMINAL_ID` is set inside Herdr, discovered Herdr launch templates appear directly on the main menu and launch via `hc run --bg --outlive-parent` + immediate TTY `hc attach <address>`). When driving setup as an agent, pass `--yes` along with only the harnesses and component flags the user opted into:
 
 ```sh
-# Local workstation node (default profile: local)
+# Local workstation node with user-selected harnesses & optional UI components
 hyp onboard --yes --profile local --node-id <user@host> --harness auto --json
+
+# Example with explicit harness subset + live statusLine + native Herdr mod (or opt-outs):
+hyp onboard --yes --node-id <user@host> --harness claude,antigravity,herdr --statusline --mod --json
+hyp onboard --yes --node-id <user@host> --harness claude --no-skills --no-commands --json
 
 # Or bootstrap AND stage an incoming hp2p1_ / am2_ pairing token via stdin or 0600 file:
 hyp onboard --yes --node-id <user@host> --join - --json <<< "$TOKEN"
 hyp onboard --yes --node-id <user@host> --join /path/to/0600-token-file --json
 ```
 
-Preview or adjust harness wiring with `hyp setup`:
+Preview or adjust harness wiring & optional components with `hyp setup` (or run `hyp setup --interactive` in a TTY for the toggle checklist):
 
 ```sh
 hyp setup --harness claude,codex,antigravity --dry-run --json
-hyp setup --harness claude,codex,antigravity --json
+hyp setup --harness claude,antigravity --statusline --json
+hyp setup --harness claude --no-skills --no-commands --json
+hyp setup --harness herdr --mod --json
+hyp setup --interactive   # TTY-only interactive harness & component toggle checklist
 ```
 
 ### Native Wakeup Transports & Orchestrators
@@ -158,13 +170,29 @@ hyp doctor --json
 
 Identify what the user wants to change and execute only the targeted workflow:
 
-### A. Add, Update, or Remove Harnesses & Refresh Skills
-- **Add or re-wire harnesses** (idempotent — renders orchestrator-aware tailored `hyphae/SKILL.md` per harness without duplicating native OpenClaw/Antigravity tools, and preserves unrelated user settings):
+### A. Add, Update, or Remove Harnesses, Optional UI Plugins & Skills
+- **Add or re-wire harnesses & optional components** (idempotent — renders orchestrator-aware tailored `hyphae/SKILL.md` per harness without duplicating native OpenClaw/Antigravity tools, and preserves unrelated user settings; ask which optional components the user wants first):
   ```sh
   hyp setup --harness <name> --dry-run --json
   hyp setup --harness <name> --json
+  hyp setup --harness <name> --no-skills --no-commands --json   # MCP & hooks only
+  hyp setup --interactive                                        # TTY toggle checklist for harnesses & plugins
   ```
   Valid harness names: `antigravity`, `claude`, `codex`, `cursor`, `opencode`, `gemini`, `openclaw`, `herdr`, `t3` (or `auto`, `all`).
+- **Live `statusLine` for Claude Code & Antigravity CLI** (non-destructively chains any existing custom `statusLine` into a `0600` backup):
+  ```sh
+  hyp setup --harness claude,antigravity --statusline --json
+  hyp setup --harness claude,antigravity --restore-statusline --json   # cleanly restore original bar
+  ```
+- **Claude Code slash commands & native side-panel plugin**:
+  - Standalone commands (`/hyphae`, `/hyphae-subs`, `/hyphae-focus`, `/hyphae-mute`, plus `!hyp ui`) install into `~/.claude/commands/` by default (pass `--no-commands` to skip).
+  - For the bundled Claude Code plugin & native side panel (`/hyphae-panel`), point the user to `plugins/claude-code`.
+- **Native Herdr desktop mod** (`hyphae-pane` + `hyphae-panel`, symlink-safe):
+  ```sh
+  hyp setup --harness herdr --mod --json
+  hyp setup --harness herdr --mod --clone-layout herdr-hyphae --json   # clone shipped main.json safely
+  ```
+  *(Respects symlinked git-managed layouts and custom pane headers by default; custom pane mods can compose Hyphae using reusable `pill.js` from `mods/hyphae-pane/`.)*
 - **Refresh managed orchestrator-aware `hyphae/SKILL.md` files** after upgrades (preserves unmanaged custom edits unless `--force-skills` is passed):
   ```sh
   hyp setup --refresh-skills --json
@@ -174,7 +202,9 @@ Identify what the user wants to change and execute only the targeted workflow:
   ```sh
   hyp onboard --install-skill --json
   ```
-- **Remove a harness integration**: Remove only the `"hyphae"` MCP server entry and Hyphae hook commands (`hyp hook <harness> ...`) from that harness's config file (check exact paths via `hyp doctor --json`), preserving all non-Hyphae entries.
+- **Remove a harness integration or full clean uninstall / reset**:
+  - Single harness: remove only the `"hyphae"` MCP server entry and Hyphae hook commands (`hyp hook <harness> ...`) from that harness's config file (check exact paths via `hyp doctor --json`), preserving all non-Hyphae entries.
+  - Full clean removal/reset (stops background service, restores chained `statusLine`, cleans harness integrations, and optionally removes state/binary): use `hyp uninstall` (or the standalone `uninstall.sh` script).
 
 ### B. Pair New Laptops, Servers, or Public Nodes
 - Inspect the built-in pairing guide: `hyp pair guide --json` (or `--mode p2p|team|public`).
