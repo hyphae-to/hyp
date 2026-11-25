@@ -65,6 +65,43 @@ if (allowedChannels) {
   }
 }
 const lastTsByChannel = new Map();
+const lastReactionByMsg = new Map();
+
+function chunkText(text, maxLen = 3900) {
+  if (typeof text !== "string" || text.length === 0) return [];
+  if (text.length <= maxLen) return [text];
+  const chunks = [];
+  let remaining = text;
+  while (remaining.length > maxLen) {
+    let cut = maxLen;
+    const prevCode = remaining.charCodeAt(cut - 1);
+    if (prevCode >= 0xd800 && prevCode <= 0xdbff) {
+      cut -= 1;
+    }
+    const minBreak = Math.floor(maxLen * 0.5);
+    if (remaining[cut] !== "\n" && remaining[cut] !== " ") {
+      const nlIdx = remaining.lastIndexOf("\n", cut - 1);
+      if (nlIdx >= minBreak) {
+        cut = nlIdx + 1;
+      } else {
+        const spIdx = remaining.lastIndexOf(" ", cut - 1);
+        if (spIdx >= minBreak) {
+          cut = spIdx + 1;
+        }
+      }
+    }
+    const part = remaining.slice(0, cut).trimEnd();
+    if (part.length > 0) {
+      chunks.push(part);
+    }
+    remaining = remaining.slice(cut).replace(/^[ \t\n]+/, "");
+    if (remaining.length === 0) break;
+  }
+  if (remaining.length > 0) {
+    chunks.push(remaining);
+  }
+  return chunks;
+}
 
 const SLACK_EMOJI_MAP = new Map([
   ["👍", "thumbsup"],
@@ -119,7 +156,13 @@ async function slackApi(method, token, payload) {
 const mesh = new MeshPluginClient({
   onDeliveryFailed: (msg) => console.error(`slack plugin delivery_failed target=${msg.target} reason=${msg.reason}`),
   onPost: async (params) => {
-    const hasReaction = typeof params.reaction === "string";
+    const hasReaction = typeof params.reaction === "string" || typeof params.emoji === "string";
+    const rawReactionArg =
+      typeof params.reaction === "string"
+        ? params.reaction
+        : typeof params.emoji === "string"
+          ? params.emoji
+          : "";
     const hasRemoveReaction = typeof params.removeReaction === "string" && params.removeReaction.trim().length > 0;
     const text = typeof params.text === "string" ? params.text.trim() : "";
     if (!hasReaction && !hasRemoveReaction && !text) throw new Error("text or reaction is required");
@@ -159,38 +202,69 @@ const mesh = new MeshPluginClient({
     let reactionName = "";
     let targetTs;
     if (hasReaction || hasRemoveReaction) {
-      isRemove = params.remove === true || (hasRemoveReaction && (!hasReaction || !params.reaction.trim()));
-      const rawEmoji = hasReaction && params.reaction.trim() ? params.reaction : hasRemoveReaction ? params.removeReaction : "";
-      reactionName = normalizeSlackReaction(rawEmoji);
-      if (!reactionName) {
-        throw new Error("Slack reactions.remove requires an emoji name (pass reaction with remove: true)");
-      }
       targetTs = replyTo || explicitThreadTs || lastTsByChannel.get(channel);
       if (!targetTs) {
         throw new Error(`No message timestamp specified via replyTo/threadTs and no recent inbound message in channel '${channel}' to react to`);
+      }
+      const msgKey = `${channel}:${targetTs}`;
+      const trimmedReaction = rawReactionArg.trim();
+      const emptyRemoval = hasReaction && trimmedReaction === "" && !hasRemoveReaction;
+      isRemove = params.remove === true || emptyRemoval || (hasRemoveReaction && !trimmedReaction);
+      const rawEmoji = trimmedReaction
+        ? trimmedReaction
+        : hasRemoveReaction
+          ? params.removeReaction
+          : isRemove
+            ? (lastReactionByMsg.get(msgKey) ?? "")
+            : "";
+      reactionName = normalizeSlackReaction(rawEmoji);
+      if (!reactionName) {
+        throw new Error("Slack reactions.remove requires an emoji name (pass reaction with remove: true)");
       }
       await slackApi(isRemove ? "reactions.remove" : "reactions.add", botToken, {
         channel,
         timestamp: targetTs,
         name: reactionName,
       });
+      if (isRemove) {
+        if (lastReactionByMsg.get(msgKey) === reactionName) {
+          lastReactionByMsg.delete(msgKey);
+        }
+      } else {
+        lastReactionByMsg.delete(msgKey);
+        lastReactionByMsg.set(msgKey, reactionName);
+        if (lastReactionByMsg.size > 2000) {
+          lastReactionByMsg.delete(lastReactionByMsg.keys().next().value);
+        }
+      }
       didReact = true;
     }
 
     let postRes = null;
+    const sentTs = [];
     if (text) {
-      postRes = await slackApi("chat.postMessage", botToken, {
-        channel,
-        text,
-        ...(threadTs ? { thread_ts: threadTs } : {}),
-      });
+      const chunks = chunkText(text, 3900);
+      for (let i = 0; i < chunks.length; i += 1) {
+        const res = await slackApi("chat.postMessage", botToken, {
+          channel,
+          text: chunks[i],
+          ...(threadTs ? { thread_ts: threadTs } : {}),
+        });
+        if (i === 0) postRes = res;
+        if (res?.ts) sentTs.push(res.ts);
+      }
     }
 
     return {
       ok: true,
       channel: postRes?.channel ?? channel,
       ...(didReact ? { reacted: !isRemove, removed: isRemove, reaction: reactionName, reactedTs: targetTs } : {}),
-      ...(text ? { ts: postRes?.ts ?? null } : {}),
+      ...(text
+        ? {
+            ts: postRes?.ts ?? null,
+            ...(sentTs.length > 1 ? { timestamps: sentTs, chunks: sentTs.length } : {}),
+          }
+        : {}),
     };
   },
 });

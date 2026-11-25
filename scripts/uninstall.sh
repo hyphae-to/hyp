@@ -1337,13 +1337,17 @@ JSEOF
 
 DAEMON_PIDS=""
 if [ "$IS_REAL_HOME" -eq 1 ]; then
+  _cur_uid="$(id -u 2>/dev/null || printf '')"
   DAEMON_PIDS="$(
-    ps -eo pid=,args= 2>/dev/null | awk -v self_pid="$$" -v parent_pid="${PPID:-0}" '
+    ps -eo pid=,uid=,args= 2>/dev/null | awk -v self_pid="$$" -v parent_pid="${PPID:-0}" -v cur_uid="$_cur_uid" '
       {
         pid = $1
-        sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", $0)
+        uid = $2
+        sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/, "", $0)
+        if (cur_uid != "" && uid != cur_uid) next
         if (pid == self_pid || pid == parent_pid) next
         if ($0 ~ /uninstall\.sh|reset-local\.sh/) next
+        if ($0 ~ /--(config|state-dir)([[:space:]]+|=)\/(etc|var\/lib)\/hyphae(\/|[[:space:]]|$)/) next
         if ($0 ~ /(^|\/)(hyp|hyp-rs)[[:space:]]+(daemon|node[[:space:]]+start)([[:space:]]|$)/ || $0 ~ /hyphae\.mjs[[:space:]]+(daemon|node)([[:space:]]|$)/) {
           print pid ":" $0
         }
@@ -1357,10 +1361,10 @@ LAUNCH_PLISTS=""
 SYSTEMD_UNITS=""
 if [ "$OS_NAME" = "Darwin" ]; then
   if [ "$IS_REAL_HOME" -eq 1 ] && command -v launchctl >/dev/null 2>&1; then
-    LAUNCH_AGENTS="$(launchctl list 2>/dev/null | awk '{print $3}' | grep -iE 'hyphae|t3-mesh|agents-mesh' || true)"
+    LAUNCH_AGENTS="$(launchctl list 2>/dev/null | awk '{print $3}' | grep -iE 'hyphae|agents-mesh' || true)"
   fi
   if [ -d "$HOME/Library/LaunchAgents" ]; then
-    LAUNCH_PLISTS="$(find "$HOME/Library/LaunchAgents" -maxdepth 1 \( -type f -o -type l \) \( -iname '*hyphae*' -o -iname '*t3-mesh*' -o -iname '*agents-mesh*' \) 2>/dev/null | sort || true)"
+    LAUNCH_PLISTS="$(find "$HOME/Library/LaunchAgents" -maxdepth 1 \( -type f -o -type l \) \( -iname '*hyphae*' -o -iname '*agents-mesh*' \) 2>/dev/null | sort || true)"
   fi
 elif [ "$OS_NAME" = "Linux" ]; then
   for _sd_dir in "$CONFIG_HOME/systemd/user" "$HOME/.config/systemd/user"; do

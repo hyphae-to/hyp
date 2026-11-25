@@ -188,6 +188,42 @@ async function sendWhatsAppMessage(phoneNumberId, payload) {
   return json;
 }
 
+function chunkText(text, maxLen = 4096) {
+  if (typeof text !== "string" || text.length === 0) return [];
+  if (text.length <= maxLen) return [text];
+  const chunks = [];
+  let remaining = text;
+  while (remaining.length > maxLen) {
+    let cut = maxLen;
+    const prevCode = remaining.charCodeAt(cut - 1);
+    if (prevCode >= 0xd800 && prevCode <= 0xdbff) {
+      cut -= 1;
+    }
+    const minBreak = Math.floor(maxLen * 0.5);
+    if (remaining[cut] !== "\n" && remaining[cut] !== " ") {
+      const nlIdx = remaining.lastIndexOf("\n", cut - 1);
+      if (nlIdx >= minBreak) {
+        cut = nlIdx + 1;
+      } else {
+        const spIdx = remaining.lastIndexOf(" ", cut - 1);
+        if (spIdx >= minBreak) {
+          cut = spIdx + 1;
+        }
+      }
+    }
+    const part = remaining.slice(0, cut).trimEnd();
+    if (part.length > 0) {
+      chunks.push(part);
+    }
+    remaining = remaining.slice(cut).replace(/^[ \t\n]+/, "");
+    if (remaining.length === 0) break;
+  }
+  if (remaining.length > 0) {
+    chunks.push(remaining);
+  }
+  return chunks;
+}
+
 mesh.onPost(async (params) => {
   const hasReaction = typeof params?.reaction === "string";
   const reaction = hasReaction ? params.reaction.trim() : "";
@@ -253,15 +289,22 @@ mesh.onPost(async (params) => {
   }
 
   let textJson = null;
+  const messageIds = [];
   if (hasText) {
-    textJson = await sendWhatsAppMessage(phoneNumberId, {
-      messaging_product: "whatsapp",
-      recipient_type: "individual",
-      to: recipient,
-      type: "text",
-      text: { preview_url: false, body: rawText },
-      ...(replyTo ? { context: { message_id: replyTo } } : {}),
-    });
+    const chunks = chunkText(rawText, 4096);
+    for (let i = 0; i < chunks.length; i += 1) {
+      const res = await sendWhatsAppMessage(phoneNumberId, {
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to: recipient,
+        type: "text",
+        text: { preview_url: false, body: chunks[i] },
+        ...(i === 0 && replyTo ? { context: { message_id: replyTo } } : {}),
+      });
+      if (i === 0) textJson = res;
+      const msgId = res?.messages?.[0]?.id ?? null;
+      if (msgId) messageIds.push(msgId);
+    }
   }
 
   return {
@@ -276,7 +319,12 @@ mesh.onPost(async (params) => {
           reactionMessageId: reactionJson?.messages?.[0]?.id ?? null,
         }
       : {}),
-    ...(hasText ? { messageId: textJson?.messages?.[0]?.id ?? null } : {}),
+    ...(hasText
+      ? {
+          messageId: textJson?.messages?.[0]?.id ?? null,
+          ...(messageIds.length > 1 ? { messageIds, chunks: messageIds.length } : {}),
+        }
+      : {}),
   };
 });
 

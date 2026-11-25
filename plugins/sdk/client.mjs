@@ -1,6 +1,14 @@
 import { createReadStream, createWriteStream } from "node:fs";
 import { createInterface } from "node:readline";
 
+const DEFAULT_ACK_TIMEOUT_MS = 60_000;
+const MAX_ECHO_ID_CHARS = 256;
+
+function correlationIdForEvent(event) {
+  if (typeof event?.id !== "string" || event.id.length === 0) return null;
+  return Array.from(event.id).slice(0, MAX_ECHO_ID_CHARS).join("");
+}
+
 /**
  * Minimal Node 24 client for the Hyphae local plugin channel (fd 3, protocol v1).
  */
@@ -8,13 +16,22 @@ export class MeshPluginClient {
   plugin;
   targets;
   #out;
-  #pending = [];
+  #pending = new Map();
+  #pendingNoId = [];
   #closed = false;
   #onPost;
+  #onError;
 
-  constructor({ fd = Number(process.env.HYPHAE_FD ?? process.env.AGENTS_MESH_FD ?? process.env.T3_MESH_FD ?? 3), onStatus, onDeliveryFailed, onPost } = {}) {
+  constructor({
+    fd = Number(process.env.HYPHAE_FD ?? process.env.AGENTS_MESH_FD ?? process.env.T3_MESH_FD ?? 3),
+    onStatus,
+    onDeliveryFailed,
+    onPost,
+    onError,
+  } = {}) {
     this.plugin = process.env.HYPHAE_PLUGIN ?? process.env.AGENTS_MESH_PLUGIN ?? process.env.T3_MESH_PLUGIN ?? "plugin";
     this.#onPost = onPost;
+    this.#onError = onError;
     this.#out = createWriteStream("", { fd, autoClose: false });
     const input = createReadStream("", { fd, autoClose: false });
     const rl = createInterface({ input });
@@ -37,8 +54,7 @@ export class MeshPluginClient {
           return;
         }
         if (msg.type === "ack" || msg.type === "nack") {
-          const next = this.#pending.shift();
-          if (next) next.resolve(msg);
+          this.#resolveAckOrNack(msg);
         } else if (msg.type === "status") {
           onStatus?.(msg);
         } else if (msg.type === "delivery_failed") {
@@ -50,12 +66,64 @@ export class MeshPluginClient {
       rl.on("close", () => {
         this.#closed = true;
         if (!greeted) reject(new Error("Mesh plugin channel closed before hello"));
-        while (this.#pending.length > 0) {
-          this.#pending.shift().reject(new Error("Mesh plugin channel closed"));
+        const closedErr = new Error("Mesh plugin channel closed");
+        for (const bucket of this.#pending.values()) {
+          while (bucket.length > 0) {
+            const entry = bucket.shift();
+            clearTimeout(entry.timer);
+            entry.reject(closedErr);
+          }
+        }
+        this.#pending.clear();
+        while (this.#pendingNoId.length > 0) {
+          const entry = this.#pendingNoId.shift();
+          clearTimeout(entry.timer);
+          entry.reject(closedErr);
         }
         process.exit(0);
       });
     });
+  }
+
+  #resolveAckOrNack(msg) {
+    const msgId = typeof msg.id === "string" && msg.id.length > 0 ? msg.id : null;
+    if (msgId !== null) {
+      const bucket = this.#pending.get(msgId);
+      if (bucket && bucket.length > 0) {
+        const entry = bucket.shift();
+        if (bucket.length === 0) {
+          this.#pending.delete(msgId);
+        }
+        clearTimeout(entry.timer);
+        entry.resolve(msg);
+      }
+      return;
+    }
+    if (this.#pendingNoId.length > 0) {
+      const entry = this.#pendingNoId.shift();
+      clearTimeout(entry.timer);
+      entry.resolve(msg);
+      return;
+    }
+    // Unsolicited or id-less host error frame: surface cleanly without shifting id-correlated requests.
+    if (typeof this.#onError === "function") {
+      this.#onError(msg);
+    } else {
+      console.error(`hyphae plugin id-less ${msg.type}: ${msg.error ?? msg.message ?? "unknown"}`);
+    }
+  }
+
+  #removePendingEntry(corrId, entry) {
+    if (corrId !== null) {
+      const bucket = this.#pending.get(corrId);
+      if (!bucket) return;
+      const idx = bucket.indexOf(entry);
+      if (idx >= 0) bucket.splice(idx, 1);
+      if (bucket.length === 0) this.#pending.delete(corrId);
+    } else {
+      const idx = this.#pendingNoId.indexOf(entry);
+      if (idx >= 0) this.#pendingNoId.splice(idx, 1);
+    }
   }
 
   /** Register or replace the outbound `hyp_plugin_post` handler for this plugin. */
@@ -87,16 +155,34 @@ export class MeshPluginClient {
     }
   }
 
-  /** Sends one CloudEvent 1.0 to `to` (configured target name) and awaits durable ack/nack. */
-  async send(to, event) {
+  /** Sends one CloudEvent 1.0 to `to` (configured target name) and awaits durable id-correlated ack/nack. */
+  async send(to, event, { timeoutMs = DEFAULT_ACK_TIMEOUT_MS } = {}) {
     if (this.#closed) throw new Error("Mesh plugin channel closed");
     const line = JSON.stringify({ type: "event", to, event }) + "\n";
+    const corrId = correlationIdForEvent(event);
     return new Promise((resolve, reject) => {
-      this.#pending.push({ resolve, reject });
+      const entry = { resolve, reject, timer: null };
+      if (timeoutMs > 0 && Number.isFinite(timeoutMs)) {
+        entry.timer = setTimeout(() => {
+          this.#removePendingEntry(corrId, entry);
+          reject(new Error(`Timed out waiting for ack/nack${corrId ? ` for event '${corrId}'` : ""}`));
+        }, timeoutMs);
+        entry.timer.unref?.();
+      }
+      if (corrId !== null) {
+        let bucket = this.#pending.get(corrId);
+        if (!bucket) {
+          bucket = [];
+          this.#pending.set(corrId, bucket);
+        }
+        bucket.push(entry);
+      } else {
+        this.#pendingNoId.push(entry);
+      }
       this.#out.write(line, (error) => {
         if (error) {
-          const idx = this.#pending.findIndex((p) => p.resolve === resolve);
-          if (idx >= 0) this.#pending.splice(idx, 1);
+          this.#removePendingEntry(corrId, entry);
+          clearTimeout(entry.timer);
           reject(error);
         }
       });

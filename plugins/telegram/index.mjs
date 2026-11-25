@@ -56,7 +56,68 @@ function pickNonEmpty(...values) {
   return "";
 }
 
+function chunkText(text, maxLen = 4096) {
+  if (typeof text !== "string" || text.length === 0) return [];
+  if (text.length <= maxLen) return [text];
+  const chunks = [];
+  let remaining = text;
+  while (remaining.length > maxLen) {
+    let cut = maxLen;
+    const prevCode = remaining.charCodeAt(cut - 1);
+    if (prevCode >= 0xd800 && prevCode <= 0xdbff) {
+      cut -= 1;
+    }
+    const minBreak = Math.floor(maxLen * 0.5);
+    if (remaining[cut] !== "\n" && remaining[cut] !== " ") {
+      const nlIdx = remaining.lastIndexOf("\n", cut - 1);
+      if (nlIdx >= minBreak) {
+        cut = nlIdx + 1;
+      } else {
+        const spIdx = remaining.lastIndexOf(" ", cut - 1);
+        if (spIdx >= minBreak) {
+          cut = spIdx + 1;
+        }
+      }
+    }
+    const part = remaining.slice(0, cut).trimEnd();
+    if (part.length > 0) {
+      chunks.push(part);
+    }
+    remaining = remaining.slice(cut).replace(/^[ \t\n]+/, "");
+    if (remaining.length === 0) break;
+  }
+  if (remaining.length > 0) {
+    chunks.push(remaining);
+  }
+  return chunks;
+}
+
 const apiBase = resolveApiBase(process.env.TELEGRAM_API_BASE, "https://api.telegram.org");
+
+async function telegramPost(method, payload) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const res = await fetch(`${apiBase}/bot${token}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(15_000),
+    });
+    let body = {};
+    try {
+      body = await res.json();
+    } catch {}
+    if (res.status === 429 && attempt === 0) {
+      const retryAfterSec = Number(body?.parameters?.retry_after ?? res.headers.get("retry-after") ?? 1);
+      const clampedSec = Math.min(Math.max(Number.isFinite(retryAfterSec) ? retryAfterSec : 1, 0), 10);
+      await new Promise((r) => setTimeout(r, clampedSec * 1000));
+      continue;
+    }
+    if (!res.ok || !body.ok) {
+      throw new Error(`Telegram ${method} failed: ${body.description ?? res.status}`);
+    }
+    return body;
+  }
+}
 const defaultChatId = pickNonEmpty(process.env.TELEGRAM_DEFAULT_CHAT, process.env.TELEGRAM_CHAT_ID) || null;
 const seenAllowedChats = new Set();
 for (const envChat of [process.env.TELEGRAM_DEFAULT_CHAT, process.env.TELEGRAM_CHAT_ID]) {
@@ -122,52 +183,39 @@ const mesh = new MeshPluginClient({
       if (targetMessageId === undefined || targetMessageId === null) {
         throw new Error(`No message_id specified via replyTo and no recent inbound message in chat '${chatId}' to react to`);
       }
-      const res = await fetch(`${apiBase}/bot${token}/setMessageReaction`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          chat_id: chatId,
-          message_id: targetMessageId,
-          reaction: reaction ? [{ type: "emoji", emoji: reaction }] : [],
-        }),
-        signal: AbortSignal.timeout(15_000),
+      await telegramPost("setMessageReaction", {
+        chat_id: chatId,
+        message_id: targetMessageId,
+        reaction: reaction ? [{ type: "emoji", emoji: reaction }] : [],
       });
-      let body = {};
-      try {
-        body = await res.json();
-      } catch {}
-      if (!res.ok || !body.ok) {
-        throw new Error(`Telegram setMessageReaction failed: ${body.description ?? res.status}`);
-      }
     }
 
     let messageId = null;
+    const messageIds = [];
     if (text) {
-      const res = await fetch(`${apiBase}/bot${token}/sendMessage`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
+      const chunks = chunkText(text, 4096);
+      for (let i = 0; i < chunks.length; i += 1) {
+        const body = await telegramPost("sendMessage", {
           chat_id: chatId,
-          text,
-          ...(replyToMessageId !== undefined ? { reply_to_message_id: replyToMessageId } : {}),
-        }),
-        signal: AbortSignal.timeout(15_000),
-      });
-      let body = {};
-      try {
-        body = await res.json();
-      } catch {}
-      if (!res.ok || !body.ok) {
-        throw new Error(`Telegram sendMessage failed: ${body.description ?? res.status}`);
+          text: chunks[i],
+          ...(i === 0 && replyToMessageId !== undefined ? { reply_to_message_id: replyToMessageId } : {}),
+        });
+        const id = body.result?.message_id ?? null;
+        if (i === 0) messageId = id;
+        if (id !== null) messageIds.push(id);
       }
-      messageId = body.result?.message_id ?? null;
     }
 
     return {
       ok: true,
       chatId,
       ...(hasReaction ? { reacted: true, reaction, reactedMessageId: targetMessageId } : {}),
-      ...(text ? { messageId } : {}),
+      ...(text
+        ? {
+            messageId,
+            ...(messageIds.length > 1 ? { messageIds, chunks: messageIds.length } : {}),
+          }
+        : {}),
     };
   },
 });
