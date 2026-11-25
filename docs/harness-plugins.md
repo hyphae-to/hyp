@@ -29,14 +29,17 @@ hyp setup --harness claude --plugin --statusline
 hyp setup --harness claude --remove-statusline
 ```
 
-### Visual States (`hyp statusline`)
+### Visual States (`hyp statusline` & Claude native plugin)
 
-- Idle enrolled: `⟁ @alice · 3 subs`
-- Queued items: `⟁ @alice · 3 subs · 2 queued`
-- Focus Mode: `⟁ @alice · FOCUS · 3 subs · 2 queued`
-- Muted: `⟁ @alice · 3 subs · 2 queued · 1 muted` (`muted*` when wildcard `*` is muted)
-- Quarantine alert: `⟁ @alice · 3 subs · !1 gate` (run `hyp gate review` in a terminal)
-- Unenrolled / offline: empty by default (`--when-unenrolled dim` or `--show-offline` to opt in)
+- Idle enrolled: `hyphae @alice · 3 subs`
+- Linked bridge: `hyphae @integration-tests · telegram:personal`
+- Queued items: `hyphae @alice · 3 subs · 2 queued`
+- Focus Mode: `hyphae @alice · 3 subs · 2 queued · focus`
+- Muted: `hyphae @alice · 3 subs · 2 queued · 1 muted` (`muted` when wildcard `*` is muted)
+- Quarantine alert: `hyphae @alice · 3 subs · ⚠ 1 held` (run `hyp gate review` in a terminal)
+- Unenrolled / offline: empty by default (`--when-unenrolled dim` prints `hyphae: idle` / `hyphae: offline`)
+
+> **Claude Code v2.1.287+ tip — pick one status bar:** `hyp setup --harness claude` installs `~/.claude/skills/hyphae-panel/` automatically, which already renders a persistent live status line (`$.ui.status`) whenever your session is enrolled plus the `/hyphae-panel` side panel. You don't need `--statusline` on Claude Code unless you explicitly want shell `statusLine` chaining (for Antigravity CLI `agy` or older Claude Code). Run `hyp setup --harness claude --restore-statusline` if you previously enabled both.
 
 ### Slash Commands & Zero-Token TUI
 

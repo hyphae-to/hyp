@@ -182,7 +182,7 @@ async fn statusline_e2e_hot_path_latency_pill_json_and_quarantine() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let line = stdout.trim();
     assert_eq!(
-        line, "⟁ @alice · 2 subs · 1 queued · focus · 1 muted",
+        line, "hyphae @alice · 2 subs · 1 queued · focus · 1 muted",
         "unexpected statusline pill: {line:?}"
     );
     assert!(
@@ -298,7 +298,7 @@ async fn statusline_e2e_hot_path_latency_pill_json_and_quarantine() {
     )
     .await;
     assert_eq!(agy_out.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&agy_out.stdout).trim(), "⟁ @agybot");
+    assert_eq!(String::from_utf8_lossy(&agy_out.stdout).trim(), "hyphae @agybot");
 
     daemon.stop().await;
 }
@@ -350,7 +350,7 @@ async fn statusline_unenrolled_hide_vs_dim_and_offline() {
     assert_eq!(dimmed.status.code(), Some(0));
     assert_eq!(
         String::from_utf8_lossy(&dimmed.stdout).trim(),
-        "⟁ hyp: idle"
+        "hyphae: idle"
     );
 
     // Offline daemon: hide -> empty stdout; dim -> offline pill; --json -> online: false
@@ -385,7 +385,7 @@ async fn statusline_unenrolled_hide_vs_dim_and_offline() {
     assert_eq!(off_dim.status.code(), Some(0));
     assert_eq!(
         String::from_utf8_lossy(&off_dim.stdout).trim(),
-        "⟁ hyp: offline"
+        "hyphae: offline"
     );
 
     let off_json = run_hyp_with_stdin(
@@ -467,7 +467,7 @@ async fn statusline_chain_file_wrapper_and_fault_isolation() {
         "chained command must receive original stdin bytes: {:?}",
         lines[0]
     );
-    assert_eq!(lines[1], "⟁ @alice");
+    assert_eq!(lines[1], "hyphae @alice");
 
     // 2. Broken / non-zero-exiting chained command MUST NOT break Hyphae output!
     let broken_path = dir.path().join("broken-chain.json");
@@ -489,7 +489,7 @@ async fn statusline_chain_file_wrapper_and_fault_isolation() {
     assert_eq!(resilient.status.code(), Some(0));
     assert_eq!(
         String::from_utf8_lossy(&resilient.stdout).trim(),
-        "⟁ @alice"
+        "hyphae @alice"
     );
 
     // 3. Missing chain file MUST also fail safe and output Hyphae cleanly
@@ -511,7 +511,7 @@ async fn statusline_chain_file_wrapper_and_fault_isolation() {
     assert_eq!(still_ok.status.code(), Some(0));
     assert_eq!(
         String::from_utf8_lossy(&still_ok.stdout).trim(),
-        "⟁ @alice"
+        "hyphae @alice"
     );
 
     daemon.stop().await;
@@ -626,7 +626,7 @@ async fn statusline_security_fuzzing_and_ansi_injection_stripping() {
     .await;
     assert_eq!(plain.status.code(), Some(0));
     let plain_str = String::from_utf8_lossy(&plain.stdout);
-    assert_eq!(plain_str.trim(), "⟁ @evil");
+    assert_eq!(plain_str.trim(), "hyphae @evil");
     assert!(!plain_str.contains('\x1b'));
     assert!(!plain_str.contains("pwn"));
 
@@ -1063,7 +1063,7 @@ async fn ui_non_tty_fallback_tcp_loopback_parity_and_help_flags() {
     )
     .await;
     assert_eq!(sl.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&sl.stdout).trim(), "⟁ @alice");
+    assert_eq!(String::from_utf8_lossy(&sl.stdout).trim(), "hyphae @alice");
 
     // 2. `hyp ui` with non-TTY piped stdout cleanly prints `hyp inspect` output and exits 0 without hanging!
     let ui_out = run_hyp_with_stdin(

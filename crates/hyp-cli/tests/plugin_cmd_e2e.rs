@@ -288,3 +288,110 @@ fn setup_skill_and_plugins_doc_enforce_verified_plugin_manager_contract() {
         );
     }
 }
+
+#[test]
+fn compiled_hyp_plugin_cli_install_verify_tamper_and_remove_e2e() {
+    let bin = env!("CARGO_BIN_EXE_hyp");
+    let root = repo_root();
+    let plugins_dir = root.join("plugins");
+    let tmp = TempDir::new().expect("create temp dir");
+    let state_dir = tmp.path().join("state");
+
+    let run = |args: &[&str]| {
+        std::process::Command::new(bin)
+            .args(args)
+            .env("HYPHAE_SECRET_BACKEND", "file")
+            .env("HOME", tmp.path())
+            .output()
+            .expect("spawn hyp plugin")
+    };
+
+    // 1. `hyp plugin list --json`
+    let list_out = run(&[
+        "plugin",
+        "list",
+        "--state-dir",
+        state_dir.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        list_out.status.success(),
+        "hyp plugin list failed: {}",
+        String::from_utf8_lossy(&list_out.stderr)
+    );
+    let list_json: serde_json::Value =
+        serde_json::from_slice(&list_out.stdout).expect("parse list json");
+    assert_eq!(list_json["ok"], true);
+    assert_eq!(list_json["data"]["plugins"].as_array().map(Vec::len), Some(5));
+
+    // 2. `hyp plugin install telegram --from-dir ./plugins --json`
+    let inst_out = run(&[
+        "plugin",
+        "install",
+        "telegram",
+        "--from-dir",
+        plugins_dir.to_str().unwrap(),
+        "--state-dir",
+        state_dir.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        inst_out.status.success(),
+        "hyp plugin install failed: {}",
+        String::from_utf8_lossy(&inst_out.stderr)
+    );
+    let inst_json: serde_json::Value =
+        serde_json::from_slice(&inst_out.stdout).expect("parse install json");
+    assert_eq!(inst_json["ok"], true);
+    let script_path = inst_json["data"]["plugins"][0]["scriptPath"]
+        .as_str()
+        .expect("scriptPath present");
+    assert!(Path::new(script_path).is_file());
+    assert!(state_dir.join("plugins/sdk/client.mjs").is_file());
+
+    // 3. `hyp plugin verify --json` passes before tamper
+    let ver_ok = run(&[
+        "plugin",
+        "verify",
+        "--state-dir",
+        state_dir.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        ver_ok.status.success(),
+        "hyp plugin verify failed: {}",
+        String::from_utf8_lossy(&ver_ok.stderr)
+    );
+
+    // 4. 1-byte tamper on installed plugin MUST fail `hyp plugin verify` closed!
+    let mut bytes = fs::read(script_path).expect("read installed telegram plugin");
+    bytes.push(b' ');
+    fs::write(script_path, bytes).expect("tamper installed telegram plugin");
+    let ver_bad = run(&[
+        "plugin",
+        "verify",
+        "--state-dir",
+        state_dir.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        !ver_bad.status.success(),
+        "tampered plugin MUST fail hyp plugin verify"
+    );
+
+    // 5. `hyp plugin remove telegram --json` cleans up plugin + unused SDK
+    let rem_out = run(&[
+        "plugin",
+        "remove",
+        "telegram",
+        "--state-dir",
+        state_dir.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        rem_out.status.success(),
+        "hyp plugin remove failed: {}",
+        String::from_utf8_lossy(&rem_out.stderr)
+    );
+    assert!(!Path::new(script_path).exists());
+}

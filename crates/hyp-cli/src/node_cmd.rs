@@ -1720,7 +1720,7 @@ mod plugin_runtime {
                 let mut matched = res.matched;
                 if !res.deduplicated && self.kind == AdapterKind::Bridge {
                     if let Some(daemon) = self.daemon.as_ref().and_then(Weak::upgrade) {
-                        let rendered = render_bridge_cloudevent(&self.plugin_id, to, &event);
+                        let rendered = render_bridge_cloudevent(&event);
                         if let Ok(delivered) = daemon
                             .deliver_bridge_inbound(&self.plugin_id, to, &event.id, &rendered)
                             .await
@@ -1791,39 +1791,77 @@ mod plugin_runtime {
         }
     }
 
-    fn render_bridge_cloudevent(plugin_id: &str, target: &str, event: &ProtoCloudEvent) -> String {
-        let mut header = format!("[{plugin_id}:{target}]");
-        if let Some(ref subj) = event.subject {
-            let trimmed = subj.trim();
-            if !trimmed.is_empty() {
-                header.push_str(&format!(" ({trimmed})"));
+    /// Renders an inbound bridge CloudEvent body without repeating `[plugin:target]`
+    /// (which the delivery packer already puts in the `[hyphae · plugin:target]` header).
+    fn render_bridge_cloudevent(event: &ProtoCloudEvent) -> String {
+        let obj = event.data.as_ref().and_then(Value::as_object);
+        let msg_ref = obj
+            .and_then(|o| o.get("message_id"))
+            .and_then(|v| match v {
+                Value::Number(n) => Some(format!("#{n}")),
+                Value::String(s) if !s.trim().is_empty() => Some(format!("#{}", s.trim())),
+                _ => None,
+            })
+            .or_else(|| {
+                event.subject.as_deref().and_then(|subj| {
+                    let trimmed = subj.trim();
+                    if trimmed.is_empty() {
+                        return None;
+                    }
+                    match trimmed.rsplit_once('/') {
+                        Some((_, tail)) if !tail.is_empty() => Some(format!("#{tail}")),
+                        _ => Some(trimmed.to_string()),
+                    }
+                })
+            });
+
+        if let Some(obj) = obj {
+            if let Some(text) = obj.get("text").and_then(Value::as_str) {
+                let sender = obj
+                    .get("from_username")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|u| format!("@{}", u.trim_start_matches('@')))
+                    .or_else(|| {
+                        obj.get("from_name")
+                            .or_else(|| obj.get("from"))
+                            .or_else(|| obj.get("sender"))
+                            .or_else(|| obj.get("author"))
+                            .or_else(|| obj.get("user"))
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(ToString::to_string)
+                    });
+
+                return match (sender, msg_ref) {
+                    (Some(s), Some(m)) => format!("{s} ({m}): {text}"),
+                    (Some(s), None) => format!("{s}: {text}"),
+                    (None, Some(m)) => format!("({m}) {text}"),
+                    (None, None) => text.to_string(),
+                };
             }
         }
+
         if let Some(ref data) = event.data {
-            if let Some(obj) = data.as_object() {
-                if let Some(text) = obj.get("text").and_then(Value::as_str) {
-                    if let Some(sender) = obj
-                        .get("from")
-                        .or_else(|| obj.get("sender"))
-                        .or_else(|| obj.get("author"))
-                        .or_else(|| obj.get("user"))
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                    {
-                        return format!("{header} {sender}: {text}");
-                    }
-                    return format!("{header} {text}");
-                }
-            }
             if let Some(s) = data.as_str() {
-                return format!("{header} {s}");
+                return match msg_ref {
+                    Some(m) => format!("({m}) {s}"),
+                    None => s.to_string(),
+                };
             }
             if let Ok(compact) = serde_json::to_string(data) {
-                return format!("{header} {compact}");
+                return match msg_ref {
+                    Some(m) => format!("({m}) {compact}"),
+                    None => compact,
+                };
             }
         }
-        format!("{header} {} ({})", event.event_type, event.source)
+        match msg_ref {
+            Some(m) => format!("({m}) {} ({})", event.event_type, event.source),
+            None => format!("{} ({})", event.event_type, event.source),
+        }
     }
 
     pub(super) async fn start_plugins(

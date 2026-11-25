@@ -84,15 +84,16 @@ hyp setup --harness antigravity --statusline
 hyp setup --harness antigravity --restore-statusline
 ```
 
-## Native Claude Code Side Panel (`/hyphae-panel`)
+## Native Claude Code Status & Side Panel (`/hyphae-panel`)
 
-On Claude Code **v2.1.287+**, `hooks/hooks.json` loads the in-process TypeScript/JSX mod (`hooks/register.tsx`) alongside the standard lifecycle shell hooks:
+On Claude Code **v2.1.287+**, `hyp setup --harness claude` automatically installs the UI-only `hyphae-panel` mod under `~/.claude/skills/hyphae-panel/` (activates on your next Claude session):
 
-- Run **`/hyphae-panel`** (or `/hyphae-panel subs|queue|rules|mesh|close`) to open a docked live side panel (`Esc` closes it) showing:
-  - **Header**: active `@handle`, `nodeId`, daemon online state, peer count, `FOCUS` / `MUTED*` badges, and a prominent red `⚠ N quarantined` alert pointing you to `hyp gate review` in your terminal.
-  - **Tabs**: **Subs** (`topic`, `mode`, `originNode`, `filterSummary` + `Unsub`), **Queue** (metadata-only `kind`, `source`, `urgency`, relative age), **Rules** (active mutes + `Unmute`, per-source urgency rules), and **Mesh** (`#channels` + `Leave`, durable wakeup schedules).
-  - **Quick Controls**: toggle Focus Mode, refresh state, toggle the optional compact `AbovePrompt` badge (`/hyphae-panel strip on|off`), or close the panel — all invoking `hyp session ...` with strict argv arrays (never shell string interpolation).
-- **Zero-clutter `AbovePrompt` strip**: stays completely hidden unless Security Gate items are quarantined (`quarantined > 0`) or you explicitly toggle it on.
+- **Single persistent status line (ON by default when enrolled)**: renders a concise native line directly beneath the prompt via `$.ui.status(...)` (e.g. `hyphae @integration-tests · telegram:personal · /hyphae-panel`) with zero changes to your `~/.claude/settings.json` `statusLine` and zero clutter when a session is not enrolled. Silence or re-enable anytime with `/hyphae-panel status off|on`.
+  - *Tip — pick one status bar:* If you use the native `hyphae-panel` plugin on Claude Code v2.1.287+, you don't need `--statusline` (shell `statusLine` chaining is mainly for Antigravity CLI `agy` or older Claude Code versions). If you previously ran `--statusline`, run `hyp setup --harness claude --restore-statusline` to avoid showing two bars.
+- **Interactive side panel (`/hyphae-panel`)**: run `/hyphae-panel` (or `/hyphae-panel subs|queue|rules|mesh|close`) to open the docked live inspector (`Esc` closes it, `1`–`4` switch tabs, `f` toggles Focus Mode, `r` refreshes):
+  - **Header**: active `@handle`, `nodeId`, daemon online state, peer count, linked bridge target, `FOCUS` / `MUTED*` badges, and a prominent red `⚠ N quarantined` alert pointing to `hyp gate review`.
+  - **Tabs**: **Subs** (linked external bridges like `telegram:personal [primary]` + `hyp_stream` subscriptions with `× unsub`), **Queue** (metadata-only `kind`, `source`, `urgency`, relative age), **Rules** (active mutes + `× unmute`, per-source urgency rules), and **Mesh** (`#channels` + `× leave`, durable wakeup schedules).
+- **Emergency-only `AbovePrompt` alert**: stays completely hidden unless Security Gate items are quarantined (`quarantined > 0`).
 - **State projection**: reads Hyphae's atomic metadata-only snapshot at `~/.config/hyphae/ui/state.json` (respecting `HYPHAE_STATE_DIR` and `node.json`'s `stateDir` override) and degrades cleanly when the daemon is offline.
 
 ## Live Inspector & Slash Commands

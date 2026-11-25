@@ -2,6 +2,7 @@ import type { Register } from 'claude-code';
 import {
   buildSessionControlArgs,
   formatNextFire,
+  formatPersistentStatusLine,
   formatRelativeAge,
   getQuarantinedCount,
   parseControlCommandResult,
@@ -25,18 +26,22 @@ const MAX_VISIBLE_ROWS = 12;
 interface PanelUiState {
   tab: PanelTab;
   selectedSessionId: string | null;
-  abovePromptEnabled: boolean;
+  statusEnabled: boolean;
+  lastStatusText: string | undefined;
   notice: { ok: boolean; text: string } | null;
-  refreshTimer: { cancel(): void } | null;
+  paneRefreshTimer: { cancel(): void } | null;
+  statusRefreshTimer: { cancel(): void } | null;
 }
 
 function createInitialState(): PanelUiState {
   return {
     tab: 'subs',
     selectedSessionId: null,
-    abovePromptEnabled: false,
+    statusEnabled: true,
+    lastStatusText: undefined,
     notice: null,
-    refreshTimer: null,
+    paneRefreshTimer: null,
+    statusRefreshTimer: null,
   };
 }
 
@@ -71,28 +76,99 @@ async function loadHyphaeSnapshot(
   return { snapshot: null, stateFile: files[0] ?? null };
 }
 
+function applyStatusText(
+  $: { ui: { status(text: string | undefined): void } },
+  uiState: PanelUiState,
+  nextText: string | undefined,
+): void {
+  if (nextText === uiState.lastStatusText) return;
+  uiState.lastStatusText = nextText;
+  try {
+    $.ui.status(nextText);
+  } catch {
+    // Ignore if host surface does not support status line updates.
+  }
+}
+
+async function syncPersistentStatus(
+  $: {
+    fs: { read(path: string, opts: { as: 'text' }): Promise<unknown> };
+    env: { get(name: string): Promise<string | undefined> };
+    session: { id(): Promise<string> };
+    ui: { status(text: string | undefined): void };
+  },
+  uiState: PanelUiState,
+): Promise<void> {
+  if (!uiState.statusEnabled) {
+    applyStatusText($, uiState, undefined);
+    return;
+  }
+
+  const safeReadText = async (path: string): Promise<string | null> => {
+    try {
+      const res = await $.fs.read(path, { as: 'text' });
+      return typeof res === 'string' ? res : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const [homeDir, envStateDir, envSessionId, claudeSessionId] = await Promise.all([
+    $.env.get('HOME').then((v) => v ?? '').catch(() => ''),
+    $.env.get('HYPHAE_STATE_DIR').catch(() => undefined),
+    $.env.get('HYPHAE_SESSION_ID').catch(() => undefined),
+    $.session.id().catch(() => ''),
+  ]);
+
+  const { snapshot } = await loadHyphaeSnapshot(homeDir, envStateDir, safeReadText);
+  const resolved = resolveActiveSession(
+    snapshot,
+    claudeSessionId,
+    envSessionId,
+    uiState.selectedSessionId,
+  );
+  const quarantined = getQuarantinedCount(snapshot, resolved.active);
+  const line = formatPersistentStatusLine(snapshot, resolved.active, quarantined);
+  applyStatusText($, uiState, line);
+}
+
 export const register: Register = (on) => {
   const uiState = createInitialState();
 
-  const stopRefreshTimer = (): void => {
-    if (uiState.refreshTimer) {
+  const stopTimer = (timer: { cancel(): void } | null): null => {
+    if (timer) {
       try {
-        uiState.refreshTimer.cancel();
+        timer.cancel();
       } catch {
         // Ignore timer already cancelled.
       }
-      uiState.refreshTimer = null;
     }
+    return null;
+  };
+
+  const stopPaneRefreshTimer = (): void => {
+    uiState.paneRefreshTimer = stopTimer(uiState.paneRefreshTimer);
+  };
+
+  const stopStatusRefreshTimer = (): void => {
+    uiState.statusRefreshTimer = stopTimer(uiState.statusRefreshTimer);
   };
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: COMMAND_NAME,
       description:
-        'Open the native Hyphae Mesh side panel (metadata-only inspector & session controls)',
-      argumentHint: '[subs|queue|rules|mesh|strip on|off|close]',
+        'Open the native Hyphae Mesh side panel (metadata-only inspector, bridges & controls)',
+      argumentHint: '[subs|queue|rules|mesh|status on|off|close]',
       immediate: true,
     });
+
+    await syncPersistentStatus($, uiState).catch(() => {});
+    stopStatusRefreshTimer();
+    uiState.statusRefreshTimer = $.clock.every(REFRESH_INTERVAL_MS, () => {
+      void syncPersistentStatus($, uiState).catch(() => {});
+    });
+
     return next(e);
   });
 
@@ -100,16 +176,17 @@ export const register: Register = (on) => {
     const parsed = parsePanelCommandArgs(e.args);
 
     if (parsed.action === 'close') {
-      stopRefreshTimer();
+      stopPaneRefreshTimer();
       await $.ui.close({ id: PANE_ID });
       return { text: 'Closed Hyphae Mesh side panel.', isTextDisplayOnly: true };
     }
 
-    if (parsed.action === 'strip') {
-      uiState.abovePromptEnabled = parsed.enabled;
+    if (parsed.action === 'status') {
+      uiState.statusEnabled = parsed.enabled;
+      await syncPersistentStatus($, uiState).catch(() => {});
       $.ui.invalidate('ui.render');
       return {
-        text: `Hyphae above-prompt badge ${parsed.enabled ? 'enabled' : 'disabled'}.`,
+        text: `Hyphae status indicator ${parsed.enabled ? 'enabled' : 'disabled'}.`,
         isTextDisplayOnly: true,
       };
     }
@@ -126,8 +203,9 @@ export const register: Register = (on) => {
       closeOnEscape: true,
     });
 
-    stopRefreshTimer();
-    uiState.refreshTimer = $.clock.every(REFRESH_INTERVAL_MS, () => {
+    await syncPersistentStatus($, uiState).catch(() => {});
+    stopPaneRefreshTimer();
+    uiState.paneRefreshTimer = $.clock.every(REFRESH_INTERVAL_MS, () => {
       $.ui.invalidate('ui.render');
     });
     $.ui.invalidate('ui.render');
@@ -136,12 +214,14 @@ export const register: Register = (on) => {
   });
 
   on('ui.close', { id: PANE_ID }, async (_$, e, next) => {
-    stopRefreshTimer();
+    stopPaneRefreshTimer();
     return next(e);
   });
 
-  on('session.end', async (_$, e, next) => {
-    stopRefreshTimer();
+  on('session.end', async ($, e, next) => {
+    stopPaneRefreshTimer();
+    stopStatusRefreshTimer();
+    applyStatusText($, uiState, undefined);
     return next(e);
   });
 
@@ -179,6 +259,12 @@ export const register: Register = (on) => {
     const active: SessionSummary | null = resolved.active;
     const quarantined = getQuarantinedCount(snapshot, active);
 
+    // Keep the persistent bottom status line in sync whenever the panel redraws.
+    const statusText = uiState.statusEnabled
+      ? formatPersistentStatusLine(snapshot, active, quarantined)
+      : undefined;
+    applyStatusText($, uiState, statusText);
+
     const runSessionControl = async (
       action: SessionControlAction,
       targetSession: SessionSummary,
@@ -199,20 +285,42 @@ export const register: Register = (on) => {
       $.ui.invalidate('ui.render');
     };
 
+    const closePanel = async (): Promise<void> => {
+      stopPaneRefreshTimer();
+      await $.ui.close({ id: PANE_ID });
+    };
+
     // Offline / missing ui/state.json graceful degradation
     if (!snapshot) {
       return (
         <Box flexDirection="column" paddingX={1} paddingY={1} gap={1}>
           <Box flexDirection="row" justifyContent="space-between" gap={1}>
-            <Text bold color="cyan">
-              Hyphae Mesh
-            </Text>
-            <Text color="yellow">OFFLINE</Text>
+            <Box flexDirection="row" gap={1}>
+              <Text bold color="cyan">
+                hyphae
+              </Text>
+              <Text color="yellow">○ offline</Text>
+            </Box>
+            <Box key="hover-hyphae-close-offline">
+              <Button
+                key="hyphae-close"
+                plain
+                role="dismiss"
+                hover={{ color: 'white' }}
+                onPress={closePanel}
+              >
+                <Text dimColor>× close</Text>
+              </Button>
+            </Box>
           </Box>
-          <Text dimColor>
-            Metadata-only view · untrusted external data · zero bodies or secrets
-          </Text>
-          <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1} gap={0}>
+          <Box
+            flexDirection="column"
+            borderStyle="round"
+            borderDimColor
+            paddingX={1}
+            paddingY={0}
+            gap={0}
+          >
             <Text color="yellow">Hyphae daemon offline or ui/state.json not found.</Text>
             {stateFile ? <Text dimColor>{`Checked: ${sanitizeUiText(stateFile, 96)}`}</Text> : null}
             <Text dimColor>Start your local node with `hyp node start` or check `hyp doctor`.</Text>
@@ -220,26 +328,23 @@ export const register: Register = (on) => {
           {uiState.notice ? (
             <Text color={uiState.notice.ok ? 'green' : 'red'}>{uiState.notice.text}</Text>
           ) : null}
-          <Box flexDirection="row" gap={1}>
-            <Button
-              key="hyphae-refresh"
-              label="Refresh"
-              variant="secondary"
-              onPress={() => {
-                uiState.notice = { ok: true, text: 'Refreshed Hyphae state.' };
-                $.ui.invalidate('ui.render');
-              }}
-            />
-            <Button
-              key="hyphae-close"
-              label="Close"
-              role="dismiss"
-              onPress={async () => {
-                stopRefreshTimer();
-                await $.ui.close({ id: PANE_ID });
-              }}
-            />
+          <Box flexDirection="row" gap={2}>
+            <Box key="hover-hyphae-refresh-offline">
+              <Button
+                key="hyphae-refresh"
+                plain
+                hotkey="r"
+                hover={{ color: 'cyan' }}
+                onPress={() => {
+                  uiState.notice = { ok: true, text: 'Refreshed Hyphae state.' };
+                  $.ui.invalidate('ui.render');
+                }}
+              >
+                <Text dimColor>↻ refresh (r)</Text>
+              </Button>
+            </Box>
           </Box>
+          <Text dimColor>metadata only · untrusted external data · Esc to close</Text>
         </Box>
       );
     }
@@ -250,9 +355,16 @@ export const register: Register = (on) => {
     const peersOnline = daemon?.peersOnline ?? 0;
     const handleLabel = active?.handle ? `@${active.handle}` : active ? 'unenrolled' : 'all sessions';
 
-    const subsCount = active
+    const bridgeCount = active
+      ? Math.max(active.counts.bridges, active.details.bridges.length)
+      : snapshot.sessions.reduce(
+          (acc, s) => acc + Math.max(s.counts.bridges, s.details.bridges.length),
+          0,
+        );
+    const streamSubsCount = active
       ? active.counts.subscriptions
       : snapshot.sessions.reduce((acc, s) => acc + s.counts.subscriptions, 0);
+    const subsCount = bridgeCount + streamSubsCount;
     const queueCount = active
       ? active.counts.queued
       : snapshot.sessions.reduce((acc, s) => acc + s.counts.queued, 0);
@@ -271,7 +383,7 @@ export const register: Register = (on) => {
         const visibleSessions = snapshot.sessions.slice(0, MAX_VISIBLE_ROWS);
         return (
           <Box flexDirection="column" gap={1}>
-            <Text bold>Local Sessions Summary</Text>
+            <Text bold>Local Sessions</Text>
             <Text dimColor>
               No active Claude session matched ({sanitizeUiText(claudeSessionId || 'unbound', 48)}
               ). Select a session below or enroll with hyp_mesh.
@@ -279,80 +391,131 @@ export const register: Register = (on) => {
             {visibleSessions.length === 0 ? (
               <Text dimColor>No registered sessions on this node yet.</Text>
             ) : (
-              visibleSessions.map((sess, idx) => (
-                <Box
-                  key={`sess-row-${idx}`}
-                  flexDirection="row"
-                  justifyContent="space-between"
-                  gap={1}
-                >
-                  <Text>
-                    {`${sess.handle ? `@${sess.handle}` : sess.sessionId} · ${sess.harness} · ${sess.counts.subscriptions}s · ${sess.counts.queued}q${sess.focusMode ? ' · FOCUS' : ''}`}
-                  </Text>
-                  <Button
-                    key={`hyphae-select-${idx}`}
-                    label="Inspect"
-                    variant="secondary"
-                    onPress={() => {
-                      uiState.selectedSessionId = sess.sessionId;
-                      uiState.notice = null;
-                      $.ui.invalidate('ui.render');
-                    }}
-                  />
-                </Box>
-              ))
+              visibleSessions.map((sess, idx) => {
+                const sessSubs = sess.counts.subscriptions + sess.counts.bridges;
+                const bridgeSuffix =
+                  sess.bridges.length > 0 ? ` · ${sess.bridges[0]}` : '';
+                return (
+                  <Box
+                    key={`sess-row-${idx}`}
+                    flexDirection="row"
+                    justifyContent="space-between"
+                    gap={1}
+                  >
+                    <Text>
+                      {`${sess.handle ? `@${sess.handle}` : sess.sessionId} · ${sess.harness}${bridgeSuffix} · ${sessSubs}s · ${sess.counts.queued}q${sess.focusMode ? ' · FOCUS' : ''}`}
+                    </Text>
+                    <Box key={`hover-select-${idx}`}>
+                      <Button
+                        key={`hyphae-select-${idx}`}
+                        plain
+                        hover={{ color: 'cyan' }}
+                        onPress={() => {
+                          uiState.selectedSessionId = sess.sessionId;
+                          uiState.notice = null;
+                          $.ui.invalidate('ui.render');
+                        }}
+                      >
+                        <Text color="cyan">inspect →</Text>
+                      </Button>
+                    </Box>
+                  </Box>
+                );
+              })
             )}
           </Box>
         );
       }
 
       if (uiState.tab === 'subs') {
+        const bridges = active.details.bridges.slice(0, MAX_VISIBLE_ROWS);
         const subs = active.details.subscriptions.slice(0, MAX_VISIBLE_ROWS);
         return (
           <Box flexDirection="column" gap={1}>
-            <Text bold>{`Subscriptions (${active.counts.subscriptions})`}</Text>
-            {subs.length === 0 ? (
-              <Text dimColor>No active stream subscriptions. Use hyp_stream to subscribe.</Text>
-            ) : (
-              subs.map((sub, idx) => {
-                const subId = sub.id || sub.key || sub.topic;
-                const detailLine = [
-                  sub.mode,
-                  sub.originNode,
-                  sub.coalesceSeconds > 0 ? `${sub.coalesceSeconds}s coalesce` : '',
-                  sub.filterSummary ? `filter: ${sub.filterSummary}` : '',
-                ]
-                  .filter(Boolean)
-                  .join(' · ');
-                return (
+            {bridges.length > 0 ? (
+              <Box flexDirection="column" gap={0}>
+                <Text bold>{`Bridges (${bridges.length})`}</Text>
+                {bridges.map((bridge, idx) => (
                   <Box
-                    key={`sub-row-${idx}`}
+                    key={`bridge-row-${idx}`}
                     flexDirection="row"
                     justifyContent="space-between"
                     gap={1}
                   >
-                    <Box flexDirection="column" flexGrow={1}>
+                    <Box flexDirection="row" gap={1}>
+                      <Text color={bridge.role === 'primary' ? 'green' : 'cyan'}>●</Text>
                       <Text bold color="cyan">
-                        {sub.topic}
+                        {bridge.label}
                       </Text>
-                      <Text dimColor>{detailLine}</Text>
                     </Box>
-                    <Button
-                      key={`hyphae-unsub-${idx}`}
-                      label="Unsub"
-                      variant="secondary"
-                      onPress={() =>
-                        runSessionControl(
-                          { kind: 'unsubscribe', id: subId },
-                          active,
-                          `Unsubscribe ${sub.topic}`,
-                        )
-                      }
-                    />
+                    <Box flexDirection="row" gap={1}>
+                      <Text
+                        bold={bridge.role === 'primary'}
+                        color={bridge.role === 'primary' ? 'green' : undefined}
+                        dimColor={bridge.role !== 'primary'}
+                      >
+                        {bridge.role}
+                      </Text>
+                      <Text dimColor>· bridge</Text>
+                    </Box>
                   </Box>
-                );
-              })
-            )}
+                ))}
+              </Box>
+            ) : null}
+
+            <Box flexDirection="column" gap={0}>
+              <Text bold>{`Streams (${active.counts.subscriptions})`}</Text>
+              {subs.length === 0 ? (
+                <Text dimColor>
+                  {bridges.length > 0
+                    ? 'No stream subscriptions · use hyp_stream to subscribe.'
+                    : 'No linked bridges or stream subscriptions. Use hyp_bridge or hyp_stream.'}
+                </Text>
+              ) : (
+                subs.map((sub, idx) => {
+                  const subId = sub.id || sub.key || sub.topic;
+                  const detailLine = [
+                    sub.mode,
+                    sub.originNode,
+                    sub.coalesceSeconds > 0 ? `${sub.coalesceSeconds}s coalesce` : '',
+                    sub.filterSummary ? `filter: ${sub.filterSummary}` : '',
+                  ]
+                    .filter(Boolean)
+                    .join(' · ');
+                  return (
+                    <Box
+                      key={`sub-row-${idx}`}
+                      flexDirection="row"
+                      justifyContent="space-between"
+                      gap={1}
+                    >
+                      <Box flexDirection="column" flexGrow={1}>
+                        <Text bold color="cyan">
+                          {sub.topic}
+                        </Text>
+                        <Text dimColor>{detailLine}</Text>
+                      </Box>
+                      <Box key={`hover-unsub-${idx}`}>
+                        <Button
+                          key={`hyphae-unsub-${idx}`}
+                          plain
+                          hover={{ color: 'red' }}
+                          onPress={() =>
+                            runSessionControl(
+                              { kind: 'unsubscribe', id: subId },
+                              active,
+                              `Unsubscribe ${sub.topic}`,
+                            )
+                          }
+                        >
+                          <Text dimColor>× unsub</Text>
+                        </Button>
+                      </Box>
+                    </Box>
+                  );
+                })
+              )}
+            </Box>
           </Box>
         );
       }
@@ -378,7 +541,7 @@ export const register: Register = (on) => {
                       : 'cyan';
                 return (
                   <Box key={`q-row-${idx}`} flexDirection="row" gap={1}>
-                    <Text color={urgencyColor}>{`[${item.urgency}]`}</Text>
+                    <Text color={urgencyColor}>{item.urgency}</Text>
                     <Text bold>{item.kind}</Text>
                     <Text>{item.source}</Text>
                     {age ? <Text dimColor>{age}</Text> : null}
@@ -414,19 +577,23 @@ export const register: Register = (on) => {
                     justifyContent="space-between"
                     gap={1}
                   >
-                    <Text>{`MUTE ${m.pattern} (${m.scope}${age ? ` · ${age}` : ''})`}</Text>
-                    <Button
-                      key={`hyphae-unmute-${idx}`}
-                      label="Unmute"
-                      variant="secondary"
-                      onPress={() =>
-                        runSessionControl(
-                          { kind: 'unmute', pattern: m.pattern, scope: m.scope },
-                          active,
-                          `Unmute ${m.pattern}`,
-                        )
-                      }
-                    />
+                    <Text>{`mute ${m.pattern} (${m.scope}${age ? ` · ${age}` : ''})`}</Text>
+                    <Box key={`hover-unmute-${idx}`}>
+                      <Button
+                        key={`hyphae-unmute-${idx}`}
+                        plain
+                        hover={{ color: 'cyan' }}
+                        onPress={() =>
+                          runSessionControl(
+                            { kind: 'unmute', pattern: m.pattern, scope: m.scope },
+                            active,
+                            `Unmute ${m.pattern}`,
+                          )
+                        }
+                      >
+                        <Text dimColor>× unmute</Text>
+                      </Button>
+                    </Box>
                   </Box>
                 );
               })
@@ -443,7 +610,7 @@ export const register: Register = (on) => {
         );
       }
 
-      // 'mesh' tab: Channels, Wakeups (metadata-only), and other sessions
+      // 'mesh' tab: Channels, Wakeups (metadata-only), and peer count
       const chanRows =
         active.details.channelEntries.length > 0
           ? active.details.channelEntries.slice(0, MAX_VISIBLE_ROWS)
@@ -473,18 +640,22 @@ export const register: Register = (on) => {
                   gap={1}
                 >
                   <Text>{`${display} (${ch.mode})`}</Text>
-                  <Button
-                    key={`hyphae-leave-${idx}`}
-                    label="Leave"
-                    variant="secondary"
-                    onPress={() =>
-                      runSessionControl(
-                        { kind: 'leave', channel: display },
-                        active,
-                        `Leave ${display}`,
-                      )
-                    }
-                  />
+                  <Box key={`hover-leave-${idx}`}>
+                    <Button
+                      key={`hyphae-leave-${idx}`}
+                      plain
+                      hover={{ color: 'red' }}
+                      onPress={() =>
+                        runSessionControl(
+                          { kind: 'leave', channel: display },
+                          active,
+                          `Leave ${display}`,
+                        )
+                      }
+                    >
+                      <Text dimColor>× leave</Text>
+                    </Button>
+                  </Box>
                 </Box>
               );
             })
@@ -503,21 +674,53 @@ export const register: Register = (on) => {
       );
     };
 
+    const tabs: { id: PanelTab; hotkey: string; label: string }[] = [
+      { id: 'subs', hotkey: '1', label: `Subs ${subsCount}` },
+      { id: 'queue', hotkey: '2', label: `Queue ${queueCount}` },
+      { id: 'rules', hotkey: '3', label: `Rules ${rulesCount}` },
+      { id: 'mesh', hotkey: '4', label: `Mesh ${meshCount}` },
+    ];
+
+    const headerBridgeText =
+      active && active.bridges.length > 0
+        ? active.bridges.length === 1
+          ? active.bridges[0]
+          : `${active.bridges[0]} +${active.bridges.length - 1}`
+        : null;
+
     return (
       <Box flexDirection="column" paddingX={1} paddingY={1} gap={1}>
         {/* Header */}
         <Box flexDirection="column" gap={0}>
           <Box flexDirection="row" justifyContent="space-between" gap={1}>
-            <Text bold color="cyan">
-              {`Hyphae · ${handleLabel}`}
-            </Text>
-            <Text color={daemonOnline ? 'green' : 'yellow'}>
-              {daemonOnline ? `ONLINE · ${nodeId}` : `OFFLINE · ${nodeId}`}
-            </Text>
+            <Box flexDirection="row" gap={1}>
+              <Text bold color="cyan">
+                hyphae
+              </Text>
+              <Text dimColor>·</Text>
+              <Text bold>{handleLabel}</Text>
+            </Box>
+            <Box flexDirection="row" gap={1}>
+              <Text color={daemonOnline ? 'green' : 'yellow'}>
+                {daemonOnline ? `● online · ${nodeId}` : `○ offline · ${nodeId}`}
+              </Text>
+              <Box key="hover-hyphae-close">
+                <Button
+                  key="hyphae-close"
+                  plain
+                  role="dismiss"
+                  hover={{ color: 'white' }}
+                  onPress={closePanel}
+                >
+                  <Text dimColor> ×</Text>
+                </Button>
+              </Box>
+            </Box>
           </Box>
-          <Box flexDirection="row" gap={1}>
+          <Box flexDirection="row" gap={1} flexWrap="wrap">
             <Text dimColor>{`${peersOnline} peers`}</Text>
             {active?.transportKind ? <Text dimColor>{`· ${active.transportKind}`}</Text> : null}
+            {headerBridgeText ? <Text color="cyan">{`· ${headerBridgeText}`}</Text> : null}
             {active?.focusMode ? (
               <Text bold color="yellow">
                 · FOCUS
@@ -532,7 +735,6 @@ export const register: Register = (on) => {
               <Text dimColor>{`· ${active.counts.mutedArchived} muted-archived`}</Text>
             ) : null}
           </Box>
-          <Text dimColor>Untrusted external mesh metadata · zero message bodies or secrets</Text>
         </Box>
 
         {/* Red Quarantine Alert (STRICTLY human-CLI-only — NEVER an approve/reject button!) */}
@@ -547,60 +749,88 @@ export const register: Register = (on) => {
           </Box>
         ) : null}
 
-        {/* Interactive Quick Controls */}
-        <Box flexDirection="row" gap={1} flexWrap="wrap">
+        {/* Sleek Borderless Controls (zero [ ... ] brackets) */}
+        <Box flexDirection="row" gap={2} flexWrap="wrap">
           {active ? (
-            <Button
-              key="hyphae-toggle-focus"
-              label={active.focusMode ? 'Focus: ON' : 'Focus: OFF'}
-              variant={active.focusMode ? 'primary' : 'secondary'}
-              onPress={() =>
-                runSessionControl(
-                  { kind: 'focus', enabled: !active.focusMode },
-                  active,
-                  active.focusMode ? 'Focus OFF' : 'Focus ON',
-                )
-              }
-            />
+            <Box key="hover-hyphae-focus">
+              <Button
+                key="hyphae-toggle-focus"
+                plain
+                hotkey="f"
+                hover={{ color: 'yellow' }}
+                onPress={() =>
+                  runSessionControl(
+                    { kind: 'focus', enabled: !active.focusMode },
+                    active,
+                    active.focusMode ? 'Focus OFF' : 'Focus ON',
+                  )
+                }
+              >
+                <Text
+                  bold={active.focusMode}
+                  color={active.focusMode ? 'yellow' : undefined}
+                  dimColor={!active.focusMode}
+                >
+                  {active.focusMode ? '● focus on (f)' : '○ focus (f)'}
+                </Text>
+              </Button>
+            </Box>
           ) : null}
-          <Button
-            key="hyphae-refresh"
-            label="Refresh"
-            variant="secondary"
-            onPress={() => {
-              uiState.notice = { ok: true, text: 'Refreshed Hyphae metadata.' };
-              $.ui.invalidate('ui.render');
-            }}
-          />
-          <Button
-            key="hyphae-toggle-strip"
-            label={uiState.abovePromptEnabled ? 'Strip: ON' : 'Strip: OFF'}
-            variant="secondary"
-            onPress={() => {
-              uiState.abovePromptEnabled = !uiState.abovePromptEnabled;
-              $.ui.invalidate('ui.render');
-            }}
-          />
-          {uiState.selectedSessionId ? (
+          <Box key="hover-hyphae-refresh">
             <Button
-              key="hyphae-all-sessions"
-              label="All Sessions"
-              variant="secondary"
+              key="hyphae-refresh"
+              plain
+              hotkey="r"
+              hover={{ color: 'cyan' }}
               onPress={() => {
-                uiState.selectedSessionId = null;
+                uiState.notice = { ok: true, text: 'Refreshed Hyphae metadata.' };
                 $.ui.invalidate('ui.render');
               }}
-            />
+            >
+              <Text dimColor>↻ refresh (r)</Text>
+            </Button>
+          </Box>
+          <Box key="hover-hyphae-status">
+            <Button
+              key="hyphae-toggle-status"
+              plain
+              hover={{ color: 'cyan' }}
+              onPress={() => {
+                uiState.statusEnabled = !uiState.statusEnabled;
+                applyStatusText(
+                  $,
+                  uiState,
+                  uiState.statusEnabled
+                    ? formatPersistentStatusLine(snapshot, active, quarantined)
+                    : undefined,
+                );
+                uiState.notice = {
+                  ok: true,
+                  text: `Status indicator ${uiState.statusEnabled ? 'ON' : 'OFF'}.`,
+                };
+                $.ui.invalidate('ui.render');
+              }}
+            >
+              <Text color={uiState.statusEnabled ? 'green' : undefined} dimColor={!uiState.statusEnabled}>
+                {uiState.statusEnabled ? '● status' : '○ status'}
+              </Text>
+            </Button>
+          </Box>
+          {uiState.selectedSessionId ? (
+            <Box key="hover-hyphae-all-sessions">
+              <Button
+                key="hyphae-all-sessions"
+                plain
+                hover={{ color: 'cyan' }}
+                onPress={() => {
+                  uiState.selectedSessionId = null;
+                  $.ui.invalidate('ui.render');
+                }}
+              >
+                <Text dimColor>← all sessions</Text>
+              </Button>
+            </Box>
           ) : null}
-          <Button
-            key="hyphae-close"
-            label="Close"
-            role="dismiss"
-            onPress={async () => {
-              stopRefreshTimer();
-              await $.ui.close({ id: PANE_ID });
-            }}
-          />
         </Box>
 
         {/* Action Feedback */}
@@ -608,56 +838,55 @@ export const register: Register = (on) => {
           <Text color={uiState.notice.ok ? 'green' : 'red'}>{uiState.notice.text}</Text>
         ) : null}
 
-        {/* Section Tabs */}
+        {/* Underlined Tab Bar (zero [ ... ] brackets) */}
         {active ? (
-          <Box flexDirection="row" gap={1} flexWrap="wrap">
-            <Button
-              key="hyphae-tab-subs"
-              label={`Subs (${subsCount})`}
-              variant={uiState.tab === 'subs' ? 'primary' : 'secondary'}
-              onPress={() => {
-                uiState.tab = 'subs';
-                $.ui.invalidate('ui.render');
-              }}
-            />
-            <Button
-              key="hyphae-tab-queue"
-              label={`Queue (${queueCount})`}
-              variant={uiState.tab === 'queue' ? 'primary' : 'secondary'}
-              onPress={() => {
-                uiState.tab = 'queue';
-                $.ui.invalidate('ui.render');
-              }}
-            />
-            <Button
-              key="hyphae-tab-rules"
-              label={`Rules (${rulesCount})`}
-              variant={uiState.tab === 'rules' ? 'primary' : 'secondary'}
-              onPress={() => {
-                uiState.tab = 'rules';
-                $.ui.invalidate('ui.render');
-              }}
-            />
-            <Button
-              key="hyphae-tab-mesh"
-              label={`Mesh (${meshCount})`}
-              variant={uiState.tab === 'mesh' ? 'primary' : 'secondary'}
-              onPress={() => {
-                uiState.tab = 'mesh';
-                $.ui.invalidate('ui.render');
-              }}
-            />
+          <Box flexDirection="row" gap={2} flexWrap="wrap">
+            {tabs.map((tab) => {
+              const isActive = uiState.tab === tab.id;
+              return (
+                <Box key={`hover-tab-${tab.id}`}>
+                  <Button
+                    key={`hyphae-tab-${tab.id}`}
+                    plain
+                    hotkey={tab.hotkey}
+                    hover={{ color: 'cyan' }}
+                    onPress={() => {
+                      uiState.tab = tab.id;
+                      $.ui.invalidate('ui.render');
+                    }}
+                  >
+                    <Text
+                      bold={isActive}
+                      underline={isActive}
+                      color={isActive ? 'cyan' : undefined}
+                      dimColor={!isActive}
+                    >
+                      {tab.label}
+                    </Text>
+                  </Button>
+                </Box>
+              );
+            })}
           </Box>
         ) : null}
 
         {/* Tab Content */}
-        <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1} paddingY={0}>
+        <Box
+          flexDirection="column"
+          borderStyle="round"
+          borderDimColor
+          paddingX={1}
+          paddingY={0}
+        >
           {renderTabBody()}
         </Box>
+
+        <Text dimColor>metadata only · untrusted external data · Esc to close</Text>
       </Box>
     );
   });
 
+  // Emergency-only AbovePrompt banner: 100% hidden unless Security Gate has quarantined items.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const safeReadText = async (path: string): Promise<string | null> => {
       try {
@@ -682,26 +911,23 @@ export const register: Register = (on) => {
       envSessionId,
       uiState.selectedSessionId,
     );
-    const active = resolved.active;
-    const quarantined = getQuarantinedCount(snapshot, active);
+    const quarantined = getQuarantinedCount(snapshot, resolved.active);
 
-    // Zero-clutter default: hide completely unless quarantined > 0 or user opted in.
-    if (quarantined === 0 && !uiState.abovePromptEnabled) {
+    if (quarantined === 0) {
       return next(e);
     }
 
     const { Box, Text, Button } = $.ui.resolve(e);
-
-    if (quarantined > 0) {
-      return (
-        <Box flexDirection="row" gap={1} paddingX={1}>
-          <Text bold color="red">
-            {`⚠ Hyphae: ${quarantined} quarantined — run \`hyp gate review\` in terminal`}
-          </Text>
+    return (
+      <Box flexDirection="row" gap={1} paddingX={1}>
+        <Text bold color="red">
+          {`⚠ hyphae: ${quarantined} quarantined — run \`hyp gate review\` in terminal`}
+        </Text>
+        <Box key="hover-hyphae-strip-open">
           <Button
             key="hyphae-strip-open"
-            label="Panel"
             plain
+            hover={{ color: 'white' }}
             onPress={async () => {
               await $.ui.open({
                 id: PANE_ID,
@@ -710,33 +936,10 @@ export const register: Register = (on) => {
                 closeOnEscape: true,
               });
             }}
-          />
+          >
+            <Text color="cyan">open panel →</Text>
+          </Button>
         </Box>
-      );
-    }
-
-    const summary = active
-      ? `Hyphae ${active.handle ? `@${active.handle}` : active.sessionId} · ${active.counts.subscriptions}s · ${active.counts.queued}q${active.focusMode ? ' · FOCUS' : ''}`
-      : snapshot
-        ? `Hyphae · ${snapshot.daemon?.nodeId ?? 'local'} · ${snapshot.sessions.length} sessions`
-        : 'Hyphae · offline';
-
-    return (
-      <Box flexDirection="row" gap={1} paddingX={1}>
-        <Text color="cyan">{summary}</Text>
-        <Button
-          key="hyphae-strip-open"
-          label="Panel"
-          plain
-          onPress={async () => {
-            await $.ui.open({
-              id: PANE_ID,
-              title: 'Hyphae Mesh',
-              focus: true,
-              closeOnEscape: true,
-            });
-          }}
-        />
       </Box>
     );
   });

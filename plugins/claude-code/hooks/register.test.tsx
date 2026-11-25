@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing';
 import {
   buildSessionControlArgs,
+  formatPersistentStatusLine,
   parseSnapshotJson,
   resolveUiStateCandidates,
   sanitizeUiText,
@@ -114,8 +115,10 @@ function makeRichSnapshotJson(overrides?: {
         focusMode,
         focusAllowInterruptVips: true,
         mutedAll: false,
+        bridges: [adv ? `${escRed}telegram:personal${bidiTrap}${escReset}` : 'telegram:personal'],
         counts: {
           subscriptions: 1,
+          bridges: 1,
           queued: 2,
           unnotified: 1,
           quarantined,
@@ -133,6 +136,15 @@ function makeRichSnapshotJson(overrides?: {
           sources: ['bob@peer'],
         },
         details: {
+          bridges: [
+            {
+              plugin: 'telegram',
+              target: adv ? `${oscTrap}personal${bidiTrap}` : 'personal',
+              label: adv ? `${escRed}telegram:personal${bidiTrap}${escReset}` : 'telegram:personal',
+              role: 'primary',
+              ...(adv ? { token: 'BRIDGE_TOKEN_LEAK' } : {}),
+            },
+          ],
           subscriptions: [
             {
               id: adv ? '-rf; $(whoami) | cat /etc/passwd' : 'sub-ci-1',
@@ -328,16 +340,29 @@ describe('hyphae pure state & security helpers', () => {
 });
 
 describe('hyphae native Claude Code side-panel mod', () => {
-  test('registers /hyphae-panel on session.start and opens/closes the side panel', async ($, on) => {
+  test('registers /hyphae-panel on session.start, enables live status by default, and opens/closes panel', async ($, on) => {
     const registered: { name: string; immediate?: boolean }[] = [];
     const opened: { id: string; title?: string; focus?: boolean; closeOnEscape?: boolean }[] = [];
     const closed: string[] = [];
+    const statusUpdates: (string | undefined)[] = [];
 
     mock.clock(on, { now: 1_700_000_000_000 });
+    mock.env(on, { HOME: '/fake-home' });
+    on('session.id', () => ({ value: 'sess-42' }));
+    on('fs.read', (_$, e) => {
+      if (e.path === '/fake-home/.config/hyphae/ui/state.json') {
+        return { value: makeRichSnapshotJson({ sessionId: 'claude:sess-42', focusMode: true }) };
+      }
+      return { deny: 'ENOENT' };
+    });
     on('session.start', (_$, e) => ({ cwd: e.cwd }));
     on('command.register', (_$, e) => {
       registered.push({ name: e.name, immediate: e.immediate });
       return { value: { command: e.name } };
+    });
+    on('ui.status', (_$, e) => {
+      statusUpdates.push(e.text);
+      return { value: undefined };
     });
     on('ui.open', (_$, e) => {
       opened.push({
@@ -356,6 +381,26 @@ describe('hyphae native Claude Code side-panel mod', () => {
 
     await $.session.start({ cwd: '/workspace', surface: 'terminal', isInteractive: true });
     expect(registered).toEqual([{ name: 'hyphae-panel', immediate: true }]);
+    expect(statusUpdates[statusUpdates.length - 1]).toBe(
+      'hyphae @alice · telegram:personal · 1 sub · 2 queued · FOCUS · 1 muted · /hyphae-panel',
+    );
+
+    // Users can silence and re-enable the native status line via `/hyphae-panel status off|on`.
+    await $.command.run({
+      command: 'hyphae-panel',
+      args: 'status off',
+      origin: { kind: 'composer' },
+      presentation: { isFullscreen: false, columns: 120 },
+    });
+    expect(statusUpdates[statusUpdates.length - 1]).toBeUndefined();
+
+    await $.command.run({
+      command: 'hyphae-panel',
+      args: 'status on',
+      origin: { kind: 'composer' },
+      presentation: { isFullscreen: false, columns: 120 },
+    });
+    expect(statusUpdates[statusUpdates.length - 1]).toContain('hyphae @alice · telegram:personal');
 
     await $.command.run({
       command: 'hyphae-panel',
@@ -394,6 +439,7 @@ describe('hyphae native Claude Code side-panel mod', () => {
     mock.env(on, { HOME: '/fake-home', HYPHAE_STATE_DIR: '/custom-state' });
     on('session.id', () => ({ value: 'sess-42' }));
     on('ui.invalidate', () => ({ value: undefined }));
+    on('ui.status', () => ({ value: undefined }));
     on('fs.read', (_$, e) => {
       if (e.path === '/custom-state/ui/state.json') {
         return { value: stateJson };
@@ -443,16 +489,21 @@ describe('hyphae native Claude Code side-panel mod', () => {
       return joined;
     };
 
-    // Tab 1: Subscriptions (default)
+    // Tab 1: Bridges + Streams (default)
     const subsText = checkInvariants(await mounted.drawn());
     expect(subsText).toContain('@alice');
-    expect(subsText).toContain('ONLINE · laptop');
+    expect(subsText).toContain('● online · laptop');
     expect(subsText).toContain('FOCUS');
     expect(subsText).toContain('⚠ 2 quarantined items');
     expect(subsText).toContain('hyp gate review');
-    expect(subsText).toContain('Untrusted external mesh metadata');
+    expect(subsText).toContain('untrusted external data');
+    expect(subsText).toContain('Subs 2');
+    expect(subsText).toContain('Bridges (1)');
+    expect(subsText).toContain('telegram:personal');
+    expect(subsText).toContain('primary');
     expect(subsText).toContain('ci.builds');
     expect(subsText).toContain('branch=main');
+    expect(subsText).not.toContain('BRIDGE_TOKEN_LEAK');
 
     // Tab 2: Queue (metadata only)
     await mounted.press({ key: 'hyphae-tab-queue' });
@@ -491,6 +542,7 @@ describe('hyphae native Claude Code side-panel mod', () => {
     mock.env(on, { HOME: '/empty-home' });
     on('session.id', () => ({ value: 'sess-offline' }));
     on('ui.invalidate', () => ({ value: undefined }));
+    on('ui.status', () => ({ value: undefined }));
     on('ui.close', (_$, e) => {
       closed.push(e.id);
       return { value: undefined };
@@ -512,7 +564,7 @@ describe('hyphae native Claude Code side-panel mod', () => {
     });
 
     const text = collectStrings(await mounted.drawn()).join('\n');
-    expect(text).toContain('OFFLINE');
+    expect(text).toContain('offline');
     expect(text).toContain('hyp node start');
     expect(text).toContain('untrusted external data');
 
@@ -521,7 +573,7 @@ describe('hyphae native Claude Code side-panel mod', () => {
     await mounted.press({ key: 'hyphae-refresh' });
     await mounted.redraw(PANE_PROPS);
     const malformedText = collectStrings(await mounted.drawn()).join('\n');
-    expect(malformedText).toContain('OFFLINE');
+    expect(malformedText).toContain('offline');
 
     await mounted.press({ key: 'hyphae-close' });
     expect(closed).toEqual(['hyphae-panel']);
@@ -536,6 +588,7 @@ describe('hyphae native Claude Code side-panel mod', () => {
     mock.env(on, { HOME: '/fake-home' });
     on('session.id', () => ({ value: 'unregistered-99' }));
     on('ui.invalidate', () => ({ value: undefined }));
+    on('ui.status', () => ({ value: undefined }));
     on('fs.read', (_$, e) => {
       if (e.path === '/fake-home/.config/hyphae/node.json') {
         return { value: JSON.stringify({ stateDir: '~/my-state' }) };
@@ -556,7 +609,7 @@ describe('hyphae native Claude Code side-panel mod', () => {
     });
 
     const summaryText = collectStrings(await mounted.drawn()).join('\n');
-    expect(summaryText).toContain('Local Sessions Summary');
+    expect(summaryText).toContain('Local Sessions');
     expect(summaryText).toContain('@alice');
     expect(summaryText).toContain('@builder');
 
@@ -564,7 +617,8 @@ describe('hyphae native Claude Code side-panel mod', () => {
     await mounted.press({ key: 'hyphae-select-0' });
     await mounted.redraw(PANE_PROPS);
     const inspectedText = collectStrings(await mounted.drawn()).join('\n');
-    expect(inspectedText).toContain('Subscriptions (1)');
+    expect(inspectedText).toContain('Streams (1)');
+    expect(inspectedText).toContain('telegram:personal');
     expect(inspectedText).toContain('ci.builds');
 
     await mounted.unmount();
@@ -582,6 +636,7 @@ describe('hyphae native Claude Code side-panel mod', () => {
     mock.env(on, { HOME: '/fake-home' });
     on('session.id', () => ({ value: 'sess-42' }));
     on('ui.invalidate', () => ({ value: undefined }));
+    on('ui.status', () => ({ value: undefined }));
     on('fs.read', (_$, e) => {
       if (e.path === '/fake-home/.config/hyphae/ui/state.json') {
         return { value: stateJson };
@@ -642,7 +697,7 @@ describe('hyphae native Claude Code side-panel mod', () => {
     await mounted.unmount();
   });
 
-  test('AbovePrompt strip stays hidden by default and surfaces quarantine warning when > 0', async ($, on) => {
+  test('AbovePrompt stays strictly hidden unless quarantined > 0, and formatPersistentStatusLine hides unenrolled', async ($, on) => {
     let quarantinedCount = 0;
     const opened: string[] = [];
 
@@ -650,6 +705,7 @@ describe('hyphae native Claude Code side-panel mod', () => {
     mock.env(on, { HOME: '/fake-home' });
     on('session.id', () => ({ value: 'sess-42' }));
     on('ui.invalidate', () => ({ value: undefined }));
+    on('ui.status', () => ({ value: undefined }));
     on('ui.open', (_$, e) => {
       opened.push(e.id);
       return { value: { isPlaced: true } };
@@ -667,7 +723,11 @@ describe('hyphae native Claude Code side-panel mod', () => {
       return { deny: 'ENOENT' };
     });
 
-    // Zero clutter when quarantined === 0 and strip not explicitly enabled
+    // Pure status-line helper stays hidden when unenrolled and has zero alerts
+    expect(formatPersistentStatusLine(null, null, 0)).toBeUndefined();
+    expect(formatPersistentStatusLine(null, null, 2)).toContain('⚠ hyphae: 2 held');
+
+    // Zero clutter in AbovePrompt whenever quarantined === 0
     const cleanMount = await $.ui.mount({
       plugin: 'hyphae',
       surface: 'terminal',
@@ -679,33 +739,7 @@ describe('hyphae native Claude Code side-panel mod', () => {
     expect(await cleanMount.keepsBeneath()).toBe(true);
     await cleanMount.unmount();
 
-    // User can opt in via `/hyphae-panel strip on` and opt back out via `strip off`
-    await $.command.run({
-      command: 'hyphae-panel',
-      args: 'strip on',
-      origin: { kind: 'composer' },
-      presentation: { isFullscreen: false, columns: 120 },
-    });
-    const optInMount = await $.ui.mount({
-      plugin: 'hyphae',
-      surface: 'terminal',
-      component: 'AbovePrompt',
-      requestId: 'hyphae-above-prompt',
-      props: ABOVE_PROMPT_PROPS,
-      viewport: VIEWPORT,
-    });
-    expect(await optInMount.keepsBeneath()).toBe(false);
-    expect(collectStrings(await optInMount.drawn()).join('\n')).toContain('Hyphae @alice');
-    await optInMount.unmount();
-
-    await $.command.run({
-      command: 'hyphae-panel',
-      args: 'strip off',
-      origin: { kind: 'composer' },
-      presentation: { isFullscreen: false, columns: 120 },
-    });
-
-    // When quarantined > 0, renders 1-line red warning + Panel opener button
+    // When quarantined > 0, renders 1-line red emergency warning + plain panel opener
     quarantinedCount = 3;
     const alertMount = await $.ui.mount({
       plugin: 'hyphae',

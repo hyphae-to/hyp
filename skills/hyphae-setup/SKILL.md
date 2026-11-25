@@ -70,8 +70,8 @@ Ask **2 crisp questions** tailored to what Turn 0 detected (never write files be
 1. **Coding harnesses & optional UI components to enable**:
    - **Harnesses**: Which detected harnesses should Hyphae wire? (`auto` for all detected, `all` for all 9, or a comma-separated subset of `antigravity,claude,codex,cursor,opencode,gemini,openclaw,herdr,t3`.)
    - **Runtime skills (`hyphae/SKILL.md`)**: On by default (tailored per harness/orchestrator); pass `--no-skills` to keep MCP & hooks only.
-   - **Live `statusLine`** (`--statusline` for **Claude Code** & **Antigravity CLI**): Shows live unread/focus/mesh badge in the CLI status bar, **non-destructively chaining** any existing custom `statusLine` into a `0600` backup (reversible anytime with `--restore-statusline`).
-   - **Claude Code slash commands & auto-installed native side-panel mod (`/hyphae-panel`)**: Standalone slash commands (`/hyphae`, `/hyphae-subs`, `/hyphae-focus`, `/hyphae-mute`, plus `!hyp ui`) install under `~/.claude/commands/` AND the UI-only Claude Code native side-panel mod (`/hyphae-panel`) auto-installs into `~/.claude/skills/hyphae-panel/` (and `$CLAUDE_CONFIG_DIR/skills/hyphae-panel/` if not symlinked) alongside `plugins/claude-code/`. Pass `--no-commands` to skip both.
+   - **Claude Code native plugin & slash commands (recommended — ON by default)**: Installs `/hyphae`, `/hyphae-subs`, `/hyphae-focus`, `/hyphae-mute` under `~/.claude/commands/` AND the UI-only Claude Code native plugin (`hyphae-panel`) under `~/.claude/skills/hyphae-panel/` (and `$CLAUDE_CONFIG_DIR/skills/hyphae-panel/` if not symlinked). On Claude Code v2.1.287+, the plugin provides **both** a persistent live status indicator beneath the prompt (ON automatically when enrolled) and the interactive `/hyphae-panel` side panel with zero changes to `settings.json` `statusLine`. Pass `--no-commands` to skip both.
+   - **Shell `statusLine`** (`--statusline` — recommended for **Antigravity CLI**, optional fallback on Claude Code < v2.1.287): Non-destructively chains any existing custom `statusLine` into a `0600` backup (reversible anytime with `--restore-statusline`). Avoid enabling **both** `--statusline` and `hyphae-panel` on Claude Code v2.1.287+ so you don't see two status bars.
    - **`CLAUDE_CONFIG_DIR` profiles**: `hyp setup` / `hyp onboard` automatically respects `CLAUDE_CONFIG_DIR` (and `--claude-config-dir <DIR>` for extra profiles) without breaking dotfiles symlinks (`settings.json`, `skills`, etc.).
    - **Native Herdr desktop mod** (`--mod` when Herdr is selected): Installs `hyphae-pane` + `hyphae-panel` into `~/.config/herdr-app` (symlink-safe; respects git-tracked layouts and custom pane headers — use `--clone-layout <name>` for a ready-made layout or import reusable `pill.js` into custom pane headers).
 2. **Mesh topology**:
@@ -225,14 +225,14 @@ Identify what the user wants to change and execute only the targeted workflow:
   hyp setup --interactive                                        # TTY toggle checklist for harnesses & plugins
   ```
   Valid harness names: `antigravity`, `claude`, `codex`, `cursor`, `opencode`, `gemini`, `openclaw`, `herdr`, `t3` (or `auto`, `all`).
-- **Live `statusLine` for Claude Code & Antigravity CLI** (non-destructively chains any existing custom `statusLine` into a `0600` backup):
+- **Claude Code native plugin (`hyphae-panel`), slash commands & `CLAUDE_CONFIG_DIR` profiles**:
+  - Standalone commands (`/hyphae`, `/hyphae-subs`, `/hyphae-focus`, `/hyphae-mute`, plus `!hyp ui`) install into `~/.claude/commands/` and the UI-only native plugin (`hyphae-panel`) auto-installs into `~/.claude/skills/hyphae-panel/` (and `$CLAUDE_CONFIG_DIR/skills/hyphae-panel/` if not symlinked) — giving Claude Code v2.1.287+ both a persistent live status indicator beneath the prompt (ON by default when enrolled; toggleable via `/hyphae-panel status off|on`) and the `/hyphae-panel` side panel. Pass `--no-commands` to skip both.
+  - `hyp setup` automatically respects `CLAUDE_CONFIG_DIR` (and `--claude-config-dir <DIR>` for extra profiles) while preserving dotfiles symlinks.
+- **Shell `statusLine`** (recommended for **Antigravity CLI**, optional shell fallback for Claude Code < v2.1.287 — avoid running alongside `hyphae-panel` on modern Claude Code):
   ```sh
-  hyp setup --harness claude,antigravity --statusline --json
+  hyp setup --harness antigravity --statusline --json
   hyp setup --harness claude,antigravity --restore-statusline --json   # cleanly restore original bar
   ```
-- **Claude Code slash commands, `CLAUDE_CONFIG_DIR` profiles & native side-panel mod**:
-  - Standalone commands (`/hyphae`, `/hyphae-subs`, `/hyphae-focus`, `/hyphae-mute`, plus `!hyp ui`) install into `~/.claude/commands/` and the UI-only native side-panel mod (`/hyphae-panel`) auto-installs into `~/.claude/skills/hyphae-panel/` (and `$CLAUDE_CONFIG_DIR/skills/hyphae-panel/` if not symlinked) alongside `plugins/claude-code/`. Pass `--no-commands` to skip both.
-  - `hyp setup` automatically respects `CLAUDE_CONFIG_DIR` (and `--claude-config-dir <DIR>` for extra profiles) while preserving dotfiles symlinks.
 - **Native Herdr desktop mod** (`hyphae-pane` + `hyphae-panel`, symlink-safe):
   ```sh
   hyp setup --harness herdr --mod --json

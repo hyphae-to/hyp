@@ -3958,6 +3958,7 @@ impl LocalDaemonInner {
         } else {
             "reader"
         };
+        self.bump_ui_rev();
         Ok(json!({
             "linked": true,
             "plugin": plugin,
@@ -4021,6 +4022,7 @@ impl LocalDaemonInner {
             }
         };
 
+        self.bump_ui_rev();
         Ok(json!({
             "removed": removed > 0,
             "removedCount": removed,
@@ -4098,6 +4100,7 @@ impl LocalDaemonInner {
             (target_session, current.map(|h| h.session_id))
         };
 
+        self.bump_ui_rev();
         Ok(json!({
             "handoff": true,
             "plugin": plugin,
@@ -6151,7 +6154,17 @@ impl LocalDaemonInner {
         let herdr_created_ms = self.session_herdr_created_ms(sess);
         let transport_kind = self.active_transport_kind(&sess.id);
 
-        let (policy, digest, muted_archived, mutes, subs, channel_pairs, wakeups, queued_meta) = {
+        let (
+            policy,
+            digest,
+            muted_archived,
+            mutes,
+            subs,
+            bridge_entries,
+            channel_pairs,
+            wakeups,
+            queued_meta,
+        ) = {
             let db = self.node.db();
             let policy = self.delivery.policy(&db, &sess.id).unwrap_or_default();
             let digest = db.local().unread_digest(&sess.id).unwrap_or_default();
@@ -6161,6 +6174,21 @@ impl LocalDaemonInner {
                 .events()
                 .list_subscriptions(Some(&sess.id))
                 .unwrap_or_default();
+            let bridge_links = db
+                .local()
+                .bridge_links_for_session(&sess.id)
+                .unwrap_or_default();
+            let mut bridge_entries: Vec<(String, String, bool)> =
+                Vec::with_capacity(bridge_links.len());
+            for link in bridge_links {
+                let is_primary = db
+                    .local()
+                    .get_plugin_target(&link.plugin, &link.target)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|h| h.session_id == sess.id);
+                bridge_entries.push((link.plugin, link.target, is_primary));
+            }
             let channel_pairs = match address.as_deref() {
                 Some(addr) => db
                     .channels()
@@ -6185,6 +6213,7 @@ impl LocalDaemonInner {
                 muted_archived,
                 mutes,
                 subs,
+                bridge_entries,
                 channel_pairs,
                 wakeups,
                 queued_meta,
@@ -6199,6 +6228,12 @@ impl LocalDaemonInner {
 
         let mut sources = digest.sources;
         sources.truncate(MAX_SUMMARY_SOURCES);
+
+        let compact_bridges: Vec<String> = bridge_entries
+            .iter()
+            .take(8)
+            .map(|(plugin, target, _)| format!("{plugin}:{target}"))
+            .collect();
 
         let mut obj = Map::new();
         obj.insert("sessionId".into(), json!(sess.id));
@@ -6218,10 +6253,12 @@ impl LocalDaemonInner {
             json!(policy.focus_allow_interrupt_vips),
         );
         obj.insert("mutedAll".into(), json!(muted_all));
+        obj.insert("bridges".into(), json!(compact_bridges));
         obj.insert(
             "counts".into(),
             json!({
                 "subscriptions": subs.len(),
+                "bridges": bridge_entries.len(),
                 "queued": digest.unread,
                 "unnotified": digest.unnotified,
                 "quarantined": digest.quarantined,
@@ -6369,9 +6406,22 @@ impl LocalDaemonInner {
                 })
                 .collect();
 
+            let bridges_json: Vec<Value> = bridge_entries
+                .into_iter()
+                .map(|(plugin, target, is_primary)| {
+                    json!({
+                        "plugin": plugin,
+                        "target": target,
+                        "label": format!("{plugin}:{target}"),
+                        "role": if is_primary { "primary" } else { "reader" },
+                    })
+                })
+                .collect();
+
             obj.insert(
                 "details".into(),
                 json!({
+                    "bridges": bridges_json,
                     "subscriptions": subs_json,
                     "queuedItems": queued_json,
                     "mutes": mutes_json,

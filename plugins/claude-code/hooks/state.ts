@@ -23,6 +23,7 @@ export interface DaemonSummary {
 
 export interface SessionCounts {
   subscriptions: number;
+  bridges: number;
   queued: number;
   unnotified: number;
   quarantined: number;
@@ -30,6 +31,13 @@ export interface SessionCounts {
   mutedArchived: number;
   channels: number;
   wakeups: number;
+}
+
+export interface BridgeLinkSummary {
+  plugin: string;
+  target: string;
+  label: string;
+  role: 'primary' | 'reader';
 }
 
 export interface UnreadBreakdown {
@@ -88,6 +96,7 @@ export interface WakeupSummary {
 }
 
 export interface SessionDetails {
+  bridges: BridgeLinkSummary[];
   subscriptions: SubscriptionSummary[];
   queuedItems: QueuedItemMeta[];
   mutes: MuteSummary[];
@@ -110,6 +119,7 @@ export interface SessionSummary {
   focusMode: boolean;
   focusAllowInterruptVips: boolean;
   mutedAll: boolean;
+  bridges: string[];
   counts: SessionCounts;
   unreadBreakdown: UnreadBreakdown;
   details: SessionDetails;
@@ -301,6 +311,30 @@ function parseSessionSummary(raw: unknown): SessionSummary | null {
   const unreadObj = asRecord(obj.unreadBreakdown);
   const detailsObj = asRecord(obj.details);
 
+  const rawBridges = Array.isArray(detailsObj?.bridges) ? detailsObj.bridges : [];
+  const bridges: BridgeLinkSummary[] = [];
+  for (const item of rawBridges) {
+    const b = asRecord(item);
+    if (!b) continue;
+    const plugin = sanitizeUiText(b.plugin, 40);
+    const target = sanitizeUiText(b.target, 64);
+    const label = sanitizeUiText(b.label, 96) || (plugin && target ? `${plugin}:${target}` : plugin || target);
+    if (!label) continue;
+    bridges.push({
+      plugin: plugin || label.split(':')[0] || 'bridge',
+      target: target || label.split(':').slice(1).join(':') || '*',
+      label,
+      role: b.role === 'primary' ? 'primary' : 'reader',
+    });
+  }
+
+  const rawCompactBridges = Array.isArray(obj.bridges) ? obj.bridges : [];
+  const compactBridges = rawCompactBridges
+    .map((b) => sanitizeUiText(b, 96))
+    .filter((b) => b.length > 0);
+  const effectiveBridgeLabels =
+    compactBridges.length > 0 ? compactBridges : bridges.map((b) => b.label);
+
   const rawSubs = Array.isArray(detailsObj?.subscriptions) ? detailsObj.subscriptions : [];
   const subscriptions: SubscriptionSummary[] = [];
   for (const item of rawSubs) {
@@ -423,8 +457,10 @@ function parseSessionSummary(raw: unknown): SessionSummary | null {
     focusMode: Boolean(obj.focusMode),
     focusAllowInterruptVips: Boolean(obj.focusAllowInterruptVips),
     mutedAll: Boolean(obj.mutedAll),
+    bridges: effectiveBridgeLabels,
     counts: {
       subscriptions: asCount(countsObj?.subscriptions ?? subscriptions.length),
+      bridges: asCount(countsObj?.bridges ?? Math.max(bridges.length, effectiveBridgeLabels.length)),
       queued: asCount(countsObj?.queued ?? queuedItems.length),
       unnotified: asCount(countsObj?.unnotified ?? 0),
       quarantined: asCount(countsObj?.quarantined ?? 0),
@@ -442,6 +478,7 @@ function parseSessionSummary(raw: unknown): SessionSummary | null {
       sources,
     },
     details: {
+      bridges,
       subscriptions,
       queuedItems,
       mutes,
@@ -702,6 +739,62 @@ export function parseControlCommandResult(
 }
 
 /**
+ * Formats the single persistent native status line (`$.ui.status`) beneath the Claude Code prompt.
+ * Returns `undefined` when the current session is unenrolled and has no alerts (zero clutter).
+ */
+export function formatPersistentStatusLine(
+  snapshot: HyphaeSnapshot | null,
+  active: SessionSummary | null,
+  quarantined: number,
+): string | undefined {
+  if (quarantined > 0) {
+    return `⚠ hyphae: ${quarantined} held · run \`hyp gate review\``;
+  }
+  if (!snapshot || !active) {
+    return undefined;
+  }
+  const hasActivity =
+    active.enrolled ||
+    active.counts.bridges > 0 ||
+    active.counts.subscriptions > 0 ||
+    active.counts.queued > 0;
+  if (!hasActivity) {
+    return undefined;
+  }
+
+  const parts: string[] = [active.handle ? `hyphae @${active.handle}` : 'hyphae'];
+
+  const firstBridge = active.bridges[0];
+  if (firstBridge && active.bridges.length === 1) {
+    parts.push(firstBridge);
+  } else if (firstBridge && active.bridges.length > 1) {
+    parts.push(`${firstBridge} +${active.bridges.length - 1}`);
+  } else if (active.counts.bridges > 0) {
+    parts.push(active.counts.bridges === 1 ? '1 bridge' : `${active.counts.bridges} bridges`);
+  }
+
+  if (active.counts.subscriptions > 0) {
+    parts.push(
+      active.counts.subscriptions === 1 ? '1 sub' : `${active.counts.subscriptions} subs`,
+    );
+  }
+  if (active.counts.queued > 0) {
+    parts.push(`${active.counts.queued} queued`);
+  }
+  if (active.focusMode) {
+    parts.push('FOCUS');
+  }
+  if (active.mutedAll) {
+    parts.push('muted');
+  } else if (active.counts.mutedRules > 0) {
+    parts.push(`${active.counts.mutedRules} muted`);
+  }
+
+  parts.push('/hyphae-panel');
+  return parts.join(' · ');
+}
+
+/**
  * Parses optional `/hyphae-panel` command arguments.
  */
 export function parsePanelCommandArgs(
@@ -709,18 +802,20 @@ export function parsePanelCommandArgs(
 ):
   | { action: 'open'; tab?: PanelTab }
   | { action: 'close' }
-  | { action: 'strip'; enabled: boolean } {
+  | { action: 'status'; enabled: boolean } {
   const tokens = rawArgs.trim().toLowerCase().split(/\s+/).filter(Boolean);
   if (tokens.length === 0) return { action: 'open' };
   const first = tokens[0];
   if (first === 'close' || first === 'hide') {
     return { action: 'close' };
   }
-  if (first === 'strip' || first === 'badge') {
+  if (first === 'status' || first === 'strip' || first === 'badge') {
     const second = tokens[1];
-    return { action: 'strip', enabled: second !== 'off' && second !== 'false' && second !== '0' };
+    return { action: 'status', enabled: second !== 'off' && second !== 'false' && second !== '0' };
   }
-  if (first === 'subs' || first === 'subscriptions') return { action: 'open', tab: 'subs' };
+  if (first === 'subs' || first === 'subscriptions' || first === 'bridges' || first === 'links') {
+    return { action: 'open', tab: 'subs' };
+  }
   if (first === 'queue' || first === 'inbox') return { action: 'open', tab: 'queue' };
   if (first === 'rules' || first === 'mutes') return { action: 'open', tab: 'rules' };
   if (first === 'mesh' || first === 'channels') return { action: 'open', tab: 'mesh' };

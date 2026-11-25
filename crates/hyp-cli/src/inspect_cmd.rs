@@ -258,6 +258,10 @@ fn render_single_session_block(out: &mut String, sess: &Value, peers_online: u64
         .and_then(|c| c.get("subscriptions"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let c_bridges = counts
+        .and_then(|c| c.get("bridges"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let c_queued = counts
         .and_then(|c| c.get("queued"))
         .and_then(Value::as_u64)
@@ -308,7 +312,7 @@ fn render_single_session_block(out: &mut String, sess: &Value, peers_online: u64
     );
     let _ = writeln!(
         out,
-        "Counts:     subs={c_subs}  queued={c_queued} (unnotified={c_unnotified})  mutes={c_muted_rules} (archived={c_muted_archived})  quarantined={c_quarantined}"
+        "Counts:     bridges={c_bridges}  subs={c_subs}  queued={c_queued} (unnotified={c_unnotified})  mutes={c_muted_rules} (archived={c_muted_archived})  quarantined={c_quarantined}"
     );
 
     if c_quarantined > 0 {
@@ -319,6 +323,26 @@ fn render_single_session_block(out: &mut String, sess: &Value, peers_online: u64
     }
 
     let details = sess.get("details").and_then(Value::as_object);
+
+    // Linked bridges table (when any bridge target is linked)
+    let bridges = details
+        .and_then(|d| d.get("bridges"))
+        .and_then(Value::as_array);
+    if let Some(list) = bridges {
+        if !list.is_empty() {
+            out.push('\n');
+            let _ = writeln!(out, "Bridges ({}):", list.len());
+            let rows: Vec<Vec<String>> = list
+                .iter()
+                .map(|b| {
+                    let label = clean_str(b.get("label"));
+                    let role = clean_str(b.get("role"));
+                    vec![label, if role.is_empty() { "reader".to_string() } else { role }]
+                })
+                .collect();
+            render_table(out, &["TARGET", "ROLE"], &rows);
+        }
+    }
 
     // Subscriptions table
     let subs = details

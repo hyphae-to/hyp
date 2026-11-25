@@ -558,9 +558,9 @@ pub fn format_statusline_pill(
             WhenUnenrolled::Hide => None,
             WhenUnenrolled::Dim => {
                 if use_color {
-                    Some("\x1b[2m⟁ hyp: offline\x1b[0m".to_string())
+                    Some("\x1b[2mhyphae: offline\x1b[0m".to_string())
                 } else {
-                    Some("⟁ hyp: offline".to_string())
+                    Some("hyphae: offline".to_string())
                 }
             }
         };
@@ -572,9 +572,9 @@ pub fn format_statusline_pill(
             WhenUnenrolled::Hide => None,
             WhenUnenrolled::Dim => {
                 if use_color {
-                    Some("\x1b[2m⟁ hyp: idle\x1b[0m".to_string())
+                    Some("\x1b[2mhyphae: idle\x1b[0m".to_string())
                 } else {
-                    Some("⟁ hyp: idle".to_string())
+                    Some("hyphae: idle".to_string())
                 }
             }
         };
@@ -589,6 +589,22 @@ pub fn format_statusline_pill(
         .and_then(|c| c.get("subscriptions"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let bridge_labels: Vec<String> = sess
+        .get("bridges")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(sanitize_terminal_text)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let bridges = counts
+        .and_then(|c| c.get("bridges"))
+        .and_then(Value::as_u64)
+        .unwrap_or(bridge_labels.len() as u64);
     let queued = counts
         .and_then(|c| c.get("queued"))
         .and_then(Value::as_u64)
@@ -610,14 +626,14 @@ pub fn format_statusline_pill(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    if !enrolled && subs == 0 && queued == 0 && quarantined == 0 {
+    if !enrolled && subs == 0 && bridges == 0 && queued == 0 && quarantined == 0 {
         return match when_unenrolled {
             WhenUnenrolled::Hide => None,
             WhenUnenrolled::Dim => {
                 if use_color {
-                    Some("\x1b[2m⟁ hyp: idle\x1b[0m".to_string())
+                    Some("\x1b[2mhyphae: idle\x1b[0m".to_string())
                 } else {
-                    Some("⟁ hyp: idle".to_string())
+                    Some("hyphae: idle".to_string())
                 }
             }
         };
@@ -630,12 +646,12 @@ pub fn format_statusline_pill(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let mut segments: Vec<String> = Vec::with_capacity(6);
+    let mut segments: Vec<String> = Vec::with_capacity(7);
 
-    // Primary identity segment
+    // Primary identity segment — always visibly labeled `hyphae` so the user knows the source.
     let id_text = match clean_handle {
-        Some(h) => format!("⟁ @{h}"),
-        None => "⟁ hyp".to_string(),
+        Some(h) => format!("hyphae @{h}"),
+        None => "hyphae".to_string(),
     };
     if use_color {
         if muted_all {
@@ -645,6 +661,31 @@ pub fn format_statusline_pill(
         }
     } else {
         segments.push(id_text);
+    }
+
+    // Linked bridges (e.g. `telegram:personal` or `telegram:personal +1`)
+    if !bridge_labels.is_empty() {
+        let label = if bridge_labels.len() == 1 {
+            bridge_labels[0].clone()
+        } else {
+            format!("{} +{}", bridge_labels[0], bridge_labels.len() - 1)
+        };
+        if use_color {
+            segments.push(format!("\x1b[36m{label}\x1b[0m"));
+        } else {
+            segments.push(label);
+        }
+    } else if bridges > 0 {
+        let label = if bridges == 1 {
+            "1 bridge".to_string()
+        } else {
+            format!("{bridges} bridges")
+        };
+        if use_color {
+            segments.push(format!("\x1b[36m{label}\x1b[0m"));
+        } else {
+            segments.push(label);
+        }
     }
 
     // Subscriptions count
@@ -915,13 +956,13 @@ mod tests {
         let plain = format_statusline_pill(Some(map), WhenUnenrolled::Hide, false).unwrap();
         assert_eq!(
             plain,
-            "⟁ @alice · 3 subs · 2 queued · focus · 1 muted · ⚠ 1 held"
+            "hyphae @alice · 3 subs · 2 queued · focus · 1 muted · ⚠ 1 held"
         );
         assert!(!plain.contains('\x1b'));
         assert!(!plain.contains("pwn"));
 
         let colored = format_statusline_pill(Some(map), WhenUnenrolled::Hide, true).unwrap();
-        assert!(colored.contains("@alice"));
+        assert!(colored.contains("hyphae @alice"));
         assert!(colored.contains("3 subs"));
         assert!(colored.contains("2 queued"));
         assert!(colored.contains("focus"));
@@ -929,6 +970,19 @@ mod tests {
         assert!(colored.contains("⚠ 1 held"));
         assert!(!colored.contains("pwn"));
         assert!(!colored.contains("\x1b]0;"));
+
+        let bridged = json!({
+            "session": {
+                "enrolled": true,
+                "handle": "integration-tests",
+                "bridges": ["telegram:personal"],
+                "counts": { "bridges": 1, "subscriptions": 0, "queued": 0, "quarantined": 0, "mutedRules": 0 }
+            }
+        });
+        assert_eq!(
+            format_statusline_pill(bridged.as_object(), WhenUnenrolled::Hide, false).as_deref(),
+            Some("hyphae @integration-tests · telegram:personal")
+        );
     }
 
     #[test]
@@ -936,7 +990,7 @@ mod tests {
         assert_eq!(format_statusline_pill(None, WhenUnenrolled::Hide, false), None);
         assert_eq!(
             format_statusline_pill(None, WhenUnenrolled::Dim, false).as_deref(),
-            Some("⟁ hyp: offline")
+            Some("hyphae: offline")
         );
 
         let unenrolled = json!({
@@ -951,7 +1005,7 @@ mod tests {
         );
         assert_eq!(
             format_statusline_pill(unenrolled.as_object(), WhenUnenrolled::Dim, false).as_deref(),
-            Some("⟁ hyp: idle")
+            Some("hyphae: idle")
         );
     }
 

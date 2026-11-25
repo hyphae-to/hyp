@@ -3000,7 +3000,7 @@ fn setup_claude(
                 }
                 if profile.is_default_home {
                     notes.push(
-                        "Installed native Claude Code side-panel mod (/hyphae-panel) under ~/.claude/skills/hyphae-panel/."
+                        "Installed native Claude Code plugin (live status indicator + /hyphae-panel) under ~/.claude/skills/hyphae-panel/ (activates on next Claude session)."
                             .to_string(),
                     );
                 } else {

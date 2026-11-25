@@ -681,7 +681,13 @@ export default class HyphaePanel extends View {
     const rulesCount = (entry?.details?.mutes?.length ?? counts.mutedRules ?? 0) + (entry?.details?.rules?.length ?? 0);
     const badgeFor = (id) => {
       if (!entry) return null;
-      if (id === "subs") return Number(counts.subscriptions) || 0;
+      if (id === "subs") {
+        const subCount = Number(counts.subscriptions) || 0;
+        const bridgeCount =
+          Number(counts.bridges) ||
+          (Array.isArray(entry?.details?.bridges) ? entry.details.bridges.length : 0);
+        return subCount + bridgeCount;
+      }
       if (id === "queue") return Number(counts.queued) || 0;
       if (id === "rules") return rulesCount;
       return null;
@@ -726,18 +732,70 @@ export default class HyphaePanel extends View {
   }
 
   renderSubsTab(t, entry) {
+    const bridges = Array.isArray(entry?.details?.bridges) ? entry.details.bridges : [];
     const subs = Array.isArray(entry?.details?.subscriptions) ? entry.details.subscriptions : [];
-    if (subs.length === 0) {
+    if (bridges.length === 0 && subs.length === 0) {
       return [
         div()
           .p(12)
           .text_size(11.5)
           .text_color(t.dim)
-          .child("No active stream subscriptions for this session."),
+          .child("No linked bridges or stream subscriptions for this session."),
       ];
     }
 
-    return subs.map((sub, idx) => {
+    const cards = bridges.map((bridge, idx) => {
+      const label = sanitizeUiText(
+        bridge.label || `${bridge.plugin || "bridge"}:${bridge.target || "*"}`,
+        64
+      );
+      const role = bridge.role === "primary" ? "primary" : "reader";
+      return v_flex()
+        .id(`hyphae-bridge-${idx}`)
+        .flex_none()
+        .p(8)
+        .pr(10)
+        .gap(4)
+        .rounded(7)
+        .border_1()
+        .border_color(t.border)
+        .bg(t.surface || t.raised || t.background)
+        .child(
+          h_flex()
+            .gap(6)
+            .items_center()
+            .child(
+              div()
+                .flex_1()
+                .min_w(0)
+                .truncate()
+                .font_medium()
+                .text_size(12)
+                .text_color(t.foreground)
+                .child(label)
+            )
+            .child(
+              div()
+                .flex_none()
+                .px(6)
+                .py(1)
+                .rounded(4)
+                .bg(t.background)
+                .text_size(10)
+                .font_medium()
+                .text_color(role === "primary" ? t.success || t.accent : t.muted)
+                .child(role)
+            )
+        )
+        .child(
+          div()
+            .text_size(10.5)
+            .text_color(t.dim)
+            .child("External chat bridge · inbound wakeups & replies")
+        );
+    });
+
+    const subCards = subs.map((sub, idx) => {
       const topic = sanitizeUiText(sub.topic || "(topic)", 64);
       const origin = sanitizeUiText(sub.originNode || "local", 40);
       const mode = sanitizeUiText(sub.mode || "queue", 16);
@@ -830,6 +888,8 @@ export default class HyphaePanel extends View {
           )
         );
     });
+
+    return [...cards, ...subCards];
   }
 
   renderQueueTab(t, entry) {
