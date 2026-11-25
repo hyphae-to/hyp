@@ -516,18 +516,17 @@ where
             None
         };
 
-        let mut pkt = Map::new();
-        pkt.insert("type".into(), json!("session.hint"));
-        pkt.insert("harness".into(), json!(options.harness.as_str()));
-        pkt.insert("sessionId".into(), json!(session_id));
-        attach_session_token(&mut pkt, session_token);
-        let added_hints =
-            insert_transport_hints(&mut pkt, options.harness, payload, &options.transport_hints);
-
         if let Some(env_file) = claude_env_file {
-            pkt.insert("requestSessionToken".into(), json!(true));
+            let mut pkt = Map::new();
+            pkt.insert("type".into(), json!("session.start"));
+            pkt.insert("harness".into(), json!(options.harness.as_str()));
+            pkt.insert("sessionId".into(), json!(session_id));
+            pkt.insert("envFileExported".into(), json!(true));
+            attach_session_token(&mut pkt, session_token);
+            let _ =
+                insert_transport_hints(&mut pkt, options.harness, payload, &options.transport_hints);
             let res = rpc(&options.socket_path, &Value::Object(pkt));
-            let minted_token = res
+            let derived_token = res
                 .ok
                 .then(|| {
                     res.result
@@ -538,14 +537,23 @@ where
                         .map(ToString::to_string)
                 })
                 .flatten();
-            let effective_tok = minted_token.as_deref().or(session_token);
+            let effective_tok = derived_token.as_deref().or(session_token);
             let _ = export_claude_session_env_file_with_token(
                 Path::new(&env_file),
                 &session_id,
                 effective_tok,
             );
-        } else if added_hints {
-            let _ = rpc(&options.socket_path, &Value::Object(pkt));
+        } else {
+            let mut pkt = Map::new();
+            pkt.insert("type".into(), json!("session.hint"));
+            pkt.insert("harness".into(), json!(options.harness.as_str()));
+            pkt.insert("sessionId".into(), json!(session_id));
+            attach_session_token(&mut pkt, session_token);
+            let added_hints =
+                insert_transport_hints(&mut pkt, options.harness, payload, &options.transport_hints);
+            if added_hints {
+                let _ = rpc(&options.socket_path, &Value::Object(pkt));
+            }
         }
         return json!({});
     }

@@ -73,7 +73,7 @@ use crate::sock::{
 };
 use crate::transport::codex::{
     CodexQueueTarget, CodexQueueTransport, DEFAULT_CODEX_BIN, build_codex_queue_args,
-    codex_binary_available, default_codex_home, is_valid_codex_uuid, verify_codex_rollout_thread,
+    codex_queue_supported, default_codex_home, is_valid_codex_uuid, verify_codex_rollout_thread,
 };
 use crate::transport::herdr::{
     DEFAULT_HERDR_BIN, DEFAULT_SPAWN_TIMEOUT, HerdrTransport, is_valid_herdr_template,
@@ -87,10 +87,16 @@ use crate::transport::openclaw::{
 };
 use crate::transport::t3::{
     DEFAULT_PROBE_TIMEOUT, DEFAULT_T3_TOKEN_SECRET, DEFAULT_T3_URL, FALLBACK_T3_TOKEN_SECRET,
-    T3Target, T3Transport, default_t3_base_dir, normalize_t3_server_url, probe_t3_server,
+    T3Target, T3Transport, default_t3_base_dir, is_allowed_t3_token_secret,
+    normalize_t3_server_url_with_remote, probe_t3_server_with_remote,
     resolve_t3_thread_by_provider_session, t3_state_db_path, verify_t3_thread_exists,
 };
 use crate::transport::{PushMode, PushOutcome, PushTransport};
+
+/// Reserved `SecretStore` key name holding the daemon's 32-byte deterministic HMAC-SHA256
+/// key used to derive per-session `sessionToken` values that survive daemon restarts & resume.
+pub const DAEMON_SESSION_TOKEN_KEY_SECRET: &str = "daemon-session-token-key";
+const SESSION_TOKEN_DOMAIN_PREFIX: &str = "hyphae-session-token-v1:";
 
 const PRIORITY_EXPLICIT: u8 = 100;
 const PRIORITY_HERDR: u8 = 30;
@@ -398,6 +404,8 @@ struct ChannelDeliverCommand {
 
 #[derive(Debug, Clone)]
 struct ClassifiedItemMeta {
+    item_id: String,
+    payload_sha256: Option<String>,
     urgency: DeliveryUrgency,
     burst_demoted: bool,
     burst_source_key: String,
@@ -439,11 +447,17 @@ struct LocalDaemonInner {
     channels: Mutex<HashMap<String, LiveChannel>>,
     /// Attached native external push transports (`Herdr`, `T3`, `OpenClaw`, `CodexQueue`, or test doubles).
     session_transports: Mutex<HashMap<String, AttachedPushTransport>>,
-    /// Per-session 256-bit authentication secrets (`session_id -> sessionToken`).
-    /// Kept strictly in-memory — NEVER serialized into `ui/state.json`, SQLite, or logs (`X5`).
-    session_tokens: Mutex<HashMap<String, String>>,
-    /// Harnesses that have registered at least one real `PreToolUse` hook call (`X6`).
-    hook_registered_harnesses: Mutex<HashSet<HarnessKind>>,
+    /// Deterministic 256-bit HMAC-SHA256 key loaded/persisted in `SecretStore` under
+    /// [`DAEMON_SESSION_TOKEN_KEY_SECRET`] (`"daemon-session-token-key"`).
+    /// NEVER serialized into `ui/state.json`, SQLite, or logs.
+    session_token_key: [u8; 32],
+    /// Sessions that completed `SessionStart` with `envFileExported: true` (hydrated from SQLite
+    /// `sessions.backend_json` on startup) and therefore REQUIRE a valid `sessionToken` on
+    /// `wait.subscribe` / `inbox.wait` / `inbox.watch`.
+    env_file_exported_sessions: Mutex<HashSet<String>>,
+    /// Specific `session_id`s that have registered a real `PreToolUse` `call.start` (`X6`).
+    /// Never poisons an entire hookless harness (e.g. OpenClaw) globally from one forged call!
+    hook_registered_sessions: Mutex<HashSet<String>>,
     /// Live reverse index mapping `herdrTerminalId -> Vec<session_id>` (most-recently-seen first),
     /// hydrated from SQLite `sessions.backend_json` on startup and updated on hints/calls/transports.
     herdr_terminal_index: Mutex<HashMap<String, Vec<String>>>,
@@ -570,6 +584,7 @@ impl LocalDaemon {
 
         inner.sweep_expired_mutes_and_policies(now_ms());
         let _ = inner.prune_stale_sessions_now();
+        sweep_approved_local_ingest_on_startup(&inner).await;
         let inbox_task = spawn_inbox_watcher(Arc::clone(&inner), shutdown_tx.subscribe());
         let _ = inner.write_ui_state_snapshot();
         let projector_task = spawn_ui_state_projector(Arc::clone(&inner), shutdown_tx.subscribe());
@@ -660,6 +675,7 @@ impl LocalDaemon {
 
         inner.sweep_expired_mutes_and_policies(now_ms());
         let _ = inner.prune_stale_sessions_now();
+        sweep_approved_local_ingest_on_startup(&inner).await;
         let inbox_task = spawn_inbox_watcher(Arc::clone(&inner), shutdown_tx.subscribe());
         let _ = inner.write_ui_state_snapshot();
         let projector_task = spawn_ui_state_projector(Arc::clone(&inner), shutdown_tx.subscribe());
@@ -768,27 +784,21 @@ impl LocalDaemon {
         self.inner.active_transport_kind(session_id)
     }
 
-    /// Mints (or returns existing, only on first mint) a 256-bit per-session socket authentication
-    /// secret (`sessionToken`) for `session_id` (`X5`).
-    ///
-    /// Once minted, `mailbox.drain`, `wait.subscribe`/`inbox.wait`/`inbox.watch`, and `call.start`
-    /// targeting `session_id` MUST present the matching `sessionToken` or fail closed.
+    /// Derives the deterministic HMAC-SHA256 per-session authentication token (`sessionToken`)
+    /// for `session_id` and marks `session_id` as `envFileExported: true` so `wait.subscribe` /
+    /// `inbox.wait` / `inbox.watch` require the matching token even across daemon restarts.
     pub fn mint_session_token(&self, session_id: &str) -> Result<String, String> {
         if !is_valid_session_id(session_id) {
             return Err("invalid_session".to_string());
         }
-        self.inner
-            .mint_or_verify_session_token(session_id, None)
-            .map_err(|e| e.to_string())
+        self.inner.mark_session_env_file_exported(session_id);
+        Ok(self.inner.session_token_for(session_id))
     }
 
-    /// Returns `true` iff `session_id` currently requires a per-session `sessionToken`.
+    /// Returns `true` iff `session_id` currently requires a per-session `sessionToken` on
+    /// `wait.subscribe` / `inbox.wait` / `inbox.watch` (`envFileExported: true`).
     pub fn session_has_token(&self, session_id: &str) -> bool {
-        self.inner
-            .session_tokens
-            .lock()
-            .expect("session_tokens lock poisoned")
-            .contains_key(session_id)
+        self.inner.session_requires_wait_token(session_id)
     }
 
     /// Registers a pluggable outbound [`BridgePoster`] for `plugin` (case-insensitive slug).
@@ -870,11 +880,7 @@ impl LocalDaemon {
             .configured_bridge_targets
             .lock()
             .expect("configured_bridge_targets lock poisoned");
-        if clean_targets.is_empty() {
-            cfg_targets.remove(&key);
-        } else {
-            cfg_targets.insert(key, clean_targets);
-        }
+        cfg_targets.insert(key, clean_targets);
     }
 
     /// Fans out an inbound external chat/webhook bridge message to all sessions linked to
@@ -1058,8 +1064,10 @@ impl LocalDaemon {
         } = item;
         let now = now_ms();
         let mut gate_downgraded = false;
-        let effective_trust_tier = if kind == MailboxKind::Plugin {
+        let effective_trust_tier = if kind == MailboxKind::Plugin || origin_node.starts_with("bridge:") {
             GateTrustTier::Bridge
+        } else if kind == MailboxKind::Event || raw_has_external_webhook_origin(&source, &text) {
+            cap_trust_tier_to_external_webhook(trust_tier)
         } else {
             trust_tier
         };
@@ -1257,6 +1265,7 @@ impl LocalDaemon {
             }
         };
 
+        let item_sha = Some(sha256_hex(insert.text.as_bytes()));
         let is_announcement = self
             .inner
             .is_announcement_channel(classification.parsed.channel.as_deref());
@@ -1264,6 +1273,8 @@ impl LocalDaemon {
             &session_id,
             receipt,
             ClassifiedItemMeta {
+                item_id: insert.item_id,
+                payload_sha256: item_sha,
                 urgency: classification.effective_urgency,
                 burst_demoted: classification.burst.demoted,
                 burst_source_key: classification.burst_source_key,
@@ -1395,6 +1406,7 @@ impl LocalDaemonInner {
         shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
         let mut hydrated_herdr_index: HashMap<String, Vec<String>> = HashMap::new();
+        let mut hydrated_env_exported: HashSet<String> = HashSet::new();
         {
             let db = node.db();
             if let Ok(sessions) = db.local().list_sessions() {
@@ -1403,13 +1415,17 @@ impl LocalDaemonInner {
                         if is_valid_terminal_id(&tid) {
                             let entry = hydrated_herdr_index.entry(tid).or_default();
                             if !entry.iter().any(|existing| existing == &s.id) {
-                                entry.push(s.id);
+                                entry.push(s.id.clone());
                             }
                         }
+                    }
+                    if backend_json_flag_true(&s.backend_json, "envFileExported") {
+                        hydrated_env_exported.insert(s.id);
                     }
                 }
             }
         }
+        let session_token_key = load_or_init_session_token_key(&node);
         let (ui_rev_tx, _) = watch::channel(1u64);
         Self {
             node,
@@ -1422,8 +1438,9 @@ impl LocalDaemonInner {
             waiters: Mutex::new(HashMap::new()),
             channels: Mutex::new(HashMap::new()),
             session_transports: Mutex::new(HashMap::new()),
-            session_tokens: Mutex::new(HashMap::new()),
-            hook_registered_harnesses: Mutex::new(HashSet::new()),
+            session_token_key,
+            env_file_exported_sessions: Mutex::new(hydrated_env_exported),
+            hook_registered_sessions: Mutex::new(HashSet::new()),
             herdr_terminal_index: Mutex::new(hydrated_herdr_index),
             pending_probes: Mutex::new(HashMap::new()),
             flushing: Mutex::new(HashSet::new()),
@@ -1962,9 +1979,18 @@ impl LocalDaemonInner {
             }
             {
                 let mut guard = self
-                    .session_tokens
+                    .env_file_exported_sessions
                     .lock()
-                    .expect("session_tokens lock poisoned");
+                    .expect("env_file_exported_sessions lock poisoned");
+                for sid in &pruned {
+                    guard.remove(sid);
+                }
+            }
+            {
+                let mut guard = self
+                    .hook_registered_sessions
+                    .lock()
+                    .expect("hook_registered_sessions lock poisoned");
                 for sid in &pruned {
                     guard.remove(sid);
                 }
@@ -2131,7 +2157,7 @@ impl LocalDaemonInner {
                 for n in list.iter() {
                     if !n.surfaced_in_batch {
                         lines.push(format!(
-                            "[hyphae gate · quarantined receipt={} source={} tier={} reason={}; review via `hyp gate review`]",
+                            "[hyphae gate · receipt={} source={} tier={} reason={} — Quarantined by Security Gate — ask the human to review via `hyp gate review` / `hyp inbox approve`]",
                             n.receipt, n.source, n.trust_tier, n.reason
                         ));
                     }
@@ -2381,13 +2407,38 @@ impl LocalDaemonInner {
                     && entry.reviewed_at.is_none()
                     && !already_human_verified;
 
-                if !needs_gate {
-                    let existing_meta = self
-                        .item_meta
-                        .lock()
-                        .expect("item_meta lock poisoned")
-                        .get(session_id)
-                        .and_then(|m| m.get(&entry.receipt).cloned());
+                if needs_gate {
+                    // G3: Clear any stale cached classification before screening (e.g. after a
+                    // coalesced UPDATE overwrote `text` and reset `reviewed_at` / `human_auth_json`).
+                    let mut guard = self.item_meta.lock().expect("item_meta lock poisoned");
+                    if let Some(map) = guard.get_mut(session_id) {
+                        map.remove(&entry.receipt);
+                    }
+                } else {
+                    let existing_meta = {
+                        let mut guard = self.item_meta.lock().expect("item_meta lock poisoned");
+                        let cached = guard
+                            .get(session_id)
+                            .and_then(|m| m.get(&entry.receipt).cloned());
+                        match cached {
+                            Some(meta)
+                                if meta.item_id == entry.item_id
+                                    && meta.payload_sha256 == entry.payload_sha256
+                                    && (entry.notified || !meta.notified) =>
+                            {
+                                Some(meta)
+                            }
+                            Some(_) => {
+                                // G3: Coalesced overwrite changed item_id / payload_sha256 / notified;
+                                // invalidate cached classification so it is re-classified cleanly!
+                                if let Some(map) = guard.get_mut(session_id) {
+                                    map.remove(&entry.receipt);
+                                }
+                                None
+                            }
+                            None => None,
+                        }
+                    };
                     if let Some(meta) = existing_meta {
                         if meta.urgency.triggers_delivery_or_digest() && !meta.notified {
                             wake_needed = true;
@@ -2595,6 +2646,8 @@ impl LocalDaemonInner {
             session_id,
             entry.receipt,
             ClassifiedItemMeta {
+                item_id: entry.item_id,
+                payload_sha256: entry.payload_sha256,
                 urgency: classification.effective_urgency,
                 burst_demoted: classification.burst.demoted,
                 burst_source_key: classification.burst_source_key,
@@ -2637,15 +2690,17 @@ impl LocalDaemonInner {
         entry.origin_node.clone()
     }
 
-    /// Resolves the fail-closed [`GateTrustTier`] for an unverified inbound mailbox entry (G2).
+    /// Resolves the fail-closed [`GateTrustTier`] for an unverified inbound mailbox entry (G2 + Hub Tier Cap).
     ///
     /// Security invariants:
     /// - `MailboxKind::Plugin` and `bridge:*` origins ALWAYS resolve to `GateTrustTier::Bridge`.
-    /// - Local-origin `MailboxKind::Event` (GitHub/Prometheus/generic webhooks, fd-3 source plugins,
-    ///   bridge stream mirrors, unsigned local ingest) and `MailboxKind::Kv` ALWAYS resolve to
-    ///   `GateTrustTier::ExternalWebhook` — NEVER `SelfHost`, so Stage 2 matchers
-    ///   `[Guest, ExternalWebhook, Peer, Bridge]` and tamper checks always screen them.
-    /// - Only genuine same-node `MailboxKind::Message` DMs/posts resolve to `GateTrustTier::SelfHost`.
+    /// - ALL `MailboxKind::Event` items (both local AND hub-relayed remote events!) and ANY item
+    ///   whose source/envelope indicates webhook/adapter origin or `hyphaesourcekind == "external-webhook"`
+    ///   are strictly capped at `ExternalWebhook` (keeping `Bridge` if already `Bridge`), so a
+    ///   GitHub/external webhook ingested by an `Org` Team Hub NEVER skips Stage 2 as `Org`!
+    /// - Local `MailboxKind::Kv` resolves to `GateTrustTier::ExternalWebhook` (`G2`).
+    /// - Only genuine same-node `MailboxKind::Message` DMs/posts (without external-webhook origin)
+    ///   resolve to `GateTrustTier::SelfHost`.
     /// - Remote origins can NEVER escalate to `GateTrustTier::SelfHost`.
     fn resolve_entry_trust_tier(
         &self,
@@ -2656,10 +2711,14 @@ impl LocalDaemonInner {
             return GateTrustTier::Bridge;
         }
 
+        let is_webhook_or_event = entry.kind == MailboxKind::Event
+            || raw_has_external_webhook_origin(&entry.source, &entry.text);
+
         let is_local_origin =
             effective_origin == "local" || effective_origin == self.node.node_id().as_str();
 
-        // Preserve explicit non-SelfHost trust tier recorded when `ingest_inbound` retained a Hold.
+        // Preserve explicit non-SelfHost trust tier recorded when `ingest_inbound` retained a Hold,
+        // still enforcing the ExternalWebhook cap on events/webhooks!
         if let Some(held_tier) = entry
             .gate_reason
             .as_deref()
@@ -2667,13 +2726,21 @@ impl LocalDaemonInner {
             .and_then(parse_gate_trust_tier)
         {
             match held_tier {
-                GateTrustTier::SelfHost => {}
-                GateTrustTier::HumanVerified => {}
-                other => return other,
+                GateTrustTier::SelfHost | GateTrustTier::HumanVerified => {}
+                other => {
+                    return if is_webhook_or_event {
+                        cap_trust_tier_to_external_webhook(other)
+                    } else {
+                        other
+                    };
+                }
             }
         }
 
         if is_local_origin {
+            if is_webhook_or_event {
+                return GateTrustTier::ExternalWebhook;
+            }
             return match entry.kind {
                 MailboxKind::Message => GateTrustTier::SelfHost,
                 MailboxKind::Event | MailboxKind::Kv => GateTrustTier::ExternalWebhook,
@@ -2682,7 +2749,12 @@ impl LocalDaemonInner {
             };
         }
 
-        self.resolve_peer_trust_tier(effective_origin)
+        let peer_tier = self.resolve_peer_trust_tier(effective_origin);
+        if is_webhook_or_event {
+            cap_trust_tier_to_external_webhook(peer_tier)
+        } else {
+            peer_tier
+        }
     }
 
     fn resolve_peer_trust_tier(&self, peer_node: &str) -> GateTrustTier {
@@ -2903,55 +2975,108 @@ impl LocalDaemonInner {
         self.bump_ui_rev();
     }
 
-    fn verify_session_auth(
+    /// Deterministically derives `st_<base64url(HMAC-SHA256(k_session, "hyphae-session-token-v1:" || session_id))>`.
+    /// Survives daemon restarts & `claude --resume` without storing tokens in SQLite or `ui/state.json`.
+    fn session_token_for(&self, session_id: &str) -> String {
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &self.session_token_key);
+        let msg = format!("{SESSION_TOKEN_DOMAIN_PREFIX}{session_id}");
+        let tag = ring::hmac::sign(&key, msg.as_bytes());
+        format!("st_{}", URL_SAFE_NO_PAD.encode(tag.as_ref()))
+    }
+
+    fn mark_session_env_file_exported(&self, session_id: &str) {
+        {
+            let mut guard = self
+                .env_file_exported_sessions
+                .lock()
+                .expect("env_file_exported_sessions lock poisoned");
+            guard.insert(session_id.to_string());
+        }
+        let mut patch = Map::new();
+        patch.insert("envFileExported".into(), json!(true));
+        let _ = self
+            .node
+            .db()
+            .local()
+            .merge_session_backend(session_id, &Value::Object(patch), now_ms());
+    }
+
+    fn session_requires_wait_token(&self, session_id: &str) -> bool {
+        if self
+            .env_file_exported_sessions
+            .lock()
+            .expect("env_file_exported_sessions lock poisoned")
+            .contains(session_id)
+        {
+            return true;
+        }
+        let db = self.node.db();
+        if let Ok(Some(sess)) = db.local().get_session(session_id) {
+            if backend_json_flag_true(&sess.backend_json, "envFileExported") {
+                self.env_file_exported_sessions
+                    .lock()
+                    .expect("env_file_exported_sessions lock poisoned")
+                    .insert(session_id.to_string());
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Verifies `sessionToken` on hook/register/hint paths:
+    /// - If `sessionToken` is omitted (or `null`), returns `Ok(())` so Claude Code `PreToolUse` /
+    ///   `PostToolUse` hook subprocesses (which do NOT source `CLAUDE_ENV_FILE`) never break!
+    /// - If `sessionToken` IS provided, verifies it in constant time against
+    ///   `session_token_for(session_id)` — rejecting wrong/forged/empty tokens fail-closed!
+    fn verify_optional_session_token(
         &self,
         session_id: &str,
         packet: &Map<String, Value>,
     ) -> Result<(), &'static str> {
-        let provided = packet
-            .get("sessionToken")
-            .and_then(Value::as_str)
-            .map(str::trim);
-        self.verify_session_token_value(session_id, provided)
-    }
-
-    fn verify_session_token_value(
-        &self,
-        session_id: &str,
-        provided: Option<&str>,
-    ) -> Result<(), &'static str> {
-        let guard = self
-            .session_tokens
-            .lock()
-            .expect("session_tokens lock poisoned");
-        let Some(expected) = guard.get(session_id) else {
-            return Ok(());
-        };
-        if verify_session_token_ct(expected, provided) {
-            Ok(())
-        } else {
-            Err("session_token_invalid")
-        }
-    }
-
-    fn mint_or_verify_session_token(
-        &self,
-        session_id: &str,
-        provided: Option<&str>,
-    ) -> Result<String, &'static str> {
-        let mut guard = self
-            .session_tokens
-            .lock()
-            .expect("session_tokens lock poisoned");
-        if let Some(existing) = guard.get(session_id) {
-            if verify_session_token_ct(existing, provided) {
-                return Ok(existing.clone());
+        match packet.get("sessionToken") {
+            None | Some(Value::Null) => Ok(()),
+            Some(Value::String(raw)) => {
+                let expected = self.session_token_for(session_id);
+                if verify_session_token_ct(&expected, Some(raw)) {
+                    Ok(())
+                } else {
+                    Err("session_token_invalid")
+                }
             }
-            return Err("session_token_invalid");
+            Some(_) => Err("session_token_invalid"),
         }
-        let minted = generate_session_token();
-        guard.insert(session_id.to_string(), minted.clone());
-        Ok(minted)
+    }
+
+    /// Verifies `sessionToken` on `wait.subscribe` / `inbox.wait` / `inbox.watch`:
+    /// - If `sessionToken` is provided, ALWAYS verifies it in constant time against
+    ///   `session_token_for(session_id)` (so Session A carrying `HYPHAE_SESSION_TOKEN(A)` trying
+    ///   `hyp wait --session B` is immediately rejected fail-closed!).
+    /// - If `sessionToken` is omitted, fails closed (`session_token_invalid`) whenever
+    ///   `session_id` completed `SessionStart` with `envFileExported: true` (blocking even
+    ///   `env -u HYPHAE_SESSION_TOKEN hyp wait --session claude:<victim>`!).
+    fn verify_wait_session_auth(
+        &self,
+        session_id: &str,
+        packet: &Map<String, Value>,
+    ) -> Result<(), &'static str> {
+        match packet.get("sessionToken") {
+            None | Some(Value::Null) => {
+                if self.session_requires_wait_token(session_id) {
+                    Err("session_token_invalid")
+                } else {
+                    Ok(())
+                }
+            }
+            Some(Value::String(raw)) => {
+                let expected = self.session_token_for(session_id);
+                if verify_session_token_ct(&expected, Some(raw)) {
+                    Ok(())
+                } else {
+                    Err("session_token_invalid")
+                }
+            }
+            Some(_) => Err("session_token_invalid"),
+        }
     }
 
     /// Flushes eligible batches to live transports (`claude-channel` > `PushTransport` > `watch` stream > `wait` once).
@@ -5109,12 +5234,60 @@ impl LocalDaemonInner {
         }))
     }
 
+    /// Enforces configured bridge target allowlists fail-closed (`B3`).
+    ///
+    /// - If `configured_bridge_targets` contains an allowlist for `plugin`, `target` MUST match an
+    ///   entry in that allowlist (or the allowlist must contain `"*"`).
+    /// - If `configured_bridge_targets` has no allowlist for `plugin` and `bridge_posters` does NOT
+    ///   have a legacy poster registered for `plugin`, any link/handoff fails closed whenever at
+    ///   least one bridge poster or configured target map exists.
+    fn ensure_bridge_target_configured(
+        &self,
+        plugin: &str,
+        target: &str,
+    ) -> Result<(), (String, String)> {
+        let cfg_guard = self
+            .configured_bridge_targets
+            .lock()
+            .expect("configured_bridge_targets lock poisoned");
+        if let Some(allowed) = cfg_guard.get(plugin) {
+            if allowed.iter().any(|t| t == target || t == "*") {
+                return Ok(());
+            }
+            return Err((
+                "bridge_target_not_configured".into(),
+                format!(
+                    "Bridge target '{plugin}:{target}' is not configured for plugin '{plugin}'"
+                ),
+            ));
+        }
+        let cfg_non_empty = !cfg_guard.is_empty();
+        drop(cfg_guard);
+
+        let posters_guard = self
+            .bridge_posters
+            .lock()
+            .expect("bridge_posters lock poisoned");
+        if posters_guard.contains_key(plugin) {
+            // Legacy test registration via `register_bridge_poster` without explicit target list.
+            return Ok(());
+        }
+        if cfg_non_empty || !posters_guard.is_empty() {
+            return Err((
+                "bridge_target_not_configured".into(),
+                format!("Bridge target '{plugin}:{target}' is not configured"),
+            ));
+        }
+        Ok(())
+    }
+
     async fn tool_bridge_link(
         &self,
         session_id: &str,
         args: &Map<String, Value>,
     ) -> Result<Value, (String, String)> {
         let (plugin, target) = parse_bridge_plugin_target(args)?;
+        self.ensure_bridge_target_configured(&plugin, &target)?;
         let read_only = args.get("readOnly").and_then(Value::as_bool) == Some(true);
         let now = now_ms();
         let link = BridgeLink {
@@ -5233,6 +5406,7 @@ impl LocalDaemonInner {
         args: &Map<String, Value>,
     ) -> Result<Value, (String, String)> {
         let (plugin, target) = parse_bridge_plugin_target(args)?;
+        self.ensure_bridge_target_configured(&plugin, &target)?;
         let now = now_ms();
 
         let (target_session, previous_session) = {
@@ -5346,6 +5520,8 @@ impl LocalDaemonInner {
                     format!("No local bridge plugin configured for '{full_dest}'"),
                 )
             })?;
+
+        self.ensure_bridge_target_configured(&plugin, target)?;
 
         let holder = self
             .node
@@ -5582,6 +5758,11 @@ async fn handle_connection<R, W>(
                                 maybe_spawn_transport_probe(&daemon, sid, hints);
                             }
                         }
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
+                    "session.start" => {
+                        let resp = handle_session_start(&daemon, &packet);
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
                         break;
                     }
@@ -5833,7 +6014,7 @@ async fn handle_connection<R, W>(
                             break;
                         };
 
-                        if let Err(err_code) = daemon.verify_session_auth(&session_id, &packet) {
+                        if let Err(err_code) = daemon.verify_wait_session_auth(&session_id, &packet) {
                             let _ = write_ndjson_line_async(
                                 &mut write_half,
                                 &json!({
@@ -6130,19 +6311,22 @@ async fn resolve_tool_caller(
                 let ephemeral_opt = mcp_ctx
                     .as_deref()
                     .and_then(|c| c.ephemeral_client_id.as_ref());
-                let backend_has_hooks = mcp_ctx.as_deref().and_then(|c| c.backend).is_some_and(
-                    |harness| {
-                        daemon
-                            .hook_registered_harnesses
-                            .lock()
-                            .expect("hook_registered_harnesses lock poisoned")
-                            .contains(&harness)
-                    },
-                );
+                let backend_opt = mcp_ctx.as_deref().and_then(|c| c.backend);
+                let backend_has_hooks = backend_opt.is_some_and(harness_natively_uses_hooks);
+                let session_has_hooks = ephemeral_opt.is_some_and(|cid| {
+                    let harness = backend_opt.unwrap_or(HarnessKind::Claude);
+                    let sid = format!("{}:{cid}", harness.as_str());
+                    daemon
+                        .hook_registered_sessions
+                        .lock()
+                        .expect("hook_registered_sessions lock poisoned")
+                        .contains(&sid)
+                });
                 if explicit_token_supplied
                     || ephemeral_opt.is_none()
                     || code != CallerErrorCode::CallerNotFound
                     || backend_has_hooks
+                    || session_has_hooks
                 {
                     return Err((code.as_str().to_string(), message));
                 }
@@ -6189,7 +6373,93 @@ async fn resolve_tool_caller(
     ))
 }
 
-fn generate_session_token() -> String {
+fn harness_natively_uses_hooks(harness: HarnessKind) -> bool {
+    matches!(
+        harness,
+        HarnessKind::Claude
+            | HarnessKind::Antigravity
+            | HarnessKind::Cursor
+            | HarnessKind::Gemini
+            | HarnessKind::Codex
+            | HarnessKind::Opencode
+    )
+}
+
+fn backend_json_flag_true(backend_json: &str, key: &str) -> bool {
+    serde_json::from_str::<Value>(backend_json)
+        .ok()
+        .and_then(|v| v.get(key).and_then(Value::as_bool))
+        == Some(true)
+}
+
+fn cap_trust_tier_to_external_webhook(tier: GateTrustTier) -> GateTrustTier {
+    match tier {
+        GateTrustTier::Bridge => GateTrustTier::Bridge,
+        _ => GateTrustTier::ExternalWebhook,
+    }
+}
+
+fn value_indicates_external_webhook(val: &Value) -> bool {
+    let Some(obj) = val.as_object() else {
+        return false;
+    };
+    let check_source_kind = |map: &Map<String, Value>| {
+        map.get("hyphaesourcekind")
+            .and_then(Value::as_str)
+            .is_some_and(|s| {
+                let low = s.trim().to_ascii_lowercase();
+                low == "external-webhook" || low == "webhook" || low == "bridge"
+            })
+    };
+    if check_source_kind(obj) {
+        return true;
+    }
+    if let Some(ext) = obj.get("extensions").and_then(Value::as_object) {
+        if check_source_kind(ext) {
+            return true;
+        }
+    }
+    if let Some(src) = obj.get("source").and_then(Value::as_str) {
+        let low = src.trim().to_ascii_lowercase();
+        if low.starts_with("webhook:")
+            || low.starts_with("adapter:")
+            || low.starts_with("external-webhook:")
+            || low.ends_with(":webhook")
+        {
+            return true;
+        }
+    }
+    if let Some(events) = obj.get("events").and_then(Value::as_array) {
+        for ev in events {
+            if value_indicates_external_webhook(ev) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn raw_has_external_webhook_origin(source: &str, text: &str) -> bool {
+    let low_src = source.trim().to_ascii_lowercase();
+    if low_src.starts_with("webhook:")
+        || low_src.starts_with("adapter:")
+        || low_src.starts_with("external-webhook:")
+        || low_src.contains(":webhook")
+    {
+        return true;
+    }
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') {
+        if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+            if value_indicates_external_webhook(&parsed) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn generate_random_key_32() -> [u8; 32] {
     use ring::rand::{SecureRandom, SystemRandom};
     let mut buf = [0u8; 32];
     if SystemRandom::new().fill(&mut buf).is_err() {
@@ -6197,7 +6467,28 @@ fn generate_session_token() -> String {
         let digest = ring::digest::digest(&ring::digest::SHA256, fallback.as_bytes());
         buf.copy_from_slice(digest.as_ref());
     }
-    format!("st_{}", URL_SAFE_NO_PAD.encode(buf))
+    buf
+}
+
+fn load_or_init_session_token_key(node: &UnifiedNode) -> [u8; 32] {
+    let cfg = node.config();
+    let store = match cfg.secret_backend {
+        Some(backend) => hyp_crypto::SecretStore::new(cfg.state_dir.clone(), backend),
+        None => hyp_crypto::SecretStore::from_env(cfg.state_dir.clone()),
+    };
+    if let Ok(existing) = store.get(DAEMON_SESSION_TOKEN_KEY_SECRET) {
+        if let Ok(decoded) = URL_SAFE_NO_PAD.decode(existing.trim().as_bytes()) {
+            if decoded.len() == 32 {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&decoded);
+                return key;
+            }
+        }
+    }
+    let key = generate_random_key_32();
+    let encoded = URL_SAFE_NO_PAD.encode(key);
+    let _ = store.set(DAEMON_SESSION_TOKEN_KEY_SECRET, &encoded);
+    key
 }
 
 fn verify_session_token_ct(expected: &str, provided: Option<&str>) -> bool {
@@ -6235,6 +6526,7 @@ struct NodeJsonT3Config {
     url: Option<String>,
     base_dir: Option<PathBuf>,
     token_secret: Option<String>,
+    allow_remote: bool,
 }
 
 impl NodeJsonT3Config {
@@ -6249,10 +6541,15 @@ impl NodeJsonT3Config {
                 .filter(|s| !s.is_empty())
                 .map(ToString::to_string)
         };
+        let allow_remote = obj
+            .get("allowRemote")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         Self {
             url: clean_str("url"),
             base_dir: clean_str("baseDir").map(PathBuf::from),
             token_secret: clean_str("tokenSecret"),
+            allow_remote,
         }
     }
 }
@@ -6284,6 +6581,67 @@ fn read_node_json_for_state_dir(state_dir: &Path) -> Option<Value> {
     None
 }
 
+/// Exclusive `SessionStart` hook handler returning the deterministic HMAC-derived `sessionToken`
+/// for writing into `$CLAUDE_ENV_FILE`. When `envFileExported: true` is passed, persists that
+/// flag so `wait.subscribe` / `inbox.wait` / `inbox.watch` require the matching `sessionToken`.
+fn handle_session_start(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Value>) -> Value {
+    let Some(session_id) = packet
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|s| is_valid_session_id(s))
+    else {
+        return json!({ "ok": false, "error": "invalid_session" });
+    };
+    if let Err(err) = daemon.verify_optional_session_token(session_id, packet) {
+        return json!({ "ok": false, "error": err });
+    }
+
+    let env_file_exported = packet
+        .get("envFileExported")
+        .and_then(Value::as_bool)
+        == Some(true);
+    let harness = packet
+        .get("harness")
+        .or_else(|| packet.get("backend"))
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<HarnessKind>().ok());
+    let hints = TransportHints::from_packet(packet, harness);
+    let mut patch = hints.backend_patch(harness);
+    if env_file_exported {
+        patch.insert("envFileExported".into(), json!(true));
+    }
+    let now = now_ms();
+    if patch.is_empty() {
+        let db = daemon.node.db();
+        if db.local().get_session(session_id).ok().flatten().is_none() {
+            let _ = db.local().register_session(session_id, "{}", now);
+        } else {
+            let _ = db.local().touch_session(session_id, now);
+        }
+    } else if let Err(e) = daemon.merge_session_backend_and_index(session_id, &patch, now) {
+        return json!({ "ok": false, "error": e.to_string() });
+    }
+    if env_file_exported {
+        daemon
+            .env_file_exported_sessions
+            .lock()
+            .expect("env_file_exported_sessions lock poisoned")
+            .insert(session_id.to_string());
+    }
+    daemon.bump_ui_rev();
+    maybe_spawn_transport_probe(daemon, session_id, hints);
+
+    let token = daemon.session_token_for(session_id);
+    json!({
+        "ok": true,
+        "result": {
+            "sessionId": session_id,
+            "sessionToken": token,
+            "envFileExported": env_file_exported,
+        }
+    })
+}
+
 fn handle_session_register(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Value>) -> Value {
     let Some(session_id) = packet
         .get("sessionId")
@@ -6292,11 +6650,9 @@ fn handle_session_register(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, 
     else {
         return json!({ "ok": false, "error": "invalid_session" });
     };
-    let provided_tok = packet.get("sessionToken").and_then(Value::as_str);
-    let token = match daemon.mint_or_verify_session_token(session_id, provided_tok) {
-        Ok(tok) => tok,
-        Err(err) => return json!({ "ok": false, "error": err }),
-    };
+    if let Err(err) = daemon.verify_optional_session_token(session_id, packet) {
+        return json!({ "ok": false, "error": err });
+    }
 
     let harness = packet
         .get("harness")
@@ -6322,7 +6678,6 @@ fn handle_session_register(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, 
         "ok": true,
         "result": {
             "sessionId": session_id,
-            "sessionToken": token,
         }
     })
 }
@@ -6335,23 +6690,9 @@ fn handle_session_hint(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Valu
     else {
         return json!({ "ok": false, "error": "invalid_session" });
     };
-    let request_token = packet
-        .get("requestSessionToken")
-        .and_then(Value::as_bool)
-        == Some(true);
-    let provided_tok = packet.get("sessionToken").and_then(Value::as_str);
-
-    let minted_token = if request_token {
-        match daemon.mint_or_verify_session_token(session_id, provided_tok) {
-            Ok(tok) => Some(tok),
-            Err(err) => return json!({ "ok": false, "error": err }),
-        }
-    } else {
-        if let Err(err) = daemon.verify_session_auth(session_id, packet) {
-            return json!({ "ok": false, "error": err });
-        }
-        None
-    };
+    if let Err(err) = daemon.verify_optional_session_token(session_id, packet) {
+        return json!({ "ok": false, "error": err });
+    }
 
     let harness = packet
         .get("harness")
@@ -6365,11 +6706,7 @@ fn handle_session_hint(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Valu
     }
     maybe_spawn_transport_probe(daemon, session_id, hints);
 
-    let mut result = Map::new();
-    if let Some(tok) = minted_token {
-        result.insert("sessionToken".into(), json!(tok));
-    }
-    json!({ "ok": true, "result": Value::Object(result) })
+    json!({ "ok": true, "result": {} })
 }
 
 fn read_t3_secret_for_node(node: &UnifiedNode, custom_secret_name: Option<&str>) -> Option<String> {
@@ -6380,16 +6717,14 @@ fn read_t3_secret_for_node(node: &UnifiedNode, custom_secret_name: Option<&str>)
     };
 
     if let Some(name) = custom_secret_name.map(str::trim).filter(|s| !s.is_empty()) {
-        if let Ok(val) = store.get(name) {
-            let trimmed = val.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-        // Fail closed when a custom non-default secret name was configured explicitly.
-        if name != DEFAULT_T3_TOKEN_SECRET && name != FALLBACK_T3_TOKEN_SECRET {
+        if !is_allowed_t3_token_secret(name) {
             return None;
         }
+        return store
+            .get(name)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
     }
 
     if let Ok(val) = store.get(DEFAULT_T3_TOKEN_SECRET) {
@@ -6539,20 +6874,24 @@ fn maybe_spawn_transport_probe(
                     .or(daemon_arc.config.t3_default_url.as_deref())
                     .or(node_t3.url.as_deref())
                     .unwrap_or(DEFAULT_T3_URL);
-                if let Ok(origin) = normalize_t3_server_url(raw_url) {
+                if let Ok(origin) = normalize_t3_server_url_with_remote(raw_url, node_t3.allow_remote)
+                {
                     let token =
                         read_t3_secret_for_node(&daemon_arc.node, node_t3.token_secret.as_deref());
-                    let probe =
-                        probe_t3_server(&origin, token.as_deref(), DEFAULT_PROBE_TIMEOUT).await;
+                    let probe = probe_t3_server_with_remote(
+                        &origin,
+                        token.as_deref(),
+                        node_t3.allow_remote,
+                        DEFAULT_PROBE_TIMEOUT,
+                    )
+                    .await;
                     // X3 (P1): Attach T3Transport ONLY when a bearer token is present AND the T3
                     // server confirmed authentication succeeded (`authenticated == Some(true)`).
                     if token.is_some() && probe.is_authenticated() {
                         let mut target = T3Target::new(thread_id, origin);
                         target.base_dir = Some(t3_base_candidate.clone());
                         if let Some(ref custom_sec) = node_t3.token_secret {
-                            if custom_sec != DEFAULT_T3_TOKEN_SECRET
-                                && custom_sec != FALLBACK_T3_TOKEN_SECRET
-                            {
+                            if is_allowed_t3_token_secret(custom_sec) {
                                 target.token_secret = Some(custom_sec.clone());
                             }
                         }
@@ -6560,7 +6899,9 @@ fn maybe_spawn_transport_probe(
                         target.secret_backend = daemon_arc.node.config().secret_backend;
                         if daemon_arc.attach_transport_if_higher_priority(
                             &sid,
-                            Arc::new(T3Transport::new(target)),
+                            Arc::new(
+                                T3Transport::new(target).with_allow_remote(node_t3.allow_remote),
+                            ),
                             PRIORITY_T3,
                         ) {
                             attached = true;
@@ -6622,7 +6963,9 @@ fn maybe_spawn_transport_probe(
 
                 let allow_attach = if hints.explicit_codex_queue {
                     true
-                } else if is_codex && is_valid_codex_uuid(thread_id) && codex_binary_available(codex_bin)
+                } else if is_codex
+                    && is_valid_codex_uuid(thread_id)
+                    && codex_queue_supported(codex_bin).await
                 {
                     let codex_home = hints.codex_home.clone().unwrap_or_else(default_codex_home);
                     if hints.codex_remote.is_none() && codex_home.join("sessions").is_dir() {
@@ -6684,22 +7027,9 @@ fn handle_call_start(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> 
         return json!({ "ok": false, "error": "invalid_call_start" });
     };
 
-    let request_token = packet
-        .get("requestSessionToken")
-        .and_then(Value::as_bool)
-        == Some(true);
-    let provided_tok = packet.get("sessionToken").and_then(Value::as_str);
-    let minted_session_token = if request_token {
-        match daemon.mint_or_verify_session_token(session_id, provided_tok) {
-            Ok(tok) => Some(tok),
-            Err(err) => return json!({ "ok": false, "error": err }),
-        }
-    } else {
-        if let Err(err) = daemon.verify_session_auth(session_id, packet) {
-            return json!({ "ok": false, "error": err });
-        }
-        None
-    };
+    if let Err(err) = daemon.verify_optional_session_token(session_id, packet) {
+        return json!({ "ok": false, "error": err });
+    }
 
     let call_id = packet
         .get("callId")
@@ -6715,10 +7045,10 @@ fn handle_call_start(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> 
         return json!({ "ok": false, "error": e.to_string() });
     }
     daemon
-        .hook_registered_harnesses
+        .hook_registered_sessions
         .lock()
-        .expect("hook_registered_harnesses lock poisoned")
-        .insert(harness);
+        .expect("hook_registered_sessions lock poisoned")
+        .insert(session_id.to_string());
     daemon.bump_ui_rev();
 
     match daemon.calls.start_call(
@@ -6736,9 +7066,6 @@ fn handle_call_start(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> 
             let mut result = Map::new();
             result.insert("callToken".into(), json!(reg.token));
             result.insert("sessionId".into(), json!(reg.session_id));
-            if let Some(tok) = minted_session_token {
-                result.insert("sessionToken".into(), json!(tok));
-            }
             json!({
                 "ok": true,
                 "result": Value::Object(result)
@@ -6760,7 +7087,7 @@ async fn handle_mailbox_drain(
         return json!({ "ok": false, "error": "invalid_session" });
     };
 
-    if let Err(err) = daemon.verify_session_auth(session_id, packet) {
+    if let Err(err) = daemon.verify_optional_session_token(session_id, packet) {
         return json!({ "ok": false, "error": err });
     }
 
@@ -7460,18 +7787,12 @@ fn spawn_external_drop_watcher(
                                         return;
                                     }
                                     Err(err) => {
+                                        // H18: Never kill the drop watcher on a single junk /
+                                        // unverifiable SSE envelope — ignore it and keep waiting
+                                        // until a valid submission arrives or the deadline elapses!
                                         let (code, _) = node_err_tuple(err);
-                                        let safe_code = sanitize_notice_label(&code);
-                                        daemon
-                                            .enqueue_system_notice(
-                                                &requesting_session_id,
-                                                format!("drop-error:{drop_id}:{safe_code}"),
-                                                format!(
-                                                    "[hyphae notice] Verified human drop '{drop_id}' failed verification ({safe_code}); payload rejected without exposure."
-                                                ),
-                                            )
-                                            .await;
-                                        return;
+                                        let _ = sanitize_notice_label(&code);
+                                        continue;
                                     }
                                 }
                             }
@@ -7678,12 +7999,14 @@ async fn fanout_approved_local_ingest(
             }
         };
 
+        let approved_event_id = ce.id.clone();
         if daemon.node.publish_event(&qualified_topic, ce).await.is_err() {
             continue;
         }
 
-        // Flush matched local subscriber batches into their mailboxes and mark them gate-approved
-        // atomically under the DB lock so `reconcile_session_inbox` never re-quarantines them.
+        // G8: Flush matched local subscriber batches into their mailboxes, marking ONLY the
+        // exact human-approved event (`ev.id == approved_event_id`) as gate-approved — NEVER
+        // blanket-marking unrelated due batches or sibling events on the same topic!
         {
             let db = daemon.node.db();
             let _ = db.events().tick(now);
@@ -7711,73 +8034,138 @@ async fn fanout_approved_local_ingest(
                 .collect();
 
             for subscriber in local_subscribers {
-                let due = db
-                    .events()
-                    .claim_due_batches(&subscriber, now)
-                    .unwrap_or_default();
-                for local_batch in due {
-                    if (local_batch.origin_node != my_id && local_batch.origin_node != "local")
-                        || local_batch.topic != topic
-                    {
-                        continue;
+                let mut skipped_batches: HashSet<String> = HashSet::new();
+                for _ in 0..128 {
+                    let due = db
+                        .events()
+                        .due_batches(&subscriber, |bid| skipped_batches.contains(bid), now)
+                        .unwrap_or_default();
+                    if due.is_empty() {
+                        break;
                     }
-                    let kind = if local_batch.topic == "kv" {
-                        MailboxKind::Kv
-                    } else {
-                        MailboxKind::Event
-                    };
-                    let traceparent = local_batch
-                        .events
-                        .first()
-                        .and_then(|ev| ev.extensions.get(EXT_TRACEPARENT))
-                        .cloned();
-                    let Ok(payload_text) = serde_json::to_string(&json!({
-                        "batchId": local_batch.id,
-                        "originNode": local_batch.origin_node,
-                        "topic": local_batch.topic,
-                        "events": local_batch.events,
-                    })) else {
-                        continue;
-                    };
-                    let put = db.local().put_in_mailbox(
-                        &MailboxInsert {
-                            session_id: subscriber.clone(),
-                            origin_node: my_id.clone(),
-                            item_id: format!("batch:{}", local_batch.id),
-                            text: payload_text,
-                            kind,
-                            source: format!("local.{}", local_batch.topic),
-                            gate_state: GateState::Pending,
-                            gate_reason: None,
-                            traceparent,
-                        },
-                        now,
-                    );
-                    match put {
-                        Ok(MailboxPutResult::Stored { receipt: sub_rcpt }) => {
-                            let _ = db.local().mark_mailbox_gate_approved(
-                                &subscriber,
-                                &sub_rcpt,
-                                false,
-                                now,
-                            );
-                            let _ = db.events().ack_batch(
-                                &subscriber,
-                                &local_batch.id,
-                                &AckOutcome::Delivered,
-                                now,
-                            );
-                            sessions_to_wake.insert(subscriber.clone());
+                    let mut progressed = false;
+                    let mut saw_approved = false;
+                    for local_batch in due {
+                        if (local_batch.origin_node != my_id && local_batch.origin_node != "local")
+                            || local_batch.topic != topic
+                        {
+                            skipped_batches.insert(local_batch.id);
+                            continue;
                         }
-                        Ok(MailboxPutResult::Duplicate) => {
-                            let _ = db.events().ack_batch(
-                                &subscriber,
-                                &local_batch.id,
-                                &AckOutcome::Delivered,
-                                now,
-                            );
+                        let kind = if local_batch.topic == "kv" {
+                            MailboxKind::Kv
+                        } else {
+                            MailboxKind::Event
+                        };
+                        let mut approved_events = Vec::new();
+                        let mut unrelated_events = Vec::new();
+                        for ev in local_batch.events {
+                            if ev.id == approved_event_id {
+                                approved_events.push(ev);
+                            } else {
+                                unrelated_events.push(ev);
+                            }
                         }
-                        Ok(MailboxPutResult::QueueFull) => {
+
+                        let mut queue_full = false;
+                        let mut put_ok = false;
+
+                        // 1. Deliver ONLY the exact approved event with `mark_mailbox_gate_approved`.
+                        if !approved_events.is_empty() {
+                            saw_approved = true;
+                            let traceparent = approved_events
+                                .first()
+                                .and_then(|ev| ev.extensions.get(EXT_TRACEPARENT))
+                                .cloned();
+                            let item_id = if unrelated_events.is_empty() {
+                                format!("batch:{}", local_batch.id)
+                            } else {
+                                format!("approved:{}:{}", local_batch.id, approved_event_id)
+                            };
+                            if let Ok(payload_text) = serde_json::to_string(&json!({
+                                "batchId": local_batch.id,
+                                "originNode": local_batch.origin_node,
+                                "topic": local_batch.topic,
+                                "events": approved_events,
+                            })) {
+                                match db.local().put_in_mailbox(
+                                    &MailboxInsert {
+                                        session_id: subscriber.clone(),
+                                        origin_node: my_id.clone(),
+                                        item_id,
+                                        text: payload_text,
+                                        kind,
+                                        source: format!("local.{}", local_batch.topic),
+                                        gate_state: GateState::Pending,
+                                        gate_reason: None,
+                                        traceparent,
+                                    },
+                                    now,
+                                ) {
+                                    Ok(MailboxPutResult::Stored { receipt: sub_rcpt }) => {
+                                        let _ = db.local().mark_mailbox_gate_approved(
+                                            &subscriber,
+                                            &sub_rcpt,
+                                            false,
+                                            now,
+                                        );
+                                        sessions_to_wake.insert(subscriber.clone());
+                                        put_ok = true;
+                                    }
+                                    Ok(MailboxPutResult::Duplicate) => {
+                                        put_ok = true;
+                                    }
+                                    Ok(MailboxPutResult::QueueFull) => {
+                                        queue_full = true;
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
+                        }
+
+                        // 2. Any unrelated due events on the same topic stay UNSCREENED
+                        //    (`reviewed_at = NULL`) so `reconcile_session_inbox` gates them normally!
+                        if !unrelated_events.is_empty() && !queue_full {
+                            let traceparent = unrelated_events
+                                .first()
+                                .and_then(|ev| ev.extensions.get(EXT_TRACEPARENT))
+                                .cloned();
+                            if let Ok(payload_text) = serde_json::to_string(&json!({
+                                "batchId": local_batch.id,
+                                "originNode": local_batch.origin_node,
+                                "topic": local_batch.topic,
+                                "events": unrelated_events,
+                            })) {
+                                match db.local().put_in_mailbox(
+                                    &MailboxInsert {
+                                        session_id: subscriber.clone(),
+                                        origin_node: my_id.clone(),
+                                        item_id: format!("batch:{}", local_batch.id),
+                                        text: payload_text,
+                                        kind,
+                                        source: format!("local.{}", local_batch.topic),
+                                        gate_state: GateState::Pending,
+                                        gate_reason: None,
+                                        traceparent,
+                                    },
+                                    now,
+                                ) {
+                                    Ok(MailboxPutResult::Stored { .. }) => {
+                                        sessions_to_wake.insert(subscriber.clone());
+                                        put_ok = true;
+                                    }
+                                    Ok(MailboxPutResult::Duplicate) => {
+                                        put_ok = true;
+                                    }
+                                    Ok(MailboxPutResult::QueueFull) => {
+                                        queue_full = true;
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
+                        }
+
+                        if queue_full {
                             let _ = db.events().ack_batch(
                                 &subscriber,
                                 &local_batch.id,
@@ -7787,8 +8175,21 @@ async fn fanout_approved_local_ingest(
                                 },
                                 now,
                             );
+                            skipped_batches.insert(local_batch.id);
+                        } else if put_ok {
+                            let _ = db.events().ack_batch(
+                                &subscriber,
+                                &local_batch.id,
+                                &AckOutcome::Delivered,
+                                now,
+                            );
+                            progressed = true;
+                        } else {
+                            skipped_batches.insert(local_batch.id);
                         }
-                        Err(_) => {}
+                    }
+                    if saw_approved || !progressed {
+                        break;
                     }
                 }
             }
@@ -7807,6 +8208,24 @@ async fn fanout_approved_local_ingest(
         }
     }
     woken_any
+}
+
+/// Startup sweep fanning out any `local-ingest:<topic>` rows that were approved by a human
+/// operator (`hyp inbox approve`) while the daemon was stopped (`G8`).
+async fn sweep_approved_local_ingest_on_startup(daemon: &Arc<LocalDaemonInner>) {
+    let staging_sessions = {
+        let db = daemon.node.db();
+        db.local()
+            .list_approved_local_ingest_sessions()
+            .unwrap_or_default()
+    };
+    for staging_sid in staging_sessions {
+        if let Some(topic) = staging_sid.strip_prefix("local-ingest:") {
+            if !topic.is_empty() {
+                let _ = fanout_approved_local_ingest(daemon, &staging_sid, topic, None).await;
+            }
+        }
+    }
 }
 
 async fn handle_inbox_wake_rpc(
@@ -9697,14 +10116,19 @@ async fn handle_session_leave_channel(
     };
 
     match daemon.node.leave_channel(channel, &handle).await {
-        Ok(left) => {
+        Ok(false) => json!({
+            "ok": false,
+            "code": "not_found",
+            "error": format!("Session '{}' (@{}) is not a member of channel '{channel}'", sess.id, handle),
+        }),
+        Ok(true) => {
             let rev = daemon.bump_ui_rev();
             json!({
                 "ok": true,
                 "result": {
                     "sessionId": sess.id,
                     "channel": channel,
-                    "left": left,
+                    "left": true,
                     "rev": rev,
                 }
             })

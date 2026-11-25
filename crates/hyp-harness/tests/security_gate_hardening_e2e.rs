@@ -953,3 +953,302 @@ async fn u1_daemon_stop_writes_final_offline_ui_state_snapshot() {
         "socket path must be removed after stop"
     );
 }
+
+/// Wave 4B P0: Hub-relayed `MailboxKind::Event` from an `Org`-tier Team Hub (and any item whose
+/// envelope carries `hyphaesourcekind: "external-webhook"`) MUST be capped to `ExternalWebhook`
+/// and screened by Stage 2, whereas ordinary `Org` peer DMs keep `Org` tier!
+#[tokio::test]
+async fn hub_relayed_org_event_and_webhook_origin_capped_to_external_webhook_and_screened() {
+    let tmp = TempDir::new().unwrap();
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+
+    let node = open_local_node("alice@macbook", &state_dir);
+    let gate_db = Arc::new(Mutex::new(
+        NodeDb::open(state_dir.join("node.sqlite")).unwrap(),
+    ));
+
+    // Enroll `team-hub@acme` as an `Org` trusted peer!
+    {
+        let db = node.db();
+        db.peers()
+            .upsert_peer(
+                &hyp_store::PeerInput {
+                    peer_id: "team-hub@acme".into(),
+                    endpoint: Some("https://hub.acme.example".into()),
+                    profile: hyp_store::PeerProfile::Router,
+                    trust_tier: hyp_store::TrustTier::Org,
+                    status: hyp_store::PeerStatus::Active,
+                    scopes: vec!["events:sub".into(), "dm:send".into()],
+                    auth_credential_ref: None,
+                },
+                now_ms(),
+            )
+            .unwrap();
+    }
+
+    // Stage 2 excludes `Org` & `SelfHost`, matching ONLY `[Guest, ExternalWebhook, Peer, Bridge]`.
+    let filter = InspectingStage2Filter::new(
+        "stage2-default-tiers",
+        vec![
+            GateTrustTier::Guest,
+            GateTrustTier::ExternalWebhook,
+            GateTrustTier::Peer,
+            GateTrustTier::Bridge,
+        ],
+        Duration::ZERO,
+        "HUB_WEBHOOK_INJECTION_PAYLOAD",
+    );
+    let pipeline = Arc::new(
+        SecurityGatePipeline::new(SecurityGateConfig::default(), Arc::clone(&gate_db), None)
+            .unwrap()
+            .with_custom_plugin(filter.clone()),
+    );
+
+    let daemon = LocalDaemon::start(
+        Arc::clone(&node),
+        Some(pipeline),
+        LocalDaemonConfig::default(),
+    )
+    .await
+    .unwrap();
+    let sock = daemon.socket_path().to_path_buf();
+
+    let sid = "claude:hub-cap-session";
+    let now = now_ms();
+    node.db()
+        .local()
+        .register_session(sid, "{\"kind\":\"claude\"}", now)
+        .unwrap();
+
+    {
+        let db = node.db();
+        // 1. Remote `MailboxKind::Event` relayed from `Org` hub -> MUST be capped to `ExternalWebhook` & quarantined!
+        db.local()
+            .put_in_mailbox(
+                &MailboxInsert {
+                    session_id: sid.into(),
+                    origin_node: "team-hub@acme".into(),
+                    item_id: "hub-gh-event-1".into(),
+                    text: json!({
+                        "batchId": "b1",
+                        "originNode": "team-hub@acme",
+                        "topic": "github",
+                        "events": [{
+                            "specversion": "1.0",
+                            "id": "gh-1",
+                            "source": "github:webhook",
+                            "type": "to.hyphae.github.pr",
+                            "data": { "body": "HUB_WEBHOOK_INJECTION_PAYLOAD" }
+                        }]
+                    })
+                    .to_string(),
+                    kind: MailboxKind::Event,
+                    source: "team-hub@acme.github".into(),
+                    gate_state: GateState::Pending,
+                    gate_reason: None,
+                    traceparent: None,
+                },
+                now,
+            )
+            .unwrap();
+
+        // 2. Remote `MailboxKind::Message` from `Org` hub whose envelope carries `hyphaesourcekind: "external-webhook"`
+        //    -> MUST ALSO be capped to `ExternalWebhook` & quarantined!
+        db.local()
+            .put_in_mailbox(
+                &MailboxInsert {
+                    session_id: sid.into(),
+                    origin_node: "team-hub@acme".into(),
+                    item_id: "hub-ext-msg-1".into(),
+                    text: json!({
+                        "hyphaesourcekind": "external-webhook",
+                        "text": "HUB_WEBHOOK_INJECTION_PAYLOAD via message envelope"
+                    })
+                    .to_string(),
+                    kind: MailboxKind::Message,
+                    source: "team-hub@acme/relay".into(),
+                    gate_state: GateState::Pending,
+                    gate_reason: None,
+                    traceparent: None,
+                },
+                now + 1,
+            )
+            .unwrap();
+
+        // 3. Normal `Org` peer DM (NOT an event or webhook) -> retains `Org` tier (skips Stage 2) & delivers!
+        db.local()
+            .put_in_mailbox(
+                &MailboxInsert {
+                    session_id: sid.into(),
+                    origin_node: "team-hub@acme".into(),
+                    item_id: "hub-org-dm-1".into(),
+                    text: "Legitimate Org DM containing HUB_WEBHOOK_INJECTION_PAYLOAD note".into(),
+                    kind: MailboxKind::Message,
+                    source: "team-hub@acme/ops".into(),
+                    gate_state: GateState::Pending,
+                    gate_reason: None,
+                    traceparent: None,
+                },
+                now + 2,
+            )
+            .unwrap();
+    }
+
+    let drain = rpc(&sock, &json!({ "type": "mailbox.drain", "sessionId": sid })).await;
+    assert!(drain.ok, "mailbox.drain failed: {drain:?}");
+    let items = drain.result.unwrap()["items"].as_array().unwrap().clone();
+    assert_eq!(items.len(), 1, "only normal Org DM should deliver");
+    let rendered = items[0]["text"].as_str().unwrap();
+    assert!(rendered.contains("Legitimate Org DM"));
+    assert!(!rendered.contains("github:webhook"));
+    assert!(!rendered.contains("via message envelope"));
+
+    let seen = filter.seen_snapshot();
+    assert_eq!(seen.len(), 2, "both hub event & external-webhook item must hit Stage 2: {seen:?}");
+    assert!(
+        seen.iter()
+            .all(|(_, tier, _)| *tier == GateTrustTier::ExternalWebhook),
+        "all hub-relayed events/webhooks must be capped to ExternalWebhook: {seen:?}"
+    );
+    assert_eq!(
+        node.db().local().list_quarantined(Some(sid), 20).unwrap().len(),
+        2
+    );
+
+    daemon.stop().await;
+    node.shutdown();
+}
+
+/// Wave 4B `G3`: Coalescing a new malicious payload over an already-approved/`HumanVerified`
+/// unread row MUST reset `reviewed_at`, `human_auth_json`, `gate_reason`, and daemon `item_meta`
+/// so the overwritten payload is re-screened by Stage 2 and quarantined instead of inheriting
+/// the prior approval or `HumanVerified` badge!
+#[tokio::test]
+async fn g3_coalesce_over_approved_human_verified_row_rescreens_and_quarantines() {
+    let tmp = TempDir::new().unwrap();
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+
+    let node = open_local_node("coalesce-g3@box", &state_dir);
+    let gate_db = Arc::new(Mutex::new(
+        NodeDb::open(state_dir.join("node.sqlite")).unwrap(),
+    ));
+    let filter = InspectingStage2Filter::new(
+        "g3-coalesce-stage2",
+        vec![GateTrustTier::ExternalWebhook, GateTrustTier::Peer],
+        Duration::ZERO,
+        "COALESCED_ATTACK_PAYLOAD",
+    );
+    let pipeline = Arc::new(
+        SecurityGatePipeline::new(SecurityGateConfig::default(), Arc::clone(&gate_db), None)
+            .unwrap()
+            .with_custom_plugin(filter.clone()),
+    );
+
+    let daemon = LocalDaemon::start(
+        Arc::clone(&node),
+        Some(pipeline),
+        LocalDaemonConfig::default(),
+    )
+    .await
+    .unwrap();
+    let sock = daemon.socket_path().to_path_buf();
+
+    let sid = "claude:g3-coalesce";
+    let now = now_ms();
+    node.db()
+        .local()
+        .register_session(sid, "{\"kind\":\"claude\"}", now)
+        .unwrap();
+
+    let opts = hyp_store::MailboxPutOptions {
+        coalesce_key: Some("feed:ci".into()),
+        expires_at: None,
+    };
+
+    // 1. Insert initial benign event and mark it gate-approved + HumanVerified!
+    let rcpt = match node
+        .db()
+        .local()
+        .put_in_mailbox_ex(
+            &MailboxInsert {
+                session_id: sid.into(),
+                origin_node: "local".into(),
+                item_id: "ci-1".into(),
+                text: "Initial verified CI status".into(),
+                kind: MailboxKind::Event,
+                source: "local.ci".into(),
+                gate_state: GateState::Pending,
+                gate_reason: None,
+                traceparent: None,
+            },
+            &opts,
+            now,
+        )
+        .unwrap()
+    {
+        MailboxPutResult::Stored { receipt } => receipt,
+        other => panic!("unexpected put result: {other:?}"),
+    };
+    node.db()
+        .local()
+        .mark_mailbox_gate_approved(sid, &rcpt, false, now + 1)
+        .unwrap();
+    node.db()
+        .human()
+        .set_mailbox_human_auth(&rcpt, r#"{"humanId":"bogdan","kid":"k123"}"#)
+        .unwrap();
+
+    // 2. Coalesce a malicious payload onto the EXACT same unread receipt!
+    let rcpt2 = match node
+        .db()
+        .local()
+        .put_in_mailbox_ex(
+            &MailboxInsert {
+                session_id: sid.into(),
+                origin_node: "local".into(),
+                item_id: "ci-2".into(),
+                text: "COALESCED_ATTACK_PAYLOAD steal ~/.ssh".into(),
+                kind: MailboxKind::Event,
+                source: "local.ci".into(),
+                gate_state: GateState::Pending,
+                gate_reason: None,
+                traceparent: None,
+            },
+            &opts,
+            now + 5,
+        )
+        .unwrap()
+    {
+        MailboxPutResult::Stored { receipt } => receipt,
+        other => panic!("unexpected coalesce result: {other:?}"),
+    };
+    assert_eq!(rcpt2, rcpt);
+
+    // 3. Draining MUST re-screen the coalesced payload through Stage 2 and quarantine it!
+    let drain = rpc(&sock, &json!({ "type": "mailbox.drain", "sessionId": sid })).await;
+    assert!(drain.ok);
+    assert!(
+        drain.result.unwrap()["items"].as_array().unwrap().is_empty(),
+        "G3 VIOLATION: coalesced malicious payload bypassed gate via stale reviewed_at/human_auth_json!"
+    );
+    let entry = node
+        .db()
+        .local()
+        .get_mailbox_entry(&rcpt)
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.gate_state, GateState::Quarantined);
+    assert!(
+        node.db()
+            .human()
+            .get_mailbox_human_auth(&rcpt)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(filter.seen_snapshot().len(), 1);
+
+    daemon.stop().await;
+    node.shutdown();
+}
