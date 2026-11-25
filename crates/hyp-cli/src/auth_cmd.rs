@@ -14,6 +14,7 @@ use crate::config_file::{
 };
 use crate::ui::{
     EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
+    print_warnings,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -23,18 +24,26 @@ use http_body_util::{BodyExt, Full};
 use hyp_crypto::human::{
     HumanAudience, HumanClaimV1, HumanDropKind, HumanRevocationPayloadV1, NodeCertPayloadV1,
     SecretDropSpec, SignedHumanRevocationV1, SignedNodeCertV1, decode_hcert1, encode_hdrop1,
-    is_reserved_secret_name, seal_human_drop, sign_human_revocation, verify_node_cert,
+    is_reserved_secret_name, seal_human_drop, sign_human_revocation, sign_local_ingest_event,
+    verify_node_cert,
 };
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keys::{Ed25519KeyPair, Ed25519PublicKey, OkpJwk, X25519PublicKey};
 use hyp_crypto::keystore::{SecretStore, validate_secret_name};
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms, parse_rfc3339_millis};
-use hyp_node::engine::{NodeConfig, NodeProfile, UnifiedNode, resolve_drop_portal_url};
+use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync};
+use hyp_node::engine::{
+    LocalIngestConfig, NodeConfig, NodeProfile, UnifiedNode, canonical_local_event_for_signing,
+    resolve_drop_portal_url, send_local_ingest_event,
+};
 use hyp_node::gates::policy::{SecurityGateConfig, sign_gate_policy, verify_gate_policy_sig};
 use hyp_proto::address::{LOCAL_NODE_ID, NodeId, is_valid_handle, is_valid_node_id};
+use hyp_proto::cloudevent::{
+    CONTENT_TYPE_JSON, CloudEvent as ProtoCloudEvent, EXT_LOCAL_EVENT_SIG, TYPE_HUMAN_REVOCATION_V1,
+};
 use hyp_store::{
     HumanAuthorityInput, HumanAuthorityRecord, HumanAuthorityRole, HumanAuthorityStatus,
-    HumanNodeCertInput, KeyUse, NodeDb, now_ms,
+    HumanNodeCertInput, KeyUse, NodeDb, now_ms, uuid_v4,
 };
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
@@ -58,6 +67,8 @@ const MAX_SIGN_BODY_BYTES: u64 = 32 * 1024;
 const MAX_ENROLL_CALLBACK_BYTES: usize = 16 * 1024;
 const DEFAULT_WEB_TIMEOUT_SECS: u64 = 300;
 const MAX_DROP_TTL_SECS: u64 = 900;
+const LIVE_DAEMON_RPC_TIMEOUT: Duration = Duration::from_secs(2);
+const HUMAN_REVOCATIONS_TOPIC: &str = "human.revocations";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CliHumanRole {
@@ -174,6 +185,9 @@ pub enum AuthCommand {
         /// Explicit admin kid to sign SignedHumanRevocationV1 (defaults to local admin key)
         #[arg(long, allow_hyphen_values = true)]
         issuer_kid: Option<String>,
+        /// Publish the signed HumanRevocationV1 CloudEvent (`to.hyphae.human.revocation.v1`) on topic `human.revocations`
+        #[arg(long)]
+        broadcast: bool,
         /// Explicit state directory containing node.sqlite and secrets/
         #[arg(long)]
         state_dir: Option<PathBuf>,
@@ -277,10 +291,13 @@ pub fn run_auth(command: AuthCommand) -> ExitCode {
             bump_epoch,
             reason,
             issuer_kid,
+            broadcast,
             state_dir,
             config,
             json,
-        } => run_auth_revoke(kid, bump_epoch, reason, issuer_kid, state_dir, config, json),
+        } => run_auth_revoke(
+            kid, bump_epoch, reason, issuer_kid, broadcast, state_dir, config, json,
+        ),
         AuthCommand::CertifyNode {
             ttl_days,
             kid,
@@ -420,6 +437,166 @@ pub fn sync_gate_policy_digest_if_locked(
     cfg_map.insert("gate".to_string(), updated_gate);
     write_atomic_json(config_path, &Value::Object(cfg_map), true)?;
     Ok(true)
+}
+
+fn resolve_daemon_socket_for_auth(
+    explicit_state_dir: bool,
+    explicit_config: bool,
+    resolved_state_dir: &Path,
+) -> PathBuf {
+    if !explicit_state_dir && !explicit_config {
+        for key in ["HYPHAE_SOCKET", "AGENTS_MESH_SOCKET"] {
+            if let Ok(sock) = std::env::var(key) {
+                let trimmed = sock.trim();
+                if !trimmed.is_empty() {
+                    return PathBuf::from(trimmed);
+                }
+            }
+        }
+    }
+    resolved_state_dir.join(DEFAULT_SOCKET_FILENAME)
+}
+
+/// Attempts a live `gate.reload` IPC RPC against a running daemon after re-signing a locked gate
+/// policy. Returns `(gate_reloaded, error_detail)` and appends actionable warnings + restart hint
+/// whenever live reload did not confirm success.
+fn reload_live_gate_after_resign(
+    explicit_state_dir: bool,
+    explicit_config: bool,
+    state_dir: &Path,
+    warnings: &mut Vec<String>,
+    next: &mut Vec<String>,
+) -> (bool, Option<String>) {
+    let sock = resolve_daemon_socket_for_auth(explicit_state_dir, explicit_config, state_dir);
+    let resp = daemon_rpc_sync(
+        &sock,
+        &json!({ "type": "gate.reload" }),
+        LIVE_DAEMON_RPC_TIMEOUT,
+    );
+    let reloaded = resp.ok
+        && resp
+            .result
+            .as_ref()
+            .and_then(|r| r.get("reloaded"))
+            .and_then(Value::as_bool)
+            == Some(true);
+    if reloaded {
+        return (true, None);
+    }
+    let detail = resp
+        .error
+        .unwrap_or_else(|| "running daemon did not confirm gate reload".to_string());
+    warnings.push(format!(
+        "Locked Security Gate policy was re-signed on disk, but live daemon gate.reload did not complete ({detail}); restart the daemon so inbound traffic is not quarantined."
+    ));
+    let restart_cmd = "hyp service restart --json".to_string();
+    if !next.contains(&restart_cmd) {
+        next.insert(0, restart_cmd);
+    }
+    (false, Some(detail))
+}
+
+struct RevocationBroadcastOutcome {
+    event_id: String,
+    topic: String,
+    via: &'static str,
+    matched: usize,
+}
+
+fn broadcast_human_revocation(
+    state_dir: &Path,
+    config_read: &Path,
+    secrets: &SecretStore,
+    signed: &SignedHumanRevocationV1,
+    issuer_kp: &Ed25519KeyPair,
+    target: &HumanAuthorityRecord,
+    revoked_at: &str,
+) -> Result<RevocationBroadcastOutcome, String> {
+    let loaded = if config_read.exists() {
+        load_node_or_legacy_config(config_read).ok()
+    } else {
+        None
+    };
+    let local_node_id = {
+        let db = NodeDb::open(state_dir.join("node.sqlite"))
+            .map_err(|e| format!("failed to open node.sqlite: {e}"))?;
+        resolve_effective_node_id(loaded.as_ref(), Some(&db))
+    };
+
+    let data_val = serde_json::to_value(signed)
+        .map_err(|e| format!("failed to serialize SignedHumanRevocationV1: {e}"))?;
+    let event_id = format!("human-rev-{}", uuid_v4());
+    let mut ce = ProtoCloudEvent::new(
+        event_id.clone(),
+        format!("hyphae://{local_node_id}/auth"),
+        TYPE_HUMAN_REVOCATION_V1,
+        data_val,
+    );
+    ce.subject = Some(format!("{}:{}", target.human_id, target.kid));
+    ce.time = Some(revoked_at.to_string());
+    ce.datacontenttype = Some(CONTENT_TYPE_JSON.to_string());
+
+    let local_ingest_cfg: LocalIngestConfig = loaded
+        .as_ref()
+        .and_then(|c| c.raw.get("localIngest"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let ingest_socket = local_ingest_cfg.resolved_socket_path(state_dir);
+
+    // 1. Prefer live local ingest socket when running and permitted by route policy so active
+    //    SSE peer subscribers receive the event immediately.
+    if ingest_socket.exists() {
+        let mut signed_ce = ce.clone();
+        if let Ok(canonical) = canonical_local_event_for_signing(&signed_ce) {
+            let sig = sign_local_ingest_event(issuer_kp, &canonical);
+            signed_ce.set_extension(EXT_LOCAL_EVENT_SIG, sig);
+        }
+        if let Ok(Value::Object(mut wire_obj)) = serde_json::to_value(&signed_ce) {
+            wire_obj.insert(
+                "topic".to_string(),
+                Value::String(HUMAN_REVOCATIONS_TOPIC.to_string()),
+            );
+            let wire_json = Value::Object(wire_obj);
+            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                if let Ok(receipt) = rt.block_on(send_local_ingest_event(&ingest_socket, &wire_json))
+                {
+                    if receipt.get("ok").and_then(Value::as_bool) == Some(true) {
+                        let receipt_id = receipt
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or(&event_id)
+                            .to_string();
+                        let matched = receipt
+                            .get("matchedSubscribers")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0) as usize;
+                        return Ok(RevocationBroadcastOutcome {
+                            event_id: receipt_id,
+                            topic: HUMAN_REVOCATIONS_TOPIC.to_string(),
+                            via: "local_ingest",
+                            matched,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Fallback: durably ingest the CloudEvent into local EventStore on `human.revocations`
+    //    via UnifiedNode so paired peers subscribed to `human.revocations` receive and apply it.
+    let node = open_local_unified_node(state_dir, config_read, secrets)?;
+    let ingest_res = node
+        .ingest_inbound_event(&local_node_id, HUMAN_REVOCATIONS_TOPIC, &ce)
+        .map_err(|e| format!("failed to publish human revocation event to EventStore: {e}"))?;
+    Ok(RevocationBroadcastOutcome {
+        event_id,
+        topic: HUMAN_REVOCATIONS_TOPIC.to_string(),
+        via: "event_store",
+        matched: ingest_res.matched,
+    })
 }
 
 fn default_human_id() -> String {
@@ -882,42 +1059,59 @@ fn run_auth_init(
         let db = node.db();
         db.human().authorities_digest().ok()
     };
+    let node_id_str = node.node_id().as_str().to_string();
+    drop(node);
 
-    let next = vec![
+    let mut warnings = Vec::new();
+    let mut next = vec![
         format!("hyp auth list --state-dir {}", state_dir.display()),
         format!(
             "hyp drop create --kind directive --offline --state-dir {}",
             state_dir.display()
         ),
     ];
+    let (gate_reloaded, gate_reload_error) = if gate_resigned {
+        reload_live_gate_after_resign(
+            state_dir_arg.is_some(),
+            config_arg.is_some(),
+            &state_dir,
+            &mut warnings,
+            &mut next,
+        )
+    } else {
+        (false, None)
+    };
 
     if as_json {
+        let mut data = json!({
+            "humanId": inserted.human_id,
+            "kid": inserted.kid,
+            "role": inserted.role.as_str(),
+            "label": inserted.label,
+            "authEpoch": inserted.auth_epoch,
+            "publicJwk": jwk,
+            "secretName": secret_name,
+            "secretBackend": secrets.backend().as_str(),
+            "nodeId": node_id_str,
+            "nodeCert": hcert1,
+            "authoritiesDigest": digest,
+            "gatePolicyResigned": gate_resigned,
+            "gateReloaded": gate_reloaded,
+            "webEnrolled": web_enrolled,
+            "stateDir": state_dir.display().to_string(),
+        });
+        if let Some(ref err) = gate_reload_error {
+            data["gateReloadError"] = json!(err);
+        }
         let envelope = JsonEnvelope {
             ok: true,
             command: cmd.to_string(),
             summary: Some(format!(
                 "Initialized human admin authority '{}' (kid {}) and certified node '{}'",
-                inserted.human_id,
-                inserted.kid,
-                node.node_id().as_str()
+                inserted.human_id, inserted.kid, node_id_str
             )),
-            data: Some(json!({
-                "humanId": inserted.human_id,
-                "kid": inserted.kid,
-                "role": inserted.role.as_str(),
-                "label": inserted.label,
-                "authEpoch": inserted.auth_epoch,
-                "publicJwk": jwk,
-                "secretName": secret_name,
-                "secretBackend": secrets.backend().as_str(),
-                "nodeId": node.node_id().as_str(),
-                "nodeCert": hcert1,
-                "authoritiesDigest": digest,
-                "gatePolicyResigned": gate_resigned,
-                "webEnrolled": web_enrolled,
-                "stateDir": state_dir.display().to_string(),
-            })),
-            warnings: Vec::new(),
+            data: Some(data),
+            warnings,
             next,
             error: None,
         };
@@ -929,7 +1123,7 @@ fn run_auth_init(
         );
         println!("      Label:     {}", inserted.label);
         println!("      Keystore:  {} ({})", secret_name, secrets.backend().as_str());
-        println!("      Node Cert: issued 365d hcert1_ for '{}'", node.node_id().as_str());
+        println!("      Node Cert: issued 365d hcert1_ for '{node_id_str}'");
         if let Some(ref w) = web_enrolled {
             println!(
                 "      Passkey:   enrolled signer kid={}",
@@ -938,7 +1132,11 @@ fn run_auth_init(
         }
         if gate_resigned {
             println!("      Gate Sig:  re-signed with updated human_authorities_digest");
+            if gate_reloaded {
+                println!("      Gate Live: reloaded active daemon policy (no restart needed)");
+            }
         }
+        print_warnings(&warnings);
         print_next_steps(&next);
     }
 
@@ -1237,8 +1435,41 @@ fn run_auth_add(
         }
     };
     let digest = db.human().authorities_digest().ok();
+    drop(db);
+
+    let mut warnings = Vec::new();
+    let mut next = vec![format!("hyp auth list --state-dir {}", state_dir.display())];
+    let (gate_reloaded, gate_reload_error) = if gate_resigned {
+        reload_live_gate_after_resign(
+            state_dir_arg.is_some(),
+            config_arg.is_some(),
+            &state_dir,
+            &mut warnings,
+            &mut next,
+        )
+    } else {
+        (false, None)
+    };
 
     if as_json {
+        let mut data = json!({
+            "humanId": rec.human_id,
+            "kid": rec.kid,
+            "role": rec.role.as_str(),
+            "label": rec.label,
+            "authEpoch": rec.auth_epoch,
+            "encKey": rec.enc_jwk_json.is_some(),
+            "encKid": enc_kid,
+            "nodeCertStored": node_cert_stored,
+            "prfSalt": rec.prf_salt,
+            "status": rec.status.as_str(),
+            "authoritiesDigest": digest,
+            "gatePolicyResigned": gate_resigned,
+            "gateReloaded": gate_reloaded,
+        });
+        if let Some(ref err) = gate_reload_error {
+            data["gateReloadError"] = json!(err);
+        }
         let envelope = JsonEnvelope {
             ok: true,
             command: cmd.to_string(),
@@ -1248,22 +1479,9 @@ fn run_auth_add(
                 rec.role.as_str(),
                 rec.kid
             )),
-            data: Some(json!({
-                "humanId": rec.human_id,
-                "kid": rec.kid,
-                "role": rec.role.as_str(),
-                "label": rec.label,
-                "authEpoch": rec.auth_epoch,
-                "encKey": rec.enc_jwk_json.is_some(),
-                "encKid": enc_kid,
-                "nodeCertStored": node_cert_stored,
-                "prfSalt": rec.prf_salt,
-                "status": rec.status.as_str(),
-                "authoritiesDigest": digest,
-                "gatePolicyResigned": gate_resigned,
-            })),
-            warnings: Vec::new(),
-            next: vec![format!("hyp auth list --state-dir {}", state_dir.display())],
+            data: Some(data),
+            warnings,
+            next,
             error: None,
         };
         print_json(&envelope);
@@ -1283,7 +1501,12 @@ fn run_auth_add(
         }
         if gate_resigned {
             println!("      Gate Sig: re-signed with updated human_authorities_digest");
+            if gate_reloaded {
+                println!("      Gate Live: reloaded active daemon policy (no restart needed)");
+            }
         }
+        print_warnings(&warnings);
+        print_next_steps(&next);
     }
     ExitCode::from(EXIT_OK)
 }
@@ -1417,6 +1640,7 @@ fn run_auth_revoke(
     bump_epoch: bool,
     reason: String,
     issuer_kid_arg: Option<String>,
+    broadcast: bool,
     state_dir_arg: Option<PathBuf>,
     config_arg: Option<PathBuf>,
     as_json: bool,
@@ -1428,6 +1652,8 @@ fn run_auth_revoke(
     }
 
     let state_dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
+    let config_read =
+        resolve_config_path_for_read(config_arg.as_deref(), state_dir_arg.as_deref(), None);
     let config_write =
         resolve_config_path_for_write(config_arg.as_deref(), state_dir_arg.as_deref(), None);
     let db_path = state_dir.join("node.sqlite");
@@ -1466,41 +1692,51 @@ fn run_auth_revoke(
     let revoked_at = format_rfc3339_millis(now);
 
     let secrets = open_secret_store(&state_dir, state_dir_arg.is_some());
-    let signed_revocation: Option<SignedHumanRevocationV1> = {
-        let issuer_candidate = if let Some(ref ik) = issuer_kid_arg {
-            all.iter()
-                .find(|a| a.status == HumanAuthorityStatus::Active && a.kid == *ik)
-                .and_then(|a| load_local_authority_keypair(&secrets, &a.kid).ok())
-        } else {
-            // Prefer another active admin key in SecretStore; fallback to target itself if it is a local admin key.
-            all.iter()
-                .filter(|a| {
-                    a.status == HumanAuthorityStatus::Active
-                        && a.role == HumanAuthorityRole::Admin
-                        && a.kid != target.kid
-                })
-                .find_map(|a| load_local_authority_keypair(&secrets, &a.kid).ok())
-                .or_else(|| {
-                    if target.role == HumanAuthorityRole::Admin {
-                        load_local_authority_keypair(&secrets, &target.kid).ok()
-                    } else {
-                        None
-                    }
-                })
-        };
-        issuer_candidate.and_then(|kp| {
-            let payload = HumanRevocationPayloadV1 {
-                v: 1,
-                human_id: target.human_id.clone(),
-                revoked_kid: target.kid.clone(),
-                new_min_auth_epoch: new_min,
-                revoked_at: revoked_at.clone(),
-                reason: reason.clone(),
-                issuer_kid: kp.kid(),
-            };
-            sign_human_revocation(&payload, &kp).ok()
-        })
+    let issuer_kp: Option<Ed25519KeyPair> = if let Some(ref ik) = issuer_kid_arg {
+        all.iter()
+            .find(|a| a.status == HumanAuthorityStatus::Active && a.kid == *ik)
+            .and_then(|a| load_local_authority_keypair(&secrets, &a.kid).ok())
+    } else {
+        // Prefer another active admin key in SecretStore; fallback to target itself if it is a local admin key.
+        all.iter()
+            .filter(|a| {
+                a.status == HumanAuthorityStatus::Active
+                    && a.role == HumanAuthorityRole::Admin
+                    && a.kid != target.kid
+            })
+            .find_map(|a| load_local_authority_keypair(&secrets, &a.kid).ok())
+            .or_else(|| {
+                if target.role == HumanAuthorityRole::Admin {
+                    load_local_authority_keypair(&secrets, &target.kid).ok()
+                } else {
+                    None
+                }
+            })
     };
+
+    let signed_revocation: Option<SignedHumanRevocationV1> = issuer_kp.as_ref().and_then(|kp| {
+        let payload = HumanRevocationPayloadV1 {
+            v: 1,
+            human_id: target.human_id.clone(),
+            revoked_kid: target.kid.clone(),
+            new_min_auth_epoch: new_min,
+            revoked_at: revoked_at.clone(),
+            reason: reason.clone(),
+            issuer_kid: kp.kid(),
+        };
+        sign_human_revocation(&payload, kp).ok()
+    });
+
+    if broadcast && signed_revocation.is_none() {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "SIGNER_KEY_UNAVAILABLE",
+            "Cannot --broadcast revocation without an active local admin Ed25519 signing key to sign SignedHumanRevocationV1",
+            Some("Pass --issuer-kid <active-admin-kid> or run `hyp auth init` on an admin node.".to_string()),
+        );
+    }
 
     let revocation_json = match &signed_revocation {
         Some(sr) => serde_json::to_string(sr).unwrap_or_else(|_| "{}".to_string()),
@@ -1535,8 +1771,77 @@ fn run_auth_revoke(
         }
     };
     let digest = db.human().authorities_digest().ok();
+    drop(db);
+
+    let mut warnings = Vec::new();
+    let mut next = Vec::new();
+    let (gate_reloaded, gate_reload_error) = if gate_resigned {
+        reload_live_gate_after_resign(
+            state_dir_arg.is_some(),
+            config_arg.is_some(),
+            &state_dir,
+            &mut warnings,
+            &mut next,
+        )
+    } else {
+        (false, None)
+    };
+
+    let broadcast_outcome = if broadcast {
+        let sr = signed_revocation
+            .as_ref()
+            .expect("validated signed_revocation when broadcast=true");
+        let kp = issuer_kp
+            .as_ref()
+            .expect("validated issuer_kp when broadcast=true");
+        match broadcast_human_revocation(
+            &state_dir,
+            &config_read,
+            &secrets,
+            sr,
+            kp,
+            &target,
+            &revoked_at,
+        ) {
+            Ok(outcome) => Some(outcome),
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "BROADCAST_FAILED",
+                    format!("Authority revoked locally, but --broadcast failed: {e}"),
+                    None,
+                );
+            }
+        }
+    } else {
+        None
+    };
 
     if as_json {
+        let mut data = json!({
+            "humanId": target.human_id,
+            "kid": target.kid,
+            "status": "revoked",
+            "minAuthEpoch": effective_min,
+            "epochBumped": bump_epoch,
+            "authoritiesDigest": digest,
+            "gatePolicyResigned": gate_resigned,
+            "gateReloaded": gate_reloaded,
+            "signedRevocation": signed_revocation,
+            "broadcasted": broadcast_outcome.is_some(),
+        });
+        if let Some(ref err) = gate_reload_error {
+            data["gateReloadError"] = json!(err);
+        }
+        if let Some(ref b) = broadcast_outcome {
+            data["broadcastTopic"] = json!(b.topic);
+            data["broadcastEventId"] = json!(b.event_id);
+            data["broadcastEventType"] = json!(TYPE_HUMAN_REVOCATION_V1);
+            data["broadcastVia"] = json!(b.via);
+            data["broadcastMatched"] = json!(b.matched);
+        }
         let envelope = JsonEnvelope {
             ok: true,
             command: cmd.to_string(),
@@ -1544,18 +1849,9 @@ fn run_auth_revoke(
                 "Revoked human authority '{}' kid {} (minAuthEpoch={effective_min})",
                 target.human_id, target.kid
             )),
-            data: Some(json!({
-                "humanId": target.human_id,
-                "kid": target.kid,
-                "status": "revoked",
-                "minAuthEpoch": effective_min,
-                "epochBumped": bump_epoch,
-                "authoritiesDigest": digest,
-                "gatePolicyResigned": gate_resigned,
-                "signedRevocation": signed_revocation,
-            })),
-            warnings: Vec::new(),
-            next: Vec::new(),
+            data: Some(data),
+            warnings,
+            next,
             error: None,
         };
         print_json(&envelope);
@@ -1565,8 +1861,19 @@ fn run_auth_revoke(
             target.human_id, target.kid
         );
         if gate_resigned {
-            println!("      Gate Sig: re-signed with updated human_authorities_digest");
+            println!("      Gate Sig:  re-signed with updated human_authorities_digest");
+            if gate_reloaded {
+                println!("      Gate Live: reloaded active daemon policy (no restart needed)");
+            }
         }
+        if let Some(ref b) = broadcast_outcome {
+            println!(
+                "      Broadcast: published {} to topic '{}' via {} (eventId={}, matched={})",
+                TYPE_HUMAN_REVOCATION_V1, b.topic, b.via, b.event_id, b.matched
+            );
+        }
+        print_warnings(&warnings);
+        print_next_steps(&next);
     }
     ExitCode::from(EXIT_OK)
 }

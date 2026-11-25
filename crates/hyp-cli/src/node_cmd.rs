@@ -1925,6 +1925,7 @@ fn parse_plugins_config(
         };
 
         let mut env_map: BTreeMap<String, String> = BTreeMap::new();
+        let mut secret_env_refs: Vec<(String, String)> = Vec::new();
         let mut redacted_values: Vec<String> = Vec::new();
         let mut secret_skip_reason: Option<String> = None;
         let mut config_error_reason: Option<String> = None;
@@ -1976,6 +1977,8 @@ fn parse_plugins_config(
                                         Ok(secret) => {
                                             redacted_values.push((*secret).clone());
                                             env_map.insert(env_key.clone(), (*secret).clone());
+                                            secret_env_refs
+                                                .push((env_key.clone(), secret_name.to_string()));
                                         }
                                         Err(CryptoError::SecretNotFound(_)) => {
                                             secret_skip_reason = Some(format!(
@@ -2060,6 +2063,22 @@ fn parse_plugins_config(
         let mut cfg = SubprocessConfig::new(id.clone(), kind, exec, args, targets);
         cfg.cwd = cwd;
         cfg.env = env_map;
+        if !secret_env_refs.is_empty() {
+            let store_for_respawn = secrets.clone();
+            let plugin_id_for_err = id.clone();
+            cfg.env_resolver = Some(Arc::new(move || {
+                let mut resolved = BTreeMap::new();
+                for (env_key, secret_name) in &secret_env_refs {
+                    let val = store_for_respawn.get(secret_name).map_err(|e| {
+                        format!(
+                            "plugins[{plugin_id_for_err}].env.{env_key} failed to load secret '{secret_name}': {e}"
+                        )
+                    })?;
+                    resolved.insert(env_key.clone(), (*val).clone());
+                }
+                Ok(resolved)
+            }));
+        }
         cfg.hello_mode = HelloMode::Auto;
         cfg.stderr_log_path = Some(state_dir.join("logs").join(format!("plugin-{id}.log")));
         cfg.redacted_values = redacted_values;

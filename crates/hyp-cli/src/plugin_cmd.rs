@@ -22,8 +22,8 @@
 //!   - `corrupt` (missing file / symlink / invalid target): fails closed in `verify` & `doctor`.
 
 use crate::config_file::{
-    build_http_client, ct_eq, ensure_dir, resolve_home_dir, resolve_state_dir, write_atomic_file,
-    write_atomic_json,
+    build_http_client, ct_eq, ensure_dir, read_json_object_or_empty, resolve_config_path_for_read,
+    resolve_home_dir, resolve_state_dir, write_atomic_file, write_atomic_json,
 };
 use crate::herdr_mod::detect_herdr_app_dir;
 use crate::setup::{ClaudeConfigProfile, canonical_dedup_key, resolve_claude_profiles};
@@ -39,7 +39,7 @@ use hyp_store::now_ms;
 use hyper::body::Bytes;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -168,6 +168,9 @@ pub enum PluginCommand {
         /// Plugin name: sdk, telegram, slack, whatsapp, webhook, prometheus, claude-panel, claude-code, herdr-mod, or all
         #[arg(value_name = "PLUGIN")]
         plugin: String,
+        /// Keep matching `plugins[]` entries in node.json instead of removing them
+        #[arg(long)]
+        keep_config: bool,
         /// Explicit Hyphae state directory (defaults to ~/.config/hyphae)
         #[arg(long)]
         state_dir: Option<PathBuf>,
@@ -498,6 +501,7 @@ pub fn run_plugin(command: PluginCommand) -> ExitCode {
         ),
         PluginCommand::Remove {
             plugin,
+            keep_config,
             state_dir,
             config,
             home,
@@ -505,6 +509,7 @@ pub fn run_plugin(command: PluginCommand) -> ExitCode {
             json,
         } => run_plugin_remove(
             &plugin,
+            keep_config,
             state_dir.as_deref(),
             config.as_deref(),
             home.as_deref(),
@@ -1364,13 +1369,17 @@ async fn download_plugin_archive(
                 PluginInstallError::new(
                     "HTTP_TIMEOUT",
                     format!(
-                        "GET {current_url} timed out after {}s",
+                        "GET {} timed out after {}s",
+                        redact_source_location(&current_url),
                         HTTP_TIMEOUT.as_secs()
                     ),
                 )
             })?
             .map_err(|e| {
-                PluginInstallError::new("HTTP_ERROR", format!("GET {current_url} failed: {e}"))
+                PluginInstallError::new(
+                    "HTTP_ERROR",
+                    format!("GET {} failed: {e}", redact_source_location(&current_url)),
+                )
             })?;
 
         let status = resp.status();
@@ -1378,7 +1387,10 @@ async fn download_plugin_archive(
             if redirect_count >= MAX_REDIRECTS {
                 return Err(PluginInstallError::new(
                     "TOO_MANY_REDIRECTS",
-                    format!("GET {current_url} exceeded {MAX_REDIRECTS} redirects"),
+                    format!(
+                        "GET {} exceeded {MAX_REDIRECTS} redirects",
+                        redact_source_location(&current_url)
+                    ),
                 ));
             }
             let location = resp
@@ -1389,7 +1401,8 @@ async fn download_plugin_archive(
                     PluginInstallError::new(
                         "HTTP_ERROR",
                         format!(
-                            "GET {current_url} returned redirect HTTP {} without Location header",
+                            "GET {} returned redirect HTTP {} without Location header",
+                            redact_source_location(&current_url),
                             status.as_u16()
                         ),
                     )
@@ -1403,7 +1416,11 @@ async fn download_plugin_archive(
         if !status.is_success() {
             return Err(PluginInstallError::new(
                 "HTTP_STATUS",
-                format!("GET {current_url} returned HTTP {}", status.as_u16()),
+                format!(
+                    "GET {} returned HTTP {}",
+                    redact_source_location(&current_url),
+                    status.as_u16()
+                ),
             ));
         }
 
@@ -1418,20 +1435,44 @@ async fn download_plugin_archive(
                     return Err(PluginInstallError::new(
                         "RESPONSE_TOO_LARGE",
                         format!(
-                            "Download from {current_url} exceeds {MAX_ARCHIVE_BYTES} byte limit"
+                            "Download from {} exceeds {MAX_ARCHIVE_BYTES} byte limit",
+                            redact_source_location(&current_url)
                         ),
                     ));
                 }
                 out.extend_from_slice(chunk);
             }
         }
-        return Ok((out, current_url));
+        return Ok((out, redact_source_location(&current_url)));
     }
 
     Err(PluginInstallError::new(
         "TOO_MANY_REDIRECTS",
-        format!("GET {initial_url} exceeded redirect limit"),
+        format!(
+            "GET {} exceeded redirect limit",
+            redact_source_location(initial_url)
+        ),
     ))
+}
+
+/// Strips any URL query string (`?sig=...`, `?sv=...`) or fragment (`#...`) from HTTP(S)
+/// `sourceLocation` values so short-lived CDN / Azure blob SAS signatures are never echoed into
+/// JSON envelopes, terminal logs, or error messages. Local filesystem paths pass through unchanged.
+pub fn redact_source_location(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        let cut = raw
+            .find('?')
+            .into_iter()
+            .chain(raw.find('#'))
+            .min();
+        match cut {
+            Some(idx) => raw[..idx].to_string(),
+            None => raw.to_string(),
+        }
+    } else {
+        raw.to_string()
+    }
 }
 
 fn normalize_archive_rel_path(archive_path: &str) -> &str {
@@ -2678,7 +2719,7 @@ fn run_plugin_install(
                 "cachePath": cached_plugins_archive_path(&state_dir).display().to_string(),
                 "nodePath": node_path,
                 "source": source_kind.as_str(),
-                "sourceLocation": source_detail,
+                "sourceLocation": redact_source_location(&source_detail),
             })),
             warnings,
             next,
@@ -3012,7 +3053,7 @@ fn run_plugin_update(
                 "dryRun": false,
                 "downloaded": source_kind == InstallSourceKind::Release,
                 "source": source_kind.as_str(),
-                "sourceLocation": source_detail,
+                "sourceLocation": redact_source_location(&source_detail),
                 "updated": updated_names,
                 "upToDate": up_to_date,
                 "modified": modified_skipped,
@@ -3071,8 +3112,123 @@ fn remove_plugin_on_disk(plugin_id: &str, target_roots: &[PathBuf]) -> Result<bo
     Ok(removed_any)
 }
 
+fn arg_points_into_plugin_dir(
+    arg: &str,
+    plugin_dir: &Path,
+    canon_plugin_dir: Option<&Path>,
+    home: Option<&Path>,
+) -> bool {
+    let trimmed = arg.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let expanded = if let Some(rest) = trimmed.strip_prefix("~/") {
+        match home {
+            Some(h) => h.join(rest),
+            None => PathBuf::from(trimmed),
+        }
+    } else {
+        PathBuf::from(trimmed)
+    };
+    if expanded.starts_with(plugin_dir) {
+        return true;
+    }
+    if let Some(canon_dir) = canon_plugin_dir {
+        if expanded.starts_with(canon_dir) {
+            return true;
+        }
+        if let Ok(canon_arg) = fs::canonicalize(&expanded) {
+            if canon_arg.starts_with(canon_dir) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn plugin_config_entry_matches(
+    entry: &Value,
+    target_ids: &[&str],
+    plugins_dir: &Path,
+    canon_plugins_dir: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<String> {
+    let obj = entry.as_object()?;
+    let entry_id = obj
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    for &target_id in target_ids {
+        if entry_id.is_some_and(|id| id.eq_ignore_ascii_case(target_id)) {
+            return Some(entry_id.unwrap_or(target_id).to_string());
+        }
+        let target_dir = plugins_dir.join(target_id);
+        let canon_target_dir = canon_plugins_dir.map(|p| p.join(target_id));
+        if let Some(args) = obj.get("args").and_then(Value::as_array) {
+            for arg in args {
+                if let Some(s) = arg.as_str() {
+                    if arg_points_into_plugin_dir(
+                        s,
+                        &target_dir,
+                        canon_target_dir.as_deref(),
+                        home,
+                    ) {
+                        return Some(entry_id.unwrap_or(target_id).to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn remove_plugins_from_node_json(
+    config_path: &Path,
+    plugins_dir: &Path,
+    home: Option<&Path>,
+    target_ids: &[&str],
+) -> Result<Vec<String>, String> {
+    if !config_path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut cfg_map = read_json_object_or_empty(config_path)?;
+    let Some(plugins_val) = cfg_map.get("plugins") else {
+        return Ok(Vec::new());
+    };
+    let Some(arr) = plugins_val.as_array() else {
+        return Ok(Vec::new());
+    };
+
+    let canon_plugins_dir = fs::canonicalize(plugins_dir).ok();
+    let mut kept = Vec::with_capacity(arr.len());
+    let mut removed_ids = Vec::new();
+    for item in arr {
+        if let Some(matched_id) = plugin_config_entry_matches(
+            item,
+            target_ids,
+            plugins_dir,
+            canon_plugins_dir.as_deref(),
+            home,
+        ) {
+            removed_ids.push(matched_id);
+        } else {
+            kept.push(item.clone());
+        }
+    }
+
+    if !removed_ids.is_empty() {
+        cfg_map.insert("plugins".to_string(), Value::Array(kept));
+        write_atomic_json(config_path, &Value::Object(cfg_map), true)?;
+    }
+    Ok(removed_ids)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_plugin_remove(
     plugin_arg: &str,
+    keep_config: bool,
     state_dir_arg: Option<&Path>,
     config_arg: Option<&Path>,
     home_arg: Option<&Path>,
@@ -3087,6 +3243,7 @@ fn run_plugin_remove(
     };
 
     let state_dir = resolve_state_dir(state_dir_arg, config_arg, home_arg);
+    let config_path = resolve_config_path_for_read(config_arg, state_dir_arg, home_arg);
     let plugins_dir = state_dir.join("plugins");
     let resolved_home = resolve_home_dir(home_arg);
     let explicit_home = home_arg.is_some();
@@ -3156,10 +3313,43 @@ fn run_plugin_remove(
         let _ = fs::remove_dir(&plugins_dir);
     }
 
-    let summary = if removed.is_empty() && !sdk_removed {
+    // Remove matching `plugins[]` entries from `node.json` unless `--keep-config` is passed.
+    let target_ids: Vec<&str> = targets.iter().map(|s| s.id).collect();
+    let mut warnings = Vec::new();
+    let removed_config_entries = if keep_config {
+        Vec::new()
+    } else {
+        match remove_plugins_from_node_json(
+            &config_path,
+            &plugins_dir,
+            resolved_home.as_deref(),
+            &target_ids,
+        ) {
+            Ok(entries) => entries,
+            Err(e) => {
+                warnings.push(format!(
+                    "Could not clean matching plugins[] entries from {}: {e}",
+                    config_path.display()
+                ));
+                Vec::new()
+            }
+        }
+    };
+
+    let mut next = Vec::new();
+    if !removed_config_entries.is_empty() {
+        next.push("hyp service restart --json".to_string());
+    }
+
+    let summary = if removed.is_empty() && !sdk_removed && removed_config_entries.is_empty() {
         format!(
             "Nothing to remove for '{plugin_arg}' under {}",
             plugins_dir.display()
+        )
+    } else if removed.is_empty() && !sdk_removed {
+        format!(
+            "Removed node.json plugins[] entry(ies): {}",
+            removed_config_entries.join(", ")
         )
     } else {
         format!(
@@ -3179,16 +3369,28 @@ fn run_plugin_remove(
             summary: Some(summary),
             data: Some(json!({
                 "pluginsDir": plugins_dir.display().to_string(),
+                "configPath": config_path.display().to_string(),
                 "removed": removed,
                 "sdkRemoved": sdk_removed,
+                "keepConfig": keep_config,
+                "removedConfigEntries": removed_config_entries,
             })),
-            warnings: Vec::new(),
-            next: Vec::new(),
+            warnings,
+            next,
             error: None,
         };
         print_json(&envelope);
     } else {
         println!("OK    {summary}");
+        if !removed_config_entries.is_empty() {
+            println!(
+                "      Config: removed plugins[] entry(ies) ({}) from {}",
+                removed_config_entries.join(", "),
+                config_path.display()
+            );
+        }
+        print_warnings(&warnings);
+        print_next_steps(&next);
     }
 
     ExitCode::from(EXIT_OK)
@@ -3865,6 +4067,7 @@ mod tests {
         // 5. Remove telegram -> cleans up telegram/ AND sdk/ (no bridges remain)!
         let remove_code = run_plugin(PluginCommand::Remove {
             plugin: "telegram".to_string(),
+            keep_config: false,
             state_dir: Some(state_ok.clone()),
             config: None,
             home: Some(tmp_ok.path().to_path_buf()),
@@ -3989,6 +4192,7 @@ mod tests {
         // Removing one bridge keeps sdk/ intact because 4 other bridges remain!
         let rm_one = run_plugin(PluginCommand::Remove {
             plugin: "webhook".to_string(),
+            keep_config: false,
             state_dir: Some(state_dir.clone()),
             config: None,
             home: Some(home.clone()),
@@ -4002,6 +4206,7 @@ mod tests {
         // Removing `all` cleans up plugins/ AND harness mods!
         let rm_all = run_plugin(PluginCommand::Remove {
             plugin: "all".to_string(),
+            keep_config: false,
             state_dir: Some(state_dir.clone()),
             config: None,
             home: Some(home.clone()),

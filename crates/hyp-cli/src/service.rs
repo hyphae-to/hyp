@@ -7,9 +7,9 @@
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use crate::config_file::{ensure_dir, write_atomic_file};
-use crate::config_file::{resolve_home_dir, resolve_state_dir};
+use crate::config_file::{default_config_dir, resolve_home_dir, resolve_state_dir};
 use crate::ui::{
-    EXIT_ERROR, EXIT_OK, JsonEnvelope, emit_error, print_json, print_next_steps,
+    EXIT_ERROR, EXIT_OK, JsonEnvelope, emit_error, print_json, print_next_steps, print_warnings,
 };
 use clap::Subcommand;
 use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync, default_socket_path};
@@ -123,13 +123,35 @@ pub enum ServiceCommand {
 pub struct ServiceSpec {
     pub bin_path: PathBuf,
     pub state_dir: PathBuf,
+    /// When `true`, `--state-dir <state_dir>` was explicitly requested and MUST be passed to
+    /// the generated daemon argv (`ExecStart` / `ProgramArguments` / Windows task args).
+    pub explicit_state_dir: bool,
     pub config_path: Option<PathBuf>,
     pub socket_path: Option<PathBuf>,
     pub logs_dir: PathBuf,
     #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
     pub path_env: String,
+    /// Optional `HYPHAE_SECRET_BACKEND` value pinned into the service environment so headless
+    /// background services use the exact same secret store as interactive CLI invocations.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+    pub secret_backend: Option<String>,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub user_id: Option<String>,
+}
+
+/// Outcome of attempting to restart a managed background service after `hyp update`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceRestartOutcome {
+    pub attempted: bool,
+    pub installed: bool,
+    pub restarted: bool,
+    pub skipped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub detail: String,
 }
 
 /// Result of attempting automatic background daemon startup during `hyp onboard`.
@@ -174,6 +196,55 @@ pub fn linux_systemd_unit_path(home: &Path) -> PathBuf {
         .join("systemd")
         .join("user")
         .join(LINUX_SYSTEMD_UNIT)
+}
+
+/// Computes the Linux `systemd --user` unit path, honoring an explicit `XDG_CONFIG_HOME` when set.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn linux_systemd_unit_path_with_xdg(
+    home: &Path,
+    xdg_config_home: Option<&Path>,
+) -> PathBuf {
+    if let Some(xdg) = xdg_config_home {
+        if !xdg.as_os_str().is_empty() {
+            return xdg.join("systemd").join("user").join(LINUX_SYSTEMD_UNIT);
+        }
+    }
+    linux_systemd_unit_path(home)
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn resolve_xdg_config_home(explicit_home: bool) -> Option<PathBuf> {
+    if explicit_home {
+        return None;
+    }
+    let raw = std::env::var_os("XDG_CONFIG_HOME")?;
+    if raw.is_empty() {
+        return None;
+    }
+    if let Some(s) = raw.to_str() {
+        if s.trim().is_empty() {
+            return None;
+        }
+    }
+    Some(PathBuf::from(raw))
+}
+
+/// Parses `loginctl show-user <user> -p Linger` stdout (`Linger=yes` / `Linger=no`).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn parse_loginctl_linger(stdout: &str) -> Option<bool> {
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(val) = trimmed.strip_prefix("Linger=") {
+            let lower = val.trim().to_ascii_lowercase();
+            if lower == "yes" {
+                return Some(true);
+            }
+            if lower == "no" {
+                return Some(false);
+            }
+        }
+    }
+    None
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -264,6 +335,10 @@ pub fn build_service_path_env(current_path: Option<&str>, bin_dir: Option<&Path>
 #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub fn build_daemon_argv(spec: &ServiceSpec) -> Vec<String> {
     let mut argv = vec![spec.bin_path.display().to_string(), "daemon".to_string()];
+    if spec.explicit_state_dir && !spec.state_dir.as_os_str().is_empty() {
+        argv.push("--state-dir".to_string());
+        argv.push(spec.state_dir.display().to_string());
+    }
     if let Some(ref cfg) = spec.config_path {
         argv.push("--config".to_string());
         argv.push(cfg.display().to_string());
@@ -288,6 +363,18 @@ pub fn render_macos_plist(spec: &ServiceSpec) -> String {
     let out_log = xml_escape(&spec.logs_dir.join("daemon.out.log").display().to_string());
     let err_log = xml_escape(&spec.logs_dir.join("daemon.err.log").display().to_string());
     let path_xml = xml_escape(&spec.path_env);
+    let secret_backend_xml = match spec
+        .secret_backend
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(backend) => format!(
+            "    <key>HYPHAE_SECRET_BACKEND</key>\n    <string>{}</string>\n",
+            xml_escape(backend)
+        ),
+        None => String::new(),
+    };
 
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -312,6 +399,7 @@ pub fn render_macos_plist(spec: &ServiceSpec) -> String {
          \x20\x20<dict>\n\
          \x20\x20\x20\x20<key>PATH</key>\n\
          \x20\x20\x20\x20<string>{path_xml}</string>\n\
+         {secret_backend_xml}\
          \x20\x20</dict>\n\
          </dict>\n\
          </plist>\n"
@@ -327,6 +415,21 @@ pub fn render_linux_systemd_unit(spec: &ServiceSpec) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     let env_path = spec.path_env.replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%");
+    let secret_backend_line = match spec
+        .secret_backend
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(backend) => {
+            let escaped = backend
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('%', "%%");
+            format!("Environment=\"HYPHAE_SECRET_BACKEND={escaped}\"\n")
+        }
+        None => String::new(),
+    };
 
     format!(
         "[Unit]\n\
@@ -339,6 +442,7 @@ pub fn render_linux_systemd_unit(spec: &ServiceSpec) -> String {
          Restart=on-failure\n\
          RestartSec=3\n\
          Environment=\"PATH={env_path}\"\n\
+         {secret_backend_line}\
          \n\
          [Install]\n\
          WantedBy=default.target\n"
@@ -775,6 +879,7 @@ fn build_spec(
     bin: Option<&Path>,
     home: &Path,
     state_dir_arg: Option<&Path>,
+    explicit_state_dir: bool,
     config_arg: Option<&Path>,
     socket_arg: Option<&Path>,
 ) -> Result<ServiceSpec, String> {
@@ -783,6 +888,21 @@ fn build_spec(
     let logs_dir = default_daemon_logs_dir(&state_dir);
     let current_path = std::env::var("PATH").ok();
     let path_env = build_service_path_env(current_path.as_deref(), bin_path.parent());
+    let explicit_backend_env = std::env::var("HYPHAE_SECRET_BACKEND")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| matches!(s.as_str(), "file" | "keychain" | "secret-service"));
+    let active_backend = hyp_crypto::keystore::detect_backend_with(
+        &state_dir,
+        explicit_backend_env.as_deref(),
+    );
+    let secret_backend = if let Some(explicit) = explicit_backend_env {
+        Some(explicit)
+    } else if active_backend == hyp_crypto::keystore::SecretBackend::File {
+        Some(active_backend.as_str().to_string())
+    } else {
+        None
+    };
     #[cfg(target_os = "windows")]
     let user_id = {
         let domain = std::env::var("USERDOMAIN").ok();
@@ -794,10 +914,12 @@ fn build_spec(
     Ok(ServiceSpec {
         bin_path,
         state_dir,
+        explicit_state_dir,
         config_path: config_arg.map(Path::to_path_buf),
         socket_path: socket_arg.map(Path::to_path_buf),
         logs_dir,
         path_env,
+        secret_backend,
         user_id,
     })
 }
@@ -818,6 +940,8 @@ struct ServiceActionReport {
     loaded: bool,
     daemon: DaemonProbe,
     detail: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
     next: Vec<String>,
 }
 
@@ -866,7 +990,12 @@ mod platform {
             .unwrap_or(false)
     }
 
-    pub fn install(spec: &ServiceSpec, home: &Path, socket: &Path) -> Result<ServiceActionReport, String> {
+    pub fn install(
+        spec: &ServiceSpec,
+        home: &Path,
+        socket: &Path,
+        _explicit_home: bool,
+    ) -> Result<ServiceActionReport, String> {
         ensure_dir(&spec.state_dir, true)?;
         ensure_dir(&spec.logs_dir, true)?;
 
@@ -912,6 +1041,7 @@ mod platform {
             loaded: true,
             daemon: probe,
             detail,
+            warnings: Vec::new(),
             next: vec![
                 "hyp service status".to_string(),
                 "hyp doctor".to_string(),
@@ -919,7 +1049,11 @@ mod platform {
         })
     }
 
-    pub fn uninstall(home: &Path, socket: &Path) -> Result<ServiceActionReport, String> {
+    pub fn uninstall(
+        home: &Path,
+        socket: &Path,
+        _explicit_home: bool,
+    ) -> Result<ServiceActionReport, String> {
         let uid = current_uid()?;
         let target = service_target(&uid);
         let _ = run_launchctl(&["bootout", &target]);
@@ -940,11 +1074,16 @@ mod platform {
             loaded: false,
             daemon: probe,
             detail: format!("Uninstalled LaunchAgent {MACOS_LAUNCHAGENT_LABEL}"),
+            warnings: Vec::new(),
             next: vec!["hyp service install".to_string()],
         })
     }
 
-    pub fn start(home: &Path, socket: &Path) -> Result<ServiceActionReport, String> {
+    pub fn start(
+        home: &Path,
+        socket: &Path,
+        _explicit_home: bool,
+    ) -> Result<ServiceActionReport, String> {
         let plist_path = macos_plist_path(home);
         if !plist_path.exists() {
             return Err(format!(
@@ -986,11 +1125,16 @@ mod platform {
             loaded: true,
             daemon: probe,
             detail,
+            warnings: Vec::new(),
             next: vec!["hyp service status".to_string()],
         })
     }
 
-    pub fn stop(home: &Path, socket: &Path) -> Result<ServiceActionReport, String> {
+    pub fn stop(
+        home: &Path,
+        socket: &Path,
+        _explicit_home: bool,
+    ) -> Result<ServiceActionReport, String> {
         let uid = current_uid()?;
         let target = service_target(&uid);
         let _ = run_launchctl(&["bootout", &target]);
@@ -1006,11 +1150,16 @@ mod platform {
             loaded: false,
             daemon: probe,
             detail: format!("Stopped LaunchAgent {MACOS_LAUNCHAGENT_LABEL}"),
+            warnings: Vec::new(),
             next: vec!["hyp service start".to_string()],
         })
     }
 
-    pub fn restart(home: &Path, socket: &Path) -> Result<ServiceActionReport, String> {
+    pub fn restart(
+        home: &Path,
+        socket: &Path,
+        _explicit_home: bool,
+    ) -> Result<ServiceActionReport, String> {
         let plist_path = macos_plist_path(home);
         if !plist_path.exists() {
             return Err(format!(
@@ -1048,6 +1197,7 @@ mod platform {
             loaded: true,
             daemon: probe,
             detail,
+            warnings: Vec::new(),
             next: vec!["hyp service status".to_string()],
         })
     }
@@ -1084,6 +1234,7 @@ mod platform {
             loaded,
             daemon: probe,
             detail,
+            warnings: Vec::new(),
             next,
         })
     }
@@ -1116,11 +1267,85 @@ mod platform {
         ))
     }
 
-    pub fn install(spec: &ServiceSpec, home: &Path, socket: &Path) -> Result<ServiceActionReport, String> {
+    fn unit_path_for(home: &Path, explicit_home: bool) -> PathBuf {
+        let xdg = resolve_xdg_config_home(explicit_home);
+        linux_systemd_unit_path_with_xdg(home, xdg.as_deref())
+    }
+
+    fn is_isolated_test_home(home: &Path, explicit_home: bool) -> bool {
+        if std::env::var("HYPHAE_TEST_CHECK_LINGER").ok().as_deref() == Some("1") {
+            return false;
+        }
+        if explicit_home {
+            return true;
+        }
+        let sys_tmp = std::env::temp_dir();
+        home.starts_with(&sys_tmp) || home.starts_with("/tmp")
+    }
+
+    /// Best-effort check for systemd user lingering (`loginctl show-user <user> -p Linger`).
+    /// If disabled, attempts `loginctl enable-linger <user>`; if that requires root privileges,
+    /// returns an actionable `(warning, next_step)` pair so headless Linux daemons don't die on SSH logout.
+    fn check_and_enable_linger(home: &Path, explicit_home: bool) -> (Option<String>, Option<String>) {
+        if is_isolated_test_home(home, explicit_home) {
+            return (None, None);
+        }
+        let user = std::env::var("USER")
+            .ok()
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty())
+            .or_else(|| {
+                Command::new("id")
+                    .arg("-un")
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .filter(|u| !u.is_empty())
+            });
+        let Some(user) = user else {
+            return (None, None);
+        };
+        let Ok(show_out) = Command::new("loginctl")
+            .args(["show-user", &user, "-p", "Linger"])
+            .output()
+        else {
+            return (None, None);
+        };
+        if !show_out.status.success() {
+            return (None, None);
+        }
+        let stdout = String::from_utf8_lossy(&show_out.stdout);
+        if parse_loginctl_linger(&stdout) != Some(false) {
+            return (None, None);
+        }
+        // Linger=no -> try enabling without sudo first.
+        if let Ok(enable_out) = Command::new("loginctl")
+            .args(["enable-linger", &user])
+            .output()
+        {
+            if enable_out.status.success() {
+                return (None, None);
+            }
+        }
+        (
+            Some(format!(
+                "systemd user lingering is disabled for '{user}'; the background daemon may stop when your SSH session logs out."
+            )),
+            Some(format!("sudo loginctl enable-linger {user}")),
+        )
+    }
+
+    pub fn install(
+        spec: &ServiceSpec,
+        home: &Path,
+        socket: &Path,
+        explicit_home: bool,
+    ) -> Result<ServiceActionReport, String> {
         ensure_dir(&spec.state_dir, true)?;
         ensure_dir(&spec.logs_dir, true)?;
 
-        let unit_path = linux_systemd_unit_path(home);
+        let unit_path = unit_path_for(home, explicit_home);
         let unit_content = render_linux_systemd_unit(spec);
         write_atomic_file(&unit_path, unit_content.as_bytes(), false)?;
 
@@ -1128,6 +1353,19 @@ mod platform {
         check_systemctl_ok(&reload, "daemon-reload")?;
         let enable = run_systemctl(&["enable", "--now", LINUX_SYSTEMD_UNIT])?;
         check_systemctl_ok(&enable, "enable --now")?;
+
+        let mut warnings = Vec::new();
+        let mut next = vec![
+            "hyp service status".to_string(),
+            "hyp doctor".to_string(),
+        ];
+        let (linger_warn, linger_next) = check_and_enable_linger(home, explicit_home);
+        if let Some(w) = linger_warn {
+            warnings.push(w);
+        }
+        if let Some(n) = linger_next {
+            next.insert(0, n);
+        }
 
         let probe = wait_for_daemon_alive(socket, DAEMON_READY_TIMEOUT);
         let detail = if probe.alive {
@@ -1145,16 +1383,18 @@ mod platform {
             loaded: true,
             daemon: probe,
             detail,
-            next: vec![
-                "hyp service status".to_string(),
-                "hyp doctor".to_string(),
-            ],
+            warnings,
+            next,
         })
     }
 
-    pub fn uninstall(home: &Path, socket: &Path) -> Result<ServiceActionReport, String> {
+    pub fn uninstall(
+        home: &Path,
+        socket: &Path,
+        explicit_home: bool,
+    ) -> Result<ServiceActionReport, String> {
         let _ = run_systemctl(&["disable", "--now", LINUX_SYSTEMD_UNIT]);
-        let unit_path = linux_systemd_unit_path(home);
+        let unit_path = unit_path_for(home, explicit_home);
         if unit_path.exists() {
             fs::remove_file(&unit_path)
                 .map_err(|e| format!("failed to remove {}: {e}", unit_path.display()))?;
@@ -1170,12 +1410,17 @@ mod platform {
             loaded: false,
             daemon: probe,
             detail: format!("Uninstalled systemd user service {LINUX_SYSTEMD_UNIT}"),
+            warnings: Vec::new(),
             next: vec!["hyp service install".to_string()],
         })
     }
 
-    pub fn start(home: &Path, socket: &Path) -> Result<ServiceActionReport, String> {
-        let unit_path = linux_systemd_unit_path(home);
+    pub fn start(
+        home: &Path,
+        socket: &Path,
+        explicit_home: bool,
+    ) -> Result<ServiceActionReport, String> {
+        let unit_path = unit_path_for(home, explicit_home);
         if !unit_path.exists() {
             return Err(format!(
                 "systemd unit not found at {} (run `hyp service install` first)",
@@ -1194,12 +1439,17 @@ mod platform {
             loaded: true,
             daemon: probe,
             detail: format!("Started systemd user service {LINUX_SYSTEMD_UNIT}"),
+            warnings: Vec::new(),
             next: vec!["hyp service status".to_string()],
         })
     }
 
-    pub fn stop(home: &Path, socket: &Path) -> Result<ServiceActionReport, String> {
-        let unit_path = linux_systemd_unit_path(home);
+    pub fn stop(
+        home: &Path,
+        socket: &Path,
+        explicit_home: bool,
+    ) -> Result<ServiceActionReport, String> {
+        let unit_path = unit_path_for(home, explicit_home);
         let _ = run_systemctl(&["stop", LINUX_SYSTEMD_UNIT]);
         let probe = probe_daemon_once(socket);
         Ok(ServiceActionReport {
@@ -1211,12 +1461,17 @@ mod platform {
             loaded: false,
             daemon: probe,
             detail: format!("Stopped systemd user service {LINUX_SYSTEMD_UNIT}"),
+            warnings: Vec::new(),
             next: vec!["hyp service start".to_string()],
         })
     }
 
-    pub fn restart(home: &Path, socket: &Path) -> Result<ServiceActionReport, String> {
-        let unit_path = linux_systemd_unit_path(home);
+    pub fn restart(
+        home: &Path,
+        socket: &Path,
+        explicit_home: bool,
+    ) -> Result<ServiceActionReport, String> {
+        let unit_path = unit_path_for(home, explicit_home);
         if !unit_path.exists() {
             return Err(format!(
                 "systemd unit not found at {} (run `hyp service install` first)",
@@ -1235,12 +1490,17 @@ mod platform {
             loaded: true,
             daemon: probe,
             detail: format!("Restarted systemd user service {LINUX_SYSTEMD_UNIT}"),
+            warnings: Vec::new(),
             next: vec!["hyp service status".to_string()],
         })
     }
 
-    pub fn status(home: &Path, socket: &Path, _explicit_home: bool) -> Result<ServiceActionReport, String> {
-        let unit_path = linux_systemd_unit_path(home);
+    pub fn status(
+        home: &Path,
+        socket: &Path,
+        explicit_home: bool,
+    ) -> Result<ServiceActionReport, String> {
+        let unit_path = unit_path_for(home, explicit_home);
         let installed = unit_path.exists();
         let loaded = run_systemctl(&["is-active", "--quiet", LINUX_SYSTEMD_UNIT])
             .map(|o| o.status.success())
@@ -1273,6 +1533,7 @@ mod platform {
             loaded,
             daemon: probe,
             detail,
+            warnings: Vec::new(),
             next,
         })
     }
@@ -1320,7 +1581,12 @@ mod platform {
         }
     }
 
-    pub fn install(spec: &ServiceSpec, _home: &Path, socket: &Path) -> Result<ServiceActionReport, String> {
+    pub fn install(
+        spec: &ServiceSpec,
+        _home: &Path,
+        socket: &Path,
+        _explicit_home: bool,
+    ) -> Result<ServiceActionReport, String> {
         ensure_dir(&spec.state_dir, true)?;
         ensure_dir(&spec.logs_dir, true)?;
 
@@ -1356,6 +1622,7 @@ mod platform {
             loaded: true,
             daemon: probe,
             detail,
+            warnings: Vec::new(),
             next: vec![
                 "hyp service status".to_string(),
                 "hyp doctor".to_string(),
@@ -1363,7 +1630,11 @@ mod platform {
         })
     }
 
-    pub fn uninstall(home: &Path, socket: &Path) -> Result<ServiceActionReport, String> {
+    pub fn uninstall(
+        home: &Path,
+        socket: &Path,
+        _explicit_home: bool,
+    ) -> Result<ServiceActionReport, String> {
         let _ = run_schtasks(&build_schtasks_end_args(WINDOWS_TASK_NAME));
         let _ = run_schtasks(&build_schtasks_delete_args(WINDOWS_TASK_NAME));
 
@@ -1384,11 +1655,16 @@ mod platform {
             loaded: false,
             daemon: probe,
             detail: format!("Uninstalled Windows scheduled task {WINDOWS_TASK_NAME}"),
+            warnings: Vec::new(),
             next: vec!["hyp service install".to_string()],
         })
     }
 
-    pub fn start(home: &Path, socket: &Path) -> Result<ServiceActionReport, String> {
+    pub fn start(
+        home: &Path,
+        socket: &Path,
+        _explicit_home: bool,
+    ) -> Result<ServiceActionReport, String> {
         let state_dir = resolve_state_dir(None, None, Some(home));
         let xml_path = windows_task_xml_path(&state_dir);
         let (installed, _running) = query_task(WINDOWS_TASK_NAME);
@@ -1417,11 +1693,16 @@ mod platform {
             loaded: true,
             daemon: probe,
             detail,
+            warnings: Vec::new(),
             next: vec!["hyp service status".to_string()],
         })
     }
 
-    pub fn stop(home: &Path, socket: &Path) -> Result<ServiceActionReport, String> {
+    pub fn stop(
+        home: &Path,
+        socket: &Path,
+        _explicit_home: bool,
+    ) -> Result<ServiceActionReport, String> {
         let state_dir = resolve_state_dir(None, None, Some(home));
         let xml_path = windows_task_xml_path(&state_dir);
         let _ = run_schtasks(&build_schtasks_end_args(WINDOWS_TASK_NAME));
@@ -1437,11 +1718,16 @@ mod platform {
             loaded: false,
             daemon: probe,
             detail: format!("Stopped Windows scheduled task {WINDOWS_TASK_NAME}"),
+            warnings: Vec::new(),
             next: vec!["hyp service start".to_string()],
         })
     }
 
-    pub fn restart(home: &Path, socket: &Path) -> Result<ServiceActionReport, String> {
+    pub fn restart(
+        home: &Path,
+        socket: &Path,
+        _explicit_home: bool,
+    ) -> Result<ServiceActionReport, String> {
         let state_dir = resolve_state_dir(None, None, Some(home));
         let xml_path = windows_task_xml_path(&state_dir);
         let (installed, _running) = query_task(WINDOWS_TASK_NAME);
@@ -1472,6 +1758,7 @@ mod platform {
             loaded: true,
             daemon: probe,
             detail,
+            warnings: Vec::new(),
             next: vec!["hyp service status".to_string()],
         })
     }
@@ -1521,6 +1808,7 @@ mod platform {
             loaded,
             daemon: probe,
             detail,
+            warnings: Vec::new(),
             next,
         })
     }
@@ -1543,7 +1831,12 @@ mod platform {
         vec!["hyp daemon".to_string(), "hyp status".to_string()]
     }
 
-    pub fn install(_spec: &ServiceSpec, _home: &Path, socket: &Path) -> Result<ServiceActionReport, String> {
+    pub fn install(
+        _spec: &ServiceSpec,
+        _home: &Path,
+        socket: &Path,
+        _explicit_home: bool,
+    ) -> Result<ServiceActionReport, String> {
         let probe = probe_daemon_once(socket);
         Ok(ServiceActionReport {
             action: "install",
@@ -1554,11 +1847,16 @@ mod platform {
             loaded: probe.alive,
             daemon: probe,
             detail: guidance_detail("install"),
+            warnings: Vec::new(),
             next: guidance_next(),
         })
     }
 
-    pub fn uninstall(_home: &Path, socket: &Path) -> Result<ServiceActionReport, String> {
+    pub fn uninstall(
+        _home: &Path,
+        socket: &Path,
+        _explicit_home: bool,
+    ) -> Result<ServiceActionReport, String> {
         let probe = probe_daemon_once(socket);
         Ok(ServiceActionReport {
             action: "uninstall",
@@ -1569,11 +1867,16 @@ mod platform {
             loaded: probe.alive,
             daemon: probe,
             detail: guidance_detail("uninstall"),
+            warnings: Vec::new(),
             next: guidance_next(),
         })
     }
 
-    pub fn start(_home: &Path, socket: &Path) -> Result<ServiceActionReport, String> {
+    pub fn start(
+        _home: &Path,
+        socket: &Path,
+        _explicit_home: bool,
+    ) -> Result<ServiceActionReport, String> {
         let probe = probe_daemon_once(socket);
         Ok(ServiceActionReport {
             action: "start",
@@ -1584,11 +1887,16 @@ mod platform {
             loaded: probe.alive,
             daemon: probe,
             detail: guidance_detail("start"),
+            warnings: Vec::new(),
             next: guidance_next(),
         })
     }
 
-    pub fn stop(_home: &Path, socket: &Path) -> Result<ServiceActionReport, String> {
+    pub fn stop(
+        _home: &Path,
+        socket: &Path,
+        _explicit_home: bool,
+    ) -> Result<ServiceActionReport, String> {
         let probe = probe_daemon_once(socket);
         Ok(ServiceActionReport {
             action: "stop",
@@ -1599,11 +1907,16 @@ mod platform {
             loaded: probe.alive,
             daemon: probe,
             detail: guidance_detail("stop"),
+            warnings: Vec::new(),
             next: guidance_next(),
         })
     }
 
-    pub fn restart(_home: &Path, socket: &Path) -> Result<ServiceActionReport, String> {
+    pub fn restart(
+        _home: &Path,
+        socket: &Path,
+        _explicit_home: bool,
+    ) -> Result<ServiceActionReport, String> {
         let probe = probe_daemon_once(socket);
         Ok(ServiceActionReport {
             action: "restart",
@@ -1614,6 +1927,7 @@ mod platform {
             loaded: probe.alive,
             daemon: probe,
             detail: guidance_detail("restart"),
+            warnings: Vec::new(),
             next: guidance_next(),
         })
     }
@@ -1634,19 +1948,108 @@ mod platform {
             loaded: probe.alive,
             daemon: probe,
             detail,
+            warnings: Vec::new(),
             next: guidance_next(),
         })
     }
 }
 
 // ============================================================================
-// Public Entrypoints (`hyp service ...` & `hyp onboard` Auto-Start Hook)
+// Public Entrypoints (`hyp service ...`, `hyp onboard`, & `hyp update` Hooks)
 // ============================================================================
+
+/// Checks whether a managed OS background daemon service is installed (and restarts it cleanly
+/// after a `hyp update` binary swap). Never panics; returns a structured `ServiceRestartOutcome`.
+pub fn restart_if_installed(
+    home_override: Option<&Path>,
+    state_dir_override: Option<&Path>,
+) -> ServiceRestartOutcome {
+    let Some(resolved_home) = resolve_home_dir(home_override) else {
+        return ServiceRestartOutcome {
+            attempted: false,
+            installed: false,
+            restarted: false,
+            skipped: true,
+            skip_reason: Some("missing_home".to_string()),
+            error: None,
+            detail: "Could not resolve home directory to inspect background service.".to_string(),
+        };
+    };
+    let explicit_home = home_override.is_some();
+    let probe_sock = resolve_probe_socket(None, state_dir_override, &resolved_home, explicit_home);
+
+    let status = match platform::status(&resolved_home, &probe_sock, explicit_home) {
+        Ok(st) => st,
+        Err(e) => {
+            return ServiceRestartOutcome {
+                attempted: false,
+                installed: false,
+                restarted: false,
+                skipped: false,
+                skip_reason: None,
+                error: Some(e.clone()),
+                detail: format!("Failed to inspect background service status: {e}"),
+            };
+        }
+    };
+
+    if !status.installed {
+        if status.daemon.alive {
+            return ServiceRestartOutcome {
+                attempted: false,
+                installed: false,
+                restarted: false,
+                skipped: true,
+                skip_reason: Some("unmanaged_daemon".to_string()),
+                error: None,
+                detail: "A foreground/unmanaged daemon is running without an installed OS service; restart it to load the new binary.".to_string(),
+            };
+        }
+        return ServiceRestartOutcome {
+            attempted: false,
+            installed: false,
+            restarted: false,
+            skipped: false,
+            skip_reason: Some("not_installed".to_string()),
+            error: None,
+            detail: "No managed background service installed.".to_string(),
+        };
+    }
+
+    match platform::restart(&resolved_home, &probe_sock, explicit_home) {
+        Ok(report) => ServiceRestartOutcome {
+            attempted: true,
+            installed: true,
+            restarted: true,
+            skipped: false,
+            skip_reason: None,
+            error: None,
+            detail: report.detail,
+        },
+        Err(e) => ServiceRestartOutcome {
+            attempted: true,
+            installed: true,
+            restarted: false,
+            skipped: false,
+            skip_reason: None,
+            error: Some(e.clone()),
+            detail: format!("Background service restart failed: {e}"),
+        },
+    }
+}
 
 /// Installs and starts the default OS background daemon service during `hyp onboard`.
 /// Never panics or fails onboarding fatally — callers surface `warning` cleanly if unavailable.
 pub fn install_and_start_default(bin_path: &Path, home: &Path, state_dir: &Path) -> AutoStartResult {
-    let spec = match build_spec(Some(bin_path), home, Some(state_dir), None, None) {
+    let explicit_state = state_dir != default_config_dir(Some(home));
+    let spec = match build_spec(
+        Some(bin_path),
+        home,
+        Some(state_dir),
+        explicit_state,
+        None,
+        None,
+    ) {
         Ok(s) => s,
         Err(e) => {
             return AutoStartResult {
@@ -1662,7 +2065,7 @@ pub fn install_and_start_default(bin_path: &Path, home: &Path, state_dir: &Path)
         }
     };
     let socket = default_socket_path();
-    match platform::install(&spec, home, &socket) {
+    match platform::install(&spec, home, &socket, false) {
         Ok(report) => {
             let started = report.daemon.alive;
             let warning = if !report.installed {
@@ -1673,7 +2076,7 @@ pub fn install_and_start_default(bin_path: &Path, home: &Path, state_dir: &Path)
                     report.service
                 ))
             } else {
-                None
+                report.warnings.first().cloned()
             };
             let detail = if started && report.installed {
                 format!("running ({} {})", report.manager, report.service)
@@ -1712,6 +2115,7 @@ pub fn run_service(command: ServiceCommand) -> ExitCode {
             socket,
             json: as_json,
         } => {
+            let explicit_home = home.is_some();
             let Some(resolved_home) = resolve_home_dir(home.as_deref()) else {
                 return emit_error(
                     "service install",
@@ -1726,6 +2130,7 @@ pub fn run_service(command: ServiceCommand) -> ExitCode {
                 bin.as_deref(),
                 &resolved_home,
                 state_dir.as_deref(),
+                state_dir.is_some(),
                 config.as_deref(),
                 socket.as_deref(),
             ) {
@@ -1738,9 +2143,9 @@ pub fn run_service(command: ServiceCommand) -> ExitCode {
                 socket.as_deref(),
                 state_dir.as_deref(),
                 &resolved_home,
-                home.is_some(),
+                explicit_home,
             );
-            match platform::install(&spec, &resolved_home, &probe_sock) {
+            match platform::install(&spec, &resolved_home, &probe_sock, explicit_home) {
                 Ok(report) => emit_report("service install", &report, as_json),
                 Err(e) => emit_error(
                     "service install",
@@ -1753,6 +2158,7 @@ pub fn run_service(command: ServiceCommand) -> ExitCode {
             }
         }
         ServiceCommand::Uninstall { home, json: as_json } => {
+            let explicit_home = home.is_some();
             let Some(resolved_home) = resolve_home_dir(home.as_deref()) else {
                 return emit_error(
                     "service uninstall",
@@ -1763,8 +2169,8 @@ pub fn run_service(command: ServiceCommand) -> ExitCode {
                     None,
                 );
             };
-            let probe_sock = resolve_probe_socket(None, None, &resolved_home, home.is_some());
-            match platform::uninstall(&resolved_home, &probe_sock) {
+            let probe_sock = resolve_probe_socket(None, None, &resolved_home, explicit_home);
+            match platform::uninstall(&resolved_home, &probe_sock, explicit_home) {
                 Ok(report) => emit_report("service uninstall", &report, as_json),
                 Err(e) => emit_error("service uninstall", as_json, EXIT_ERROR, "SERVICE_UNINSTALL_FAILED", e, None),
             }
@@ -1774,6 +2180,7 @@ pub fn run_service(command: ServiceCommand) -> ExitCode {
             socket,
             json: as_json,
         } => {
+            let explicit_home = home.is_some();
             let Some(resolved_home) = resolve_home_dir(home.as_deref()) else {
                 return emit_error(
                     "service start",
@@ -1785,13 +2192,14 @@ pub fn run_service(command: ServiceCommand) -> ExitCode {
                 );
             };
             let probe_sock =
-                resolve_probe_socket(socket.as_deref(), None, &resolved_home, home.is_some());
-            match platform::start(&resolved_home, &probe_sock) {
+                resolve_probe_socket(socket.as_deref(), None, &resolved_home, explicit_home);
+            match platform::start(&resolved_home, &probe_sock, explicit_home) {
                 Ok(report) => emit_report("service start", &report, as_json),
                 Err(e) => emit_error("service start", as_json, EXIT_ERROR, "SERVICE_START_FAILED", e, Some("Run `hyp service install`.".to_string())),
             }
         }
         ServiceCommand::Stop { home, json: as_json } => {
+            let explicit_home = home.is_some();
             let Some(resolved_home) = resolve_home_dir(home.as_deref()) else {
                 return emit_error(
                     "service stop",
@@ -1802,8 +2210,8 @@ pub fn run_service(command: ServiceCommand) -> ExitCode {
                     None,
                 );
             };
-            let probe_sock = resolve_probe_socket(None, None, &resolved_home, home.is_some());
-            match platform::stop(&resolved_home, &probe_sock) {
+            let probe_sock = resolve_probe_socket(None, None, &resolved_home, explicit_home);
+            match platform::stop(&resolved_home, &probe_sock, explicit_home) {
                 Ok(report) => emit_report("service stop", &report, as_json),
                 Err(e) => emit_error("service stop", as_json, EXIT_ERROR, "SERVICE_STOP_FAILED", e, None),
             }
@@ -1813,6 +2221,7 @@ pub fn run_service(command: ServiceCommand) -> ExitCode {
             socket,
             json: as_json,
         } => {
+            let explicit_home = home.is_some();
             let Some(resolved_home) = resolve_home_dir(home.as_deref()) else {
                 return emit_error(
                     "service restart",
@@ -1824,8 +2233,8 @@ pub fn run_service(command: ServiceCommand) -> ExitCode {
                 );
             };
             let probe_sock =
-                resolve_probe_socket(socket.as_deref(), None, &resolved_home, home.is_some());
-            match platform::restart(&resolved_home, &probe_sock) {
+                resolve_probe_socket(socket.as_deref(), None, &resolved_home, explicit_home);
+            match platform::restart(&resolved_home, &probe_sock, explicit_home) {
                 Ok(report) => emit_report("service restart", &report, as_json),
                 Err(e) => emit_error("service restart", as_json, EXIT_ERROR, "SERVICE_RESTART_FAILED", e, Some("Run `hyp service install`.".to_string())),
             }
@@ -1835,6 +2244,7 @@ pub fn run_service(command: ServiceCommand) -> ExitCode {
             socket,
             json: as_json,
         } => {
+            let explicit_home = home.is_some();
             let Some(resolved_home) = resolve_home_dir(home.as_deref()) else {
                 return emit_error(
                     "service status",
@@ -1846,8 +2256,8 @@ pub fn run_service(command: ServiceCommand) -> ExitCode {
                 );
             };
             let probe_sock =
-                resolve_probe_socket(socket.as_deref(), None, &resolved_home, home.is_some());
-            match platform::status(&resolved_home, &probe_sock, home.is_some()) {
+                resolve_probe_socket(socket.as_deref(), None, &resolved_home, explicit_home);
+            match platform::status(&resolved_home, &probe_sock, explicit_home) {
                 Ok(report) => emit_report("service status", &report, as_json),
                 Err(e) => emit_error("service status", as_json, EXIT_ERROR, "SERVICE_STATUS_FAILED", e, None),
             }
@@ -1862,7 +2272,7 @@ fn emit_report(cmd: &str, report: &ServiceActionReport, as_json: bool) -> ExitCo
             command: cmd.to_string(),
             summary: Some(report.detail.clone()),
             data: Some(report),
-            warnings: Vec::new(),
+            warnings: report.warnings.clone(),
             next: report.next.clone(),
             error: None,
         };
@@ -1887,6 +2297,7 @@ fn emit_report(cmd: &str, report: &ServiceActionReport, as_json: bool) -> ExitCo
                 format!("offline ({})", report.daemon.socket)
             }
         );
+        print_warnings(&report.warnings);
         print_next_steps(&report.next);
     }
     ExitCode::from(EXIT_OK)
@@ -1904,6 +2315,7 @@ mod tests {
         ServiceSpec {
             bin_path: PathBuf::from("/Users/alice/.local/bin/hyp"),
             state_dir: PathBuf::from("/Users/alice/.config/hyphae"),
+            explicit_state_dir: false,
             config_path: None,
             socket_path: None,
             logs_dir: PathBuf::from("/Users/alice/.config/hyphae/logs"),
@@ -1911,6 +2323,7 @@ mod tests {
                 Some("/Users/alice/.local/bin:/usr/bin"),
                 Some(Path::new("/Users/alice/.local/bin")),
             ),
+            secret_backend: None,
             user_id: None,
         }
     }
@@ -1981,10 +2394,12 @@ mod tests {
         let spec = ServiceSpec {
             bin_path: PathBuf::from(r"C:\Users\O'Malley & Co\bin\hyp.exe"),
             state_dir: PathBuf::from(r"C:\Users\O'Malley & Co\.config\hyphae"),
+            explicit_state_dir: true,
             config_path: Some(PathBuf::from(r#"C:\Users\O'Malley & Co\cfg "v2"\node.json"#)),
             socket_path: Some(PathBuf::from(r"C:\Users\O'Malley & Co\.config\hyphae\connector.addr")),
             logs_dir: PathBuf::from(r"C:\Users\O'Malley & Co\.config\hyphae\logs"),
             path_env: String::new(),
+            secret_backend: None,
             user_id: Some(r"CORP\o'malley & co".to_string()),
         };
 
@@ -2148,5 +2563,43 @@ mod tests {
         assert_eq!(parts[0], "/home/u/.local/bin");
         assert_eq!(parts.iter().filter(|&&p| p == "/usr/bin").count(), 1);
         assert!(parts.contains(&"/opt/homebrew/bin"));
+    }
+
+    #[test]
+    fn d10_and_d16_systemd_secret_backend_state_dir_xdg_and_linger_parser() {
+        let mut spec = sample_spec();
+        spec.state_dir = PathBuf::from("/var/lib/hyphae custom");
+        spec.explicit_state_dir = true;
+        spec.secret_backend = Some("file".to_string());
+
+        let unit = render_linux_systemd_unit(&spec);
+        assert!(
+            unit.contains("--state-dir \"/var/lib/hyphae custom\""),
+            "expected explicit --state-dir in ExecStart:\n{unit}"
+        );
+        assert!(
+            unit.contains("Environment=\"HYPHAE_SECRET_BACKEND=file\""),
+            "expected HYPHAE_SECRET_BACKEND pinned in systemd unit:\n{unit}"
+        );
+
+        let plist = render_macos_plist(&spec);
+        assert!(plist.contains("<string>--state-dir</string>"));
+        assert!(plist.contains("<string>/var/lib/hyphae custom</string>"));
+        assert!(plist.contains("<key>HYPHAE_SECRET_BACKEND</key>"));
+        assert!(plist.contains("<string>file</string>"));
+
+        let home = Path::new("/home/alice");
+        assert_eq!(
+            linux_systemd_unit_path_with_xdg(home, Some(Path::new("/srv/xdg-config"))),
+            PathBuf::from("/srv/xdg-config/systemd/user/hyphae-daemon.service")
+        );
+        assert_eq!(
+            linux_systemd_unit_path_with_xdg(home, None),
+            PathBuf::from("/home/alice/.config/systemd/user/hyphae-daemon.service")
+        );
+
+        assert_eq!(parse_loginctl_linger("Linger=yes\n"), Some(true));
+        assert_eq!(parse_loginctl_linger("Linger=no\n"), Some(false));
+        assert_eq!(parse_loginctl_linger("Other=1\n"), None);
     }
 }

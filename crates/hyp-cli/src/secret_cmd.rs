@@ -7,9 +7,12 @@
 //!   CSRF nonce that writes directly into `SecretStore` and shuts down immediately).
 //! - Secret values are NEVER printed to stdout, stderr, or `--json` output.
 
-use crate::config_file::{ct_eq, open_secret_store, resolve_state_dir};
+use crate::config_file::{
+    ct_eq, open_secret_store, read_json_value, resolve_config_path_for_read, resolve_state_dir,
+};
 use crate::ui::{
     EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
+    print_warnings,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -23,10 +26,10 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::convert::Infallible;
 use std::io::{self, Read as _, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -150,6 +153,64 @@ fn resolve_store(state_dir: Option<&PathBuf>) -> (PathBuf, SecretStore) {
     (dir, store)
 }
 
+fn collect_secret_refs_recursive(val: &Value, prefix: &str, target: &str, out: &mut Vec<String>) {
+    match val {
+        Value::Object(map) => {
+            if map.len() == 1
+                && map.get("secret").and_then(Value::as_str) == Some(target)
+            {
+                out.push(prefix.to_string());
+                return;
+            }
+            for (k, v) in map {
+                collect_secret_refs_recursive(v, &format!("{prefix}.{k}"), target, out);
+            }
+        }
+        Value::Array(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                let label = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| idx.to_string());
+                collect_secret_refs_recursive(item, &format!("{prefix}[{label}]"), target, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Best-effort inspection of `node.json` for `{ "secret": "<name>" }` references inside
+/// `plugins[]`, `sources[]`, or `pairing.adminKey`. Never fails secret operations if `node.json`
+/// is missing or unreadable.
+fn find_secret_references_in_node_json(
+    state_dir: &Path,
+    explicit_state: bool,
+    secret_name: &str,
+) -> Vec<String> {
+    let cfg_path = resolve_config_path_for_read(
+        None,
+        if explicit_state { Some(state_dir) } else { None },
+        None,
+    );
+    let Ok(root) = read_json_value(&cfg_path) else {
+        return Vec::new();
+    };
+    let mut refs = Vec::new();
+    if let Some(plugins) = root.get("plugins") {
+        collect_secret_refs_recursive(plugins, "plugins", secret_name, &mut refs);
+    }
+    if let Some(sources) = root.get("sources") {
+        collect_secret_refs_recursive(sources, "sources", secret_name, &mut refs);
+    }
+    if let Some(admin_key) = root.get("pairing").and_then(|p| p.get("adminKey")) {
+        collect_secret_refs_recursive(admin_key, "pairing.adminKey", secret_name, &mut refs);
+    }
+    refs
+}
+
 fn run_secret_set(
     name: Option<String>,
     web: bool,
@@ -209,9 +270,21 @@ fn run_secret_set(
             no_open,
         )) {
             Ok(saved) => {
-                let next = vec![format!(
-                    "Reference in node.json as {{ \"secret\": \"{name}\" }} (never plaintext!)."
-                )];
+                let referenced_by =
+                    find_secret_references_in_node_json(&dir, state_dir.is_some(), &name);
+                let mut warnings = Vec::new();
+                let mut next = Vec::new();
+                if !referenced_by.is_empty() {
+                    warnings.push(format!(
+                        "Secret '{name}' is referenced in node.json ({}); restart running plugins/sources so the updated value takes effect.",
+                        referenced_by.join(", ")
+                    ));
+                    next.push("hyp service restart --json".to_string());
+                } else {
+                    next.push(format!(
+                        "Reference in node.json as {{ \"secret\": \"{name}\" }} (never plaintext!)."
+                    ));
+                }
                 if as_json {
                     let envelope = JsonEnvelope {
                         ok: true,
@@ -226,8 +299,9 @@ fn run_secret_set(
                             "location": saved.location,
                             "captureMode": "web",
                             "stateDir": dir.display().to_string(),
+                            "referencedBy": referenced_by,
                         })),
-                        warnings: Vec::new(),
+                        warnings,
                         next,
                         error: None,
                     };
@@ -238,6 +312,7 @@ fn run_secret_set(
                         saved.backend
                     );
                     println!("      Location: {}", saved.location);
+                    print_warnings(&warnings);
                     print_next_steps(&next);
                 }
                 ExitCode::from(EXIT_OK)
@@ -288,9 +363,21 @@ fn run_secret_set(
 
     match store.set(&name, &trimmed) {
         Ok(saved) => {
-            let next = vec![format!(
-                "Reference in node.json as {{ \"secret\": \"{name}\" }} (never plaintext!)."
-            )];
+            let referenced_by =
+                find_secret_references_in_node_json(&dir, state_dir.is_some(), &name);
+            let mut warnings = Vec::new();
+            let mut next = Vec::new();
+            if !referenced_by.is_empty() {
+                warnings.push(format!(
+                    "Secret '{name}' is referenced in node.json ({}); restart running plugins/sources so the updated value takes effect.",
+                    referenced_by.join(", ")
+                ));
+                next.push("hyp service restart --json".to_string());
+            } else {
+                next.push(format!(
+                    "Reference in node.json as {{ \"secret\": \"{name}\" }} (never plaintext!)."
+                ));
+            }
             if as_json {
                 let envelope = JsonEnvelope {
                     ok: true,
@@ -305,8 +392,9 @@ fn run_secret_set(
                         "location": saved.location,
                         "captureMode": "stdin",
                         "stateDir": dir.display().to_string(),
+                        "referencedBy": referenced_by,
                     })),
-                    warnings: Vec::new(),
+                    warnings,
                     next,
                     error: None,
                 };
@@ -318,6 +406,7 @@ fn run_secret_set(
                     saved.backend.as_str()
                 );
                 println!("      Location: {}", saved.location);
+                print_warnings(&warnings);
                 print_next_steps(&next);
             }
             ExitCode::from(EXIT_OK)
@@ -439,6 +528,17 @@ fn run_secret_delete(
     let (dir, store) = resolve_store(state_dir.as_ref());
     match store.delete(&name) {
         Ok(true) => {
+            let referenced_by =
+                find_secret_references_in_node_json(&dir, state_dir.is_some(), &name);
+            let mut warnings = Vec::new();
+            let mut next = Vec::new();
+            if !referenced_by.is_empty() {
+                warnings.push(format!(
+                    "Deleted secret '{name}' is still referenced in node.json ({}); update or remove those references and restart the service.",
+                    referenced_by.join(", ")
+                ));
+                next.push("hyp service restart --json".to_string());
+            }
             if as_json {
                 let envelope = JsonEnvelope {
                     ok: true,
@@ -449,14 +549,17 @@ fn run_secret_delete(
                         "deleted": true,
                         "backend": store.backend().as_str(),
                         "stateDir": dir.display().to_string(),
+                        "referencedBy": referenced_by,
                     })),
-                    warnings: Vec::new(),
-                    next: Vec::new(),
+                    warnings,
+                    next,
                     error: None,
                 };
                 print_json(&envelope);
             } else {
                 println!("OK    Deleted secret '{name}'");
+                print_warnings(&warnings);
+                print_next_steps(&next);
             }
             ExitCode::from(EXIT_OK)
         }

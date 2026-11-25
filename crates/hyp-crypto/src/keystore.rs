@@ -425,6 +425,21 @@ impl SecretStore {
         serde_json::from_str(&raw).unwrap_or_default()
     }
 
+    fn read_index_strict(&self) -> Result<SecretIndexFile, CryptoError> {
+        let path = self.index_path();
+        if !path.exists() {
+            return Ok(SecretIndexFile::default());
+        }
+        let _ = check_private_owner_and_mode(&path, false)?;
+        let raw = fs::read_to_string(&path)?;
+        serde_json::from_str(&raw).map_err(|e| {
+            CryptoError::Keystore(format!(
+                "failed to parse {}: {e}",
+                path.display()
+            ))
+        })
+    }
+
     fn write_index(&self, index: &SecretIndexFile) -> Result<(), CryptoError> {
         let mut json = serde_json::to_string_pretty(index)?;
         json.push('\n');
@@ -621,44 +636,88 @@ impl SecretStore {
     /// Loads or creates a Node's persistent Ed25519 + X25519 identity keypair.
     /// Transparently reads legacy v1 `id-sign-<hash12>` / `id-enc-<hash12>` keys if present so
     /// upgraded machines keep their cryptographic fingerprints.
+    ///
+    /// Security invariant (`D10`): ONLY generates fresh keys when BOTH keys are genuinely absent
+    /// (`CryptoError::SecretNotFound`) AND neither is recorded in `secrets/index.json` (and no
+    /// sibling key exists). Backend errors (locked Keychain, D-Bus unavailable, permission errors,
+    /// corrupt key/index) ALWAYS fail closed without silently regenerating a brand-new identity.
     pub fn load_or_create_node_keys(&self, node_id: &str) -> Result<NodeIdentityKeys, CryptoError> {
         let (v2_sign, v2_enc) = node_key_secret_names(node_id);
         let (v1_sign, v1_enc) = legacy_connector_key_secret_names(node_id);
+        let index = self.read_index_strict()?;
 
-        let signing = match self.get(&v2_sign) {
-            Ok(b64) => Ed25519KeyPair::from_pkcs8_b64(&b64)?,
-            Err(CryptoError::SecretNotFound(_)) => match self.get(&v1_sign) {
-                Ok(b64) => Ed25519KeyPair::from_pkcs8_b64(&b64)?,
-                Err(CryptoError::SecretNotFound(_)) => {
-                    let kp = Ed25519KeyPair::generate()?;
-                    let exported = kp.export_pkcs8_b64();
-                    self.set(&v2_sign, &exported)?;
-                    kp
+        let existing_signing: Option<Ed25519KeyPair> = match self.get(&v2_sign) {
+            Ok(b64) => Some(Ed25519KeyPair::from_pkcs8_b64(&b64)?),
+            Err(CryptoError::SecretNotFound(_)) => {
+                if index.secrets.contains_key(&v2_sign) {
+                    return Err(CryptoError::Keystore(format!(
+                        "node signing key '{v2_sign}' is recorded in secrets/index.json but missing from keystore; refusing to silently regenerate identity for '{node_id}'"
+                    )));
                 }
-                Err(e) => return Err(e),
-            },
+                match self.get(&v1_sign) {
+                    Ok(b64) => Some(Ed25519KeyPair::from_pkcs8_b64(&b64)?),
+                    Err(CryptoError::SecretNotFound(_)) => {
+                        if index.secrets.contains_key(&v1_sign) {
+                            return Err(CryptoError::Keystore(format!(
+                                "legacy node signing key '{v1_sign}' is recorded in secrets/index.json but missing from keystore; refusing to silently regenerate identity for '{node_id}'"
+                            )));
+                        }
+                        None
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             Err(e) => return Err(e),
         };
 
-        let encryption = match self.get(&v2_enc) {
-            Ok(b64) => X25519KeyPair::from_pkcs8_b64(&b64)?,
-            Err(CryptoError::SecretNotFound(_)) => match self.get(&v1_enc) {
-                Ok(b64) => X25519KeyPair::from_pkcs8_b64(&b64)?,
-                Err(CryptoError::SecretNotFound(_)) => {
-                    let kp = X25519KeyPair::generate()?;
-                    let exported = kp.export_pkcs8_b64();
-                    self.set(&v2_enc, &exported)?;
-                    kp
+        let existing_encryption: Option<X25519KeyPair> = match self.get(&v2_enc) {
+            Ok(b64) => Some(X25519KeyPair::from_pkcs8_b64(&b64)?),
+            Err(CryptoError::SecretNotFound(_)) => {
+                if index.secrets.contains_key(&v2_enc) {
+                    return Err(CryptoError::Keystore(format!(
+                        "node encryption key '{v2_enc}' is recorded in secrets/index.json but missing from keystore; refusing to silently regenerate identity for '{node_id}'"
+                    )));
                 }
-                Err(e) => return Err(e),
-            },
+                match self.get(&v1_enc) {
+                    Ok(b64) => Some(X25519KeyPair::from_pkcs8_b64(&b64)?),
+                    Err(CryptoError::SecretNotFound(_)) => {
+                        if index.secrets.contains_key(&v1_enc) {
+                            return Err(CryptoError::Keystore(format!(
+                                "legacy node encryption key '{v1_enc}' is recorded in secrets/index.json but missing from keystore; refusing to silently regenerate identity for '{node_id}'"
+                            )));
+                        }
+                        None
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             Err(e) => return Err(e),
         };
 
-        Ok(NodeIdentityKeys {
-            signing,
-            encryption,
-        })
+        match (existing_signing, existing_encryption) {
+            (Some(signing), Some(encryption)) => Ok(NodeIdentityKeys {
+                signing,
+                encryption,
+            }),
+            (Some(_), None) => Err(CryptoError::Keystore(format!(
+                "node encryption key '{v2_enc}' is missing while signing key exists for '{node_id}'; refusing to silently regenerate partial node identity"
+            ))),
+            (None, Some(_)) => Err(CryptoError::Keystore(format!(
+                "node signing key '{v2_sign}' is missing while encryption key exists for '{node_id}'; refusing to silently regenerate partial node identity"
+            ))),
+            (None, None) => {
+                let signing = Ed25519KeyPair::generate()?;
+                let encryption = X25519KeyPair::generate()?;
+                let sign_exported = signing.export_pkcs8_b64();
+                let enc_exported = encryption.export_pkcs8_b64();
+                self.set(&v2_sign, &sign_exported)?;
+                self.set(&v2_enc, &enc_exported)?;
+                Ok(NodeIdentityKeys {
+                    signing,
+                    encryption,
+                })
+            }
+        }
     }
 
     // ---- File backend ----
@@ -752,24 +811,8 @@ impl SecretStore {
             .stdin(Stdio::null())
             .output()
             .map_err(|e| CryptoError::Keystore(format!("failed to run security: {e}")))?;
-        if !output.status.success() {
-            return Ok(None);
-        }
-        let raw = Zeroizing::new(
-            String::from_utf8(output.stdout)
-                .map_err(|e| CryptoError::Keystore(format!("non-UTF8 keychain output: {e}")))?,
-        );
-        let stripped = raw.trim_end_matches(['\r', '\n']);
-        if stripped.is_empty() {
-            return Ok(None);
-        }
-        let decoded = decode_keychain_payload(stripped)?;
-        let trimmed = decoded.trim().to_string();
-        if trimmed.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(Zeroizing::new(trimmed)))
-        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        classify_mac_keychain_output(name, output.status.code(), &output.stdout, &stderr)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -854,19 +897,8 @@ impl SecretStore {
             .stdin(Stdio::null())
             .output()
             .map_err(|e| CryptoError::Keystore(format!("failed to run secret-tool: {e}")))?;
-        if !output.status.success() {
-            return Ok(None);
-        }
-        let raw = Zeroizing::new(
-            String::from_utf8(output.stdout)
-                .map_err(|e| CryptoError::Keystore(format!("non-UTF8 secret-tool output: {e}")))?,
-        );
-        let trimmed = raw.trim().to_string();
-        if trimmed.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(Zeroizing::new(trimmed)))
-        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        classify_linux_secret_service_output(name, output.status.code(), &output.stdout, &stderr)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -895,6 +927,117 @@ impl SecretStore {
     #[cfg(not(target_os = "linux"))]
     fn delete_linux_secret_service(&self, _name: &str, _service: &str) -> bool {
         false
+    }
+}
+
+/// Classifies the exit status, stdout, and stderr of macOS `/usr/bin/security find-generic-password`.
+///
+/// Only genuine `errSecItemNotFound` (exit code `44` or explicit not-found stderr without
+/// interaction/lock/auth errors) maps to `Ok(None)`. Locked keychains (`errSecInteractionNotAllowed`,
+/// exit `36`), denied access, or any other non-zero exit fail closed with `Err(CryptoError::Keystore)`.
+pub fn classify_mac_keychain_output(
+    name: &str,
+    exit_code: Option<i32>,
+    stdout: &[u8],
+    stderr: &str,
+) -> Result<Option<Zeroizing<String>>, CryptoError> {
+    if exit_code != Some(0) {
+        let stderr_trimmed = stderr.trim();
+        let lower = stderr_trimmed.to_ascii_lowercase();
+        let is_backend_denied = lower.contains("interaction is not allowed")
+            || lower.contains("errsecinteractionnotallowed")
+            || lower.contains("locked")
+            || lower.contains("authfailed")
+            || lower.contains("denied");
+        let is_not_found = !is_backend_denied
+            && (exit_code == Some(44)
+                || stderr_trimmed.contains("errSecItemNotFound")
+                || lower.contains("could not be found in the keychain"));
+        if is_not_found {
+            return Ok(None);
+        }
+        return Err(CryptoError::Keystore(if stderr_trimmed.is_empty() {
+            format!(
+                "macOS Keychain read failed for '{name}' (exit {exit_code:?}); unlock your login Keychain or set HYPHAE_SECRET_BACKEND=file"
+            )
+        } else {
+            format!(
+                "macOS Keychain read failed for '{name}' (exit {exit_code:?}): {stderr_trimmed}"
+            )
+        }));
+    }
+
+    let raw = Zeroizing::new(
+        String::from_utf8(stdout.to_vec())
+            .map_err(|e| CryptoError::Keystore(format!("non-UTF8 keychain output: {e}")))?,
+    );
+    let stripped = raw.trim_end_matches(['\r', '\n']);
+    if stripped.is_empty() {
+        return Err(CryptoError::Keystore(format!(
+            "macOS Keychain secret '{name}' is empty"
+        )));
+    }
+    let decoded = decode_keychain_payload(stripped)?;
+    let trimmed = decoded.trim().to_string();
+    if trimmed.is_empty() {
+        Err(CryptoError::Keystore(format!(
+            "macOS Keychain secret '{name}' is empty"
+        )))
+    } else {
+        Ok(Some(Zeroizing::new(trimmed)))
+    }
+}
+
+/// Classifies the exit status, stdout, and stderr of Linux `secret-tool lookup`.
+///
+/// Only empty stdout with exit `0` or an explicit item-not-found stderr (without D-Bus,
+/// lock, or permission errors) maps to `Ok(None)`. Any D-Bus error, locked keyring,
+/// permission error, or unrecognized non-zero exit fails closed with `Err(CryptoError::Keystore)`.
+pub fn classify_linux_secret_service_output(
+    name: &str,
+    exit_code: Option<i32>,
+    stdout: &[u8],
+    stderr: &str,
+) -> Result<Option<Zeroizing<String>>, CryptoError> {
+    if exit_code != Some(0) {
+        let stderr_trimmed = stderr.trim();
+        let lower = stderr_trimmed.to_ascii_lowercase();
+        let is_backend_err = lower.contains("dbus")
+            || lower.contains("d-bus")
+            || lower.contains("cannot autolaunch")
+            || lower.contains("locked")
+            || lower.contains("permission")
+            || lower.contains("denied")
+            || lower.contains("unavailable")
+            || lower.contains("org.freedesktop.secrets");
+        let is_explicit_not_found = !is_backend_err
+            && (lower.contains("no matching")
+                || lower.contains("not found")
+                || lower.contains("no such item")
+                || lower.contains("no such secret"));
+        if is_explicit_not_found {
+            return Ok(None);
+        }
+        return Err(CryptoError::Keystore(if stderr_trimmed.is_empty() {
+            format!(
+                "Linux Secret Service read failed for '{name}' (exit {exit_code:?}); ensure a Secret Service daemon is unlocked or set HYPHAE_SECRET_BACKEND=file"
+            )
+        } else {
+            format!(
+                "Linux Secret Service read failed for '{name}' (exit {exit_code:?}): {stderr_trimmed}"
+            )
+        }));
+    }
+
+    let raw = Zeroizing::new(
+        String::from_utf8(stdout.to_vec())
+            .map_err(|e| CryptoError::Keystore(format!("non-UTF8 secret-tool output: {e}")))?,
+    );
+    let trimmed = raw.trim().to_string();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(Zeroizing::new(trimmed)))
     }
 }
 
@@ -1016,5 +1159,124 @@ mod tests {
         assert!(stdin_cmd.starts_with("add-generic-password -U -s hyphae -a node-sign-abc -X "));
         assert!(stdin_cmd.ends_with('\n'));
         assert!(!stdin_cmd.contains(plain)); // hex-encoded in stdin, never plaintext argv
+    }
+
+    #[test]
+    fn d10_keychain_and_secret_service_error_classification_fails_closed() {
+        // macOS Keychain: exit 44 / errSecItemNotFound -> genuine None
+        assert!(
+            classify_mac_keychain_output(
+                "node-sign-1",
+                Some(44),
+                b"",
+                "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain."
+            )
+            .unwrap()
+            .is_none()
+        );
+        // macOS Keychain: exit 36 errSecInteractionNotAllowed / locked -> Err(Keystore), NEVER None!
+        assert!(matches!(
+            classify_mac_keychain_output(
+                "node-sign-1",
+                Some(36),
+                b"",
+                "security: SecKeychainSearchCopyNext: User interaction is not allowed."
+            ),
+            Err(CryptoError::Keystore(_))
+        ));
+        assert!(matches!(
+            classify_mac_keychain_output("node-sign-1", Some(51), b"", "errSecAuthFailed"),
+            Err(CryptoError::Keystore(_))
+        ));
+        assert!(matches!(
+            classify_mac_keychain_output("node-sign-1", Some(1), b"", ""),
+            Err(CryptoError::Keystore(_))
+        ));
+        // Valid macOS read
+        assert_eq!(
+            &*classify_mac_keychain_output("node-sign-1", Some(0), b"secret-abc\n", "")
+                .unwrap()
+                .unwrap(),
+            "secret-abc"
+        );
+
+        // Linux secret-tool: exit 0 with empty stdout -> genuine None
+        assert!(
+            classify_linux_secret_service_output("node-sign-1", Some(0), b"", "")
+                .unwrap()
+                .is_none()
+        );
+        // Linux secret-tool: explicit not-found without D-Bus error -> genuine None
+        assert!(
+            classify_linux_secret_service_output(
+                "node-sign-1",
+                Some(1),
+                b"",
+                "secret-tool: no matching secret found"
+            )
+            .unwrap()
+            .is_none()
+        );
+        // Linux secret-tool: D-Bus unavailable / locked / permission denied / non-zero empty -> Err(Keystore)
+        for (code, stderr) in [
+            (Some(1), "secret-tool: Cannot autolaunch D-Bus without X11 $DISPLAY"),
+            (Some(1), "secret-tool: Keyring is locked"),
+            (Some(1), "secret-tool: Permission denied"),
+            (Some(1), ""),
+            (Some(2), "org.freedesktop.secrets unavailable"),
+        ] {
+            assert!(
+                matches!(
+                    classify_linux_secret_service_output("node-sign-1", code, b"", stderr),
+                    Err(CryptoError::Keystore(_))
+                ),
+                "expected Keystore error for code={code:?} stderr={stderr:?}"
+            );
+        }
+        // Valid Linux read
+        assert_eq!(
+            &*classify_linux_secret_service_output("node-sign-1", Some(0), b"secret-xyz\n", "")
+                .unwrap()
+                .unwrap(),
+            "secret-xyz"
+        );
+    }
+
+    #[test]
+    fn d10_load_or_create_node_keys_fails_closed_on_missing_indexed_or_sibling_key() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::file_only(tmp.path());
+
+        let orig = store.load_or_create_node_keys("node-d10@host").unwrap();
+        let (v2_sign, v2_enc) = node_key_secret_names("node-d10@host");
+        let sign_path = store.secret_file_path(&v2_sign).unwrap();
+        let enc_path = store.secret_file_path(&v2_enc).unwrap();
+
+        // 1. Delete signing secret file on disk while index.json still records it -> MUST fail closed!
+        let saved_sign_bytes = fs::read(&sign_path).unwrap();
+        fs::remove_file(&sign_path).unwrap();
+        let err = store
+            .load_or_create_node_keys("node-d10@host")
+            .expect_err("must not regenerate when key is recorded in index.json");
+        assert!(matches!(err, CryptoError::Keystore(_)), "unexpected err: {err}");
+        assert!(!sign_path.exists(), "must not write a newly generated signing key");
+
+        // Restore signing file -> loads original keys again!
+        fs::write(&sign_path, &saved_sign_bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&sign_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let reloaded = store.load_or_create_node_keys("node-d10@host").unwrap();
+        assert_eq!(reloaded.kid(), orig.kid());
+
+        // 2. Delete encryption key cleanly (removes from both disk & index) while signing sibling exists -> MUST fail closed!
+        assert!(store.delete(&v2_enc).unwrap());
+        let err2 = store
+            .load_or_create_node_keys("node-d10@host")
+            .expect_err("must not regenerate partial identity when sibling key exists");
+        assert!(matches!(err2, CryptoError::Keystore(_)), "unexpected err: {err2}");
+        assert!(!enc_path.exists(), "must not silently regenerate missing sibling key");
     }
 }
