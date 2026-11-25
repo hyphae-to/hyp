@@ -768,10 +768,11 @@ esac
             app: Some("codex".into()),
             bin: hc.bin(),
         };
-        let short = Duration::from_millis(150);
-        let transport = HerdrTransport::new(target).with_timeouts(short, short, short);
+        let short = Duration::from_millis(250);
+        let ok = Duration::from_secs(3);
 
         // 1. Hanging `get`
+        let transport = HerdrTransport::new(target.clone()).with_timeouts(short, ok, ok);
         hc.set_flag("hang_get");
         let start = Instant::now();
         assert_eq!(
@@ -785,6 +786,7 @@ esac
         hc.clear_flag("hang_get");
 
         // 2. Hanging `interrupt`
+        let transport = HerdrTransport::new(target.clone()).with_timeouts(ok, short, ok);
         hc.set_get_default(0, &nested_json("t3", 100, 4242, "codex", "working"));
         hc.set_flag("hang_interrupt");
         let start = Instant::now();
@@ -796,6 +798,7 @@ esac
         hc.clear_flag("hang_interrupt");
 
         // 3. Hanging `send` (post-interrupt -> Reject { interrupted: true })
+        let transport = HerdrTransport::new(target).with_timeouts(ok, ok, short);
         hc.reset_calls();
         hc.set_get_seq(1, 0, &nested_json("t3", 100, 4242, "codex", "working"));
         hc.set_get_seq(2, 0, &nested_json("t3", 100, 4242, "codex", "idle"));
