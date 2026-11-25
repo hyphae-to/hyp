@@ -288,7 +288,7 @@ fn deploy_init_all_six_providers_overwrite_guard_and_config_check() {
             assert!(dockerfile.contains(&format!("ARG HYP_VERSION=v{}", env!("CARGO_PKG_VERSION"))));
             assert!(dockerfile.contains("ARG TARGETARCH"));
             assert!(dockerfile.contains("x86_64-unknown-linux-musl"));
-            assert!(dockerfile.contains("aarch64-unknown-linux-musl"));
+            assert!(dockerfile.contains("aarch64-unknown-linux-gnu"));
             assert!(dockerfile.contains("https://github.com/hyphae-to/hyp/releases/download/${HYP_VERSION}"));
             assert!(dockerfile.contains("SHA256SUMS.txt"));
             assert!(dockerfile.contains("sha256sum -c --ignore-missing"));
