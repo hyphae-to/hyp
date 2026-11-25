@@ -34,7 +34,7 @@ use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
 use hyp_node::engine::http_util::{SseParser, percent_encode};
 use hyp_node::engine::{
     AckDropResponse, CreateDropRequest, CreateDropResponse, DROP_CAP_HEADER, DropRelayConfig,
-    IngestedHumanDrop, NodeConfig, NodeProfile, UnifiedNode,
+    IngestedHumanDrop, NodeConfig, NodeProfile, UnifiedNode, resolve_drop_portal_url,
 };
 use hyp_node::gates::{SecurityGateConfig, SecurityGatePipeline};
 use hyp_proto::address::{NodeId, is_valid_handle};
@@ -49,7 +49,6 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-const DROP_PORTAL_BASE_URL: &str = "https://hyphae.to/drop";
 const LAST_DROP_FILENAME: &str = "last_drop.json";
 const MAX_HDROP1_STDIN_BYTES: u64 = 64 * 1024;
 const MAX_DRAFT_STDIN_BYTES: u64 = 8 * 1024;
@@ -563,6 +562,46 @@ fn run_drop_create(
         None
     };
 
+    let configured_drop_portal_url: Option<String> = match loaded
+        .as_ref()
+        .and_then(|c| c.raw.get("dropPortalUrl"))
+    {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "CONFIG_ERROR",
+                format!(
+                    "Invalid dropPortalUrl in {}: must be a string",
+                    config_read.display()
+                ),
+                Some(
+                    "Set dropPortalUrl to an https:// URL (e.g. \"https://hyphae.to/drop\") or loopback http://127.0.0.1."
+                        .to_string(),
+                ),
+            );
+        }
+    };
+    let drop_portal_url = match resolve_drop_portal_url(configured_drop_portal_url.as_deref()) {
+        Ok(u) => u,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "CONFIG_ERROR",
+                format!("Invalid Drop Portal URL: {e}"),
+                Some(
+                    "Set HYPHAE_DROP_PORTAL_URL or node.json dropPortalUrl to an https:// URL (e.g. https://hyphae.to/drop) or loopback http://127.0.0.1."
+                        .to_string(),
+                ),
+            );
+        }
+    };
+
     let relay_url: Option<String> = if offline {
         None
     } else if let Some(ref explicit) = relay_arg {
@@ -852,7 +891,7 @@ fn run_drop_create(
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
     };
     let drop_url = format!(
-        "{DROP_PORTAL_BASE_URL}#drop={}",
+        "{drop_portal_url}#drop={}",
         URL_SAFE_NO_PAD.encode(canon.as_bytes())
     );
 

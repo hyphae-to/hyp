@@ -17,20 +17,28 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::{Subcommand, ValueEnum};
 use http::{Method, Request, header};
 use http_body_util::{BodyExt, Empty, Full};
-use hyp_crypto::compat_v1::{issue_grant_v1, parse_pairing_code_v1};
+use hyp_crypto::compat_v1::{
+    PairingCodeV1, derive_pairing_key_v1, issue_grant_v1, parse_pairing_code_v1,
+};
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keys::{
     Ed25519KeyPair, Ed25519PublicKey, NodeIdentityKeys, OkpJwk as CryptoOkpJwk, SignedPayload,
     X25519PublicKey,
 };
-use hyp_crypto::keystore::{SecretBackend, SecretStore};
+use hyp_crypto::keystore::SecretStore;
 use hyp_crypto::pairing::{
-    AM2_PREFIX, AdminInviteV2, GrantV2, HP2P1_PREFIX, P2P_SECRET_BYTES, create_p2p_offer,
-    decode_am2, decode_hp2p1, encode_am2, encode_hp2p1, sign_grant_v2, validate_endpoint_origin,
-    verify_grant_v2,
+    AM2_PREFIX, AdminInviteV2, GrantV2, HP2P1_PREFIX, P2P_SECRET_BYTES, P2pOfferToken,
+    P2pPairConfirmation, P2pPairResponse, create_p2p_offer, create_p2p_response, decode_am2,
+    decode_hp2p1, encode_am2, encode_hp2p1, sign_grant_v2, validate_endpoint_origin,
+    verify_grant_v2, verify_p2p_confirmation,
 };
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms, parse_rfc3339_millis};
-use hyp_node::engine::{GuestPairReply, GuestPairRequest, guest_pair_proof_canonical};
+use hyp_node::engine::http_util::percent_encode;
+use hyp_node::engine::peer_link::{PairBindingV2, PairRequestV2};
+use hyp_node::engine::{
+    GuestPairReply, GuestPairRequest, P2pPairServerReply, PairServerReply,
+    guest_pair_proof_canonical, p2p_offer_secret_name,
+};
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
 use hyp_proto::manifest::{NodeManifestPayload, NodeProfile as ProtoNodeProfile, SignedNodeManifest};
 use hyp_proto::problem::ProblemDetails;
@@ -182,6 +190,9 @@ pub enum PairCommand {
         /// Optional counter-grant scopes to offer the peer in return (P2P mutual pairing)
         #[arg(long, num_args = 1..)]
         grant: Vec<String>,
+        /// Stage peer locally in node.sqlite without contacting the remote peer over HTTP
+        #[arg(long)]
+        offline: bool,
         /// Output structured JSON envelope
         #[arg(long)]
         json: bool,
@@ -245,8 +256,9 @@ pub fn run_pair(command: PairCommand) -> ExitCode {
             state_dir,
             node_id,
             grant,
+            offline,
             json,
-        } => run_accept(token_file, state_dir, node_id, grant, json),
+        } => run_accept(token_file, state_dir, node_id, grant, offline, json),
         PairCommand::Join {
             url,
             state_dir,
@@ -512,39 +524,6 @@ fn looks_like_scope_start(s: &str) -> bool {
     prefix.contains(':')
 }
 
-fn default_config_dir() -> PathBuf {
-    if let Ok(explicit) = std::env::var("HYPHAE_CONFIG_DIR") {
-        if !explicit.trim().is_empty() {
-            return PathBuf::from(explicit);
-        }
-    }
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        if !xdg.trim().is_empty() {
-            return PathBuf::from(xdg).join("hyphae");
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.trim().is_empty() {
-            return PathBuf::from(home).join(".config").join("hyphae");
-        }
-    }
-    PathBuf::from(".hyphae")
-}
-
-fn open_secret_store(state_dir: Option<&Path>) -> SecretStore {
-    match state_dir {
-        Some(dir) => {
-            if std::env::var_os("HYPHAE_SECRET_BACKEND").is_some() {
-                SecretStore::from_env(dir)
-            } else {
-                // Explicit --state-dir defaults to isolated file backend so it never mutates live OS Keychain.
-                SecretStore::new(dir, SecretBackend::File)
-            }
-        }
-        None => SecretStore::from_env(default_config_dir()),
-    }
-}
-
 fn generate_offer_id() -> Result<String, String> {
     let rng = SystemRandom::new();
     let mut b = [0u8; 16];
@@ -744,7 +723,11 @@ fn run_invite(
         .map(EscalationNote::sanitize)
         .filter(|n| !n.is_empty());
 
-    let store = open_secret_store(state_dir.as_deref());
+    let effective_state_dir = resolve_state_dir(state_dir.as_deref(), None, None);
+    if let Err(e) = ensure_dir(&effective_state_dir, true) {
+        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
+    }
+    let store = crate::config_file::open_secret_store(&effective_state_dir, state_dir.is_some());
     let now_ms = now_unix_ms();
     let ttl_ms = (expires_hours as i64) * 3_600_000;
     let expires_at = format_rfc3339_millis(now_ms + ttl_ms);
@@ -814,6 +797,70 @@ fn run_invite(
                     );
                 }
             };
+
+            // Persist single-use sentinel grant row in `node.sqlite` AND the full serialized
+            // `P2pOfferToken` in `SecretStore` (zero plaintext secret on disk) so a running
+            // `UnifiedNode` daemon can verify and atomically claim `POST /v1/p2p/pair/<offerId>`.
+            let db_path = effective_state_dir.join("node.sqlite");
+            let db = match NodeDb::open(&db_path) {
+                Ok(d) => d,
+                Err(e) => {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "DB_ERROR",
+                        format!("Failed to open {}: {e}", db_path.display()),
+                        None,
+                    );
+                }
+            };
+            let sentinel_json = match serde_json::to_string(&json!({ "offerId": offer_id })) {
+                Ok(s) => s,
+                Err(e) => {
+                    return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None);
+                }
+            };
+            if let Err(e) = db.peers().add_grant(
+                &GrantInput {
+                    id: format!("p2p-offer:{offer_id}"),
+                    peer_id: node_id.clone(),
+                    direction: GrantDirection::Inbound,
+                    signed_json: sentinel_json,
+                    scopes: offered_scopes.clone(),
+                    trust_tier: StoreTrustTier::Peer,
+                    issued_at: now_ms,
+                    pair_by: Some(now_ms + ttl_ms),
+                    expires_at: None,
+                },
+                now_ms,
+            ) {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "DB_ERROR",
+                    format!("Failed to persist single-use P2P offer grant in SQLite: {e}"),
+                    None,
+                );
+            }
+            let offer_secret_key = p2p_offer_secret_name(&offer.offer_id);
+            let offer_json = match serde_json::to_string(&offer) {
+                Ok(s) => s,
+                Err(e) => {
+                    return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None);
+                }
+            };
+            if let Err(e) = store.set(&offer_secret_key, &offer_json) {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "KEYSTORE_ERROR",
+                    format!("Failed to persist P2P offer in SecretStore: {e}"),
+                    None,
+                );
+            }
 
             let kid = keys.kid();
             let enc_kid = keys.encryption.kid();
@@ -918,14 +965,42 @@ fn run_invite(
                 }
             };
 
-            // Also sign a canonical v2 GrantV2 with the full v2 scope list so callers have the complete signed grant.
+            let parsed_v1 = match parse_pairing_code_v1(&issued_v1.code) {
+                Ok(p) => p,
+                Err(e) => {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "GRANT_ERROR",
+                        format!("Failed to parse issued pairing code: {e}"),
+                        None,
+                    );
+                }
+            };
+            let pair_kp = match derive_pairing_key_v1(&parsed_v1.secret, &issued_v1.grant.id) {
+                Ok(kp) => kp,
+                Err(e) => {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "GRANT_ERROR",
+                        format!("Failed to derive one-time pairing key: {e}"),
+                        None,
+                    );
+                }
+            };
+
+            // Also sign a canonical v2 GrantV2 carrying the one-time `pairingKey` and full v2 scopes
+            // and persist it into `node.sqlite` so the running hub can claim `POST /v1/pair`!
             let grant_v2 = GrantV2 {
                 v: 2,
                 id: issued_v1.grant.id.clone(),
                 node_id: target_peer.clone(),
                 scopes: offered_scopes.clone(),
                 trust_tier: Some(trust_tier.to_string()),
-                pairing_key: None,
+                pairing_key: Some(pair_kp.to_jwk()),
                 subject_signing_jwk: None,
                 subject_encryption_jwk: None,
                 issued_at: issued_v1.grant.issued_at.clone(),
@@ -945,6 +1020,50 @@ fn run_invite(
                     );
                 }
             };
+
+            let db_path = effective_state_dir.join("node.sqlite");
+            let db = match NodeDb::open(&db_path) {
+                Ok(d) => d,
+                Err(e) => {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "DB_ERROR",
+                        format!("Failed to open {}: {e}", db_path.display()),
+                        None,
+                    );
+                }
+            };
+            let signed_grant_json = match serde_json::to_string(&signed_grant_v2) {
+                Ok(s) => s,
+                Err(e) => {
+                    return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None);
+                }
+            };
+            if let Err(e) = db.peers().add_grant(
+                &GrantInput {
+                    id: issued_v1.grant.id.clone(),
+                    peer_id: target_peer.clone(),
+                    direction: GrantDirection::Inbound,
+                    signed_json: signed_grant_json,
+                    scopes: offered_scopes.clone(),
+                    trust_tier: parse_store_trust_tier(trust_tier, StoreTrustTier::Org),
+                    issued_at: now_ms,
+                    pair_by: Some(now_ms + ttl_ms),
+                    expires_at: None,
+                },
+                now_ms,
+            ) {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "DB_ERROR",
+                    format!("Failed to persist Admin-CA grant in SQLite: {e}"),
+                    None,
+                );
+            }
 
             let invite = AdminInviteV2 {
                 v: 2,
@@ -1002,6 +1121,7 @@ fn run_invite(
                         "peerId": target_peer,
                         "endpoint": endpoint,
                         "kid": kid,
+                        "adminJwk": admin_key.to_jwk(),
                         "adminFingerprint": fingerprint,
                         "requireE2ee": true,
                         "trustTier": trust_tier,
@@ -1920,6 +2040,529 @@ fn check_existing_signing_pin(
 }
 
 // ============================================================================
+// Live HTTP Pairing Handshakes (`hp2p1_` & `am2_`, shared with `onboard --join`)
+// ============================================================================
+
+const PAIR_HTTP_TIMEOUT_SECS: u64 = 15;
+
+pub(crate) enum LiveHandshakeError {
+    Unreachable(String),
+    Rejected { code: &'static str, message: String },
+}
+
+pub(crate) struct OnboardJoinResult {
+    pub format: &'static str,
+    pub peer_id: String,
+    pub endpoint: String,
+    pub kid: Option<String>,
+    pub scopes: Vec<String>,
+    pub enrolled: bool,
+}
+
+struct LiveP2pHandshakeResult {
+    bob_grant_id: String,
+    bob_grant_signed: SignedPayload,
+    alice_grant_verified: GrantV2,
+    alice_grant_signed: SignedPayload,
+    auth_credential: String,
+    signed_manifest: SignedNodeManifest,
+    manifest_payload: Box<NodeManifestPayload>,
+    manifest_etag: String,
+}
+
+struct LiveAm2HandshakeResult {
+    hub_node_id: String,
+    verified_grant: GrantV2,
+    signed_grant: SignedPayload,
+    auth_credential: String,
+    signed_manifest: SignedNodeManifest,
+    manifest_payload: Box<NodeManifestPayload>,
+    hub_signing_pk: Ed25519PublicKey,
+    hub_encryption_pk: X25519PublicKey,
+    manifest_etag: String,
+}
+
+fn compute_manifest_etag(manifest_json: &str) -> String {
+    let digest = hex::encode(Sha256::digest(manifest_json.as_bytes()));
+    format!("\"{}\"", &digest[..16])
+}
+
+fn verify_signed_manifest_strict(
+    signed: &SignedNodeManifest,
+    expected_node_id: Option<&str>,
+    expected_signing_pk: Option<&Ed25519PublicKey>,
+    expected_enc_x: Option<&str>,
+) -> Result<(NodeManifestPayload, Ed25519PublicKey, X25519PublicKey), (&'static str, String)> {
+    let payload = signed.decode_payload().map_err(|e| {
+        (
+            "INVALID_MANIFEST",
+            format!("Invalid NodeManifestPayload in pairing reply: {e}"),
+        )
+    })?;
+    if let Some(expected) = expected_node_id {
+        if payload.node_id.as_str() != expected {
+            return Err((
+                "NODE_ID_MISMATCH",
+                format!(
+                    "Pairing reply manifest nodeId '{}' does not match expected '{expected}'",
+                    payload.node_id
+                ),
+            ));
+        }
+    }
+    let canonical = payload.to_canonical_payload().map_err(|e| {
+        (
+            "INVALID_MANIFEST",
+            format!("Failed to canonicalize pairing manifest payload: {e}"),
+        )
+    })?;
+    if canonical != signed.payload {
+        return Err((
+            "NON_CANONICAL_MANIFEST",
+            "Pairing reply manifest payload is not canonical RFC 8785 JCS (fail-closed)".to_string(),
+        ));
+    }
+    let crypto_sign_jwk = proto_jwk_to_crypto(&payload.identity.signing_jwk);
+    let crypto_enc_jwk = proto_jwk_to_crypto(&payload.identity.encryption_jwk);
+    let signing_pk = crypto_sign_jwk.to_ed25519().map_err(|e| {
+        (
+            "INVALID_KEY",
+            format!("Invalid signingJwk in pairing manifest: {e}"),
+        )
+    })?;
+    let encryption_pk = crypto_enc_jwk.to_x25519().map_err(|e| {
+        (
+            "INVALID_KEY",
+            format!("Invalid encryptionJwk in pairing manifest: {e}"),
+        )
+    })?;
+
+    if let Some(expected_pk) = expected_signing_pk {
+        if &signing_pk != expected_pk {
+            return Err((
+                "KEY_PIN_MISMATCH",
+                "Pairing reply manifest signingJwk does not match out-of-band pinned key (fail-closed)"
+                    .to_string(),
+            ));
+        }
+    }
+    if let Some(expected_x) = expected_enc_x {
+        if payload.identity.encryption_jwk.x != expected_x {
+            return Err((
+                "KEY_PIN_MISMATCH",
+                "Pairing reply manifest encryptionJwk does not match out-of-band pinned key (fail-closed)"
+                    .to_string(),
+            ));
+        }
+    }
+
+    let verifier_pk = expected_signing_pk.unwrap_or(&signing_pk);
+    verifier_pk
+        .verify_domain_b64("manifest", signed.payload.as_bytes(), &signed.sig)
+        .map_err(|e| {
+            (
+                "INVALID_SIGNATURE",
+                format!("Pairing reply manifest Ed25519 signature verification failed (fail-closed): {e}"),
+            )
+        })?;
+
+    let exp_ms = parse_rfc3339_millis(&payload.expires_at).map_err(|e| {
+        (
+            "INVALID_MANIFEST",
+            format!("Invalid expiresAt '{}' in pairing manifest: {e}", payload.expires_at),
+        )
+    })?;
+    if now_unix_ms() > exp_ms {
+        return Err((
+            "MANIFEST_EXPIRED",
+            format!(
+                "Peer '{}' manifest in pairing reply expired at {}",
+                payload.node_id, payload.expires_at
+            ),
+        ));
+    }
+
+    Ok((payload, signing_pk, encryption_pk))
+}
+
+fn post_json_handshake(url: &str, body_bytes: Vec<u8>) -> Result<(u16, Vec<u8>), LiveHandshakeError> {
+    let uri: http::Uri = url.parse().map_err(|e| LiveHandshakeError::Rejected {
+        code: "INVALID_ENDPOINT",
+        message: format!("Invalid pairing URI '{url}': {e}"),
+    })?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| LiveHandshakeError::Rejected {
+            code: "RUNTIME_ERROR",
+            message: format!("Failed to start async runtime: {e}"),
+        })?;
+
+    rt.block_on(async {
+        let client = build_http_client::<Full<Bytes>>().map_err(|e| {
+            LiveHandshakeError::Rejected {
+                code: "HTTP_ERROR",
+                message: format!("Failed to initialize HTTP client: {e}"),
+            }
+        })?;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(&uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json")
+            .header(
+                header::USER_AGENT,
+                format!("hyp/{}", env!("CARGO_PKG_VERSION")),
+            )
+            .body(Full::new(Bytes::from(body_bytes)))
+            .map_err(|e| LiveHandshakeError::Rejected {
+                code: "HTTP_ERROR",
+                message: format!("Failed to build pairing HTTP request: {e}"),
+            })?;
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(PAIR_HTTP_TIMEOUT_SECS),
+            client.request(req),
+        )
+        .await
+        .map_err(|_| {
+            LiveHandshakeError::Unreachable(format!(
+                "POST {url} timed out after {PAIR_HTTP_TIMEOUT_SECS}s"
+            ))
+        })?
+        .map_err(|e| LiveHandshakeError::Unreachable(format!("POST {url} failed: {e}")))?;
+
+        let status = resp.status().as_u16();
+        let bytes = tokio::time::timeout(Duration::from_secs(PAIR_HTTP_TIMEOUT_SECS), async {
+            let mut body = resp.into_body();
+            let mut out = Vec::new();
+            while let Some(frame_res) = body.frame().await {
+                let frame = frame_res.map_err(|e| {
+                    LiveHandshakeError::Unreachable(format!("Pairing response body read error: {e}"))
+                })?;
+                if let Some(chunk) = frame.data_ref() {
+                    if out.len() + chunk.len() > MAX_MANIFEST_RESPONSE_BYTES {
+                        return Err(LiveHandshakeError::Rejected {
+                            code: "PAIR_HANDSHAKE_INVALID",
+                            message: format!(
+                                "Pairing response exceeds {MAX_MANIFEST_RESPONSE_BYTES} byte safety cap"
+                            ),
+                        });
+                    }
+                    out.extend_from_slice(chunk);
+                }
+            }
+            Ok::<Vec<u8>, LiveHandshakeError>(out)
+        })
+        .await
+        .map_err(|_| {
+            LiveHandshakeError::Unreachable("Timed out reading pairing response body".to_string())
+        })??;
+
+        Ok::<(u16, Vec<u8>), LiveHandshakeError>((status, bytes))
+    })
+}
+
+fn decode_handshake_http_error(
+    url: &str,
+    status: u16,
+    body_bytes: &[u8],
+    not_found_code: &'static str,
+    conflict_code: &'static str,
+) -> LiveHandshakeError {
+    if let Ok(problem) = serde_json::from_slice::<ProblemDetails>(body_bytes) {
+        let code = match (status, problem.error.as_str()) {
+            (401, _) | (403, _) => "PAIR_REJECTED",
+            (404, _) => not_found_code,
+            (409, _) => conflict_code,
+            (410, _) => "TOKEN_EXPIRED",
+            (429, _) | (_, "rate_limited") => "RATE_LIMITED",
+            _ => "PAIR_HANDSHAKE_FAILED",
+        };
+        let detail = problem
+            .detail
+            .unwrap_or_else(|| format!("{} (HTTP {status})", problem.title));
+        return LiveHandshakeError::Rejected {
+            code,
+            message: format!("POST {url} rejected ({}): {detail}", problem.error),
+        };
+    }
+    let snippet: String = String::from_utf8_lossy(body_bytes).chars().take(200).collect();
+    let code = match status {
+        401 | 403 => "PAIR_REJECTED",
+        404 => not_found_code,
+        409 => conflict_code,
+        410 => "TOKEN_EXPIRED",
+        429 => "RATE_LIMITED",
+        _ => "PAIR_HANDSHAKE_FAILED",
+    };
+    LiveHandshakeError::Rejected {
+        code,
+        message: format!("POST {url} returned HTTP {status}: {}", snippet.trim()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_live_p2p_handshake(
+    offer: &P2pOfferToken,
+    alice_sign_pk: &Ed25519PublicKey,
+    local_node_id: &str,
+    local_endpoint: Option<&str>,
+    local_keys: &NodeIdentityKeys,
+    granted_scopes: &[String],
+    trust_tier: StoreTrustTier,
+) -> Result<LiveP2pHandshakeResult, LiveHandshakeError> {
+    let now_db = now_ms();
+    let bob_grant_id = format!("p2p-{}", offer.offer_id);
+    let bob_grant = GrantV2 {
+        v: 2,
+        id: bob_grant_id.clone(),
+        node_id: offer.node_id.clone(),
+        scopes: granted_scopes.to_vec(),
+        trust_tier: Some(trust_tier.as_str().to_string()),
+        pairing_key: None,
+        subject_signing_jwk: Some(offer.signing_jwk.clone()),
+        subject_encryption_jwk: Some(offer.encryption_jwk.clone()),
+        issued_at: format_rfc3339_millis(now_db),
+        pair_by: None,
+        expires_at: None,
+    };
+    let bob_grant_signed = sign_grant_v2(&bob_grant, &local_keys.signing).map_err(|e| {
+        LiveHandshakeError::Rejected {
+            code: "GRANT_ERROR",
+            message: format!("Failed to sign local P2P counter-grant: {e}"),
+        }
+    })?;
+    let resp_body: P2pPairResponse = create_p2p_response(
+        offer,
+        local_node_id,
+        local_endpoint,
+        local_keys,
+        &bob_grant,
+    )
+    .map_err(|e| LiveHandshakeError::Rejected {
+        code: "OFFER_ERROR",
+        message: format!("Failed to construct P2P pairing response: {e}"),
+    })?;
+    let req_bytes = serde_json::to_vec(&resp_body).map_err(|e| LiveHandshakeError::Rejected {
+        code: "ENCODE_ERROR",
+        message: format!("Failed to serialize P2P pairing response: {e}"),
+    })?;
+
+    let url = format!(
+        "{}/v1/p2p/pair/{}",
+        offer.endpoint.trim_end_matches('/'),
+        percent_encode(&offer.offer_id)
+    );
+    let (status, body_bytes) = post_json_handshake(&url, req_bytes)?;
+    if status != 200 {
+        return Err(decode_handshake_http_error(
+            &url,
+            status,
+            &body_bytes,
+            "OFFER_NOT_FOUND",
+            "OFFER_ALREADY_CLAIMED",
+        ));
+    }
+
+    let server_reply: P2pPairServerReply =
+        serde_json::from_slice(&body_bytes).map_err(|e| LiveHandshakeError::Rejected {
+            code: "PAIR_HANDSHAKE_INVALID",
+            message: format!("Invalid P2pPairServerReply JSON from {url}: {e}"),
+        })?;
+    if server_reply.auth_credential.trim().is_empty() {
+        return Err(LiveHandshakeError::Rejected {
+            code: "PAIR_HANDSHAKE_INVALID",
+            message: "Peer returned an empty authCredential in P2P pairing reply".to_string(),
+        });
+    }
+
+    let confirmation = P2pPairConfirmation {
+        offer_id: server_reply.offer_id.clone(),
+        alice_grant_to_bob: server_reply.alice_grant_to_bob.clone(),
+    };
+    let alice_grant_verified =
+        verify_p2p_confirmation(offer, &confirmation, local_node_id).map_err(|e| {
+            LiveHandshakeError::Rejected {
+                code: "INVALID_SIGNATURE",
+                message: format!(
+                    "Peer P2P confirmation failed zero-TOFU verification against out-of-band JWK: {e}"
+                ),
+            }
+        })?;
+
+    let (manifest_payload, _sign_pk, _enc_pk) = verify_signed_manifest_strict(
+        &server_reply.signed_manifest,
+        Some(&offer.node_id),
+        Some(alice_sign_pk),
+        Some(&offer.encryption_jwk.x),
+    )
+    .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
+
+    let manifest_json = serde_json::to_string(&server_reply.signed_manifest).map_err(|e| {
+        LiveHandshakeError::Rejected {
+            code: "ENCODE_ERROR",
+            message: e.to_string(),
+        }
+    })?;
+    let manifest_etag = compute_manifest_etag(&manifest_json);
+
+    Ok(LiveP2pHandshakeResult {
+        bob_grant_id,
+        bob_grant_signed,
+        alice_grant_verified,
+        alice_grant_signed: server_reply.alice_grant_to_bob,
+        auth_credential: server_reply.auth_credential,
+        signed_manifest: server_reply.signed_manifest,
+        manifest_payload: Box::new(manifest_payload),
+        manifest_etag,
+    })
+}
+
+fn execute_live_am2_handshake(
+    invite: &AdminInviteV2,
+    parsed_v1: &PairingCodeV1,
+    admin_pk: &Ed25519PublicKey,
+    expected_hub_id: Option<&str>,
+    local_node_id: &str,
+    local_keys: &NodeIdentityKeys,
+) -> Result<LiveAm2HandshakeResult, LiveHandshakeError> {
+    let pair_kp =
+        derive_pairing_key_v1(&parsed_v1.secret, &parsed_v1.grant_id).map_err(|e| {
+            LiveHandshakeError::Rejected {
+                code: "INVALID_TOKEN",
+                message: format!("Failed to derive one-time pairing key from am2_ bundle: {e}"),
+            }
+        })?;
+
+    let binding = PairBindingV2 {
+        v: 2,
+        grant_id: parsed_v1.grant_id.clone(),
+        node_id: local_node_id.to_string(),
+        signing_jwk: local_keys.signing_jwk(),
+        encryption_jwk: local_keys.encryption_jwk(),
+        bound_at: format_rfc3339_millis(now_ms()),
+    };
+    let payload = to_canonical_json(&binding).map_err(|e| LiveHandshakeError::Rejected {
+        code: "ENCODE_ERROR",
+        message: format!("Failed to canonicalize PairBindingV2: {e}"),
+    })?;
+    let pairing_sig = pair_kp.sign_domain_b64("binding", payload.as_bytes());
+    let self_sig = local_keys
+        .signing
+        .sign_domain_b64("binding-self", payload.as_bytes());
+
+    let pair_req = PairRequestV2 {
+        grant_id: parsed_v1.grant_id.clone(),
+        payload,
+        pairing_sig,
+        self_sig,
+    };
+    let req_bytes = serde_json::to_vec(&pair_req).map_err(|e| LiveHandshakeError::Rejected {
+        code: "ENCODE_ERROR",
+        message: format!("Failed to serialize PairRequestV2: {e}"),
+    })?;
+
+    let url = format!("{}/v1/pair", invite.router.trim_end_matches('/'));
+    let (status, body_bytes) = post_json_handshake(&url, req_bytes)?;
+    if status != 200 {
+        return Err(decode_handshake_http_error(
+            &url,
+            status,
+            &body_bytes,
+            "GRANT_NOT_FOUND",
+            "GRANT_ALREADY_CLAIMED",
+        ));
+    }
+
+    let reply: PairServerReply =
+        serde_json::from_slice(&body_bytes).map_err(|e| LiveHandshakeError::Rejected {
+            code: "PAIR_HANDSHAKE_INVALID",
+            message: format!("Invalid PairServerReply JSON from {url}: {e}"),
+        })?;
+    if reply.auth_credential.trim().is_empty() {
+        return Err(LiveHandshakeError::Rejected {
+            code: "PAIR_HANDSHAKE_INVALID",
+            message: "Hub returned an empty authCredential in /v1/pair reply".to_string(),
+        });
+    }
+    if reply.node_id == LOCAL_NODE_ID || !is_valid_node_id(&reply.node_id) {
+        return Err(LiveHandshakeError::Rejected {
+            code: "PAIR_HANDSHAKE_INVALID",
+            message: format!("Hub returned invalid nodeId '{}' in /v1/pair reply", reply.node_id),
+        });
+    }
+    if let Some(expected) = expected_hub_id {
+        if reply.node_id != expected {
+            return Err(LiveHandshakeError::Rejected {
+                code: "NODE_ID_MISMATCH",
+                message: format!(
+                    "Hub /v1/pair returned nodeId '{}' which does not match expected '{expected}'",
+                    reply.node_id
+                ),
+            });
+        }
+    }
+
+    let verified_grant = verify_grant_v2(&reply.grant, admin_pk).map_err(|e| {
+        LiveHandshakeError::Rejected {
+            code: "INVALID_SIGNATURE",
+            message: format!(
+                "Hub /v1/pair returned grant that failed Admin-CA signature verification: {e}"
+            ),
+        }
+    })?;
+    if verified_grant.node_id != local_node_id {
+        return Err(LiveHandshakeError::Rejected {
+            code: "PAIR_REJECTED",
+            message: format!(
+                "Hub returned grant for nodeId '{}' which does not match local nodeId '{local_node_id}'",
+                verified_grant.node_id
+            ),
+        });
+    }
+
+    let (manifest_payload, hub_signing_pk, hub_encryption_pk) = verify_signed_manifest_strict(
+        &reply.signed_manifest,
+        Some(&reply.node_id),
+        None,
+        None,
+    )
+    .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
+
+    let manifest_json = serde_json::to_string(&reply.signed_manifest).map_err(|e| {
+        LiveHandshakeError::Rejected {
+            code: "ENCODE_ERROR",
+            message: e.to_string(),
+        }
+    })?;
+    let manifest_etag = compute_manifest_etag(&manifest_json);
+
+    Ok(LiveAm2HandshakeResult {
+        hub_node_id: reply.node_id,
+        verified_grant,
+        signed_grant: reply.grant,
+        auth_credential: reply.auth_credential,
+        signed_manifest: reply.signed_manifest,
+        manifest_payload: Box::new(manifest_payload),
+        hub_signing_pk,
+        hub_encryption_pk,
+        manifest_etag,
+    })
+}
+
+fn load_local_public_endpoint(state_dir: &Path) -> Option<String> {
+    let cfg_path = resolve_config_path_for_read(None, Some(state_dir), None);
+    if !cfg_path.exists() {
+        return None;
+    }
+    load_node_or_legacy_config(&cfg_path)
+        .ok()
+        .and_then(|c| c.public_url)
+        .filter(|u| validate_endpoint_origin(u).is_ok())
+}
+
+// ============================================================================
 // `pair accept` (stdin or --token-file ONLY)
 // ============================================================================
 
@@ -1928,6 +2571,7 @@ fn run_accept(
     state_dir_arg: Option<PathBuf>,
     node_id_arg: Option<String>,
     grant_args: Vec<String>,
+    offline: bool,
     as_json: bool,
 ) -> ExitCode {
     let cmd = "pair accept";
@@ -1992,6 +2636,7 @@ fn run_accept(
             state_dir_arg,
             node_id_arg,
             explicit_grant_scopes,
+            offline,
             warnings,
             as_json,
         )
@@ -2001,6 +2646,7 @@ fn run_accept(
             state_dir_arg,
             node_id_arg,
             explicit_grant_scopes,
+            offline,
             warnings,
             as_json,
         )
@@ -2030,7 +2676,8 @@ fn accept_hp2p1(
     state_dir_arg: Option<PathBuf>,
     node_id_arg: Option<String>,
     explicit_grant_scopes: Option<Vec<String>>,
-    warnings: Vec<String>,
+    offline: bool,
+    mut warnings: Vec<String>,
     as_json: bool,
 ) -> ExitCode {
     let cmd = "pair accept";
@@ -2194,39 +2841,49 @@ fn accept_hp2p1(
     let trust_tier = parse_store_trust_tier(trust_tier_raw, StoreTrustTier::Peer);
     let untrusted_note = extract_untrusted_escalation(raw_map.as_ref(), &offer.node_id);
 
-    // All cryptographic checks passed — now persist peer, pinned JWKs, grant, and secret credential!
     let explicit_state = state_dir_arg.is_some();
     let state_dir = resolve_state_dir(state_dir_arg.as_deref(), None, None);
     if let Err(e) = ensure_dir(&state_dir, true) {
         return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
     }
 
-    let db_path = state_dir.join("node.sqlite");
-    let db = match NodeDb::open(&db_path) {
-        Ok(d) => d,
-        Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "DB_ERROR",
-                format!("Failed to open {}: {e}", db_path.display()),
-                None,
-            );
-        }
-    };
-
-    let local_node_id = match resolve_local_node_id(node_id_arg.as_deref(), &state_dir, Some(&db)) {
-        Ok(id) => id,
-        Err((exit, code, msg)) => return emit_error(cmd, as_json, exit, code, msg, None),
-    };
-
     let kid = signing_pk.kid();
     let enc_kid = encryption_pk.kid();
     let fingerprint = signing_pk.fingerprint();
-    if let Err((code, msg)) = check_existing_signing_pin(&db, &offer.node_id, &kid) {
-        return emit_error(cmd, as_json, EXIT_ERROR, code, msg, None);
+
+    let db_path = state_dir.join("node.sqlite");
+    let existing_db = if db_path.exists() {
+        match NodeDb::open(&db_path) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "DB_ERROR",
+                    format!("Failed to open {}: {e}", db_path.display()),
+                    None,
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(ref db) = existing_db {
+        if let Err((code, msg)) = check_existing_signing_pin(db, &offer.node_id, &kid) {
+            return emit_error(cmd, as_json, EXIT_ERROR, code, msg, None);
+        }
     }
+
+    let local_node_id = match resolve_local_node_id(
+        node_id_arg.as_deref(),
+        &state_dir,
+        existing_db.as_ref(),
+    ) {
+        Ok(id) => id,
+        Err((exit, code, msg)) => return emit_error(cmd, as_json, exit, code, msg, None),
+    };
 
     let secrets = crate::config_file::open_secret_store(&state_dir, explicit_state);
     let local_keys = match secrets.load_or_create_node_keys(&local_node_id) {
@@ -2243,17 +2900,98 @@ fn accept_hp2p1(
         }
     };
 
-    let cred_ref = credential_secret_name("pair-p2p", &offer.node_id);
-    if let Err(e) = secrets.set(&cred_ref, token) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "KEYSTORE_ERROR",
-            format!("Failed to store pairing credential in SecretStore: {e}"),
-            None,
+    // Execute real live HTTP `POST /v1/p2p/pair/<offerId>` handshake unless `--offline` is set!
+    let live_res = if offline {
+        warnings.push(
+            "Accepted in --offline mode; run without --offline once the peer is reachable to complete the live mutual handshake."
+                .to_string(),
         );
-    }
+        None
+    } else {
+        let local_endpoint = load_local_public_endpoint(&state_dir);
+        match execute_live_p2p_handshake(
+            &offer,
+            &signing_pk,
+            &local_node_id,
+            local_endpoint.as_deref(),
+            &local_keys,
+            &granted_scopes,
+            trust_tier,
+        ) {
+            Ok(res) => Some(res),
+            Err(LiveHandshakeError::Unreachable(msg)) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "PAIR_HANDSHAKE_FAILED",
+                    msg,
+                    Some(
+                        "Verify the inviting peer is running and reachable, or pass --offline to pre-configure locally without contacting the peer."
+                            .to_string(),
+                    ),
+                );
+            }
+            Err(LiveHandshakeError::Rejected { code, message }) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    code,
+                    message,
+                    Some(format!(
+                        "Ask '{}' for a fresh hp2p1_ invite if this single-use offer was already claimed or expired.",
+                        offer.node_id
+                    )),
+                );
+            }
+        }
+    };
+
+    let db = match existing_db {
+        Some(d) => d,
+        None => match NodeDb::open(&db_path) {
+            Ok(d) => d,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "DB_ERROR",
+                    format!("Failed to open {}: {e}", db_path.display()),
+                    None,
+                );
+            }
+        },
+    };
+
+    let cred_ref = if let Some(ref live) = live_res {
+        let name = credential_secret_name("peer-auth", &offer.node_id);
+        if let Err(e) = secrets.set(&name, &live.auth_credential) {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "KEYSTORE_ERROR",
+                format!("Failed to store peer authCredential in SecretStore: {e}"),
+                None,
+            );
+        }
+        name
+    } else {
+        let name = credential_secret_name("pair-p2p", &offer.node_id);
+        if let Err(e) = secrets.set(&name, token) {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "KEYSTORE_ERROR",
+                format!("Failed to store pairing credential in SecretStore: {e}"),
+                None,
+            );
+        }
+        name
+    };
 
     let now_db = now_ms();
     let _ = db.local().ensure_metadata("node_id", &local_node_id);
@@ -2330,57 +3068,138 @@ fn accept_hp2p1(
         );
     }
 
-    // Sign and persist local counter-grant (`GrantV2`) targeting the paired P2P peer.
-    let counter_grant_id = format!("p2p-{}", offer.offer_id);
-    let counter_grant = GrantV2 {
-        v: 2,
-        id: counter_grant_id.clone(),
-        node_id: offer.node_id.clone(),
-        scopes: granted_scopes.clone(),
-        trust_tier: Some(trust_tier.as_str().to_string()),
-        pairing_key: None,
-        subject_signing_jwk: Some(offer.signing_jwk.clone()),
-        subject_encryption_jwk: Some(offer.encryption_jwk.clone()),
-        issued_at: format_rfc3339_millis(now_db),
-        pair_by: Some(offer.expires_at.clone()),
-        expires_at: Some(offer.expires_at.clone()),
-    };
-    let signed_counter = match sign_grant_v2(&counter_grant, &local_keys.signing) {
-        Ok(sg) => sg,
-        Err(e) => {
+    if let Some(ref live) = live_res {
+        // Persist Alice's verified outbound grant, Bob's inbound counter-grant, and Alice's verified manifest!
+        let alice_grant_json = match serde_json::to_string(&live.alice_grant_signed) {
+            Ok(s) => s,
+            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+        };
+        if let Err(e) = save_grant_idempotent(
+            &db,
+            &GrantInput {
+                id: live.alice_grant_verified.id.clone(),
+                peer_id: offer.node_id.clone(),
+                direction: GrantDirection::Outbound,
+                signed_json: alice_grant_json,
+                scopes: live.alice_grant_verified.scopes.clone(),
+                trust_tier,
+                issued_at: now_db,
+                pair_by: None,
+                expires_at: None,
+            },
+            now_db,
+        ) {
+            return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None);
+        }
+
+        let bob_grant_json = match serde_json::to_string(&live.bob_grant_signed) {
+            Ok(s) => s,
+            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+        };
+        if let Err(e) = save_grant_idempotent(
+            &db,
+            &GrantInput {
+                id: live.bob_grant_id.clone(),
+                peer_id: offer.node_id.clone(),
+                direction: GrantDirection::Inbound,
+                signed_json: bob_grant_json,
+                scopes: granted_scopes.clone(),
+                trust_tier,
+                issued_at: now_db,
+                pair_by: Some(exp_ms),
+                expires_at: Some(exp_ms),
+            },
+            now_db,
+        ) {
+            return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None);
+        }
+
+        let manifest_json = match serde_json::to_string(&live.signed_manifest) {
+            Ok(s) => s,
+            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+        };
+        let caps: Vec<String> = live
+            .manifest_payload
+            .capabilities
+            .iter()
+            .map(|c| c.as_str().to_string())
+            .collect();
+        if let Err(e) = db.peers().cache_manifest(
+            &offer.node_id,
+            &ManifestCacheUpdate {
+                manifest_version: live.manifest_payload.manifest_version as i64,
+                manifest_json,
+                etag: Some(live.manifest_etag.clone()),
+                capabilities: caps,
+                accept_downgrade: false,
+            },
+            now_db,
+        ) {
             return emit_error(
                 cmd,
                 as_json,
                 EXIT_ERROR,
-                "GRANT_ERROR",
-                format!("Failed to sign local P2P counter-grant: {e}"),
+                "MANIFEST_CACHE_ERROR",
+                format!("Failed to cache verified manifest for '{}': {e}", offer.node_id),
                 None,
             );
         }
-    };
-    let signed_counter_json = match serde_json::to_string(&signed_counter) {
-        Ok(s) => s,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
-    };
-    if let Err(e) = save_grant_idempotent(
-        &db,
-        &GrantInput {
-            id: counter_grant_id,
-            peer_id: offer.node_id.clone(),
-            direction: GrantDirection::Inbound,
-            signed_json: signed_counter_json,
+    } else {
+        // Offline local staging: sign and persist local counter-grant (`GrantV2`).
+        let counter_grant_id = format!("p2p-{}", offer.offer_id);
+        let counter_grant = GrantV2 {
+            v: 2,
+            id: counter_grant_id.clone(),
+            node_id: offer.node_id.clone(),
             scopes: granted_scopes.clone(),
-            trust_tier,
-            issued_at: now_db,
-            pair_by: Some(exp_ms),
-            expires_at: Some(exp_ms),
-        },
-        now_db,
-    ) {
-        return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None);
+            trust_tier: Some(trust_tier.as_str().to_string()),
+            pairing_key: None,
+            subject_signing_jwk: Some(offer.signing_jwk.clone()),
+            subject_encryption_jwk: Some(offer.encryption_jwk.clone()),
+            issued_at: format_rfc3339_millis(now_db),
+            pair_by: Some(offer.expires_at.clone()),
+            expires_at: Some(offer.expires_at.clone()),
+        };
+        let signed_counter = match sign_grant_v2(&counter_grant, &local_keys.signing) {
+            Ok(sg) => sg,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "GRANT_ERROR",
+                    format!("Failed to sign local P2P counter-grant: {e}"),
+                    None,
+                );
+            }
+        };
+        let signed_counter_json = match serde_json::to_string(&signed_counter) {
+            Ok(s) => s,
+            Err(e) => {
+                return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None);
+            }
+        };
+        if let Err(e) = save_grant_idempotent(
+            &db,
+            &GrantInput {
+                id: counter_grant_id,
+                peer_id: offer.node_id.clone(),
+                direction: GrantDirection::Inbound,
+                signed_json: signed_counter_json,
+                scopes: granted_scopes.clone(),
+                trust_tier,
+                issued_at: now_db,
+                pair_by: Some(exp_ms),
+                expires_at: Some(exp_ms),
+            },
+            now_db,
+        ) {
+            return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None);
+        }
     }
 
     let next = vec![
+        "hyp service restart".to_string(),
         format!("hyp status --state-dir {}", state_dir.display()),
         format!("hyp daemon --state-dir {}", state_dir.display()),
     ];
@@ -2402,6 +3221,8 @@ fn accept_hp2p1(
         "scopes": granted_scopes,
         "expiresAt": offer.expires_at,
         "escalationNote": untrusted_note,
+        "offline": offline,
+        "handshakeCompleted": live_res.is_some(),
         "credentialRef": cred_ref,
         "secretBackend": secrets.backend().as_str(),
         "stateDir": state_dir.display().to_string(),
@@ -2450,6 +3271,7 @@ fn accept_am2(
     state_dir_arg: Option<PathBuf>,
     node_id_arg: Option<String>,
     explicit_grant_scopes: Option<Vec<String>>,
+    offline: bool,
     mut warnings: Vec<String>,
     as_json: bool,
 ) -> ExitCode {
@@ -2590,31 +3412,22 @@ fn accept_am2(
         }
     }
 
-    let peer_id = match raw_map
+    let raw_hub_node_id = raw_map
         .as_ref()
         .and_then(|m| m.get("nodeId"))
-        .and_then(Value::as_str)
-    {
-        Some(raw_nid) => {
-            if raw_nid == LOCAL_NODE_ID || !is_valid_node_id(raw_nid) {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    "INVALID_TOKEN",
-                    format!("Invalid hub nodeId '{raw_nid}' in am2_ bundle"),
-                    None,
-                );
-            }
-            raw_nid.to_string()
+        .and_then(Value::as_str);
+    if let Some(raw_nid) = raw_hub_node_id {
+        if raw_nid == LOCAL_NODE_ID || !is_valid_node_id(raw_nid) {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "INVALID_TOKEN",
+                format!("Invalid hub nodeId '{raw_nid}' in am2_ bundle"),
+                None,
+            );
         }
-        None => match derive_peer_id_from_url(&invite.router) {
-            Ok(host) => host,
-            Err(e) => {
-                return emit_error(cmd, as_json, EXIT_ERROR, "INVALID_TOKEN", e, None);
-            }
-        },
-    };
+    }
 
     let target_peer_id = verified_grant_pair
         .as_ref()
@@ -2627,7 +3440,7 @@ fn accept_am2(
                 .map(ToOwned::to_owned)
         });
 
-    let scopes = if let Some((_, ref g)) = verified_grant_pair {
+    let mut scopes = if let Some((_, ref g)) = verified_grant_pair {
         match expand_v2_scopes(&g.scopes) {
             Ok(s) => s,
             Err(e) => {
@@ -2690,7 +3503,6 @@ fn accept_am2(
         })
         .unwrap_or("org");
     let trust_tier = parse_store_trust_tier(trust_tier_raw, StoreTrustTier::Org);
-    let untrusted_note = extract_untrusted_escalation(raw_map.as_ref(), &peer_id);
 
     let explicit_state = state_dir_arg.is_some();
     let state_dir = resolve_state_dir(state_dir_arg.as_deref(), None, None);
@@ -2699,48 +3511,174 @@ fn accept_am2(
     }
 
     let db_path = state_dir.join("node.sqlite");
-    let db = match NodeDb::open(&db_path) {
-        Ok(d) => d,
-        Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "DB_ERROR",
-                format!("Failed to open {}: {e}", db_path.display()),
-                None,
-            );
+    let existing_db = if db_path.exists() {
+        match NodeDb::open(&db_path) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "DB_ERROR",
+                    format!("Failed to open {}: {e}", db_path.display()),
+                    None,
+                );
+            }
         }
+    } else {
+        None
     };
 
-    let local_node_id = match resolve_local_node_id(node_id_arg.as_deref(), &state_dir, Some(&db)) {
+    let local_node_id = match resolve_local_node_id(
+        node_id_arg.as_deref(),
+        &state_dir,
+        existing_db.as_ref(),
+    ) {
         Ok(id) => id,
         Err((exit, code, msg)) => return emit_error(cmd, as_json, exit, code, msg, None),
     };
 
     let secrets = crate::config_file::open_secret_store(&state_dir, explicit_state);
-    if let Err(e) = secrets.load_or_create_node_keys(&local_node_id) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "KEYSTORE_ERROR",
-            format!("Failed to load/create local node keys: {e}"),
-            None,
+    let local_keys = match secrets.load_or_create_node_keys(&local_node_id) {
+        Ok(k) => k,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "KEYSTORE_ERROR",
+                format!("Failed to load/create local node keys: {e}"),
+                None,
+            );
+        }
+    };
+
+    // Execute live HTTP `POST <invite.router>/v1/pair` handshake unless `--offline` is set!
+    let live_res = if offline {
+        warnings.push(
+            "Accepted in --offline mode; run without --offline once the team hub is reachable to claim the single-use invite via POST /v1/pair."
+                .to_string(),
         );
+        None
+    } else {
+        let Some(ref v1_code) = parsed_v1 else {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "INVALID_TOKEN",
+                "am2_ invite bundle is missing a valid t3mp1_ pairingCode required for live POST /v1/pair",
+                Some("Generate a fresh team invite with `hyp pair invite --mode team`.".to_string()),
+            );
+        };
+        match execute_live_am2_handshake(
+            &invite,
+            v1_code,
+            &admin_pk,
+            raw_hub_node_id,
+            &local_node_id,
+            &local_keys,
+        ) {
+            Ok(res) => Some(res),
+            Err(LiveHandshakeError::Unreachable(msg)) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "PAIR_HANDSHAKE_FAILED",
+                    msg,
+                    Some(
+                        "Verify the team hub is running and reachable, or pass --offline to pre-configure locally without contacting the hub."
+                            .to_string(),
+                    ),
+                );
+            }
+            Err(LiveHandshakeError::Rejected { code, message }) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    code,
+                    message,
+                    Some(
+                        "Verify the hub has pairing.adminKey configured and this single-use am2_ invite has not already been claimed."
+                            .to_string(),
+                    ),
+                );
+            }
+        }
+    };
+
+    let peer_id = if let Some(ref live) = live_res {
+        live.hub_node_id.clone()
+    } else if let Some(raw_nid) = raw_hub_node_id {
+        raw_nid.to_string()
+    } else {
+        match derive_peer_id_from_url(&invite.router) {
+            Ok(host) => host,
+            Err(e) => {
+                return emit_error(cmd, as_json, EXIT_ERROR, "INVALID_TOKEN", e, None);
+            }
+        }
+    };
+
+    if let Some(ref live) = live_res {
+        scopes = live.verified_grant.scopes.clone();
+        if let Some(ref db) = existing_db {
+            if let Err((code, msg)) =
+                check_existing_signing_pin(db, &peer_id, &live.hub_signing_pk.kid())
+            {
+                return emit_error(cmd, as_json, EXIT_ERROR, code, msg, None);
+            }
+        }
     }
 
-    let cred_ref = credential_secret_name("pair-am2", &peer_id);
-    if let Err(e) = secrets.set(&cred_ref, token) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "KEYSTORE_ERROR",
-            format!("Failed to store am2_ invite credential in SecretStore: {e}"),
-            None,
-        );
-    }
+    let untrusted_note = extract_untrusted_escalation(raw_map.as_ref(), &peer_id);
+
+    let db = match existing_db {
+        Some(d) => d,
+        None => match NodeDb::open(&db_path) {
+            Ok(d) => d,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "DB_ERROR",
+                    format!("Failed to open {}: {e}", db_path.display()),
+                    None,
+                );
+            }
+        },
+    };
+
+    let cred_ref = if let Some(ref live) = live_res {
+        let name = credential_secret_name("peer-auth", &peer_id);
+        if let Err(e) = secrets.set(&name, &live.auth_credential) {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "KEYSTORE_ERROR",
+                format!("Failed to store hub authCredential in SecretStore: {e}"),
+                None,
+            );
+        }
+        name
+    } else {
+        let name = credential_secret_name("pair-am2", &peer_id);
+        if let Err(e) = secrets.set(&name, token) {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "KEYSTORE_ERROR",
+                format!("Failed to store am2_ invite credential in SecretStore: {e}"),
+                None,
+            );
+        }
+        name
+    };
 
     let now_db = now_ms();
     let _ = db.local().ensure_metadata("node_id", &local_node_id);
@@ -2792,13 +3730,102 @@ fn accept_am2(
         );
     }
 
-    let grant_id = verified_grant_pair
+    if let Some(ref live) = live_res {
+        let hub_sign_jwk = proto_jwk_to_crypto(&live.manifest_payload.identity.signing_jwk);
+        let hub_enc_jwk = proto_jwk_to_crypto(&live.manifest_payload.identity.encryption_jwk);
+        let hub_sign_json = match serde_json::to_string(&hub_sign_jwk) {
+            Ok(s) => s,
+            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+        };
+        let hub_enc_json = match serde_json::to_string(&hub_enc_jwk) {
+            Ok(s) => s,
+            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+        };
+        if let Err(e) = db.peers().upsert_peer_key(
+            &PeerKeyInput {
+                peer_id: peer_id.clone(),
+                kid: live.hub_signing_pk.kid(),
+                key_use: KeyUse::Signing,
+                jwk_json: hub_sign_json,
+                status: KeyStatus::Active,
+                expires_at: None,
+            },
+            now_db,
+        ) {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "DB_ERROR",
+                format!("Failed to pin hub signing JWK: {e}"),
+                None,
+            );
+        }
+        if let Err(e) = db.peers().upsert_peer_key(
+            &PeerKeyInput {
+                peer_id: peer_id.clone(),
+                kid: live.hub_encryption_pk.kid(),
+                key_use: KeyUse::Encryption,
+                jwk_json: hub_enc_json,
+                status: KeyStatus::Active,
+                expires_at: None,
+            },
+            now_db,
+        ) {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "DB_ERROR",
+                format!("Failed to pin hub encryption JWK: {e}"),
+                None,
+            );
+        }
+        let manifest_json = match serde_json::to_string(&live.signed_manifest) {
+            Ok(s) => s,
+            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+        };
+        let caps: Vec<String> = live
+            .manifest_payload
+            .capabilities
+            .iter()
+            .map(|c| c.as_str().to_string())
+            .collect();
+        if let Err(e) = db.peers().cache_manifest(
+            &peer_id,
+            &ManifestCacheUpdate {
+                manifest_version: live.manifest_payload.manifest_version as i64,
+                manifest_json,
+                etag: Some(live.manifest_etag.clone()),
+                capabilities: caps,
+                accept_downgrade: false,
+            },
+            now_db,
+        ) {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "MANIFEST_CACHE_ERROR",
+                format!("Failed to cache verified hub manifest: {e}"),
+                None,
+            );
+        }
+    }
+
+    let grant_id = live_res
         .as_ref()
-        .map(|(_, g)| g.id.clone())
+        .map(|l| l.verified_grant.id.clone())
+        .or_else(|| verified_grant_pair.as_ref().map(|(_, g)| g.id.clone()))
         .or_else(|| parsed_v1.as_ref().map(|p| p.grant_id.clone()))
         .unwrap_or_else(|| format!("am2-{}", &hex::encode(Sha256::digest(token.as_bytes()))[..12]));
 
-    let stored_grant_json = if let Some((ref sg, _)) = verified_grant_pair {
+    let stored_grant_json = if let Some(ref live) = live_res {
+        match serde_json::to_string(&live.signed_grant) {
+            Ok(s) => s,
+            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+        }
+    } else if let Some((ref sg, _)) = verified_grant_pair {
         match serde_json::to_string(sg) {
             Ok(s) => s,
             Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
@@ -2836,6 +3863,7 @@ fn accept_am2(
     }
 
     let next = vec![
+        "hyp service restart".to_string(),
         format!("hyp status --state-dir {}", state_dir.display()),
         format!("hyp daemon --state-dir {}", state_dir.display()),
     ];
@@ -2855,6 +3883,8 @@ fn accept_am2(
         "scopes": scopes,
         "expiresAt": expires_at_str,
         "escalationNote": untrusted_note,
+        "offline": offline,
+        "handshakeCompleted": live_res.is_some(),
         "credentialRef": cred_ref,
         "secretBackend": secrets.backend().as_str(),
         "stateDir": state_dir.display().to_string(),
@@ -2897,6 +3927,631 @@ fn accept_am2(
         print_next_steps(&next);
     }
     ExitCode::from(EXIT_OK)
+}
+
+/// Executes a live `hp2p1_` mutual pairing handshake during `hyp onboard --join`.
+pub(crate) fn live_pair_hp2p1_for_onboard(
+    token: &str,
+    state_dir: &Path,
+    local_node_id: &str,
+    local_keys: &NodeIdentityKeys,
+    db: &NodeDb,
+    secrets: &SecretStore,
+) -> Result<OnboardJoinResult, LiveHandshakeError> {
+    let offer = decode_hp2p1(token).map_err(|e| LiveHandshakeError::Rejected {
+        code: "INVALID_TOKEN",
+        message: format!("Invalid hp2p1_ join token: {e}"),
+    })?;
+    if offer.node_id == LOCAL_NODE_ID || !is_valid_node_id(&offer.node_id) {
+        return Err(LiveHandshakeError::Rejected {
+            code: "INVALID_TOKEN",
+            message: format!("Invalid peer nodeId '{}' in hp2p1_ token", offer.node_id),
+        });
+    }
+    validate_endpoint_origin(&offer.endpoint).map_err(|e| LiveHandshakeError::Rejected {
+        code: "INVALID_ENDPOINT",
+        message: format!("Untrusted endpoint '{}' in hp2p1_ token: {e}", offer.endpoint),
+    })?;
+    let signing_pk = offer
+        .signing_jwk
+        .to_ed25519()
+        .map_err(|e| LiveHandshakeError::Rejected {
+            code: "INVALID_KEY",
+            message: format!("Invalid signingJwk in hp2p1_ token: {e}"),
+        })?;
+    let encryption_pk =
+        offer
+            .encryption_jwk
+            .to_x25519()
+            .map_err(|e| LiveHandshakeError::Rejected {
+                code: "INVALID_KEY",
+                message: format!("Invalid encryptionJwk in hp2p1_ token: {e}"),
+            })?;
+    let raw_map = extract_raw_json_object(HP2P1_PREFIX, token);
+    verify_optional_hp2p1_sig(&offer, &signing_pk, raw_map.as_ref())
+        .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
+    let exp_ms = parse_rfc3339_millis(&offer.expires_at).map_err(|e| LiveHandshakeError::Rejected {
+        code: "INVALID_TOKEN",
+        message: format!("Invalid expiresAt timestamp: {e}"),
+    })?;
+    if now_unix_ms() > exp_ms {
+        return Err(LiveHandshakeError::Rejected {
+            code: "TOKEN_EXPIRED",
+            message: format!(
+                "P2P pairing offer '{}' from '{}' expired at {}",
+                offer.offer_id, offer.node_id, offer.expires_at
+            ),
+        });
+    }
+    let kid = signing_pk.kid();
+    let enc_kid = encryption_pk.kid();
+    check_existing_signing_pin(db, &offer.node_id, &kid)
+        .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
+
+    let expanded_offered = if offer.offered_scopes.is_empty() {
+        Vec::new()
+    } else {
+        expand_v2_scopes(&offer.offered_scopes).map_err(|e| LiveHandshakeError::Rejected {
+            code: "INVALID_TOKEN",
+            message: format!("Invalid offeredScopes in hp2p1_ token: {e}"),
+        })?
+    };
+    let expanded_requested = if offer.requested_scopes.is_empty() {
+        Vec::new()
+    } else {
+        expand_v2_scopes(&offer.requested_scopes).map_err(|e| LiveHandshakeError::Rejected {
+            code: "INVALID_TOKEN",
+            message: format!("Invalid requestedScopes in hp2p1_ token: {e}"),
+        })?
+    };
+    let granted_scopes = if !expanded_requested.is_empty() {
+        expanded_requested
+    } else if !expanded_offered.is_empty() {
+        expanded_offered.clone()
+    } else {
+        ScopePreset::Member.expand()
+    };
+    let trust_tier_raw = raw_map
+        .as_ref()
+        .and_then(|m| m.get("trustTier"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| infer_trust_tier(InviteMode::P2p, None, &expanded_offered));
+    let trust_tier = parse_store_trust_tier(trust_tier_raw, StoreTrustTier::Peer);
+    let local_endpoint = load_local_public_endpoint(state_dir);
+
+    let live = execute_live_p2p_handshake(
+        &offer,
+        &signing_pk,
+        local_node_id,
+        local_endpoint.as_deref(),
+        local_keys,
+        &granted_scopes,
+        trust_tier,
+    )?;
+
+    let cred_ref = credential_secret_name("peer-auth", &offer.node_id);
+    secrets
+        .set(&cred_ref, &live.auth_credential)
+        .map_err(|e| LiveHandshakeError::Rejected {
+            code: "KEYSTORE_ERROR",
+            message: format!("Failed to store peer authCredential in SecretStore: {e}"),
+        })?;
+    let now_db = now_ms();
+    db.peers()
+        .upsert_peer(
+            &PeerInput {
+                peer_id: offer.node_id.clone(),
+                endpoint: Some(offer.endpoint.clone()),
+                profile: PeerProfile::P2p,
+                trust_tier,
+                status: PeerStatus::Active,
+                scopes: granted_scopes.clone(),
+                auth_credential_ref: Some(cred_ref),
+            },
+            now_db,
+        )
+        .map_err(|e| LiveHandshakeError::Rejected {
+            code: "DB_ERROR",
+            message: format!("Failed to upsert peer '{}': {e}", offer.node_id),
+        })?;
+    let sign_jwk_json =
+        serde_json::to_string(&offer.signing_jwk).map_err(|e| LiveHandshakeError::Rejected {
+            code: "ENCODE_ERROR",
+            message: e.to_string(),
+        })?;
+    let enc_jwk_json = serde_json::to_string(&offer.encryption_jwk).map_err(|e| {
+        LiveHandshakeError::Rejected {
+            code: "ENCODE_ERROR",
+            message: e.to_string(),
+        }
+    })?;
+    db.peers()
+        .upsert_peer_key(
+            &PeerKeyInput {
+                peer_id: offer.node_id.clone(),
+                kid: kid.clone(),
+                key_use: KeyUse::Signing,
+                jwk_json: sign_jwk_json,
+                status: KeyStatus::Active,
+                expires_at: None,
+            },
+            now_db,
+        )
+        .map_err(|e| LiveHandshakeError::Rejected {
+            code: "DB_ERROR",
+            message: format!("Failed to pin peer signing JWK: {e}"),
+        })?;
+    db.peers()
+        .upsert_peer_key(
+            &PeerKeyInput {
+                peer_id: offer.node_id.clone(),
+                kid: enc_kid,
+                key_use: KeyUse::Encryption,
+                jwk_json: enc_jwk_json,
+                status: KeyStatus::Active,
+                expires_at: None,
+            },
+            now_db,
+        )
+        .map_err(|e| LiveHandshakeError::Rejected {
+            code: "DB_ERROR",
+            message: format!("Failed to pin peer encryption JWK: {e}"),
+        })?;
+    let alice_grant_json =
+        serde_json::to_string(&live.alice_grant_signed).map_err(|e| LiveHandshakeError::Rejected {
+            code: "ENCODE_ERROR",
+            message: e.to_string(),
+        })?;
+    save_grant_idempotent(
+        db,
+        &GrantInput {
+            id: live.alice_grant_verified.id.clone(),
+            peer_id: offer.node_id.clone(),
+            direction: GrantDirection::Outbound,
+            signed_json: alice_grant_json,
+            scopes: live.alice_grant_verified.scopes.clone(),
+            trust_tier,
+            issued_at: now_db,
+            pair_by: None,
+            expires_at: None,
+        },
+        now_db,
+    )
+    .map_err(|message| LiveHandshakeError::Rejected {
+        code: "DB_ERROR",
+        message,
+    })?;
+    let bob_grant_json =
+        serde_json::to_string(&live.bob_grant_signed).map_err(|e| LiveHandshakeError::Rejected {
+            code: "ENCODE_ERROR",
+            message: e.to_string(),
+        })?;
+    save_grant_idempotent(
+        db,
+        &GrantInput {
+            id: live.bob_grant_id,
+            peer_id: offer.node_id.clone(),
+            direction: GrantDirection::Inbound,
+            signed_json: bob_grant_json,
+            scopes: granted_scopes.clone(),
+            trust_tier,
+            issued_at: now_db,
+            pair_by: Some(exp_ms),
+            expires_at: Some(exp_ms),
+        },
+        now_db,
+    )
+    .map_err(|message| LiveHandshakeError::Rejected {
+        code: "DB_ERROR",
+        message,
+    })?;
+    let manifest_json =
+        serde_json::to_string(&live.signed_manifest).map_err(|e| LiveHandshakeError::Rejected {
+            code: "ENCODE_ERROR",
+            message: e.to_string(),
+        })?;
+    let caps: Vec<String> = live
+        .manifest_payload
+        .capabilities
+        .iter()
+        .map(|c| c.as_str().to_string())
+        .collect();
+    db.peers()
+        .cache_manifest(
+            &offer.node_id,
+            &ManifestCacheUpdate {
+                manifest_version: live.manifest_payload.manifest_version as i64,
+                manifest_json,
+                etag: Some(live.manifest_etag),
+                capabilities: caps,
+                accept_downgrade: false,
+            },
+            now_db,
+        )
+        .map_err(|e| LiveHandshakeError::Rejected {
+            code: "MANIFEST_CACHE_ERROR",
+            message: format!("Failed to cache verified manifest: {e}"),
+        })?;
+
+    Ok(OnboardJoinResult {
+        format: "hp2p1",
+        peer_id: offer.node_id,
+        endpoint: offer.endpoint,
+        kid: Some(kid),
+        scopes: granted_scopes,
+        enrolled: true,
+    })
+}
+
+/// Executes a live `am2_` Org Admin-CA pairing handshake during `hyp onboard --join`.
+pub(crate) fn live_pair_am2_for_onboard(
+    token: &str,
+    local_node_id: &str,
+    local_keys: &NodeIdentityKeys,
+    db: &NodeDb,
+    secrets: &SecretStore,
+) -> Result<OnboardJoinResult, LiveHandshakeError> {
+    let invite = decode_am2(token).map_err(|e| LiveHandshakeError::Rejected {
+        code: "INVALID_TOKEN",
+        message: format!("Invalid am2_ join token: {e}"),
+    })?;
+    validate_endpoint_origin(&invite.router).map_err(|e| LiveHandshakeError::Rejected {
+        code: "INVALID_ENDPOINT",
+        message: format!("Untrusted router endpoint '{}' in am2_ bundle: {e}", invite.router),
+    })?;
+    let admin_pk = invite
+        .admin_jwk
+        .to_ed25519()
+        .map_err(|e| LiveHandshakeError::Rejected {
+            code: "INVALID_KEY",
+            message: format!("Invalid adminJwk in am2_ bundle: {e}"),
+        })?;
+    let parsed_v1 = parse_pairing_code_v1(&invite.pairing_code).map_err(|e| {
+        LiveHandshakeError::Rejected {
+            code: "INVALID_TOKEN",
+            message: format!("Malformed pairingCode in am2_ bundle: {e}"),
+        }
+    })?;
+    let raw_map = extract_raw_json_object(AM2_PREFIX, token);
+    verify_optional_am2_signed_grant(&admin_pk, Some(&parsed_v1.grant_id), raw_map.as_ref())
+        .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
+    let raw_hub_node_id = raw_map
+        .as_ref()
+        .and_then(|m| m.get("nodeId"))
+        .and_then(Value::as_str);
+
+    let live = execute_live_am2_handshake(
+        &invite,
+        &parsed_v1,
+        &admin_pk,
+        raw_hub_node_id,
+        local_node_id,
+        local_keys,
+    )?;
+
+    check_existing_signing_pin(db, &live.hub_node_id, &live.hub_signing_pk.kid())
+        .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
+
+    let cred_ref = credential_secret_name("peer-auth", &live.hub_node_id);
+    secrets
+        .set(&cred_ref, &live.auth_credential)
+        .map_err(|e| LiveHandshakeError::Rejected {
+            code: "KEYSTORE_ERROR",
+            message: format!("Failed to store hub authCredential in SecretStore: {e}"),
+        })?;
+
+    let trust_tier = live
+        .verified_grant
+        .trust_tier
+        .as_deref()
+        .map(|t| parse_store_trust_tier(t, StoreTrustTier::Org))
+        .unwrap_or(StoreTrustTier::Org);
+    let now_db = now_ms();
+    db.peers()
+        .upsert_peer(
+            &PeerInput {
+                peer_id: live.hub_node_id.clone(),
+                endpoint: Some(invite.router.clone()),
+                profile: PeerProfile::Router,
+                trust_tier,
+                status: PeerStatus::Active,
+                scopes: live.verified_grant.scopes.clone(),
+                auth_credential_ref: Some(cred_ref),
+            },
+            now_db,
+        )
+        .map_err(|e| LiveHandshakeError::Rejected {
+            code: "DB_ERROR",
+            message: format!("Failed to upsert hub peer '{}': {e}", live.hub_node_id),
+        })?;
+    let admin_jwk_json =
+        serde_json::to_string(&invite.admin_jwk).map_err(|e| LiveHandshakeError::Rejected {
+            code: "ENCODE_ERROR",
+            message: e.to_string(),
+        })?;
+    let hub_sign_jwk = proto_jwk_to_crypto(&live.manifest_payload.identity.signing_jwk);
+    let hub_enc_jwk = proto_jwk_to_crypto(&live.manifest_payload.identity.encryption_jwk);
+    let hub_sign_json =
+        serde_json::to_string(&hub_sign_jwk).map_err(|e| LiveHandshakeError::Rejected {
+            code: "ENCODE_ERROR",
+            message: e.to_string(),
+        })?;
+    let hub_enc_json =
+        serde_json::to_string(&hub_enc_jwk).map_err(|e| LiveHandshakeError::Rejected {
+            code: "ENCODE_ERROR",
+            message: e.to_string(),
+        })?;
+    db.peers()
+        .upsert_peer_key(
+            &PeerKeyInput {
+                peer_id: live.hub_node_id.clone(),
+                kid: admin_pk.kid(),
+                key_use: KeyUse::Admin,
+                jwk_json: admin_jwk_json,
+                status: KeyStatus::Active,
+                expires_at: None,
+            },
+            now_db,
+        )
+        .map_err(|e| LiveHandshakeError::Rejected {
+            code: "DB_ERROR",
+            message: format!("Failed to pin Admin-CA JWK: {e}"),
+        })?;
+    db.peers()
+        .upsert_peer_key(
+            &PeerKeyInput {
+                peer_id: live.hub_node_id.clone(),
+                kid: live.hub_signing_pk.kid(),
+                key_use: KeyUse::Signing,
+                jwk_json: hub_sign_json,
+                status: KeyStatus::Active,
+                expires_at: None,
+            },
+            now_db,
+        )
+        .map_err(|e| LiveHandshakeError::Rejected {
+            code: "DB_ERROR",
+            message: format!("Failed to pin hub signing JWK: {e}"),
+        })?;
+    db.peers()
+        .upsert_peer_key(
+            &PeerKeyInput {
+                peer_id: live.hub_node_id.clone(),
+                kid: live.hub_encryption_pk.kid(),
+                key_use: KeyUse::Encryption,
+                jwk_json: hub_enc_json,
+                status: KeyStatus::Active,
+                expires_at: None,
+            },
+            now_db,
+        )
+        .map_err(|e| LiveHandshakeError::Rejected {
+            code: "DB_ERROR",
+            message: format!("Failed to pin hub encryption JWK: {e}"),
+        })?;
+    let signed_grant_json =
+        serde_json::to_string(&live.signed_grant).map_err(|e| LiveHandshakeError::Rejected {
+            code: "ENCODE_ERROR",
+            message: e.to_string(),
+        })?;
+    save_grant_idempotent(
+        db,
+        &GrantInput {
+            id: live.verified_grant.id.clone(),
+            peer_id: live.hub_node_id.clone(),
+            direction: GrantDirection::Outbound,
+            signed_json: signed_grant_json,
+            scopes: live.verified_grant.scopes.clone(),
+            trust_tier,
+            issued_at: now_db,
+            pair_by: None,
+            expires_at: None,
+        },
+        now_db,
+    )
+    .map_err(|message| LiveHandshakeError::Rejected {
+        code: "DB_ERROR",
+        message,
+    })?;
+    let manifest_json =
+        serde_json::to_string(&live.signed_manifest).map_err(|e| LiveHandshakeError::Rejected {
+            code: "ENCODE_ERROR",
+            message: e.to_string(),
+        })?;
+    let caps: Vec<String> = live
+        .manifest_payload
+        .capabilities
+        .iter()
+        .map(|c| c.as_str().to_string())
+        .collect();
+    db.peers()
+        .cache_manifest(
+            &live.hub_node_id,
+            &ManifestCacheUpdate {
+                manifest_version: live.manifest_payload.manifest_version as i64,
+                manifest_json,
+                etag: Some(live.manifest_etag),
+                capabilities: caps,
+                accept_downgrade: false,
+            },
+            now_db,
+        )
+        .map_err(|e| LiveHandshakeError::Rejected {
+            code: "MANIFEST_CACHE_ERROR",
+            message: format!("Failed to cache verified hub manifest: {e}"),
+        })?;
+
+    Ok(OnboardJoinResult {
+        format: "am2",
+        peer_id: live.hub_node_id,
+        endpoint: invite.router,
+        kid: Some(admin_pk.kid()),
+        scopes: live.verified_grant.scopes,
+        enrolled: true,
+    })
+}
+
+/// Executes a live public/team node URL join (`/v1/manifest` + optional `/v1/guest/pair`) during `hyp onboard --join`.
+pub(crate) fn live_join_url_for_onboard(
+    raw_url: &str,
+    local_node_id: &str,
+    local_keys: &NodeIdentityKeys,
+    db: &NodeDb,
+    warnings: &mut Vec<String>,
+) -> Result<OnboardJoinResult, LiveHandshakeError> {
+    validate_endpoint_origin(raw_url).map_err(|e| LiveHandshakeError::Rejected {
+        code: "INVALID_ENDPOINT",
+        message: format!("Invalid target URL '{raw_url}': {e}"),
+    })?;
+    let trimmed = raw_url.trim().trim_end_matches('/');
+    let base_url = trimmed
+        .strip_suffix("/v1/manifest")
+        .unwrap_or(trimmed)
+        .to_string();
+
+    let v = match fetch_and_verify_manifest(&base_url) {
+        Ok(v) => v,
+        Err((code, msg)) => {
+            if code == "MANIFEST_FETCH_FAILED" {
+                return Err(LiveHandshakeError::Unreachable(msg));
+            }
+            return Err(LiveHandshakeError::Rejected { code, message: msg });
+        }
+    };
+
+    let peer_id = v.payload.node_id.as_str().to_string();
+    let peer_profile = proto_profile_to_store(v.payload.profile);
+    check_existing_signing_pin(db, &peer_id, &v.signing_pk.kid())
+        .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
+
+    let mut enrolled = false;
+    let mut effective_scopes = ScopePreset::GuestRo.expand();
+    let mut effective_signed = v.signed.clone();
+    let mut effective_payload = v.payload.clone();
+
+    match attempt_guest_self_enroll(&base_url, &peer_id, &v.signing_pk, local_node_id, local_keys) {
+        Ok(GuestEnrollOutcome::Enrolled {
+            preset: _,
+            scopes,
+            manifest,
+            manifest_payload,
+        }) => {
+            enrolled = true;
+            effective_scopes = scopes;
+            effective_signed = manifest;
+            effective_payload = *manifest_payload;
+        }
+        Ok(GuestEnrollOutcome::NotEnabled) => {
+            warnings.push(format!(
+                "Node '{peer_id}' does not expose self-service guest pairing (POST /v1/guest/pair returned 404); request an am2_ invite from the hub admin to enroll."
+            ));
+        }
+        Err((code, message)) => {
+            if code == "GUEST_PAIR_FAILED" {
+                return Err(LiveHandshakeError::Unreachable(message));
+            }
+            return Err(LiveHandshakeError::Rejected { code, message });
+        }
+    }
+
+    let now_db = now_ms();
+    db.peers()
+        .upsert_peer(
+            &PeerInput {
+                peer_id: peer_id.clone(),
+                endpoint: Some(base_url.clone()),
+                profile: peer_profile,
+                trust_tier: StoreTrustTier::Guest,
+                status: PeerStatus::Active,
+                scopes: effective_scopes.clone(),
+                auth_credential_ref: None,
+            },
+            now_db,
+        )
+        .map_err(|e| LiveHandshakeError::Rejected {
+            code: "DB_ERROR",
+            message: format!("Failed to register peer '{peer_id}': {e}"),
+        })?;
+
+    let sign_jwk = proto_jwk_to_crypto(&v.payload.identity.signing_jwk);
+    let enc_jwk = proto_jwk_to_crypto(&v.payload.identity.encryption_jwk);
+    let sign_json =
+        serde_json::to_string(&sign_jwk).map_err(|e| LiveHandshakeError::Rejected {
+            code: "ENCODE_ERROR",
+            message: e.to_string(),
+        })?;
+    let enc_json =
+        serde_json::to_string(&enc_jwk).map_err(|e| LiveHandshakeError::Rejected {
+            code: "ENCODE_ERROR",
+            message: e.to_string(),
+        })?;
+    db.peers()
+        .upsert_peer_key(
+            &PeerKeyInput {
+                peer_id: peer_id.clone(),
+                kid: v.signing_pk.kid(),
+                key_use: KeyUse::Signing,
+                jwk_json: sign_json,
+                status: KeyStatus::Active,
+                expires_at: None,
+            },
+            now_db,
+        )
+        .map_err(|e| LiveHandshakeError::Rejected {
+            code: "DB_ERROR",
+            message: format!("Failed to pin signing JWK for '{peer_id}': {e}"),
+        })?;
+    db.peers()
+        .upsert_peer_key(
+            &PeerKeyInput {
+                peer_id: peer_id.clone(),
+                kid: v.encryption_pk.kid(),
+                key_use: KeyUse::Encryption,
+                jwk_json: enc_json,
+                status: KeyStatus::Active,
+                expires_at: None,
+            },
+            now_db,
+        )
+        .map_err(|e| LiveHandshakeError::Rejected {
+            code: "DB_ERROR",
+            message: format!("Failed to pin encryption JWK for '{peer_id}': {e}"),
+        })?;
+    let manifest_json =
+        serde_json::to_string(&effective_signed).map_err(|e| LiveHandshakeError::Rejected {
+            code: "ENCODE_ERROR",
+            message: e.to_string(),
+        })?;
+    let caps: Vec<String> = effective_payload
+        .capabilities
+        .iter()
+        .map(|c| c.as_str().to_string())
+        .collect();
+    db.peers()
+        .cache_manifest(
+            &peer_id,
+            &ManifestCacheUpdate {
+                manifest_version: effective_payload.manifest_version as i64,
+                manifest_json,
+                etag: v.etag,
+                capabilities: caps,
+                accept_downgrade: false,
+            },
+            now_db,
+        )
+        .map_err(|e| LiveHandshakeError::Rejected {
+            code: "MANIFEST_CACHE_ERROR",
+            message: format!("Failed to cache verified manifest for '{peer_id}': {e}"),
+        })?;
+
+    Ok(OnboardJoinResult {
+        format: "url",
+        peer_id,
+        endpoint: base_url,
+        kid: Some(v.signing_pk.kid()),
+        scopes: effective_scopes,
+        enrolled,
+    })
 }
 
 // ============================================================================
@@ -3691,6 +5346,7 @@ fn run_join(
 
     let manifest_verified = verified_live.is_some();
     let next = vec![
+        "hyp service restart".to_string(),
         format!("hyp status --state-dir {}", state_dir.display()),
         format!("hyp daemon --state-dir {}", state_dir.display()),
     ];

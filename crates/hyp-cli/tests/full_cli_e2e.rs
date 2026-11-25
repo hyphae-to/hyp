@@ -310,6 +310,22 @@ fn onboard_and_setup_all_nine_harnesses_in_isolated_home() {
     assert_eq!(codex_toml_1.matches("[mcp_servers.hyphae]").count(), 1);
     assert!(home.join(".config/opencode/plugins/hyphae.ts").exists());
 
+    let opencode_cfg: Value = serde_json::from_str(
+        &fs::read_to_string(home.join(".config/opencode/opencode.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        opencode_cfg["mcp"]["hyphae"]["command"],
+        json!([fake_bin, "mcp", "--backend", "opencode", "--ephemeral"])
+    );
+
+    let agy_sidecar: Value = serde_json::from_str(
+        &fs::read_to_string(home.join(".gemini/config/plugins/hyphae/sidecars/daemon/sidecar.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(agy_sidecar["restart_policy"], "on-failure");
+
     // 4. Re-run `setup --harness all` and assert strict idempotency (byte-for-byte identical!)
     let setup2 = isolated_cmd(&home)
         .args([

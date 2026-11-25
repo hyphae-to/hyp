@@ -29,7 +29,7 @@ use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keys::{Ed25519KeyPair, Ed25519PublicKey, OkpJwk, X25519PublicKey};
 use hyp_crypto::keystore::{SecretStore, validate_secret_name};
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms, parse_rfc3339_millis};
-use hyp_node::engine::{NodeConfig, NodeProfile, UnifiedNode};
+use hyp_node::engine::{NodeConfig, NodeProfile, UnifiedNode, resolve_drop_portal_url};
 use hyp_node::gates::policy::{SecurityGateConfig, sign_gate_policy, verify_gate_policy_sig};
 use hyp_proto::address::{LOCAL_NODE_ID, NodeId, is_valid_handle, is_valid_node_id};
 use hyp_store::{
@@ -53,8 +53,6 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-const DROP_PORTAL_BASE_URL: &str = "https://hyphae.to/drop";
-const ALLOWED_ENROLL_ORIGIN: &str = "https://hyphae.to";
 const MAX_JWK_STDIN_BYTES: u64 = 16 * 1024;
 const MAX_SIGN_BODY_BYTES: u64 = 32 * 1024;
 const MAX_ENROLL_CALLBACK_BYTES: usize = 16 * 1024;
@@ -634,6 +632,55 @@ fn run_auth_init(
     let config_write =
         resolve_config_path_for_write(config_arg.as_deref(), state_dir_arg.as_deref(), None);
 
+    // Resolve and validate Drop Portal URL fail-closed BEFORE generating keys or opening callbacks.
+    let resolved_drop_portal_url = if web {
+        let configured_drop_portal_url: Option<String> = if config_read.exists() {
+            match load_node_or_legacy_config(&config_read) {
+                Ok(cfg) => match cfg.raw.get("dropPortalUrl") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(s)) => Some(s.clone()),
+                    Some(_) => {
+                        return emit_error(
+                            cmd,
+                            as_json,
+                            EXIT_ERROR,
+                            "CONFIG_ERROR",
+                            format!(
+                                "Invalid dropPortalUrl in {}: must be a string",
+                                cfg.path.display()
+                            ),
+                            Some(
+                                "Set dropPortalUrl to an https:// URL (e.g. \"https://hyphae.to/drop\") or loopback http://127.0.0.1."
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                },
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        match resolve_drop_portal_url(configured_drop_portal_url.as_deref()) {
+            Ok(u) => Some(u),
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "CONFIG_ERROR",
+                    format!("Invalid Drop Portal URL: {e}"),
+                    Some(
+                        "Set HYPHAE_DROP_PORTAL_URL or node.json dropPortalUrl to an https:// URL (e.g. https://hyphae.to/drop) or loopback http://127.0.0.1."
+                            .to_string(),
+                    ),
+                );
+            }
+        }
+    } else {
+        None
+    };
+
     if let Err(e) = ensure_dir(&state_dir, true) {
         return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
     }
@@ -726,7 +773,11 @@ fn run_auth_init(
         };
         let node_sign_jwk = node.identity().signing_jwk();
         let node_enc_jwk = node.identity().encryption_jwk();
+        let drop_portal_url = resolved_drop_portal_url
+            .as_deref()
+            .expect("resolved_drop_portal_url set when web is true");
         let enrolled = match rt.block_on(enroll_passkey_via_web(
+            drop_portal_url,
             &human_id,
             min_epoch,
             node.node_id().as_str(),
@@ -2039,6 +2090,7 @@ struct WebEnrolledAuthority {
 }
 
 struct WebEnrollState {
+    allowed_origin: String,
     default_human_id: String,
     default_prf_salt: String,
     default_auth_epoch: u64,
@@ -2047,6 +2099,19 @@ struct WebEnrollState {
     node_enc_jwk_x: String,
     csrf_token: String,
     done_tx: Mutex<Option<oneshot::Sender<Result<WebEnrolledAuthority, String>>>>,
+}
+
+fn extract_portal_origin(portal_url: &str) -> Result<String, String> {
+    let uri: http::Uri = portal_url
+        .parse()
+        .map_err(|e| format!("invalid Drop Portal URL '{portal_url}': {e}"))?;
+    let scheme = uri
+        .scheme_str()
+        .ok_or_else(|| format!("Drop Portal URL '{portal_url}' is missing a scheme"))?;
+    let authority = uri
+        .authority()
+        .ok_or_else(|| format!("Drop Portal URL '{portal_url}' is missing a host"))?;
+    Ok(format!("{scheme}://{authority}"))
 }
 
 fn should_skip_browser_open(no_open: bool, store: &SecretStore) -> bool {
@@ -2080,19 +2145,19 @@ fn try_open_browser(url: &str) {
     let _ = url;
 }
 
-fn apply_enroll_cors(origin: Option<&str>, resp: &mut Response<Full<Bytes>>) {
+fn apply_enroll_cors(origin: Option<&str>, allowed_origin: &str, resp: &mut Response<Full<Bytes>>) {
     if let Some(orig) = origin {
-        if orig == ALLOWED_ENROLL_ORIGIN {
-            resp.headers_mut().insert(
-                header::ACCESS_CONTROL_ALLOW_ORIGIN,
-                HeaderValue::from_static(ALLOWED_ENROLL_ORIGIN),
-            );
-            resp.headers_mut()
-                .insert(header::VARY, HeaderValue::from_static("Origin"));
-            resp.headers_mut().insert(
-                header::HeaderName::from_static("access-control-allow-private-network"),
-                HeaderValue::from_static("true"),
-            );
+        if orig == allowed_origin {
+            if let Ok(hdr_val) = HeaderValue::from_str(allowed_origin) {
+                resp.headers_mut()
+                    .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, hdr_val);
+                resp.headers_mut()
+                    .insert(header::VARY, HeaderValue::from_static("Origin"));
+                resp.headers_mut().insert(
+                    header::HeaderName::from_static("access-control-allow-private-network"),
+                    HeaderValue::from_static("true"),
+                );
+            }
         }
     }
 }
@@ -2100,6 +2165,7 @@ fn apply_enroll_cors(origin: Option<&str>, resp: &mut Response<Full<Bytes>>) {
 fn json_enroll_response(
     status: StatusCode,
     origin: Option<&str>,
+    allowed_origin: &str,
     body: Value,
 ) -> Response<Full<Bytes>> {
     let bytes = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
@@ -2110,12 +2176,13 @@ fn json_enroll_response(
         .header(header::CONNECTION, "close")
         .body(Full::new(Bytes::from(bytes)))
         .expect("valid JSON response");
-    apply_enroll_cors(origin, &mut resp);
+    apply_enroll_cors(origin, allowed_origin, &mut resp);
     resp
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn enroll_passkey_via_web(
+    drop_portal_url: &str,
     human_id: &str,
     auth_epoch: u64,
     node_id: &str,
@@ -2126,6 +2193,7 @@ async fn enroll_passkey_via_web(
     no_open: bool,
     secrets: &SecretStore,
 ) -> Result<WebEnrolledAuthority, String> {
+    let allowed_origin = extract_portal_origin(drop_portal_url)?;
     let prf_salt = random_b64url(16)?;
     let csrf_token = random_b64url(24)?;
 
@@ -2151,12 +2219,13 @@ async fn enroll_passkey_via_web(
     let canon = to_canonical_json(&enroll_payload)
         .map_err(|e| format!("failed to encode enrollment fragment: {e}"))?;
     let enroll_url = format!(
-        "{DROP_PORTAL_BASE_URL}#enroll={}",
+        "{drop_portal_url}#enroll={}",
         URL_SAFE_NO_PAD.encode(canon.as_bytes())
     );
 
     let (done_tx, mut done_rx) = oneshot::channel::<Result<WebEnrolledAuthority, String>>();
     let state = Arc::new(WebEnrollState {
+        allowed_origin,
         default_human_id: human_id.to_string(),
         default_prf_salt: prf_salt,
         default_auth_epoch: auth_epoch,
@@ -2211,18 +2280,20 @@ async fn handle_enroll_callback(
     state: Arc<WebEnrollState>,
     req: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
+    let allowed = state.allowed_origin.as_str();
     let origin = req
         .headers()
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok())
         .map(ToOwned::to_owned);
 
-    // Fail closed on untrusted browser Origin headers (allow strictly https://hyphae.to or absent Origin).
+    // Fail closed on untrusted browser Origin headers (allow strictly the configured portal origin or absent Origin).
     if let Some(ref orig) = origin {
-        if orig != ALLOWED_ENROLL_ORIGIN {
+        if orig != allowed {
             return json_enroll_response(
                 StatusCode::FORBIDDEN,
                 None,
+                allowed,
                 json!({ "ok": false, "error": "origin_not_allowed" }),
             );
         }
@@ -2233,6 +2304,7 @@ async fn handle_enroll_callback(
         return json_enroll_response(
             StatusCode::NOT_FOUND,
             origin.as_deref(),
+            allowed,
             json!({ "ok": false, "error": "not_found" }),
         );
     }
@@ -2249,7 +2321,7 @@ async fn handle_enroll_callback(
             .header(header::CONNECTION, "close")
             .body(Full::new(Bytes::new()))
             .expect("valid preflight response");
-        apply_enroll_cors(origin.as_deref(), &mut resp);
+        apply_enroll_cors(origin.as_deref(), allowed, &mut resp);
         return resp;
     }
 
@@ -2257,6 +2329,7 @@ async fn handle_enroll_callback(
         return json_enroll_response(
             StatusCode::METHOD_NOT_ALLOWED,
             origin.as_deref(),
+            allowed,
             json!({ "ok": false, "error": "method_not_allowed" }),
         );
     }
@@ -2274,6 +2347,7 @@ async fn handle_enroll_callback(
             return json_enroll_response(
                 StatusCode::BAD_REQUEST,
                 origin.as_deref(),
+                allowed,
                 json!({ "ok": false, "error": "body_read_error" }),
             );
         };
@@ -2282,6 +2356,7 @@ async fn handle_enroll_callback(
                 return json_enroll_response(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     origin.as_deref(),
+                    allowed,
                     json!({ "ok": false, "error": "payload_too_large" }),
                 );
             }
@@ -2295,6 +2370,7 @@ async fn handle_enroll_callback(
             return json_enroll_response(
                 StatusCode::BAD_REQUEST,
                 origin.as_deref(),
+                allowed,
                 json!({ "ok": false, "error": "invalid_json" }),
             );
         }
@@ -2303,6 +2379,7 @@ async fn handle_enroll_callback(
         return json_enroll_response(
             StatusCode::BAD_REQUEST,
             origin.as_deref(),
+            allowed,
             json!({ "ok": false, "error": "expected_json_object" }),
         );
     };
@@ -2320,6 +2397,7 @@ async fn handle_enroll_callback(
         return json_enroll_response(
             StatusCode::FORBIDDEN,
             origin.as_deref(),
+            allowed,
             json!({ "ok": false, "error": "invalid_state_token" }),
         );
     }
@@ -2328,6 +2406,7 @@ async fn handle_enroll_callback(
         return json_enroll_response(
             StatusCode::BAD_REQUEST,
             origin.as_deref(),
+            allowed,
             json!({ "ok": false, "error": "missing_jwk" }),
         );
     };
@@ -2337,6 +2416,7 @@ async fn handle_enroll_callback(
             return json_enroll_response(
                 StatusCode::BAD_REQUEST,
                 origin.as_deref(),
+                allowed,
                 json!({ "ok": false, "error": "invalid_jwk" }),
             );
         }
@@ -2345,6 +2425,7 @@ async fn handle_enroll_callback(
         return json_enroll_response(
             StatusCode::BAD_REQUEST,
             origin.as_deref(),
+            allowed,
             json!({ "ok": false, "error": "invalid_ed25519_jwk" }),
         );
     };
@@ -2355,6 +2436,7 @@ async fn handle_enroll_callback(
             return json_enroll_response(
                 StatusCode::BAD_REQUEST,
                 origin.as_deref(),
+                allowed,
                 json!({ "ok": false, "error": "invalid_enc_jwk", "message": msg }),
             );
         }
@@ -2363,6 +2445,7 @@ async fn handle_enroll_callback(
         return json_enroll_response(
             StatusCode::BAD_REQUEST,
             origin.as_deref(),
+            allowed,
             json!({ "ok": false, "error": "invalid_jwk_thumbprint" }),
         );
     };
@@ -2371,6 +2454,7 @@ async fn handle_enroll_callback(
             return json_enroll_response(
                 StatusCode::BAD_REQUEST,
                 origin.as_deref(),
+                allowed,
                 json!({ "ok": false, "error": "kid_mismatch" }),
             );
         }
@@ -2379,6 +2463,7 @@ async fn handle_enroll_callback(
         return json_enroll_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             origin.as_deref(),
+            allowed,
             json!({ "ok": false, "error": "serialization_failed" }),
         );
     };
@@ -2433,6 +2518,7 @@ async fn handle_enroll_callback(
                     return json_enroll_response(
                         StatusCode::BAD_REQUEST,
                         origin.as_deref(),
+                        allowed,
                         json!({ "ok": false, "error": "invalid_node_cert", "message": msg }),
                     );
                 }
@@ -2443,6 +2529,7 @@ async fn handle_enroll_callback(
             return json_enroll_response(
                 StatusCode::BAD_REQUEST,
                 origin.as_deref(),
+                allowed,
                 json!({ "ok": false, "error": "invalid_node_cert", "message": "nodeCert must be an hcert1_ string" }),
             );
         }
@@ -2470,6 +2557,7 @@ async fn handle_enroll_callback(
     json_enroll_response(
         StatusCode::OK,
         origin.as_deref(),
+        allowed,
         json!({ "ok": true, "kid": kid }),
     )
 }

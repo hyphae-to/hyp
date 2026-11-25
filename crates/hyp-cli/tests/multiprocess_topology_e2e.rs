@@ -386,6 +386,7 @@ fn three_process_hub_alice_bob_e2ee_dm_and_channel_with_zero_hub_plaintext() {
             .args([
                 "pair",
                 "accept",
+                "--offline",
                 "--node-id",
                 peer_node_id,
                 "--state-dir",
@@ -1924,6 +1925,7 @@ fn two_hub_agent_descriptions_and_auto_routing_without_hub_prefix() {
             .args([
                 "pair",
                 "accept",
+                "--offline",
                 "--node-id",
                 peer_id,
                 "--state-dir",

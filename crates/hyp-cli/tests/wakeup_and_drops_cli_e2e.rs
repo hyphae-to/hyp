@@ -1050,6 +1050,32 @@ fn cli_deploy_init_drop_relay_and_relay_set_validation() {
         "drop-relay README must mention workers/drop-relay/: {readme}"
     );
     assert!(readme.contains("DropSlotDO"));
+    assert!(
+        readme.contains("spore.hyphae.to") && !readme.contains("drop.hyphae.to"),
+        "drop-relay README must reference spore.hyphae.to instead of drop.hyphae.to: {readme}"
+    );
+    let useradd_pos = readme
+        .find("sudo useradd -r -s /usr/sbin/nologin hyphae || true")
+        .expect("drop-relay README missing useradd step");
+    let bin_pos = readme
+        .find("/usr/local/bin/hyp")
+        .expect("drop-relay README missing /usr/local/bin/hyp install");
+    let dirs_pos = readme
+        .find("sudo mkdir -p /var/lib/hyphae /etc/hyphae && sudo chown -R hyphae:hyphae /var/lib/hyphae /etc/hyphae && sudo chmod 0700 /var/lib/hyphae")
+        .expect("drop-relay README missing /var/lib/hyphae setup");
+    let systemctl_pos = readme
+        .find("systemctl enable --now")
+        .expect("drop-relay README missing systemctl enable --now");
+    assert!(useradd_pos < systemctl_pos);
+    assert!(bin_pos < systemctl_pos);
+    assert!(dirs_pos < systemctl_pos);
+
+    let dockerfile = fs::read_to_string(kit_dir.join("Dockerfile"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    assert!(dockerfile.contains("ARG HYP_VERSION=v0.5.0"));
+    assert!(dockerfile.contains("sha256sum -c --ignore-missing"));
+    assert!(!dockerfile.contains("COPY Cargo.toml"));
 
     // 2. `hyp deploy check --config <tmp>/node.json --json` exits 0
     let check_out = isolated_cmd(home)
@@ -1773,4 +1799,267 @@ fn cli_gate_propose_then_lock_merges_and_cleans_proposal() {
     .unwrap();
     assert_eq!(cfg_val["gate"]["require_signed_policy"], true);
     assert_eq!(cfg_val["gate"]["filters"][0]["id"], "local-ollama-guard");
+}
+
+// ============================================================================
+// 8. `dropPortalUrl` & `HYPHAE_DROP_PORTAL_URL` Override + Fail-Closed Guard
+// ============================================================================
+
+#[test]
+fn cli_drop_portal_url_override_and_fail_closed_validation() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let state_dir = home.join("state");
+    let config_path = state_dir.join("node.json");
+    let state_str = state_dir.to_str().unwrap();
+    let cfg_str = config_path.to_str().unwrap();
+
+    // 1. Write `node.json` with `dropPortalUrl` and initialize authority using the same config/nodeId.
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&json!({
+            "v": 2,
+            "nodeId": "portal-test",
+            "profile": "local",
+            "stateDir": state_str,
+            "dropPortalUrl": "https://portal.corp.example/drop/"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let init_out = isolated_cmd(home)
+        .args([
+            "auth",
+            "init",
+            "--human-id",
+            "bogdan",
+            "--label",
+            "laptop-admin",
+            "--state-dir",
+            state_str,
+            "--config",
+            cfg_str,
+            "--json",
+        ])
+        .output()
+        .expect("run auth init");
+    assert_eq!(init_out.status.code(), Some(0));
+
+    // 2. `node.json` `dropPortalUrl` is honored when `HYPHAE_DROP_PORTAL_URL` is unset.
+    let cfg_drop = isolated_cmd(home)
+        .args([
+            "drop",
+            "create",
+            "--kind",
+            "directive",
+            "--offline",
+            "--state-dir",
+            state_str,
+            "--config",
+            cfg_str,
+            "--json",
+        ])
+        .output()
+        .expect("run drop create with node.json dropPortalUrl");
+    assert_eq!(cfg_drop.status.code(), Some(0));
+    let cfg_drop_json = parse_json_stdout(&cfg_drop);
+    assert!(
+        cfg_drop_json["data"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://portal.corp.example/drop#drop="),
+        "expected node.json dropPortalUrl, got: {cfg_drop_json}"
+    );
+
+    // 3. `HYPHAE_DROP_PORTAL_URL=https://drop.acme.com` overrides `node.json` for `drop create` (`#drop=`)!
+    let env_drop = isolated_cmd(home)
+        .env("HYPHAE_DROP_PORTAL_URL", "https://drop.acme.com")
+        .args([
+            "drop",
+            "create",
+            "--kind",
+            "directive",
+            "--offline",
+            "--state-dir",
+            state_str,
+            "--config",
+            cfg_str,
+            "--json",
+        ])
+        .output()
+        .expect("run drop create with HYPHAE_DROP_PORTAL_URL");
+    assert_eq!(env_drop.status.code(), Some(0));
+    let env_drop_json = parse_json_stdout(&env_drop);
+    assert!(
+        env_drop_json["data"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://drop.acme.com#drop="),
+        "expected https://drop.acme.com#drop=, got: {env_drop_json}"
+    );
+
+    // 4. `HYPHAE_DROP_PORTAL_URL=https://drop.acme.com` overrides `hyp auth init --web` (`#enroll=`)
+    //    AND scopes loopback callback CORS strictly to `https://drop.acme.com`!
+    let mut web_cmd = isolated_cmd(home);
+    web_cmd
+        .env("HYPHAE_DROP_PORTAL_URL", "https://drop.acme.com")
+        .args([
+            "auth",
+            "init",
+            "--human-id",
+            "acme-user",
+            "--label",
+            "laptop",
+            "--web",
+            "--no-open",
+            "--port",
+            "0",
+            "--timeout",
+            "15",
+            "--state-dir",
+            state_str,
+            "--config",
+            cfg_str,
+            "--json",
+        ]);
+    let mut web_proc = ManagedProcess::spawn("hyp auth init --web (custom portal)", &mut web_cmd);
+    let url_line = web_proc
+        .try_read_stderr_line(Duration::from_secs(5))
+        .expect("read custom portal enroll URL from stderr");
+    assert!(
+        url_line.contains("https://drop.acme.com#enroll="),
+        "expected https://drop.acme.com#enroll= in stderr, got: {url_line}"
+    );
+    let enroll_b64 = url_line
+        .split("https://drop.acme.com#enroll=")
+        .nth(1)
+        .unwrap()
+        .trim();
+    let enroll_payload: Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(enroll_b64).unwrap()).unwrap();
+    let callback_url = enroll_payload["callbackUrl"].as_str().unwrap().to_string();
+    let csrf_token = enroll_payload["csrfToken"].as_str().unwrap().to_string();
+
+    let phone_kp = Ed25519KeyPair::generate().unwrap();
+    let phone_jwk = phone_kp.to_jwk();
+    let phone_kid = phone_kp.kid();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let client = hyp_node::engine::http_util::HttpClient::new().unwrap();
+        // Default origin `https://hyphae.to` MUST be rejected when overridden to `https://drop.acme.com`!
+        let wrong_origin = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(&callback_url)
+            .header(http::header::ORIGIN, "https://hyphae.to")
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header("x-hyphae-csrf", &csrf_token)
+            .body(hyp_node::engine::http_util::full_body(
+                serde_json::to_vec(&json!({ "jwk": phone_jwk })).unwrap(),
+            ))
+            .unwrap();
+        let resp = client.request(wrong_origin).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
+
+        // Configured origin `https://drop.acme.com` MUST succeed!
+        let ok_req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(&callback_url)
+            .header(http::header::ORIGIN, "https://drop.acme.com")
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header("x-hyphae-csrf", &csrf_token)
+            .body(hyp_node::engine::http_util::full_body(
+                serde_json::to_vec(&json!({
+                    "v": 1,
+                    "humanId": "acme-user",
+                    "kid": phone_kid,
+                    "jwk": phone_jwk,
+                    "label": "acme-passkey"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = client.request(ok_req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://drop.acme.com")
+        );
+    });
+    let (web_status, web_json) = web_proc.wait_json_output(Duration::from_secs(5));
+    assert_eq!(web_status.code(), Some(0));
+    assert_eq!(web_json["ok"], true);
+
+    // 5. Fail-closed: `HYPHAE_DROP_PORTAL_URL=http://evil.example` MUST fail with `CONFIG_ERROR`!
+    let bad_drop = isolated_cmd(home)
+        .env("HYPHAE_DROP_PORTAL_URL", "http://evil.example")
+        .args([
+            "drop",
+            "create",
+            "--kind",
+            "directive",
+            "--offline",
+            "--state-dir",
+            state_str,
+            "--json",
+        ])
+        .output()
+        .expect("run drop create with invalid portal URL");
+    assert_eq!(bad_drop.status.code(), Some(1));
+    let bad_drop_json = parse_json_stdout(&bad_drop);
+    assert_eq!(bad_drop_json["ok"], false);
+    assert_eq!(bad_drop_json["error"]["code"], "CONFIG_ERROR");
+
+    let bad_auth = isolated_cmd(home)
+        .env("HYPHAE_DROP_PORTAL_URL", "http://evil.example")
+        .args([
+            "auth",
+            "init",
+            "--web",
+            "--no-open",
+            "--state-dir",
+            state_str,
+            "--json",
+        ])
+        .output()
+        .expect("run auth init --web with invalid portal URL");
+    assert_eq!(bad_auth.status.code(), Some(1));
+    let bad_auth_json = parse_json_stdout(&bad_auth);
+    assert_eq!(bad_auth_json["ok"], false);
+    assert_eq!(bad_auth_json["error"]["code"], "CONFIG_ERROR");
+
+    // 6. Fail-closed: invalid `dropPortalUrl` in `node.json` fails `hyp node start` with `CONFIG_ERROR`!
+    let bad_node_cfg = home.join("bad-portal-node.json");
+    fs::write(
+        &bad_node_cfg,
+        serde_json::to_string_pretty(&json!({
+            "v": 2,
+            "nodeId": "bad-portal-node",
+            "profile": "local",
+            "stateDir": state_str,
+            "dropPortalUrl": "http://evil.example"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let bad_node = isolated_cmd(home)
+        .args([
+            "node",
+            "start",
+            "--config",
+            bad_node_cfg.to_str().unwrap(),
+            "--no-local-socket",
+            "--json",
+        ])
+        .output()
+        .expect("run node start with invalid dropPortalUrl");
+    assert_eq!(bad_node.status.code(), Some(1));
+    let bad_node_json = parse_json_stdout(&bad_node);
+    assert_eq!(bad_node_json["ok"], false);
+    assert_eq!(bad_node_json["error"]["code"], "CONFIG_ERROR");
 }

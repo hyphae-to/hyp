@@ -11,7 +11,7 @@ use http_body_util::{BodyExt, Empty};
 use hyp_crypto::keys::OkpJwk as CryptoOkpJwk;
 use hyp_crypto::pairing::validate_endpoint_origin;
 use hyp_crypto::rfc3339::{now_unix_ms, parse_rfc3339_millis};
-use hyp_node::engine::DropRelayConfig;
+use hyp_node::engine::{DropRelayConfig, normalize_drop_portal_url};
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
 use hyp_proto::manifest::{NodeManifestPayload, SignedNodeManifest};
 use hyp_proto::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
@@ -1130,13 +1130,30 @@ WantedBy=multi-user.target
 
 fn render_dockerfile() -> String {
     r#"# syntax=docker/dockerfile:1
-# Hyphae v2 multi-stage static Rust build (non-root UID 10001)
+# Hyphae v2 standalone runtime image (SHA-256 verified release binary, non-root UID 10001)
 
-FROM rust:1.87-bookworm AS builder
-WORKDIR /src
-COPY Cargo.toml Cargo.lock ./
-COPY crates ./crates
-RUN cargo build --release --locked --bin hyp
+FROM debian:bookworm-slim AS downloader
+ARG HYP_VERSION=v0.5.0
+ARG TARGETARCH
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl tar \
+    && rm -rf /var/lib/apt/lists/* \
+    && ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
+    && case "${ARCH}" in \
+         amd64) HYP_TARGET="x86_64-unknown-linux-musl" ;; \
+         arm64) HYP_TARGET="aarch64-unknown-linux-musl" ;; \
+         *) echo "Unsupported TARGETARCH: ${ARCH}" >&2; exit 1 ;; \
+       esac \
+    && ARCHIVE="hyp-${HYP_VERSION}-${HYP_TARGET}.tar.gz" \
+    && BASE_URL="https://github.com/hyphae-to/hyp/releases/download/${HYP_VERSION}" \
+    && cd /tmp \
+    && curl -fsSL --proto '=https' --tlsv1.2 "${BASE_URL}/${ARCHIVE}" -o "${ARCHIVE}" \
+    && curl -fsSL --proto '=https' --tlsv1.2 "${BASE_URL}/SHA256SUMS.txt" -o SHA256SUMS.txt \
+    && grep -E "[ *]${ARCHIVE}$" SHA256SUMS.txt >/dev/null \
+    && sha256sum -c --ignore-missing SHA256SUMS.txt \
+    && tar -xzf "${ARCHIVE}" -C /tmp \
+    && install -m 0755 /tmp/hyp /usr/local/bin/hyp \
+    && rm -rf "/tmp/${ARCHIVE}" /tmp/SHA256SUMS.txt /tmp/hyp
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -1148,7 +1165,7 @@ RUN apt-get update \
     && chown 10001:10001 /var/lib/hyphae /etc/hyphae \
     && chmod 0700 /var/lib/hyphae
 
-COPY --from=builder /src/target/release/hyp /usr/local/bin/hyp
+COPY --from=downloader /usr/local/bin/hyp /usr/local/bin/hyp
 
 ENV HYPHAE_SECRET_BACKEND=file \
     HYPHAE_STATE_DIR=/var/lib/hyphae \
@@ -1349,7 +1366,7 @@ fn render_kit_readme(
              - **Private / Team mode (`DROP_AUTH_MODE = \"private\"`, default fail-closed)**:\n\
                set `DROP_CAP_HMAC_KEY` and `ALLOWED_NODE_KEYS` via `npx wrangler secret put`, then\n\
                run `cd workers/drop-relay && npx wrangler deploy`.\n\
-             - **Public mode (`DROP_AUTH_MODE = \"open\"`, e.g. `drop.hyphae.to`)**: accepts\n\
+             - **Public mode (`DROP_AUTH_MODE = \"open\"`, e.g. `spore.hyphae.to`)**: accepts\n\
                `Hyphae-Ed25519` requests carrying `X-Hyphae-Public-Key` with per-IP & per-key\n\
                quotas.\n",
         );
@@ -1867,7 +1884,10 @@ fn build_init_next_steps(
             pair_cmd,
         ],
         DeployProvider::Vps => vec![
-            format!("sudo install -d -m 0750 /etc/hyphae && sudo cp {dir}/node.json /etc/hyphae/node.json"),
+            "sudo useradd -r -s /usr/sbin/nologin hyphae || true".to_string(),
+            "sudo install -m 0755 \"$(command -v hyp)\" /usr/local/bin/hyp".to_string(),
+            "sudo mkdir -p /var/lib/hyphae /etc/hyphae && sudo chown -R hyphae:hyphae /var/lib/hyphae /etc/hyphae && sudo chmod 0700 /var/lib/hyphae".to_string(),
+            format!("sudo install -m 0640 -o hyphae -g hyphae {dir}/node.json /etc/hyphae/node.json"),
             format!("sudo cp {dir}/hyphae-node.service /etc/systemd/system/ && sudo cp {dir}/Caddyfile /etc/caddy/Caddyfile"),
             "sudo systemctl daemon-reload && sudo systemctl enable --now hyphae-node caddy".to_string(),
             format!("hyp deploy check --url https://{domain} --config /etc/hyphae/node.json"),
@@ -1898,13 +1918,21 @@ fn build_init_next_steps(
         DeployProvider::PublicNode => vec![
             "hyp secret set github-public-token  # optional GitHub PAT for higher public ETag rate limits (never in node.json!)".to_string(),
             format!("hyp deploy check --config {dir}/node.json"),
-            format!("Deploy with Caddy + systemd ({dir}/hyphae-node.service + {dir}/Caddyfile) or Docker Compose ({dir}/docker-compose.yml)"),
+            "sudo useradd -r -s /usr/sbin/nologin hyphae || true".to_string(),
+            "sudo install -m 0755 \"$(command -v hyp)\" /usr/local/bin/hyp".to_string(),
+            "sudo mkdir -p /var/lib/hyphae /etc/hyphae && sudo chown -R hyphae:hyphae /var/lib/hyphae /etc/hyphae && sudo chmod 0700 /var/lib/hyphae".to_string(),
+            format!("sudo install -m 0640 -o hyphae -g hyphae {dir}/node.json /etc/hyphae/node.json && sudo cp {dir}/hyphae-node.service /etc/systemd/system/ && sudo cp {dir}/Caddyfile /etc/caddy/Caddyfile"),
+            format!("sudo systemctl daemon-reload && sudo systemctl enable --now hyphae-node caddy  # or run via Docker Compose: cd {dir} && docker compose up -d --build"),
             format!("hyp deploy check --url https://{domain} --config {dir}/node.json"),
             pair_cmd,
         ],
         DeployProvider::DropRelay => vec![
             format!("hyp deploy check --config {dir}/node.json"),
-            format!("Launch via systemd ({dir}/hyphae-drop-relay.service + {dir}/Caddyfile), Docker Compose ({dir}/docker-compose.yml), or Fly.io ({dir}/fly.toml)"),
+            "sudo useradd -r -s /usr/sbin/nologin hyphae || true".to_string(),
+            "sudo install -m 0755 \"$(command -v hyp)\" /usr/local/bin/hyp".to_string(),
+            "sudo mkdir -p /var/lib/hyphae /etc/hyphae && sudo chown -R hyphae:hyphae /var/lib/hyphae /etc/hyphae && sudo chmod 0700 /var/lib/hyphae".to_string(),
+            format!("sudo install -m 0640 -o hyphae -g hyphae {dir}/node.json /etc/hyphae/node.json && sudo cp {dir}/hyphae-drop-relay.service /etc/systemd/system/ && sudo cp {dir}/Caddyfile /etc/caddy/Caddyfile"),
+            format!("sudo systemctl daemon-reload && sudo systemctl enable --now hyphae-drop-relay caddy  # or use Docker Compose ({dir}/docker-compose.yml) / Fly.io ({dir}/fly.toml)"),
             format!("hyp relay set https://{domain}"),
             format!("hyp relay status --url https://{domain}"),
             format!("hyp drop create --kind secret --secret-name example-api-key --relay https://{domain}"),
@@ -2314,6 +2342,29 @@ fn validate_config_file(path: &Path, checks: &mut Vec<CliCheck>) -> Option<Value
                 format!("Invalid dropRelayUrl '{raw_relay_url}': {e}"),
                 Some("Run `hyp relay set https://<your-drop-relay>`.".to_string()),
             )),
+        }
+    }
+
+    if let Some(dp_val) = parsed.get("dropPortalUrl") {
+        if !dp_val.is_null() {
+            match dp_val.as_str() {
+                Some(raw_portal) => match normalize_drop_portal_url(raw_portal) {
+                    Ok(url) => checks.push(CliCheck::ok(
+                        "config.dropPortalUrl",
+                        format!("Valid Drop Portal URL '{url}'"),
+                    )),
+                    Err(e) => checks.push(CliCheck::fail(
+                        "config.dropPortalUrl",
+                        format!("Invalid dropPortalUrl '{raw_portal}': {e}"),
+                        Some("Set dropPortalUrl to an https:// URL (e.g. https://hyphae.to/drop).".to_string()),
+                    )),
+                },
+                None => checks.push(CliCheck::fail(
+                    "config.dropPortalUrl",
+                    "Invalid dropPortalUrl: must be a string",
+                    Some("Set dropPortalUrl to an https:// URL (e.g. https://hyphae.to/drop).".to_string()),
+                )),
+            }
         }
     }
 

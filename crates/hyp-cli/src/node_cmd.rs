@@ -13,6 +13,7 @@ use crate::drop_cmd::validate_relay_url;
 use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error};
 use clap::{Args, Subcommand, ValueEnum};
 use hyp_crypto::CryptoError;
+use hyp_crypto::keys::OkpJwk as CryptoOkpJwk;
 use hyp_crypto::keystore::{SecretBackend, validate_secret_name};
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
 use hyp_harness::daemon::{DeliveryRetryConfig, LocalDaemon, LocalDaemonConfig};
@@ -22,11 +23,13 @@ use hyp_node::adapters::{
 use hyp_node::engine::{
     DropRelayConfig, E2eePolicy, EscalationConfig, GuestPairingConfig, LocalIngestConfig,
     LocalIngestServer, NodeConfig, NodeProfile, TopicConfig, UnifiedNode,
+    normalize_drop_portal_url,
 };
 use hyp_node::gates::{SecurityGateConfig, SecurityGatePipeline};
 use hyp_proto::address::{
     LOCAL_NODE_ID, NodeId, is_valid_handle, is_valid_node_id, is_valid_topic,
 };
+use hyp_proto::manifest::{OkpCurve as ProtoOkpCurve, OkpJwk as ProtoOkpJwk};
 use hyp_proto::scopes::ScopePreset;
 use hyp_store::{NodeDb, PeerStatus};
 use serde_json::{Value, json};
@@ -342,6 +345,44 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             }
         }
 
+        // Parse optional `dropPortalUrl` (fail closed on invalid URLs).
+        if let Some(dp_val) = cfg.raw.get("dropPortalUrl") {
+            if !dp_val.is_null() {
+                let Some(raw_url) = dp_val.as_str() else {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "CONFIG_ERROR",
+                        format!(
+                            "Invalid dropPortalUrl in {}: must be a string",
+                            cfg.path.display()
+                        ),
+                        Some(
+                            "Set dropPortalUrl to an https:// URL (e.g. \"https://hyphae.to/drop\") or loopback http://127.0.0.1."
+                                .to_string(),
+                        ),
+                    );
+                };
+                match normalize_drop_portal_url(raw_url) {
+                    Ok(valid_url) => node_cfg.drop_portal_url = Some(valid_url),
+                    Err(e) => {
+                        return emit_error(
+                            cmd,
+                            as_json,
+                            EXIT_ERROR,
+                            "CONFIG_ERROR",
+                            format!("Invalid dropPortalUrl in {}: {e}", cfg.path.display()),
+                            Some(
+                                "Set dropPortalUrl to an https:// URL (e.g. \"https://hyphae.to/drop\") or loopback http://127.0.0.1."
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
         // Parse optional `escalation` hints (default + byScope).
         if let Some(esc_val) = cfg.raw.get("escalation") {
             match serde_json::from_value::<EscalationConfig>(esc_val.clone()) {
@@ -377,6 +418,31 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         }
 
         let secrets = open_secret_store(&state_dir, explicit_state);
+
+        // Parse optional `pairing.adminKey` (OKP Ed25519 JWK object, 43-char base64url raw pubkey,
+        // or `{ "secret": "<name>" }` reference) so `POST /v1/pair` can verify Org Admin-CA `am2_` grants.
+        if let Some(admin_key_val) = cfg
+            .raw
+            .get("pairing")
+            .and_then(|p| p.get("adminKey"))
+        {
+            match parse_pairing_admin_key(admin_key_val, &secrets, &mut startup_warnings) {
+                Ok(maybe_jwk) => node_cfg.admin_jwk = maybe_jwk,
+                Err(e) => {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "CONFIG_ERROR",
+                        format!("Invalid pairing.adminKey in {}: {e}", cfg.path.display()),
+                        Some(
+                            "Set pairing.adminKey to a public OKP Ed25519 JWK object, a 43-char base64url Ed25519 public key, or { \"secret\": \"hyphae-admin-pubkey\" }."
+                                .to_string(),
+                        ),
+                    );
+                }
+            }
+        }
 
         // Parse `sources` entries (currently `kind == "github-public"`).
         if let Some(sources_val) = cfg.raw.get("sources") {
@@ -974,6 +1040,114 @@ fn parse_guest_pairing_config(
     }
 
     Ok(cfg)
+}
+
+fn parse_ed25519_jwk_str_or_b64(raw: &str, context: &str) -> Result<ProtoOkpJwk, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{context} cannot be empty"));
+    }
+    if trimmed.starts_with('{') {
+        let val: Value = serde_json::from_str(trimmed)
+            .map_err(|e| format!("invalid JSON in {context}: {e}"))?;
+        return parse_ed25519_jwk_object(&val, context);
+    }
+    if trimmed.len() != 43 {
+        return Err(format!(
+            "{context} string must be a 43-character unpadded base64url Ed25519 public key (got {} chars)",
+            trimmed.len()
+        ));
+    }
+    let crypto_jwk = CryptoOkpJwk {
+        kty: "OKP".to_string(),
+        crv: "Ed25519".to_string(),
+        x: trimmed.to_string(),
+    };
+    crypto_jwk
+        .to_ed25519()
+        .map_err(|e| format!("invalid Ed25519 public key in {context}: {e}"))?;
+    let proto_jwk = ProtoOkpJwk {
+        kty: "OKP".to_string(),
+        crv: ProtoOkpCurve::Ed25519,
+        x: trimmed.to_string(),
+    };
+    proto_jwk
+        .validate(Some(ProtoOkpCurve::Ed25519))
+        .map_err(|e| format!("invalid Ed25519 public key in {context}: {e}"))?;
+    Ok(proto_jwk)
+}
+
+fn parse_ed25519_jwk_object(val: &Value, context: &str) -> Result<ProtoOkpJwk, String> {
+    let obj = val.as_object().ok_or_else(|| {
+        format!("{context} must be an OKP Ed25519 JWK object or 43-char base64url string")
+    })?;
+    if obj.contains_key("d") {
+        return Err(format!(
+            "{context} must be a public OKP Ed25519 JWK (private key field 'd' is forbidden in node.json)"
+        ));
+    }
+    let crypto_jwk: CryptoOkpJwk = serde_json::from_value(val.clone())
+        .map_err(|e| format!("malformed OKP Ed25519 JWK in {context}: {e}"))?;
+    if crypto_jwk.kty != "OKP" || crypto_jwk.crv != "Ed25519" {
+        return Err(format!(
+            "{context} must have kty=\"OKP\" and crv=\"Ed25519\", got kty={:?} crv={:?}",
+            crypto_jwk.kty, crypto_jwk.crv
+        ));
+    }
+    crypto_jwk
+        .to_ed25519()
+        .map_err(|e| format!("invalid Ed25519 public key in {context}: {e}"))?;
+    let proto_jwk = ProtoOkpJwk {
+        kty: "OKP".to_string(),
+        crv: ProtoOkpCurve::Ed25519,
+        x: crypto_jwk.x,
+    };
+    proto_jwk
+        .validate(Some(ProtoOkpCurve::Ed25519))
+        .map_err(|e| format!("invalid Ed25519 public key in {context}: {e}"))?;
+    Ok(proto_jwk)
+}
+
+fn parse_pairing_admin_key(
+    val: &Value,
+    secrets: &hyp_crypto::SecretStore,
+    warnings: &mut Vec<String>,
+) -> Result<Option<ProtoOkpJwk>, String> {
+    if val.is_null() {
+        return Ok(None);
+    }
+    if let Some(s) = val.as_str() {
+        return parse_ed25519_jwk_str_or_b64(s, "pairing.adminKey").map(Some);
+    }
+    if let Some(obj) = val.as_object() {
+        if obj.len() == 1 && obj.contains_key("secret") {
+            let secret_name = obj
+                .get("secret")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "pairing.adminKey.secret must be a string".to_string())?;
+            validate_secret_name(secret_name).map_err(|e| {
+                format!("invalid secret name '{secret_name}' in pairing.adminKey: {e}")
+            })?;
+            return match secrets.get(secret_name) {
+                Ok(secret) => parse_ed25519_jwk_str_or_b64(
+                    &secret,
+                    &format!("pairing.adminKey (secret '{secret_name}')"),
+                )
+                .map(Some),
+                Err(CryptoError::SecretNotFound(_)) => {
+                    warnings.push(format!(
+                        "Secret '{secret_name}' referenced by pairing.adminKey is not set; am2_ Admin-CA pairing disabled until `hyp secret set {secret_name}` is configured."
+                    ));
+                    Ok(None)
+                }
+                Err(e) => Err(format!(
+                    "failed to load pairing.adminKey secret '{secret_name}': {e}"
+                )),
+            };
+        }
+        return parse_ed25519_jwk_object(val, "pairing.adminKey").map(Some);
+    }
+    Err("pairing.adminKey must be an OKP Ed25519 JWK object, a 43-char base64url public key string, or { \"secret\": \"<name>\" }".to_string())
 }
 
 fn parse_secret_ref_name(val: &Value, field_name: &str) -> Result<Option<String>, String> {
