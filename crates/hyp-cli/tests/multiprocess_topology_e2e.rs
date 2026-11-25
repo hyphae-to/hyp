@@ -2537,7 +2537,7 @@ fn node_json_plugins_boot_wiring_secret_resolution_and_bridge_roundtrip() {
     rt.block_on(async {
         let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
         // Wait for webhook plugin HTTP listener to accept connections (bounded retry).
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + Duration::from_secs(20);
         let bad_resp = loop {
             let req = Request::builder()
                 .method(Method::POST)

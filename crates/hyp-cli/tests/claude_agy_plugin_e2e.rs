@@ -256,7 +256,7 @@ fn claude_statusline_fresh_idempotent_and_slash_commands() {
     assert_eq!(settings_1["statusLine"]["refreshInterval"], 5);
     let expected_cmd = format!(
         "{fake_bin} statusline --harness claude --socket {}",
-        fake_sock.display()
+        hyp_harness::hooks::shell_quote_cli(&fake_sock.display().to_string())
     );
     assert_eq!(settings_1["statusLine"]["command"], expected_cmd);
     assert!(
