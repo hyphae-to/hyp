@@ -14,8 +14,10 @@
 //!    `local.schedule` + `hyp emit` tip on harnesses without native scheduling.
 
 use crate::config_file::{read_json_value, write_atomic_file};
+use crate::setup::{ClaudeConfigProfile, canonical_dedup_key};
 use hyp_harness::protocol::HarnessKind;
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -600,10 +602,14 @@ fn render_capabilities_layer(caps: SkillCapabilities) -> Option<String> {
 ///
 /// When `codex_present` is `true`, `T3` leaves `~/.agents/skills/hyphae/SKILL.md` to Codex's
 /// dual-push skill (avoiding conflicting overwrites during `hyp setup --harness all`).
+///
+/// For `HarnessKind::Claude`, resolves all active `claude_profiles` (`$CLAUDE_CONFIG_DIR` and/or
+/// `~/.claude`) and deduplicates symlinked `skills/` directories by canonical target path.
 pub fn runtime_skill_paths(
     kind: HarnessKind,
     home: &Path,
     codex_present: bool,
+    claude_profiles: &[ClaudeConfigProfile],
 ) -> (PathBuf, Vec<PathBuf>) {
     match kind {
         HarnessKind::Antigravity => (
@@ -616,13 +622,28 @@ pub fn runtime_skill_paths(
                 .join("SKILL.md"),
             Vec::new(),
         ),
-        HarnessKind::Claude => (
-            home.join(".claude")
-                .join("skills")
-                .join("hyphae")
-                .join("SKILL.md"),
-            Vec::new(),
-        ),
+        HarnessKind::Claude => {
+            let mut seen = BTreeSet::new();
+            let mut paths = Vec::new();
+            for profile in claude_profiles {
+                let skill_path = profile.runtime_skill_path();
+                if seen.insert(canonical_dedup_key(&skill_path)) {
+                    paths.push(skill_path);
+                }
+            }
+            if paths.is_empty() {
+                (
+                    home.join(".claude")
+                        .join("skills")
+                        .join("hyphae")
+                        .join("SKILL.md"),
+                    Vec::new(),
+                )
+            } else {
+                let primary = paths.remove(0);
+                (primary, paths)
+            }
+        }
         HarnessKind::Codex => (
             home.join(".codex")
                 .join("skills")
@@ -767,9 +788,8 @@ fn find_executable_in_path(program: &str) -> bool {
     false
 }
 
-fn detect_claude_channel_in_config(home: &Path) -> bool {
-    let claude_json = home.join(".claude.json");
-    let Ok(val) = read_json_value(&claude_json) else {
+fn detect_claude_channel_in_file(claude_json: &Path) -> bool {
+    let Ok(val) = read_json_value(claude_json) else {
         return false;
     };
     val.get("mcpServers")
@@ -782,6 +802,15 @@ fn detect_claude_channel_in_config(home: &Path) -> bool {
         })
 }
 
+fn detect_claude_channel_in_config(home: &Path, claude_profiles: &[ClaudeConfigProfile]) -> bool {
+    if claude_profiles.is_empty() {
+        return detect_claude_channel_in_file(&home.join(".claude.json"));
+    }
+    claude_profiles
+        .iter()
+        .any(|profile| detect_claude_channel_in_file(&profile.mcp_file))
+}
+
 /// Detects whether Herdr (`hc`), T3 Code (`t3`), or `--claude-channel` are active for `home`
 /// and the current `selected_targets` batch. When `scan_path` is `false` (e.g., isolated
 /// `--home` tests), never probes the host machine's `$PATH`.
@@ -789,6 +818,7 @@ pub fn detect_host_orchestrators(
     home: &Path,
     selected_targets: &[HarnessKind],
     scan_path: bool,
+    claude_profiles: &[ClaudeConfigProfile],
 ) -> HostOrchestratorHints {
     let has_herdr = selected_targets.contains(&HarnessKind::Herdr)
         || home.join(".config").join("herdr").exists()
@@ -800,7 +830,7 @@ pub fn detect_host_orchestrators(
         || home.join(".t3").exists()
         || (scan_path && find_executable_in_path("t3"));
 
-    let claude_channel = detect_claude_channel_in_config(home);
+    let claude_channel = detect_claude_channel_in_config(home, claude_profiles);
 
     HostOrchestratorHints {
         has_herdr,
@@ -1111,5 +1141,38 @@ mod tests {
             SkillWriteOutcome::Written
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), rendered);
+    }
+
+    #[test]
+    fn runtime_skill_paths_honors_distinct_claude_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let work = home.join("profiles").join("work");
+        fs::create_dir_all(home.join(".claude").join("skills")).unwrap();
+        fs::create_dir_all(work.join("skills")).unwrap();
+
+        let profiles = vec![
+            ClaudeConfigProfile {
+                config_dir: work.clone(),
+                mcp_file: work.join(".claude.json"),
+                is_default_home: false,
+            },
+            ClaudeConfigProfile {
+                config_dir: home.join(".claude"),
+                mcp_file: home.join(".claude.json"),
+                is_default_home: true,
+            },
+        ];
+        let (primary, extras) = runtime_skill_paths(HarnessKind::Claude, &home, false, &profiles);
+        assert_eq!(primary, work.join("skills").join("hyphae").join("SKILL.md"));
+        assert_eq!(
+            extras,
+            vec![
+                home.join(".claude")
+                    .join("skills")
+                    .join("hyphae")
+                    .join("SKILL.md")
+            ]
+        );
     }
 }

@@ -39,10 +39,213 @@ use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
 use hyp_store::{NodeDb, PeerInput, PeerProfile, PeerStatus, TrustTier, now_ms};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
+use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, IsTerminal as _, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+/// Resolved Claude Code configuration profile (`~/.claude` default or `$CLAUDE_CONFIG_DIR`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeConfigProfile {
+    pub config_dir: PathBuf,
+    pub mcp_file: PathBuf,
+    pub is_default_home: bool,
+}
+
+impl ClaudeConfigProfile {
+    pub fn settings_file(&self) -> PathBuf {
+        self.config_dir.join("settings.json")
+    }
+
+    pub fn commands_dir(&self) -> PathBuf {
+        self.config_dir.join("commands")
+    }
+
+    pub fn skills_dir(&self) -> PathBuf {
+        self.config_dir.join("skills")
+    }
+
+    pub fn runtime_skill_path(&self) -> PathBuf {
+        self.skills_dir().join("hyphae").join("SKILL.md")
+    }
+
+    pub fn setup_skill_path(&self) -> PathBuf {
+        self.skills_dir().join("hyphae-setup").join("SKILL.md")
+    }
+
+    pub fn panel_dir(&self) -> PathBuf {
+        self.skills_dir().join("hyphae-panel")
+    }
+}
+
+fn env_claude_config_dir() -> Option<PathBuf> {
+    let raw = std::env::var_os("CLAUDE_CONFIG_DIR")?;
+    if raw.is_empty() {
+        return None;
+    }
+    if let Some(s) = raw.to_str() {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        return Some(PathBuf::from(trimmed));
+    }
+    Some(PathBuf::from(raw))
+}
+
+fn same_path_or_canonical(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+fn path_is_within(child: &Path, parent: &Path) -> bool {
+    if child.starts_with(parent) {
+        return true;
+    }
+    if let Ok(canon_parent) = fs::canonicalize(parent) {
+        if child.starts_with(&canon_parent) {
+            return true;
+        }
+        if let Ok(canon_child) = fs::canonicalize(child) {
+            return canon_child.starts_with(&canon_parent);
+        }
+    }
+    false
+}
+
+/// Computes a stable canonical deduplication key for `path` even when leaf files or
+/// subdirectories do not yet exist (e.g. under a symlinked `skills/` directory).
+pub(crate) fn canonical_dedup_key(path: &Path) -> PathBuf {
+    if let Ok(canon) = fs::canonicalize(path) {
+        return canon;
+    }
+    let mut resolved = path.to_path_buf();
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            if let Ok(link_target) = fs::read_link(path) {
+                resolved = if link_target.is_absolute() {
+                    link_target
+                } else {
+                    path.parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(link_target)
+                };
+            }
+        }
+    }
+
+    let mut tail: Vec<OsString> = Vec::new();
+    let mut cur = resolved.as_path();
+    loop {
+        if let Ok(canon) = fs::canonicalize(cur) {
+            let mut out = canon;
+            for seg in tail.into_iter().rev() {
+                out.push(seg);
+            }
+            return out;
+        }
+        let Some(name) = cur.file_name() else {
+            return resolved;
+        };
+        tail.push(name.to_os_string());
+        match cur.parent() {
+            Some(p) if !p.as_os_str().is_empty() => cur = p,
+            _ => return resolved,
+        }
+    }
+}
+
+/// Resolves active Claude Code profile(s) honoring `--claude-config-dir`, `$CLAUDE_CONFIG_DIR`,
+/// and hermetic `--home` test isolation.
+pub fn resolve_claude_profiles(
+    home: &Path,
+    explicit_home: bool,
+    cli_override: Option<&Path>,
+) -> Vec<ClaudeConfigProfile> {
+    resolve_claude_profiles_with_env(
+        home,
+        explicit_home,
+        cli_override,
+        env_claude_config_dir().as_deref(),
+    )
+}
+
+pub(crate) fn resolve_claude_profiles_with_env(
+    home: &Path,
+    explicit_home: bool,
+    cli_override: Option<&Path>,
+    env_override: Option<&Path>,
+) -> Vec<ClaudeConfigProfile> {
+    let default_claude_dir = home.join(".claude");
+    let make_profile = |dir: PathBuf| -> ClaudeConfigProfile {
+        let is_default_home = same_path_or_canonical(&dir, &default_claude_dir);
+        let mcp_file = if is_default_home {
+            home.join(".claude.json")
+        } else {
+            dir.join(".claude.json")
+        };
+        ClaudeConfigProfile {
+            config_dir: dir,
+            mcp_file,
+            is_default_home,
+        }
+    };
+
+    if let Some(dir) = cli_override.filter(|p| !p.as_os_str().is_empty()) {
+        return vec![make_profile(dir.to_path_buf())];
+    }
+
+    let usable_env = env_override
+        .filter(|p| !p.as_os_str().is_empty())
+        .filter(|env_dir| !explicit_home || path_is_within(env_dir, home));
+
+    if let Some(env_dir) = usable_env {
+        let primary = make_profile(env_dir.to_path_buf());
+        let mut profiles = vec![primary.clone()];
+        if !primary.is_default_home
+            && (default_claude_dir.exists() || home.join(".claude.json").exists())
+        {
+            profiles.push(ClaudeConfigProfile {
+                config_dir: default_claude_dir,
+                mcp_file: home.join(".claude.json"),
+                is_default_home: true,
+            });
+        }
+        return profiles;
+    }
+
+    vec![ClaudeConfigProfile {
+        config_dir: default_claude_dir,
+        mcp_file: home.join(".claude.json"),
+        is_default_home: true,
+    }]
+}
+
+fn claude_chain_file_path(
+    home: &Path,
+    profile: &ClaudeConfigProfile,
+    state_dir: &Path,
+) -> PathBuf {
+    let default_settings = home.join(".claude").join("settings.json");
+    let profile_settings = profile.settings_file();
+    if profile.is_default_home
+        || canonical_dedup_key(&profile_settings) == canonical_dedup_key(&default_settings)
+    {
+        return state_dir.join("claude-statusline-chain.json");
+    }
+    let canon = canonical_dedup_key(&profile_settings);
+    let digest = ring::digest::digest(&ring::digest::SHA256, canon.to_string_lossy().as_bytes());
+    let short_hash = hex::encode(&digest.as_ref()[..4]);
+    state_dir.join(format!("claude-{short_hash}-statusline-chain.json"))
+}
 
 const MAX_JOIN_TOKEN_BYTES: u64 = 64 * 1024;
 
@@ -84,6 +287,9 @@ pub struct SetupArgs {
     /// Override home directory (defaults to $HOME; ideal for isolated testing)
     #[arg(long)]
     pub home: Option<PathBuf>,
+    /// Explicit Claude Code config profile directory (overrides $CLAUDE_CONFIG_DIR)
+    #[arg(long, value_name = "DIR")]
+    pub claude_config_dir: Option<PathBuf>,
     /// Explicit state/config directory (used by T3 adapter config and statusLine chain backups)
     #[arg(long)]
     pub state_dir: Option<PathBuf>,
@@ -151,6 +357,9 @@ pub struct OnboardArgs {
     /// Override home directory (defaults to $HOME)
     #[arg(long)]
     pub home: Option<PathBuf>,
+    /// Explicit Claude Code config profile directory (overrides $CLAUDE_CONFIG_DIR)
+    #[arg(long, value_name = "DIR")]
+    pub claude_config_dir: Option<PathBuf>,
     /// Explicit path to static hyp binary (defaults to current_exe)
     #[arg(long)]
     pub bin: Option<PathBuf>,
@@ -308,7 +517,13 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "BIN_PATH_ERROR", e, None),
     };
 
-    let mut targets = match parse_harness_selection(&args.harness, &home) {
+    let claude_profiles = resolve_claude_profiles(
+        &home,
+        args.home.is_some(),
+        args.claude_config_dir.as_deref(),
+    );
+
+    let mut targets = match parse_harness_selection(&args.harness, &home, &claude_profiles) {
         Ok(t) => t,
         Err(e) => {
             return emit_error(
@@ -331,7 +546,11 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
         || args.force_layout;
 
     if args.interactive {
-        let mut toggle_state = wizard::SetupToggleState::from_home(&home, args.home.is_some());
+        let mut toggle_state = wizard::SetupToggleState::from_home_with_claude(
+            &home,
+            args.home.is_some(),
+            args.claude_config_dir.as_deref(),
+        );
         let trimmed_spec = args.harness.trim();
         if !trimmed_spec.is_empty() && !trimmed_spec.eq_ignore_ascii_case("auto") {
             toggle_state.set_selected_harnesses(&targets);
@@ -382,6 +601,7 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
         &targets,
         args.home.is_none(),
         args.force_skills,
+        &claude_profiles,
     );
 
     let mut results = Vec::new();
@@ -400,6 +620,7 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
     let setup_opts = SetupOptions {
         socket: socket_str.as_deref(),
         state_dir: &state_dir,
+        claude_profiles: &claude_profiles,
         statusline: args.statusline,
         no_skills: args.no_skills,
         no_commands: args.no_commands,
@@ -408,9 +629,15 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
 
     for kind in targets {
         let step_res = if args.restore_statusline {
-            restore_harness_statusline_only(kind, &home, &state_dir, args.dry_run)
+            restore_harness_statusline_only(
+                kind,
+                &home,
+                &claude_profiles,
+                &state_dir,
+                args.dry_run,
+            )
         } else if args.refresh_skills {
-            refresh_harness_skill_only(kind, &home, &skill_ctx, args.dry_run)
+            refresh_harness_skill_only(kind, &home, &claude_profiles, &skill_ctx, args.dry_run)
         } else {
             configure_harness(kind, &home, &bin_path, &config_path, setup_opts, &skill_ctx)
         };
@@ -559,6 +786,7 @@ pub fn run_onboard(args: OnboardArgs) -> ExitCode {
         return wizard::run_install_skill(
             &home,
             args.home.is_some(),
+            args.claude_config_dir.as_deref(),
             args.harness.as_deref(),
             as_json,
         );
@@ -836,6 +1064,11 @@ fn run_onboard_deterministic(
         Ok(p) => p,
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "BIN_PATH_ERROR", e, None),
     };
+    let claude_profiles = resolve_claude_profiles(
+        &home,
+        args.home.is_some(),
+        args.claude_config_dir.as_deref(),
+    );
     let (targets, opt_statusline, opt_install_mod, opt_no_skills, opt_no_commands) =
         if let Some(sel) = selection_override {
             (
@@ -847,7 +1080,7 @@ fn run_onboard_deterministic(
             )
         } else {
             let harness_spec = args.harness.as_deref().unwrap_or("auto");
-            let targets = match parse_harness_selection(harness_spec, &home) {
+            let targets = match parse_harness_selection(harness_spec, &home, &claude_profiles) {
                 Ok(t) => t,
                 Err(e) => return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_HARNESS", e, None),
             };
@@ -865,10 +1098,12 @@ fn run_onboard_deterministic(
         &targets,
         args.home.is_none(),
         false,
+        &claude_profiles,
     );
     let onboard_setup_opts = SetupOptions {
         socket: None,
         state_dir: &state_dir,
+        claude_profiles: &claude_profiles,
         statusline: opt_statusline,
         no_skills: opt_no_skills,
         no_commands: opt_no_commands,
@@ -1401,10 +1636,14 @@ fn resolve_binary_path(explicit: Option<&Path>) -> Result<String, String> {
     Ok(exe.display().to_string())
 }
 
-fn parse_harness_selection(raw: &str, home: &Path) -> Result<Vec<HarnessKind>, String> {
+fn parse_harness_selection(
+    raw: &str,
+    home: &Path,
+    claude_profiles: &[ClaudeConfigProfile],
+) -> Result<Vec<HarnessKind>, String> {
     let trimmed = raw.trim().to_ascii_lowercase();
     if trimmed.is_empty() || trimmed == "auto" {
-        return Ok(detect_installed_harnesses(home));
+        return Ok(detect_installed_harnesses(home, claude_profiles));
     }
     if trimmed == "all" {
         return Ok(HarnessKind::ALL.to_vec());
@@ -1426,23 +1665,32 @@ fn parse_harness_selection(raw: &str, home: &Path) -> Result<Vec<HarnessKind>, S
     Ok(selected)
 }
 
-fn detect_installed_harnesses(home: &Path) -> Vec<HarnessKind> {
+fn detect_installed_harnesses(
+    home: &Path,
+    claude_profiles: &[ClaudeConfigProfile],
+) -> Vec<HarnessKind> {
     let mut found = Vec::new();
     for kind in HarnessKind::ALL {
-        if is_harness_detected(kind, home) {
+        if is_harness_detected(kind, home, claude_profiles) {
             found.push(kind);
         }
     }
     found
 }
 
-fn is_harness_detected(kind: HarnessKind, home: &Path) -> bool {
+fn is_harness_detected(
+    kind: HarnessKind,
+    home: &Path,
+    claude_profiles: &[ClaudeConfigProfile],
+) -> bool {
     match kind {
         HarnessKind::Antigravity => {
             home.join(".gemini").join("antigravity-cli").exists()
                 || home.join(".gemini").join("config").exists()
         }
-        HarnessKind::Claude => home.join(".claude").exists() || home.join(".claude.json").exists(),
+        HarnessKind::Claude => claude_profiles
+            .iter()
+            .any(|p| p.config_dir.exists() || p.mcp_file.exists()),
         HarnessKind::Codex => home.join(".codex").exists(),
         HarnessKind::Cursor => home.join(".cursor").exists(),
         HarnessKind::Opencode => home.join(".config").join("opencode").exists(),
@@ -1455,12 +1703,106 @@ fn is_harness_detected(kind: HarnessKind, home: &Path) -> bool {
     }
 }
 
+fn claude_mcp_file_has_hyphae(mcp_file: &Path) -> bool {
+    let Ok(val) = read_json_value(mcp_file) else {
+        return false;
+    };
+    val.get("mcpServers")
+        .and_then(Value::as_object)
+        .and_then(|servers| servers.get("hyphae"))
+        .is_some()
+}
+
 /// Inspects detection & configuration state of all 9 harnesses under `home` for `doctor` / `status`.
-pub fn detect_harness_statuses(home: &Path, config_path: Option<&Path>) -> Vec<HarnessDiagnostic> {
+pub fn detect_harness_statuses(
+    home: &Path,
+    explicit_home: bool,
+    claude_config_dir: Option<&Path>,
+    config_path: Option<&Path>,
+) -> Vec<HarnessDiagnostic> {
+    let claude_profiles = resolve_claude_profiles(home, explicit_home, claude_config_dir);
     HarnessKind::ALL
         .iter()
         .map(|&kind| {
-            let detected = is_harness_detected(kind, home);
+            let detected = is_harness_detected(kind, home, &claude_profiles);
+            if kind == HarnessKind::Claude {
+                let mut configured_locations = Vec::new();
+                let mut missing_mcp: Option<&ClaudeConfigProfile> = None;
+                let mut unconfigured_profile: Option<&ClaudeConfigProfile> = None;
+
+                for profile in &claude_profiles {
+                    let settings_path = profile.settings_file();
+                    let has_hooks = settings_path.exists()
+                        && fs::read_to_string(&settings_path)
+                            .map(|s| contains_hyphae_hook(&s))
+                            .unwrap_or(false);
+                    let has_mcp = claude_mcp_file_has_hyphae(&profile.mcp_file);
+                    let profile_ok = if profile.is_default_home {
+                        has_hooks && (!profile.mcp_file.exists() || has_mcp)
+                    } else {
+                        has_hooks && has_mcp
+                    };
+                    if profile_ok {
+                        if claude_profiles.len() == 1 && profile.is_default_home {
+                            configured_locations.push(settings_path.display().to_string());
+                        } else {
+                            configured_locations.push(profile.config_dir.display().to_string());
+                        }
+                    } else {
+                        if has_hooks && !has_mcp && missing_mcp.is_none() {
+                            missing_mcp = Some(profile);
+                        }
+                        if unconfigured_profile.is_none() {
+                            unconfigured_profile = Some(profile);
+                        }
+                    }
+                }
+
+                let configured =
+                    !claude_profiles.is_empty() && unconfigured_profile.is_none();
+                let (detail, fix) = if configured {
+                    (
+                        format!("Configured ({})", configured_locations.join(", ")),
+                        None,
+                    )
+                } else if let Some(p) = missing_mcp {
+                    let fix_cmd = if p.is_default_home {
+                        "hyp setup --harness claude".to_string()
+                    } else {
+                        format!(
+                            "hyp setup --harness claude --claude-config-dir {}",
+                            p.config_dir.display()
+                        )
+                    };
+                    (
+                        format!(
+                            "Detected, but missing mcpServers.hyphae in {}",
+                            p.mcp_file.display()
+                        ),
+                        Some(fix_cmd),
+                    )
+                } else if detected {
+                    let fix_cmd = match unconfigured_profile {
+                        Some(p) if !p.is_default_home => format!(
+                            "hyp setup --harness claude --claude-config-dir {}",
+                            p.config_dir.display()
+                        ),
+                        _ => "hyp setup --harness claude".to_string(),
+                    };
+                    ("Detected (not configured)".to_string(), Some(fix_cmd))
+                } else {
+                    ("Not detected".to_string(), None)
+                };
+
+                return HarnessDiagnostic {
+                    harness: kind.as_str().to_string(),
+                    detected,
+                    configured,
+                    detail,
+                    fix,
+                };
+            }
+
             let (configured, location) = match kind {
                 HarnessKind::Antigravity => {
                     let p = home
@@ -1471,14 +1813,7 @@ pub fn detect_harness_statuses(home: &Path, config_path: Option<&Path>) -> Vec<H
                         .join("hooks.json");
                     (p.exists(), p.display().to_string())
                 }
-                HarnessKind::Claude => {
-                    let p = home.join(".claude").join("settings.json");
-                    let ok = p.exists()
-                        && fs::read_to_string(&p)
-                            .map(|s| contains_hyphae_hook(&s))
-                            .unwrap_or(false);
-                    (ok, p.display().to_string())
-                }
+                HarnessKind::Claude => unreachable!(),
                 HarnessKind::Codex => {
                     let p = home.join(".codex").join("hooks.json");
                     let ok = p.exists()
@@ -1682,9 +2017,11 @@ impl SetupSkillContext {
         selected_targets: &[HarnessKind],
         scan_path: bool,
         force_skills: bool,
+        claude_profiles: &[ClaudeConfigProfile],
     ) -> Self {
         let capabilities = detect_capabilities_from_config_path(config_path);
-        let orchestrators = detect_host_orchestrators(home, selected_targets, scan_path);
+        let orchestrators =
+            detect_host_orchestrators(home, selected_targets, scan_path, claude_profiles);
         let codex_present =
             selected_targets.contains(&HarnessKind::Codex) || home.join(".codex").exists();
         Self {
@@ -1699,6 +2036,7 @@ impl SetupSkillContext {
 fn install_harness_runtime_skills(
     kind: HarnessKind,
     home: &Path,
+    claude_profiles: &[ClaudeConfigProfile],
     ctx: &SetupSkillContext,
     dry_run: bool,
     files: &mut Vec<String>,
@@ -1708,7 +2046,7 @@ fn install_harness_runtime_skills(
     let transport = resolve_transport_for_harness(target, &ctx.orchestrators);
     let profile = SkillProfile::new(target, transport, ctx.capabilities);
     let rendered = render_runtime_skill(&profile);
-    let (primary, extras) = runtime_skill_paths(kind, home, ctx.codex_present);
+    let (primary, extras) = runtime_skill_paths(kind, home, ctx.codex_present, claude_profiles);
     for path in std::iter::once(primary).chain(extras) {
         match apply_managed_skill(&path, &rendered, ctx.force_skills, dry_run)? {
             SkillWriteOutcome::Written | SkillWriteOutcome::Unchanged => {
@@ -1729,12 +2067,21 @@ fn install_harness_runtime_skills(
 fn refresh_harness_skill_only(
     kind: HarnessKind,
     home: &Path,
+    claude_profiles: &[ClaudeConfigProfile],
     ctx: &SetupSkillContext,
     dry_run: bool,
 ) -> Result<HarnessSetupOutcome, String> {
     let mut files = Vec::new();
     let mut notes = Vec::new();
-    install_harness_runtime_skills(kind, home, ctx, dry_run, &mut files, &mut notes)?;
+    install_harness_runtime_skills(
+        kind,
+        home,
+        claude_profiles,
+        ctx,
+        dry_run,
+        &mut files,
+        &mut notes,
+    )?;
     if notes.is_empty() {
         notes.push(format!(
             "Refreshed tailored runtime hyphae/SKILL.md for {}.",
@@ -1753,6 +2100,7 @@ fn refresh_harness_skill_only(
 struct SetupOptions<'a> {
     socket: Option<&'a str>,
     state_dir: &'a Path,
+    claude_profiles: &'a [ClaudeConfigProfile],
     statusline: bool,
     no_skills: bool,
     no_commands: bool,
@@ -1771,7 +2119,15 @@ fn maybe_install_harness_runtime_skills(
         notes.push("Skipped runtime skills (--no-skills).".to_string());
         return Ok(());
     }
-    install_harness_runtime_skills(kind, home, ctx, opts.dry_run, files, notes)
+    install_harness_runtime_skills(
+        kind,
+        home,
+        opts.claude_profiles,
+        ctx,
+        opts.dry_run,
+        files,
+        notes,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -1965,12 +2321,12 @@ fn statusline_command(
 fn configure_statusline_in_doc(
     settings_doc: &mut Map<String, Value>,
     target: StatusLineHarness,
+    default_chain_path: &Path,
     bin: &str,
     opts: SetupOptions<'_>,
     files: &mut Vec<String>,
     notes: &mut Vec<String>,
 ) -> Result<(), String> {
-    let default_chain_path = target.chain_file_path(opts.state_dir);
     let existing = settings_doc
         .get("statusLine")
         .filter(|v| !v.is_null())
@@ -1995,7 +2351,7 @@ fn configure_statusline_in_doc(
                 .and_then(parse_chain_file_from_command);
             let chain_to_keep = match existing_chain {
                 Some(p) => Some(p),
-                None if default_chain_path.exists() => Some(default_chain_path.clone()),
+                None if default_chain_path.exists() => Some(default_chain_path.to_path_buf()),
                 None => None,
             };
             let cmd = statusline_command(
@@ -2021,13 +2377,13 @@ fn configure_statusline_in_doc(
             }
         }
         Some(custom_val) => {
-            maybe_write_json(&default_chain_path, &custom_val, true, opts.dry_run)?;
+            maybe_write_json(default_chain_path, &custom_val, true, opts.dry_run)?;
             files.push(default_chain_path.display().to_string());
             let cmd = statusline_command(
                 bin,
                 target.as_str(),
                 opts.socket,
-                Some(&default_chain_path),
+                Some(default_chain_path),
             );
             settings_doc.insert(
                 "statusLine".to_string(),
@@ -2043,31 +2399,23 @@ fn configure_statusline_in_doc(
     Ok(())
 }
 
-fn restore_statusline(
+fn restore_statusline_file(
     target: StatusLineHarness,
-    home: &Path,
-    state_dir: &Path,
+    settings_file: &Path,
+    default_chain_path: &Path,
     dry_run: bool,
-) -> Result<HarnessSetupOutcome, String> {
-    let settings_file = target.settings_path(home);
-    let default_chain_path = target.chain_file_path(state_dir);
-    let mut files = Vec::new();
-    let mut notes = Vec::new();
-
+    files: &mut Vec<String>,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
     if !settings_file.exists() {
         notes.push(format!(
             "No {} found; nothing to restore.",
             settings_file.display()
         ));
-        return Ok(HarnessSetupOutcome {
-            harness: target.as_str().to_string(),
-            dry_run,
-            files,
-            notes,
-        });
+        return Ok(());
     }
 
-    let mut settings_doc = read_json_object_or_empty(&settings_file)?;
+    let mut settings_doc = read_json_object_or_empty(settings_file)?;
     let existing = settings_doc
         .get("statusLine")
         .filter(|v| !v.is_null())
@@ -2093,12 +2441,12 @@ fn restore_statusline(
                 .and_then(parse_chain_file_from_command);
             let chain_path = referenced_chain
                 .clone()
-                .unwrap_or_else(|| default_chain_path.clone());
+                .unwrap_or_else(|| default_chain_path.to_path_buf());
 
             if chain_path.exists() {
                 let original = read_json_value(&chain_path)?;
                 settings_doc.insert("statusLine".to_string(), original);
-                maybe_write_json(&settings_file, &Value::Object(settings_doc), false, dry_run)?;
+                maybe_write_json(settings_file, &Value::Object(settings_doc), false, dry_run)?;
                 if !dry_run {
                     fs::remove_file(&chain_path).map_err(|e| {
                         format!(
@@ -2115,7 +2463,7 @@ fn restore_statusline(
                 ));
             } else if let Some(missing_chain) = referenced_chain {
                 settings_doc.remove("statusLine");
-                maybe_write_json(&settings_file, &Value::Object(settings_doc), false, dry_run)?;
+                maybe_write_json(settings_file, &Value::Object(settings_doc), false, dry_run)?;
                 files.push(settings_file.display().to_string());
                 notes.push(format!(
                     "Chained statusLine backup {} was missing; removed Hyphae statusLine entry from {}.",
@@ -2124,13 +2472,59 @@ fn restore_statusline(
                 ));
             } else {
                 settings_doc.remove("statusLine");
-                maybe_write_json(&settings_file, &Value::Object(settings_doc), false, dry_run)?;
+                maybe_write_json(settings_file, &Value::Object(settings_doc), false, dry_run)?;
                 files.push(settings_file.display().to_string());
                 notes.push(format!(
                     "Removed Hyphae statusLine entry from {}.",
                     settings_file.display()
                 ));
             }
+        }
+    }
+
+    Ok(())
+}
+
+fn restore_statusline(
+    target: StatusLineHarness,
+    home: &Path,
+    claude_profiles: &[ClaudeConfigProfile],
+    state_dir: &Path,
+    dry_run: bool,
+) -> Result<HarnessSetupOutcome, String> {
+    let mut files = Vec::new();
+    let mut notes = Vec::new();
+
+    match target {
+        StatusLineHarness::Claude => {
+            let mut seen_settings = BTreeSet::new();
+            for profile in claude_profiles {
+                let settings_file = profile.settings_file();
+                if !seen_settings.insert(canonical_dedup_key(&settings_file)) {
+                    continue;
+                }
+                let default_chain_path = claude_chain_file_path(home, profile, state_dir);
+                restore_statusline_file(
+                    target,
+                    &settings_file,
+                    &default_chain_path,
+                    dry_run,
+                    &mut files,
+                    &mut notes,
+                )?;
+            }
+        }
+        StatusLineHarness::Antigravity => {
+            let settings_file = target.settings_path(home);
+            let default_chain_path = target.chain_file_path(state_dir);
+            restore_statusline_file(
+                target,
+                &settings_file,
+                &default_chain_path,
+                dry_run,
+                &mut files,
+                &mut notes,
+            )?;
         }
     }
 
@@ -2145,14 +2539,25 @@ fn restore_statusline(
 fn restore_harness_statusline_only(
     kind: HarnessKind,
     home: &Path,
+    claude_profiles: &[ClaudeConfigProfile],
     state_dir: &Path,
     dry_run: bool,
 ) -> Result<HarnessSetupOutcome, String> {
     match kind {
-        HarnessKind::Claude => restore_statusline(StatusLineHarness::Claude, home, state_dir, dry_run),
-        HarnessKind::Antigravity => {
-            restore_statusline(StatusLineHarness::Antigravity, home, state_dir, dry_run)
-        }
+        HarnessKind::Claude => restore_statusline(
+            StatusLineHarness::Claude,
+            home,
+            claude_profiles,
+            state_dir,
+            dry_run,
+        ),
+        HarnessKind::Antigravity => restore_statusline(
+            StatusLineHarness::Antigravity,
+            home,
+            claude_profiles,
+            state_dir,
+            dry_run,
+        ),
         other => Ok(HarnessSetupOutcome {
             harness: other.as_str().to_string(),
             dry_run,
@@ -2167,18 +2572,38 @@ fn restore_harness_statusline_only(
 
 /// Inspects `statusLine` configuration & chain-file health for Claude Code and Antigravity CLI
 /// under `home` for `hyp doctor` and `hyp status`.
-pub fn detect_statusline_statuses(home: &Path) -> Vec<StatusLineDiagnostic> {
-    [StatusLineHarness::Claude, StatusLineHarness::Antigravity]
-        .into_iter()
-        .map(|target| inspect_statusline_target(target, home))
-        .collect()
+pub fn detect_statusline_statuses(
+    home: &Path,
+    explicit_home: bool,
+    claude_config_dir: Option<&Path>,
+) -> Vec<StatusLineDiagnostic> {
+    let claude_profiles = resolve_claude_profiles(home, explicit_home, claude_config_dir);
+    let mut results = Vec::new();
+    let mut seen_claude_settings = BTreeSet::new();
+    for profile in &claude_profiles {
+        let settings_path = profile.settings_file();
+        if seen_claude_settings.insert(canonical_dedup_key(&settings_path)) {
+            results.push(inspect_statusline_path(
+                StatusLineHarness::Claude,
+                &settings_path,
+            ));
+        }
+    }
+    let agy_settings = StatusLineHarness::Antigravity.settings_path(home);
+    results.push(inspect_statusline_path(
+        StatusLineHarness::Antigravity,
+        &agy_settings,
+    ));
+    results
 }
 
-fn inspect_statusline_target(target: StatusLineHarness, home: &Path) -> StatusLineDiagnostic {
-    let settings_path = target.settings_path(home);
+fn inspect_statusline_path(
+    target: StatusLineHarness,
+    settings_path: &Path,
+) -> StatusLineDiagnostic {
     let settings_str = settings_path.display().to_string();
 
-    let sl_val = fs::read_to_string(&settings_path)
+    let sl_val = fs::read_to_string(settings_path)
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .and_then(|doc| doc.get("statusLine").cloned())
@@ -2391,10 +2816,12 @@ fn setup_antigravity(
 
     if opts.statusline {
         let agy_settings_file = StatusLineHarness::Antigravity.settings_path(home);
+        let agy_chain_path = StatusLineHarness::Antigravity.chain_file_path(opts.state_dir);
         let mut agy_settings_doc = read_json_object_or_empty(&agy_settings_file)?;
         configure_statusline_in_doc(
             &mut agy_settings_doc,
             StatusLineHarness::Antigravity,
+            &agy_chain_path,
             bin,
             opts,
             &mut files,
@@ -2425,95 +2852,8 @@ fn setup_claude(
 ) -> Result<HarnessSetupOutcome, String> {
     let socket = opts.socket;
     let dry_run = opts.dry_run;
-    let mcp_file = home.join(".claude.json");
-    let settings_file = home.join(".claude").join("settings.json");
 
-    let mut mcp_doc = read_json_object_or_empty(&mcp_file)?;
-    let mut servers = mcp_doc
-        .get("mcpServers")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    servers.insert(
-        "hyphae".to_string(),
-        json!({
-            "command": bin,
-            "args": mcp_args(socket, &[])
-        }),
-    );
-    mcp_doc.insert("mcpServers".to_string(), Value::Object(servers));
-    maybe_write_json(&mcp_file, &Value::Object(mcp_doc), false, dry_run)?;
-
-    let mut settings_doc = read_json_object_or_empty(&settings_file)?;
-    let mut hooks = settings_doc
-        .get("hooks")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    hooks.insert(
-        "SessionStart".to_string(),
-        merge_hook_groups(
-            hooks.get("SessionStart"),
-            json!({
-                "hooks": [{
-                    "type": "command",
-                    "command": hook_command(bin, "claude", "session-start", socket),
-                    "statusMessage": "Hyphae · Register session",
-                    "timeout": 10
-                }]
-            }),
-        ),
-    );
-    hooks.insert(
-        "PreToolUse".to_string(),
-        merge_hook_groups(
-            hooks.get("PreToolUse"),
-            json!({
-                "matcher": "mcp__hyphae__.*",
-                "hooks": [{
-                    "type": "command",
-                    "command": hook_command(bin, "claude", "pre-tool-use", socket),
-                    "statusMessage": "Hyphae · Verify MCP caller",
-                    "timeout": 10
-                }]
-            }),
-        ),
-    );
-    hooks.insert(
-        "PostToolUse".to_string(),
-        merge_hook_groups(
-            hooks.get("PostToolUse"),
-            json!({
-                "matcher": ".*",
-                "hooks": [{
-                    "type": "command",
-                    "command": hook_command(bin, "claude", "post-tool-use", socket),
-                    "statusMessage": "Hyphae · Deliver inbox messages",
-                    "timeout": 10
-                }]
-            }),
-        ),
-    );
-    hooks.insert(
-        "Stop".to_string(),
-        merge_hook_groups(
-            hooks.get("Stop"),
-            json!({
-                "hooks": [{
-                    "type": "command",
-                    "command": hook_command(bin, "claude", "stop", socket),
-                    "statusMessage": "Hyphae · Check inbox on turn end",
-                    "timeout": 10
-                }]
-            }),
-        ),
-    );
-    settings_doc.insert("hooks".to_string(), Value::Object(hooks));
-
-    let mut files = vec![
-        mcp_file.display().to_string(),
-        settings_file.display().to_string(),
-    ];
+    let mut files = Vec::new();
     let claude_summary_note = if opts.no_skills || opts.no_commands {
         "Claude MCP and hooks configured (existing settings preserved)."
     } else {
@@ -2521,47 +2861,161 @@ fn setup_claude(
     };
     let mut notes = vec![claude_summary_note.to_string()];
 
-    if opts.statusline {
-        configure_statusline_in_doc(
-            &mut settings_doc,
-            StatusLineHarness::Claude,
-            bin,
-            opts,
-            &mut files,
-            &mut notes,
-        )?;
-    }
+    let mut seen_mcp = BTreeSet::new();
+    let mut seen_settings = BTreeSet::new();
+    let mut seen_commands = BTreeSet::new();
+    let mut seen_panel = BTreeSet::new();
 
-    maybe_write_json(&settings_file, &Value::Object(settings_doc), false, dry_run)?;
+    let panel_files: [(&str, &str); 4] = [
+        (".claude-plugin/plugin.json", CLAUDE_PANEL_MANIFEST_JSON),
+        ("hooks/hooks.json", CLAUDE_PANEL_HOOKS_JSON),
+        ("hooks/register.tsx", CLAUDE_PANEL_REGISTER_TSX),
+        ("hooks/state.ts", CLAUDE_PANEL_STATE_TS),
+    ];
+
+    for profile in opts.claude_profiles {
+        // 1. Profile-local `.claude.json` (distinct per CLAUDE_CONFIG_DIR profile!).
+        if seen_mcp.insert(canonical_dedup_key(&profile.mcp_file)) {
+            let mut mcp_doc = read_json_object_or_empty(&profile.mcp_file)?;
+            let mut servers = mcp_doc
+                .get("mcpServers")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            servers.insert(
+                "hyphae".to_string(),
+                json!({
+                    "command": bin,
+                    "args": mcp_args(socket, &[])
+                }),
+            );
+            mcp_doc.insert("mcpServers".to_string(), Value::Object(servers));
+            maybe_write_json(&profile.mcp_file, &Value::Object(mcp_doc), false, dry_run)?;
+            files.push(profile.mcp_file.display().to_string());
+        }
+
+        // 2. Profile `settings.json` (deduplicated across symlinked targets; atomic write preserves symlink!).
+        let settings_file = profile.settings_file();
+        if seen_settings.insert(canonical_dedup_key(&settings_file)) {
+            let mut settings_doc = read_json_object_or_empty(&settings_file)?;
+            let mut hooks = settings_doc
+                .get("hooks")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            hooks.insert(
+                "SessionStart".to_string(),
+                merge_hook_groups(
+                    hooks.get("SessionStart"),
+                    json!({
+                        "hooks": [{
+                            "type": "command",
+                            "command": hook_command(bin, "claude", "session-start", socket),
+                            "statusMessage": "Hyphae · Register session",
+                            "timeout": 10
+                        }]
+                    }),
+                ),
+            );
+            hooks.insert(
+                "PreToolUse".to_string(),
+                merge_hook_groups(
+                    hooks.get("PreToolUse"),
+                    json!({
+                        "matcher": "mcp__hyphae__.*",
+                        "hooks": [{
+                            "type": "command",
+                            "command": hook_command(bin, "claude", "pre-tool-use", socket),
+                            "statusMessage": "Hyphae · Verify MCP caller",
+                            "timeout": 10
+                        }]
+                    }),
+                ),
+            );
+            hooks.insert(
+                "PostToolUse".to_string(),
+                merge_hook_groups(
+                    hooks.get("PostToolUse"),
+                    json!({
+                        "matcher": ".*",
+                        "hooks": [{
+                            "type": "command",
+                            "command": hook_command(bin, "claude", "post-tool-use", socket),
+                            "statusMessage": "Hyphae · Deliver inbox messages",
+                            "timeout": 10
+                        }]
+                    }),
+                ),
+            );
+            hooks.insert(
+                "Stop".to_string(),
+                merge_hook_groups(
+                    hooks.get("Stop"),
+                    json!({
+                        "hooks": [{
+                            "type": "command",
+                            "command": hook_command(bin, "claude", "stop", socket),
+                            "statusMessage": "Hyphae · Check inbox on turn end",
+                            "timeout": 10
+                        }]
+                    }),
+                ),
+            );
+            settings_doc.insert("hooks".to_string(), Value::Object(hooks));
+
+            if opts.statusline {
+                let chain_path = claude_chain_file_path(home, profile, opts.state_dir);
+                configure_statusline_in_doc(
+                    &mut settings_doc,
+                    StatusLineHarness::Claude,
+                    &chain_path,
+                    bin,
+                    opts,
+                    &mut files,
+                    &mut notes,
+                )?;
+            }
+
+            maybe_write_json(&settings_file, &Value::Object(settings_doc), false, dry_run)?;
+            files.push(settings_file.display().to_string());
+        }
+
+        // 3. Slash commands & UI-only native Claude Code side-panel mod (`/hyphae-panel`).
+        if !opts.no_commands {
+            let commands_dir = profile.commands_dir();
+            if seen_commands.insert(canonical_dedup_key(&commands_dir)) {
+                for (filename, content) in CLAUDE_SLASH_COMMANDS {
+                    let cmd_path = commands_dir.join(filename);
+                    maybe_write_text(&cmd_path, content, false, dry_run)?;
+                    files.push(cmd_path.display().to_string());
+                }
+            }
+
+            let panel_root = profile.panel_dir();
+            if seen_panel.insert(canonical_dedup_key(&panel_root)) {
+                for (rel, content) in panel_files {
+                    let target = panel_root.join(rel);
+                    maybe_write_text(&target, content, false, dry_run)?;
+                    files.push(target.display().to_string());
+                }
+                if profile.is_default_home {
+                    notes.push(
+                        "Installed native Claude Code side-panel mod (/hyphae-panel) under ~/.claude/skills/hyphae-panel/."
+                            .to_string(),
+                    );
+                } else {
+                    notes.push(format!(
+                        "Installed native Claude Code side-panel mod (/hyphae-panel) under {}/.",
+                        panel_root.display()
+                    ));
+                }
+            }
+        }
+    }
 
     if opts.no_commands {
         notes.push(
             "Skipped Claude slash commands & native side-panel mod (--no-commands).".to_string(),
-        );
-    } else {
-        let commands_dir = home.join(".claude").join("commands");
-        for (filename, content) in CLAUDE_SLASH_COMMANDS {
-            let cmd_path = commands_dir.join(filename);
-            maybe_write_text(&cmd_path, content, false, dry_run)?;
-            files.push(cmd_path.display().to_string());
-        }
-        // Install UI-only native Claude Code side-panel mod (`/hyphae-panel`, auto-loads as
-        // `hyphae-panel@skills-dir` on Claude Code v2.1.287+ without duplicating hooks or MCP).
-        let panel_root = home.join(".claude").join("skills").join("hyphae-panel");
-        let panel_files: [(&str, &str); 4] = [
-            (".claude-plugin/plugin.json", CLAUDE_PANEL_MANIFEST_JSON),
-            ("hooks/hooks.json", CLAUDE_PANEL_HOOKS_JSON),
-            ("hooks/register.tsx", CLAUDE_PANEL_REGISTER_TSX),
-            ("hooks/state.ts", CLAUDE_PANEL_STATE_TS),
-        ];
-        for (rel, content) in panel_files {
-            let target = panel_root.join(rel);
-            maybe_write_text(&target, content, false, dry_run)?;
-            files.push(target.display().to_string());
-        }
-        notes.push(
-            "Installed native Claude Code side-panel mod (/hyphae-panel) under ~/.claude/skills/hyphae-panel/."
-                .to_string(),
         );
     }
 
@@ -3212,6 +3666,75 @@ mod tests {
         assert_eq!(
             parse_chain_file_from_command("hyp statusline --harness claude"),
             None
+        );
+    }
+
+    #[test]
+    fn resolve_claude_profiles_honors_override_env_and_hermetic_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let gateway = home.join("profiles").join("claude-gateway");
+        let outside = tmp.path().join("outside-host-profile");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::create_dir_all(&gateway).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        // 1. Explicit CLI override targets only the requested directory.
+        let cli_only =
+            resolve_claude_profiles_with_env(&home, true, Some(&gateway), Some(&outside));
+        assert_eq!(cli_only.len(), 1);
+        assert_eq!(cli_only[0].config_dir, gateway);
+        assert_eq!(cli_only[0].mcp_file, gateway.join(".claude.json"));
+        assert!(!cli_only[0].is_default_home);
+
+        // 2. CLI override pointing at ~/.claude uses ~/.claude.json.
+        let cli_default = resolve_claude_profiles_with_env(
+            &home,
+            true,
+            Some(&home.join(".claude")),
+            Some(&gateway),
+        );
+        assert_eq!(cli_default.len(), 1);
+        assert!(cli_default[0].is_default_home);
+        assert_eq!(cli_default[0].mcp_file, home.join(".claude.json"));
+
+        // 3. Explicit --home MUST ignore ambient CLAUDE_CONFIG_DIR outside `home`.
+        let hermetic = resolve_claude_profiles_with_env(&home, true, None, Some(&outside));
+        assert_eq!(hermetic.len(), 1);
+        assert!(hermetic[0].is_default_home);
+        assert_eq!(hermetic[0].config_dir, home.join(".claude"));
+        assert_eq!(hermetic[0].mcp_file, home.join(".claude.json"));
+
+        // 4. Explicit --home + CLAUDE_CONFIG_DIR inside `home` includes BOTH profile and ~/.claude.
+        let both = resolve_claude_profiles_with_env(&home, true, None, Some(&gateway));
+        assert_eq!(both.len(), 2);
+        assert_eq!(both[0].config_dir, gateway);
+        assert_eq!(both[0].mcp_file, gateway.join(".claude.json"));
+        assert!(!both[0].is_default_home);
+        assert_eq!(both[1].config_dir, home.join(".claude"));
+        assert_eq!(both[1].mcp_file, home.join(".claude.json"));
+        assert!(both[1].is_default_home);
+
+        // 5. Normal user run (!explicit_home) honors CLAUDE_CONFIG_DIR anywhere on host + ~/.claude.
+        let host_env = resolve_claude_profiles_with_env(&home, false, None, Some(&outside));
+        assert_eq!(host_env.len(), 2);
+        assert_eq!(host_env[0].config_dir, outside);
+        assert_eq!(host_env[0].mcp_file, outside.join(".claude.json"));
+        assert_eq!(host_env[1].config_dir, home.join(".claude"));
+
+        // 6. Per-profile chain backup path is distinct for independent settings.json.
+        let state_dir = tmp.path().join("state");
+        let default_chain = claude_chain_file_path(&home, &both[1], &state_dir);
+        let gateway_chain = claude_chain_file_path(&home, &both[0], &state_dir);
+        assert_eq!(default_chain, state_dir.join("claude-statusline-chain.json"));
+        assert_ne!(gateway_chain, default_chain);
+        assert!(
+            gateway_chain
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("claude-")
         );
     }
 }
