@@ -24,9 +24,11 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use http::{Method, Request, Uri};
 use http_body_util::BodyExt;
+use hyp_crypto::OkpJwk as CryptoOkpJwk;
 use hyp_crypto::human::{
-    HumanDropEnvelopeV1, NodeCertPayloadV1, SignedNodeCertV1, decode_hdrop1, encode_hcert1,
-    is_reserved_secret_name,
+    EncryptedHumanDraftV1, HumanDraftPayloadV1, HumanDropEnvelopeV1,
+    MAX_HUMAN_DRAFT_CONTEXT_CHARS, NodeCertPayloadV1, SignedNodeCertV1, decode_hdrop1,
+    encode_hcert1, is_reserved_secret_name, seal_human_draft, validate_draft_text,
 };
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keystore::validate_secret_name;
@@ -44,16 +46,11 @@ use hyp_node::engine::{
 use hyp_node::gates::{
     GateDecision, InboundContext, OutboundContext, SecurityGatePipeline, TrustTier as GateTrustTier,
 };
-use hyp_proto::cloudevent::{
-    CONTENT_TYPE_JSON, CloudEvent as ProtoCloudEvent, parse_rfc3339_utc_nanos,
-};
-use hyp_proto::cron::CronTimezone;
+use hyp_proto::cloudevent::{CONTENT_TYPE_JSON, CloudEvent as ProtoCloudEvent};
 use hyp_proto::filter::Filter as ProtoFilter;
 use hyp_store::{
-    BridgeLink, DEFAULT_WAKEUP_TTL_MS, DeliveryMode, FiredWakeup, GateState, MailboxEntry,
-    MailboxInsert, MailboxKind, MailboxPutOptions, MailboxPutResult, PluginTargetHandoff,
-    StoreError, WakeupInsert, WakeupLimits, WakeupRecord, WakeupState, WakeupTriggerKind,
-    WakeupUrgency, WriteModel, epoch_ms_to_rfc3339, format_address, now_ms, parse_address,
+    BridgeLink, DeliveryMode, GateState, MailboxEntry, MailboxInsert, MailboxKind,
+    MailboxPutResult, PluginTargetHandoff, WriteModel, format_address, now_ms, parse_address,
     sha256_hex, uuid_v4,
 };
 use serde::{Deserialize, Serialize};
@@ -66,9 +63,7 @@ use tokio::task::JoinHandle;
 use crate::call_registry::{
     CallRegistry, CallerResolution, DEFAULT_RESOLVE_WAIT, StartCallInput, is_valid_session_id,
 };
-use crate::protocol::{
-    HarnessKind, UNTRUSTED_PROVENANCE, is_bridge_destination, normalize_mesh_tool_name,
-};
+use crate::protocol::{HarnessKind, is_bridge_destination, normalize_mesh_tool_name};
 use crate::sock::{
     DEFAULT_SOCKET_FILENAME, MAX_SOCKET_LINE_BYTES, read_bounded_line_async,
     write_ndjson_line_async,
@@ -135,46 +130,23 @@ pub struct InboundItem {
     pub trust_tier: GateTrustTier,
 }
 
-/// Exposure policy for the conditional `hyp_wakeup` MCP tool in `mcp.caps`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum WakeupMcpToolMode {
-    /// Advertise `hyp_wakeup` to all harnesses EXCEPT those listed in `deny_backends`.
-    #[default]
-    Auto,
-    /// Advertise `hyp_wakeup` to every MCP connection when `wakeup.enabled == true`.
-    Always,
-    /// Never advertise `hyp_wakeup` in MCP (CLI / OS triggers & `hyp_stream` only; 0 MCP tokens).
-    Never,
-}
-
-/// Opt-in wakeup delivery, Tier 3 `Hold` retry backoff, Tier 4 cold-revival, and Security Gate
-/// configuration for [`LocalDaemon`].
-#[derive(Debug, Clone)]
-pub struct WakeupDaemonConfig {
-    pub enabled: bool,
-    pub mcp_tool_mode: WakeupMcpToolMode,
-    pub deny_backends: Vec<HarnessKind>,
+/// Tier 3 bounded `Hold` retry backoff and opt-in Tier 4 cold-revival configuration
+/// for [`LocalDaemon`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryRetryConfig {
     pub hold_retry_backoff_ms: Vec<u64>,
     pub hold_retry_max_attempts: u32,
     pub codex_resume: bool,
     pub herdr_spawn_allowlist: Vec<String>,
-    pub screen_external_notes: bool,
-    pub screen_agent_notes: bool,
 }
 
-impl Default for WakeupDaemonConfig {
+impl Default for DeliveryRetryConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            mcp_tool_mode: WakeupMcpToolMode::Auto,
-            deny_backends: vec![HarnessKind::Openclaw, HarnessKind::Antigravity],
             hold_retry_backoff_ms: vec![5_000, 15_000, 30_000, 60_000],
             hold_retry_max_attempts: 6,
             codex_resume: false,
             herdr_spawn_allowlist: Vec::new(),
-            screen_external_notes: true,
-            screen_agent_notes: false,
         }
     }
 }
@@ -209,8 +181,8 @@ pub struct LocalDaemonConfig {
     pub t3_default_base_dir: Option<PathBuf>,
     /// Optional override for the default T3 Code server URL during auto-detection.
     pub t3_default_url: Option<String>,
-    /// Opt-in wakeup scheduler, Tier 3 `Hold` retry backoff, and Tier 4 cold-revival settings.
-    pub wakeup: WakeupDaemonConfig,
+    /// Tier 3 bounded `Hold` retry backoff and opt-in Tier 4 cold-revival settings.
+    pub delivery_retry: DeliveryRetryConfig,
 }
 
 impl Default for LocalDaemonConfig {
@@ -226,7 +198,7 @@ impl Default for LocalDaemonConfig {
             codex_bin: None,
             t3_default_base_dir: None,
             t3_default_url: None,
-            wakeup: WakeupDaemonConfig::default(),
+            delivery_retry: DeliveryRetryConfig::default(),
         }
     }
 }
@@ -384,7 +356,6 @@ pub struct LocalDaemon {
     shutdown_tx: watch::Sender<bool>,
     accept_task: Mutex<Option<JoinHandle<()>>>,
     inbox_task: Mutex<Option<JoinHandle<()>>>,
-    wakeup_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Drop for LocalDaemon {
@@ -460,7 +431,6 @@ impl LocalDaemon {
         });
 
         let inbox_task = spawn_inbox_watcher(Arc::clone(&inner), shutdown_tx.subscribe());
-        let wakeup_task = spawn_wakeup_watcher(Arc::clone(&inner), shutdown_tx.subscribe());
 
         Ok(Self {
             inner,
@@ -468,7 +438,6 @@ impl LocalDaemon {
             shutdown_tx,
             accept_task: Mutex::new(Some(accept_task)),
             inbox_task: Mutex::new(Some(inbox_task)),
-            wakeup_task: Mutex::new(Some(wakeup_task)),
         })
     }
 
@@ -544,7 +513,6 @@ impl LocalDaemon {
         });
 
         let inbox_task = spawn_inbox_watcher(Arc::clone(&inner), shutdown_tx.subscribe());
-        let wakeup_task = spawn_wakeup_watcher(Arc::clone(&inner), shutdown_tx.subscribe());
 
         Ok(Self {
             inner,
@@ -552,7 +520,6 @@ impl LocalDaemon {
             shutdown_tx,
             accept_task: Mutex::new(Some(accept_task)),
             inbox_task: Mutex::new(Some(inbox_task)),
-            wakeup_task: Mutex::new(Some(wakeup_task)),
         })
     }
 
@@ -590,10 +557,20 @@ impl LocalDaemon {
         }
         self.inner
             .attach_transport_if_higher_priority(&sid, transport, PRIORITY_EXPLICIT);
-        let flush_inner = Arc::clone(&self.inner);
-        tokio::spawn(async move {
-            flush_inner.flush_session(&sid).await;
-        });
+        let has_pending = self
+            .inner
+            .node
+            .db()
+            .local()
+            .pending_count(&sid)
+            .unwrap_or(0)
+            > 0;
+        if has_pending {
+            let flush_inner = Arc::clone(&self.inner);
+            tokio::spawn(async move {
+                flush_inner.flush_session(&sid).await;
+            });
+        }
     }
 
     /// Removes any attached native [`PushTransport`] for `session_id`.
@@ -786,23 +763,21 @@ impl LocalDaemon {
         {
             h.abort();
         }
-        if let Some(h) = self
-            .wakeup_task
-            .lock()
-            .expect("wakeup_task lock poisoned")
-            .take()
-        {
-            h.abort();
-        }
         let _ = std::fs::remove_file(&self.inner.socket_path);
     }
 
-    /// Delivers a fired durable wakeup (`FiredWakeup`) through the `to.hyphae.wakeup.v1`
-    /// CloudEvents bus, optional Security Gate screening, coalesced durable SQLite mailbox,
-    /// Tiers 1–3 delivery flush, and opt-in Tier 4 cold revival (Codex `--resume` / allowlisted
-    /// Herdr `hc run <template>`), updating `wakeups.consecutive_failures` atomically.
-    pub async fn deliver_fired_wakeup(&self, fired: &FiredWakeup) -> Result<bool, String> {
-        self.inner.deliver_fired_wakeup(fired).await
+    /// Invokes opt-in Tier 4 allowlisted Herdr cold-spawn (`hc run <template> <prompt>`)
+    /// guarded by `delivery_retry.herdr_spawn_allowlist` and a per-key concurrency limit
+    /// (`maxConcurrentSpawns: 1`).
+    pub async fn try_herdr_cold_spawn(
+        &self,
+        spawn_key: &str,
+        template: &str,
+        prompt: &str,
+    ) -> PushOutcome {
+        self.inner
+            .try_herdr_cold_spawn(spawn_key, template, prompt)
+            .await
     }
 
     /// Directly ingests an inbound item through `SecurityGatePipeline` (if configured) ->
@@ -1023,34 +998,6 @@ fn spawn_inbox_watcher(
     })
 }
 
-fn spawn_wakeup_watcher(
-    inner: Arc<LocalDaemonInner>,
-    mut shutdown_rx: watch::Receiver<bool>,
-) -> JoinHandle<()> {
-    let mut rx = inner.node.subscribe_fired_wakeups();
-    tokio::spawn(async move {
-        loop {
-            let fired = tokio::select! {
-                res = rx.recv() => match res {
-                    Ok(fired) => fired,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                },
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        break;
-                    }
-                    continue;
-                }
-            };
-            let deliver_inner = Arc::clone(&inner);
-            tokio::spawn(async move {
-                let _ = deliver_inner.deliver_fired_wakeup(&fired).await;
-            });
-        }
-    })
-}
-
 impl LocalDaemonInner {
     fn new(
         node: Arc<UnifiedNode>,
@@ -1083,19 +1030,6 @@ impl LocalDaemonInner {
         }
     }
 
-    fn has_wakeup_capability(&self, backend: Option<HarnessKind>) -> bool {
-        if !self.config.wakeup.enabled {
-            return false;
-        }
-        match self.config.wakeup.mcp_tool_mode {
-            WakeupMcpToolMode::Never => false,
-            WakeupMcpToolMode::Always => true,
-            WakeupMcpToolMode::Auto => {
-                !backend.is_some_and(|b| self.config.wakeup.deny_backends.contains(&b))
-            }
-        }
-    }
-
     fn cancel_hold_retry(&self, session_id: &str) {
         self.hold_retries
             .lock()
@@ -1108,11 +1042,11 @@ impl LocalDaemonInner {
     /// `t3_server_unreachable`, `codex_queue_unavailable`).
     ///
     /// Zero background polling when `hold_retries` is empty; immediately invalidated
-    /// whenever `commit_delivered_batch`, `mailbox.drain`, `hyp_inbox(ack)`, or daemon
-    /// shutdown clears the session's pending items.
+    /// whenever `commit_delivered_batch`, `mailbox.drain`, `hyp_inbox(ack)`, `tool_leave`,
+    /// or daemon shutdown clears the session's pending items.
     fn schedule_hold_retry(self: &Arc<Self>, session_id: &str) {
-        let max_attempts = self.config.wakeup.hold_retry_max_attempts;
-        if max_attempts == 0 || self.config.wakeup.hold_retry_backoff_ms.is_empty() {
+        let max_attempts = self.config.delivery_retry.hold_retry_max_attempts;
+        if max_attempts == 0 || self.config.delivery_retry.hold_retry_backoff_ms.is_empty() {
             return;
         }
         let (generation, delay_ms) = {
@@ -1131,8 +1065,8 @@ impl LocalDaemonInner {
             let generation = self.next_seq();
             map.insert(session_id.to_string(), (next_attempt, generation));
             let idx = ((next_attempt - 1) as usize)
-                .min(self.config.wakeup.hold_retry_backoff_ms.len() - 1);
-            let delay = self.config.wakeup.hold_retry_backoff_ms[idx].max(1);
+                .min(self.config.delivery_retry.hold_retry_backoff_ms.len() - 1);
+            let delay = self.config.delivery_retry.hold_retry_backoff_ms[idx].max(1);
             (generation, delay)
         };
 
@@ -1164,17 +1098,17 @@ impl LocalDaemonInner {
     }
 
     /// Invokes allowlisted Tier 4 Herdr cold-spawn (`hc run <template> <prompt>`)
-    /// guarded by a per-wakeup concurrency limit (`maxConcurrentSpawns: 1`).
+    /// guarded by a per-key concurrency limit (`maxConcurrentSpawns: 1`).
     async fn try_herdr_cold_spawn(
         &self,
-        wakeup_id: &str,
+        spawn_key: &str,
         template: &str,
         prompt: &str,
     ) -> PushOutcome {
         if !is_valid_herdr_template(template)
             || !self
                 .config
-                .wakeup
+                .delivery_retry
                 .herdr_spawn_allowlist
                 .iter()
                 .any(|t| t == template)
@@ -1190,25 +1124,25 @@ impl LocalDaemonInner {
                 .active_cold_spawns
                 .lock()
                 .expect("active_cold_spawns lock poisoned");
-            if !active.insert(wakeup_id.to_string()) {
+            if !active.insert(spawn_key.to_string()) {
                 return PushOutcome::hold("herdr_spawn_already_active");
             }
         }
         struct ColdSpawnGuard<'a> {
             active: &'a Mutex<HashSet<String>>,
-            wakeup_id: String,
+            spawn_key: String,
         }
         impl Drop for ColdSpawnGuard<'_> {
             fn drop(&mut self) {
                 self.active
                     .lock()
                     .expect("active_cold_spawns lock poisoned")
-                    .remove(&self.wakeup_id);
+                    .remove(&self.spawn_key);
             }
         }
         let _guard = ColdSpawnGuard {
             active: &self.active_cold_spawns,
-            wakeup_id: wakeup_id.to_string(),
+            spawn_key: spawn_key.to_string(),
         };
 
         let hc_bin = self
@@ -1220,546 +1154,10 @@ impl LocalDaemonInner {
             hc_bin,
             template,
             prompt,
-            &self.config.wakeup.herdr_spawn_allowlist,
+            &self.config.delivery_retry.herdr_spawn_allowlist,
             DEFAULT_SPAWN_TIMEOUT,
         )
         .await
-    }
-
-    async fn screen_wakeup_via_gate(
-        &self,
-        req: &WakeupDeliveryRequest,
-        session_id: &str,
-        item_id: &str,
-        formatted_text: &str,
-        ce: &ProtoCloudEvent,
-        now: i64,
-    ) -> Result<bool, String> {
-        let Some(ref pipeline) = self.gate else {
-            return Ok(false);
-        };
-        let should_screen = if req.is_external {
-            self.config.wakeup.screen_external_notes
-        } else {
-            self.config.wakeup.screen_agent_notes
-        };
-        if !should_screen {
-            return Ok(false);
-        }
-
-        let topic = req
-            .target_topic
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("wakeup");
-        let mut gate_ce = ce.clone();
-        gate_ce.id = format!("gate-wakeup:{item_id}");
-        let trust_tier = if req.is_external {
-            GateTrustTier::ExternalWebhook
-        } else {
-            GateTrustTier::SelfHost
-        };
-        let ctx = InboundContext {
-            session_id: session_id.to_string(),
-            origin_node: self.node.node_id().as_str().to_string(),
-            sender: format!("wakeup:{}", req.wakeup_id),
-            trust_tier,
-            e2ee_verified: true,
-            identity_verified: true,
-            kind: MailboxKind::Event,
-            channel: None,
-            topic: Some(topic.to_string()),
-            bridge: None,
-            event: gate_ce,
-            transfer_paths: Vec::new(),
-            rendered_text: Some(formatted_text.to_string()),
-            human_auth: None,
-        };
-
-        let eval = pipeline
-            .evaluate_inbound(&ctx, now)
-            .await
-            .map_err(|e| format!("wakeup_gate_error:{e}"))?;
-        match eval.decision {
-            GateDecision::Allow {
-                downgraded_to_notify,
-            } => {
-                // Remove any duplicate non-coalesced mailbox row written by the gate pipeline
-                // so our coalesced `put_in_mailbox_ex` row is the single source of truth.
-                if let Some(dup_receipt) = eval.receipt {
-                    self.dismissed_receipts
-                        .lock()
-                        .expect("dismissed lock poisoned")
-                        .insert(dup_receipt.clone());
-                    let db = self.node.db();
-                    let _ = db
-                        .local()
-                        .acknowledge_inbox(session_id, &[dup_receipt.as_str()], now);
-                }
-                Ok(downgraded_to_notify)
-            }
-            GateDecision::Block { reason } => Err(format!("wakeup_gate_blocked:{reason}")),
-            GateDecision::Quarantine { reason, .. } => {
-                Err(format!("wakeup_gate_quarantined:{reason}"))
-            }
-            GateDecision::Hold { reason, .. } => Err(format!("wakeup_gate_held:{reason}")),
-        }
-    }
-
-    async fn deliver_fired_wakeup(self: &Arc<Self>, fired: &FiredWakeup) -> Result<bool, String> {
-        let w = &fired.wakeup;
-        let coalesce_key = w.coalesce.then(|| format!("wakeup:{}", w.id));
-        let req = WakeupDeliveryRequest {
-            wakeup_id: w.id.clone(),
-            label: w.label.clone(),
-            note: w.note.clone(),
-            trigger: w.trigger_kind.as_str().to_string(),
-            urgency: w.urgency,
-            target_session_id: w.target_session_id.clone(),
-            target_handle: w.target_handle.clone(),
-            target_topic: w.target_topic.clone(),
-            coalesce_key,
-            ttl_ms: Some(w.ttl_ms),
-            scheduled_for_ms: fired.scheduled_for_ms,
-            fired_at_ms: fired.fired_at_ms,
-            iteration: w.iteration,
-            max_iterations: w.max_iterations,
-            missed_count: fired.missed_count,
-            cold_revival_template: w.cold_revival_template.clone(),
-            is_external: w.owner_session_id.is_none(),
-            is_persisted_wakeup: true,
-        };
-        self.deliver_wakeup_internal(req)
-            .await
-            .map(|res| res.delivered)
-    }
-
-    async fn deliver_wakeup_internal(
-        self: &Arc<Self>,
-        req: WakeupDeliveryRequest,
-    ) -> Result<WakeupDeliveryOutcome, String> {
-        let now = now_ms();
-        let topic = req
-            .target_topic
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("wakeup");
-        let expires_at = req.ttl_ms.map(|ttl| now.saturating_add(ttl));
-
-        // 1. Resolve target session (direct `target_session_id` or `session_by_handle`).
-        let resolved_session: Option<(String, String)> = {
-            let db = self.node.db();
-            let direct = req.target_session_id.as_deref().and_then(|sid| {
-                db.local()
-                    .get_session(sid)
-                    .ok()
-                    .flatten()
-                    .map(|s| (s.id, s.backend_json))
-            });
-            if direct.is_some() {
-                direct
-            } else if let Some(raw_handle) = req.target_handle.as_deref() {
-                let clean = raw_handle.strip_prefix('@').unwrap_or(raw_handle);
-                let lookup = parse_address(clean).map(|(_, h)| h).unwrap_or(clean);
-                db.local()
-                    .session_by_handle(lookup)
-                    .ok()
-                    .flatten()
-                    .map(|s| (s.id, s.backend_json))
-            } else {
-                None
-            }
-        };
-
-        // Compute effective missed count ahead of formatting if coalescing into an existing pending row.
-        let mut effective_missed = req.missed_count;
-        if let (Some((sid, _)), Some(ckey)) = (&resolved_session, &req.coalesce_key) {
-            let db = self.node.db();
-            if let Ok(existing) = db.local().peek_inbox_ex(sid, 500) {
-                if let Some(prev) = existing
-                    .iter()
-                    .find(|e| e.coalesce_key.as_deref() == Some(ckey.as_str()))
-                {
-                    effective_missed = effective_missed
-                        .saturating_add(prev.missed_count)
-                        .saturating_add(1);
-                }
-            }
-        }
-
-        let formatted_text = format_wakeup_text(
-            &req.wakeup_id,
-            &req.trigger,
-            &req.label,
-            req.iteration,
-            req.max_iterations,
-            effective_missed,
-            &req.note,
-        );
-
-        let ce = build_wakeup_cloudevent(
-            self.node.node_id().as_str(),
-            &req,
-            resolved_session.as_ref().map(|(sid, _)| sid.as_str()),
-            effective_missed,
-            expires_at,
-        );
-
-        let item_id = format!("wkp-item-{}", uuid_v4());
-        let gate_session = resolved_session
-            .as_ref()
-            .map(|(sid, _)| sid.as_str())
-            .unwrap_or("wakeup:topic");
-
-        // 2. Optional Security Gate evaluation (fails closed on Block/Quarantine/Hold/Error).
-        let gate_downgraded = match self
-            .screen_wakeup_via_gate(&req, gate_session, &item_id, &formatted_text, &ce, now)
-            .await
-        {
-            Ok(downgraded) => downgraded,
-            Err(reason) => {
-                if req.is_persisted_wakeup {
-                    let db = self.node.db();
-                    let _ = db.wakeups().record_delivery_result(
-                        &req.wakeup_id,
-                        false,
-                        Some(&reason),
-                        WakeupLimits::default().max_consecutive_failures,
-                        now,
-                    );
-                }
-                return Err(reason);
-            }
-        };
-
-        // 3. Publish `to.hyphae.wakeup.v1` CloudEvent onto local topic `wakeup` (or `target_topic`).
-        let _ = self.node.publish_event(topic, ce).await;
-
-        let wakeup_source = format!("wakeup:{}", req.wakeup_id);
-        let label_source = format!("wakeup:{}", req.label);
-        let base_urgency = match req.urgency {
-            WakeupUrgency::Interrupt => DeliveryUrgency::Interrupt,
-            WakeupUrgency::Queue => DeliveryUrgency::Queue,
-            WakeupUrgency::Notify => DeliveryUrgency::Notify,
-        };
-        let effective_urgency = if gate_downgraded && base_urgency == DeliveryUrgency::Interrupt {
-            DeliveryUrgency::Queue
-        } else {
-            base_urgency
-        };
-
-        // 4. Targeted session path: durable coalesced SQLite mailbox + Tier 1-3 flush + Tier 4 fallback.
-        if let Some((session_id, backend_json)) = resolved_session {
-            let is_muted = {
-                let db = self.node.db();
-                db.local()
-                    .is_muted(&session_id, &[&wakeup_source, &label_source, "wakeup"])
-                    .ok()
-                    .flatten()
-                    .is_some()
-            };
-            let insert = MailboxInsert {
-                session_id: session_id.clone(),
-                origin_node: self.node.node_id().as_str().to_string(),
-                item_id,
-                text: formatted_text.clone(),
-                kind: MailboxKind::Event,
-                source: wakeup_source.clone(),
-                gate_state: GateState::Pending,
-                gate_reason: None,
-                traceparent: None,
-            };
-
-            if is_muted {
-                let db = self.node.db();
-                let _ = archive_muted_entry(&db, &insert, now);
-                if req.is_persisted_wakeup {
-                    let _ = db.wakeups().record_delivery_result(
-                        &req.wakeup_id,
-                        true,
-                        None,
-                        WakeupLimits::default().max_consecutive_failures,
-                        now,
-                    );
-                }
-                return Ok(WakeupDeliveryOutcome {
-                    delivered: false,
-                    pushed: false,
-                    session_id: Some(session_id),
-                    receipt: None,
-                    missed_count: effective_missed,
-                    cold_revived: false,
-                    muted: true,
-                });
-            }
-
-            let put_opts = MailboxPutOptions {
-                coalesce_key: req.coalesce_key.clone(),
-                expires_at,
-            };
-            let (receipt, stored_missed) = {
-                let db = self.node.db();
-                match db
-                    .local()
-                    .put_in_mailbox_ex(&insert, &put_opts, now)
-                    .map_err(|e| e.to_string())?
-                {
-                    MailboxPutResult::Stored { receipt } => {
-                        let mc = db
-                            .local()
-                            .get_mailbox_entry_ex(&receipt)
-                            .ok()
-                            .flatten()
-                            .map(|e| e.missed_count)
-                            .unwrap_or(effective_missed);
-                        (receipt, mc)
-                    }
-                    MailboxPutResult::Duplicate => {
-                        return Ok(WakeupDeliveryOutcome {
-                            delivered: true,
-                            pushed: false,
-                            session_id: Some(session_id),
-                            receipt: None,
-                            missed_count: effective_missed,
-                            cold_revived: false,
-                            muted: false,
-                        });
-                    }
-                    MailboxPutResult::QueueFull => return Err("local_inbox_full".to_string()),
-                }
-            };
-
-            self.record_item_meta(
-                &session_id,
-                receipt.clone(),
-                ClassifiedItemMeta {
-                    urgency: effective_urgency,
-                    burst_demoted: false,
-                    burst_source_key: wakeup_source,
-                    channel: None,
-                    is_announcement: false,
-                    notified: false,
-                },
-            );
-
-            let mut delivered = false;
-            let mut cold_revived = false;
-            let mut terminal_err: Option<String> = None;
-
-            if self.has_live_transport(&session_id) {
-                terminal_err = self.flush_session(&session_id).await;
-                let still_pending = {
-                    let db = self.node.db();
-                    db.local()
-                        .get_mailbox_entry(&receipt)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|e| e.gate_state == GateState::Pending)
-                };
-                if !still_pending {
-                    delivered = true;
-                }
-            }
-
-            // Tier 4 Opt-In Cold Revival when no live transport delivered (or transport reported terminal unavailability).
-            if !delivered && (!self.has_live_transport(&session_id) || terminal_err.is_some()) {
-                // 4a. Codex CLI opt-in `--resume` revival when no live transport is attached.
-                let is_codex = session_id.starts_with("codex:")
-                    || backend_json.contains("\"codex\"");
-                if !self.has_live_transport(&session_id)
-                    && self.config.wakeup.codex_resume
-                    && is_codex
-                {
-                    let thread_id = session_id
-                        .strip_prefix("codex:")
-                        .unwrap_or(&session_id)
-                        .to_string();
-                    let codex_bin = self
-                        .config
-                        .codex_bin
-                        .as_deref()
-                        .unwrap_or(DEFAULT_CODEX_BIN);
-                    let target = CodexQueueTarget::new(thread_id)
-                        .with_bin(codex_bin.to_string())
-                        .with_resume(true);
-                    let transport = CodexQueueTransport::new(target);
-                    if transport
-                        .deliver(&formatted_text, PushMode::Queue)
-                        .await
-                        .is_delivered()
-                    {
-                        let db = self.node.db();
-                        let _ = db
-                            .local()
-                            .acknowledge_inbox(&session_id, &[receipt.as_str()], now);
-                        self.cancel_hold_retry(&session_id);
-                        delivered = true;
-                        cold_revived = true;
-                        terminal_err = None;
-                    }
-                }
-
-                // 4b. Allowlisted Herdr cold-spawn (`hc run <template> <prompt>`).
-                if !delivered {
-                    if let Some(ref tpl) = req.cold_revival_template {
-                        match self
-                            .try_herdr_cold_spawn(&req.wakeup_id, tpl, &formatted_text)
-                            .await
-                        {
-                            PushOutcome::Delivered => {
-                                let db = self.node.db();
-                                let _ = db.local().acknowledge_inbox(
-                                    &session_id,
-                                    &[receipt.as_str()],
-                                    now,
-                                );
-                                self.cancel_hold_retry(&session_id);
-                                delivered = true;
-                                cold_revived = true;
-                                terminal_err = None;
-                            }
-                            PushOutcome::Reject { reason, .. } => {
-                                terminal_err = Some(reason);
-                            }
-                            PushOutcome::Hold { .. } => {}
-                        }
-                    }
-                }
-            }
-
-            if req.is_persisted_wakeup {
-                let db = self.node.db();
-                let succeeded = terminal_err.is_none();
-                let _ = db.wakeups().record_delivery_result(
-                    &req.wakeup_id,
-                    succeeded,
-                    terminal_err.as_deref(),
-                    WakeupLimits::default().max_consecutive_failures,
-                    now,
-                );
-            }
-
-            if let Some(err) = terminal_err {
-                if req.cold_revival_template.is_some()
-                    && matches!(
-                        err.as_str(),
-                        "herdr_template_not_allowlisted"
-                            | "herdr_invalid_prompt"
-                            | "herdr_spawn_failed"
-                    )
-                {
-                    return Err(err);
-                }
-            }
-
-            return Ok(WakeupDeliveryOutcome {
-                delivered: true,
-                pushed: delivered,
-                session_id: Some(session_id),
-                receipt: Some(receipt),
-                missed_count: stored_missed,
-                cold_revived,
-                muted: false,
-            });
-        }
-
-        // 5. No live/registered target session resolved: try Tier 4 allowlisted Herdr cold-spawn!
-        if let Some(ref tpl) = req.cold_revival_template {
-            let outcome = self
-                .try_herdr_cold_spawn(&req.wakeup_id, tpl, &formatted_text)
-                .await;
-            return match outcome {
-                PushOutcome::Delivered => {
-                    if req.is_persisted_wakeup {
-                        let db = self.node.db();
-                        let _ = db.wakeups().record_delivery_result(
-                            &req.wakeup_id,
-                            true,
-                            None,
-                            WakeupLimits::default().max_consecutive_failures,
-                            now,
-                        );
-                    }
-                    Ok(WakeupDeliveryOutcome {
-                        delivered: true,
-                        pushed: true,
-                        session_id: None,
-                        receipt: None,
-                        missed_count: effective_missed,
-                        cold_revived: true,
-                        muted: false,
-                    })
-                }
-                PushOutcome::Hold { .. } => Ok(WakeupDeliveryOutcome {
-                    delivered: false,
-                    pushed: false,
-                    session_id: None,
-                    receipt: None,
-                    missed_count: effective_missed,
-                    cold_revived: false,
-                    muted: false,
-                }),
-                PushOutcome::Reject { reason, .. } => {
-                    if req.is_persisted_wakeup {
-                        let db = self.node.db();
-                        let _ = db.wakeups().record_delivery_result(
-                            &req.wakeup_id,
-                            false,
-                            Some(&reason),
-                            WakeupLimits::default().max_consecutive_failures,
-                            now,
-                        );
-                    }
-                    Err(reason)
-                }
-            };
-        }
-
-        // 6. Topic-only wakeup (no explicit session/handle) succeeded via `publish_event`.
-        if req.target_session_id.is_none() && req.target_handle.is_none() {
-            if req.is_persisted_wakeup {
-                let db = self.node.db();
-                let _ = db.wakeups().record_delivery_result(
-                    &req.wakeup_id,
-                    true,
-                    None,
-                    WakeupLimits::default().max_consecutive_failures,
-                    now,
-                );
-            }
-            return Ok(WakeupDeliveryOutcome {
-                delivered: true,
-                pushed: false,
-                session_id: None,
-                receipt: None,
-                missed_count: effective_missed,
-                cold_revived: false,
-                muted: false,
-            });
-        }
-
-        // 7. Targeted session/handle unavailable and no cold-revival configured -> record failure.
-        if req.is_persisted_wakeup {
-            let db = self.node.db();
-            let _ = db.wakeups().record_delivery_result(
-                &req.wakeup_id,
-                false,
-                Some("target_session_unavailable"),
-                WakeupLimits::default().max_consecutive_failures,
-                now,
-            );
-        }
-        Ok(WakeupDeliveryOutcome {
-            delivered: false,
-            pushed: false,
-            session_id: None,
-            receipt: None,
-            missed_count: effective_missed,
-            cold_revived: false,
-            muted: false,
-        })
     }
 
     fn has_plugins_capability(&self) -> bool {
@@ -1987,7 +1385,8 @@ impl LocalDaemonInner {
                     .flatten()
                     .is_some()
             };
-            let mut gate_downgraded = false;
+            let mut gate_downgraded =
+                entry.gate_reason.as_deref() == Some("downgraded_to_notify");
             if entry.reviewed_at.is_none() && !already_human_verified {
                 if let Some(ref pipeline) = self.gate {
                     let parsed = hyp_node::delivery::ParsedMailboxSource::from_entry(&entry);
@@ -2027,7 +1426,7 @@ impl LocalDaemonInner {
                             GateDecision::Allow {
                                 downgraded_to_notify,
                             } => {
-                                gate_downgraded = downgraded_to_notify;
+                                gate_downgraded = gate_downgraded || downgraded_to_notify;
                                 // If pipeline shares the same SQLite DB and inserted a duplicate `gate:` row,
                                 // dismiss the duplicate so we keep exactly one row (`entry.receipt`).
                                 if let Some(dup_receipt) = eval.receipt {
@@ -2562,7 +1961,6 @@ impl LocalDaemonInner {
             "hyp_subscriptions" => self.tool_subscriptions(session_id).await,
             "hyp_topics" => self.tool_topics(args).await,
             "hyp_kv" => self.tool_kv(args).await,
-            "hyp_wakeup" => self.tool_wakeup(session_id, args).await,
             "hyp_bridge" => self.tool_bridge(session_id, args).await,
             "hyp_plugin_targets" => self.tool_bridge_targets(session_id).await,
             "hyp_bridge_link" => self.tool_bridge_link(session_id, args).await,
@@ -2620,6 +2018,53 @@ impl LocalDaemonInner {
                 ));
             }
         };
+
+        let draft: Option<&str> = match args.get("draft") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.as_str()),
+            Some(_) => {
+                return Err(("invalid_request".into(), "Expected string 'draft'".into()));
+            }
+        };
+        let context: Option<&str> = match args.get("context") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.as_str()),
+            Some(_) => {
+                return Err(("invalid_request".into(), "Expected string 'context'".into()));
+            }
+        };
+
+        // Fail-closed security invariant #1: secrets MUST NEVER carry draft/context prefill.
+        if kind == "secret" && (draft.is_some() || context.is_some()) {
+            return Err((
+                "invalid_request".into(),
+                "Draft prefill is forbidden for secret drops; secrets must be entered fresh by the human"
+                    .into(),
+            ));
+        }
+        if draft.is_none() && context.is_some() {
+            return Err((
+                "invalid_request".into(),
+                "Optional 'context' requires 'draft' for encrypted directive prefill".into(),
+            ));
+        }
+        if let Some(draft_text) = draft {
+            validate_draft_text(draft_text)
+                .map_err(|e| ("invalid_request".into(), e.to_string()))?;
+            if let Some(ctx_text) = context {
+                validate_draft_text(ctx_text)
+                    .map_err(|e| ("invalid_request".into(), e.to_string()))?;
+                let ctx_chars = ctx_text.chars().count();
+                if ctx_chars > MAX_HUMAN_DRAFT_CONTEXT_CHARS {
+                    return Err((
+                        "invalid_request".into(),
+                        format!(
+                            "human draft context length {ctx_chars} exceeds maximum {MAX_HUMAN_DRAFT_CONTEXT_CHARS} chars"
+                        ),
+                    ));
+                }
+            }
+        }
 
         let secret_name: Option<String> = if kind == "secret" {
             let raw_name = args
@@ -2692,7 +2137,13 @@ impl LocalDaemonInner {
         let enc_jwk = self.node.identity().encryption_jwk();
         let enc_kid = self.node.identity().encryption.kid();
 
-        let (node_cert_hcert1, hint_human_id, hint_prf_salt, hint_auth_epoch) = {
+        let (
+            node_cert_hcert1,
+            mut hint_human_id,
+            mut hint_prf_salt,
+            mut hint_auth_epoch,
+            min_epoch,
+        ) = {
             let db = self.node.db();
             let min_epoch = db.human().min_auth_epoch().unwrap_or(1);
             let cert_rec = db
@@ -2737,7 +2188,80 @@ impl LocalDaemonInner {
             let human_id = hint.as_ref().map(|a| a.human_id.clone());
             let prf_salt = hint.as_ref().and_then(|a| a.prf_salt.clone());
             let auth_epoch = hint.as_ref().map(|a| a.auth_epoch.max(min_epoch));
-            (encoded_cert, human_id, prf_salt, auth_epoch)
+            (encoded_cert, human_id, prf_salt, auth_epoch, min_epoch)
+        };
+
+        // Fail-closed security invariant #2: encrypt `draft` to the human's Passkey X25519 key
+        // (`encDraft` ONLY — NEVER downgrade to plaintext `draft` or `proposedText`!).
+        let encrypted_draft: Option<EncryptedHumanDraftV1> = if let Some(draft_text) = draft {
+            let enc_authority = {
+                let db = self.node.db();
+                match hint_human_id.as_deref() {
+                    Some(hid) => match db
+                        .human()
+                        .get_preferred_human_enc_jwk(Some(hid))
+                        .map_err(store_err_tuple)?
+                    {
+                        Some(found) => Some(found),
+                        None => db
+                            .human()
+                            .get_preferred_human_enc_jwk(None)
+                            .map_err(store_err_tuple)?,
+                    },
+                    None => db
+                        .human()
+                        .get_preferred_human_enc_jwk(None)
+                        .map_err(store_err_tuple)?,
+                }
+            };
+
+            let Some(auth_rec) = enc_authority else {
+                return Err((
+                    "human_enc_key_missing".into(),
+                    "No human X25519 encryption key enrolled for encrypted draft prefill; re-enroll via `hyp auth init --web` or omit `draft` for fresh input"
+                        .into(),
+                ));
+            };
+            let Some(ref raw_enc_jwk) = auth_rec.enc_jwk_json else {
+                return Err((
+                    "human_enc_key_missing".into(),
+                    "No human X25519 encryption key enrolled for encrypted draft prefill; re-enroll via `hyp auth init --web` or omit `draft` for fresh input"
+                        .into(),
+                ));
+            };
+
+            let parsed_jwk: CryptoOkpJwk = serde_json::from_str(raw_enc_jwk).map_err(|e| {
+                (
+                    "human_enc_key_invalid".into(),
+                    format!("Stored human encryption JWK is invalid: {e}"),
+                )
+            })?;
+            let human_enc_pk = parsed_jwk.to_x25519().map_err(|e| {
+                (
+                    "human_enc_key_invalid".into(),
+                    format!("Stored human encryption JWK is not a valid X25519 public key: {e}"),
+                )
+            })?;
+
+            // Keep fragment Passkey PRF hints aligned with the authority whose X25519 key sealed `encDraft`.
+            hint_human_id = Some(auth_rec.human_id.clone());
+            if auth_rec.prf_salt.is_some() {
+                hint_prf_salt = auth_rec.prf_salt.clone();
+            }
+            hint_auth_epoch = Some(auth_rec.auth_epoch.max(min_epoch));
+
+            let payload = HumanDraftPayloadV1 {
+                v: 1,
+                node_id: node_id.to_string(),
+                text: draft_text.to_string(),
+                context: context.map(ToString::to_string),
+                created_at: format_rfc3339_millis(now),
+            };
+            let sealed = seal_human_draft(&payload, &human_enc_pk)
+                .map_err(|e| ("invalid_request".into(), e.to_string()))?;
+            Some(sealed)
+        } else {
+            None
         };
 
         let explicit_relay = args
@@ -2880,7 +2404,8 @@ impl LocalDaemonInner {
         let expires_at = format_rfc3339_millis(expires_at_ms);
 
         // Build URL fragment matching `site/drop/drop.js` `parseFragmentString` bit-for-bit!
-        // Security invariant: NEVER include `proposedText` or `body` — fresh human input only.
+        // Security invariant: NEVER include plaintext `draft`, `proposedText`, or `body` —
+        // directive prefill uses HPKE-encrypted `encDraft` ONLY.
         let mut frag = Map::new();
         frag.insert("v".into(), json!(1));
         frag.insert("kind".into(), json!(kind));
@@ -2912,6 +2437,12 @@ impl LocalDaemonInner {
         if let Some(ep) = hint_auth_epoch {
             frag.insert("authEpoch".into(), json!(ep));
         }
+        if let Some(ref enc_draft) = encrypted_draft {
+            let draft_val = serde_json::to_value(enc_draft).map_err(|e| {
+                ("internal_error".into(), format!("serialize encDraft: {e}"))
+            })?;
+            frag.insert("encDraft".into(), draft_val);
+        }
         if let Some((ref relay_url, ref drop_id, ref post_cap)) = relay_meta {
             frag.insert("relay".into(), json!(relay_url));
             frag.insert("dropId".into(), json!(drop_id));
@@ -2937,6 +2468,7 @@ impl LocalDaemonInner {
         out.insert("nodeId".into(), json!(node_id));
         out.insert("encKid".into(), json!(enc_kid));
         out.insert("hasNodeCert".into(), json!(node_cert_hcert1.is_some()));
+        out.insert("hasEncryptedDraft".into(), json!(encrypted_draft.is_some()));
         out.insert("expiresAt".into(), json!(expires_at));
         out.insert("expiresAtMs".into(), json!(expires_at_ms));
         if let Some((relay_url, drop_id, _)) = relay_meta {
@@ -3066,12 +2598,8 @@ impl LocalDaemonInner {
 
     async fn tool_leave(&self, session_id: &str) -> Result<Value, (String, String)> {
         let now = now_ms();
-        let (left, cancelled_wakeups) = {
+        let left = {
             let db = self.node.db();
-            let cancelled = db
-                .wakeups()
-                .cancel_owned_by_session(session_id, now)
-                .unwrap_or(0);
             let prev = db
                 .local()
                 .get_session(session_id)
@@ -3082,14 +2610,11 @@ impl LocalDaemonInner {
                 let _ = db
                     .messages()
                     .remove_handle(self.node.node_id().as_str(), &handle, now);
-                (true, cancelled)
+                true
             } else {
-                (false, cancelled)
+                false
             }
         };
-        if cancelled_wakeups > 0 {
-            self.node.wake_scheduler();
-        }
         self.cancel_hold_retry(session_id);
         Ok(json!({ "left": left }))
     }
@@ -3786,7 +3311,11 @@ impl LocalDaemonInner {
             .and_then(Value::as_u64)
             .unwrap_or(0)
             .min(600) as u32;
-        let urgency = match args.get("mode").and_then(Value::as_str) {
+        let urgency = match args
+            .get("mode")
+            .or_else(|| args.get("urgency"))
+            .and_then(Value::as_str)
+        {
             Some(raw) => DeliveryUrgency::parse(raw).map_err(delivery_err_tuple)?,
             None => DeliveryUrgency::Queue,
         };
@@ -4050,260 +3579,6 @@ impl LocalDaemonInner {
             other => Err((
                 "invalid_request".into(),
                 format!("Unsupported hyp_kv action '{other}'"),
-            )),
-        }
-    }
-
-    async fn tool_wakeup(
-        self: &Arc<Self>,
-        session_id: &str,
-        args: &Map<String, Value>,
-    ) -> Result<Value, (String, String)> {
-        if !self.config.wakeup.enabled {
-            return Err((
-                "wakeup_disabled".into(),
-                "Wakeup scheduler is disabled. Enable it via `hyp wakeup enable` or node.json."
-                    .into(),
-            ));
-        }
-
-        let action = args
-            .get("action")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                (
-                    "invalid_request".into(),
-                    "Expected hyp_wakeup action: set | list | cancel | fire".into(),
-                )
-            })?;
-
-        let now = now_ms();
-        match action {
-            "set" => {
-                let label = match args.get("label") {
-                    Some(v) => v
-                        .as_str()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .ok_or_else(|| {
-                            ("invalid_request".into(), "Expected non-empty 'label'".into())
-                        })?
-                        .to_string(),
-                    None => "wakeup".to_string(),
-                };
-                let note = args
-                    .get("note")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.trim().is_empty())
-                    .ok_or_else(|| ("invalid_request".into(), "Expected non-empty 'note'".into()))?
-                    .to_string();
-
-                let (target_session_id, target_handle) = match args
-                    .get("to")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    Some(raw_to) => {
-                        let local_handle =
-                            resolve_local_wakeup_target(raw_to, self.node.node_id().as_str())?;
-                        (None, Some(local_handle))
-                    }
-                    None => (Some(session_id.to_string()), None),
-                };
-
-                let parsed = parse_wakeup_schedule_args(args, true, now)?;
-                let urgency = parse_wakeup_urgency_arg(args)?;
-                let ttl_ms = parse_wakeup_ttl_ms_arg(args, true)?;
-                let coalesce = args
-                    .get("coalesce")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true);
-                let id = args
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(ToString::to_string);
-
-                let insert = WakeupInsert {
-                    id,
-                    owner_session_id: Some(session_id.to_string()),
-                    target_session_id,
-                    target_handle,
-                    target_topic: None,
-                    label,
-                    note,
-                    trigger_kind: parsed.trigger_kind,
-                    cron_expr: parsed.cron_expr,
-                    timezone: parsed.timezone,
-                    exact_timing: parsed.exact_timing,
-                    urgency,
-                    ttl_ms,
-                    coalesce,
-                    fire_at: parsed.fire_at,
-                    max_iterations: parsed.max_iterations,
-                    // Agents are NEVER permitted to specify cold-revival launch templates via MCP.
-                    cold_revival_template: None,
-                };
-
-                let rec = {
-                    let db = self.node.db();
-                    db.wakeups()
-                        .create_wakeup(&insert, &WakeupLimits::default(), now)
-                        .map_err(wakeup_store_err_tuple)?
-                };
-                self.node.wake_scheduler();
-                Ok(wakeup_record_to_json(&rec))
-            }
-            "list" => {
-                let state_filter = match args.get("state").and_then(Value::as_str) {
-                    None | Some("all") => None,
-                    Some(s) => Some(WakeupState::parse(s).map_err(wakeup_store_err_tuple)?),
-                };
-                let wakeups = {
-                    let db = self.node.db();
-                    let session_handle = db
-                        .local()
-                        .get_session(session_id)
-                        .ok()
-                        .flatten()
-                        .and_then(|s| s.handle);
-                    db.wakeups()
-                        .list_wakeups(None, state_filter)
-                        .map_err(wakeup_store_err_tuple)?
-                        .into_iter()
-                        .filter(|w| {
-                            w.owner_session_id.as_deref() == Some(session_id)
-                                || w.target_session_id.as_deref() == Some(session_id)
-                                || (session_handle.is_some()
-                                    && w.target_handle.as_deref() == session_handle.as_deref())
-                        })
-                        .map(|w| wakeup_record_to_json(&w))
-                        .collect::<Vec<_>>()
-                };
-                Ok(json!({ "wakeups": wakeups }))
-            }
-            "cancel" => {
-                let id = args
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| ("invalid_request".into(), "Expected wakeup 'id'".into()))?;
-                let rec = {
-                    let db = self.node.db();
-                    db.wakeups()
-                        .cancel_wakeup(id, Some(session_id), now)
-                        .map_err(wakeup_store_err_tuple)?
-                };
-                self.node.wake_scheduler();
-                Ok(json!({
-                    "cancelled": true,
-                    "id": rec.id,
-                    "state": rec.state.as_str(),
-                }))
-            }
-            "fire" => {
-                let label = args
-                    .get("label")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("wakeup")
-                    .to_string();
-                let note = args
-                    .get("note")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.trim().is_empty())
-                    .ok_or_else(|| ("invalid_request".into(), "Expected non-empty 'note'".into()))?
-                    .to_string();
-                let limits = WakeupLimits::default();
-                if note.len() > limits.max_note_bytes {
-                    return Err((
-                        "invalid_request".into(),
-                        format!(
-                            "wakeup note is {} bytes; limit {}",
-                            note.len(),
-                            limits.max_note_bytes
-                        ),
-                    ));
-                }
-
-                let (target_session_id, target_handle) = match args
-                    .get("to")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    Some(raw_to) => {
-                        let local_handle =
-                            resolve_local_wakeup_target(raw_to, self.node.node_id().as_str())?;
-                        (None, Some(local_handle))
-                    }
-                    None => (Some(session_id.to_string()), None),
-                };
-
-                let urgency = parse_wakeup_urgency_arg(args)?;
-                let ttl_ms = parse_wakeup_ttl_ms_arg(args, true)?;
-                let wakeup_id = args
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| format!("wk-agent-{}", uuid_v4()));
-                let coalesce_key = args
-                    .get("coalesceKey")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(ToString::to_string)
-                    .or_else(|| {
-                        if args.get("coalesce").and_then(Value::as_bool) == Some(true) {
-                            Some(format!("wakeup:{wakeup_id}"))
-                        } else {
-                            None
-                        }
-                    });
-
-                let outcome = self
-                    .deliver_wakeup_internal(WakeupDeliveryRequest {
-                        wakeup_id: wakeup_id.clone(),
-                        label,
-                        note,
-                        trigger: "agent".to_string(),
-                        urgency,
-                        target_session_id,
-                        target_handle,
-                        target_topic: None,
-                        coalesce_key,
-                        ttl_ms: Some(ttl_ms),
-                        scheduled_for_ms: now,
-                        fired_at_ms: now,
-                        iteration: 1,
-                        max_iterations: Some(1),
-                        missed_count: 0,
-                        cold_revival_template: None,
-                        is_external: false,
-                        is_persisted_wakeup: false,
-                    })
-                    .await
-                    .map_err(|msg| ("wakeup_delivery_failed".into(), msg))?;
-
-                Ok(json!({
-                    "fired": true,
-                    "wakeupId": wakeup_id,
-                    "sessionId": outcome.session_id,
-                    "delivered": outcome.delivered,
-                    "pushed": outcome.pushed,
-                    "missedCount": outcome.missed_count,
-                    "receipt": outcome.receipt,
-                }))
-            }
-            other => Err((
-                "invalid_request".into(),
-                format!("Unsupported hyp_wakeup action '{other}'"),
             )),
         }
     }
@@ -4922,31 +4197,6 @@ async fn handle_connection<R, W>(
                         .await;
                         break;
                     }
-                    "wakeup.set" => {
-                        let resp = handle_wakeup_set_rpc(&daemon, &packet).await;
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "wakeup.list" => {
-                        let resp = handle_wakeup_list_rpc(&daemon, &packet);
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "wakeup.cancel" => {
-                        let resp = handle_wakeup_cancel_rpc(&daemon, &packet);
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "wakeup.fire" => {
-                        let resp = handle_wakeup_fire_rpc(&daemon, &packet).await;
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "wakeup.emit" => {
-                        let resp = handle_wakeup_emit_rpc(&daemon, &packet).await;
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
                     "drop.ingest" => {
                         let resp = handle_drop_ingest_rpc(&daemon, &packet).await;
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
@@ -5078,13 +4328,11 @@ async fn handle_connection<R, W>(
                     }
                     "mcp.caps" => {
                         if let Some(req_id) = packet.get("id").and_then(Value::as_u64) {
-                            let backend = mcp_ctx.as_ref().and_then(|c| c.backend);
                             let resp = json!({
                                 "id": req_id,
                                 "result": {
                                     "hasPlugins": daemon.has_plugins_capability(),
                                     "hasKv": daemon.has_kv_capability(),
-                                    "hasWakeup": daemon.has_wakeup_capability(backend),
                                 }
                             });
                             if write_ndjson_line_async(&mut write_half, &resp).await.is_err() {
@@ -5472,7 +4720,9 @@ fn maybe_spawn_transport_probe(
                     .unwrap_or(DEFAULT_CODEX_BIN);
                 let mut target = CodexQueueTarget::new(thread_id.clone())
                     .with_bin(codex_bin.to_string())
-                    .with_resume(hints.codex_resume);
+                    .with_resume(
+                        hints.codex_resume || daemon_arc.config.delivery_retry.codex_resume,
+                    );
                 if let Some(ref home) = hints.codex_home {
                     target = target.with_codex_home(home.clone());
                 }
@@ -5797,759 +5047,6 @@ fn delivery_err_tuple(err: hyp_node::delivery::DeliveryError) -> (String, String
     ("delivery_error".into(), err.to_string())
 }
 
-fn wakeup_store_err_tuple(err: StoreError) -> (String, String) {
-    match err {
-        StoreError::QuotaExceeded(msg) => ("wakeup_quota_exceeded".into(), msg),
-        StoreError::Unauthorized(msg) => ("forbidden".into(), msg),
-        StoreError::NotFound(msg) => ("not_found".into(), msg),
-        StoreError::IdConflict(msg) => ("id_conflict".into(), msg),
-        StoreError::InvalidState(msg) => ("invalid_state".into(), msg),
-        StoreError::InvalidInput(msg) | StoreError::TooLarge(msg) => ("invalid_request".into(), msg),
-        other => ("store_error".into(), other.to_string()),
-    }
-}
-
-struct WakeupDeliveryRequest {
-    wakeup_id: String,
-    label: String,
-    note: String,
-    trigger: String,
-    urgency: WakeupUrgency,
-    target_session_id: Option<String>,
-    target_handle: Option<String>,
-    target_topic: Option<String>,
-    coalesce_key: Option<String>,
-    ttl_ms: Option<i64>,
-    scheduled_for_ms: i64,
-    fired_at_ms: i64,
-    iteration: u64,
-    max_iterations: Option<u64>,
-    missed_count: u64,
-    cold_revival_template: Option<String>,
-    is_external: bool,
-    is_persisted_wakeup: bool,
-}
-
-struct WakeupDeliveryOutcome {
-    delivered: bool,
-    pushed: bool,
-    session_id: Option<String>,
-    receipt: Option<String>,
-    missed_count: u64,
-    cold_revived: bool,
-    muted: bool,
-}
-
-struct ParsedWakeupSchedule {
-    trigger_kind: WakeupTriggerKind,
-    cron_expr: Option<String>,
-    fire_at: Option<i64>,
-    timezone: CronTimezone,
-    exact_timing: bool,
-    max_iterations: Option<u64>,
-}
-
-fn format_wakeup_text(
-    wakeup_id: &str,
-    trigger: &str,
-    label: &str,
-    iteration: u64,
-    max_iterations: Option<u64>,
-    missed_count: u64,
-    note: &str,
-) -> String {
-    let max_part = match max_iterations {
-        Some(max) => format!("/{max}"),
-        None => String::new(),
-    };
-    let safe_label = label.replace(['\r', '\n', '"'], " ");
-    format!(
-        "{UNTRUSTED_PROVENANCE}\n[wakeup:{wakeup_id} trigger={trigger} label=\"{safe_label}\" iter={iteration}{max_part} missed={missed_count}]\n{note}"
-    )
-}
-
-fn build_wakeup_cloudevent(
-    node_id: &str,
-    req: &WakeupDeliveryRequest,
-    resolved_session_id: Option<&str>,
-    missed_count: u64,
-    expires_at: Option<i64>,
-) -> ProtoCloudEvent {
-    let mut extensions = BTreeMap::new();
-    extensions.insert("hyphaetrigger".into(), Value::String(req.trigger.clone()));
-    extensions.insert(
-        "hyphaeurgency".into(),
-        Value::String(req.urgency.as_str().to_string()),
-    );
-    let safe_wk_id: String = req.wakeup_id.chars().take(128).collect();
-    extensions.insert("hyphaewakeupid".into(), Value::String(safe_wk_id));
-
-    ProtoCloudEvent {
-        specversion: "1.0".into(),
-        id: format!("wkp_{}", uuid_v4()),
-        source: format!("hyphae://{node_id}/wakeup/{}", req.trigger),
-        event_type: "to.hyphae.wakeup.v1".into(),
-        datacontenttype: Some(CONTENT_TYPE_JSON.into()),
-        dataschema: None,
-        subject: Some(format!("wakeup/{}", req.label)),
-        time: Some(epoch_ms_to_rfc3339(req.fired_at_ms)),
-        data: Some(json!({
-            "wakeupId": req.wakeup_id,
-            "label": req.label,
-            "note": req.note,
-            "targetSession": resolved_session_id.or(req.target_session_id.as_deref()),
-            "targetHandle": req.target_handle,
-            "targetTopic": req.target_topic,
-            "urgency": req.urgency.as_str(),
-            "trigger": req.trigger,
-            "scheduledFor": epoch_ms_to_rfc3339(req.scheduled_for_ms),
-            "firedAt": epoch_ms_to_rfc3339(req.fired_at_ms),
-            "iteration": req.iteration,
-            "maxIterations": req.max_iterations,
-            "missedCount": missed_count,
-            "expiresAt": expires_at.map(epoch_ms_to_rfc3339),
-            "untrusted": true,
-        })),
-        data_base64: None,
-        extensions,
-    }
-}
-
-fn resolve_local_wakeup_target(
-    raw_to: &str,
-    local_node_id: &str,
-) -> Result<String, (String, String)> {
-    let trimmed = raw_to.trim();
-    let stripped = trimmed.strip_prefix('@').unwrap_or(trimmed);
-    if stripped.is_empty() {
-        return Err(("invalid_request".into(), "Expected non-empty target 'to'".into()));
-    }
-    if stripped.starts_with('#') || stripped.contains(':') {
-        return Err((
-            "invalid_request".into(),
-            format!("Wakeup target '{raw_to}' must be a local handle, not a channel or bridge"),
-        ));
-    }
-    if stripped.contains('/') {
-        let Some((node_part, handle_part)) = parse_address(stripped) else {
-            return Err((
-                "remote_target_forbidden".into(),
-                format!("Wakeup target '{raw_to}' is not a valid local handle"),
-            ));
-        };
-        if node_part != "local" && node_part != local_node_id {
-            return Err((
-                "remote_target_forbidden".into(),
-                format!(
-                    "Cross-node wakeup target '{raw_to}' is not permitted; use hyp_send for remote peers"
-                ),
-            ));
-        }
-        return Ok(handle_part.to_string());
-    }
-    if !hyp_store::is_handle(stripped) {
-        return Err((
-            "invalid_request".into(),
-            format!("Invalid local handle '{raw_to}'"),
-        ));
-    }
-    Ok(stripped.to_string())
-}
-
-fn parse_wakeup_urgency_arg(args: &Map<String, Value>) -> Result<WakeupUrgency, (String, String)> {
-    match args.get("urgency").and_then(Value::as_str) {
-        None => Ok(WakeupUrgency::Queue),
-        Some(raw) => WakeupUrgency::parse(raw).map_err(wakeup_store_err_tuple),
-    }
-}
-
-fn parse_wakeup_ttl_ms_arg(
-    args: &Map<String, Value>,
-    enforce_mcp_bounds: bool,
-) -> Result<i64, (String, String)> {
-    let Some(raw) = args.get("ttlSeconds") else {
-        return Ok(DEFAULT_WAKEUP_TTL_MS);
-    };
-    if raw.is_null() {
-        return Ok(DEFAULT_WAKEUP_TTL_MS);
-    }
-    let secs = raw.as_i64().ok_or_else(|| {
-        (
-            "invalid_request".into(),
-            "Expected integer 'ttlSeconds'".into(),
-        )
-    })?;
-    if enforce_mcp_bounds && !(30..=86_400).contains(&secs) {
-        return Err((
-            "invalid_request".into(),
-            format!("ttlSeconds ({secs}) must be between 30 and 86400"),
-        ));
-    }
-    if secs < 1 {
-        return Err((
-            "invalid_request".into(),
-            "ttlSeconds must be >= 1".into(),
-        ));
-    }
-    Ok(secs.saturating_mul(1000))
-}
-
-fn parse_wakeup_schedule_args(
-    args: &Map<String, Value>,
-    is_agent: bool,
-    now: i64,
-) -> Result<ParsedWakeupSchedule, (String, String)> {
-    let in_seconds_val = args.get("inSeconds").filter(|v| !v.is_null());
-    let at_val = args.get("at").filter(|v| !v.is_null());
-    let cron_val = args.get("cron").filter(|v| !v.is_null());
-
-    let provided_count = usize::from(in_seconds_val.is_some())
-        + usize::from(at_val.is_some())
-        + usize::from(cron_val.is_some());
-    if provided_count != 1 {
-        return Err((
-            "invalid_request".into(),
-            "Specify exactly one of 'inSeconds', 'at', or 'cron'".into(),
-        ));
-    }
-
-    let timezone = match args.get("timezone").and_then(Value::as_str) {
-        None => CronTimezone::Local,
-        Some(tz) => CronTimezone::parse(tz).map_err(|e| ("invalid_request".into(), e.to_string()))?,
-    };
-    let exact_timing = args.get("exact").and_then(Value::as_bool).unwrap_or(false);
-
-    if let Some(secs_v) = in_seconds_val {
-        let secs = secs_v.as_i64().ok_or_else(|| {
-            (
-                "invalid_request".into(),
-                "Expected integer 'inSeconds'".into(),
-            )
-        })?;
-        let min_secs = if is_agent { 5 } else { 1 };
-        if !(min_secs..=2_592_000).contains(&secs) {
-            return Err((
-                "invalid_request".into(),
-                format!("inSeconds ({secs}) must be between {min_secs} and 2592000"),
-            ));
-        }
-        return Ok(ParsedWakeupSchedule {
-            trigger_kind: WakeupTriggerKind::Timer,
-            cron_expr: None,
-            fire_at: Some(now.saturating_add(secs.saturating_mul(1000))),
-            timezone,
-            exact_timing,
-            max_iterations: Some(1),
-        });
-    }
-
-    if let Some(at_v) = at_val {
-        let at_str = at_v.as_str().ok_or_else(|| {
-            (
-                "invalid_request".into(),
-                "Expected RFC 3339 string for 'at'".into(),
-            )
-        })?;
-        let nanos = parse_rfc3339_utc_nanos(at_str).ok_or_else(|| {
-            (
-                "invalid_request".into(),
-                format!("Invalid RFC 3339 timestamp '{at_str}'"),
-            )
-        })?;
-        let fire_at_ms = i64::try_from(nanos.div_euclid(1_000_000))
-            .map_err(|_| ("invalid_request".into(), "Timestamp out of range".into()))?;
-        return Ok(ParsedWakeupSchedule {
-            trigger_kind: WakeupTriggerKind::Timer,
-            cron_expr: None,
-            fire_at: Some(fire_at_ms),
-            timezone,
-            exact_timing,
-            max_iterations: Some(1),
-        });
-    }
-
-    let cron_str = cron_val
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            (
-                "invalid_request".into(),
-                "Expected non-empty 5-field cron expression".into(),
-            )
-        })?;
-
-    let max_iterations = match args.get("maxIterations").filter(|v| !v.is_null()) {
-        Some(v) => {
-            let n = v.as_u64().ok_or_else(|| {
-                (
-                    "invalid_request".into(),
-                    "Expected positive integer 'maxIterations'".into(),
-                )
-            })?;
-            if n < 1 || (is_agent && n > 1000) {
-                return Err((
-                    "invalid_request".into(),
-                    format!("maxIterations ({n}) must be in 1..=1000"),
-                ));
-            }
-            Some(n)
-        }
-        None if is_agent => Some(100),
-        None => None,
-    };
-
-    Ok(ParsedWakeupSchedule {
-        trigger_kind: WakeupTriggerKind::Cron,
-        cron_expr: Some(cron_str.to_string()),
-        fire_at: None,
-        timezone,
-        exact_timing,
-        max_iterations,
-    })
-}
-
-fn wakeup_record_to_json(rec: &WakeupRecord) -> Value {
-    json!({
-        "id": rec.id,
-        "ownerSessionId": rec.owner_session_id,
-        "targetSessionId": rec.target_session_id,
-        "targetHandle": rec.target_handle,
-        "targetTopic": rec.target_topic,
-        "label": rec.label,
-        "note": rec.note,
-        "trigger": rec.trigger_kind.as_str(),
-        "cron": rec.cron_expr,
-        "timezone": rec.timezone.as_str(),
-        "exact": rec.exact_timing,
-        "urgency": rec.urgency.as_str(),
-        "ttlMs": rec.ttl_ms,
-        "coalesce": rec.coalesce,
-        "nextFireAt": rec.next_fire_at,
-        "nextFireAtRfc3339": epoch_ms_to_rfc3339(rec.next_fire_at),
-        "lastFiredAt": rec.last_fired_at,
-        "iteration": rec.iteration,
-        "maxIterations": rec.max_iterations,
-        "consecutiveFailures": rec.consecutive_failures,
-        "coldRevivalTemplate": rec.cold_revival_template,
-        "state": rec.state.as_str(),
-        "lastError": rec.last_error,
-    })
-}
-
-async fn handle_wakeup_set_rpc(
-    daemon: &Arc<LocalDaemonInner>,
-    packet: &Map<String, Value>,
-) -> Value {
-    if !daemon.config.wakeup.enabled {
-        return json!({ "ok": false, "error": "wakeup_disabled" });
-    }
-    let now = now_ms();
-
-    let label = packet
-        .get("label")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("wakeup")
-        .to_string();
-    let Some(note) = packet
-        .get("note")
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .map(ToString::to_string)
-    else {
-        return json!({ "ok": false, "error": "Expected non-empty 'note'" });
-    };
-
-    let owner_session_id = packet
-        .get("ownerSessionId")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string);
-    let target_session_id = packet
-        .get("targetSessionId")
-        .or_else(|| packet.get("sessionId"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string);
-    let target_handle = match packet
-        .get("targetHandle")
-        .or_else(|| packet.get("to"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        Some(raw) => match resolve_local_wakeup_target(raw, daemon.node.node_id().as_str()) {
-            Ok(h) => Some(h),
-            Err((code, msg)) => return json!({ "ok": false, "error": format!("{code}: {msg}") }),
-        },
-        None => None,
-    };
-    let target_topic = packet
-        .get("targetTopic")
-        .or_else(|| packet.get("topic"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string);
-
-    let cold_revival_template = match packet
-        .get("coldRevivalTemplate")
-        .or_else(|| packet.get("template"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        Some(tpl) => {
-            if !is_valid_herdr_template(tpl)
-                || !daemon
-                    .config
-                    .wakeup
-                    .herdr_spawn_allowlist
-                    .iter()
-                    .any(|a| a == tpl)
-            {
-                return json!({ "ok": false, "error": "herdr_template_not_allowlisted" });
-            }
-            Some(tpl.to_string())
-        }
-        None => None,
-    };
-
-    let parsed = match parse_wakeup_schedule_args(packet, owner_session_id.is_some(), now) {
-        Ok(p) => p,
-        Err((code, msg)) => return json!({ "ok": false, "error": format!("{code}: {msg}") }),
-    };
-    let urgency = match parse_wakeup_urgency_arg(packet) {
-        Ok(u) => u,
-        Err((code, msg)) => return json!({ "ok": false, "error": format!("{code}: {msg}") }),
-    };
-    let ttl_ms = match parse_wakeup_ttl_ms_arg(packet, false) {
-        Ok(t) => t,
-        Err((code, msg)) => return json!({ "ok": false, "error": format!("{code}: {msg}") }),
-    };
-    let coalesce = packet
-        .get("coalesce")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let id = packet
-        .get("id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string);
-
-    let insert = WakeupInsert {
-        id,
-        owner_session_id,
-        target_session_id,
-        target_handle,
-        target_topic,
-        label,
-        note,
-        trigger_kind: parsed.trigger_kind,
-        cron_expr: parsed.cron_expr,
-        timezone: parsed.timezone,
-        exact_timing: parsed.exact_timing,
-        urgency,
-        ttl_ms,
-        coalesce,
-        fire_at: parsed.fire_at,
-        max_iterations: parsed.max_iterations,
-        cold_revival_template,
-    };
-
-    let res = {
-        let db = daemon.node.db();
-        db.wakeups()
-            .create_wakeup(&insert, &WakeupLimits::default(), now)
-    };
-    match res {
-        Ok(rec) => {
-            daemon.node.wake_scheduler();
-            json!({ "ok": true, "result": wakeup_record_to_json(&rec) })
-        }
-        Err(err) => {
-            let (code, msg) = wakeup_store_err_tuple(err);
-            json!({ "ok": false, "error": format!("{code}: {msg}") })
-        }
-    }
-}
-
-fn handle_wakeup_list_rpc(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> Value {
-    let owner_filter = packet
-        .get("ownerSessionId")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let state_filter = match packet.get("state").and_then(Value::as_str) {
-        None | Some("all") => None,
-        Some(raw) => match WakeupState::parse(raw) {
-            Ok(s) => Some(s),
-            Err(e) => return json!({ "ok": false, "error": e.to_string() }),
-        },
-    };
-    let db = daemon.node.db();
-    match db.wakeups().list_wakeups(owner_filter, state_filter) {
-        Ok(list) => {
-            let items: Vec<Value> = list.iter().map(wakeup_record_to_json).collect();
-            json!({ "ok": true, "result": { "wakeups": items } })
-        }
-        Err(e) => json!({ "ok": false, "error": e.to_string() }),
-    }
-}
-
-fn handle_wakeup_cancel_rpc(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> Value {
-    let Some(id) = packet
-        .get("id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    else {
-        return json!({ "ok": false, "error": "Expected wakeup 'id'" });
-    };
-    let owner = packet
-        .get("ownerSessionId")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let res = {
-        let db = daemon.node.db();
-        db.wakeups().cancel_wakeup(id, owner, now_ms())
-    };
-    match res {
-        Ok(rec) => {
-            daemon.node.wake_scheduler();
-            json!({
-                "ok": true,
-                "result": {
-                    "cancelled": true,
-                    "wakeup": wakeup_record_to_json(&rec),
-                }
-            })
-        }
-        Err(err) => {
-            let (code, msg) = wakeup_store_err_tuple(err);
-            json!({ "ok": false, "error": format!("{code}: {msg}") })
-        }
-    }
-}
-
-async fn handle_wakeup_fire_rpc(
-    daemon: &Arc<LocalDaemonInner>,
-    packet: &Map<String, Value>,
-) -> Value {
-    if !daemon.config.wakeup.enabled {
-        return json!({ "ok": false, "error": "wakeup_disabled" });
-    }
-    execute_external_wakeup_payload(daemon, packet).await
-}
-
-async fn handle_wakeup_emit_rpc(
-    daemon: &Arc<LocalDaemonInner>,
-    packet: &Map<String, Value>,
-) -> Value {
-    if !daemon.config.wakeup.enabled {
-        return json!({ "ok": false, "error": "wakeup_disabled" });
-    }
-
-    // Accept either a nested CloudEvents v1.0 / compact object under `event` or `payload`,
-    // or fields directly at top-level of `packet`.
-    let source_obj = packet
-        .get("event")
-        .or_else(|| packet.get("payload"))
-        .and_then(Value::as_object)
-        .unwrap_or(packet);
-
-    // If it's a CloudEvents v1.0 envelope (`specversion == "1.0"` and `data` is an object),
-    // merge `data` fields with CloudEvents header fallbacks (`subject`, `hyphaeurgency`, `hyphaewakeupid`).
-    let mut normalized = Map::new();
-    if let Some(data_obj) = source_obj.get("data").and_then(Value::as_object) {
-        for (k, v) in data_obj {
-            normalized.insert(k.clone(), v.clone());
-        }
-        if !normalized.contains_key("label") {
-            if let Some(subj) = source_obj.get("subject").and_then(Value::as_str) {
-                let lbl = subj.strip_prefix("wakeup/").unwrap_or(subj);
-                if !lbl.is_empty() {
-                    normalized.insert("label".into(), json!(lbl));
-                }
-            }
-        }
-        if !normalized.contains_key("urgency") {
-            if let Some(u) = source_obj.get("hyphaeurgency").and_then(Value::as_str) {
-                normalized.insert("urgency".into(), json!(u));
-            }
-        }
-        if !normalized.contains_key("id") && !normalized.contains_key("wakeupId") {
-            if let Some(wid) = source_obj
-                .get("hyphaewakeupid")
-                .or_else(|| source_obj.get("id"))
-                .and_then(Value::as_str)
-            {
-                normalized.insert("id".into(), json!(wid));
-            }
-        }
-        if !normalized.contains_key("topic") && !normalized.contains_key("targetTopic") {
-            if let Some(topic) = packet.get("topic").and_then(Value::as_str) {
-                normalized.insert("topic".into(), json!(topic));
-            }
-        }
-    } else {
-        for (k, v) in source_obj {
-            normalized.insert(k.clone(), v.clone());
-        }
-    }
-
-    execute_external_wakeup_payload(daemon, &normalized).await
-}
-
-async fn execute_external_wakeup_payload(
-    daemon: &Arc<LocalDaemonInner>,
-    args: &Map<String, Value>,
-) -> Value {
-    let now = now_ms();
-    let Some(note) = args
-        .get("note")
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .map(ToString::to_string)
-    else {
-        return json!({ "ok": false, "error": "Expected non-empty 'note'" });
-    };
-    let limits = WakeupLimits::default();
-    if note.len() > limits.max_note_bytes {
-        return json!({
-            "ok": false,
-            "error": format!("wakeup note is {} bytes; limit {}", note.len(), limits.max_note_bytes)
-        });
-    }
-
-    let label = args
-        .get("label")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("external")
-        .to_string();
-
-    let target_session_id = args
-        .get("targetSessionId")
-        .or_else(|| args.get("targetSession"))
-        .or_else(|| args.get("sessionId"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string);
-    let target_handle = match args
-        .get("targetHandle")
-        .or_else(|| args.get("to"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        Some(raw) => match resolve_local_wakeup_target(raw, daemon.node.node_id().as_str()) {
-            Ok(h) => Some(h),
-            Err((code, msg)) => return json!({ "ok": false, "error": format!("{code}: {msg}") }),
-        },
-        None => None,
-    };
-    let target_topic = args
-        .get("targetTopic")
-        .or_else(|| args.get("topic"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string);
-
-    let cold_revival_template = args
-        .get("coldRevivalTemplate")
-        .or_else(|| args.get("template"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string);
-
-    if target_session_id.is_none()
-        && target_handle.is_none()
-        && target_topic.is_none()
-        && cold_revival_template.is_none()
-    {
-        return json!({
-            "ok": false,
-            "error": "Expected target ('to', 'sessionId', 'topic', or 'coldRevivalTemplate')"
-        });
-    }
-
-    let urgency = match parse_wakeup_urgency_arg(args) {
-        Ok(u) => u,
-        Err((code, msg)) => return json!({ "ok": false, "error": format!("{code}: {msg}") }),
-    };
-    let ttl_ms = match parse_wakeup_ttl_ms_arg(args, false) {
-        Ok(t) => t,
-        Err((code, msg)) => return json!({ "ok": false, "error": format!("{code}: {msg}") }),
-    };
-
-    let wakeup_id = args
-        .get("wakeupId")
-        .or_else(|| args.get("id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| format!("wk-ext-{}", uuid_v4()));
-
-    let coalesce_key = args
-        .get("coalesceKey")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string);
-
-    match daemon
-        .deliver_wakeup_internal(WakeupDeliveryRequest {
-            wakeup_id: wakeup_id.clone(),
-            label,
-            note,
-            trigger: "external".to_string(),
-            urgency,
-            target_session_id,
-            target_handle,
-            target_topic,
-            coalesce_key,
-            ttl_ms: Some(ttl_ms),
-            scheduled_for_ms: now,
-            fired_at_ms: now,
-            iteration: 1,
-            max_iterations: Some(1),
-            missed_count: 0,
-            cold_revival_template,
-            is_external: true,
-            is_persisted_wakeup: false,
-        })
-        .await
-    {
-        Ok(outcome) => json!({
-            "ok": true,
-            "result": {
-                "fired": true,
-                "wakeupId": wakeup_id,
-                "sessionId": outcome.session_id,
-                "delivered": outcome.delivered,
-                "pushed": outcome.pushed,
-                "coldRevived": outcome.cold_revived,
-                "muted": outcome.muted,
-                "missedCount": outcome.missed_count,
-                "receipt": outcome.receipt,
-            }
-        }),
-        Err(reason) => json!({ "ok": false, "error": reason }),
-    }
-}
-
 fn is_reserved_drop_secret_name(name: &str) -> bool {
     if is_reserved_secret_name(name) {
         return true;
@@ -6671,6 +5168,7 @@ async fn create_external_drop(
         .method(Method::POST)
         .uri(&url)
         .header(AUTHORIZATION, auth_header)
+        .header("X-Hyphae-Public-Key", node.identity().signing_jwk().x)
         .header(CONTENT_TYPE, CONTENT_TYPE_JSON)
         .body(full_body(body_bytes))
         .map_err(|e| ("drop_relay_error".into(), format!("build drop request: {e}")))?;
