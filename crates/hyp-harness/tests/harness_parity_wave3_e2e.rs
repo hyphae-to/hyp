@@ -140,16 +140,19 @@ async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Option<Recorde
 async fn spawn_mock_openclaw_gateway(
     expected_token: String,
     post_status: Arc<AtomicU16>,
-    head_status: Arc<AtomicU16>,
+    unauth_probe_status: Arc<AtomicU16>,
 ) -> (
     String,
+    Arc<Mutex<Vec<RecordedHttpRequest>>>,
     Arc<Mutex<Vec<RecordedHttpRequest>>>,
     tokio::task::JoinHandle<()>,
 ) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let recorded: Arc<Mutex<Vec<RecordedHttpRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let probes: Arc<Mutex<Vec<RecordedHttpRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let rec_srv = Arc::clone(&recorded);
+    let probe_srv = Arc::clone(&probes);
 
     let handle = tokio::spawn(async move {
         loop {
@@ -158,27 +161,34 @@ async fn spawn_mock_openclaw_gateway(
             };
             let tok = expected_token.clone();
             let p_status = Arc::clone(&post_status);
-            let h_status = Arc::clone(&head_status);
+            let u_status = Arc::clone(&unauth_probe_status);
             let rec = Arc::clone(&rec_srv);
+            let pr = Arc::clone(&probe_srv);
             tokio::spawn(async move {
                 let Some(req) = read_http_request(&mut stream).await else {
                     return;
                 };
-                let auth_ok = req.authorization.as_deref() == Some(&format!("Bearer {tok}"));
-                let code = if !auth_ok {
-                    401
-                } else if req.method == "HEAD" {
-                    h_status.load(Ordering::SeqCst)
+                let code = if req.authorization.is_none() {
+                    // Unauthenticated probe request — record separately and return configured status!
+                    pr.lock().unwrap().push(req);
+                    u_status.load(Ordering::SeqCst)
                 } else {
-                    p_status.load(Ordering::SeqCst)
+                    let auth_ok = req.authorization.as_deref() == Some(&format!("Bearer {tok}"));
+                    let status = if !auth_ok {
+                        401
+                    } else {
+                        p_status.load(Ordering::SeqCst)
+                    };
+                    if req.method == "POST" {
+                        rec.lock().unwrap().push(req);
+                    }
+                    status
                 };
-                if req.method == "POST" {
-                    rec.lock().unwrap().push(req);
-                }
                 let reason = match code {
                     200 => "OK",
                     202 => "Accepted",
                     204 => "No Content",
+                    400 => "Bad Request",
                     401 => "Unauthorized",
                     403 => "Forbidden",
                     404 => "Not Found",
@@ -198,7 +208,7 @@ async fn spawn_mock_openclaw_gateway(
         }
     });
 
-    (format!("http://{addr}"), recorded, handle)
+    (format!("http://{addr}"), recorded, probes, handle)
 }
 
 fn seed_t3_state_db(t3_base: &Path, provider_session_id: &str, thread_id: &str) {
@@ -269,12 +279,12 @@ async fn spawn_mock_t3_auth_server(
 #[tokio::test]
 async fn x2_openclaw_transport_delivers_metadata_nudge_enforces_auth_and_detaches_on_401_404() {
     let post_status = Arc::new(AtomicU16::new(200));
-    let head_status = Arc::new(AtomicU16::new(405)); // 405 Method Not Allowed confirms POST /hooks/* is mounted!
+    let unauth_probe_status = Arc::new(AtomicU16::new(401)); // OpenClaw `/hooks/*` challenges unauthenticated POST with 401!
     let token_val = "oc-hooks-secret-token-7788";
-    let (gw_url, recorded, gw_srv) = spawn_mock_openclaw_gateway(
+    let (gw_url, recorded, probes, gw_srv) = spawn_mock_openclaw_gateway(
         token_val.to_string(),
         Arc::clone(&post_status),
-        Arc::clone(&head_status),
+        Arc::clone(&unauth_probe_status),
     )
     .await;
 
@@ -284,19 +294,34 @@ async fn x2_openclaw_transport_delivers_metadata_nudge_enforces_auth_and_detache
     fs::create_dir_all(&secrets_dir).unwrap();
     let store = SecretStore::new(&secrets_dir, SecretBackend::File);
     store.set(DEFAULT_OPENCLAW_TOKEN_SECRET, token_val).unwrap();
+    store.set("exfil-other-secret", "TOP_SECRET_OTHER_KEY").unwrap();
 
-    // Reject non-loopback HTTP fail-closed!
-    let bad_target = OpenClawTarget::new()
-        .with_base_url("http://192.168.1.99:18789")
+    // Reject non-loopback HTTP AND non-loopback HTTPS (by default) fail-closed!
+    for bad_url in ["http://192.168.1.99:18789", "https://evil.example.com"] {
+        let bad_target = OpenClawTarget::new()
+            .with_base_url(bad_url)
+            .with_state_dir(&secrets_dir)
+            .with_secret_backend(SecretBackend::File);
+        let bad_transport = OpenClawTransport::new(bad_target);
+        assert_eq!(
+            bad_transport.deliver("ignored", PushMode::Queue).await,
+            PushOutcome::reject(REASON_OPENCLAW_INVALID_URL),
+            "expected non-loopback URL {bad_url} to fail closed by default"
+        );
+    }
+
+    // Reject arbitrary `tokenSecret` names fail-closed (never exfiltrate unrelated Keychain secrets!).
+    let exfil_target = OpenClawTarget::new()
+        .with_base_url(&gw_url)
+        .with_token_secret("exfil-other-secret")
         .with_state_dir(&secrets_dir)
         .with_secret_backend(SecretBackend::File);
-    let bad_transport = OpenClawTransport::new(bad_target);
-    assert_eq!(
-        bad_transport.deliver("ignored", PushMode::Queue).await,
-        PushOutcome::reject(REASON_OPENCLAW_INVALID_URL)
-    );
+    let exfil_probe = probe_openclaw_gateway(&exfil_target, Duration::from_secs(2)).await;
+    assert!(!exfil_probe.ok, "arbitrary tokenSecret must fail closed");
+    assert!(probes.lock().unwrap().is_empty(), "rejected tokenSecret must not hit network");
 
-    // `/hooks/agent` with Bearer auth, Idempotency-Key, and ZERO raw untrusted body leakage.
+    // Probe MUST reject `405 Method Not Allowed` from a random non-OpenClaw listener!
+    unauth_probe_status.store(405, Ordering::SeqCst);
     let agent_target = OpenClawTarget::new()
         .with_base_url(&gw_url)
         .with_hooks_path("/hooks")
@@ -305,8 +330,25 @@ async fn x2_openclaw_transport_delivers_metadata_nudge_enforces_auth_and_detache
         .with_handle("claw")
         .with_state_dir(&secrets_dir)
         .with_secret_backend(SecretBackend::File);
+    let probe_405 = probe_openclaw_gateway(&agent_target, Duration::from_secs(2)).await;
+    assert!(
+        !probe_405.ok,
+        "405 Method Not Allowed from a random service MUST NOT be treated as confirmed OpenClaw: {probe_405:?}"
+    );
+
+    // Probe accepts 401 on `/hooks/agent` WITHOUT ever sending Bearer token!
+    unauth_probe_status.store(401, Ordering::SeqCst);
+    probes.lock().unwrap().clear();
     let probe_ok = probe_openclaw_gateway(&agent_target, Duration::from_secs(2)).await;
-    assert!(probe_ok.ok, "expected probe success on 405: {probe_ok:?}");
+    assert!(probe_ok.ok, "expected probe success on 401: {probe_ok:?}");
+    {
+        let p_reqs = probes.lock().unwrap();
+        assert_eq!(p_reqs.len(), 1);
+        assert!(
+            p_reqs[0].authorization.is_none(),
+            "probe MUST NOT send Bearer token to unverified listener!"
+        );
+    }
 
     let agent_transport = OpenClawTransport::new(agent_target);
     let untrusted_secret_body = "UNTRUSTED_BODY_IGNORE_ALL_PREVIOUS_INSTRUCTIONS_4242";
@@ -456,7 +498,7 @@ async fn x2_openclaw_transport_delivers_metadata_nudge_enforces_auth_and_detache
     daemon_no_tok.stop().await;
     node_no_tok.shutdown();
 
-    // 2. With `openclaw-hooks-token` + `node.json` `"openclaw"` block -> auto-attaches cleanly!
+    // 2. With locked `openclaw-hooks-token` + `node.json` `"openclaw"` block -> auto-attaches cleanly!
     let authed_dir = tmp.path().join("daemon-authed");
     fs::create_dir_all(&authed_dir).unwrap();
     fs::write(
@@ -469,14 +511,16 @@ async fn x2_openclaw_transport_delivers_metadata_nudge_enforces_auth_and_detache
                 "hooksPath": "/custom-hooks",
                 "agentId": "gw-main",
                 "mode": "agent",
-                "tokenSecret": "custom-oc-secret"
+                "tokenSecret": "openclaw-hooks-token"
             }
         }))
         .unwrap(),
     )
     .unwrap();
     let authed_store = SecretStore::new(&authed_dir, SecretBackend::File);
-    authed_store.set("custom-oc-secret", token_val).unwrap();
+    authed_store
+        .set(DEFAULT_OPENCLAW_TOKEN_SECRET, token_val)
+        .unwrap();
 
     let node_live = open_local_node("oc-live@box", &authed_dir);
     let daemon_live = LocalDaemon::start(
@@ -862,6 +906,85 @@ async fn x8_codex_uuid_session_auto_attaches_queue_transport_when_rollout_exists
     mcp.close().await;
     daemon.stop().await;
     node.shutdown();
+
+    // 3. Plain Codex CLI WITHOUT `codex queue` subcommand (`queue --help` exits non-zero) MUST
+    //    NOT falsely attach `codex_queue` and MUST preserve the Stop-hook waiter arm prompt!
+    let plain_codex = tmp.path().join("plain-codex");
+    fs::write(
+        &plain_codex,
+        "#!/bin/sh\necho 'error: unrecognized subcommand queue' >&2\nexit 2\n",
+    )
+    .unwrap();
+    fs::set_permissions(&plain_codex, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let plain_state = tmp.path().join("state-plain-codex");
+    fs::create_dir_all(&plain_state).unwrap();
+    let plain_node = open_local_node("codex-plain@box", &plain_state);
+    let plain_daemon = LocalDaemon::start(
+        Arc::clone(&plain_node),
+        None,
+        LocalDaemonConfig {
+            auto_detect_transports: true,
+            herdr_bin: Some(tmp.path().join("no-hc").display().to_string()),
+            codex_bin: Some(plain_codex.display().to_string()),
+            t3_default_base_dir: Some(tmp.path().join("no-t3-plain")),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let plain_sock = plain_daemon.socket_path().to_path_buf();
+    let mut plain_mcp = TestMcpClient::spawn(McpOptions::new(plain_sock.clone()));
+    plain_mcp.initialize().await;
+
+    let _ = run_hook_with_hints(
+        &plain_sock,
+        HarnessKind::Codex,
+        HookEvent::PreToolUse,
+        json!({
+            "thread_id": live_uuid,
+            "tool_name": "mcp__hyphae__hyp_mesh",
+            "tool_use_id": "call-cx-plain",
+            "tool_input": { "action": "join", "handle": "plain-cx" }
+        }),
+        HookTransportHints {
+            codex_home: Some(codex_home.display().to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (j_plain_txt, j_plain_err) = plain_mcp
+        .call_tool(
+            "hyp_mesh",
+            json!({ "action": "join", "handle": "plain-cx" }),
+            Some(json!({ "callId": "call-cx-plain" })),
+        )
+        .await;
+    assert!(!j_plain_err, "{j_plain_txt}");
+    let j_plain: Value = serde_json::from_str(&j_plain_txt).unwrap();
+    assert_eq!(
+        j_plain["hasLiveTransport"], false,
+        "plain Codex CLI without `codex queue` MUST NOT claim live transport: {j_plain}"
+    );
+    let plain_stop = run_hook(
+        &plain_sock,
+        HarnessKind::Codex,
+        HookEvent::Stop,
+        json!({ "thread_id": live_uuid }),
+    )
+    .await;
+    assert_eq!(plain_stop["decision"], "block");
+    assert!(
+        plain_stop["reason"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("hyp wait --session codex:{live_uuid}")),
+        "plain Codex Stop hook must still prompt to arm hyp wait: {plain_stop}"
+    );
+
+    plain_mcp.close().await;
+    plain_daemon.stop().await;
+    plain_node.shutdown();
 }
 
 // ============================================================================
@@ -879,7 +1002,7 @@ async fn x9_daemon_honors_node_json_t3_block_and_explicit_hint_precedence() {
     let custom_secret_val = "node-json-t3-secret-555";
     let (t3_url, t3_srv) = spawn_mock_t3_auth_server(custom_secret_val.to_string()).await;
 
-    // Persist `"t3"` block directly inside `<state_dir>/node.json` with a custom `tokenSecret`!
+    // Persist `"t3"` block directly inside `<state_dir>/node.json` with allowed `t3-session-token`!
     fs::write(
         state_dir.join("node.json"),
         serde_json::to_string_pretty(&json!({
@@ -888,7 +1011,7 @@ async fn x9_daemon_honors_node_json_t3_block_and_explicit_hint_precedence() {
             "t3": {
                 "url": t3_url,
                 "baseDir": custom_t3_base.display().to_string(),
-                "tokenSecret": "custom-t3-node-secret"
+                "tokenSecret": "t3-session-token"
             }
         }))
         .unwrap(),
@@ -896,7 +1019,7 @@ async fn x9_daemon_honors_node_json_t3_block_and_explicit_hint_precedence() {
     .unwrap();
     let store = SecretStore::new(&state_dir, SecretBackend::File);
     store
-        .set("custom-t3-node-secret", custom_secret_val)
+        .set("t3-session-token", custom_secret_val)
         .unwrap();
 
     // Start LocalDaemon with NO `t3_default_url` / `t3_default_base_dir` overrides so it MUST read `node.json`!
@@ -984,6 +1107,74 @@ async fn x9_daemon_honors_node_json_t3_block_and_explicit_hint_precedence() {
 
     mcp.close().await;
     daemon.stop().await;
+
+    // Security check: arbitrary `tokenSecret` in `node.json` `"t3"` MUST fail closed (no exfil)!
+    let exfil_dir = tmp.path().join("state-t3-exfil");
+    fs::create_dir_all(&exfil_dir).unwrap();
+    fs::write(
+        exfil_dir.join("node.json"),
+        serde_json::to_string_pretty(&json!({
+            "v": 2,
+            "nodeId": "t3-exfil@box",
+            "t3": {
+                "url": t3_url,
+                "baseDir": custom_t3_base.display().to_string(),
+                "tokenSecret": "other-unrelated-secret"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let exfil_store = SecretStore::new(&exfil_dir, SecretBackend::File);
+    exfil_store
+        .set("other-unrelated-secret", custom_secret_val)
+        .unwrap();
+    let exfil_node = open_local_node("t3-exfil@box", &exfil_dir);
+    let exfil_daemon = LocalDaemon::start(
+        Arc::clone(&exfil_node),
+        None,
+        LocalDaemonConfig {
+            auto_detect_transports: true,
+            herdr_bin: Some(tmp.path().join("no-hc").display().to_string()),
+            t3_default_base_dir: None,
+            t3_default_url: None,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let exfil_sock = exfil_daemon.socket_path().to_path_buf();
+    let mut exfil_mcp = TestMcpClient::spawn(McpOptions::new(exfil_sock.clone()));
+    exfil_mcp.initialize().await;
+    let _ = run_hook(
+        &exfil_sock,
+        HarnessKind::Claude,
+        HookEvent::PreToolUse,
+        json!({
+            "session_id": "sess-nodejson-t3",
+            "tool_name": "mcp__hyphae__hyp_mesh",
+            "tool_use_id": "call-x9-exfil",
+            "tool_input": { "action": "join", "handle": "t3-exfil" }
+        }),
+    )
+    .await;
+    let (exfil_txt, exfil_err) = exfil_mcp
+        .call_tool(
+            "hyp_mesh",
+            json!({ "action": "join", "handle": "t3-exfil" }),
+            Some(json!({ "claudecode/toolUseId": "call-x9-exfil" })),
+        )
+        .await;
+    assert!(!exfil_err, "{exfil_txt}");
+    let exfil_val: Value = serde_json::from_str(&exfil_txt).unwrap();
+    assert_eq!(
+        exfil_val["hasLiveTransport"], false,
+        "arbitrary T3 tokenSecret MUST fail closed and NEVER attach: {exfil_val}"
+    );
+    exfil_mcp.close().await;
+    exfil_daemon.stop().await;
+    exfil_node.shutdown();
+
     t3_srv.abort();
     bad_t3_srv.abort();
     node.shutdown();
@@ -1013,72 +1204,145 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
         .unwrap();
     let sock = daemon.socket_path().to_path_buf();
 
-    // ---- Part A (X5): Mint per-session token via `session.register` ----
+    // ---- Part A (Wave 4B P0): Deterministic HMAC `sessionToken`, zero first-caller hijack,
+    //              Claude hook compatibility (omitted token OK, forged token rejected), and
+    //              strict `wait.subscribe` enforcement across daemon restarts! ----
     let victim_sid = "claude:victim-x5";
     let attacker_sid = "claude:attacker-x5";
+    let unexported_sid = "codex:other-no-env";
 
-    let reg_victim = rpc(
+    // 1. `session.register`, `session.hint{requestSessionToken:true}`, and
+    //    `call.start{requestSessionToken:true}` MUST NEVER mint/return `sessionToken`!
+    let reg_res = rpc(
         &sock,
         &json!({
             "type": "session.register",
             "harness": "claude",
             "sessionId": victim_sid,
+            "requestSessionToken": true,
         }),
     )
     .await;
-    assert!(reg_victim.ok, "session.register failed: {reg_victim:?}");
-    let victim_token = reg_victim.result.unwrap()["sessionToken"]
+    assert!(reg_res.ok, "session.register failed: {reg_res:?}");
+    assert!(
+        reg_res.result.as_ref().unwrap().get("sessionToken").is_none(),
+        "session.register MUST NOT return sessionToken: {reg_res:?}"
+    );
+
+    let hint_res = rpc(
+        &sock,
+        &json!({
+            "type": "session.hint",
+            "harness": "claude",
+            "sessionId": victim_sid,
+            "requestSessionToken": true,
+        }),
+    )
+    .await;
+    assert!(hint_res.ok);
+    assert!(
+        hint_res
+            .result
+            .as_ref()
+            .unwrap()
+            .get("sessionToken")
+            .is_none(),
+        "session.hint MUST NOT return sessionToken: {hint_res:?}"
+    );
+
+    let cs_req_res = rpc(
+        &sock,
+        &json!({
+            "type": "call.start",
+            "harness": "claude",
+            "sessionId": victim_sid,
+            "tool": "hyp_session",
+            "callId": "call-no-mint",
+            "requestSessionToken": true,
+        }),
+    )
+    .await;
+    assert!(cs_req_res.ok);
+    assert!(
+        cs_req_res
+            .result
+            .as_ref()
+            .unwrap()
+            .get("sessionToken")
+            .is_none(),
+        "call.start MUST NOT return sessionToken: {cs_req_res:?}"
+    );
+
+    // 2. ONLY `session.start` (`SessionStart` hook path) derives & returns `sessionToken`!
+    let start_victim = rpc(
+        &sock,
+        &json!({
+            "type": "session.start",
+            "harness": "claude",
+            "sessionId": victim_sid,
+            "envFileExported": true,
+        }),
+    )
+    .await;
+    assert!(start_victim.ok, "session.start failed: {start_victim:?}");
+    let victim_token = start_victim.result.unwrap()["sessionToken"]
         .as_str()
-        .expect("minted sessionToken")
+        .expect("derived sessionToken")
         .to_string();
     assert!(victim_token.starts_with("st_") && victim_token.len() >= 40);
 
-    let reg_attacker = rpc(
+    let start_attacker = rpc(
         &sock,
         &json!({
-            "type": "session.register",
+            "type": "session.start",
             "harness": "claude",
             "sessionId": attacker_sid,
+            "envFileExported": true,
         }),
     )
     .await;
-    assert!(reg_attacker.ok);
-    let attacker_token = reg_attacker.result.unwrap()["sessionToken"]
+    assert!(start_attacker.ok);
+    let attacker_token = start_attacker.result.unwrap()["sessionToken"]
         .as_str()
         .unwrap()
         .to_string();
     assert_ne!(victim_token, attacker_token);
 
-    // Re-registering victim without matching token MUST fail closed (cannot overwrite/steal token)!
-    let hijack_reg = rpc(
+    // Passing a mismatched token on `session.start` fails closed!
+    let bad_start = rpc(
         &sock,
         &json!({
-            "type": "session.register",
+            "type": "session.start",
             "harness": "claude",
             "sessionId": victim_sid,
             "sessionToken": attacker_token,
         }),
     )
     .await;
-    assert!(!hijack_reg.ok);
-    assert_eq!(hijack_reg.error.as_deref(), Some("session_token_invalid"));
+    assert!(!bad_start.ok);
+    assert_eq!(bad_start.error.as_deref(), Some("session_token_invalid"));
 
-    // Enroll victim's handle cleanly using victim's matching `sessionToken`.
+    // 3. CRITICAL FOR REAL CLAUDE CODE: `PreToolUse` (`call.start`) and `PostToolUse`
+    //    (`mailbox.drain`) OMITTING `sessionToken` MUST SUCCEED cleanly (because Claude Code
+    //    does NOT source `$CLAUDE_ENV_FILE` for hook subprocesses!), while providing a WRONG
+    //    `sessionToken` MUST FAIL CLOSED!
     let mut victim_mcp = TestMcpClient::spawn(McpOptions::new(sock.clone()));
     victim_mcp.initialize().await;
-    let join_start = rpc(
+    let join_start_no_tok = rpc(
         &sock,
         &json!({
             "type": "call.start",
             "harness": "claude",
             "sessionId": victim_sid,
-            "sessionToken": victim_token,
             "tool": "hyp_session",
             "callId": "call-victim-join"
         }),
     )
     .await;
-    assert!(join_start.ok, "verified call.start with matching token must succeed: {join_start:?}");
+    assert!(
+        join_start_no_tok.ok,
+        "Claude PreToolUse hook omitting sessionToken MUST succeed: {join_start_no_tok:?}"
+    );
     let (join_txt, join_err) = victim_mcp
         .call_tool(
             "hyp_mesh",
@@ -1087,6 +1351,10 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
         )
         .await;
     assert!(!join_err, "{join_txt}");
+
+    // Register a non-env-exported session too so we test cross-session token mismatch on it!
+    node.register_session(unexported_sid, "{\"kind\":\"codex\"}")
+        .unwrap();
 
     // Verify `ui/state.json` keeps `sessionId` for UI controls and NEVER leaks `sessionToken`!
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1111,33 +1379,35 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
         .await
         .unwrap();
 
-    // Cross-session attacks with missing or wrong token MUST ALL FAIL CLOSED!
-    for bad_tok in [None, Some(attacker_token.as_str()), Some("st_forged_wrong")] {
-        // 1. mailbox.drain
-        let mut drain_pkt = json!({ "type": "mailbox.drain", "sessionId": victim_sid });
-        if let Some(t) = bad_tok {
-            drain_pkt["sessionToken"] = json!(t);
-        }
-        let d_res = rpc(&sock, &drain_pkt).await;
-        assert!(!d_res.ok, "mailbox.drain must fail for bad_tok={bad_tok:?}");
+    // Wrong/forged tokens on `call.start` and `mailbox.drain` MUST fail closed!
+    for wrong_tok in [attacker_token.as_str(), "st_forged_wrong", ""] {
+        let d_res = rpc(
+            &sock,
+            &json!({ "type": "mailbox.drain", "sessionId": victim_sid, "sessionToken": wrong_tok }),
+        )
+        .await;
+        assert!(!d_res.ok, "mailbox.drain must fail for wrong_tok={wrong_tok:?}");
         assert_eq!(d_res.error.as_deref(), Some("session_token_invalid"));
 
-        // 2. call.start targeting victim session
-        let mut call_pkt = json!({
-            "type": "call.start",
-            "harness": "claude",
-            "sessionId": victim_sid,
-            "tool": "hyp_send",
-            "callId": "call-hijack-attempt"
-        });
-        if let Some(t) = bad_tok {
-            call_pkt["sessionToken"] = json!(t);
-        }
-        let c_res = rpc(&sock, &call_pkt).await;
-        assert!(!c_res.ok, "call.start must fail for bad_tok={bad_tok:?}");
+        let c_res = rpc(
+            &sock,
+            &json!({
+                "type": "call.start",
+                "harness": "claude",
+                "sessionId": victim_sid,
+                "tool": "hyp_send",
+                "callId": "call-hijack-attempt",
+                "sessionToken": wrong_tok,
+            }),
+        )
+        .await;
+        assert!(!c_res.ok, "call.start must fail for wrong_tok={wrong_tok:?}");
         assert_eq!(c_res.error.as_deref(), Some("session_token_invalid"));
+    }
 
-        // 3. inbox.wait by sessionId AND by handle
+    // `wait.subscribe` / `inbox.wait` / `inbox.watch` against victim (which has `envFileExported: true`):
+    // BOTH missing token (`env -u HYPHAE_SESSION_TOKEN`) AND wrong/attacker token MUST FAIL CLOSED!
+    for bad_tok in [None, Some(attacker_token.as_str()), Some("st_forged_wrong")] {
         let mut wait_pkt = json!({ "type": "inbox.wait", "sessionId": victim_sid });
         if let Some(t) = bad_tok {
             wait_pkt["sessionToken"] = json!(t);
@@ -1155,35 +1425,89 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
         assert_eq!(wh_err["code"], "session_token_invalid");
     }
 
-    // `run_wait_to_writer_with_token` without token or with wrong token MUST fail closed!
-    let mut attacker_buf = Vec::new();
-    let bad_wait = run_wait_to_writer_with_token(
-        WaitOptions {
-            socket_path: sock.clone(),
-            mode: WaitMode::Once,
-            session_id: Some(victim_sid.into()),
-            handle: None,
-            timeout_seconds: Some(2.0),
-            json: false,
-        },
-        Some(attacker_token.clone()),
-        &mut attacker_buf,
+    // Even targeting a non-exported session with Session A's `HYPHAE_SESSION_TOKEN(A)` fails closed!
+    let cross_unexported_err = expect_wait_error(
+        &sock,
+        json!({
+            "type": "wait.subscribe",
+            "mode": "once",
+            "sessionId": unexported_sid,
+            "sessionToken": attacker_token,
+        }),
     )
     .await;
-    assert!(
-        bad_wait.is_err(),
-        "hyp wait with attacker token MUST be rejected"
-    );
-    assert!(attacker_buf.is_empty());
+    assert_eq!(cross_unexported_err["type"], "wait.error");
+    assert_eq!(cross_unexported_err["code"], "session_token_invalid");
+
+    // `run_wait_to_writer_with_token` without token OR with attacker token MUST fail closed!
+    for bad_opt in [None, Some(attacker_token.clone())] {
+        let mut attacker_buf = Vec::new();
+        let bad_wait = run_wait_to_writer_with_token(
+            WaitOptions {
+                socket_path: sock.clone(),
+                mode: WaitMode::Once,
+                session_id: Some(victim_sid.into()),
+                handle: None,
+                timeout_seconds: Some(2.0),
+                json: false,
+            },
+            bad_opt,
+            &mut attacker_buf,
+        )
+        .await;
+        assert!(
+            bad_wait.is_err(),
+            "hyp wait without matching token MUST be rejected"
+        );
+        assert!(attacker_buf.is_empty());
+    }
 
     // Victim's private DM is STILL untouched and pending!
     assert_eq!(session_status(&sock, victim_sid).await["pending"], 1);
 
-    // Legitimate `run_wait_to_writer_with_token` with victim's matching token SUCCEEDS!
+    // ---- DAEMON RESTART PERSISTENCE CHECK ----
+    // Stop daemon #1, reopen UnifiedNode + start daemon #2 on the SAME `state_dir`!
+    victim_mcp.close().await;
+    daemon.stop().await;
+    node.shutdown();
+
+    let node2 = open_local_node("sec-x5x6@box", tmp.path());
+    let daemon2 = LocalDaemon::start(Arc::clone(&node2), None, LocalDaemonConfig::default())
+        .await
+        .unwrap();
+    let sock2 = daemon2.socket_path().to_path_buf();
+
+    // `session.start` (e.g. `claude --resume`) derives the EXACT SAME deterministic HMAC token!
+    let resumed_start = rpc(
+        &sock2,
+        &json!({
+            "type": "session.start",
+            "harness": "claude",
+            "sessionId": victim_sid,
+            "envFileExported": true,
+        }),
+    )
+    .await;
+    assert!(resumed_start.ok);
+    assert_eq!(
+        resumed_start.result.unwrap()["sessionToken"].as_str(),
+        Some(victim_token.as_str()),
+        "deterministic HMAC sessionToken MUST survive daemon restarts!"
+    );
+
+    // After restart, missing token on `wait.subscribe` STILL fails closed (envFileExported persisted)!
+    let post_restart_missing = expect_wait_error(
+        &sock2,
+        json!({ "type": "inbox.wait", "sessionId": victim_sid }),
+    )
+    .await;
+    assert_eq!(post_restart_missing["code"], "session_token_invalid");
+
+    // Legitimate `run_wait_to_writer_with_token` with the pre-restart `victim_token` SUCCEEDS!
     let mut victim_buf = Vec::new();
     let ok_wait = run_wait_to_writer_with_token(
         WaitOptions {
-            socket_path: sock.clone(),
+            socket_path: sock2.clone(),
             mode: WaitMode::Once,
             session_id: Some(victim_sid.into()),
             handle: None,
@@ -1194,7 +1518,7 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
         &mut victim_buf,
     )
     .await
-    .expect("wait with matching sessionToken must succeed");
+    .expect("wait with persisted HMAC sessionToken must succeed after daemon restart");
     assert_eq!(ok_wait, 0);
     assert!(
         String::from_utf8(victim_buf)
@@ -1202,8 +1526,8 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
             .contains("TOP_SECRET_VICTIM_DM_X5")
     );
 
-    // Legitimate hook flow with victim's matching token drains cleanly too!
-    let _ = daemon
+    // Real Claude Code `PostToolUse` hook OMITTING `sessionToken` drains cleanly too!
+    let _ = daemon2
         .ingest_inbound(InboundItem {
             session_id: victim_sid.into(),
             origin_node: "boss@mac".into(),
@@ -1218,43 +1542,66 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
     let hook_opts = HandleHookOptions {
         harness: HarnessKind::Claude,
         event: HookEvent::PostToolUse,
-        socket_path: sock.clone(),
+        socket_path: sock2.clone(),
         cli_path: Some("hyp".into()),
         explicit_socket: None,
         transport_hints: HookTransportHints::default(),
     };
-    let sock_for_hook = sock.clone();
-    let tok_for_hook = victim_token.clone();
-    let post_ok = tokio::task::spawn_blocking(move || {
+    let post_no_tok = tokio::task::spawn_blocking(move || {
         handle_hook_payload_with_session_token(
             json!({ "session_id": "victim-x5", "tool_name": "Bash", "tool_use_id": "tu-ok" })
                 .as_object()
                 .unwrap(),
             &hook_opts,
-            Some(&tok_for_hook),
+            None,
             |s, p| daemon_rpc_sync(s, p, Duration::from_secs(2)),
         )
     })
     .await
     .unwrap();
-    let _ = sock_for_hook;
     assert!(
-        post_ok.to_string().contains("SECOND_VICTIM_DM_X5"),
-        "hook with matching sessionToken must drain: {post_ok}"
+        post_no_tok.to_string().contains("SECOND_VICTIM_DM_X5"),
+        "Claude PostToolUse hook omitting sessionToken MUST drain cleanly: {post_no_tok}"
     );
 
-    // ---- Part B (X6): `--ephemeral` MUST NEVER bypass an invalid/replayed `_meshCall` token ----
-    let mut eph_opts = McpOptions::new(sock.clone());
+    // ---- Part B (X6): `--ephemeral` MUST NEVER bypass an invalid/replayed `_meshCall` token,
+    //              AND one forged `call.start{harness:"openclaw"}` MUST NOT poison all OpenClaw sessions! ----
+    let forged_oc_hook = rpc(
+        &sock2,
+        &json!({
+            "type": "call.start",
+            "harness": "openclaw",
+            "sessionId": "openclaw:forged-attacker",
+            "tool": "hyp_session",
+            "callId": "forged-oc-call-1"
+        }),
+    )
+    .await;
+    assert!(forged_oc_hook.ok);
+
+    let mut eph_opts = McpOptions::new(sock2.clone());
     eph_opts.backend = Some(HarnessKind::Openclaw);
     eph_opts.ephemeral = true;
     let mut eph_mcp = TestMcpClient::spawn(eph_opts);
     eph_mcp.initialize().await;
 
-    // 1. Plain call with no `_meshCall` on hookless OpenClaw `--ephemeral` succeeds.
+    // 1. Plain call AND unregistered `_meta.callId` on hookless OpenClaw `--ephemeral` STILL succeed
+    //    (NOT globally poisoned by the forged `call.start{harness:"openclaw"}` above!).
     let (ok_txt, ok_err) = eph_mcp
         .call_tool("hyp_mesh", json!({ "action": "status" }), None)
         .await;
     assert!(!ok_err, "hookless openclaw ephemeral status failed: {ok_txt}");
+    let (ok_meta_txt, ok_meta_err) = eph_mcp
+        .call_tool(
+            "hyp_mesh",
+            json!({ "action": "status" }),
+            Some(json!({ "callId": "unrelated-openclaw-call-id" })),
+        )
+        .await;
+    assert!(
+        !ok_meta_err,
+        "X6: forged call.start{{harness:\"openclaw\"}} MUST NOT globally poison unrelated OpenClaw sessions: {ok_meta_txt}"
+    );
 
     // 2. Forged/invalid `_meshCall` on `--ephemeral` MUST FAIL CLOSED (never fall back to ephemeral!).
     let (forged_txt, forged_err) = eph_mcp
@@ -1270,8 +1617,10 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
     );
 
     // 3. Replayed single-use `_meshCall` token on `--ephemeral` MUST FAIL CLOSED!
+    let mut victim_mcp2 = TestMcpClient::spawn(McpOptions::new(sock2.clone()));
+    victim_mcp2.initialize().await;
     let legit_call = rpc(
-        &sock,
+        &sock2,
         &json!({
             "type": "call.start",
             "harness": "claude",
@@ -1287,7 +1636,7 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
         .as_str()
         .unwrap()
         .to_string();
-    let (_first_txt, first_err) = victim_mcp
+    let (_first_txt, first_err) = victim_mcp2
         .call_tool(
             "hyp_mesh",
             json!({ "action": "status", "_meshCall": real_call_tok }),
@@ -1295,7 +1644,6 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
         )
         .await;
     assert!(!first_err);
-    // Replay the exact consumed token on `--ephemeral` -> MUST fail closed!
     let (replay_txt, replay_err) = eph_mcp
         .call_tool(
             "hyp_mesh",
@@ -1308,9 +1656,9 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
         "X6: --ephemeral MUST NOT bypass a replayed _meshCall token: {replay_txt}"
     );
 
-    // 4. Since real Claude PreToolUse hooks are registered on this daemon, an `--ephemeral`
-    //    Claude client presenting an unregistered `_meta.callId` MUST also fail closed!
-    let mut eph_claude_opts = McpOptions::new(sock.clone());
+    // 4. Native-hook harness (`Claude`) `--ephemeral` client presenting an unregistered `_meta.callId`
+    //    MUST fail closed!
+    let mut eph_claude_opts = McpOptions::new(sock2.clone());
     eph_claude_opts.backend = Some(HarnessKind::Claude);
     eph_claude_opts.ephemeral = true;
     let mut eph_claude_mcp = TestMcpClient::spawn(eph_claude_opts);
@@ -1324,12 +1672,12 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
         .await;
     assert!(
         unreg_err,
-        "X6: --ephemeral claude client with unregistered callId when Claude hooks exist must fail closed: {unreg_txt}"
+        "X6: --ephemeral claude client with unregistered callId must fail closed: {unreg_txt}"
     );
 
     eph_claude_mcp.close().await;
     eph_mcp.close().await;
-    victim_mcp.close().await;
-    daemon.stop().await;
-    node.shutdown();
+    victim_mcp2.close().await;
+    daemon2.stop().await;
+    node2.shutdown();
 }

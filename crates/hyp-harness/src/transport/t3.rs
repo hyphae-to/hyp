@@ -271,7 +271,17 @@ fn default_hyphae_config_dir() -> PathBuf {
     home_dir().join(".config").join("hyphae")
 }
 
-const INVALID_URL_ERR: &str = "T3 Code server URL must be an HTTPS origin or loopback HTTP origin (e.g. http://127.0.0.1:3773)";
+const INVALID_URL_ERR: &str = "T3 Code server URL must be a loopback origin (e.g. http://127.0.0.1:3773) or an explicit HTTPS origin when remote access is enabled";
+
+/// Returns `true` iff `name` is one of the two allowed T3 Code bearer token secret names
+/// (`"t3-auth-token"` or `"t3-session-token"`). Arbitrary `tokenSecret` names from config
+/// MUST fail closed so a config writer can never exfiltrate other Keychain/SecretStore entries.
+pub fn is_allowed_t3_token_secret(name: &str) -> bool {
+    matches!(
+        name.trim(),
+        DEFAULT_T3_TOKEN_SECRET | FALLBACK_T3_TOKEN_SECRET
+    )
+}
 
 /// Validates and normalizes a T3 Code server URL to its canonical origin (`scheme://host[:port]`).
 ///
@@ -281,6 +291,15 @@ const INVALID_URL_ERR: &str = "T3 Code server URL must be an HTTPS origin or loo
 ///   backslashes, whitespace, and control characters.
 /// - Omits default ports (`:80` for `http`, `:443` for `https`) and trailing `/`.
 pub fn normalize_t3_server_url(raw: &str) -> Result<String, String> {
+    normalize_t3_server_url_with_remote(raw, true)
+}
+
+/// Validates and normalizes a T3 Code server URL, enforcing loopback-only origins
+/// (`127.0.0.1`, `localhost`, `[::1]`) unless `allow_remote == true` AND `scheme == "https"`.
+pub fn normalize_t3_server_url_with_remote(
+    raw: &str,
+    allow_remote: bool,
+) -> Result<String, String> {
     if raw.is_empty()
         || raw
             .bytes()
@@ -350,7 +369,8 @@ pub fn normalize_t3_server_url(raw: &str) -> Result<String, String> {
     };
 
     let is_loopback = matches!(host_lower.as_str(), "localhost" | "127.0.0.1" | "[::1]");
-    if scheme == "http" && !is_loopback {
+    let allowed = is_loopback || (allow_remote && scheme == "https");
+    if !allowed {
         return Err(INVALID_URL_ERR.to_string());
     }
 
@@ -813,6 +833,9 @@ fn resolve_bearer_token(target: &T3Target) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
+        if !is_allowed_t3_token_secret(custom_name) {
+            return None;
+        }
         return store
             .get(custom_name)
             .ok()
@@ -867,13 +890,24 @@ async fn read_bounded_http_body(
     Ok(out)
 }
 
-/// Probes a running T3 Code server's `GET /api/auth/session` endpoint.
+/// Probes a running T3 Code server's `GET /api/auth/session` endpoint (loopback-only by default).
 pub async fn probe_t3_server(
     server_url: &str,
     token: Option<&str>,
     timeout: Duration,
 ) -> T3ProbeResult {
-    let origin = match normalize_t3_server_url(server_url) {
+    probe_t3_server_with_remote(server_url, token, false, timeout).await
+}
+
+/// Probes a running T3 Code server's `GET /api/auth/session` endpoint, allowing remote `https://`
+/// origins ONLY when `allow_remote == true`.
+pub async fn probe_t3_server_with_remote(
+    server_url: &str,
+    token: Option<&str>,
+    allow_remote: bool,
+    timeout: Duration,
+) -> T3ProbeResult {
+    let origin = match normalize_t3_server_url_with_remote(server_url, allow_remote) {
         Ok(o) => o,
         Err(e) => {
             return T3ProbeResult {
@@ -1550,20 +1584,23 @@ pub struct T3Transport {
     connect_timeout: Duration,
     projection_timeout: Duration,
     dispatch_timeout: Duration,
+    allow_remote: bool,
 }
 
 impl T3Transport {
-    /// Creates a `T3Transport` with default timeouts (8s connect, 12s projection, 15s dispatch).
+    /// Creates a `T3Transport` with default timeouts (8s connect, 12s projection, 15s dispatch)
+    /// and loopback-only origin enforcement (`allow_remote = false`).
     pub fn new(target: T3Target) -> Self {
         Self {
             target,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             projection_timeout: DEFAULT_PROJECTION_TIMEOUT,
             dispatch_timeout: DEFAULT_DISPATCH_TIMEOUT,
+            allow_remote: false,
         }
     }
 
-    /// Creates a `T3Transport` with explicit RPC timeouts.
+    /// Creates a `T3Transport` with explicit RPC timeouts and loopback-only origin enforcement.
     pub fn with_timeouts(
         target: T3Target,
         connect_timeout: Duration,
@@ -1575,7 +1612,14 @@ impl T3Transport {
             connect_timeout,
             projection_timeout,
             dispatch_timeout,
+            allow_remote: false,
         }
+    }
+
+    /// Explicitly opts into remote `https://` T3 server origins (default `false`: loopback-only).
+    pub fn with_allow_remote(mut self, allow_remote: bool) -> Self {
+        self.allow_remote = allow_remote;
+        self
     }
 
     /// Returns the bound [`T3Target`].
@@ -1587,7 +1631,8 @@ impl T3Transport {
     /// `dispatchCommand` `message.dispatch`), returning both the [`PushOutcome`] and
     /// detailed dispatch mode / interrupt metadata.
     pub async fn deliver_detailed(&self, text: &str, mode: PushMode) -> T3DeliveryDetail {
-        let origin = match normalize_t3_server_url(&self.target.server_url) {
+        let origin =
+            match normalize_t3_server_url_with_remote(&self.target.server_url, self.allow_remote) {
             Ok(o) => o,
             Err(_) => {
                 return T3DeliveryDetail {
@@ -2060,5 +2105,53 @@ mod tests {
         assert!(matches!(err, WsError::FrameTooLarge(_)));
 
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn token_secret_lockdown_and_loopback_default_block_exfiltration() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(dir.path(), SecretBackend::File);
+        store.set("t3-auth-token", "auth-ok").unwrap();
+        store.set("t3-session-token", "session-ok").unwrap();
+        store.set("node-sign-priv", "SENSITIVE_PRIVATE_KEY").unwrap();
+
+        assert!(is_allowed_t3_token_secret("t3-auth-token"));
+        assert!(is_allowed_t3_token_secret("t3-session-token"));
+        assert!(!is_allowed_t3_token_secret("node-sign-priv"));
+        assert!(!is_allowed_t3_token_secret("custom-secret"));
+
+        let mut ok_t = T3Target::new("thr-1", DEFAULT_T3_URL);
+        ok_t.state_dir = Some(dir.path().to_path_buf());
+        ok_t.secret_backend = Some(SecretBackend::File);
+        ok_t.token_secret = Some("t3-session-token".into());
+        assert_eq!(resolve_bearer_token(&ok_t).as_deref(), Some("session-ok"));
+
+        let mut exfil_t = ok_t.clone();
+        exfil_t.token_secret = Some("node-sign-priv".into());
+        assert_eq!(
+            resolve_bearer_token(&exfil_t),
+            None,
+            "arbitrary tokenSecret MUST fail closed and never read unrelated secrets"
+        );
+
+        // Loopback-only enforced by default on probe & T3Transport!
+        assert!(normalize_t3_server_url_with_remote("https://evil.example.com", false).is_err());
+        assert!(normalize_t3_server_url_with_remote("http://127.0.0.1:3773", false).is_ok());
+        assert!(normalize_t3_server_url_with_remote("https://127.0.0.1:3773", false).is_ok());
+
+        let remote_probe = probe_t3_server(
+            "https://evil.example.com",
+            Some("auth-ok"),
+            Duration::from_millis(200),
+        )
+        .await;
+        assert!(!remote_probe.ok);
+
+        let mut remote_target = T3Target::new("thr-1", "https://evil.example.com");
+        remote_target.token_override = Some("auth-ok".into());
+        let outcome = T3Transport::new(remote_target)
+            .deliver("should never leave loopback", PushMode::Queue)
+            .await;
+        assert_eq!(outcome, PushOutcome::reject("t3_invalid_server_url"));
     }
 }

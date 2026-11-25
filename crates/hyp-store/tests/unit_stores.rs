@@ -1654,6 +1654,22 @@ fn edge_cases_session_pruning_set_subscriptions_and_staged_transfer_rollback() {
 
     let mut active = HashSet::new();
     active.insert("s-active".to_string());
+
+    // UR1: While `s-stale` holds unread `pending` mail, `prune_sessions` MUST NOT prune it or
+    // delete its unread mailbox rows!
+    let report_blocked = db.local().prune_sessions(t0 + 1_000, &active).unwrap();
+    assert!(
+        report_blocked.pruned_sessions.is_empty(),
+        "UR1: session with unread pending mail must not be pruned: {report_blocked:?}"
+    );
+    assert!(db.local().get_session("s-stale").unwrap().is_some());
+    assert_eq!(db.local().pending_count("s-stale").unwrap(), 1);
+    assert_eq!(db.local().bridge_links("slack", "ops").unwrap().len(), 1);
+    assert!(db.local().get_plugin_target("slack", "ops").unwrap().is_some());
+
+    // Once unread mail is drained (`pending` -> `delivered`), `prune_sessions` cascades cleanly!
+    let drained = db.local().drain_inbox("s-stale", 10, t0 + 500).unwrap();
+    assert_eq!(drained.len(), 1);
     let report = db.local().prune_sessions(t0 + 1_000, &active).unwrap();
     assert_eq!(report.pruned_sessions, vec!["s-stale"]);
     assert!(db.local().get_session("s-stale").unwrap().is_none());
@@ -2014,4 +2030,191 @@ fn v060_backend_merge_and_metadata_read_helpers() {
         .unwrap();
     assert_eq!(active_wks.len(), 1);
     assert_eq!(active_wks[0].id, wk1.id);
+}
+
+#[test]
+fn ur1_prune_sessions_preserves_unread_pending_and_quarantined_mail() {
+    let db = NodeDb::open_in_memory().unwrap();
+    let t0 = 1_700_000_000_000i64;
+
+    db.local().register_session("s-pending", "{}", t0).unwrap();
+    db.local()
+        .register_session("s-quarantined", "{}", t0)
+        .unwrap();
+    db.local()
+        .register_session("s-delivered", "{}", t0)
+        .unwrap();
+    db.local().register_session("s-empty", "{}", t0).unwrap();
+
+    db.local()
+        .put_in_mailbox(
+            &MailboxInsert {
+                session_id: "s-pending".into(),
+                origin_node: "bob@lap".into(),
+                item_id: "p1".into(),
+                text: "unread important DM".into(),
+                kind: MailboxKind::Message,
+                source: "bob@lap/dev".into(),
+                gate_state: GateState::Pending,
+                gate_reason: None,
+                traceparent: None,
+            },
+            t0,
+        )
+        .unwrap();
+    db.local()
+        .put_in_mailbox(
+            &MailboxInsert {
+                session_id: "s-quarantined".into(),
+                origin_node: "ext@host".into(),
+                item_id: "q1".into(),
+                text: "quarantined payload".into(),
+                kind: MailboxKind::Message,
+                source: "ext@host/bot".into(),
+                gate_state: GateState::Quarantined,
+                gate_reason: Some("prompt_injection".into()),
+                traceparent: None,
+            },
+            t0,
+        )
+        .unwrap();
+    db.local()
+        .put_in_mailbox(
+            &MailboxInsert {
+                session_id: "s-delivered".into(),
+                origin_node: "bob@lap".into(),
+                item_id: "d1".into(),
+                text: "already read".into(),
+                kind: MailboxKind::Message,
+                source: "bob@lap/dev".into(),
+                gate_state: GateState::Pending,
+                gate_reason: None,
+                traceparent: None,
+            },
+            t0,
+        )
+        .unwrap();
+    db.local().drain_inbox("s-delivered", 10, t0 + 100).unwrap();
+
+    let report = db
+        .local()
+        .prune_sessions(t0 + 10_000, &HashSet::new())
+        .unwrap();
+    let pruned: HashSet<String> = report.pruned_sessions.into_iter().collect();
+    assert!(pruned.contains("s-empty"));
+    assert!(pruned.contains("s-delivered"));
+    assert!(!pruned.contains("s-pending"));
+    assert!(!pruned.contains("s-quarantined"));
+
+    assert_eq!(db.local().pending_count("s-pending").unwrap(), 1);
+    assert_eq!(
+        db.local().quarantined_count(Some("s-quarantined")).unwrap(),
+        1
+    );
+}
+
+#[test]
+fn g3_coalesce_update_resets_reviewed_at_human_auth_and_gate_reason() {
+    let db = NodeDb::open_in_memory().unwrap();
+    let t0 = 1_700_000_000_000i64;
+    db.local().register_session("claude:s1", "{}", t0).unwrap();
+
+    let opts = hyp_store::MailboxPutOptions {
+        coalesce_key: Some("feed:alerts".into()),
+        expires_at: Some(t0 + 60_000),
+    };
+    let receipt = match db
+        .local()
+        .put_in_mailbox_ex(
+            &MailboxInsert {
+                session_id: "claude:s1".into(),
+                origin_node: "local".into(),
+                item_id: "ev-1".into(),
+                text: "Verified initial alert".into(),
+                kind: MailboxKind::Event,
+                source: "local.alerts".into(),
+                gate_state: GateState::Pending,
+                gate_reason: Some("downgraded_to_notify".into()),
+                traceparent: None,
+            },
+            &opts,
+            t0,
+        )
+        .unwrap()
+    {
+        MailboxPutResult::Stored { receipt } => receipt,
+        other => panic!("expected Stored, got {other:?}"),
+    };
+
+    // Simulate prior gate approval + HumanVerified cryptographic badge + notified = 1.
+    assert!(
+        db.local()
+            .mark_mailbox_gate_approved("claude:s1", &receipt, true, t0 + 10)
+            .unwrap()
+    );
+    assert!(
+        db.human()
+            .set_mailbox_human_auth(&receipt, r#"{"humanId":"alice","kid":"k1"}"#)
+            .unwrap()
+    );
+    db.local().mark_mailbox_notified("claude:s1").unwrap();
+
+    let before = db.local().get_mailbox_entry(&receipt).unwrap().unwrap();
+    assert!(before.reviewed_at.is_some());
+    assert_eq!(before.gate_reason.as_deref(), Some("downgraded_to_notify"));
+    assert!(before.notified);
+    assert!(db.human().get_mailbox_human_auth(&receipt).unwrap().is_some());
+
+    // Coalesce a new untrusted payload onto the same receipt!
+    let receipt2 = match db
+        .local()
+        .put_in_mailbox_ex(
+            &MailboxInsert {
+                session_id: "claude:s1".into(),
+                origin_node: "local".into(),
+                item_id: "ev-2".into(),
+                text: "UNTRUSTED OVERWRITTEN PAYLOAD".into(),
+                kind: MailboxKind::Event,
+                source: "local.alerts".into(),
+                gate_state: GateState::Pending,
+                gate_reason: Some("stale_hint".into()),
+                traceparent: None,
+            },
+            &opts,
+            t0 + 20,
+        )
+        .unwrap()
+    {
+        MailboxPutResult::Stored { receipt } => receipt,
+        other => panic!("expected Stored on coalesce, got {other:?}"),
+    };
+    assert_eq!(receipt2, receipt);
+
+    let after = db.local().get_mailbox_entry_ex(&receipt).unwrap().unwrap();
+    assert_eq!(after.entry.item_id, "ev-2");
+    assert_eq!(after.entry.text, "UNTRUSTED OVERWRITTEN PAYLOAD");
+    assert_eq!(after.missed_count, 1);
+    assert!(!after.entry.notified);
+    assert!(
+        after.entry.reviewed_at.is_none(),
+        "G3: coalesce MUST reset reviewed_at to NULL"
+    );
+    assert!(
+        after.entry.gate_reason.is_none(),
+        "G3: coalesce MUST reset gate_reason to NULL"
+    );
+    assert!(
+        db.human()
+            .get_mailbox_human_auth(&receipt)
+            .unwrap()
+            .is_none(),
+        "G3: coalesce MUST reset human_auth_json to NULL"
+    );
+    assert!(
+        db.local()
+            .peek_inbox_gate_cleared("claude:s1", 10)
+            .unwrap()
+            .is_empty(),
+        "G3: coalesced row must NOT appear in gate-cleared inbox until re-screened"
+    );
 }

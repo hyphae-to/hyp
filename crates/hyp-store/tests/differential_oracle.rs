@@ -842,10 +842,10 @@ impl MemoryOracle {
     }
 
     fn prune_sessions(&mut self, cutoff_ms: i64, active: &HashSet<String>) -> BTreeSet<String> {
-        let quarantined_sessions: HashSet<&str> = self
+        let protected_sessions: HashSet<&str> = self
             .mailbox
             .iter()
-            .filter(|m| m.gate_state == GateState::Quarantined)
+            .filter(|m| matches!(m.gate_state, GateState::Pending | GateState::Quarantined))
             .map(|m| m.session_id.as_str())
             .collect();
         let stale: BTreeSet<String> = self
@@ -855,7 +855,7 @@ impl MemoryOracle {
                 s.last_seen > 0
                     && s.last_seen < cutoff_ms
                     && !active.contains(&s.id)
-                    && !quarantined_sessions.contains(s.id.as_str())
+                    && !protected_sessions.contains(s.id.as_str())
             })
             .map(|s| s.id.clone())
             .collect();

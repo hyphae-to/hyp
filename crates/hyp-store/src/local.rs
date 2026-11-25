@@ -520,8 +520,9 @@ impl<'a> LocalStateStore<'a> {
     }
 
     /// Removes inactive sessions older than `cutoff_ms` (skipping `active_session_ids` and any
-    /// session still holding `gate_state = 'quarantined'` mailbox items awaiting human review),
-    /// cleaning up their mailbox, per-session mutes, bridge links, and plugin targets.
+    /// session still holding unread `gate_state = 'pending'` or `gate_state = 'quarantined'`
+    /// mailbox items), cleaning up their delivered/rejected mailbox rows, per-session mutes,
+    /// bridge links, and plugin targets (`UR1`/`U6`/`G16`).
     pub fn prune_sessions(
         &self,
         cutoff_ms: i64,
@@ -534,7 +535,7 @@ impl<'a> LocalStateStore<'a> {
                AND s.last_seen < ?1
                AND NOT EXISTS (
                    SELECT 1 FROM mailbox m
-                   WHERE m.session_id = s.id AND m.gate_state = 'quarantined'
+                   WHERE m.session_id = s.id AND m.gate_state IN ('pending', 'quarantined')
                )",
         )?;
         let candidates: Vec<String> = stmt
@@ -549,7 +550,8 @@ impl<'a> LocalStateStore<'a> {
 
         for id in &stale {
             tx.conn().execute(
-                "DELETE FROM mailbox WHERE session_id = ?1 AND gate_state != 'quarantined'",
+                "DELETE FROM mailbox
+                 WHERE session_id = ?1 AND gate_state NOT IN ('pending', 'quarantined')",
                 params![id],
             )?;
             tx.conn()
@@ -593,8 +595,10 @@ impl<'a> LocalStateStore<'a> {
     /// When `input.gate_state == GateState::Pending` and `opts.coalesce_key` is `Some(key)`,
     /// if a `pending` row already exists for `(session_id, key)`, it is superseded in place
     /// (updating `origin_node`, `item_id`, `text`, `received_at`, `kind`, `source`, `expires_at`,
-    /// resetting `notified = 0`, and incrementing `missed_count = missed_count + 1`) while
-    /// reusing the existing receipt.
+    /// resetting `notified = 0`, `reviewed_at = NULL`, `human_auth_json = NULL`, and
+    /// `gate_reason = NULL`, and incrementing `missed_count = missed_count + 1`) while
+    /// reusing the existing receipt so the overwritten payload MUST be re-screened by the
+    /// Security Gate and can never inherit an earlier approval or `HumanVerified` badge (`G3`).
     pub fn put_in_mailbox_ex(
         &self,
         input: &MailboxInsert,
@@ -657,12 +661,14 @@ impl<'a> LocalStateStore<'a> {
                              kind = ?5,
                              source = ?6,
                              notified = 0,
-                             gate_reason = ?7,
-                             traceparent = ?8,
-                             payload_sha256 = ?9,
-                             expires_at = ?10,
+                             gate_reason = NULL,
+                             reviewed_at = NULL,
+                             human_auth_json = NULL,
+                             traceparent = ?7,
+                             payload_sha256 = ?8,
+                             expires_at = ?9,
                              missed_count = missed_count + 1
-                         WHERE receipt = ?11 AND gate_state = 'pending'",
+                         WHERE receipt = ?10 AND gate_state = 'pending'",
                         params![
                             &input.origin_node,
                             &input.item_id,
@@ -670,7 +676,6 @@ impl<'a> LocalStateStore<'a> {
                             now_ms,
                             input.kind.as_str(),
                             &input.source,
-                            input.gate_reason.as_deref(),
                             input.traceparent.as_deref(),
                             &payload_sha256,
                             opts.expires_at,
@@ -1160,6 +1165,22 @@ impl<'a> LocalStateStore<'a> {
             .query_map(params![session_id, limit as i64], decode_mailbox_meta_row)?
             .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter().collect()
+    }
+
+    /// Lists distinct `local-ingest:<topic>` staging session IDs that hold human-approved
+    /// (`gate_state = 'pending' AND reviewed_at IS NOT NULL`) rows waiting for fanout (`G8`).
+    pub fn list_approved_local_ingest_sessions(&self) -> StoreResult<Vec<String>> {
+        let mut stmt = self.db.conn().prepare(
+            "SELECT DISTINCT session_id FROM mailbox
+             WHERE session_id LIKE 'local-ingest:%'
+               AND gate_state = 'pending'
+               AND reviewed_at IS NOT NULL
+             ORDER BY session_id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Lists quarantined items awaiting human review (`hyp gate review`).

@@ -75,9 +75,16 @@ pub const REASON_OPENCLAW_RATE_LIMITED: &str = "openclaw_rate_limited";
 /// Reject reason on unexpected non-auth 4xx responses.
 pub const REASON_OPENCLAW_REQUEST_REJECTED: &str = "openclaw_request_rejected";
 
-const INVALID_URL_ERR: &str = "OpenClaw Gateway URL must be a loopback HTTP origin (e.g. http://127.0.0.1:18789) or HTTPS origin";
+const INVALID_URL_ERR: &str = "OpenClaw Gateway URL must be a loopback origin (e.g. http://127.0.0.1:18789) unless allowRemote=true with https://";
 const INVALID_HOOKS_PATH_ERR: &str =
     "OpenClaw hooks path must start with '/' and contain no traversal, query, or control characters";
+
+/// Returns `true` iff `name` is the sole allowed OpenClaw Gateway hooks secret name
+/// (`"openclaw-hooks-token"`). Arbitrary `tokenSecret` names from config MUST fail closed
+/// so a config writer can never exfiltrate other Keychain/SecretStore entries.
+pub fn is_allowed_openclaw_token_secret(name: &str) -> bool {
+    name.trim() == DEFAULT_OPENCLAW_TOKEN_SECRET
+}
 
 /// OpenClaw Gateway webhook endpoint mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,8 +133,10 @@ pub struct OpenClawTarget {
     pub agent_id: String,
     /// Optional Hyphae handle used in the metadata-only wake nudge (`@<handle>`).
     pub handle: Option<String>,
-    /// Optional `SecretStore` key name (defaults to [`DEFAULT_OPENCLAW_TOKEN_SECRET`]).
+    /// Optional `SecretStore` key name (locked strictly to [`DEFAULT_OPENCLAW_TOKEN_SECRET`]).
     pub token_secret: Option<String>,
+    /// Explicitly allow non-loopback `https://` gateway origins (default `false`: loopback-only).
+    pub allow_remote: bool,
     /// Optional Hyphae state/config directory used to open [`SecretStore`].
     pub state_dir: Option<PathBuf>,
     /// Optional explicit [`SecretBackend`] override (e.g. `SecretBackend::File` in tests).
@@ -154,6 +163,7 @@ impl OpenClawTarget {
             agent_id: DEFAULT_OPENCLAW_AGENT_ID.to_string(),
             handle: None,
             token_secret: None,
+            allow_remote: false,
             state_dir: None,
             secret_backend: None,
             token_override: None,
@@ -190,6 +200,11 @@ impl OpenClawTarget {
         self
     }
 
+    pub fn with_allow_remote(mut self, allow_remote: bool) -> Self {
+        self.allow_remote = allow_remote;
+        self
+    }
+
     pub fn with_state_dir(mut self, state_dir: impl Into<PathBuf>) -> Self {
         self.state_dir = Some(state_dir.into());
         self
@@ -205,18 +220,14 @@ impl OpenClawTarget {
         self
     }
 
-    /// Returns the effective `SecretStore` key name used for bearer authentication.
+    /// Returns the sole permitted `SecretStore` key name (`"openclaw-hooks-token"`).
     pub fn effective_token_secret_name(&self) -> &str {
-        self.token_secret
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(DEFAULT_OPENCLAW_TOKEN_SECRET)
+        DEFAULT_OPENCLAW_TOKEN_SECRET
     }
 
     /// Resolves the validated full endpoint URI (`<origin><hooks_path>/<mode>`).
     pub fn endpoint_url(&self) -> Result<String, String> {
-        let origin = normalize_openclaw_base_url(&self.base_url)?;
+        let origin = normalize_openclaw_base_url_with_remote(&self.base_url, self.allow_remote)?;
         let hooks_path = normalize_openclaw_hooks_path(&self.hooks_path)?;
         Ok(format!("{origin}{hooks_path}/{}", self.endpoint_mode.as_str()))
     }
@@ -231,6 +242,7 @@ impl fmt::Debug for OpenClawTarget {
             .field("agent_id", &self.agent_id)
             .field("handle", &self.handle)
             .field("token_secret", &self.token_secret)
+            .field("allow_remote", &self.allow_remote)
             .field("state_dir", &self.state_dir)
             .field("secret_backend", &self.secret_backend)
             .field(
@@ -249,10 +261,11 @@ pub struct OpenClawNodeConfig {
     pub agent_id: Option<String>,
     pub mode: Option<OpenClawEndpointMode>,
     pub token_secret: Option<String>,
+    pub allow_remote: bool,
 }
 
 impl OpenClawNodeConfig {
-    /// Extracts `"openclaw": { "url", "hooksPath", "agentId", "mode", "tokenSecret" }`
+    /// Extracts `"openclaw": { "url", "hooksPath", "agentId", "mode", "tokenSecret", "allowRemote" }`
     /// from a parsed `node.json` document.
     pub fn from_node_json(doc: &Value) -> Self {
         let Some(obj) = doc.get("openclaw").and_then(Value::as_object) else {
@@ -266,12 +279,17 @@ impl OpenClawNodeConfig {
                 .map(ToString::to_string)
         };
         let mode = clean_str("mode").and_then(|s| s.parse::<OpenClawEndpointMode>().ok());
+        let allow_remote = obj
+            .get("allowRemote")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         Self {
             url: clean_str("url"),
             hooks_path: clean_str("hooksPath"),
             agent_id: clean_str("agentId"),
             mode,
             token_secret: clean_str("tokenSecret"),
+            allow_remote,
         }
     }
 
@@ -293,6 +311,7 @@ impl OpenClawNodeConfig {
         if let Some(ref secret) = self.token_secret {
             target.token_secret = Some(secret.clone());
         }
+        target.allow_remote = self.allow_remote;
         target
     }
 }
@@ -311,15 +330,28 @@ pub struct OpenClawProbeResult {
 // URL, Path, Nudge & Secret Helpers
 // ============================================================================
 
-/// Validates and normalizes an OpenClaw Gateway base URL to its canonical origin
+/// Validates and normalizes an OpenClaw Gateway base URL to its canonical loopback origin
 /// (`scheme://host[:port]`).
 ///
+/// Fails closed by default on any non-loopback host (`127.0.0.1`, `localhost`, `[::1]` only)
+/// so a config writer cannot redirect bearer tokens to an arbitrary remote server.
+pub fn normalize_openclaw_base_url(raw: &str) -> Result<String, String> {
+    normalize_openclaw_base_url_with_remote(raw, false)
+}
+
+/// Validates and normalizes an OpenClaw Gateway base URL to its canonical origin
+/// (`scheme://host[:port]`), permitting remote `https://` origins ONLY when `allow_remote == true`.
+///
 /// Fails closed on:
-/// - Non-loopback `http://` origins (only `127.0.0.1`, `localhost`, `[::1]` allowed for `http://`).
+/// - Any non-loopback origin when `allow_remote == false`.
+/// - Non-loopback `http://` origins even when `allow_remote == true`.
 /// - Any scheme other than `http` or `https`.
 /// - Userinfo/credentials (`@`), non-root paths, query strings (`?`), fragments (`#`),
 ///   backslashes, whitespace, or control characters.
-pub fn normalize_openclaw_base_url(raw: &str) -> Result<String, String> {
+pub fn normalize_openclaw_base_url_with_remote(
+    raw: &str,
+    allow_remote: bool,
+) -> Result<String, String> {
     if raw.is_empty()
         || raw
             .bytes()
@@ -383,7 +415,8 @@ pub fn normalize_openclaw_base_url(raw: &str) -> Result<String, String> {
     };
 
     let is_loopback = matches!(host_lower.as_str(), "localhost" | "127.0.0.1" | "[::1]");
-    if scheme == "http" && !is_loopback {
+    let allowed = is_loopback || (allow_remote && scheme == "https");
+    if !allowed {
         return Err(INVALID_URL_ERR.to_string());
     }
 
@@ -565,7 +598,10 @@ fn is_valid_header_token(tok: &str) -> bool {
 }
 
 /// Resolves the OpenClaw Gateway hooks bearer token strictly from `token_override` (tests)
-/// or [`SecretStore`] (default secret name `"openclaw-hooks-token"`).
+/// or [`SecretStore`] under the locked key name `"openclaw-hooks-token"`.
+///
+/// Fails closed (`None`) if `target.token_secret` names any secret other than
+/// `"openclaw-hooks-token"`, preventing config-driven exfiltration of arbitrary Keychain entries.
 pub fn resolve_openclaw_token(target: &OpenClawTarget) -> Option<String> {
     if let Some(ref direct) = target.token_override {
         let trimmed = direct.trim();
@@ -573,6 +609,17 @@ pub fn resolve_openclaw_token(target: &OpenClawTarget) -> Option<String> {
             return Some(trimmed.to_string());
         }
         return None;
+    }
+
+    if let Some(raw_name) = target
+        .token_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !is_allowed_openclaw_token_secret(raw_name) {
+            return None;
+        }
     }
 
     let config_dir = target
@@ -583,9 +630,8 @@ pub fn resolve_openclaw_token(target: &OpenClawTarget) -> Option<String> {
         Some(backend) => SecretStore::new(config_dir, backend),
         None => SecretStore::from_env(config_dir),
     };
-    let secret_name = target.effective_token_secret_name();
     store
-        .get(secret_name)
+        .get(DEFAULT_OPENCLAW_TOKEN_SECRET)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| is_valid_header_token(s))
@@ -625,12 +671,15 @@ async fn drain_bounded_http_body(mut body: hyper::body::Incoming, max_bytes: usi
 ///
 /// Security & honesty invariants:
 /// - Immediately returns `ok: false` (`openclaw_token_missing`) WITHOUT touching the network
-///   when no valid hook token exists in [`SecretStore`].
-/// - Sends a side-effect-free `HEAD <origin><hooks_path>/<mode>` request with
-///   `Authorization: Bearer <token>` (never triggers an agent wake during probe).
-/// - Accepts `200`, `202`, `204`, or `405` (route mounted, POST required, auth not rejected)
-///   as reachable; fails closed on `401`/`403` (`openclaw_auth_failed`), `404`
-///   (`openclaw_hooks_disabled`), `5xx`, connection refused, or timeout.
+///   when no valid `"openclaw-hooks-token"` exists in [`SecretStore`] (or if a disallowed
+///   `tokenSecret` name was configured).
+/// - NEVER sends the `Authorization: Bearer` token to an unverified listener during probing!
+///   Sends an unauthenticated `POST <origin><hooks_path>/<mode>` with empty JSON `{}` so an
+///   OpenClaw Gateway rejects with `401 Unauthorized` or `400 Bad Request` (or `200`/`204`
+///   non-HTML) without executing a wake or exposing any credential.
+/// - Rejects `405 Method Not Allowed` (random services), HTML responses (`text/html`),
+///   `404 Not Found` (`openclaw_hooks_disabled`), `403 Forbidden`, `5xx`, connection refused,
+///   and timeouts fail-closed.
 pub async fn probe_openclaw_gateway(
     target: &OpenClawTarget,
     timeout: Duration,
@@ -646,13 +695,13 @@ pub async fn probe_openclaw_gateway(
         }
     };
 
-    let Some(token) = resolve_openclaw_token(target) else {
+    if resolve_openclaw_token(target).is_none() {
         return OpenClawProbeResult {
             ok: false,
             status: None,
             error: Some(REASON_OPENCLAW_TOKEN_MISSING.to_string()),
         };
-    };
+    }
 
     let uri: Uri = match endpoint_url.parse() {
         Ok(u) => u,
@@ -665,22 +714,11 @@ pub async fn probe_openclaw_gateway(
         }
     };
 
-    let auth_header = match HeaderValue::from_str(&format!("Bearer {token}")) {
-        Ok(v) => v,
-        Err(_) => {
-            return OpenClawProbeResult {
-                ok: false,
-                status: None,
-                error: Some(REASON_OPENCLAW_TOKEN_MISSING.to_string()),
-            };
-        }
-    };
-
     let req = match Request::builder()
-        .method(Method::HEAD)
+        .method(Method::POST)
         .uri(uri)
-        .header(header::AUTHORIZATION, auth_header)
-        .body(Full::new(Bytes::new()))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from_static(b"{}")))
     {
         Ok(r) => r,
         Err(e) => {
@@ -706,22 +744,35 @@ pub async fn probe_openclaw_gateway(
 
     let status = resp.status();
     let code = status.as_u16();
+    let is_html = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/html"));
     let _ = tokio::time::timeout(
         Duration::from_millis(250),
         drain_bounded_http_body(resp.into_body(), MAX_OPENCLAW_HTTP_BODY_BYTES),
     )
     .await;
 
+    if is_html {
+        return OpenClawProbeResult {
+            ok: false,
+            status: Some(code),
+            error: Some(REASON_OPENCLAW_GATEWAY_UNAVAILABLE.to_string()),
+        };
+    }
+
     match status {
         StatusCode::OK
-        | StatusCode::ACCEPTED
         | StatusCode::NO_CONTENT
-        | StatusCode::METHOD_NOT_ALLOWED => OpenClawProbeResult {
+        | StatusCode::BAD_REQUEST
+        | StatusCode::UNAUTHORIZED => OpenClawProbeResult {
             ok: true,
             status: Some(code),
             error: None,
         },
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => OpenClawProbeResult {
+        StatusCode::FORBIDDEN => OpenClawProbeResult {
             ok: false,
             status: Some(code),
             error: Some(REASON_OPENCLAW_AUTH_FAILED.to_string()),
@@ -730,6 +781,11 @@ pub async fn probe_openclaw_gateway(
             ok: false,
             status: Some(code),
             error: Some(REASON_OPENCLAW_HOOKS_DISABLED.to_string()),
+        },
+        StatusCode::METHOD_NOT_ALLOWED => OpenClawProbeResult {
+            ok: false,
+            status: Some(code),
+            error: Some(REASON_OPENCLAW_REQUEST_REJECTED.to_string()),
         },
         _ => OpenClawProbeResult {
             ok: false,
@@ -910,7 +966,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalizes_valid_origins_and_rejects_non_loopback_http_and_smuggling() {
+    fn normalizes_valid_origins_and_enforces_loopback_default_and_blocks_smuggling() {
         assert_eq!(
             normalize_openclaw_base_url("http://127.0.0.1:18789").unwrap(),
             "http://127.0.0.1:18789"
@@ -924,12 +980,20 @@ mod tests {
             "http://[::1]:18789"
         );
         assert_eq!(
-            normalize_openclaw_base_url("https://gw.example.com:443/").unwrap(),
+            normalize_openclaw_base_url("https://127.0.0.1:18789").unwrap(),
+            "https://127.0.0.1:18789"
+        );
+        // Remote HTTPS is rejected by default (loopback-only) and allowed only with explicit opt-in.
+        assert!(normalize_openclaw_base_url("https://gw.example.com:443/").is_err());
+        assert_eq!(
+            normalize_openclaw_base_url_with_remote("https://gw.example.com:443/", true).unwrap(),
             "https://gw.example.com"
         );
+        assert!(normalize_openclaw_base_url_with_remote("http://gw.example.com:18789", true).is_err());
 
         for bad in [
             "",
+            "https://evil.example.com",
             "http://192.168.1.50:18789",
             "http://openclaw.internal:18789",
             "http://user:pass@127.0.0.1:18789",
@@ -945,6 +1009,41 @@ mod tests {
                 "expected base URL {bad:?} to fail closed"
             );
         }
+    }
+
+    #[test]
+    fn token_secret_is_strictly_locked_to_openclaw_hooks_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(dir.path(), SecretBackend::File);
+        store.set("openclaw-hooks-token", "valid-oc-token").unwrap();
+        store.set("aws-secret-key", "DO_NOT_EXFILTRATE").unwrap();
+
+        let default_target = OpenClawTarget::new()
+            .with_state_dir(dir.path())
+            .with_secret_backend(SecretBackend::File);
+        assert_eq!(
+            resolve_openclaw_token(&default_target).as_deref(),
+            Some("valid-oc-token")
+        );
+
+        let explicit_ok = OpenClawTarget::new()
+            .with_token_secret("openclaw-hooks-token")
+            .with_state_dir(dir.path())
+            .with_secret_backend(SecretBackend::File);
+        assert_eq!(
+            resolve_openclaw_token(&explicit_ok).as_deref(),
+            Some("valid-oc-token")
+        );
+
+        let exfil_attempt = OpenClawTarget::new()
+            .with_token_secret("aws-secret-key")
+            .with_state_dir(dir.path())
+            .with_secret_backend(SecretBackend::File);
+        assert_eq!(
+            resolve_openclaw_token(&exfil_attempt),
+            None,
+            "arbitrary tokenSecret MUST fail closed and never read unrelated secrets"
+        );
     }
 
     #[test]

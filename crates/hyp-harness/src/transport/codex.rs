@@ -16,10 +16,12 @@
 //!   - Non-zero exit with offline/daemon stderr -> `PushOutcome::Hold("codex_queue_unavailable")`
 //!   - Any other failure -> `PushOutcome::Reject("codex_queue_outcome_unknown")`
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -33,6 +35,12 @@ pub const DEFAULT_CODEX_BIN: &str = "codex";
 
 /// Default timeout for a single `codex queue` invocation (matches v1 25 s).
 pub const DEFAULT_CODEX_QUEUE_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Default short timeout for probing whether `codex queue --help` is supported.
+pub const DEFAULT_CODEX_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Cache TTL for `codex queue --help` support probes.
+const CODEX_PROBE_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// Maximum allowed length (in Unicode scalar values) of `thread_id`.
 pub const MAX_THREAD_ID_LEN: usize = 256;
@@ -299,35 +307,124 @@ pub fn default_codex_home() -> PathBuf {
 /// Returns `true` iff the configured `codex` binary exists as a file (if an explicit path) or
 /// resolves in the current process `PATH`.
 pub fn codex_binary_available(bin: &str) -> bool {
+    resolve_codex_binary_path(bin).is_some()
+}
+
+fn resolve_codex_binary_path(bin: &str) -> Option<PathBuf> {
     let trimmed = bin.trim();
     if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
-        return false;
+        return None;
     }
     if trimmed.contains('/') || trimmed.contains('\\') {
-        return is_executable_file(Path::new(trimmed));
+        let p = PathBuf::from(trimmed);
+        return is_executable_file(&p).then_some(p);
     }
-    let Some(path_var) = std::env::var_os("PATH") else {
-        return false;
-    };
+    let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         if dir.as_os_str().is_empty() {
             continue;
         }
         let direct = dir.join(trimmed);
         if is_executable_file(&direct) {
-            return true;
+            return Some(direct);
         }
         #[cfg(windows)]
         {
             for ext in ["exe", "cmd", "bat"] {
                 let with_ext = dir.join(format!("{trimmed}.{ext}"));
                 if with_ext.is_file() {
-                    return true;
+                    return Some(with_ext);
                 }
             }
         }
     }
-    false
+    None
+}
+
+fn codex_probe_cache_key(resolved: &Path) -> String {
+    let canonical = std::fs::canonicalize(resolved).unwrap_or_else(|_| resolved.to_path_buf());
+    let mtime_nanos = std::fs::metadata(&canonical)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}#{mtime_nanos}", canonical.display())
+}
+
+/// Uncached probe running `<bin> queue --help` with a bounded timeout to verify whether the
+/// installed Codex CLI actually supports the `codex queue` subcommand.
+pub async fn codex_queue_supported_uncached(bin: &str, timeout: Duration) -> bool {
+    let Some(resolved) = resolve_codex_binary_path(bin) else {
+        return false;
+    };
+    let mut cmd = Command::new(&resolved);
+    cmd.args(["queue", "--help"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let Ok(mut child) = cmd.spawn() else {
+        return false;
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let probe_fut = async {
+        let out_fut = async {
+            if let Some(mut r) = stdout {
+                let _ = read_bounded_drain(&mut r, 16 * 1024).await;
+            }
+        };
+        let err_fut = async {
+            if let Some(mut r) = stderr {
+                let _ = read_bounded_drain(&mut r, 16 * 1024).await;
+            }
+        };
+        let (status_res, _, _) = tokio::join!(child.wait(), out_fut, err_fut);
+        status_res
+    };
+
+    match tokio::time::timeout(timeout, probe_fut).await {
+        Ok(Ok(status)) => status.success(),
+        Ok(Err(_)) => false,
+        Err(_) => {
+            let _ = child.kill().await;
+            false
+        }
+    }
+}
+
+/// Cached probe verifying `<bin> queue --help` succeeds before auto-attaching
+/// [`CodexQueueTransport`]. Plain Codex CLI installations without `codex queue` fail closed
+/// (`false`) so `LocalDaemon` never falsely claims push wakeups are live and preserves Stop-hook
+/// waiter prompts.
+pub async fn codex_queue_supported(bin: &str) -> bool {
+    let Some(resolved) = resolve_codex_binary_path(bin) else {
+        return false;
+    };
+    let key = codex_probe_cache_key(&resolved);
+    static CACHE: OnceLock<Mutex<HashMap<String, (Instant, bool)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let now = Instant::now();
+    {
+        let guard = cache.lock().expect("codex_queue_supported cache poisoned");
+        if let Some(&(checked_at, supported)) = guard.get(&key) {
+            if now.saturating_duration_since(checked_at) < CODEX_PROBE_CACHE_TTL {
+                return supported;
+            }
+        }
+    }
+
+    let supported = codex_queue_supported_uncached(bin, DEFAULT_CODEX_PROBE_TIMEOUT).await;
+    {
+        let mut guard = cache.lock().expect("codex_queue_supported cache poisoned");
+        if guard.len() >= 64 {
+            guard.retain(|_, (ts, _)| now.saturating_duration_since(*ts) < CODEX_PROBE_CACHE_TTL);
+        }
+        guard.insert(key, (Instant::now(), supported));
+    }
+    supported
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -355,10 +452,13 @@ fn is_executable_file(path: &Path) -> bool {
 /// - Rejects invalid/traversal/path-separator `thread_id`s fail-closed before touching disk.
 /// - Refuses symlinks (`symlink_metadata`) at every directory/file level so symlink escapes or
 ///   cycles can never traverse outside `codex_home/sessions`.
-/// - Strictly bounded traversal depth (`<= 4`) and visited entry cap (`<= 4096`).
+/// - Traverses directories and files newest-first (descending `YYYY/MM/DD` & rollout timestamp
+///   order) so long-time Codex users with >4,096 historical session files still find recent
+///   threads immediately within the bounded visit cap (`<= 4096`).
 pub fn verify_codex_rollout_thread(codex_home: &Path, thread_id: &str) -> bool {
     const MAX_WALK_DEPTH: usize = 4;
     const MAX_WALK_ENTRIES: usize = 4096;
+    const MAX_DIR_COLLECT: usize = 16_384;
 
     if !is_safe_rollout_thread_id(thread_id) {
         return false;
@@ -380,10 +480,11 @@ pub fn verify_codex_rollout_thread(codex_home: &Path, thread_id: &str) -> bool {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
+        let mut subdirs: Vec<(String, PathBuf)> = Vec::new();
+        let mut files: Vec<String> = Vec::new();
         for entry_res in entries {
-            visited += 1;
-            if visited > MAX_WALK_ENTRIES {
-                return false;
+            if subdirs.len() + files.len() >= MAX_DIR_COLLECT {
+                break;
             }
             let Ok(entry) = entry_res else {
                 continue;
@@ -395,20 +496,37 @@ pub fn verify_codex_rollout_thread(codex_home: &Path, thread_id: &str) -> bool {
             if meta.file_type().is_symlink() {
                 continue;
             }
+            let name = entry.file_name().to_string_lossy().into_owned();
             if meta.is_dir() {
                 if depth < MAX_WALK_DEPTH {
-                    stack.push((path, depth + 1));
+                    subdirs.push((name, path));
                 }
-                continue;
+            } else if meta.is_file() {
+                files.push(name);
             }
-            if !meta.is_file() {
-                continue;
+        }
+
+        // Check files newest-first (descending lexicographical timestamp order).
+        files.sort_unstable_by(|a, b| b.cmp(a));
+        for name in files {
+            visited += 1;
+            if visited > MAX_WALK_ENTRIES {
+                return false;
             }
-            if let Some(name) = entry.file_name().to_str() {
-                if filename_matches_codex_rollout(name, &tid_lower) {
-                    return true;
-                }
+            if filename_matches_codex_rollout(&name, &tid_lower) {
+                return true;
             }
+        }
+
+        // Sort subdirectories ascending before pushing onto the LIFO stack so the newest
+        // `YYYY/MM/DD` directories are popped and scanned first!
+        subdirs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for (_, path) in subdirs {
+            visited += 1;
+            if visited > MAX_WALK_ENTRIES {
+                return false;
+            }
+            stack.push((path, depth + 1));
         }
     }
 
@@ -742,5 +860,68 @@ mod tests {
                 "stderr should classify as unknown: {stderr:?}"
             );
         }
+    }
+
+    #[test]
+    fn verify_rollout_thread_scans_newest_dirs_first_past_4096_old_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_dir = tmp.path().join("sessions/2024/01/01");
+        let new_dir = tmp.path().join("sessions/2026/11/25");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+
+        // Populate >4,096 old rollout files in 2024 so an unsorted/oldest-first walk would hit
+        // MAX_WALK_ENTRIES before reaching 2026!
+        for i in 0..4_120usize {
+            let path = old_dir.join(format!("rollout-2024-01-01-{i:06}.jsonl"));
+            std::fs::write(path, "{}\n").unwrap();
+        }
+        let target_uuid = "0196a1b2-c3d4-7e5f-8a9b-202611250001";
+        std::fs::write(
+            new_dir.join(format!("rollout-2026-11-25T23-59-00-{target_uuid}.jsonl")),
+            "{}\n",
+        )
+        .unwrap();
+
+        assert!(
+            verify_codex_rollout_thread(tmp.path(), target_uuid),
+            "newest-first traversal must find 2026 rollout thread despite >4,096 old files in 2024"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_queue_supported_probes_subcommand_and_rejects_plain_codex() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let plain_codex = tmp.path().join("plain-codex");
+        std::fs::write(
+            &plain_codex,
+            "#!/bin/sh\necho 'error: unrecognized subcommand queue' >&2\nexit 2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&plain_codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let queue_codex = tmp.path().join("queue-codex");
+        std::fs::write(
+            &queue_codex,
+            "#!/bin/sh\nif [ \"$1\" = \"queue\" ] && [ \"$2\" = \"--help\" ]; then echo 'Usage: codex queue'; exit 0; fi\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&queue_codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            !codex_queue_supported(&plain_codex.display().to_string()).await,
+            "plain Codex CLI without `codex queue` must return false"
+        );
+        assert!(
+            codex_queue_supported(&queue_codex.display().to_string()).await,
+            "Codex CLI supporting `codex queue --help` must return true"
+        );
+        assert!(
+            !codex_queue_supported(&tmp.path().join("nonexistent-codex").display().to_string())
+                .await
+        );
     }
 }

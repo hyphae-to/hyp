@@ -632,11 +632,14 @@ async fn u6_g16_prune_sessions_removes_stale_idle_and_preserves_quarantined_and_
     let now = now_ms();
     let stale_ts = now - (10 * 24 * 60 * 60 * 1_000); // 10 days ago
 
-    // 1. Seed 3 sessions: stale-clean, stale-quarantined, fresh-idle.
+    // 1. Seed 4 sessions: stale-clean, stale-pending (UR1), stale-quarantined, fresh-idle.
     {
         let db = node.db();
         db.local()
             .register_session("claude:stale-clean", "{}", stale_ts)
+            .unwrap();
+        db.local()
+            .register_session("claude:stale-pending", "{}", stale_ts)
             .unwrap();
         db.local()
             .register_session("claude:stale-quarantined", "{}", stale_ts)
@@ -644,6 +647,25 @@ async fn u6_g16_prune_sessions_removes_stale_idle_and_preserves_quarantined_and_
         db.local()
             .register_session("claude:fresh-idle", "{}", now)
             .unwrap();
+
+        let p_res = db
+            .local()
+            .put_in_mailbox(
+                &MailboxInsert {
+                    session_id: "claude:stale-pending".into(),
+                    origin_node: "bob@lap".into(),
+                    item_id: "p-preserve-1".into(),
+                    text: "Unread pending DM that UR1 must NEVER delete".into(),
+                    kind: MailboxKind::Message,
+                    source: "bob@lap/dev".into(),
+                    gate_state: GateState::Pending,
+                    gate_reason: None,
+                    traceparent: None,
+                },
+                stale_ts,
+            )
+            .unwrap();
+        assert!(matches!(p_res, MailboxPutResult::Stored { .. }));
 
         let q_res = db
             .local()
@@ -678,10 +700,18 @@ async fn u6_g16_prune_sessions_removes_stale_idle_and_preserves_quarantined_and_
     .await
     .unwrap();
 
-    // `stale-clean` MUST be pruned on startup; `stale-quarantined` and `fresh-idle` MUST survive!
+    // `stale-clean` MUST be pruned on startup; `stale-pending`, `stale-quarantined`, and `fresh-idle` MUST survive!
     {
         let db = node.db();
         assert!(db.local().get_session("claude:stale-clean").unwrap().is_none());
+        assert!(
+            db.local()
+                .get_session("claude:stale-pending")
+                .unwrap()
+                .is_some(),
+            "UR1: stale session holding unread pending items MUST NOT be pruned"
+        );
+        assert_eq!(db.local().pending_count("claude:stale-pending").unwrap(), 1);
         assert!(
             db.local()
                 .get_session("claude:stale-quarantined")
@@ -1410,6 +1440,10 @@ async fn g10_reconcile_quarantine_surfaces_coalesced_metadata_only_notice() {
     assert!(rendered1.contains("BENIGN_MSG_1"));
     assert!(rendered1.contains(&q_rcpt));
     assert!(rendered1.contains("evil@ext/bot"));
+    assert!(
+        rendered1.contains("ask the human to review via `hyp gate review` / `hyp inbox approve`"),
+        "G10: quarantine notice must direct agent to ask the human, not run gate review itself: {rendered1}"
+    );
     assert!(!rendered1.contains("SECRET_EXFIL_BODY_G10"));
 
     // Second benign message MUST NOT re-spam the already-surfaced quarantine receipt!
@@ -1705,5 +1739,532 @@ async fn r5_daemon_status_exposes_binary_version_and_pid() {
     assert!(body.get("quarantinedCount").is_some());
 
     daemon.stop().await;
+    node.shutdown();
+}
+
+// ============================================================================
+// 12. Wave 4B: `B3` Bridge Target Enforcement, `U2` Leave Channel, `H18` Junk Drop, `G8` Sweep
+// ============================================================================
+
+#[tokio::test]
+async fn b3_bridge_enforces_configured_targets_on_link_handoff_and_send() {
+    use hyp_harness::daemon::{BoxFuture, BridgePoster};
+    use serde_json::Map;
+
+    struct CountingPoster(Arc<AtomicUsize>);
+    impl BridgePoster for CountingPoster {
+        fn post<'a>(
+            &'a self,
+            plugin: &'a str,
+            target: &'a str,
+            _text: &'a str,
+            _meta: &'a Map<String, Value>,
+        ) -> BoxFuture<'a, Result<Value, (String, String)>> {
+            let p = plugin.to_string();
+            let t = target.to_string();
+            let c = Arc::clone(&self.0);
+            Box::pin(async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({ "ok": true, "plugin": p, "target": t }))
+            })
+        }
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let node = open_local_node("b3-bridge@box", tmp.path());
+    let daemon = LocalDaemon::start(Arc::clone(&node), None, LocalDaemonConfig::default())
+        .await
+        .unwrap();
+    let sent_count = Arc::new(AtomicUsize::new(0));
+    daemon.register_bridge_poster_with_targets(
+        "telegram",
+        vec!["allowed-chat".to_string()],
+        Arc::new(CountingPoster(Arc::clone(&sent_count))),
+    );
+    let sock = daemon.socket_path().to_path_buf();
+
+    let mut mcp = TestMcpClient::spawn(McpOptions::new(sock.clone()));
+    mcp.initialize().await;
+    let (_, j_err) = mcp
+        .call_verified_claude(
+            &sock,
+            "b3-sess",
+            "hyp_mesh",
+            json!({ "action": "join", "handle": "ops" }),
+        )
+        .await;
+    assert!(!j_err);
+
+    // 1. Link, handoff, and send to unconfigured target OR wildcard `*` MUST ALL fail closed!
+    for bad_target in ["unconfigured-chat", "*"] {
+        let (l_txt, l_err) = mcp
+            .call_verified_claude(
+                &sock,
+                "b3-sess",
+                "hyp_bridge",
+                json!({ "action": "link", "plugin": "telegram", "target": bad_target }),
+            )
+            .await;
+        assert!(
+            l_err && l_txt.contains("bridge_target_not_configured"),
+            "B3: link to {bad_target} must fail closed: {l_txt}"
+        );
+
+        let (h_txt, h_err) = mcp
+            .call_verified_claude(
+                &sock,
+                "b3-sess",
+                "hyp_bridge",
+                json!({ "action": "handoff", "plugin": "telegram", "target": bad_target }),
+            )
+            .await;
+        assert!(
+            h_err && h_txt.contains("bridge_target_not_configured"),
+            "B3: handoff to {bad_target} must fail closed: {h_txt}"
+        );
+    }
+
+    // Even if a stale `plugin_targets` row existed in SQLite for an unconfigured target,
+    // `hyp_send` MUST STILL fail closed with `bridge_target_not_configured`!
+    node.db()
+        .local()
+        .set_plugin_target(&hyp_store::PluginTargetHandoff {
+            plugin: "telegram".into(),
+            target: "stale-unconfigured".into(),
+            session_id: "claude:b3-sess".into(),
+            set_at: now_ms(),
+            set_by: "claude:b3-sess".into(),
+        })
+        .unwrap();
+    let (s_bad_txt, s_bad_err) = mcp
+        .call_verified_claude(
+            &sock,
+            "b3-sess",
+            "hyp_send",
+            json!({ "to": "telegram:stale-unconfigured", "text": "must be blocked" }),
+        )
+        .await;
+    assert!(
+        s_bad_err && s_bad_txt.contains("bridge_target_not_configured"),
+        "B3: send to unconfigured target must fail closed even with stale DB holder: {s_bad_txt}"
+    );
+    assert_eq!(sent_count.load(Ordering::SeqCst), 0);
+
+    // 2. Configured target `telegram:allowed-chat` links, hands off, and sends cleanly!
+    let (l_ok_txt, l_ok_err) = mcp
+        .call_verified_claude(
+            &sock,
+            "b3-sess",
+            "hyp_bridge",
+            json!({ "action": "link", "plugin": "telegram", "target": "allowed-chat" }),
+        )
+        .await;
+    assert!(!l_ok_err, "configured target link failed: {l_ok_txt}");
+    let (s_ok_txt, s_ok_err) = mcp
+        .call_verified_claude(
+            &sock,
+            "b3-sess",
+            "hyp_send",
+            json!({ "to": "telegram:allowed-chat", "text": "hello allowed" }),
+        )
+        .await;
+    assert!(!s_ok_err, "configured target send failed: {s_ok_txt}");
+    assert_eq!(sent_count.load(Ordering::SeqCst), 1);
+
+    mcp.close().await;
+    daemon.stop().await;
+    node.shutdown();
+}
+
+#[tokio::test]
+async fn u2_session_leave_channel_returns_error_when_not_a_member() {
+    let tmp = TempDir::new().unwrap();
+    let node = open_local_node("u2-leave@box", tmp.path());
+    let daemon = LocalDaemon::start(Arc::clone(&node), None, LocalDaemonConfig::default())
+        .await
+        .unwrap();
+    let sock = daemon.socket_path().to_path_buf();
+
+    let mut mcp = TestMcpClient::spawn(McpOptions::new(sock.clone()));
+    mcp.initialize().await;
+    let (_, j_err) = mcp
+        .call_verified_claude(
+            &sock,
+            "u2-sess",
+            "hyp_mesh",
+            json!({ "action": "join", "handle": "alice" }),
+        )
+        .await;
+    assert!(!j_err);
+
+    // Leaving a channel the session NEVER joined MUST return `ok: false`!
+    let leave_missing = rpc(
+        &sock,
+        &json!({
+            "type": "session.leave_channel",
+            "sessionId": "claude:u2-sess",
+            "channel": "#never-joined"
+        }),
+    )
+    .await;
+    assert!(
+        !leave_missing.ok,
+        "U2: session.leave_channel must return ok=false when left==false: {leave_missing:?}"
+    );
+
+    // Joining and then leaving `#ops` returns `ok: true` once, then `ok: false` on second leave!
+    let (_, ch_err) = mcp
+        .call_verified_claude(
+            &sock,
+            "u2-sess",
+            "hyp_mesh",
+            json!({ "action": "join", "channel": "#ops" }),
+        )
+        .await;
+    assert!(!ch_err);
+
+    let leave_ok = rpc(
+        &sock,
+        &json!({
+            "type": "session.leave_channel",
+            "sessionId": "claude:u2-sess",
+            "channel": "#ops"
+        }),
+    )
+    .await;
+    assert!(leave_ok.ok, "first leave_channel should succeed: {leave_ok:?}");
+
+    let leave_twice = rpc(
+        &sock,
+        &json!({
+            "type": "session.leave_channel",
+            "sessionId": "claude:u2-sess",
+            "channel": "#ops"
+        }),
+    )
+    .await;
+    assert!(
+        !leave_twice.ok,
+        "second leave_channel after already leaving must fail closed: {leave_twice:?}"
+    );
+
+    mcp.close().await;
+    daemon.stop().await;
+    node.shutdown();
+}
+
+#[tokio::test]
+async fn h18_drop_watcher_ignores_junk_envelope_and_delivers_subsequent_valid_drop() {
+    let tmp = TempDir::new().unwrap();
+    let node = open_local_node("h18-drop@box", tmp.path());
+
+    let human_kp = Ed25519KeyPair::generate().unwrap();
+    enroll_human_authority(&node, "bogdan", &human_kp, HumanAuthorityRole::Admin);
+
+    let wrong_kp = Ed25519KeyPair::generate().unwrap();
+    let now = now_ms();
+    let build_env = |kp: &Ed25519KeyPair, body: &str| {
+        let claim = HumanClaimV1 {
+            v: 1,
+            claim_id: format!("claim-h18-{}", uuid_v4()),
+            kind: HumanDropKind::Directive,
+            human_id: "bogdan".into(),
+            human_kid: kp.kid(),
+            auth_epoch: 1,
+            issued_at: format_rfc3339_millis(now),
+            expires_at: format_rfc3339_millis(now + 300_000),
+            drop_id: "drop-h18-1".into(),
+            audience: HumanAudience {
+                node_id: "h18-drop@box".into(),
+                node_enc_kid: node.identity().encryption.kid(),
+                handle: Some("dev".into()),
+            },
+            secret_spec: None,
+            body: body.into(),
+        };
+        serde_json::to_string(
+            &seal_human_drop(&claim, kp, &node.identity().encryption.public_key()).unwrap(),
+        )
+        .unwrap()
+    };
+
+    // Event 1: signed by an UNENROLLED attacker key (fails verification!).
+    let junk_env = build_env(&wrong_kp, "FORGED_JUNK_DROP_H18");
+    // Event 2: signed by the REAL enrolled human authority!
+    let valid_env = build_env(&human_kp, "REAL_HUMAN_DROP_AFTER_JUNK_H18");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_url = format!("http://{}", listener.local_addr().unwrap());
+    let relay_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let junk = junk_env.clone();
+            let valid = valid_env.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let first_line = req.lines().next().unwrap_or_default();
+                if first_line.starts_with("POST /v1/drops ") {
+                    let exp_ms = now_ms() + 300_000;
+                    let body = json!({
+                        "dropId": "drop-h18-1",
+                        "postCap": "post-h18",
+                        "subCap": "sub-h18",
+                        "expiresAt": format_rfc3339_millis(exp_ms),
+                        "expiresAtMs": exp_ms,
+                        "maxPayloadBytes": 65536,
+                        "maxItems": 4,
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                } else if first_line.starts_with("GET /v1/drops/drop-h18-1/stream") {
+                    let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(hdr.as_bytes()).await;
+                    let ev1 = format!("id: 1\ndata: {junk}\n\n");
+                    let _ = stream.write_all(ev1.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let ev2 = format!("id: 2\ndata: {valid}\n\n");
+                    let _ = stream.write_all(ev2.as_bytes()).await;
+                    let _ = stream.flush().await;
+                } else {
+                    let body = "{\"ok\":true}";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                }
+            });
+        }
+    });
+
+    let daemon = LocalDaemon::start(Arc::clone(&node), None, LocalDaemonConfig::default())
+        .await
+        .unwrap();
+    let sock = daemon.socket_path().to_path_buf();
+
+    let mut mcp = TestMcpClient::spawn(McpOptions::new(sock.clone()));
+    mcp.initialize().await;
+    let (_, j_err) = mcp
+        .call_verified_claude(
+            &sock,
+            "h18-sess",
+            "hyp_mesh",
+            json!({ "action": "join", "handle": "dev" }),
+        )
+        .await;
+    assert!(!j_err);
+
+    let transport = ScriptedTransport::new("herdr", vec![], PushOutcome::delivered());
+    daemon.register_session_transport("claude:h18-sess", transport.clone());
+
+    let (_, drop_err) = mcp
+        .call_verified_claude(
+            &sock,
+            "h18-sess",
+            "hyp_mesh",
+            json!({ "action": "drop_link", "kind": "directive", "relay": relay_url }),
+        )
+        .await;
+    assert!(!drop_err);
+
+    let delivered = transport.wait_for_delivered(1, Duration::from_secs(5)).await;
+    assert!(
+        delivered[0].contains("REAL_HUMAN_DROP_AFTER_JUNK_H18"),
+        "H18: drop watcher must survive junk envelope and deliver valid drop: {delivered:?}"
+    );
+    assert!(
+        !delivered[0].contains("FORGED_JUNK_DROP_H18"),
+        "junk drop must never be delivered"
+    );
+
+    mcp.close().await;
+    daemon.stop().await;
+    relay_task.abort();
+    node.shutdown();
+}
+
+#[tokio::test]
+async fn g8_approval_never_blanket_approves_unrelated_batches_and_sweeps_on_startup() {
+    let tmp = TempDir::new().unwrap();
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+
+    let node = open_local_node("g8-strict@box", &state_dir);
+    let gate_db = Arc::new(Mutex::new(
+        NodeDb::open(state_dir.join("node.sqlite")).unwrap(),
+    ));
+
+    let mut gate_cfg = SecurityGateConfig::default();
+    gate_cfg
+        .stage1
+        .inbound_regex_denylist
+        .push("BLOCK_UNRELATED_G8".into());
+    gate_cfg.stage1.regex_deny_action = Stage1DenyAction::Quarantine;
+    let pipeline = Arc::new(SecurityGatePipeline::new(gate_cfg, Arc::clone(&gate_db), None).unwrap());
+
+    let daemon = LocalDaemon::start(
+        Arc::clone(&node),
+        Some(Arc::clone(&pipeline)),
+        LocalDaemonConfig::default(),
+    )
+    .await
+    .unwrap();
+    let sock = daemon.socket_path().to_path_buf();
+
+    let mut mcp = TestMcpClient::spawn(McpOptions::new(sock.clone()));
+    mcp.initialize().await;
+    let (_, j_err) = mcp
+        .call_verified_claude(
+            &sock,
+            "g8-strict-sub",
+            "hyp_mesh",
+            json!({ "action": "join", "handle": "worker" }),
+        )
+        .await;
+    assert!(!j_err);
+    let (_, sub_err) = mcp
+        .call_verified_claude(
+            &sock,
+            "g8-strict-sub",
+            "hyp_stream",
+            json!({ "action": "subscribe", "topic": "local.schedule", "coalesceSeconds": 0 }),
+        )
+        .await;
+    assert!(!sub_err);
+
+    // 1. Seed an UNRELATED malicious due batch in EventStore on the exact same `schedule` topic!
+    let now = now_ms();
+    let mut unrelated_ev = hyp_store::CloudEvent::new(
+        "unrelated-malicious-ev-1",
+        "local:schedule",
+        TYPE_SCHEDULED_MESSAGE_V1,
+        json!({ "text": "BLOCK_UNRELATED_G8 sneaky payload" }),
+    );
+    unrelated_ev.subject = Some("schedule".into());
+    unrelated_ev.time = Some(format_rfc3339_millis(now));
+    node.db()
+        .events()
+        .ingest("g8-strict@box", "schedule", "p", &unrelated_ev, now - 10)
+        .unwrap();
+
+    // 2. Seed a quarantined `local-ingest:schedule` staging row and approve ONLY that receipt!
+    let q_rcpt = match node
+        .db()
+        .local()
+        .put_in_mailbox(
+            &MailboxInsert {
+                session_id: "local-ingest:schedule".into(),
+                origin_node: "g8-strict@box".into(),
+                item_id: "approved-only-ev-1".into(),
+                text: json!({ "text": "BLOCK_UNRELATED_G8 explicitly human approved" }).to_string(),
+                kind: MailboxKind::Event,
+                source: "local:schedule".into(),
+                gate_state: GateState::Quarantined,
+                gate_reason: Some("regex_deny".into()),
+                traceparent: None,
+            },
+            now,
+        )
+        .unwrap()
+    {
+        MailboxPutResult::Stored { receipt } => receipt,
+        other => panic!("unexpected put: {other:?}"),
+    };
+    node.db()
+        .local()
+        .approve_quarantined(&q_rcpt, "human@cli", now + 1)
+        .unwrap();
+
+    let transport = ScriptedTransport::new("herdr", vec![], PushOutcome::delivered());
+    daemon.register_session_transport("claude:g8-strict-sub", transport.clone());
+
+    let wake = rpc(&sock, &json!({ "type": "inbox.wake", "receipt": q_rcpt })).await;
+    assert!(wake.ok);
+
+    let delivered = transport.wait_for_delivered(1, Duration::from_secs(3)).await;
+    let combined = delivered.join("\n");
+    assert!(
+        combined.contains("explicitly human approved"),
+        "approved event must be delivered: {combined}"
+    );
+    assert!(
+        !combined.contains("sneaky payload"),
+        "G8 VIOLATION: unrelated due batch on same topic was blanket-approved! {combined}"
+    );
+    assert_eq!(
+        node.db()
+            .local()
+            .quarantined_count(Some("claude:g8-strict-sub"))
+            .unwrap(),
+        1,
+        "unrelated malicious event must be quarantined by Security Gate"
+    );
+
+    // 3. Startup sweep test: stop daemon, approve a quarantined `local-ingest:schedule` row while
+    //    daemon is STOPPED, then restart daemon -> startup sweep fans it out to subscriber!
+    mcp.close().await;
+    daemon.stop().await;
+
+    let offline_rcpt = match node
+        .db()
+        .local()
+        .put_in_mailbox(
+            &MailboxInsert {
+                session_id: "local-ingest:schedule".into(),
+                origin_node: "g8-strict@box".into(),
+                item_id: "approved-offline-ev-2".into(),
+                text: json!({ "text": "OFFLINE_APPROVED_STARTUP_SWEEP_G8" }).to_string(),
+                kind: MailboxKind::Event,
+                source: "local:schedule".into(),
+                gate_state: GateState::Quarantined,
+                gate_reason: Some("regex_deny".into()),
+                traceparent: None,
+            },
+            now + 50,
+        )
+        .unwrap()
+    {
+        MailboxPutResult::Stored { receipt } => receipt,
+        other => panic!("unexpected offline put: {other:?}"),
+    };
+    node.db()
+        .local()
+        .approve_quarantined(&offline_rcpt, "human@cli", now + 51)
+        .unwrap();
+
+    let daemon2 = LocalDaemon::start(
+        Arc::clone(&node),
+        Some(Arc::clone(&pipeline)),
+        LocalDaemonConfig::default(),
+    )
+    .await
+    .unwrap();
+    let sock2 = daemon2.socket_path().to_path_buf();
+
+    // Subscriber's mailbox MUST now contain the offline-approved event (gate-cleared)!
+    let drain2 = rpc(
+        &sock2,
+        &json!({ "type": "mailbox.drain", "sessionId": "claude:g8-strict-sub" }),
+    )
+    .await;
+    assert!(drain2.ok);
+    let rendered2 = serde_json::to_string(&drain2.result).unwrap();
+    assert!(
+        rendered2.contains("OFFLINE_APPROVED_STARTUP_SWEEP_G8"),
+        "G8 startup sweep must fan out offline-approved local-ingest row: {rendered2}"
+    );
+
+    daemon2.stop().await;
     node.shutdown();
 }
