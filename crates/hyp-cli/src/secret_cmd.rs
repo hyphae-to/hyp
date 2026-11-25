@@ -556,8 +556,416 @@ fn html_response(status: StatusCode, body: String) -> Response<Full<Bytes>> {
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-store")
         .header(header::CONNECTION, "close")
+        .header(
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        )
+        .header(header::REFERRER_POLICY, "no-referrer")
+        .header("X-Frame-Options", "DENY")
         .body(Full::new(Bytes::from(body)))
         .expect("valid HTML response")
+}
+
+fn friendly_backend_label(raw: &str) -> String {
+    match raw {
+        "keychain" => "macOS Keychain".to_string(),
+        "secret-service" => "Linux Secret Service".to_string(),
+        "file" => "0600 Private Secret File".to_string(),
+        other => escape_html(other),
+    }
+}
+
+const WEB_CAPTURE_CSS: &str = r#"
+:root {
+  --bg: #0b0f0c;
+  --surface: #121814;
+  --surface-2: #18211b;
+  --border: rgba(232, 236, 224, 0.11);
+  --border-strong: rgba(229, 185, 92, 0.36);
+  --text: #eef2e6;
+  --muted: #98a89a;
+  --gold: #e5b95c;
+  --gold-hover: #efc874;
+  --sage: #86d39a;
+  --sage-bg: rgba(134, 211, 154, 0.1);
+  --sage-border: rgba(134, 211, 154, 0.3);
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  min-height: 100%;
+  background: radial-gradient(900px 520px at 50% -120px, rgba(134, 211, 154, 0.08), transparent 60%),
+              radial-gradient(640px 420px at 90% 100%, rgba(229, 185, 92, 0.06), transparent 65%),
+              var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 16px;
+}
+.shell {
+  width: 100%;
+  max-width: 480px;
+}
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding: 0 4px;
+}
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text);
+  text-decoration: none;
+}
+.brand-mark {
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  display: grid;
+  place-items: center;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--gold);
+}
+.brand-name {
+  font-weight: 600;
+  font-size: 0.98rem;
+  letter-spacing: -0.01em;
+}
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--gold);
+  background: rgba(229, 185, 92, 0.08);
+  border: 1px solid rgba(229, 185, 92, 0.25);
+  border-radius: 999px;
+  padding: 5px 10px;
+  white-space: nowrap;
+}
+.pill-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--gold);
+}
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 24px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+}
+.eyebrow {
+  margin: 0 0 6px;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--gold);
+}
+h1 {
+  margin: 0 0 8px;
+  font-size: 1.4rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
+}
+.lead {
+  margin: 0 0 20px;
+  color: var(--muted);
+  font-size: 0.92rem;
+  line-height: 1.5;
+}
+.meta-strip {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  align-items: center;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin-bottom: 20px;
+}
+.meta-label {
+  display: block;
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-bottom: 3px;
+}
+.meta-name {
+  font-family: var(--mono);
+  font-size: 0.96rem;
+  font-weight: 600;
+  color: var(--gold);
+  word-break: break-all;
+}
+.backend-chip {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--sage);
+  background: var(--sage-bg);
+  border: 1px solid var(--sage-border);
+  border-radius: 999px;
+  padding: 4px 10px;
+  white-space: nowrap;
+}
+.field-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+label {
+  font-size: 0.84rem;
+  font-weight: 500;
+  color: var(--text);
+}
+.hint {
+  font-family: var(--mono);
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+.input-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+input[type="password"], input[type="text"] {
+  flex: 1;
+  min-width: 0;
+  background: #0c110e;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  font-family: var(--mono);
+  font-size: 0.92rem;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+input[type="password"]:focus, input[type="text"]:focus {
+  border-color: var(--border-strong);
+  box-shadow: 0 0 0 3px rgba(229, 185, 92, 0.14);
+}
+.btn-toggle {
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0 14px;
+  font-size: 0.82rem;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn-toggle:hover { border-color: var(--border-strong); }
+.btn-primary {
+  width: 100%;
+  background: var(--gold);
+  color: #111510;
+  border: none;
+  border-radius: 11px;
+  padding: 13px 16px;
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, transform 0.05s ease;
+}
+.btn-primary:hover { background: var(--gold-hover); }
+.btn-primary:active { transform: translateY(1px); }
+.done-banner {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  background: var(--sage-bg);
+  border: 1px solid var(--sage-border);
+  border-radius: 12px;
+  padding: 14px 16px;
+  margin-bottom: 18px;
+}
+.done-icon {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: rgba(134, 211, 154, 0.2);
+  color: var(--sage);
+  display: grid;
+  place-items: center;
+  font-weight: 700;
+  font-size: 0.85rem;
+}
+.done-banner strong {
+  display: block;
+  color: var(--sage);
+  font-size: 0.88rem;
+  margin-bottom: 3px;
+}
+.done-banner span {
+  display: block;
+  color: var(--text);
+  font-size: 0.86rem;
+  line-height: 1.45;
+}
+.code-ref {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  color: var(--muted);
+  background: #0c110e;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  word-break: break-all;
+}
+.footer {
+  margin-top: 14px;
+  text-align: center;
+  font-size: 0.74rem;
+  color: var(--muted);
+  line-height: 1.5;
+}
+"#;
+
+const HYPHAE_BRAND_SVG: &str = r#"<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3" fill="currentColor" stroke="none"/><path d="M12 3v6M12 15v6M3 12h6M15 12h6M5.6 5.6l4.2 4.2M14.2 14.2l4.2 4.2M18.4 5.6l-4.2 4.2M9.8 14.2l-4.2 4.2"/></svg>"#;
+
+fn render_web_capture_form_html(
+    safe_name: &str,
+    backend_raw: &str,
+    expected_path: &str,
+    csrf_nonce: &str,
+) -> String {
+    let backend_pretty = friendly_backend_label(backend_raw);
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="referrer" content="no-referrer" />
+  <title>Hyphae · Save secret {safe_name}</title>
+  <style>{WEB_CAPTURE_CSS}</style>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">{HYPHAE_BRAND_SVG}</span>
+        <span class="brand-name">hyphae</span>
+      </div>
+      <span class="pill"><span class="pill-dot" aria-hidden="true"></span>127.0.0.1 · One-Shot</span>
+    </header>
+    <section class="card">
+      <p class="eyebrow">Out-of-Band Secret Capture</p>
+      <h1>Save secret locally</h1>
+      <p class="lead">Captured directly into your OS keystore over loopback. Never enters LLM context, chat logs, or shell history.</p>
+      <div class="meta-strip">
+        <div>
+          <span class="meta-label">Secret Name</span>
+          <span class="meta-name">{safe_name}</span>
+        </div>
+        <span class="backend-chip">{backend_pretty}</span>
+      </div>
+      <form method="POST" action="{expected_path}" autocomplete="off">
+        <input type="hidden" name="csrf" value="{csrf_nonce}" />
+        <div class="field-head">
+          <label for="secretValue">Secret Value</label>
+          <span id="lenHint" class="hint">0 chars</span>
+        </div>
+        <div class="input-row">
+          <input id="secretValue" type="password" name="value" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Paste secret value…" autofocus required />
+          <button id="toggleBtn" class="btn-toggle" type="button">Show</button>
+        </div>
+        <button id="submitBtn" class="btn-primary" type="submit">Save Secret &amp; Finish</button>
+      </form>
+    </section>
+    <p class="footer">Server exits immediately after saving · Zero network egress · CSRF protected</p>
+  </main>
+  <script>
+    (function () {{
+      var input = document.getElementById("secretValue");
+      var toggle = document.getElementById("toggleBtn");
+      var hint = document.getElementById("lenHint");
+      var btn = document.getElementById("submitBtn");
+      function updateLen() {{
+        var n = input.value.trim().length;
+        hint.textContent = n === 1 ? "1 char" : n + " chars";
+      }}
+      input.addEventListener("input", updateLen);
+      toggle.addEventListener("click", function () {{
+        var isPwd = input.type === "password";
+        input.type = isPwd ? "text" : "password";
+        toggle.textContent = isPwd ? "Hide" : "Show";
+        input.focus();
+      }});
+      input.form.addEventListener("submit", function () {{
+        btn.disabled = true;
+        btn.textContent = "Saving…";
+      }});
+    }})();
+  </script>
+</body>
+</html>"#
+    )
+}
+
+fn render_web_capture_saved_html(safe_name: &str, backend_raw: &str) -> String {
+    let backend_pretty = friendly_backend_label(backend_raw);
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="referrer" content="no-referrer" />
+  <title>Hyphae · Saved {safe_name}</title>
+  <style>{WEB_CAPTURE_CSS}</style>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">{HYPHAE_BRAND_SVG}</span>
+        <span class="brand-name">hyphae</span>
+      </div>
+      <span class="pill"><span class="pill-dot" aria-hidden="true"></span>Saved Locally</span>
+    </header>
+    <section class="card">
+      <p class="eyebrow">Secret Saved</p>
+      <h1>Return to your setup now</h1>
+      <p class="lead">Your secret was saved securely and the one-shot local listener has shut down. You can close this tab.</p>
+      <div class="done-banner">
+        <span class="done-icon" aria-hidden="true">✓</span>
+        <div>
+          <strong>Stored in {backend_pretty}</strong>
+          <span>Saved under <code>{safe_name}</code> without echoing any secret bytes.</span>
+        </div>
+      </div>
+      <div class="code-ref">Reference in node.json: {{ "secret": "{safe_name}" }}</div>
+    </section>
+    <p class="footer">You can safely close this tab now.</p>
+  </main>
+</body>
+</html>"#
+    )
 }
 
 fn text_response(status: StatusCode, body: &'static str) -> Response<Full<Bytes>> {
@@ -622,19 +1030,8 @@ async fn capture_secret_via_web(
     let csrf_nonce = random_b64url(24)?;
     let expected_path = format!("/s/{url_token}");
     let safe_name = escape_html(name);
-    let backend_label = escape_html(store.backend().as_str());
-
-    let form_html = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-         <title>Hyphae · Save secret {safe_name}</title></head><body>\
-         <form method=\"POST\" action=\"{expected_path}\">\
-         <h1>Save secret: <code>{safe_name}</code></h1>\
-         <p>Stored directly in {backend_label}. Never enters LLM context or shell history.</p>\
-         <input type=\"hidden\" name=\"csrf\" value=\"{csrf_nonce}\" />\
-         <input type=\"password\" name=\"value\" autocomplete=\"off\" autofocus required />\
-         <button type=\"submit\">Save secret &amp; close</button>\
-         </form></body></html>"
-    );
+    let form_html =
+        render_web_capture_form_html(&safe_name, store.backend().as_str(), &expected_path, &csrf_nonce);
 
     let listener = TcpListener::bind(("127.0.0.1", port))
         .await
@@ -780,11 +1177,7 @@ async fn handle_web_capture_request(
                     let safe_name = escape_html(&state.name);
                     html_response(
                         StatusCode::OK,
-                        format!(
-                            "<!doctype html><html><body><h1>Saved <code>{safe_name}</code></h1>\
-                             <p>Stored in {}. You may close this tab.</p></body></html>",
-                            escape_html(&backend)
-                        ),
+                        render_web_capture_saved_html(&safe_name, &backend),
                     )
                 }
                 Err(e) => {
