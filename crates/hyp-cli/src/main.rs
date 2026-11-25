@@ -11,15 +11,19 @@ mod deploy;
 mod drop_cmd;
 mod emit_cmd;
 mod gate_cmd;
+mod inspect_cmd;
 mod kv_cmd;
 mod node_cmd;
 mod pair;
 mod secret_cmd;
 mod service;
+mod session_cmd;
 mod setup;
 mod skill_render;
 mod status_doctor;
+mod statusline_cmd;
 mod ui;
+mod ui_tui;
 mod update;
 mod wizard;
 
@@ -194,6 +198,14 @@ enum Commands {
         #[command(subcommand)]
         command: pair::PairCommand,
     },
+    /// Ultra-fast status bar pill for Claude Code, Antigravity & generic harnesses (<5 ms cold start)
+    Statusline(statusline_cmd::StatuslineArgs),
+    /// Inspect live session state, subscriptions, queued metadata, rules, mutes & channels (--watch supported)
+    Inspect(inspect_cmd::InspectArgs),
+    /// Quick session controls (`focus`, `mute`, `unmute`, `rule`, `unsubscribe`, `leave`)
+    Session(session_cmd::SessionArgs),
+    /// Interactive zero-dependency fullscreen terminal UI for live sessions, subscriptions & controls
+    Ui(ui_tui::UiArgs),
     /// Print version info (supports --json agent-first envelope)
     Version {
         /// Output structured JSON envelope
@@ -291,6 +303,9 @@ fn build_current_thread_runtime() -> Result<tokio::runtime::Runtime, String> {
 
 fn main() -> ExitCode {
     if let Some(code) = try_hook_fast_path() {
+        return code;
+    }
+    if let Some(code) = statusline_cmd::try_statusline_fast_path() {
         return code;
     }
 
@@ -471,6 +486,10 @@ fn main() -> ExitCode {
         Commands::Update(args) => update::run_update(args),
         Commands::Deploy { command } => deploy::run_deploy(command),
         Commands::Pair { command } => pair::run_pair(command),
+        Commands::Statusline(args) => statusline_cmd::run_statusline(&args),
+        Commands::Inspect(args) => inspect_cmd::run_inspect(&args),
+        Commands::Session(args) => session_cmd::run_session(&args),
+        Commands::Ui(args) => ui_tui::run_ui(&args),
         Commands::Version { json: as_json } => {
             let version = env!("CARGO_PKG_VERSION");
             if as_json {
