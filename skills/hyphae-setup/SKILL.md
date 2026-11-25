@@ -46,6 +46,8 @@ Use the results to pick the right mode automatically:
 5. **Phone URLs — ALWAYS include BOTH a scannable QR code AND the clickable URL**:
    - Whenever a setup or drop step produces a URL meant to be opened on the user's phone (e.g. `https://hyphae.to/drop#enroll=...`, `https://hyphae.to/drop#drop=...`, WhatsApp bridge pairing, Tailscale auth, or Telegram/Slack mobile links), **ALWAYS present BOTH a crisp terminal QR code** (e.g. via `qrencode -t ANSIUTF8 "$URL"` or `python3` / `npx` QR output if `qrencode` is absent) **AND the full clickable URL** so the user can scan immediately with their phone camera or tap/copy it directly.
    - *(Remember: never pass secrets in URLs — `#drop=` and `#enroll=` links only carry public metadata, one-shot `postCap`s, or HPKE-encrypted `encDraft`s.)*
+6. **Guided Credential & Lock Walkthroughs — NEVER dump bare `hyp secret set` or `hyp gate lock` commands without context**:
+   - Whenever you ask the user to run `hyp secret set <name> --web` or `hyp gate lock`, **always explain in 2–4 crisp bullets**: (a) **why** it's needed (or whether it's optional), (b) **exact URL + exact clicks/scopes** to generate the token (with a QR code + URL for phone apps like `https://t.me/BotFather`), and (c) what `hyp gate lock` is about to apply & sign (`adapter`, `model`, `base_url`, `on_error`) so the user can review before locking. Walk through one integration cleanly rather than leaving the user guessing where a token comes from!
 
 ---
 
@@ -243,7 +245,19 @@ hyp deploy check --url https://<hostname> --json
   *(Always offer **`https://spore.hyphae.to`** first as the ready-to-use public blind relay — zero setup, 100% RAM-only Cloudflare Durable Object, E2EE ciphertext only — alongside self-hosted private relay options: Cloudflare Workers `workers/drop-relay/`, `hyp deploy init drop-relay`, or local Tailscale Serve. Use `hyp drop ingest` reading stdin for offline/air-gapped `hdrop1_` envelopes.)*
 
 ### F. Configure Event Streams & External Chat Bridges
-1. **Capture required tokens out-of-band** (never in chat, never in CLI argv):
+1. **Capture required tokens out-of-band** (never in chat, never in CLI argv) — **always give the user the exact step-by-step instructions to create each token**:
+   - **`github-public-token`** *(optional for public repos: unauthenticated polling works up to 60 req/hr; a PAT raises the limit to 5,000 req/hr or unlocks private repos)*:
+     1. Open **`https://github.com/settings/personal-access-tokens/new`** (Fine-grained personal access token).
+     2. Choose *"Public Repositories (read-only)"* (or select specific repos) with minimal read-only permissions (`Metadata: Read`, `Issues: Read`, `Pull requests: Read`, and `Actions: Read` if watching CI).
+     3. Click **Generate token**, then paste it **only** into the localhost form opened by `hyp secret set github-public-token --web`.
+   - **`telegram-bot-token`** + **`TELEGRAM_ALLOWED_USERS`** *(required for `plugins/telegram`)*:
+     1. Open **`https://t.me/BotFather`** *(print QR code + URL for phone!)*, send `/newbot`, choose a display name and `@...bot` username, and copy the `123456:ABC...` token into `hyp secret set telegram-bot-token --web`.
+     2. Get the user's numeric Telegram ID for `TELEGRAM_ALLOWED_USERS` by messaging **`https://t.me/userinfobot`** (or `@raw_data_bot`) — never leave `TELEGRAM_ALLOWED_USERS` empty (fail-closed!).
+   - **`slack-app-token`** (`xapp-...`) & **`slack-bot-token`** (`xoxb-...`) + **`SLACK_ALLOWED_USERS`** *(required for `plugins/slack`)*:
+     1. Open **`https://api.slack.com/apps`** -> **Create New App** -> **From scratch**.
+     2. Enable **Socket Mode**, generate an **App-Level Token** with scope `connections:write` (`xapp-...`), and store it via `hyp secret set slack-app-token --web`.
+     3. Under **OAuth & Permissions**, add Bot Token Scopes (`app_mentions:read`, `chat:write`, `im:history`, `im:read`, `im:write`, `channels:history`, `channels:read`), click **Install to Workspace**, and store the **Bot User OAuth Token** (`xoxb-...`) via `hyp secret set slack-bot-token --web`.
+     4. Under **Event Subscriptions**, enable events and subscribe to `app_mention` + `message.im` (and `message.channels` if desired). Find your Slack Member ID (`U...`) via Profile → `⋮` → *Copy member ID*.
    ```sh
    hyp secret set github-public-token --web
    hyp secret set slack-app-token --web
@@ -259,7 +273,9 @@ hyp deploy check --url https://<hostname> --json
 4. Restart the background daemon after editing `node.json` (`hyp service restart --json`), then verify with `hyp doctor --json`.
 
 ### G. Propose & Lock a Local Security Gate
-1. Store the classifier API key out-of-band (skip for local Ollama `openai-compat` or local `subprocess` plugins):
+1. Store the classifier API key out-of-band (skip for local Ollama `openai-compat` or local `subprocess` plugins) and tell the user where to get it:
+   - Direct Anthropic: **`https://console.anthropic.com/settings/keys`** -> **Create Key** -> paste only into `hyp secret set anthropic-api-key --web`.
+   - Company proxy / LiteLLM / Bedrock gateway: ask for their proxy `--base-url`, `--model`, and store their proxy token via `hyp secret set <name> --web`.
    ```sh
    hyp secret set anthropic-api-key --web
    ```
@@ -269,10 +285,10 @@ hyp deploy check --url https://<hostname> --json
    # Or with a custom Anthropic-compatible gateway / proxy URL:
    hyp gate propose --adapter anthropic --base-url https://ai-gateway.company.internal --secret company-anthropic-token --model claude-haiku-4-5 --json
    ```
-3. Have the human review the proposed policy and lock the tamper-evident signature (`gate_policy_sig`, binding `human_authorities_digest` when human keys are enrolled):
+3. **Summarize the staged proposal** (`adapter`, `model`, `base_url`, `secret`, `on_error`) for the human before asking them to lock the tamper-evident signature (`gate_policy_sig`, binding `human_authorities_digest` when human keys are enrolled — `hyp gate lock` automatically applies staged `gate.proposed.json` into `node.json` and signs it):
    ```sh
    hyp gate init --adapter anthropic --secret anthropic-api-key --lock
-   # Or sign an already-edited gate block / staged gate.proposed.json:
+   # Or apply & sign staged gate.proposed.json / an edited gate block:
    hyp gate lock
    ```
 4. Quarantine review & audit log (human CLI only):
