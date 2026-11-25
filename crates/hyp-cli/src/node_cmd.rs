@@ -10,16 +10,17 @@ use crate::config_file::{
     resolve_config_path_for_read, resolve_state_dir, write_atomic_file, write_atomic_json,
 };
 use crate::drop_cmd::validate_relay_url;
-use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error};
+use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json};
 use clap::{Args, Subcommand, ValueEnum};
 use hyp_crypto::CryptoError;
 use hyp_crypto::keys::OkpJwk as CryptoOkpJwk;
 use hyp_crypto::keystore::{SecretBackend, validate_secret_name};
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
 use hyp_harness::daemon::{
-    BoxFuture as DaemonBoxFuture, DEFAULT_PEERS_RELOAD_TIMEOUT, DeliveryRetryConfig, LocalDaemon,
-    LocalDaemonConfig, PeersReloader,
+    BoxFuture as DaemonBoxFuture, DEFAULT_PEERS_RELOAD_TIMEOUT, DaemonError, DeliveryRetryConfig,
+    LocalDaemon, LocalDaemonConfig, PeersReloader,
 };
+use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync};
 use hyp_node::adapters::github_public::normalize_repo_token_pattern;
 use hyp_node::adapters::{
     AdapterKind, GitHubPublicAdapter, GitHubPublicConfig, HelloMode, SubprocessConfig,
@@ -100,9 +101,64 @@ pub struct NodeStartArgs {
     /// Override Drop Relay maximum RAM budget in MiB (default: 256)
     #[arg(long = "drop-max-memory-mb", alias = "max-memory-mb")]
     pub drop_max_memory_mb: Option<usize>,
+    /// Exit cleanly (code 0) if a healthy Hyphae daemon is already running on the target socket
+    #[arg(long)]
+    pub if_not_running: bool,
     /// Output structured JSON envelope on startup
     #[arg(long)]
     pub json: bool,
+}
+
+const ALREADY_RUNNING_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+enum NodeStartOutcome {
+    Stopped,
+    AlreadyRunning { socket: PathBuf },
+}
+
+fn emit_already_running(
+    cmd: &str,
+    as_json: bool,
+    socket: &Path,
+    state_dir: &Path,
+    probe_result: Option<&serde_json::Map<String, Value>>,
+) -> ExitCode {
+    let summary = format!(
+        "Hyphae daemon already running at {}; exiting cleanly (--if-not-running).",
+        socket.display()
+    );
+    if as_json {
+        let node_id = probe_result
+            .and_then(|m| m.get("nodeId").or_else(|| m.get("connectorId")))
+            .and_then(Value::as_str);
+        let pid = probe_result
+            .and_then(|m| m.get("pid"))
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                fs::read_to_string(state_dir.join("node.pid"))
+                    .ok()
+                    .and_then(|raw| raw.trim().parse::<u64>().ok())
+            });
+        let envelope = JsonEnvelope {
+            ok: true,
+            command: cmd.to_string(),
+            summary: Some(summary),
+            data: Some(json!({
+                "alreadyRunning": true,
+                "socketPath": socket.display().to_string(),
+                "nodeId": node_id,
+                "pid": pid,
+            })),
+            warnings: Vec::new(),
+            next: Vec::new(),
+            error: None,
+        };
+        print_json(&envelope);
+    } else {
+        println!("OK    {summary}");
+        let _ = std::io::stdout().flush();
+    }
+    ExitCode::from(EXIT_OK)
 }
 
 pub fn run_node(command: NodeCommand) -> ExitCode {
@@ -207,6 +263,31 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             }
         }),
     };
+
+    let start_local_daemon = !args.no_local_socket
+        && (matches!(profile, NodeProfile::Local | NodeProfile::P2p) || args.socket.is_some());
+    let explicit_socket = args.socket.clone();
+    let if_not_running = args.if_not_running;
+
+    if if_not_running && start_local_daemon {
+        let target_socket = explicit_socket
+            .clone()
+            .unwrap_or_else(|| state_dir.join(DEFAULT_SOCKET_FILENAME));
+        let probe = daemon_rpc_sync(
+            &target_socket,
+            &json!({ "type": "daemon.status" }),
+            ALREADY_RUNNING_PROBE_TIMEOUT,
+        );
+        if probe.ok {
+            return emit_already_running(
+                cmd,
+                as_json,
+                &target_socket,
+                &state_dir,
+                probe.result.as_ref(),
+            );
+        }
+    }
 
     if let Err(e) = ensure_dir(&state_dir, true) {
         return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
@@ -582,10 +663,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
     let drop_relay_enabled = node_cfg.drop_relay.enabled;
     let drop_relay_url = node_cfg.drop_relay_url.clone();
 
-    let start_local_daemon = !args.no_local_socket
-        && (matches!(profile, NodeProfile::Local | NodeProfile::P2p) || args.socket.is_some());
     let start_local_ingest = node_cfg.local_ingest.enabled && !args.no_local_socket;
-    let explicit_socket = args.socket.clone();
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -610,6 +688,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         .filter(|c| c.is_legacy_v1)
         .map(|c| format!("Loaded legacy v1 config {}; consider migrating to node.json.", c.path.display()));
 
+    let state_dir_for_probe = state_dir.clone();
     let res = rt.block_on(async move {
         let node = UnifiedNode::open(node_cfg)
             .map_err(|e| format!("Failed to initialize UnifiedNode: {e}"))?;
@@ -677,14 +756,21 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                 delivery_retry: delivery_retry_cfg,
                 ..Default::default()
             };
-            let daemon = LocalDaemon::start(Arc::clone(&node), gate_pipeline.clone(), local_cfg)
-                .await
-                .map_err(|e| format!("Failed to start local harness IPC daemon: {e}"))?;
-            daemon.set_peers_reloader(Arc::new(NodeCmdPeersReloader {
-                node: Arc::clone(&node),
-                status_doc: Arc::clone(&status_doc_state),
-            }));
-            Some(Arc::new(daemon))
+            match LocalDaemon::start(Arc::clone(&node), gate_pipeline.clone(), local_cfg).await {
+                Ok(daemon) => {
+                    daemon.set_peers_reloader(Arc::new(NodeCmdPeersReloader {
+                        node: Arc::clone(&node),
+                        status_doc: Arc::clone(&status_doc_state),
+                    }));
+                    Some(Arc::new(daemon))
+                }
+                Err(DaemonError::AlreadyRunning(sock)) if if_not_running => {
+                    node.shutdown_adapters().await;
+                    node.shutdown();
+                    return Ok(NodeStartOutcome::AlreadyRunning { socket: sock });
+                }
+                Err(e) => return Err(format!("Failed to start local harness IPC daemon: {e}")),
+            }
         } else {
             None
         };
@@ -932,11 +1018,25 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         if !as_json {
             eprintln!("OK    Hyphae v2 Node '{}' stopped cleanly", node.node_id().as_str());
         }
-        Ok::<(), String>(())
+        Ok::<NodeStartOutcome, String>(NodeStartOutcome::Stopped)
     });
 
     match res {
-        Ok(()) => ExitCode::from(EXIT_OK),
+        Ok(NodeStartOutcome::Stopped) => ExitCode::from(EXIT_OK),
+        Ok(NodeStartOutcome::AlreadyRunning { socket }) => {
+            let probe = daemon_rpc_sync(
+                &socket,
+                &json!({ "type": "daemon.status" }),
+                ALREADY_RUNNING_PROBE_TIMEOUT,
+            );
+            emit_already_running(
+                cmd,
+                as_json,
+                &socket,
+                &state_dir_for_probe,
+                probe.result.as_ref(),
+            )
+        }
         Err(e) => emit_error(cmd, as_json, EXIT_ERROR, "NODE_START_FAILED", e, None),
     }
 }
