@@ -16,7 +16,7 @@
  * - Dual auth modes (`DROP_AUTH_MODE`):
  *   - `"private"` (default, fail-closed): allowlist of Ed25519 node public keys in
  *     `ALLOWED_NODE_KEYS` (JSON map or comma/newline `nodeId=b64url` pairs).
- *   - `"open"` (public relay e.g. `drop.hyphae.to`): self-authenticated Ed25519
+ *   - `"open"` (public relay e.g. `spore.hyphae.to`): self-authenticated Ed25519
  *     requests carrying `X-Hyphae-Public-Key` (raw 43-char base64url or OKP JWK),
  *     protected by per-IP and per-pubkey sliding-window creation quotas.
  * - Fail-closed CORS + Chrome Private Network Access (PNA): strict explicit
@@ -2000,6 +2000,25 @@ export function createWorkerApp(options = {}) {
       const method = request.method.toUpperCase();
       const reqOrigin = request.headers.get("Origin");
       const nowMs = getNow();
+
+      // ------------------------------------------------------------------
+      // GET / & GET /drop(/) — redirect humans to static zero-trust UI
+      // (browsers preserve `#drop=...` / `#enroll=...` fragments client-side)
+      // ------------------------------------------------------------------
+      if (
+        (path === "/" || path === "/drop" || path === "/drop/") &&
+        (method === "GET" || method === "HEAD")
+      ) {
+        const portalOrigin = cfg.allowedOrigins[0] || DEFAULT_ALLOWED_ORIGIN;
+        return new Response(null, {
+          status: 302,
+          headers: {
+            Location: `${portalOrigin}/drop`,
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+          },
+        });
+      }
 
       // ------------------------------------------------------------------
       // GET /v1/health — aggregate-only status (ZERO drop IDs / IPs / keys)

@@ -710,9 +710,14 @@ async function initDropMode(fragment) {
   badge.textContent = isSecret ? "SECRET" : "DIRECTIVE";
   badge.className = `kind-badge ${isSecret ? "secret" : "directive"}`;
 
+  const relayOrigin = hasRelay ? new URL(fragment.relay).origin : "";
   $("metaNodeId").textContent = fragment.nodeId;
   $("metaHandle").textContent = fragment.handle || "(node-level)";
-  $("metaRelay").textContent = hasRelay ? new URL(fragment.relay).origin : "Offline hdrop1_ only";
+  $("metaRelay").textContent = !hasRelay
+    ? "Offline hdrop1_ only"
+    : relayOrigin === "https://spore.hyphae.to"
+      ? `${relayOrigin} (public)`
+      : `${relayOrigin} (private/custom)`;
   $("metaCertHint").textContent = fragment.nodeCert ? "NodeCert attached" : "No NodeCert attached";
 
   if (isSecret) {

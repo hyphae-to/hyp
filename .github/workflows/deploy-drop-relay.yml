@@ -38,14 +38,14 @@ jobs:
           node workers/drop-relay/test/worker.test.mjs
 
   deploy:
-    name: Deploy drop.hyphae.to to Cloudflare Workers
+    name: Deploy spore.hyphae.to to Cloudflare Workers
     needs: test
     if: github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.repository == 'hyphae-to/hyp')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment:
       name: production-drop-relay
-      url: https://drop.hyphae.to/v1/health
+      url: https://spore.hyphae.to/v1/health
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -61,10 +61,10 @@ jobs:
             echo "configured=true" >> "$GITHUB_OUTPUT"
           else
             echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Skipping drop.hyphae.to deploy: set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID in GitHub repository/environment secrets to enable automatic deployment."
+            echo "::notice::Skipping spore.hyphae.to deploy: set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID in GitHub repository/environment secrets to enable automatic deployment."
           fi
 
-      - name: Deploy Worker (production env -> drop.hyphae.to)
+      - name: Deploy Worker (production env -> spore.hyphae.to)
         if: steps.creds.outputs.configured == 'true'
         uses: cloudflare/wrangler-action@v3
         with:
@@ -73,23 +73,23 @@ jobs:
           workingDirectory: workers/drop-relay
           command: deploy --env production
 
-      - name: Smoke-test GET https://drop.hyphae.to/v1/health
+      - name: Smoke-test GET https://spore.hyphae.to/v1/health
         if: steps.creds.outputs.configured == 'true'
         shell: bash
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if out="$(curl -fsS --max-time 10 https://drop.hyphae.to/v1/health)"; then
+            if out="$(curl -fsS --max-time 10 https://spore.hyphae.to/v1/health)"; then
               echo "$out"
               python3 -c '
 import json, sys
 j = json.loads(sys.argv[1])
 assert j.get("ok") is True and j.get("dropRelay", {}).get("enabled") is True, j
 ' "$out"
-              echo "drop.hyphae.to health check verified."
+              echo "spore.hyphae.to health check verified."
               exit 0
             fi
             sleep 3
           done
-          echo "ERROR: https://drop.hyphae.to/v1/health failed after 5 attempts." >&2
+          echo "ERROR: https://spore.hyphae.to/v1/health failed after 5 attempts." >&2
           exit 1

@@ -6,7 +6,7 @@
 #   2. Choose mode below:
 #      - Private / Team (default, fail-closed): keep DROP_AUTH_MODE = "private" and set:
 #          wrangler secret put ALLOWED_NODE_KEYS
-#      - Public relay (e.g. drop.hyphae.to): set DROP_AUTH_MODE = "open"
+#      - Public relay (e.g. spore.hyphae.to): set DROP_AUTH_MODE = "open"
 #   3. Deploy:
 #        wrangler deploy
 
@@ -16,7 +16,7 @@ compatibility_date = "2025-01-01"
 
 # Uncomment to attach a custom domain on deploy:
 # routes = [
-#   { pattern = "drop.hyphae.to", custom_domain = true }
+#   { pattern = "spore.hyphae.to", custom_domain = true }
 # ]
 
 # RAM-only Durable Object (DropSlotDO NEVER calls ctx.storage; zero disk persistence).
@@ -62,13 +62,13 @@ CREATES_PER_HOUR_PER_IP = "20"
 #   ALLOWED_NODE_KEYS        (required in "private" mode; JSON map or nodeId=b64url pairs)
 
 # Production public Drop Relay environment (`wrangler deploy --env production`)
-# Used by `.github/workflows/deploy-drop-relay.yml` for https://drop.hyphae.to.
+# Used by `.github/workflows/deploy-drop-relay.yml` for https://spore.hyphae.to.
 # Note: `DROP_CAP_HMAC_KEY` must be set once directly on Cloudflare via:
 #   openssl rand -base64 32 | tr '+/' '-_' | tr -d '=' | npx wrangler secret put DROP_CAP_HMAC_KEY --env production
 [env.production]
 name = "hyphae-drop-relay"
 routes = [
-  { pattern = "drop.hyphae.to", custom_domain = true }
+  { pattern = "spore.hyphae.to", custom_domain = true }
 ]
 
 [[env.production.durable_objects.bindings]]

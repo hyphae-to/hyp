@@ -996,7 +996,7 @@ async fn test4_mesh_drop_link_encrypted_draft_roundtrip_and_fail_closed_guards()
     assert!(orphan_ctx_err, "context without draft must fail closed");
 
     // 4d. External relay `POST /v1/drops` includes `X-Hyphae-Public-Key: <signing_jwk().x>`
-    //     for public Cloudflare Worker (`drop.hyphae.to`) open-mode compatibility!
+    //     for public Cloudflare Worker (`spore.hyphae.to`) open-mode compatibility!
     let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mock_addr = mock_listener.local_addr().unwrap();
     let expected_pubkey_x = node.identity().signing_jwk().x;

@@ -2,7 +2,7 @@
 
 A zero-dependency, RAM-only Blind Ephemeral Drop Relay for **Hyphae Verified Human Drops** (`hdrop1_`), built on Cloudflare Workers + Durable Objects (`DropSlotDO`).
 
-Speaks the exact same HTTP/SSE and stateless `hdcap1_` wire protocol as `crates/hyp-node/src/engine/drop_relay.rs`, and supports both **Private / Team allowlist mode** (default, fail-closed) and **Public relay mode** (e.g. `drop.hyphae.to`) via a single `DROP_AUTH_MODE` switch.
+Speaks the exact same HTTP/SSE and stateless `hdcap1_` wire protocol as `crates/hyp-node/src/engine/drop_relay.rs`, and supports both **Private / Team allowlist mode** (default, fail-closed) and **Public relay mode** (e.g. `spore.hyphae.to`) via a single `DROP_AUTH_MODE` switch.
 
 ---
 
@@ -66,7 +66,7 @@ cd workers/drop-relay
 
 ---
 
-### Option B — Public Drop Relay (e.g. `drop.hyphae.to`)
+### Option B — Public Drop Relay (e.g. `spore.hyphae.to`)
 
 Public mode allows any Hyphae node to allocate ephemeral blind slots by signing `POST /v1/drops` with `Authorization: Hyphae-Ed25519 ...` and supplying its Ed25519 public key in `X-Hyphae-Public-Key` (raw 43-char base64url or OKP JWK). Slots are pinned to the creator's `(nodeId, pubKey)` and rate-limited per IP and per public key.
 
@@ -74,7 +74,7 @@ Public mode allows any Hyphae node to allocate ephemeral blind slots by signing 
 
    ```toml
    routes = [
-     { pattern = "drop.hyphae.to", custom_domain = true }
+     { pattern = "spore.hyphae.to", custom_domain = true }
    ]
 
    [vars]
@@ -99,7 +99,7 @@ Public mode allows any Hyphae node to allocate ephemeral blind slots by signing 
 4. **Point any Hyphae CLI at the public relay**:
 
    ```bash
-   hyp relay set https://drop.hyphae.to
+   hyp relay set https://spore.hyphae.to
    hyp relay status --probe
    ```
 
@@ -133,6 +133,7 @@ Because drop slots have a hard maximum TTL of 15 minutes (`900s`), you can rotat
 | `POST /v1/drops/{id}` | `X-Hyphae-Drop-Cap: <postCap>` (verified pre-body) | Post opaque ciphertext `<= 64 KiB` (`201`: `seq`, `expiresAtMs`) |
 | `GET /v1/drops/{id}/stream` | `X-Hyphae-Drop-Cap: <subCap>` or creator `Hyphae-Ed25519` | SSE catch-up (`Last-Event-ID` / `?after=`) + live push + 25s `: keepalive` |
 | `POST /v1/drops/{id}/ack` | `X-Hyphae-Drop-Cap: <subCap>` or creator `Hyphae-Ed25519` | Ack & burn/zeroize items (`200`: `ackedSeq`, `burnedItems`, `burnedBytes`, `remainingItems`, `slotClosed`) |
+| `GET /` & `GET /drop` | None | `302` redirect to the static zero-trust Drop UI (`https://hyphae.to/drop`, preserving `#fragment` client-side) |
 | `GET /v1/health` | None | Aggregate-only health JSON (zero drop IDs, IPs, or secrets) |
 
 ---
@@ -146,9 +147,9 @@ node test/worker.test.mjs
 
 ---
 
-## GitHub Actions Auto-Deploy Setup (`drop.hyphae.to`)
+## GitHub Actions Auto-Deploy Setup (`spore.hyphae.to`)
 
-The workflow [`.github/workflows/deploy-drop-relay.yml`](../../.github/workflows/deploy-drop-relay.yml) automatically tests and deploys `workers/drop-relay/` to `https://drop.hyphae.to` (`--env production`) on every push to `main` touching `workers/drop-relay/**` (and skips cleanly without failing CI if secrets aren't configured yet).
+The workflow [`.github/workflows/deploy-drop-relay.yml`](../../.github/workflows/deploy-drop-relay.yml) automatically tests and deploys `workers/drop-relay/` to `https://spore.hyphae.to` (`--env production`) on every push to `main` touching `workers/drop-relay/**` (and skips cleanly without failing CI if secrets aren't configured yet).
 
 **One-time operator setup (3 steps):**
 

@@ -1261,6 +1261,32 @@ test("GET /v1/health returns aggregate-only JSON with zero drop IDs, IPs, or sec
   harness.dropSlotNs.instances.get(created.dropId)?._destroySlot({ markExpired: false });
 });
 
+test("GET / and GET /drop redirect humans to the static zero-trust Drop UI", async () => {
+  const harness = createTestHarness({
+    ALLOWED_ORIGINS: "https://hyphae.to",
+  });
+
+  for (const path of ["/", "/drop", "/drop/"]) {
+    const resp = await harness.fetch(path, { method: "GET" });
+    assert.equal(resp.status, 302, `${path} must return 302`);
+    assert.equal(resp.headers.get("Location"), "https://hyphae.to/drop");
+    assert.equal(resp.headers.get("Cache-Control"), "no-store");
+    assert.equal(resp.headers.get("Referrer-Policy"), "no-referrer");
+  }
+
+  const headResp = await harness.fetch("/drop", { method: "HEAD" });
+  assert.equal(headResp.status, 302);
+  assert.equal(headResp.headers.get("Location"), "https://hyphae.to/drop");
+
+  // Private deployment with custom ALLOWED_ORIGINS redirects to its own portal origin
+  const customHarness = createTestHarness({
+    ALLOWED_ORIGINS: "https://portal.acme.internal",
+  });
+  const customResp = await customHarness.fetch("/", { method: "GET" });
+  assert.equal(customResp.status, 302);
+  assert.equal(customResp.headers.get("Location"), "https://portal.acme.internal/drop");
+});
+
 test("HTTP-level HMAC key rotation (DROP_CAP_HMAC_KEY_PREV) & query-string signature binding", async () => {
   const alice = await generateEd25519Identity("alice@macbook");
   const harness = createTestHarness({
