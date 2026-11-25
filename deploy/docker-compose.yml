@@ -1,13 +1,18 @@
 # Hyphae v2 Docker Compose stack: hyphae-node + Caddy auto-TLS (zero-buffering SSE)
 #
 # Quick start:
-#   1. Generate a hardened node.json and Caddyfile:
+#   1. Generate a hardened node.json (mode 0644, zero plaintext secrets) and Caddyfile:
 #        hyp deploy init docker --node-id acme-team --domain mesh.example.com --out ./deploy-out
-#      Or copy deploy/Caddyfile.example -> deploy/Caddyfile and create deploy/node.json
-#      (with upstream set to `hyphae-node:8790` in Caddyfile).
+#      Or copy deploy/Caddyfile.example -> deploy/Caddyfile (set upstream to `hyphae-node:8790`)
+#      and place a non-secret deploy/node.json readable by UID 10001 (`chmod 0644 deploy/node.json`,
+#      binding `0.0.0.0:8790` with `behindReverseProxy: true`).
 #   2. Start the stack from repo root:
 #        docker compose -f deploy/docker-compose.yml up -d --build
-#   3. Verify anti-recon & TLS health:
+#   3. For Team Hubs, provision the public Admin-CA JWK (private key stays on admin laptop):
+#        docker compose -f deploy/docker-compose.yml exec -T hyphae-node \
+#          hyp secret set hyphae-admin-pubkey <<< '<public adminJwk JSON>'
+#        docker compose -f deploy/docker-compose.yml restart hyphae-node
+#   4. Verify anti-recon & TLS health:
 #        hyp deploy check --url https://mesh.example.com --config ./deploy/node.json
 
 services:
@@ -19,7 +24,7 @@ services:
     restart: unless-stopped
     read_only: true
     tmpfs:
-      - /tmp:size=32M,noexec,nosuid
+      - /tmp:size=32M,noexec,nosuid,uid=10001,gid=10001,mode=1777
     cap_drop:
       - ALL
     security_opt:
@@ -28,8 +33,19 @@ services:
       HYPHAE_SECRET_BACKEND: file
       HYPHAE_STATE_DIR: /var/lib/hyphae
       HYPHAE_CONFIG: /etc/hyphae/node.json
+    command:
+      - node
+      - start
+      - --config
+      - /etc/hyphae/node.json
+      - --bind
+      - 0.0.0.0:8790
+      - --no-local-socket
     volumes:
+      # node.json holds zero plaintext secrets (references only via SecretStore in /var/lib/hyphae/secrets);
+      # keep host mode 0644 so non-root container USER 10001:10001 can read it when bind-mounted :ro.
       - ./node.json:/etc/hyphae/node.json:ro
+      # Named volume inherits UID 10001:10001 mode 0700 from /var/lib/hyphae in deploy/Dockerfile.
       - hyphae_state:/var/lib/hyphae
     # Intentionally NOT publishing 8790 on the host — only Caddy talks to hyphae-node
     # over the isolated internal bridge network.

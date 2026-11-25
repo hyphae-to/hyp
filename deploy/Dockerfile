@@ -1,15 +1,20 @@
 # syntax=docker/dockerfile:1
-# Hyphae v2 multi-stage static Rust build (non-root UID 10001)
+# Hyphae v2 multi-stage Rust build (non-root UID 10001)
 # Build from repository root:
 #   docker build -f deploy/Dockerfile -t hyphae-node:latest .
 
 FROM rust:1.87-bookworm AS builder
 WORKDIR /src
 
+# Copy workspace manifests, Rust crates, and all compile-time assets read by
+# crates/hyp-cli/build.rs and include_str!() macros (plugins/, skills/, scripts/).
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY plugins ./plugins
+COPY skills ./skills
+COPY scripts ./scripts
 
-RUN cargo build --release --locked --bin hyp
+RUN cargo build --release --locked -p hyp-cli
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -37,4 +42,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["/usr/local/bin/hyp", "deploy", "check", "--url", "http://127.0.0.1:8790", "--json"]
 
 ENTRYPOINT ["/usr/local/bin/hyp"]
-CMD ["node", "start", "--config", "/etc/hyphae/node.json", "--no-local-socket"]
+CMD ["node", "start", "--config", "/etc/hyphae/node.json", "--bind", "0.0.0.0:8790", "--no-local-socket"]

@@ -1,0 +1,18 @@
+# Keep Docker build context lean while preserving Cargo.toml, Cargo.lock,
+# crates/, plugins/, skills/, and scripts/ required by `cargo build --release --locked -p hyp-cli`.
+target/
+.git/
+.gitignore
+.github/
+site/
+workers/
+docs/
+dist/
+node_modules/
+**/node_modules/
+.mesh/
+.claude/
+.DS_Store
+*.tgz
+__pycache__/
+*.pyc
