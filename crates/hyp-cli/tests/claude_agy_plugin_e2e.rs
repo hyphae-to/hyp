@@ -39,7 +39,7 @@ fn claude_code_plugin_bundle_conforms_to_schema_and_security_invariants() {
         .expect("read plugin.json");
     let manifest: Value = serde_json::from_str(&manifest_raw).expect("valid plugin.json");
     assert_eq!(manifest["name"], "hyphae");
-    assert_eq!(manifest["version"], "0.6.1");
+    assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(manifest["license"], "MIT");
     assert!(
         manifest["description"]
