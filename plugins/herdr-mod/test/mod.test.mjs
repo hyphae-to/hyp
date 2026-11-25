@@ -18,12 +18,15 @@ import {
   formatNextFire,
   formatPillMetrics,
   formatRelativeAge,
+  getEffectiveQuarantinedCount,
   parseSnapshotJson,
   parseTerminalAddress,
+  qualifyChannelTarget,
   resolveSessionById,
   resolveSessionForTerminal,
   resolveUiStateCandidates,
   sanitizeUiText,
+  stripControlChars,
   withAlpha,
 } from "../mods/hyphae-pane/shared-client.js";
 
@@ -188,6 +191,55 @@ test("formatPillMetrics hides plain shells and formats enrolled, queued, focus, 
   assert.equal(quarantined.alertLabel, "⚠ 2");
   assert.equal(quarantined.handle, "alice");
   assert.ok(!quarantined.wideLabel.includes("\u001b"));
+
+  // U3: daemon.quarantinedGlobal surfaces on the pill even when session.counts.quarantined === 0
+  const globalQuarantined = formatPillMetrics(
+    {
+      enrolled: true,
+      handle: "alice",
+      counts: { subscriptions: 1, queued: 0, quarantined: 0 },
+    },
+    { quarantinedGlobal: 4 }
+  );
+  assert.equal(globalQuarantined.visible, true);
+  assert.equal(globalQuarantined.quarantined, 4);
+  assert.equal(globalQuarantined.tone, "alert");
+  assert.equal(globalQuarantined.alertLabel, "⚠ 4");
+  assert.equal(
+    getEffectiveQuarantinedCount({ counts: { quarantined: 1 } }, { daemon: { quarantinedGlobal: 3 } }),
+    3
+  );
+  assert.equal(
+    getEffectiveQuarantinedCount({ counts: { quarantined: 5 } }, { daemon: { quarantinedGlobal: 2 } }),
+    5
+  );
+
+  // U15: linked bridges surface in the Herdr pane pill across density modes
+  const bridged = formatPillMetrics({
+    enrolled: true,
+    handle: "integration-tests",
+    bridges: ["telegram:\u001b[31mpersonal\u001b[0m"],
+    counts: { bridges: 1, subscriptions: 0, queued: 0, quarantined: 0 },
+  });
+  assert.equal(bridged.visible, true);
+  assert.equal(bridged.bridges, 1);
+  assert.equal(bridged.bridgeSummary, "telegram:personal");
+  assert.equal(bridged.compactLabel, "telegram");
+  assert.equal(bridged.mediumLabel, "telegram:personal");
+  assert.equal(bridged.wideLabel, "@integration-tests · telegram:personal");
+  assert.ok(!bridged.wideLabel.includes("\u001b"));
+
+  const multiBridged = formatPillMetrics({
+    enrolled: false,
+    handle: null,
+    bridges: ["telegram:personal", "slack:ops"],
+    counts: { bridges: 2, subscriptions: 1, queued: 0, quarantined: 0 },
+  });
+  assert.equal(multiBridged.visible, true);
+  assert.equal(multiBridged.bridgeSummary, "telegram:personal +1");
+  assert.equal(multiBridged.compactLabel, "2b·1s");
+  assert.equal(multiBridged.mediumLabel, "telegram:personal +1 · 1s");
+  assert.equal(multiBridged.wideLabel, "telegram:personal +1 · 1 sub");
 });
 
 test("anti-body-leakage invariant: parseSnapshotJson strips body/text/note/payload/secret keys", () => {
@@ -252,11 +304,26 @@ test("anti-body-leakage invariant: parseSnapshotJson strips body/text/note/paylo
   assert.equal(snap.sessions[0].details.wakeups[0].label, "deploy-check");
 });
 
-test("sanitizeUiText strips ANSI CSI/OSC and control characters", () => {
+test("sanitizeUiText, stripControlChars, and qualifyChannelTarget preserve long control values without truncation (U2 & U9)", () => {
   assert.equal(sanitizeUiText("\u001b[1;31malice\u001b[0m\r\n\t"), "alice");
   assert.equal(sanitizeUiText("\u001b]8;;https://evil.test\u0007click\u001b]8;;\u0007"), "click");
   assert.equal(withAlpha("#33aa66", "26"), "#33aa6626");
   assert.equal(withAlpha("#33aa6680", "26"), "#33aa6680");
+
+  // Long patterns (>120 chars) keep full length under stripControlChars while stripping ANSI/BiDi
+  const longPattern = `#very-long-channel-${"a".repeat(140)}`;
+  assert.equal(stripControlChars(`\u001b[31m${longPattern}\u202e\u001b[0m`), longPattern);
+  assert.ok(!stripControlChars(longPattern).includes("…"));
+  assert.ok(sanitizeUiText(longPattern, 64).endsWith("…"));
+
+  // U2: qualifyChannelTarget always qualifies local & remote channels without double-prefixing
+  assert.equal(qualifyChannelTarget("alice@macbook", "#ops", "alice@macbook"), "alice@macbook/#ops");
+  assert.equal(qualifyChannelTarget("local", "#ops", "alice@macbook"), "local/#ops");
+  assert.equal(qualifyChannelTarget("", "#ops", "alice@macbook"), "alice@macbook/#ops");
+  assert.equal(qualifyChannelTarget("", "#ops", ""), "local/#ops");
+  assert.equal(qualifyChannelTarget("acme-hub", "#release", "alice@macbook"), "acme-hub/#release");
+  assert.equal(qualifyChannelTarget("local", "acme-hub/#release", "alice@macbook"), "acme-hub/#release");
+  assert.equal(qualifyChannelTarget("local", longPattern, "alice@macbook"), `local/${longPattern}`);
 });
 
 test("buildSessionControlArgs generates exact hyp session CLI argv", () => {
@@ -371,6 +438,88 @@ test("createHyphaeClient cancels watchFolder cleanly on dispose and deduplicates
   client.dispose();
   await Promise.allSettled(pendingTasks);
   assert.equal(cancelled, 1);
+});
+
+test("U5: multiple pane clients sharing shared() deduplicate in-flight remote SSH fetches via hyphae.remoteInFlight", async () => {
+  const sharedStore = {};
+  let execCalls = 0;
+  let resolveExec;
+  const execPromise = new Promise((resolve) => {
+    resolveExec = resolve;
+  });
+
+  const makeHost = () => ({
+    home: () => "/Users/alice",
+    readTextFile: async () => null,
+    watchFolder: () => {
+      const p = new Promise(() => {});
+      p.cancel = () => {};
+      return p;
+    },
+    exec: async (_cmd, _args, opts) => {
+      execCalls += 1;
+      assert.equal(opts.on, "solace");
+      return execPromise;
+    },
+    shared: (k) => sharedStore[k],
+    setShared: (k, v) => {
+      sharedStore[k] = v;
+    },
+    terminals: () => [],
+  });
+
+  const pendingTasks = [];
+  const fakeCx = {
+    notify: () => {},
+    spawn: (fn) => {
+      pendingTasks.push(fn(fakeCx));
+    },
+  };
+
+  // Simulate 3 separate panes on SSH host `solace` starting up simultaneously!
+  const paneA = createHyphaeClient(makeHost());
+  const paneB = createHyphaeClient(makeHost());
+  const paneC = createHyphaeClient(makeHost());
+
+  paneA.ensureRemoteFresh("solace", fakeCx, false);
+  // Lock MUST be written synchronously BEFORE exec completes so panes B & C dedup immediately!
+  assert.equal(typeof sharedStore["hyphae.remoteInFlight"]?.solace, "number");
+
+  paneB.ensureRemoteFresh("solace", fakeCx, false);
+  paneC.ensureRemoteFresh("solace", fakeCx, false);
+  assert.equal(execCalls, 1, "3 panes on the same SSH host must share ONE in-flight exec");
+
+  resolveExec({
+    code: 0,
+    stdout: JSON.stringify({
+      ok: true,
+      data: {
+        schemaVersion: 1,
+        rev: 15,
+        daemon: { online: true, nodeId: "solace", quarantinedGlobal: 0 },
+        sessions: [{ sessionId: "claude:r1", enrolled: true, handle: "remote-alice", herdrTerminalId: "t2" }],
+        byHerdrTerminal: { t2: "claude:r1" },
+      },
+    }),
+    stderr: "",
+  });
+  await Promise.allSettled(pendingTasks);
+
+  // Lock must be released after completion, and all panes resolve the shared cached snapshot.
+  assert.equal(sharedStore["hyphae.remoteInFlight"]?.solace, undefined);
+  assert.equal(paneA.resolveTerminal("solace/t2").entry?.handle, "remote-alice");
+  assert.equal(paneB.resolveTerminal("solace/t2").entry?.handle, "remote-alice");
+  assert.equal(paneC.resolveTerminal("solace/t2").entry?.handle, "remote-alice");
+
+  // Stale in-flight lock older than TTL must automatically recover instead of deadlocking!
+  sharedStore["hyphae.remoteCache"] = {};
+  sharedStore["hyphae.remoteInFlight"] = { solace: Date.now() - 30_000 };
+  paneB.ensureRemoteFresh("solace", fakeCx, false);
+  assert.equal(execCalls, 2, "expired stale in-flight lock must allow a fresh remote fetch");
+
+  paneA.dispose();
+  paneB.dispose();
+  paneC.dispose();
 });
 
 test("pill.js renderHyphaePill integrates cleanly and dispatches dock vs overlay clicks", async () => {
@@ -544,6 +693,13 @@ test("static Herdr mod quality gates & file parity", () => {
     assert.ok(src.includes("async close("), `${modMain} must implement async close(cx)`);
     assert.ok(src.includes("this.client.dispose()"), `${modMain} must dispose watchFolder handle in close()`);
   }
+
+  // U2 & U9 static guard: hyphae-panel must qualify leave channels & avoid truncated display values in actions
+  const panelSrc = fs.readFileSync(path.join(MOD_ROOT, "mods/hyphae-panel/main.js"), "utf8");
+  assert.ok(panelSrc.includes("qualifyChannelTarget("), "hyphae-panel must qualify channel targets before leave");
+  assert.ok(panelSrc.includes("rawPattern || pattern"), "hyphae-panel must pass untruncated rawPattern to unmute");
+  assert.ok(panelSrc.includes("rawSource || source"), "hyphae-panel must pass untruncated rawSource to mute");
+  assert.ok(panelSrc.includes("rawRuleTarget || ruleTarget"), "hyphae-panel must pass untruncated rawRuleTarget to rule");
 
   // Validate JSON metadata files
   const keys = JSON.parse(fs.readFileSync(path.join(MOD_ROOT, "keys.json"), "utf8"));

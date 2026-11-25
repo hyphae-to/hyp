@@ -2,7 +2,9 @@ import { describe, expect, mock, test } from 'claude-code/testing';
 import {
   buildSessionControlArgs,
   formatPersistentStatusLine,
+  getQuarantinedCount,
   parseSnapshotJson,
+  qualifyChannelTarget,
   resolveUiStateCandidates,
   sanitizeUiText,
 } from './state';
@@ -315,6 +317,52 @@ describe('hyphae pure state & security helpers', () => {
     ]) {
       expect(serialized.includes(sentinel)).toBe(false);
     }
+  });
+
+  test('parseSnapshotJson unwraps hyp inspect --json { ok, data } envelope before stripping nested data', () => {
+    const inner = JSON.parse(makeRichSnapshotJson({ adversarial: true }));
+    const envelope = JSON.stringify({
+      ok: true,
+      command: 'inspect',
+      data: inner,
+    });
+    const snap = parseSnapshotJson(envelope);
+    expect(snap).not.toBeNull();
+    expect(snap!.daemon?.nodeId).toBe('laptop');
+    expect(snap!.sessions.length).toBe(2);
+    expect(snap!.sessions[0]?.handle).toBe('alice');
+    const serialized = JSON.stringify(snap);
+    expect(serialized.includes('CLOUDEVENT_DATA_LEAK')).toBe(false);
+    expect(serialized.includes('SECRET_DM_BODY')).toBe(false);
+    expect(parseSnapshotJson(JSON.stringify({ ok: false, error: 'offline' }))).toBeNull();
+  });
+
+  test('getQuarantinedCount consistently computes max(session.counts.quarantined, daemon.quarantinedGlobal)', () => {
+    const snap = parseSnapshotJson(
+      makeRichSnapshotJson({ sessionId: 'claude:sess-42', quarantined: 0, quarantinedGlobal: 3 }),
+    );
+    expect(snap).not.toBeNull();
+    expect(getQuarantinedCount(snap, snap!.sessions[0] ?? null)).toBe(3);
+
+    const snapLocalOnly = parseSnapshotJson(
+      makeRichSnapshotJson({ sessionId: 'claude:sess-42', quarantined: 2, quarantinedGlobal: 1 }),
+    );
+    expect(getQuarantinedCount(snapLocalOnly, snapLocalOnly!.sessions[0] ?? null)).toBe(2);
+
+    // Other session's stale count is ignored if daemon.quarantinedGlobal is 0 and active is 0
+    const snapOther = JSON.parse(makeRichSnapshotJson({ quarantined: 0, quarantinedGlobal: 0 }));
+    snapOther.sessions[1].counts.quarantined = 5;
+    const parsedOther = parseSnapshotJson(JSON.stringify(snapOther));
+    expect(getQuarantinedCount(parsedOther, parsedOther!.sessions[0] ?? null)).toBe(0);
+  });
+
+  test('qualifyChannelTarget always qualifies local and remote channels without double prefixing', () => {
+    expect(qualifyChannelTarget('laptop', '#ops', 'laptop')).toBe('laptop/#ops');
+    expect(qualifyChannelTarget('local', '#ops', 'laptop')).toBe('local/#ops');
+    expect(qualifyChannelTarget('', '#ops', 'laptop')).toBe('laptop/#ops');
+    expect(qualifyChannelTarget('', '#ops', '')).toBe('local/#ops');
+    expect(qualifyChannelTarget('acme-hub', '#release', 'laptop')).toBe('acme-hub/#release');
+    expect(qualifyChannelTarget('local', 'acme-hub/#release', 'laptop')).toBe('acme-hub/#release');
   });
 
   test('buildSessionControlArgs guards flag-like arguments with -- and rejects control chars', () => {
@@ -691,8 +739,76 @@ describe('hyphae native Claude Code side-panel mod', () => {
         '-rf; $(whoami) | cat /etc/passwd',
       ],
       ['hyp', 'session', 'unmute', '--session', 'claude:sess-42', '--scope', 'connector', '--json', '#noisy'],
-      ['hyp', 'session', 'leave', '--session', 'claude:sess-42', '--json', '#ops'],
+      ['hyp', 'session', 'leave', '--session', 'claude:sess-42', '--json', 'laptop/#ops'],
     ]);
+
+    await mounted.unmount();
+  });
+
+  test('controls preserve full untruncated IDs/patterns/channels beyond display maxLen (U9 & U2)', async ($, on) => {
+    const ranArgvs: (readonly string[])[] = [];
+    const longSubId = `sub-${'x'.repeat(145)}`;
+    const longMute = `#noisy-mute-pattern-${'y'.repeat(135)}`;
+    const longChannel = `#long-channel-name-${'z'.repeat(105)}`;
+    const snapObj = JSON.parse(makeRichSnapshotJson({ sessionId: 'claude:sess-42' }));
+    snapObj.sessions[0].details.subscriptions[0].id = longSubId;
+    snapObj.sessions[0].details.mutes[0].pattern = longMute;
+    snapObj.sessions[0].details.channelEntries = [
+      { hostNode: 'local', channel: longChannel, mode: 'open' },
+      { hostNode: 'acme-hub', channel: '#release', mode: 'restricted' },
+    ];
+
+    mock.clock(on, { now: 1_700_000_000_000 });
+    mock.env(on, { HOME: '/fake-home' });
+    on('session.id', () => ({ value: 'sess-42' }));
+    on('ui.invalidate', () => ({ value: undefined }));
+    on('ui.status', () => ({ value: undefined }));
+    on('fs.read', (_$, e) => {
+      if (e.path === '/fake-home/.config/hyphae/ui/state.json') {
+        return { value: JSON.stringify(snapObj) };
+      }
+      return { deny: 'ENOENT' };
+    });
+    on('process.run', (_$, e) => {
+      ranArgvs.push(e.argv);
+      return {
+        value: {
+          exitCode: 0,
+          stdout: JSON.stringify({ ok: true, summary: 'ok' }),
+          stderr: '',
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      };
+    });
+
+    const mounted = await $.ui.mount({
+      plugin: 'hyphae',
+      surface: 'terminal',
+      component: 'Pane',
+      requestId: 'hyphae-panel',
+      props: PANE_PROPS,
+      viewport: VIEWPORT,
+    });
+
+    await mounted.press({ key: 'hyphae-unsub-0' });
+    await mounted.press({ key: 'hyphae-tab-rules' });
+    await mounted.redraw(PANE_PROPS);
+    await mounted.press({ key: 'hyphae-unmute-0' });
+    await mounted.press({ key: 'hyphae-tab-mesh' });
+    await mounted.redraw(PANE_PROPS);
+    await mounted.press({ key: 'hyphae-leave-0' });
+    await mounted.press({ key: 'hyphae-leave-1' });
+
+    expect(ranArgvs).toEqual([
+      ['hyp', 'session', 'unsubscribe', '--session', 'claude:sess-42', '--json', longSubId],
+      ['hyp', 'session', 'unmute', '--session', 'claude:sess-42', '--scope', 'connector', '--json', longMute],
+      ['hyp', 'session', 'leave', '--session', 'claude:sess-42', '--json', `local/${longChannel}`],
+      ['hyp', 'session', 'leave', '--session', 'claude:sess-42', '--json', 'acme-hub/#release'],
+    ]);
+    for (const argv of ranArgvs) {
+      expect(argv.join(' ').includes('…')).toBe(false);
+    }
 
     await mounted.unmount();
   });
@@ -701,10 +817,14 @@ describe('hyphae native Claude Code side-panel mod', () => {
     let quarantinedCount = 0;
     const opened: string[] = [];
 
-    mock.clock(on, { now: 1_700_000_000_000 });
+    let invalidatedCount = 0;
+    const clock = mock.clock(on, { now: 1_700_000_000_000 });
     mock.env(on, { HOME: '/fake-home' });
     on('session.id', () => ({ value: 'sess-42' }));
-    on('ui.invalidate', () => ({ value: undefined }));
+    on('ui.invalidate', () => {
+      invalidatedCount += 1;
+      return { value: undefined };
+    });
     on('ui.status', () => ({ value: undefined }));
     on('ui.open', (_$, e) => {
       opened.push(e.id);
@@ -754,8 +874,14 @@ describe('hyphae native Claude Code side-panel mod', () => {
     expect(alertText).toContain('3 quarantined');
     expect(alertText).toContain('hyp gate review');
 
+    const beforeOpenInvalidations = invalidatedCount;
     await alertMount.press({ key: 'hyphae-strip-open' });
     expect(opened).toEqual(['hyphae-panel']);
+    expect(invalidatedCount).toBeGreaterThan(beforeOpenInvalidations);
+    // U17: opening panel from AbovePrompt quarantine strip MUST start the 5s refresh timer!
+    const afterOpenInvalidations = invalidatedCount;
+    await clock.advance(5_000);
+    expect(invalidatedCount).toBeGreaterThan(afterOpenInvalidations);
     await alertMount.unmount();
   });
 });

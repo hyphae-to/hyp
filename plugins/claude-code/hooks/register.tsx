@@ -8,6 +8,7 @@ import {
   parseControlCommandResult,
   parsePanelCommandArgs,
   parseSnapshotJson,
+  qualifyChannelTarget,
   resolveActiveSession,
   resolveUiStateCandidates,
   sanitizeUiText,
@@ -473,7 +474,7 @@ export const register: Register = (on) => {
                 </Text>
               ) : (
                 subs.map((sub, idx) => {
-                  const subId = sub.id || sub.key || sub.topic;
+                  const subId = sub.rawId || sub.id || sub.rawKey || sub.key || sub.topic;
                   const detailLine = [
                     sub.mode,
                     sub.originNode,
@@ -585,7 +586,7 @@ export const register: Register = (on) => {
                         hover={{ color: 'cyan' }}
                         onPress={() =>
                           runSessionControl(
-                            { kind: 'unmute', pattern: m.pattern, scope: m.scope },
+                            { kind: 'unmute', pattern: m.rawPattern || m.pattern, scope: m.scope },
                             active,
                             `Unmute ${m.pattern}`,
                           )
@@ -611,12 +612,15 @@ export const register: Register = (on) => {
       }
 
       // 'mesh' tab: Channels, Wakeups (metadata-only), and peer count
+      const fallbackRawNodeId = daemon?.rawNodeId || nodeId;
       const chanRows =
         active.details.channelEntries.length > 0
           ? active.details.channelEntries.slice(0, MAX_VISIBLE_ROWS)
-          : active.details.channels.slice(0, MAX_VISIBLE_ROWS).map((ch) => ({
+          : active.details.channels.slice(0, MAX_VISIBLE_ROWS).map((ch, idx) => ({
               hostNode: nodeId,
+              rawHostNode: fallbackRawNodeId,
               channel: ch,
+              rawChannel: active.details.rawChannels?.[idx] ?? ch,
               mode: 'open',
             }));
       const wakeups = active.details.wakeups.slice(0, 6);
@@ -632,6 +636,11 @@ export const register: Register = (on) => {
                 ch.hostNode && ch.hostNode !== 'local' && ch.hostNode !== nodeId
                   ? `${ch.hostNode}/${ch.channel}`
                   : ch.channel;
+              const leaveTarget = qualifyChannelTarget(
+                ch.rawHostNode ?? ch.hostNode,
+                ch.rawChannel ?? ch.channel,
+                fallbackRawNodeId,
+              );
               return (
                 <Box
                   key={`ch-row-${idx}`}
@@ -647,7 +656,7 @@ export const register: Register = (on) => {
                       hover={{ color: 'red' }}
                       onPress={() =>
                         runSessionControl(
-                          { kind: 'leave', channel: display },
+                          { kind: 'leave', channel: leaveTarget },
                           active,
                           `Leave ${display}`,
                         )
@@ -935,6 +944,11 @@ export const register: Register = (on) => {
                 focus: true,
                 closeOnEscape: true,
               });
+              stopPaneRefreshTimer();
+              uiState.paneRefreshTimer = $.clock.every(REFRESH_INTERVAL_MS, () => {
+                $.ui.invalidate('ui.render');
+              });
+              $.ui.invalidate('ui.render');
             }}
           >
             <Text color="cyan">open panel →</Text>

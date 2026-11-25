@@ -13,7 +13,7 @@ Native GPUI pane header status pills and expandable thread inspector for [Herdr]
 ## Zero-Polling Architecture
 
 - **Local panes:** Watches `~/.config/hyphae/ui/` (or `<stateDir>/ui` from `node.json`, with `~/.config/hyphae/state/ui` fallback) using Herdr's native `watchFolder` + `readTextFile("state.json")` — zero polling and zero subprocess spawns.
-- **Remote SSH spaces (`solace/t4g`):** Deduplicates fetches across all panes on the same remote host through `shared("hyphae.remoteCache")` and runs `exec("hyp", ["inspect", "--all", "--json"], { on: machine })` with exponential backoff.
+- **Remote SSH spaces (`solace/t4g`):** Deduplicates in-flight and cached fetches across all panes on the same remote host through `shared("hyphae.remoteInFlight")` + `shared("hyphae.remoteCache")` and runs `exec("hyp", ["inspect", "--all", "--json"], { on: machine })` with exponential backoff.
 - **Strict metadata boundary:** Neither `ui/state.json` nor the Herdr mods ever read or render message bodies, CloudEvent `data`, wakeup `note`s, quarantined payloads, or secrets. Quarantined alerts direct you to `hyp gate review` in your terminal.
 
 ## Install
@@ -24,7 +24,7 @@ Native GPUI pane header status pills and expandable thread inspector for [Herdr]
 hyp setup --harness herdr --mod
 ```
 
-By default, `hyp` copies both mods into `~/.config/herdr-app/mods/`, merges `cmd-shift-h` into `keys.json` (if unbound), and **never** mutates symlinked layouts, shipped layouts (`main`, `terminals`, `win98`), or custom pane headers without explicit opt-in (`--patch-layout`, `--clone-layout <name>`, or `--force`).
+By default, `hyp` copies both mods into `~/.config/herdr-app/mods/`, merges `cmd-shift-h` into `keys.json` (if unbound), and **never** mutates symlinked layouts, shipped layouts (`main`, `terminals`, `win98`), or custom pane headers without explicit opt-in (`--patch-layout`, `--clone-layout <name>`, or `--force-layout`).
 
 ### Option 2 — Standalone Script
 

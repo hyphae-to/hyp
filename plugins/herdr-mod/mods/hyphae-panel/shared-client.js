@@ -8,8 +8,10 @@
 const REMOTE_REFRESH_MS = 10_000;
 const REMOTE_MAX_BACKOFF_MS = 60_000;
 const REMOTE_CACHE_KEY = "hyphae.remoteCache";
+const REMOTE_INFLIGHT_KEY = "hyphae.remoteInFlight";
 const CONTROL_TIMEOUT_MS = 10_000;
 const REMOTE_INSPECT_TIMEOUT_MS = 8_000;
+const REMOTE_INFLIGHT_TTL_MS = REMOTE_INSPECT_TIMEOUT_MS + 4_000;
 
 const FORBIDDEN_BODY_KEYS = new Set([
   "body",
@@ -22,21 +24,65 @@ const FORBIDDEN_BODY_KEYS = new Set([
 ]);
 
 /**
- * Strips ANSI escape sequences and C0/C1 control characters from untrusted
+ * Strips ANSI escape sequences (OSC/DCS/CSI/ESC), C0/C1 control characters,
+ * zero-width characters, and Unicode BiDi overrides WITHOUT truncating length.
+ * Use this for CLI control arguments (`mute`, `unmute`, `unsubscribe`, `leave`, `rule`).
+ */
+export function stripControlChars(raw) {
+  if (raw === null || raw === undefined) return "";
+  return String(raw)
+    // Strip OSC sequences (\x1b] ... \x07 or \x1b\\)
+    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, "")
+    // Strip DCS / SOS / PM / APC strings
+    .replace(/\u001b[PX^_][^\u001b]*(?:\u001b\\)?/g, "")
+    // Strip CSI sequences (\x1b[ ... final byte)
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    // Strip remaining 2-byte ESC sequences
+    .replace(/\u001b[@-Z\\-_]/g, "")
+    // Strip remaining ESC and C0/C1 control characters
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
+    // Strip Unicode BiDi overrides/isolates/marks + zero-width / BOM
+    .replace(/[\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, "")
+    .trim();
+}
+
+/**
+ * Strips ANSI escape sequences and control/BiDi characters from untrusted
  * metadata fields (`handle`, `topic`, `source`, `channel`, `label`) before display.
  */
 export function sanitizeUiText(raw, maxLen = 120) {
-  if (raw === null || raw === undefined) return "";
-  const str = String(raw)
-    // Strip OSC sequences (\x1b] ... \x07 or \x1b\\)
-    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, "")
-    // Strip CSI sequences (\x1b[ ... final byte)
-    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
-    // Strip remaining ESC and C0/C1 control characters
-    .replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
-    .trim();
+  const str = stripControlChars(raw);
   if (str.length <= maxLen) return str;
   return str.slice(0, Math.max(0, maxLen - 1)) + "…";
+}
+
+/**
+ * Qualifies a channel target as `<hostNode>/<channel>` so `hyp session leave`
+ * targets the exact host node and never resolves bare `#channel` to a default Hub.
+ */
+export function qualifyChannelTarget(hostNode, channel, fallbackNodeId = "local") {
+  const cleanChannel = stripControlChars(channel);
+  if (!cleanChannel) return "";
+  if (cleanChannel.includes("/")) return cleanChannel;
+  const cleanHost = stripControlChars(hostNode) || stripControlChars(fallbackNodeId) || "local";
+  return `${cleanHost}/${cleanChannel}`;
+}
+
+/**
+ * Consistently computes `max(session.counts.quarantined, daemon.quarantinedGlobal)`
+ * across Herdr pane pills and the inspector panel.
+ */
+export function getEffectiveQuarantinedCount(entry, daemonOrSnapshot = null) {
+  const sessionCount = Math.max(0, Number(entry?.counts?.quarantined) || 0);
+  const globalCount = Math.max(
+    0,
+    Number(
+      daemonOrSnapshot?.quarantinedGlobal ??
+        daemonOrSnapshot?.daemon?.quarantinedGlobal ??
+        0
+    ) || 0
+  );
+  return Math.max(sessionCount, globalCount);
 }
 
 /**
@@ -268,15 +314,18 @@ export function resolveSessionById(snapshot, sessionId) {
 /**
  * Computes crisp, metadata-only display metrics for the pane header pill.
  * Returns `{ visible: false, ... }` when the terminal is unenrolled and has
- * zero subscriptions, queued items, and quarantined items (zero visual clutter).
+ * zero bridges, subscriptions, queued items, and quarantined items (zero visual clutter).
  */
-export function formatPillMetrics(entry) {
+export function formatPillMetrics(entry, daemonOrSnapshot = null) {
   if (!entry || typeof entry !== "object") {
     return {
       visible: false,
       enrolled: false,
       handle: null,
       subs: 0,
+      bridges: 0,
+      bridgeLabels: [],
+      bridgeSummary: null,
       queued: 0,
       unnotified: 0,
       quarantined: 0,
@@ -296,9 +345,35 @@ export function formatPillMetrics(entry) {
 
   const counts = entry.counts && typeof entry.counts === "object" ? entry.counts : {};
   const subs = Math.max(0, Number(counts.subscriptions) || 0);
+  const compactBridges = Array.isArray(entry.bridges)
+    ? entry.bridges.map((b) => sanitizeUiText(b, 48)).filter(Boolean)
+    : [];
+  const detailBridges = Array.isArray(entry.details?.bridges)
+    ? entry.details.bridges
+        .map((b) =>
+          sanitizeUiText(
+            b?.label || (b?.plugin && b?.target ? `${b.plugin}:${b.target}` : b?.plugin || ""),
+            48
+          )
+        )
+        .filter(Boolean)
+    : [];
+  const bridgeLabels = compactBridges.length > 0 ? compactBridges : detailBridges;
+  const bridges = Math.max(0, Number(counts.bridges) || 0, bridgeLabels.length);
+  const bridgeSummary =
+    bridgeLabels.length > 0
+      ? bridgeLabels.length === 1
+        ? bridgeLabels[0]
+        : `${bridgeLabels[0]} +${bridgeLabels.length - 1}`
+      : bridges > 0
+        ? bridges === 1
+          ? "1 bridge"
+          : `${bridges} bridges`
+        : null;
+
   const queued = Math.max(0, Number(counts.queued) || 0);
   const unnotified = Math.max(0, Number(counts.unnotified) || 0);
-  const quarantined = Math.max(0, Number(counts.quarantined) || 0);
+  const quarantined = getEffectiveQuarantinedCount(entry, daemonOrSnapshot);
   const mutedRules = Math.max(0, Number(counts.mutedRules) || 0);
   const channels = Math.max(0, Number(counts.channels) || 0);
   const wakeups = Math.max(0, Number(counts.wakeups) || 0);
@@ -308,13 +383,16 @@ export function formatPillMetrics(entry) {
   const mutedAll = Boolean(entry.mutedAll);
   const handle = entry.handle ? sanitizeUiText(entry.handle, 32) : null;
 
-  const visible = enrolled || subs > 0 || queued > 0 || quarantined > 0;
+  const visible = enrolled || subs > 0 || bridges > 0 || queued > 0 || quarantined > 0;
   if (!visible) {
     return {
       visible: false,
       enrolled: false,
       handle,
       subs,
+      bridges,
+      bridgeLabels,
+      bridgeSummary,
       queued,
       unnotified,
       quarantined,
@@ -343,7 +421,13 @@ export function formatPillMetrics(entry) {
 
   let compactLabel;
   if (queued > 0) {
-    compactLabel = `${subs}·${queued}`;
+    compactLabel = `${subs + bridges}·${queued}`;
+  } else if (bridgeSummary && subs === 0) {
+    compactLabel = bridgeLabels[0]
+      ? sanitizeUiText(bridgeLabels[0].split(":")[0], 14)
+      : `${bridges}b`;
+  } else if (subs > 0 && bridges > 0) {
+    compactLabel = `${bridges}b·${subs}s`;
   } else if (subs > 0) {
     compactLabel = `${subs}s`;
   } else {
@@ -351,17 +435,21 @@ export function formatPillMetrics(entry) {
   }
 
   const medParts = [];
+  if (bridgeSummary) medParts.push(bridgeSummary);
   if (focusMode) medParts.push("focus");
   if (mutedAll) medParts.push("muted");
-  if (subs > 0 || queued === 0) medParts.push(`${subs}s`);
+  if (subs > 0 || (!bridgeSummary && queued === 0)) medParts.push(`${subs}s`);
   if (queued > 0) medParts.push(`${queued}q`);
   const mediumLabel = medParts.join(" · ");
 
   const wideParts = [];
   if (handle) wideParts.push(`@${handle}`);
+  if (bridgeSummary) wideParts.push(bridgeSummary);
   if (focusMode) wideParts.push("FOCUS");
   if (mutedAll) wideParts.push("muted*");
-  wideParts.push(subs === 1 ? "1 sub" : `${subs} subs`);
+  if (subs > 0 || !bridgeSummary) {
+    wideParts.push(subs === 1 ? "1 sub" : `${subs} subs`);
+  }
   if (queued > 0) wideParts.push(`${queued} queued`);
   const wideLabel = wideParts.join(" · ");
 
@@ -370,6 +458,9 @@ export function formatPillMetrics(entry) {
     enrolled,
     handle,
     subs,
+    bridges,
+    bridgeLabels,
+    bridgeSummary,
     queued,
     unnotified,
     quarantined,
@@ -610,9 +701,36 @@ export function createHyphaeClient(host) {
     return getRemoteCache()[machine] ?? null;
   }
 
+  function getRemoteInFlight() {
+    const raw = host.shared(REMOTE_INFLIGHT_KEY);
+    return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  }
+
+  function isRemoteInFlightShared(machine, now) {
+    const startedAt = Number(getRemoteInFlight()[machine]) || 0;
+    return startedAt > 0 && now - startedAt < REMOTE_INFLIGHT_TTL_MS;
+  }
+
+  function setRemoteInFlightShared(machine, startedAt) {
+    const prev = getRemoteInFlight();
+    if (startedAt === null) {
+      if (!(machine in prev)) return;
+      const next = { ...prev };
+      delete next[machine];
+      host.setShared(REMOTE_INFLIGHT_KEY, next);
+      return;
+    }
+    host.setShared(REMOTE_INFLIGHT_KEY, { ...prev, [machine]: startedAt });
+  }
+
   function ensureRemoteFresh(machine, cx, force = false) {
     if (!machine || disposed || remoteInFlight.has(machine)) return;
     const now = Date.now();
+    // Cross-pane deduplication: check shared in-flight timestamp lock BEFORE spawning exec
+    // so multiple panes on the same SSH host share ONE remote fetch.
+    if (isRemoteInFlightShared(machine, now)) {
+      return;
+    }
     const cached = getRemoteCache()[machine];
     const minInterval = cached?.backoffMs || REMOTE_REFRESH_MS;
     if (!force && cached?.fetchedAt && now - cached.fetchedAt < minInterval) {
@@ -620,6 +738,8 @@ export function createHyphaeClient(host) {
     }
 
     remoteInFlight.add(machine);
+    const lockToken = now;
+    setRemoteInFlightShared(machine, lockToken);
     cx.spawn(async (spawnCx) => {
       try {
         const res = await host.exec("hyp", ["inspect", "--all", "--json"], {
@@ -668,6 +788,9 @@ export function createHyphaeClient(host) {
         spawnCx.notify();
       } finally {
         remoteInFlight.delete(machine);
+        if (getRemoteInFlight()[machine] === lockToken) {
+          setRemoteInFlightShared(machine, null);
+        }
       }
     });
   }

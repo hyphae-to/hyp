@@ -15,6 +15,7 @@ export interface DaemonSummary {
   online: boolean;
   pid: number;
   nodeId: string;
+  rawNodeId?: string;
   version: string;
   profile: string;
   peersOnline: number;
@@ -51,7 +52,9 @@ export interface UnreadBreakdown {
 
 export interface SubscriptionSummary {
   id: string;
+  rawId?: string;
   key: string | null;
+  rawKey?: string | null;
   originNode: string;
   topic: string;
   mode: string;
@@ -71,18 +74,22 @@ export interface QueuedItemMeta {
 
 export interface MuteSummary {
   pattern: string;
+  rawPattern?: string;
   scope: 'session' | 'connector';
   mutedAt: number;
 }
 
 export interface DeliveryRuleSummary {
   target: string;
+  rawTarget?: string;
   delivery: string;
 }
 
 export interface ChannelEntrySummary {
   hostNode: string;
+  rawHostNode?: string;
   channel: string;
+  rawChannel?: string;
   mode: string;
 }
 
@@ -102,6 +109,7 @@ export interface SessionDetails {
   mutes: MuteSummary[];
   rules: DeliveryRuleSummary[];
   channels: string[];
+  rawChannels?: string[];
   channelEntries: ChannelEntrySummary[];
   wakeups: WakeupSummary[];
 }
@@ -172,11 +180,11 @@ const FORBIDDEN_BODY_KEYS = new Set([
 /**
  * Strips ANSI escape sequences (OSC, CSI, DCS/APC/PM/SOS, ESC), C0/C1 control
  * characters, zero-width joiners/marks, and Unicode BiDi override/isolate
- * characters from untrusted external strings before rendering.
+ * characters WITHOUT truncating length — safe for CLI action identifiers/patterns.
  */
-export function sanitizeUiText(raw: unknown, maxLen = 120): string {
+export function sanitizeControlValue(raw: unknown): string {
   if (raw === null || raw === undefined) return '';
-  const cleaned = String(raw)
+  return String(raw)
     // OSC sequences: ESC ] ... (BEL | ST)
     .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, '')
     // DCS / SOS / PM / APC strings: ESC [PX^_] ... ST
@@ -190,9 +198,33 @@ export function sanitizeUiText(raw: unknown, maxLen = 120): string {
     // Unicode BiDi overrides/isolates/marks + zero-width / BOM characters
     .replace(/[\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '')
     .trim();
+}
 
+/**
+ * Strips ANSI escape sequences (OSC, CSI, DCS/APC/PM/SOS, ESC), C0/C1 control
+ * characters, zero-width joiners/marks, and Unicode BiDi override/isolate
+ * characters from untrusted external strings before rendering, bounded to `maxLen`.
+ */
+export function sanitizeUiText(raw: unknown, maxLen = 120): string {
+  const cleaned = sanitizeControlValue(raw);
   if (cleaned.length <= maxLen) return cleaned;
   return `${cleaned.slice(0, Math.max(0, maxLen - 1))}…`;
+}
+
+/**
+ * Qualifies a channel target as `<hostNode>/<channel>` so `hyp session leave`
+ * targets the exact host node and never resolves bare `#channel` to a default Hub.
+ */
+export function qualifyChannelTarget(
+  hostNode: string | null | undefined,
+  channel: string,
+  fallbackNodeId?: string | null,
+): string {
+  const cleanChannel = sanitizeControlValue(channel);
+  if (!cleanChannel) return '';
+  if (cleanChannel.includes('/')) return cleanChannel;
+  const cleanHost = sanitizeControlValue(hostNode) || sanitizeControlValue(fallbackNodeId) || 'local';
+  return `${cleanHost}/${cleanChannel}`;
 }
 
 /**
@@ -304,7 +336,7 @@ export function resolveUiStateCandidates(
 function parseSessionSummary(raw: unknown): SessionSummary | null {
   const obj = asRecord(raw);
   if (!obj) return null;
-  const sessionId = sanitizeUiText(obj.sessionId, 128);
+  const sessionId = sanitizeControlValue(obj.sessionId);
   if (!sessionId) return null;
 
   const countsObj = asRecord(obj.counts);
@@ -340,12 +372,17 @@ function parseSessionSummary(raw: unknown): SessionSummary | null {
   for (const item of rawSubs) {
     const s = asRecord(item);
     if (!s) continue;
+    const rawId = sanitizeControlValue(s.id);
+    const rawKey = typeof s.key === 'string' && s.key.trim() ? sanitizeControlValue(s.key) : null;
+    const rawTopic = sanitizeControlValue(s.topic);
     const id = sanitizeUiText(s.id, 128);
     const topic = sanitizeUiText(s.topic, 120);
-    if (!id && !topic) continue;
+    if (!rawId && !rawTopic) continue;
     subscriptions.push({
       id: id || topic,
-      key: typeof s.key === 'string' && s.key.trim() ? sanitizeUiText(s.key, 80) : null,
+      rawId: rawId || rawKey || rawTopic,
+      key: rawKey ? sanitizeUiText(rawKey, 80) : null,
+      rawKey,
       originNode: sanitizeUiText(s.originNode, 64) || 'local',
       topic: topic || id,
       mode: sanitizeUiText(s.mode, 24) || 'queue',
@@ -375,10 +412,11 @@ function parseSessionSummary(raw: unknown): SessionSummary | null {
   for (const item of rawMutes) {
     const m = asRecord(item);
     if (!m) continue;
-    const pattern = sanitizeUiText(m.pattern, 120);
-    if (!pattern) continue;
+    const rawPattern = sanitizeControlValue(m.pattern);
+    if (!rawPattern) continue;
     mutes.push({
-      pattern,
+      pattern: sanitizeUiText(rawPattern, 120),
+      rawPattern,
       scope: m.scope === 'connector' ? 'connector' : 'session',
       mutedAt: asNum(m.mutedAt, 0),
     });
@@ -389,29 +427,34 @@ function parseSessionSummary(raw: unknown): SessionSummary | null {
   for (const item of rawRules) {
     const r = asRecord(item);
     if (!r) continue;
-    const target = sanitizeUiText(r.target, 120);
-    if (!target) continue;
+    const rawTarget = sanitizeControlValue(r.target);
+    if (!rawTarget) continue;
     rules.push({
-      target,
+      target: sanitizeUiText(rawTarget, 120),
+      rawTarget,
       delivery: sanitizeUiText(r.delivery, 24) || 'queue',
     });
   }
 
-  const rawChannels = Array.isArray(detailsObj?.channels) ? detailsObj.channels : [];
-  const channels = rawChannels
-    .map((c) => sanitizeUiText(c, 96))
+  const rawChannelsList = Array.isArray(detailsObj?.channels) ? detailsObj.channels : [];
+  const rawChannels = rawChannelsList
+    .map((c) => sanitizeControlValue(c))
     .filter((c) => c.length > 0);
+  const channels = rawChannels.map((c) => sanitizeUiText(c, 96));
 
   const rawChanEntries = Array.isArray(detailsObj?.channelEntries) ? detailsObj.channelEntries : [];
   const channelEntries: ChannelEntrySummary[] = [];
   for (const item of rawChanEntries) {
     const c = asRecord(item);
     if (!c) continue;
-    const channel = sanitizeUiText(c.channel, 96);
-    if (!channel) continue;
+    const rawChannel = sanitizeControlValue(c.channel);
+    if (!rawChannel) continue;
+    const rawHostNode = sanitizeControlValue(c.hostNode) || 'local';
     channelEntries.push({
-      hostNode: sanitizeUiText(c.hostNode, 64) || 'local',
-      channel,
+      hostNode: sanitizeUiText(rawHostNode, 64) || 'local',
+      rawHostNode,
+      channel: sanitizeUiText(rawChannel, 96),
+      rawChannel,
       mode: sanitizeUiText(c.mode, 24) || 'open',
     });
   }
@@ -484,6 +527,7 @@ function parseSessionSummary(raw: unknown): SessionSummary | null {
       mutes,
       rules,
       channels,
+      rawChannels,
       channelEntries,
       wakeups,
     },
@@ -503,22 +547,29 @@ export function parseSnapshotJson(rawText: string): HyphaeSnapshot | null {
     return null;
   }
 
-  const stripped = asRecord(stripMetadataOnly(parsed));
-  if (!stripped) return null;
+  const parsedObj = asRecord(parsed);
+  if (!parsedObj) return null;
 
-  let root: Record<string, unknown> = stripped;
-  if ('ok' in stripped) {
-    if (stripped.ok === false) return null;
-    const envelopeData = asRecord(stripped.data) ?? asRecord(stripped.result);
-    if (envelopeData) root = envelopeData;
+  // Unwrap `{ ok: true, data: ... }` / `{ ok: true, result: ... }` BEFORE stripping
+  // forbidden nested payload keys (`data`, `body`, `text`, ...) so CLI envelopes work!
+  let unwrapped: Record<string, unknown> = parsedObj;
+  if ('ok' in parsedObj) {
+    if (parsedObj.ok === false) return null;
+    const envelopeData = asRecord(parsedObj.data) ?? asRecord(parsedObj.result);
+    if (envelopeData) unwrapped = envelopeData;
   }
 
+  const root = asRecord(stripMetadataOnly(unwrapped));
+  if (!root) return null;
+
   const daemonObj = asRecord(root.daemon);
+  const rawNodeId = daemonObj ? sanitizeControlValue(daemonObj.nodeId) || 'local' : 'local';
   const daemon: DaemonSummary | null = daemonObj
     ? {
         online: Boolean(daemonObj.online),
         pid: asCount(daemonObj.pid),
-        nodeId: sanitizeUiText(daemonObj.nodeId, 64) || 'local',
+        nodeId: sanitizeUiText(rawNodeId, 64) || 'local',
+        rawNodeId,
         version: sanitizeUiText(daemonObj.version, 32),
         profile: sanitizeUiText(daemonObj.profile, 32),
         peersOnline: asCount(daemonObj.peersOnline),
@@ -589,7 +640,8 @@ export function resolveActiveSession(
 }
 
 /**
- * Computes total visible quarantined count (never exposes quarantined payloads or sources).
+ * Consistently computes `max(session.counts.quarantined, daemon.quarantinedGlobal)`
+ * across status bars and panels (never exposes quarantined payloads or sources).
  */
 export function getQuarantinedCount(
   snapshot: HyphaeSnapshot | null,
@@ -597,11 +649,7 @@ export function getQuarantinedCount(
 ): number {
   const globalCount = snapshot?.daemon?.quarantinedGlobal ?? 0;
   const sessionCount = active?.counts.quarantined ?? 0;
-  const maxSession = (snapshot?.sessions ?? []).reduce(
-    (acc, s) => Math.max(acc, s.counts.quarantined),
-    0,
-  );
-  return Math.max(globalCount, sessionCount, maxSession);
+  return Math.max(sessionCount, globalCount);
 }
 
 /**
