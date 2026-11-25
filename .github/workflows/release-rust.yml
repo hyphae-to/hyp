@@ -232,12 +232,56 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout release commit (for official external plugins archive)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.git_sha }}
+          fetch-depth: 1
+
       - name: Download all target archives
         uses: actions/download-artifact@v4
         with:
           pattern: release-*
           merge-multiple: true
           path: dist
+
+      - name: Package official external plugins archive (LF-normalized)
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          STAGE="$(mktemp -d)"
+          trap 'rm -rf "$STAGE"' EXIT
+          for rel in \
+            sdk/client.mjs \
+            telegram/index.mjs \
+            slack/index.mjs \
+            whatsapp/index.mjs \
+            webhook/index.mjs \
+            prometheus/index.mjs
+          do
+            if [ ! -f "plugins/${rel}" ]; then
+              echo "Missing official plugin file: plugins/${rel}" >&2
+              exit 1
+            fi
+            mkdir -p "${STAGE}/$(dirname "$rel")"
+            node -e '
+              const fs = require("node:fs");
+              const raw = fs.readFileSync(process.argv[1]);
+              const norm = Buffer.from(raw.toString("binary").replace(/\r\n/g, "\n"), "binary");
+              fs.writeFileSync(process.argv[2], norm);
+            ' "plugins/${rel}" "${STAGE}/${rel}"
+            chmod 0644 "${STAGE}/${rel}"
+          done
+          tar --format=ustar -C "$STAGE" -czf "dist/hyp-${TAG}-plugins.tar.gz" \
+            sdk/client.mjs \
+            telegram/index.mjs \
+            slack/index.mjs \
+            whatsapp/index.mjs \
+            webhook/index.mjs \
+            prometheus/index.mjs
+          ls -lh "dist/hyp-${TAG}-plugins.tar.gz"
 
       - name: Generate and verify SHA256SUMS.txt & canonical release-manifest.json
         shell: bash
@@ -260,6 +304,7 @@ jobs:
             "hyp-${TAG}-x86_64-unknown-linux-musl.tar.gz"
             "hyp-${TAG}-aarch64-unknown-linux-gnu.tar.gz"
             "hyp-${TAG}-x86_64-pc-windows-msvc.zip"
+            "hyp-${TAG}-plugins.tar.gz"
           )
 
           for file in "${expected[@]}"; do
@@ -284,6 +329,7 @@ jobs:
           const targets = [
             ["aarch64-apple-darwin", "tar.gz"],
             ["aarch64-unknown-linux-gnu", "tar.gz"],
+            ["plugins", "tar.gz"],
             ["x86_64-apple-darwin", "tar.gz"],
             ["x86_64-pc-windows-msvc", "zip"],
             ["x86_64-unknown-linux-gnu", "tar.gz"],

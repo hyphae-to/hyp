@@ -132,7 +132,7 @@ In Turn 2 (right after bootstrapping the core node/harnesses and connecting any 
 
 > **"Which optional capabilities do you want to set up now?"**
 > 1. **Event Streams** — GitHub (Webhook on a Hub node vs. Multi-owner `repoTokens` Poll on a Local node), Prometheus Alertmanager, or custom OS cron / `local.schedule` routes (`hyp emit` / `ingest.sock` is already enabled by default)
-> 2. **Chat Bridges** — Telegram (`@BotFather`), Slack (Socket Mode), WhatsApp, or generic Webhook
+> 2. **Chat Bridges** — Telegram (`@BotFather`), Slack (Socket Mode), WhatsApp, or generic Webhook *(always install via `hyp plugin install <name> --json` into `~/.config/hyphae/plugins/` and wire `data.nodePath` + `data.plugins[0].scriptPath` — NEVER point `node.json` at a local git checkout)*
 > 3. **Verified Human Drops** — Phone WebAuthn Passkey (`https://hyphae.to/drop`, QR + URL) + `https://spore.hyphae.to` Blind Drop Relay for zero-leak secret handoffs & signed directives
 > 4. **Local Security Gate** — Prompt-injection filter (`anthropic` [supports `--base-url` + `--auth-header bearer|x-api-key`], `openai-compat`, `google`, `lakera-guard`, `http-classifier`) + `hyp gate lock`
 > 5. **None for now** — skip straight to final `hyp doctor` check
@@ -385,8 +385,34 @@ hyp deploy check --url https://<hostname> --json
 3. **Compiled-in pure-Rust event sources** (`sources[]` in `~/.config/hyphae/node.json` — zero Node/Python needed):
    - `github-public` (deduplicated ETag poller with multi-owner `repoTokens` + optional GitHub App webhook), `github-webhook`, `prometheus-webhook`, `webhook-stream`.
    - Reference secrets strictly as `{ "secret": "<name>" }`.
-4. **Optional external chat bridges** (`plugins/slack`, `plugins/telegram`, `plugins/whatsapp`, `plugins/webhook`, `plugins/prometheus`):
-   - Supervised over fd-3 JSON-RPC 2.0 by `hyp daemon`; always configure explicit allowlists (`SLACK_ALLOWED_USERS` / `SLACK_ALLOWED_CHANNELS`, `TELEGRAM_ALLOWED_USERS` / `TELEGRAM_ALLOWED_CHATS`, etc.) and reference tokens via `{ "secret": "<name>" }`.
+4. **Optional external chat bridges & sources (`telegram`, `slack`, `whatsapp`, `webhook`, `prometheus`) — ALWAYS install via `hyp plugin install`**:
+   - **NEVER** point `node.json` `plugins[]` at a local git checkout (e.g., `plugins/telegram/index.mjs` inside a workspace repository — checkouts move, get deleted, and are not SHA-256 verified against the installed `hyp` binary).
+   - **ALWAYS** run `hyp plugin install <telegram|slack|whatsapp|webhook|prometheus> --json` first. It downloads the version-matched release artifact (`hyp-vX.Y.Z-plugins.tar.gz`), unpacks safely, verifies every file (`sdk/client.mjs` + `<name>/index.mjs`) in constant time against compile-time pinned SHA-256 digests, and atomically installs them into `~/.config/hyphae/plugins/`:
+     ```sh
+     hyp plugin list --json
+     hyp plugin install telegram --json
+     hyp plugin install slack --json
+     hyp plugin verify --json
+     ```
+   - Wire `~/.config/hyphae/node.json` `plugins[]` using the exact **`data.nodePath`** (absolute `node` binary path, falling back to `"node"` only if `null`) as `"command"` and **`data.plugins[0].scriptPath`** (`~/.config/hyphae/plugins/<name>/index.mjs`) as `"args"`:
+     ```json
+     {
+       "plugins": [
+         {
+           "id": "telegram",
+           "command": "<data.nodePath>",
+           "args": ["<data.plugins[0].scriptPath>"],
+           "targets": ["personal"],
+           "env": {
+             "TELEGRAM_BOT_TOKEN": { "secret": "telegram-bot-token" },
+             "TELEGRAM_ALLOWED_USERS": "<numeric-user-id>",
+             "TELEGRAM_DEFAULT_CHAT": "<numeric-user-id>"
+           }
+         }
+       ]
+     }
+     ```
+   - Supervised over fd-3 JSON-RPC 2.0 by `hyp daemon`; always configure explicit allowlists (`SLACK_ALLOWED_USERS` / `SLACK_ALLOWED_CHANNELS`, `TELEGRAM_ALLOWED_USERS` / `TELEGRAM_ALLOWED_CHATS`, etc.) and reference tokens via `{ "secret": "<name>" }`. Use `hyp plugin remove <name> --json` when retiring a bridge.
 5. Restart the background daemon after editing `node.json` (`hyp service restart --json`), then verify with `hyp doctor --json`.
 
 ### G. Propose & Lock a Local Security Gate
