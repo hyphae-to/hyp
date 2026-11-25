@@ -96,25 +96,27 @@ use hyp_store::{
 
 use crate::adapters::github_public::canonicalize_repo;
 use crate::adapters::{
-    AdapterError, AdapterHealth, BoxFuture, CompiledSubscription, GitHubPublicAdapter, NodeAdapter,
-    NodeAdapterHost, PublishErrorCode, PublishOutcome, PublishStatus,
+    AdapterError, AdapterHealth, BoxFuture, CompiledSubscription, GenericWebhookAdapter,
+    GitHubPublicAdapter, GitHubWebhookAdapter, NodeAdapter, NodeAdapterHost,
+    PrometheusWebhookAdapter, PublishErrorCode, PublishOutcome, PublishStatus,
 };
 use crate::engine::config::{
-    ChannelMode, ChannelPolicy, NodeConfig, NodeError, crypto_jwk_to_proto, profile_to_store,
-    proto_ce_to_store, proto_filter_to_store, proto_jwk_to_crypto, store_ce_to_proto,
-    store_filter_to_proto,
+    ChannelMode, ChannelPolicy, NodeConfig, NodeError, NodeProfile, crypto_jwk_to_proto,
+    profile_to_store, proto_ce_to_store, proto_filter_to_store, proto_jwk_to_crypto,
+    store_ce_to_proto, store_filter_to_proto,
 };
 use crate::engine::drop_relay::DropRelay;
 use crate::engine::http_util::{
     HttpClient, compute_etag, full_body,
 };
 use crate::gates::{
-    GateDecision, InboundContext, SecurityGatePipeline, TrustTier as GateTrustTier,
-    VerifiedHumanClaim,
+    GateDecision, InboundContext, OutboundContext, SecurityGatePipeline, Stage1Config,
+    Stage1Engine, TrustTier as GateTrustTier, VerifiedHumanClaim,
 };
 use crate::engine::peer_link::{
-    ChannelDirectoryEntry, ChannelJoinResponse, ChannelPostRequest, GuestPairReply,
-    GuestPairRequest, KeyRegPayloadV2, KvSetBody, MAX_JSON_RESPONSE_BYTES, ManifestFetchOutcome,
+    BridgePostRequest, BridgePostResponse, ChannelDirectoryEntry, ChannelJoinResponse,
+    ChannelPostRequest, GuestPairReply, GuestPairRequest, KeyRegPayloadV2, KvSetBody,
+    MAX_JSON_RESPONSE_BYTES, ManifestFetchOutcome, NodeUpdateRequest, NodeUpdateResponse,
     P2pPairServerReply, PairBindingV2, PairRequestV2, PairServerReply, PeerAuth,
     PeerKeyDirectoryEntry, PeerLink, PostMessageRequest, PublishEventRequest,
     PutChannelEpochRequest, PutKeyRequest, PutKvEpochRequest, PutSubscriptionsRequest,
@@ -287,6 +289,27 @@ pub fn p2p_offer_secret_name(offer_id: &str) -> String {
     format!("p2p-offer-{}", &hash[..16])
 }
 
+/// Async handler invoked by `POST /v1/bridges/post` after explicit `bridge:post=<plugin>:<target>`
+/// scope verification and Stage 1 outbound DLP scanning succeed.
+pub trait BridgePostHandler: Send + Sync {
+    fn post_bridge<'a>(
+        &'a self,
+        plugin: &'a str,
+        target: &'a str,
+        text: &'a str,
+        reply_to: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<Option<String>, NodeError>>;
+}
+
+/// Async handler invoked by `POST /v1/node/update` after explicit `node:update` scope verification
+/// and strict parameter validation succeed.
+pub trait RemoteUpdateHandler: Send + Sync {
+    fn trigger_update<'a>(
+        &'a self,
+        req: NodeUpdateRequest,
+    ) -> BoxFuture<'a, Result<(), NodeError>>;
+}
+
 /// Composable Hyphae v2 Unified Rust `Node` engine.
 pub struct UnifiedNode {
     config: NodeConfig,
@@ -305,6 +328,12 @@ pub struct UnifiedNode {
     seen_http_nonces: Mutex<HashMap<(String, String), i64>>,
     guest_join_timestamps: Mutex<VecDeque<i64>>,
     github_public: Mutex<Option<Arc<GitHubPublicAdapter>>>,
+    github_webhooks: Mutex<BTreeMap<String, Arc<GitHubWebhookAdapter>>>,
+    prometheus_webhooks: Mutex<BTreeMap<String, Arc<PrometheusWebhookAdapter>>>,
+    generic_webhooks: Mutex<BTreeMap<String, Arc<GenericWebhookAdapter>>>,
+    security_gate: Mutex<Arc<std::sync::RwLock<Option<Arc<SecurityGatePipeline>>>>>,
+    bridge_post_handler: Mutex<Option<Arc<dyn BridgePostHandler>>>,
+    remote_update_handler: Mutex<Option<Arc<dyn RemoteUpdateHandler>>>,
     peer_links: RwLock<HashMap<String, Arc<PeerLink>>>,
     sse_tasks: Mutex<HashMap<String, JoinHandle<()>>>,
     peer_reconcile_lock: tokio::sync::Mutex<()>,
@@ -400,6 +429,12 @@ impl UnifiedNode {
             seen_http_nonces: Mutex::new(HashMap::new()),
             guest_join_timestamps: Mutex::new(VecDeque::new()),
             github_public: Mutex::new(None),
+            github_webhooks: Mutex::new(BTreeMap::new()),
+            prometheus_webhooks: Mutex::new(BTreeMap::new()),
+            generic_webhooks: Mutex::new(BTreeMap::new()),
+            security_gate: Mutex::new(Arc::new(std::sync::RwLock::new(None))),
+            bridge_post_handler: Mutex::new(None),
+            remote_update_handler: Mutex::new(None),
             peer_links: RwLock::new(HashMap::new()),
             sse_tasks: Mutex::new(HashMap::new()),
             peer_reconcile_lock: tokio::sync::Mutex::new(()),
@@ -507,7 +542,172 @@ impl UnifiedNode {
             .clone()
     }
 
-    /// Gracefully stops any attached live source adapters (e.g. `GitHubPublicAdapter`).
+    /// Attaches and starts a compiled-in pure-Rust [`GitHubWebhookAdapter`].
+    pub async fn attach_github_webhook(
+        self: &Arc<Self>,
+        adapter: Arc<GitHubWebhookAdapter>,
+    ) -> Result<(), NodeError> {
+        let host: Arc<dyn NodeAdapterHost> = Arc::new(UnifiedNodeAdapterHost {
+            node: Arc::downgrade(self),
+        });
+        adapter.start(host).await.map_err(|e| {
+            NodeError::BadRequest(format!("failed to start github-webhook adapter: {e}"))
+        })?;
+        self.github_webhooks
+            .lock()
+            .expect("github_webhooks lock poisoned")
+            .insert(adapter.id().to_string(), adapter);
+        Ok(())
+    }
+
+    /// Attaches and starts a compiled-in pure-Rust [`PrometheusWebhookAdapter`].
+    pub async fn attach_prometheus_webhook(
+        self: &Arc<Self>,
+        adapter: Arc<PrometheusWebhookAdapter>,
+    ) -> Result<(), NodeError> {
+        let host: Arc<dyn NodeAdapterHost> = Arc::new(UnifiedNodeAdapterHost {
+            node: Arc::downgrade(self),
+        });
+        adapter.start(host).await.map_err(|e| {
+            NodeError::BadRequest(format!("failed to start prometheus-webhook adapter: {e}"))
+        })?;
+        self.prometheus_webhooks
+            .lock()
+            .expect("prometheus_webhooks lock poisoned")
+            .insert(adapter.id().to_string(), adapter);
+        Ok(())
+    }
+
+    /// Attaches and starts a compiled-in pure-Rust [`GenericWebhookAdapter`].
+    pub async fn attach_generic_webhook(
+        self: &Arc<Self>,
+        adapter: Arc<GenericWebhookAdapter>,
+    ) -> Result<(), NodeError> {
+        let host: Arc<dyn NodeAdapterHost> = Arc::new(UnifiedNodeAdapterHost {
+            node: Arc::downgrade(self),
+        });
+        adapter.start(host).await.map_err(|e| {
+            NodeError::BadRequest(format!("failed to start webhook-stream adapter: {e}"))
+        })?;
+        self.generic_webhooks
+            .lock()
+            .expect("generic_webhooks lock poisoned")
+            .insert(adapter.id().to_string(), adapter);
+        Ok(())
+    }
+
+    /// Looks up a registered [`GitHubWebhookAdapter`] by optional ID.
+    pub fn github_webhook_adapter(&self, id: Option<&str>) -> Option<Arc<GitHubWebhookAdapter>> {
+        let map = self
+            .github_webhooks
+            .lock()
+            .expect("github_webhooks lock poisoned");
+        match id {
+            Some(k) => map.get(k).cloned(),
+            None => {
+                if map.len() == 1 {
+                    map.values().next().cloned()
+                } else {
+                    map.get("github")
+                        .or_else(|| map.get("github-webhook"))
+                        .cloned()
+                }
+            }
+        }
+    }
+
+    /// Looks up a registered [`PrometheusWebhookAdapter`] by optional ID.
+    pub fn prometheus_webhook_adapter(
+        &self,
+        id: Option<&str>,
+    ) -> Option<Arc<PrometheusWebhookAdapter>> {
+        let map = self
+            .prometheus_webhooks
+            .lock()
+            .expect("prometheus_webhooks lock poisoned");
+        match id {
+            Some(k) => map.get(k).cloned(),
+            None => {
+                if map.len() == 1 {
+                    map.values().next().cloned()
+                } else {
+                    map.get("prometheus")
+                        .or_else(|| map.get("prometheus-webhook"))
+                        .cloned()
+                }
+            }
+        }
+    }
+
+    /// Looks up a registered [`GenericWebhookAdapter`] by ID.
+    pub fn generic_webhook_adapter(&self, id: &str) -> Option<Arc<GenericWebhookAdapter>> {
+        self.generic_webhooks
+            .lock()
+            .expect("generic_webhooks lock poisoned")
+            .get(id)
+            .cloned()
+    }
+
+    /// Attaches a standalone [`SecurityGatePipeline`] to this `UnifiedNode` (used for outbound
+    /// bridge DLP checks and stage-before-unpack inbound transfer screening).
+    pub fn set_security_gate(&self, gate: Option<Arc<SecurityGatePipeline>>) {
+        let slot = self
+            .security_gate
+            .lock()
+            .expect("security_gate lock poisoned")
+            .clone();
+        *slot.write().expect("security_gate rwlock poisoned") = gate;
+    }
+
+    /// Shares a live hot-reloadable [`SecurityGatePipeline`] slot (e.g. `LocalDaemon::gate_slot()`).
+    pub fn set_shared_security_gate(
+        &self,
+        slot: Arc<std::sync::RwLock<Option<Arc<SecurityGatePipeline>>>>,
+    ) {
+        *self
+            .security_gate
+            .lock()
+            .expect("security_gate lock poisoned") = slot;
+    }
+
+    /// Returns the currently active [`SecurityGatePipeline`], if any.
+    pub fn security_gate(&self) -> Option<Arc<SecurityGatePipeline>> {
+        let slot = self
+            .security_gate
+            .lock()
+            .expect("security_gate lock poisoned")
+            .clone();
+        slot.read().expect("security_gate rwlock poisoned").clone()
+    }
+
+    /// Registers an async handler for authenticated `POST /v1/bridges/post` requests.
+    pub fn set_bridge_post_handler(&self, handler: Option<Arc<dyn BridgePostHandler>>) {
+        *self
+            .bridge_post_handler
+            .lock()
+            .expect("bridge_post_handler lock poisoned") = handler;
+    }
+
+    /// Registers an async handler for opt-in authenticated `POST /v1/node/update` requests.
+    pub fn set_remote_update_handler(&self, handler: Option<Arc<dyn RemoteUpdateHandler>>) {
+        *self
+            .remote_update_handler
+            .lock()
+            .expect("remote_update_handler lock poisoned") = handler;
+    }
+
+    /// Returns `true` iff remote self-update (`node.self-update.v1`) is enabled on this node.
+    pub fn is_remote_update_enabled(&self) -> bool {
+        self.config.allow_remote_update
+            || self
+                .remote_update_handler
+                .lock()
+                .expect("remote_update_handler lock poisoned")
+                .is_some()
+    }
+
+    /// Gracefully stops any attached live source adapters (e.g. `GitHubPublicAdapter` and
+    /// compiled-in webhook adapters).
     pub async fn shutdown_adapters(&self) {
         let adapter = self
             .github_public
@@ -517,21 +717,87 @@ impl UnifiedNode {
         if let Some(gh) = adapter {
             let _ = gh.stop().await;
         }
+        let gh_webhooks: Vec<Arc<GitHubWebhookAdapter>> = {
+            let mut map = self
+                .github_webhooks
+                .lock()
+                .expect("github_webhooks lock poisoned");
+            std::mem::take(&mut *map).into_values().collect()
+        };
+        for a in gh_webhooks {
+            let _ = a.stop().await;
+        }
+        let prom_webhooks: Vec<Arc<PrometheusWebhookAdapter>> = {
+            let mut map = self
+                .prometheus_webhooks
+                .lock()
+                .expect("prometheus_webhooks lock poisoned");
+            std::mem::take(&mut *map).into_values().collect()
+        };
+        for a in prom_webhooks {
+            let _ = a.stop().await;
+        }
+        let gen_webhooks: Vec<Arc<GenericWebhookAdapter>> = {
+            let mut map = self
+                .generic_webhooks
+                .lock()
+                .expect("generic_webhooks lock poisoned");
+            std::mem::take(&mut *map).into_values().collect()
+        };
+        for a in gen_webhooks {
+            let _ = a.stop().await;
+        }
     }
 
     /// Gracefully stops the scheduler, attached source adapters, and all background SSE peer links.
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
         self.scheduler_notify.notify_waiters();
-        if let Some(gh) = self
+        let gh_opt = self
             .github_public
             .lock()
             .expect("github_public lock poisoned")
-            .take()
+            .take();
+        let gh_webhooks: Vec<Arc<GitHubWebhookAdapter>> = {
+            let mut map = self
+                .github_webhooks
+                .lock()
+                .expect("github_webhooks lock poisoned");
+            std::mem::take(&mut *map).into_values().collect()
+        };
+        let prom_webhooks: Vec<Arc<PrometheusWebhookAdapter>> = {
+            let mut map = self
+                .prometheus_webhooks
+                .lock()
+                .expect("prometheus_webhooks lock poisoned");
+            std::mem::take(&mut *map).into_values().collect()
+        };
+        let gen_webhooks: Vec<Arc<GenericWebhookAdapter>> = {
+            let mut map = self
+                .generic_webhooks
+                .lock()
+                .expect("generic_webhooks lock poisoned");
+            std::mem::take(&mut *map).into_values().collect()
+        };
+        if gh_opt.is_some()
+            || !gh_webhooks.is_empty()
+            || !prom_webhooks.is_empty()
+            || !gen_webhooks.is_empty()
         {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
-                    let _ = gh.stop().await;
+                    if let Some(gh) = gh_opt {
+                        let _ = gh.stop().await;
+                    }
+                    for a in gh_webhooks {
+                        let _ = a.stop().await;
+                    }
+                    for a in prom_webhooks {
+                        let _ = a.stop().await;
+                    }
+                    for a in gen_webhooks {
+                        let _ = a.stop().await;
+                    }
                 });
             }
         }
@@ -1062,6 +1328,67 @@ impl UnifiedNode {
                         });
                     }
                 }
+                {
+                    let map = self
+                        .github_webhooks
+                        .lock()
+                        .expect("github_webhooks lock poisoned");
+                    for adapter in map.values() {
+                        let wh_topic = adapter.topic();
+                        if !topics.iter().any(|t| t.topic == wh_topic)
+                            && peer_may_see_topic(&peer.scopes, wh_topic)
+                        {
+                            topics.push(AdvertisedTopic {
+                                topic: wh_topic.to_string(),
+                                kind: Some("github-webhook".to_string()),
+                                description: Some(
+                                    "GitHub webhook CloudEvents stream".to_string(),
+                                ),
+                            });
+                        }
+                    }
+                }
+                {
+                    let map = self
+                        .prometheus_webhooks
+                        .lock()
+                        .expect("prometheus_webhooks lock poisoned");
+                    for adapter in map.values() {
+                        let wh_topic = adapter.topic();
+                        if !topics.iter().any(|t| t.topic == wh_topic)
+                            && peer_may_see_topic(&peer.scopes, wh_topic)
+                        {
+                            topics.push(AdvertisedTopic {
+                                topic: wh_topic.to_string(),
+                                kind: Some("prometheus-webhook".to_string()),
+                                description: Some(
+                                    "Prometheus Alertmanager webhook CloudEvents stream"
+                                        .to_string(),
+                                ),
+                            });
+                        }
+                    }
+                }
+                {
+                    let map = self
+                        .generic_webhooks
+                        .lock()
+                        .expect("generic_webhooks lock poisoned");
+                    for adapter in map.values() {
+                        let wh_topic = adapter.topic();
+                        if !topics.iter().any(|t| t.topic == wh_topic)
+                            && peer_may_see_topic(&peer.scopes, wh_topic)
+                        {
+                            topics.push(AdvertisedTopic {
+                                topic: wh_topic.to_string(),
+                                kind: Some("webhook-stream".to_string()),
+                                description: Some(
+                                    "Generic signed webhook CloudEvents stream".to_string(),
+                                ),
+                            });
+                        }
+                    }
+                }
                 if !topics.iter().any(|t| t.topic == "kv") && peer_may_see_topic(&peer.scopes, "kv")
                 {
                     topics.push(AdvertisedTopic {
@@ -1200,6 +1527,10 @@ impl UnifiedNode {
             }
             if self.config.drop_relay.enabled && !caps.contains(&CapabilityToken::DropRelayV1) {
                 caps.push(CapabilityToken::DropRelayV1);
+            }
+            let cap_update = CapabilityToken::Other("node.self-update.v1".to_string());
+            if self.is_remote_update_enabled() && !caps.contains(&cap_update) {
+                caps.push(cap_update);
             }
         }
         caps
@@ -1411,9 +1742,11 @@ impl UnifiedNode {
     // Request Authentication & Scope Enforcement
     // ========================================================================
 
-    /// Authenticates an incoming peer HTTP request via either `Authorization: Bearer <token>`
-    /// or `Authorization: Hyphae-Ed25519 ...`. Returns `Ok(None)` if no Authorization header is
-    /// present; fails closed with `NodeError::Unauthorized` on any invalid/revoked credential.
+    /// Authenticates an incoming peer HTTP request via `Authorization: Bearer <token>`,
+    /// `Authorization: Hyphae-Ed25519 ...`, or standalone Ed25519 signature headers
+    /// (`X-Hyphae-Node`, `X-Hyphae-Timestamp`, `X-Hyphae-Nonce`, `X-Hyphae-Sig`).
+    /// Returns `Ok(None)` if no authentication headers are present; fails closed with
+    /// `NodeError::Unauthorized` on any invalid, malformed, replayed, or revoked credential.
     pub fn authenticate_request(
         &self,
         headers: &HeaderMap,
@@ -1421,8 +1754,55 @@ impl UnifiedNode {
         path_and_query: &str,
         body_sha256: &str,
     ) -> Result<Option<AuthenticatedPeer>, NodeError> {
+        let sig_hdr = headers
+            .get("x-hyphae-sig")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let ts_hdr = headers
+            .get("x-hyphae-timestamp")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let nonce_hdr = headers
+            .get("x-hyphae-nonce")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let node_hdr = headers
+            .get("x-hyphae-node")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let has_any_ed25519_hdr =
+            sig_hdr.is_some() || ts_hdr.is_some() || nonce_hdr.is_some();
+
         let Some(raw_auth) = headers.get(AUTHORIZATION) else {
-            return Ok(None);
+            if !has_any_ed25519_hdr {
+                return Ok(None);
+            }
+            let peer_id = node_hdr.ok_or_else(|| {
+                NodeError::Unauthorized("missing X-Hyphae-Node header for Ed25519 auth".into())
+            })?;
+            let ts_str = ts_hdr.ok_or_else(|| {
+                NodeError::Unauthorized("missing X-Hyphae-Timestamp header for Ed25519 auth".into())
+            })?;
+            let nonce = nonce_hdr.ok_or_else(|| {
+                NodeError::Unauthorized("missing X-Hyphae-Nonce header for Ed25519 auth".into())
+            })?;
+            let sig = sig_hdr.ok_or_else(|| {
+                NodeError::Unauthorized("missing X-Hyphae-Sig header for Ed25519 auth".into())
+            })?;
+            let peer = self.verify_ed25519_http_auth(
+                peer_id,
+                ts_str,
+                nonce,
+                sig,
+                method,
+                path_and_query,
+                body_sha256,
+            )?;
+            return Ok(Some(peer));
         };
         let auth_str = raw_auth
             .to_str()
@@ -1435,11 +1815,41 @@ impl UnifiedNode {
                 return Err(NodeError::Unauthorized("empty bearer token".into()));
             }
             let hash = sha256_hex(token.as_bytes());
-            let db = self.db();
-            let Some(peer_id) = db.local().get_metadata(&format!("auth_token:{hash}"))? else {
-                return Err(NodeError::Unauthorized("unknown bearer credential".into()));
+            let peer = {
+                let db = self.db();
+                let Some(peer_id) = db.local().get_metadata(&format!("auth_token:{hash}"))? else {
+                    return Err(NodeError::Unauthorized("unknown bearer credential".into()));
+                };
+                load_active_authenticated_peer(&db, &peer_id)?
             };
-            let peer = load_active_authenticated_peer(&db, &peer_id)?;
+            // Defense-in-depth: if the caller also supplied X-Hyphae-Sig headers alongside Bearer,
+            // verify the Ed25519 signature and confirm it binds to the same peer identity.
+            if has_any_ed25519_hdr {
+                let claimed_node = node_hdr.unwrap_or(&peer.peer_id);
+                if claimed_node != peer.peer_id {
+                    return Err(NodeError::Unauthorized(
+                        "X-Hyphae-Node does not match Bearer credential peer".into(),
+                    ));
+                }
+                let ts_str = ts_hdr.ok_or_else(|| {
+                    NodeError::Unauthorized("missing X-Hyphae-Timestamp header".into())
+                })?;
+                let nonce = nonce_hdr.ok_or_else(|| {
+                    NodeError::Unauthorized("missing X-Hyphae-Nonce header".into())
+                })?;
+                let sig = sig_hdr.ok_or_else(|| {
+                    NodeError::Unauthorized("missing X-Hyphae-Sig header".into())
+                })?;
+                let _ = self.verify_ed25519_http_auth(
+                    claimed_node,
+                    ts_str,
+                    nonce,
+                    sig,
+                    method,
+                    path_and_query,
+                    body_sha256,
+                )?;
+            }
             return Ok(Some(peer));
         }
 
@@ -1454,89 +1864,106 @@ impl UnifiedNode {
             let nonce = params
                 .get("nonce")
                 .ok_or_else(|| NodeError::Unauthorized("missing nonce in Ed25519 auth".into()))?;
-            if nonce.is_empty() {
-                return Err(NodeError::Unauthorized(
-                    "empty nonce in Ed25519 auth".into(),
-                ));
-            }
             let sig = params
                 .get("sig")
                 .ok_or_else(|| NodeError::Unauthorized("missing sig in Ed25519 auth".into()))?;
-
-            let ts: i64 = ts_str
-                .parse()
-                .map_err(|_| NodeError::Unauthorized("invalid ts in Ed25519 auth".into()))?;
-            let now = now_ms();
-            if (now - ts).abs() > HTTP_AUTH_SKEW_MS {
-                return Err(NodeError::Unauthorized(
-                    "Ed25519 auth timestamp outside allowed skew window".into(),
-                ));
-            }
-
-            let peer = {
-                let db = self.db();
-                let (peer, signing_pk) = if peer_id == self.config.node_id.as_str() {
-                    (
-                        AuthenticatedPeer {
-                            peer_id: self.config.node_id.to_string(),
-                            scopes: ScopeSet::from_strings(&["*"]),
-                            trust_tier: TrustTier::SelfNode,
-                        },
-                        self.identity.signing.public_key(),
-                    )
-                } else {
-                    let peer = load_active_authenticated_peer(&db, peer_id)?;
-                    let signing_pk =
-                        lookup_peer_signing_key_in_db(&db, peer_id)?.ok_or_else(|| {
-                            NodeError::Unauthorized(format!(
-                                "no pinned signing key for peer '{peer_id}'"
-                            ))
-                        })?;
-                    (peer, signing_pk)
-                };
-                let signing_input =
-                    http_auth_signing_input(method, path_and_query, ts, nonce, body_sha256);
-                signing_pk
-                    .verify_domain_b64("http-auth", &signing_input, sig)
-                    .map_err(|_| {
-                        NodeError::Unauthorized("Ed25519 auth signature invalid".into())
-                    })?;
-                peer
-            };
-
-            // Bounded in-memory replay guard: reject any (peer_id, nonce) reuse while the
-            // signed request could still be valid within the skew window.
-            let expires_at = ts.saturating_add(HTTP_AUTH_SKEW_MS);
-            let mut nonces = self
-                .seen_http_nonces
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let key = (peer_id.clone(), nonce.clone());
-            if let Some(&existing_exp) = nonces.get(&key) {
-                if existing_exp >= now {
-                    return Err(NodeError::Unauthorized("replayed request nonce".into()));
-                }
-            }
-            if nonces.len() >= MAX_HTTP_AUTH_NONCES {
-                nonces.retain(|_, &mut exp| exp >= now);
-                if nonces.len() >= MAX_HTTP_AUTH_NONCES {
-                    let evict_count = (MAX_HTTP_AUTH_NONCES / 8).max(1);
-                    let mut oldest: Vec<((String, String), i64)> =
-                        nonces.iter().map(|(k, &v)| (k.clone(), v)).collect();
-                    oldest.sort_by_key(|(_, exp)| *exp);
-                    for (k, _) in oldest.into_iter().take(evict_count) {
-                        nonces.remove(&k);
-                    }
-                }
-            }
-            nonces.insert(key, expires_at);
-
+            let peer = self.verify_ed25519_http_auth(
+                peer_id,
+                ts_str,
+                nonce,
+                sig,
+                method,
+                path_and_query,
+                body_sha256,
+            )?;
             return Ok(Some(peer));
         }
 
         Err(NodeError::Unauthorized(
             "unsupported Authorization scheme".into(),
         ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_ed25519_http_auth(
+        &self,
+        peer_id: &str,
+        ts_str: &str,
+        nonce: &str,
+        sig: &str,
+        method: &str,
+        path_and_query: &str,
+        body_sha256: &str,
+    ) -> Result<AuthenticatedPeer, NodeError> {
+        if nonce.is_empty() {
+            return Err(NodeError::Unauthorized(
+                "empty nonce in Ed25519 auth".into(),
+            ));
+        }
+        let ts: i64 = ts_str
+            .parse()
+            .map_err(|_| NodeError::Unauthorized("invalid ts in Ed25519 auth".into()))?;
+        let now = now_ms();
+        if (now - ts).abs() > HTTP_AUTH_SKEW_MS {
+            return Err(NodeError::Unauthorized(
+                "Ed25519 auth timestamp outside allowed skew window".into(),
+            ));
+        }
+
+        let peer = {
+            let db = self.db();
+            let (peer, signing_pk) = if peer_id == self.config.node_id.as_str() {
+                (
+                    AuthenticatedPeer {
+                        peer_id: self.config.node_id.to_string(),
+                        scopes: ScopeSet::from_strings(&["*"]),
+                        trust_tier: TrustTier::SelfNode,
+                    },
+                    self.identity.signing.public_key(),
+                )
+            } else {
+                let peer = load_active_authenticated_peer(&db, peer_id)?;
+                let signing_pk = lookup_peer_signing_key_in_db(&db, peer_id)?.ok_or_else(|| {
+                    NodeError::Unauthorized(format!("no pinned signing key for peer '{peer_id}'"))
+                })?;
+                (peer, signing_pk)
+            };
+            let signing_input =
+                http_auth_signing_input(method, path_and_query, ts, nonce, body_sha256);
+            signing_pk
+                .verify_domain_b64("http-auth", &signing_input, sig)
+                .map_err(|_| NodeError::Unauthorized("Ed25519 auth signature invalid".into()))?;
+            peer
+        };
+
+        // Bounded in-memory replay guard: reject any (peer_id, nonce) reuse while the
+        // signed request could still be valid within the skew window.
+        let expires_at = ts.saturating_add(HTTP_AUTH_SKEW_MS);
+        let mut nonces = self
+            .seen_http_nonces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let key = (peer_id.to_string(), nonce.to_string());
+        if let Some(&existing_exp) = nonces.get(&key) {
+            if existing_exp >= now {
+                return Err(NodeError::Unauthorized("replayed request nonce".into()));
+            }
+        }
+        if nonces.len() >= MAX_HTTP_AUTH_NONCES {
+            nonces.retain(|_, &mut exp| exp >= now);
+            if nonces.len() >= MAX_HTTP_AUTH_NONCES {
+                let evict_count = (MAX_HTTP_AUTH_NONCES / 8).max(1);
+                let mut oldest: Vec<((String, String), i64)> =
+                    nonces.iter().map(|(k, &v)| (k.clone(), v)).collect();
+                oldest.sort_by_key(|(_, exp)| *exp);
+                for (k, _) in oldest.into_iter().take(evict_count) {
+                    nonces.remove(&k);
+                }
+            }
+        }
+        nonces.insert(key, expires_at);
+
+        Ok(peer)
     }
 
     /// Enforces a boolean scope predicate fail-closed, resolving any matching `escalationNote`.
@@ -1744,8 +2171,7 @@ impl UnifiedNode {
         ttl_ms: i64,
     ) -> Result<(String, GrantRecord), NodeError> {
         let _ = NodeId::new(target_node_id)?;
-        let expanded = expand_v2_scopes(scopes)
-            .map_err(|e| NodeError::BadRequest(format!("invalid scopes: {e}")))?;
+        let expanded = expand_node_scopes(scopes)?;
 
         let now = now_ms();
         let grant_id = uuid_v4();
@@ -1905,8 +2331,7 @@ impl UnifiedNode {
             None => None,
         };
 
-        let expanded_scopes = expand_v2_scopes(&grant.scopes)
-            .map_err(|e| NodeError::BadRequest(format!("invalid grant scopes: {e}")))?;
+        let expanded_scopes = expand_node_scopes(&grant.scopes)?;
 
         let pairing_jwk = grant.pairing_key.as_ref().ok_or_else(|| {
             NodeError::BadRequest("grant does not carry a one-time pairingKey".into())
@@ -2380,13 +2805,11 @@ impl UnifiedNode {
             }
             let _ = NodeId::new(pid)?;
         }
-        let expanded_offered = expand_v2_scopes(&offered_scopes)
-            .map_err(|e| NodeError::BadRequest(format!("invalid offered scopes: {e}")))?;
+        let expanded_offered = expand_node_scopes(&offered_scopes)?;
         let expanded_requested = if requested_scopes.is_empty() {
             Vec::new()
         } else {
-            expand_v2_scopes(&requested_scopes)
-                .map_err(|e| NodeError::BadRequest(format!("invalid requested scopes: {e}")))?
+            expand_node_scopes(&requested_scopes)?
         };
 
         let now = now_ms();
@@ -2746,8 +3169,7 @@ impl UnifiedNode {
                 }
             }
         }
-        let expanded_to_alice = expand_v2_scopes(&bob_grants_to_alice)
-            .map_err(|e| NodeError::BadRequest(format!("invalid granted scopes: {e}")))?;
+        let expanded_to_alice = expand_node_scopes(&bob_grants_to_alice)?;
 
         let now = now_ms();
         let bob_grant_id = uuid_v4();
@@ -3968,8 +4390,10 @@ impl UnifiedNode {
         false
     }
 
-    /// Server-side handler for `POST /v1/messages`: enforces `dm:send`, stores ciphertext verbatim,
-    /// and delivers immediately if addressed to `self.node_id` (Direct P2P), else wakes SSE inbox.
+    /// Server-side handler for `POST /v1/messages`: enforces `dm:send`, `dm:receive` (for direct
+    /// Router mailbox delivery), and `forward:via` + `forwarding` allowlist (for non-router or
+    /// multi-hop transit relay), stores ciphertext verbatim, and delivers immediately if addressed
+    /// to `self.node_id` (Direct P2P), else wakes SSE inbox.
     pub async fn handle_server_post_message(
         &self,
         caller: &AuthenticatedPeer,
@@ -3987,6 +4411,50 @@ impl UnifiedNode {
             )));
         };
         let to_node_owned = to_node.to_string();
+
+        if to_node_owned != self.config.node_id.as_str() {
+            let direct_router_peer = if self.config.profile == NodeProfile::Router {
+                let db = self.db();
+                match db.peers().get_peer(&to_node_owned)? {
+                    Some(peer) if peer.status == PeerStatus::Active => Some(peer),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            if let Some(recipient_peer) = direct_router_peer {
+                // Case A — Team Hub (`NodeProfile::Router`) delivering to a directly paired
+                // `Active` member: zero `forward:via` required, but recipient MUST hold `dm:receive`.
+                let recipient_scopes = ScopeSet::from_strings(&recipient_peer.scopes);
+                if !recipient_scopes.may_dm_receive() {
+                    return Err(NodeError::ScopeDenied {
+                        missing_scope: "dm:receive".to_string(),
+                        current_scopes: recipient_peer.scopes,
+                        escalation_note: self
+                            .config
+                            .escalation
+                            .resolve("dm:receive")
+                            .map(|n| n.as_str().to_string()),
+                    });
+                }
+            } else {
+                // Case B — Non-router (`Local`/`P2p`) relaying to a 3rd node, OR Router transit-
+                // forwarding to a non-direct 3rd node: require BOTH local `forwarding` allowlist
+                // AND caller's explicit `forward:via=<target>` grant.
+                let policy_ok = self
+                    .config
+                    .forwarding
+                    .permits(&caller.peer_id, &to_node_owned, "dm");
+                let scope_ok = caller.scopes.may_forward_via(&to_node_owned);
+                self.require_scope(
+                    caller,
+                    policy_ok && scope_ok,
+                    &format!("forward:via={to_node_owned}"),
+                )?;
+            }
+        }
+
         let now = now_ms();
 
         let (enq, maybe_direct_record) = {
@@ -4048,6 +4516,182 @@ impl UnifiedNode {
         }
 
         Ok((enq.id, enq.deduplicated))
+    }
+
+    /// Server-side handler for `POST /v1/bridges/post` (`B20`): strictly enforces explicit
+    /// `bridge:post=<plugin>:<target>` (`*`/`full` NEVER grants `bridge:post`), runs Stage 1
+    /// outbound DLP secret scanning, and dispatches to the registered [`BridgePostHandler`].
+    pub async fn handle_server_bridge_post(
+        &self,
+        caller: &AuthenticatedPeer,
+        req: BridgePostRequest,
+    ) -> Result<BridgePostResponse, NodeError> {
+        let plugin = req.plugin.trim();
+        let target = req.target.trim();
+        if plugin.is_empty()
+            || plugin.len() > 64
+            || plugin.chars().any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(NodeError::BadRequest("invalid bridge plugin id".into()));
+        }
+        if target.is_empty()
+            || target.len() > 128
+            || target.chars().any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(NodeError::BadRequest("invalid bridge target".into()));
+        }
+        if req.text.trim().is_empty() {
+            return Err(NodeError::BadRequest(
+                "bridge post text must be non-empty".into(),
+            ));
+        }
+        let max_text = self.config.store_config.message_limits.max_text_bytes;
+        if req.text.len() > max_text {
+            return Err(NodeError::PayloadTooLarge(format!(
+                "bridge post text {} bytes exceeds limit {max_text}",
+                req.text.len()
+            )));
+        }
+
+        let required_scope = format!("bridge:post={plugin}:{target}");
+        self.require_scope(
+            caller,
+            caller.scopes.may_bridge_post(plugin, target),
+            &required_scope,
+        )?;
+
+        // Pre-post outbound DLP check (never leaks secret text in error or audit).
+        let dlp_ctx = OutboundContext {
+            session_id: None,
+            destination_node: Some(self.config.node_id.to_string()),
+            destination: format!("bridge:{plugin}:{target}"),
+            event_type: "to.hyphae.bridge.post.v1".to_string(),
+            trust_tier: GateTrustTier::Bridge,
+            traceparent: None,
+            payload: req.text.clone(),
+        };
+        let dlp_decision = if let Some(gate) = self.security_gate() {
+            gate.evaluate_outbound(&dlp_ctx, now_ms())
+                .map(|eval| eval.decision)
+                .map_err(|e| NodeError::Unauthorized(format!("outbound DLP gate error: {e}")))?
+        } else {
+            let stage1 = Stage1Engine::new(Stage1Config::default())
+                .map_err(|e| NodeError::Http(format!("stage1 DLP init error: {e}")))?;
+            stage1.evaluate_outbound(&dlp_ctx).decision
+        };
+        match dlp_decision {
+            GateDecision::Allow { .. } => {}
+            GateDecision::Block { reason }
+            | GateDecision::Quarantine { reason, .. }
+            | GateDecision::Hold { reason, .. } => {
+                return Err(NodeError::BadRequest(format!(
+                    "outbound_dlp_blocked: {reason}"
+                )));
+            }
+        }
+
+        let handler = self
+            .bridge_post_handler
+            .lock()
+            .expect("bridge_post_handler lock poisoned")
+            .clone()
+            .ok_or_else(|| {
+                NodeError::NotFound(format!(
+                    "bridge '{plugin}' is not configured on node '{}'",
+                    self.config.node_id
+                ))
+            })?;
+
+        let message_id = handler
+            .post_bridge(plugin, target, &req.text, req.reply_to.as_deref())
+            .await?;
+
+        Ok(BridgePostResponse {
+            ok: true,
+            plugin: plugin.to_string(),
+            target: target.to_string(),
+            message_id,
+        })
+    }
+
+    /// Server-side handler for `POST /v1/node/update` (`D6`): strictly enforces explicit
+    /// `node:update` scope (NEVER granted by `*`, `full`, `member`, `observer`, or `Guest`),
+    /// validates SemVer / channel / manifestUrl fail-closed, and schedules the registered
+    /// [`RemoteUpdateHandler`] returning `202 Accepted`.
+    pub async fn handle_server_node_update(
+        &self,
+        caller: &AuthenticatedPeer,
+        mut req: NodeUpdateRequest,
+    ) -> Result<NodeUpdateResponse, NodeError> {
+        let has_explicit_node_update = caller.trust_tier != TrustTier::Guest
+            && caller
+                .scopes
+                .raw_scopes()
+                .iter()
+                .any(|s| s == "node:update");
+        self.require_scope(caller, has_explicit_node_update, "node:update")?;
+
+        if !self.is_remote_update_enabled() {
+            return Err(NodeError::NotFound(
+                "remote node self-update is disabled on this node".into(),
+            ));
+        }
+
+        if let Some(ref ch) = req.channel {
+            let trimmed = ch.trim().to_ascii_lowercase();
+            if !is_valid_update_channel(&trimmed) {
+                return Err(NodeError::BadRequest(format!(
+                    "invalid update channel '{ch}'; allowed values are 'stable' or 'nightly'"
+                )));
+            }
+            req.channel = Some(trimmed);
+        }
+
+        if let Some(ref ver) = req.target_version {
+            let trimmed = ver.trim();
+            if !is_valid_update_semver(trimmed) {
+                return Err(NodeError::BadRequest(format!(
+                    "invalid targetVersion '{ver}'; expected strict SemVer (e.g. '2.3.0')"
+                )));
+            }
+            req.target_version = Some(trimmed.to_string());
+        }
+
+        if let Some(ref url) = req.manifest_url {
+            let trimmed = url.trim();
+            if trimmed.is_empty()
+                || trimmed.len() > 512
+                || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+            {
+                return Err(NodeError::BadRequest("invalid manifestUrl".into()));
+            }
+            hyp_crypto::pairing::validate_endpoint_origin(trimmed)
+                .map_err(|e| NodeError::BadRequest(format!("unsafe manifestUrl: {e}")))?;
+            req.manifest_url = Some(trimmed.to_string());
+        }
+
+        let handler = self
+            .remote_update_handler
+            .lock()
+            .expect("remote_update_handler lock poisoned")
+            .clone()
+            .ok_or_else(|| {
+                NodeError::NotFound(
+                    "remote node self-update handler is not configured on this node".into(),
+                )
+            })?;
+
+        req.from = Some(caller.peer_id.clone());
+        handler.trigger_update(req.clone()).await?;
+
+        Ok(NodeUpdateResponse {
+            ok: true,
+            scheduled: true,
+            node_id: self.config.node_id.to_string(),
+            current_version: self.config.hyphae_version.clone(),
+            target_version: req.target_version,
+            channel: req.channel,
+        })
     }
 
     /// Processes an inbound DM or `#channel` message received from `origin_node` (either via
@@ -5860,85 +6504,25 @@ impl UnifiedNode {
         blob: &[u8],
         origin_link: Option<&Arc<PeerLink>>,
     ) -> Result<PathBuf, NodeError> {
+        if transfer.id.is_empty()
+            || transfer.id.len() > 128
+            || transfer.id == "."
+            || transfer.id == ".."
+            || !transfer
+                .id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        {
+            return Err(NodeError::BadRequest(format!(
+                "invalid transfer id '{}'",
+                transfer.id
+            )));
+        }
+
         let signed_header: SignedTransferHeaderV2 = serde_json::from_str(&transfer.header_json)?;
         let (sender_sign_pk, _) = self
             .resolve_peer_keys(&transfer.from_node, origin_link)
             .await?;
-
-        let stage_dir = self.config.state_dir.join("transfer_stage");
-        fs::create_dir_all(&stage_dir)?;
-        let dec_tar_path = stage_dir.join(format!("{}.dec.tar.gz", transfer.id));
-        let dest_dir = self
-            .config
-            .state_dir
-            .join("received_transfers")
-            .join(&transfer.id);
-
-        let unpack_res = (|| -> Result<(hyp_crypto::transfer::TransferStreamHeaderV2, hyp_crypto::transfer::UnpackedTarGz), NodeError> {
-            let dec_file = File::create(&dec_tar_path)?;
-            let header = decrypt_stream_v2(
-                &signed_header,
-                blob,
-                dec_file,
-                &sender_sign_pk,
-                self.config.node_id.as_str(),
-                &self.identity.encryption,
-            )?;
-            let reader = BufReader::new(File::open(&dec_tar_path)?);
-            let opts = TarUnpackOptions {
-                attachment_guard: Some(&default_stage1_attachment_guard),
-                ..TarUnpackOptions::default()
-            };
-            let unpacked = unpack_tar_gz(reader, &dest_dir, &opts)?;
-            if unpacked.compressed_digest != header.plaintext_digest {
-                let _ = fs::remove_dir_all(&dest_dir);
-                return Err(NodeError::BadRequest(
-                    "unpacked tar.gz OCI digest does not match signed transfer header".into(),
-                ));
-            }
-            Ok((header, unpacked))
-        })();
-        let _ = fs::remove_file(&dec_tar_path);
-
-        let (header, unpacked) = unpack_res?;
-
-        // Deliver path-only reference (NEVER raw file bodies!) into recipient local session mailbox.
-        let file_refs: Vec<Value> = unpacked
-            .files
-            .iter()
-            .map(|f| {
-                json!({
-                    "archivePath": f.archive_path,
-                    "diskPath": f.disk_path.display().to_string(),
-                    "size": f.size,
-                    "digest": f.digest,
-                })
-            })
-            .collect();
-        let notice = serde_json::to_string(&json!({
-            "transferId": transfer.id,
-            "from": transfer.from_node,
-            "destDir": dest_dir.display().to_string(),
-            "plaintextDigest": header.plaintext_digest,
-            "files": file_refs,
-        }))?;
-
-        let target_handle = {
-            let db = self.db();
-            let hint = db
-                .local()
-                .get_metadata(&format!("transfer_handle:{}", transfer.id))?;
-            match hint {
-                Some(h) => h,
-                None => db
-                    .messages()
-                    .list_handles(Some(self.config.node_id.as_str()))?
-                    .into_iter()
-                    .next()
-                    .map(|h| h.handle)
-                    .unwrap_or_else(|| "default".to_string()),
-            }
-        };
 
         // Direct P2P transfers arrive with `origin_node == self.config.node_id`; attribute them to
         // the remote sender node so Security Gates never misclassify remote transfers as `SelfHost`.
@@ -5950,6 +6534,264 @@ impl UnifiedNode {
             origin_node
         };
 
+        let sender_trust_tier = if transfer.from_node == self.config.node_id.as_str() {
+            GateTrustTier::SelfHost
+        } else {
+            let db = self.db();
+            match db.peers().get_peer(&transfer.from_node)? {
+                Some(peer) => GateTrustTier::from(peer.trust_tier),
+                None => GateTrustTier::Peer,
+            }
+        };
+
+        let gate = self.security_gate();
+
+        let stage_dir = self.config.state_dir.join("transfer_stage");
+        ensure_private_dir(&stage_dir)?;
+        let dec_tar_path = stage_dir.join(format!("{}.dec.tar.gz", transfer.id));
+
+        let received_root = self.config.state_dir.join("received_transfers");
+        fs::create_dir_all(&received_root)?;
+        let staging_root = received_root.join(".staging");
+        ensure_private_dir(&staging_root)?;
+        let staged_dir = staging_root.join(&transfer.id);
+        if staged_dir.exists() {
+            let _ = fs::remove_dir_all(&staged_dir);
+        }
+        ensure_private_dir(&staged_dir)?;
+
+        let quarantine_root = received_root.join(".quarantine");
+        let quarantine_dir = quarantine_root.join(&transfer.id);
+        let final_dir = received_root.join(&transfer.id);
+
+        // G9 Stage-Before-Unpack: decrypt & extract strictly into private `0700` `.staging/<id>`
+        // with Stage 1 / per-peer attachment allowlist checks BEFORE any file ever touches `final_dir`.
+        let unpack_res = (|| -> Result<
+            (
+                hyp_crypto::transfer::TransferStreamHeaderV2,
+                hyp_crypto::transfer::UnpackedTarGz,
+            ),
+            NodeError,
+        > {
+            let dec_file = File::create(&dec_tar_path)?;
+            let header = decrypt_stream_v2(
+                &signed_header,
+                blob,
+                dec_file,
+                &sender_sign_pk,
+                self.config.node_id.as_str(),
+                &self.identity.encryption,
+            )?;
+            let reader = BufReader::new(File::open(&dec_tar_path)?);
+            let unpacked = if let Some(ref g) = gate {
+                let guard = |rel_path: &str| {
+                    g.check_transfer_attachment(&transfer.from_node, sender_trust_tier, rel_path)
+                };
+                let opts = TarUnpackOptions {
+                    attachment_guard: Some(&guard),
+                    ..TarUnpackOptions::default()
+                };
+                unpack_tar_gz(reader, &staged_dir, &opts)?
+            } else {
+                let opts = TarUnpackOptions {
+                    attachment_guard: Some(&default_stage1_attachment_guard),
+                    ..TarUnpackOptions::default()
+                };
+                unpack_tar_gz(reader, &staged_dir, &opts)?
+            };
+            if unpacked.compressed_digest != header.plaintext_digest {
+                return Err(NodeError::BadRequest(
+                    "unpacked tar.gz OCI digest does not match signed transfer header".into(),
+                ));
+            }
+            Ok((header, unpacked))
+        })();
+        let _ = fs::remove_file(&dec_tar_path);
+
+        let (header, unpacked) = match unpack_res {
+            Ok(pair) => pair,
+            Err(err) => {
+                let _ = fs::remove_dir_all(&staged_dir);
+                if gate.is_some() {
+                    let blocked_reason = match err {
+                        NodeError::Crypto(hyp_crypto::CryptoError::AttachmentBlocked(ref msg))
+                        | NodeError::Crypto(hyp_crypto::CryptoError::UnsafeArchiveEntry(ref msg))
+                        | NodeError::Crypto(hyp_crypto::CryptoError::ArchiveLimitExceeded(ref msg)) => {
+                            Some(msg.clone())
+                        }
+                        _ => None,
+                    };
+                    if let Some(msg) = blocked_reason {
+                        let db = self.db();
+                        let _ = db.local().append_gate_audit(
+                            &GateAuditInput {
+                                direction: GateDirection::Inbound,
+                                stage: "stage1.attachment".to_string(),
+                                decision: StoreGateDecision::Block,
+                                origin_node: Some(delivery_origin.to_string()),
+                                source: Some(transfer.from_node.clone()),
+                                session_id: None,
+                                receipt_id: None,
+                                event_type: Some(TYPE_TRANSFER_V1.to_string()),
+                                trust_tier: Some(sender_trust_tier.as_str().to_string()),
+                                confidence: Some(1.0),
+                                categories: vec![
+                                    "gate.blocked".to_string(),
+                                    "attachment_blocked".to_string(),
+                                ],
+                                reason: Some(msg),
+                                traceparent: None,
+                                payload_sha256: transfer.sha256.clone(),
+                                reviewer: None,
+                            },
+                            now_ms(),
+                        );
+                    }
+                }
+                return Err(err);
+            }
+        };
+
+        // Resolve target handle & local session BEFORE gate evaluation so `gate.evaluate_inbound`
+        // records mailbox state (`pending` or `quarantined`) for the right recipient session.
+        let (target_handle, target_session_id) = {
+            let db = self.db();
+            let now = now_ms();
+            let hint = db
+                .local()
+                .get_metadata(&format!("transfer_handle:{}", transfer.id))?;
+            let handle = match hint {
+                Some(h) => h,
+                None => db
+                    .messages()
+                    .list_handles(Some(self.config.node_id.as_str()))?
+                    .into_iter()
+                    .next()
+                    .map(|h| h.handle)
+                    .unwrap_or_else(|| "default".to_string()),
+            };
+            let sid = match db.local().session_by_handle(&handle)? {
+                Some(s) => s.id,
+                None => {
+                    let sid = format!("handle:{handle}");
+                    db.local().register_session(&sid, "{}", now)?;
+                    let _ = db.local().set_session_handle(&sid, Some(&handle), now);
+                    sid
+                }
+            };
+            (handle, sid)
+        };
+
+        let transfer_paths: Vec<String> = unpacked
+            .files
+            .iter()
+            .map(|f| f.archive_path.clone())
+            .collect();
+
+        // Build path-only reference pointing at `final_dir` (NEVER raw file bodies!).
+        let file_refs: Vec<Value> = unpacked
+            .files
+            .iter()
+            .map(|f| {
+                json!({
+                    "archivePath": f.archive_path,
+                    "diskPath": final_dir.join(&f.archive_path).display().to_string(),
+                    "size": f.size,
+                    "digest": f.digest,
+                })
+            })
+            .collect();
+        let notice_value = json!({
+            "transferId": transfer.id,
+            "from": transfer.from_node,
+            "destDir": final_dir.display().to_string(),
+            "plaintextDigest": header.plaintext_digest,
+            "files": file_refs,
+        });
+        let notice = serde_json::to_string(&notice_value)?;
+
+        if let Some(ref g) = gate {
+            let mut ce = ProtoCloudEvent::new(
+                format!("transfer:{}", transfer.id),
+                transfer.from_node.clone(),
+                TYPE_TRANSFER_V1,
+                notice_value,
+            );
+            ce.time = Some(format_rfc3339_millis(now_ms()));
+            let ctx = InboundContext {
+                session_id: target_session_id.clone(),
+                origin_node: delivery_origin.to_string(),
+                sender: transfer.from_node.clone(),
+                trust_tier: sender_trust_tier,
+                e2ee_verified: true,
+                identity_verified: true,
+                kind: MailboxKind::Transfer,
+                channel: None,
+                topic: None,
+                bridge: None,
+                event: ce,
+                transfer_paths,
+                rendered_text: Some(notice.clone()),
+                human_auth: None,
+            };
+
+            let eval = match g.evaluate_inbound(&ctx, now_ms()).await {
+                Ok(ev) => ev,
+                Err(err) => {
+                    let _ = fs::remove_dir_all(&staged_dir);
+                    return Err(NodeError::Unauthorized(format!(
+                        "transfer security gate error: {err}"
+                    )));
+                }
+            };
+
+            match eval.decision {
+                GateDecision::Allow { .. } => {
+                    if final_dir.exists() {
+                        let _ = fs::remove_dir_all(&final_dir);
+                    }
+                    fs::rename(&staged_dir, &final_dir)?;
+                    self.notify_local_session(&target_session_id);
+                    return Ok(final_dir);
+                }
+                GateDecision::Quarantine { .. } => {
+                    ensure_private_dir(&quarantine_root)?;
+                    if quarantine_dir.exists() {
+                        let _ = fs::remove_dir_all(&quarantine_dir);
+                    }
+                    fs::rename(&staged_dir, &quarantine_dir)?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = fs::set_permissions(
+                            &quarantine_dir,
+                            fs::Permissions::from_mode(0o700),
+                        );
+                    }
+                    return Ok(quarantine_dir);
+                }
+                GateDecision::Block { reason } => {
+                    let _ = fs::remove_dir_all(&staged_dir);
+                    return Err(NodeError::Unauthorized(format!(
+                        "transfer blocked by security gate: {reason}"
+                    )));
+                }
+                GateDecision::Hold { reason, .. } => {
+                    let _ = fs::remove_dir_all(&staged_dir);
+                    return Err(NodeError::Conflict(format!(
+                        "transfer held by security gate: {reason}"
+                    )));
+                }
+            }
+        }
+
+        // No custom SecurityGatePipeline attached: `staged_dir` already passed default Stage 1
+        // attachment guard + OCI digest verification; promote atomically to `final_dir`.
+        if final_dir.exists() {
+            let _ = fs::remove_dir_all(&final_dir);
+        }
+        fs::rename(&staged_dir, &final_dir)?;
+
         self.deliver_plaintext_to_local_handle(
             delivery_origin,
             &format!("transfer:{}", transfer.id),
@@ -5958,7 +6800,7 @@ impl UnifiedNode {
             &notice,
             MailboxKind::Transfer,
         )?;
-        Ok(dest_dir)
+        Ok(final_dir)
     }
 
     // ========================================================================
@@ -6471,6 +7313,28 @@ impl UnifiedNode {
         topic: &str,
         event: &ProtoCloudEvent,
     ) -> Result<IngestResult, NodeError> {
+        self.ingest_inbound_event_inner(caller_node, None, topic, event)
+    }
+
+    /// Authenticated variant of [`Self::ingest_inbound_event`] used by `POST /v1/events`:
+    /// enforces BOTH local `forwarding` allowlist policy AND caller's explicit `forward:via`
+    /// scope when ingesting foreign-origin transit events (`P1-7`).
+    pub fn ingest_inbound_event_for_caller(
+        &self,
+        caller: &AuthenticatedPeer,
+        topic: &str,
+        event: &ProtoCloudEvent,
+    ) -> Result<IngestResult, NodeError> {
+        self.ingest_inbound_event_inner(&caller.peer_id, Some(caller), topic, event)
+    }
+
+    fn ingest_inbound_event_inner(
+        &self,
+        caller_node: &str,
+        caller: Option<&AuthenticatedPeer>,
+        topic: &str,
+        event: &ProtoCloudEvent,
+    ) -> Result<IngestResult, NodeError> {
         let val = serde_json::to_value(event)?;
         let (mut validated, _) = hyp_proto::cloudevent::check_cloudevent_v2(&val)?;
 
@@ -6480,15 +7344,34 @@ impl UnifiedNode {
             .check_forwarding(&self.config.node_id, None, max_hops)
             .map_err(map_provenance_err)?;
 
-        // Enforce default-deny transit forwarding for foreign-origin events (§2.3).
-        let is_foreign_transit = prov
-            .origin
-            .as_ref()
-            .is_some_and(|orig| orig.as_str() != caller_node && orig != &self.config.node_id);
-        if is_foreign_transit && !self.config.forwarding.permits(caller_node, "*", topic) {
-            return Err(NodeError::Unauthorized(format!(
-                "transit forwarding denied by default policy for origin from '{caller_node}' on topic '{topic}'"
-            )));
+        // Enforce default-deny transit forwarding + explicit `forward:via` for foreign-origin events (§2.3).
+        if let Some(orig) = prov.origin.as_ref() {
+            let is_foreign_transit =
+                orig.as_str() != caller_node && orig != &self.config.node_id;
+            if is_foreign_transit {
+                let policy_ok = self.config.forwarding.permits(caller_node, "*", topic);
+                let scope_ok = match caller {
+                    Some(peer) => peer.scopes.may_forward_via(orig.as_str()),
+                    None => true,
+                };
+                if !policy_ok || !scope_ok {
+                    if let Some(peer) = caller {
+                        let missing = format!("forward:via={}", orig.as_str());
+                        return Err(NodeError::ScopeDenied {
+                            missing_scope: missing.clone(),
+                            current_scopes: peer.scopes.raw_scopes().to_vec(),
+                            escalation_note: self
+                                .config
+                                .escalation
+                                .resolve(&missing)
+                                .map(|n| n.as_str().to_string()),
+                        });
+                    }
+                    return Err(NodeError::Unauthorized(format!(
+                        "transit forwarding denied by default policy for origin from '{caller_node}' on topic '{topic}'"
+                    )));
+                }
+            }
         }
 
         // Record this node's hop in `hyphaeorigin`/`hyphaevia`/`hyphaehops` if cross-node.
@@ -7670,6 +8553,15 @@ impl NodeAdapterHost for UnifiedNodeAdapterHost {
             let status = if res.deduplicated {
                 PublishStatus::Duplicate
             } else {
+                if res.matched > 0 {
+                    let _ = node.deliver_local_topic_batches(
+                        topic,
+                        &MailboxPutOptions::default(),
+                        None,
+                        false,
+                        now_ms(),
+                    );
+                }
                 PublishStatus::Stored
             };
             Ok(PublishOutcome {
@@ -7916,6 +8808,63 @@ fn parse_auth_kv(input: &str) -> BTreeMap<String, String> {
         }
     }
     out
+}
+
+fn ensure_private_dir(path: &std::path::Path) -> Result<(), NodeError> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+    }
+    Ok(())
+}
+
+fn expand_node_scopes<S: AsRef<str>>(raw_scopes: &[S]) -> Result<Vec<String>, NodeError> {
+    let mut normal: Vec<&str> = Vec::with_capacity(raw_scopes.len());
+    let mut has_node_update = false;
+    for raw in raw_scopes {
+        let s = raw.as_ref().trim();
+        if s == "node:update" {
+            has_node_update = true;
+        } else {
+            normal.push(s);
+        }
+    }
+    let mut out = if normal.is_empty() && has_node_update {
+        Vec::new()
+    } else {
+        expand_v2_scopes(&normal)
+            .map_err(|e| NodeError::BadRequest(format!("invalid scopes: {e}")))?
+    };
+    if has_node_update && !out.iter().any(|s| s == "node:update") {
+        out.push("node:update".to_string());
+    }
+    Ok(out)
+}
+
+fn is_valid_update_channel(ch: &str) -> bool {
+    matches!(ch, "stable" | "nightly")
+}
+
+fn is_valid_update_semver(v: &str) -> bool {
+    if v.is_empty() || v.len() > 64 || v.starts_with('-') {
+        return false;
+    }
+    if !v
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+    {
+        return false;
+    }
+    let core = v.split(['-', '+']).next().unwrap_or("");
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    parts
+        .iter()
+        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Helper to generate a random 160-bit P2P secret (re-exported constant check).

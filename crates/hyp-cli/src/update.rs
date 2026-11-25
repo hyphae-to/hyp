@@ -12,8 +12,9 @@
 
 use crate::config_file::{
     build_http_client, ct_eq, default_node_id, ensure_v2_node_json_defaults,
-    load_node_or_legacy_config, read_json_object_or_empty, resolve_config_path_for_read,
-    resolve_config_path_for_write, resolve_state_dir, write_atomic_json,
+    load_node_or_legacy_config, open_secret_store, read_json_object_or_empty,
+    resolve_config_path_for_read, resolve_config_path_for_write, resolve_state_dir,
+    write_atomic_json,
 };
 use crate::ui::{
     CliError, EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json,
@@ -22,12 +23,14 @@ use crate::ui::{
 use clap::{Args, Subcommand, ValueEnum};
 use http::{Method, Request, header};
 use http_body_util::{BodyExt, Empty, Full};
+use hyp_crypto::NodeIdentityKeys;
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keys::Ed25519PublicKey;
 use hyp_crypto::pairing::validate_endpoint_origin;
 use hyp_crypto::rfc3339::parse_rfc3339_millis;
 use hyp_crypto::transfer::{TarUnpackOptions, unpack_tar_gz};
 use hyp_node::engine::NodeProfile;
+use hyp_node::engine::peer_link::http_auth_signing_input;
 use hyp_proto::manifest::{NodeManifestPayload, SignedNodeManifest};
 use hyp_store::{NodeDb, PeerRecord, PeerStatus, TrustTier, now_ms};
 use hyper::body::Bytes;
@@ -135,6 +138,14 @@ pub struct UpdateArgs {
     /// Release channel (stable or nightly)
     #[arg(long, value_enum)]
     pub channel: Option<UpdateChannel>,
+
+    /// Require release manifest version to match this exact SemVer (fail-closed)
+    #[arg(long)]
+    pub version: Option<String>,
+
+    /// Non-interactive confirmation (used by unattended / remote self-update workers)
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 
     /// Plan and roll out updates across all eligible paired fleet peers (remote first, local last)
     #[arg(long)]
@@ -1005,6 +1016,23 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
         Err((code, msg)) => return emit_error(cmd, as_json, EXIT_ERROR, code, msg, None),
     };
 
+    if let Some(ref requested_version) = args.version {
+        let req_ver = requested_version.trim();
+        if manifest.version != req_ver {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "VERSION_MISMATCH",
+                format!(
+                    "Requested version '{req_ver}' does not match verified release manifest version '{}'",
+                    manifest.version
+                ),
+                None,
+            );
+        }
+    }
+
     let Some(artifact) = manifest.artifacts.get(&target_triple) else {
         return emit_error(
             cmd,
@@ -1023,13 +1051,46 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
     let mut warnings: Vec<String> = Vec::new();
 
     if args.all {
+        let mut peer_auth_refs: BTreeMap<String, Option<String>> = BTreeMap::new();
         if let Some(ref db) = db {
             if let Ok(peers) = db.peers().list_peers(None) {
                 for peer in &peers {
+                    peer_auth_refs
+                        .insert(peer.peer_id.clone(), peer.auth_credential_ref.clone());
                     fleet_plan.push(classify_fleet_peer(peer));
                 }
             }
         }
+        let local_node_id = db
+            .as_ref()
+            .and_then(|d| d.local().get_metadata("node_id").ok().flatten())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                let cfg_path = resolve_config_path_for_read(
+                    args.config.as_deref(),
+                    args.state_dir.as_deref(),
+                    None,
+                );
+                load_node_or_legacy_config(&cfg_path)
+                    .ok()
+                    .and_then(|c| c.node_id)
+            })
+            .unwrap_or_else(default_node_id);
+        let secrets = open_secret_store(&dir, args.state_dir.is_some());
+        let local_identity = if args.dry_run {
+            None
+        } else {
+            match secrets.load_or_create_node_keys(&local_node_id) {
+                Ok(keys) => Some(keys),
+                Err(e) => {
+                    warnings.push(format!(
+                        "Failed to load local Ed25519 identity key for signed remote updates: {e}"
+                    ));
+                    None
+                }
+            }
+        };
+
         // Trigger eligible remote peers FIRST (before upgrading local node!).
         for entry in &mut fleet_plan {
             if entry.eligibility != FleetEligibility::Eligible {
@@ -1045,8 +1106,30 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
                 entry.outcome = Some("SKIPPED".to_string());
                 continue;
             };
+            let Some(ref identity) = local_identity else {
+                entry.outcome = Some("FAILED: local Ed25519 identity key unavailable".to_string());
+                warnings.push(format!(
+                    "Remote peer '{}' update skipped: local Ed25519 identity key unavailable",
+                    entry.peer_id
+                ));
+                continue;
+            };
+            let peer_bearer = peer_auth_refs
+                .get(&entry.peer_id)
+                .and_then(|r| r.as_deref())
+                .and_then(|secret_name| secrets.get(secret_name).ok())
+                .or_else(|| {
+                    let fallback = format!(
+                        "peer-auth-{}",
+                        &hex::encode(Sha256::digest(entry.peer_id.as_bytes()))[..12]
+                    );
+                    secrets.get(&fallback).ok()
+                });
             match rt.block_on(trigger_remote_peer_update(
                 ep,
+                &local_node_id,
+                identity,
+                peer_bearer.as_deref().map(String::as_str),
                 channel,
                 &manifest.version,
                 &manifest_url,
@@ -1679,6 +1762,9 @@ async fn download_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>, (&'stati
 
 async fn trigger_remote_peer_update(
     endpoint: &str,
+    local_node_id: &str,
+    identity: &NodeIdentityKeys,
+    peer_bearer_token: Option<&str>,
     channel: UpdateChannel,
     version: &str,
     manifest_url: &str,
@@ -1689,12 +1775,33 @@ async fn trigger_remote_peer_update(
     let uri: http::Uri = url
         .parse()
         .map_err(|e| format!("invalid remote update URI '{url}': {e}"))?;
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/v1/node/update");
     let body = serde_json::to_vec(&json!({
         "channel": channel.as_str(),
+        "targetVersion": version,
         "version": version,
         "manifestUrl": manifest_url,
     }))
     .map_err(|e| format!("JSON serialize failed: {e}"))?;
+
+    let body_sha = hex::encode(Sha256::digest(&body));
+    let ts = now_ms();
+    let mut nonce_bytes = [0u8; 12];
+    SystemRandom::new()
+        .fill(&mut nonce_bytes)
+        .map_err(|_| "OS CSPRNG failure generating auth nonce".to_string())?;
+    let nonce = hex::encode(nonce_bytes);
+    let signing_input = http_auth_signing_input("POST", path_and_query, ts, &nonce, &body_sha);
+    let sig = identity.signing.sign_domain_b64("http-auth", &signing_input);
+    let auth_header = match peer_bearer_token.filter(|t| !t.trim().is_empty()) {
+        Some(tok) => format!("Bearer {}", tok.trim()),
+        None => format!(
+            "Hyphae-Ed25519 node=\"{local_node_id}\",ts=\"{ts}\",nonce=\"{nonce}\",sig=\"{sig}\""
+        ),
+    };
 
     let client = build_http_client::<Full<Bytes>>()?;
     let req = Request::builder()
@@ -1705,6 +1812,11 @@ async fn trigger_remote_peer_update(
             header::USER_AGENT,
             format!("hyp/{}", env!("CARGO_PKG_VERSION")),
         )
+        .header(header::AUTHORIZATION, auth_header)
+        .header("x-hyphae-node", local_node_id)
+        .header("x-hyphae-timestamp", ts.to_string())
+        .header("x-hyphae-nonce", &nonce)
+        .header("x-hyphae-sig", &sig)
         .body(Full::new(Bytes::from(body)))
         .map_err(|e| format!("failed to construct remote update request: {e}"))?;
 

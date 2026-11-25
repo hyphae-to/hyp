@@ -24,12 +24,17 @@ use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync};
 use hyp_node::adapters::github_public::normalize_repo_token_pattern;
 use hyp_node::adapters::supervisor::is_secret_like_env_key;
 use hyp_node::adapters::{
-    AdapterKind, GitHubPublicAdapter, GitHubPublicConfig, HelloMode, SubprocessConfig,
+    AdapterKind, BoxFuture as AdapterBoxFuture, GenericWebhookAdapter, GenericWebhookConfig,
+    GitHubPublicAdapter, GitHubPublicConfig, GitHubWebhookAdapter, GitHubWebhookConfig, HelloMode,
+    PrometheusWebhookAdapter, PrometheusWebhookConfig, SubprocessConfig,
 };
+use hyp_node::engine::config::ForwardingPolicy;
+use hyp_node::engine::node::RemoteUpdateHandler;
+use hyp_node::engine::peer_link::NodeUpdateRequest;
 use hyp_node::engine::{
     DropRelayConfig, E2eePolicy, EscalationConfig, GuestPairingConfig, LocalIngestConfig,
-    LocalIngestServer, NodeConfig, NodeProfile, PeerReconcileReport, TopicConfig, UnifiedNode,
-    normalize_drop_portal_url,
+    LocalIngestServer, NodeConfig, NodeError, NodeProfile, PeerReconcileReport, TopicConfig,
+    UnifiedNode, normalize_drop_portal_url,
 };
 use hyp_node::gates::{SecurityGateConfig, SecurityGatePipeline};
 use hyp_proto::address::{
@@ -305,6 +310,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
 
     let mut startup_warnings: Vec<String> = Vec::new();
     let mut github_public_cfg: Option<GitHubPublicConfig> = None;
+    let mut webhook_sources = ParsedWebhookSources::default();
     let mut delivery_retry_cfg = DeliveryRetryConfig::default();
     let mut parsed_plugins: Vec<ParsedPlugin> = Vec::new();
     let mut skipped_plugin_statuses: Vec<Value> = Vec::new();
@@ -316,6 +322,17 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         } else {
             E2eePolicy::Prefer
         };
+
+        if let Err(e) = parse_node_runtime_policies(&cfg.raw, &mut node_cfg) {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "CONFIG_ERROR",
+                format!("Invalid runtime policy in {}: {e}", cfg.path.display()),
+                None,
+            );
+        }
 
         // Parse optional `localIngest` policy (default enabled: true!).
         if let Some(li_val) = cfg.raw.get("localIngest") {
@@ -531,7 +548,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             }
         }
 
-        // Parse `sources` entries (currently `kind == "github-public"`).
+        // Parse `sources` entries (`github-public`, `github-webhook`, `prometheus-webhook`, `webhook-stream`).
         if let Some(sources_val) = cfg.raw.get("sources") {
             let public_read_only = cfg
                 .raw
@@ -569,6 +586,65 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                         format!("Invalid github-public source in {}: {e}", cfg.path.display()),
                         Some(
                             "Verify sources[] in node.json uses { \"secret\": \"<name>\" } references, never plaintext tokens."
+                                .to_string(),
+                        ),
+                    );
+                }
+            }
+
+            match parse_webhook_sources(sources_val, &secrets) {
+                Ok(parsed) => {
+                    for gh in &parsed.github {
+                        if !node_cfg.topics.iter().any(|t| t.topic == gh.topic) {
+                            node_cfg.topics.push(TopicConfig {
+                                topic: gh.topic.clone(),
+                                kind: Some("github-webhook".to_string()),
+                                description: Some(
+                                    "GitHub webhook CloudEvents stream".to_string(),
+                                ),
+                                metadata: None,
+                                has_provisioned_publisher: true,
+                            });
+                        }
+                    }
+                    for prom in &parsed.prometheus {
+                        if !node_cfg.topics.iter().any(|t| t.topic == prom.topic) {
+                            node_cfg.topics.push(TopicConfig {
+                                topic: prom.topic.clone(),
+                                kind: Some("prometheus-webhook".to_string()),
+                                description: Some(
+                                    "Prometheus Alertmanager webhook CloudEvents stream"
+                                        .to_string(),
+                                ),
+                                metadata: None,
+                                has_provisioned_publisher: true,
+                            });
+                        }
+                    }
+                    for gen_wh in &parsed.generic {
+                        if !node_cfg.topics.iter().any(|t| t.topic == gen_wh.topic) {
+                            node_cfg.topics.push(TopicConfig {
+                                topic: gen_wh.topic.clone(),
+                                kind: Some("webhook-stream".to_string()),
+                                description: Some(
+                                    "Generic signed webhook CloudEvents stream".to_string(),
+                                ),
+                                metadata: None,
+                                has_provisioned_publisher: true,
+                            });
+                        }
+                    }
+                    webhook_sources = parsed;
+                }
+                Err(e) => {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "CONFIG_ERROR",
+                        format!("Invalid webhook source in {}: {e}", cfg.path.display()),
+                        Some(
+                            "Verify webhook sources[] in node.json use { \"secret\": \"<name>\" } references stored via `hyp secret set <name>`, never plaintext secrets."
                                 .to_string(),
                         ),
                     );
@@ -715,9 +791,43 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             } else {
                 (false, Vec::new())
             };
+
+        // Attach compiled-in pure-Rust webhook adapters BEFORE serving HTTP!
+        for gh_cfg in webhook_sources.github {
+            let adapter = Arc::new(GitHubWebhookAdapter::new(gh_cfg));
+            node.attach_github_webhook(adapter)
+                .await
+                .map_err(|e| format!("Failed to attach github-webhook adapter: {e}"))?;
+        }
+        for prom_cfg in webhook_sources.prometheus {
+            let adapter = Arc::new(PrometheusWebhookAdapter::new(prom_cfg));
+            node.attach_prometheus_webhook(adapter)
+                .await
+                .map_err(|e| format!("Failed to attach prometheus-webhook adapter: {e}"))?;
+        }
+        for gen_cfg in webhook_sources.generic {
+            let adapter = Arc::new(GenericWebhookAdapter::new(gen_cfg));
+            node.attach_generic_webhook(adapter)
+                .await
+                .map_err(|e| format!("Failed to attach webhook-stream adapter: {e}"))?;
+        }
+
+        // Wire opt-in authenticated remote self-update (`POST /v1/node/update`, `node.self-update.v1`).
+        if node.config().allow_remote_update {
+            node.set_remote_update_handler(Some(Arc::new(DetachedSelfUpdateHandler {
+                state_dir: state_dir.clone(),
+                config_path: has_explicit_config.then(|| config_path.clone()),
+            })));
+        }
+
         let guest_pairing_enabled = node.config().guest_pairing.enabled;
 
-        let (gate_pipeline, gate_db_shared) = if start_local_daemon || start_local_ingest {
+        let has_gate_cfg = loaded
+            .as_ref()
+            .and_then(|c| c.raw.get("gate"))
+            .is_some();
+        let (gate_pipeline, gate_db_shared) =
+            if start_local_daemon || start_local_ingest || has_gate_cfg {
             let gate_cfg: SecurityGateConfig = match loaded.as_ref().and_then(|c| c.raw.get("gate"))
             {
                 Some(gate_val) => serde_json::from_value(gate_val.clone())
@@ -785,6 +895,14 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         } else {
             None
         };
+
+        // Wire live SecurityGatePipeline into `UnifiedNode` (shares `LocalDaemon`'s hot-reloadable
+        // gate slot when present) for stage-before-unpack transfer gating and remote bridge DLP.
+        if let Some(ref daemon) = local_daemon {
+            node.set_shared_security_gate(daemon.gate_slot());
+        } else if let Some(ref pipeline) = gate_pipeline {
+            node.set_security_gate(Some(Arc::clone(pipeline)));
+        }
 
         let local_ingest_server = if start_local_ingest {
             let srv = if let Some(ref daemon) = local_daemon {
@@ -1372,6 +1490,457 @@ fn parse_secret_ref_name(val: &Value, field_name: &str) -> Result<Option<String>
     validate_secret_name(name)
         .map_err(|e| format!("invalid secret name '{name}' in '{field_name}': {e}"))?;
     Ok(Some(name.to_string()))
+}
+
+#[derive(Default)]
+struct ParsedWebhookSources {
+    github: Vec<GitHubWebhookConfig>,
+    prometheus: Vec<PrometheusWebhookConfig>,
+    generic: Vec<GenericWebhookConfig>,
+}
+
+struct DetachedSelfUpdateHandler {
+    state_dir: PathBuf,
+    config_path: Option<PathBuf>,
+}
+
+impl RemoteUpdateHandler for DetachedSelfUpdateHandler {
+    fn trigger_update<'a>(
+        &'a self,
+        req: NodeUpdateRequest,
+    ) -> AdapterBoxFuture<'a, Result<(), NodeError>> {
+        Box::pin(async move {
+            let exe = std::env::current_exe().map_err(|e| {
+                NodeError::Http(format!("failed to resolve current hyp executable: {e}"))
+            })?;
+            let state_dir = self.state_dir.clone();
+            let config_path = self.config_path.clone();
+            tokio::spawn(async move {
+                // Allow the HTTP 202 Accepted response to flush cleanly before starting swap/restart.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let mut cmd = std::process::Command::new(&exe);
+                cmd.arg("update")
+                    .arg("--yes")
+                    .arg("--json")
+                    .arg("--state-dir")
+                    .arg(&state_dir);
+                if let Some(ref cfg_path) = config_path {
+                    cmd.arg("--config").arg(cfg_path);
+                }
+                if let Some(ref ch) = req.channel {
+                    cmd.arg("--channel").arg(ch);
+                }
+                if let Some(ref ver) = req.target_version {
+                    cmd.arg("--version").arg(ver);
+                }
+                if let Some(ref manifest_url) = req.manifest_url {
+                    cmd.arg("--manifest-url").arg(manifest_url);
+                }
+                cmd.stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                if let Err(err) = cmd.spawn() {
+                    eprintln!("hyphae: failed to spawn remote self-update worker: {err}");
+                }
+            });
+            Ok(())
+        })
+    }
+}
+
+fn parse_node_runtime_policies(raw: &Value, node_cfg: &mut NodeConfig) -> Result<(), String> {
+    if let Some(fwd_val) = raw.get("forwarding") {
+        if !fwd_val.is_null() {
+            let fp: ForwardingPolicy = serde_json::from_value(fwd_val.clone())
+                .map_err(|e| format!("invalid forwarding policy: {e}"))?;
+            node_cfg.forwarding = fp;
+        }
+    }
+
+    let listen_proxy = match raw.get("listen").and_then(|l| l.get("behindReverseProxy")) {
+        Some(v) if !v.is_null() => Some(
+            v.as_bool()
+                .ok_or_else(|| "listen.behindReverseProxy must be a boolean".to_string())?,
+        ),
+        _ => None,
+    };
+    let top_proxy = match raw.get("behindReverseProxy") {
+        Some(v) if !v.is_null() => Some(
+            v.as_bool()
+                .ok_or_else(|| "behindReverseProxy must be a boolean".to_string())?,
+        ),
+        _ => None,
+    };
+    if let Some(val) = top_proxy.or(listen_proxy) {
+        node_cfg.behind_reverse_proxy = val;
+    }
+
+    if let Some(aru_val) = raw.get("allowRemoteUpdate") {
+        if !aru_val.is_null() {
+            let val = aru_val
+                .as_bool()
+                .ok_or_else(|| "allowRemoteUpdate must be a boolean".to_string())?;
+            node_cfg.allow_remote_update = val;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_webhook_source_id(id: &str, field: &str) -> Result<String, String> {
+    let trimmed = id.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 64
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(format!("invalid {field} '{id}'"));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn parse_optional_string_vec(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+    field: &str,
+) -> Result<Vec<String>, String> {
+    let Some(val) = obj.get(key) else {
+        return Ok(Vec::new());
+    };
+    if val.is_null() {
+        return Ok(Vec::new());
+    }
+    let arr = val
+        .as_array()
+        .ok_or_else(|| format!("{field} must be an array of strings"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let s = item
+            .as_str()
+            .ok_or_else(|| format!("{field} entries must be strings"))?
+            .trim();
+        if !s.is_empty() {
+            out.push(s.to_string());
+        }
+    }
+    Ok(out)
+}
+
+fn parse_webhook_sources(
+    sources_val: &Value,
+    secrets: &hyp_crypto::SecretStore,
+) -> Result<ParsedWebhookSources, String> {
+    let arr = sources_val
+        .as_array()
+        .ok_or_else(|| "sources must be a JSON array".to_string())?;
+
+    let mut out = ParsedWebhookSources::default();
+    let mut gh_ids: HashSet<String> = HashSet::new();
+    let mut prom_ids: HashSet<String> = HashSet::new();
+    let mut gen_ids: HashSet<String> = HashSet::new();
+
+    for entry in arr {
+        let Some(obj) = entry.as_object() else {
+            continue;
+        };
+        if obj.get("enabled").and_then(Value::as_bool) == Some(false) {
+            continue;
+        }
+        let Some(kind) = obj.get("kind").and_then(Value::as_str) else {
+            continue;
+        };
+
+        match kind {
+            "github-webhook" => {
+                let raw_id = obj
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("github");
+                let id = validate_webhook_source_id(raw_id, "sources[github-webhook].id")?;
+                if !gh_ids.insert(id.clone()) {
+                    return Err(format!("duplicate github-webhook source id '{id}'"));
+                }
+                let topic = obj
+                    .get("topic")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("github")
+                    .to_string();
+                if !is_valid_topic(&topic) {
+                    return Err(format!(
+                        "invalid topic '{topic}' in github-webhook source '{id}'"
+                    ));
+                }
+                let secret_val = obj
+                    .get("secret")
+                    .or_else(|| obj.get("webhookSecret"))
+                    .ok_or_else(|| {
+                        format!(
+                            "sources[github-webhook:'{id}'] requires 'secret': {{ \"secret\": \"<name>\" }}"
+                        )
+                    })?;
+                let secret_name = parse_secret_ref_name(
+                    secret_val,
+                    &format!("sources[github-webhook:'{id}'].secret"),
+                )?
+                .ok_or_else(|| {
+                    format!(
+                        "sources[github-webhook:'{id}'] requires non-null 'secret': {{ \"secret\": \"<name>\" }}"
+                    )
+                })?;
+                let secret = secrets.get(&secret_name).map_err(|e| {
+                    format!(
+                        "failed to load secret '{secret_name}' for github-webhook '{id}': {e}"
+                    )
+                })?;
+                if secret.is_empty() {
+                    return Err(format!(
+                        "secret '{secret_name}' for github-webhook '{id}' must not be empty"
+                    ));
+                }
+                let mut cfg = GitHubWebhookConfig::new(id.clone(), topic, secret.as_str());
+                cfg.allowed_repos = parse_optional_string_vec(
+                    obj,
+                    "allowedRepos",
+                    &format!("sources[github-webhook:'{id}'].allowedRepos"),
+                )?;
+                cfg.allowed_orgs = parse_optional_string_vec(
+                    obj,
+                    "allowedOrgs",
+                    &format!("sources[github-webhook:'{id}'].allowedOrgs"),
+                )?;
+                if let Some(max_b) = obj.get("maxBodyBytes").and_then(Value::as_u64) {
+                    if max_b == 0 {
+                        return Err(format!(
+                            "sources[github-webhook:'{id}'].maxBodyBytes must be >= 1"
+                        ));
+                    }
+                    cfg.max_body_bytes = usize::try_from(max_b).unwrap_or(usize::MAX);
+                }
+                out.github.push(cfg);
+            }
+            "prometheus-webhook" => {
+                let raw_id = obj
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("prometheus");
+                let id = validate_webhook_source_id(raw_id, "sources[prometheus-webhook].id")?;
+                if !prom_ids.insert(id.clone()) {
+                    return Err(format!("duplicate prometheus-webhook source id '{id}'"));
+                }
+                let topic = obj
+                    .get("topic")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("alerts")
+                    .to_string();
+                if !is_valid_topic(&topic) {
+                    return Err(format!(
+                        "invalid topic '{topic}' in prometheus-webhook source '{id}'"
+                    ));
+                }
+                let mut cfg = PrometheusWebhookConfig::new(id.clone(), topic);
+
+                if let Some(tok_val) = obj.get("bearerToken").or_else(|| obj.get("token")) {
+                    if let Some(secret_name) = parse_secret_ref_name(
+                        tok_val,
+                        &format!("sources[prometheus-webhook:'{id}'].bearerToken"),
+                    )? {
+                        let val = secrets.get(&secret_name).map_err(|e| {
+                            format!(
+                                "failed to load bearerToken secret '{secret_name}' for prometheus-webhook '{id}': {e}"
+                            )
+                        })?;
+                        if val.is_empty() {
+                            return Err(format!(
+                                "bearerToken secret '{secret_name}' for prometheus-webhook '{id}' must not be empty"
+                            ));
+                        }
+                        cfg.bearer_token = Some(val);
+                    }
+                }
+
+                if let Some(sec_val) = obj.get("secret").or_else(|| obj.get("webhookSecret")) {
+                    if let Some(secret_name) = parse_secret_ref_name(
+                        sec_val,
+                        &format!("sources[prometheus-webhook:'{id}'].webhookSecret"),
+                    )? {
+                        let val = secrets.get(&secret_name).map_err(|e| {
+                            format!(
+                                "failed to load webhookSecret '{secret_name}' for prometheus-webhook '{id}': {e}"
+                            )
+                        })?;
+                        if val.is_empty() {
+                            return Err(format!(
+                                "webhookSecret '{secret_name}' for prometheus-webhook '{id}' must not be empty"
+                            ));
+                        }
+                        cfg.webhook_secret = Some(val);
+                    }
+                }
+
+                if let Some(basic_val) = obj.get("basicAuth") {
+                    if !basic_val.is_null() {
+                        let b_obj = basic_val.as_object().ok_or_else(|| {
+                            format!(
+                                "sources[prometheus-webhook:'{id}'].basicAuth must be an object with 'username' and 'password': {{ \"secret\": \"<name>\" }}"
+                            )
+                        })?;
+                        let username = b_obj
+                            .get("username")
+                            .or_else(|| b_obj.get("user"))
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .ok_or_else(|| {
+                                format!(
+                                    "sources[prometheus-webhook:'{id}'].basicAuth requires non-empty 'username'"
+                                )
+                            })?;
+                        let pass_val = b_obj
+                            .get("password")
+                            .or_else(|| b_obj.get("pass"))
+                            .ok_or_else(|| {
+                                format!(
+                                    "sources[prometheus-webhook:'{id}'].basicAuth requires 'password': {{ \"secret\": \"<name>\" }}"
+                                )
+                            })?;
+                        let pass_name = parse_secret_ref_name(
+                            pass_val,
+                            &format!("sources[prometheus-webhook:'{id}'].basicAuth.password"),
+                        )?
+                        .ok_or_else(|| {
+                            format!(
+                                "sources[prometheus-webhook:'{id}'].basicAuth.password must be {{ \"secret\": \"<name>\" }}"
+                            )
+                        })?;
+                        let pass = secrets.get(&pass_name).map_err(|e| {
+                            format!(
+                                "failed to load basicAuth password secret '{pass_name}' for prometheus-webhook '{id}': {e}"
+                            )
+                        })?;
+                        if pass.is_empty() {
+                            return Err(format!(
+                                "basicAuth password secret '{pass_name}' for prometheus-webhook '{id}' must not be empty"
+                            ));
+                        }
+                        cfg.basic_auth = Some((username.to_string(), pass));
+                    }
+                }
+
+                if !cfg.has_auth_configured() {
+                    return Err(format!(
+                        "sources[prometheus-webhook:'{id}'] requires bearerToken, basicAuth, or webhookSecret via {{ \"secret\": \"<name>\" }}"
+                    ));
+                }
+
+                if let Some(max_b) = obj.get("maxBodyBytes").and_then(Value::as_u64) {
+                    if max_b == 0 {
+                        return Err(format!(
+                            "sources[prometheus-webhook:'{id}'].maxBodyBytes must be >= 1"
+                        ));
+                    }
+                    cfg.max_body_bytes = usize::try_from(max_b).unwrap_or(usize::MAX);
+                }
+                out.prometheus.push(cfg);
+            }
+            "webhook-stream" => {
+                let fallback_id = obj
+                    .get("topic")
+                    .and_then(Value::as_str)
+                    .unwrap_or("webhook");
+                let raw_id = obj
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(fallback_id);
+                let id = validate_webhook_source_id(raw_id, "sources[webhook-stream].id")?;
+                if !gen_ids.insert(id.clone()) {
+                    return Err(format!("duplicate webhook-stream source id '{id}'"));
+                }
+                let topic = obj
+                    .get("topic")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(id.as_str())
+                    .to_string();
+                if !is_valid_topic(&topic) {
+                    return Err(format!(
+                        "invalid topic '{topic}' in webhook-stream source '{id}'"
+                    ));
+                }
+                let secret_val = obj
+                    .get("secret")
+                    .or_else(|| obj.get("webhookSecret"))
+                    .ok_or_else(|| {
+                        format!(
+                            "sources[webhook-stream:'{id}'] requires 'secret': {{ \"secret\": \"<name>\" }}"
+                        )
+                    })?;
+                let secret_name = parse_secret_ref_name(
+                    secret_val,
+                    &format!("sources[webhook-stream:'{id}'].secret"),
+                )?
+                .ok_or_else(|| {
+                    format!(
+                        "sources[webhook-stream:'{id}'] requires non-null 'secret': {{ \"secret\": \"<name>\" }}"
+                    )
+                })?;
+                let secret = secrets.get(&secret_name).map_err(|e| {
+                    format!(
+                        "failed to load secret '{secret_name}' for webhook-stream '{id}': {e}"
+                    )
+                })?;
+                if secret.is_empty() {
+                    return Err(format!(
+                        "secret '{secret_name}' for webhook-stream '{id}' must not be empty"
+                    ));
+                }
+                let mut cfg = GenericWebhookConfig::new(id.clone(), topic);
+                cfg.secret = Some(secret);
+                if let Some(hdr) = obj
+                    .get("signatureHeader")
+                    .or_else(|| obj.get("header"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    cfg.signature_header = hdr.to_ascii_lowercase();
+                }
+                if let Some(src) = obj
+                    .get("defaultSource")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    cfg.default_source = src.to_string();
+                }
+                if let Some(ty) = obj
+                    .get("defaultType")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    cfg.default_type = ty.to_string();
+                }
+                if let Some(max_b) = obj.get("maxBodyBytes").and_then(Value::as_u64) {
+                    if max_b == 0 {
+                        return Err(format!(
+                            "sources[webhook-stream:'{id}'].maxBodyBytes must be >= 1"
+                        ));
+                    }
+                    cfg.max_body_bytes = usize::try_from(max_b).unwrap_or(usize::MAX);
+                }
+                out.generic.push(cfg);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(out)
 }
 
 fn parse_github_public_source(
@@ -2101,6 +2670,7 @@ mod plugin_runtime {
         AdapterError, AdapterHealth, AdapterKind, BoxFuture as AdapterBoxFuture, NodeAdapter,
         NodeAdapterHost, PublishErrorCode, PublishOutcome, PublishStatus, SubprocessSupervisor,
     };
+    use hyp_node::engine::node::BridgePostHandler;
     use hyp_node::engine::{NodeError, UnifiedNode};
     use hyp_proto::address::{LOCAL_NODE_ID, is_valid_topic};
     use hyp_proto::cloudevent::CloudEvent as ProtoCloudEvent;
@@ -2505,6 +3075,55 @@ mod plugin_runtime {
         }
     }
 
+    struct NodeRemoteBridgeHandler {
+        bridges: BTreeMap<String, (Vec<String>, Arc<SubprocessSupervisor>)>,
+    }
+
+    impl BridgePostHandler for NodeRemoteBridgeHandler {
+        fn post_bridge<'a>(
+            &'a self,
+            plugin: &'a str,
+            target: &'a str,
+            text: &'a str,
+            reply_to: Option<&'a str>,
+        ) -> AdapterBoxFuture<'a, Result<Option<String>, NodeError>> {
+            Box::pin(async move {
+                let Some((targets, supervisor)) = self.bridges.get(plugin) else {
+                    return Err(NodeError::NotFound(format!(
+                        "bridge plugin '{plugin}' is not running on this node"
+                    )));
+                };
+                if !targets.is_empty() && !targets.iter().any(|t| t == "*" || t == target) {
+                    return Err(NodeError::BadRequest(format!(
+                        "bridge target '{plugin}:{target}' is not in configured targets allowlist"
+                    )));
+                }
+                let mut params: BTreeMap<String, Value> = BTreeMap::new();
+                params.insert("text".to_string(), Value::String(text.to_string()));
+                if let Some(reply) = reply_to {
+                    if !reply.trim().is_empty() {
+                        params.insert("reply_to".to_string(), Value::String(reply.to_string()));
+                    }
+                }
+                let val = supervisor
+                    .post(target, params, DEFAULT_PLUGIN_POST_TIMEOUT)
+                    .await
+                    .map_err(|err| NodeError::Http(format!("bridge post failed: {err}")))?;
+                let message_id = val
+                    .get("message_id")
+                    .or_else(|| val.get("messageId"))
+                    .or_else(|| val.get("id"))
+                    .or_else(|| val.get("ts"))
+                    .and_then(|v| match v {
+                        Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+                        Value::Number(n) => Some(n.to_string()),
+                        _ => None,
+                    });
+                Ok(message_id)
+            })
+        }
+    }
+
     pub(super) async fn start_plugins(
         plugins: Vec<ParsedPlugin>,
         skipped_statuses: Vec<Value>,
@@ -2515,6 +3134,8 @@ mod plugin_runtime {
     ) -> (Vec<Arc<SubprocessSupervisor>>, Arc<PluginStatusRegistry>) {
         let registry = Arc::new(PluginStatusRegistry::new(skipped_statuses, status_doc));
         let mut started: Vec<Arc<SubprocessSupervisor>> = Vec::with_capacity(plugins.len());
+        let mut remote_bridges: BTreeMap<String, (Vec<String>, Arc<SubprocessSupervisor>)> =
+            BTreeMap::new();
 
         for parsed in plugins {
             let cfg = parsed.config;
@@ -2555,6 +3176,7 @@ mod plugin_runtime {
             let register_poster = kind == AdapterKind::Bridge
                 || (plugin_id == "webhook" && parsed.has_webhook_post_url);
             if register_poster {
+                remote_bridges.insert(plugin_id.clone(), (targets.clone(), Arc::clone(&sup)));
                 if let Some(daemon) = local_daemon {
                     daemon.register_bridge_poster_with_targets(
                         &plugin_id,
@@ -2565,7 +3187,7 @@ mod plugin_runtime {
                     );
                 } else {
                     startup_warnings.push(format!(
-                        "Bridge plugin '{plugin_id}' started without local IPC socket; sessions cannot link bridge targets until local socket is enabled."
+                        "Bridge plugin '{plugin_id}' started without local IPC socket; available for remote POST /v1/bridges/post (sessions require local socket)."
                     ));
                 }
             }
@@ -2584,6 +3206,12 @@ mod plugin_runtime {
             started.push(sup);
         }
 
+        if !remote_bridges.is_empty() {
+            node.set_bridge_post_handler(Some(Arc::new(NodeRemoteBridgeHandler {
+                bridges: remote_bridges,
+            })));
+        }
+
         (started, registry)
     }
 
@@ -2598,6 +3226,99 @@ mod plugin_runtime {
 mod tests {
     use super::*;
     use hyp_crypto::keystore::{SecretBackend, SecretStore};
+
+    #[test]
+    fn parse_webhook_sources_resolves_secret_refs_and_rejects_plaintext() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let secrets = SecretStore::new(tmp.path(), SecretBackend::File);
+        secrets.set("gh-hook-sec", "gh-secret-value").unwrap();
+        secrets.set("prom-pass", "prom-basic-pass").unwrap();
+        secrets.set("ci-hook-sec", "ci-hmac-secret").unwrap();
+
+        let sources = json!([
+            {
+                "kind": "github-webhook",
+                "id": "gh-main",
+                "topic": "github",
+                "secret": { "secret": "gh-hook-sec" },
+                "allowedRepos": ["acme/app"]
+            },
+            {
+                "kind": "prometheus-webhook",
+                "id": "prom-ops",
+                "topic": "alerts",
+                "basicAuth": {
+                    "username": "alertmanager",
+                    "password": { "secret": "prom-pass" }
+                }
+            },
+            {
+                "kind": "webhook-stream",
+                "id": "ci-events",
+                "topic": "ci",
+                "secret": { "secret": "ci-hook-sec" },
+                "signatureHeader": "X-CI-Sig-256"
+            }
+        ]);
+        let parsed = parse_webhook_sources(&sources, &secrets).expect("valid webhook sources");
+        assert_eq!(parsed.github.len(), 1);
+        assert_eq!(parsed.github[0].id, "gh-main");
+        assert_eq!(parsed.github[0].allowed_repos, vec!["acme/app"]);
+        assert_eq!(parsed.prometheus.len(), 1);
+        assert!(parsed.prometheus[0].has_auth_configured());
+        assert_eq!(parsed.generic.len(), 1);
+        assert_eq!(parsed.generic[0].signature_header, "x-ci-sig-256");
+
+        // Plaintext secret MUST fail closed.
+        let plaintext = json!([
+            {
+                "kind": "github-webhook",
+                "id": "gh-bad",
+                "topic": "github",
+                "secret": "hardcoded-plaintext-secret"
+            }
+        ]);
+        assert!(parse_webhook_sources(&plaintext, &secrets).is_err());
+
+        // Unauthenticated Prometheus webhook MUST fail closed.
+        let unauth_prom = json!([
+            {
+                "kind": "prometheus-webhook",
+                "id": "prom-bad",
+                "topic": "alerts"
+            }
+        ]);
+        assert!(parse_webhook_sources(&unauth_prom, &secrets).is_err());
+    }
+
+    #[test]
+    fn parse_node_runtime_policies_loads_forwarding_reverse_proxy_and_remote_update() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = NodeConfig::router(NodeId::new("hub-1").unwrap(), tmp.path());
+        let raw = json!({
+            "forwarding": {
+                "mode": "allowlist",
+                "rules": [
+                    { "fromPeer": "alice@laptop", "toPeer": "bob@server", "topic": "dm" }
+                ]
+            },
+            "listen": { "behindReverseProxy": true },
+            "allowRemoteUpdate": true
+        });
+        parse_node_runtime_policies(&raw, &mut cfg).expect("valid policies");
+        assert!(cfg.forwarding.permits("alice@laptop", "bob@server", "dm"));
+        assert!(!cfg.forwarding.permits("eve@other", "bob@server", "dm"));
+        assert!(cfg.behind_reverse_proxy);
+        assert!(cfg.allow_remote_update);
+
+        // Top-level behindReverseProxy also works and overrides listen.behindReverseProxy.
+        let raw_override = json!({
+            "behindReverseProxy": false,
+            "listen": { "behindReverseProxy": true }
+        });
+        parse_node_runtime_policies(&raw_override, &mut cfg).expect("override");
+        assert!(!cfg.behind_reverse_proxy);
+    }
 
     #[test]
     fn parse_github_public_source_repo_tokens_missing_secret_isolation_and_duplicate_warning() {

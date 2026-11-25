@@ -60,14 +60,20 @@ pub struct ForwardingRule {
     pub max_hops: Option<u8>,
 }
 
+fn default_forwarding_max_hops() -> u8 {
+    DEFAULT_MAX_HOPS
+}
+
 /// Cross-node forwarding & loop-prevention policy (§2.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ForwardingPolicy {
+    #[serde(default)]
     pub mode: ForwardingMode,
     #[serde(default)]
     pub rules: Vec<ForwardingRule>,
     /// Maximum hop count accepted/forwarded by this node (default 2, hard cap 4).
+    #[serde(default = "default_forwarding_max_hops")]
     pub max_hops: u8,
 }
 
@@ -552,6 +558,10 @@ pub struct NodeConfig {
     /// Trust `X-Forwarded-For` / `X-Real-Ip` from loopback or private (RFC1918/ULA) TCP peers
     /// for Drop Relay per-IP rate limiting (`node.json`: `behindReverseProxy`, default: `false`).
     pub behind_reverse_proxy: bool,
+    /// Opt-in authenticated remote self-update via `POST /v1/node/update` (`node.json`:
+    /// `allowRemoteUpdate`, default: `false`). Advertises `"node.self-update.v1"` in signed
+    /// manifests ONLY when enabled.
+    pub allow_remote_update: bool,
     pub require_pairing: bool,
     /// Optional Org Admin-CA Ed25519 root public key for verifying `am2_` grants.
     pub admin_jwk: Option<ProtoOkpJwk>,
@@ -591,6 +601,7 @@ impl NodeConfig {
             channel_policies: BTreeMap::new(),
             expose_a2a_card: false,
             behind_reverse_proxy: false,
+            allow_remote_update: false,
             require_pairing: true,
             admin_jwk: None,
             secret_backend: None,
@@ -616,7 +627,7 @@ impl NodeConfig {
         if let Some(ref custom) = self.capabilities_override {
             return custom.clone();
         }
-        vec![
+        let mut caps = vec![
             CapabilityToken::ManifestV1,
             CapabilityToken::EnvelopeCeV1,
             CapabilityToken::DmV1,
@@ -633,7 +644,11 @@ impl NodeConfig {
             CapabilityToken::PairingAdminCaV1,
             CapabilityToken::PairingP2pMutualV1,
             CapabilityToken::P2pDirectV1,
-        ]
+        ];
+        if self.allow_remote_update {
+            caps.push(CapabilityToken::Other("node.self-update.v1".to_string()));
+        }
+        caps
     }
 }
 
