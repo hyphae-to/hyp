@@ -1,24 +1,30 @@
 /**
- * Hyphae v2 Blind Ephemeral Drop Relay — Cloudflare Workers + RAM-only Durable Object.
+ * Hyphae v2 Blind Ephemeral Drop Relay — Cloudflare Workers + Durable Objects.
  *
  * Wire-compatible with `crates/hyp-node/src/engine/drop_relay.rs`,
  * `crates/hyp-node/src/engine/peer_link.rs`, `crates/hyp-node/src/engine/server.rs`,
  * and `site/drop/drop.js`:
  *
- * - RAM-only `DropSlotDO`: NEVER touches Durable Object persistent storage. Every
- *   opaque ciphertext `Uint8Array` lives strictly in volatile isolate RAM and is
- *   zeroized via `.fill(0)` on burn, TTL expiration, or slot close.
+ * - Blind ephemeral `DropSlotDO`: stores ONLY opaque `hdrop1_` encrypted ciphertext
+ *   envelopes and minimal slot metadata in Durable Object storage so drops survive
+ *   isolate eviction before node catch-up, armed with a Cloudflare DO Alarm
+ *   (`storage.setAlarm(expiresAtMs)`, hard max 15 min) that unconditionally wipes
+ *   all stored ciphertext and metadata via `storage.deleteAll()` on TTL expiry.
+ *   In-RAM buffers are also zeroized via `.fill(0)` on burn, expiry, or slot close,
+ *   and storage is wiped immediately on burn-after-read completion.
  * - Zero sensitive logging: never logs `dropId`, client IPs, capability tokens,
  *   public keys, or payload bytes.
  * - Stateless HMAC-SHA256 capabilities (`hdcap1_`): constant-time verified BEFORE
  *   reading request body bytes on `POST /v1/drops/{id}`, with zero-downtime key
  *   rotation via `DROP_CAP_HMAC_KEY_PREV`.
  * - Dual auth modes (`DROP_AUTH_MODE`):
- *   - `"private"` (default, fail-closed): allowlist of Ed25519 node public keys in
- *     `ALLOWED_NODE_KEYS` (JSON map or comma/newline `nodeId=b64url` pairs).
+ *   - `"private"` / `"allowlist"` (default, fail-closed): allowlist of Ed25519 node
+ *     public keys in `ALLOWED_NODE_KEYS` (or alias `DROP_ALLOWED_KEYS`; JSON map or
+ *     comma/newline `nodeId=b64url` pairs).
  *   - `"open"` (public relay e.g. `spore.hyphae.to`): self-authenticated Ed25519
  *     requests carrying `X-Hyphae-Public-Key` (raw 43-char base64url or OKP JWK),
- *     protected by per-IP and per-pubkey sliding-window creation quotas.
+ *     protected by durable (`RateLimiterDO`) or isolate-fallback per-IP burst/hourly,
+ *     per-pubkey hourly, and global burst creation quotas.
  * - Fail-closed CORS + Chrome Private Network Access (PNA): strict explicit
  *   origin allowlist (never `"*"` or `"null"`).
  */
@@ -44,8 +50,12 @@ export const DEFAULT_MAX_SSE_STREAMS_PER_DROP = 2;
 export const DEFAULT_ALLOWED_ORIGIN = "https://hyphae.to";
 export const DROP_SSE_KEEPALIVE_MS = 25_000;
 export const CREATE_RATE_WINDOW_MS = 3_600_000;
+export const CREATE_BURST_WINDOW_MS = 60_000;
 export const DEFAULT_CREATES_PER_HOUR_PER_NODE = 10;
 export const DEFAULT_CREATES_PER_HOUR_PER_IP = 20;
+export const DEFAULT_OPEN_CREATES_PER_MINUTE_PER_IP = 5;
+export const DEFAULT_OPEN_CREATES_PER_MINUTE_GLOBAL = 120;
+export const DEFAULT_PRIVATE_CREATES_PER_MINUTE_GLOBAL = 600;
 
 const MAX_CONTROL_BODY_BYTES = 16_384;
 const MAX_CREATOR_NODE_ID_LEN = 256;
@@ -54,6 +64,11 @@ const MIN_HMAC_KEY_BYTES = 32;
 const RATE_TABLE_PRUNE_THRESHOLD = 4_096;
 const MAX_HTTP_AUTH_NONCES = 16_384;
 const MAX_TIMEOUT_MS = 2_147_483_647;
+const STORAGE_ITEM_CHUNK_BYTES = 96 * 1024;
+const SLOT_META_STORAGE_KEY = "slot:meta";
+const SLOT_ITEM_KEY_PREFIX = "slot:item:";
+const RATE_LIMIT_STORAGE_KEY = "rl:events";
+const RATE_LIMIT_HMAC_DOMAIN = "hyphae/v2/drop-rate-limit\n";
 const PROBLEM_TYPE_BASE = "https://hyphae.to/errors/";
 const CONTENT_TYPE_PROBLEM_JSON = "application/problem+json";
 
@@ -949,7 +964,8 @@ function checkAndRecordNonce(nonceCache, nodeId, nonce, ts, nowMs) {
  * >}
  */
 export async function verifyHyphaeEd25519Request(request, options = {}) {
-  const mode = options.mode ?? "private";
+  const rawMode = options.mode ?? "private";
+  const mode = rawMode === "allowlist" ? "private" : rawMode;
   const nowMs = options.nowMs ?? Date.now();
   const parsed = parseHyphaeEd25519Header(request.headers.get("Authorization"));
   if (!parsed.ok) {
@@ -1155,8 +1171,24 @@ function parseBoundedInt(value, fallback, min, max) {
 }
 
 /**
+ * Resolves the configured allowlist secret (`ALLOWED_NODE_KEYS` or alias `DROP_ALLOWED_KEYS`).
+ * @param {Record<string, unknown> | undefined | null} env
+ */
+function resolveAllowedNodeKeysEnv(env) {
+  if (!env) return undefined;
+  if (
+    env.ALLOWED_NODE_KEYS !== undefined &&
+    env.ALLOWED_NODE_KEYS !== null &&
+    (typeof env.ALLOWED_NODE_KEYS !== "string" || env.ALLOWED_NODE_KEYS.trim() !== "")
+  ) {
+    return env.ALLOWED_NODE_KEYS;
+  }
+  return env.DROP_ALLOWED_KEYS;
+}
+
+/**
  * Resolves validated worker configuration from `env`.
- * Defaults to fail-closed `"private"` mode.
+ * Defaults to fail-closed `"private"` (alias `"allowlist"`) mode.
  * @param {Record<string, unknown>} env
  */
 function resolveConfig(env) {
@@ -1164,7 +1196,12 @@ function resolveConfig(env) {
     env && typeof env.DROP_AUTH_MODE === "string" && env.DROP_AUTH_MODE.trim()
       ? env.DROP_AUTH_MODE.trim().toLowerCase()
       : "private";
-  const validMode = rawMode === "private" || rawMode === "open" ? rawMode : null;
+  const validMode =
+    rawMode === "private" || rawMode === "allowlist"
+      ? "private"
+      : rawMode === "open"
+        ? "open"
+        : null;
   const maxTtlSeconds = parseBoundedInt(
     env?.MAX_TTL_SECONDS,
     HARD_MAX_TTL_SECONDS,
@@ -1207,6 +1244,26 @@ function resolveConfig(env) {
     0,
     10_000
   );
+  const defaultPerMinIp =
+    validMode === "open"
+      ? DEFAULT_OPEN_CREATES_PER_MINUTE_PER_IP
+      : createsPerHourPerIp;
+  const createsPerMinutePerIp = parseBoundedInt(
+    env?.CREATES_PER_MINUTE_PER_IP,
+    defaultPerMinIp,
+    0,
+    10_000
+  );
+  const defaultPerMinGlobal =
+    validMode === "open"
+      ? DEFAULT_OPEN_CREATES_PER_MINUTE_GLOBAL
+      : DEFAULT_PRIVATE_CREATES_PER_MINUTE_GLOBAL;
+  const createsPerMinuteGlobal = parseBoundedInt(
+    env?.CREATES_PER_MINUTE_GLOBAL,
+    defaultPerMinGlobal,
+    0,
+    100_000
+  );
   const allowedOrigins = parseAllowedOrigins(env?.ALLOWED_ORIGINS);
   const rawPna = env?.ALLOW_PRIVATE_NETWORK;
   const allowPrivateNetwork =
@@ -1223,13 +1280,65 @@ function resolveConfig(env) {
     maxSseStreamsPerDrop,
     createsPerHourPerNode,
     createsPerHourPerIp,
+    createsPerMinutePerIp,
+    createsPerMinuteGlobal,
     allowedOrigins,
     allowPrivateNetwork,
   };
 }
 
 /**
- * Sliding-window hourly rate limiter (pure volatile RAM).
+ * Evaluates one or more sliding-window rate limits against a sorted timestamp list.
+ * Prunes entries older than the widest window in place.
+ *
+ * @param {number[]} list
+ * @param {Array<{ windowMs: number, limit: number, reason: string }>} windows
+ * @param {number} nowMs
+ * @returns {{ ok: true } | { ok: false, retryAfterSeconds: number, reason: string }}
+ */
+function evaluateRateWindows(list, windows, nowMs) {
+  let maxWindowMs = CREATE_RATE_WINDOW_MS;
+  for (const w of windows) {
+    if (w.windowMs > maxWindowMs) maxWindowMs = w.windowMs;
+  }
+  const maxCutoff = nowMs - maxWindowMs;
+  while (list.length > 0 && list[0] <= maxCutoff) {
+    list.shift();
+  }
+
+  for (const w of windows) {
+    if (w.limit <= 0) {
+      return {
+        ok: false,
+        retryAfterSeconds: Math.max(1, Math.ceil(w.windowMs / 1000)),
+        reason: w.reason,
+      };
+    }
+    const cutoff = nowMs - w.windowMs;
+    let firstIdx = list.length;
+    for (let i = 0; i < list.length; i += 1) {
+      if (list[i] > cutoff) {
+        firstIdx = i;
+        break;
+      }
+    }
+    const count = list.length - firstIdx;
+    if (count >= w.limit) {
+      const oldest = list[firstIdx];
+      const retryMs = oldest + w.windowMs - nowMs;
+      return {
+        ok: false,
+        retryAfterSeconds: Math.max(1, Math.ceil(retryMs / 1000)),
+        reason: w.reason,
+      };
+    }
+  }
+  return { ok: true };
+}
+
+/**
+ * Sliding-window rate limiter (in-isolate RAM fallback when `RATE_LIMITER` DO is unbound,
+ * and fast global isolate burst guardrail).
  */
 class SlidingWindowLimiter {
   constructor() {
@@ -1238,40 +1347,41 @@ class SlidingWindowLimiter {
   }
 
   /**
-   * Checks whether `key` is within `limit` events per hour as of `nowMs` (without recording yet).
+   * Checks whether `key` is within all `windows` as of `nowMs` (without recording yet).
    * @param {string} key
-   * @param {number} limit
+   * @param {Array<{ windowMs: number, limit: number, reason: string }>} windows
    * @param {number} nowMs
-   * @returns {{ ok: true } | { ok: false, retryAfterSeconds: number }}
+   * @returns {{ ok: true } | { ok: false, retryAfterSeconds: number, reason: string }}
    */
-  check(key, limit, nowMs) {
-    if (limit <= 0) {
-      return { ok: false, retryAfterSeconds: 3600 };
-    }
-    const cutoff = nowMs - CREATE_RATE_WINDOW_MS;
+  checkWindows(key, windows, nowMs) {
     const list = this.windows.get(key);
-    if (!list) return { ok: true };
-    while (list.length > 0 && list[0] <= cutoff) {
-      list.shift();
-    }
-    if (list.length === 0) {
-      this.windows.delete(key);
+    if (!list) {
+      for (const w of windows) {
+        if (w.limit <= 0) {
+          return {
+            ok: false,
+            retryAfterSeconds: Math.max(1, Math.ceil(w.windowMs / 1000)),
+            reason: w.reason,
+          };
+        }
+      }
       return { ok: true };
     }
-    if (list.length >= limit) {
-      const retryMs = list[0] + CREATE_RATE_WINDOW_MS - nowMs;
-      return { ok: false, retryAfterSeconds: Math.max(1, Math.ceil(retryMs / 1000)) };
+    const res = evaluateRateWindows(list, windows, nowMs);
+    if (list.length === 0) {
+      this.windows.delete(key);
     }
-    return { ok: true };
+    return res;
   }
 
   /**
    * Records a creation timestamp for `key` and bounds table cardinality.
    * @param {string} key
    * @param {number} nowMs
+   * @param {number} [retentionMs]
    */
-  record(key, nowMs) {
-    const cutoff = nowMs - CREATE_RATE_WINDOW_MS;
+  record(key, nowMs, retentionMs = CREATE_RATE_WINDOW_MS) {
+    const cutoff = nowMs - retentionMs;
     if (this.windows.size > RATE_TABLE_PRUNE_THRESHOLD) {
       for (const [k, arr] of this.windows.entries()) {
         while (arr.length > 0 && arr[0] <= cutoff) arr.shift();
@@ -1283,7 +1393,203 @@ class SlidingWindowLimiter {
       list = [];
       this.windows.set(key, list);
     }
+    while (list.length > 0 && list[0] <= cutoff) {
+      list.shift();
+    }
     list.push(nowMs);
+  }
+}
+
+/**
+ * Derives an HMAC-blinded pseudonymous Durable Object name for `RateLimiterDO`
+ * so raw client IPs and node public keys are never persisted or exposed as DO IDs.
+ *
+ * @param {Uint8Array} hmacKey
+ * @param {"ip" | "creator"} kind
+ * @param {string} rawKey
+ * @returns {Promise<string>}
+ */
+async function rateLimiterDoName(hmacKey, kind, rawKey) {
+  const input = TEXT_ENCODER.encode(`${RATE_LIMIT_HMAC_DOMAIN}${kind}\n${rawKey}`);
+  const mac = await hmacSha256(hmacKey, input);
+  let hex = "";
+  for (let i = 0; i < 16; i += 1) {
+    hex += mac[i].toString(16).padStart(2, "0");
+  }
+  mac.fill(0);
+  return `rl:${kind}:${hex}`;
+}
+
+/**
+ * Extracts a usable Durable Object storage interface if provided by `ctx` (or legacy `state`).
+ * Returns `null` when absent so minimal unit-test mocks without storage stay backwards-compatible.
+ *
+ * @param {unknown} ctx
+ * @returns {{
+ *   get(key: string): Promise<unknown>,
+ *   put(key: string, value: unknown): Promise<void>,
+ *   delete(key: string | string[]): Promise<unknown>,
+ *   deleteAll(): Promise<void>,
+ *   setAlarm?(scheduledTime: number | Date): Promise<void>,
+ *   deleteAlarm?(): Promise<void>,
+ * } | null}
+ */
+function extractDoStorage(ctx) {
+  if (!ctx || typeof ctx !== "object") return null;
+  /** @type {any} */
+  const candidate = /** @type {any} */ (ctx).storage;
+  if (
+    candidate &&
+    typeof candidate.get === "function" &&
+    typeof candidate.put === "function" &&
+    typeof candidate.deleteAll === "function"
+  ) {
+    return candidate;
+  }
+  return null;
+}
+
+/**
+ * Durable cross-PoP sliding-window rate limiter Durable Object (`RATE_LIMITER`).
+ *
+ * Persists only numeric event timestamps (never raw IPs, node IDs, or keys) and
+ * arms a Cloudflare DO alarm to wipe storage cleanly via `storage.deleteAll()` once
+ * the sliding window expires.
+ */
+export class RateLimiterDO {
+  /**
+   * @param {unknown} ctx
+   * @param {Record<string, unknown>} env
+   * @param {{ now?: () => number }} [options]
+   */
+  constructor(ctx, env, options = {}) {
+    this.ctx = ctx;
+    this.env = env;
+    this._now = options.now ?? (() => Date.now());
+    /** @type {number[]} */
+    this.timestamps = [];
+    this._hydrated = false;
+    /** @type {Promise<void> | null} */
+    this._hydrating = null;
+
+    if (this.ctx && typeof /** @type {any} */ (this.ctx).blockConcurrencyWhile === "function") {
+      /** @type {any} */ (this.ctx).blockConcurrencyWhile(() => this._ensureHydrated());
+    }
+  }
+
+  _getStorage() {
+    return extractDoStorage(this.ctx);
+  }
+
+  async _ensureHydrated() {
+    if (this._hydrated) return;
+    if (this._hydrating) return this._hydrating;
+    this._hydrating = (async () => {
+      const storage = this._getStorage();
+      if (storage) {
+        const stored = /** @type {{ timestamps?: unknown } | undefined} */ (
+          await storage.get(RATE_LIMIT_STORAGE_KEY)
+        );
+        if (stored && Array.isArray(stored.timestamps)) {
+          this.timestamps = stored.timestamps
+            .filter((t) => typeof t === "number" && Number.isSafeInteger(t))
+            .sort((a, b) => a - b);
+        }
+      }
+      this._hydrated = true;
+    })().finally(() => {
+      this._hydrating = null;
+    });
+    return this._hydrating;
+  }
+
+  /**
+   * Unconditionally wipes expired rate-limit timestamps when the DO alarm fires.
+   */
+  async alarm() {
+    this.timestamps.length = 0;
+    this._hydrated = true;
+    const storage = this._getStorage();
+    if (storage) {
+      await storage.deleteAll();
+    }
+  }
+
+  /**
+   * Internal DO endpoints:
+   * - `POST /check`   — non-mutating check against `windows`
+   * - `POST /consume` — atomic check + record + persist + setAlarm
+   *
+   * @param {Request} request
+   * @returns {Promise<Response>}
+   */
+  async fetch(request) {
+    await this._ensureHydrated();
+    const url = new URL(request.url);
+    const method = request.method.toUpperCase();
+    if (method !== "POST" || (url.pathname !== "/check" && url.pathname !== "/consume")) {
+      return problemResponse(errNotFound("unknown rate limiter route"));
+    }
+
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return problemResponse(errBadRequest("invalid JSON in rate limiter request"));
+    }
+    if (!body || typeof body !== "object" || !Array.isArray(body.windows)) {
+      return problemResponse(errBadRequest("rate limiter requires 'windows' array"));
+    }
+
+    const nowMs =
+      typeof body.nowMs === "number" && Number.isSafeInteger(body.nowMs)
+        ? body.nowMs
+        : this._now();
+    /** @type {Array<{ windowMs: number, limit: number, reason: string }>} */
+    const windows = [];
+    let maxWindowMs = CREATE_RATE_WINDOW_MS;
+    for (const w of body.windows) {
+      if (
+        !w ||
+        typeof w !== "object" ||
+        typeof w.windowMs !== "number" ||
+        !Number.isFinite(w.windowMs) ||
+        w.windowMs <= 0 ||
+        typeof w.limit !== "number" ||
+        !Number.isFinite(w.limit) ||
+        typeof w.reason !== "string"
+      ) {
+        return problemResponse(errBadRequest("invalid window entry in rate limiter request"));
+      }
+      const windowMs = Math.trunc(w.windowMs);
+      if (windowMs > maxWindowMs) maxWindowMs = windowMs;
+      windows.push({ windowMs, limit: Math.trunc(w.limit), reason: w.reason });
+    }
+
+    const evalRes = evaluateRateWindows(this.timestamps, windows, nowMs);
+    if (!evalRes.ok) {
+      return jsonResponse(429, {
+        ok: false,
+        retryAfterSeconds: evalRes.retryAfterSeconds,
+        reason: evalRes.reason,
+      });
+    }
+
+    if (url.pathname === "/consume") {
+      this.timestamps.push(nowMs);
+      const storage = this._getStorage();
+      if (storage) {
+        await storage.put(RATE_LIMIT_STORAGE_KEY, {
+          timestamps: this.timestamps.slice(),
+          maxWindowMs,
+        });
+        if (typeof storage.setAlarm === "function") {
+          await storage.setAlarm(nowMs + maxWindowMs);
+        }
+      }
+    }
+
+    return jsonResponse(200, { ok: true });
   }
 }
 
@@ -1404,15 +1710,19 @@ function extractClientIp(request) {
 }
 
 // ============================================================================
-// RAM-Only Durable Object (`DropSlotDO`) — ZERO Persistent Storage Calls!
+// Blind Ephemeral Durable Object (`DropSlotDO`) — Ciphertext-Only + Alarm Wipe
 // ============================================================================
 
 /**
- * RAM-only Durable Object storing one ephemeral blind drop slot.
+ * Blind Ephemeral Durable Object storing one short-lived ciphertext drop slot.
  *
- * Strictly volatile: NEVER reads or writes Durable Object persistent storage.
- * Every buffered ciphertext `Uint8Array` is zeroized via `.fill(0)` on burn,
- * TTL expiry, or slot close.
+ * Persists ONLY opaque encrypted `hdrop1_` ciphertext envelopes and minimal slot
+ * metadata in `ctx.storage` so drops survive Cloudflare DO isolate evictions before
+ * the target node connects, armed with a Cloudflare DO Alarm (`storage.setAlarm(expiresAtMs)`,
+ * hard max 15 min) whose `alarm()` handler unconditionally wipes all stored ciphertext
+ * and metadata via `storage.deleteAll()`. Every in-RAM `Uint8Array` is also zeroized
+ * via `.fill(0)` on burn, TTL expiry, or slot close. Gracefully falls back to volatile
+ * RAM if `ctx.storage` is absent in minimal mocks.
  */
 export class DropSlotDO {
   /**
@@ -1427,7 +1737,8 @@ export class DropSlotDO {
     this._keepaliveMs = options.keepaliveMs ?? DROP_SSE_KEEPALIVE_MS;
 
     /**
-     * Volatile in-RAM drop slot state (null when uninitialized, expired, or burned closed).
+     * Hydrated in-RAM drop slot state (backed by `ctx.storage`; null when uninitialized,
+     * expired, or burned closed).
      * @type {{
      *   dropId: string,
      *   creatorNodeId: string,
@@ -1448,6 +1759,12 @@ export class DropSlotDO {
     /** @type {boolean} */
     this.expired = false;
 
+    /** @type {boolean} */
+    this._hydrated = false;
+
+    /** @type {Promise<void> | null} */
+    this._hydrating = null;
+
     /**
      * Active SSE subscriber handles.
      * @type {Set<{
@@ -1465,13 +1782,298 @@ export class DropSlotDO {
 
     /** @type {Map<string, number>} */
     this._deferredNonceCache = new Map();
+
+    if (this.ctx && typeof /** @type {any} */ (this.ctx).blockConcurrencyWhile === "function") {
+      /** @type {any} */ (this.ctx).blockConcurrencyWhile(() => this._ensureHydrated());
+    }
+  }
+
+  _getStorage() {
+    return extractDoStorage(this.ctx);
   }
 
   /**
-   * Zeroizes every buffered ciphertext buffer in RAM and clears slot references.
-   * @param {{ markExpired: boolean }} opts
+   * Serializes slot metadata (zero plaintext) for `ctx.storage`.
+   * @param {NonNullable<DropSlotDO["slot"]>} slot
    */
-  _destroySlot({ markExpired }) {
+  _serializeSlotMeta(slot) {
+    return {
+      v: 1,
+      dropId: slot.dropId,
+      creatorNodeId: slot.creatorNodeId,
+      creatorPubKeyB64: slot.creatorPubKeyB64,
+      expiresAtMs: slot.expiresAtMs,
+      maxItems: slot.maxItems,
+      maxPayloadBytes: slot.maxPayloadBytes,
+      maxSseStreamsPerDrop: slot.maxSseStreamsPerDrop,
+      burnAfterRead: slot.burnAfterRead,
+      nextSeq: slot.nextSeq,
+      highestAckedSeq: slot.highestAckedSeq,
+      itemSeqs: slot.items.map((it) => it.seq),
+    };
+  }
+
+  /**
+   * Persists slot metadata and schedules the hard-TTL Durable Object alarm.
+   * @param {NonNullable<DropSlotDO["slot"]>} slot
+   */
+  async _persistSlotMeta(slot) {
+    const storage = this._getStorage();
+    if (!storage) return;
+    await storage.put(SLOT_META_STORAGE_KEY, this._serializeSlotMeta(slot));
+  }
+
+  /**
+   * Schedules a Cloudflare Durable Object alarm at `expiresAtMs` for guaranteed hard delete.
+   * @param {number} expiresAtMs
+   */
+  async _setStorageAlarm(expiresAtMs) {
+    const storage = this._getStorage();
+    if (!storage || typeof storage.setAlarm !== "function") return;
+    await storage.setAlarm(expiresAtMs);
+  }
+
+  /**
+   * Persists an encrypted ciphertext item (chunking cleanly above 96 KiB for KV value limits)
+   * alongside updated slot metadata and ensures the hard-TTL alarm is armed.
+   * @param {NonNullable<DropSlotDO["slot"]>} slot
+   * @param {{ seq: number, payload: Uint8Array, receivedAtMs: number }} item
+   */
+  async _persistItemAndMeta(slot, item) {
+    const storage = this._getStorage();
+    if (!storage) return;
+    const itemKey = `${SLOT_ITEM_KEY_PREFIX}${item.seq}`;
+    /** @type {Array<Promise<unknown>>} */
+    const ops = [];
+    if (item.payload.byteLength <= STORAGE_ITEM_CHUNK_BYTES) {
+      ops.push(
+        storage.put(itemKey, {
+          seq: item.seq,
+          receivedAtMs: item.receivedAtMs,
+          chunks: 0,
+          payload: new Uint8Array(item.payload),
+        })
+      );
+    } else {
+      const numChunks = Math.ceil(item.payload.byteLength / STORAGE_ITEM_CHUNK_BYTES);
+      ops.push(
+        storage.put(itemKey, {
+          seq: item.seq,
+          receivedAtMs: item.receivedAtMs,
+          chunks: numChunks,
+          byteLength: item.payload.byteLength,
+        })
+      );
+      for (let i = 0; i < numChunks; i += 1) {
+        const start = i * STORAGE_ITEM_CHUNK_BYTES;
+        const end = Math.min(start + STORAGE_ITEM_CHUNK_BYTES, item.payload.byteLength);
+        ops.push(storage.put(`${itemKey}:c:${i}`, new Uint8Array(item.payload.subarray(start, end))));
+      }
+    }
+    ops.push(storage.put(SLOT_META_STORAGE_KEY, this._serializeSlotMeta(slot)));
+    await Promise.all(ops);
+    await this._setStorageAlarm(slot.expiresAtMs);
+  }
+
+  /**
+   * Deletes burned ciphertext item keys from DO storage and persists updated metadata.
+   * @param {NonNullable<DropSlotDO["slot"]>} slot
+   * @param {Array<{ seq: number, byteLength: number }>} burnedItems
+   */
+  async _deleteBurnedItemsFromStorage(slot, burnedItems) {
+    const storage = this._getStorage();
+    if (!storage) return;
+    /** @type {Array<Promise<unknown>>} */
+    const ops = [];
+    for (const burned of burnedItems) {
+      const itemKey = `${SLOT_ITEM_KEY_PREFIX}${burned.seq}`;
+      if (typeof storage.delete === "function") {
+        ops.push(storage.delete(itemKey));
+        if (burned.byteLength > STORAGE_ITEM_CHUNK_BYTES) {
+          const numChunks = Math.ceil(burned.byteLength / STORAGE_ITEM_CHUNK_BYTES);
+          for (let i = 0; i < numChunks; i += 1) {
+            ops.push(storage.delete(`${itemKey}:c:${i}`));
+          }
+        }
+      }
+    }
+    ops.push(storage.put(SLOT_META_STORAGE_KEY, this._serializeSlotMeta(slot)));
+    await Promise.all(ops);
+  }
+
+  /**
+   * Unconditionally wipes ALL Durable Object persistent storage keys (and cancels alarm when requested).
+   * @param {{ clearAlarm?: boolean }} [opts]
+   */
+  async _wipeStorage({ clearAlarm = true } = {}) {
+    const storage = this._getStorage();
+    if (!storage) return;
+    await storage.deleteAll();
+    if (clearAlarm && typeof storage.deleteAlarm === "function") {
+      await storage.deleteAlarm();
+    }
+  }
+
+  /**
+   * Cold-start hydration from Durable Object storage (survives isolate eviction).
+   * If the stored slot has already expired (`now >= expiresAtMs`), immediately hard-wipes
+   * all DO storage via `deleteAll()` and marks the slot expired (`410 Gone`).
+   */
+  async _ensureHydrated() {
+    if (this._hydrated) return;
+    if (this._hydrating) return this._hydrating;
+    this._hydrating = (async () => {
+      const storage = this._getStorage();
+      if (!storage) {
+        this._hydrated = true;
+        return;
+      }
+      const meta = /** @type {any} */ (await storage.get(SLOT_META_STORAGE_KEY));
+      if (!meta || typeof meta !== "object") {
+        this.slot = null;
+        this._hydrated = true;
+        return;
+      }
+      if (
+        !isValidDropId(meta.dropId) ||
+        typeof meta.creatorNodeId !== "string" ||
+        typeof meta.creatorPubKeyB64 !== "string" ||
+        typeof meta.expiresAtMs !== "number" ||
+        !Number.isSafeInteger(meta.expiresAtMs)
+      ) {
+        await this._wipeStorage({ clearAlarm: true });
+        this.slot = null;
+        this._hydrated = true;
+        return;
+      }
+
+      if (this._now() >= meta.expiresAtMs) {
+        await this._wipeStorage({ clearAlarm: true });
+        this.slot = null;
+        this.expired = true;
+        this._hydrated = true;
+        return;
+      }
+
+      /** @type {Array<{ seq: number, payload: Uint8Array, receivedAtMs: number }>} */
+      const items = [];
+      let bufferedBytes = 0;
+      const itemSeqs = Array.isArray(meta.itemSeqs) ? meta.itemSeqs : [];
+      for (const seq of itemSeqs) {
+        if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq <= 0) continue;
+        const itemKey = `${SLOT_ITEM_KEY_PREFIX}${seq}`;
+        const storedItem = /** @type {any} */ (await storage.get(itemKey));
+        if (!storedItem || typeof storedItem !== "object") continue;
+
+        /** @type {Uint8Array | null} */
+        let payload = null;
+        if (typeof storedItem.chunks === "number" && storedItem.chunks > 0) {
+          /** @type {Uint8Array[]} */
+          const parts = [];
+          let missing = false;
+          for (let i = 0; i < storedItem.chunks; i += 1) {
+            const chunk = await storage.get(`${itemKey}:c:${i}`);
+            if (chunk instanceof Uint8Array) {
+              parts.push(new Uint8Array(chunk));
+            } else if (ArrayBuffer.isView(chunk)) {
+              parts.push(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength).slice());
+            } else if (chunk instanceof ArrayBuffer) {
+              parts.push(new Uint8Array(chunk).slice());
+            } else {
+              missing = true;
+              break;
+            }
+          }
+          if (!missing) {
+            payload = concatBytes(parts);
+          }
+          for (const p of parts) p.fill(0);
+        } else if (storedItem.payload instanceof Uint8Array) {
+          payload = new Uint8Array(storedItem.payload);
+        } else if (ArrayBuffer.isView(storedItem.payload)) {
+          payload = new Uint8Array(
+            storedItem.payload.buffer,
+            storedItem.payload.byteOffset,
+            storedItem.payload.byteLength
+          ).slice();
+        } else if (storedItem.payload instanceof ArrayBuffer) {
+          payload = new Uint8Array(storedItem.payload).slice();
+        }
+
+        if (!payload) continue;
+        bufferedBytes += payload.byteLength;
+        items.push({
+          seq,
+          payload,
+          receivedAtMs:
+            typeof storedItem.receivedAtMs === "number" ? storedItem.receivedAtMs : this._now(),
+        });
+      }
+
+      this.slot = {
+        dropId: meta.dropId,
+        creatorNodeId: meta.creatorNodeId,
+        creatorPubKeyB64: meta.creatorPubKeyB64,
+        expiresAtMs: meta.expiresAtMs,
+        maxItems: parseBoundedInt(
+          meta.maxItems,
+          DEFAULT_MAX_ITEMS_PER_DROP,
+          1,
+          DEFAULT_MAX_ITEMS_PER_DROP
+        ),
+        maxPayloadBytes: parseBoundedInt(
+          meta.maxPayloadBytes,
+          DEFAULT_MAX_PAYLOAD_BYTES,
+          1,
+          10 * 1024 * 1024
+        ),
+        maxSseStreamsPerDrop: parseBoundedInt(
+          meta.maxSseStreamsPerDrop,
+          DEFAULT_MAX_SSE_STREAMS_PER_DROP,
+          1,
+          16
+        ),
+        burnAfterRead: Boolean(meta.burnAfterRead),
+        nextSeq:
+          typeof meta.nextSeq === "number" && Number.isSafeInteger(meta.nextSeq) && meta.nextSeq >= 1
+            ? meta.nextSeq
+            : items.length + 1,
+        highestAckedSeq:
+          typeof meta.highestAckedSeq === "number" && Number.isSafeInteger(meta.highestAckedSeq)
+            ? meta.highestAckedSeq
+            : 0,
+        bufferedBytes,
+        items,
+      };
+      this.expired = false;
+      this._hydrated = true;
+      this._armExpiryTimer(this.slot.expiresAtMs);
+    })().finally(() => {
+      this._hydrating = null;
+    });
+    return this._hydrating;
+  }
+
+  /**
+   * Cloudflare Durable Object Alarm handler: unconditionally wipes all encrypted slot
+   * metadata and ciphertext items via `storage.deleteAll()`, zeroizes RAM buffers,
+   * marks the slot expired, and closes any open SSE subscribers.
+   */
+  async alarm() {
+    await this._destroySlot({
+      markExpired: true,
+      wipeStorage: true,
+      clearAlarm: false,
+    });
+    this._hydrated = true;
+  }
+
+  /**
+   * Zeroizes every buffered ciphertext buffer in RAM, clears slot references,
+   * closes active SSE streams, and optionally wipes persistent DO storage.
+   * @param {{ markExpired?: boolean, wipeStorage?: boolean, clearAlarm?: boolean }} [opts]
+   */
+  async _destroySlot({ markExpired = false, wipeStorage = true, clearAlarm = true } = {}) {
     if (this.expiryTimer !== null) {
       clearTimeout(this.expiryTimer);
       this.expiryTimer = null;
@@ -1491,10 +2093,13 @@ export class DropSlotDO {
     for (const sub of Array.from(this.subscribers)) {
       this._closeSubscriber(sub);
     }
+    if (wipeStorage) {
+      await this._wipeStorage({ clearAlarm });
+    }
   }
 
   /**
-   * Schedules an in-RAM TTL sweep timer (no persistent DO alarm!).
+   * Schedules an in-RAM TTL sweep timer as a fast warm-isolate complement to the DO alarm.
    * @param {number} expiresAtMs
    */
   _armExpiryTimer(expiresAtMs) {
@@ -1506,7 +2111,7 @@ export class DropSlotDO {
     this.expiryTimer = setTimeout(() => {
       this.expiryTimer = null;
       if (this.slot && this._now() >= this.slot.expiresAtMs) {
-        this._destroySlot({ markExpired: true });
+        void this._destroySlot({ markExpired: true, wipeStorage: true }).catch(() => {});
       } else if (this.slot) {
         this._armExpiryTimer(this.slot.expiresAtMs);
       }
@@ -1517,15 +2122,16 @@ export class DropSlotDO {
   }
 
   /**
-   * Checks whether `this.slot` is currently live; sweeps and zeroizes if expired.
-   * @returns {{ ok: true, slot: NonNullable<DropSlotDO["slot"]> } | { ok: false, problem: ProblemSpec }}
+   * Checks whether `this.slot` is currently live; sweeps, zeroizes RAM, and wipes DO
+   * storage if expired (`410 Gone`).
+   * @returns {Promise<{ ok: true, slot: NonNullable<DropSlotDO["slot"]> } | { ok: false, problem: ProblemSpec }>}
    */
-  _requireActiveSlot() {
+  async _requireActiveSlot() {
     if (!this.slot) {
       return { ok: false, problem: this.expired ? errExpired() : errNotFound() };
     }
     if (this._now() >= this.slot.expiresAtMs) {
-      this._destroySlot({ markExpired: true });
+      await this._destroySlot({ markExpired: true, wipeStorage: true });
       return { ok: false, problem: errExpired() };
     }
     return { ok: true, slot: this.slot };
@@ -1690,10 +2296,11 @@ export class DropSlotDO {
    * @returns {Promise<Response>}
    */
   async fetch(request) {
+    await this._ensureHydrated();
     const url = new URL(request.url);
     const method = request.method.toUpperCase();
 
-    // POST /init — initialize slot in volatile RAM
+    // POST /init — initialize slot in RAM + durable encrypted DO storage + TTL alarm
     if (method === "POST" && url.pathname === "/init") {
       let initData;
       try {
@@ -1714,8 +2321,8 @@ export class DropSlotDO {
         return problemResponse(errBadRequest("missing required slot init fields"));
       }
 
-      // Zeroize any prior slot state before initializing.
-      this._destroySlot({ markExpired: false });
+      // Zeroize and wipe any prior slot state before initializing.
+      await this._destroySlot({ markExpired: false, wipeStorage: true });
       this.expired = false;
 
       const maxItems = parseBoundedInt(
@@ -1751,13 +2358,16 @@ export class DropSlotDO {
         bufferedBytes: 0,
         items: [],
       };
+      this._hydrated = true;
+      await this._persistSlotMeta(this.slot);
+      await this._setStorageAlarm(this.slot.expiresAtMs);
       this._armExpiryTimer(this.slot.expiresAtMs);
       return jsonResponse(201, { ok: true, expiresAtMs: this.slot.expiresAtMs });
     }
 
-    // POST /post — append opaque ciphertext bytes into RAM FIFO and wake SSE streams
+    // POST /post — persist opaque ciphertext bytes into DO storage + RAM FIFO and wake SSE streams
     if (method === "POST" && url.pathname === "/post") {
-      const active = this._requireActiveSlot();
+      const active = await this._requireActiveSlot();
       if (!active.ok) return problemResponse(active.problem);
       const slot = active.slot;
 
@@ -1774,7 +2384,7 @@ export class DropSlotDO {
       }
 
       // Re-check slot state after async body read in case TTL elapsed or slot filled concurrently.
-      const recheck = this._requireActiveSlot();
+      const recheck = await this._requireActiveSlot();
       if (!recheck.ok) {
         payload.fill(0);
         return problemResponse(recheck.problem);
@@ -1794,6 +2404,16 @@ export class DropSlotDO {
       slot.items.push(item);
       slot.bufferedBytes += payload.byteLength;
 
+      try {
+        await this._persistItemAndMeta(slot, item);
+      } catch {
+        slot.items.pop();
+        slot.nextSeq -= 1;
+        slot.bufferedBytes = Math.max(0, slot.bufferedBytes - payload.byteLength);
+        payload.fill(0);
+        return problemResponse(errInternal("failed to persist encrypted drop item"));
+      }
+
       const sseFrame = formatSseDropEvent(item);
       for (const sub of this.subscribers) {
         this._enqueueWrite(sub, sseFrame, seq);
@@ -1805,9 +2425,9 @@ export class DropSlotDO {
       });
     }
 
-    // GET /stream — atomic late-subscriber catch-up + live SSE stream with 25s keepalives
+    // GET /stream — atomic late-subscriber catch-up (survives DO eviction) + live SSE stream
     if (method === "GET" && url.pathname === "/stream") {
-      const active = this._requireActiveSlot();
+      const active = await this._requireActiveSlot();
       if (!active.ok) return problemResponse(active.problem);
       const slot = active.slot;
 
@@ -1815,7 +2435,7 @@ export class DropSlotDO {
       if (!authRes.ok) return problemResponse(authRes.problem);
 
       // Re-check expiry after any async Ed25519 verification.
-      const recheck = this._requireActiveSlot();
+      const recheck = await this._requireActiveSlot();
       if (!recheck.ok) return problemResponse(recheck.problem);
 
       const rawAfter = url.searchParams.get("after");
@@ -1863,7 +2483,7 @@ export class DropSlotDO {
       subscriber.keepaliveTimer = setInterval(() => {
         if (subscriber.closed) return;
         if (!this.slot || this._now() >= this.slot.expiresAtMs) {
-          this._destroySlot({ markExpired: true });
+          void this._destroySlot({ markExpired: true, wipeStorage: true }).catch(() => {});
           return;
         }
         this._enqueueWrite(subscriber, ": keepalive\n\n");
@@ -1887,16 +2507,16 @@ export class DropSlotDO {
       });
     }
 
-    // POST /ack — acknowledge & optionally burn/zeroize items up to `seq`
+    // POST /ack — acknowledge & optionally burn/zeroize items up to `seq` (RAM + DO storage)
     if (method === "POST" && url.pathname === "/ack") {
-      const active = this._requireActiveSlot();
+      const active = await this._requireActiveSlot();
       if (!active.ok) return problemResponse(active.problem);
       const slot = active.slot;
 
       const authRes = await this._authorizeSubscriberOrCreator(request, slot);
       if (!authRes.ok) return problemResponse(authRes.problem);
 
-      const recheck = this._requireActiveSlot();
+      const recheck = await this._requireActiveSlot();
       if (!recheck.ok) return problemResponse(recheck.problem);
 
       let ackBody;
@@ -1928,6 +2548,8 @@ export class DropSlotDO {
 
       let burnedItems = 0;
       let burnedBytes = 0;
+      /** @type {Array<{ seq: number, byteLength: number }>} */
+      const burnedRecords = [];
       if (burn && seq > 0) {
         while (slot.items.length > 0 && slot.items[0].seq <= seq) {
           const removed = slot.items.shift();
@@ -1936,6 +2558,7 @@ export class DropSlotDO {
             removed.payload.fill(0);
             burnedItems += 1;
             burnedBytes += len;
+            burnedRecords.push({ seq: removed.seq, byteLength: len });
             slot.bufferedBytes = Math.max(0, slot.bufferedBytes - len);
           }
         }
@@ -1945,7 +2568,11 @@ export class DropSlotDO {
       const shouldClose =
         burn && slot.burnAfterRead && remainingItems === 0 && effectiveSeq > 0;
       if (shouldClose) {
-        this._destroySlot({ markExpired: false });
+        await this._destroySlot({ markExpired: false, wipeStorage: true });
+      } else if (burnedRecords.length > 0) {
+        await this._deleteBurnedItemsFromStorage(slot, burnedRecords);
+      } else {
+        await this._persistSlotMeta(slot);
       }
 
       return jsonResponse(200, {
@@ -1966,8 +2593,9 @@ export class DropSlotDO {
 // ============================================================================
 
 /**
- * Creates a self-contained Cloudflare Worker app with isolated in-RAM rate limiters,
- * replay cache, and optional injectable clock (for deterministic testing).
+ * Creates a self-contained Cloudflare Worker app with durable `RateLimiterDO` support
+ * (falling back seamlessly to isolated in-RAM sliding-window limiters when unbound),
+ * global isolate burst guardrails, replay cache, and optional injectable clock.
  *
  * @param {{ now?: () => number }} [options]
  * @returns {{ fetch(request: Request, env: Record<string, unknown>, ctx?: unknown): Promise<Response> }}
@@ -1976,8 +2604,48 @@ export function createWorkerApp(options = {}) {
   const getNow = options.now ?? (() => Date.now());
   const creatorLimiter = new SlidingWindowLimiter();
   const ipLimiter = new SlidingWindowLimiter();
+  const globalLimiter = new SlidingWindowLimiter();
   /** @type {Map<string, number>} */
   const nonceCache = new Map();
+
+  /**
+   * Calls `RateLimiterDO` `/check` or `/consume` for an HMAC-blinded bucket name.
+   * @param {any} rateLimiterNs
+   * @param {Uint8Array} hmacKey
+   * @param {"ip" | "creator"} kind
+   * @param {string} rawKey
+   * @param {"check" | "consume"} action
+   * @param {Array<{ windowMs: number, limit: number, reason: string }>} windows
+   * @param {number} nowMs
+   * @returns {Promise<{ ok: true } | { ok: false, retryAfterSeconds: number, reason: string }>}
+   */
+  async function callRateLimiterDo(rateLimiterNs, hmacKey, kind, rawKey, action, windows, nowMs) {
+    const doName = await rateLimiterDoName(hmacKey, kind, rawKey);
+    const stub = rateLimiterNs.get(rateLimiterNs.idFromName(doName));
+    const resp = await stub.fetch(`https://rate-limiter.internal/${action}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ nowMs, windows }),
+    });
+    if (resp.ok) {
+      return { ok: true };
+    }
+    let payload = null;
+    try {
+      payload = await resp.json();
+    } catch {
+      payload = null;
+    }
+    return {
+      ok: false,
+      retryAfterSeconds:
+        payload && typeof payload.retryAfterSeconds === "number" ? payload.retryAfterSeconds : 60,
+      reason:
+        payload && typeof payload.reason === "string"
+          ? payload.reason
+          : "drop relay rate limit exceeded",
+    };
+  }
 
   return {
     /**
@@ -1991,7 +2659,7 @@ export function createWorkerApp(options = {}) {
       const cfg = resolveConfig(env ?? {});
       if (!cfg.mode) {
         return problemResponse(
-          errInternal("invalid DROP_AUTH_MODE (expected 'private' or 'open')")
+          errInternal("invalid DROP_AUTH_MODE (expected 'private', 'allowlist', or 'open')")
         );
       }
 
@@ -2108,7 +2776,7 @@ export function createWorkerApp(options = {}) {
 
         const authRes = await verifyHyphaeEd25519Request(request, {
           mode: cfg.mode,
-          allowedNodeKeys: env?.ALLOWED_NODE_KEYS,
+          allowedNodeKeys: resolveAllowedNodeKeysEnv(env),
           bodyBytes,
           nowMs,
           nonceCache,
@@ -2165,28 +2833,124 @@ export function createWorkerApp(options = {}) {
         }
         const burnAfterRead = Boolean(createReq.burnAfterRead);
 
-        // Enforce per-creator (pubkey in open mode, nodeId in private mode) & per-IP rate limits.
-        const creatorRateKey =
-          cfg.mode === "open" ? `pk:${authRes.pubKeyB64}` : `node:${authRes.nodeId}`;
-        const creatorQuota = creatorLimiter.check(creatorRateKey, cfg.createsPerHourPerNode, nowMs);
-        if (!creatorQuota.ok) {
+        // Enforce global burst guardrail, per-creator (pubkey in open mode, nodeId in private mode),
+        // and per-IP (1-minute burst + 1-hour sliding window) rate limits.
+        // Tight per-IP burst + hourly caps prevent single-IP key-rotation bypass in open mode.
+        const globalWindows = [
+          {
+            windowMs: CREATE_BURST_WINDOW_MS,
+            limit: cfg.createsPerMinuteGlobal,
+            reason: `global drop creation burst limit (${cfg.createsPerMinuteGlobal}/min) exceeded`,
+          },
+        ];
+        const globalQuota = globalLimiter.checkWindows("global", globalWindows, nowMs);
+        if (!globalQuota.ok) {
           return problemResponse(
-            errRateLimited(
-              `per-creator hourly drop creation limit (${cfg.createsPerHourPerNode}/hr) exceeded`,
-              creatorQuota.retryAfterSeconds
-            )
+            errRateLimited(globalQuota.reason, globalQuota.retryAfterSeconds)
           );
         }
 
+        const creatorRateKey =
+          cfg.mode === "open" ? `pk:${authRes.pubKeyB64}` : `node:${authRes.nodeId}`;
+        const creatorWindows = [
+          {
+            windowMs: CREATE_RATE_WINDOW_MS,
+            limit: cfg.createsPerHourPerNode,
+            reason: `per-creator hourly drop creation limit (${cfg.createsPerHourPerNode}/hr) exceeded`,
+          },
+        ];
+
         const clientIp = extractClientIp(request);
-        const ipQuota = ipLimiter.check(clientIp, cfg.createsPerHourPerIp, nowMs);
-        if (!ipQuota.ok) {
-          return problemResponse(
-            errRateLimited(
-              `per-IP hourly drop creation limit (${cfg.createsPerHourPerIp}/hr) exceeded`,
-              ipQuota.retryAfterSeconds
-            )
+        const ipWindows = [
+          {
+            windowMs: CREATE_BURST_WINDOW_MS,
+            limit: cfg.createsPerMinutePerIp,
+            reason: `per-IP burst drop creation limit (${cfg.createsPerMinutePerIp}/min) exceeded`,
+          },
+          {
+            windowMs: CREATE_RATE_WINDOW_MS,
+            limit: cfg.createsPerHourPerIp,
+            reason: `per-IP hourly drop creation limit (${cfg.createsPerHourPerIp}/hr) exceeded`,
+          },
+        ];
+
+        const rateLimiterNs = env?.RATE_LIMITER;
+        const useDurableLimiter = Boolean(
+          rateLimiterNs &&
+            typeof rateLimiterNs.idFromName === "function" &&
+            typeof rateLimiterNs.get === "function"
+        );
+
+        if (useDurableLimiter) {
+          // Non-mutating pre-checks first so a rejected creator never consumes IP quota (and vice versa).
+          const creatorCheck = await callRateLimiterDo(
+            rateLimiterNs,
+            hmacKey,
+            "creator",
+            creatorRateKey,
+            "check",
+            creatorWindows,
+            nowMs
           );
+          if (!creatorCheck.ok) {
+            return problemResponse(
+              errRateLimited(creatorCheck.reason, creatorCheck.retryAfterSeconds)
+            );
+          }
+
+          const ipCheck = await callRateLimiterDo(
+            rateLimiterNs,
+            hmacKey,
+            "ip",
+            clientIp,
+            "check",
+            ipWindows,
+            nowMs
+          );
+          if (!ipCheck.ok) {
+            return problemResponse(errRateLimited(ipCheck.reason, ipCheck.retryAfterSeconds));
+          }
+
+          // Atomic serialized consumption across PoPs in Durable Objects.
+          const ipConsume = await callRateLimiterDo(
+            rateLimiterNs,
+            hmacKey,
+            "ip",
+            clientIp,
+            "consume",
+            ipWindows,
+            nowMs
+          );
+          if (!ipConsume.ok) {
+            return problemResponse(errRateLimited(ipConsume.reason, ipConsume.retryAfterSeconds));
+          }
+
+          const creatorConsume = await callRateLimiterDo(
+            rateLimiterNs,
+            hmacKey,
+            "creator",
+            creatorRateKey,
+            "consume",
+            creatorWindows,
+            nowMs
+          );
+          if (!creatorConsume.ok) {
+            return problemResponse(
+              errRateLimited(creatorConsume.reason, creatorConsume.retryAfterSeconds)
+            );
+          }
+        } else {
+          const creatorQuota = creatorLimiter.checkWindows(creatorRateKey, creatorWindows, nowMs);
+          if (!creatorQuota.ok) {
+            return problemResponse(
+              errRateLimited(creatorQuota.reason, creatorQuota.retryAfterSeconds)
+            );
+          }
+
+          const ipQuota = ipLimiter.checkWindows(clientIp, ipWindows, nowMs);
+          if (!ipQuota.ok) {
+            return problemResponse(errRateLimited(ipQuota.reason, ipQuota.retryAfterSeconds));
+          }
         }
 
         const dropId = generateDropId();
@@ -2223,8 +2987,11 @@ export function createWorkerApp(options = {}) {
           return initResp;
         }
 
-        creatorLimiter.record(creatorRateKey, nowMs);
-        ipLimiter.record(clientIp, nowMs);
+        globalLimiter.record("global", nowMs, CREATE_BURST_WINDOW_MS);
+        if (!useDurableLimiter) {
+          creatorLimiter.record(creatorRateKey, nowMs, CREATE_RATE_WINDOW_MS);
+          ipLimiter.record(clientIp, nowMs, CREATE_RATE_WINDOW_MS);
+        }
 
         return jsonResponse(201, {
           dropId,
@@ -2288,7 +3055,7 @@ export function createWorkerApp(options = {}) {
         } else {
           const authRes = await verifyHyphaeEd25519Request(request, {
             mode: cfg.mode,
-            allowedNodeKeys: env?.ALLOWED_NODE_KEYS,
+            allowedNodeKeys: resolveAllowedNodeKeysEnv(env),
             bodyBytes: EMPTY_BYTES,
             nowMs,
             nonceCache,
@@ -2366,7 +3133,7 @@ export function createWorkerApp(options = {}) {
         if (!capHeader) {
           const authRes = await verifyHyphaeEd25519Request(request, {
             mode: cfg.mode,
-            allowedNodeKeys: env?.ALLOWED_NODE_KEYS,
+            allowedNodeKeys: resolveAllowedNodeKeysEnv(env),
             bodyBytes,
             nowMs,
             nonceCache,

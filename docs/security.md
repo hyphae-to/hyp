@@ -58,6 +58,7 @@ Implemented in `crates/hyp-node/src/gates/` and controlled strictly via the huma
    - Opt-in per `(peer | #channel | topic | bridge | trustTier)` across 6 adapters: `anthropic`, `openai-compat` (e.g. Ollama `http://127.0.0.1:11434/v1`), `google`, `lakera-guard`, `http-classifier` (Llama Prompt Guard 2 / DeBERTa), and JSON-RPC 2.0 `subprocess`.
    - **Isolation**: Zero tools, zero workspace context, zero conversation history, zero host secrets; compiled-in immutable core rubric; randomized 64-bit untrusted payload fences; bounded budget (`16,384` chars, `160` output tokens, `4,000 ms` timeout, `4` max concurrent -> `Hold("gate_busy")`).
    - **Fail-Closed Error Semantics**: `on_error` accepts **only** `quarantine` or `block` (enforced at the Rust type level — never fails open to `allow`). Low-confidence allows (`< 0.75`) downgrade to `quarantine`.
+   - **Privacy Notice (Remote Stage 2 Classifiers)**: When a remote Stage 2 classifier (`anthropic`, remote `openai-compat`, `google`, `lakera-guard`, or remote `http-classifier`) is enabled, **decrypted inbound untrusted plaintext** is sent over HTTPS to that configured classifier endpoint (non-loopback `http://` classifier URLs are rejected fail-closed). If inbound plaintext must never leave the local machine, use local Ollama via `openai-compat` at `http://127.0.0.1:11434/v1` or a local JSON-RPC 2.0 `subprocess` filter.
 4. **Tamper-Evident Policy Lock (`gate_policy_sig`) & Immutable Audit Trail**:
    - `hyp gate init --adapter <name> --secret <secret-name> --lock` (or `hyp gate lock`) computes a domain-separated HMAC-SHA256 (`"hyphae/v2/gate-policy-sig\n"`) over RFC 8785 JCS of the gate policy keyed from `SecretStore` (`gate-policy-hmac-key`). Unauthorized edits to `node.json` fail closed in `hyp doctor` and runtime startup.
    - Agents may stage an unsigned proposal via `hyp gate propose`, which writes `gate.proposed.json` without modifying live signed policy.
@@ -65,6 +66,14 @@ Implemented in `crates/hyp-node/src/gates/` and controlled strictly via the huma
 5. **Human-CLI-Only Quarantine Review (No MCP Self-Approval)**:
    - Quarantined items emit a strictly metadata-only notice (`hyphae quarantine · 1 item held (reason: ...) · review via hyp gate review`) — never leaking unscreened body text.
    - `hyp_inbox` refuses `state: "quarantined"` / `"rejected"` fail-closed. Only a human at the local CLI can run `hyp gate review`, `hyp gate log`, `hyp inbox approve <receipt>`, or `hyp inbox reject <receipt> [--mute]`.
+
+### Local Threat Model & Same-OS-User Boundary
+
+Interactive CLI commands (`hyp gate lock`, `hyp auth add`/`revoke`, `hyp inbox approve`/`reject`) enforce interactive TTY confirmation as **deliberate friction** against accidental or MCP-driven agent invocation — **not** as an OS-level security sandbox against a prompt-injected agent with arbitrary shell execution running as the **same OS user**:
+
+- Any process running under the same OS UID with unrestricted shell access shares access to the user's files, PTYs, and user-scoped secret backends unless isolated by the operating system.
+- **Cryptographic human-presence enforcement** — requiring hardware-backed Passkey (`human.auth.v1`) signatures over gate locks, authority mutations, and mobile quarantine approvals so even a compromised same-UID shell cannot forge human authorization — is tracked in GitHub issues **`#2`** and **`#10`**.
+- **For hard local isolation today**, run untrusted coding agents under a dedicated OS user, container, or VM without direct access to the host user's Hyphae state directory or OS Keychain.
 
 ---
 
@@ -91,11 +100,10 @@ Verified Human Drops provide a cryptographic out-of-band channel from an enrolle
 - **Verified Human Directives (`TrustTier::HumanVerified`) & Tamper-Evident Policy Binding**:
   - Cryptographically authenticated directives receive `TrustTier::HumanVerified`, bypassing Stage 2 untrusted-peer prompt-injection filters while still writing immutable `gate_audit` rows (`stage: "human_authority"`, `trust_tier: "human-verified"`).
   - When a gate policy is locked (`hyp gate lock`), `human_authorities_digest` (computed over `human_authorities` in `node.sqlite`) is bound into `gate_policy_sig`. Unauthorized SQLite tampering with enrolled human keys fails closed at runtime and in `hyp doctor`.
-- **RAM-Only Blind Drop Relay (`dropRelay`)**:
-  - Holds ciphertext exclusively in a bounded RAM-only zeroized buffer (`256 MiB` default, zero disk writes, zero plaintext).
-  - Stateless HMAC-SHA256 `hdcap1_` upload and claim capability tokens are verified **before** reading the HTTP request body.
-  - Allocating slots (`POST /v1/drops`) requires the explicit `drop:create` scope (never included in `guest-ro`).
-  - Target nodes catch up via burn-after-read SSE (`GET /v1/drops/{id}/stream` + `POST /v1/drops/{id}/ack`), and strict CORS + Chrome Private Network Access (PNA) headers protect direct LAN/Tailscale drops.
+- **Blind Drop Relay (`dropRelay`) — Public Open Relay vs. Private Self-Hosted Relay**:
+  - **Official public relay (`https://spore.hyphae.to`)**: Runs the Cloudflare Workers kit (`workers/drop-relay`) in rate-limited `DROP_AUTH_MODE = "open"` mode for zero-friction onboarding — requiring signed Ed25519 requests (`X-Hyphae-Public-Key`) with durable per-IP burst/hourly and per-pubkey quotas (`RateLimiterDO`), persisting **only** zero-knowledge `hdrop1_` ciphertext envelopes in ephemeral Durable Object storage so drops survive isolate eviction, and hard-wiping all stored ciphertext and metadata via a Durable Object alarm (`storage.deleteAll()`) within the hard `15 min` (`900s`) TTL (or immediately on burn-after-read close).
+  - **Private self-hosted relays**: Self-hosted Cloudflare Worker deployments default fail-closed to `DROP_AUTH_MODE = "private"` (alias `"allowlist"`), restricting `POST /v1/drops` strictly to pre-registered node public keys (`ALLOWED_NODE_KEYS` / `DROP_ALLOWED_KEYS`). The in-node Rust Blind Drop Relay (`hyp deploy init drop-relay` / `--enable-drop-relay`) holds ciphertext exclusively in a bounded RAM-only zeroized buffer (`256 MiB` default, zero disk writes) and enforces the explicit `drop:create` scope (never included in `guest-ro`).
+  - Both relay implementations verify stateless HMAC-SHA256 `hdcap1_` upload and claim capability tokens in constant time **before** reading the HTTP request body, deliver items via burn-after-read SSE catch-up (`GET /v1/drops/{id}/stream` + `POST /v1/drops/{id}/ack`), and enforce strict explicit CORS + Chrome Private Network Access (PNA) headers.
 
 ---
 

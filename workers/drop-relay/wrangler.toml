@@ -1,14 +1,17 @@
-# Hyphae v2 Blind Ephemeral Drop Relay — Cloudflare Workers + RAM-only Durable Object
+# Hyphae v2 Blind Ephemeral Drop Relay — Cloudflare Workers + Durable Objects
 #
 # Quick start:
 #   1. Generate a 32-byte HMAC secret:
 #        openssl rand -base64 32 | wrangler secret put DROP_CAP_HMAC_KEY
-#   2. Choose mode below:
-#      - Private / Team (default, fail-closed): keep DROP_AUTH_MODE = "private" and set:
-#          wrangler secret put ALLOWED_NODE_KEYS
-#      - Public relay (e.g. spore.hyphae.to): set DROP_AUTH_MODE = "open"
+#   2. Choose auth mode below:
+#      - Private / Enterprise allowlist (default, fail-closed):
+#        keep DROP_AUTH_MODE = "private" (or alias "allowlist") and set:
+#          wrangler secret put ALLOWED_NODE_KEYS   # (alias: DROP_ALLOWED_KEYS)
+#      - Public relay (e.g. https://spore.hyphae.to):
+#        uses DROP_AUTH_MODE = "open" under [env.production.vars] below.
 #   3. Deploy:
-#        wrangler deploy
+#        wrangler deploy                  # self-hosted private/allowlist relay
+#        wrangler deploy --env production # public spore.hyphae.to relay
 
 name = "hyphae-drop-relay"
 main = "src/index.mjs"
@@ -19,22 +22,38 @@ compatibility_date = "2025-01-01"
 #   { pattern = "spore.hyphae.to", custom_domain = true }
 # ]
 
-# RAM-only Durable Object (DropSlotDO NEVER calls ctx.storage; zero disk persistence).
+# Ephemeral ciphertext-only Durable Object: persists opaque hdrop1_ ciphertext
+# envelopes across isolate evictions and hard-wipes all storage via a Cloudflare
+# DO alarm (storage.deleteAll()) at expiresAtMs (hard max 15 min) or on burn-close.
 [[durable_objects.bindings]]
 name = "DROP_SLOT"
 class_name = "DropSlotDO"
 
+# Durable cross-PoP sliding-window rate limiter keyed by HMAC-blinded IP/pubkey
+# hashes (never persists raw client IPs or keys; alarm-wiped after window expiry).
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiterDO"
+
 [[migrations]]
 tag = "v1"
-# Works on BOTH Cloudflare Workers Free and Paid plans (DropSlotDO still NEVER reads
-# or writes ctx.storage — every ciphertext lives strictly in volatile isolate RAM).
+# SQLite-backed Durable Objects work on BOTH Cloudflare Workers Free and Paid plans.
 new_sqlite_classes = ["DropSlotDO"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["RateLimiterDO"]
 
 [vars]
 # Auth mode for POST /v1/drops slot creation:
-#   "private" — (default, fail-closed) only Ed25519 nodes listed in ALLOWED_NODE_KEYS secret.
-#   "open"    — public blind relay accepting any self-signed Ed25519 node (X-Hyphae-Public-Key)
-#               with per-IP + per-pubkey hourly rate limits.
+#   "private" / "allowlist" — (default, fail-closed for self-hosted/enterprise relays)
+#                             restricts POST /v1/drops strictly to allowlisted node
+#                             Ed25519 public keys in ALLOWED_NODE_KEYS / DROP_ALLOWED_KEYS.
+#   "open"                  — (intentional zero-friction public relay mode for spore.hyphae.to)
+#                             requires valid Ed25519 request signatures (X-Hyphae-Public-Key)
+#                             and strict durable per-IP burst/hourly + per-pubkey quotas;
+#                             any node can allocate a short-lived ciphertext-only slot
+#                             without pre-registration.
 DROP_AUTH_MODE = "private"
 # DROP_AUTH_MODE = "open"
 
@@ -51,14 +70,25 @@ DEFAULT_TTL_SECONDS = "600"
 MAX_ITEMS_PER_DROP = "16"
 MAX_SSE_STREAMS_PER_DROP = "2"
 
-# Sliding-window hourly slot-creation quotas (enforced per creator & per client IP).
+# Sliding-window slot-creation quotas (enforced durably via RateLimiterDO across PoPs
+# with in-isolate fallback):
+#   - Per-pubkey hourly cap prevents single-key abuse across IPs.
+#   - Per-IP hourly + 1-minute burst caps prevent key-rotation bypass from one IP.
 CREATES_PER_HOUR_PER_NODE = "10"
 CREATES_PER_HOUR_PER_IP = "20"
+CREATES_PER_MINUTE_PER_IP = "5"
+CREATES_PER_MINUTE_GLOBAL = "600"
 
 # Required Cloudflare Worker secrets (set via `wrangler secret put`, NEVER commit here):
-#   DROP_CAP_HMAC_KEY        (required, >= 32 bytes; signs stateless hdcap1_ tokens)
+#   DROP_CAP_HMAC_KEY        (required, >= 32 bytes; signs stateless hdcap1_ tokens & blinds RL keys)
 #   DROP_CAP_HMAC_KEY_PREV   (optional; previous key during zero-downtime key rotation)
-#   ALLOWED_NODE_KEYS        (required in "private" mode; JSON map or nodeId=b64url pairs)
+#   ALLOWED_NODE_KEYS        (required in "private"/"allowlist" mode; JSON map or nodeId=b64url pairs;
+#                             alias DROP_ALLOWED_KEYS is also accepted)
+#
+# Recommended Cloudflare WAF edge rate-limiting rules (defense-in-depth for public relays;
+# configure in Cloudflare Dashboard -> Security -> WAF -> Rate limiting rules):
+#   1. POST /v1/drops:    20 requests / 10 minutes per IP (action: Block / 429)
+#   2. POST /v1/drops/*:  60 requests / 1 minute per IP   (action: Block / 429)
 
 # Production public Drop Relay environment (`wrangler deploy --env production`)
 # Used by `.github/workflows/deploy-drop-relay.yml` for https://spore.hyphae.to.
@@ -74,7 +104,14 @@ routes = [
 name = "DROP_SLOT"
 class_name = "DropSlotDO"
 
+[[env.production.durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiterDO"
+
 [env.production.vars]
+# Intentional zero-friction public relay mode for https://spore.hyphae.to:
+# requires Ed25519 signatures + durable per-IP burst/hourly & per-pubkey quotas;
+# stores only short-lived ciphertext-only envelopes wiped by DO alarm within 15 min.
 DROP_AUTH_MODE = "open"
 ALLOWED_ORIGINS = "https://hyphae.to"
 ALLOW_PRIVATE_NETWORK = "true"
@@ -85,3 +122,5 @@ MAX_ITEMS_PER_DROP = "16"
 MAX_SSE_STREAMS_PER_DROP = "2"
 CREATES_PER_HOUR_PER_NODE = "10"
 CREATES_PER_HOUR_PER_IP = "20"
+CREATES_PER_MINUTE_PER_IP = "5"
+CREATES_PER_MINUTE_GLOBAL = "120"

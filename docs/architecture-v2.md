@@ -1,6 +1,6 @@
 # Hyphae v2 Architecture: Unified Rust Node, Standards-First Wire Layer, P2P Federation, Capability Negotiation, Permissioned Pairing & Local Security Gates
 
-> **Design North Star:** Collapse the legacy asymmetric *Connector vs. Router* split into **one composable `Node` primitive** implemented as a **single static Rust binary (`hyp`, ~8 MiB compressed download)** speaking **open, battle-tested standards** (CloudEvents v1.0, RFC 9180 HPKE, RFC 8785 JCS, RFC 9457 Problem Details, POSIX `tar+gzip`, JSON-RPC 2.0) — delivering **~2.7 ms hook cold starts**, **~2.8 MB idle MCP RSS**, **memory-zeroized E2EE**, **direct laptop-to-laptop P2P**, **demand-driven public streams (such as `public.hyphae.to` or self-hosted public nodes)**, **pluggable local Security Gates**, and **100% wire & fd-3 plugin compatibility** across all 9 agent harnesses.
+> **Design North Star:** Collapse the legacy asymmetric *Connector vs. Router* split into **one composable `Node` primitive** implemented as a **single static Rust binary (`hyp`, ~8 MiB compressed download)** speaking **open, battle-tested standards** (CloudEvents v1.0, RFC 9180 HPKE, RFC 8785 JCS, RFC 9457 Problem Details, POSIX `tar+gzip`, JSON-RPC 2.0) — delivering **~2.7 ms hook cold starts**, **~2.8 MB idle MCP RSS**, **memory-zeroized E2EE**, **direct laptop-to-laptop P2P**, **demand-driven public streams (such as `public.hyphae.to` or self-hosted public nodes)**, **pluggable local Security Gates**, and **100% wire compatibility** across all 9 agent harnesses (plus Unix fd-3 external bridge plugins on macOS, Linux, and WSL).
 
 ---
 
@@ -13,7 +13,7 @@ flowchart LR
     subgraph AdaptersIn["Local Adapters"]
       Harnesses["Harness Adapters (9 harnesses via connector.sock / connector.addr + ~2.7ms hooks + wait/watch)"]
       Sources["Event Source Adapters (localIngest ingest.sock / hyp emit, github-public, github-webhook, prometheus-webhook, webhook-stream, fd-3)"]
-      Bridges["Optional External Chat Bridges (plugins/slack, telegram, whatsapp via JSON-RPC 2.0 / fd-3 v1)"]
+      Bridges["Optional External Chat Bridges (plugins/slack, telegram, whatsapp via JSON-RPC 2.0 / fd-3 v1 on macOS/Linux/WSL)"]
     end
 
     subgraph NodeCore["Unified Rust NodeCore + Single node.sqlite (WAL)"]
@@ -91,7 +91,7 @@ Every `Node` bundles four cleanly separated layers:
 | --- | --- | --- |
 | **(a) Harness Adapters** (`crates/hyp-harness`, `crates/hyp-cli/src/skill_render.rs`) | Unix socket server (`connector.sock`, `0600`) / Windows loopback TCP (`connector.addr`), `CallRegistry` hooks (`PreToolUse`/`PostToolUse`/`PreInvocation`/`Stop`), Claude native channel, `hyp wait`/`hyp watch`, Codex rollout/queue, T3 Code (`statev2.sqlite`), Herdr (`hc`), Cursor, OpenCode, Gemini CLI, OpenClaw; orchestrator-aware tailored `hyphae/SKILL.md` rendering (`hyp setup --refresh-skills` / `--force-skills`) + dynamic backend-aware MCP `initialize.instructions`. | Calls `UnifiedNode` in-process with zero loopback HTTP overhead, ~2.7 ms hook latency, and zero duplicate messaging/scheduling instructions on OpenClaw or Antigravity. |
 | **(b) Compiled-In Event Source Adapters & Local Ingest** (`crates/hyp-node/src/adapters/`, `engine/local_ingest.rs`) | Pure-Rust in-process `github-public`, `github-webhook`, `prometheus-webhook`, `webhook-stream`, plus the default-enabled socket-only Local Ingest Route (`localIngest` on `0600` `ingest.sock` / Windows `ingest.addr`, `hyp emit` -> `local.schedule` / `local.<topic>`) calling `host.publish_event()` directly + demand-driven `on_subscriptions_changed()` / `validate_subscription()` hooks. | Zero Node/Python runtime and zero extra MCP tools needed for core streams or OS-scheduled triggers (`systemd-run`, `crontab`, `launchd`, `schtasks`); no extra loopback webhook hop. |
-| **(c) Optional External Bridges & Custom Sources** (`plugins/` + `SubprocessSupervisor`) | Optional external scripts (`plugins/slack`, `plugins/telegram`, `plugins/whatsapp`, `plugins/webhook`, `plugins/prometheus`, or custom binaries) supervised over duplex Unix fd 3 (JSON-RPC 2.0 v2 + auto-detected legacy fd-3 v1). | One bounded 64 KiB supervisor with scrubbed `ALLOWED_PARENT_ENV`, `bridge_links`, live `handoff`, and outbound `hyp_send({ to: "<plugin>:<target>" })`. |
+| **(c) Optional External Bridges & Custom Sources** (`plugins/` + `SubprocessSupervisor`) | Optional external scripts (`plugins/slack`, `plugins/telegram`, `plugins/whatsapp`, `plugins/webhook`, `plugins/prometheus`, or custom binaries) supervised over duplex Unix fd 3 (JSON-RPC 2.0 v2 + auto-detected legacy fd-3 v1). **Platform scope:** currently supported on **macOS, Linux, and WSL** (core `hyp`, MCP, hooks, `schtasks` background service, and loopback-TCP IPC/local-ingest work natively on Windows; native Windows external bridge supervision is tracked separately). | One bounded 64 KiB supervisor with scrubbed `ALLOWED_PARENT_ENV`, `bridge_links`, live `handoff`, and outbound `hyp_send({ to: "<plugin>:<target>" })`. |
 | **(d) Peer Node Links** (`PeerLink` in `crates/hyp-node/src/engine/peer_link.rs`) | Bidirectional `hyper 1` HTTPS + WHATWG SSE link to any remote Hyphae `Node`. | Eliminates `"primary"` hegemony: Team Hubs, public read-only nodes, and Direct P2P laptops are all symmetric `PeerLink`s. |
 
 ### 1.3 Specializations Are Pure Configuration Profiles
@@ -237,7 +237,7 @@ Every v2 `Node` serves a signed **Node Capability Manifest** (`crates/hyp-proto/
 | `keys.prekey.v1` / `directory.checkpoint.v1` | Rotating prekeys / signed anti-rollback directory checkpoints |
 | `node.self-update.v1` | Signed remote fleet update orchestration (`hyp update --all`, requires `node:update` scope) |
 | `human.auth.v1` (`HumanAuthV1`) | Tier 1 Ed25519 + companion X25519 (`enc_jwk_json`, schema v5) Verified Human Drops (`hdrop1_`, `hcert1_`, HPKE `human.draft.v1` `encDraft` directive prefills, `TrustTier::HumanVerified`, zero-knowledge `SecretStore` drops, and `hyphaesig` signed local ingest events) |
-| `drop.relay.v1` (`DropRelayV1`) | RAM-only zeroized ciphertext Blind Drop Relay (`POST /v1/drops`, stateless `hdcap1_` caps, burn-after-read SSE catch-up) |
+| `drop.relay.v1` (`DropRelayV1`) | Ephemeral ciphertext-only Blind Drop Relay (`POST /v1/drops`, stateless `hdcap1_` caps, burn-after-read SSE catch-up; RAM-only in-node Rust relay or alarm-wiped DO storage on Cloudflare Workers) |
 
 ### 3.2 Capability Negotiation & Fail-Closed Skew Diagnostics
 
@@ -325,7 +325,7 @@ flowchart LR
 
 **Non-negotiable invariants:**
 1. **Strictly post-decrypt (inbound) and pre-encrypt (outbound).**
-2. **No MCP self-approval:** Approving/rejecting quarantined items (`hyp inbox approve`, `hyp inbox reject --mute`) and locking gate policy (`hyp gate lock`) are **strictly human local CLI operations** — there is zero MCP surface for quarantine approval.
+2. **No MCP self-approval:** Approving/rejecting quarantined items (`hyp inbox approve`, `hyp inbox reject --mute`) and locking gate policy (`hyp gate lock`) are **strictly human local CLI operations** — there is zero MCP surface for quarantine approval. *(See [Security Model & Hardening Guide — Local Threat Model & Same-OS-User Boundary](security.md#local-threat-model--same-os-user-boundary) regarding interactive CLI confirmation vs. same-OS-user shell isolation and Passkey-enforced approval tracking in `#2`/`#10`.)*
 
 ### 5.2 Stage 1 (Deterministic) & Stage 2 (Pluggable `FilterPlugin` Chain)
 
@@ -349,7 +349,7 @@ flowchart LR
 | **Canonical Signing & Key Identity** | **RFC 8785 JCS** + **RFC 8032 Ed25519** + **RFC 7517/8037 OKP JWK** + **RFC 7638 Thumbprint** | `crates/hyp-proto`, `crates/hyp-crypto` (`ring`, `sha2`) | Deterministic cross-language signing, standard JWK `kid` thumbprints, domain separation (`"hyphae/v2/<kind>\n"`), no `alg:none` pitfalls. |
 | **File Transfer Container** | **POSIX `tar` (USTAR/PAX)** + **RFC 1952 `gzip`** + **OCI `sha256:<hex>`** + 64 KiB chunked AEAD | `crates/hyp-crypto/src/transfer.rs` (`flate2`, `ring`, `sha2`) | Single-pass `O(64 KiB)` constant-RAM streaming with fail-closed symlink/traversal/256 MiB decompression-bomb enforcement. |
 | **HTTP Errors, Caching & Transport** | **RFC 9457 Problem Details**, **RFC 9110** (`ETag`/`If-None-Match`/`If-Match`/`Retry-After`), **WHATWG SSE**, **SemVer 2.0** | `crates/hyp-node` (`hyper 1`, `hyper-util`, `hyper-rustls`, `rustls`, `http`, `tower`, `semver`) | Machine-actionable errors, zero-quota `304` polling, atomic KV CAS headers, zero proxy friction over Tailscale/Caddy/Cloudflare/Fly. |
-| **Plugin Subprocess IPC** | **JSON-RPC 2.0 over NDJSON** (duplex Unix fd 3, auto-detected legacy v1 fallback) | `crates/hyp-proto/src/rpc.rs`, `crates/hyp-node/src/adapters/supervisor.rs` | Matches MCP & LSP framing while preserving compatibility with `plugins/sdk/client.{mjs,py}` and all scripts in `plugins/`. |
+| **Plugin Subprocess IPC** | **JSON-RPC 2.0 over NDJSON** (duplex Unix fd 3 on macOS/Linux/WSL, auto-detected legacy v1 fallback; native Windows bridge supervision tracked separately) | `crates/hyp-proto/src/rpc.rs`, `crates/hyp-node/src/adapters/supervisor.rs` | Matches MCP & LSP framing while preserving compatibility with `plugins/sdk/client.{mjs,py}` and all scripts in `plugins/`. |
 | **Permissions & Discovery** | **RFC 6749**-style scope tokens + Signed Manifest (+ opt-in **A2A** `/.well-known/agent.json` projection) | `crates/hyp-proto/src/{scopes,manifest}.rs`, `crates/hyp-node/src/engine/server.rs` | Maps cleanly to enterprise OIDC/Okta policies without forcing cloud auth onto local P2P nodes. |
 
 ---
