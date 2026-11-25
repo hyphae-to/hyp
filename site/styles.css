@@ -4981,9 +4981,20 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
   position: relative;
   z-index: 2;
   display: grid;
-  grid-template-columns: minmax(0, 1.08fr) 68px minmax(208px, 0.78fr) 68px minmax(0, 1.08fr);
-  gap: 0;
+  grid-template-columns: minmax(0, 1.06fr) minmax(220px, 0.84fr) minmax(0, 1.06fr);
+  column-gap: clamp(54px, 6.2vw, 84px);
   align-items: stretch;
+}
+
+/* Full-canvas DOM-measured Bezier wire layer */
+.sb-wire-layer {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 1;
+  pointer-events: none;
+  overflow: visible;
 }
 
 .sb-col {
@@ -5187,30 +5198,7 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
 .sb-tag.moss { background: rgba(127, 201, 123, 0.15); border-color: rgba(127, 201, 123, 0.42); color: #9ae096; }
 .sb-tag.amber { background: rgba(232, 163, 49, 0.16); border-color: rgba(232, 163, 49, 0.45); color: #ffd37d; }
 
-/* Braided Mycelial SVG Signal Bridges — overlap cleanly into center Hyphae Node rim */
-.sb-wire {
-  position: relative;
-  z-index: 1;
-  pointer-events: none;
-}
-
-.sb-wire-in {
-  width: calc(100% + 72px);
-  margin: 0 -66px 0 -6px;
-}
-
-.sb-wire-out {
-  width: calc(100% + 72px);
-  margin: 0 -6px 0 -66px;
-}
-
-.sb-wire svg {
-  width: 100%;
-  height: 100%;
-  display: block;
-  overflow: visible;
-}
-
+/* Braided Mycelial SVG Signal Paths */
 .sb-weave {
   stroke: rgba(183, 217, 86, 0.16);
   stroke-width: 0.9;
@@ -6468,7 +6456,7 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
   .uc-stage { min-height: 0; }
   .sec-gallery { grid-template-columns: minmax(0, 1fr); }
   .sb-grid { grid-template-columns: minmax(0, 1fr); gap: 14px; }
-  .sb-wire { display: none; }
+  .sb-wire-layer { display: none; }
   .sb-col-head.center { text-align: left; }
 }
 

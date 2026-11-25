@@ -18,7 +18,7 @@
   <meta name="twitter:title" content="Hyphae (hyp) — One wire under every agent" />
   <meta name="twitter:description" content="A standardized real-time event and messaging bus for coding agents. Unify CI/GitHub events, alerts, cron triggers, Passkey secrets, and cross-machine team messages over one encrypted wire with per-agent exposure control." />
   <meta name="twitter:image" content="https://hyphae.to/assets/social-card.jpg" />
-  <link rel="stylesheet" href="./styles.css?v=22" />
+  <link rel="stylesheet" href="./styles.css?v=23" />
 </head>
 <body>
   <header id="siteHeader" class="header-dark">
@@ -94,14 +94,44 @@
           </div>
         </div>
 
-        <!-- HERO VISUAL: Living Mycelial Signal Bus (Unified visual language with #streams, zero control duplication) -->
-        <div class="signal-bus-stage" id="signalBusStage" aria-label="Interactive architecture diagram: standardized real-time signals routed through Hyphae Wire to agents across machines">
-          <div class="sb-stage-canvas">
+        <!-- HERO VISUAL: Living Mycelial Signal Bus (DOM-locked wires, unified with #streams) -->
+        <div class="signal-bus-stage" id="signalBusStage" aria-label="Interactive architecture diagram: standardized real-time signals routed through Hyphae Node to agents across machines">
+          <div class="sb-stage-canvas" id="sbStageCanvas">
             <svg class="sb-soil-web" viewBox="0 0 1120 340" fill="none" preserveAspectRatio="none" aria-hidden="true">
               <path d="M 18 28 C 190 54, 340 24, 490 88 C 530 105, 550 132, 560 156" />
               <path d="M 560 156 C 680 96, 810 42, 950 56 C 1030 64, 1080 38, 1110 22" />
               <path d="M 30 318 C 190 296, 320 310, 448 258" />
               <path d="M 672 260 C 804 306, 948 312, 1106 322" />
+            </svg>
+
+            <!-- Full-canvas DOM-measured Bezier wire overlay (pixel-locked to cards & brass Hyphae Node rim) -->
+            <svg class="sb-wire-layer" id="sbWireSvg" fill="none" aria-hidden="true">
+              <defs>
+                <filter id="heroWireGlow" x="-30%" y="-30%" width="160%" height="160%">
+                  <feGaussianBlur stdDeviation="2.2" result="b" />
+                  <feMerge>
+                    <feMergeNode in="b" />
+                    <feMergeNode in="SourceGraphic" />
+                  </feMerge>
+                </filter>
+              </defs>
+              <g id="sbWireWeaves"></g>
+              <g id="sbWireBg"></g>
+              <path class="sb-path-live coral is-lit" id="sbIn0" filter="url(#heroWireGlow)" />
+              <path class="sb-path-live olive" id="sbIn1" filter="url(#heroWireGlow)" />
+              <path class="sb-path-live moss" id="sbIn2" filter="url(#heroWireGlow)" />
+              <path class="sb-path-live amber" id="sbIn3" filter="url(#heroWireGlow)" />
+              <path class="sb-pulse coral is-lit" id="sbInPulse0" pathLength="100" />
+              <path class="sb-pulse olive" id="sbInPulse1" pathLength="100" />
+              <path class="sb-pulse moss" id="sbInPulse2" pathLength="100" />
+              <path class="sb-pulse amber" id="sbInPulse3" pathLength="100" />
+
+              <path class="sb-path-live coral is-lit" id="sbOut0" filter="url(#heroWireGlow)" />
+              <path class="sb-path-live" id="sbOut1" filter="url(#heroWireGlow)" />
+              <path class="sb-path-live amber is-soft" id="sbOut2" filter="url(#heroWireGlow)" />
+              <path class="sb-pulse coral is-lit" id="sbOutPulse0" pathLength="100" />
+              <path class="sb-pulse" id="sbOutPulse1" pathLength="100" />
+              <path class="sb-pulse amber is-soft" id="sbOutPulse2" pathLength="100" />
             </svg>
 
             <div class="sb-grid">
@@ -155,47 +185,13 @@
                 </div>
               </div>
 
-              <!-- LEFT BRAIDED MYCELIAL WIRE BRIDGE (terminates cleanly into brass Hyphae Node rim) -->
-              <div class="sb-wire sb-wire-in" aria-hidden="true">
-                <svg viewBox="0 0 132 310" fill="none" preserveAspectRatio="none">
-                  <defs>
-                    <filter id="heroWireGlow" x="-30%" y="-30%" width="160%" height="160%">
-                      <feGaussianBlur stdDeviation="2.2" result="b" />
-                      <feMerge>
-                        <feMergeNode in="b" />
-                        <feMergeNode in="SourceGraphic" />
-                      </feMerge>
-                    </filter>
-                  </defs>
-                  <path class="sb-weave" vector-effect="non-scaling-stroke" d="M 0 60 C 44 54, 78 104, 132 108" />
-                  <path class="sb-weave" vector-effect="non-scaling-stroke" d="M 0 132 C 46 136, 80 118, 132 114" />
-                  <path class="sb-weave" vector-effect="non-scaling-stroke" d="M 0 206 C 48 196, 82 132, 132 120" />
-                  <path class="sb-weave" vector-effect="non-scaling-stroke" d="M 0 274 C 50 274, 84 146, 132 126" />
-
-                  <path class="sb-path-bg" vector-effect="non-scaling-stroke" d="M 0 64 C 46 64, 78 108, 132 110" />
-                  <path class="sb-path-bg" vector-effect="non-scaling-stroke" d="M 0 130 C 46 130, 80 116, 132 115" />
-                  <path class="sb-path-bg" vector-effect="non-scaling-stroke" d="M 0 198 C 48 198, 82 128, 132 120" />
-                  <path class="sb-path-bg" vector-effect="non-scaling-stroke" d="M 0 264 C 50 264, 84 140, 132 125" />
-
-                  <path class="sb-path-live coral is-lit" id="sbIn0" filter="url(#heroWireGlow)" vector-effect="non-scaling-stroke" d="M 0 64 C 46 64, 78 108, 132 110" />
-                  <path class="sb-path-live olive" id="sbIn1" filter="url(#heroWireGlow)" vector-effect="non-scaling-stroke" d="M 0 130 C 46 130, 80 116, 132 115" />
-                  <path class="sb-path-live moss" id="sbIn2" filter="url(#heroWireGlow)" vector-effect="non-scaling-stroke" d="M 0 198 C 48 198, 82 128, 132 120" />
-                  <path class="sb-path-live amber" id="sbIn3" filter="url(#heroWireGlow)" vector-effect="non-scaling-stroke" d="M 0 264 C 50 264, 84 140, 132 125" />
-
-                  <path class="sb-pulse coral is-lit" id="sbInPulse0" pathLength="100" vector-effect="non-scaling-stroke" d="M 0 64 C 46 64, 78 108, 132 110" />
-                  <path class="sb-pulse olive" id="sbInPulse1" pathLength="100" vector-effect="non-scaling-stroke" d="M 0 130 C 46 130, 80 116, 132 115" />
-                  <path class="sb-pulse moss" id="sbInPulse2" pathLength="100" vector-effect="non-scaling-stroke" d="M 0 198 C 48 198, 82 128, 132 120" />
-                  <path class="sb-pulse amber" id="sbInPulse3" pathLength="100" vector-effect="non-scaling-stroke" d="M 0 264 C 50 264, 84 140, 132 125" />
-                </svg>
-              </div>
-
-              <!-- CENTER COLUMN: Floating Brass Hyphae Node (consistent vocabulary with rest of site) -->
+              <!-- CENTER COLUMN: Floating Brass Hyphae Node -->
               <div class="sb-col sb-center">
                 <div class="sb-col-head center">
                   <span class="sb-col-kicker">Hyphae Node · Signal Bus</span>
                 </div>
                 <div class="sb-hub-medallion tone-coral" id="sbCore">
-                  <div class="sb-hub-visual">
+                  <div class="sb-hub-visual" id="sbHubVisual">
                     <div class="sb-valve-ring tone-coral" id="sbValveRing" aria-hidden="true"></div>
                     <img class="sb-hub-img" src="./assets/node-hub.webp?v=1" alt="Hyphae Node brass oscilloscope hub" />
                   </div>
@@ -205,27 +201,6 @@
                     github.ci → claude@laptop
                   </div>
                 </div>
-              </div>
-
-              <!-- RIGHT BRAIDED MYCELIAL WIRE BRIDGE (starts cleanly inside brass Hyphae Node rim) -->
-              <div class="sb-wire sb-wire-out" aria-hidden="true">
-                <svg viewBox="0 0 132 310" fill="none" preserveAspectRatio="none">
-                  <path class="sb-weave" vector-effect="non-scaling-stroke" d="M 0 108 C 52 104, 86 68, 132 74" />
-                  <path class="sb-weave" vector-effect="non-scaling-stroke" d="M 0 116 C 52 122, 86 168, 132 166" />
-                  <path class="sb-weave" vector-effect="non-scaling-stroke" d="M 0 124 C 54 140, 86 258, 132 254" />
-
-                  <path class="sb-path-bg" vector-effect="non-scaling-stroke" d="M 0 110 C 52 108, 86 78, 132 78" />
-                  <path class="sb-path-bg" vector-effect="non-scaling-stroke" d="M 0 117 C 52 120, 86 166, 132 166" />
-                  <path class="sb-path-bg" vector-effect="non-scaling-stroke" d="M 0 124 C 54 138, 86 254, 132 254" />
-
-                  <path class="sb-path-live coral is-lit" id="sbOut0" filter="url(#heroWireGlow)" vector-effect="non-scaling-stroke" d="M 0 110 C 52 108, 86 78, 132 78" />
-                  <path class="sb-path-live" id="sbOut1" filter="url(#heroWireGlow)" vector-effect="non-scaling-stroke" d="M 0 117 C 52 120, 86 166, 132 166" />
-                  <path class="sb-path-live amber is-soft" id="sbOut2" filter="url(#heroWireGlow)" vector-effect="non-scaling-stroke" d="M 0 124 C 54 138, 86 254, 132 254" />
-
-                  <path class="sb-pulse coral is-lit" id="sbOutPulse0" pathLength="100" vector-effect="non-scaling-stroke" d="M 0 110 C 52 108, 86 78, 132 78" />
-                  <path class="sb-pulse" id="sbOutPulse1" pathLength="100" vector-effect="non-scaling-stroke" d="M 0 117 C 52 120, 86 166, 132 166" />
-                  <path class="sb-pulse amber is-soft" id="sbOutPulse2" pathLength="100" vector-effect="non-scaling-stroke" d="M 0 124 C 54 138, 86 254, 132 254" />
-                </svg>
               </div>
 
               <!-- RIGHT COLUMN: Any Agent, Any Machine -->
@@ -1709,6 +1684,6 @@ curl -fsSL https://hyphae.to/install.sh | sh</pre>
     <p class="cmp-pop-body" id="cmpPopBody"></p>
   </div>
 
-  <script type="module" src="./app.js?v=23"></script>
+  <script type="module" src="./app.js?v=24"></script>
 </body>
 </html>

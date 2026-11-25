@@ -72,6 +72,11 @@ renderHeroInstall();
   const outPulses = [0, 1, 2].map((i) => document.getElementById(`sbOutPulse${i}`));
 
   const core = document.getElementById("sbCore");
+  const canvasEl = document.getElementById("sbStageCanvas");
+  const wireSvg = document.getElementById("sbWireSvg");
+  const wireWeaves = document.getElementById("sbWireWeaves");
+  const wireBg = document.getElementById("sbWireBg");
+  const hubVisual = document.getElementById("sbHubVisual");
   const valveRing = document.getElementById("sbValveRing");
   const ruleEl = document.getElementById("sbRouteRule");
   const captionEl = document.getElementById("sbCaption");
@@ -84,6 +89,79 @@ renderHeroInstall();
     state: document.getElementById(`sbAgentState${i}`),
     msg: document.getElementById(`sbAgentMsg${i}`),
   }));
+
+  function layoutHeroWires() {
+    if (!canvasEl || !wireSvg || !hubVisual) return;
+    const cRect = canvasEl.getBoundingClientRect();
+    if (cRect.width < 100 || window.innerWidth <= 1040) return;
+
+    const w = Math.round(cRect.width);
+    const h = Math.round(cRect.height);
+    wireSvg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+
+    const hRect = hubVisual.getBoundingClientRect();
+    const hubCx = hRect.left + hRect.width / 2 - cRect.left;
+    const hubCy = hRect.top + hRect.height / 2 - cRect.top;
+    const r = Math.max(40, hRect.width / 2 - 4);
+
+    const NS = "http://www.w3.org/2000/svg";
+    if (wireWeaves) wireWeaves.innerHTML = "";
+    if (wireBg) wireBg.innerHTML = "";
+
+    const addPath = (parent, cls, d) => {
+      if (!parent) return;
+      const p = document.createElementNS(NS, "path");
+      p.setAttribute("class", cls);
+      p.setAttribute("d", d);
+      parent.appendChild(p);
+    };
+
+    // Left sources -> brass Hyphae Node rim (tucked 6px inside glowing circle so wires never float)
+    const inSpread = [-18, -6, 6, 18];
+    sources.forEach((el, i) => {
+      if (!el) return;
+      const sr = el.getBoundingClientRect();
+      const x1 = sr.right - cRect.left - 2;
+      const y1 = sr.top + sr.height / 2 - cRect.top;
+      const dy = inSpread[i] || 0;
+      const dxRim = Math.sqrt(Math.max(1, r * r - dy * dy));
+      const x2 = hubCx - dxRim + 6;
+      const y2 = hubCy + dy;
+      const span = Math.max(30, x2 - x1);
+      const d = `M ${x1.toFixed(1)} ${y1.toFixed(1)} C ${(x1 + span * 0.44).toFixed(1)} ${y1.toFixed(1)}, ${(x2 - span * 0.42).toFixed(1)} ${y2.toFixed(1)}, ${x2.toFixed(1)} ${y2.toFixed(1)}`;
+      const dw = `M ${x1.toFixed(1)} ${(y1 - 4).toFixed(1)} C ${(x1 + span * 0.36).toFixed(1)} ${(y1 - 10).toFixed(1)}, ${(x2 - span * 0.36).toFixed(1)} ${(y2 + 6).toFixed(1)}, ${x2.toFixed(1)} ${(y2 - 2).toFixed(1)}`;
+      addPath(wireWeaves, "sb-weave", dw);
+      addPath(wireBg, "sb-path-bg", d);
+      if (inLines[i]) inLines[i].setAttribute("d", d);
+      if (inPulses[i]) inPulses[i].setAttribute("d", d);
+    });
+
+    // Brass Hyphae Node rim -> right agent cards
+    const outSpread = [-14, 0, 14];
+    agents.forEach((a, i) => {
+      if (!a.card) return;
+      const ar = a.card.getBoundingClientRect();
+      const dy = outSpread[i] || 0;
+      const dxRim = Math.sqrt(Math.max(1, r * r - dy * dy));
+      const x1 = hubCx + dxRim - 6;
+      const y1 = hubCy + dy;
+      const x2 = ar.left - cRect.left + 2;
+      const y2 = ar.top + ar.height / 2 - cRect.top;
+      const span = Math.max(30, x2 - x1);
+      const d = `M ${x1.toFixed(1)} ${y1.toFixed(1)} C ${(x1 + span * 0.42).toFixed(1)} ${y1.toFixed(1)}, ${(x2 - span * 0.44).toFixed(1)} ${y2.toFixed(1)}, ${x2.toFixed(1)} ${y2.toFixed(1)}`;
+      const dw = `M ${x1.toFixed(1)} ${(y1 + 2).toFixed(1)} C ${(x1 + span * 0.36).toFixed(1)} ${(y1 - 6).toFixed(1)}, ${(x2 - span * 0.38).toFixed(1)} ${(y2 + 9).toFixed(1)}, ${x2.toFixed(1)} ${(y2 + 3).toFixed(1)}`;
+      addPath(wireWeaves, "sb-weave", dw);
+      addPath(wireBg, "sb-path-bg", d);
+      if (outLines[i]) outLines[i].setAttribute("d", d);
+      if (outPulses[i]) outPulses[i].setAttribute("d", d);
+    });
+  }
+
+  if (typeof ResizeObserver !== "undefined" && canvasEl) {
+    new ResizeObserver(() => requestAnimationFrame(layoutHeroWires)).observe(canvasEl);
+  }
+  window.addEventListener("resize", () => requestAnimationFrame(layoutHeroWires), { passive: true });
+  document.fonts?.ready?.then(() => requestAnimationFrame(layoutHeroWires));
 
   const BEATS = [
     {
@@ -280,6 +358,8 @@ renderHeroInstall();
       btn.classList.toggle("active", i === idx);
       btn.classList.toggle("passed", i < idx);
     });
+
+    requestAnimationFrame(layoutHeroWires);
   }
 
   function schedule() {
@@ -314,6 +394,8 @@ renderHeroInstall();
     });
   }
 
+  layoutHeroWires();
+  requestAnimationFrame(layoutHeroWires);
   renderBeat(beatIdx);
   schedule();
 })();
