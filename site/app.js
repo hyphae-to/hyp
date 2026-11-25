@@ -2356,23 +2356,10 @@ document.querySelectorAll("[data-copy-topo]").forEach((btn) => {
 // 5. QUICK START TABS
 // ============================================================================
 const QS = {
-  unix: `# Install ~6 MiB verified Rust binary
-curl -fsSL https://hyphae.to/install.sh | sh
-
-# Wire harnesses, Team Hub / P2P & guards
-hyp onboard
-
-# Hub deploy kits & fleet-wide updates
-hyp deploy providers
-hyp update --all  # --nightly for main`,
-  win: `# Install ~6 MiB Rust binary (PowerShell)
-irm https://hyphae.to/install.ps1 | iex
-
-# Wire harnesses, Keychain & guard plugins
-hyp onboard
-
-# Join any public node or your Team Hub
-hyp pair join public.hyphae.to`,
+  unix: `# Install ~8 MiB verified Rust binary & launch onboarding
+curl -fsSL https://hyphae.to/install.sh | sh`,
+  win: `# Install ~8 MiB verified Rust binary & launch onboarding (PowerShell)
+irm https://hyphae.to/install.ps1 | iex`,
   deploy: `# Generate a Hub kit (tailscale/docker/fly)
 hyp deploy init tailscale
 
@@ -2382,20 +2369,12 @@ hyp pair inspect <<< "$TOKEN"
 
 # Enable a prompt-injection guard
 hyp gate init --adapter anthropic`,
-  assist: `# Let your coding agent handle full setup
-hyp onboard --assist
-
-# Capture tokens safely (zero LLM context)
-hyp secret set slack-bot-token --web
-
-# Lock guard policy & update every node
-hyp gate lock
-hyp update --all`,
   drops: `# Pair phone Passkey & send an HPKE-encrypted directive draft
 hyp auth init --web
+hyp relay set https://spore.hyphae.to
 hyp drop create --kind directive --draft "Approve canary rollout"
 
-# Host a 256 MiB RAM-only Drop Relay in 60s
+# Or self-host your own 256 MiB RAM-only Drop Relay in 60s
 hyp deploy init drop-relay --domain drop.example.com
 
 # Trigger local.schedule from cron / systemd / launchd

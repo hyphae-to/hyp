@@ -25,6 +25,7 @@ mod status_doctor;
 mod statusline_cmd;
 mod ui;
 mod ui_tui;
+mod uninstall_cmd;
 mod update;
 mod wizard;
 
@@ -45,7 +46,7 @@ use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE};
 #[derive(Parser)]
 #[command(
     name = "hyp",
-    about = "Hyphae v2 native CLI (hook, statusline, mcp, wait, watch, node, onboard, setup, inspect, session, ui, status, doctor, secret, gate, inbox, kv, emit, auth, drop, relay, update, deploy, pair, version)",
+    about = "Hyphae v2 native CLI (hook, statusline, mcp, wait, watch, node, onboard, setup, inspect, session, ui, status, doctor, secret, gate, inbox, kv, emit, auth, drop, relay, update, uninstall, deploy, pair, version)",
     version
 )]
 struct Cli {
@@ -189,6 +190,8 @@ enum Commands {
     },
     /// Cryptographically signed self-update, release channels, and `--all` fleet rollout
     Update(update::UpdateArgs),
+    /// Cleanly uninstall Hyphae (stops daemons, restores chained statusLines, removes hooks/skills/mods/state/binary)
+    Uninstall(uninstall_cmd::UninstallArgs),
     /// Internet deployment provider catalog, hardened kit generator, and fail-closed health checks
     Deploy {
         #[command(subcommand)]
@@ -485,6 +488,7 @@ fn main() -> ExitCode {
         Commands::Drop { command } => drop_cmd::run_drop(command),
         Commands::Relay { command } => drop_cmd::run_relay(command),
         Commands::Update(args) => update::run_update(args),
+        Commands::Uninstall(args) => uninstall_cmd::run_uninstall(args),
         Commands::Deploy { command } => deploy::run_deploy(command),
         Commands::Pair { command } => pair::run_pair(command),
         Commands::Statusline(args) => statusline_cmd::run_statusline(&args),

@@ -7,7 +7,7 @@ description: Install and onboard the pure-Rust Hyphae (hyp) binary on laptops an
 
 ## 1. Check or Install `hyp` (Single Static Rust Binary)
 
-No Node.js or Python runtime is required for `hyp` (~6 MiB compressed download, SHA-256 verified):
+No Node.js or Python runtime is required for `hyp` (~8 MiB compressed download, SHA-256 verified):
 
 ```sh
 hyp version --json || hyp status --json

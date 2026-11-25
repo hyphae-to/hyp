@@ -1,6 +1,6 @@
 # Hyphae v2 Architecture: Unified Rust Node, Standards-First Wire Layer, P2P Federation, Capability Negotiation, Permissioned Pairing & Local Security Gates
 
-> **Design North Star:** Collapse the legacy asymmetric *Connector vs. Router* split into **one composable `Node` primitive** implemented as a **single static Rust binary (`hyp`, ~6 MiB compressed download)** speaking **open, battle-tested standards** (CloudEvents v1.0, RFC 9180 HPKE, RFC 8785 JCS, RFC 9457 Problem Details, POSIX `tar+gzip`, JSON-RPC 2.0) — delivering **~2.7 ms hook cold starts**, **~2.8 MB idle MCP RSS**, **memory-zeroized E2EE**, **direct laptop-to-laptop P2P**, **demand-driven public streams (such as `public.hyphae.to` or self-hosted public nodes)**, **pluggable local Security Gates**, and **100% wire & fd-3 plugin compatibility** across all 9 agent harnesses.
+> **Design North Star:** Collapse the legacy asymmetric *Connector vs. Router* split into **one composable `Node` primitive** implemented as a **single static Rust binary (`hyp`, ~8 MiB compressed download)** speaking **open, battle-tested standards** (CloudEvents v1.0, RFC 9180 HPKE, RFC 8785 JCS, RFC 9457 Problem Details, POSIX `tar+gzip`, JSON-RPC 2.0) — delivering **~2.7 ms hook cold starts**, **~2.8 MB idle MCP RSS**, **memory-zeroized E2EE**, **direct laptop-to-laptop P2P**, **demand-driven public streams (such as `public.hyphae.to` or self-hosted public nodes)**, **pluggable local Security Gates**, and **100% wire & fd-3 plugin compatibility** across all 9 agent harnesses.
 
 ---
 
@@ -388,7 +388,7 @@ flowchart TD
 
 | Metric | Pure-Rust Static Binary (`hyp`) |
 | --- | --- |
-| **Compressed release download** | ~6 MiB static binary (macOS, Linux, Windows; zero Node.js/Python required) |
+| **Compressed release download** | ~8 MiB static binary (macOS, Linux, Windows; zero Node.js/Python required) |
 | **Hook cold start (`hyp hook`)** | ~2.7 ms (zero-`clap`, zero-Tokio synchronous fast path) |
 | **Idle MCP shim RSS (`hyp mcp`)** | ~2.8 MB RSS (shared stateless multiplexer across concurrent threads) |
 | **Secret storage** | macOS Keychain (`/usr/bin/security`), Linux Secret Service (`secret-tool`), and `0600` file fallback (`HYPHAE_SECRET_BACKEND=keychain\|secret-service\|file`) |

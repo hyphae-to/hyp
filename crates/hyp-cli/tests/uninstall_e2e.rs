@@ -1084,4 +1084,63 @@ fast_mode = true
         let keys = read_json(&h.join(".config/herdr-app/keys.json"));
         assert_eq!(keys["global"]["cmd-shift-h"], "my.custom.action");
     }
+
+    #[test]
+    fn hyp_uninstall_cli_dry_run_and_embedded_full_cleanup_work_in_isolated_home() {
+        let fx = build_populated_home();
+        let h = fx.home.path();
+        let bin = env!("CARGO_BIN_EXE_hyp");
+
+        // Also seed the native Claude Code side-panel mod dir (`~/.claude/skills/hyphae-panel`).
+        let panel_dir = h.join(".claude/skills/hyphae-panel/hooks");
+        fs::create_dir_all(&panel_dir).unwrap();
+        fs::write(panel_dir.join("register.tsx"), "// panel mod").unwrap();
+
+        // 1. `hyp uninstall --dry-run --home <tmp>` leaves everything intact.
+        let dry = Command::new(bin)
+            .args(["uninstall", "--dry-run", "--home", h.to_str().unwrap()])
+            .env("HOME", h)
+            .env("XDG_CONFIG_HOME", h.join(".config"))
+            .env("XDG_STATE_HOME", h.join(".local/state"))
+            .env("HYPHAE_INSTALL_DIR", h.join(".local/bin"))
+            .env("HYPHAE_SECRET_BACKEND", "file")
+            .output()
+            .expect("run hyp uninstall --dry-run");
+        assert_eq!(
+            dry.status.code(),
+            Some(0),
+            "hyp uninstall --dry-run failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&dry.stdout),
+            String::from_utf8_lossy(&dry.stderr)
+        );
+        assert!(h.join(".claude/skills/hyphae-panel/hooks/register.tsx").exists());
+        assert!(h.join(".config/hyphae/node.json").exists());
+
+        // 2. `hyp uninstall --yes --home <tmp>` runs the embedded script and removes everything cleanly.
+        let run = Command::new(bin)
+            .args(["uninstall", "--yes", "--home", h.to_str().unwrap()])
+            .env("HOME", h)
+            .env("XDG_CONFIG_HOME", h.join(".config"))
+            .env("XDG_STATE_HOME", h.join(".local/state"))
+            .env("HYPHAE_INSTALL_DIR", h.join(".local/bin"))
+            .env("HYPHAE_SECRET_BACKEND", "file")
+            .output()
+            .expect("run hyp uninstall --yes");
+        assert_eq!(
+            run.status.code(),
+            Some(0),
+            "hyp uninstall --yes failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(!h.join(".claude/skills/hyphae-panel").exists());
+        assert!(!h.join(".config/hyphae").exists());
+        assert!(!h.join(".local/bin/hyp").exists());
+        // Original custom Claude statusLine was restored verbatim!
+        let claude_settings = read_json(&h.join(".claude/settings.json"));
+        assert_eq!(
+            claude_settings["statusLine"]["command"],
+            "/usr/local/bin/my-claude-bar --git --branch"
+        );
+    }
 }

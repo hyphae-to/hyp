@@ -85,6 +85,11 @@ fn setup_claude_no_skills_and_no_commands_writes_only_mcp_and_hooks() {
         );
     }
 
+    assert!(
+        !home.join(".claude/skills/hyphae-panel").exists(),
+        "native side-panel mod must be skipped when --no-commands is passed"
+    );
+
     let notes = payload["data"]["harnesses"][0]["notes"]
         .as_array()
         .expect("notes array");
@@ -95,9 +100,9 @@ fn setup_claude_no_skills_and_no_commands_writes_only_mcp_and_hooks() {
         "expected explicit --no-skills skip note in {notes:?}"
     );
     assert!(
-        notes
-            .iter()
-            .any(|n| n.as_str() == Some("Skipped Claude slash commands (--no-commands).")),
+        notes.iter().any(|n| n
+            .as_str()
+            .is_some_and(|s| s.contains("--no-commands") && s.contains("Claude slash commands"))),
         "expected explicit --no-commands skip note in {notes:?}"
     );
 }

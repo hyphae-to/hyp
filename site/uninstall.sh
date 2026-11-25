@@ -1380,7 +1380,7 @@ if [ "$KEEP_HARNESSES" -eq 0 ]; then
     "$HOME/.config/herdr/skills" \
     "$HOME/.t3/skills"
   do
-    for _skill_name in hyphae hyphae-setup hyphae-schedule; do
+    for _skill_name in hyphae hyphae-setup hyphae-schedule hyphae-panel; do
       _s="${_skill_root}/${_skill_name}"
       if [ -e "$_s" ] || [ -L "$_s" ]; then
         SKILL_DIRS_TO_REMOVE="$(list_append_unique "$SKILL_DIRS_TO_REMOVE" "$_s")"

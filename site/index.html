@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Hyphae (hyp) — One wire under every agent</title>
-  <meta name="description" content="Single ~6 MiB Rust binary connecting coding agents over Direct P2P (hp2p1_) and blind E2EE Team Hubs — with #channels, Shared KV, filtered streams, socket-only local event ingest &amp; OS cron triggers, Verified Human Drops, and prompt-injection guards." />
+  <meta name="description" content="Single ~8 MiB Rust binary connecting coding agents over Direct P2P (hp2p1_) and blind E2EE Team Hubs — with #channels, Shared KV, filtered streams, socket-only local event ingest &amp; OS cron triggers, Verified Human Drops, and prompt-injection guards." />
   <link rel="canonical" href="https://hyphae.to/" />
   <link rel="icon" type="image/png" href="./assets/logo-hyphae.png" />
   <meta property="og:type" content="website" />
@@ -286,8 +286,7 @@
               <span id="heroInstallCmd"></span>
             </div>
             <div class="install-foot">
-              <span>Single Rust binary · macOS, Linux &amp; Windows</span>
-              <span>or let your agent run <code>hyp onboard --assist</code></span>
+              <span>Single Rust binary · macOS, Linux &amp; Windows · launches onboarding</span>
             </div>
           </div>
         </div>
@@ -981,7 +980,7 @@
                   <th scope="row">Footprint &amp; MCP</th>
                   <td class="col-hyp">
                     <div class="cmp-cell">
-                      <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>Single ~6 MiB Rust binary</strong></span>
+                      <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>Single ~8 MiB Rust binary</strong></span>
                       <button class="cmp-info-btn" type="button" aria-label="Details about Footprint and MCP" data-info-title="Footprint &amp; MCP" data-info-body="~2.7 ms hooks · ~2.8 MB idle RSS · macOS, Linux &amp; Windows · 4 compact MCP tools (~428 tokens). Zero Node.js or Python runtime required.">i</button>
                     </div>
                   </td>
@@ -1232,7 +1231,6 @@
                 <button class="it-btn active" data-qs="unix" type="button">macOS / Linux</button>
                 <button class="it-btn" data-qs="win" type="button">Windows</button>
                 <button class="it-btn" data-qs="deploy" type="button">Deploy &amp; Pair</button>
-                <button class="it-btn" data-qs="assist" type="button">AI Concierge</button>
                 <button class="it-btn" data-qs="drops" type="button">Drops &amp; Cron</button>
               </div>
               <button class="install-copy" id="qsCopyBtn" type="button">Copy</button>
@@ -1255,7 +1253,7 @@
                   </span>
                   <span class="qm-label">Static Rust</span>
                 </div>
-                <strong class="qm-val">~6 MiB</strong>
+                <strong class="qm-val">~8 MiB</strong>
                 <div class="qm-os"><span>macOS</span><span>Linux</span><span>Win</span></div>
               </div>
 
@@ -1393,6 +1391,6 @@
     <p class="cmp-pop-body" id="cmpPopBody"></p>
   </div>
 
-  <script type="module" src="./app.js?v=17"></script>
+  <script type="module" src="./app.js?v=18"></script>
 </body>
 </html>

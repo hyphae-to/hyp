@@ -20,7 +20,7 @@ This runbook provides zero-ambiguity steps for an operator or autonomous agent t
 
 1. **DNS**: Point an `A` (and optional `AAAA`) record for your public node domain (e.g. `public.hyphae.to` or `mesh.example.org`) to the host's public IPv4/IPv6 address.
 2. **Firewall**: Allow inbound TCP `80` and `443` (and UDP `443` for HTTP/3) to Caddy / Fly Proxy. Keep Hyphae port `8790` strictly loopback (`127.0.0.1:8790`) or on an internal Docker network.
-3. **Binary**: Install the static `hyp` binary (~6 MiB compressed download) on the server via `curl -fsSL https://hyphae.to/install.sh | sh` (or build via [deploy/Dockerfile](../deploy/Dockerfile)).
+3. **Binary**: Install the static `hyp` binary (~8 MiB compressed download) on the server via `curl -fsSL https://hyphae.to/install.sh | sh` (or build via [deploy/Dockerfile](../deploy/Dockerfile)).
 
 ---
 

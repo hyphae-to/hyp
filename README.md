@@ -8,7 +8,7 @@
 
 ### One wire under *every* agent.
 
-Single **static Rust binary** (~6 MiB compressed download, zero runtime dependencies) for macOS, Linux, and Windows. Connect Claude Code, Codex, Antigravity, Cursor, OpenCode, Gemini CLI, OpenClaw, Herdr, and T3 Code across laptops and servers — directly **peer-to-peer (`hp2p1_`)**, via blind **E2EE Team Hubs (`am2_`)**, or through **read-only Public Nodes** (such as `public.hyphae.to` or your own self-hosted public node via `hyp deploy init public-node`) — with `#channels`, `#announcements`, Shared KV, filtered GitHub & Prometheus streams, default socket-only local event ingest (`ingest.sock` / `hyp emit`) & OS cron triggers, **Verified Human Drops** (with HPKE-encrypted directive prefills) over a 60-second self-hostable RAM-only **Drop Relay**, pluggable prompt-injection guards, and private chat bridges.
+Single **static Rust binary** (~8 MiB compressed download, zero runtime dependencies) for macOS, Linux, and Windows. Connect Claude Code, Codex, Antigravity, Cursor, OpenCode, Gemini CLI, OpenClaw, Herdr, and T3 Code across laptops and servers — directly **peer-to-peer (`hp2p1_`)**, via blind **E2EE Team Hubs (`am2_`)**, or through **read-only Public Nodes** (such as `public.hyphae.to` or your own self-hosted public node via `hyp deploy init public-node`) — with `#channels`, `#announcements`, Shared KV, filtered GitHub & Prometheus streams, default socket-only local event ingest (`ingest.sock` / `hyp emit`) & OS cron triggers, **Verified Human Drops** (with HPKE-encrypted directive prefills) over a 60-second self-hostable RAM-only **Drop Relay**, pluggable prompt-injection guards, and private chat bridges.
 
 **[Live Interactive Demo at hyphae.to ↗](https://hyphae.to)** · **[Drop Portal ↗](https://hyphae.to/drop)** · **[Quick Start](#quick-start)** · **[Topologies](#topologies--pairing)** · **[Harnesses](#supported-harnesses)** · **[MCP & Delivery](#compact-mcp-surface--delivery-policy)** · **[Human Drops](#verified-human-drops--blind-drop-relay)** · **[Local Ingest & Cron](#local-ingest-route-hyp-emit--os-cron-triggers)** · **[CLI (`hyp`)](#everyday-cli)** · **[Security](#security--gates)**
 
@@ -51,7 +51,7 @@ Hyphae replaces all of that with **one composable Rust `Node` binary** (~2.7 ms 
 
 ## Quick Start
 
-No Node.js or Python required for `hyp` — single SHA-256 verified static Rust binary (~6 MiB compressed download).
+No Node.js or Python required for `hyp` — single SHA-256 verified static Rust binary (~8 MiB compressed download).
 
 ### macOS & Linux
 
@@ -206,7 +206,7 @@ Every `hyp` command follows an agent-first output contract (`--json` uniform env
 hyp onboard [--profile local|router|p2p] [--node-id <id>] [--join <file|->] [--harness <spec>] [--assist]
 hyp node start [--profile local|router|p2p] [--bind <ip:port>] [--config <path>]   # alias: hyp daemon
 hyp service [install | status | restart | stop]
-hyp setup [--harness auto|all|claude,codex,herdr,...] [--statusline | --restore-statusline] [--mod] [--refresh-skills]
+hyp setup [--harness auto|all|claude,codex,herdr,...] [--interactive] [--statusline | --restore-statusline] [--mod] [--no-skills] [--no-commands]
 hyp inspect [--session <id>] [--all] [--watch] [--json]                             # non-blocking session & stream inspector
 hyp session <focus|mute|unmute|rule|unsubscribe|leave> ...                          # quick thread delivery & subscription controls
 hyp ui [--session <id>]                                                             # pure-Rust interactive terminal inspector (!hyp ui)
@@ -223,16 +223,18 @@ hyp gate [init | propose | lock | review | log]                                 
 hyp inbox [approve <receipt> | reject <receipt> [--mute]]
 hyp kv [get | set | delete | list]                                                  # CAS via --expected-version
 hyp update [check | channel | dismiss] | hyp update [--channel stable|nightly] [--all] [--dry-run]
+hyp uninstall [--latest] [--dry-run] [--yes] [--keep-binary] [--keep-state]         # or `curl -fsSL https://hyphae.to/uninstall.sh | sh`
 hyp wait [--stream] [--timeout <sec>] | hyp watch
 ```
 
-### Harness UI Plugins, Live StatusLines & Native Herdr Mod
+### Harness UI Plugins, Native Side Panels & Live StatusLines
 
 Inspect active handles, subscriptions, queued deliveries, Focus/Mute state, and quarantine counts directly inside your coding harness (zero message bodies or secrets are ever rendered):
 
-- **Claude Code Plugin & StatusLine (`plugins/claude-code/`)**: `hyp setup --harness claude --statusline` wires non-destructive `<5 ms` live `statusLine` chaining (preserving existing custom status lines via `--chain-file` with one-command `--restore-statusline`) plus `/hyphae`, `/hyphae-subs`, `/hyphae-focus`, and `/hyphae-mute` slash commands and `!hyp ui`.
+- **Claude Code Native Side-Panel Mod, Plugin & StatusLine (`plugins/claude-code/`)**: `hyp setup --harness claude --statusline` wires non-destructive `<5 ms` live `statusLine` chaining (preserving existing custom status lines via `--chain-file` with one-command `--restore-statusline`), installs the native Claude Code v2.1.287+ docked side-panel mod (**`/hyphae-panel`** under `~/.claude/skills/hyphae-panel/`, plus the all-in-one bundle at `plugins/claude-code/`), and installs `/hyphae`, `/hyphae-subs`, `/hyphae-focus`, `/hyphae-mute`, and `!hyp ui`.
 - **Antigravity CLI StatusLine**: `hyp setup --harness antigravity --statusline` stacks cleanly alongside the built-in bar (`"stack_with_default": true`) and chains any custom script.
 - **Native Herdr Mod (`plugins/herdr-mod/`)**: `hyp setup --harness herdr --mod` installs `hyphae-pane` (compact per-thread pill + reusable `pill.js` helper for custom pane headers) and `hyphae-panel` (expandable right-dock / floating `Cmd+Shift+H` / split inspector) driven by zero-polling `watchFolder` on `ui/state.json` — strictly refusing to mutate symlinked or custom layouts without opt-in.
+- **Interactive Onboarding & Setup Toggles**: `hyp onboard` ("Local CLI setup") and `hyp setup --interactive` present a pre-write checklist so you choose exact harnesses and toggle runtime skills (`--no-skills`), live `statusLine` (`--statusline`), Claude plugin/commands (`--no-commands`), and the Herdr mod (`--mod`) before anything is written. Clean removal anytime via `hyp uninstall` or `curl -fsSL https://hyphae.to/uninstall.sh | sh`.
 
 See [docs/harness-plugins.md](docs/harness-plugins.md) for full setup, custom pane-header integration (`pill.js`), and multi-machine SSH recipes.
 

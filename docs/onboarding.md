@@ -1,6 +1,6 @@
 # Onboarding Guide
 
-Hyphae (`hyp`) ships as a **single static Rust binary** (~6 MiB compressed download, ~2.7 ms hooks, ~2.8 MB idle MCP RSS, zero Node.js or Python runtime required for the core binary) and supports three composable topologies with the exact same `Node` binary:
+Hyphae (`hyp`) ships as a **single static Rust binary** (~8 MiB compressed download, ~2.7 ms hooks, ~2.8 MB idle MCP RSS, zero Node.js or Python runtime required for the core binary) and supports three composable topologies with the exact same `Node` binary:
 
 1. **Local Multi-Harness Node (`profile: "local"`)** — connects all coding agents on one workstation across Antigravity, Claude Code / Desktop, Codex / Desktop, Cursor, OpenCode, Gemini CLI, OpenClaw, Herdr Core, and T3 Code.
 2. **Direct P2P Collaborator Mesh (`profile: "p2p"`, `hp2p1_`)** — direct mutual E2EE pairing between two laptops or servers with **zero** central hub or CA.

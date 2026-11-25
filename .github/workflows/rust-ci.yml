@@ -53,8 +53,8 @@ jobs:
             python3 -m py_compile "$file"
           done < <(find plugins -type f -name '*.py' | sort)
 
-          sh -n install.sh scripts/install.sh site/install.sh plugins/herdr-mod/scripts/install.sh
-          bash -n scripts/test-installer.sh
+          sh -n install.sh scripts/install.sh site/install.sh uninstall.sh scripts/uninstall.sh site/uninstall.sh plugins/herdr-mod/scripts/install.sh
+          bash -n scripts/test-installer.sh scripts/uninstall.sh scripts/reset-local.sh
           if command -v shellcheck >/dev/null 2>&1; then
             shellcheck -s sh scripts/install.sh
           fi
@@ -62,6 +62,8 @@ jobs:
           cmp -s scripts/install.sh site/install.sh
           cmp -s scripts/install.sh install.sh
           cmp -s scripts/install.ps1 site/install.ps1
+          cmp -s scripts/uninstall.sh site/uninstall.sh
+          cmp -s scripts/uninstall.sh uninstall.sh
 
           if command -v pwsh >/dev/null 2>&1; then
             pwsh -NoProfile -Command '

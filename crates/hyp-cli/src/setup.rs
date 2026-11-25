@@ -62,6 +62,17 @@ const CLAUDE_SLASH_COMMANDS: [(&str, &str); 4] = [
     ("hyphae-mute.md", CLAUDE_CMD_HYPHAE_MUTE),
 ];
 
+const CLAUDE_PANEL_REGISTER_TSX: &str =
+    include_str!("../../../plugins/claude-code/hooks/register.tsx");
+const CLAUDE_PANEL_STATE_TS: &str =
+    include_str!("../../../plugins/claude-code/hooks/state.ts");
+const CLAUDE_PANEL_MANIFEST_JSON: &str = concat!(
+    "{\n  \"name\": \"hyphae-panel\",\n  \"version\": \"",
+    env!("CARGO_PKG_VERSION"),
+    "\",\n  \"description\": \"Native Hyphae live mesh side-panel mod (/hyphae-panel) for Claude Code.\",\n  \"author\": { \"name\": \"Hyphae\" },\n  \"license\": \"MIT\",\n  \"repository\": \"https://github.com/hyphae-to/hyp\"\n}\n"
+);
+const CLAUDE_PANEL_HOOKS_JSON: &str = "{\n  \"modules\": [\"./register.tsx\"]\n}\n";
+
 #[derive(Args)]
 pub struct SetupArgs {
     /// Target harness: all, auto, or one/comma-separated of claude,codex,antigravity,cursor,opencode,gemini,openclaw,herdr,t3
@@ -2524,7 +2535,9 @@ fn setup_claude(
     maybe_write_json(&settings_file, &Value::Object(settings_doc), false, dry_run)?;
 
     if opts.no_commands {
-        notes.push("Skipped Claude slash commands (--no-commands).".to_string());
+        notes.push(
+            "Skipped Claude slash commands & native side-panel mod (--no-commands).".to_string(),
+        );
     } else {
         let commands_dir = home.join(".claude").join("commands");
         for (filename, content) in CLAUDE_SLASH_COMMANDS {
@@ -2532,6 +2545,24 @@ fn setup_claude(
             maybe_write_text(&cmd_path, content, false, dry_run)?;
             files.push(cmd_path.display().to_string());
         }
+        // Install UI-only native Claude Code side-panel mod (`/hyphae-panel`, auto-loads as
+        // `hyphae-panel@skills-dir` on Claude Code v2.1.287+ without duplicating hooks or MCP).
+        let panel_root = home.join(".claude").join("skills").join("hyphae-panel");
+        let panel_files: [(&str, &str); 4] = [
+            (".claude-plugin/plugin.json", CLAUDE_PANEL_MANIFEST_JSON),
+            ("hooks/hooks.json", CLAUDE_PANEL_HOOKS_JSON),
+            ("hooks/register.tsx", CLAUDE_PANEL_REGISTER_TSX),
+            ("hooks/state.ts", CLAUDE_PANEL_STATE_TS),
+        ];
+        for (rel, content) in panel_files {
+            let target = panel_root.join(rel);
+            maybe_write_text(&target, content, false, dry_run)?;
+            files.push(target.display().to_string());
+        }
+        notes.push(
+            "Installed native Claude Code side-panel mod (/hyphae-panel) under ~/.claude/skills/hyphae-panel/."
+                .to_string(),
+        );
     }
 
     maybe_install_harness_runtime_skills(
