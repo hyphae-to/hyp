@@ -990,9 +990,12 @@ pub fn classify_mac_keychain_output(
 
 /// Classifies the exit status, stdout, and stderr of Linux `secret-tool lookup`.
 ///
-/// Only empty stdout with exit `0` or an explicit item-not-found stderr (without D-Bus,
-/// lock, or permission errors) maps to `Ok(None)`. Any D-Bus error, locked keyring,
-/// permission error, or unrecognized non-zero exit fails closed with `Err(CryptoError::Keystore)`.
+/// On Linux, `secret-tool lookup` legitimately exits with status `1` and empty stderr (and empty
+/// stdout) when the requested item does not exist in GNOME Keyring / KWallet (`OR1`). That case,
+/// empty stdout with exit `0`, or exit `1` with explicit item-not-found stderr (without D-Bus,
+/// lock, auth, or permission errors) maps to `Ok(None)` (`CryptoError::SecretNotFound`).
+/// Any D-Bus error, locked keyring, permission/auth failure, non-empty unexpected stderr, or exit
+/// code other than `0`/`1` fails closed with `Err(CryptoError::Keystore)`.
 pub fn classify_linux_secret_service_output(
     name: &str,
     exit_code: Option<i32>,
@@ -1001,22 +1004,31 @@ pub fn classify_linux_secret_service_output(
 ) -> Result<Option<Zeroizing<String>>, CryptoError> {
     if exit_code != Some(0) {
         let stderr_trimmed = stderr.trim();
-        let lower = stderr_trimmed.to_ascii_lowercase();
-        let is_backend_err = lower.contains("dbus")
-            || lower.contains("d-bus")
-            || lower.contains("cannot autolaunch")
-            || lower.contains("locked")
-            || lower.contains("permission")
-            || lower.contains("denied")
-            || lower.contains("unavailable")
-            || lower.contains("org.freedesktop.secrets");
-        let is_explicit_not_found = !is_backend_err
-            && (lower.contains("no matching")
-                || lower.contains("not found")
-                || lower.contains("no such item")
-                || lower.contains("no such secret"));
-        if is_explicit_not_found {
-            return Ok(None);
+        let stdout_empty = stdout.iter().all(|b| b.is_ascii_whitespace());
+        if exit_code == Some(1) {
+            if stderr_trimmed.is_empty() && stdout_empty {
+                return Ok(None);
+            }
+            let lower = stderr_trimmed.to_ascii_lowercase();
+            let is_backend_err = lower.contains("dbus")
+                || lower.contains("d-bus")
+                || lower.contains("cannot autolaunch")
+                || lower.contains("locked")
+                || lower.contains("permission")
+                || lower.contains("denied")
+                || lower.contains("auth failed")
+                || lower.contains("authentication")
+                || lower.contains("unavailable")
+                || lower.contains("org.freedesktop.secrets");
+            let is_explicit_not_found = !is_backend_err
+                && stdout_empty
+                && (lower.contains("no matching")
+                    || lower.contains("not found")
+                    || lower.contains("no such item")
+                    || lower.contains("no such secret"));
+            if is_explicit_not_found {
+                return Ok(None);
+            }
         }
         return Err(CryptoError::Keystore(if stderr_trimmed.is_empty() {
             format!(
@@ -1206,6 +1218,12 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        // OR1: Linux secret-tool legitimately exits 1 with empty stdout & empty stderr on not-found!
+        assert!(
+            classify_linux_secret_service_output("node-sign-1", Some(1), b"", "")
+                .unwrap()
+                .is_none()
+        );
         // Linux secret-tool: explicit not-found without D-Bus error -> genuine None
         assert!(
             classify_linux_secret_service_output(
@@ -1217,13 +1235,24 @@ mod tests {
             .unwrap()
             .is_none()
         );
-        // Linux secret-tool: D-Bus unavailable / locked / permission denied / non-zero empty -> Err(Keystore)
+        // Linux secret-tool: exit 1 with non-empty stdout fails closed (never silently NotFound)
+        assert!(matches!(
+            classify_linux_secret_service_output("node-sign-1", Some(1), b"partial-output", ""),
+            Err(CryptoError::Keystore(_))
+        ));
+        // Linux secret-tool: D-Bus unavailable / locked / permission denied / auth failed / exit 2+ -> Err(Keystore)
         for (code, stderr) in [
             (Some(1), "secret-tool: Cannot autolaunch D-Bus without X11 $DISPLAY"),
             (Some(1), "secret-tool: Keyring is locked"),
             (Some(1), "secret-tool: Permission denied"),
-            (Some(1), ""),
+            (Some(1), "secret-tool: auth failed"),
+            (Some(1), "secret-tool: authentication cancelled"),
+            (Some(1), "secret-tool: org.freedesktop.secrets service unavailable"),
+            (Some(2), ""),
             (Some(2), "org.freedesktop.secrets unavailable"),
+            (Some(2), "secret-tool: no matching secret found"),
+            (Some(127), ""),
+            (None, ""),
         ] {
             assert!(
                 matches!(

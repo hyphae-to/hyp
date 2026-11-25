@@ -21,12 +21,12 @@ use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, DaemonRpcResult, daemon_rpc_syn
 use hyp_node::engine::NodeProfile;
 use hyp_node::gates::plugins::validate_filter_plugin_endpoint_url;
 use hyp_node::gates::policy::{
-    AnthropicAuthHeader, DEFAULT_HTTP_CLASSIFIER_THRESHOLD, DEFAULT_STAGE2_BUSY_RETRY_MS,
-    DEFAULT_STAGE2_MAX_CONCURRENT, DEFAULT_STAGE2_MAX_INPUT_CHARS,
+    AnthropicAuthHeader, DEFAULT_HTTP_CLASSIFIER_THRESHOLD, DEFAULT_POLICY_SIGNING_SECRET,
+    DEFAULT_STAGE2_BUSY_RETRY_MS, DEFAULT_STAGE2_MAX_CONCURRENT, DEFAULT_STAGE2_MAX_INPUT_CHARS,
     DEFAULT_STAGE2_MAX_OUTPUT_TOKENS, DEFAULT_STAGE2_MIN_ALLOW_CONFIDENCE,
     DEFAULT_STAGE2_TIMEOUT_MS, FilterAdapterConfig, FilterPluginConfig, LlmProvider,
-    SecurityGateConfig, Stage2ErrorAction, Stage2Matchers, TrustTier, sign_gate_policy,
-    verify_gate_policy_sig,
+    RateLimitAction, SecurityGateConfig, Stage1Config, Stage1DenyAction, Stage2ErrorAction,
+    Stage2Matchers, TierDeliveryAction, TrustTier, sign_gate_policy, verify_gate_policy_sig,
 };
 use hyp_node::gates::stage2::validate_stage2_endpoint_urls;
 use hyp_store::{
@@ -61,6 +61,91 @@ pub(crate) fn is_interactive_tty() -> bool {
     io::stdin().is_terminal() && io::stderr().is_terminal()
 }
 
+/// Strips ANSI CSI/OSC/DCS/ESC escape sequences, C0/C1 control characters, Unicode line/paragraph
+/// separators, and Unicode BiDi override/isolate/mark codepoints (`U+202A..=U+202E`,
+/// `U+2066..=U+2069`, `U+200E`, `U+200F`, `U+061C`) from untrusted or config strings before
+/// rendering them on a human interactive terminal.
+pub(crate) fn sanitize_tty_display(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    let consume_csi = |iter: &mut std::iter::Peekable<std::str::Chars<'_>>| {
+        while let Some(&c) = iter.peek() {
+            let code = c as u32;
+            if (0x30..=0x3F).contains(&code) || (0x20..=0x2F).contains(&code) {
+                iter.next();
+            } else {
+                if (0x40..=0x7E).contains(&code) {
+                    iter.next();
+                }
+                break;
+            }
+        }
+    };
+
+    let consume_st_or_bel = |iter: &mut std::iter::Peekable<std::str::Chars<'_>>| {
+        while let Some(c) = iter.next() {
+            if c == '\u{0007}' || c == '\u{009C}' {
+                break;
+            }
+            if c == '\u{001B}' && iter.peek() == Some(&'\\') {
+                iter.next();
+                break;
+            }
+        }
+    };
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\u{001B}' => match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    consume_csi(&mut chars);
+                }
+                Some(']') | Some('P') | Some('X') | Some('^') | Some('_') => {
+                    chars.next();
+                    consume_st_or_bel(&mut chars);
+                }
+                Some(next_ch) => {
+                    let code = next_ch as u32;
+                    if (0x20..=0x2F).contains(&code) {
+                        while let Some(&c) = chars.peek() {
+                            let c_code = c as u32;
+                            if (0x20..=0x2F).contains(&c_code) {
+                                chars.next();
+                            } else {
+                                if (0x30..=0x7E).contains(&c_code) {
+                                    chars.next();
+                                }
+                                break;
+                            }
+                        }
+                    } else if (0x30..=0x7E).contains(&code) {
+                        chars.next();
+                    }
+                }
+                None => {}
+            },
+            '\u{009B}' => {
+                consume_csi(&mut chars);
+            }
+            '\u{009D}' | '\u{0090}' | '\u{0098}' | '\u{009E}' | '\u{009F}' => {
+                consume_st_or_bel(&mut chars);
+            }
+            '\u{0000}'..='\u{001F}'
+            | '\u{007F}'..='\u{009F}'
+            | '\u{061C}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}' => {}
+            _ => out.push(ch),
+        }
+    }
+
+    out
+}
+
 fn read_bounded_line<R: BufRead>(reader: &mut R, max_bytes: usize) -> io::Result<Option<String>> {
     let mut buf = Vec::new();
     let mut total = 0usize;
@@ -92,8 +177,8 @@ fn read_bounded_line<R: BufRead>(reader: &mut R, max_bytes: usize) -> io::Result
 /// Pure injectable interactive TTY confirmation core.
 ///
 /// Fails closed with [`ConfirmError::NotInteractiveTty`] whenever `is_tty == false`.
-/// Otherwise writes `summary_lines` and `prompt` to `writer`, reads one line from `reader`,
-/// and returns `Ok(())` ONLY on exact `"y"` or `"yes"` (ASCII case-insensitive).
+/// Otherwise writes sanitized `summary_lines` and `prompt` to `writer`, reads one line from
+/// `reader`, and returns `Ok(())` ONLY on exact `"y"` or `"yes"` (ASCII case-insensitive).
 pub(crate) fn confirm_interactive_with<R: BufRead, W: Write>(
     is_tty: bool,
     summary_lines: &[String],
@@ -106,9 +191,11 @@ pub(crate) fn confirm_interactive_with<R: BufRead, W: Write>(
     }
     writeln!(writer).map_err(|e| ConfirmError::Io(e.to_string()))?;
     for line in summary_lines {
-        writeln!(writer, "{line}").map_err(|e| ConfirmError::Io(e.to_string()))?;
+        let safe_line = sanitize_tty_display(line);
+        writeln!(writer, "{safe_line}").map_err(|e| ConfirmError::Io(e.to_string()))?;
     }
-    write!(writer, "{prompt}").map_err(|e| ConfirmError::Io(e.to_string()))?;
+    let safe_prompt = sanitize_tty_display(prompt);
+    write!(writer, "{safe_prompt}").map_err(|e| ConfirmError::Io(e.to_string()))?;
     writer.flush().map_err(|e| ConfirmError::Io(e.to_string()))?;
 
     let Some(line) = read_bounded_line(reader, MAX_CONFIRM_LINE_BYTES)
@@ -239,7 +326,96 @@ fn error_action_str(action: Stage2ErrorAction) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+fn tier_action_str(action: TierDeliveryAction) -> &'static str {
+    match action {
+        TierDeliveryAction::Allow => "allow",
+        TierDeliveryAction::DowngradeToNotify => "downgrade_to_notify",
+        TierDeliveryAction::Quarantine => "quarantine",
+    }
+}
+
+fn tier_action_strictness(action: TierDeliveryAction) -> u8 {
+    match action {
+        TierDeliveryAction::Allow => 0,
+        TierDeliveryAction::DowngradeToNotify => 1,
+        TierDeliveryAction::Quarantine => 2,
+    }
+}
+
+fn rate_limit_action_str(action: RateLimitAction) -> &'static str {
+    match action {
+        RateLimitAction::Hold => "hold",
+        RateLimitAction::Block => "block",
+    }
+}
+
+fn stage1_deny_action_str(action: Stage1DenyAction) -> &'static str {
+    match action {
+        Stage1DenyAction::Block => "block",
+        Stage1DenyAction::Quarantine => "quarantine",
+    }
+}
+
+fn matchers_is_empty(m: &Stage2Matchers) -> bool {
+    m.trust_tiers.is_empty()
+        && m.peers.is_empty()
+        && m.channels.is_empty()
+        && m.topics.is_empty()
+        && m.bridges.is_empty()
+}
+
+fn format_matchers_display(m: &Stage2Matchers) -> String {
+    if matchers_is_empty(m) {
+        return "EMPTY (matches nothing!)".to_string();
+    }
+    let mut parts = Vec::new();
+    if !m.trust_tiers.is_empty() {
+        let tiers: Vec<&str> = m.trust_tiers.iter().map(|t| t.as_str()).collect();
+        parts.push(format!("trust_tiers=[{}]", tiers.join(",")));
+    }
+    if !m.peers.is_empty() {
+        let vals: Vec<String> = m.peers.iter().map(|s| sanitize_tty_display(s)).collect();
+        parts.push(format!("peers=[{}]", vals.join(",")));
+    }
+    if !m.channels.is_empty() {
+        let vals: Vec<String> = m.channels.iter().map(|s| sanitize_tty_display(s)).collect();
+        parts.push(format!("channels=[{}]", vals.join(",")));
+    }
+    if !m.topics.is_empty() {
+        let vals: Vec<String> = m.topics.iter().map(|s| sanitize_tty_display(s)).collect();
+        parts.push(format!("topics=[{}]", vals.join(",")));
+    }
+    if !m.bridges.is_empty() {
+        let vals: Vec<String> = m.bridges.iter().map(|s| sanitize_tty_display(s)).collect();
+        parts.push(format!("bridges=[{}]", vals.join(",")));
+    }
+    parts.join(", ")
+}
+
+fn format_sanitized_list(items: &[String]) -> String {
+    if items.is_empty() {
+        "[]".to_string()
+    } else {
+        let cleaned: Vec<String> = items.iter().map(|s| sanitize_tty_display(s)).collect();
+        format!("[{}]", cleaned.join(", "))
+    }
+}
+
+fn matchers_lost_coverage(before: &Stage2Matchers, after: &Stage2Matchers) -> bool {
+    if !matchers_is_empty(before) && matchers_is_empty(after) {
+        return true;
+    }
+    before
+        .trust_tiers
+        .iter()
+        .any(|t| !after.trust_tiers.contains(t))
+        || before.peers.iter().any(|p| !after.peers.contains(p))
+        || before.channels.iter().any(|c| !after.channels.contains(c))
+        || before.topics.iter().any(|t| !after.topics.contains(t))
+        || before.bridges.iter().any(|b| !after.bridges.contains(b))
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct FilterSnapshot {
     id: String,
     enabled: bool,
@@ -249,120 +425,227 @@ struct FilterSnapshot {
     auth_header: String,
     secret_name: String,
     on_error: &'static str,
+    on_flagged: Option<&'static str>,
+    matchers: Stage2Matchers,
+    max_input_chars: usize,
+    min_allow_confidence: Option<f64>,
+    classifier_threshold: Option<f64>,
+    subprocess_args: Vec<String>,
+    subprocess_env_allowlist: Vec<String>,
+    policy_notes: String,
 }
 
 impl FilterSnapshot {
     fn from_config(cfg: &FilterPluginConfig) -> Self {
         let on_error = error_action_str(cfg.on_error);
+        let id = sanitize_tty_display(&cfg.id);
         match &cfg.adapter {
             FilterAdapterConfig::Anthropic {
                 model,
                 api_key_secret,
                 base_url,
                 auth_header,
+                max_input_chars,
+                min_allow_confidence,
+                policy_notes,
                 ..
             } => Self {
-                id: cfg.id.clone(),
+                id,
                 enabled: cfg.enabled,
                 adapter: "anthropic",
-                model: model.clone(),
+                model: sanitize_tty_display(model),
                 base_url: base_url
-                    .clone()
+                    .as_deref()
+                    .map(sanitize_tty_display)
                     .unwrap_or_else(|| "https://api.anthropic.com (default)".to_string()),
                 auth_header: auth_header.as_str().to_string(),
                 secret_name: api_key_secret
-                    .clone()
+                    .as_deref()
+                    .map(sanitize_tty_display)
                     .unwrap_or_else(|| "none".to_string()),
                 on_error,
+                on_flagged: None,
+                matchers: cfg.matchers.clone(),
+                max_input_chars: *max_input_chars,
+                min_allow_confidence: Some(*min_allow_confidence),
+                classifier_threshold: None,
+                subprocess_args: Vec::new(),
+                subprocess_env_allowlist: Vec::new(),
+                policy_notes: sanitize_tty_display(policy_notes),
             },
             FilterAdapterConfig::OpenAiCompat {
                 base_url,
                 model,
                 api_key_secret,
+                max_input_chars,
+                min_allow_confidence,
+                policy_notes,
                 ..
             } => Self {
-                id: cfg.id.clone(),
+                id,
                 enabled: cfg.enabled,
                 adapter: "openai-compat",
-                model: model.clone(),
-                base_url: base_url.clone(),
+                model: sanitize_tty_display(model),
+                base_url: sanitize_tty_display(base_url),
                 auth_header: "bearer".to_string(),
                 secret_name: api_key_secret
-                    .clone()
+                    .as_deref()
+                    .map(sanitize_tty_display)
                     .unwrap_or_else(|| "none".to_string()),
                 on_error,
+                on_flagged: None,
+                matchers: cfg.matchers.clone(),
+                max_input_chars: *max_input_chars,
+                min_allow_confidence: Some(*min_allow_confidence),
+                classifier_threshold: None,
+                subprocess_args: Vec::new(),
+                subprocess_env_allowlist: Vec::new(),
+                policy_notes: sanitize_tty_display(policy_notes),
             },
             FilterAdapterConfig::Google {
                 model,
                 api_key_secret,
                 base_url,
+                max_input_chars,
+                min_allow_confidence,
+                policy_notes,
                 ..
             } => Self {
-                id: cfg.id.clone(),
+                id,
                 enabled: cfg.enabled,
                 adapter: "google",
-                model: model.clone(),
-                base_url: base_url.clone().unwrap_or_else(|| {
-                    "https://generativelanguage.googleapis.com (default)".to_string()
-                }),
+                model: sanitize_tty_display(model),
+                base_url: base_url
+                    .as_deref()
+                    .map(sanitize_tty_display)
+                    .unwrap_or_else(|| {
+                        "https://generativelanguage.googleapis.com (default)".to_string()
+                    }),
                 auth_header: "x-goog-api-key".to_string(),
                 secret_name: api_key_secret
-                    .clone()
+                    .as_deref()
+                    .map(sanitize_tty_display)
                     .unwrap_or_else(|| "none".to_string()),
                 on_error,
+                on_flagged: None,
+                matchers: cfg.matchers.clone(),
+                max_input_chars: *max_input_chars,
+                min_allow_confidence: Some(*min_allow_confidence),
+                classifier_threshold: None,
+                subprocess_args: Vec::new(),
+                subprocess_env_allowlist: Vec::new(),
+                policy_notes: sanitize_tty_display(policy_notes),
             },
             FilterAdapterConfig::LakeraGuard {
                 base_url,
                 api_key_secret,
+                max_input_chars,
+                on_flagged,
                 ..
             } => Self {
-                id: cfg.id.clone(),
+                id,
                 enabled: cfg.enabled,
                 adapter: "lakera-guard",
                 model: "-".to_string(),
-                base_url: base_url.clone(),
+                base_url: sanitize_tty_display(base_url),
                 auth_header: "bearer".to_string(),
                 secret_name: api_key_secret
-                    .clone()
+                    .as_deref()
+                    .map(sanitize_tty_display)
                     .unwrap_or_else(|| "none".to_string()),
                 on_error,
+                on_flagged: Some(error_action_str(*on_flagged)),
+                matchers: cfg.matchers.clone(),
+                max_input_chars: *max_input_chars,
+                min_allow_confidence: None,
+                classifier_threshold: None,
+                subprocess_args: Vec::new(),
+                subprocess_env_allowlist: Vec::new(),
+                policy_notes: String::new(),
             },
             FilterAdapterConfig::HttpClassifier {
                 url,
                 api_key_secret,
                 auth_header,
+                threshold,
+                max_input_chars,
+                on_flagged,
                 ..
             } => Self {
-                id: cfg.id.clone(),
+                id,
                 enabled: cfg.enabled,
                 adapter: "http-classifier",
                 model: "-".to_string(),
-                base_url: url.clone(),
+                base_url: sanitize_tty_display(url),
                 auth_header: auth_header
-                    .clone()
+                    .as_deref()
+                    .map(sanitize_tty_display)
                     .unwrap_or_else(|| "authorization".to_string()),
                 secret_name: api_key_secret
-                    .clone()
+                    .as_deref()
+                    .map(sanitize_tty_display)
                     .unwrap_or_else(|| "none".to_string()),
                 on_error,
+                on_flagged: Some(error_action_str(*on_flagged)),
+                matchers: cfg.matchers.clone(),
+                max_input_chars: *max_input_chars,
+                min_allow_confidence: None,
+                classifier_threshold: Some(*threshold),
+                subprocess_args: Vec::new(),
+                subprocess_env_allowlist: Vec::new(),
+                policy_notes: String::new(),
             },
-            FilterAdapterConfig::Subprocess { command, .. } => Self {
-                id: cfg.id.clone(),
+            FilterAdapterConfig::Subprocess {
+                command,
+                args,
+                env_allowlist,
+                max_input_chars,
+                min_allow_confidence,
+                ..
+            } => Self {
+                id,
                 enabled: cfg.enabled,
                 adapter: "subprocess",
                 model: "-".to_string(),
-                base_url: command.clone(),
+                base_url: sanitize_tty_display(command),
                 auth_header: "-".to_string(),
                 secret_name: "none".to_string(),
                 on_error,
+                on_flagged: None,
+                matchers: cfg.matchers.clone(),
+                max_input_chars: *max_input_chars,
+                min_allow_confidence: Some(*min_allow_confidence),
+                classifier_threshold: None,
+                subprocess_args: args.iter().map(|s| sanitize_tty_display(s)).collect(),
+                subprocess_env_allowlist: env_allowlist
+                    .iter()
+                    .map(|s| sanitize_tty_display(s))
+                    .collect(),
+                policy_notes: String::new(),
             },
         }
     }
 
-    fn diff_fields(&self, before: &Self) -> Vec<String> {
+    fn threshold_summary(&self) -> String {
+        if let Some(conf) = self.min_allow_confidence {
+            format!("min_allow_confidence={conf:.2}")
+        } else if let Some(th) = self.classifier_threshold {
+            format!("threshold={th:.2}")
+        } else {
+            "threshold=-".to_string()
+        }
+    }
+
+    fn diff_fields(&self, before: &Self, weakenings: &mut Vec<String>) -> Vec<String> {
         let mut diffs = Vec::new();
         if before.enabled != self.enabled {
-            diffs.push(format!("enabled: {} -> {}", before.enabled, self.enabled));
+            let tag = if before.enabled && !self.enabled {
+                weakenings.push(format!("Filter '{}' disabled (true -> false)", self.id));
+                " [WEAKENING]"
+            } else {
+                ""
+            };
+            diffs.push(format!("enabled: {} -> {}{tag}", before.enabled, self.enabled));
         }
         if before.adapter != self.adapter {
             diffs.push(format!("adapter: {} -> {}", before.adapter, self.adapter));
@@ -386,9 +669,267 @@ impl FilterSnapshot {
             ));
         }
         if before.on_error != self.on_error {
-            diffs.push(format!("on_error: {} -> {}", before.on_error, self.on_error));
+            let tag = if before.on_error == "block" && self.on_error == "quarantine" {
+                weakenings.push(format!(
+                    "Filter '{}' on_error weakened (block -> quarantine)",
+                    self.id
+                ));
+                " [WEAKENING]"
+            } else {
+                ""
+            };
+            diffs.push(format!(
+                "on_error: {} -> {}{tag}",
+                before.on_error, self.on_error
+            ));
+        }
+        if before.on_flagged != self.on_flagged {
+            let b_str = before.on_flagged.unwrap_or("-");
+            let a_str = self.on_flagged.unwrap_or("-");
+            let tag = if before.on_flagged == Some("block") && self.on_flagged == Some("quarantine")
+            {
+                weakenings.push(format!(
+                    "Filter '{}' on_flagged weakened (block -> quarantine)",
+                    self.id
+                ));
+                " [WEAKENING]"
+            } else {
+                ""
+            };
+            diffs.push(format!("on_flagged: {b_str} -> {a_str}{tag}"));
+        }
+        if before.matchers != self.matchers {
+            let tag = if matchers_lost_coverage(&before.matchers, &self.matchers) {
+                if matchers_is_empty(&self.matchers) {
+                    weakenings.push(format!(
+                        "Filter '{}' matchers emptied (matches nothing)",
+                        self.id
+                    ));
+                } else {
+                    weakenings.push(format!(
+                        "Filter '{}' matchers narrowed (lost trust tiers or selectors)",
+                        self.id
+                    ));
+                }
+                " [WEAKENING]"
+            } else {
+                ""
+            };
+            diffs.push(format!(
+                "matchers: {} -> {}{tag}",
+                format_matchers_display(&before.matchers),
+                format_matchers_display(&self.matchers)
+            ));
+        }
+        if before.min_allow_confidence != self.min_allow_confidence {
+            if let (Some(b), Some(a)) = (before.min_allow_confidence, self.min_allow_confidence) {
+                let tag = if a < b {
+                    weakenings.push(format!(
+                        "Filter '{}' min_allow_confidence lowered ({b:.2} -> {a:.2})",
+                        self.id
+                    ));
+                    " [WEAKENING]"
+                } else {
+                    ""
+                };
+                diffs.push(format!("min_allow_confidence: {b:.2} -> {a:.2}{tag}"));
+            }
+        }
+        if before.classifier_threshold != self.classifier_threshold {
+            if let (Some(b), Some(a)) = (before.classifier_threshold, self.classifier_threshold) {
+                let tag = if a > b {
+                    weakenings.push(format!(
+                        "Filter '{}' classifier threshold raised ({b:.2} -> {a:.2})",
+                        self.id
+                    ));
+                    " [WEAKENING]"
+                } else {
+                    ""
+                };
+                diffs.push(format!("threshold: {b:.2} -> {a:.2}{tag}"));
+            }
+        }
+        if before.max_input_chars != self.max_input_chars {
+            diffs.push(format!(
+                "max_input_chars: {} -> {}",
+                before.max_input_chars, self.max_input_chars
+            ));
+        }
+        if before.subprocess_args != self.subprocess_args {
+            diffs.push(format!(
+                "subprocess args: {} -> {}",
+                format_sanitized_list(&before.subprocess_args),
+                format_sanitized_list(&self.subprocess_args)
+            ));
+        }
+        if before.subprocess_env_allowlist != self.subprocess_env_allowlist {
+            let expanded = self
+                .subprocess_env_allowlist
+                .iter()
+                .any(|v| !before.subprocess_env_allowlist.contains(v));
+            let tag = if expanded {
+                weakenings.push(format!(
+                    "Subprocess filter '{}' env_allowlist expanded",
+                    self.id
+                ));
+                " [WEAKENING]"
+            } else {
+                ""
+            };
+            diffs.push(format!(
+                "subprocess env_allowlist: {} -> {}{tag}",
+                format_sanitized_list(&before.subprocess_env_allowlist),
+                format_sanitized_list(&self.subprocess_env_allowlist)
+            ));
+        }
+        if before.policy_notes != self.policy_notes {
+            let before_snip: String = before.policy_notes.chars().take(60).collect();
+            let after_snip: String = self.policy_notes.chars().take(60).collect();
+            diffs.push(format!(
+                "policy_notes: '{}' -> '{}'",
+                before_snip, after_snip
+            ));
         }
         diffs
+    }
+}
+
+fn summarize_stage1_and_diffs(
+    before: Option<&Stage1Config>,
+    after: &Stage1Config,
+    lines: &mut Vec<String>,
+    weakenings: &mut Vec<String>,
+) {
+    lines.push(format!(
+        "  Stage 1:  outbound_dlp={}, require_e2ee_for_peers={}, transfer_guard={}, rate_limit_action={}, regex_deny_action={}, custom_dlp={}, regex_denylist={}, acl_allow={}, acl_deny={}",
+        after.outbound_dlp_enabled,
+        after.require_e2ee_for_peers,
+        after.enforce_transfer_attachment_guard,
+        rate_limit_action_str(after.rate_limit_action),
+        stage1_deny_action_str(after.regex_deny_action),
+        after.custom_dlp_patterns.len(),
+        after.inbound_regex_denylist.len(),
+        after.inbound_allowlist.len(),
+        after.inbound_denylist.len(),
+    ));
+
+    if !after.outbound_dlp_enabled {
+        weakenings.push("Stage 1 outbound DLP secret scanner is DISABLED".to_string());
+    }
+    if !after.require_e2ee_for_peers {
+        weakenings.push("Stage 1 require_e2ee_for_peers is DISABLED".to_string());
+    }
+    if !after.enforce_transfer_attachment_guard {
+        weakenings.push("Stage 1 enforce_transfer_attachment_guard is DISABLED".to_string());
+    }
+
+    let mut tier_parts = Vec::new();
+    for (tier, tp) in &after.tier_policies {
+        tier_parts.push(format!(
+            "{}({}/{}m,cap={}B,{})",
+            tier.as_str(),
+            tp.rate_limit.max_burst,
+            tp.rate_limit.refill_per_min,
+            tp.max_payload_bytes,
+            tier_action_str(tp.default_action)
+        ));
+    }
+    if !tier_parts.is_empty() {
+        lines.push(format!("    tiers:  {}", tier_parts.join("; ")));
+    }
+
+    if let Some(b) = before {
+        if b.outbound_dlp_enabled != after.outbound_dlp_enabled {
+            let tag = if b.outbound_dlp_enabled && !after.outbound_dlp_enabled {
+                " [WEAKENING]"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "      changed: stage1.outbound_dlp_enabled: {} -> {}{tag}",
+                b.outbound_dlp_enabled, after.outbound_dlp_enabled
+            ));
+        }
+        if b.require_e2ee_for_peers != after.require_e2ee_for_peers {
+            let tag = if b.require_e2ee_for_peers && !after.require_e2ee_for_peers {
+                " [WEAKENING]"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "      changed: stage1.require_e2ee_for_peers: {} -> {}{tag}",
+                b.require_e2ee_for_peers, after.require_e2ee_for_peers
+            ));
+        }
+        if b.enforce_transfer_attachment_guard != after.enforce_transfer_attachment_guard {
+            let tag = if b.enforce_transfer_attachment_guard
+                && !after.enforce_transfer_attachment_guard
+            {
+                " [WEAKENING]"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "      changed: stage1.enforce_transfer_attachment_guard: {} -> {}{tag}",
+                b.enforce_transfer_attachment_guard, after.enforce_transfer_attachment_guard
+            ));
+        }
+        if b.inbound_regex_denylist.len() != after.inbound_regex_denylist.len() {
+            let tag = if after.inbound_regex_denylist.len() < b.inbound_regex_denylist.len() {
+                weakenings.push(format!(
+                    "Stage 1 inbound_regex_denylist reduced ({} -> {})",
+                    b.inbound_regex_denylist.len(),
+                    after.inbound_regex_denylist.len()
+                ));
+                " [WEAKENING]"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "      changed: stage1.inbound_regex_denylist count: {} -> {}{tag}",
+                b.inbound_regex_denylist.len(),
+                after.inbound_regex_denylist.len()
+            ));
+        }
+        for (tier, after_tp) in &after.tier_policies {
+            let before_tp = b.policy_for(*tier);
+            if before_tp != *after_tp {
+                let relaxed = after_tp.max_payload_bytes > before_tp.max_payload_bytes
+                    || after_tp.rate_limit.max_burst > before_tp.rate_limit.max_burst
+                    || after_tp.rate_limit.refill_per_min > before_tp.rate_limit.refill_per_min
+                    || tier_action_strictness(after_tp.default_action)
+                        < tier_action_strictness(before_tp.default_action);
+                let tag = if relaxed {
+                    weakenings.push(format!(
+                        "Stage 1 tier '{}' policy relaxed ({}/{}m cap={}B {} -> {}/{}m cap={}B {})",
+                        tier.as_str(),
+                        before_tp.rate_limit.max_burst,
+                        before_tp.rate_limit.refill_per_min,
+                        before_tp.max_payload_bytes,
+                        tier_action_str(before_tp.default_action),
+                        after_tp.rate_limit.max_burst,
+                        after_tp.rate_limit.refill_per_min,
+                        after_tp.max_payload_bytes,
+                        tier_action_str(after_tp.default_action),
+                    ));
+                    " [WEAKENING]"
+                } else {
+                    ""
+                };
+                lines.push(format!(
+                    "      changed: stage1.tier.{}: {}/{}m cap={}B {} -> {}/{}m cap={}B {}{tag}",
+                    tier.as_str(),
+                    before_tp.rate_limit.max_burst,
+                    before_tp.rate_limit.refill_per_min,
+                    before_tp.max_payload_bytes,
+                    tier_action_str(before_tp.default_action),
+                    after_tp.rate_limit.max_burst,
+                    after_tp.rate_limit.refill_per_min,
+                    after_tp.max_payload_bytes,
+                    tier_action_str(after_tp.default_action),
+                ));
+            }
+        }
     }
 }
 
@@ -397,22 +938,51 @@ fn format_gate_lock_summary(
     after: &SecurityGateConfig,
     merged_proposal: bool,
     config_path: &Path,
+    existing_tampered: Option<&str>,
 ) -> Vec<String> {
-    let mut lines = vec![
-        format!("Security Gate Policy Summary (config: {})", config_path.display()),
-        format!(
-            "  Signing:  require_signed_policy=true, signing_secret={}",
-            after.policy_signing_secret
-        ),
-        format!(
-            "  Proposal: {}",
-            if merged_proposal {
-                "merging staged gate.proposed.json"
-            } else {
-                "none (locking node.json policy)"
-            }
-        ),
-    ];
+    let mut lines = Vec::new();
+    let mut weakenings = Vec::new();
+
+    if let Some(tamper_detail) = existing_tampered {
+        lines.push(
+            "========================================================================".to_string(),
+        );
+        lines.push("WARNING: POLICY TAMPERED SINCE LAST SIGNATURE".to_string());
+        lines.push(format!(
+            "  Existing node.json failed gate_policy_sig verification: {}",
+            sanitize_tty_display(tamper_detail)
+        ));
+        lines.push(
+            "  Do NOT re-lock unless you have personally inspected EVERY field below!".to_string(),
+        );
+        lines.push(
+            "========================================================================".to_string(),
+        );
+    }
+
+    lines.push(format!(
+        "Security Gate Policy Summary (config: {})",
+        sanitize_tty_display(&config_path.display().to_string())
+    ));
+    lines.push(format!(
+        "  Signing:  require_signed_policy=true, signing_secret={}",
+        DEFAULT_POLICY_SIGNING_SECRET
+    ));
+    lines.push(format!(
+        "  Proposal: {}",
+        if merged_proposal {
+            "merging staged gate.proposed.json"
+        } else {
+            "none (locking node.json policy)"
+        }
+    ));
+
+    summarize_stage1_and_diffs(
+        before.map(|b| &b.stage1),
+        &after.stage1,
+        &mut lines,
+        &mut weakenings,
+    );
 
     let show_stage2 = after.stage2.enabled
         || before.is_some_and(|b| {
@@ -423,6 +993,9 @@ fn format_gate_lock_summary(
                 || b.stage2.auth_header != after.stage2.auth_header
                 || b.stage2.api_key_secret != after.stage2.api_key_secret
                 || b.stage2.on_error != after.stage2.on_error
+                || b.stage2.matchers != after.stage2.matchers
+                || b.stage2.min_allow_confidence != after.stage2.min_allow_confidence
+                || b.stage2.max_input_chars != after.stage2.max_input_chars
         });
     if show_stage2 {
         let (s2_adapter, s2_url) = match &after.stage2.provider {
@@ -432,7 +1005,8 @@ fn format_gate_lock_summary(
                     .stage2
                     .base_url_override
                     .as_deref()
-                    .unwrap_or("https://api.anthropic.com (default)"),
+                    .map(sanitize_tty_display)
+                    .unwrap_or_else(|| "https://api.anthropic.com (default)".to_string()),
             ),
             LlmProvider::OpenAi => (
                 "openai",
@@ -440,7 +1014,8 @@ fn format_gate_lock_summary(
                     .stage2
                     .base_url_override
                     .as_deref()
-                    .unwrap_or("https://api.openai.com/v1 (default)"),
+                    .map(sanitize_tty_display)
+                    .unwrap_or_else(|| "https://api.openai.com/v1 (default)".to_string()),
             ),
             LlmProvider::Google => (
                 "google",
@@ -448,30 +1023,95 @@ fn format_gate_lock_summary(
                     .stage2
                     .base_url_override
                     .as_deref()
-                    .unwrap_or("https://generativelanguage.googleapis.com (default)"),
+                    .map(sanitize_tty_display)
+                    .unwrap_or_else(|| {
+                        "https://generativelanguage.googleapis.com (default)".to_string()
+                    }),
             ),
             LlmProvider::OpenAiCompatible { base_url } => (
                 "openai-compat",
-                after
-                    .stage2
-                    .base_url_override
-                    .as_deref()
-                    .unwrap_or(base_url.as_str()),
+                sanitize_tty_display(
+                    after
+                        .stage2
+                        .base_url_override
+                        .as_deref()
+                        .unwrap_or(base_url.as_str()),
+                ),
             ),
         };
         lines.push(format!(
-            "  Stage 2:  enabled={}, adapter={}, model={}, base_url={}, auth_header={}, secret_name={}, on_error={}",
+            "  Stage 2:  enabled={}, adapter={}, model={}, base_url={}, auth_header={}, secret_name={}, on_error={}, min_allow_confidence={:.2}, max_input_chars={}",
             after.stage2.enabled,
             s2_adapter,
-            after.stage2.model,
+            sanitize_tty_display(&after.stage2.model),
             s2_url,
             after.stage2.auth_header.as_str(),
-            after.stage2.api_key_secret.as_deref().unwrap_or("none"),
+            after
+                .stage2
+                .api_key_secret
+                .as_deref()
+                .map(sanitize_tty_display)
+                .unwrap_or_else(|| "none".to_string()),
             error_action_str(after.stage2.on_error),
+            after.stage2.min_allow_confidence,
+            after.stage2.max_input_chars,
         ));
+        lines.push(format!(
+            "    matchers: {}",
+            format_matchers_display(&after.stage2.matchers)
+        ));
+        if after.stage2.enabled && matchers_is_empty(&after.stage2.matchers) {
+            weakenings.push("Stage 2 is enabled with EMPTY matchers (matches nothing)".to_string());
+        }
+        if let Some(b) = before {
+            if b.stage2.enabled && !after.stage2.enabled {
+                weakenings.push("Stage 2 disabled (true -> false)".to_string());
+                lines.push("      changed: stage2.enabled: true -> false [WEAKENING]".to_string());
+            }
+            if b.stage2.matchers != after.stage2.matchers {
+                let tag = if matchers_lost_coverage(&b.stage2.matchers, &after.stage2.matchers) {
+                    weakenings.push("Stage 2 matchers narrowed or emptied".to_string());
+                    " [WEAKENING]"
+                } else {
+                    ""
+                };
+                lines.push(format!(
+                    "      changed: stage2.matchers: {} -> {}{tag}",
+                    format_matchers_display(&b.stage2.matchers),
+                    format_matchers_display(&after.stage2.matchers)
+                ));
+            }
+            if (b.stage2.min_allow_confidence - after.stage2.min_allow_confidence).abs()
+                > f64::EPSILON
+            {
+                let tag = if after.stage2.min_allow_confidence < b.stage2.min_allow_confidence {
+                    weakenings.push(format!(
+                        "Stage 2 min_allow_confidence lowered ({:.2} -> {:.2})",
+                        b.stage2.min_allow_confidence, after.stage2.min_allow_confidence
+                    ));
+                    " [WEAKENING]"
+                } else {
+                    ""
+                };
+                lines.push(format!(
+                    "      changed: stage2.min_allow_confidence: {:.2} -> {:.2}{tag}",
+                    b.stage2.min_allow_confidence, after.stage2.min_allow_confidence
+                ));
+            }
+            if b.stage2.max_input_chars != after.stage2.max_input_chars {
+                lines.push(format!(
+                    "      changed: stage2.max_input_chars: {} -> {}",
+                    b.stage2.max_input_chars, after.stage2.max_input_chars
+                ));
+            }
+        }
     }
 
-    let filter_names: Vec<&str> = after.filters.iter().map(|f| f.id.as_str()).collect();
+    let filter_names: Vec<String> = after
+        .filters
+        .iter()
+        .map(|f| sanitize_tty_display(&f.id))
+        .collect();
     if filter_names.is_empty() {
         lines.push("  Filters:  0 configured (Stage 1 deterministic defaults only)".to_string());
     } else {
@@ -489,13 +1129,21 @@ fn format_gate_lock_summary(
     for f in &after.filters {
         let snap = FilterSnapshot::from_config(f);
         let prev = before_snaps.iter().find(|b| b.id == snap.id);
+        let mut filter_diffs = Vec::new();
         let status_tag = match prev {
             None if before.is_some() || merged_proposal => " [NEW]",
-            Some(p) if !snap.diff_fields(p).is_empty() => " [UPDATED]",
+            Some(p) => {
+                filter_diffs = snap.diff_fields(p, &mut weakenings);
+                if !filter_diffs.is_empty() {
+                    " [UPDATED]"
+                } else {
+                    ""
+                }
+            }
             _ => "",
         };
         lines.push(format!(
-            "    - {}{}: enabled={}, adapter={}, model={}, base_url={}, auth_header={}, secret_name={}, on_error={}",
+            "    - {}{}: enabled={}, adapter={}, model={}, base_url={}, auth_header={}, secret_name={}, on_error={}, {}, max_input_chars={}",
             snap.id,
             status_tag,
             snap.enabled,
@@ -505,17 +1153,48 @@ fn format_gate_lock_summary(
             snap.auth_header,
             snap.secret_name,
             snap.on_error,
+            snap.threshold_summary(),
+            snap.max_input_chars,
         ));
-        if let Some(prev_snap) = prev {
-            for diff in snap.diff_fields(prev_snap) {
-                lines.push(format!("        changed: {diff}"));
-            }
+        lines.push(format!(
+            "        matchers: {}",
+            format_matchers_display(&snap.matchers)
+        ));
+        if snap.adapter == "subprocess" {
+            lines.push(format!(
+                "        subprocess: args={}, env_allowlist={}",
+                format_sanitized_list(&snap.subprocess_args),
+                format_sanitized_list(&snap.subprocess_env_allowlist),
+            ));
+        }
+        if !snap.enabled {
+            weakenings.push(format!("Filter '{}' is DISABLED", snap.id));
+        } else if matchers_is_empty(&snap.matchers) {
+            weakenings.push(format!(
+                "Filter '{}' is enabled with EMPTY matchers (matches nothing)",
+                snap.id
+            ));
+        }
+        for diff in filter_diffs {
+            lines.push(format!("        changed: {diff}"));
         }
     }
 
     for prev_snap in &before_snaps {
-        if !after.filters.iter().any(|f| f.id == prev_snap.id) {
-            lines.push(format!("    - {} [REMOVED]", prev_snap.id));
+        if !after
+            .filters
+            .iter()
+            .any(|f| sanitize_tty_display(&f.id) == prev_snap.id)
+        {
+            weakenings.push(format!("Filter '{}' removed", prev_snap.id));
+            lines.push(format!("    - {} [REMOVED] [WEAKENING]", prev_snap.id));
+        }
+    }
+
+    if !weakenings.is_empty() {
+        lines.push("  WARNING — WEAKENING POLICY CHANGES DETECTED:".to_string());
+        for w in weakenings {
+            lines.push(format!("    ! {w}"));
         }
     }
 
@@ -529,20 +1208,25 @@ fn format_inbox_disposition_summary(
     mute_pattern: Option<&str>,
 ) -> Vec<String> {
     let mut lines = vec![
-        format!("Quarantined Item Disposition ({action})"),
-        format!("  Receipt:     {}", entry.receipt),
-        format!("  Session:     {}", entry.session_id),
-        format!("  Source:      {} (origin: {})", entry.source, entry.origin_node),
-        format!("  Trust Tier:  {trust_tier}"),
+        format!("Quarantined Item Disposition ({})", sanitize_tty_display(action)),
+        format!("  Receipt:     {}", sanitize_tty_display(&entry.receipt)),
+        format!("  Session:     {}", sanitize_tty_display(&entry.session_id)),
+        format!(
+            "  Source:      {} (origin: {})",
+            sanitize_tty_display(&entry.source),
+            sanitize_tty_display(&entry.origin_node)
+        ),
+        format!("  Trust Tier:  {}", sanitize_tty_display(trust_tier)),
         format!(
             "  Quarantined: {} (reason: {})",
             format_rfc3339_millis(entry.received_at),
-            entry.gate_reason.as_deref().unwrap_or("policy_quarantine")
+            sanitize_tty_display(entry.gate_reason.as_deref().unwrap_or("policy_quarantine"))
         ),
     ];
     if let Some(pat) = mute_pattern {
         lines.push(format!(
-            "  Mute Rule:   will install global Stage 1 mute for '{pat}'"
+            "  Mute Rule:   will install global Stage 1 mute for '{}'",
+            sanitize_tty_display(pat)
         ));
     }
     lines
@@ -750,10 +1434,13 @@ pub enum GateCommand {
         /// Maximum quarantined items to display
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Show bounded sanitized body snippets (strictly interactive TTY only; forbidden with --json)
+        #[arg(long)]
+        show_body: bool,
         /// Explicit state directory containing node.sqlite
         #[arg(long)]
         state_dir: Option<PathBuf>,
-        /// Output structured JSON envelope
+        /// Output structured JSON envelope (strictly metadata-only; never includes body text)
         #[arg(long)]
         json: bool,
     },
@@ -886,6 +1573,22 @@ pub fn inspect_gate_status(
         .iter()
         .map(summarize_filter_plugin)
         .collect();
+
+    if !gate_cfg.policy_signing_secret.is_empty()
+        && gate_cfg.policy_signing_secret != DEFAULT_POLICY_SIGNING_SECRET
+    {
+        return GateStatusSummary {
+            configured: true,
+            require_signed_policy: gate_cfg.require_signed_policy,
+            gate_policy_sig: "FAIL".to_string(),
+            tampered: true,
+            detail: format!(
+                "gate_policy_tampered: policy_signing_secret cannot be overridden (expected '{DEFAULT_POLICY_SIGNING_SECRET}')"
+            ),
+            filters,
+            quarantined_count,
+        };
+    }
 
     if gate_cfg.require_signed_policy || gate_cfg.policy_signature.is_some() {
         match gate_cfg.policy_signature.as_deref() {
@@ -1044,9 +1747,10 @@ pub fn run_gate(command: GateCommand) -> ExitCode {
         GateCommand::Review {
             session,
             limit,
+            show_body,
             state_dir,
             json,
-        } => run_gate_review(session, limit, state_dir, json),
+        } => run_gate_review(session, limit, show_body, state_dir, json),
         GateCommand::Log {
             decision,
             limit,
@@ -1335,13 +2039,21 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
 
     let mut locked = false;
     if args.lock {
+        let secrets = open_secret_store(&state_dir, args.state_dir.is_some());
+        let existing_tampered = check_existing_gate_tampered(
+            existing_gate.as_ref(),
+            &state_dir,
+            &secrets,
+        );
+        gate_cfg.policy_signing_secret = DEFAULT_POLICY_SIGNING_SECRET.to_string();
         let mut summary = format_gate_lock_summary(
             existing_gate.as_ref(),
             &gate_cfg,
             false,
             &config_path,
+            existing_tampered.as_deref(),
         );
-        if was_locked {
+        if was_locked && existing_tampered.is_none() {
             summary.insert(
                 0,
                 "WARNING: Security Gate is currently LOCKED. Updating and re-signing will replace the locked policy."
@@ -1355,7 +2067,6 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
             return emit_confirm_error(cmd, as_json, err);
         }
 
-        let secrets = open_secret_store(&state_dir, args.state_dir.is_some());
         if let Err(e) = bind_human_authorities_digest_if_present(&state_dir, &mut gate_cfg) {
             return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None);
         }
@@ -1388,16 +2099,41 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
         locked = true;
     } else {
         if was_locked {
+            let secrets = open_secret_store(&state_dir, args.state_dir.is_some());
+            let existing_tampered = check_existing_gate_tampered(
+                existing_gate.as_ref(),
+                &state_dir,
+                &secrets,
+            );
             let snap = FilterSnapshot::from_config(&plugin);
-            let summary = vec![
-                format!("Security Gate Overwrite (config: {})", config_path.display()),
-                format!(
-                    "  Filter:   {} (adapter={}, model={}, base_url={}, secret_name={}, on_error={})",
-                    snap.id, snap.adapter, snap.model, snap.base_url, snap.secret_name, snap.on_error
-                ),
+            let mut summary = Vec::new();
+            if let Some(ref detail) = existing_tampered {
+                summary.push(
+                    "========================================================================"
+                        .to_string(),
+                );
+                summary.push("WARNING: POLICY TAMPERED SINCE LAST SIGNATURE".to_string());
+                summary.push(format!(
+                    "  Existing node.json failed gate_policy_sig verification: {}",
+                    sanitize_tty_display(detail)
+                ));
+                summary.push(
+                    "========================================================================"
+                        .to_string(),
+                );
+            }
+            summary.push(format!(
+                "Security Gate Overwrite (config: {})",
+                sanitize_tty_display(&config_path.display().to_string())
+            ));
+            summary.push(format!(
+                "  Filter:   {} (adapter={}, model={}, base_url={}, secret_name={}, on_error={})",
+                snap.id, snap.adapter, snap.model, snap.base_url, snap.secret_name, snap.on_error
+            ));
+            summary.push(
                 "  WARNING:  Security Gate is currently LOCKED. Overwriting/unlocking it will disable tamper protection until re-locked."
                     .to_string(),
-            ];
+            );
             if let Err(err) = require_interactive_tty_confirmation(
                 &summary,
                 "WARNING: Security Gate is currently LOCKED. Overwriting/unlocking it will disable tamper protection until re-locked. Continue? [y/N]: ",
@@ -1553,6 +2289,69 @@ fn bind_human_authorities_digest_if_present(
     Ok(())
 }
 
+fn check_existing_gate_tampered(
+    existing: Option<&SecurityGateConfig>,
+    state_dir: &Path,
+    secrets: &SecretStore,
+) -> Option<String> {
+    let cfg = existing?;
+    if !cfg.require_signed_policy && cfg.policy_signature.is_none() {
+        return None;
+    }
+    let Some(sig) = cfg.policy_signature.as_deref() else {
+        return Some("require_signed_policy is true but policy_signature is missing".to_string());
+    };
+    if let Err(e) = verify_gate_policy_sig(cfg, sig, secrets) {
+        return Some(e.to_string());
+    }
+    if let Some(ref expected_digest) = cfg.human_authorities_digest {
+        let db_path = state_dir.join("node.sqlite");
+        if db_path.exists() {
+            match NodeDb::open(&db_path) {
+                Ok(db) => match db.human().authorities_digest() {
+                    Ok(actual) if actual != *expected_digest => {
+                        return Some(
+                            "human_authorities_digest mismatch with node.sqlite".to_string(),
+                        );
+                    }
+                    Err(e) => {
+                        return Some(format!("failed to verify human_authorities_digest: {e}"));
+                    }
+                    Ok(_) => {}
+                },
+                Err(e) => {
+                    return Some(format!("failed to open node.sqlite to verify digest: {e}"));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn check_raw_gate_json_signing_secret(val: &Value, label: &str) -> Result<(), String> {
+    let Some(obj) = val.as_object() else {
+        return Ok(());
+    };
+    for key in ["policySigningSecret", "policy_signing_secret"] {
+        if let Some(v) = obj.get(key) {
+            if v.is_null() {
+                continue;
+            }
+            let Some(s) = v.as_str() else {
+                return Err(format!(
+                    "Rejected {label}: '{key}' must not be overridden (expected constant '{DEFAULT_POLICY_SIGNING_SECRET}')"
+                ));
+            };
+            if !s.is_empty() && s != DEFAULT_POLICY_SIGNING_SECRET {
+                return Err(format!(
+                    "Rejected {label}: '{key}' cannot be changed from constant '{DEFAULT_POLICY_SIGNING_SECRET}'"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_gate_lock(
     config: Option<PathBuf>,
     state_dir: Option<PathBuf>,
@@ -1606,6 +2405,12 @@ fn run_gate_lock(
         },
         None => None,
     };
+
+    // Tamper laundering defense: verify existing signed gate policy FIRST before merging any
+    // proposal or prompting, so unauthorized disk edits are flagged with a loud banner!
+    let secrets = open_secret_store(&dir, state_dir.is_some());
+    let existing_tampered = check_existing_gate_tampered(before_gate.as_ref(), &dir, &secrets);
+
     let mut gate_cfg = before_gate.clone().unwrap_or_default();
 
     // Merge staged `gate.proposed.json` (from `hyp gate propose`) BEFORE binding
@@ -1628,7 +2433,23 @@ fn run_gate_lock(
                 );
             }
         };
-        let mut proposed_cfg: SecurityGateConfig = match serde_json::from_str(&raw_proposal) {
+        let raw_proposal_val: Value = match serde_json::from_str(&raw_proposal) {
+            Ok(v) => v,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "INVALID_GATE_CONFIG",
+                    format!("Malformed staged gate proposal {}: {e}", proposal_path.display()),
+                    None,
+                );
+            }
+        };
+        if let Err(e) = check_raw_gate_json_signing_secret(&raw_proposal_val, "gate.proposed.json") {
+            return emit_error(cmd, as_json, EXIT_ERROR, "INVALID_GATE_CONFIG", e, None);
+        }
+        let mut proposed_cfg: SecurityGateConfig = match serde_json::from_value(raw_proposal_val) {
             Ok(g) => g,
             Err(e) => {
                 return emit_error(
@@ -1655,7 +2476,7 @@ fn run_gate_lock(
         merged_proposal = true;
     }
 
-    if let Err(e) = gate_cfg.stage2.validate() {
+    if let Err(e) = gate_cfg.validate() {
         return emit_error(cmd, as_json, EXIT_ERROR, "INVALID_GATE_CONFIG", e.to_string(), None);
     }
     if gate_cfg.stage2.enabled {
@@ -1664,19 +2485,27 @@ fn run_gate_lock(
         }
     }
     for f in &gate_cfg.filters {
-        if let Err(e) = f.validate() {
-            return emit_error(cmd, as_json, EXIT_ERROR, "INVALID_GATE_CONFIG", e.to_string(), None);
-        }
-        if let Err(e) = validate_filter_plugin_endpoint_url(f) {
-            return emit_error(cmd, as_json, EXIT_ERROR, "INVALID_GATE_CONFIG", e.to_string(), None);
+        if f.enabled {
+            if let Err(e) = validate_filter_plugin_endpoint_url(f) {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "INVALID_GATE_CONFIG",
+                    e.to_string(),
+                    None,
+                );
+            }
         }
     }
+    gate_cfg.policy_signing_secret = DEFAULT_POLICY_SIGNING_SECRET.to_string();
 
     let summary = format_gate_lock_summary(
         before_gate.as_ref(),
         &gate_cfg,
         merged_proposal,
         &config_path,
+        existing_tampered.as_deref(),
     );
     if let Err(err) = require_interactive_tty_confirmation(
         &summary,
@@ -1685,7 +2514,6 @@ fn run_gate_lock(
         return emit_confirm_error(cmd, as_json, err);
     }
 
-    let secrets = open_secret_store(&dir, state_dir.is_some());
     if let Err(e) = bind_human_authorities_digest_if_present(&dir, &mut gate_cfg) {
         return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None);
     }
@@ -1822,10 +2650,30 @@ fn run_gate_lock(
 fn run_gate_review(
     session: Option<String>,
     limit: usize,
+    show_body: bool,
     state_dir: Option<PathBuf>,
     as_json: bool,
 ) -> ExitCode {
     let cmd = "gate review";
+
+    // G6/G10: Quarantined plaintext is NEVER emitted in `--json`, and `--show-body` requires a
+    // real interactive human terminal so agents cannot exfiltrate quarantined prompts via CLI.
+    if show_body {
+        if as_json {
+            return emit_error(
+                cmd,
+                true,
+                EXIT_USAGE,
+                "SHOW_BODY_FORBIDDEN_WITH_JSON",
+                "`--show-body` cannot be combined with `--json`; `hyp gate review --json` is strictly metadata-only.",
+                Some("Run `hyp gate review --show-body` directly in an interactive human terminal.".to_string()),
+            );
+        }
+        if !is_interactive_tty() {
+            return emit_confirm_error(cmd, false, ConfirmError::NotInteractiveTty);
+        }
+    }
+
     let dir = resolve_state_dir(state_dir.as_deref(), None, None);
     let db_path = dir.join("node.sqlite");
     let db = match NodeDb::open(&db_path) {
@@ -1838,20 +2686,29 @@ fn run_gate_review(
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
     };
 
+    let trust_tiers: Vec<String> = items
+        .iter()
+        .map(|entry| lookup_quarantined_trust_tier(&db, &entry.receipt, &entry.session_id))
+        .collect();
+
+    // G6/G10: Strictly metadata-only JSON (NO `preview`, NO `text`, NO `body`!).
     let rows: Vec<Value> = items
         .iter()
-        .map(|entry| {
-            let preview: String = entry.text.chars().take(160).collect();
+        .zip(trust_tiers.iter())
+        .map(|(entry, trust_tier)| {
             json!({
                 "receipt": entry.receipt,
                 "sessionId": entry.session_id,
                 "originNode": entry.origin_node,
                 "sender": entry.source,
+                "source": entry.source,
+                "trustTier": trust_tier,
                 "kind": entry.kind.as_str(),
                 "reason": entry.gate_reason,
                 "receivedAt": entry.received_at,
-                "preview": preview,
+                "receivedAtRfc3339": format_rfc3339_millis(entry.received_at),
                 "payloadSha256": entry.payload_sha256,
+                "bodyBytes": entry.text.len(),
             })
         })
         .collect();
@@ -1860,12 +2717,12 @@ fn run_gate_review(
         vec![
             format!(
                 "Approve: hyp inbox approve {} --state-dir {}",
-                first.receipt,
+                sanitize_tty_display(&first.receipt),
                 dir.display()
             ),
             format!(
                 "Reject & mute sender: hyp inbox reject {} --mute --state-dir {}",
-                first.receipt,
+                sanitize_tty_display(&first.receipt),
                 dir.display()
             ),
         ]
@@ -1893,21 +2750,39 @@ fn run_gate_review(
             println!("  (no quarantined items)");
         } else {
             println!();
-            for item in &items {
-                let preview: String = item
-                    .text
-                    .chars()
-                    .map(|c| if c.is_control() { ' ' } else { c })
-                    .take(120)
-                    .collect();
-                println!("Receipt:  {}", item.receipt);
-                println!("  Session:  {}", item.session_id);
-                println!("  From:     {} (origin: {})", item.source, item.origin_node);
+            for (item, trust_tier) in items.iter().zip(trust_tiers.iter()) {
+                println!("Receipt:  {}", sanitize_tty_display(&item.receipt));
+                println!("  Session:  {}", sanitize_tty_display(&item.session_id));
+                println!(
+                    "  From:     {} (origin: {})",
+                    sanitize_tty_display(&item.source),
+                    sanitize_tty_display(&item.origin_node)
+                );
+                println!("  Trust:    {}", sanitize_tty_display(trust_tier));
                 println!(
                     "  Reason:   {}",
-                    item.gate_reason.as_deref().unwrap_or("policy_quarantine")
+                    sanitize_tty_display(
+                        item.gate_reason.as_deref().unwrap_or("policy_quarantine")
+                    )
                 );
-                println!("  Preview:  {preview}");
+                println!("  Received: {}", format_rfc3339_millis(item.received_at));
+                if let Some(ref sha) = item.payload_sha256 {
+                    println!("  SHA-256:  {}", sanitize_tty_display(sha));
+                }
+                println!("  Bytes:    {}", item.text.len());
+                if show_body {
+                    let snippet: String = sanitize_tty_display(&item.text)
+                        .chars()
+                        .take(240)
+                        .collect();
+                    println!("  Body:     {snippet}");
+                }
+                println!();
+            }
+            if !show_body {
+                println!(
+                    "  (Body text hidden by default; pass --show-body in an interactive terminal to inspect sanitized snippets.)"
+                );
                 println!();
             }
             print_next_steps(&next);
@@ -2057,7 +2932,7 @@ fn run_inbox_approve(
     let summary = format_inbox_disposition_summary("approve", &entry, &trust_tier, None);
     let prompt = format!(
         "Approve quarantined item {} for delivery? [y/N]: ",
-        entry.receipt
+        sanitize_tty_display(&entry.receipt)
     );
     if let Err(err) = require_interactive_tty_confirmation(&summary, &prompt) {
         return emit_confirm_error(cmd, as_json, err);
@@ -2210,7 +3085,10 @@ fn run_inbox_reject(
         &trust_tier,
         mute_rule.as_ref().map(|m| m.pattern.as_str()),
     );
-    let prompt = format!("Reject quarantined item {}? [y/N]: ", entry.receipt);
+    let prompt = format!(
+        "Reject quarantined item {}? [y/N]: ",
+        sanitize_tty_display(&entry.receipt)
+    );
     if let Err(err) = require_interactive_tty_confirmation(&summary, &prompt) {
         return emit_confirm_error(cmd, as_json, err);
     }
@@ -2440,6 +3318,7 @@ mod tests {
             &after,
             true,
             Path::new("/tmp/node.json"),
+            None,
         );
         let text = lines.join("\n");
         assert!(text.contains("merging staged gate.proposed.json"), "text={text}");
@@ -2493,5 +3372,101 @@ mod tests {
             !summary.contains(canary),
             "inbox confirmation summary MUST NEVER leak raw body text: {summary}"
         );
+    }
+
+    #[test]
+    fn sanitize_tty_display_strips_ansi_csi_osc_controls_and_bidi() {
+        // ANSI CSI colors & cursor movement
+        assert_eq!(
+            sanitize_tty_display("\x1b[31mRED\x1b[2J\x1b[0m ok"),
+            "RED ok"
+        );
+        // 8-bit CSI
+        assert_eq!(sanitize_tty_display("a\u{009B}32mgreen\u{009B}0mb"), "agreenb");
+        // ANSI OSC terminated by BEL and ST (`ESC \`)
+        assert_eq!(
+            sanitize_tty_display("\x1b]0;spoofed title\x07clean\x1b]8;;https://evil.example\x1b\\link\x1b]8;;\x1b\\"),
+            "cleanlink"
+        );
+        // C0/C1 controls + BiDi overrides/isolates/marks
+        let dirty = "hello\x00\x07\x08\r\n\u{007F}\u{0085}\u{202A}\u{202E}evil\u{2066}iso\u{2069}\u{200E}\u{200F}\u{061C}world";
+        assert_eq!(sanitize_tty_display(dirty), "helloevilisoworld");
+    }
+
+    #[test]
+    fn gate_lock_summary_flags_tampered_policy_and_weakening_changes() {
+        let mut before = SecurityGateConfig::default();
+        before.filters.push(FilterPluginConfig {
+            id: "cls-1".into(),
+            enabled: true,
+            matchers: Stage2Matchers {
+                trust_tiers: vec![TrustTier::Guest, TrustTier::ExternalWebhook],
+                ..Stage2Matchers::default()
+            },
+            on_error: Stage2ErrorAction::Block,
+            max_concurrent: 4,
+            busy_retry_after_ms: 1_000,
+            adapter: FilterAdapterConfig::HttpClassifier {
+                url: "https://guard.example.com/classify".into(),
+                api_key_secret: None,
+                auth_header: None,
+                score_field: "score".into(),
+                label_field: "label".into(),
+                flagged_labels: vec![],
+                threshold: 0.75,
+                timeout_ms: 4_000,
+                max_input_chars: 16_384,
+                on_flagged: Stage2ErrorAction::Block,
+            },
+        });
+
+        let mut after = before.clone();
+        after.stage1.outbound_dlp_enabled = false;
+        after.filters[0].enabled = false;
+        after.filters[0].matchers.trust_tiers.clear();
+        if let FilterAdapterConfig::HttpClassifier {
+            ref mut threshold, ..
+        } = after.filters[0].adapter
+        {
+            *threshold = 0.99;
+        }
+        after.filters.push(FilterPluginConfig {
+            id: "sub-1".into(),
+            enabled: true,
+            matchers: Stage2Matchers {
+                trust_tiers: vec![TrustTier::Peer],
+                ..Stage2Matchers::default()
+            },
+            on_error: Stage2ErrorAction::Quarantine,
+            max_concurrent: 2,
+            busy_retry_after_ms: 500,
+            adapter: FilterAdapterConfig::Subprocess {
+                command: "/usr/local/bin/my-filter".into(),
+                args: vec!["--strict".into(), "\x1b[31m--evil".into()],
+                env_allowlist: vec!["RUST_LOG".into()],
+                timeout_ms: 2_000,
+                max_input_chars: 8_192,
+                min_allow_confidence: 0.80,
+            },
+        });
+
+        let text = format_gate_lock_summary(
+            Some(&before),
+            &after,
+            true,
+            Path::new("/tmp/node.json"),
+            Some("gate policy signature mismatch"),
+        )
+        .join("\n");
+        assert!(text.contains("WARNING: POLICY TAMPERED SINCE LAST SIGNATURE"), "text={text}");
+        assert!(text.contains("WARNING — WEAKENING POLICY CHANGES DETECTED"), "text={text}");
+        assert!(text.contains("outbound_dlp=false"), "text={text}");
+        assert!(text.contains("Stage 1 outbound DLP secret scanner is DISABLED"), "text={text}");
+        assert!(text.contains("Filter 'cls-1' disabled"), "text={text}");
+        assert!(text.contains("matchers emptied"), "text={text}");
+        assert!(text.contains("threshold raised (0.75 -> 0.99)"), "text={text}");
+        assert!(text.contains("max_input_chars=8192"), "text={text}");
+        assert!(text.contains("subprocess: args=[--strict, --evil], env_allowlist=[RUST_LOG]"), "text={text}");
+        assert!(!text.contains('\x1b'), "ANSI escape must be stripped: {text}");
     }
 }

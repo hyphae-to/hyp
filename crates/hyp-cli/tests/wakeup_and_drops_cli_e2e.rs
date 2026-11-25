@@ -37,6 +37,64 @@ use std::process::{Output, Stdio};
 use std::time::Duration;
 use tempfile::TempDir;
 
+#[cfg(not(unix))]
+fn seal_hdrop1_via_stored_admin(
+    state_dir: &Path,
+    node_id: &str,
+    human_id: &str,
+    admin_kid: &str,
+    kind: hyp_crypto::human::HumanDropKind,
+    secret_name: Option<&str>,
+    drop_id: &str,
+    body: &str,
+) -> String {
+    use hyp_crypto::human::{HumanAudience, HumanClaimV1, SecretDropSpec, encode_hdrop1, seal_human_drop};
+    use sha2::{Digest, Sha256};
+
+    let store = SecretStore::new(state_dir, SecretBackend::File);
+    let prefix: String = admin_kid
+        .chars()
+        .take(8)
+        .map(|c| {
+            let low = c.to_ascii_lowercase();
+            if low.is_ascii_lowercase() || low.is_ascii_digit() || matches!(low, '_' | '-') {
+                low
+            } else {
+                'x'
+            }
+        })
+        .collect();
+    let hash = hex::encode(&Sha256::digest(admin_kid.as_bytes())[..4]);
+    let admin_secret = format!("human-admin-{prefix}-{hash}");
+    let raw_pkcs8 = store.get(&admin_secret).expect("stored admin key");
+    let admin_kp = Ed25519KeyPair::from_pkcs8_b64(&raw_pkcs8).unwrap();
+    let node_keys = store.load_or_create_node_keys(node_id).unwrap();
+    let now = now_unix_ms();
+    let claim = HumanClaimV1 {
+        v: 1,
+        kind,
+        claim_id: format!("win-claim-{now}"),
+        human_id: human_id.to_string(),
+        human_kid: admin_kp.kid(),
+        auth_epoch: 1,
+        issued_at: format_rfc3339_millis(now),
+        expires_at: format_rfc3339_millis(now + 300_000),
+        drop_id: drop_id.to_string(),
+        audience: HumanAudience {
+            node_id: node_id.to_string(),
+            node_enc_kid: node_keys.encryption.kid(),
+            handle: None,
+        },
+        secret_spec: secret_name.map(|n| SecretDropSpec {
+            name: n.to_string(),
+            overwrite: false,
+        }),
+        body: body.to_string(),
+    };
+    let env = seal_human_drop(&claim, &admin_kp, &node_keys.encryption.public_key()).unwrap();
+    encode_hdrop1(&env).unwrap()
+}
+
 fn run_hyp_with_stdin(home: &Path, args: &[&str], stdin_data: &str) -> Output {
     let mut child = isolated_cmd(home)
         .args(args)
@@ -203,7 +261,7 @@ fn cli_emit_to_live_node_local_ingest_socket_unsigned_and_signed() {
     assert_eq!(stdin_json["data"]["topic"], "local.schedule");
     assert_eq!(stdin_json["data"]["decision"], "allow");
 
-    // 5. `hyp auth init` + `hyp emit --sign --label prod-op --note "signed trigger" --json`.
+    // 5. `hyp auth init` + `hyp emit --sign` requires interactive TTY confirmation!
     let auth_out = isolated_cmd(home)
         .args([
             "auth",
@@ -220,7 +278,8 @@ fn cli_emit_to_live_node_local_ingest_socket_unsigned_and_signed() {
         .expect("run auth init");
     assert_eq!(auth_out.status.code(), Some(0));
 
-    let signed_out = isolated_cmd(home)
+    // Non-TTY `hyp emit --sign` fails closed with exit 2 (INTERACTIVE_TTY_REQUIRED).
+    let signed_nontty = isolated_cmd(home)
         .args([
             "emit",
             "--sign",
@@ -234,20 +293,45 @@ fn cli_emit_to_live_node_local_ingest_socket_unsigned_and_signed() {
         ])
         .stdin(Stdio::null())
         .output()
-        .expect("run emit --sign");
+        .expect("run emit --sign non-tty");
+    assert_eq!(signed_nontty.status.code(), Some(2));
     assert_eq!(
-        signed_out.status.code(),
-        Some(0),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&signed_out.stdout),
-        String::from_utf8_lossy(&signed_out.stderr)
+        parse_json_stdout(&signed_nontty)["error"]["code"],
+        "INTERACTIVE_TTY_REQUIRED"
     );
-    let signed_json = parse_json_stdout(&signed_out);
-    assert_eq!(signed_json["ok"], true);
-    assert_eq!(signed_json["data"]["topic"], "local.schedule");
-    assert_eq!(signed_json["data"]["decision"], "allow");
-    assert_eq!(signed_json["data"]["trustTier"], "human-verified");
-    assert_eq!(signed_json["data"]["verifiedHumanId"], "bogdan");
+
+    #[cfg(unix)]
+    {
+        let signed_pty = run_hyp_in_pty(
+            home,
+            &[
+                "emit",
+                "--sign",
+                "--label",
+                "prod-op",
+                "--note",
+                "signed trigger",
+                "--state-dir",
+                state_str,
+                "--json",
+            ],
+            None,
+            Some("y\n"),
+        );
+        assert_eq!(
+            signed_pty.code, 0,
+            "stdout={} tty={}",
+            signed_pty.stdout, signed_pty.tty
+        );
+        assert!(signed_pty.tty.contains("Label:      prod-op"));
+        assert!(signed_pty.tty.contains("Note:       signed trigger"));
+        let signed_json = signed_pty.parse_json();
+        assert_eq!(signed_json["ok"], true);
+        assert_eq!(signed_json["data"]["topic"], "local.schedule");
+        assert_eq!(signed_json["data"]["decision"], "allow");
+        assert_eq!(signed_json["data"]["trustTier"], "human-verified");
+        assert_eq!(signed_json["data"]["verifiedHumanId"], "bogdan");
+    }
 
     // 6. Verify `hyp status --json` reports `data.localIngest.enabled == true` & `socketExists == true`.
     let status_out = isolated_cmd(home)
@@ -621,7 +705,8 @@ fn cli_auth_init_certify_sign_and_drop_ingest_secret_zero_leak() {
 
     // 4. Pipe secret via stdin into `hyp auth sign --kind secret --secret-name demo-api-key --json`
     let secret_plaintext = "hyphae_zk_test_value_001";
-    let sign_out = run_hyp_with_stdin(
+    // Non-TTY `hyp auth sign` fails closed with exit 2 (INTERACTIVE_TTY_REQUIRED) and zero secret leak!
+    let sign_nontty = run_hyp_with_stdin(
         home,
         &[
             "auth",
@@ -636,23 +721,58 @@ fn cli_auth_init_certify_sign_and_drop_ingest_secret_zero_leak() {
         ],
         secret_plaintext,
     );
+    assert_eq!(sign_nontty.status.code(), Some(2));
     assert_eq!(
-        sign_out.status.code(),
-        Some(0),
-        "stderr={}",
-        String::from_utf8_lossy(&sign_out.stderr)
+        parse_json_stdout(&sign_nontty)["error"]["code"],
+        "INTERACTIVE_TTY_REQUIRED"
     );
-    let sign_stdout = String::from_utf8_lossy(&sign_out.stdout);
-    let sign_stderr = String::from_utf8_lossy(&sign_out.stderr);
-    assert!(
-        !sign_stdout.contains(secret_plaintext) && !sign_stderr.contains(secret_plaintext),
-        "SECRET LEAKED IN `hyp auth sign` OUTPUT!"
+    assert!(!String::from_utf8_lossy(&sign_nontty.stdout).contains(secret_plaintext));
+    assert!(!String::from_utf8_lossy(&sign_nontty.stderr).contains(secret_plaintext));
+
+    #[cfg(unix)]
+    let hdrop1 = {
+        let sign_pty = run_hyp_in_pty(
+            home,
+            &[
+                "auth",
+                "sign",
+                "--kind",
+                "secret",
+                "--secret-name",
+                "demo-api-key",
+                "--state-dir",
+                state_str,
+                "--json",
+            ],
+            Some(secret_plaintext),
+            Some("y\n"),
+        );
+        assert_eq!(
+            sign_pty.code, 0,
+            "stdout={} tty={}",
+            sign_pty.stdout, sign_pty.tty
+        );
+        assert!(
+            !sign_pty.stdout.contains(secret_plaintext) && !sign_pty.tty.contains(secret_plaintext),
+            "SECRET LEAKED IN `hyp auth sign` OUTPUT!"
+        );
+        let sign_json = sign_pty.parse_json();
+        sign_json["data"]["token"]
+            .as_str()
+            .expect("hdrop1 token")
+            .to_string()
+    };
+    #[cfg(not(unix))]
+    let hdrop1 = seal_hdrop1_via_stored_admin(
+        &state_dir,
+        init_json["data"]["nodeId"].as_str().unwrap(),
+        "bogdan",
+        init_json["data"]["kid"].as_str().unwrap(),
+        hyp_crypto::human::HumanDropKind::Secret,
+        Some("demo-api-key"),
+        "",
+        secret_plaintext,
     );
-    let sign_json = parse_json_stdout(&sign_out);
-    let hdrop1 = sign_json["data"]["token"]
-        .as_str()
-        .expect("hdrop1 token")
-        .to_string();
     assert!(hdrop1.starts_with("hdrop1_"));
 
     // 5. Pipe `hdrop1_` via stdin into `hyp drop ingest --json`
@@ -815,8 +935,8 @@ fn cli_auth_directive_gate_lock_replay_and_revocation_fail_closed() {
         .to_string();
     assert!(!locked_digest.is_empty());
 
-    // 3. `hyp auth sign --kind directive` -> `hyp drop ingest --json`
-    let sign_dir = run_hyp_with_stdin(
+    // 3. `hyp auth sign --kind directive` (interactive PTY!) -> `hyp drop ingest --json`
+    let sign_dir = run_hyp_in_pty(
         home,
         &[
             "auth",
@@ -829,10 +949,11 @@ fn cli_auth_directive_gate_lock_replay_and_revocation_fail_closed() {
             cfg_str,
             "--json",
         ],
-        "Deploy release v0.4.0 to staging now.",
+        Some("Deploy release v0.4.0 to staging now."),
+        Some("y\n"),
     );
-    assert_eq!(sign_dir.status.code(), Some(0));
-    let directive_token = parse_json_stdout(&sign_dir)["data"]["token"]
+    assert_eq!(sign_dir.code, 0, "tty={}", sign_dir.tty);
+    let directive_token = sign_dir.parse_json()["data"]["token"]
         .as_str()
         .unwrap()
         .to_string();
@@ -914,7 +1035,7 @@ fn cli_auth_directive_gate_lock_replay_and_revocation_fail_closed() {
 
     // 5. Sign a second fresh drop BEFORE revoking, then revoke `<kid> --bump-epoch`,
     //    and verify the pre-signed drop from the revoked key fails closed!
-    let sign_second = run_hyp_with_stdin(
+    let sign_second = run_hyp_in_pty(
         home,
         &[
             "auth",
@@ -927,10 +1048,11 @@ fn cli_auth_directive_gate_lock_replay_and_revocation_fail_closed() {
             cfg_str,
             "--json",
         ],
-        "Second directive signed before revocation",
+        Some("Second directive signed before revocation"),
+        Some("y\n"),
     );
-    assert_eq!(sign_second.status.code(), Some(0));
-    let second_token = parse_json_stdout(&sign_second)["data"]["token"]
+    assert_eq!(sign_second.code, 0, "tty={}", sign_second.tty);
+    let second_token = sign_second.parse_json()["data"]["token"]
         .as_str()
         .unwrap()
         .to_string();
@@ -1488,6 +1610,19 @@ fn cli_auth_init_web_callback_csrf_cors_and_live_relay_drop_wait() {
     rt.block_on(async {
         let client = hyp_node::engine::http_util::HttpClient::new().unwrap();
 
+        // Missing Origin header MUST be rejected with 403 (`#5`: local curl cannot bypass Origin check)!
+        let missing_origin_req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(&callback_url)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header("x-hyphae-csrf", &csrf_token)
+            .body(hyp_node::engine::http_util::full_body(
+                serde_json::to_vec(&json!({ "jwk": phone_jwk })).unwrap(),
+            ))
+            .unwrap();
+        let resp = client.request(missing_origin_req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
+
         // Untrusted Origin MUST be rejected with 403!
         let bad_origin_req = http::Request::builder()
             .method(http::Method::POST)
@@ -1643,36 +1778,49 @@ fn cli_auth_init_web_callback_csrf_cors_and_live_relay_drop_wait() {
         assert_eq!(mode, 0o600, "last_drop.json must be 0600, got {:o}", mode);
     }
 
-    // Sign secret bound to `drop_id` via `hyp auth sign --drop-id <drop_id>`
+    // Sign secret bound to `drop_id` via `hyp auth sign --drop-id <drop_id>` (PTY on Unix)
     let relay_secret = "hyphae_zk_relay_test_value_042";
-    let signed = run_hyp_with_stdin(
-        home,
-        &[
-            "auth",
-            "sign",
-            "--kind",
-            "secret",
-            "--secret-name",
-            "relay-e2e-key",
-            "--drop-id",
-            &drop_id,
-            "--state-dir",
-            state_str,
-            "--json",
-        ],
+    #[cfg(unix)]
+    let token = {
+        let signed = run_hyp_in_pty(
+            home,
+            &[
+                "auth",
+                "sign",
+                "--kind",
+                "secret",
+                "--secret-name",
+                "relay-e2e-key",
+                "--drop-id",
+                &drop_id,
+                "--state-dir",
+                state_str,
+                "--json",
+            ],
+            Some(relay_secret),
+            Some("y\n"),
+        );
+        assert_eq!(
+            signed.code, 0,
+            "auth sign failed: stdout={} tty={}",
+            signed.stdout, signed.tty
+        );
+        signed.parse_json()["data"]["token"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    #[cfg(not(unix))]
+    let token = seal_hdrop1_via_stored_admin(
+        &state_dir,
+        out_json["data"]["nodeId"].as_str().unwrap(),
+        "web-user",
+        out_json["data"]["kid"].as_str().unwrap(),
+        hyp_crypto::human::HumanDropKind::Secret,
+        Some("relay-e2e-key"),
+        &drop_id,
         relay_secret,
     );
-    assert_eq!(
-        signed.status.code(),
-        Some(0),
-        "auth sign failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&signed.stdout),
-        String::from_utf8_lossy(&signed.stderr)
-    );
-    let token = parse_json_stdout(&signed)["data"]["token"]
-        .as_str()
-        .unwrap()
-        .to_string();
     let env_obj = hyp_crypto::human::decode_hdrop1(&token).unwrap();
 
     // Post opaque ciphertext to Drop Relay using `X-Hyphae-Drop-Cap: <postCap>`
@@ -1909,8 +2057,40 @@ fn cli_drop_portal_url_override_and_fail_closed_validation() {
         "expected https://drop.acme.com#drop=, got: {env_drop_json}"
     );
 
-    // 4. `HYPHAE_DROP_PORTAL_URL=https://drop.acme.com` overrides `hyp auth init --web` (`#enroll=`)
-    //    AND scopes loopback callback CORS strictly to `https://drop.acme.com`!
+    // 4a. P0 `#5`: Non-TTY `hyp auth init --web` on ALREADY-INITIALIZED `state_dir` MUST fail closed!
+    let reinit_web = isolated_cmd(home)
+        .env("HYPHAE_DROP_PORTAL_URL", "https://drop.acme.com")
+        .args([
+            "auth",
+            "init",
+            "--human-id",
+            "attacker-web",
+            "--label",
+            "laptop",
+            "--web",
+            "--no-open",
+            "--port",
+            "0",
+            "--timeout",
+            "5",
+            "--state-dir",
+            state_str,
+            "--config",
+            cfg_str,
+            "--json",
+        ])
+        .output()
+        .expect("run non-tty auth init --web on existing node");
+    assert_eq!(reinit_web.status.code(), Some(2));
+    assert_eq!(
+        parse_json_stdout(&reinit_web)["error"]["code"],
+        "INTERACTIVE_TTY_REQUIRED"
+    );
+
+    // 4b. `HYPHAE_DROP_PORTAL_URL=https://drop.acme.com` overrides `hyp auth init --web` (`#enroll=`)
+    //     on a fresh node AND scopes loopback callback Origin/CORS strictly to `https://drop.acme.com`!
+    let web_state_dir = home.join("web-portal-state");
+    let web_state_str = web_state_dir.to_str().unwrap();
     let mut web_cmd = isolated_cmd(home);
     web_cmd
         .env("HYPHAE_DROP_PORTAL_URL", "https://drop.acme.com")
@@ -1928,9 +2108,7 @@ fn cli_drop_portal_url_override_and_fail_closed_validation() {
             "--timeout",
             "15",
             "--state-dir",
-            state_str,
-            "--config",
-            cfg_str,
+            web_state_str,
             "--json",
         ]);
     let mut web_proc = ManagedProcess::spawn("hyp auth init --web (custom portal)", &mut web_cmd);
@@ -1960,6 +2138,19 @@ fn cli_drop_portal_url_override_and_fail_closed_validation() {
         .unwrap();
     rt.block_on(async {
         let client = hyp_node::engine::http_util::HttpClient::new().unwrap();
+        // Missing Origin MUST be rejected with 403!
+        let missing_origin = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(&callback_url)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header("x-hyphae-csrf", &csrf_token)
+            .body(hyp_node::engine::http_util::full_body(
+                serde_json::to_vec(&json!({ "jwk": phone_jwk })).unwrap(),
+            ))
+            .unwrap();
+        let resp = client.request(missing_origin).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
+
         // Default origin `https://hyphae.to` MUST be rejected when overridden to `https://drop.acme.com`!
         let wrong_origin = http::Request::builder()
             .method(http::Method::POST)

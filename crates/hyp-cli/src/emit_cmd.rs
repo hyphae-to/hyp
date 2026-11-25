@@ -17,6 +17,9 @@ use crate::auth_cmd::select_local_signing_authority;
 use crate::config_file::{
     load_node_or_legacy_config, open_secret_store, resolve_config_path_for_read, resolve_state_dir,
 };
+use crate::gate_cmd::{
+    ConfirmError, emit_confirm_error, require_controlling_tty_confirmation, sanitize_tty_display,
+};
 use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json};
 use clap::Args;
 use hyp_crypto::human::sign_local_ingest_event;
@@ -99,6 +102,13 @@ pub fn run_emit(args: EmitArgs) -> ExitCode {
                 None,
             );
         }
+    }
+
+    // P0: `hyp emit --sign` attaches a `HumanVerified` Ed25519 signature using the local admin
+    // key and MUST require an interactive human controlling terminal (unsigned `hyp emit` for
+    // cron/scripts remains completely non-interactive).
+    if args.sign && !io::stderr().is_terminal() {
+        return emit_confirm_error("emit --sign", as_json, ConfirmError::NotInteractiveTty);
     }
 
     let config_path =
@@ -186,7 +196,7 @@ pub fn run_emit(args: EmitArgs) -> ExitCode {
             }
         };
         let secrets = open_secret_store(&state_dir, args.state_dir.is_some());
-        let (_admin_rec, admin_kp) =
+        let (admin_rec, admin_kp) =
             match select_local_signing_authority(&db, &secrets, args.kid.as_deref(), true) {
                 Ok(pair) => pair,
                 Err(e) => {
@@ -200,6 +210,52 @@ pub fn run_emit(args: EmitArgs) -> ExitCode {
                     );
                 }
             };
+        let label_summary = event
+            .extensions
+            .get("label")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                event
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("label"))
+                    .and_then(Value::as_str)
+            })
+            .or(args.label.as_deref())
+            .unwrap_or("-");
+        let raw_note = event
+            .data
+            .as_ref()
+            .and_then(|d| d.get("note").or_else(|| d.get("text")))
+            .and_then(Value::as_str)
+            .or(args.note.as_deref())
+            .unwrap_or("-");
+        let clean_note_full = sanitize_tty_display(raw_note);
+        let note_preview: String = clean_note_full.chars().take(160).collect();
+        let note_suffix = if clean_note_full.chars().count() > 160 {
+            "..."
+        } else {
+            ""
+        };
+        let confirm_summary = vec![
+            "Signed Local Event Confirmation (HumanVerified)".to_string(),
+            format!(
+                "  Authority:  {} (kid: {})",
+                sanitize_tty_display(&admin_rec.human_id),
+                sanitize_tty_display(&admin_rec.kid)
+            ),
+            format!("  Topic:      local.{}", sanitize_tty_display(&topic)),
+            format!("  Event Type: {}", sanitize_tty_display(&event.event_type)),
+            format!("  Source:     {}", sanitize_tty_display(&event.source)),
+            format!("  Label:      {}", sanitize_tty_display(label_summary)),
+            format!("  Note:       {note_preview}{note_suffix}"),
+        ];
+        if let Err(err) = require_controlling_tty_confirmation(
+            &confirm_summary,
+            "Sign & emit this event as HumanVerified? [y/N]: ",
+        ) {
+            return emit_confirm_error("emit --sign", as_json, err);
+        }
         let canonical = match canonical_local_event_for_signing(&event) {
             Ok(c) => c,
             Err(e) => {
