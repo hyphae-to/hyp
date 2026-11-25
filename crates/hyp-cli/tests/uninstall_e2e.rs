@@ -76,8 +76,17 @@ mod unix_e2e {
     }
 
     fn run_script(script: &Path, home: &Path, args: &[&str]) -> Output {
-        Command::new("/bin/bash")
-            .arg(script)
+        run_script_with_claude_dir(script, home, None, args)
+    }
+
+    fn run_script_with_claude_dir(
+        script: &Path,
+        home: &Path,
+        claude_config_dir: Option<&Path>,
+        args: &[&str],
+    ) -> Output {
+        let mut cmd = Command::new("/bin/bash");
+        cmd.arg(script)
             .args(args)
             .env("HOME", home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
@@ -86,8 +95,16 @@ mod unix_e2e {
             .env("HERDR_APP_HOME", home.join(".config/herdr-app"))
             .env("HYPHAE_SECRET_BACKEND", "file")
             .env("CI", "1")
-            .stdin(Stdio::null())
-            .output()
+            .stdin(Stdio::null());
+        match claude_config_dir {
+            Some(dir) => {
+                cmd.env("CLAUDE_CONFIG_DIR", dir);
+            }
+            None => {
+                cmd.env_remove("CLAUDE_CONFIG_DIR");
+            }
+        }
+        cmd.output()
             .unwrap_or_else(|e| panic!("failed executing {}: {e}", script.display()))
     }
 
@@ -1142,6 +1159,316 @@ fast_mode = true
         assert_eq!(
             claude_settings["statusLine"]["command"],
             "/usr/local/bin/my-claude-bar --git --branch"
+        );
+    }
+
+    #[test]
+    fn claude_config_dir_profile_symlinks_preserved_and_hermetic_guard_holds() {
+        let script = repo_root().join("scripts/uninstall.sh");
+        let tmp = TempDir::new().expect("temp home");
+        let h = tmp.path();
+        let profile = h.join(".claude-work");
+        let config_hyphae = h.join(".config/hyphae");
+
+        // Seed original custom statusLine backup & default ~/.claude state.
+        let orig_sl = json!({
+            "type": "command",
+            "command": "/usr/local/bin/my-starship-claude --git",
+            "refreshInterval": 10
+        });
+        let chain_path = config_hyphae.join("claude-statusline-chain.json");
+        write_json(&chain_path, &orig_sl);
+        write_json(
+            &config_hyphae.join("node.json"),
+            &json!({ "v": 2, "nodeId": "bogdan@macbook" }),
+        );
+
+        let default_settings = h.join(".claude/settings.json");
+        write_json(
+            &default_settings,
+            &json!({
+                "theme": "dark",
+                "statusLine": {
+                    "type": "command",
+                    "command": format!(
+                        "{} statusline --harness claude --chain-file {}",
+                        h.join(".local/bin/hyp").display(),
+                        chain_path.display()
+                    ),
+                    "refreshInterval": 5
+                },
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [{ "type": "command", "command": "/usr/local/bin/keep-hook" }]
+                        },
+                        {
+                            "matcher": "mcp__hyphae__.*",
+                            "hooks": [{ "type": "command", "command": "hyp hook claude pre-tool-use" }]
+                        }
+                    ],
+                    "Stop": [
+                        {
+                            "hooks": [{ "type": "command", "command": "hyp hook claude stop" }]
+                        }
+                    ]
+                }
+            }),
+        );
+        fs::set_permissions(&default_settings, fs::Permissions::from_mode(0o600))
+            .expect("chmod settings.json");
+
+        // Default ~/.claude.json + default commands & skills (including hyphae-panel + custom user files)
+        write_json(
+            &h.join(".claude.json"),
+            &json!({
+                "numStartups": 11,
+                "mcpServers": {
+                    "github": { "command": "npx", "args": ["github-mcp"] },
+                    "hyphae": { "command": "hyp", "args": ["mcp"] }
+                }
+            }),
+        );
+        for cmd in ["hyphae.md", "hyphae-subs.md", "hyphae-focus.md", "hyphae-mute.md"] {
+            write_file(&h.join(".claude/commands").join(cmd), "# default hyphae cmd\n");
+        }
+        write_file(&h.join(".claude/commands/default-custom.md"), "# keep default cmd\n");
+        for skill in ["hyphae", "hyphae-setup", "hyphae-schedule", "hyphae-panel"] {
+            write_file(&h.join(".claude/skills").join(skill).join("SKILL.md"), "# hyphae skill\n");
+        }
+        write_file(&h.join(".claude/skills/my-shared-skill/SKILL.md"), "# keep shared skill\n");
+
+        // Profile $CLAUDE_CONFIG_DIR:
+        // - real .claude.json (profile-specific MCP servers)
+        // - symlinked settings.json -> ~/.claude/settings.json
+        // - symlinked skills -> ~/.claude/skills
+        // - profile-local commands/ directory with hyphae*.md + custom command
+        fs::create_dir_all(&profile).expect("create CLAUDE_CONFIG_DIR");
+        write_json(
+            &profile.join(".claude.json"),
+            &json!({
+                "profileName": "work",
+                "mcpServers": {
+                    "linear": { "command": "linear-mcp", "args": [] },
+                    "hyphae": { "command": "hyp", "args": ["mcp"] }
+                }
+            }),
+        );
+        symlink(&default_settings, profile.join("settings.json"))
+            .expect("symlink profile settings.json");
+        symlink(h.join(".claude/skills"), profile.join("skills"))
+            .expect("symlink profile skills dir");
+        for cmd in ["hyphae.md", "hyphae-subs.md", "hyphae-focus.md", "hyphae-mute.md"] {
+            write_file(&profile.join("commands").join(cmd), "# profile hyphae cmd\n");
+        }
+        write_file(&profile.join("commands/work-custom.md"), "# keep profile cmd\n");
+
+        // 1. Dry-run reports profile .claude.json & profile commands without duplicating symlinked
+        //    settings.json or symlinked skills, and modifies zero files.
+        let dry = run_script_with_claude_dir(&script, h, Some(&profile), &["--dry-run"]);
+        let dry_stdout = String::from_utf8_lossy(&dry.stdout);
+        assert_eq!(
+            dry.status.code(),
+            Some(0),
+            "dry-run failed: stdout={dry_stdout}\nstderr={}",
+            String::from_utf8_lossy(&dry.stderr)
+        );
+        assert!(dry_stdout.contains(&profile.join(".claude.json").display().to_string()));
+        assert!(dry_stdout.contains(&profile.join("commands/hyphae.md").display().to_string()));
+        assert!(
+            !dry_stdout.contains(&profile.join("skills/hyphae").display().to_string()),
+            "canonical dedup must avoid listing symlinked profile skills twice:\n{dry_stdout}"
+        );
+        assert!(read_json(&profile.join(".claude.json"))["mcpServers"].get("hyphae").is_some());
+
+        // 2. Full uninstall cleans BOTH profiles, restores statusLine verbatim, preserves BOTH symlinks.
+        let out = run_script_with_claude_dir(&script, h, Some(&profile), &["--yes"]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "uninstall with CLAUDE_CONFIG_DIR failed: stdout={}\nstderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let default_mcp = read_json(&h.join(".claude.json"));
+        assert_eq!(default_mcp["numStartups"], 11);
+        assert!(default_mcp["mcpServers"].get("hyphae").is_none());
+        assert!(default_mcp["mcpServers"].get("github").is_some());
+
+        let profile_mcp = read_json(&profile.join(".claude.json"));
+        assert_eq!(profile_mcp["profileName"], "work");
+        assert!(profile_mcp["mcpServers"].get("hyphae").is_none());
+        assert!(profile_mcp["mcpServers"].get("linear").is_some());
+
+        // Symlinks remain symlinks pointing to the exact original targets!
+        assert!(
+            fs::symlink_metadata(profile.join("settings.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "CLAUDE_CONFIG_DIR/settings.json symlink must NEVER be replaced with a regular file"
+        );
+        assert_eq!(
+            fs::read_link(profile.join("settings.json")).unwrap(),
+            default_settings
+        );
+        assert!(
+            fs::symlink_metadata(profile.join("skills"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "CLAUDE_CONFIG_DIR/skills symlink must NEVER be unlinked"
+        );
+        assert_eq!(
+            fs::read_link(profile.join("skills")).unwrap(),
+            h.join(".claude/skills")
+        );
+
+        // Chained statusLine restored verbatim, Hyphae hooks removed, custom hooks & 0600 preserved.
+        let settings_after = read_json(&default_settings);
+        assert_eq!(settings_after["statusLine"], orig_sl);
+        assert_eq!(settings_after["theme"], "dark");
+        assert!(settings_after["hooks"].get("Stop").is_none());
+        let pre = settings_after["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 1);
+        assert_eq!(pre[0]["hooks"][0]["command"], "/usr/local/bin/keep-hook");
+        assert_eq!(
+            fs::metadata(&default_settings).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // Commands & skills cleaned in both places; user custom commands & skills preserved!
+        for cmd in ["hyphae.md", "hyphae-subs.md", "hyphae-focus.md", "hyphae-mute.md"] {
+            assert!(!h.join(".claude/commands").join(cmd).exists());
+            assert!(!profile.join("commands").join(cmd).exists());
+        }
+        assert!(h.join(".claude/commands/default-custom.md").exists());
+        assert!(profile.join("commands/work-custom.md").exists());
+
+        for skill in ["hyphae", "hyphae-setup", "hyphae-schedule", "hyphae-panel"] {
+            assert!(!h.join(".claude/skills").join(skill).exists());
+            assert!(!profile.join("skills").join(skill).exists());
+        }
+        assert!(h.join(".claude/skills/my-shared-skill/SKILL.md").exists());
+        assert!(profile.join("skills/my-shared-skill/SKILL.md").exists());
+
+        // 3. Re-running with CLAUDE_CONFIG_DIR set is cleanly idempotent.
+        let out2 = run_script_with_claude_dir(&script, h, Some(&profile), &["--yes"]);
+        assert_eq!(out2.status.code(), Some(0));
+        assert!(String::from_utf8_lossy(&out2.stdout).contains("Already clean"));
+
+        // 4. Direct symlink to external dotfiles inside isolated HOME (no ~/.claude/settings.json)
+        //    is cleaned through os.path.realpath / fs.realpathSync without replacing the symlink,
+        //    differentially verified across BOTH Python 3 and Node.js cleaners!
+        let setup_symlink_only_profile = |base: &Path| {
+            let prof = base.join(".claude-dot");
+            let df = base.join("dotfiles/claude-work-settings.json");
+            let chain = base.join(".config/hyphae/claude-statusline-chain.json");
+            write_json(&chain, &orig_sl);
+            write_json(
+                &df,
+                &json!({
+                    "owner": "dotfiles",
+                    "statusLine": {
+                        "type": "command",
+                        "command": format!("hyp statusline --harness claude --chain-file {}", chain.display())
+                    },
+                    "hooks": {
+                        "Stop": [{ "hooks": [{ "type": "command", "command": "hyp hook claude stop" }] }]
+                    }
+                }),
+            );
+            fs::create_dir_all(&prof).unwrap();
+            symlink(&df, prof.join("settings.json")).unwrap();
+            write_json(
+                &prof.join(".claude.json"),
+                &json!({ "mcpServers": { "hyphae": { "command": "hyp", "args": ["mcp"] }, "keep": { "command": "k" } } }),
+            );
+            (prof, df)
+        };
+
+        let tmp_py = TempDir::new().expect("temp home py");
+        let (prof_py, df_py) = setup_symlink_only_profile(tmp_py.path());
+        let out_py = run_script_with_claude_dir(&script, tmp_py.path(), Some(&prof_py), &["--yes"]);
+        assert_eq!(out_py.status.code(), Some(0));
+        assert!(fs::symlink_metadata(prof_py.join("settings.json")).unwrap().file_type().is_symlink());
+        assert_eq!(read_json(&df_py)["statusLine"], orig_sl);
+        assert!(read_json(&df_py).get("hooks").is_none());
+        assert!(read_json(&prof_py.join(".claude.json"))["mcpServers"].get("hyphae").is_none());
+        assert!(read_json(&prof_py.join(".claude.json"))["mcpServers"].get("keep").is_some());
+
+        if let Ok(which_node) = Command::new("/usr/bin/which").arg("node").output() {
+            let node_path = PathBuf::from(String::from_utf8_lossy(&which_node.stdout).trim());
+            if which_node.status.success() && node_path.is_file() {
+                let no_py_bin = TempDir::new().expect("no-python bin dir");
+                symlink(&node_path, no_py_bin.path().join("node")).expect("symlink node");
+                for util in ["awk", "basename", "find", "grep", "id", "rm", "sort", "uname", "wc", "cat"] {
+                    for dir in ["/usr/bin", "/bin"] {
+                        let cand = Path::new(dir).join(util);
+                        if cand.is_file() {
+                            let _ = symlink(&cand, no_py_bin.path().join(util));
+                            break;
+                        }
+                    }
+                }
+                let tmp_js = TempDir::new().expect("temp home js");
+                let (prof_js, df_js) = setup_symlink_only_profile(tmp_js.path());
+                let out_js = Command::new("/bin/bash")
+                    .arg(&script)
+                    .args(["--yes"])
+                    .env("PATH", no_py_bin.path())
+                    .env("HOME", tmp_js.path())
+                    .env("XDG_CONFIG_HOME", tmp_js.path().join(".config"))
+                    .env("XDG_STATE_HOME", tmp_js.path().join(".local/state"))
+                    .env("HYPHAE_INSTALL_DIR", tmp_js.path().join(".local/bin"))
+                    .env("HERDR_APP_HOME", tmp_js.path().join(".config/herdr-app"))
+                    .env("CLAUDE_CONFIG_DIR", &prof_js)
+                    .env("HYPHAE_SECRET_BACKEND", "file")
+                    .env("CI", "1")
+                    .stdin(Stdio::null())
+                    .output()
+                    .expect("run node fallback with CLAUDE_CONFIG_DIR");
+                assert_eq!(
+                    out_js.status.code(),
+                    Some(0),
+                    "node fallback with CLAUDE_CONFIG_DIR failed: stdout={}\nstderr={}",
+                    String::from_utf8_lossy(&out_js.stdout),
+                    String::from_utf8_lossy(&out_js.stderr)
+                );
+                assert!(fs::symlink_metadata(prof_js.join("settings.json")).unwrap().file_type().is_symlink());
+                assert_eq!(read_json(&df_py), read_json(&df_js));
+                assert_eq!(read_json(&prof_py.join(".claude.json")), read_json(&prof_js.join(".claude.json")));
+            }
+        }
+
+        // 5. Hermetic guard: when HOME is isolated, an external CLAUDE_CONFIG_DIR outside HOME
+        //    (e.g. inherited from host shell during tests) MUST NOT be mutated!
+        let outside_dir = TempDir::new().expect("outside CLAUDE_CONFIG_DIR");
+        let outside_mcp = outside_dir.path().join(".claude.json");
+        let outside_cmd = outside_dir.path().join("commands/hyphae.md");
+        write_json(
+            &outside_mcp,
+            &json!({ "mcpServers": { "hyphae": { "command": "hyp", "args": ["mcp"] } } }),
+        );
+        write_file(&outside_cmd, "# untouched outside home\n");
+
+        let isolated_home = TempDir::new().expect("isolated home for hermetic guard");
+        let guard_out = run_script_with_claude_dir(
+            &script,
+            isolated_home.path(),
+            Some(outside_dir.path()),
+            &["--yes"],
+        );
+        assert_eq!(guard_out.status.code(), Some(0));
+        assert!(
+            read_json(&outside_mcp)["mcpServers"].get("hyphae").is_some(),
+            "hermetic guard must protect external CLAUDE_CONFIG_DIR outside isolated HOME"
+        );
+        assert!(
+            outside_cmd.exists(),
+            "hermetic guard must protect external CLAUDE_CONFIG_DIR commands outside isolated HOME"
         );
     }
 }

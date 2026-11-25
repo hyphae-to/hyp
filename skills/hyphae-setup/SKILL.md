@@ -15,14 +15,15 @@ You are guiding the user through first-time onboarding **or** ongoing configurat
 
 ---
 
-## 0. First Step (Always): Inspect Current State (Secret-Free)
+## 0. First Step (Always / Turn 0): Silent State Inspection (Secret-Free)
 
-Before asking questions or modifying files, inspect the machine with structured `--json` probes (and check whether orchestrators like Herdr `hc` are present):
+Before asking questions or modifying files, inspect the machine silently with structured `--json` probes (including `CLAUDE_CONFIG_DIR` and orchestrators like Herdr `hc`):
 
 ```sh
 hyp version --json
 hyp status --json
 hyp doctor --json
+printf 'CLAUDE_CONFIG_DIR=%s\n' "${CLAUDE_CONFIG_DIR:-}"
 command -v hc >/dev/null && hc templates --json || true
 ```
 
@@ -48,27 +49,43 @@ Use the results to pick the right mode automatically:
    - *(Remember: never pass secrets in URLs — `#drop=` and `#enroll=` links only carry public metadata, one-shot `postCap`s, or HPKE-encrypted `encDraft`s.)*
 6. **Guided Credential & Lock Walkthroughs — NEVER dump bare `hyp secret set` or `hyp gate lock` commands without context**:
    - Whenever you ask the user to run `hyp secret set <name> --web` or `hyp gate lock`, **always explain in 2–4 crisp bullets**: (a) **why** it's needed (or whether it's optional), (b) **exact URL + exact clicks/scopes** to generate the token (with a QR code + URL for phone apps like `https://t.me/BotFather`), and (c) what `hyp gate lock` is about to apply & sign (`adapter`, `model`, `base_url`, `on_error`) so the user can review before locking. Walk through one integration cleanly rather than leaving the user guessing where a token comes from!
+7. **Complete All 4 Onboarding Pillars & Ask Direct Questions (NEVER Punt to "Later")**:
+   - During **Mode 1 (First-Time Onboarding)**, **NEVER stop after bootstrapping the local node & harnesses** and dump Event Streams, Chat Bridges, Verified Human Drops, or Local Security Gates into a passive *"Later you can add..."* list unless the user explicitly answers *"none / skip optional integrations"*.
+   - Keep each turn focused (**2–3 crisp choices**; use native multi-choice / interactive question tools if the harness provides them, or short numbered A/B/C options).
+   - **NEVER dump a passive *"Three things need your input"* bullet wall at the end** — turn every machine-specific decision (Herdr symlinked/custom layout, T3 session token, `CLAUDE_CONFIG_DIR` profiles) into a crisp direct question right when it arises!
 
 ---
 
-## Mode 1: First-Time Onboarding Interview
+## Mode 1: Mandatory Multi-Turn Guided Onboarding (`Turn 0` → `Turn 1` → `Turn 2` → `Turn 3+` → `Finish`)
 
-Start with **2–3 concise questions** (adapt based on what `hyp doctor --json` already detected):
+Follow these explicit turns in order so nothing is written without consent and no optional pillar is silently skipped:
 
-1. **Coding harnesses & optional components / UI plugins to install** *(ask explicitly before running `hyp onboard --yes` or `hyp setup` so nothing unwanted is written)*:
+### Turn 0 — Silent Inspection
+Run the secret-free probes in Section 0 (`hyp version --json`, `hyp status --json`, `hyp doctor --json`, `CLAUDE_CONFIG_DIR`, and `hc templates --json` if `hc` exists) before speaking to the user.
+
+### Turn 1 — Core Node, Harnesses & UI Extras + Topology
+
+Ask **2 crisp questions** tailored to what Turn 0 detected (never write files before the user confirms):
+
+1. **Coding harnesses & optional UI components to enable**:
    - **Harnesses**: Which detected harnesses should Hyphae wire? (`auto` for all detected, `all` for all 9, or a comma-separated subset of `antigravity,claude,codex,cursor,opencode,gemini,openclaw,herdr,t3`.)
    - **Runtime skills (`hyphae/SKILL.md`)**: On by default (tailored per harness/orchestrator); pass `--no-skills` to keep MCP & hooks only.
    - **Live `statusLine`** (`--statusline` for **Claude Code** & **Antigravity CLI**): Shows live unread/focus/mesh badge in the CLI status bar, **non-destructively chaining** any existing custom `statusLine` into a `0600` backup (reversible anytime with `--restore-statusline`).
-   - **Claude Code slash commands & native side-panel plugin**: Standalone slash commands (`/hyphae`, `/hyphae-subs`, `/hyphae-focus`, `/hyphae-mute`, plus `!hyp ui` live terminal inspector) install under `~/.claude/commands/` by default (pass `--no-commands` to skip); for the native Claude Code side panel (`/hyphae-panel`), mention the bundled `plugins/claude-code` plugin.
+   - **Claude Code slash commands & auto-installed native side-panel mod (`/hyphae-panel`)**: Standalone slash commands (`/hyphae`, `/hyphae-subs`, `/hyphae-focus`, `/hyphae-mute`, plus `!hyp ui`) install under `~/.claude/commands/` AND the UI-only Claude Code native side-panel mod (`/hyphae-panel`) auto-installs into `~/.claude/skills/hyphae-panel/` (and `$CLAUDE_CONFIG_DIR/skills/hyphae-panel/` if not symlinked) alongside `plugins/claude-code/`. Pass `--no-commands` to skip both.
+   - **`CLAUDE_CONFIG_DIR` profiles**: `hyp setup` / `hyp onboard` automatically respects `CLAUDE_CONFIG_DIR` (and `--claude-config-dir <DIR>` for extra profiles) without breaking dotfiles symlinks (`settings.json`, `skills`, etc.).
    - **Native Herdr desktop mod** (`--mod` when Herdr is selected): Installs `hyphae-pane` + `hyphae-panel` into `~/.config/herdr-app` (symlink-safe; respects git-tracked layouts and custom pane headers — use `--clone-layout <name>` for a ready-made layout or import reusable `pill.js` into custom pane headers).
 2. **Mesh topology**:
    - **Local only** (`--profile local`) — connect coding agents on this machine.
    - **Direct P2P** (`--profile p2p`, `hp2p1_`) — pair directly with another laptop/server (zero central hub).
    - **Team Hub** (`--profile router`, `am2_`) — join an org's blind E2EE Team Hub or deploy a new one.
    - **Public Read-Only Node** (`guest-ro`) — subscribe to read-only GitHub event streams (e.g., `https://public.hyphae.to` or self-hosted `public-node`).
-3. **Optional integrations**: Do they want custom `localIngest` route policy / OS cron triggers (`ingest.sock` / `hyp emit` is enabled by default on `local.schedule`), Verified Human Drops (`hyp auth init --web` + Drop Relay + encrypted directive prefills), event streams (GitHub `github-public`, webhooks, Prometheus Alertmanager v4), external local chat bridges (`plugins/slack`, `plugins/telegram`, `plugins/whatsapp`, `plugins/webhook`), or a Local Security Gate prompt-injection guard?
 
-### Step 1.1 — Bootstrap Node, Keys & Harnesses
+End Turn 1 by explicitly setting expectations:
+> *"Once the base node & harnesses are wired, we'll pick any optional streams, chat bridges, Verified Human Drops, and Security Gate you want."*
+
+### Turn 2 — Bootstrap Core + Ask Machine Follow-Ups & Optional Integrations Directly
+
+#### Step 2.1 — Bootstrap Node, Keys & Harnesses
 
 Running `hyp onboard` interactively opens the borderless high-res 2×4 Unicode Braille organic mycelium & glowing **`HYPHAE`** interactive TUI wizard (picking **Local CLI setup** opens an interactive harness & component toggle checklist before writing any files; when `HC_TERMINAL_ID` is set inside Herdr, discovered Herdr launch templates appear directly on the main menu and launch via `hc run --bg --outlive-parent` + immediate TTY `hc attach <address>`). When driving setup as an agent, pass `--yes` along with only the harnesses and component flags the user opted into:
 
@@ -90,12 +107,37 @@ Preview or adjust harness wiring & optional components with `hyp setup` (or run 
 ```sh
 hyp setup --harness claude,codex,antigravity --dry-run --json
 hyp setup --harness claude,antigravity --statusline --json
+hyp setup --harness claude --claude-config-dir ~/.claude-work --json
 hyp setup --harness claude --no-skills --no-commands --json
 hyp setup --harness herdr --mod --json
 hyp setup --interactive   # TTY-only interactive harness & component toggle checklist
 ```
 
-### Native Wakeup Transports & Orchestrators
+#### Step 2.2 — Inspect JSON Output & Ask Any Machine-Specific Follow-Ups Directly
+
+Inspect `herdrMod`, `harnesses`, and `warnings` from the `--json` output and turn any machine-specific follow-up into a crisp direct question (never a passive end-of-turn list):
+
+- **Herdr symlinked or custom pane header (`herdrMod.layoutAction == "skipped_symlink"` or `"skipped_custom_header"`)**: inspect `pane.header.content.mod` in the active Herdr layout JSON first!
+  - If customized (NOT `"pane"` and NOT `"hyphae-pane"`): **NEVER recommend overwriting `pane.header.content.mod = "hyphae-pane"`** (that would replace their custom pane header!). Ask directly:
+    - **(A)** Wire reusable `pill.js` (`mods/hyphae-pane/{pill.js,shared-client.js,hyphae.svg}`) into your custom pane header mod + add `hyphae-panel` to `panel-body.children`,
+    - **(B)** Keep `Cmd+Shift+H` floating inspector only, or
+    - **(C)** Replace the pane header with `hyphae-pane`.
+  - If default `"pane"` in a symlinked repo (`skipped_symlink`): ask directly whether to apply `--patch-layout` (updates the target atomically while keeping the symlink intact!) or leave floating `Cmd+Shift+H` only.
+- **T3 Code**: if `t3` was wired and `t3-session-token` is missing, ask directly: *"Do you want live T3 Code push wakeups configured now?"* (If yes, walk through `hyp secret set t3-session-token --web`; if no, skip cleanly.)
+- **Extra `CLAUDE_CONFIG_DIR` profiles**: if additional Claude profiles exist beyond the active `CLAUDE_CONFIG_DIR`, ask directly whether to wire them via `--claude-config-dir <DIR>`.
+
+#### Step 2.3 — MANDATORY Optional Capabilities & Security Gate Question (DO NOT SKIP!)
+
+In Turn 2 (right after bootstrapping the core node/harnesses and connecting any chosen topology below), **ALWAYS ask directly** (never relegate to *"Later you can..."*):
+
+> **"Which optional capabilities do you want to set up now?"**
+> 1. **Event Streams** — GitHub (Webhook on a Hub node vs. Multi-owner `repoTokens` Poll on a Local node), Prometheus Alertmanager, or custom OS cron / `local.schedule` routes (`hyp emit` / `ingest.sock` is already enabled by default)
+> 2. **Chat Bridges** — Telegram (`@BotFather`), Slack (Socket Mode), WhatsApp, or generic Webhook
+> 3. **Verified Human Drops** — Phone WebAuthn Passkey (`https://hyphae.to/drop`, QR + URL) + `https://spore.hyphae.to` Blind Drop Relay for zero-leak secret handoffs & signed directives
+> 4. **Local Security Gate** — Prompt-injection filter (`anthropic` [supports `--base-url` + `--auth-header bearer|x-api-key`], `openai-compat`, `google`, `lakera-guard`, `http-classifier`) + `hyp gate lock`
+> 5. **None for now** — skip straight to final `hyp doctor` check
+
+#### Native Wakeup Transports & Orchestrators
 
 Check which orchestrators and native push transports are present on this machine and wire them cleanly so idle agents wake automatically without polling:
 
@@ -106,7 +148,7 @@ Check which orchestrators and native push transports are present on this machine
 - **OpenClaw (`openclaw`)**: Daemon/GUI orchestrator configured in `~/.openclaw/openclaw.json` (`hyp mcp --backend openclaw --ephemeral`) with its orchestrator skill at `~/.openclaw/skills/hyphae/SKILL.md`. Wire with `hyp setup --harness openclaw --json`; for guided onboarding inside OpenClaw, run `hyp onboard --assist openclaw` to install `hyphae-setup` and paste the printed prompt in a new thread.
 - **Desktop & IDE Apps (`claude-desktop`, `codex-desktop`, `opencode`, `t3`, `cursor`)**: In `hyp onboard`, **Claude Desktop** and **Codex Desktop** show a preview -> confirm -> atomic non-destructive MCP config merge (`claude_desktop_config.json` / `~/.codex/config.toml`), print a restart reminder, and provide **`[o] Open in App`** verified deep links (`claude://claude.ai/new?q=...`, `codex://threads/new?prompt=...`, `opencode://new-session?...`, `t3code://`, `cursor://`) with automatic clipboard fallback. You can also run `hyp onboard --assist claude-desktop` / `--assist codex-desktop` / `--assist cursor` to install `hyphae-setup` directly into their skill directory (`~/.claude/skills`, `~/.codex/skills`, `~/.cursor/skills`).
 
-### Step 1.2 — Connect Chosen Topology (If Beyond Local-Only)
+#### Connect Chosen Topology (If Beyond Local-Only)
 
 - **Join a Public Read-Only Node** (verifies signed `/v1/manifest` fail-closed):
   ```sh
@@ -147,9 +189,13 @@ Check which orchestrators and native push transports are present on this machine
     hyp pair accept --json <<< "$TOKEN"
     ```
 
-### Step 1.3 — Install & Verify Background Daemon Service
+### Turn 3+ — Configure Every Selected Integration (One by One)
 
-Always ensure the user finishes onboarding with a live background daemon running (macOS LaunchAgent `to.hyphae.daemon` or Linux `systemd --user` `hyphae-daemon.service`). `hyp onboard --yes` installs and starts it automatically on default workstation setups; you can also manage it explicitly with `hyp service`:
+For every option the user selected in Step 2.3 (plus any Herdr/T3/`CLAUDE_CONFIG_DIR` follow-up they chose in Step 2.2), walk through **one capability at a time** using the exact recipes in Mode 2 (**D** Local Ingest/OS cron, **E** Verified Human Drops, **F** Event Streams & Chat Bridges, **G** Local Security Gate) while strictly following **Guardrails #5 & #6** (QR code + clickable URL for phone flows; exact URL/clicks/scopes before `hyp secret set <name> --web`; exact summary before `hyp gate lock`). Restart the daemon (`hyp service restart --json`) after editing `node.json`.
+
+### Finish — Install & Verify Background Daemon Service
+
+Once all selected integrations are configured (or if the user chose **5. None for now**), always finish with a live background daemon (macOS LaunchAgent `to.hyphae.daemon` or Linux `systemd --user` `hyphae-daemon.service`) and a green `hyp doctor --json` check (`hyp onboard --yes` installs and starts it automatically on default workstation setups; manage explicitly with `hyp service`):
 
 ```sh
 # Install and start the persistent background daemon service (LaunchAgent / systemd --user)
@@ -184,9 +230,9 @@ Identify what the user wants to change and execute only the targeted workflow:
   hyp setup --harness claude,antigravity --statusline --json
   hyp setup --harness claude,antigravity --restore-statusline --json   # cleanly restore original bar
   ```
-- **Claude Code slash commands & native side-panel plugin**:
-  - Standalone commands (`/hyphae`, `/hyphae-subs`, `/hyphae-focus`, `/hyphae-mute`, plus `!hyp ui`) install into `~/.claude/commands/` by default (pass `--no-commands` to skip).
-  - For the bundled Claude Code plugin & native side panel (`/hyphae-panel`), point the user to `plugins/claude-code`.
+- **Claude Code slash commands, `CLAUDE_CONFIG_DIR` profiles & native side-panel mod**:
+  - Standalone commands (`/hyphae`, `/hyphae-subs`, `/hyphae-focus`, `/hyphae-mute`, plus `!hyp ui`) install into `~/.claude/commands/` and the UI-only native side-panel mod (`/hyphae-panel`) auto-installs into `~/.claude/skills/hyphae-panel/` (and `$CLAUDE_CONFIG_DIR/skills/hyphae-panel/` if not symlinked) alongside `plugins/claude-code/`. Pass `--no-commands` to skip both.
+  - `hyp setup` automatically respects `CLAUDE_CONFIG_DIR` (and `--claude-config-dir <DIR>` for extra profiles) while preserving dotfiles symlinks.
 - **Native Herdr desktop mod** (`hyphae-pane` + `hyphae-panel`, symlink-safe):
   ```sh
   hyp setup --harness herdr --mod --json
