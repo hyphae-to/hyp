@@ -276,6 +276,32 @@ if ! cmp -s "${REPO_ROOT}/scripts/install.ps1" "${REPO_ROOT}/site/install.ps1"; 
   echo "FAIL [Test 3]: scripts/install.ps1 and site/install.ps1 differ!" >&2
   exit 1
 fi
+if [ ! -f "${REPO_ROOT}/scripts/uninstall.ps1" ] || [ ! -f "${REPO_ROOT}/site/uninstall.ps1" ]; then
+  echo "FAIL [Test 3]: scripts/uninstall.ps1 or site/uninstall.ps1 is missing!" >&2
+  exit 1
+fi
+if ! cmp -s "${REPO_ROOT}/scripts/uninstall.ps1" "${REPO_ROOT}/site/uninstall.ps1"; then
+  echo "FAIL [Test 3]: scripts/uninstall.ps1 and site/uninstall.ps1 differ!" >&2
+  exit 1
+fi
+if command -v pwsh >/dev/null 2>&1; then
+  (
+    cd "$REPO_ROOT"
+    pwsh -NoProfile -Command '
+      $ErrorActionPreference = "Stop"
+      foreach ($path in @("scripts/install.ps1", "site/install.ps1", "scripts/uninstall.ps1", "site/uninstall.ps1")) {
+        $tokens = $null
+        $errors = $null
+        $resolved = (Resolve-Path $path).Path
+        [void][System.Management.Automation.Language.Parser]::ParseFile($resolved, [ref]$tokens, [ref]$errors)
+        if ($errors -and $errors.Count -gt 0) {
+          $msg = ($errors | ForEach-Object { $_.ToString() }) -join "`n"
+          throw "PowerShell syntax error(s) in ${path}:`n$msg"
+        }
+      }
+    '
+  )
+fi
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck -s sh "${REPO_ROOT}/scripts/install.sh"
 fi

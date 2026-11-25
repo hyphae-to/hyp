@@ -164,6 +164,105 @@ function Ensure-UserPathContains([string]$Dir) {
     }
 }
 
+function Test-StagedBinary([string]$CandidatePath) {
+    $prevEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $global:LASTEXITCODE = 0
+        $null = & $CandidatePath --version 2>$null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+}
+
+function Invoke-SchtasksQuiet([string[]]$Arguments) {
+    $schtasks = Get-Command schtasks.exe -ErrorAction SilentlyContinue
+    if (-not $schtasks) {
+        return $false
+    }
+    $prevEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $global:LASTEXITCODE = 0
+        $null = & $schtasks.Source @Arguments 2>$null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+}
+
+function Install-BinaryAtomic([string]$StagedPath, [string]$TargetPath) {
+    $targetDir = [System.IO.Path]::GetDirectoryName($TargetPath)
+    $backupPath = "$TargetPath.old"
+    $movedAside = $false
+    $stoppedService = $false
+
+    if (Test-Path -LiteralPath $TargetPath) {
+        # Clear stale backup if possible; if locked by an older draining process, pick a unique backup name.
+        if (Test-Path -LiteralPath $backupPath) {
+            try {
+                Remove-Item -LiteralPath $backupPath -Force -ErrorAction Stop
+            } catch {
+                $backupPath = Join-Path $targetDir ("hyp.exe.old." + [System.Guid]::NewGuid().ToString("N").Substring(0, 8))
+            }
+        }
+
+        # On Windows, a running hyp.exe cannot be overwritten directly, but it CAN be renamed aside on the same volume.
+        try {
+            Move-Item -LiteralPath $TargetPath -Destination $backupPath -Force -ErrorAction Stop
+            $movedAside = $true
+        } catch {
+            $firstErr = $_.Exception.Message
+            # Best-effort stop HyphaeDaemon scheduled task in case it holds a restrictive handle, then retry.
+            if (Invoke-SchtasksQuiet -Arguments @("/End", "/TN", "HyphaeDaemon")) {
+                $stoppedService = $true
+                Start-Sleep -Milliseconds 500
+                try {
+                    Move-Item -LiteralPath $TargetPath -Destination $backupPath -Force -ErrorAction Stop
+                    $movedAside = $true
+                } catch {
+                    $retryErr = $_.Exception.Message
+                    throw "Could not replace running binary at '${TargetPath}' (file is locked). Run 'hyp service stop' (or stop running hyp.exe processes) and re-run the installer. Error: ${retryErr}"
+                }
+            } else {
+                throw "Could not replace running binary at '${TargetPath}' (file is locked). Run 'hyp service stop' (or stop running hyp.exe processes) and re-run the installer. Error: ${firstErr}"
+            }
+        }
+    }
+
+    try {
+        Move-Item -LiteralPath $StagedPath -Destination $TargetPath -Force -ErrorAction Stop
+    } catch {
+        $moveErr = $_.Exception.Message
+        if ($movedAside -and (Test-Path -LiteralPath $backupPath) -and (-not (Test-Path -LiteralPath $TargetPath))) {
+            try {
+                Move-Item -LiteralPath $backupPath -Destination $TargetPath -Force -ErrorAction Stop
+                Write-Warning "Restored previous binary at ${TargetPath} after failed replacement."
+            } catch {
+                $restoreErr = $_.Exception.Message
+                throw "Failed to install new binary to '${TargetPath}' (${moveErr}) and failed to restore backup from '${backupPath}' (${restoreErr})."
+            }
+        }
+        throw "Failed to move staged binary into place at '${TargetPath}': ${moveErr}"
+    }
+
+    if ($movedAside -and (Test-Path -LiteralPath $backupPath)) {
+        try {
+            Remove-Item -LiteralPath $backupPath -Force -ErrorAction Stop
+        } catch {
+            # Expected when an older hyp.exe process is still draining; safe to leave until it exits.
+            Write-Host "Note: Previous binary renamed aside to ${backupPath} (still in use; safe to delete once running hyp processes exit)."
+        }
+    }
+
+    return $stoppedService
+}
+
 $Target = Resolve-Target
 
 if (-not [string]::IsNullOrWhiteSpace($Version)) {
@@ -265,6 +364,7 @@ if ($WasInstalled -and (-not [string]::IsNullOrWhiteSpace($ExistingVer)) -and ($
 }
 
 $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("hyphae-install-" + [System.Guid]::NewGuid().ToString("N"))
+$StagedBin = $null
 New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
 
 try {
@@ -303,7 +403,16 @@ try {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     $StagedBin = Join-Path $InstallDir (".hyp.tmp." + [System.Guid]::NewGuid().ToString("N") + ".exe")
     Copy-Item -LiteralPath $SourceBin -Destination $StagedBin -Force
-    Move-Item -LiteralPath $StagedBin -Destination $BinPath -Force
+
+    # Smoke-test the extracted candidate binary BEFORE replacing any existing installation.
+    if (-not (Test-StagedBinary -CandidatePath $StagedBin)) {
+        Remove-Item -LiteralPath $StagedBin -Force -ErrorAction SilentlyContinue
+        $StagedBin = $null
+        throw "Downloaded binary failed smoke test ('--version'); existing installation left untouched."
+    }
+
+    $StoppedService = Install-BinaryAtomic -StagedPath $StagedBin -TargetPath $BinPath
+    $StagedBin = $null
 
     Ensure-UserPathContains -Dir $InstallDir
 
@@ -315,11 +424,35 @@ try {
     }
     & $BinPath version
 
+    $ServiceRestarted = $false
+    if ($StoppedService) {
+        if (Invoke-SchtasksQuiet -Arguments @("/Run", "/TN", "HyphaeDaemon")) {
+            $ServiceRestarted = $true
+            Write-Host "Restarted background HyphaeDaemon scheduled task."
+        }
+    }
+
     if ($IsUpdate -and $IsConfigured) {
         try {
             & $BinPath onboard --install-skill 2>$null | Out-Null
         } catch {
             # Best-effort skill refresh on update.
+        }
+        if (-not $ServiceRestarted -and (Invoke-SchtasksQuiet -Arguments @("/Query", "/TN", "HyphaeDaemon"))) {
+            $prevEap = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = "Continue"
+                $global:LASTEXITCODE = 0
+                $null = & $BinPath service restart 2>$null
+                if ($LASTEXITCODE -eq 0) {
+                    $ServiceRestarted = $true
+                    Write-Host "Restarted background hyp daemon service."
+                }
+            } catch {
+                # Non-fatal post-update service restart attempt.
+            } finally {
+                $ErrorActionPreference = $prevEap
+            }
         }
         if ($IsInteractive) {
             Write-Host ""
@@ -329,8 +462,10 @@ try {
             } catch {
                 # Non-fatal post-update diagnostic check.
             }
-            Write-Host ""
-            Write-Host "Tip: Restart any running 'hyp daemon' process so the updated binary takes effect."
+            if (-not $ServiceRestarted) {
+                Write-Host ""
+                Write-Host "Tip: Restart any running 'hyp daemon' process (or run 'hyp service restart') so the updated binary takes effect."
+            }
         } else {
             Write-NextSteps
         }
@@ -342,6 +477,9 @@ try {
         Write-NextSteps
     }
 } finally {
+    if (-not [string]::IsNullOrWhiteSpace($StagedBin) -and (Test-Path -LiteralPath $StagedBin)) {
+        Remove-Item -LiteralPath $StagedBin -Force -ErrorAction SilentlyContinue
+    }
     if (Test-Path -LiteralPath $TmpDir) {
         Remove-Item -LiteralPath $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
     }
