@@ -3221,7 +3221,8 @@ esac
     .await;
     assert_eq!(stop_out, json!({}));
 
-    // Send a DM from sender -> Herdr auto-pushes via `fake-hc send --json --if idle t9h <text>`!
+    // Send a DM from sender -> Herdr auto-pushes a strictly metadata-only wake nudge via
+    // `fake-hc send --json --if idle t9h <nudge>` (NEVER leaking untrusted body into terminal prompt!).
     let (_, dm_err) = sender_mcp
         .call_verified_claude(
             &sock,
@@ -3235,15 +3236,52 @@ esac
     let mut log_contents = String::new();
     for _ in 0..100 {
         log_contents = std::fs::read_to_string(&log_path).unwrap_or_default();
-        if log_contents.contains("wake-up-codex-via-herdr") {
+        if log_contents.contains("send --json --if idle t9h") {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(
         log_contents.contains("send --json --if idle t9h")
-            && log_contents.contains("wake-up-codex-via-herdr"),
-        "expected fake-hc to receive guarded send with DM payload, got:\n{log_contents}"
+            && log_contents.contains("Hyphae mesh: 1 new message(s) queued for @codex-in-herdr. Call hyp_inbox({ ack: true }) to read them."),
+        "expected fake-hc to receive guarded metadata-only wake nudge, got:\n{log_contents}"
+    );
+    assert!(
+        !log_contents.contains("wake-up-codex-via-herdr"),
+        "Herdr terminal push MUST NOT leak untrusted DM body into user prompt:\n{log_contents}"
+    );
+    // Unread message MUST stay preserved in SQLite until the woken agent reads it via hyp_inbox!
+    assert_eq!(session_status(&sock, "codex:thr-herdr-1").await["pending"], 1);
+
+    let inbox_call_id = "call-codex-herdr-inbox-1";
+    let pre_inbox = run_hook_with_hints(
+        &sock,
+        HarnessKind::Codex,
+        HookEvent::PreToolUse,
+        json!({
+            "thread_id": "thr-herdr-1",
+            "tool_name": "mcp__hyphae__hyp_inbox",
+            "tool_use_id": inbox_call_id,
+            "tool_input": { "ack": true }
+        }),
+        HookTransportHints {
+            herdr_terminal_id: Some("t9h".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(pre_inbox, json!({}));
+    let (inbox_txt, inbox_err) = codex_mcp
+        .call_tool(
+            "hyp_inbox",
+            json!({ "ack": true }),
+            Some(json!({ "callId": inbox_call_id })),
+        )
+        .await;
+    assert!(!inbox_err, "codex-in-herdr hyp_inbox failed: {inbox_txt}");
+    assert!(
+        inbox_txt.contains("wake-up-codex-via-herdr"),
+        "hyp_inbox must deliver the unread DM body with structured provenance: {inbox_txt}"
     );
     assert_eq!(session_status(&sock, "codex:thr-herdr-1").await["pending"], 0);
 

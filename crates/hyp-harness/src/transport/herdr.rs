@@ -286,6 +286,10 @@ impl PushTransport for HerdrTransport {
         true
     }
 
+    fn is_nudge_only(&self) -> bool {
+        true
+    }
+
     fn herdr_terminal_id(&self) -> Option<&str> {
         Some(self.target.terminal_id.as_str())
     }
@@ -314,6 +318,19 @@ impl PushTransport for HerdrTransport {
 
     fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
         Box::pin(async move { self.deliver_with_runner(&ProcessRunner, text, mode).await })
+    }
+
+    fn deliver_nudge<'a>(
+        &'a self,
+        message_count: usize,
+        handle: Option<&'a str>,
+        _batch_id: &'a str,
+        mode: PushMode,
+    ) -> TransportFuture<'a, PushOutcome> {
+        let nudge = super::format_push_wake_nudge(message_count, handle, mode);
+        Box::pin(async move {
+            self.deliver_with_runner(&ProcessRunner, &nudge, mode).await
+        })
     }
 }
 

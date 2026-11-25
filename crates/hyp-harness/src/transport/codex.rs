@@ -256,12 +256,27 @@ impl PushTransport for CodexQueueTransport {
         false
     }
 
+    fn is_nudge_only(&self) -> bool {
+        true
+    }
+
     fn target_metadata(&self) -> Value {
         json!({ "codexThreadId": self.target.thread_id })
     }
 
     fn deliver<'a>(&'a self, text: &'a str, _mode: PushMode) -> TransportFuture<'a, PushOutcome> {
         Box::pin(self.deliver_inner(text))
+    }
+
+    fn deliver_nudge<'a>(
+        &'a self,
+        message_count: usize,
+        handle: Option<&'a str>,
+        _batch_id: &'a str,
+        mode: PushMode,
+    ) -> TransportFuture<'a, PushOutcome> {
+        let nudge = super::format_push_wake_nudge(message_count, handle, mode);
+        Box::pin(async move { self.deliver_inner(&nudge).await })
     }
 }
 

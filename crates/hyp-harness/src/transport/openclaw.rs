@@ -500,22 +500,6 @@ pub fn normalize_openclaw_hooks_path(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-fn sanitize_handle_for_nudge(handle: Option<&str>) -> Option<&str> {
-    let raw = handle?.trim();
-    let clean = raw.strip_prefix('@').unwrap_or(raw);
-    if clean.is_empty() || clean.len() > 64 {
-        return None;
-    }
-    if clean
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-    {
-        Some(clean)
-    } else {
-        None
-    }
-}
-
 fn sanitize_agent_id(raw: &str) -> &str {
     let trimmed = raw.trim();
     if trimmed.is_empty()
@@ -546,7 +530,7 @@ fn sanitize_idempotency_suffix(raw: &str) -> String {
 /// NEVER accepts or embeds any message body text, sender text, or untrusted payload.
 pub fn format_openclaw_wake_nudge(message_count: usize, handle: Option<&str>) -> String {
     let count = message_count.max(1);
-    match sanitize_handle_for_nudge(handle) {
+    match super::sanitize_handle_for_nudge(handle) {
         Some(clean) => format!(
             "Hyphae mesh: {count} new message(s) queued for @{clean}. Call hyp_inbox to read them."
         ),
