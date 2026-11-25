@@ -482,6 +482,65 @@ function initEnrollMode(payload) {
 
   let lastBundleJson = "";
 
+  function showEnrollCompleteState() {
+    $("enrollStepLabel").textContent = "Enrollment Complete";
+    $("enrollCardTitle").textContent = "Return to Your Setup Now";
+    $("enrollCardLead").textContent =
+      "Your local hyp CLI received and saved your public keys. You can safely close this tab and continue setup in your terminal.";
+    $("enrollKindBadge").textContent = "DONE";
+    $("enrollParamsGrid").classList.add("hidden");
+    $("btnEnrollPasskey").classList.add("hidden");
+    $("enrollManualFallback").classList.add("hidden");
+    $("enrollResultBlock").classList.remove("hidden");
+    setBanner(
+      $("enrollBanner"),
+      $("enrollBannerTitle"),
+      $("enrollBannerBody"),
+      "verified",
+      "PASSKEY ENROLLED & SENT TO HYP CLI",
+      "Your public Ed25519 signing JWK, companion X25519 draft JWK, and PRF salt are saved locally (ephemeral private seeds wiped from RAM). Return to your setup now."
+    );
+  }
+
+  function showEnrollManualFallback(bannerTone, title, body, showRetry) {
+    $("enrollBundleBox").textContent = lastBundleJson;
+    $("enrollResultBlock").classList.remove("hidden");
+    $("enrollManualFallback").classList.remove("hidden");
+    $("btnEnrollPasskey").classList.add("hidden");
+    if (showRetry && callbackUrl) {
+      $("btnSendEnrollCallback").classList.remove("hidden");
+      $("btnSendEnrollCallback").disabled = false;
+      $("btnSendEnrollCallback").textContent = "Retry Send to Local hyp CLI";
+    } else {
+      $("btnSendEnrollCallback").classList.add("hidden");
+    }
+    setBanner(
+      $("enrollBanner"),
+      $("enrollBannerTitle"),
+      $("enrollBannerBody"),
+      bannerTone,
+      title,
+      body
+    );
+  }
+
+  async function postEnrollToLocalCli() {
+    if (!callbackUrl || !lastBundleJson) return false;
+    const headers = { "Content-Type": "application/json" };
+    if (csrfToken) headers["X-Hyphae-CSRF"] = csrfToken;
+    const resp = await fetch(callbackUrl, {
+      method: "POST",
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+      headers,
+      body: lastBundleJson,
+    });
+    if (!resp.ok) {
+      throw new Error(`Local CLI callback returned HTTP ${resp.status}`);
+    }
+    return true;
+  }
+
   $("btnEnrollPasskey").addEventListener("click", async () => {
     const btn = $("btnEnrollPasskey");
     btn.disabled = true;
@@ -489,6 +548,7 @@ function initEnrollMode(payload) {
     let prfOut = null;
     let seed = null;
     let encKp = null;
+    let derivedOk = false;
     try {
       const enrolled = await enrollPasskeyWithPrf(humanId, prfSalt);
       prfOut = enrolled.prfOut;
@@ -546,22 +606,7 @@ function initEnrollMode(payload) {
       $("enrollFingerprint").textContent = `${sas.formatted} (${sas.phrase})`;
       $("enrollEncKid").textContent = encKp.kid;
       $("enrollEncFingerprint").textContent = `${encSas.formatted} (${encSas.phrase})`;
-      $("enrollBundleBox").textContent = lastBundleJson;
-      $("enrollResultBlock").classList.remove("hidden");
-
-      setBanner(
-        $("enrollBanner"),
-        $("enrollBannerTitle"),
-        $("enrollBannerBody"),
-        "verified",
-        "PASSKEY ENROLLED",
-        "Public Ed25519 signing JWK and companion X25519 draft JWK derived cleanly; ephemeral private seeds wiped from RAM."
-      );
-
-      if (callbackUrl) {
-        $("btnSendEnrollCallback").classList.remove("hidden");
-      }
-      btn.textContent = "Re-derive Public Keys";
+      derivedOk = true;
     } catch (err) {
       setBanner(
         $("enrollBanner"),
@@ -576,7 +621,31 @@ function initEnrollMode(payload) {
       if (prfOut) zeroize(prfOut);
       if (seed) zeroize(seed);
       if (encKp && encKp.privateKeyBytes) zeroize(encKp.privateKeyBytes);
-      btn.disabled = false;
+      if (!derivedOk) btn.disabled = false;
+    }
+
+    if (!derivedOk) return;
+
+    if (callbackUrl) {
+      btn.textContent = "Sending to local hyp CLI…";
+      try {
+        await postEnrollToLocalCli();
+        showEnrollCompleteState();
+      } catch (err) {
+        showEnrollManualFallback(
+          "warn",
+          "COULD NOT REACH LOCAL HYP CLI",
+          `${err instanceof Error ? err.message : "Failed to reach loopback CLI"} — retry below, or copy this public enrollment bundle into your terminal setup.`,
+          true
+        );
+      }
+    } else {
+      showEnrollManualFallback(
+        "verified",
+        "PASSKEY ENROLLED — COPY TO YOUR LAPTOP",
+        "Public Ed25519 + X25519 keys derived cleanly (ephemeral seeds wiped). Copy the bundle below and paste it into `hyp auth add` on your laptop.",
+        false
+      );
     }
   });
 
@@ -592,38 +661,15 @@ function initEnrollMode(payload) {
     btn.disabled = true;
     btn.textContent = "Sending to local hyp CLI…";
     try {
-      const headers = { "Content-Type": "application/json" };
-      if (csrfToken) headers["X-Hyphae-CSRF"] = csrfToken;
-      const resp = await fetch(callbackUrl, {
-        method: "POST",
-        credentials: "omit",
-        referrerPolicy: "no-referrer",
-        headers,
-        body: lastBundleJson,
-      });
-      if (!resp.ok) {
-        throw new Error(`Local CLI callback returned HTTP ${resp.status}`);
-      }
-      setBanner(
-        $("enrollBanner"),
-        $("enrollBannerTitle"),
-        $("enrollBannerBody"),
-        "verified",
-        "SENT TO LOCAL HYP CLI",
-        "Your laptop CLI received your public Ed25519 signing JWK, companion X25519 draft JWK, and PRF salt."
-      );
-      btn.textContent = "Sent to Local hyp CLI";
+      await postEnrollToLocalCli();
+      showEnrollCompleteState();
     } catch (err) {
-      setBanner(
-        $("enrollBanner"),
-        $("enrollBannerTitle"),
-        $("enrollBannerBody"),
+      showEnrollManualFallback(
         "warn",
-        "CALLBACK UNREACHABLE",
-        `${err instanceof Error ? err.message : "Failed to reach loopback CLI"} — copy the Public JWKs & Salt above instead.`
+        "COULD NOT REACH LOCAL HYP CLI",
+        `${err instanceof Error ? err.message : "Failed to reach loopback CLI"} — copy the Public JWKs & Salt above into your terminal setup instead.`,
+        true
       );
-      btn.disabled = false;
-      btn.textContent = "Retry Send to Local hyp CLI";
     }
   });
 }

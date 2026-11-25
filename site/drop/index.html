@@ -336,16 +336,16 @@
     <section id="viewEnroll" class="card hidden">
       <div class="card-header">
         <div>
-          <p class="step-label">Authority Enrollment</p>
-          <h1 class="card-title">Enroll Phone Passkey</h1>
-          <p class="card-lead">
+          <p id="enrollStepLabel" class="step-label">Authority Enrollment</p>
+          <h1 id="enrollCardTitle" class="card-title">Enroll Phone Passkey</h1>
+          <p id="enrollCardLead" class="card-lead">
             Create a synced Passkey (FaceID / TouchID) with PRF enabled to derive your Ed25519 signing identity and companion X25519 draft-encryption key without storing private keys in browser storage.
           </p>
         </div>
-        <span class="kind-badge directive">PASSKEY + PRF</span>
+        <span id="enrollKindBadge" class="kind-badge directive">PASSKEY + PRF</span>
       </div>
 
-      <div class="meta-grid">
+      <div id="enrollParamsGrid" class="meta-grid">
         <div class="meta-item">
           <span class="meta-k">Human ID</span>
           <span id="enrollHumanId" class="meta-v">—</span>
@@ -393,17 +393,19 @@
           </div>
         </div>
 
-        <div class="field">
-          <div class="field-head">
-            <span class="field-label">Public Enrollment Bundle</span>
-            <span class="field-hint">Public Ed25519 + X25519 JWKs &amp; salt only</span>
+        <div id="enrollManualFallback" class="hidden">
+          <div class="field">
+            <div class="field-head">
+              <span class="field-label">Public Enrollment Bundle</span>
+              <span class="field-hint">Public Ed25519 + X25519 JWKs &amp; salt only</span>
+            </div>
+            <div id="enrollBundleBox" class="token-box"></div>
           </div>
-          <div id="enrollBundleBox" class="token-box"></div>
-        </div>
 
-        <div class="btn-stack">
-          <button id="btnCopyEnrollBundle" class="btn-primary" type="button">Copy Public JWKs &amp; Salt</button>
-          <button id="btnSendEnrollCallback" class="btn-secondary hidden" type="button">Send to Local hyp CLI</button>
+          <div class="btn-stack">
+            <button id="btnCopyEnrollBundle" class="btn-primary" type="button">Copy Public JWKs &amp; Salt</button>
+            <button id="btnSendEnrollCallback" class="btn-secondary hidden" type="button">Retry Send to Local hyp CLI</button>
+          </div>
         </div>
       </div>
     </section>
@@ -414,6 +416,6 @@
     </footer>
   </main>
 
-  <script type="module" src="./drop.js?v=2"></script>
+  <script type="module" src="./drop.js?v=3"></script>
 </body>
 </html>
