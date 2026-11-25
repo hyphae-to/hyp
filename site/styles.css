@@ -5897,10 +5897,10 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
 /* Visual 3-node signal flow inside Use Case Stage */
 .uc-flow {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 36px auto 36px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) 34px 46px 34px minmax(0, 1fr);
   align-items: center;
   gap: 0;
-  padding: 14px 14px;
+  padding: 14px 14px 28px;
   border-radius: 15px;
   background: rgba(8, 10, 7, 0.64);
   border: 1px solid rgba(244, 241, 232, 0.09);
@@ -5987,10 +5987,14 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
 
 .uc-flow-wire {
   position: relative;
+  z-index: 1;
   height: 2px;
   background: rgba(183, 217, 86, 0.34);
   overflow: hidden;
 }
+
+.uc-flow > .uc-flow-wire:nth-child(2) { margin-right: -8px; }
+.uc-flow > .uc-flow-wire:nth-child(4) { margin-left: -8px; }
 
 .uc-flow-wire i {
   position: absolute;
@@ -6010,26 +6014,34 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
 .uc-stage.tone-moss .uc-flow-wire i { background: linear-gradient(90deg, transparent, #a1e59d, transparent); }
 
 .uc-flow-mid {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 3px;
-  padding: 0 4px;
+  position: relative;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: 46px;
+  padding: 0;
 }
 
 .uc-flow-mid img {
   width: 46px;
   height: 46px;
   object-fit: contain;
+  display: block;
   filter: drop-shadow(0 6px 14px rgba(0, 0, 0, 0.7));
 }
 
 .uc-flow-mid span {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 50%;
+  transform: translateX(-50%);
   font-family: var(--mono);
   font-size: 0.56rem;
   font-weight: 700;
   color: var(--chartreuse);
   white-space: nowrap;
+  pointer-events: none;
 }
 
 .uc-stage.tone-amber .uc-flow-mid span { color: #ffd37d; }
@@ -7026,8 +7038,10 @@ footer { border-top: 1px solid var(--border); padding: 34px 0 48px; font-size: 0
   .uc-term-pre { height: auto; min-height: 0; }
   .uc-stage-foot,
   .uc-chips { flex-wrap: wrap; }
-  .uc-flow { grid-template-columns: minmax(0, 1fr); gap: 10px; }
-  .uc-flow-wire { width: 2px; height: 18px; margin: 0 auto; }
+  .uc-flow { grid-template-columns: minmax(0, 1fr); gap: 10px; padding: 14px; }
+  .uc-flow > .uc-flow-wire:nth-child(n) { width: 2px; height: 18px; margin: 0 auto; justify-self: center; }
+  .uc-flow-mid { width: auto; height: auto; display: flex; flex-direction: column; align-items: center; gap: 3px; }
+  .uc-flow-mid span { position: static; transform: none; }
   .sec-card-body { padding: 18px 18px 18px; }
   .walkthrough-toggle { padding: 14px 16px; }
 }
