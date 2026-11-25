@@ -11,7 +11,7 @@
  * - Hard-blocks `kind === "secret"` drops on unverified nodes or reserved system secret names.
  * - Zeroes ephemeral seeds and wipes form inputs immediately after sealing, on reset/skip, on `pagehide`,
  *   or on `visibilitychange` when hidden.
- * - Falls back cleanly to 1-tap offline `hdrop1_` copy if the Drop Relay is unreachable.
+ * - Falls back cleanly to 1-tap offline `hdrop1_` copy + retry if the Drop Relay is unreachable.
  */
 
 import {
@@ -193,6 +193,25 @@ function peekNodeCertMeta(nodeCert) {
     // Untrusted hint peek; full cryptographic check happens after Passkey unlock.
   }
   return { humanId: "", authEpoch: null, prfSalt: "" };
+}
+
+function formatRelayDisplay(relayUrl, hasRelay) {
+  if (!hasRelay || !relayUrl) {
+    return { host: "Offline", tag: "", tagClass: "", origin: "" };
+  }
+  try {
+    const u = new URL(relayUrl);
+    const host = u.host;
+    if (u.origin === "https://spore.hyphae.to" || u.origin === "https://public.hyphae.to") {
+      return { host, tag: "Public", tagClass: "public", origin: u.origin };
+    }
+    if (u.hostname === "127.0.0.1" || u.hostname === "localhost") {
+      return { host, tag: "Direct", tagClass: "direct", origin: u.origin };
+    }
+    return { host, tag: "Relay", tagClass: "relay", origin: u.origin };
+  } catch {
+    return { host: "Offline", tag: "", tagClass: "", origin: "" };
+  }
 }
 
 // ============================================================================
@@ -394,7 +413,7 @@ async function enrollPasskeyWithPrf(humanId, prfSalt) {
 }
 
 // ============================================================================
-// Browser UI Controller
+// Browser UI Helpers
 // ============================================================================
 
 function $(id) {
@@ -407,12 +426,24 @@ function setBanner(el, titleEl, bodyEl, variant, title, body) {
   bodyEl.textContent = body;
 }
 
+function clearBanner(el) {
+  el.classList.add("hidden");
+}
+
 function formatCountdown(msRemaining) {
   if (msRemaining <= 0) return "EXPIRED";
   const totalSec = Math.ceil(msRemaining / 1000);
   const mins = Math.floor(totalSec / 60);
   const secs = totalSec % 60;
   return `${mins}m ${String(secs).padStart(2, "0")}s`;
+}
+
+function formatLocalTime(date) {
+  try {
+    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  } catch {
+    return date.toISOString().slice(11, 19) + " UTC";
+  }
 }
 
 async function copyText(text, btn, idleLabel) {
@@ -426,6 +457,23 @@ async function copyText(text, btn, idleLabel) {
     btn.textContent = "Select & Copy Above";
   }
 }
+
+function autoSizeTextarea(el) {
+  if (!el) return;
+  el.style.height = "auto";
+  const nextHeight = Math.max(el.scrollHeight + 2, 108);
+  el.style.height = `${nextHeight}px`;
+}
+
+function formatDirectiveStats(text) {
+  const charCount = [...text].length;
+  const lineCount = text.length === 0 ? 0 : text.split("\n").length;
+  return `${charCount} ${charCount === 1 ? "char" : "chars"} · ${lineCount} ${lineCount === 1 ? "line" : "lines"}`;
+}
+
+// ============================================================================
+// App Entry Point
+// ============================================================================
 
 function initBrowserApp() {
   // 1. Immediately capture and scrub URL #fragment before any other work!
@@ -460,6 +508,10 @@ function initBrowserApp() {
   initDropMode(parsed.fragment);
 }
 
+// ============================================================================
+// Enroll Mode (#enroll=...)
+// ============================================================================
+
 function initEnrollMode(payload) {
   $("viewEnroll").classList.remove("hidden");
 
@@ -483,41 +535,35 @@ function initEnrollMode(payload) {
   let lastBundleJson = "";
 
   function showEnrollCompleteState() {
-    $("enrollStepLabel").textContent = "Enrollment Complete";
-    $("enrollCardTitle").textContent = "Return to Your Setup Now";
-    $("enrollCardLead").textContent =
-      "Your local hyp CLI received and saved your public keys. You can safely close this tab and continue setup in your terminal.";
-    $("enrollKindBadge").textContent = "DONE";
-    $("enrollParamsGrid").classList.add("hidden");
-    $("btnEnrollPasskey").classList.add("hidden");
-    $("enrollManualFallback").classList.add("hidden");
+    $("enrollStageStart").classList.add("hidden");
+    $("enrollFallbackBlock").classList.add("hidden");
+    $("enrollDoneHero").classList.remove("hidden");
     $("enrollResultBlock").classList.remove("hidden");
-    setBanner(
-      $("enrollBanner"),
-      $("enrollBannerTitle"),
-      $("enrollBannerBody"),
-      "verified",
-      "PASSKEY ENROLLED & SENT TO HYP CLI",
-      "Your public Ed25519 signing JWK, companion X25519 draft JWK, and PRF salt are saved locally (ephemeral private seeds wiped from RAM). Return to your setup now."
-    );
+    $("enrollKeysDrawer").open = false;
   }
 
   function showEnrollManualFallback(bannerTone, title, body, showRetry) {
+    $("enrollStageStart").classList.add("hidden");
+    $("enrollDoneHero").classList.add("hidden");
     $("enrollBundleBox").textContent = lastBundleJson;
+    $("enrollFallbackBlock").classList.remove("hidden");
     $("enrollResultBlock").classList.remove("hidden");
-    $("enrollManualFallback").classList.remove("hidden");
-    $("btnEnrollPasskey").classList.add("hidden");
+    $("enrollKeysDrawer").open = false;
+
+    const retryBtn = $("btnSendEnrollCallback");
     if (showRetry && callbackUrl) {
-      $("btnSendEnrollCallback").classList.remove("hidden");
-      $("btnSendEnrollCallback").disabled = false;
-      $("btnSendEnrollCallback").textContent = "Retry Send to Local hyp CLI";
+      retryBtn.classList.remove("hidden");
+      retryBtn.disabled = false;
+      $("enrollRetrySpinner").classList.add("hidden");
+      $("btnSendEnrollCallbackLabel").textContent = "Retry Send to Local hyp CLI";
     } else {
-      $("btnSendEnrollCallback").classList.add("hidden");
+      retryBtn.classList.add("hidden");
     }
+
     setBanner(
-      $("enrollBanner"),
-      $("enrollBannerTitle"),
-      $("enrollBannerBody"),
+      $("enrollFallbackBanner"),
+      $("enrollFallbackBannerTitle"),
+      $("enrollFallbackBannerBody"),
       bannerTone,
       title,
       body
@@ -543,8 +589,13 @@ function initEnrollMode(payload) {
 
   $("btnEnrollPasskey").addEventListener("click", async () => {
     const btn = $("btnEnrollPasskey");
+    const label = $("btnEnrollPasskeyLabel");
+    const spinner = $("enrollSpinner");
     btn.disabled = true;
-    btn.textContent = "Waiting for FaceID / TouchID…";
+    spinner.classList.remove("hidden");
+    label.textContent = "Waiting for Face ID / Touch ID…";
+    clearBanner($("enrollErrorBanner"));
+
     let prfOut = null;
     let seed = null;
     let encKp = null;
@@ -603,47 +654,53 @@ function initEnrollMode(payload) {
       lastBundleJson = JSON.stringify(bundle, null, 2);
 
       $("enrollKid").textContent = kid;
-      $("enrollFingerprint").textContent = `${sas.formatted} (${sas.phrase})`;
+      $("enrollFingerprint").textContent = `${sas.formatted} · ${sas.phrase}`;
       $("enrollEncKid").textContent = encKp.kid;
-      $("enrollEncFingerprint").textContent = `${encSas.formatted} (${encSas.phrase})`;
+      $("enrollEncFingerprint").textContent = `${encSas.formatted} · ${encSas.phrase}`;
       derivedOk = true;
     } catch (err) {
       setBanner(
-        $("enrollBanner"),
-        $("enrollBannerTitle"),
-        $("enrollBannerBody"),
+        $("enrollErrorBanner"),
+        $("enrollErrorBannerTitle"),
+        $("enrollErrorBannerBody"),
         "danger",
-        "ENROLLMENT FAILED",
+        "Enrollment Failed",
         err instanceof Error ? err.message : "Could not enroll Passkey"
       );
-      btn.textContent = "Create Passkey & Derive Public Keys";
+      label.textContent = "Create Passkey & Enroll";
     } finally {
       if (prfOut) zeroize(prfOut);
       if (seed) zeroize(seed);
       if (encKp && encKp.privateKeyBytes) zeroize(encKp.privateKeyBytes);
-      if (!derivedOk) btn.disabled = false;
+      if (!derivedOk) {
+        spinner.classList.add("hidden");
+        btn.disabled = false;
+      }
     }
 
     if (!derivedOk) return;
 
     if (callbackUrl) {
-      btn.textContent = "Sending to local hyp CLI…";
+      label.textContent = "Sending to local hyp CLI…";
       try {
         await postEnrollToLocalCli();
         showEnrollCompleteState();
       } catch (err) {
         showEnrollManualFallback(
           "warn",
-          "COULD NOT REACH LOCAL HYP CLI",
-          `${err instanceof Error ? err.message : "Failed to reach loopback CLI"} — retry below, or copy this public enrollment bundle into your terminal setup.`,
+          "Could Not Reach Local hyp CLI",
+          `${err instanceof Error ? err.message : "Failed to reach loopback CLI"} — retry below, or copy this public bundle into your terminal setup.`,
           true
         );
+      } finally {
+        spinner.classList.add("hidden");
       }
     } else {
+      spinner.classList.add("hidden");
       showEnrollManualFallback(
         "verified",
-        "PASSKEY ENROLLED — COPY TO YOUR LAPTOP",
-        "Public Ed25519 + X25519 keys derived cleanly (ephemeral seeds wiped). Copy the bundle below and paste it into `hyp auth add` on your laptop.",
+        "Passkey Enrolled — Copy to Laptop",
+        "Public Ed25519 + X25519 keys derived cleanly (ephemeral seeds wiped). Copy the bundle below into `hyp auth add` on your laptop.",
         false
       );
     }
@@ -658,43 +715,41 @@ function initEnrollMode(payload) {
   $("btnSendEnrollCallback").addEventListener("click", async () => {
     if (!callbackUrl || !lastBundleJson) return;
     const btn = $("btnSendEnrollCallback");
+    const label = $("btnSendEnrollCallbackLabel");
+    const spinner = $("enrollRetrySpinner");
     btn.disabled = true;
-    btn.textContent = "Sending to local hyp CLI…";
+    spinner.classList.remove("hidden");
+    label.textContent = "Sending to local hyp CLI…";
     try {
       await postEnrollToLocalCli();
       showEnrollCompleteState();
     } catch (err) {
       showEnrollManualFallback(
         "warn",
-        "COULD NOT REACH LOCAL HYP CLI",
+        "Could Not Reach Local hyp CLI",
         `${err instanceof Error ? err.message : "Failed to reach loopback CLI"} — copy the Public JWKs & Salt above into your terminal setup instead.`,
         true
       );
+    } finally {
+      spinner.classList.add("hidden");
     }
   });
 }
 
-function autoSizeTextarea(el) {
-  if (!el) return;
-  el.style.height = "auto";
-  const nextHeight = Math.max(el.scrollHeight + 2, 112);
-  el.style.height = `${nextHeight}px`;
-}
-
-function formatDirectiveStats(text) {
-  const charCount = [...text].length;
-  const lineCount = text.length === 0 ? 0 : text.split("\n").length;
-  return `${charCount} ${charCount === 1 ? "char" : "chars"} · ${lineCount} ${lineCount === 1 ? "line" : "lines"}`;
-}
+// ============================================================================
+// Drop Mode (#drop=...) — 3-Stage Focused Stepper
+// ============================================================================
 
 async function initDropMode(fragment) {
   $("viewDrop").classList.remove("hidden");
 
   const isSecret = fragment.kind === "secret";
   const hasRelay = Boolean(fragment.relay && fragment.dropId && fragment.postCap);
+  const relayDisplay = formatRelayDisplay(fragment.relay, hasRelay);
 
-  // Ephemeral RAM state (strictly wiped on send, reset, skip, pagehide, or hidden tab)
+  // Ephemeral RAM state (strictly wiped on send, lock, skip, pagehide, or hidden tab)
   const state = {
+    stage: "locked", // "locked" | "unlocked" | "done"
     unlockedEdSeed: null,
     humanId: "",
     authEpoch: 1,
@@ -702,165 +757,93 @@ async function initDropMode(fragment) {
     certReason: "",
     hardBlocked: false,
     expired: false,
-    lastHdrop1: "",
+    sealing: false,
+    delivered: false,
     activeEncDraft: !isSecret && fragment.encDraft ? fragment.encDraft : null,
     draftLoaded: false,
+    lastHdrop1: "",
+    lastEnvelopeJson: "",
   };
 
-  function wipeSecretRam({ clearDraft = false } = {}) {
-    if (state.unlockedEdSeed) {
-      zeroize(state.unlockedEdSeed);
-      state.unlockedEdSeed = null;
-    }
-    state.certVerified = false;
-    state.draftLoaded = false;
-    if (clearDraft) {
-      state.activeEncDraft = null;
-    }
-    $("inputSecretValue").value = "";
-    $("inputDirectiveValue").value = "";
-    $("inputDirectiveValue").style.height = "";
-    $("inputSecretValue").type = "password";
-    $("btnToggleReveal").textContent = "Reveal";
-    $("draftApproveCheck").checked = false;
-    $("chkManualSasConfirm").checked = false;
-    $("draftWarningBanner").classList.add("hidden");
-    $("draftContextRow").classList.add("hidden");
-    $("draftContextText").textContent = "";
-    $("draftApproveRow").classList.add("hidden");
-  }
-
-  function applyFreshWriteHeadings() {
-    $("unlockCardTitle").textContent = "Unlock Authority & Verify Node";
-    $("unlockCardLead").textContent =
-      "Tap below to authenticate with your Passkey and verify the target node certificate in RAM.";
-    $("sealStepLabel").textContent = "Step 2 · Type or Paste Fresh";
-    if (isSecret) {
-      $("sealCardTitle").textContent = `Enter Secret: ${fragment.secretName || "—"}`;
-      $("sealCardLead").textContent =
-        "Drop links never pre-fill secrets. Type or paste directly here; plaintext is sealed in your browser and immediately wiped.";
-    } else {
-      $("sealCardTitle").textContent = "Write Verified Directive";
-      $("sealCardLead").textContent =
-        "Drop links never pre-fill plaintext payloads. Type or paste directly here; plaintext is sealed in your browser and immediately wiped.";
-    }
-  }
-
-  function applyEncDraftLockedUi() {
-    $("unlockCardTitle").textContent = "Unlock Encrypted Draft";
-    $("unlockCardLead").textContent =
-      "Face ID / Touch ID decrypts the draft and prepares your signing key in a single tap.";
-    $("encDraftPanelText").textContent =
-      `Encrypted directive draft from ${fragment.nodeId} — only readable after Face ID / Touch ID.`;
-    $("encDraftPanel").classList.remove("hidden");
-    $("btnUnlockPasskey").classList.add("hidden");
-    $("btnLockClear").classList.add("hidden");
-    $("stepSealCard").classList.add("hidden");
-    $("directiveInputGroup").classList.add("hidden");
-  }
-
-  function lockAndResetUi({ clearDraft = false } = {}) {
-    wipeSecretRam({ clearDraft });
-    $("btnLockClear").classList.add("hidden");
-    $("sasConfirmRow").classList.add("hidden");
-    $("certStatusBanner").classList.add("hidden");
-    if (state.activeEncDraft && !isSecret) {
-      applyEncDraftLockedUi();
-    } else {
-      applyFreshWriteHeadings();
-      $("encDraftPanel").classList.add("hidden");
-      $("btnUnlockPasskey").classList.remove("hidden");
-      $("stepSealCard").classList.remove("hidden");
-      if (isSecret) {
-        $("secretInputGroup").classList.remove("hidden");
-      } else {
-        $("directiveInputGroup").classList.remove("hidden");
-      }
-    }
-    syncSealControls();
-  }
-
-  window.addEventListener("pagehide", () => wipeSecretRam({ clearDraft: true }));
-  window.addEventListener("beforeunload", () => wipeSecretRam({ clearDraft: true }));
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden" && (state.unlockedEdSeed || state.draftLoaded)) {
-      lockAndResetUi({ clearDraft: false });
-    }
-  });
-  window.addEventListener("resize", () => {
-    if (!isSecret && !$("directiveInputGroup").classList.contains("hidden")) {
-      autoSizeTextarea($("inputDirectiveValue"));
-    }
-  });
-
-  // Render target metadata
-  $("dropTitle").textContent = isSecret ? "Zero-Knowledge Secret Drop" : "Verified Human Directive";
-  $("dropSubtitle").textContent = isSecret
-    ? "Decrypts directly into the target node's SecretStore — never enters LLM context or logs."
-    : "Signed by your Passkey authority and delivered directly to your target agent.";
-
-  const badge = $("dropKindBadge");
-  badge.textContent = isSecret ? "SECRET" : "DIRECTIVE";
-  badge.className = `kind-badge ${isSecret ? "secret" : "directive"}`;
-
-  const relayOrigin = hasRelay ? new URL(fragment.relay).origin : "";
+  // --- Context Strip Initial Render ---
   $("metaNodeId").textContent = fragment.nodeId;
-  $("metaHandle").textContent = fragment.handle || "(node-level)";
-  $("metaRelay").textContent = !hasRelay
-    ? "Offline hdrop1_ only"
-    : relayOrigin === "https://spore.hyphae.to"
-      ? `${relayOrigin} (public)`
-      : `${relayOrigin} (private/custom)`;
-  $("metaCertHint").textContent = fragment.nodeCert ? "NodeCert attached" : "No NodeCert attached";
+  if (fragment.handle) {
+    $("metaHandlePill").textContent = fragment.handle;
+    $("metaHandlePill").classList.remove("hidden");
+  }
+
+  const kindBadge = $("dropKindBadge");
+  kindBadge.textContent = isSecret ? "SECRET" : "DIRECTIVE";
+  kindBadge.className = `kind-badge ${isSecret ? "secret" : "directive"}`;
+
+  $("metaRelayHost").textContent = relayDisplay.host;
+  if (relayDisplay.tag) {
+    $("metaRelayTag").textContent = relayDisplay.tag;
+    $("metaRelayTag").className = `relay-tag ${relayDisplay.tagClass}`;
+    $("metaRelayTag").classList.remove("hidden");
+  }
+  if (relayDisplay.origin) {
+    $("drawerRelayUrl").textContent = relayDisplay.origin;
+    $("drawerRelayRow").classList.remove("hidden");
+  }
+
+  function setCertBadge(variant, text) {
+    const el = $("metaCertBadge");
+    el.className = `cert-badge ${variant}`;
+    el.textContent = text;
+  }
+
+  if (fragment.nodeCert) {
+    setCertBadge("pending", "Cert pending");
+    $("metaCertHint").textContent = "Cert attached · verifies on unlock";
+  } else {
+    setCertBadge("warn", "⚠ Uncertified");
+    $("metaCertHint").textContent = "No NodeCert attached";
+    $("securityDrawer").open = true;
+  }
 
   if (isSecret) {
-    $("metaSecretRow").classList.remove("hidden");
+    $("metaSecretStrip").classList.remove("hidden");
     $("metaSecretName").textContent = fragment.secretName || "(missing)";
-    $("secretInputGroup").classList.remove("hidden");
-    applyFreshWriteHeadings();
-  } else if (state.activeEncDraft) {
-    applyEncDraftLockedUi();
-  } else {
-    $("directiveInputGroup").classList.remove("hidden");
-    applyFreshWriteHeadings();
   }
 
-  // Validate secret name & reserved system-key denylist up front
+  // --- Validate secret name & reserved system-key denylist up front ---
   if (isSecret) {
     const nameCheck = validateSecretName(fragment.secretName);
     if (!nameCheck.ok) {
       state.hardBlocked = true;
-      $("metaSecretName").classList.add("danger");
+      $("metaSecretStrip").classList.add("danger");
       setBanner(
         $("dropGlobalBanner"),
         $("dropGlobalBannerTitle"),
         $("dropGlobalBannerBody"),
         "danger",
-        "INVALID SECRET NAME — BLOCKED",
+        "Invalid Secret Name — Blocked",
         nameCheck.message
       );
     } else if (isReservedSecretName(fragment.secretName)) {
       state.hardBlocked = true;
-      $("metaSecretName").classList.add("danger");
+      $("metaSecretStrip").classList.add("danger");
       setBanner(
         $("dropGlobalBanner"),
         $("dropGlobalBannerTitle"),
         $("dropGlobalBannerBody"),
         "danger",
-        "RESERVED SYSTEM SECRET — BLOCKED",
+        "Reserved System Secret — Blocked",
         `"${fragment.secretName}" targets an internal Hyphae system key and is permanently blocked.`
       );
     }
   }
 
-  // Render SAS fingerprint of target X25519 encryption key
+  // --- Render Target X25519 SAS Fingerprint ---
   const sas = await sasFingerprint(fragment.encJwk);
   $("sasHex").textContent = sas.formatted;
   $("sasWords").textContent = sas.phrase;
+  $("securityDrawerPreview").textContent = sas.formatted.slice(0, 9) + "…";
   $("sasConfirmText").textContent =
     `I manually verified SAS fingerprint ${sas.formatted} (${sas.phrase}) on ${fragment.nodeId} and accept sending this directive to an uncertified key.`;
 
-  // Populate authority parameters (from fragment, cert hint, or saved public hint)
+  // --- Populate Authority Parameters ---
   const certMeta = peekNodeCertMeta(fragment.nodeCert);
   const savedHint = loadPublicHint(fragment.humanId || certMeta.humanId);
   const initialHumanId = fragment.humanId || certMeta.humanId || savedHint?.humanId || "";
@@ -875,44 +858,185 @@ async function initDropMode(fragment) {
     const h = $("inputHumanId").value.trim();
     const s = $("inputPrfSalt").value.trim();
     const e = $("inputAuthEpoch").value.trim();
-    $("identitySummaryText").textContent = h && s ? `${h} · epoch ${e || 1}` : "Needs humanId & salt";
+    const ok = Boolean(h && s);
+    $("identitySummaryText").textContent = ok ? `${h} · epoch ${e || 1}` : "Needs humanId & salt";
+    if (!ok) {
+      $("securityDrawerPreview").textContent = "Needs setup";
+    } else {
+      $("securityDrawerPreview").textContent = sas.formatted.slice(0, 9) + "…";
+    }
   }
   updateIdentitySummary();
   if (!initialHumanId || !initialPrfSalt) {
-    $("identityDetails").open = true;
+    $("securityDrawer").open = true;
   }
   $("inputHumanId").addEventListener("input", updateIdentitySummary);
   $("inputPrfSalt").addEventListener("input", updateIdentitySummary);
   $("inputAuthEpoch").addEventListener("input", updateIdentitySummary);
 
-  // Live expiration countdown
+  // --- Stepper & Stage Transitions ---
+  function updateStepper(stage) {
+    const s1 = $("stepDot1");
+    const s2 = $("stepDot2");
+    const s3 = $("stepDot3");
+
+    $("stepDot2Label").textContent = isSecret
+      ? "Secret"
+      : (state.activeEncDraft || state.draftLoaded ? "Review" : "Write");
+
+    if (stage === "locked") {
+      s1.className = "step-pill active";
+      s2.className = "step-pill";
+      s3.className = "step-pill";
+    } else if (stage === "unlocked") {
+      s1.className = "step-pill done";
+      s2.className = "step-pill active";
+      s3.className = "step-pill";
+    } else {
+      s1.className = "step-pill done";
+      s2.className = "step-pill done";
+      s3.className = "step-pill done";
+    }
+  }
+
+  function renderLockedCopy() {
+    const hasDraft = Boolean(state.activeEncDraft && !isSecret);
+    if (hasDraft) {
+      $("lockedTitle").textContent = "Unlock Proposed Directive";
+      $("lockedSubtitle").textContent =
+        `Authenticate with Face ID / Touch ID to verify ${fragment.nodeId} and decrypt the agent's draft.`;
+      $("btnUnlockPrimaryLabel").textContent = "Unlock Draft with Face ID / Touch ID";
+      $("btnSkipDraft").classList.remove("hidden");
+    } else if (isSecret) {
+      $("lockedTitle").textContent = "Unlock to Deliver Secret";
+      $("lockedSubtitle").textContent =
+        `Verify ${fragment.nodeId} with Face ID / Touch ID before entering ${fragment.secretName || "this secret"}.`;
+      $("btnUnlockPrimaryLabel").textContent = "Unlock with Face ID / Touch ID";
+      $("btnSkipDraft").classList.add("hidden");
+    } else {
+      $("lockedTitle").textContent = "Unlock to Sign Directive";
+      $("lockedSubtitle").textContent =
+        `Authenticate with Face ID / Touch ID to verify ${fragment.nodeId}.`;
+      $("btnUnlockPrimaryLabel").textContent = "Unlock with Face ID / Touch ID";
+      $("btnSkipDraft").classList.add("hidden");
+    }
+  }
+
+  function showStage(stage) {
+    state.stage = stage;
+    $("stageLocked").classList.toggle("hidden", stage !== "locked");
+    $("stageUnlocked").classList.toggle("hidden", stage !== "unlocked");
+    $("stageDone").classList.toggle("hidden", stage !== "done");
+    updateStepper(stage);
+  }
+
+  function wipeSecretRam({ clearDraft = false, clearSealed = false } = {}) {
+    if (state.unlockedEdSeed) {
+      zeroize(state.unlockedEdSeed);
+      state.unlockedEdSeed = null;
+    }
+    state.certVerified = false;
+    state.draftLoaded = false;
+    if (clearDraft) {
+      state.activeEncDraft = null;
+    }
+    if (clearSealed) {
+      state.lastHdrop1 = "";
+      state.lastEnvelopeJson = "";
+    }
+    $("inputSecretValue").value = "";
+    $("inputDirectiveValue").value = "";
+    $("inputDirectiveValue").style.height = "";
+    $("inputSecretValue").type = "password";
+    $("btnToggleReveal").textContent = "Reveal";
+    $("draftApproveCheck").checked = false;
+    $("chkManualSasConfirm").checked = false;
+    $("draftWarningBanner").classList.add("hidden");
+    $("draftContextRow").classList.add("hidden");
+    $("draftContextText").textContent = "";
+    $("draftApproveRow").classList.add("hidden");
+    $("sasConfirmRow").classList.add("hidden");
+    clearBanner($("uncertifiedBanner"));
+    clearBanner($("sealActionBanner"));
+  }
+
+  function lockAndResetUi({ clearDraft = false, keepUnlockBanner = false } = {}) {
+    wipeSecretRam({ clearDraft });
+    if (!keepUnlockBanner) {
+      clearBanner($("unlockBanner"));
+    }
+    if (fragment.nodeCert) {
+      setCertBadge("pending", "Cert pending");
+      $("metaCertHint").textContent = "Cert attached · verifies on unlock";
+    } else {
+      setCertBadge("warn", "⚠ Uncertified");
+      $("metaCertHint").textContent = "No NodeCert attached";
+    }
+    renderLockedCopy();
+    showStage("locked");
+    syncSealControls();
+  }
+
+  // --- Lifecycle Memory-Wipe Hooks ---
+  window.addEventListener("pagehide", () => wipeSecretRam({ clearDraft: true, clearSealed: true }));
+  window.addEventListener("beforeunload", () => wipeSecretRam({ clearDraft: true, clearSealed: true }));
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden" && (state.unlockedEdSeed || state.draftLoaded)) {
+      lockAndResetUi({ clearDraft: false });
+    }
+  });
+  window.addEventListener("resize", () => {
+    if (state.stage === "unlocked" && !isSecret && !$("directiveInputGroup").classList.contains("hidden")) {
+      autoSizeTextarea($("inputDirectiveValue"));
+    }
+  });
+
+  // --- Live Expiration Countdown ---
   function refreshExpiry() {
+    if (state.delivered || state.sealing) return;
+    const pill = $("metaExpires");
     if (!fragment.expiresAtMs) {
-      $("metaExpires").textContent = "10m on seal";
+      pill.textContent = "10m on seal";
+      pill.className = "countdown-pill";
       return;
     }
     const rem = fragment.expiresAtMs - Date.now();
-    $("metaExpires").textContent = formatCountdown(rem);
-    if (rem <= 0 && !state.expired) {
-      state.expired = true;
-      $("metaExpires").classList.add("danger");
-      setBanner(
-        $("dropGlobalBanner"),
-        $("dropGlobalBannerTitle"),
-        $("dropGlobalBannerBody"),
-        "danger",
-        "DROP LINK EXPIRED",
-        "This drop invitation has expired. Request a fresh drop link from your node."
-      );
-      syncSealControls();
+    pill.textContent = formatCountdown(rem);
+    if (rem <= 0) {
+      pill.className = "countdown-pill danger";
+      if (!state.expired) {
+        state.expired = true;
+        setBanner(
+          $("dropGlobalBanner"),
+          $("dropGlobalBannerTitle"),
+          $("dropGlobalBannerBody"),
+          "danger",
+          "Drop Link Expired",
+          "This drop invitation has expired. Request a fresh drop link from your node."
+        );
+        if (state.stage === "unlocked") {
+          lockAndResetUi({ clearDraft: true });
+        } else {
+          syncSealControls();
+        }
+      }
+    } else if (rem <= 2 * 60 * 1000) {
+      pill.className = "countdown-pill warn";
+    } else {
+      pill.className = "countdown-pill";
     }
   }
   refreshExpiry();
   const countdownTimer = setInterval(refreshExpiry, 1000);
   window.addEventListener("pagehide", () => clearInterval(countdownTimer));
 
-  if (!hasRelay) {
+  // --- Configure Primary vs Offline Action Buttons ---
+  if (hasRelay) {
+    $("btnSealSendLabel").textContent = isSecret ? "Seal & Send Secret" : "Sign, Seal & Send";
+  } else {
     $("btnSealSend").classList.add("hidden");
+    $("btnSealOffline").className = "btn-primary";
+    $("btnSealOffline").textContent = "Seal Offline hdrop1_ Token";
   }
 
   function syncSealControls() {
@@ -924,8 +1048,8 @@ async function initDropMode(fragment) {
     $("btnToggleReveal").disabled = !canEdit;
     $("chkOverwriteSecret").disabled = !canEdit;
     $("inputDirectiveValue").disabled = !canEdit;
-    $("btnUnlockDraft").disabled = state.hardBlocked || state.expired;
-    $("btnUnlockPasskey").disabled = state.hardBlocked || state.expired;
+    $("btnUnlockPrimary").disabled = state.hardBlocked || state.expired;
+    $("btnSkipDraft").disabled = state.hardBlocked || state.expired;
 
     const activeVal = isSecret ? $("inputSecretValue").value : $("inputDirectiveValue").value;
     const byteLen = utf8Bytes(activeVal).length;
@@ -941,6 +1065,11 @@ async function initDropMode(fragment) {
     $("btnSealSend").disabled = !canSubmit || !hasRelay;
     $("btnSealOffline").disabled = !canSubmit;
   }
+
+  // Initial Locked Render
+  renderLockedCopy();
+  showStage("locked");
+  syncSealControls();
 
   $("inputSecretValue").addEventListener("input", syncSealControls);
   $("inputDirectiveValue").addEventListener("input", () => {
@@ -971,14 +1100,14 @@ async function initDropMode(fragment) {
     const authEpoch = parseInt($("inputAuthEpoch").value, 10);
 
     if (!humanId || !prfSalt || !Number.isInteger(authEpoch) || authEpoch < 1) {
-      $("identityDetails").open = true;
+      $("securityDrawer").open = true;
       setBanner(
-        $("certStatusBanner"),
-        $("certStatusTitle"),
-        $("certStatusBody"),
+        $("unlockBanner"),
+        $("unlockBannerTitle"),
+        $("unlockBannerBody"),
         "warn",
-        "MISSING AUTHORITY PARAMETERS",
-        "Enter your Human ID, PRF Salt, and Auth Epoch (from `hyp auth init`) before unlocking."
+        "Missing Authority Parameters",
+        "Enter your Human ID, PRF Salt, and Auth Epoch in the Security drawer above before unlocking."
       );
       return null;
     }
@@ -992,18 +1121,17 @@ async function initDropMode(fragment) {
       state.authEpoch = authEpoch;
       state.certVerified = true;
       state.certReason = "";
-      $("metaCertHint").textContent = "NodeCert verified";
+      setCertBadge("verified", "✓ Verified");
+      $("metaCertHint").textContent = `Verified by ${certRes.cert.humanId} (epoch ${certRes.cert.authEpoch})`;
+      $("securityDrawer").open = false;
+      $("verifiedStrip").className = "verified-strip verified";
+      $("verifiedStripIcon").textContent = "✓";
+      $("verifiedStripText").textContent = `Verified ${fragment.nodeId} · ${certRes.cert.humanId} (epoch ${certRes.cert.authEpoch})`;
+      clearBanner($("uncertifiedBanner"));
       $("sasConfirmRow").classList.add("hidden");
-      setBanner(
-        $("certStatusBanner"),
-        $("certStatusTitle"),
-        $("certStatusBody"),
-        "verified",
-        "VERIFIED FLEET NODE",
-        `Node certificate for ${fragment.nodeId} verified by ${certRes.cert.humanId} (epoch ${certRes.cert.authEpoch}).`
-      );
       return true;
     }
+
     if (isSecret) {
       // HARD-BLOCK secrets on unverified nodes and immediately wipe seed!
       zeroize(edSeed);
@@ -1011,46 +1139,106 @@ async function initDropMode(fragment) {
       state.certVerified = false;
       state.hardBlocked = true;
       state.certReason = certRes.message;
+      setCertBadge("danger", "⚠ Uncertified");
       $("metaCertHint").textContent = "Cert verification failed";
+      $("securityDrawer").open = true;
       setBanner(
-        $("certStatusBanner"),
-        $("certStatusTitle"),
-        $("certStatusBody"),
+        $("unlockBanner"),
+        $("unlockBannerTitle"),
+        $("unlockBannerBody"),
         "danger",
-        "UNVERIFIED NODE — SECRET BLOCKED",
+        "Unverified Node — Secret Blocked",
         `${certRes.message}. Secret drops are hard-blocked unless the node holds a valid certificate signed by your Passkey.`
       );
       return false;
     }
-    // Directive on unverified node: allow ONLY with prominent red warning + manual SAS checkbox.
+
+    // Directive on unverified node: allow ONLY with prominent danger warning + auto-expanded SAS drawer + manual SAS checkbox.
     state.unlockedEdSeed = edSeed;
     state.humanId = humanId;
     state.authEpoch = authEpoch;
     state.certVerified = false;
     state.certReason = certRes.message;
+    setCertBadge("danger", "⚠ Uncertified");
     $("metaCertHint").textContent = "UNVERIFIED NODE";
+    $("securityDrawer").open = true;
+    $("verifiedStrip").className = "verified-strip danger";
+    $("verifiedStripIcon").textContent = "⚠";
+    $("verifiedStripText").textContent = `Unverified ${fragment.nodeId} · ${humanId} (epoch ${authEpoch})`;
     setBanner(
-      $("certStatusBanner"),
-      $("certStatusTitle"),
-      $("certStatusBody"),
+      $("uncertifiedBanner"),
+      $("uncertifiedBannerTitle"),
+      $("uncertifiedBannerBody"),
       "danger",
-      "UNVERIFIED NODE WARNING",
-      `${certRes.message}. Compare the SAS fingerprint above directly with ${fragment.nodeId} before confirming.`
+      "Unverified Node Warning",
+      `${certRes.message}. Compare the SAS fingerprint in the drawer above directly with ${fragment.nodeId} before confirming.`
     );
     $("sasConfirmRow").classList.remove("hidden");
     return true;
   }
 
-  // Step 1A: 1-Tap Encrypted Draft Unlock (Single WebAuthn PRF -> X25519 open + Ed25519 RAM seed)
-  $("btnUnlockDraft").addEventListener("click", async () => {
-    if (state.hardBlocked || state.expired || !state.activeEncDraft) return;
+  function enterUnlockedStage({ draftPayload = null } = {}) {
+    clearBanner($("unlockBanner"));
+    clearBanner($("sealActionBanner"));
+
+    if (isSecret) {
+      $("secretInputGroup").classList.remove("hidden");
+      $("directiveInputGroup").classList.add("hidden");
+      $("draftWarningBanner").classList.add("hidden");
+      $("draftContextRow").classList.add("hidden");
+      $("draftApproveRow").classList.add("hidden");
+    } else if (draftPayload) {
+      state.draftLoaded = true;
+      $("secretInputGroup").classList.add("hidden");
+      $("directiveInputGroup").classList.remove("hidden");
+      $("directiveFieldLabel").textContent = "Proposed Directive";
+      $("draftWarningBanner").classList.remove("hidden");
+      if (draftPayload.context) {
+        $("draftContextText").textContent = draftPayload.context;
+        $("draftContextRow").classList.remove("hidden");
+      } else {
+        $("draftContextText").textContent = "";
+        $("draftContextRow").classList.add("hidden");
+      }
+      $("draftApproveCheck").checked = false;
+      $("draftApproveRow").classList.remove("hidden");
+      $("inputDirectiveValue").value = draftPayload.text;
+    } else {
+      state.draftLoaded = false;
+      $("secretInputGroup").classList.add("hidden");
+      $("directiveInputGroup").classList.remove("hidden");
+      $("directiveFieldLabel").textContent = "Verified Directive";
+      $("draftWarningBanner").classList.add("hidden");
+      $("draftContextRow").classList.add("hidden");
+      $("draftApproveRow").classList.add("hidden");
+    }
+
+    showStage("unlocked");
+    syncSealControls();
+
+    if (!isSecret) {
+      autoSizeTextarea($("inputDirectiveValue"));
+    }
+  }
+
+  // --- Step 1: Unified Passkey Unlock (Handles both encDraft & standard unlock) ---
+  $("btnUnlockPrimary").addEventListener("click", async () => {
+    if (state.hardBlocked || state.expired) return;
 
     const auth = readAuthorityInputs();
     if (!auth) return;
 
-    const btn = $("btnUnlockDraft");
+    const isDraftFlow = Boolean(state.activeEncDraft && !isSecret);
+    const btn = $("btnUnlockPrimary");
+    const label = $("btnUnlockPrimaryLabel");
+    const spinner = $("unlockSpinner");
     btn.disabled = true;
-    btn.textContent = "Unlocking draft with Face ID / Touch ID…";
+    $("btnSkipDraft").disabled = true;
+    spinner.classList.remove("hidden");
+    label.textContent = isDraftFlow
+      ? "Unlocking draft with Face ID / Touch ID…"
+      : "Authenticating with Face ID / Touch ID…";
+    clearBanner($("unlockBanner"));
 
     let prfOut = null;
     let encKp = null;
@@ -1066,21 +1254,25 @@ async function initDropMode(fragment) {
       );
       prfOut = rawPrf;
 
-      // Derive BOTH companion X25519 keypair and Ed25519 signing seed from the single PRF output.
-      encKp = await derivePrfX25519Keypair(prfOut, auth.humanId, auth.authEpoch);
-      edSeed = await derivePrfEd25519Seed(prfOut, auth.humanId, auth.authEpoch);
+      let draftPayload = null;
+      if (isDraftFlow) {
+        // Derive BOTH companion X25519 keypair and Ed25519 signing seed from the single PRF output.
+        encKp = await derivePrfX25519Keypair(prfOut, auth.humanId, auth.authEpoch);
+        edSeed = await derivePrfEd25519Seed(prfOut, auth.humanId, auth.authEpoch);
 
-      // Decrypt & strictly validate the encrypted draft, then immediately zero X25519 private key!
-      let draftPayload;
-      try {
-        draftPayload = await openHumanDraft({
-          encDraft: state.activeEncDraft,
-          recipientPriv32: encKp.privateKeyBytes,
-          expectedNodeId: fragment.nodeId,
-        });
-      } finally {
-        zeroize(encKp.privateKeyBytes);
-        encKp = null;
+        // Decrypt & strictly validate the encrypted draft, then immediately zero X25519 private key!
+        try {
+          draftPayload = await openHumanDraft({
+            encDraft: state.activeEncDraft,
+            recipientPriv32: encKp.privateKeyBytes,
+            expectedNodeId: fragment.nodeId,
+          });
+        } finally {
+          zeroize(encKp.privateKeyBytes);
+          encKp = null;
+        }
+      } else {
+        edSeed = await derivePrfEd25519Seed(prfOut, auth.humanId, auth.authEpoch);
       }
 
       const { publicKeyBytes } = await ed25519KeypairFromSeed(edSeed);
@@ -1098,116 +1290,127 @@ async function initDropMode(fragment) {
         Date.now()
       );
 
-      applyCertVerificationResult(certRes, edSeed, auth.humanId, auth.authEpoch);
-      handedOffSeed = true;
-      state.draftLoaded = true;
-
-      $("encDraftPanel").classList.add("hidden");
-      $("btnUnlockPasskey").classList.add("hidden");
-      $("btnLockClear").classList.remove("hidden");
-
-      $("sealStepLabel").textContent = "Step 2 · Review & Approve Draft";
-      $("sealCardTitle").textContent = "Review Proposed Directive";
-      $("sealCardLead").textContent =
-        "Inspect every line carefully, edit if needed, then tick the approval box to sign with your unlocked Passkey.";
-
-      $("draftWarningBanner").classList.remove("hidden");
-      if (draftPayload.context) {
-        $("draftContextText").textContent = draftPayload.context;
-        $("draftContextRow").classList.remove("hidden");
-      } else {
-        $("draftContextText").textContent = "";
-        $("draftContextRow").classList.add("hidden");
+      const allowed = applyCertVerificationResult(certRes, edSeed, auth.humanId, auth.authEpoch);
+      if (allowed) {
+        handedOffSeed = true;
+        enterUnlockedStage({ draftPayload });
       }
-
-      $("stepSealCard").classList.remove("hidden");
-      $("directiveInputGroup").classList.remove("hidden");
-      $("draftApproveCheck").checked = false;
-      $("draftApproveRow").classList.remove("hidden");
-
-      const textarea = $("inputDirectiveValue");
-      textarea.value = draftPayload.text;
-      syncSealControls();
-      autoSizeTextarea(textarea);
     } catch (err) {
       setBanner(
-        $("certStatusBanner"),
-        $("certStatusTitle"),
-        $("certStatusBody"),
+        $("unlockBanner"),
+        $("unlockBannerTitle"),
+        $("unlockBannerBody"),
         "danger",
-        "DRAFT UNLOCK FAILED",
-        `${err instanceof Error ? err.message : "Could not unlock encrypted draft"}. You can retry or skip the draft and write from scratch.`
+        isDraftFlow ? "Draft Unlock Failed" : "Passkey Unlock Failed",
+        isDraftFlow
+          ? `${err instanceof Error ? err.message : "Could not unlock encrypted draft"}. Retry or skip the draft to write from scratch.`
+          : (err instanceof Error ? err.message : "Could not unlock Passkey")
       );
     } finally {
       if (prfOut) zeroize(prfOut);
       if (encKp && encKp.privateKeyBytes) zeroize(encKp.privateKeyBytes);
       if (edSeed && !handedOffSeed) zeroize(edSeed);
-      btn.disabled = state.hardBlocked || state.expired;
-      btn.textContent = "Unlock draft with Face ID / Touch ID";
-    }
-  });
-
-  // Step 1B: Standard Passkey Unlock & NodeCertV1 Verify (Fresh Write / Secret Drops)
-  $("btnUnlockPasskey").addEventListener("click", async () => {
-    if (state.hardBlocked || state.expired) return;
-
-    const auth = readAuthorityInputs();
-    if (!auth) return;
-
-    const btn = $("btnUnlockPasskey");
-    btn.disabled = true;
-    btn.textContent = "Authenticating with Passkey…";
-
-    let prfOut = null;
-    try {
-      const hint = loadPublicHint(auth.humanId);
-      const { prfOut: rawPrf, credentialId } = await evaluatePasskeyPrf(
-        auth.humanId,
-        auth.prfSalt,
-        hint?.credentialId || ""
-      );
-      prfOut = rawPrf;
-
-      const seed32 = await derivePrfEd25519Seed(prfOut, auth.humanId, auth.authEpoch);
-      const { publicKeyBytes } = await ed25519KeypairFromSeed(seed32);
-
-      savePublicHint(auth.humanId, {
-        prfSalt: auth.prfSalt,
-        authEpoch: auth.authEpoch,
-        credentialId,
-      });
-
-      const certRes = await verifyNodeCert(
-        fragment.nodeCert,
-        publicKeyBytes,
-        fragment.nodeId,
-        fragment.encJwk,
-        Date.now()
-      );
-
-      const allowed = applyCertVerificationResult(certRes, seed32, auth.humanId, auth.authEpoch);
-      if (allowed) {
-        $("btnUnlockPasskey").classList.add("hidden");
-        $("btnLockClear").classList.remove("hidden");
-      }
+      spinner.classList.add("hidden");
+      renderLockedCopy();
       syncSealControls();
-    } catch (err) {
-      setBanner(
-        $("certStatusBanner"),
-        $("certStatusTitle"),
-        $("certStatusBody"),
-        "danger",
-        "PASSKEY UNLOCK FAILED",
-        err instanceof Error ? err.message : "Could not unlock Passkey"
-      );
-    } finally {
-      if (prfOut) zeroize(prfOut);
-      btn.disabled = state.hardBlocked || state.expired;
-      btn.textContent = "Unlock with Passkey (FaceID / TouchID)";
     }
   });
 
-  // Step 2: Sign, Seal & Send (or Offline Copy) — reuses unlockedEdSeed with NO second biometric tap
+  // --- Relay Upload Helper (Used by Step 2 Send & Step 3 Retry) ---
+  async function uploadSealedEnvelope(envelopeJson) {
+    const endpoint = `${fragment.relay}/v1/drops/${encodeURIComponent(fragment.dropId)}`;
+    const resp = await fetch(endpoint, {
+      method: "POST",
+      mode: "cors",
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Hyphae-Drop-Cap": fragment.postCap,
+      },
+      body: envelopeJson,
+    });
+    if (!resp.ok) {
+      throw new Error(`Drop Relay responded with HTTP ${resp.status}`);
+    }
+    return resp.json().catch(() => ({}));
+  }
+
+  function showDeliveredDoneState(ack) {
+    state.delivered = true;
+    state.sealing = false;
+    clearInterval(countdownTimer);
+    clearBanner($("dropGlobalBanner"));
+    $("metaExpires").textContent = "Delivered";
+    $("metaExpires").className = "countdown-pill done";
+    $("securityDrawer").open = false;
+
+    $("doneTitle").textContent = isSecret ? "Secret Delivered" : "Directive Delivered";
+    $("doneSubtitle").textContent =
+      `Delivered end-to-end encrypted to ${fragment.nodeId}. Ephemeral keys wiped from memory — you can close this tab now.`;
+
+    $("doneTarget").textContent = fragment.nodeId;
+
+    if (isSecret) {
+      $("doneKindLabel").textContent = "Secret";
+      $("doneKindValue").textContent = fragment.secretName;
+    } else {
+      $("doneKindLabel").textContent = "Handle";
+      $("doneKindValue").textContent = fragment.handle || "Node-level";
+    }
+
+    const seqPart = ack && ack.seq !== undefined ? ` (#${ack.seq})` : "";
+    $("doneDelivery").textContent = `${relayDisplay.host}${seqPart}`;
+    $("doneTimestamp").textContent = formatLocalTime(new Date());
+
+    $("doneOfflineBlock").classList.add("hidden");
+    $("doneDeliveredBlock").classList.remove("hidden");
+    showStage("done");
+  }
+
+  function showOfflineDoneState({ isRelayError, errorMessage }) {
+    state.delivered = true;
+    state.sealing = false;
+    clearInterval(countdownTimer);
+    clearBanner($("dropGlobalBanner"));
+    $("metaExpires").textContent = "Sealed";
+    $("metaExpires").className = "countdown-pill done";
+    $("securityDrawer").open = false;
+
+    $("offlineTokenValue").textContent = state.lastHdrop1;
+    $("doneDeliveredBlock").classList.add("hidden");
+    $("doneOfflineBlock").classList.remove("hidden");
+
+    const retryBtn = $("btnRetryUpload");
+    if (isRelayError && hasRelay && state.lastEnvelopeJson) {
+      setBanner(
+        $("doneOfflineBanner"),
+        $("doneOfflineBannerTitle"),
+        $("doneOfflineBannerBody"),
+        "warn",
+        "Relay Unreachable — Offline Token Ready",
+        `${errorMessage}. Your drop is already sealed & wiped from RAM — retry upload or copy the opaque hdrop1_ token below.`
+      );
+      retryBtn.classList.remove("hidden");
+      retryBtn.disabled = false;
+      $("retryUploadSpinner").classList.add("hidden");
+      $("btnRetryUploadLabel").textContent = "Retry Upload";
+    } else {
+      setBanner(
+        $("doneOfflineBanner"),
+        $("doneOfflineBannerTitle"),
+        $("doneOfflineBannerBody"),
+        "verified",
+        "Offline Drop Sealed",
+        "Plaintext and ephemeral keys wiped from RAM. Copy the opaque hdrop1_ token below and paste it into chat or `hyp drop ingest`."
+      );
+      retryBtn.classList.add("hidden");
+    }
+
+    showStage("done");
+  }
+
+  // --- Step 2: Sign, Seal & Send (or Offline Seal) — Reuses unlockedEdSeed with NO second biometric tap ---
   async function executeSeal(sendToRelay) {
     if (state.hardBlocked || state.expired) return;
     if (isSecret && !state.certVerified) return;
@@ -1217,7 +1420,6 @@ async function initDropMode(fragment) {
     const rawBody = isSecret ? $("inputSecretValue").value : $("inputDirectiveValue").value;
     if (!rawBody) return;
 
-    // Use volatile unlockedEdSeed from Step 1 if present; otherwise authenticate via Passkey PRF once.
     let signingSeed = state.unlockedEdSeed;
     let ephemeralPrfOut = null;
     let signingHumanId = state.humanId;
@@ -1239,7 +1441,7 @@ async function initDropMode(fragment) {
           $("sealActionTitle"),
           $("sealActionBody"),
           "danger",
-          "PASSKEY AUTHENTICATION FAILED",
+          "Passkey Authentication Failed",
           err instanceof Error ? err.message : "Could not authenticate Passkey"
         );
         return;
@@ -1248,8 +1450,14 @@ async function initDropMode(fragment) {
       }
     }
 
+    state.sealing = true;
     $("btnSealSend").disabled = true;
     $("btnSealOffline").disabled = true;
+    $("btnLockClear").disabled = true;
+    if (sendToRelay && hasRelay) {
+      $("sealSendSpinner").classList.remove("hidden");
+      $("btnSealSendLabel").textContent = "Sealing & sending…";
+    }
 
     const nowMs = Date.now();
     const maxExpMs = nowMs + MAX_DROP_TTL_MS;
@@ -1281,95 +1489,82 @@ async function initDropMode(fragment) {
         recipientEncJwk: fragment.encJwk,
       });
     } catch (err) {
+      state.sealing = false;
+      if (signingSeed && signingSeed !== state.unlockedEdSeed) {
+        zeroize(signingSeed);
+      }
+      wipeSecretRam({ clearDraft: true });
+      $("sealSendSpinner").classList.add("hidden");
+      $("btnSealSendLabel").textContent = isSecret ? "Seal & Send Secret" : "Sign, Seal & Send";
+      $("btnLockClear").disabled = false;
       setBanner(
-        $("sealActionBanner"),
-        $("sealActionTitle"),
-        $("sealActionBody"),
+        $("unlockBanner"),
+        $("unlockBannerTitle"),
+        $("unlockBannerBody"),
         "danger",
-        "SEALING FAILED",
+        "Sealing Failed",
         err instanceof Error ? err.message : "Could not seal drop"
       );
-      syncSealControls();
+      lockAndResetUi({ clearDraft: true, keepUnlockBanner: true });
       return;
     } finally {
       if (signingSeed && signingSeed !== state.unlockedEdSeed) {
         zeroize(signingSeed);
       }
       // Always wipe plaintext input, draft, and signing seed immediately after sealing!
-      lockAndResetUi({ clearDraft: true });
+      wipeSecretRam({ clearDraft: true });
     }
 
     state.lastHdrop1 = sealed.hdrop1;
-    $("dropResultCard").classList.remove("hidden");
-    $("resClaimId").textContent = sealed.claim.claimId;
+    state.lastEnvelopeJson = toCanonicalJson(sealed.envelope);
 
     if (sendToRelay && hasRelay) {
       try {
-        const endpoint = `${fragment.relay}/v1/drops/${encodeURIComponent(fragment.dropId)}`;
-        const resp = await fetch(endpoint, {
-          method: "POST",
-          mode: "cors",
-          credentials: "omit",
-          referrerPolicy: "no-referrer",
-          headers: {
-            "Content-Type": "application/json",
-            "X-Hyphae-Drop-Cap": fragment.postCap,
-          },
-          body: toCanonicalJson(sealed.envelope),
-        });
-        if (!resp.ok) {
-          throw new Error(`Drop Relay responded with HTTP ${resp.status}`);
-        }
-        const ack = await resp.json().catch(() => ({}));
-        $("resultMetaGrid").classList.remove("hidden");
-        $("resSeq").textContent = ack && ack.seq !== undefined ? `#${ack.seq}` : "accepted";
-        $("offlineTokenBlock").classList.add("hidden");
-        setBanner(
-          $("resultBanner"),
-          $("resultTitle"),
-          $("resultMessage"),
-          "verified",
-          "DROP SEALED & DELIVERED",
-          `Opaque ciphertext accepted by ${new URL(fragment.relay).origin}. Your input and Passkey seed were wiped from memory.`
-        );
+        const ack = await uploadSealedEnvelope(state.lastEnvelopeJson);
+        showDeliveredDoneState(ack);
       } catch (err) {
-        // Offline / Relay-Failure Fallback: show 1-tap Copy Sealed hdrop1_ token!
-        $("resultMetaGrid").classList.remove("hidden");
-        $("resSeq").textContent = "offline fallback";
-        $("offlineTokenValue").textContent = sealed.hdrop1;
-        $("offlineTokenBlock").classList.remove("hidden");
-        setBanner(
-          $("resultBanner"),
-          $("resultTitle"),
-          $("resultMessage"),
-          "warn",
-          "RELAY UNREACHABLE — COPY OFFLINE TOKEN",
-          `${err instanceof Error ? err.message : "Network error"}. Your drop is already sealed & wiped from RAM — copy the opaque hdrop1_ token below and paste it safely into chat.`
-        );
+        showOfflineDoneState({
+          isRelayError: true,
+          errorMessage: err instanceof Error ? err.message : "Network error",
+        });
+      } finally {
+        $("sealSendSpinner").classList.add("hidden");
+        $("btnSealSendLabel").textContent = isSecret ? "Seal & Send Secret" : "Sign, Seal & Send";
+        $("btnLockClear").disabled = false;
       }
     } else {
-      $("resultMetaGrid").classList.remove("hidden");
-      $("resSeq").textContent = "offline token";
-      $("offlineTokenValue").textContent = sealed.hdrop1;
-      $("offlineTokenBlock").classList.remove("hidden");
-      setBanner(
-        $("resultBanner"),
-        $("resultTitle"),
-        $("resultMessage"),
-        "verified",
-        "OFFLINE DROP SEALED",
-        "Plaintext and Passkey seed have been wiped from RAM. Copy the opaque hdrop1_ token below and paste it safely into chat or `hyp drop ingest`."
-      );
+      $("btnLockClear").disabled = false;
+      showOfflineDoneState({ isRelayError: false, errorMessage: "" });
     }
-
-    syncSealControls();
   }
 
   $("btnSealSend").addEventListener("click", () => executeSeal(true));
   $("btnSealOffline").addEventListener("click", () => executeSeal(false));
+
   $("btnCopyHdrop1").addEventListener("click", () => {
     if (state.lastHdrop1) {
-      copyText(state.lastHdrop1, $("btnCopyHdrop1"), "Copy Sealed hdrop1_");
+      copyText(state.lastHdrop1, $("btnCopyHdrop1"), "Copy hdrop1_ Token");
+    }
+  });
+
+  $("btnRetryUpload").addEventListener("click", async () => {
+    if (!hasRelay || !state.lastEnvelopeJson) return;
+    const btn = $("btnRetryUpload");
+    const label = $("btnRetryUploadLabel");
+    const spinner = $("retryUploadSpinner");
+    btn.disabled = true;
+    spinner.classList.remove("hidden");
+    label.textContent = "Retrying upload…";
+    try {
+      const ack = await uploadSealedEnvelope(state.lastEnvelopeJson);
+      showDeliveredDoneState(ack);
+    } catch (err) {
+      showOfflineDoneState({
+        isRelayError: true,
+        errorMessage: err instanceof Error ? err.message : "Network error",
+      });
+    } finally {
+      spinner.classList.add("hidden");
     }
   });
 }
