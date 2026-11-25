@@ -2079,7 +2079,8 @@ async fn chaos_oversized_and_malformed_wire_mutation_fuzz() {
             let mut builder = Request::builder()
                 .method(method)
                 .uri(format!("http://{hub_addr}{path}"))
-                .header(CONTENT_TYPE, "application/json");
+                .header(CONTENT_TYPE, "application/json")
+                .header(http::header::CONNECTION, "close");
             if let Some(auth) = auth_header {
                 builder = builder.header(AUTHORIZATION, auth);
             }
@@ -2121,17 +2122,39 @@ async fn chaos_oversized_and_malformed_wire_mutation_fuzz() {
     };
 
     // 1. Oversized >2 MiB body to `POST /v1/messages` -> 413 `too_large`
-    let huge_body = vec![b'A'; 2 * 1024 * 1024 + 4096];
-    let auth_huge = sign_alice("POST", "/v1/messages", &huge_body);
-    send_expect_4xx(
-        Method::POST,
-        "/v1/messages".to_string(),
-        huge_body,
-        Some(auth_huge),
-        StatusCode::PAYLOAD_TOO_LARGE,
-        Some("too_large"),
-    )
-    .await;
+    //    Send HTTP/1.1 headers directly so pre-read Content-Length rejection returns 413
+    //    deterministically without Windows Winsock RST races on un-drained >2 MiB writes.
+    let huge_len = 2 * 1024 * 1024 + 4096;
+    let auth_huge = sign_alice("POST", "/v1/messages", &[]);
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut tcp = tokio::net::TcpStream::connect(hub_addr).await.unwrap();
+        let req_head = format!(
+            "POST /v1/messages HTTP/1.1\r\n\
+             Host: {hub_addr}\r\n\
+             Content-Type: application/json\r\n\
+             Authorization: {auth_huge}\r\n\
+             Content-Length: {huge_len}\r\n\
+             Connection: close\r\n\r\n"
+        );
+        tcp.write_all(req_head.as_bytes()).await.unwrap();
+        let mut raw_resp = Vec::new();
+        tcp.read_to_end(&mut raw_resp).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&raw_resp);
+        assert!(
+            resp_str.starts_with("HTTP/1.1 413 "),
+            "expected 413 Payload Too Large, got:\n{resp_str}"
+        );
+        let lower = resp_str.to_ascii_lowercase();
+        assert!(
+            lower.contains("content-type: application/problem+json"),
+            "413 must use RFC 9457 application/problem+json:\n{resp_str}"
+        );
+        let (_, body_part) = resp_str.split_once("\r\n\r\n").expect("HTTP response body");
+        let prob: ProblemDetails = serde_json::from_str(body_part).expect("valid ProblemDetails");
+        assert_eq!(prob.status, StatusCode::PAYLOAD_TOO_LARGE.as_u16());
+        assert_eq!(prob.error, "too_large");
+    }
 
     // 2. Oversized >1 MiB CloudEvent `data` to `POST /v1/events` -> 413 `too_large`
     let big_ce_body = serde_json::to_vec(&json!({
