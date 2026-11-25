@@ -418,22 +418,35 @@ fn wire_active_layout(
         let target_display = fs::read_link(&layout_path)
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| layout_path.display().to_string());
-        warnings.push(format!(
-            "Active layout '{}' is a symlink (-> {target_display}); skipped editing it.",
-            layout_path.display()
-        ));
-        notes.push(
-            "Layout JSON snippet (2 lines): set `pane.header.content.mod = \"hyphae-pane\"` and add `{ \"id\": \"hyphae\", \"type\": \"block\", \"content\": { \"mod\": \"hyphae-panel\" } }` to `panel-body.children`."
-                .to_string(),
-        );
-        notes.push(
-            "Custom pane header composition: copy `mods/hyphae-pane/{pill.js,shared-client.js,hyphae.svg}` into your pane mod folder and use `import { renderHyphaePill } from \"./pill.js\"` (Herdr sandboxes JS module imports per mod folder)."
-                .to_string(),
-        );
-        next.push(
-            "Re-run with `--patch-layout` to edit the symlinked layout in place, or apply the 2-line snippet in your custom UI repo."
-                .to_string(),
-        );
+        if let Some(custom_mod) = detect_custom_pane_header_mod(&layout_path) {
+            warnings.push(format!(
+                "Active layout '{}' is a symlink (-> {target_display}) using custom pane header mod '{custom_mod}'; skipped editing it.",
+                layout_path.display()
+            ));
+            notes.push(format!(
+                "Keep `{custom_mod}` intact via `pill.js`: copy `mods/hyphae-pane/{{pill.js,shared-client.js,hyphae.svg}}` into `mods/{custom_mod}/`, add `import {{ renderHyphaePill }} from \"./pill.js\"` + `renderHyphaePill(...)`, and add `{{ \"id\": \"hyphae\", \"type\": \"block\", \"content\": {{ \"mod\": \"hyphae-panel\" }} }}` to `panel-body.children`."
+            ));
+            next.push(format!(
+                "Compose pill.js inside mods/{custom_mod}/ and add hyphae-panel to panel-body.children in your custom UI repo (or press {DEFAULT_SHORTCUT_KEY} for the floating inspector)."
+            ));
+        } else {
+            warnings.push(format!(
+                "Active layout '{}' is a symlink (-> {target_display}); skipped editing it.",
+                layout_path.display()
+            ));
+            notes.push(
+                "Layout JSON snippet (2 lines): set `pane.header.content.mod = \"hyphae-pane\"` and add `{ \"id\": \"hyphae\", \"type\": \"block\", \"content\": { \"mod\": \"hyphae-panel\" } }` to `panel-body.children`."
+                    .to_string(),
+            );
+            notes.push(
+                "Custom pane header composition: copy `mods/hyphae-pane/{pill.js,shared-client.js,hyphae.svg}` into your pane mod folder and use `import { renderHyphaePill } from \"./pill.js\"` (Herdr sandboxes JS module imports per mod folder)."
+                    .to_string(),
+            );
+            next.push(
+                "Re-run with `--patch-layout` to edit the symlinked layout in place, or apply the 2-line snippet in your custom UI repo."
+                    .to_string(),
+            );
+        }
         return Ok(LayoutAction::SkippedSymlink);
     }
 
@@ -452,7 +465,7 @@ fn wire_active_layout(
                 "Compose Hyphae inside `mods/{custom_mod}/`: copy `mods/hyphae-pane/{{pill.js,shared-client.js,hyphae.svg}}` into `mods/{custom_mod}/` and call `renderHyphaePill(...)` via `import {{ renderHyphaePill }} from \"./pill.js\"`."
             ));
             next.push(
-                "Re-run with `--force` to replace the custom pane header with `hyphae-pane`."
+                "Re-run with `--force-layout` to replace the custom pane header with `hyphae-pane`."
                     .to_string(),
             );
             Ok(LayoutAction::SkippedCustomHeader)
@@ -474,9 +487,19 @@ fn wire_active_layout(
                 return Ok(LayoutAction::DryRun);
             }
 
-            let backup_file = create_layout_backup(herdr_home, active_layout, &layout_path)?;
+            let write_target = if meta.file_type().is_symlink() {
+                fs::canonicalize(&layout_path).map_err(|e| {
+                    format!(
+                        "failed to resolve symlinked layout {}: {e}",
+                        layout_path.display()
+                    )
+                })?
+            } else {
+                layout_path.clone()
+            };
+            let backup_file = create_layout_backup(herdr_home, active_layout, &write_target)?;
             *backup_path = Some(backup_file.clone());
-            write_json_pretty_atomic(&layout_path, &tree)?;
+            write_json_pretty_atomic(&write_target, &tree)?;
             files.push(layout_path.display().to_string());
             notes.push(format!(
                 "Backed up {} -> {} and enabled hyphae-pane + hyphae-panel.",
@@ -485,6 +508,45 @@ fn wire_active_layout(
             ));
             Ok(LayoutAction::Patched)
         }
+    }
+}
+
+fn find_pane_header_mod(node: &Value) -> Option<&str> {
+    let obj = node.as_object()?;
+    if let Some(content) = obj.get("content").and_then(Value::as_object) {
+        if content.contains_key("tab") {
+            if let Some(mod_name) = content
+                .get("pane")
+                .and_then(Value::as_object)
+                .and_then(|p| p.get("header"))
+                .and_then(Value::as_object)
+                .and_then(|h| h.get("content"))
+                .and_then(Value::as_object)
+                .and_then(|c| c.get("mod"))
+                .and_then(Value::as_str)
+            {
+                return Some(mod_name);
+            }
+        }
+    }
+    if let Some(children) = obj.get("children").and_then(Value::as_array) {
+        for child in children {
+            if let Some(found) = find_pane_header_mod(child) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn detect_custom_pane_header_mod(layout_path: &Path) -> Option<String> {
+    let raw = fs::read_to_string(layout_path).ok()?;
+    let tree: Value = serde_json::from_str(&raw).ok()?;
+    let mod_name = find_pane_header_mod(&tree)?;
+    if mod_name != "pane" && mod_name != "hyphae-pane" {
+        Some(mod_name.to_string())
+    } else {
+        None
     }
 }
 
@@ -634,34 +696,7 @@ fn write_json_pretty_atomic(path: &Path, value: &Value) -> Result<(), String> {
 }
 
 fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-    }
-    // Resolve symlink target when explicitly patching a symlinked file so we preserve the symlink.
-    let target = match fs::symlink_metadata(path) {
-        Ok(m) if m.file_type().is_symlink() => fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
-        _ => path.to_path_buf(),
-    };
-    let tmp_name = format!(
-        ".{}.hyp.tmp.{}",
-        target
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("file"),
-        std::process::id()
-    );
-    let tmp_path = target
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(tmp_name);
-    fs::write(&tmp_path, bytes)
-        .map_err(|e| format!("failed to write temp file {}: {e}", tmp_path.display()))?;
-    fs::rename(&tmp_path, &target).map_err(|e| {
-        let _ = fs::remove_file(&tmp_path);
-        format!("failed to replace {}: {e}", target.display())
-    })?;
-    Ok(())
+    crate::config_file::write_atomic_file(path, bytes, false)
 }
 
 fn find_herdr_app_binary(home: &Path) -> Option<PathBuf> {
@@ -807,6 +842,114 @@ mod tests {
                 .unwrap()
                 .file_type()
                 .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_custom_header_advises_pill_js_and_patch_layout_preserves_symlink() {
+        use std::os::unix::fs::symlink;
+
+        // 1. Symlinked layout using custom header `folder-pane`: must advise pill.js composition
+        //    WITHOUT suggesting overwriting `pane.header.content.mod = "hyphae-pane"`.
+        let tmp = TempDir::new().unwrap();
+        let herdr_home = setup_herdr_fixture(&tmp, "herdr-folders");
+        let external_repo = tmp.path().join("herdr-custom-ui");
+        fs::create_dir_all(&external_repo).unwrap();
+        let external_custom = external_repo.join("herdr-folders.json");
+        let original_custom = serde_json::to_string_pretty(&sample_layout("folder-pane")).unwrap();
+        fs::write(&external_custom, &original_custom).unwrap();
+        let custom_link = herdr_home.join("layouts").join("herdr-folders.json");
+        symlink(&external_custom, &custom_link).unwrap();
+
+        let skipped = install_herdr_mod(
+            tmp.path(),
+            HerdrModInstallOptions {
+                skip_check: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(skipped.layout_action, LayoutAction::SkippedSymlink);
+        assert_eq!(fs::read_to_string(&external_custom).unwrap(), original_custom);
+        assert!(
+            skipped
+                .warnings
+                .iter()
+                .any(|w| w.contains("folder-pane") && w.contains("symlink")),
+            "warning must name custom header mod and symlink: {:?}",
+            skipped.warnings
+        );
+        assert!(
+            skipped
+                .notes
+                .iter()
+                .any(|n| n.contains("pill.js")
+                    && n.contains("renderHyphaePill")
+                    && n.contains("mods/folder-pane/")
+                    && n.contains("hyphae-panel")),
+            "note must guide pill.js composition + hyphae-panel: {:?}",
+            skipped.notes
+        );
+        assert!(
+            skipped
+                .next
+                .iter()
+                .any(|n| n.contains("mods/folder-pane/") && n.contains("panel-body.children")),
+            "next must mention mods/folder-pane/ + panel-body.children: {:?}",
+            skipped.next
+        );
+        for msg in skipped
+            .warnings
+            .iter()
+            .chain(skipped.notes.iter())
+            .chain(skipped.next.iter())
+        {
+            assert!(
+                !msg.contains("pane.header.content.mod = \"hyphae-pane\""),
+                "must NOT recommend replacing custom pane header mod: {msg}"
+            );
+        }
+
+        // 2. `--patch-layout` on a symlinked default-header layout updates target atomically
+        //    while preserving the symlink itself 100% intact.
+        let tmp2 = TempDir::new().unwrap();
+        let herdr_home2 = setup_herdr_fixture(&tmp2, "git-layout");
+        let ext_repo2 = tmp2.path().join("herdr-dotfiles");
+        fs::create_dir_all(&ext_repo2).unwrap();
+        let ext_default = ext_repo2.join("git-layout.json");
+        fs::write(
+            &ext_default,
+            serde_json::to_string_pretty(&sample_layout("pane")).unwrap(),
+        )
+        .unwrap();
+        let link2 = herdr_home2.join("layouts").join("git-layout.json");
+        symlink(&ext_default, &link2).unwrap();
+
+        let patched = install_herdr_mod(
+            tmp2.path(),
+            HerdrModInstallOptions {
+                patch_layout: true,
+                skip_check: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(patched.layout_action, LayoutAction::Patched);
+        assert!(patched.backup_path.as_ref().is_some_and(|p| p.is_file()));
+        assert!(
+            fs::symlink_metadata(&link2)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "--patch-layout must preserve the layout symlink intact"
+        );
+        let updated: Value =
+            serde_json::from_str(&fs::read_to_string(&ext_default).unwrap()).unwrap();
+        assert_eq!(
+            updated["children"][0]["children"][0]["content"]["pane"]["header"]["content"]["mod"],
+            "hyphae-pane"
         );
     }
 

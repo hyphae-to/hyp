@@ -14,7 +14,10 @@
 use crate::config_file::{
     load_node_or_legacy_config, resolve_config_path_for_read, write_atomic_file,
 };
-use crate::setup::{HarnessDiagnostic, OnboardArgs, default_node_id, detect_harness_statuses};
+use crate::setup::{
+    HarnessDiagnostic, OnboardArgs, canonical_dedup_key, default_node_id, detect_harness_statuses,
+    resolve_claude_profiles,
+};
 use crate::ui::{
     EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
     print_warnings,
@@ -153,12 +156,28 @@ impl LaunchableHarness {
 
     /// Primary global skill file path for `hyphae-setup/SKILL.md`.
     pub fn primary_skill_path(self, home: &Path) -> PathBuf {
+        self.primary_skill_path_for(home, true, None)
+    }
+
+    /// Profile-aware primary skill path for `hyphae-setup/SKILL.md` (honors `$CLAUDE_CONFIG_DIR`
+    /// and `--claude-config-dir` for Claude Code).
+    pub fn primary_skill_path_for(
+        self,
+        home: &Path,
+        explicit_home: bool,
+        claude_config_dir: Option<&Path>,
+    ) -> PathBuf {
         match self {
-            Self::Claude => home
-                .join(".claude")
-                .join("skills")
-                .join("hyphae-setup")
-                .join("SKILL.md"),
+            Self::Claude => resolve_claude_profiles(home, explicit_home, claude_config_dir)
+                .into_iter()
+                .next()
+                .map(|p| p.setup_skill_path())
+                .unwrap_or_else(|| {
+                    home.join(".claude")
+                        .join("skills")
+                        .join("hyphae-setup")
+                        .join("SKILL.md")
+                }),
             Self::Codex => home
                 .join(".codex")
                 .join("skills")
@@ -190,8 +209,31 @@ impl LaunchableHarness {
     }
 
     /// Additional cross-tool skill paths to populate alongside `primary_skill_path`.
+    #[allow(dead_code)]
     pub fn extra_skill_paths(self, home: &Path) -> Vec<PathBuf> {
+        self.extra_skill_paths_for(home, true, None)
+    }
+
+    /// Profile-aware additional skill paths to populate alongside `primary_skill_path_for`.
+    pub fn extra_skill_paths_for(
+        self,
+        home: &Path,
+        explicit_home: bool,
+        claude_config_dir: Option<&Path>,
+    ) -> Vec<PathBuf> {
         match self {
+            Self::Claude => {
+                let profiles = resolve_claude_profiles(home, explicit_home, claude_config_dir);
+                let mut seen = BTreeSet::new();
+                let mut extras = Vec::new();
+                for (idx, profile) in profiles.into_iter().enumerate() {
+                    let path = profile.setup_skill_path();
+                    if seen.insert(canonical_dedup_key(&path)) && idx > 0 {
+                        extras.push(path);
+                    }
+                }
+                extras
+            }
             Self::Codex => vec![
                 home.join(".agents")
                     .join("skills")
@@ -282,9 +324,21 @@ impl ManualGuideHarness {
         }
     }
 
+    #[allow(dead_code)]
     pub fn primary_skill_path(self, home: &Path) -> PathBuf {
+        self.primary_skill_path_for(home, true, None)
+    }
+
+    pub fn primary_skill_path_for(
+        self,
+        home: &Path,
+        explicit_home: bool,
+        claude_config_dir: Option<&Path>,
+    ) -> PathBuf {
         match self {
-            Self::ClaudeDesktop => LaunchableHarness::Claude.primary_skill_path(home),
+            Self::ClaudeDesktop => {
+                LaunchableHarness::Claude.primary_skill_path_for(home, explicit_home, claude_config_dir)
+            }
             Self::CodexDesktop => LaunchableHarness::Codex.primary_skill_path(home),
             Self::OpenCodeDesktop => LaunchableHarness::Opencode.primary_skill_path(home),
             Self::CursorIde => LaunchableHarness::Cursor.primary_skill_path(home),
@@ -298,13 +352,27 @@ impl ManualGuideHarness {
                 .join("skills")
                 .join("hyphae-setup")
                 .join("SKILL.md"),
-            Self::ConfigOnlyCli(lh) => lh.primary_skill_path(home),
+            Self::ConfigOnlyCli(lh) => {
+                lh.primary_skill_path_for(home, explicit_home, claude_config_dir)
+            }
         }
     }
 
+    #[allow(dead_code)]
     pub fn extra_skill_paths(self, home: &Path) -> Vec<PathBuf> {
+        self.extra_skill_paths_for(home, true, None)
+    }
+
+    pub fn extra_skill_paths_for(
+        self,
+        home: &Path,
+        explicit_home: bool,
+        claude_config_dir: Option<&Path>,
+    ) -> Vec<PathBuf> {
         match self {
-            Self::ClaudeDesktop => Vec::new(),
+            Self::ClaudeDesktop => {
+                LaunchableHarness::Claude.extra_skill_paths_for(home, explicit_home, claude_config_dir)
+            }
             Self::CodexDesktop => LaunchableHarness::Codex.extra_skill_paths(home),
             Self::OpenCodeDesktop => vec![
                 home.join(".agents")
@@ -314,18 +382,28 @@ impl ManualGuideHarness {
             ],
             Self::CursorIde => Vec::new(),
             Self::Openclaw => Vec::new(),
-            // T3 Code spawns Claude and Codex sessions; install into all 3 skill locations.
-            Self::T3 => vec![
-                home.join(".claude")
-                    .join("skills")
-                    .join("hyphae-setup")
-                    .join("SKILL.md"),
-                home.join(".codex")
-                    .join("skills")
-                    .join("hyphae-setup")
-                    .join("SKILL.md"),
-            ],
-            Self::ConfigOnlyCli(lh) => lh.extra_skill_paths(home),
+            // T3 Code spawns Claude and Codex sessions; install into all active Claude profile
+            // skill directories plus Codex.
+            Self::T3 => {
+                let mut seen = BTreeSet::new();
+                let mut out = Vec::new();
+                for profile in resolve_claude_profiles(home, explicit_home, claude_config_dir) {
+                    let path = profile.setup_skill_path();
+                    if seen.insert(canonical_dedup_key(&path)) {
+                        out.push(path);
+                    }
+                }
+                out.push(
+                    home.join(".codex")
+                        .join("skills")
+                        .join("hyphae-setup")
+                        .join("SKILL.md"),
+                );
+                out
+            }
+            Self::ConfigOnlyCli(lh) => {
+                lh.extra_skill_paths_for(home, explicit_home, claude_config_dir)
+            }
         }
     }
 
@@ -3930,7 +4008,37 @@ pub fn detect_candidates_in_with_env(
     existing_node_id: Option<&str>,
     in_herdr_env: Option<&str>,
 ) -> Vec<MainMenuItem> {
-    let diagnostics = detect_harness_statuses(home, config_path);
+    detect_candidates_in_with_claude(
+        home,
+        true,
+        None,
+        config_path,
+        path_var,
+        apps_dir,
+        appdata_dir,
+        local_appdata_dir,
+        opencode_server_url,
+        existing_node_id,
+        in_herdr_env,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn detect_candidates_in_with_claude(
+    home: &Path,
+    explicit_home: bool,
+    claude_config_dir: Option<&Path>,
+    config_path: Option<&Path>,
+    path_var: Option<&OsStr>,
+    apps_dir: Option<&Path>,
+    appdata_dir: Option<&Path>,
+    local_appdata_dir: Option<&Path>,
+    opencode_server_url: Option<&str>,
+    existing_node_id: Option<&str>,
+    in_herdr_env: Option<&str>,
+) -> Vec<MainMenuItem> {
+    let diagnostics =
+        detect_harness_statuses(home, explicit_home, claude_config_dir, config_path);
     let launchables: Vec<(LaunchableHarness, PathBuf)> = LaunchableHarness::ALL
         .iter()
         .filter_map(|&h| find_executable_in_path_env(h.binary_name(), path_var).map(|p| (h, p)))
@@ -3959,7 +4067,13 @@ pub fn detect_candidates_in_with_env(
     )
 }
 
-fn is_skill_harness_detected(kind: HarnessKind, home: &Path, include_path_scan: bool) -> bool {
+fn is_skill_harness_detected(
+    kind: HarnessKind,
+    home: &Path,
+    include_path_scan: bool,
+    explicit_home: bool,
+    claude_config_dir: Option<&Path>,
+) -> bool {
     let dir_detected = match kind {
         HarnessKind::Antigravity => {
             let gemini_dir = home.join(".gemini");
@@ -3967,7 +4081,9 @@ fn is_skill_harness_detected(kind: HarnessKind, home: &Path, include_path_scan: 
                 || gemini_dir.join("config").exists()
                 || (gemini_dir.is_dir() && !gemini_dir.join("settings.json").exists())
         }
-        HarnessKind::Claude => home.join(".claude").exists() || home.join(".claude.json").exists(),
+        HarnessKind::Claude => resolve_claude_profiles(home, explicit_home, claude_config_dir)
+            .iter()
+            .any(|p| p.config_dir.exists() || p.mcp_file.exists()),
         HarnessKind::Codex => home.join(".codex").exists(),
         HarnessKind::Cursor => home.join(".cursor").exists(),
         HarnessKind::Opencode => home.join(".config").join("opencode").exists(),
@@ -4003,18 +4119,34 @@ fn launchable_from_kind(kind: HarnessKind) -> Option<LaunchableHarness> {
     }
 }
 
-fn skill_paths_for_kind(kind: HarnessKind, home: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
+fn skill_paths_for_kind(
+    kind: HarnessKind,
+    home: &Path,
+    explicit_home: bool,
+    claude_config_dir: Option<&Path>,
+) -> Option<(PathBuf, Vec<PathBuf>)> {
     if let Some(lh) = launchable_from_kind(kind) {
-        return Some((lh.primary_skill_path(home), lh.extra_skill_paths(home)));
+        return Some((
+            lh.primary_skill_path_for(home, explicit_home, claude_config_dir),
+            lh.extra_skill_paths_for(home, explicit_home, claude_config_dir),
+        ));
     }
     match kind {
         HarnessKind::Openclaw => Some((
-            ManualGuideHarness::Openclaw.primary_skill_path(home),
-            ManualGuideHarness::Openclaw.extra_skill_paths(home),
+            ManualGuideHarness::Openclaw.primary_skill_path_for(
+                home,
+                explicit_home,
+                claude_config_dir,
+            ),
+            ManualGuideHarness::Openclaw.extra_skill_paths_for(
+                home,
+                explicit_home,
+                claude_config_dir,
+            ),
         )),
         HarnessKind::T3 => Some((
-            ManualGuideHarness::T3.primary_skill_path(home),
-            ManualGuideHarness::T3.extra_skill_paths(home),
+            ManualGuideHarness::T3.primary_skill_path_for(home, explicit_home, claude_config_dir),
+            ManualGuideHarness::T3.extra_skill_paths_for(home, explicit_home, claude_config_dir),
         )),
         HarnessKind::Herdr => None,
         _ => None,
@@ -4025,13 +4157,21 @@ fn parse_skill_harness_selection(
     raw: Option<&str>,
     home: &Path,
     include_path_scan: bool,
+    explicit_home: bool,
+    claude_config_dir: Option<&Path>,
 ) -> Result<Vec<HarnessKind>, String> {
     let spec = raw.unwrap_or("auto").trim().to_ascii_lowercase();
     if spec.is_empty() || spec == "auto" {
         let mut found = Vec::new();
         for kind in HarnessKind::ALL {
-            if skill_paths_for_kind(kind, home).is_some()
-                && is_skill_harness_detected(kind, home, include_path_scan)
+            if skill_paths_for_kind(kind, home, explicit_home, claude_config_dir).is_some()
+                && is_skill_harness_detected(
+                    kind,
+                    home,
+                    include_path_scan,
+                    explicit_home,
+                    claude_config_dir,
+                )
             {
                 found.push(kind);
             }
@@ -4042,7 +4182,7 @@ fn parse_skill_harness_selection(
         return Ok(HarnessKind::ALL
             .iter()
             .copied()
-            .filter(|&k| skill_paths_for_kind(k, home).is_some())
+            .filter(|&k| skill_paths_for_kind(k, home, explicit_home, claude_config_dir).is_some())
             .collect());
     }
     let mut selected = Vec::new();
@@ -4069,23 +4209,37 @@ fn parse_skill_harness_selection(
 }
 
 /// Installs the embedded `hyphae-setup/SKILL.md` for all specified harnesses (deduplicating paths).
+#[allow(dead_code)]
 pub fn install_setup_skill_for_harnesses(
     home: &Path,
+    harnesses: &[HarnessKind],
+) -> Result<Vec<InstalledSkillEntry>, String> {
+    install_setup_skill_for_harnesses_with_claude(home, true, None, harnesses)
+}
+
+/// Profile-aware installer for `hyphae-setup/SKILL.md` that deduplicates symlinked `skills/`
+/// directories by canonical path while populating distinct `$CLAUDE_CONFIG_DIR` skill dirs.
+pub fn install_setup_skill_for_harnesses_with_claude(
+    home: &Path,
+    explicit_home: bool,
+    claude_config_dir: Option<&Path>,
     harnesses: &[HarnessKind],
 ) -> Result<Vec<InstalledSkillEntry>, String> {
     let mut entries = Vec::new();
     let mut written_paths = BTreeSet::new();
 
     for &kind in harnesses {
-        let Some((primary, extras)) = skill_paths_for_kind(kind, home) else {
+        let Some((primary, extras)) =
+            skill_paths_for_kind(kind, home, explicit_home, claude_config_dir)
+        else {
             continue;
         };
-        if written_paths.insert(primary.clone()) {
+        if written_paths.insert(canonical_dedup_key(&primary)) {
             write_atomic_file(&primary, HYPHAE_SETUP_SKILL_MD.as_bytes(), false)?;
         }
         let mut written_extras = Vec::new();
         for extra in extras {
-            if written_paths.insert(extra.clone()) {
+            if written_paths.insert(canonical_dedup_key(&extra)) {
                 write_atomic_file(&extra, HYPHAE_SETUP_SKILL_MD.as_bytes(), false)?;
             }
             written_extras.push(extra.display().to_string());
@@ -4104,7 +4258,7 @@ pub fn install_setup_skill_for_harnesses(
         .join("skills")
         .join("hyphae-setup")
         .join("SKILL.md");
-    if home.join(".agents").is_dir() && written_paths.insert(agents_skill.clone()) {
+    if home.join(".agents").is_dir() && written_paths.insert(canonical_dedup_key(&agents_skill)) {
         write_atomic_file(&agents_skill, HYPHAE_SETUP_SKILL_MD.as_bytes(), false)?;
         entries.push(InstalledSkillEntry {
             harness: "agents".to_string(),
@@ -4120,12 +4274,19 @@ pub fn install_setup_skill_for_harnesses(
 pub fn run_install_skill(
     home: &Path,
     explicit_home: bool,
+    claude_config_dir: Option<&Path>,
     harness_spec: Option<&str>,
     as_json: bool,
 ) -> ExitCode {
     let cmd = "onboard";
     let include_path_scan = !explicit_home;
-    let targets = match parse_skill_harness_selection(harness_spec, home, include_path_scan) {
+    let targets = match parse_skill_harness_selection(
+        harness_spec,
+        home,
+        include_path_scan,
+        explicit_home,
+        claude_config_dir,
+    ) {
         Ok(t) => t,
         Err(e) => {
             return emit_error(
@@ -4142,7 +4303,12 @@ pub fn run_install_skill(
         }
     };
 
-    let installed = match install_setup_skill_for_harnesses(home, &targets) {
+    let installed = match install_setup_skill_for_harnesses_with_claude(
+        home,
+        explicit_home,
+        claude_config_dir,
+        &targets,
+    ) {
         Ok(v) => v,
         Err(e) => {
             return emit_error(cmd, as_json, EXIT_ERROR, "SKILL_INSTALL_FAILED", e, None);
@@ -4671,6 +4837,7 @@ fn collect_skill_targets_with_primary(
     primary: Option<HarnessKind>,
     home: &Path,
     explicit_home: bool,
+    claude_config_dir: Option<&Path>,
 ) -> Vec<HarnessKind> {
     let mut targets = Vec::new();
     if let Some(kind) = primary {
@@ -4679,8 +4846,14 @@ fn collect_skill_targets_with_primary(
     let include_path_scan = !explicit_home;
     for kind in HarnessKind::ALL {
         if !targets.contains(&kind)
-            && skill_paths_for_kind(kind, home).is_some()
-            && is_skill_harness_detected(kind, home, include_path_scan)
+            && skill_paths_for_kind(kind, home, explicit_home, claude_config_dir).is_some()
+            && is_skill_harness_detected(
+                kind,
+                home,
+                include_path_scan,
+                explicit_home,
+                claude_config_dir,
+            )
         {
             targets.push(kind);
         }
@@ -4703,6 +4876,7 @@ fn install_and_handoff_cli(
     chosen: LaunchableHarness,
     home: &Path,
     explicit_home: bool,
+    claude_config_dir: Option<&Path>,
     existing_node: Option<&ExistingNodeInfo>,
     cli_bin: &str,
     as_json: bool,
@@ -4719,21 +4893,32 @@ fn install_and_handoff_cli(
             guide,
             home,
             explicit_home,
+            claude_config_dir,
             existing_node,
             cli_bin,
             as_json,
         );
     };
 
-    let targets = collect_skill_targets_with_primary(Some(chosen.kind()), home, explicit_home);
-    let installed = match install_setup_skill_for_harnesses(home, &targets) {
+    let targets = collect_skill_targets_with_primary(
+        Some(chosen.kind()),
+        home,
+        explicit_home,
+        claude_config_dir,
+    );
+    let installed = match install_setup_skill_for_harnesses_with_claude(
+        home,
+        explicit_home,
+        claude_config_dir,
+        &targets,
+    ) {
         Ok(v) => v,
         Err(e) => {
             return emit_error("onboard", as_json, EXIT_ERROR, "SKILL_INSTALL_FAILED", e, None);
         }
     };
 
-    let primary_skill = chosen.primary_skill_path(home);
+    let primary_skill = chosen.primary_skill_path_for(home, explicit_home, claude_config_dir);
     if !as_json {
         print_installed_skills_banner(&installed);
         println!();
@@ -4756,6 +4941,7 @@ fn install_and_handoff_herdr(
     template: &HerdrTemplate,
     home: &Path,
     explicit_home: bool,
+    claude_config_dir: Option<&Path>,
     existing_node: Option<&ExistingNodeInfo>,
     as_json: bool,
 ) -> ExitCode {
@@ -4764,9 +4950,15 @@ fn install_and_handoff_herdr(
         inferred.map(LaunchableHarness::kind),
         home,
         explicit_home,
+        claude_config_dir,
     );
 
-    let mut installed = match install_setup_skill_for_harnesses(home, &targets) {
+    let mut installed = match install_setup_skill_for_harnesses_with_claude(
+        home,
+        explicit_home,
+        claude_config_dir,
+        &targets,
+    ) {
         Ok(v) => v,
         Err(e) => {
             return emit_error("onboard", as_json, EXIT_ERROR, "SKILL_INSTALL_FAILED", e, None);
@@ -4774,7 +4966,7 @@ fn install_and_handoff_herdr(
     };
 
     let primary_skill = if let Some(lh) = inferred {
-        lh.primary_skill_path(home)
+        lh.primary_skill_path_for(home, explicit_home, claude_config_dir)
     } else if let Some(first) = installed.first() {
         PathBuf::from(&first.path)
     } else {
@@ -4818,22 +5010,33 @@ fn install_manual_guide_skills(
     harness: ManualGuideHarness,
     home: &Path,
     explicit_home: bool,
+    claude_config_dir: Option<&Path>,
 ) -> Result<(PathBuf, Vec<InstalledSkillEntry>), String> {
-    let targets = collect_skill_targets_with_primary(Some(harness.kind()), home, explicit_home);
-    let mut installed = install_setup_skill_for_harnesses(home, &targets)?;
+    let targets = collect_skill_targets_with_primary(
+        Some(harness.kind()),
+        home,
+        explicit_home,
+        claude_config_dir,
+    );
+    let mut installed = install_setup_skill_for_harnesses_with_claude(
+        home,
+        explicit_home,
+        claude_config_dir,
+        &targets,
+    )?;
 
     // Ensure harness-specific extra cross-tool skill paths (e.g. OpenCode Desktop `~/.agents`)
     // are also written and recorded cleanly without duplicates.
-    let mut already_recorded: BTreeSet<String> = BTreeSet::new();
+    let mut already_recorded: BTreeSet<PathBuf> = BTreeSet::new();
     for item in &installed {
-        already_recorded.insert(item.path.clone());
+        already_recorded.insert(canonical_dedup_key(Path::new(&item.path)));
         for extra in &item.extra_paths {
-            already_recorded.insert(extra.clone());
+            already_recorded.insert(canonical_dedup_key(Path::new(extra)));
         }
     }
-    for extra in harness.extra_skill_paths(home) {
-        let extra_str = extra.display().to_string();
-        if already_recorded.insert(extra_str.clone()) {
+    for extra in harness.extra_skill_paths_for(home, explicit_home, claude_config_dir) {
+        if already_recorded.insert(canonical_dedup_key(&extra)) {
+            let extra_str = extra.display().to_string();
             write_atomic_file(&extra, HYPHAE_SETUP_SKILL_MD.as_bytes(), false)?;
             if let Some(first) = installed.first_mut() {
                 first.extra_paths.push(extra_str);
@@ -4847,7 +5050,10 @@ fn install_manual_guide_skills(
         }
     }
 
-    Ok((harness.primary_skill_path(home), installed))
+    Ok((
+        harness.primary_skill_path_for(home, explicit_home, claude_config_dir),
+        installed,
+    ))
 }
 
 fn print_manual_guide_plain(
@@ -4911,12 +5117,13 @@ fn install_and_emit_manual_guide(
     harness: ManualGuideHarness,
     home: &Path,
     explicit_home: bool,
+    claude_config_dir: Option<&Path>,
     existing_node: Option<&ExistingNodeInfo>,
     cli_bin: &str,
     as_json: bool,
 ) -> ExitCode {
-    let (primary_skill, installed) = match install_manual_guide_skills(harness, home, explicit_home)
-    {
+    let (primary_skill, installed) =
+        match install_manual_guide_skills(harness, home, explicit_home, claude_config_dir) {
         Ok(res) => res,
         Err(e) => {
             return emit_error("onboard", as_json, EXIT_ERROR, "SKILL_INSTALL_FAILED", e, None);
@@ -6223,8 +6430,19 @@ impl SetupToggleState {
     }
 
     /// Detects installed harnesses and `~/.config/herdr-app` under `home` to build default state.
+    #[allow(dead_code)]
     pub fn from_home(home: &Path, explicit_home: bool) -> Self {
-        let diagnostics = detect_harness_statuses(home, None);
+        Self::from_home_with_claude(home, explicit_home, None)
+    }
+
+    /// Profile-aware harness & Herdr app detection under `home` (honors `$CLAUDE_CONFIG_DIR` /
+    /// `--claude-config-dir`).
+    pub fn from_home_with_claude(
+        home: &Path,
+        explicit_home: bool,
+        claude_config_dir: Option<&Path>,
+    ) -> Self {
+        let diagnostics = detect_harness_statuses(home, explicit_home, claude_config_dir, None);
         let mut detected = Vec::new();
         for kind in HarnessKind::ALL {
             if diagnostics
@@ -7299,6 +7517,7 @@ fn run_fullscreen_tui_loop(
     main_items: &[MainMenuItem],
     home: &Path,
     explicit_home: bool,
+    claude_config_dir: Option<&Path>,
     existing_node: Option<&ExistingNodeInfo>,
     in_herdr_env: Option<&str>,
     cli_bin: &str,
@@ -7493,7 +7712,12 @@ fn run_fullscreen_tui_loop(
                                 break TuiResolution::LaunchCli(*lh);
                             }
                             MainMenuAction::ManualGuide(mh) => {
-                                match install_manual_guide_skills(*mh, home, explicit_home) {
+                                match install_manual_guide_skills(
+                                    *mh,
+                                    home,
+                                    explicit_home,
+                                    claude_config_dir,
+                                ) {
                                     Ok((primary_skill, installed)) => {
                                         screen = build_initial_manual_guide_screen(
                                             *mh,
@@ -7511,7 +7735,11 @@ fn run_fullscreen_tui_loop(
                                 }
                             }
                             MainMenuAction::QuickLocalSetup => {
-                                let state = SetupToggleState::from_home(home, explicit_home);
+                                let state = SetupToggleState::from_home_with_claude(
+                                    home,
+                                    explicit_home,
+                                    claude_config_dir,
+                                );
                                 screen = WizardScreen::LocalSetupConfig {
                                     state,
                                     main_selected: idx,
@@ -7770,6 +7998,7 @@ fn execute_tui_resolution(
     resolution: TuiResolution,
     home: &Path,
     explicit_home: bool,
+    claude_config_dir: Option<&Path>,
     existing_node: Option<&ExistingNodeInfo>,
     cli_bin: &str,
 ) -> WizardOutcome {
@@ -7780,8 +8009,15 @@ fn execute_tui_resolution(
             WizardOutcome::RunLocalCliSetupWithSelection(selection)
         }
         TuiResolution::LaunchCli(lh) => {
-            let code =
-                install_and_handoff_cli(lh, home, explicit_home, existing_node, cli_bin, false);
+            let code = install_and_handoff_cli(
+                lh,
+                home,
+                explicit_home,
+                claude_config_dir,
+                existing_node,
+                cli_bin,
+                false,
+            );
             WizardOutcome::Finished(code)
         }
         TuiResolution::LaunchHerdr { hc_bin, template } => {
@@ -7790,6 +8026,7 @@ fn execute_tui_resolution(
                 &template,
                 home,
                 explicit_home,
+                claude_config_dir,
                 existing_node,
                 false,
             );
@@ -7859,6 +8096,7 @@ fn run_numbered_herdr_fallback(
     templates: &[HerdrTemplate],
     home: &Path,
     explicit_home: bool,
+    claude_config_dir: Option<&Path>,
     existing_node: Option<&ExistingNodeInfo>,
 ) -> Option<WizardOutcome> {
     println!();
@@ -7887,6 +8125,7 @@ fn run_numbered_herdr_fallback(
                 &templates[0],
                 home,
                 explicit_home,
+                claude_config_dir,
                 existing_node,
                 false,
             );
@@ -7908,6 +8147,7 @@ fn run_numbered_herdr_fallback(
                 &templates[n - 1],
                 home,
                 explicit_home,
+                claude_config_dir,
                 existing_node,
                 false,
             );
@@ -7994,12 +8234,13 @@ fn run_plain_tty_manual_guide(
     harness: ManualGuideHarness,
     home: &Path,
     explicit_home: bool,
+    claude_config_dir: Option<&Path>,
     existing_node: Option<&ExistingNodeInfo>,
     cli_bin: &str,
     allow_back: bool,
 ) -> Option<WizardOutcome> {
-    let (primary_skill, installed) = match install_manual_guide_skills(harness, home, explicit_home)
-    {
+    let (primary_skill, installed) =
+        match install_manual_guide_skills(harness, home, explicit_home, claude_config_dir) {
         Ok(res) => res,
         Err(e) => {
             return Some(WizardOutcome::Finished(emit_error(
@@ -8155,6 +8396,7 @@ fn run_numbered_fallback_wizard(
                     templates,
                     home,
                     args.home.is_some(),
+                    args.claude_config_dir.as_deref(),
                     existing_node,
                 ) {
                     return outcome;
@@ -8166,6 +8408,7 @@ fn run_numbered_fallback_wizard(
                     template,
                     home,
                     args.home.is_some(),
+                    args.claude_config_dir.as_deref(),
                     existing_node,
                     false,
                 );
@@ -8176,6 +8419,7 @@ fn run_numbered_fallback_wizard(
                     *lh,
                     home,
                     args.home.is_some(),
+                    args.claude_config_dir.as_deref(),
                     existing_node,
                     cli_bin,
                     false,
@@ -8187,6 +8431,7 @@ fn run_numbered_fallback_wizard(
                     *mh,
                     home,
                     args.home.is_some(),
+                    args.claude_config_dir.as_deref(),
                     existing_node,
                     cli_bin,
                     true,
@@ -8195,7 +8440,11 @@ fn run_numbered_fallback_wizard(
                 }
             }
             MainMenuAction::QuickLocalSetup => {
-                let mut toggle_state = SetupToggleState::from_home(home, args.home.is_some());
+                let mut toggle_state = SetupToggleState::from_home_with_claude(
+                    home,
+                    args.home.is_some(),
+                    args.claude_config_dir.as_deref(),
+                );
                 match run_plain_tty_setup_toggle(&mut toggle_state, home, true, true) {
                     Ok(SetupToggleAction::Apply(selection)) => {
                         return WizardOutcome::RunLocalCliSetupWithSelection(selection);
@@ -8242,6 +8491,7 @@ pub fn should_launch_interactive_wizard(args: &OnboardArgs, stdout_is_tty: bool)
         || args.node_id.is_some()
         || args.state_dir.is_some()
         || args.home.is_some()
+        || args.claude_config_dir.is_some()
         || args.bin.is_some()
         || args.harness.is_some()
         || args.statusline
@@ -8264,8 +8514,10 @@ pub fn run_interactive_wizard(args: &OnboardArgs, home: &Path) -> WizardOutcome 
     let herdr_env = detect_herdr_terminal_from_env();
     let cli_bin = resolve_wizard_cli_bin(args.bin.as_deref());
 
-    let main_items = detect_candidates_in_with_env(
+    let main_items = detect_candidates_in_with_claude(
         home,
+        args.home.is_some(),
+        args.claude_config_dir.as_deref(),
         config_opt,
         path_var.as_deref(),
         probe.apps_dir.as_deref(),
@@ -8284,6 +8536,7 @@ pub fn run_interactive_wizard(args: &OnboardArgs, home: &Path) -> WizardOutcome 
             &main_items,
             home,
             args.home.is_some(),
+            args.claude_config_dir.as_deref(),
             existing_node.as_ref(),
             herdr_env.as_deref(),
             &cli_bin,
@@ -8294,6 +8547,7 @@ pub fn run_interactive_wizard(args: &OnboardArgs, home: &Path) -> WizardOutcome 
                 resolution,
                 home,
                 args.home.is_some(),
+                args.claude_config_dir.as_deref(),
                 existing_node.as_ref(),
                 &cli_bin,
             );
@@ -8325,6 +8579,7 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
                 chosen,
                 home,
                 args.home.is_some(),
+                args.claude_config_dir.as_deref(),
                 existing_node.as_ref(),
                 &cli_bin,
                 args.json,
@@ -8335,6 +8590,8 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
         let existing_node = detect_existing_node(args, home);
         let diagnostics = detect_harness_statuses(
             home,
+            args.home.is_some(),
+            args.claude_config_dir.as_deref(),
             existing_node.as_ref().map(|n| n.config_path.as_path()),
         );
         for guide in [ManualGuideHarness::Openclaw, ManualGuideHarness::T3] {
@@ -8346,6 +8603,7 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
                     guide,
                     home,
                     args.home.is_some(),
+                    args.claude_config_dir.as_deref(),
                     existing_node.as_ref(),
                     &cli_bin,
                     args.json,
@@ -8408,6 +8666,7 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
                     &[],
                     home,
                     args.home.is_some(),
+                    args.claude_config_dir.as_deref(),
                     existing_node.as_ref(),
                     None,
                     &cli_bin,
@@ -8418,6 +8677,7 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
                         resolution,
                         home,
                         args.home.is_some(),
+                        args.claude_config_dir.as_deref(),
                         existing_node.as_ref(),
                         &cli_bin,
                     );
@@ -8429,6 +8689,7 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
                     &discovered,
                     home,
                     args.home.is_some(),
+                    args.claude_config_dir.as_deref(),
                     existing_node.as_ref(),
                 ) {
                     return outcome;
@@ -8475,6 +8736,7 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
             &template,
             home,
             args.home.is_some(),
+            args.claude_config_dir.as_deref(),
             existing_node.as_ref(),
             args.json,
         );
@@ -8488,7 +8750,12 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
 
         #[cfg(unix)]
         if io::stdout().is_terminal() && !args.json {
-            match install_manual_guide_skills(guide_harness, home, args.home.is_some()) {
+            match install_manual_guide_skills(
+                guide_harness,
+                home,
+                args.home.is_some(),
+                args.claude_config_dir.as_deref(),
+            ) {
                 Ok((primary_skill, installed)) => {
                     let initial = build_initial_manual_guide_screen(
                         guide_harness,
@@ -8507,6 +8774,7 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
                         &[],
                         home,
                         args.home.is_some(),
+                        args.claude_config_dir.as_deref(),
                         existing_node.as_ref(),
                         None,
                         &cli_bin,
@@ -8517,6 +8785,7 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
                             resolution,
                             home,
                             args.home.is_some(),
+                            args.claude_config_dir.as_deref(),
                             existing_node.as_ref(),
                             &cli_bin,
                         );
@@ -8540,6 +8809,7 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
                 guide_harness,
                 home,
                 args.home.is_some(),
+                args.claude_config_dir.as_deref(),
                 existing_node.as_ref(),
                 &cli_bin,
                 false,
@@ -8553,6 +8823,7 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
             guide_harness,
             home,
             args.home.is_some(),
+            args.claude_config_dir.as_deref(),
             existing_node.as_ref(),
             &cli_bin,
             args.json,
@@ -8582,6 +8853,7 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
         chosen,
         home,
         args.home.is_some(),
+        args.claude_config_dir.as_deref(),
         existing_node.as_ref(),
         &cli_bin,
         args.json,

@@ -43,6 +43,9 @@ pub struct StatusArgs {
     /// Override home directory for harness detection
     #[arg(long)]
     pub home: Option<PathBuf>,
+    /// Explicit Claude Code config profile directory (overrides $CLAUDE_CONFIG_DIR)
+    #[arg(long, value_name = "DIR")]
+    pub claude_config_dir: Option<PathBuf>,
     /// Output structured JSON envelope
     #[arg(long)]
     pub json: bool,
@@ -59,6 +62,9 @@ pub struct DoctorArgs {
     /// Override home directory for harness detection
     #[arg(long)]
     pub home: Option<PathBuf>,
+    /// Explicit Claude Code config profile directory (overrides $CLAUDE_CONFIG_DIR)
+    #[arg(long, value_name = "DIR")]
+    pub claude_config_dir: Option<PathBuf>,
     /// Output structured JSON envelope
     #[arg(long)]
     pub json: bool,
@@ -112,17 +118,32 @@ pub struct PeerSkewRow {
 }
 
 pub fn run_status(args: StatusArgs) -> ExitCode {
-    run_status_or_doctor(args.state_dir, args.config, args.home, args.json, false)
+    run_status_or_doctor(
+        args.state_dir,
+        args.config,
+        args.home,
+        args.claude_config_dir,
+        args.json,
+        false,
+    )
 }
 
 pub fn run_doctor(args: DoctorArgs) -> ExitCode {
-    run_status_or_doctor(args.state_dir, args.config, args.home, args.json, true)
+    run_status_or_doctor(
+        args.state_dir,
+        args.config,
+        args.home,
+        args.claude_config_dir,
+        args.json,
+        true,
+    )
 }
 
 fn run_status_or_doctor(
     state_dir_arg: Option<PathBuf>,
     config_arg: Option<PathBuf>,
     home_arg: Option<PathBuf>,
+    claude_config_dir_arg: Option<PathBuf>,
     as_json: bool,
     is_doctor: bool,
 ) -> ExitCode {
@@ -609,8 +630,18 @@ fn run_status_or_doctor(
     }
 
     // 4. Harness setup diagnostics
-    let harnesses: Vec<HarnessDiagnostic> = resolve_home_dir(home_arg.as_deref())
-        .map(|h| detect_harness_statuses(&h, loaded_cfg.as_ref().map(|c| c.path.as_path())))
+    let explicit_home = home_arg.is_some();
+    let resolved_home = resolve_home_dir(home_arg.as_deref());
+    let harnesses: Vec<HarnessDiagnostic> = resolved_home
+        .as_deref()
+        .map(|h| {
+            detect_harness_statuses(
+                h,
+                explicit_home,
+                claude_config_dir_arg.as_deref(),
+                loaded_cfg.as_ref().map(|c| c.path.as_path()),
+            )
+        })
         .unwrap_or_default();
     for h in &harnesses {
         if h.detected || h.configured {
@@ -627,10 +658,11 @@ fn run_status_or_doctor(
     }
 
     // 5. StatusLine diagnostics for Claude Code & Antigravity CLI (non-failing info/warning checks)
-    let resolved_home = resolve_home_dir(home_arg.as_deref());
     let status_lines: Vec<StatusLineDiagnostic> = resolved_home
         .as_deref()
-        .map(detect_statusline_statuses)
+        .map(|h| {
+            detect_statusline_statuses(h, explicit_home, claude_config_dir_arg.as_deref())
+        })
         .unwrap_or_default();
     for sl in &status_lines {
         if sl.configured {
