@@ -5,7 +5,7 @@ mod common;
 
 #[cfg(unix)]
 use common::{ManagedProcess, run_hyp_in_pty};
-use common::{hyp_bin, isolated_cmd, parse_json_stdout, repo_plugins_dir};
+use common::{isolated_cmd, parse_json_stdout, repo_plugins_dir};
 use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::Full;
 use hyp_crypto::CryptoError;
@@ -1185,7 +1185,11 @@ fn r5_doctor_flags_daemon_version_skew_and_update_supports_no_restart() {
     // 4. Verify `hyp update --no-restart` swaps binary cleanly and reports `serviceRestarted: false`
     //    with `hyp service restart --json` in `next`.
     let release_kp = Ed25519KeyPair::generate().unwrap();
-    let fake_bin_bytes = fs::read(hyp_bin()).unwrap();
+    // Use a tiny valid POSIX executable stub instead of reading the full debug
+    // `hyp` binary, which exceeds `MAX_ARCHIVE_BYTES` (128 MiB) on Linux CI.
+    let fake_bin_bytes =
+        b"#!/bin/sh\necho '{\"ok\":true,\"command\":\"version\",\"data\":{\"version\":\"9.9.9\"}}'\n"
+            .to_vec();
     let fake_sha = hex::encode(Sha256::digest(&fake_bin_bytes));
     let fake_size = fake_bin_bytes.len() as u64;
     let triple = "x86_64-test-triple";

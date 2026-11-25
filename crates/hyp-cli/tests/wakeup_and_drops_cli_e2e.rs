@@ -38,6 +38,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 #[cfg(not(unix))]
+#[allow(clippy::too_many_arguments)]
 fn seal_hdrop1_via_stored_admin(
     state_dir: &Path,
     node_id: &str,
