@@ -1,0 +1,62 @@
+# Hyphae v2 Blind Ephemeral Drop Relay — Cloudflare Workers + RAM-only Durable Object
+#
+# Quick start:
+#   1. Generate a 32-byte HMAC secret:
+#        openssl rand -base64 32 | wrangler secret put DROP_CAP_HMAC_KEY
+#   2. Choose mode below:
+#      - Private / Team (default, fail-closed): keep DROP_AUTH_MODE = "private" and set:
+#          wrangler secret put ALLOWED_NODE_KEYS
+#      - Public relay (e.g. drop.hyphae.to): set DROP_AUTH_MODE = "open"
+#   3. Deploy:
+#        wrangler deploy
+
+name = "hyphae-drop-relay"
+main = "src/index.mjs"
+compatibility_date = "2025-01-01"
+
+# Uncomment to attach a custom domain on deploy:
+# routes = [
+#   { pattern = "drop.hyphae.to", custom_domain = true }
+# ]
+
+# RAM-only Durable Object (DropSlotDO NEVER calls ctx.storage; zero disk persistence).
+[[durable_objects.bindings]]
+name = "DROP_SLOT"
+class_name = "DropSlotDO"
+
+[[migrations]]
+tag = "v1"
+# Standard Durable Object migration (no SQLite storage provisioned; works on Workers Paid).
+# If deploying on the Workers Free tier, replace `new_classes` with `new_sqlite_classes`
+# (DropSlotDO still never reads or writes any persistent storage).
+new_classes = ["DropSlotDO"]
+
+[vars]
+# Auth mode for POST /v1/drops slot creation:
+#   "private" — (default, fail-closed) only Ed25519 nodes listed in ALLOWED_NODE_KEYS secret.
+#   "open"    — public blind relay accepting any self-signed Ed25519 node (X-Hyphae-Public-Key)
+#               with per-IP + per-pubkey hourly rate limits.
+DROP_AUTH_MODE = "private"
+# DROP_AUTH_MODE = "open"
+
+# Explicit comma-separated CORS origin allowlist (NEVER "*" or "null").
+ALLOWED_ORIGINS = "https://hyphae.to"
+
+# Emit Access-Control-Allow-Private-Network: true for Chrome PNA compatibility.
+ALLOW_PRIVATE_NETWORK = "true"
+
+# Hard per-drop payload, TTL, item, and SSE concurrency ceilings.
+MAX_PAYLOAD_BYTES = "65536"
+MAX_TTL_SECONDS = "900"
+DEFAULT_TTL_SECONDS = "600"
+MAX_ITEMS_PER_DROP = "16"
+MAX_SSE_STREAMS_PER_DROP = "2"
+
+# Sliding-window hourly slot-creation quotas (enforced per creator & per client IP).
+CREATES_PER_HOUR_PER_NODE = "10"
+CREATES_PER_HOUR_PER_IP = "20"
+
+# Required Cloudflare Worker secrets (set via `wrangler secret put`, NEVER commit here):
+#   DROP_CAP_HMAC_KEY        (required, >= 32 bytes; signs stateless hdcap1_ tokens)
+#   DROP_CAP_HMAC_KEY_PREV   (optional; previous key during zero-downtime key rotation)
+#   ALLOWED_NODE_KEYS        (required in "private" mode; JSON map or nodeId=b64url pairs)
