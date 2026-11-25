@@ -47,8 +47,9 @@ Use the results to pick the right mode automatically:
 5. **Phone URLs — ALWAYS include BOTH a scannable QR code AND the clickable URL**:
    - Whenever a setup or drop step produces a URL meant to be opened on the user's phone (e.g. `https://hyphae.to/drop#enroll=...`, `https://hyphae.to/drop#drop=...`, WhatsApp bridge pairing, Tailscale auth, or Telegram/Slack mobile links), **ALWAYS present BOTH a crisp terminal QR code** (e.g. via `qrencode -t ANSIUTF8 "$URL"` or `python3` / `npx` QR output if `qrencode` is absent) **AND the full clickable URL** so the user can scan immediately with their phone camera or tap/copy it directly.
    - *(Remember: never pass secrets in URLs — `#drop=` and `#enroll=` links only carry public metadata, one-shot `postCap`s, or HPKE-encrypted `encDraft`s.)*
-6. **Guided Credential & Lock Walkthroughs — NEVER dump bare `hyp secret set` or `hyp gate lock` commands without context**:
-   - Whenever you ask the user to run `hyp secret set <name> --web` or `hyp gate lock`, **always explain in 2–4 crisp bullets**: (a) **why** it's needed (or whether it's optional), (b) **exact URL + exact clicks/scopes** to generate the token (with a QR code + URL for phone apps like `https://t.me/BotFather`), and (c) what `hyp gate lock` is about to apply & sign (`adapter`, `model`, `base_url`, `on_error`) so the user can review before locking. Walk through one integration cleanly rather than leaving the user guessing where a token comes from!
+6. **Run `hyp` Commands Directly — Only Hand Off Interactive Human-Confirm Steps**:
+   - Feel free to run `hyp` CLI commands directly (including `--web` browser ceremonies like `hyp secret set <name> --web` and `hyp auth init --web`, using a generous ~300s command timeout — they open the user's browser out-of-band so zero secrets or private keys ever enter chat or LLM context).
+   - Before launching a `--web` secret form or handing off an interactive human-confirm command (`hyp gate lock`, `hyp inbox approve`/`reject`, `hyp auth add`/`revoke`, or headless stdin secret piping), **always explain in 2–4 crisp bullets**: (a) **why** it's needed, (b) **exact URL + exact clicks/scopes** to generate any token (with QR + URL for phone apps like `https://t.me/BotFather`), or (c) what `hyp gate lock` is about to sign (`adapter`, `model`, `base_url`, `on_error`) so the user can review before confirming. Walk through one integration cleanly rather than leaving the user guessing!
 7. **Complete All 4 Onboarding Pillars & Ask Direct Questions (NEVER Punt to "Later")**:
    - During **Mode 1 (First-Time Onboarding)**, **NEVER stop after bootstrapping the local node & harnesses** and dump Event Streams, Chat Bridges, Verified Human Drops, or Local Security Gates into a passive *"Later you can add..."* list unless the user explicitly answers *"none / skip optional integrations"*.
    - Keep each turn focused (**2–3 crisp choices**; use native multi-choice / interactive question tools if the harness provides them, or short numbered A/B/C options).
@@ -304,8 +305,8 @@ hyp deploy check --url https://<hostname> --json
   - **Zero-Knowledge Secret Drops (`kind: "secret"`)**: Prefilled drafts are **strictly forbidden** (secrets are always typed fresh); zero secret bytes ever enter SQLite, logs, relay plaintext RAM, or LLM context.
   - **Encrypted Directive Prefill (`kind: "directive"`, `encDraft`-only)**: Optionally pass `--draft "..."` / `--draft-stdin` or MCP `draft: "..."` — HPKE-encrypted (`human.draft.v1`) directly into `#drop=` (`encDraft`) with **zero plaintext leak** even if pasted into Slack, Telegram, WhatsApp, or SMS. On `https://hyphae.to/drop`, **1 Face ID / Touch ID tap** unlocks & decrypts in RAM -> amber *"Draft proposed by agent (untrusted)"* banner -> auto-expanded no-scroll BiDi-safe review box -> mandatory confirmation checkbox -> Sign & Send -> immediate RAM wipe.
   ```sh
-  # Human runs locally to pair phone Passkey+PRF (derives Ed25519 + companion X25519 keys in 1 prompt)
-  hyp auth init --web
+  # Launch Passkey+PRF enrollment in the browser (derives Ed25519 + companion X25519 keys in 1 Touch ID / Face ID prompt)
+  hyp auth init --web --json
   hyp auth list --json
   hyp auth certify-node --json
   hyp auth revoke <kid> --bump-epoch --json
