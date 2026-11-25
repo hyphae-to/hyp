@@ -28,33 +28,46 @@ import {
   bucketSizeFor,
   decodeHdrop1,
   derivePrfEd25519Seed,
+  derivePrfX25519Keypair,
+  derivePrfX25519Seed,
   ed25519KeypairFromSeed,
   ed25519Sign,
   ed25519Verify,
   encodeHdrop1,
   hexDecode,
   hexEncode,
+  hkdfSha256,
   hpkeDeriveKeyPairX25519,
   hpkeOpenBase,
   hpkeSealBase,
+  HUMAN_DRAFT_INFO_PREFIX,
+  HUMAN_DRAFT_SUITE,
   HUMAN_DROP_SUITE,
+  HUMAN_PRF_X25519_SALT,
+  humanDraftHpkeAad,
+  humanDraftHpkeInfo,
   isReservedSecretName,
   isSmallOrderEd25519Point,
   jwkThumbprint,
+  MAX_HUMAN_DRAFT_CHARS,
   MAX_PADDED_PLAINTEXT,
+  openHumanDraft,
   openHumanDrop,
   padBucket,
   prfEvalInput,
   randomBytes,
   sasFingerprint,
+  sealHumanDraft,
   sealHumanDrop,
   signNodeCert,
   toCanonicalJson,
   unpadBucket,
   utf8Bytes,
+  validateDraftText,
   validateSecretName,
   verifyNodeCert,
   x25519DeriveSharedSecret,
+  x25519KeypairFromSeed,
   x25519PublicFromPrivate,
   _ed25519SignPure,
   _ed25519VerifyPure,
@@ -682,6 +695,328 @@ await test("reserved secret-name denylist, SAS fingerprint & fragment parser sec
   assert.equal(isAllowedRelayUrl("javascript:alert(1)"), false);
   assert.equal(isLoopbackCallbackUrl("http://127.0.0.1:41234/enroll"), true);
   assert.equal(isLoopbackCallbackUrl("https://evil.example.com/steal"), false);
+});
+
+// ----------------------------------------------------------------------------
+// 11. Companion Passkey-PRF X25519 Key Derivation & Domain Separation
+// ----------------------------------------------------------------------------
+await test("derivePrfX25519Keypair determinism, domain separation & golden vector parity", async () => {
+  const goldenPrf = new Uint8Array(32).fill(0x42);
+  const humanId = "bogdan@laptop";
+
+  const xSeedDefault = await derivePrfX25519Seed(goldenPrf, humanId);
+  const xSeedEpoch1 = await derivePrfX25519Seed(goldenPrf, humanId, 1);
+  const xSeedEpoch2 = await derivePrfX25519Seed(goldenPrf, humanId, 2);
+  const xSeedOtherHuman = await derivePrfX25519Seed(goldenPrf, "alice@laptop", 1);
+  const edSeedEpoch1 = await derivePrfEd25519Seed(goldenPrf, humanId, 1);
+
+  assert.equal(xSeedDefault.length, 32);
+  assert.deepEqual(xSeedDefault, xSeedEpoch1, "default authEpoch must equal 1");
+  assert.notDeepEqual(xSeedEpoch1, edSeedEpoch1, "X25519 seed must be domain-separated from Ed25519");
+  assert.notDeepEqual(xSeedEpoch1, xSeedEpoch2, "X25519 seed must rotate across authEpoch");
+  assert.notDeepEqual(xSeedEpoch1, xSeedOtherHuman, "X25519 seed must bind humanId");
+
+  // Differential check directly against raw HKDF-SHA256
+  const epochBe = new Uint8Array([0, 0, 0, 0, 0, 0, 0, 1]);
+  const rawInfo = new Uint8Array(utf8Bytes(humanId).length + 1 + 8);
+  rawInfo.set(utf8Bytes(humanId), 0);
+  rawInfo[utf8Bytes(humanId).length] = 0x0a;
+  rawInfo.set(epochBe, utf8Bytes(humanId).length + 1);
+  const expectedSeed = await hkdfSha256(utf8Bytes(HUMAN_PRF_X25519_SALT), goldenPrf, rawInfo, 32);
+  assert.deepEqual(xSeedEpoch1, expectedSeed);
+
+  const kp1 = await derivePrfX25519Keypair(goldenPrf, humanId, 1);
+  const kp2 = await derivePrfX25519Keypair(goldenPrf, humanId);
+  const kpFromSeed = await x25519KeypairFromSeed(xSeedEpoch1);
+  assert.deepEqual(kp1.privateKeyBytes, xSeedEpoch1);
+  assert.deepEqual(kp1.publicKeyBytes, kp2.publicKeyBytes);
+  assert.deepEqual(kp1.publicJwk, kp2.publicJwk);
+  assert.equal(kp1.kid, kp2.kid);
+  assert.deepEqual(kp1.publicJwk, kpFromSeed.publicJwk);
+  assert.equal(kp1.publicJwk.kty, "OKP");
+  assert.equal(kp1.publicJwk.crv, "X25519");
+  assert.equal(kp1.kid, await jwkThumbprint(kp1.publicJwk));
+
+  // Mutating returned privateKeyBytes must not mutate seed copy passed to x25519KeypairFromSeed
+  const seedCopy = new Uint8Array(xSeedEpoch1);
+  const kpMut = await x25519KeypairFromSeed(seedCopy);
+  kpMut.privateKeyBytes.fill(0);
+  assert.deepEqual(seedCopy, xSeedEpoch1);
+
+  // Fail closed on invalid inputs
+  await assert.rejects(() => derivePrfX25519Seed(new Uint8Array(31), humanId, 1), /32-byte/);
+  await assert.rejects(() => derivePrfX25519Seed(goldenPrf, "", 1), /non-empty/);
+  await assert.rejects(() => derivePrfX25519Seed(goldenPrf, "UPPER", 1), /Invalid humanId/);
+  await assert.rejects(() => derivePrfX25519Seed(goldenPrf, "bad\nhuman", 1), /Invalid humanId/);
+  await assert.rejects(() => derivePrfX25519Seed(goldenPrf, humanId, 0), /out of u64 range/);
+});
+
+// ----------------------------------------------------------------------------
+// 12. BiDi / Invisible-Control Draft Text Guard (`validateDraftText`)
+// ----------------------------------------------------------------------------
+await test("validateDraftText rejects BiDi overrides, zero-width, CR & >512 chars while allowing clean multi-line", async () => {
+  const cleanMultiLine =
+    "Approve release v0.5.0 on prod@eu-1:\n\t1. Run migrations\n\t2. Verify canary 2xx ✅";
+  assert.equal(validateDraftText(cleanMultiLine), cleanMultiLine);
+
+  // Exact 512 Unicode code points (including 4-byte emoji) MUST pass; 513 MUST fail
+  const exactly512 = "a".repeat(511) + "🚀";
+  assert.equal([...exactly512].length, MAX_HUMAN_DRAFT_CHARS);
+  assert.equal(validateDraftText(exactly512), exactly512);
+  const tooLong513 = "a".repeat(512) + "🚀";
+  assert.throws(() => validateDraftText(tooLong513), /exceeds maximum length/);
+
+  // Non-string & empty/whitespace-only MUST fail
+  assert.throws(() => validateDraftText(null), /must be a string/);
+  assert.throws(() => validateDraftText(42), /must be a string/);
+  assert.throws(() => validateDraftText(""), /empty/);
+  assert.throws(() => validateDraftText("   \n\t  "), /empty/);
+
+  // BiDi, invisible formatting, CR, NUL, and C0/C1 controls MUST fail
+  const forbiddenSamples = [
+    ["BiDi RLO U+202E", "deploy safe\u202Etxt.exe"],
+    ["BiDi LRE U+202A", "hello\u202Aworld"],
+    ["BiDi isolate U+2066", "hello\u2066world"],
+    ["Arabic letter mark U+061C", "hello\u061Cworld"],
+    ["Zero-width space U+200B", "roll\u200Bback"],
+    ["Zero-width joiner U+200D", "roll\u200Dback"],
+    ["Word joiner U+2060", "roll\u2060back"],
+    ["BOM U+FEFF", "\uFEFFdeploy"],
+    ["Line separator U+2028", "line1\u2028line2"],
+    ["Carriage return \\r", "line1\r\nline2"],
+    ["NUL byte", "deploy\u0000now"],
+    ["ESC byte", "deploy\u001B[31mred"],
+    ["DEL byte", "deploy\u007Fnow"],
+    ["C1 NEL U+0085", "deploy\u0085now"],
+  ];
+  for (const [label, sample] of forbiddenSamples) {
+    assert.throws(() => validateDraftText(sample), /disallowed/, `must reject ${label}`);
+  }
+});
+
+// ----------------------------------------------------------------------------
+// 13. HPKE Encrypted Directive Draft (`sealHumanDraft` <-> `openHumanDraft`)
+// ----------------------------------------------------------------------------
+await test("sealHumanDraft -> openHumanDraft roundtrip & fail-closed bit-flip/tamper mutations", async () => {
+  const humanPrf = new Uint8Array(32).fill(0x42);
+  const humanEnc = await derivePrfX25519Keypair(humanPrf, "bogdan@laptop", 1);
+  const otherEnc = await derivePrfX25519Keypair(new Uint8Array(32).fill(0x99), "bogdan@laptop", 1);
+
+  const payload = {
+    v: 1,
+    nodeId: "prod@eu-1",
+    text: "Roll back checkout-api to v2.4.1\nNotify #ops once healthy.",
+    context: "5xx rate rose to 4.2% after canary deploy",
+    createdAt: "2026-11-25T05:00:00Z",
+  };
+
+  const sealed = await sealHumanDraft({
+    payload,
+    recipientEncJwk: humanEnc.publicJwk,
+  });
+
+  // Envelope structure & zero plaintext leakage
+  assert.deepEqual(Object.keys(sealed).sort(), ["ct", "enc", "recipientKid", "suite", "v"]);
+  assert.equal(sealed.v, 1);
+  assert.equal(sealed.suite, HUMAN_DRAFT_SUITE);
+  assert.equal(sealed.recipientKid, humanEnc.kid);
+  assert.ok(!JSON.stringify(sealed).includes("checkout-api"));
+  assert.ok(!JSON.stringify(sealed).includes("canary"));
+
+  // Power-of-2 bucket padding + 16-byte AES-256-GCM tag
+  const rawCt = base64urlDecode(sealed.ct);
+  const paddedLen = rawCt.length - 16;
+  assert.equal(paddedLen & (paddedLen - 1), 0, "draft ciphertext must be power-of-2 padded");
+
+  // Roundtrip open with context
+  const opened = await openHumanDraft({
+    encDraft: sealed,
+    recipientPriv32: humanEnc.privateKeyBytes,
+    expectedNodeId: "prod@eu-1",
+  });
+  assert.deepEqual(opened, payload);
+
+  // Roundtrip open WITHOUT optional context (omitted, not null)
+  const payloadNoCtx = {
+    v: 1,
+    nodeId: "prod@eu-1",
+    text: "Pause batch workers until 09:00 UTC.",
+    createdAt: "2026-11-25T05:01:00Z",
+  };
+  const sealedNoCtx = await sealHumanDraft({
+    payload: payloadNoCtx,
+    recipientEncJwk: humanEnc.publicJwk,
+  });
+  const openedNoCtx = await openHumanDraft({
+    encDraft: sealedNoCtx,
+    recipientPriv32: humanEnc.privateKeyBytes,
+    expectedNodeId: "prod@eu-1",
+  });
+  assert.deepEqual(openedNoCtx, payloadNoCtx);
+  assert.equal("context" in openedNoCtx, false);
+
+  // Mutated valid inputs MUST all fail closed!
+  // 1. Wrong expectedNodeId (fails HPKE info & AAD authentication)
+  await assert.rejects(() =>
+    openHumanDraft({
+      encDraft: sealed,
+      recipientPriv32: humanEnc.privateKeyBytes,
+      expectedNodeId: "staging@eu-1",
+    })
+  );
+
+  // 2. Tampered recipientKid
+  await assert.rejects(
+    () =>
+      openHumanDraft({
+        encDraft: { ...sealed, recipientKid: otherEnc.kid },
+        recipientPriv32: humanEnc.privateKeyBytes,
+        expectedNodeId: "prod@eu-1",
+      }),
+    /recipientKid/
+  );
+
+  // 3. Wrong recipient private key
+  await assert.rejects(() =>
+    openHumanDraft({
+      encDraft: sealed,
+      recipientPriv32: otherEnc.privateKeyBytes,
+      expectedNodeId: "prod@eu-1",
+    })
+  );
+
+  // 4. 1-bit flip in enc
+  const badEnc = base64urlDecode(sealed.enc);
+  badEnc[0] ^= 0x01;
+  await assert.rejects(() =>
+    openHumanDraft({
+      encDraft: { ...sealed, enc: base64urlEncode(badEnc) },
+      recipientPriv32: humanEnc.privateKeyBytes,
+      expectedNodeId: "prod@eu-1",
+    })
+  );
+
+  // 5. 1-bit flip in ct
+  const badCt = base64urlDecode(sealed.ct);
+  badCt[badCt.length - 1] ^= 0x01;
+  await assert.rejects(() =>
+    openHumanDraft({
+      encDraft: { ...sealed, ct: base64urlEncode(badCt) },
+      recipientPriv32: humanEnc.privateKeyBytes,
+      expectedNodeId: "prod@eu-1",
+    })
+  );
+
+  // 6. Malicious sender bypassing sealHumanDraft to smuggle BiDi override inside valid HPKE ciphertext
+  const evilPayload = {
+    v: 1,
+    nodeId: "prod@eu-1",
+    text: "approve\u202Eevil",
+    createdAt: "2026-11-25T05:02:00Z",
+  };
+  const evilInfo = humanDraftHpkeInfo("prod@eu-1", humanEnc.kid);
+  const evilAad = humanDraftHpkeAad("prod@eu-1", humanEnc.kid);
+  const evilPadded = padBucket(utf8Bytes(toCanonicalJson(evilPayload)));
+  const evilHpke = await hpkeSealBase(humanEnc.publicKeyBytes, evilInfo, evilAad, evilPadded);
+  await assert.rejects(
+    () =>
+      openHumanDraft({
+        encDraft: {
+          v: 1,
+          suite: HUMAN_DRAFT_SUITE,
+          recipientKid: humanEnc.kid,
+          enc: base64urlEncode(evilHpke.enc),
+          ct: base64urlEncode(evilHpke.ciphertext),
+        },
+        recipientPriv32: humanEnc.privateKeyBytes,
+        expectedNodeId: "prod@eu-1",
+      }),
+    /BiDi\/invisible/
+  );
+
+  // 7. Reject oversized context (> 160 chars) on sealHumanDraft
+  await assert.rejects(
+    () =>
+      sealHumanDraft({
+        payload: { ...payload, context: "x".repeat(161) },
+        recipientEncJwk: humanEnc.publicJwk,
+      }),
+    /exceeds maximum length/
+  );
+
+  assert.equal(HUMAN_DRAFT_INFO_PREFIX, "hyphae/v2/human-draft\n");
+});
+
+// ----------------------------------------------------------------------------
+// 14. Fragment Parser `encDraft` Invariants (Directive-Only + Plaintext Hard-Ignore)
+// ----------------------------------------------------------------------------
+await test("parseFragmentString accepts valid encDraft ONLY on directive & ignores secret/plaintext drafts", async () => {
+  const targetEncPub = await x25519PublicFromPrivate(randomBytes(32));
+  const targetEncJwk = { kty: "OKP", crv: "X25519", x: base64urlEncode(targetEncPub) };
+
+  const humanEnc = await derivePrfX25519Keypair(new Uint8Array(32).fill(0x42), "bogdan@laptop", 1);
+  const validEncDraft = await sealHumanDraft({
+    payload: {
+      v: 1,
+      nodeId: "prod@eu-1",
+      text: "Drain eu-1 worker pool safely.",
+      createdAt: "2026-11-25T05:05:00Z",
+    },
+    recipientEncJwk: humanEnc.publicJwk,
+  });
+
+  // A) Directive with valid encDraft + smuggled plaintext draft/proposedText/body
+  const dirFrag = {
+    v: 1,
+    dropId: "drop-dir-1",
+    relay: "https://public.hyphae.to",
+    postCap: "hdcap1_test",
+    nodeId: "prod@eu-1",
+    handle: "ops",
+    encJwk: targetEncJwk,
+    kind: "directive",
+    encDraft: { ...validEncDraft, proposedText: "smuggled-inner-field" },
+    draft: "plaintext draft MUST be ignored",
+    proposedText: "plaintext proposedText MUST be ignored",
+    body: "plaintext body MUST be ignored",
+    expiresAt: "2026-11-25T05:15:00Z",
+  };
+  const parsedDir = parseFragmentString("#" + base64urlEncode(utf8Bytes(toCanonicalJson(dirFrag))));
+  assert.equal(parsedDir.mode, "drop");
+  assert.deepEqual(parsedDir.fragment.encDraft, validEncDraft);
+  assert.equal("proposedText" in parsedDir.fragment.encDraft, false);
+  assert.equal("draft" in parsedDir.fragment, false);
+  assert.equal("proposedText" in parsedDir.fragment, false);
+  assert.equal("body" in parsedDir.fragment, false);
+
+  // B) Secret with valid encDraft MUST HARD-IGNORE encDraft!
+  const secFrag = {
+    v: 1,
+    dropId: "drop-sec-1",
+    relay: "https://public.hyphae.to",
+    postCap: "hdcap1_test",
+    nodeId: "prod@eu-1",
+    encJwk: targetEncJwk,
+    kind: "secret",
+    secretName: "stripe-prod-key",
+    encDraft: validEncDraft,
+    draft: "plaintext secret draft MUST be ignored",
+    proposedText: "plaintext secret proposedText MUST be ignored",
+    expiresAt: "2026-11-25T05:15:00Z",
+  };
+  const parsedSec = parseFragmentString("#" + base64urlEncode(utf8Bytes(toCanonicalJson(secFrag))));
+  assert.equal(parsedSec.mode, "drop");
+  assert.equal(parsedSec.fragment.encDraft, null, "encDraft MUST be hard-ignored on kind === secret");
+  assert.equal("draft" in parsedSec.fragment, false);
+  assert.equal("proposedText" in parsedSec.fragment, false);
+
+  // C) Directive with malformed encDraft (wrong suite / bad enc) fails closed to encDraft: null
+  const badDraftFrag = {
+    ...dirFrag,
+    encDraft: { ...validEncDraft, suite: "human.draft.v999" },
+  };
+  const parsedBad = parseFragmentString("#" + base64urlEncode(utf8Bytes(toCanonicalJson(badDraftFrag))));
+  assert.equal(parsedBad.fragment.encDraft, null);
 });
 
 console.log(`\nAll ${passed} test groups passed!`);

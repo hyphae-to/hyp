@@ -28,7 +28,12 @@ export const HUMAN_NODE_CERT_DOMAIN = "hyphae/v2/human-node-cert\n";
 export const HUMAN_REVOCATION_DOMAIN = "hyphae/v2/human-revocation\n";
 export const HUMAN_PRF_INPUT_PREFIX = "hyphae/v2/human-prf-input\n";
 export const HUMAN_PRF_ED25519_SALT = "hyphae/v2/human-prf-ed25519";
+export const HUMAN_PRF_X25519_SALT = "hyphae/v2/human-prf-x25519";
 export const HUMAN_DROP_SUITE = "human.drop.v1";
+export const HUMAN_DRAFT_SUITE = "human.draft.v1";
+export const HUMAN_DRAFT_INFO_PREFIX = "hyphae/v2/human-draft\n";
+export const MAX_HUMAN_DRAFT_CHARS = 512;
+export const MAX_HUMAN_DRAFT_CONTEXT_CHARS = 160;
 
 export const HDROP1_PREFIX = "hdrop1_";
 export const HCERT1_PREFIX = "hcert1_";
@@ -1115,8 +1120,31 @@ export async function hpkeOpenBase(recipientPriv32, enc32, info, aad, ciphertext
 }
 
 // ============================================================================
-// WebAuthn Passkey + PRF -> Ed25519 Seed Derivation
+// WebAuthn Passkey + PRF -> Ed25519 & Companion X25519 Seed Derivation
 // ============================================================================
+
+const NODE_ID_RE = /^[a-z0-9][a-z0-9@._-]{0,63}$/;
+
+export function isValidNodeId(id) {
+  return typeof id === "string" && NODE_ID_RE.test(id);
+}
+
+function buildPrfHkdfInfo(humanId, authEpoch, requirePositiveEpoch = false) {
+  if (typeof humanId !== "string" || humanId.length === 0) {
+    throw new Error("humanId must be a non-empty string");
+  }
+  if (requirePositiveEpoch && !isValidNodeId(humanId)) {
+    throw new Error(`Invalid humanId: ${humanId}`);
+  }
+  const epochBig = typeof authEpoch === "bigint" ? authEpoch : BigInt(authEpoch);
+  const minEpoch = requirePositiveEpoch ? 1n : 0n;
+  if (epochBig < minEpoch || epochBig > 0xffffffffffffffffn) {
+    throw new Error(`authEpoch out of u64 range: ${authEpoch}`);
+  }
+  const epochBe = new Uint8Array(8);
+  new DataView(epochBe.buffer).setBigUint64(0, epochBig, false);
+  return concatBytes(utf8Bytes(humanId), new Uint8Array([0x0a]), epochBe);
+}
 
 /**
  * Computes `SHA-256("hyphae/v2/human-prf-input\n" || humanId || "\n" || prfSalt)`.
@@ -1140,19 +1168,54 @@ export async function derivePrfEd25519Seed(prfOutput32, humanId, authEpoch) {
   if (ikm.length !== 32) {
     throw new Error(`Expected 32-byte PRF output, got ${ikm.length} bytes`);
   }
-  if (typeof humanId !== "string" || humanId.length === 0) {
-    throw new Error("humanId must be a non-empty string");
-  }
-  const epochBig = typeof authEpoch === "bigint" ? authEpoch : BigInt(authEpoch);
-  if (epochBig < 0n || epochBig > 0xffffffffffffffffn) {
-    throw new Error(`authEpoch out of u64 range: ${authEpoch}`);
-  }
-  const epochBe = new Uint8Array(8);
-  new DataView(epochBe.buffer).setBigUint64(0, epochBig, false);
-
   const salt = utf8Bytes(HUMAN_PRF_ED25519_SALT);
-  const info = concatBytes(utf8Bytes(humanId), new Uint8Array([0x0a]), epochBe);
+  const info = buildPrfHkdfInfo(humanId, authEpoch, false);
   return hkdfSha256(salt, ikm, info, 32);
+}
+
+/**
+ * Derives the companion 32-byte X25519 seed from a WebAuthn PRF 32-byte output:
+ * `HKDF-SHA256(salt = "hyphae/v2/human-prf-x25519", ikm = prfOutput32, info = utf8(humanId) || 0x0a || u64_be(authEpoch), L = 32)`
+ * Matches Rust `hyp_crypto::human::derive_prf_x25519_keypair` bit-for-bit.
+ */
+export async function derivePrfX25519Seed(prfOutput32, humanId, authEpoch = 1) {
+  const ikm = prfOutput32 instanceof Uint8Array ? prfOutput32 : new Uint8Array(prfOutput32);
+  if (ikm.length !== 32) {
+    throw new Error(`Expected 32-byte PRF output, got ${ikm.length} bytes`);
+  }
+  const salt = utf8Bytes(HUMAN_PRF_X25519_SALT);
+  const info = buildPrfHkdfInfo(humanId, authEpoch, true);
+  return hkdfSha256(salt, ikm, info, 32);
+}
+
+/**
+ * Derives an OKP/X25519 keypair + RFC 7638 thumbprint (`kid`) from a 32-byte private seed.
+ */
+export async function x25519KeypairFromSeed(seed32) {
+  if (!(seed32 instanceof Uint8Array) || seed32.length !== 32) {
+    throw new Error("X25519 seed must be 32 bytes");
+  }
+  const privateKeyBytes = new Uint8Array(seed32);
+  const publicKeyBytes = await x25519PublicFromPrivate(privateKeyBytes);
+  const publicJwk = {
+    kty: "OKP",
+    crv: "X25519",
+    x: base64urlEncode(publicKeyBytes),
+  };
+  const kid = await jwkThumbprint(publicJwk);
+  return { privateKeyBytes, publicKeyBytes, publicJwk, kid };
+}
+
+/**
+ * Deterministically derives the companion Passkey-PRF X25519 keypair for encrypted directive drafts.
+ */
+export async function derivePrfX25519Keypair(prfOutput32, humanId, authEpoch = 1) {
+  const seed32 = await derivePrfX25519Seed(prfOutput32, humanId, authEpoch);
+  try {
+    return await x25519KeypairFromSeed(seed32);
+  } finally {
+    zeroize(seed32);
+  }
 }
 
 // ============================================================================
@@ -1663,6 +1726,221 @@ export async function openHumanDrop({ envelopeOrToken, recipientPriv32, expected
       throw new Error("Inner claim humanKid does not match verifying human key");
     }
     return { claim, signed };
+  } finally {
+    zeroize(padded);
+    if (unpadded) zeroize(unpadded);
+  }
+}
+
+// ============================================================================
+// Encrypted Directive Draft Prefill (`human.draft.v1`) & BiDi/Control Guard
+// ============================================================================
+
+/**
+ * Validates human-reviewable directive draft text (or optional context):
+ * - Rejects non-string, empty/whitespace-only, and Unicode code-point count > `maxChars`.
+ * - Rejects C0/C1 control characters (allowing only `\t` and `\n`), unpaired UTF-16 surrogates,
+ *   and BiDi / invisible formatting characters (`\u061C`, `\u200B-\u200F`, `\u2028-\u202F`,
+ *   `\u2060-\u206F`, `\uFEFF`).
+ */
+export function validateDraftText(text, maxChars = MAX_HUMAN_DRAFT_CHARS) {
+  if (typeof text !== "string") {
+    throw new Error("Draft text must be a string");
+  }
+  if (!Number.isInteger(maxChars) || maxChars < 1) {
+    throw new Error(`Invalid maxChars limit: ${maxChars}`);
+  }
+  if (text.trim().length === 0) {
+    throw new Error("Draft text must not be empty or whitespace-only");
+  }
+  let count = 0;
+  for (const ch of text) {
+    count += 1;
+    if (count > maxChars) {
+      throw new Error(`Draft text exceeds maximum length of ${maxChars} characters`);
+    }
+    const cp = ch.codePointAt(0);
+    // Reject C0 controls except \t (0x09) and \n (0x0A), plus DEL & C1 controls (0x7F..=0x9F).
+    if (
+      cp <= 0x08 ||
+      cp === 0x0b ||
+      cp === 0x0c ||
+      cp === 0x0d ||
+      (cp >= 0x0e && cp <= 0x1f) ||
+      (cp >= 0x7f && cp <= 0x9f)
+    ) {
+      throw new Error(
+        `Draft text contains disallowed control character U+${cp.toString(16).toUpperCase().padStart(4, "0")}`
+      );
+    }
+    // Reject BiDi controls & invisible formatting characters.
+    if (
+      cp === 0x061c ||
+      (cp >= 0x200b && cp <= 0x200f) ||
+      (cp >= 0x2028 && cp <= 0x202f) ||
+      (cp >= 0x2060 && cp <= 0x206f) ||
+      cp === 0xfeff
+    ) {
+      throw new Error(
+        `Draft text contains disallowed BiDi/invisible character U+${cp.toString(16).toUpperCase().padStart(4, "0")}`
+      );
+    }
+    // Reject unpaired UTF-16 surrogates.
+    if (cp >= 0xd800 && cp <= 0xdfff) {
+      throw new Error("Draft text contains unpaired UTF-16 surrogate");
+    }
+  }
+  return text;
+}
+
+export function humanDraftHpkeInfo(nodeId, recipientKid) {
+  return utf8Bytes(`${HUMAN_DRAFT_INFO_PREFIX}${nodeId}\n${recipientKid}`);
+}
+
+export function humanDraftHpkeAad(nodeId, recipientKid) {
+  return utf8Bytes(
+    toCanonicalJson({
+      v: 1,
+      suite: HUMAN_DRAFT_SUITE,
+      nodeId,
+      recipientKid,
+    })
+  );
+}
+
+/**
+ * Seals an untrusted agent-proposed directive draft (`human.draft.v1`) to the human's
+ * Passkey-PRF derived X25519 encryption key via power-of-2 bucket padding + RFC 9180 HPKE.
+ *
+ * Returns `{ v: 1, suite: "human.draft.v1", recipientKid, enc, ct }`.
+ */
+export async function sealHumanDraft({ payload, recipientEncJwk, hpkeOptions = {} }) {
+  if (!payload || typeof payload !== "object") {
+    throw new Error("Draft payload object is required");
+  }
+  if (payload.v !== 1) {
+    throw new Error(`Unsupported HumanDraftPayloadV1 version: ${payload.v}`);
+  }
+  if (!isValidNodeId(payload.nodeId)) {
+    throw new Error(`Invalid draft nodeId: ${payload.nodeId}`);
+  }
+  validateDraftText(payload.text, MAX_HUMAN_DRAFT_CHARS);
+
+  const normalizedPayload = {
+    v: 1,
+    nodeId: payload.nodeId,
+    text: payload.text,
+    createdAt: payload.createdAt,
+  };
+  if (payload.context !== undefined && payload.context !== null) {
+    validateDraftText(payload.context, MAX_HUMAN_DRAFT_CONTEXT_CHARS);
+    normalizedPayload.context = payload.context;
+  }
+  if (
+    typeof normalizedPayload.createdAt !== "string" ||
+    normalizedPayload.createdAt.trim().length === 0 ||
+    !Number.isFinite(Date.parse(normalizedPayload.createdAt))
+  ) {
+    throw new Error("Draft payload createdAt must be a valid RFC 3339 timestamp");
+  }
+
+  const recipientPub32 = decodeOkpJwkBytes(recipientEncJwk, "X25519");
+  const recipientKid = await jwkThumbprint(recipientEncJwk);
+
+  const info = humanDraftHpkeInfo(normalizedPayload.nodeId, recipientKid);
+  const aad = humanDraftHpkeAad(normalizedPayload.nodeId, recipientKid);
+
+  const plainBytes = utf8Bytes(toCanonicalJson(normalizedPayload));
+  let padded;
+  try {
+    padded = padBucket(plainBytes);
+    const { enc, ciphertext } = await hpkeSealBase(recipientPub32, info, aad, padded, hpkeOptions);
+    return {
+      v: 1,
+      suite: HUMAN_DRAFT_SUITE,
+      recipientKid,
+      enc: base64urlEncode(enc),
+      ct: base64urlEncode(ciphertext),
+    };
+  } finally {
+    zeroize(plainBytes);
+    if (padded) zeroize(padded);
+  }
+}
+
+/**
+ * Opens and strictly validates a sealed `human.draft.v1` encrypted directive draft
+ * using the human's Passkey-PRF derived X25519 private key. Always fails closed.
+ */
+export async function openHumanDraft({ encDraft, recipientPriv32, expectedNodeId }) {
+  if (!encDraft || typeof encDraft !== "object") {
+    throw new Error("Encrypted draft object is required");
+  }
+  if (encDraft.v !== 1 || encDraft.suite !== HUMAN_DRAFT_SUITE) {
+    throw new Error(`Unsupported draft envelope v=${encDraft.v} suite=${encDraft.suite}`);
+  }
+  if (typeof encDraft.recipientKid !== "string" || encDraft.recipientKid.length === 0) {
+    throw new Error("Encrypted draft missing recipientKid");
+  }
+  if (!isValidNodeId(expectedNodeId)) {
+    throw new Error(`Invalid expectedNodeId: ${expectedNodeId}`);
+  }
+  const encBytes = base64urlDecode(encDraft.enc);
+  if (encBytes.length !== 32) {
+    throw new Error("Encrypted draft enc must be 32 bytes");
+  }
+  const ctBytes = base64urlDecode(encDraft.ct);
+  if (ctBytes.length < 16) {
+    throw new Error("Encrypted draft ciphertext shorter than AES-GCM tag");
+  }
+
+  const recipientPub32 = await x25519PublicFromPrivate(recipientPriv32);
+  const recipientKid = await jwkThumbprint({
+    kty: "OKP",
+    crv: "X25519",
+    x: base64urlEncode(recipientPub32),
+  });
+  if (encDraft.recipientKid !== recipientKid) {
+    throw new Error("Encrypted draft recipientKid does not match Passkey encryption key");
+  }
+
+  const info = humanDraftHpkeInfo(expectedNodeId, recipientKid);
+  const aad = humanDraftHpkeAad(expectedNodeId, recipientKid);
+
+  const padded = await hpkeOpenBase(recipientPriv32, encBytes, info, aad, ctBytes);
+  let unpadded;
+  try {
+    unpadded = unpadBucket(padded);
+    const payload = JSON.parse(utf8String(unpadded));
+    if (!payload || typeof payload !== "object") {
+      throw new Error("Malformed decrypted draft payload");
+    }
+    if (payload.v !== 1) {
+      throw new Error(`Unsupported decrypted draft payload version: ${payload.v}`);
+    }
+    if (payload.nodeId !== expectedNodeId) {
+      throw new Error("Decrypted draft nodeId does not match expected target node");
+    }
+    if (
+      typeof payload.createdAt !== "string" ||
+      payload.createdAt.trim().length === 0 ||
+      !Number.isFinite(Date.parse(payload.createdAt))
+    ) {
+      throw new Error("Decrypted draft createdAt is not a valid timestamp");
+    }
+    validateDraftText(payload.text, MAX_HUMAN_DRAFT_CHARS);
+
+    const out = {
+      v: 1,
+      nodeId: payload.nodeId,
+      text: payload.text,
+      createdAt: payload.createdAt,
+    };
+    if (payload.context !== undefined && payload.context !== null) {
+      validateDraftText(payload.context, MAX_HUMAN_DRAFT_CONTEXT_CHARS);
+      out.context = payload.context;
+    }
+    return out;
   } finally {
     zeroize(padded);
     if (unpadded) zeroize(unpadded);
