@@ -945,3 +945,240 @@ async fn local_daemon_integrates_security_gate_quarantine_isolation_and_outbound
     daemon.stop().await;
     node.shutdown();
 }
+
+#[tokio::test]
+async fn peers_reload_hot_reconciles_new_and_revoked_peers_idempotently_with_ui_rev() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use hyp_harness::daemon::DEFAULT_PEERS_RELOAD_TIMEOUT;
+    use hyp_harness::sock::connect_daemon_async;
+    use hyp_store::PeerStatus;
+
+    let hub_dir = TempDir::new().unwrap();
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+
+    // 1. Start Team Hub (`acme-reload-hub`) with an Org Admin-CA key.
+    let admin_ca = Ed25519KeyPair::generate().unwrap();
+    let mut hub_cfg = NodeConfig::router(
+        NodeId::new("acme-reload-hub").unwrap(),
+        hub_dir.path(),
+    );
+    hub_cfg.secret_backend = Some(SecretBackend::File);
+    hub_cfg.admin_jwk = Some(OkpJwk::new(
+        OkpCurve::Ed25519,
+        &admin_ca.public_key_bytes(),
+    ));
+    let hub = UnifiedNode::open(hub_cfg).unwrap();
+    let (_hub_addr, _hub_srv) = Arc::clone(&hub).serve(loopback_zero()).await.unwrap();
+
+    // 2. Pair Alice normally with the hub so she can send a real E2EE DM to Bob once Bob hot-reloads.
+    let mut alice_cfg = NodeConfig::local(NodeId::new("alice@macbook").unwrap(), alice_dir.path());
+    alice_cfg.secret_backend = Some(SecretBackend::File);
+    let alice_node = UnifiedNode::open(alice_cfg).unwrap();
+    let scopes = ScopePreset::Member.expand();
+    let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
+    let (alice_am2, _) = hub
+        .create_admin_invite(&admin_ca, "alice@macbook", &scope_refs, TrustTier::Org, 300_000)
+        .unwrap();
+    alice_node.accept_am2_invite(&alice_am2).await.unwrap();
+    alice_node
+        .register_handle("claude:alice-1", "sender")
+        .await
+        .unwrap();
+
+    // 3. Start Bob's `UnifiedNode` + `LocalDaemon` with ZERO paired peers initially,
+    //    wiring a custom `on_peers_reload` hook to verify callback invocation & delegation.
+    let mut bob_cfg = NodeConfig::local(NodeId::new("bob@laptop").unwrap(), bob_dir.path());
+    bob_cfg.secret_backend = Some(SecretBackend::File);
+    let bob_node = UnifiedNode::open(bob_cfg).unwrap();
+    let bob_daemon = LocalDaemon::start(
+        Arc::clone(&bob_node),
+        None,
+        LocalDaemonConfig::default(),
+    )
+    .await
+    .unwrap();
+    bob_node
+        .register_handle("claude:bob-1", "receiver")
+        .await
+        .unwrap();
+
+    let reload_calls = Arc::new(AtomicUsize::new(0));
+    {
+        let node_ref = Arc::clone(&bob_node);
+        let counter = Arc::clone(&reload_calls);
+        bob_daemon.on_peers_reload(move || {
+            let n = Arc::clone(&node_ref);
+            let c = Arc::clone(&counter);
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(n.reconcile_peers(DEFAULT_PEERS_RELOAD_TIMEOUT).await)
+            }
+        });
+    }
+
+    let bob_sock = bob_daemon.socket_path().to_path_buf();
+
+    // Helper to inspect the raw NDJSON response line from `peers.reload`.
+    async fn raw_peers_reload(sock: &Path) -> Value {
+        let (r, mut w) = connect_daemon_async(sock).await.expect("connect daemon");
+        write_ndjson_line_async(&mut w, &json!({ "type": "peers.reload" }))
+            .await
+            .expect("write peers.reload");
+        let mut reader = BufReader::new(r);
+        let line = read_bounded_line_async(&mut reader, MAX_SOCKET_LINE_BYTES)
+            .await
+            .expect("read line")
+            .expect("non-empty response");
+        serde_json::from_str(&line).expect("valid JSON response")
+    }
+
+    // 4. Initial reload with 0 peers -> ok: true, reloaded: true, activePeers: 0, added: 0, ui_rev bumps!
+    let rev_before_0 = bob_daemon.ui_rev();
+    let resp0 = raw_peers_reload(&bob_sock).await;
+    assert_eq!(resp0["ok"], true, "resp0={resp0}");
+    assert_eq!(resp0["reloaded"], true);
+    assert_eq!(resp0["activePeers"], 0);
+    assert_eq!(resp0["added"], 0);
+    assert_eq!(resp0["removed"], 0);
+    assert!(bob_daemon.ui_rev() > rev_before_0);
+    assert_eq!(reload_calls.load(Ordering::SeqCst), 1);
+
+    // 5. Simulate an out-of-process `hyp pair accept` committing `acme-reload-hub` into Bob's
+    //    WAL `node.sqlite` + `SecretStore` WITHOUT restarting `bob_daemon`!
+    let (bob_am2, _) = hub
+        .create_admin_invite(&admin_ca, "bob@laptop", &scope_refs, TrustTier::Org, 300_000)
+        .unwrap();
+    {
+        let mut cli_cfg = NodeConfig::local(NodeId::new("bob@laptop").unwrap(), bob_dir.path());
+        cli_cfg.secret_backend = Some(SecretBackend::File);
+        let cli_node = UnifiedNode::open(cli_cfg).unwrap();
+        cli_node.accept_am2_invite(&bob_am2).await.unwrap();
+        cli_node.shutdown();
+    }
+    assert!(
+        bob_node.peer_link("acme-reload-hub").await.is_none(),
+        "running daemon must not have PeerLink before peers.reload"
+    );
+
+    // 6. Send `peers.reload` over `connector.sock` -> picks up `acme-reload-hub` live!
+    let rev_before_1 = bob_daemon.ui_rev();
+    let resp1 = raw_peers_reload(&bob_sock).await;
+    assert_eq!(resp1["ok"], true, "resp1={resp1}");
+    assert_eq!(resp1["reloaded"], true);
+    assert_eq!(resp1["activePeers"], 1);
+    assert_eq!(resp1["added"], 1);
+    assert_eq!(resp1["removed"], 0);
+    assert_eq!(resp1["result"]["reloaded"], true);
+    assert_eq!(resp1["result"]["activePeers"], 1);
+    assert_eq!(resp1["result"]["added"], 1);
+    assert!(bob_daemon.ui_rev() > rev_before_1);
+    assert_eq!(reload_calls.load(Ordering::SeqCst), 2);
+
+    let link_after_first = bob_node
+        .peer_link("acme-reload-hub")
+        .await
+        .expect("PeerLink must be active immediately after peers.reload");
+
+    // 7. Prove live E2EE DM delivery works end-to-end across the hot-reloaded PeerLink!
+    alice_node
+        .send_dm(
+            "sender",
+            "bob@laptop/receiver",
+            "hello-over-hot-reloaded-link",
+        )
+        .await
+        .expect("send E2EE DM to hot-reloaded Bob");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut delivered = false;
+    while tokio::time::Instant::now() < deadline {
+        let drained = daemon_rpc_async(
+            &bob_sock,
+            &json!({ "type": "mailbox.drain", "sessionId": "claude:bob-1" }),
+            Duration::from_secs(2),
+        )
+        .await;
+        if drained.ok {
+            if let Some(res) = drained.result {
+                if Value::Object(res)
+                    .to_string()
+                    .contains("hello-over-hot-reloaded-link")
+                {
+                    delivered = true;
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        delivered,
+        "Bob must receive Alice's E2EE DM over the hot-reloaded PeerLink without daemon restart"
+    );
+
+    // 8. Idempotency: calling `peers.reload` a SECOND time MUST NOT spawn duplicate PeerLinks!
+    let resp2 = daemon_rpc_async(&bob_sock, &json!({ "type": "peers.reload" }), Duration::from_secs(2))
+        .await;
+    assert!(resp2.ok, "daemon_rpc_async peers.reload failed: {resp2:?}");
+    let res2 = resp2.result.expect("result map");
+    assert_eq!(res2["reloaded"], true);
+    assert_eq!(res2["activePeers"], 1);
+    assert_eq!(res2["added"], 0);
+    assert_eq!(res2["removed"], 0);
+    let link_after_second = bob_node
+        .peer_link("acme-reload-hub")
+        .await
+        .expect("PeerLink still active");
+    assert!(
+        Arc::ptr_eq(&link_after_first, &link_after_second),
+        "second peers.reload must preserve the exact existing PeerLink without duplicating it"
+    );
+
+    // 9. Revocation cleanup: revoking the peer in SQLite and calling `peers.reload` cancels the link!
+    {
+        let db = bob_node.db();
+        db.peers()
+            .set_peer_status("acme-reload-hub", PeerStatus::Revoked, hyp_store::now_ms())
+            .unwrap();
+    }
+    let resp3 = raw_peers_reload(&bob_sock).await;
+    assert_eq!(resp3["ok"], true, "resp3={resp3}");
+    assert_eq!(resp3["reloaded"], true);
+    assert_eq!(resp3["activePeers"], 0);
+    assert_eq!(resp3["added"], 0);
+    assert_eq!(resp3["removed"], 1);
+    assert!(
+        bob_node.peer_link("acme-reload-hub").await.is_none(),
+        "revoked peer link must be cancelled and removed on peers.reload"
+    );
+
+    // 10. Loopback TCP (`connector.addr`) parity using the default built-in reloader (no custom hook).
+    let tcp_dir = TempDir::new().unwrap();
+    let mut tcp_cfg = NodeConfig::local(NodeId::new("tcp-bob@win").unwrap(), tcp_dir.path());
+    tcp_cfg.secret_backend = Some(SecretBackend::File);
+    let tcp_node = UnifiedNode::open(tcp_cfg).unwrap();
+    let addr_file = tcp_dir.path().join("connector.addr");
+    let tcp_daemon = LocalDaemon::start_tcp(
+        Arc::clone(&tcp_node),
+        None,
+        LocalDaemonConfig::default(),
+        addr_file.clone(),
+    )
+    .await
+    .unwrap();
+    let tcp_resp = daemon_rpc_async(&addr_file, &json!({ "type": "peers.reload" }), Duration::from_secs(2))
+        .await;
+    assert!(tcp_resp.ok, "TCP connector.addr peers.reload must succeed");
+    let tcp_res = tcp_resp.result.unwrap();
+    assert_eq!(tcp_res["reloaded"], true);
+    assert_eq!(tcp_res["activePeers"], 0);
+    assert_eq!(tcp_res["added"], 0);
+
+    tcp_daemon.stop().await;
+    tcp_node.shutdown();
+    bob_daemon.stop().await;
+    bob_node.shutdown();
+    alice_node.shutdown();
+    hub.shutdown();
+}

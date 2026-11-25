@@ -430,6 +430,17 @@ pub enum PeerAuth {
     Ed25519,
 }
 
+impl PeerAuth {
+    /// Compares two authentication configurations without logging or exposing bearer secrets.
+    pub fn matches(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Ed25519, Self::Ed25519) => true,
+            (Self::Bearer(a), Self::Bearer(b)) => a.as_str() == b.as_str(),
+            _ => false,
+        }
+    }
+}
+
 impl std::fmt::Debug for PeerAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -498,6 +509,10 @@ impl PeerLink {
 
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    pub fn auth(&self) -> &PeerAuth {
+        &self.auth
     }
 
     pub fn set_negotiated(&self, session: NegotiatedSession) {

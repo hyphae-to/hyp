@@ -141,6 +141,22 @@ pub struct PeerLinkInfo {
     pub negotiated: NegotiatedSession,
 }
 
+/// Summary returned by [`UnifiedNode::reconcile_peers`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerReconcileReport {
+    /// Total number of connected outbound `PeerLink`s after reconciliation.
+    pub active_peers: usize,
+    /// Number of newly connected or updated (reconnected) `PeerLink`s spawned in this pass.
+    pub added: usize,
+    /// Number of stale, revoked, or removed `PeerLink`s cancelled in this pass.
+    pub removed: usize,
+    /// Sorted list of peer IDs with active outbound `PeerLink`s after reconciliation.
+    pub connected_peers: Vec<String>,
+    /// Non-fatal per-peer warnings (e.g., temporarily unreachable endpoints).
+    pub warnings: Vec<String>,
+}
+
 /// Structured agent handle entry returned by [`UnifiedNode::discover_peer_handles`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -276,6 +292,7 @@ pub struct UnifiedNode {
     github_public: Mutex<Option<Arc<GitHubPublicAdapter>>>,
     peer_links: RwLock<HashMap<String, Arc<PeerLink>>>,
     sse_tasks: Mutex<HashMap<String, JoinHandle<()>>>,
+    peer_reconcile_lock: tokio::sync::Mutex<()>,
     inbox_tx: broadcast::Sender<String>,
     local_inbox_tx: broadcast::Sender<String>,
     in_flight_by_peer: Mutex<HashMap<String, HashSet<String>>>,
@@ -370,6 +387,7 @@ impl UnifiedNode {
             github_public: Mutex::new(None),
             peer_links: RwLock::new(HashMap::new()),
             sse_tasks: Mutex::new(HashMap::new()),
+            peer_reconcile_lock: tokio::sync::Mutex::new(()),
             inbox_tx,
             local_inbox_tx,
             in_flight_by_peer: Mutex::new(HashMap::new()),
@@ -2506,6 +2524,154 @@ impl UnifiedNode {
 
     pub async fn peer_link(&self, peer_id: &str) -> Option<Arc<PeerLink>> {
         self.peer_links.read().await.get(peer_id).cloned()
+    }
+
+    /// Returns a sorted snapshot of all peer IDs with an active outbound `PeerLink`.
+    pub async fn connected_peer_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.peer_links.read().await.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// Disconnects any active outbound `PeerLink` and aborts its background SSE `/v1/inbox`
+    /// worker for `peer_id`. Returns `true` if a link or worker task was removed.
+    pub async fn disconnect_peer(&self, peer_id: &str) -> bool {
+        let removed_link = self.peer_links.write().await.remove(peer_id).is_some();
+        let removed_sse = {
+            let mut tasks = self.sse_tasks.lock().expect("sse_tasks lock poisoned");
+            if let Some(handle) = tasks.remove(peer_id) {
+                handle.abort();
+                true
+            } else {
+                false
+            }
+        };
+        removed_link || removed_sse
+    }
+
+    /// Reconciles live outbound `PeerLink` supervisors and SSE `/v1/inbox` workers against
+    /// persisted `PeerStatus::Active` peers in `node.sqlite`.
+    ///
+    /// - Serialized across concurrent callers via `peer_reconcile_lock` so parallel reload
+    ///   signals never spawn duplicate links.
+    /// - Cancels and removes links for peers that were revoked, paused, deleted, or cleared.
+    /// - Leaves unchanged, healthy existing links untouched (idempotent: `added == 0`).
+    /// - Connects newly added or updated peers concurrently, bounded by `connect_timeout`.
+    pub async fn reconcile_peers(
+        self: &Arc<Self>,
+        connect_timeout: Duration,
+    ) -> PeerReconcileReport {
+        let _guard = self.peer_reconcile_lock.lock().await;
+
+        let desired: BTreeMap<String, String> = {
+            let db = self.db();
+            let peers = db
+                .peers()
+                .list_peers(Some(PeerStatus::Active))
+                .unwrap_or_default();
+            let mut map = BTreeMap::new();
+            for p in peers {
+                if p.peer_id == self.config.node_id.as_str() {
+                    continue;
+                }
+                if let Some(ep) = p
+                    .endpoint
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    map.insert(p.peer_id, ep.to_string());
+                }
+            }
+            map
+        };
+
+        let mut to_remove: Vec<String> = {
+            let links = self.peer_links.read().await;
+            links
+                .keys()
+                .filter(|pid| !desired.contains_key(*pid))
+                .cloned()
+                .collect()
+        };
+        to_remove.sort();
+
+        let mut removed = 0usize;
+        for pid in to_remove {
+            if self.disconnect_peer(&pid).await {
+                removed += 1;
+            }
+        }
+
+        let existing_links: HashMap<String, Arc<PeerLink>> = {
+            let links = self.peer_links.read().await;
+            links.clone()
+        };
+
+        let mut to_connect: Vec<(String, String)> = Vec::new();
+        for (pid, ep) in &desired {
+            let desired_ep_norm = ep.trim_end_matches('/');
+            let needs_connect = match existing_links.get(pid) {
+                None => true,
+                Some(existing) => {
+                    let desired_auth = self.load_peer_auth(pid);
+                    let sse_alive = {
+                        let tasks = self.sse_tasks.lock().expect("sse_tasks lock poisoned");
+                        tasks.get(pid).is_some_and(|h| !h.is_finished())
+                    };
+                    existing.endpoint() != desired_ep_norm
+                        || !existing.auth().matches(&desired_auth)
+                        || !sse_alive
+                }
+            };
+            if needs_connect {
+                to_connect.push((pid.clone(), ep.clone()));
+            }
+        }
+
+        let mut added = 0usize;
+        let mut warnings: Vec<String> = Vec::new();
+        if !to_connect.is_empty() {
+            let mut join_set = tokio::task::JoinSet::new();
+            for (pid, ep) in to_connect {
+                let node = Arc::clone(self);
+                join_set.spawn(async move {
+                    let outcome =
+                        tokio::time::timeout(connect_timeout, node.connect_peer(&pid, &ep)).await;
+                    (pid, ep, outcome)
+                });
+            }
+            while let Some(joined) = join_set.join_next().await {
+                match joined {
+                    Ok((_pid, _ep, Ok(Ok(_)))) => {
+                        added += 1;
+                    }
+                    Ok((pid, ep, Ok(Err(e)))) => {
+                        warnings.push(format!(
+                            "Peer '{pid}' ({ep}) could not be auto-connected: {e}"
+                        ));
+                    }
+                    Ok((pid, ep, Err(_))) => {
+                        warnings.push(format!(
+                            "Peer '{pid}' ({ep}) timed out during auto-connect"
+                        ));
+                    }
+                    Err(e) => {
+                        warnings.push(format!("Peer auto-connect task failed: {e}"));
+                    }
+                }
+            }
+        }
+        warnings.sort();
+
+        let connected_peers = self.connected_peer_ids().await;
+        PeerReconcileReport {
+            active_peers: connected_peers.len(),
+            added,
+            removed,
+            connected_peers,
+            warnings,
+        }
     }
 
     async fn require_peer_link(&self, peer_id: &str) -> Result<Arc<PeerLink>, NodeError> {

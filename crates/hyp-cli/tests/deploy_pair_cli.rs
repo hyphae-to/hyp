@@ -45,7 +45,8 @@ fn scrubbed_cmd() -> Command {
         .env_remove("AGENTS_MESH_SOCKET")
         .env_remove("HYPHAE_RELEASE_PUBKEY")
         .env_remove("HYPHAE_DISABLE_AUTO_UPDATE")
-        .env_remove("HYPHAE_DROP_PORTAL_URL");
+        .env_remove("HYPHAE_DROP_PORTAL_URL")
+        .env_remove("HYPHAE_TAILSCALE_BIN");
     cmd
 }
 
@@ -2279,4 +2280,533 @@ fn node_cmd_admin_key_and_live_am2_pair_accept() {
     );
     let b64_acc_env: Value = serde_json::from_slice(&b64_accept.stdout).unwrap();
     assert_eq!(b64_acc_env["data"]["handshakeCompleted"], true);
+    assert_eq!(b64_acc_env["data"]["daemonReloaded"], false);
+}
+
+#[test]
+fn pair_accept_hot_reloads_running_daemon_without_restart_and_degrades_offline() {
+    use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync};
+
+    let alice_dir = tempfile::tempdir().unwrap();
+    let hub_dir = tempfile::tempdir().unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    let no_daemon_dir = tempfile::tempdir().unwrap();
+    let offline_dir = tempfile::tempdir().unwrap();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // 1. Start Alice P2P `UnifiedNode` on 127.0.0.1:0.
+    let (node_a, alice_endpoint, alice_srv) = rt.block_on(async {
+        let mut cfg = NodeConfig::new(
+            NodeId::new("alice@macbook").unwrap(),
+            EngineNodeProfile::P2p,
+            alice_dir.path(),
+        );
+        cfg.secret_backend = Some(SecretBackend::File);
+        let node = UnifiedNode::open(cfg).expect("open Alice P2P node");
+        let (addr, handle) = Arc::clone(&node)
+            .serve("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("serve Alice HTTP");
+        (node, format!("http://{addr}"), handle)
+    });
+
+    // 2. Start a compiled Team Hub (`acme-hot-hub`) with `pairing.adminKey`.
+    let pre_inv = isolated_cmd(hub_dir.path())
+        .args([
+            "pair",
+            "invite",
+            "--mode",
+            "team",
+            "--node-id",
+            "acme-hot-hub",
+            "--endpoint",
+            "http://127.0.0.1:1",
+            "--peer",
+            "bootstrap@laptop",
+            "--preset",
+            "member",
+            "--state-dir",
+            hub_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(pre_inv.status.code(), Some(0));
+    let admin_jwk = serde_json::from_slice::<Value>(&pre_inv.stdout).unwrap()["data"]["adminJwk"]
+        .clone();
+
+    let hub_cfg_path = hub_dir.path().join("node.json");
+    fs::write(
+        &hub_cfg_path,
+        serde_json::to_string_pretty(&json!({
+            "v": 2,
+            "nodeId": "acme-hot-hub",
+            "profile": "router",
+            "stateDir": hub_dir.path().to_str().unwrap(),
+            "listen": { "bind": "127.0.0.1:0" },
+            "pairing": {
+                "adminCa": true,
+                "adminKey": admin_jwk
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut hub_cmd = isolated_cmd(hub_dir.path());
+    hub_cmd
+        .args([
+            "node",
+            "start",
+            "--config",
+            hub_cfg_path.to_str().unwrap(),
+            "--no-local-socket",
+            "--json",
+        ])
+        .stdin(Stdio::null());
+    let mut hub_proc = ManagedProcess::spawn("acme-hot-hub", &mut hub_cmd);
+    let hub_startup = hub_proc.read_json_line(Duration::from_secs(10));
+    assert_eq!(hub_startup["ok"], true, "hub startup: {hub_startup}");
+    let hub_endpoint = hub_startup["data"]["endpoint"]
+        .as_str()
+        .expect("hub endpoint")
+        .to_string();
+
+    // 3. Start Bob's LIVE compiled `hyp node start` daemon WITH local IPC socket enabled!
+    let mut bob_cmd = isolated_cmd(bob_dir.path());
+    bob_cmd
+        .args([
+            "node",
+            "start",
+            "--node-id",
+            "bob@laptop",
+            "--state-dir",
+            bob_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::null());
+    let mut bob_proc = ManagedProcess::spawn("bob@laptop daemon", &mut bob_cmd);
+    let bob_startup = bob_proc.read_json_line(Duration::from_secs(10));
+    assert_eq!(bob_startup["ok"], true, "bob startup: {bob_startup}");
+    assert_eq!(
+        bob_startup["data"]["connectedPeers"].as_array().unwrap().len(),
+        0
+    );
+    let bob_sock = bob_dir.path().join(DEFAULT_SOCKET_FILENAME);
+
+    // 4. Mint an `hp2p1_` offer from Alice and accept it on Bob via compiled `hyp pair accept --json`
+    //    WITHOUT restarting Bob's daemon!
+    let p2p_inv = isolated_cmd(alice_dir.path())
+        .args([
+            "pair",
+            "invite",
+            "--mode",
+            "p2p",
+            "--node-id",
+            "alice@macbook",
+            "--endpoint",
+            &alice_endpoint,
+            "--preset",
+            "member",
+            "--state-dir",
+            alice_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(p2p_inv.status.code(), Some(0));
+    let p2p_tok = serde_json::from_slice::<Value>(&p2p_inv.stdout).unwrap()["data"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let p2p_file = bob_dir.path().join("alice-p2p.token");
+    fs::write(&p2p_file, format!("{p2p_tok}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&p2p_file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let p2p_accept = isolated_cmd(bob_dir.path())
+        .args([
+            "pair",
+            "accept",
+            "--token-file",
+            p2p_file.to_str().unwrap(),
+            "--node-id",
+            "bob@laptop",
+            "--state-dir",
+            bob_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run hyp pair accept hp2p1 against live daemon");
+    assert_eq!(
+        p2p_accept.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&p2p_accept.stdout),
+        String::from_utf8_lossy(&p2p_accept.stderr)
+    );
+    let p2p_acc_env: Value = serde_json::from_slice(&p2p_accept.stdout).unwrap();
+    assert_eq!(p2p_acc_env["ok"], true);
+    assert_eq!(p2p_acc_env["data"]["handshakeCompleted"], true);
+    assert_eq!(
+        p2p_acc_env["data"]["daemonReloaded"], true,
+        "live daemon must be hot-reloaded automatically: {p2p_acc_env}"
+    );
+    assert!(
+        !p2p_acc_env["next"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str() == Some("hyp service restart")),
+        "hot-reloaded pair accept must NOT tell user to restart daemon: {p2p_acc_env}"
+    );
+
+    // Verify `node.status.json` was atomically refreshed and second `peers.reload` is idempotent!
+    let status_after_p2p: Value =
+        serde_json::from_slice(&fs::read(bob_dir.path().join("node.status.json")).unwrap())
+            .unwrap();
+    assert_eq!(status_after_p2p["connectedPeers"], json!(["alice@macbook"]));
+    let idemp1 = daemon_rpc_sync(
+        &bob_sock,
+        &json!({ "type": "peers.reload" }),
+        Duration::from_secs(2),
+    );
+    assert!(idemp1.ok, "idempotent peers.reload failed: {idemp1:?}");
+    let idemp1_res = idemp1.result.unwrap();
+    assert_eq!(idemp1_res["reloaded"], true);
+    assert_eq!(idemp1_res["activePeers"], 1);
+    assert_eq!(idemp1_res["added"], 0);
+
+    // 5. Mint an `am2_` Team Hub invite and accept it in plain TTY mode against the SAME running daemon!
+    let team_inv = isolated_cmd(hub_dir.path())
+        .args([
+            "pair",
+            "invite",
+            "--mode",
+            "team",
+            "--node-id",
+            "acme-hot-hub",
+            "--endpoint",
+            &hub_endpoint,
+            "--peer",
+            "bob@laptop",
+            "--preset",
+            "member",
+            "--state-dir",
+            hub_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(team_inv.status.code(), Some(0));
+    let am2_tok = serde_json::from_slice::<Value>(&team_inv.stdout).unwrap()["data"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let am2_file = bob_dir.path().join("hub-team.token");
+    fs::write(&am2_file, format!("{am2_tok}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&am2_file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let am2_accept = isolated_cmd(bob_dir.path())
+        .args([
+            "pair",
+            "accept",
+            "--token-file",
+            am2_file.to_str().unwrap(),
+            "--node-id",
+            "bob@laptop",
+            "--state-dir",
+            bob_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("run TTY hyp pair accept am2 against live daemon");
+    assert_eq!(
+        am2_accept.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&am2_accept.stdout),
+        String::from_utf8_lossy(&am2_accept.stderr)
+    );
+    let am2_stdout = String::from_utf8_lossy(&am2_accept.stdout);
+    assert!(
+        am2_stdout.contains("Live daemon reloaded — peer connected immediately (no restart needed)."),
+        "TTY output must announce live daemon reload: {am2_stdout}"
+    );
+    assert!(
+        !am2_stdout.contains("hyp service restart"),
+        "TTY output must not instruct restart when live reload succeeded: {am2_stdout}"
+    );
+
+    let status_after_both: Value =
+        serde_json::from_slice(&fs::read(bob_dir.path().join("node.status.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        status_after_both["connectedPeers"],
+        json!(["acme-hot-hub", "alice@macbook"])
+    );
+    let idemp2 = daemon_rpc_sync(
+        &bob_sock,
+        &json!({ "type": "peers.reload" }),
+        Duration::from_secs(2),
+    );
+    assert!(idemp2.ok);
+    let idemp2_res = idemp2.result.unwrap();
+    assert_eq!(idemp2_res["activePeers"], 2);
+    assert_eq!(idemp2_res["added"], 0);
+
+    let _ = bob_proc.shutdown_gracefully();
+    let _ = hub_proc.shutdown_gracefully();
+
+    // 6. Verify clean degradation when NO daemon is running (live handshake -> daemonReloaded: false + restart hint)
+    //    AND when `--offline` is passed!
+    let p2p_inv2 = isolated_cmd(alice_dir.path())
+        .args([
+            "pair",
+            "invite",
+            "--mode",
+            "p2p",
+            "--node-id",
+            "alice@macbook",
+            "--endpoint",
+            &alice_endpoint,
+            "--preset",
+            "member",
+            "--state-dir",
+            alice_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(p2p_inv2.status.code(), Some(0));
+    let p2p_tok2 = serde_json::from_slice::<Value>(&p2p_inv2.stdout).unwrap()["data"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let tok2_file = no_daemon_dir.path().join("nodaemon.token");
+    fs::write(&tok2_file, format!("{p2p_tok2}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tok2_file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let no_daemon_accept = isolated_cmd(no_daemon_dir.path())
+        .args([
+            "pair",
+            "accept",
+            "--token-file",
+            tok2_file.to_str().unwrap(),
+            "--node-id",
+            "carol@laptop",
+            "--state-dir",
+            no_daemon_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run live hyp pair accept without local daemon");
+    assert_eq!(no_daemon_accept.status.code(), Some(0));
+    let no_daemon_env: Value = serde_json::from_slice(&no_daemon_accept.stdout).unwrap();
+    assert_eq!(no_daemon_env["ok"], true);
+    assert_eq!(no_daemon_env["data"]["handshakeCompleted"], true);
+    assert_eq!(no_daemon_env["data"]["daemonReloaded"], false);
+    assert!(
+        no_daemon_env["next"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str() == Some("hyp service restart")),
+        "no-daemon pair accept must suggest hyp service restart: {no_daemon_env}"
+    );
+
+    // Offline accept degrades cleanly with daemonReloaded: false and restart hint.
+    let offline_accept = isolated_cmd(offline_dir.path())
+        .args([
+            "pair",
+            "accept",
+            "--token-file",
+            tok2_file.to_str().unwrap(),
+            "--node-id",
+            "dave@offline",
+            "--offline",
+            "--state-dir",
+            offline_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run --offline hyp pair accept");
+    assert_eq!(offline_accept.status.code(), Some(0));
+    let offline_env: Value = serde_json::from_slice(&offline_accept.stdout).unwrap();
+    assert_eq!(offline_env["ok"], true);
+    assert_eq!(offline_env["data"]["offline"], true);
+    assert_eq!(offline_env["data"]["daemonReloaded"], false);
+    assert!(
+        offline_env["next"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str() == Some("hyp service restart"))
+    );
+
+    alice_srv.abort();
+    node_a.shutdown();
+}
+
+#[test]
+fn pair_invite_p2p_tailscale_magicdns_autodetect_and_missing_endpoint_guidance() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // 1. Hermetic disabled Tailscale -> p2p without --endpoint exits 2 with MISSING_ENDPOINT + guidance
+    let no_ts = isolated_cmd(dir.path())
+        .env("HYPHAE_TAILSCALE_BIN", "none")
+        .args([
+            "pair",
+            "invite",
+            "--mode",
+            "p2p",
+            "--node-id",
+            "alice@macbook",
+            "--state-dir",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run p2p invite without endpoint and without tailscale");
+    assert_eq!(no_ts.status.code(), Some(2));
+    let no_ts_env: Value = serde_json::from_slice(&no_ts.stdout).unwrap();
+    assert_eq!(no_ts_env["ok"], false);
+    assert_eq!(no_ts_env["error"]["code"], "MISSING_ENDPOINT");
+    assert!(
+        no_ts_env["error"]["fix"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("--endpoint"),
+        "error fix must guide user to pass --endpoint: {no_ts_env}"
+    );
+
+    // 2. Team mode without --endpoint always requires explicit --endpoint
+    let team_no_ep = isolated_cmd(dir.path())
+        .env("HYPHAE_TAILSCALE_BIN", "none")
+        .args([
+            "pair",
+            "invite",
+            "--mode",
+            "team",
+            "--node-id",
+            "acme-team",
+            "--state-dir",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run team invite without endpoint");
+    assert_eq!(team_no_ep.status.code(), Some(2));
+    let team_no_ep_env: Value = serde_json::from_slice(&team_no_ep.stdout).unwrap();
+    assert_eq!(team_no_ep_env["ok"], false);
+    assert_eq!(team_no_ep_env["error"]["code"], "MISSING_ENDPOINT");
+
+    // 3. On Unix, exercise full subprocess Tailscale MagicDNS auto-detection with isolated mock scripts!
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mock_running = dir.path().join("mock-tailscale-running.sh");
+        fs::write(
+            &mock_running,
+            "#!/bin/sh\nprintf '%s\n' '{\"BackendState\":\"Running\",\"Self\":{\"DNSName\":\"alice-mbp.tail9f3a.ts.net.\",\"Online\":true}}'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&mock_running, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let auto_ok = isolated_cmd(dir.path())
+            .env("HYPHAE_TAILSCALE_BIN", mock_running.to_str().unwrap())
+            .args([
+                "pair",
+                "invite",
+                "--mode",
+                "p2p",
+                "--node-id",
+                "alice@macbook",
+                "--state-dir",
+                dir.path().to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .expect("run p2p invite with mock running tailscale");
+        assert_eq!(
+            auto_ok.status.code(),
+            Some(0),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&auto_ok.stdout),
+            String::from_utf8_lossy(&auto_ok.stderr)
+        );
+        let auto_env: Value = serde_json::from_slice(&auto_ok.stdout).unwrap();
+        assert_eq!(auto_env["ok"], true);
+        assert_eq!(
+            auto_env["data"]["endpoint"],
+            "https://alice-mbp.tail9f3a.ts.net"
+        );
+        assert_eq!(auto_env["data"]["endpointAutoDetected"], true);
+        let tok = auto_env["data"]["token"].as_str().unwrap();
+        let decoded = hyp_crypto::pairing::decode_hp2p1(tok).expect("valid hp2p1 token");
+        assert_eq!(decoded.endpoint, "https://alice-mbp.tail9f3a.ts.net");
+
+        // Team mode MUST NOT auto-detect Tailscale even when mock tailscale is Running!
+        let team_with_ts = isolated_cmd(dir.path())
+            .env("HYPHAE_TAILSCALE_BIN", mock_running.to_str().unwrap())
+            .args([
+                "pair",
+                "invite",
+                "--mode",
+                "team",
+                "--node-id",
+                "acme-team",
+                "--state-dir",
+                dir.path().to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(team_with_ts.status.code(), Some(2));
+        let team_with_ts_env: Value = serde_json::from_slice(&team_with_ts.stdout).unwrap();
+        assert_eq!(team_with_ts_env["error"]["code"], "MISSING_ENDPOINT");
+
+        // Stopped Tailscale -> rejected fail-closed with MISSING_ENDPOINT!
+        let mock_stopped = dir.path().join("mock-tailscale-stopped.sh");
+        fs::write(
+            &mock_stopped,
+            "#!/bin/sh\nprintf '%s\n' '{\"BackendState\":\"Stopped\",\"Self\":{\"DNSName\":\"alice-mbp.tail9f3a.ts.net.\",\"Online\":false}}'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&mock_stopped, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let stopped_out = isolated_cmd(dir.path())
+            .env("HYPHAE_TAILSCALE_BIN", mock_stopped.to_str().unwrap())
+            .args([
+                "pair",
+                "invite",
+                "--mode",
+                "p2p",
+                "--node-id",
+                "alice@macbook",
+                "--state-dir",
+                dir.path().to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(stopped_out.status.code(), Some(2));
+        let stopped_env: Value = serde_json::from_slice(&stopped_out.stdout).unwrap();
+        assert_eq!(stopped_env["error"]["code"], "MISSING_ENDPOINT");
+    }
 }

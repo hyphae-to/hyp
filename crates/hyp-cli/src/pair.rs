@@ -62,6 +62,9 @@ const MAX_TOKEN_INPUT_BYTES: u64 = 64 * 1024;
 const MAX_EXPIRES_HOURS: u64 = 24 * 365;
 const MAX_MANIFEST_RESPONSE_BYTES: usize = 512 * 1024;
 const MANIFEST_FETCH_TIMEOUT_SECS: u64 = 10;
+const TAILSCALE_DETECT_TIMEOUT_SECS: u64 = 2;
+const MAX_TAILSCALE_STATUS_BYTES: u64 = 1024 * 1024;
+const LIVE_DAEMON_RELOAD_TIMEOUT: Duration = Duration::from_millis(1_800);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -139,9 +142,9 @@ pub enum PairCommand {
         /// Inviting node's canonical nodeId (e.g. alice@macbook, acme-team)
         #[arg(long)]
         node_id: String,
-        /// Inviting node's HTTPS endpoint (or loopback http://127.0.0.1 for local testing)
+        /// Inviting node's HTTPS endpoint (auto-detected from Tailscale MagicDNS for --mode p2p if omitted)
         #[arg(long)]
-        endpoint: String,
+        endpoint: Option<String>,
         /// Target peer's nodeId (optional for p2p; recommended for team)
         #[arg(long)]
         peer: Option<String>,
@@ -611,11 +614,122 @@ fn infer_trust_tier(mode: InviteMode, preset: Option<CliScopePreset>, scopes: &[
     }
 }
 
+/// Pure parser for `tailscale status --json` output -> `https://<magicdns_host>`.
+///
+/// Fails closed (returns `None`) unless:
+/// - JSON is valid and `BackendState == "Running"`
+/// - `Self.Online` is not explicitly `false`
+/// - `Self.DNSName` (with at most one trailing FQDN `.` trimmed) is a strict multi-label
+///   ASCII DNS hostname (`<= 253` chars, labels `1..=63` `[A-Za-z0-9-]`, no leading/trailing `-`,
+///   non-numeric TLD) that passes [`validate_endpoint_origin`].
+pub(crate) fn parse_tailscale_magicdns_endpoint(json_bytes: &[u8]) -> Option<String> {
+    let parsed: Value = serde_json::from_slice(json_bytes).ok()?;
+    let root = parsed.as_object()?;
+    if root.get("BackendState").and_then(Value::as_str) != Some("Running") {
+        return None;
+    }
+    let self_obj = root.get("Self").and_then(Value::as_object)?;
+    if self_obj.get("Online").and_then(Value::as_bool) == Some(false) {
+        return None;
+    }
+    let raw_dns = self_obj.get("DNSName").and_then(Value::as_str)?;
+    if raw_dns.is_empty() || raw_dns.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+    let host_raw = raw_dns.strip_suffix('.').unwrap_or(raw_dns);
+    if host_raw.is_empty() || host_raw.len() > 253 || !host_raw.contains('.') {
+        return None;
+    }
+    let mut last_label = "";
+    for label in host_raw.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return None;
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return None;
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return None;
+        }
+        last_label = label;
+    }
+    // Reject all-numeric IPv4 literals (MagicDNS DNSName must have an alphabetic TLD).
+    if !last_label.bytes().any(|b| b.is_ascii_alphabetic()) {
+        return None;
+    }
+    let candidate = format!("https://{}", host_raw.to_ascii_lowercase());
+    validate_endpoint_origin(&candidate).ok()?;
+    Some(candidate)
+}
+
+fn detect_tailscale_magicdns_endpoint_with_bin(bin: &str, timeout: Duration) -> Option<String> {
+    let bin_trimmed = bin.trim();
+    if bin_trimmed.is_empty()
+        || bin_trimmed.eq_ignore_ascii_case("none")
+        || bin_trimmed.eq_ignore_ascii_case("disabled")
+    {
+        return None;
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    rt.block_on(async {
+        use tokio::io::AsyncReadExt;
+        use tokio::process::Command;
+
+        let mut cmd = Command::new(bin_trimmed);
+        cmd.args(["status", "--json"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().ok()?;
+        let mut stdout = child.stdout.take()?;
+
+        let outcome = tokio::time::timeout(timeout, async {
+            let mut buf = Vec::new();
+            let mut limited = (&mut stdout).take(MAX_TAILSCALE_STATUS_BYTES + 1);
+            limited.read_to_end(&mut buf).await.ok()?;
+            if buf.len() as u64 > MAX_TAILSCALE_STATUS_BYTES {
+                let _ = child.kill().await;
+                return None;
+            }
+            let status = child.wait().await.ok()?;
+            if !status.success() {
+                return None;
+            }
+            parse_tailscale_magicdns_endpoint(&buf)
+        })
+        .await;
+
+        match outcome {
+            Ok(endpoint) => endpoint,
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                None
+            }
+        }
+    })
+}
+
+fn detect_tailscale_magicdns_endpoint() -> Option<String> {
+    let bin = std::env::var("HYPHAE_TAILSCALE_BIN").unwrap_or_else(|_| "tailscale".to_string());
+    detect_tailscale_magicdns_endpoint_with_bin(
+        &bin,
+        Duration::from_secs(TAILSCALE_DETECT_TIMEOUT_SECS),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_invite(
     mode: InviteMode,
     node_id: String,
-    endpoint: String,
+    endpoint_arg: Option<String>,
     peer: Option<String>,
     preset: Option<CliScopePreset>,
     grant: Vec<String>,
@@ -639,6 +753,41 @@ fn run_invite(
             Some("Example: --node-id alice@macbook".to_string()),
         );
     }
+
+    let (endpoint, endpoint_auto_detected) = match endpoint_arg {
+        Some(ep) => (ep, false),
+        None => match mode {
+            InviteMode::P2p => match detect_tailscale_magicdns_endpoint() {
+                Some(ts_ep) => (ts_ep, true),
+                None => {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_USAGE,
+                        "MISSING_ENDPOINT",
+                        "Missing --endpoint and could not auto-detect an active Tailscale MagicDNS endpoint.",
+                        Some(
+                            "Pass --endpoint <https://...> (e.g. --endpoint https://alice.tailnet.ts.net or http://127.0.0.1:8790 for local testing), or start Tailscale with MagicDNS enabled."
+                                .to_string(),
+                        ),
+                    );
+                }
+            },
+            InviteMode::Team => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_USAGE,
+                    "MISSING_ENDPOINT",
+                    "Missing required --endpoint for --mode team.",
+                    Some(
+                        "Pass --endpoint <https://...> (e.g. --endpoint https://mesh.acme.internal or http://127.0.0.1:8790 for local testing)."
+                            .to_string(),
+                    ),
+                );
+            }
+        },
+    };
 
     if let Err(e) = validate_endpoint_origin(&endpoint) {
         return emit_error(
@@ -889,6 +1038,7 @@ fn run_invite(
                         "nodeId": node_id,
                         "peerId": peer,
                         "endpoint": endpoint,
+                        "endpointAutoDetected": endpoint_auto_detected,
                         "kid": kid,
                         "encryptionKid": enc_kid,
                         "fingerprint": fingerprint,
@@ -911,7 +1061,11 @@ fn run_invite(
                 if let Some(ref p) = peer {
                     println!("      Target Peer: {p}");
                 }
-                println!("      Endpoint:    {endpoint}");
+                if endpoint_auto_detected {
+                    println!("      Endpoint:    {endpoint} (auto-detected via Tailscale MagicDNS)");
+                } else {
+                    println!("      Endpoint:    {endpoint}");
+                }
                 println!("      Offer ID:    {offer_id}");
                 println!("      JWK kid:     {kid}");
                 println!("      Fingerprint: {fingerprint}");
@@ -1120,6 +1274,7 @@ fn run_invite(
                         "nodeId": node_id,
                         "peerId": target_peer,
                         "endpoint": endpoint,
+                        "endpointAutoDetected": endpoint_auto_detected,
                         "kid": kid,
                         "adminJwk": admin_key.to_jwk(),
                         "adminFingerprint": fingerprint,
@@ -1141,7 +1296,11 @@ fn run_invite(
                 println!("OK    Generated Org Admin-CA Team invite (am2_)");
                 println!("      Node ID:     {node_id}");
                 println!("      Target Peer: {target_peer}");
-                println!("      Endpoint:    {endpoint}");
+                if endpoint_auto_detected {
+                    println!("      Endpoint:    {endpoint} (auto-detected via Tailscale MagicDNS)");
+                } else {
+                    println!("      Endpoint:    {endpoint}");
+                }
                 println!("      Grant ID:    {}", issued_v1.grant.id);
                 println!("      Admin kid:   {kid}");
                 println!("      Fingerprint: {fingerprint}");
@@ -2562,6 +2721,73 @@ fn load_local_public_endpoint(state_dir: &Path) -> Option<String> {
         .filter(|u| validate_endpoint_origin(u).is_ok())
 }
 
+struct DaemonReloadOutcome {
+    reloaded: bool,
+    warnings: Vec<String>,
+}
+
+fn resolve_pair_daemon_socket(state_dir: &Path, explicit_state: bool) -> PathBuf {
+    if !explicit_state {
+        if let Some(raw) = std::env::var_os("HYPHAE_SOCKET")
+            .or_else(|| std::env::var_os("AGENTS_MESH_SOCKET"))
+            .filter(|v| !v.is_empty())
+        {
+            return PathBuf::from(raw);
+        }
+    }
+    state_dir.join(hyp_harness::sock::DEFAULT_SOCKET_FILENAME)
+}
+
+/// Best-effort bounded synchronous `peers.reload` ping to a running local daemon over
+/// `connector.sock` / Windows loopback `connector.addr`.
+///
+/// Always fail-safe: returns `reloaded: false` without error if the daemon is stopped,
+/// unreachable, or timed out so an already-committed pairing never fails.
+fn try_reload_live_daemon(state_dir: &Path, explicit_state: bool) -> DaemonReloadOutcome {
+    let socket_path = resolve_pair_daemon_socket(state_dir, explicit_state);
+    let resp = hyp_harness::sock::daemon_rpc_sync(
+        &socket_path,
+        &json!({ "type": "peers.reload" }),
+        LIVE_DAEMON_RELOAD_TIMEOUT,
+    );
+    if !resp.ok {
+        return DaemonReloadOutcome {
+            reloaded: false,
+            warnings: Vec::new(),
+        };
+    }
+    let Some(res) = resp.result else {
+        return DaemonReloadOutcome {
+            reloaded: false,
+            warnings: Vec::new(),
+        };
+    };
+    let reloaded = res
+        .get("reloaded")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !reloaded {
+        return DaemonReloadOutcome {
+            reloaded: false,
+            warnings: Vec::new(),
+        };
+    }
+    let warnings = res
+        .get("warnings")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    DaemonReloadOutcome {
+        reloaded: true,
+        warnings,
+    }
+}
+
 // ============================================================================
 // `pair accept` (stdin or --token-file ONLY)
 // ============================================================================
@@ -3198,11 +3424,24 @@ fn accept_hp2p1(
         }
     }
 
-    let next = vec![
-        "hyp service restart".to_string(),
-        format!("hyp status --state-dir {}", state_dir.display()),
-        format!("hyp daemon --state-dir {}", state_dir.display()),
-    ];
+    drop(db);
+    let daemon_reloaded = if offline {
+        false
+    } else {
+        let reload = try_reload_live_daemon(&state_dir, explicit_state);
+        warnings.extend(reload.warnings);
+        reload.reloaded
+    };
+
+    let next = if daemon_reloaded {
+        vec![format!("hyp status --state-dir {}", state_dir.display())]
+    } else {
+        vec![
+            "hyp service restart".to_string(),
+            format!("hyp status --state-dir {}", state_dir.display()),
+            format!("hyp daemon --state-dir {}", state_dir.display()),
+        ]
+    };
 
     let data = json!({
         "mode": "p2p",
@@ -3223,6 +3462,7 @@ fn accept_hp2p1(
         "escalationNote": untrusted_note,
         "offline": offline,
         "handshakeCompleted": live_res.is_some(),
+        "daemonReloaded": daemon_reloaded,
         "credentialRef": cred_ref,
         "secretBackend": secrets.backend().as_str(),
         "stateDir": state_dir.display().to_string(),
@@ -3254,6 +3494,9 @@ fn accept_hp2p1(
         println!("      Trust Tier:  {}", trust_tier.as_str());
         println!("      Offered:     {}", expanded_offered.join(" "));
         println!("      Granted:     {}", granted_scopes.join(" "));
+        if daemon_reloaded {
+            println!("      Daemon:      Live daemon reloaded — peer connected immediately (no restart needed).");
+        }
         if let Some(ref note) = untrusted_note {
             println!(
                 "      Access hint (untrusted, reported by {}): {}",
@@ -3862,11 +4105,24 @@ fn accept_am2(
         return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None);
     }
 
-    let next = vec![
-        "hyp service restart".to_string(),
-        format!("hyp status --state-dir {}", state_dir.display()),
-        format!("hyp daemon --state-dir {}", state_dir.display()),
-    ];
+    drop(db);
+    let daemon_reloaded = if offline {
+        false
+    } else {
+        let reload = try_reload_live_daemon(&state_dir, explicit_state);
+        warnings.extend(reload.warnings);
+        reload.reloaded
+    };
+
+    let next = if daemon_reloaded {
+        vec![format!("hyp status --state-dir {}", state_dir.display())]
+    } else {
+        vec![
+            "hyp service restart".to_string(),
+            format!("hyp status --state-dir {}", state_dir.display()),
+            format!("hyp daemon --state-dir {}", state_dir.display()),
+        ]
+    };
 
     let data = json!({
         "mode": "team",
@@ -3885,6 +4141,7 @@ fn accept_am2(
         "escalationNote": untrusted_note,
         "offline": offline,
         "handshakeCompleted": live_res.is_some(),
+        "daemonReloaded": daemon_reloaded,
         "credentialRef": cred_ref,
         "secretBackend": secrets.backend().as_str(),
         "stateDir": state_dir.display().to_string(),
@@ -3917,6 +4174,9 @@ fn accept_am2(
         println!("      Fingerprint: {admin_fingerprint}");
         println!("      Trust Tier:  {}", trust_tier.as_str());
         println!("      Scopes:      {}", scopes.join(" "));
+        if daemon_reloaded {
+            println!("      Daemon:      Live daemon reloaded — peer connected immediately (no restart needed).");
+        }
         if let Some(ref note) = untrusted_note {
             println!(
                 "      Access hint (untrusted, reported by {}): {}",
@@ -5344,12 +5604,25 @@ fn run_join(
         hyphae_version = Some(payload_to_cache.hyphae_version.clone());
     }
 
+    drop(db);
+    let daemon_reloaded = if offline {
+        false
+    } else {
+        let reload = try_reload_live_daemon(&state_dir, explicit_state);
+        warnings.extend(reload.warnings);
+        reload.reloaded
+    };
+
     let manifest_verified = verified_live.is_some();
-    let next = vec![
-        "hyp service restart".to_string(),
-        format!("hyp status --state-dir {}", state_dir.display()),
-        format!("hyp daemon --state-dir {}", state_dir.display()),
-    ];
+    let next = if daemon_reloaded {
+        vec![format!("hyp status --state-dir {}", state_dir.display())]
+    } else {
+        vec![
+            "hyp service restart".to_string(),
+            format!("hyp status --state-dir {}", state_dir.display()),
+            format!("hyp daemon --state-dir {}", state_dir.display()),
+        ]
+    };
 
     let data = json!({
         "mode": "public",
@@ -5363,6 +5636,7 @@ fn run_join(
         "offline": offline,
         "enrolled": enrolled,
         "manifestVerified": manifest_verified,
+        "daemonReloaded": daemon_reloaded,
         "kid": kid,
         "encryptionKid": enc_kid,
         "fingerprint": fingerprint,
@@ -5428,6 +5702,9 @@ fn run_join(
             println!("      Version:     {v}");
         }
         println!("      Scopes:      {}", effective_scopes.join(" "));
+        if daemon_reloaded {
+            println!("      Daemon:      Live daemon reloaded — peer connected immediately (no restart needed).");
+        }
         print_warnings(&warnings);
         print_next_steps(&next);
     }
@@ -5460,5 +5737,119 @@ mod tests {
         assert!(expanded.contains(&"stream:subscribe=github[repo=acme/a,acme/b]".to_string()));
         assert!(expanded.contains(&"dm:send=alice,bob".to_string()));
         assert!(expanded.contains(&"files:send=25mb".to_string()));
+    }
+
+    #[test]
+    fn parse_tailscale_magicdns_endpoint_valid_stopped_malformed_and_injections() {
+        // 1. Valid active Tailscale status with trailing FQDN dot + Online: true
+        let valid = br#"{
+            "Version": "1.76.0",
+            "BackendState": "Running",
+            "Self": {
+                "HostName": "alice-mbp",
+                "DNSName": "alice-mbp.tail9f3a.ts.net.",
+                "Online": true
+            }
+        }"#;
+        assert_eq!(
+            parse_tailscale_magicdns_endpoint(valid).as_deref(),
+            Some("https://alice-mbp.tail9f3a.ts.net")
+        );
+
+        // 2. Valid mixed-case DNSName without trailing dot and with Online omitted -> lowercased
+        let mixed = br#"{
+            "BackendState": "Running",
+            "Self": { "DNSName": "Alice-MBP.Tail9F3A.TS.NET" }
+        }"#;
+        assert_eq!(
+            parse_tailscale_magicdns_endpoint(mixed).as_deref(),
+            Some("https://alice-mbp.tail9f3a.ts.net")
+        );
+
+        // 3. Offline / non-Running BackendStates MUST be rejected fail-closed
+        for state in ["Stopped", "NeedsLogin", "Starting", "NoState", "running", ""] {
+            let payload = serde_json::to_vec(&json!({
+                "BackendState": state,
+                "Self": { "DNSName": "alice.tail9f3a.ts.net.", "Online": true }
+            }))
+            .unwrap();
+            assert_eq!(
+                parse_tailscale_magicdns_endpoint(&payload),
+                None,
+                "BackendState={state:?} must be rejected"
+            );
+        }
+
+        // 4. Self.Online == false MUST be rejected even if BackendState == Running
+        let offline_self = br#"{
+            "BackendState": "Running",
+            "Self": { "DNSName": "alice.tail9f3a.ts.net.", "Online": false }
+        }"#;
+        assert_eq!(parse_tailscale_magicdns_endpoint(offline_self), None);
+
+        // 5. Injection attempts, malformed hostnames, single-label names, IPv4 literals -> rejected
+        let long_label = format!("{}.ts.net.", "a".repeat(64));
+        let long_host = format!("{}.{}.{}.{}.ts.net.", "a".repeat(60), "b".repeat(60), "c".repeat(60), "d".repeat(65));
+        let bad_dns_names = [
+            "",
+            ".",
+            "alice",
+            "localhost",
+            "100.64.0.1",
+            "127.0.0.1.",
+            "alice.tail.ts.net..",
+            ".alice.tail.ts.net.",
+            "alice..ts.net.",
+            "-alice.tail.ts.net.",
+            "alice-.tail.ts.net.",
+            "alice.tail.ts.net/evil",
+            "alice.tail.ts.net?foo=bar",
+            "alice.tail.ts.net#frag",
+            "evil.com@alice.tail.ts.net",
+            "alice.tail.ts.net:8443",
+            "alice.tail.ts.net\nevil.example",
+            " alice.tail.ts.net.",
+            "alice.tail.ts.net ",
+            "alice_bad.tail.ts.net.",
+            "https://alice.tail.ts.net",
+            long_label.as_str(),
+            long_host.as_str(),
+        ];
+        for bad in bad_dns_names {
+            let payload = serde_json::to_vec(&json!({
+                "BackendState": "Running",
+                "Self": { "DNSName": bad, "Online": true }
+            }))
+            .unwrap();
+            assert_eq!(
+                parse_tailscale_magicdns_endpoint(&payload),
+                None,
+                "invalid/injected DNSName {bad:?} must be rejected"
+            );
+        }
+
+        // 6. Malformed JSON / empty / wrong structure -> None (never panics!)
+        for junk in [
+            &b""[..],
+            b"not json",
+            b"null",
+            b"[]",
+            b"{}",
+            br#"{"BackendState":"Running"}"#,
+            br#"{"BackendState":"Running","Self":null}"#,
+            br#"{"BackendState":"Running","Self":{"DNSName":123}}"#,
+        ] {
+            assert_eq!(parse_tailscale_magicdns_endpoint(junk), None);
+        }
+
+        // 7. Hermetic disabled sentinel never spawns a binary
+        assert_eq!(
+            detect_tailscale_magicdns_endpoint_with_bin("none", Duration::from_millis(50)),
+            None
+        );
+        assert_eq!(
+            detect_tailscale_magicdns_endpoint_with_bin("", Duration::from_millis(50)),
+            None
+        );
     }
 }

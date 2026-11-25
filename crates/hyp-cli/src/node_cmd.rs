@@ -16,14 +16,17 @@ use hyp_crypto::CryptoError;
 use hyp_crypto::keys::OkpJwk as CryptoOkpJwk;
 use hyp_crypto::keystore::{SecretBackend, validate_secret_name};
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
-use hyp_harness::daemon::{DeliveryRetryConfig, LocalDaemon, LocalDaemonConfig};
+use hyp_harness::daemon::{
+    BoxFuture as DaemonBoxFuture, DEFAULT_PEERS_RELOAD_TIMEOUT, DeliveryRetryConfig, LocalDaemon,
+    LocalDaemonConfig, PeersReloader,
+};
 use hyp_node::adapters::github_public::normalize_repo_token_pattern;
 use hyp_node::adapters::{
     AdapterKind, GitHubPublicAdapter, GitHubPublicConfig, HelloMode, SubprocessConfig,
 };
 use hyp_node::engine::{
     DropRelayConfig, E2eePolicy, EscalationConfig, GuestPairingConfig, LocalIngestConfig,
-    LocalIngestServer, NodeConfig, NodeProfile, TopicConfig, UnifiedNode,
+    LocalIngestServer, NodeConfig, NodeProfile, PeerReconcileReport, TopicConfig, UnifiedNode,
     normalize_drop_portal_url,
 };
 use hyp_node::gates::{SecurityGateConfig, SecurityGatePipeline};
@@ -32,7 +35,7 @@ use hyp_proto::address::{
 };
 use hyp_proto::manifest::{OkpCurve as ProtoOkpCurve, OkpJwk as ProtoOkpJwk};
 use hyp_proto::scopes::ScopePreset;
-use hyp_store::{NodeDb, PeerStatus};
+use hyp_store::NodeDb;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -665,6 +668,8 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             None
         };
 
+        let status_doc_state: Arc<Mutex<Option<(PathBuf, Value)>>> = Arc::new(Mutex::new(None));
+
         let local_daemon = if start_local_daemon {
             let local_cfg = LocalDaemonConfig {
                 socket_path: explicit_socket,
@@ -675,6 +680,10 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             let daemon = LocalDaemon::start(Arc::clone(&node), gate_pipeline.clone(), local_cfg)
                 .await
                 .map_err(|e| format!("Failed to start local harness IPC daemon: {e}"))?;
+            daemon.set_peers_reloader(Arc::new(NodeCmdPeersReloader {
+                node: Arc::clone(&node),
+                status_doc: Arc::clone(&status_doc_state),
+            }));
             Some(Arc::new(daemon))
         } else {
             None
@@ -744,46 +753,9 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         // Auto-connect persisted active peers with a configured endpoint so restarted
         // daemons immediately restore PeerLinks and background SSE `/v1/inbox` streams.
         // Never fail startup if a remote peer is temporarily offline — record a warning instead.
-        let active_peers = {
-            let db = node.db();
-            db.peers()
-                .list_peers(Some(PeerStatus::Active))
-                .unwrap_or_default()
-        };
-        let mut connected_peers: Vec<String> = Vec::new();
-        for peer in active_peers {
-            if peer.peer_id == node.node_id().as_str() {
-                continue;
-            }
-            let Some(ep) = peer
-                .endpoint
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            else {
-                continue;
-            };
-            match tokio::time::timeout(
-                Duration::from_secs(5),
-                node.connect_peer(&peer.peer_id, ep),
-            )
-            .await
-            {
-                Ok(Ok(_)) => connected_peers.push(peer.peer_id),
-                Ok(Err(e)) => {
-                    startup_warnings.push(format!(
-                        "Peer '{}' ({ep}) could not be auto-connected on startup: {e}",
-                        peer.peer_id
-                    ));
-                }
-                Err(_) => {
-                    startup_warnings.push(format!(
-                        "Peer '{}' ({ep}) timed out during startup auto-connect",
-                        peer.peer_id
-                    ));
-                }
-            }
-        }
+        let initial_reconcile = node.reconcile_peers(Duration::from_secs(5)).await;
+        startup_warnings.extend(initial_reconcile.warnings);
+        let connected_peers = initial_reconcile.connected_peers;
 
         let pid = std::process::id();
         let pid_path = state_dir.join("node.pid");
@@ -826,6 +798,10 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             "startedAt": started_at,
         });
         write_atomic_json(&status_path, &status_doc, true)?;
+        {
+            let mut guard = status_doc_state.lock().expect("status_doc lock poisoned");
+            *guard = Some((status_path.clone(), status_doc.clone()));
+        }
 
         let mut warnings = startup_warnings;
         if let Some(w) = legacy_warning {
@@ -962,6 +938,35 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
     match res {
         Ok(()) => ExitCode::from(EXIT_OK),
         Err(e) => emit_error(cmd, as_json, EXIT_ERROR, "NODE_START_FAILED", e, None),
+    }
+}
+
+struct NodeCmdPeersReloader {
+    node: Arc<UnifiedNode>,
+    status_doc: Arc<Mutex<Option<(PathBuf, Value)>>>,
+}
+
+impl PeersReloader for NodeCmdPeersReloader {
+    fn reload_peers<'a>(&'a self) -> DaemonBoxFuture<'a, Result<PeerReconcileReport, String>> {
+        Box::pin(async move {
+            let report = self.node.reconcile_peers(DEFAULT_PEERS_RELOAD_TIMEOUT).await;
+            {
+                let mut guard = self
+                    .status_doc
+                    .lock()
+                    .expect("status_doc lock poisoned");
+                if let Some((ref path, ref mut doc)) = *guard {
+                    if let Some(obj) = doc.as_object_mut() {
+                        obj.insert(
+                            "connectedPeers".to_string(),
+                            json!(report.connected_peers),
+                        );
+                    }
+                    let _ = write_atomic_json(path, doc, true);
+                }
+            }
+            Ok(report)
+        })
     }
 }
 
