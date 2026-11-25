@@ -105,6 +105,12 @@ pub fn infer_herdr_terminal_from_env() -> Option<String> {
     crate::transport::herdr::detect_env_terminal_id()
 }
 
+/// Resolves a validated per-session auth token strictly from `HYPHAE_SESSION_TOKEN` in the
+/// current process environment. NEVER reads another session's token from disk.
+pub fn infer_session_token_from_env() -> Option<String> {
+    crate::hooks::infer_session_token_from_env()
+}
+
 pub fn infer_session_id_with<F>(get_env: F) -> Option<String>
 where
     F: Fn(&str) -> Option<String>,
@@ -192,6 +198,16 @@ pub async fn run_wait_to_writer<W: Write>(
     options: WaitOptions,
     out: &mut W,
 ) -> Result<i32, WaitError> {
+    run_wait_to_writer_with_token(options, infer_session_token_from_env(), out).await
+}
+
+/// Like [`run_wait_to_writer`] with an explicit optional per-session authentication token
+/// (`sessionToken`) forwarded on `wait.subscribe`.
+pub async fn run_wait_to_writer_with_token<W: Write>(
+    options: WaitOptions,
+    session_token: Option<String>,
+    out: &mut W,
+) -> Result<i32, WaitError> {
     let session_id = match (&options.session_id, &options.handle) {
         (Some(sid), _) => Some(sid.clone()),
         (None, Some(_)) => None,
@@ -225,6 +241,13 @@ pub async fn run_wait_to_writer<W: Write>(
     }
     if let Some(handle) = options.handle {
         sub.insert("handle".into(), json!(handle));
+    }
+    if let Some(tok) = session_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| crate::hooks::is_valid_session_token(s))
+    {
+        sub.insert("sessionToken".into(), json!(tok));
     }
     write_ndjson_line_async(&mut write_half, &Value::Object(sub))
         .await

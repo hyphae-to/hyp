@@ -331,8 +331,8 @@ fn onboard_yes_selected_harnesses_with_statusline_mod_and_no_skills() {
     assert!(home.join(".claude/commands/hyphae.md").is_file());
     assert!(!home.join(".claude/skills/hyphae/SKILL.md").exists());
 
-    // Herdr adapter + native Herdr mod installed safely, runtime skills skipped.
-    assert!(home.join(".config/herdr/hyphae.json").is_file());
+    // Native Herdr mod installed safely, runtime skills skipped, no dead ~/.config/herdr/hyphae.json written (X9).
+    assert!(!home.join(".config/herdr/hyphae.json").exists());
     assert!(!home.join(".config/herdr/skills/hyphae/SKILL.md").exists());
     assert!(
         home.join(".config/herdr-app/mods/hyphae-pane/mod.json")

@@ -17,11 +17,12 @@
 //!   - Any other failure -> `PushOutcome::Reject("codex_queue_outcome_unknown")`
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
@@ -247,9 +248,207 @@ impl PushTransport for CodexQueueTransport {
         false
     }
 
+    fn target_metadata(&self) -> Value {
+        json!({ "codexThreadId": self.target.thread_id })
+    }
+
     fn deliver<'a>(&'a self, text: &'a str, _mode: PushMode) -> TransportFuture<'a, PushOutcome> {
         Box::pin(self.deliver_inner(text))
     }
+}
+
+/// Returns `true` iff `thread_id` is a canonical 36-character hyphenated UUID (`8-4-4-4-12` hex).
+pub fn is_valid_codex_uuid(thread_id: &str) -> bool {
+    let bytes = thread_id.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (i, &b) in bytes.iter().enumerate() {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            if b != b'-' {
+                return false;
+            }
+        } else if !b.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Resolves the default Codex home directory (`$CODEX_HOME` if set and non-empty, else `~/.codex`).
+pub fn default_codex_home() -> PathBuf {
+    if let Ok(env_home) = std::env::var("CODEX_HOME") {
+        let trimmed = env_home.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    if let Ok(h) = std::env::var("HOME") {
+        if !h.trim().is_empty() {
+            return PathBuf::from(h).join(".codex");
+        }
+    }
+    if let Ok(h) = std::env::var("USERPROFILE") {
+        if !h.trim().is_empty() {
+            return PathBuf::from(h).join(".codex");
+        }
+    }
+    PathBuf::from(".codex")
+}
+
+/// Returns `true` iff the configured `codex` binary exists as a file (if an explicit path) or
+/// resolves in the current process `PATH`.
+pub fn codex_binary_available(bin: &str) -> bool {
+    let trimmed = bin.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+        return false;
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return is_executable_file(Path::new(trimmed));
+    }
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for dir in std::env::split_paths(&path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let direct = dir.join(trimmed);
+        if is_executable_file(&direct) {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            for ext in ["exe", "cmd", "bat"] {
+                let with_ext = dir.join(format!("{trimmed}.{ext}"));
+                if with_ext.is_file() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        (meta.permissions().mode() & 0o111) != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Safely verifies whether `$CODEX_HOME/sessions/` contains a rollout JSONL file matching
+/// `thread_id` (e.g. `sessions/YYYY/MM/DD/rollout-<ts>-<thread_id>.jsonl`).
+///
+/// Security & safety invariants:
+/// - Rejects invalid/traversal/path-separator `thread_id`s fail-closed before touching disk.
+/// - Refuses symlinks (`symlink_metadata`) at every directory/file level so symlink escapes or
+///   cycles can never traverse outside `codex_home/sessions`.
+/// - Strictly bounded traversal depth (`<= 4`) and visited entry cap (`<= 4096`).
+pub fn verify_codex_rollout_thread(codex_home: &Path, thread_id: &str) -> bool {
+    const MAX_WALK_DEPTH: usize = 4;
+    const MAX_WALK_ENTRIES: usize = 4096;
+
+    if !is_safe_rollout_thread_id(thread_id) {
+        return false;
+    }
+
+    let sessions_dir = codex_home.join("sessions");
+    let Ok(root_meta) = std::fs::symlink_metadata(&sessions_dir) else {
+        return false;
+    };
+    if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
+        return false;
+    }
+
+    let tid_lower = thread_id.to_ascii_lowercase();
+    let mut stack: Vec<(PathBuf, usize)> = vec![(sessions_dir, 0)];
+    let mut visited = 0usize;
+
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry_res in entries {
+            visited += 1;
+            if visited > MAX_WALK_ENTRIES {
+                return false;
+            }
+            let Ok(entry) = entry_res else {
+                continue;
+            };
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                if depth < MAX_WALK_DEPTH {
+                    stack.push((path, depth + 1));
+                }
+                continue;
+            }
+            if !meta.is_file() {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                if filename_matches_codex_rollout(name, &tid_lower) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn is_safe_rollout_thread_id(thread_id: &str) -> bool {
+    if !is_valid_thread_id(thread_id) {
+        return false;
+    }
+    if thread_id.contains('/') || thread_id.contains('\\') || thread_id.contains("..") {
+        return false;
+    }
+    thread_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+fn filename_matches_codex_rollout(filename: &str, tid_lower: &str) -> bool {
+    let lower = filename.to_ascii_lowercase();
+    if !lower.ends_with(".jsonl") {
+        return false;
+    }
+    let stem = &lower[..lower.len() - ".jsonl".len()];
+    if stem == tid_lower {
+        return true;
+    }
+    let mut search_from = 0usize;
+    while let Some(rel) = stem[search_from..].find(tid_lower) {
+        let start = search_from + rel;
+        let end = start + tid_lower.len();
+        let left_ok = start == 0 || matches!(stem.as_bytes()[start - 1], b'-' | b'_' | b'.');
+        let right_ok =
+            end == stem.len() || matches!(stem.as_bytes()[end], b'-' | b'_' | b'.');
+        if left_ok && right_ok {
+            return true;
+        }
+        search_from = start + 1;
+    }
+    false
 }
 
 fn is_valid_thread_id(thread_id: &str) -> bool {

@@ -695,7 +695,7 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
                         }
                         Err(err) if err.is_offline_download => {
                             warnings.push(format!(
-                                "Skipped native Herdr mod (herdr-mod): release download unavailable while offline ({}). Pure-Rust Herdr config (~/.config/herdr/hyphae.json) was configured normally.",
+                                "Skipped native Herdr mod (herdr-mod): release download unavailable while offline ({}). Pure-Rust Herdr runtime skill was configured normally (Herdr auto-detects via HC_TERMINAL_ID).",
                                 err.message
                             ));
                             extra_next.push("hyp plugin install herdr-mod".to_string());
@@ -1919,17 +1919,49 @@ pub fn detect_harness_statuses(
                     (ok, p.display().to_string())
                 }
                 HarnessKind::Herdr => {
-                    let p = home.join(".config").join("herdr").join("hyphae.json");
-                    (p.exists(), p.display().to_string())
+                    let skill = home
+                        .join(".config")
+                        .join("herdr")
+                        .join("skills")
+                        .join("hyphae")
+                        .join("SKILL.md");
+                    let mod_pane = home
+                        .join(".config")
+                        .join("herdr-app")
+                        .join("mods")
+                        .join("hyphae-pane")
+                        .join("mod.json");
+                    let legacy = home.join(".config").join("herdr").join("hyphae.json");
+                    if skill.exists() {
+                        (true, skill.display().to_string())
+                    } else if mod_pane.exists() {
+                        (true, mod_pane.display().to_string())
+                    } else {
+                        (legacy.exists(), skill.display().to_string())
+                    }
                 }
                 HarnessKind::T3 => {
-                    let t3_file = home.join(".t3").join("hyphae.json");
+                    let t3_skill = home
+                        .join(".t3")
+                        .join("skills")
+                        .join("hyphae")
+                        .join("SKILL.md");
+                    let legacy = home.join(".t3").join("hyphae.json");
                     let in_node_cfg = config_path
                         .and_then(|cp| fs::read_to_string(cp).ok())
                         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
                         .and_then(|v| v.get("t3").cloned())
                         .is_some();
-                    (t3_file.exists() || in_node_cfg, t3_file.display().to_string())
+                    let loc = if in_node_cfg {
+                        config_path
+                            .map(|cp| cp.display().to_string())
+                            .unwrap_or_else(|| t3_skill.display().to_string())
+                    } else if t3_skill.exists() {
+                        t3_skill.display().to_string()
+                    } else {
+                        legacy.display().to_string()
+                    };
+                    (in_node_cfg || t3_skill.exists() || legacy.exists(), loc)
                 }
             };
 
@@ -3147,7 +3179,7 @@ fn setup_codex(
     let config_toml = base_dir.join("config.toml");
     let hooks_file = base_dir.join("hooks.json");
 
-    let args_vec: Vec<String> = mcp_args(socket, &[])
+    let args_vec: Vec<String> = mcp_args(socket, &["--backend", "codex"])
         .into_iter()
         .filter_map(|v| v.as_str().map(|s| serde_json::to_string(s).unwrap_or_default()))
         .collect();
@@ -3578,6 +3610,9 @@ fn setup_openclaw(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    // OpenClaw Gateway does not currently expose PreToolUse lifecycle hooks, so `--ephemeral`
+    // remains an explicit opt-in fallback solely for this hookless backend (and NEVER bypasses
+    // failed `_meshCall` token verification on LocalDaemon).
     servers.insert(
         "hyphae".to_string(),
         json!({
@@ -3590,7 +3625,10 @@ fn setup_openclaw(
     maybe_write_json(&config_file, &Value::Object(doc), false, dry_run)?;
 
     let mut files = vec![config_file.display().to_string()];
-    let mut notes = vec!["OpenClaw openclaw.json and tailored orchestrator skill configured.".to_string()];
+    let mut notes = vec![
+        "OpenClaw openclaw.json (--backend openclaw --ephemeral hookless fallback) and tailored orchestrator skill configured. Store `openclaw-hooks-token` via `hyp secret set openclaw-hooks-token` to enable Gateway webhook push wakeups."
+            .to_string(),
+    ];
     maybe_install_harness_runtime_skills(
         HarnessKind::Openclaw,
         home,
@@ -3610,34 +3648,14 @@ fn setup_openclaw(
 
 fn setup_herdr(
     home: &Path,
-    bin: &str,
+    _bin: &str,
     opts: SetupOptions<'_>,
     skill_ctx: &SetupSkillContext,
 ) -> Result<HarnessSetupOutcome, String> {
-    let socket = opts.socket;
     let dry_run = opts.dry_run;
-    let cfg_file = home.join(".config").join("herdr").join("hyphae.json");
-    let mut doc = read_json_object_or_empty(&cfg_file)?;
-    doc.insert(
-        "hyphae".to_string(),
-        json!({
-            "binary": bin,
-            "mcp": {
-                "command": bin,
-                "args": mcp_args(socket, &["--backend", "herdr"])
-            },
-            "hooks": {
-                "preToolUse": hook_command(bin, "herdr", "pre-tool-use", socket),
-                "postToolUse": hook_command(bin, "herdr", "post-tool-use", socket),
-                "stop": hook_command(bin, "herdr", "stop", socket)
-            }
-        }),
-    );
-    maybe_write_json(&cfg_file, &Value::Object(doc), false, dry_run)?;
-
-    let mut files = vec![cfg_file.display().to_string()];
+    let mut files = Vec::new();
     let mut notes = vec![
-        "Herdr Hyphae adapter configuration and tailored runtime skill written (existing keys preserved)."
+        "Herdr auto-detects live terminals via HC_TERMINAL_ID (no inert ~/.config/herdr/hyphae.json needed); installed tailored runtime skill (pass --mod for native Herdr desktop pane/panel)."
             .to_string(),
     ];
     maybe_install_harness_runtime_skills(
@@ -3659,44 +3677,35 @@ fn setup_herdr(
 
 fn setup_t3(
     home: &Path,
-    bin: &str,
+    _bin: &str,
     config_path: &Path,
     opts: SetupOptions<'_>,
     skill_ctx: &SetupSkillContext,
 ) -> Result<HarnessSetupOutcome, String> {
-    let socket = opts.socket;
     let dry_run = opts.dry_run;
     let t3_base_dir = home.join(".t3");
-    let t3_file = t3_base_dir.join("hyphae.json");
     let mut files = Vec::new();
     let mut notes = vec![
-        "T3 Code adapter and tailored runtime skill configured with secret ref 't3-session-token' (never plaintext)."
+        "T3 Code configured via node.json 't3' block (secret ref 't3-session-token', never plaintext) and tailored runtime skill (no inert ~/.t3/hyphae.json written)."
             .to_string(),
     ];
 
-    let mut t3_doc = read_json_object_or_empty(&t3_file)?;
-    t3_doc.insert(
-        "hyphae".to_string(),
-        json!({
-            "binary": bin,
-            "url": "http://127.0.0.1:3773",
-            "baseDir": t3_base_dir.display().to_string(),
-            "tokenSecret": "t3-session-token",
-            "mcp": {
-                "command": bin,
-                "args": mcp_args(socket, &["--backend", "t3"])
-            }
-        }),
-    );
-    maybe_write_json(&t3_file, &Value::Object(t3_doc), false, dry_run)?;
-    files.push(t3_file.display().to_string());
-
     if config_path.exists() {
         let mut node_cfg = read_json_object_or_empty(config_path)?;
-        let mut t3_entry = Map::new();
-        t3_entry.insert("url".to_string(), json!("http://127.0.0.1:3773"));
-        t3_entry.insert("baseDir".to_string(), json!(t3_base_dir.display().to_string()));
-        t3_entry.insert("tokenSecret".to_string(), json!("t3-session-token"));
+        let mut t3_entry = node_cfg
+            .get("t3")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        t3_entry
+            .entry("url".to_string())
+            .or_insert_with(|| json!("http://127.0.0.1:3773"));
+        t3_entry
+            .entry("baseDir".to_string())
+            .or_insert_with(|| json!(t3_base_dir.display().to_string()));
+        t3_entry
+            .entry("tokenSecret".to_string())
+            .or_insert_with(|| json!("t3-session-token"));
         node_cfg.insert("t3".to_string(), Value::Object(t3_entry));
         maybe_write_json(config_path, &Value::Object(node_cfg), true, dry_run)?;
         files.push(config_path.display().to_string());

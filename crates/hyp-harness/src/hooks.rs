@@ -378,6 +378,37 @@ fn insert_transport_hints(
     added
 }
 
+/// Validates a per-session socket authentication token (`HYPHAE_SESSION_TOKEN`).
+///
+/// Strictly allows ASCII `[A-Za-z0-9._-]` (1..=256 bytes) with zero quotes, whitespace, or
+/// control characters so it is safe both on wire JSON and in shell env files.
+pub fn is_valid_session_token(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    if bytes.is_empty() || bytes.len() > 256 {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Reads and validates `HYPHAE_SESSION_TOKEN` from the current process environment.
+pub fn infer_session_token_from_env() -> Option<String> {
+    let raw = std::env::var("HYPHAE_SESSION_TOKEN").ok()?;
+    let trimmed = raw.trim();
+    if is_valid_session_token(trimmed) {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+fn attach_session_token(pkt: &mut Map<String, Value>, session_token: Option<&str>) {
+    if let Some(tok) = session_token.map(str::trim).filter(|s| is_valid_session_token(s)) {
+        pkt.insert("sessionToken".into(), json!(tok));
+    }
+}
+
 /// Validates `session_id` strictly against [`is_valid_session_id`] (ASCII `[A-Za-z0-9:._-]`
 /// only — zero quotes, newlines, or shell metacharacters) and appends
 /// `export HYPHAE_SESSION_ID='<session_id>'\n` to `env_file` (Claude Code's `$CLAUDE_ENV_FILE`).
@@ -385,6 +416,16 @@ fn insert_transport_hints(
 /// Fails closed on invalid IDs (returning `false` without touching disk) and never panics or
 /// propagates I/O errors so hooks never fail if `env_file` is unwritable.
 pub fn export_claude_session_env_file(env_file: &Path, session_id: &str) -> bool {
+    export_claude_session_env_file_with_token(env_file, session_id, None)
+}
+
+/// Like [`export_claude_session_env_file`], additionally exporting a validated
+/// `export HYPHAE_SESSION_TOKEN='<token>'\n` line when `session_token` is present and valid.
+pub fn export_claude_session_env_file_with_token(
+    env_file: &Path,
+    session_id: &str,
+    session_token: Option<&str>,
+) -> bool {
     if !is_valid_session_id(session_id)
         || session_id
             .strip_prefix("claude:")
@@ -395,13 +436,43 @@ pub fn export_claude_session_env_file(env_file: &Path, session_id: &str) -> bool
     if env_file.as_os_str().is_empty() {
         return false;
     }
-    let export_line = format!("export HYPHAE_SESSION_ID='{session_id}'\n");
-    if let Ok(existing) = std::fs::read_to_string(env_file) {
-        let normalized = existing.replace("\r\n", "\n");
-        if normalized.lines().any(|l| l == export_line.trim_end()) {
-            return true;
+    let valid_token = match session_token {
+        Some(tok) => {
+            if !is_valid_session_token(tok) {
+                return false;
+            }
+            Some(tok)
+        }
+        None => None,
+    };
+
+    let id_line = format!("export HYPHAE_SESSION_ID='{session_id}'");
+    let tok_line = valid_token.map(|tok| format!("export HYPHAE_SESSION_TOKEN='{tok}'"));
+
+    let existing = std::fs::read_to_string(env_file)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
+    let has_id = existing.lines().any(|l| l == id_line);
+    let has_tok = match &tok_line {
+        Some(line) => existing.lines().any(|l| l == line),
+        None => true,
+    };
+    if has_id && has_tok {
+        return true;
+    }
+
+    let mut to_append = String::new();
+    if !has_id {
+        to_append.push_str(&id_line);
+        to_append.push('\n');
+    }
+    if let Some(line) = tok_line {
+        if !has_tok {
+            to_append.push_str(&line);
+            to_append.push('\n');
         }
     }
+
     let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -409,13 +480,26 @@ pub fn export_claude_session_env_file(env_file: &Path, session_id: &str) -> bool
     else {
         return false;
     };
-    file.write_all(export_line.as_bytes()).is_ok() && file.flush().is_ok()
+    file.write_all(to_append.as_bytes()).is_ok() && file.flush().is_ok()
 }
 
 /// Pure hook decision engine with injectable RPC callback (easily unit-tested without sockets).
 pub fn handle_hook_payload_with<F>(
     payload: &Map<String, Value>,
     options: &HandleHookOptions,
+    rpc: F,
+) -> Value
+where
+    F: FnMut(&Path, &Value) -> DaemonRpcResult,
+{
+    handle_hook_payload_with_session_token(payload, options, None, rpc)
+}
+
+/// Pure hook decision engine with injectable `session_token` and RPC callback.
+pub fn handle_hook_payload_with_session_token<F>(
+    payload: &Map<String, Value>,
+    options: &HandleHookOptions,
+    session_token: Option<&str>,
     mut rpc: F,
 ) -> Value
 where
@@ -426,18 +510,41 @@ where
     };
 
     if options.event == HookEvent::SessionStart {
-        if options.harness == HarnessKind::Claude {
-            if let Some(env_file) = std::env::var_os("CLAUDE_ENV_FILE") {
-                if !env_file.is_empty() {
-                    let _ = export_claude_session_env_file(Path::new(&env_file), &session_id);
-                }
-            }
-        }
+        let claude_env_file = if options.harness == HarnessKind::Claude {
+            std::env::var_os("CLAUDE_ENV_FILE").filter(|v| !v.is_empty())
+        } else {
+            None
+        };
+
         let mut pkt = Map::new();
         pkt.insert("type".into(), json!("session.hint"));
         pkt.insert("harness".into(), json!(options.harness.as_str()));
         pkt.insert("sessionId".into(), json!(session_id));
-        if insert_transport_hints(&mut pkt, options.harness, payload, &options.transport_hints) {
+        attach_session_token(&mut pkt, session_token);
+        let added_hints =
+            insert_transport_hints(&mut pkt, options.harness, payload, &options.transport_hints);
+
+        if let Some(env_file) = claude_env_file {
+            pkt.insert("requestSessionToken".into(), json!(true));
+            let res = rpc(&options.socket_path, &Value::Object(pkt));
+            let minted_token = res
+                .ok
+                .then(|| {
+                    res.result
+                        .as_ref()?
+                        .get("sessionToken")?
+                        .as_str()
+                        .filter(|s| is_valid_session_token(s))
+                        .map(ToString::to_string)
+                })
+                .flatten();
+            let effective_tok = minted_token.as_deref().or(session_token);
+            let _ = export_claude_session_env_file_with_token(
+                Path::new(&env_file),
+                &session_id,
+                effective_tok,
+            );
+        } else if added_hints {
             let _ = rpc(&options.socket_path, &Value::Object(pkt));
         }
         return json!({});
@@ -466,6 +573,7 @@ where
             if let Some(call_id) = info.call_id {
                 pkt.insert("callId".into(), json!(call_id));
             }
+            attach_session_token(&mut pkt, session_token);
             let _ = insert_transport_hints(
                 &mut pkt,
                 options.harness,
@@ -533,10 +641,12 @@ where
             if options.harness == HarnessKind::Antigravity {
                 return json!({});
             }
-            let drained = rpc(
-                &options.socket_path,
-                &json!({ "type": "mailbox.drain", "sessionId": session_id, "limit": 5 }),
-            );
+            let mut drain_pkt = Map::new();
+            drain_pkt.insert("type".into(), json!("mailbox.drain"));
+            drain_pkt.insert("sessionId".into(), json!(session_id));
+            drain_pkt.insert("limit".into(), json!(5));
+            attach_session_token(&mut drain_pkt, session_token);
+            let drained = rpc(&options.socket_path, &Value::Object(drain_pkt));
             let items = drained
                 .ok
                 .then(|| drained.result?.remove("items"))
@@ -569,10 +679,12 @@ where
             }
         }
         HookEvent::PreInvocation => {
-            let drained = rpc(
-                &options.socket_path,
-                &json!({ "type": "mailbox.drain", "sessionId": session_id, "limit": 5 }),
-            );
+            let mut drain_pkt = Map::new();
+            drain_pkt.insert("type".into(), json!("mailbox.drain"));
+            drain_pkt.insert("sessionId".into(), json!(session_id));
+            drain_pkt.insert("limit".into(), json!(5));
+            attach_session_token(&mut drain_pkt, session_token);
+            let drained = rpc(&options.socket_path, &Value::Object(drain_pkt));
             let items = drained
                 .ok
                 .then(|| drained.result?.remove("items"))
@@ -596,10 +708,12 @@ where
             json!({})
         }
         HookEvent::Stop => {
-            let drained = rpc(
-                &options.socket_path,
-                &json!({ "type": "mailbox.drain", "sessionId": session_id, "limit": 5 }),
-            );
+            let mut drain_pkt = Map::new();
+            drain_pkt.insert("type".into(), json!("mailbox.drain"));
+            drain_pkt.insert("sessionId".into(), json!(session_id));
+            drain_pkt.insert("limit".into(), json!(5));
+            attach_session_token(&mut drain_pkt, session_token);
+            let drained = rpc(&options.socket_path, &Value::Object(drain_pkt));
             let items = drained
                 .ok
                 .then(|| drained.result?.remove("items"))
@@ -670,9 +784,13 @@ where
 
 /// Evaluates a hook payload against a live daemon socket synchronously.
 pub fn handle_hook_payload(payload: &Map<String, Value>, options: &HandleHookOptions) -> Value {
-    handle_hook_payload_with(payload, options, |sock, pkt| {
-        daemon_rpc_sync(sock, pkt, DEFAULT_HOOK_TIMEOUT)
-    })
+    let session_token = infer_session_token_from_env();
+    handle_hook_payload_with_session_token(
+        payload,
+        options,
+        session_token.as_deref(),
+        |sock, pkt| daemon_rpc_sync(sock, pkt, DEFAULT_HOOK_TIMEOUT),
+    )
 }
 
 /// Shell-safe single-quoting matching `src/cli-fast.ts`.

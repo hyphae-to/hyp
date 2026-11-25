@@ -273,10 +273,13 @@ fn onboard_and_setup_all_nine_harnesses_in_isolated_home() {
         home.join(".config/opencode/opencode.json"),
         home.join(".gemini/settings.json"),
         home.join(".openclaw/openclaw.json"),
-        home.join(".config/herdr/hyphae.json"),
-        home.join(".t3/hyphae.json"),
         state_dir.join("node.json"),
     ];
+    // X9: dead/unread herdr/t3 JSON files must NOT be created; skills & node.json "t3" block are written instead.
+    assert!(!home.join(".config/herdr/hyphae.json").exists());
+    assert!(!home.join(".t3/hyphae.json").exists());
+    assert!(home.join(".config/herdr/skills/hyphae/SKILL.md").is_file());
+    assert!(home.join(".t3/skills/hyphae/SKILL.md").is_file());
     let mut snapshots: Vec<(PathBuf, String)> = Vec::new();
     for path in &expected_json_files {
         let content = fs::read_to_string(path)
@@ -307,8 +310,17 @@ fn onboard_and_setup_all_nine_harnesses_in_isolated_home() {
     assert!(codex_toml_1.contains("model = \"gpt-5\""));
     assert!(codex_toml_1.contains("[mcp_servers.hyphae]"));
     assert!(codex_toml_1.contains(fake_bin));
+    assert!(
+        codex_toml_1.contains("\"--backend\", \"codex\""),
+        "X8: setup_codex must pass --backend codex in config.toml: {codex_toml_1}"
+    );
     assert_eq!(codex_toml_1.matches("[mcp_servers.hyphae]").count(), 1);
     assert!(home.join(".config/opencode/plugins/hyphae.ts").exists());
+
+    let node_cfg_after: Value =
+        serde_json::from_str(&fs::read_to_string(state_dir.join("node.json")).unwrap()).unwrap();
+    assert_eq!(node_cfg_after["t3"]["url"], "http://127.0.0.1:3773");
+    assert_eq!(node_cfg_after["t3"]["tokenSecret"], "t3-session-token");
 
     let opencode_cfg: Value = serde_json::from_str(
         &fs::read_to_string(home.join(".config/opencode/opencode.json")).unwrap(),

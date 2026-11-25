@@ -2,6 +2,7 @@
 //! - [`herdr`] — Herdr (`hc`) terminal identity verification, interrupt & paste-send push
 //! - [`codex`] — Codex CLI (`codex queue --thread ... --message ...`) push
 //! - [`t3`] — T3 Code read-only `statev2.sqlite` thread resolution & authenticated WebSocket RPC push
+//! - [`openclaw`] — OpenClaw Gateway metadata-only webhook push (`POST /hooks/agent` or `/hooks/wake`)
 
 use std::future::Future;
 use std::pin::Pin;
@@ -11,6 +12,7 @@ use serde_json::Value;
 
 pub mod codex;
 pub mod herdr;
+pub mod openclaw;
 pub mod t3;
 
 /// Boxed `Send` future alias used by [`PushTransport`].
@@ -107,6 +109,25 @@ pub trait PushTransport: Send + Sync {
         Value::Null
     }
 
+    /// Returns `true` when this transport delivers a metadata-only wake nudge (e.g. OpenClaw
+    /// Gateway hooks) instead of inline message bodies, so `LocalDaemon` marks items notified
+    /// while leaving them `unread` in SQLite for the agent to read via `hyp_inbox`.
+    fn is_nudge_only(&self) -> bool {
+        false
+    }
+
     /// Attempts to deliver `text` to the session bound to this transport.
     fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome>;
+
+    /// Delivers a strictly metadata-only wake nudge (`message_count`, optional `@handle`,
+    /// idempotency `batch_id`) when [`Self::is_nudge_only`] is `true`.
+    fn deliver_nudge<'a>(
+        &'a self,
+        _message_count: usize,
+        _handle: Option<&'a str>,
+        _batch_id: &'a str,
+        mode: PushMode,
+    ) -> TransportFuture<'a, PushOutcome> {
+        self.deliver("", mode)
+    }
 }

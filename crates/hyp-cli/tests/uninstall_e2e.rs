@@ -787,8 +787,10 @@ fast_mode = true
         assert!(h.join(".claude/commands/hyphae.md").exists());
         assert!(h.join(".gemini/config/plugins/hyphae/hooks.json").exists());
         assert!(h.join(".config/opencode/plugins/hyphae.ts").exists());
-        assert!(h.join(".config/herdr/hyphae.json").exists());
-        assert!(h.join(".t3/hyphae.json").exists());
+        assert!(!h.join(".config/herdr/hyphae.json").exists());
+        assert!(!h.join(".t3/hyphae.json").exists());
+        assert!(h.join(".config/herdr/skills/hyphae/SKILL.md").exists());
+        assert!(h.join(".t3/skills/hyphae/SKILL.md").exists());
 
         // Now run `scripts/uninstall.sh --yes`!
         let script = repo_root().join("scripts/uninstall.sh");
