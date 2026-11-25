@@ -966,15 +966,43 @@ fn encode_kv_key_path(key: &str) -> String {
         .join("/")
 }
 
+const SSE_INITIAL_BACKOFF_MS: u64 = 50;
+const SSE_MAX_BACKOFF_MS: u64 = 5_000;
+const SSE_AUTH_INITIAL_BACKOFF_MS: u64 = 2_000;
+const SSE_AUTH_MAX_BACKOFF_MS: u64 = 60_000;
+const MAX_SSE_ERROR_BODY_BYTES: usize = 16 * 1024;
+
+fn is_permanent_sse_auth_denial(status: StatusCode, body: &[u8]) -> bool {
+    if status != StatusCode::FORBIDDEN {
+        return false;
+    }
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    text.contains("revoked")
+        || text.contains("not_granted")
+        || text.contains("not-granted")
+        || text.contains("scope_denied")
+        || text.contains("not active")
+        || text.contains("all grants for peer")
+}
+
 /// Spawns a background WHATWG SSE `/v1/inbox` worker for `link` with crash-safe
 /// commit-before-ack semantics and exponential backoff reconnect.
+///
+/// Security / resilience (P1-20):
+/// - On HTTP `403` with a permanent revocation or `not_granted` denial body, stops polling
+///   until the next `reconcile_peers` or node restart.
+/// - On HTTP `401` or other `403`, applies strong exponential backoff (`2s .. 60s`) instead of
+///   tight-loop retrying.
+/// - On malformed SSE item JSON, logs and skips cleanly (best-effort reject-ack if an event ID
+///   is available) without stalling the stream.
 pub fn spawn_sse_worker(
     node: Arc<UnifiedNode>,
     link: Arc<PeerLink>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut backoff_ms = 50u64;
+        let mut backoff_ms = SSE_INITIAL_BACKOFF_MS;
+        let mut auth_backoff_ms = SSE_AUTH_INITIAL_BACKOFF_MS;
         let mut last_event_id: Option<String> = None;
 
         loop {
@@ -992,7 +1020,8 @@ pub fn spawn_sse_worker(
 
             match connect_res {
                 Ok(resp) if resp.status() == StatusCode::OK => {
-                    backoff_ms = 50;
+                    backoff_ms = SSE_INITIAL_BACKOFF_MS;
+                    auth_backoff_ms = SSE_AUTH_INITIAL_BACKOFF_MS;
                     let mut body = resp.into_body();
                     let mut parser = SseParser::new();
 
@@ -1012,7 +1041,14 @@ pub fn spawn_sse_worker(
                                         if let Some(id) = ev.id.clone() {
                                             last_event_id = Some(id);
                                         }
-                                        dispatch_sse_event(&node, &link, ev.event.as_deref(), &ev.data).await;
+                                        dispatch_sse_event(
+                                            &node,
+                                            &link,
+                                            ev.event.as_deref(),
+                                            ev.id.as_deref(),
+                                            &ev.data,
+                                        )
+                                        .await;
                                     }
                                 }
                             }
@@ -1020,16 +1056,48 @@ pub fn spawn_sse_worker(
                         }
                     }
                 }
-                Ok(resp) => {
-                    let retry_ms = parse_retry_after_ms(resp.headers()).unwrap_or(backoff_ms);
-                    let wait = Duration::from_millis(retry_ms.min(5_000));
+                Ok(resp)
+                    if resp.status() == StatusCode::UNAUTHORIZED
+                        || resp.status() == StatusCode::FORBIDDEN =>
+                {
+                    let status = resp.status();
+                    let retry_hdr = parse_retry_after_ms(resp.headers());
+                    let body_bytes = match HttpClient::collect(resp, MAX_SSE_ERROR_BODY_BYTES).await
+                    {
+                        Ok((_st, _hdrs, bytes)) => bytes,
+                        Err(_) => Bytes::new(),
+                    };
+                    if is_permanent_sse_auth_denial(status, &body_bytes) {
+                        eprintln!(
+                            "hyphae: stopping SSE worker for peer '{}' after permanent HTTP {} denial",
+                            link.peer_id(),
+                            status.as_u16()
+                        );
+                        break;
+                    }
+                    let wait_ms = retry_hdr
+                        .unwrap_or(auth_backoff_ms)
+                        .max(auth_backoff_ms)
+                        .min(SSE_AUTH_MAX_BACKOFF_MS);
+                    let wait = Duration::from_millis(wait_ms);
                     tokio::select! {
                         _ = tokio::time::sleep(wait) => {}
                         _ = shutdown_rx.changed() => {
                             if *shutdown_rx.borrow() { break; }
                         }
                     }
-                    backoff_ms = (backoff_ms * 2).min(5_000);
+                    auth_backoff_ms = (auth_backoff_ms.saturating_mul(2)).min(SSE_AUTH_MAX_BACKOFF_MS);
+                }
+                Ok(resp) => {
+                    let retry_ms = parse_retry_after_ms(resp.headers()).unwrap_or(backoff_ms);
+                    let wait = Duration::from_millis(retry_ms.min(SSE_MAX_BACKOFF_MS));
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait) => {}
+                        _ = shutdown_rx.changed() => {
+                            if *shutdown_rx.borrow() { break; }
+                        }
+                    }
+                    backoff_ms = (backoff_ms * 2).min(SSE_MAX_BACKOFF_MS);
                 }
                 Err(_) => {
                     let wait = Duration::from_millis(backoff_ms);
@@ -1039,23 +1107,52 @@ pub fn spawn_sse_worker(
                             if *shutdown_rx.borrow() { break; }
                         }
                     }
-                    backoff_ms = (backoff_ms * 2).min(5_000);
+                    backoff_ms = (backoff_ms * 2).min(SSE_MAX_BACKOFF_MS);
                 }
             }
         }
     })
 }
 
+async fn reject_malformed_sse_item(
+    link: &Arc<PeerLink>,
+    kind: &str,
+    event_id: Option<&str>,
+    err: &serde_json::Error,
+) {
+    eprintln!(
+        "hyphae: skipping malformed SSE '{kind}' item from peer '{}': {err}",
+        link.peer_id()
+    );
+    let prefix = format!("{kind}:");
+    if let Some(raw_id) = event_id {
+        if let Some(item_id) = raw_id.strip_prefix(&prefix) {
+            if !item_id.is_empty() {
+                let _ = link
+                    .ack_inbox(&InboxAckRequest {
+                        kind: kind.to_string(),
+                        id: item_id.to_string(),
+                        outcome: AckOutcome::Rejected {
+                            reason: format!("malformed_sse_payload: {err}"),
+                        },
+                    })
+                    .await;
+            }
+        }
+    }
+}
+
 async fn dispatch_sse_event(
     node: &Arc<UnifiedNode>,
     link: &Arc<PeerLink>,
     event_name: Option<&str>,
+    event_id: Option<&str>,
     data: &str,
 ) {
     let peer_id = link.peer_id();
     match event_name {
-        Some("message") => {
-            if let Ok(msg) = serde_json::from_str::<MessageRecord>(data) {
+        Some("message") => match serde_json::from_str::<MessageRecord>(data) {
+            Ok(msg) => {
                 let id = msg.id.clone();
                 let outcome = match node.handle_inbound_peer_message(peer_id, msg).await {
                     Ok(()) => AckOutcome::Delivered,
@@ -1076,9 +1173,12 @@ async fn dispatch_sse_event(
                     })
                     .await;
             }
-        }
-        Some("batch") => {
-            if let Ok(batch) = serde_json::from_str::<DueBatch>(data) {
+            Err(err) => {
+                reject_malformed_sse_item(link, "message", event_id, &err).await;
+            }
+        },
+        Some("batch") => match serde_json::from_str::<DueBatch>(data) {
+            Ok(batch) => {
                 let id = batch.id.clone();
                 let outcome = match node.handle_inbound_peer_batch(peer_id, batch).await {
                     Ok(()) => AckOutcome::Delivered,
@@ -1094,9 +1194,12 @@ async fn dispatch_sse_event(
                     })
                     .await;
             }
-        }
-        Some("transfer") => {
-            if let Ok(transfer) = serde_json::from_str::<TransferRecord>(data) {
+            Err(err) => {
+                reject_malformed_sse_item(link, "batch", event_id, &err).await;
+            }
+        },
+        Some("transfer") => match serde_json::from_str::<TransferRecord>(data) {
+            Ok(transfer) => {
                 let id = transfer.id.clone();
                 let outcome = match node
                     .handle_inbound_peer_transfer(peer_id, link, transfer)
@@ -1115,7 +1218,10 @@ async fn dispatch_sse_event(
                     })
                     .await;
             }
-        }
+            Err(err) => {
+                reject_malformed_sse_item(link, "transfer", event_id, &err).await;
+            }
+        },
         _ => {}
     }
 }

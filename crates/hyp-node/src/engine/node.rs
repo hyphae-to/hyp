@@ -67,7 +67,8 @@ use hyp_proto::address::{
 };
 use hyp_proto::cloudevent::{
     CONTENT_TYPE_E2EE_JSON, CONTENT_TYPE_JSON, CloudEvent as ProtoCloudEvent, ProvenanceError,
-    TYPE_HUMAN_DROP_V1, TYPE_HUMAN_SECRET_STORED_V1,
+    TYPE_CHANNEL_V1, TYPE_DM_V1, TYPE_HUMAN_DROP_V1, TYPE_HUMAN_REVOCATION_V1,
+    TYPE_HUMAN_SECRET_STORED_V1, TYPE_TRANSFER_V1,
 };
 use hyp_proto::filter::{
     DiagnosticSeverity, Filter as ProtoFilter, LocalSubscription, ObservedTopicStats,
@@ -84,7 +85,8 @@ use hyp_store::{
     AckOutcome, ChannelEpoch, ChannelEpochInput, DeliveryMode, DueBatch, EnqueueMessage,
     GateAuditInput, GateDecision as StoreGateDecision, GateDirection, GateState, GrantDirection,
     GrantInput, GrantRecord, HandleRecord, HumanAuthorityRecord, HumanAuthorityRole,
-    HumanClaimKind, HumanNodeCertInput, IngestResult, KeyStatus, KeyUse, KvDeleteInput,
+    HumanAuthorityStatus, HumanClaimKind, HumanNodeCertInput, IngestResult, KeyStatus, KeyUse,
+    KvDeleteInput,
     KvDeleteResult, KvEntry, KvEpoch, KvEpochInput, KvSetInput, MailboxEntry, MailboxInsert,
     MailboxKind, MailboxPutOptions, MailboxPutResult, ManifestCacheUpdate, MessageRecord, NodeDb,
     PeerInput, PeerKeyInput, PeerRecord, PeerStatus, PostChannelInput, PostChannelResult, Session,
@@ -131,6 +133,19 @@ pub struct AuthenticatedPeer {
     pub peer_id: String,
     pub scopes: ScopeSet,
     pub trust_tier: TrustTier,
+}
+
+/// Action verified by [`UnifiedNode::authorize_peer_action`] across both inbound HTTP `POST`
+/// handlers and pulled outbound-only SSE `/v1/inbox` delivery (`P1-6`, `P1-18`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerAction<'a> {
+    DmSend { to_addr: &'a str },
+    ChannelPost { channel: &'a str },
+    TransferSend { to_node: &'a str, bytes: Option<u64> },
+    StreamPublish { topic: &'a str },
+    StreamDeliver { topic: &'a str },
+    KvRead { namespace: &'a str, key: &'a str },
+    KvWrite { namespace: &'a str, key: &'a str },
 }
 
 /// Summary returned after pairing and activating a `PeerLink`.
@@ -849,21 +864,26 @@ impl UnifiedNode {
         // Rank: 0 = local, 1 = direct peer (`h.node_id == pid`), 2 = hub-relayed.
         let mut by_addr: BTreeMap<String, (u8, DiscoveredPeerHandle)> = BTreeMap::new();
 
-        let (local_handles, active_peer_ids) = {
+        let (local_handles, active_peer_ids, indirect_allowed_peers) = {
             let db = self.db();
             let locals = db
                 .messages()
                 .list_handles(Some(self_node))
                 .unwrap_or_default();
-            let mut peer_ids: Vec<String> = db
+            let active_peers = db
                 .peers()
                 .list_peers(Some(PeerStatus::Active))
-                .unwrap_or_default()
-                .into_iter()
-                .map(|p| p.peer_id)
-                .collect();
+                .unwrap_or_default();
+            let mut peer_ids: Vec<String> = Vec::with_capacity(active_peers.len());
+            let mut indirect_allowed: HashSet<String> = HashSet::new();
+            for p in active_peers {
+                if peer_may_advertise_indirect_routes(&p) {
+                    indirect_allowed.insert(p.peer_id.clone());
+                }
+                peer_ids.push(p.peer_id);
+            }
             peer_ids.sort();
-            (locals, peer_ids)
+            (locals, peer_ids, indirect_allowed)
         };
 
         for h in local_handles {
@@ -895,6 +915,10 @@ impl UnifiedNode {
 
             for h in remote_handles {
                 if h.node_id == self_node {
+                    continue;
+                }
+                // P1-10: P2P and Guest peers may only advertise handles for their own peer_id.
+                if h.node_id != pid && !indirect_allowed_peers.contains(&pid) {
                     continue;
                 }
                 let rank = if h.node_id == pid { 1u8 } else { 2u8 };
@@ -1535,6 +1559,137 @@ impl UnifiedNode {
             current_scopes: peer.scopes.raw_scopes().to_vec(),
             escalation_note,
         })
+    }
+
+    /// Returns `true` iff `peer_id` is still active and has at least one non-revoked,
+    /// non-expired inbound grant (when inbound grants exist). Used by live `/v1/inbox`
+    /// SSE loops to terminate immediately upon revocation (`P1-4`).
+    pub(crate) fn is_peer_still_active(&self, peer_id: &str) -> bool {
+        if peer_id == self.config.node_id.as_str() {
+            return true;
+        }
+        let db = self.db();
+        load_active_authenticated_peer(&db, peer_id).is_ok()
+    }
+
+    /// Authorizes `action` for `peer_id` fail-closed against `PeerStore` status, grant
+    /// revocations, grant `expires_at` (`P1-18`), and granted `ScopeSet` (`P1-6`).
+    pub fn authorize_peer_action(
+        &self,
+        peer_id: &str,
+        action: PeerAction<'_>,
+    ) -> Result<AuthenticatedPeer, NodeError> {
+        if peer_id == self.config.node_id.as_str() {
+            return Ok(AuthenticatedPeer {
+                peer_id: self.config.node_id.to_string(),
+                scopes: ScopeSet::from_strings(&["*"]),
+                trust_tier: TrustTier::SelfNode,
+            });
+        }
+
+        let (auth_peer, profile, has_local_sub) = {
+            let db = self.db();
+            let (peer, profile) = load_active_authenticated_peer_with_profile(&db, peer_id)?;
+            let sub = match action {
+                PeerAction::StreamDeliver { topic }
+                    if profile != hyp_store::PeerProfile::Router =>
+                {
+                    db.events()
+                        .list_subscriptions(None)?
+                        .into_iter()
+                        .any(|s| s.origin_node == peer_id && s.topic == topic)
+                }
+                _ => false,
+            };
+            (peer, profile, sub)
+        };
+
+        let is_router = profile == hyp_store::PeerProfile::Router;
+        let (allowed, missing_scope) = match action {
+            PeerAction::DmSend { to_addr } => {
+                let ok = if is_router {
+                    auth_peer.scopes.may_dm_receive() || auth_peer.scopes.may_dm_send(to_addr)
+                } else {
+                    auth_peer.scopes.may_dm_send(to_addr)
+                };
+                (ok, format!("dm:send={to_addr}"))
+            }
+            PeerAction::ChannelPost { channel } => {
+                let ok = if is_router {
+                    auth_peer.scopes.may_channel_join(channel)
+                        || auth_peer.scopes.may_channel_post(channel)
+                } else {
+                    auth_peer.scopes.may_channel_post(channel)
+                };
+                (ok, format!("channel:post={channel}"))
+            }
+            PeerAction::TransferSend { to_node, bytes } => {
+                let ok = if is_router {
+                    auth_peer.scopes.may_receive_files(bytes.unwrap_or(0))
+                        || auth_peer.scopes.may_send_files(to_node, bytes)
+                } else {
+                    auth_peer.scopes.may_send_files(to_node, bytes)
+                };
+                (ok, format!("files:send={to_node}"))
+            }
+            PeerAction::StreamPublish { topic } => (
+                auth_peer.scopes.may_stream_publish(topic),
+                format!("stream:publish={topic}"),
+            ),
+            PeerAction::StreamDeliver { topic } => {
+                let ok = if is_router {
+                    peer_may_see_topic(&auth_peer.scopes, topic)
+                        || auth_peer.scopes.may_stream_publish(topic)
+                        || (topic == "kv" && peer_has_any_kv_read(&auth_peer.scopes))
+                } else {
+                    auth_peer.scopes.may_stream_publish(topic)
+                        || (peer_may_see_topic(&auth_peer.scopes, topic) && has_local_sub)
+                };
+                (ok, format!("stream:publish={topic}"))
+            }
+            PeerAction::KvRead { namespace, key } => (
+                auth_peer.scopes.may_kv_read(namespace, key),
+                format!("kv:read={namespace}/{key}"),
+            ),
+            PeerAction::KvWrite { namespace, key } => (
+                auth_peer.scopes.may_kv_write(namespace, key),
+                format!("kv:write={namespace}/{key}"),
+            ),
+        };
+
+        self.require_scope(&auth_peer, allowed, &missing_scope)?;
+        Ok(auth_peer)
+    }
+
+    fn record_peer_scope_denied_audit(
+        &self,
+        origin_node: &str,
+        event_type: &str,
+        reason: &str,
+        payload_digest_input: &[u8],
+    ) {
+        let now = now_ms();
+        let db = self.db();
+        let _ = db.local().append_gate_audit(
+            &GateAuditInput {
+                direction: GateDirection::Inbound,
+                stage: "peer_scope".to_string(),
+                decision: StoreGateDecision::Block,
+                origin_node: Some(origin_node.to_string()),
+                source: Some(origin_node.to_string()),
+                session_id: None,
+                receipt_id: None,
+                event_type: Some(event_type.to_string()),
+                trust_tier: Some("peer".to_string()),
+                confidence: None,
+                categories: vec!["peer.scope_denied".to_string()],
+                reason: Some(reason.to_string()),
+                traceparent: None,
+                payload_sha256: sha256_hex(payload_digest_input),
+                reviewer: None,
+            },
+            now,
+        );
     }
 
     fn issue_peer_bearer_token(&self, peer_id: &str) -> Result<String, NodeError> {
@@ -2890,15 +3045,17 @@ impl UnifiedNode {
     ) -> PeerReconcileReport {
         let _guard = self.peer_reconcile_lock.lock().await;
 
-        let desired: BTreeMap<String, String> = {
+        let (desired, has_inactive_peers) = {
             let db = self.db();
-            let peers = db
-                .peers()
-                .list_peers(Some(PeerStatus::Active))
-                .unwrap_or_default();
+            let all_peers = db.peers().list_peers(None).unwrap_or_default();
             let mut map = BTreeMap::new();
-            for p in peers {
+            let mut inactive = false;
+            for p in all_peers {
                 if p.peer_id == self.config.node_id.as_str() {
+                    continue;
+                }
+                if p.status != PeerStatus::Active {
+                    inactive = true;
                     continue;
                 }
                 if let Some(ep) = p
@@ -2910,10 +3067,12 @@ impl UnifiedNode {
                     map.insert(p.peer_id, ep.to_string());
                 }
             }
-            map
+            (map, inactive)
         };
 
-        let mut to_remove: Vec<String> = {
+        // P1-4: Inspect ALL currently tracked outbound PeerLinks and SSE worker tasks and
+        // immediately drop any peer whose row is no longer `PeerStatus::Active` or was deleted.
+        let mut to_remove_set: BTreeSet<String> = {
             let links = self.peer_links.read().await;
             links
                 .keys()
@@ -2921,13 +3080,27 @@ impl UnifiedNode {
                 .cloned()
                 .collect()
         };
-        to_remove.sort();
+        {
+            let tasks = self.sse_tasks.lock().expect("sse_tasks lock poisoned");
+            for pid in tasks.keys() {
+                if !desired.contains_key(pid) {
+                    to_remove_set.insert(pid.clone());
+                }
+            }
+        }
+        let to_remove: Vec<String> = to_remove_set.into_iter().collect();
 
         let mut removed = 0usize;
         for pid in to_remove {
             if self.disconnect_peer(&pid).await {
                 removed += 1;
             }
+            self.notify_peer_inbox(&pid);
+        }
+        if removed > 0 || has_inactive_peers {
+            // Wake any live inbound `/v1/inbox` SSE loops so revoked/paused/deleted peers
+            // immediately re-check `PeerStore` status and close their stream!
+            self.notify_all_inbox_subscribers();
         }
 
         let existing_links: HashMap<String, Arc<PeerLink>> = {
@@ -3002,6 +3175,26 @@ impl UnifiedNode {
     }
 
     async fn require_peer_link(&self, peer_id: &str) -> Result<Arc<PeerLink>, NodeError> {
+        let peer_status = {
+            let db = self.db();
+            db.peers().get_peer(peer_id)?.map(|p| p.status)
+        };
+        match peer_status {
+            Some(PeerStatus::Active) => {}
+            Some(status) => {
+                let _ = self.disconnect_peer(peer_id).await;
+                return Err(NodeError::Unauthorized(format!(
+                    "peer '{peer_id}' is not active (status: {})",
+                    status.as_str()
+                )));
+            }
+            None => {
+                let _ = self.disconnect_peer(peer_id).await;
+                return Err(NodeError::NotFound(format!(
+                    "no active PeerLink to '{peer_id}'"
+                )));
+            }
+        }
         self.peer_link(peer_id)
             .await
             .ok_or_else(|| NodeError::NotFound(format!("no active PeerLink to '{peer_id}'")))
@@ -3042,6 +3235,18 @@ impl UnifiedNode {
     fn learn_routes_from_handles(&self, via_peer: &str, handles: &[HandleRecord]) {
         let now = now_ms();
         let db = self.db();
+        // P1-10 (#1): Only trust indirect routes (`handle.node_id != via_peer`) from an
+        // active Router/Hub peer (`PeerProfile::Router` + `TrustTier::Org`). A P2P or Guest
+        // peer may ONLY advertise handles for its own `peer_id`.
+        let via_trusted_router = db
+            .peers()
+            .get_peer(via_peer)
+            .ok()
+            .flatten()
+            .is_some_and(|p| peer_may_advertise_indirect_routes(&p));
+        if !via_trusted_router {
+            return;
+        }
         let mut seen_nodes = HashSet::new();
         for h in handles {
             if h.node_id == self.config.node_id.as_str() || h.node_id == via_peer {
@@ -3050,15 +3255,15 @@ impl UnifiedNode {
             if !seen_nodes.insert(h.node_id.as_str()) {
                 continue;
             }
-            let is_direct_p2p = db
+            // P1-10 (#2): NEVER overwrite an existing direct `Active` peer (any profile in
+            // `peers` table) with an indirect route learned from another peer.
+            let is_direct_active_peer = db
                 .peers()
                 .get_peer(&h.node_id)
                 .ok()
                 .flatten()
-                .is_some_and(|p| {
-                    p.profile == hyp_store::PeerProfile::P2p && p.status == PeerStatus::Active
-                });
-            if is_direct_p2p {
+                .is_some_and(|p| p.status == PeerStatus::Active);
+            if is_direct_active_peer {
                 continue;
             }
             let _ = db.peers().upsert_peer_route(&h.node_id, via_peer, now);
@@ -3870,6 +4075,30 @@ impl UnifiedNode {
                 "message addressed to '{to_node}', not '{}'",
                 self.config.node_id
             )));
+        }
+
+        // P1-6: Enforce active peer status & counter-grant scopes fail-closed on pulled SSE items.
+        if origin_node != self.config.node_id.as_str() {
+            let action = match msg.channel.as_deref() {
+                Some(ch) => PeerAction::ChannelPost { channel: ch },
+                None => PeerAction::DmSend {
+                    to_addr: &msg.to_addr,
+                },
+            };
+            if let Err(err) = self.authorize_peer_action(origin_node, action) {
+                let ev_type = if msg.channel.is_some() {
+                    TYPE_CHANNEL_V1
+                } else {
+                    TYPE_DM_V1
+                };
+                self.record_peer_scope_denied_audit(
+                    origin_node,
+                    ev_type,
+                    &err.to_string(),
+                    msg.id.as_bytes(),
+                );
+                return Err(err);
+            }
         }
 
         let origin_link = self.peer_link(origin_node).await;
@@ -5593,6 +5822,24 @@ impl UnifiedNode {
         link: &Arc<PeerLink>,
         transfer: TransferRecord,
     ) -> Result<(), NodeError> {
+        // P1-6: Verify active peer status & files scope BEFORE downloading the encrypted blob!
+        if origin_node != self.config.node_id.as_str() {
+            if let Err(err) = self.authorize_peer_action(
+                origin_node,
+                PeerAction::TransferSend {
+                    to_node: self.config.node_id.as_str(),
+                    bytes: Some(transfer.size),
+                },
+            ) {
+                self.record_peer_scope_denied_audit(
+                    origin_node,
+                    TYPE_TRANSFER_V1,
+                    &err.to_string(),
+                    transfer.id.as_bytes(),
+                );
+                return Err(err);
+            }
+        }
         let blob = link.download_transfer(&transfer.id).await?;
         let actual_sha = sha256_hex(&blob);
         if actual_sha != transfer.sha256 {
@@ -6251,6 +6498,25 @@ impl UnifiedNode {
                 .map_err(map_provenance_err)?;
         }
 
+        // H4: Auto-process signed `to.hyphae.human.revocation.v1` events fail-closed when this
+        // node has enrolled human authorities (blind relay hubs without authorities still validate
+        // structure before fanning out to downstream nodes).
+        if validated.event_type == TYPE_HUMAN_REVOCATION_V1 {
+            let data_val = validated.data.as_ref().ok_or_else(|| {
+                NodeError::BadRequest(
+                    "to.hyphae.human.revocation.v1 event missing data payload".into(),
+                )
+            })?;
+            let signed_rev = extract_signed_human_revocation(data_val)?;
+            let has_authorities = {
+                let db = self.db();
+                !db.human().list_authorities(true)?.is_empty()
+            };
+            if has_authorities {
+                self.ingest_human_revocation(&signed_rev)?;
+            }
+        }
+
         let store_ev = proto_ce_to_store(&validated)?;
         let now = now_ms();
         let res = {
@@ -6403,16 +6669,65 @@ impl UnifiedNode {
         origin_node: &str,
         batch: DueBatch,
     ) -> Result<(), NodeError> {
+        // P1-6: Verify active peer status & stream/KV scope fail-closed on pulled SSE batches.
+        if origin_node != self.config.node_id.as_str() {
+            let auth_peer = match self.authorize_peer_action(
+                origin_node,
+                PeerAction::StreamDeliver {
+                    topic: &batch.topic,
+                },
+            ) {
+                Ok(peer) => peer,
+                Err(err) => {
+                    self.record_peer_scope_denied_audit(
+                        origin_node,
+                        &format!("stream.{}", batch.topic),
+                        &err.to_string(),
+                        batch.id.as_bytes(),
+                    );
+                    return Err(err);
+                }
+            };
+            if batch.topic == "kv"
+                && !peer_may_see_topic(&auth_peer.scopes, "kv")
+                && !auth_peer.scopes.may_stream_publish("kv")
+            {
+                for ev in &batch.events {
+                    let ns = ev.extensions.get("ns").map(String::as_str).unwrap_or("");
+                    let key = ev.extensions.get("key").map(String::as_str).unwrap_or("");
+                    if let Err(err) = self.require_scope(
+                        &auth_peer,
+                        auth_peer.scopes.may_kv_read(ns, key),
+                        &format!("kv:read={ns}/{key}"),
+                    ) {
+                        self.record_peer_scope_denied_audit(
+                            origin_node,
+                            "stream.kv",
+                            &err.to_string(),
+                            batch.id.as_bytes(),
+                        );
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
         let max_hops = self.config.forwarding.effective_max_hops();
         let origin_link = self.peer_link(origin_node).await;
 
-        // 1. Validate loop/hop provenance & optionally decrypt `kv.e2ee.v1` events.
+        // 1. Validate loop/hop provenance, apply H4 human revocations, and decrypt `kv.e2ee.v1`.
         let mut prepared_events = Vec::with_capacity(batch.events.len());
         for mut ev in batch.events {
             let proto_ev = store_ce_to_proto(&ev);
             proto_ev
                 .check_forwarding(&self.config.node_id, None, max_hops)
                 .map_err(map_provenance_err)?;
+
+            // H4: Auto-apply signed `to.hyphae.human.revocation.v1` events fail-closed!
+            if ev.event_type == TYPE_HUMAN_REVOCATION_V1 {
+                let signed_rev = extract_signed_human_revocation(&ev.data)?;
+                self.ingest_human_revocation(&signed_rev)?;
+            }
 
             // Transparently decrypt E2EE KV delta CloudEvents!
             if ev.event_type == "to.hyphae.kv.set" && ev.datacontenttype == CONTENT_TYPE_E2EE_JSON {
@@ -6551,10 +6866,62 @@ impl UnifiedNode {
         gate: Option<&SecurityGatePipeline>,
         overwrite_secret: bool,
     ) -> Result<IngestedHumanDrop, NodeError> {
-        let envelope = decode_hdrop1(token)
-            .map_err(|e| NodeError::Unauthorized(format!("invalid hdrop1_ token: {e}")))?;
+        let envelope = match decode_hdrop1(token) {
+            Ok(env) => env,
+            Err(e) => {
+                let reason = format!("invalid hdrop1_ token: {e}");
+                self.record_human_drop_rejected_audit(
+                    None,
+                    None,
+                    None,
+                    Some("human.invalid_token"),
+                    &reason,
+                    b"redacted-hdrop1",
+                    now_ms(),
+                );
+                return Err(NodeError::Unauthorized(reason));
+            }
+        };
         self.ingest_human_drop(&envelope, gate, overwrite_secret)
             .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_human_drop_rejected_audit(
+        &self,
+        source: Option<String>,
+        session_id: Option<String>,
+        event_type: Option<&str>,
+        extra_category: Option<&str>,
+        reason: &str,
+        payload_digest_input: &[u8],
+        now: i64,
+    ) {
+        let mut categories = vec!["gate.human_drop_rejected".to_string()];
+        if let Some(cat) = extra_category {
+            categories.push(cat.to_string());
+        }
+        let db = self.db();
+        let _ = db.local().append_gate_audit(
+            &GateAuditInput {
+                direction: GateDirection::Inbound,
+                stage: "human_authority".to_string(),
+                decision: StoreGateDecision::Block,
+                origin_node: Some(self.node_id().to_string()),
+                source,
+                session_id,
+                receipt_id: None,
+                event_type: Some(event_type.unwrap_or(TYPE_HUMAN_DROP_V1).to_string()),
+                trust_tier: Some("unverified".to_string()),
+                confidence: None,
+                categories,
+                reason: Some(reason.to_string()),
+                traceparent: None,
+                payload_sha256: sha256_hex(payload_digest_input),
+                reviewer: None,
+            },
+            now,
+        );
     }
 
     /// Strictly opens, verifies, replay-guards, and ingests a sealed [`HumanDropEnvelopeV1`]:
@@ -6562,12 +6929,15 @@ impl UnifiedNode {
     /// - Fails closed if `gate` reports `is_policy_tampered() == true`.
     /// - Decrypts Mode B HPKE (`human.drop.v1`) with this node's X25519 key, verifies the inner
     ///   Ed25519 signature against an active authority in `human_authorities`, enforces audience
-    ///   (`nodeId`, `nodeEncKid`), monotonic `min_auth_epoch`, TTL (`<= 15m`), clock skew (`60s`),
-    ///   and single-use atomic `claim_id` nonce consumption.
+    ///   (`nodeId`, `nodeEncKid`), monotonic `min_auth_epoch` AND exact authority key epoch binding
+    ///   (`rec.auth_epoch >= min_epoch && claim.auth_epoch == rec.auth_epoch`, H5), TTL (`<= 15m`),
+    ///   clock skew (`60s`), and single-use atomic `claim_id` nonce consumption.
+    /// - Writes an immutable `gate_audit` row (`gate.human_drop_rejected`) on every rejected,
+    ///   expired, revoked, epoch-stale, or replayed drop claim before returning `Err` (H11).
     /// - **`HumanDropKind::Secret`**: writes directly to [`SecretStore`] after reserved-name and
-    ///   overwrite checks; **zero** secret bytes ever touch SQLite, logs, errors, or return values;
-    ///   delivers a metadata-only notice to the target local session and records a `human_authority`
-    ///   audit row.
+    ///   human-signed overwrite checks (`spec.overwrite` governs fail-closed, H15); **zero** secret
+    ///   bytes ever touch SQLite, logs, errors, or return values; delivers a metadata-only notice to
+    ///   the target local session and records a `human_authority` audit row.
     /// - **`HumanDropKind::Directive`**: delivers with [`GateTrustTier::HumanVerified`] through
     ///   `gate` (bypassing Stage 2 / untrusted regexes while preserving anti-tamper & rate/size
     ///   limits) or directly into `mailbox` + `gate_audit` when `gate` is `None`.
@@ -6577,49 +6947,151 @@ impl UnifiedNode {
         gate: Option<&SecurityGatePipeline>,
         overwrite_secret: bool,
     ) -> Result<IngestedHumanDrop, NodeError> {
+        let now = now_ms();
         if let Some(g) = gate {
             if g.is_policy_tampered() {
+                self.record_human_drop_rejected_audit(
+                    None,
+                    None,
+                    None,
+                    Some("gate.policy_tampered"),
+                    "gate_policy_tampered",
+                    envelope.ct.as_bytes(),
+                    now,
+                );
                 return Err(NodeError::Unauthorized("gate_policy_tampered".into()));
             }
         }
 
-        let now = now_ms();
         let mut matched_authority: Option<HumanAuthorityRecord> = None;
-        let claim = Zeroizing::new(
-            open_human_drop(
-                envelope,
-                &self.identity.encryption,
-                self.node_id().as_str(),
+        let mut rejected_stale_epoch_key = false;
+        let claim = match open_human_drop(
+            envelope,
+            &self.identity.encryption,
+            self.node_id().as_str(),
+            now,
+            |human_id, human_kid| {
+                let db = self.db();
+                let min_epoch = db.human().min_auth_epoch().ok()?;
+                let rec = db.human().get_active_authority_by_kid(human_kid).ok()??;
+                if rec.human_id != human_id {
+                    return None;
+                }
+                // H5: Bumping `min_auth_epoch` MUST invalidate old-epoch keys even if the
+                // signer lies about `claim.auth_epoch` inside the claim payload!
+                if rec.auth_epoch < min_epoch {
+                    rejected_stale_epoch_key = true;
+                    return None;
+                }
+                let jwk: CryptoOkpJwk = serde_json::from_str(&rec.jwk_json).ok()?;
+                let pk = jwk.to_ed25519().ok()?;
+                matched_authority = Some(rec);
+                Some((pk, min_epoch))
+            },
+        ) {
+            Ok(c) => Zeroizing::new(c),
+            Err(e) => {
+                let err_msg = e.to_string();
+                let lower = err_msg.to_ascii_lowercase();
+                let extra_cat = if rejected_stale_epoch_key || lower.contains("authepoch") {
+                    "human.epoch_stale"
+                } else if lower.contains("expired") {
+                    "human.expired"
+                } else if lower.contains("unknown or revoked") {
+                    "human.revoked_or_unknown"
+                } else if lower.contains("reserved system secret") {
+                    "human.reserved_secret"
+                } else {
+                    "human.verification_failed"
+                };
+                let reason = format!("human drop verification failed: {err_msg}");
+                self.record_human_drop_rejected_audit(
+                    None,
+                    None,
+                    None,
+                    Some(extra_cat),
+                    &reason,
+                    envelope.ct.as_bytes(),
+                    now,
+                );
+                return Err(NodeError::Unauthorized(reason));
+            }
+        };
+
+        let auth_rec = match matched_authority {
+            Some(rec) => rec,
+            None => {
+                let reason = "verified human authority record unavailable";
+                self.record_human_drop_rejected_audit(
+                    None,
+                    None,
+                    None,
+                    Some("human.revoked_or_unknown"),
+                    reason,
+                    envelope.ct.as_bytes(),
+                    now,
+                );
+                return Err(NodeError::Unauthorized(reason.into()));
+            }
+        };
+
+        let kid8: String = auth_rec.kid.chars().take(8).collect();
+        let source = format!("human:{}:{}", auth_rec.human_id, kid8);
+
+        // H5: Enforce exact epoch binding (`claim.auth_epoch == rec.auth_epoch`), preventing an
+        // old-epoch key from claiming a forged higher epoch.
+        if claim.auth_epoch != auth_rec.auth_epoch {
+            let reason = format!(
+                "human claim authEpoch {} does not match enrolled authority key epoch {}",
+                claim.auth_epoch, auth_rec.auth_epoch
+            );
+            self.record_human_drop_rejected_audit(
+                Some(source),
+                None,
+                None,
+                Some("human.epoch_mismatch"),
+                &reason,
+                envelope.ct.as_bytes(),
                 now,
-                |human_id, human_kid| {
-                    let db = self.db();
-                    let min_epoch = db.human().min_auth_epoch().ok()?;
-                    let rec = db.human().get_active_authority_by_kid(human_kid).ok()??;
-                    if rec.human_id != human_id {
-                        return None;
-                    }
-                    let jwk: CryptoOkpJwk = serde_json::from_str(&rec.jwk_json).ok()?;
-                    let pk = jwk.to_ed25519().ok()?;
-                    matched_authority = Some(rec);
-                    Some((pk, min_epoch))
-                },
-            )
-            .map_err(|e| NodeError::Unauthorized(format!("human drop verification failed: {e}")))?,
-        );
+            );
+            return Err(NodeError::Unauthorized(reason));
+        }
 
-        let auth_rec = matched_authority.ok_or_else(|| {
-            NodeError::Unauthorized("verified human authority record unavailable".into())
-        })?;
-
-        let issued_at_ms = parse_rfc3339_millis(&claim.issued_at)
-            .map_err(|e| NodeError::BadRequest(format!("invalid claim issuedAt: {e}")))?;
-        let expires_at_ms = parse_rfc3339_millis(&claim.expires_at)
-            .map_err(|e| NodeError::BadRequest(format!("invalid claim expiresAt: {e}")))?;
+        let issued_at_ms = match parse_rfc3339_millis(&claim.issued_at) {
+            Ok(ms) => ms,
+            Err(e) => {
+                let reason = format!("invalid claim issuedAt: {e}");
+                self.record_human_drop_rejected_audit(
+                    Some(source),
+                    None,
+                    None,
+                    Some("human.invalid_timestamp"),
+                    &reason,
+                    envelope.ct.as_bytes(),
+                    now,
+                );
+                return Err(NodeError::BadRequest(reason));
+            }
+        };
+        let expires_at_ms = match parse_rfc3339_millis(&claim.expires_at) {
+            Ok(ms) => ms,
+            Err(e) => {
+                let reason = format!("invalid claim expiresAt: {e}");
+                self.record_human_drop_rejected_audit(
+                    Some(source),
+                    None,
+                    None,
+                    Some("human.invalid_timestamp"),
+                    &reason,
+                    envelope.ct.as_bytes(),
+                    now,
+                );
+                return Err(NodeError::BadRequest(reason));
+            }
+        };
 
         let target_handle = claim.audience.handle.clone();
         let target_session = self.resolve_human_drop_target_session(target_handle.as_deref())?;
-        let kid8: String = auth_rec.kid.chars().take(8).collect();
-        let source = format!("human:{}:{}", auth_rec.human_id, kid8);
 
         let verified_claim = VerifiedHumanClaim {
             human_id: auth_rec.human_id.clone(),
@@ -6633,28 +7105,83 @@ impl UnifiedNode {
 
         match claim.kind {
             HumanDropKind::Secret => {
-                let spec = claim.secret_spec.as_ref().ok_or_else(|| {
-                    NodeError::BadRequest("secret drop claim missing secretSpec".into())
-                })?;
+                let spec = match claim.secret_spec.as_ref() {
+                    Some(s) => s,
+                    None => {
+                        let reason = "secret drop claim missing secretSpec";
+                        self.record_human_drop_rejected_audit(
+                            Some(source),
+                            Some(target_session),
+                            Some(TYPE_HUMAN_DROP_V1),
+                            Some("human.invalid_secret_spec"),
+                            reason,
+                            b"redacted-secret",
+                            now,
+                        );
+                        return Err(NodeError::BadRequest(reason.into()));
+                    }
+                };
                 let secret_name = spec.name.trim();
                 if secret_name.is_empty() {
-                    return Err(NodeError::BadRequest(
-                        "secret drop name must not be empty".into(),
-                    ));
+                    let reason = "secret drop name must not be empty";
+                    self.record_human_drop_rejected_audit(
+                        Some(source),
+                        Some(target_session),
+                        Some(TYPE_HUMAN_DROP_V1),
+                        Some("human.invalid_secret_name"),
+                        reason,
+                        b"redacted-secret",
+                        now,
+                    );
+                    return Err(NodeError::BadRequest(reason.into()));
                 }
                 if is_reserved_human_drop_secret_name(secret_name) {
-                    return Err(NodeError::Unauthorized(format!(
+                    let reason = format!(
                         "reserved system secret name '{secret_name}' cannot be written via human drop"
-                    )));
+                    );
+                    self.record_human_drop_rejected_audit(
+                        Some(source),
+                        Some(target_session),
+                        Some(TYPE_HUMAN_DROP_V1),
+                        Some("human.reserved_secret"),
+                        &reason,
+                        b"redacted-secret",
+                        now,
+                    );
+                    return Err(NodeError::Unauthorized(reason));
                 }
-                validate_secret_name(secret_name)
-                    .map_err(|e| NodeError::BadRequest(format!("invalid secret name: {e}")))?;
+                if let Err(e) = validate_secret_name(secret_name) {
+                    let reason = format!("invalid secret name: {e}");
+                    self.record_human_drop_rejected_audit(
+                        Some(source),
+                        Some(target_session),
+                        Some(TYPE_HUMAN_DROP_V1),
+                        Some("human.invalid_secret_name"),
+                        &reason,
+                        b"redacted-secret",
+                        now,
+                    );
+                    return Err(NodeError::BadRequest(reason));
+                }
 
-                let allow_overwrite = overwrite_secret || spec.overwrite;
+                // H15: Human-signed `spec.overwrite` governs fail-closed; a local
+                // `overwrite_secret` flag MUST NEVER override a human's signed `overwrite: false`.
+                let _ = overwrite_secret;
+                let allow_overwrite = spec.overwrite;
                 if !allow_overwrite && self.secrets.get(secret_name).is_ok() {
-                    return Err(NodeError::Conflict(format!(
-                        "secret '{secret_name}' already exists; pass overwrite to replace"
-                    )));
+                    let reason = format!(
+                        "secret '{secret_name}' already exists and signed claim specifies overwrite=false"
+                    );
+                    self.record_human_drop_rejected_audit(
+                        Some(source),
+                        Some(target_session),
+                        Some(TYPE_HUMAN_DROP_V1),
+                        Some("human.secret_exists"),
+                        &reason,
+                        b"redacted-secret",
+                        now,
+                    );
+                    return Err(NodeError::Conflict(reason));
                 }
 
                 // Atomically consume single-use claim nonce before writing to SecretStore.
@@ -6669,9 +7196,17 @@ impl UnifiedNode {
                     )?
                 };
                 if !fresh {
-                    return Err(NodeError::Unauthorized(
-                        "human drop claim replay detected".into(),
-                    ));
+                    let reason = "human drop claim replay detected";
+                    self.record_human_drop_rejected_audit(
+                        Some(source),
+                        Some(target_session),
+                        Some(TYPE_HUMAN_DROP_V1),
+                        Some("human.claim_replay"),
+                        reason,
+                        b"redacted-secret",
+                        now,
+                    );
+                    return Err(NodeError::Unauthorized(reason.into()));
                 }
 
                 // Zero-knowledge secret sink: write directly to SecretStore; NEVER persist secret
@@ -6765,9 +7300,17 @@ impl UnifiedNode {
                     )?
                 };
                 if !fresh {
-                    return Err(NodeError::Unauthorized(
-                        "human drop claim replay detected".into(),
-                    ));
+                    let reason = "human drop claim replay detected";
+                    self.record_human_drop_rejected_audit(
+                        Some(source),
+                        Some(target_session),
+                        Some(TYPE_HUMAN_DROP_V1),
+                        Some("human.claim_replay"),
+                        reason,
+                        envelope.ct.as_bytes(),
+                        now,
+                    );
+                    return Err(NodeError::Unauthorized(reason.into()));
                 }
 
                 let body = claim.body.clone();
@@ -6921,16 +7464,43 @@ impl UnifiedNode {
         signed: &SignedHumanRevocationV1,
     ) -> Result<(), NodeError> {
         let preview: HumanRevocationPayloadV1 = serde_json::from_str(&signed.payload)?;
-        let issuer = {
+        let signed_json = serde_json::to_string(signed)?;
+        let active_issuer = {
             let db = self.db();
             db.human().get_active_authority_by_kid(&preview.issuer_kid)?
-        }
-        .ok_or_else(|| {
-            NodeError::Unauthorized(format!(
-                "unknown or inactive human revocation issuer kid '{}'",
-                preview.issuer_kid
-            ))
-        })?;
+        };
+        let issuer = match active_issuer {
+            Some(rec) => rec,
+            None => {
+                // Idempotent redelivery of an already-applied self-revocation by an admin key.
+                if preview.issuer_kid == preview.revoked_kid {
+                    let existing = {
+                        let db = self.db();
+                        db.human()
+                            .get_authority(&preview.human_id, &preview.revoked_kid)?
+                    };
+                    if let Some(prev) = existing {
+                        if prev.status == HumanAuthorityStatus::Revoked
+                            && prev.role == HumanAuthorityRole::Admin
+                            && prev.revocation_json.as_deref() == Some(signed_json.as_str())
+                        {
+                            let jwk: CryptoOkpJwk = serde_json::from_str(&prev.jwk_json)?;
+                            let issuer_pk = jwk.to_ed25519()?;
+                            verify_human_revocation(signed, &issuer_pk).map_err(|e| {
+                                NodeError::Unauthorized(format!(
+                                    "human revocation signature verification failed: {e}"
+                                ))
+                            })?;
+                            return Ok(());
+                        }
+                    }
+                }
+                return Err(NodeError::Unauthorized(format!(
+                    "unknown or inactive human revocation issuer kid '{}'",
+                    preview.issuer_kid
+                )));
+            }
+        };
 
         if issuer.role != HumanAuthorityRole::Admin {
             return Err(NodeError::Unauthorized(format!(
@@ -6945,7 +7515,6 @@ impl UnifiedNode {
             NodeError::Unauthorized(format!("human revocation signature verification failed: {e}"))
         })?;
 
-        let signed_json = serde_json::to_string(signed)?;
         let db = self.db();
         let _ = db.human().revoke_authority_monotonic(
             &verified.human_id,
@@ -7203,10 +7772,52 @@ fn load_channel_policies_from_db(db: &NodeDb) -> BTreeMap<String, ChannelPolicy>
     serde_json::from_str(&raw).unwrap_or_default()
 }
 
+fn peer_may_advertise_indirect_routes(peer: &PeerRecord) -> bool {
+    peer.status == PeerStatus::Active
+        && peer.profile == hyp_store::PeerProfile::Router
+        && peer.trust_tier == TrustTier::Org
+}
+
+fn peer_has_any_kv_read(scopes: &ScopeSet) -> bool {
+    scopes.raw_scopes().iter().any(|s| {
+        s == "*" || s == "kv:*" || s == "kv:read" || s.starts_with("kv:read=")
+    })
+}
+
+fn extract_signed_human_revocation(data: &Value) -> Result<SignedHumanRevocationV1, NodeError> {
+    let candidate = if data.get("payload").is_some() && data.get("sig").is_some() {
+        data.clone()
+    } else if let Some(inner) = data.get("revocation").or_else(|| data.get("signedRevocation")) {
+        inner.clone()
+    } else {
+        return Err(NodeError::BadRequest(
+            "to.hyphae.human.revocation.v1 payload missing signed revocation object".into(),
+        ));
+    };
+    let signed: SignedHumanRevocationV1 = serde_json::from_value(candidate).map_err(|e| {
+        NodeError::BadRequest(format!(
+            "invalid to.hyphae.human.revocation.v1 payload: {e}"
+        ))
+    })?;
+    if signed.payload.is_empty() || signed.sig.is_empty() {
+        return Err(NodeError::BadRequest(
+            "to.hyphae.human.revocation.v1 payload and sig must be non-empty".into(),
+        ));
+    }
+    Ok(signed)
+}
+
 fn load_active_authenticated_peer(
     db: &NodeDb,
     peer_id: &str,
 ) -> Result<AuthenticatedPeer, NodeError> {
+    load_active_authenticated_peer_with_profile(db, peer_id).map(|(peer, _)| peer)
+}
+
+fn load_active_authenticated_peer_with_profile(
+    db: &NodeDb,
+    peer_id: &str,
+) -> Result<(AuthenticatedPeer, hyp_store::PeerProfile), NodeError> {
     let peer: PeerRecord = db
         .peers()
         .get_peer(peer_id)?
@@ -7217,7 +7828,8 @@ fn load_active_authenticated_peer(
             peer.status.as_str()
         )));
     }
-    // Fail closed if every inbound grant for this peer has been revoked.
+    let now = now_ms();
+    // Fail closed if every inbound grant for this peer has been revoked or expired (P1-18).
     let inbound_grants: Vec<GrantRecord> = db
         .peers()
         .list_grants(Some(peer_id))?
@@ -7225,25 +7837,41 @@ fn load_active_authenticated_peer(
         .filter(|g| g.direction == GrantDirection::Inbound)
         .collect();
     if !inbound_grants.is_empty() {
+        let mut any_not_revoked = false;
         let mut any_valid = false;
         for g in &inbound_grants {
-            if !db.peers().is_grant_revoked(&g.id)? {
-                any_valid = true;
-                break;
+            if db.peers().is_grant_revoked(&g.id)? {
+                continue;
             }
+            any_not_revoked = true;
+            if let Some(exp) = g.expires_at {
+                if exp <= now {
+                    continue;
+                }
+            }
+            any_valid = true;
+            break;
         }
-        if !any_valid {
+        if !any_not_revoked {
             return Err(NodeError::Unauthorized(format!(
                 "all grants for peer '{peer_id}' have been revoked"
             )));
         }
+        if !any_valid {
+            return Err(NodeError::Unauthorized(format!(
+                "all grants for peer '{peer_id}' have expired"
+            )));
+        }
     }
 
-    Ok(AuthenticatedPeer {
-        peer_id: peer.peer_id,
-        scopes: ScopeSet::from_strings(&peer.scopes),
-        trust_tier: peer.trust_tier,
-    })
+    Ok((
+        AuthenticatedPeer {
+            peer_id: peer.peer_id,
+            scopes: ScopeSet::from_strings(&peer.scopes),
+            trust_tier: peer.trust_tier,
+        },
+        peer.profile,
+    ))
 }
 
 fn lookup_peer_signing_key_in_db(

@@ -92,6 +92,7 @@ const RESERVED_SECRET_PREFIXES: &[&str] = &[
     "human-admin-",
     "human-authority-",
     "auth-token-",
+    "staged-join-token-",
 ];
 
 const RESERVED_SECRET_EXACT: &[&str] = &[
@@ -101,6 +102,9 @@ const RESERVED_SECRET_EXACT: &[&str] = &[
     "human-admin",
     "human-authority",
     "auth-token",
+    "t3-auth-token",
+    "t3-session-token",
+    "staged-join-token",
 ];
 
 /// Supported MVP sealed drop kinds (`directive` or `secret`).
@@ -369,7 +373,8 @@ pub fn derive_prf_x25519_keypair(
 /// Fail-closed case-insensitive denylist rejecting Hyphae internal system secret names.
 ///
 /// Rejects: `node-sign-*`, `node-enc-*`, `id-sign-*`, `id-enc-*`, `admin-ca-*`,
-/// `gate-policy-*`, `human-admin-*`, `human-authority-*`, `auth-token-*`.
+/// `gate-policy-*`, `human-admin-*`, `human-authority-*`, `auth-token-*`,
+/// `t3-auth-token`, `t3-session-token`, `staged-join-token`, and `staged-join-token-*`.
 pub fn is_reserved_secret_name(name: &str) -> bool {
     let lower = name.trim().to_ascii_lowercase();
     RESERVED_SECRET_EXACT.contains(&lower.as_str())

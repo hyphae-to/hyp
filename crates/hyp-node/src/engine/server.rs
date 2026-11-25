@@ -19,7 +19,7 @@
 
 use std::convert::Infallible;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -956,6 +956,70 @@ fn drop_relay_error_response(
     resp
 }
 
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    }
+}
+
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    match normalize_ip(ip) {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback(),
+    }
+}
+
+fn is_trusted_proxy_ip(ip: IpAddr) -> bool {
+    match normalize_ip(ip) {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
+        IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00,
+    }
+}
+
+/// Extracts the effective client IP for Drop Relay per-IP rate limiting (H7).
+///
+/// Security invariant:
+/// - ONLY inspects `X-Forwarded-For` / `X-Real-Ip` when `behind_reverse_proxy == true` AND
+///   `peer_ip` is loopback or RFC1918/ULA private (trusted reverse proxy).
+/// - Picks the **rightmost non-loopback** valid IP from `X-Forwarded-For` (preventing left-side
+///   client header spoofing), falling back to `X-Real-Ip`, then `peer_ip`.
+pub fn extract_drop_relay_client_ip(
+    peer_ip: IpAddr,
+    headers: &HeaderMap,
+    behind_reverse_proxy: bool,
+) -> String {
+    if !behind_reverse_proxy || !is_trusted_proxy_ip(peer_ip) {
+        return peer_ip.to_string();
+    }
+
+    let mut xff_ips: Vec<IpAddr> = Vec::new();
+    for val in headers.get_all("x-forwarded-for") {
+        if let Ok(raw) = val.to_str() {
+            for part in raw.split(',') {
+                let candidate = part.trim();
+                if let Ok(parsed) = candidate.parse::<IpAddr>() {
+                    xff_ips.push(normalize_ip(parsed));
+                }
+            }
+        }
+    }
+    if let Some(ip) = xff_ips.into_iter().rev().find(|ip| !is_loopback_ip(*ip)) {
+        return ip.to_string();
+    }
+
+    if let Some(raw_real) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        if let Ok(parsed) = raw_real.trim().parse::<IpAddr>() {
+            let norm = normalize_ip(parsed);
+            if !is_loopback_ip(norm) {
+                return norm.to_string();
+            }
+        }
+    }
+
+    peer_ip.to_string()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_drop_relay_request(
     node: Arc<UnifiedNode>,
@@ -992,7 +1056,8 @@ async fn handle_drop_relay_request(
         return Ok(resp);
     }
 
-    let client_ip = peer_addr.ip().to_string();
+    let client_ip =
+        extract_drop_relay_client_ip(peer_addr.ip(), headers, node.config().behind_reverse_proxy);
 
     // POST /v1/drops
     if path == "/v1/drops" {
@@ -1235,21 +1300,27 @@ fn start_inbox_sse_stream(
     tokio::spawn(async move {
         let mut wake_rx = node.subscribe_peer_inbox_wakeups();
         let mut shutdown_rx = node.shutdown_receiver();
-        if *shutdown_rx.borrow() {
+        if *shutdown_rx.borrow() || !node.is_peer_still_active(&peer_id) {
             return;
         }
 
         // Reset stale in-flight entries when peer reconnects so unacked items redeliver cleanly!
         node.clear_all_in_flight_for_peer(&peer_id);
 
-        let _ = tx.send(Ok(Frame::data(Bytes::from_static(b": connected\n\n")))).await;
+        if tx
+            .send(Ok(Frame::data(Bytes::from_static(b": connected\n\n"))))
+            .await
+            .is_err()
+        {
+            return;
+        }
 
         let mut keepalive = tokio::time::interval(SSE_KEEPALIVE_INTERVAL);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         keepalive.tick().await; // consume immediate first tick
 
         loop {
-            if *shutdown_rx.borrow() {
+            if *shutdown_rx.borrow() || !node.is_peer_still_active(&peer_id) {
                 break;
             }
             if !push_due_items_to_sse(&node, &peer_id, &tx).await {
@@ -1265,6 +1336,10 @@ fn start_inbox_sse_stream(
                     }
                 }
                 _ = keepalive.tick() => {
+                    // P1-4: Re-verify peer is still Active before every keepalive tick.
+                    if !node.is_peer_still_active(&peer_id) {
+                        break;
+                    }
                     if tx.send(Ok(Frame::data(sse_keepalive_frame()))).await.is_err() {
                         break;
                     }
@@ -1273,6 +1348,9 @@ fn start_inbox_sse_stream(
                     if *shutdown_rx.borrow() {
                         break;
                     }
+                }
+                _ = tx.closed() => {
+                    break;
                 }
             }
         }
@@ -1287,6 +1365,10 @@ async fn push_due_items_to_sse(
     peer_id: &str,
     tx: &mpsc::Sender<Result<Frame<Bytes>, io::Error>>,
 ) -> bool {
+    // P1-4: Fail closed before pulling or pushing any queued items for a revoked/inactive peer.
+    if !node.is_peer_still_active(peer_id) {
+        return false;
+    }
     let now = now_ms();
     let (due_msgs, due_batches, due_transfer) = {
         let db = node.db();
@@ -1320,6 +1402,9 @@ async fn push_due_items_to_sse(
     };
 
     for msg in due_msgs {
+        if !node.is_peer_still_active(peer_id) {
+            return false;
+        }
         let key = format!("message:{}", msg.id);
         if !node.mark_in_flight(peer_id, key.clone()) {
             continue;
@@ -1333,6 +1418,9 @@ async fn push_due_items_to_sse(
     }
 
     for batch in due_batches {
+        if !node.is_peer_still_active(peer_id) {
+            return false;
+        }
         let key = format!("batch:{}", batch.id);
         if !node.mark_in_flight(peer_id, key.clone()) {
             continue;
@@ -1346,6 +1434,9 @@ async fn push_due_items_to_sse(
     }
 
     if let Some(transfer) = due_transfer {
+        if !node.is_peer_still_active(peer_id) {
+            return false;
+        }
         let key = format!("transfer:{}", transfer.id);
         if node.mark_in_flight(peer_id, key.clone()) {
             if let Ok(json_str) = serde_json::to_string(&transfer) {

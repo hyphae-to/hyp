@@ -549,6 +549,9 @@ pub struct NodeConfig {
     pub channel_policies: BTreeMap<String, ChannelPolicy>,
     /// Opt-in A2A Agent Card projection at `GET /.well-known/agent.json` (default: `false` -> 404).
     pub expose_a2a_card: bool,
+    /// Trust `X-Forwarded-For` / `X-Real-Ip` from loopback or private (RFC1918/ULA) TCP peers
+    /// for Drop Relay per-IP rate limiting (`node.json`: `behindReverseProxy`, default: `false`).
+    pub behind_reverse_proxy: bool,
     pub require_pairing: bool,
     /// Optional Org Admin-CA Ed25519 root public key for verifying `am2_` grants.
     pub admin_jwk: Option<ProtoOkpJwk>,
@@ -587,6 +590,7 @@ impl NodeConfig {
             kv_namespaces: Vec::new(),
             channel_policies: BTreeMap::new(),
             expose_a2a_card: false,
+            behind_reverse_proxy: false,
             require_pairing: true,
             admin_jwk: None,
             secret_backend: None,
