@@ -157,7 +157,7 @@ if (!allowedNumbers && !allowAll) {
 
 let lastFrom = null;
 let lastPhoneNumberId = configuredPhoneNumberId;
-let lastMessageId = null;
+const seenRecipients = new Set();
 const lastMessageIdByRecipient = new Map();
 
 const mesh = new MeshPluginClient({
@@ -203,12 +203,23 @@ mesh.onPost(async (params) => {
   if (!phoneNumberId) {
     throw new Error("WHATSAPP_PHONE_NUMBER_ID is not configured and no inbound message has established one");
   }
-  const rawRecipient =
+  const explicitRecipient =
     (typeof params?.to === "string" && params.to.trim()) ||
     (typeof params?.chatId === "string" && params.chatId.trim()) ||
     (typeof params?.channel === "string" && params.channel.trim()) ||
-    defaultTo ||
-    lastFrom;
+    "";
+  let rawRecipient = explicitRecipient;
+  if (!rawRecipient) {
+    if (defaultTo) {
+      rawRecipient = defaultTo;
+    } else if (seenRecipients.size > 1) {
+      throw new Error(
+        "Multiple WhatsApp recipients have been seen; specify an explicit recipient (to) or set WHATSAPP_DEFAULT_TO",
+      );
+    } else if (lastFrom) {
+      rawRecipient = lastFrom;
+    }
+  }
   if (!rawRecipient) {
     throw new Error("WhatsApp post requires recipient (to, WHATSAPP_DEFAULT_TO, or prior inbound message)");
   }
@@ -225,9 +236,9 @@ mesh.onPost(async (params) => {
   let targetMsgId;
   let reactionJson = null;
   if (hasReaction) {
-    targetMsgId = replyTo ?? lastMessageIdByRecipient.get(recipient) ?? lastMessageId;
+    targetMsgId = replyTo ?? lastMessageIdByRecipient.get(recipient);
     if (!targetMsgId) {
-      throw new Error("No WhatsApp message_id specified via replyTo and no recent inbound message to react to");
+      throw new Error(`No WhatsApp message_id specified via replyTo and no recent inbound message from ${recipient} to react to`);
     }
     reactionJson = await sendWhatsAppMessage(phoneNumberId, {
       messaging_product: "whatsapp",
@@ -281,7 +292,7 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", "http://localhost");
 
   if (req.method === "GET" && url.pathname === "/health" && expectedPath !== "/health") {
-    sendJson(res, 200, { ok: true, protocol: "whatsapp-cloud", lastMessageId: lastMessageId !== null });
+    sendJson(res, 200, { ok: true, protocol: "whatsapp-cloud", lastMessageId: lastMessageIdByRecipient.size > 0 });
     return;
   }
 
@@ -382,10 +393,12 @@ const server = createServer(async (req, res) => {
         const text = extractMessageText(msg);
         const fromValue = fromRaw || fromNorm;
         lastFrom = fromValue;
+        if (fromNorm) {
+          seenRecipients.add(fromNorm);
+        }
         if (phoneNumberId) lastPhoneNumberId = phoneNumberId;
         if (typeof msg.id === "string" && msg.id.trim()) {
           const cleanMsgId = msg.id.trim();
-          lastMessageId = cleanMsgId;
           if (fromNorm) {
             lastMessageIdByRecipient.set(fromNorm, cleanMsgId);
             if (lastMessageIdByRecipient.size > 1000) {

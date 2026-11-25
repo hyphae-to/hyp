@@ -18,9 +18,9 @@
 //! - Clean cross-platform compilation: Unix fd-3 process management is gated behind `#[cfg(unix)]`,
 //!   returning `AdapterError::UnsupportedPlatform` cleanly on non-Unix platforms (e.g. Windows).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -99,6 +99,35 @@ pub struct SubprocessConfig {
     pub kill_timeout: Duration,
     /// Optional explicit parent env map (defaults to `std::env::vars()` when `None`).
     pub parent_env_override: Option<BTreeMap<String, String>>,
+    /// Optional bounded per-plugin stderr log file path (e.g. `<state_dir>/logs/plugin-<id>.log`).
+    pub stderr_log_path: Option<PathBuf>,
+    /// Maximum byte size for `stderr_log_path` before truncating/rotating (default: 1 MiB).
+    pub max_stderr_log_bytes: u64,
+    /// Explicit secret values to redact (`[REDACTED]`) from captured stderr, logs, and health errors.
+    pub redacted_values: Vec<String>,
+    /// Window under which an unexpected exit counts as a rapid crash (default: 5 s).
+    pub rapid_crash_window: Duration,
+    /// Number of consecutive rapid crashes that trips the circuit breaker into `CrashLoopBackOff` (default: 5; `0` disables).
+    pub max_rapid_crashes: u32,
+}
+
+/// Default bounded per-plugin stderr log file size (1 MiB).
+pub const DEFAULT_MAX_STDERR_LOG_BYTES: u64 = 1024 * 1024;
+/// Default rapid-crash window for circuit-breaker detection (5 seconds).
+pub const DEFAULT_RAPID_CRASH_WINDOW: Duration = Duration::from_secs(5);
+/// Default consecutive rapid crashes before tripping into `CrashLoopBackOff`.
+pub const DEFAULT_MAX_RAPID_CRASHES: u32 = 5;
+
+/// Returns `true` when an environment variable name looks like it carries a raw secret value
+/// (`TOKEN`, `SECRET`, `KEY`, `PASSWORD`, `AUTH`, `PASS`), excluding `*_FILE` path pointers.
+pub fn is_secret_like_env_key(key: &str) -> bool {
+    let upper = key.trim().to_ascii_uppercase();
+    if upper.is_empty() || upper.ends_with("_FILE") {
+        return false;
+    }
+    ["TOKEN", "SECRET", "KEY", "PASSWORD", "AUTH", "PASS"]
+        .iter()
+        .any(|needle| upper.contains(needle))
 }
 
 impl SubprocessConfig {
@@ -124,6 +153,11 @@ impl SubprocessConfig {
             reset_after: Duration::from_secs(60),
             kill_timeout: Duration::from_secs(5),
             parent_env_override: None,
+            stderr_log_path: None,
+            max_stderr_log_bytes: DEFAULT_MAX_STDERR_LOG_BYTES,
+            redacted_values: Vec::new(),
+            rapid_crash_window: DEFAULT_RAPID_CRASH_WINDOW,
+            max_rapid_crashes: DEFAULT_MAX_RAPID_CRASHES,
         }
     }
 }
@@ -182,6 +216,9 @@ struct SupervisorInner {
     oversized_frames_rejected: AtomicU64,
     last_status: RwLock<Option<StatusParams>>,
     last_detected_protocol: AtomicU8,
+    recent_stderr: RwLock<VecDeque<String>>,
+    last_error: RwLock<Option<String>>,
+    crash_loop_backoff: AtomicBool,
 }
 
 /// Unified fd-3 subprocess supervisor supporting both JSON-RPC 2.0 v2 and legacy fd-3 v1 plugins.
@@ -205,6 +242,9 @@ impl SubprocessSupervisor {
                 oversized_frames_rejected: AtomicU64::new(0),
                 last_status: RwLock::new(None),
                 last_detected_protocol: AtomicU8::new(PROTO_UNKNOWN),
+                recent_stderr: RwLock::new(VecDeque::new()),
+                last_error: RwLock::new(None),
+                crash_loop_backoff: AtomicBool::new(false),
             }),
         }
     }
@@ -212,6 +252,36 @@ impl SubprocessSupervisor {
     /// Returns the number of unexpected restarts performed by this supervisor.
     pub fn restart_count(&self) -> u64 {
         self.inner.restart_count.load(Ordering::Relaxed)
+    }
+
+    /// Returns recent bounded stderr lines captured from the child process (secret values redacted).
+    pub fn recent_stderr(&self) -> Vec<String> {
+        self.inner
+            .recent_stderr
+            .read()
+            .expect("stderr lock")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Returns the most recent redacted error summary recorded by this supervisor, if any.
+    pub fn last_error(&self) -> Option<String> {
+        self.inner
+            .last_error
+            .read()
+            .expect("last_error lock")
+            .clone()
+    }
+
+    /// Returns `true` when the supervisor has tripped its rapid crash-loop circuit breaker.
+    pub fn is_crash_loop_backoff(&self) -> bool {
+        self.inner.crash_loop_backoff.load(Ordering::Acquire)
+    }
+
+    /// Returns the configured bounded per-plugin stderr log file path, if any.
+    pub fn stderr_log_path(&self) -> Option<PathBuf> {
+        self.inner.config.stderr_log_path.clone()
     }
 
     /// Returns the number of >64 KiB oversized frames rejected on fd 3.
@@ -409,6 +479,10 @@ impl NodeAdapter for SubprocessSupervisor {
                 }
 
                 self.inner.stopping.store(0, Ordering::Release);
+                self.inner
+                    .crash_loop_backoff
+                    .store(false, Ordering::Release);
+                *self.inner.last_error.write().expect("last_error lock") = None;
                 self.set_health(AdapterHealth::Starting);
                 host.update_status(&self.inner.config.id, AdapterHealth::Starting)
                     .await;
@@ -452,13 +526,17 @@ impl NodeAdapter for SubprocessSupervisor {
 
 #[cfg(unix)]
 mod unix_runtime {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
+    use std::fs::{self, DirBuilder, OpenOptions};
+    use std::io::Write as _;
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     use std::os::unix::net::UnixStream as StdUnixStream;
+    use std::path::Path;
     use std::process::Stdio;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU8, Ordering};
-    use std::time::{Duration, Instant};
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use hyp_proto::cloudevent::{CloudEventError, check_cloudevent_v2};
     use hyp_proto::rpc::{
@@ -483,12 +561,147 @@ mod unix_runtime {
 
     use super::{
         ActiveConnection, HelloMode, PROTO_JSONRPC_V2, PROTO_LEGACY_V1, PROTO_UNKNOWN, PendingMap,
-        SubprocessConfig, SupervisorInner, build_isolated_env,
+        SubprocessConfig, SupervisorInner, build_isolated_env, is_secret_like_env_key,
     };
 
     const MAX_OUTPUT_LINE_BYTES: usize = 2 * 1024;
     const MAX_ECHO_CHARS: usize = 256;
     const OUTBOUND_QUEUE_CAPACITY: usize = 256;
+    const MAX_RECENT_STDERR_LINES: usize = 32;
+    const MAX_RUN_STDERR_TAIL: usize = 4;
+    const MAX_STDERR_SUMMARY_CHARS: usize = 400;
+
+    fn collect_redacted_secrets(config: &SubprocessConfig) -> Vec<String> {
+        let mut secrets: Vec<String> = Vec::new();
+        for val in &config.redacted_values {
+            let trimmed = val.trim();
+            if trimmed.len() >= 4 && !secrets.iter().any(|s| s == trimmed) {
+                secrets.push(trimmed.to_string());
+            }
+        }
+        for (k, v) in &config.env {
+            if is_secret_like_env_key(k) {
+                let trimmed = v.trim();
+                if trimmed.len() >= 4 && !secrets.iter().any(|s| s == trimmed) {
+                    secrets.push(trimmed.to_string());
+                }
+            }
+        }
+        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        secrets
+    }
+
+    fn sanitize_and_redact(raw: &str, secrets: &[String]) -> String {
+        let mut redacted = raw.to_string();
+        for secret in secrets {
+            if secret.len() >= 4 && redacted.contains(secret.as_str()) {
+                redacted = redacted.replace(secret.as_str(), "[REDACTED]");
+            }
+        }
+        let cleaned: String = redacted
+            .chars()
+            .map(|c| {
+                if c.is_control() && c != '\t' {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        cleaned.trim().to_string()
+    }
+
+    fn append_stderr_log_line(path: &Path, max_bytes: u64, line: &str) {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                let mut builder = DirBuilder::new();
+                builder.recursive(true).mode(0o700);
+                if builder.create(parent).is_err() {
+                    return;
+                }
+            }
+        }
+        // Fail closed against symlink attacks on per-plugin log files.
+        if let Ok(meta) = fs::symlink_metadata(path) {
+            if meta.file_type().is_symlink() {
+                return;
+            }
+            if max_bytes > 0 && meta.len() >= max_bytes {
+                if let Ok(mut f) = OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(path)
+                {
+                    let _ = f.write_all(b"[log truncated]\n");
+                }
+            }
+        }
+        let ts_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        if let Ok(mut f) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+        {
+            let _ = writeln!(f, "[{ts_ms}] {line}");
+        }
+    }
+
+    fn record_stderr_line(
+        inner: &SupervisorInner,
+        secrets: &[String],
+        run_tail: Option<&StdMutex<VecDeque<String>>>,
+        raw: &str,
+    ) {
+        let clean = sanitize_and_redact(raw, secrets);
+        if clean.is_empty() {
+            return;
+        }
+        {
+            let mut ring = inner.recent_stderr.write().expect("stderr lock");
+            ring.push_back(clean.clone());
+            while ring.len() > MAX_RECENT_STDERR_LINES {
+                ring.pop_front();
+            }
+        }
+        if let Some(tail) = run_tail {
+            if let Ok(mut guard) = tail.lock() {
+                guard.push_back(clean.clone());
+                while guard.len() > MAX_RUN_STDERR_TAIL {
+                    guard.pop_front();
+                }
+            }
+        }
+        if let Some(ref log_path) = inner.config.stderr_log_path {
+            append_stderr_log_line(log_path, inner.config.max_stderr_log_bytes, &clean);
+        }
+    }
+
+    fn format_stderr_summary(run_tail: &StdMutex<VecDeque<String>>) -> String {
+        let joined = match run_tail.lock() {
+            Ok(guard) => {
+                let len = guard.len();
+                let start = len.saturating_sub(2);
+                guard
+                    .iter()
+                    .skip(start)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            }
+            Err(_) => String::new(),
+        };
+        if joined.chars().count() <= MAX_STDERR_SUMMARY_CHARS {
+            joined
+        } else {
+            let truncated: String = joined.chars().take(MAX_STDERR_SUMMARY_CHARS).collect();
+            format!("{truncated}...")
+        }
+    }
 
     const F_SETFD: i32 = 2;
     const SIGTERM: i32 = 15;
@@ -572,6 +785,8 @@ mod unix_runtime {
         mut first_ready: Option<Arc<Notify>>,
     ) {
         let mut backoff = inner.config.initial_backoff;
+        let redacted_secrets = Arc::new(collect_redacted_secrets(&inner.config));
+        let mut consecutive_rapid_crashes: u32 = 0;
 
         while inner.stopping.load(Ordering::Acquire) == 0 {
             let started_at = Instant::now();
@@ -580,15 +795,41 @@ mod unix_runtime {
             let (mut child, stream) = match spawned {
                 Ok(pair) => pair,
                 Err(err) => {
-                    let reason = format!("spawn failed: {err}");
+                    consecutive_rapid_crashes = consecutive_rapid_crashes.saturating_add(1);
+                    let err_msg = sanitize_and_redact(&format!("spawn failed: {err}"), &redacted_secrets);
+                    record_stderr_line(&inner, &redacted_secrets, None, &err_msg);
+
+                    if inner.config.max_rapid_crashes > 0
+                        && consecutive_rapid_crashes >= inner.config.max_rapid_crashes
+                    {
+                        inner.crash_loop_backoff.store(true, Ordering::Release);
+                        let reason = format!(
+                            "CrashLoopBackOff: failed to spawn {consecutive_rapid_crashes} consecutive times ({err_msg})"
+                        );
+                        record_stderr_line(&inner, &redacted_secrets, None, &reason);
+                        *inner.last_error.write().expect("last_error lock") = Some(reason.clone());
+                        *inner.health.write().expect("health lock") =
+                            AdapterHealth::Degraded(reason.clone());
+                        host.update_status(&inner.config.id, AdapterHealth::Degraded(reason))
+                            .await;
+                        if let Some(n) = first_ready.take() {
+                            n.notify_waiters();
+                        }
+                        break;
+                    }
+
+                    *inner.last_error.write().expect("last_error lock") = Some(err_msg.clone());
                     *inner.health.write().expect("health lock") =
-                        AdapterHealth::Degraded(reason.clone());
-                    host.update_status(&inner.config.id, AdapterHealth::Degraded(reason))
+                        AdapterHealth::Degraded(err_msg.clone());
+                    host.update_status(&inner.config.id, AdapterHealth::Degraded(err_msg))
                         .await;
                     if let Some(n) = first_ready.take() {
                         n.notify_waiters();
                     }
                     if !sleep_or_stop(&inner, backoff).await {
+                        *inner.health.write().expect("health lock") = AdapterHealth::Stopped;
+                        host.update_status(&inner.config.id, AdapterHealth::Stopped)
+                            .await;
                         break;
                     }
                     backoff = (backoff * 2).min(inner.config.max_backoff);
@@ -597,8 +838,16 @@ mod unix_runtime {
                 }
             };
 
+            let run_stderr_tail = Arc::new(StdMutex::new(VecDeque::new()));
             let stdout_task = child.stdout.take().map(drain_output_stream);
-            let stderr_task = child.stderr.take().map(drain_output_stream);
+            let stderr_task = child.stderr.take().map(|stderr| {
+                drain_stderr_stream(
+                    stderr,
+                    Arc::clone(&inner),
+                    Arc::clone(&redacted_secrets),
+                    Arc::clone(&run_stderr_tail),
+                )
+            });
 
             let (mut read_half, mut write_half) = stream.into_split();
             let (out_tx, mut out_rx) = mpsc::channel::<String>(OUTBOUND_QUEUE_CAPACITY);
@@ -795,10 +1044,14 @@ mod unix_runtime {
             };
 
             if let Some(t) = stdout_task {
-                let _ = t.await;
+                if tokio::time::timeout(Duration::from_secs(2), t).await.is_err() {
+                    // Best-effort bounded drain; avoid hanging if a grandchild holds stdout open.
+                }
             }
             if let Some(t) = stderr_task {
-                let _ = t.await;
+                if tokio::time::timeout(Duration::from_secs(2), t).await.is_err() {
+                    // Best-effort bounded drain; avoid hanging if a grandchild holds stderr open.
+                }
             }
 
             if inner.stopping.load(Ordering::Acquire) != 0 {
@@ -812,7 +1065,41 @@ mod unix_runtime {
             if uptime >= inner.config.reset_after {
                 backoff = inner.config.initial_backoff;
             }
-            let reason = format!("subprocess {exit_desc} unexpectedly");
+            if uptime < inner.config.rapid_crash_window {
+                consecutive_rapid_crashes = consecutive_rapid_crashes.saturating_add(1);
+            } else {
+                consecutive_rapid_crashes = 0;
+            }
+
+            let stderr_summary = format_stderr_summary(&run_stderr_tail);
+            if inner.config.max_rapid_crashes > 0
+                && consecutive_rapid_crashes >= inner.config.max_rapid_crashes
+            {
+                inner.crash_loop_backoff.store(true, Ordering::Release);
+                let reason = if stderr_summary.is_empty() {
+                    format!(
+                        "CrashLoopBackOff: subprocess {exit_desc} rapidly {consecutive_rapid_crashes} consecutive times"
+                    )
+                } else {
+                    format!(
+                        "CrashLoopBackOff: subprocess {exit_desc} rapidly {consecutive_rapid_crashes} consecutive times: {stderr_summary}"
+                    )
+                };
+                record_stderr_line(&inner, &redacted_secrets, None, &reason);
+                *inner.last_error.write().expect("last_error lock") = Some(reason.clone());
+                *inner.health.write().expect("health lock") =
+                    AdapterHealth::Degraded(reason.clone());
+                host.update_status(&inner.config.id, AdapterHealth::Degraded(reason))
+                    .await;
+                break;
+            }
+
+            let reason = if stderr_summary.is_empty() {
+                format!("subprocess {exit_desc} unexpectedly")
+            } else {
+                format!("subprocess {exit_desc} unexpectedly: {stderr_summary}")
+            };
+            *inner.last_error.write().expect("last_error lock") = Some(reason.clone());
             *inner.health.write().expect("health lock") = AdapterHealth::Degraded(reason.clone());
             host.update_status(&inner.config.id, AdapterHealth::Degraded(reason))
                 .await;
@@ -851,6 +1138,31 @@ mod unix_runtime {
                 }
             }
             splitter.flush(|_line, _truncated| {});
+        })
+    }
+
+    fn drain_stderr_stream<R: AsyncRead + Unpin + Send + 'static>(
+        mut reader: R,
+        inner: Arc<SupervisorInner>,
+        secrets: Arc<Vec<String>>,
+        run_tail: Arc<StdMutex<VecDeque<String>>>,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut splitter = LineSplitter::new(MAX_OUTPUT_LINE_BYTES, true);
+            let mut buf = [0u8; 2048];
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        splitter.push(&buf[..n], |line, _truncated| {
+                            record_stderr_line(&inner, &secrets, Some(&run_tail), &line);
+                        });
+                    }
+                }
+            }
+            splitter.flush(|line, _truncated| {
+                record_stderr_line(&inner, &secrets, Some(&run_tail), &line);
+            });
         })
     }
 

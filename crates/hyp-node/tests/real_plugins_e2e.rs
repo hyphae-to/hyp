@@ -24,6 +24,7 @@ mod unix_tests {
     use http::header::{AUTHORIZATION, CONTENT_TYPE};
     use http::{HeaderMap, HeaderValue, Method, Request, StatusCode};
     use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
     use tempfile::TempDir;
     use tokio::net::TcpListener;
     use tokio::sync::Mutex as AsyncMutex;
@@ -32,7 +33,7 @@ mod unix_tests {
     use crate::common::{MockHttpServer, MockRequest, MockResponse, UnifiedNodeAdapterHost};
     use hyp_crypto::SecretBackend;
     use hyp_node::adapters::{
-        AdapterError, AdapterKind, HelloMode, NodeAdapter, PrometheusWebhookAdapter,
+        AdapterError, AdapterHealth, AdapterKind, HelloMode, NodeAdapter, PrometheusWebhookAdapter,
         PrometheusWebhookConfig, SubprocessConfig, SubprocessSupervisor,
         compute_hmac_sha256_header, verify_hmac_sha256_header,
     };
@@ -169,7 +170,7 @@ mod unix_tests {
 
         let client = HttpClient::new().unwrap();
 
-        // (a) Valid HMAC-SHA256 POST -> 202 + CloudEvent ingested into UnifiedNode!
+        // (a) Valid HMAC-SHA256 POST -> 202 + deterministic SHA-256 event ID ingested into UnifiedNode!
         let valid_body = serde_json::to_vec(&json!({
             "id": "wh-evt-001",
             "type": "com.acme.deploy",
@@ -178,12 +179,14 @@ mod unix_tests {
             "data": { "sha": "deadbeef", "env": "staging" }
         }))
         .unwrap();
+        let expected_id = format!("sha256:{}", hex::encode(Sha256::digest(&valid_body)));
         let valid_sig = compute_hmac_sha256_header(secret.as_bytes(), &valid_body);
         let req_ok = Request::builder()
             .method(Method::POST)
             .uri(&webhook_url)
             .header(CONTENT_TYPE, "application/json")
             .header("x-webhook-signature-256", &valid_sig)
+            .header("x-delivery-id", "unsigned-header-id-ignored-1")
             .body(full_body(valid_body.clone()))
             .unwrap();
         let resp_ok = client.request(req_ok).await.unwrap();
@@ -196,11 +199,28 @@ mod unix_tests {
         );
         let ack_json: Value = serde_json::from_slice(&body_ok).unwrap();
         assert_eq!(ack_json["status"], "stored");
-        assert_eq!(ack_json["id"], "wh-evt-001");
+        assert_eq!(ack_json["id"], expected_id);
+
+        // Replaying the same signed body with a different unsigned `x-delivery-id` MUST yield
+        // the exact same SHA-256 event ID and deduplicate (`status: "duplicate"`)!
+        let req_replay_hdr = Request::builder()
+            .method(Method::POST)
+            .uri(&webhook_url)
+            .header(CONTENT_TYPE, "application/json")
+            .header("x-webhook-signature-256", &valid_sig)
+            .header("x-delivery-id", "unsigned-header-id-ignored-2")
+            .body(full_body(valid_body.clone()))
+            .unwrap();
+        let resp_replay_hdr = client.request(req_replay_hdr).await.unwrap();
+        let (st_rep, _, body_rep) = HttpClient::collect(resp_replay_hdr, 64 * 1024).await.unwrap();
+        assert_eq!(st_rep, StatusCode::ACCEPTED);
+        let rep_json: Value = serde_json::from_slice(&body_rep).unwrap();
+        assert_eq!(rep_json["status"], "duplicate");
+        assert_eq!(rep_json["id"], expected_id);
 
         let events = host.wait_for_event_count(1, Duration::from_secs(5)).await;
         assert_eq!(events[0].0, "webhook");
-        assert_eq!(events[0].1.id, "wh-evt-001");
+        assert_eq!(events[0].1.id, expected_id);
         assert_eq!(events[0].1.event_type, "com.acme.deploy");
         assert_eq!(events[0].1.source, "ci/jenkins");
         assert_eq!(events[0].1.subject.as_deref(), Some("service/api"));
@@ -215,8 +235,71 @@ mod unix_tests {
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].topic, "webhook");
         assert_eq!(batches[0].events.len(), 1);
-        assert_eq!(batches[0].events[0].id, "wh-evt-001");
+        assert_eq!(batches[0].events[0].id, expected_id);
         assert_eq!(batches[0].events[0].data["sha"], json!("deadbeef"));
+
+        // (a2) Timestamp-bound HMAC (`x-webhook-timestamp`) within 5m passes; stale >5m fails 401!
+        let fresh_ts = (now_ms() / 1000).to_string();
+        let ts_body = serde_json::to_vec(&json!({
+            "type": "com.acme.deploy",
+            "source": "ci/jenkins",
+            "data": { "sha": "cafebabe" }
+        }))
+        .unwrap();
+        let mut ts_signed_input = format!("{fresh_ts}.").into_bytes();
+        ts_signed_input.extend_from_slice(&ts_body);
+        let fresh_ts_sig = compute_hmac_sha256_header(secret.as_bytes(), &ts_signed_input);
+        let req_ts_ok = Request::builder()
+            .method(Method::POST)
+            .uri(&webhook_url)
+            .header(CONTENT_TYPE, "application/json")
+            .header("x-webhook-timestamp", &fresh_ts)
+            .header("x-webhook-signature-256", &fresh_ts_sig)
+            .body(full_body(ts_body.clone()))
+            .unwrap();
+        let resp_ts_ok = client.request(req_ts_ok).await.unwrap();
+        assert_eq!(resp_ts_ok.status(), StatusCode::ACCEPTED);
+        let _ = host.wait_for_event_count(2, Duration::from_secs(5)).await;
+
+        let stale_ts = ((now_ms() / 1000) - 600).to_string();
+        let mut stale_input = format!("{stale_ts}.").into_bytes();
+        stale_input.extend_from_slice(&ts_body);
+        let stale_sig = compute_hmac_sha256_header(secret.as_bytes(), &stale_input);
+        let req_ts_stale = Request::builder()
+            .method(Method::POST)
+            .uri(&webhook_url)
+            .header(CONTENT_TYPE, "application/json")
+            .header("x-webhook-timestamp", &stale_ts)
+            .header("x-webhook-signature-256", &stale_sig)
+            .body(full_body(ts_body))
+            .unwrap();
+        assert_eq!(
+            client.request(req_ts_stale).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "expired x-webhook-timestamp (>5m) MUST fail 401"
+        );
+
+        // Stale signed payload timestamp MUST also fail 401!
+        let stale_payload_body = serde_json::to_vec(&json!({
+            "type": "com.acme.deploy",
+            "source": "ci/jenkins",
+            "timestamp": "2020-01-01T00:00:00Z",
+            "data": { "sha": "old" }
+        }))
+        .unwrap();
+        let stale_payload_sig = compute_hmac_sha256_header(secret.as_bytes(), &stale_payload_body);
+        let req_stale_payload = Request::builder()
+            .method(Method::POST)
+            .uri(&webhook_url)
+            .header(CONTENT_TYPE, "application/json")
+            .header("x-webhook-signature-256", &stale_payload_sig)
+            .body(full_body(stale_payload_body))
+            .unwrap();
+        assert_eq!(
+            client.request(req_stale_payload).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "stale signed payload timestamp MUST fail 401"
+        );
 
         // (b) 1-bit flipped HMAC signature -> 401!
         let mut bad_sig_bytes = valid_sig.clone().into_bytes();
@@ -246,8 +329,8 @@ mod unix_tests {
         let resp_big = client.request(req_big).await.unwrap();
         assert_eq!(resp_big.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
-        // Neither rejected request may have ingested an event.
-        assert_eq!(host.published_events().await.len(), 1);
+        // None of the rejected requests (nor the duplicate replay) may have added a 3rd event.
+        assert_eq!(host.published_events().await.len(), 2);
 
         // (d) Outbound `supervisor.post(...)` -> loopback mock receives signed `X-Webhook-Signature-256`!
         let post_res = supervisor
@@ -1712,6 +1795,628 @@ client._dead.wait(timeout=15)
         let ingested = host.published_events().await;
         assert_eq!(ingested.len(), 1);
         assert_eq!(ingested[0].1.id, "sdk-py-evt-1");
+
+        let _ = supervisor.stop().await;
+        node.shutdown();
+    }
+
+    // ========================================================================
+    // 6. Fail-closed Auth on Webhook & Prometheus Plugins (B7)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn real_webhook_and_prometheus_plugins_fail_closed_without_auth_and_reject_non_loopback_unsigned() {
+        let Some(node_bin) = find_binary("node") else {
+            eprintln!("SKIP real_webhook_and_prometheus_plugins_fail_closed_without_auth_and_reject_non_loopback_unsigned: `node` not on PATH");
+            return;
+        };
+
+        let webhook_script = repo_root().join("plugins/webhook/index.mjs");
+        let prom_script = repo_root().join("plugins/prometheus/index.mjs");
+        let path_env = std::env::var("PATH").unwrap_or_default();
+
+        // 1. Webhook refuses to boot without WEBHOOK_SECRET (unless WEBHOOK_ALLOW_UNSIGNED=1).
+        let wh_no_auth = tokio::process::Command::new(&node_bin)
+            .arg(&webhook_script)
+            .env_clear()
+            .env("PATH", &path_env)
+            .output()
+            .await
+            .expect("run webhook without auth");
+        assert!(
+            !wh_no_auth.status.success(),
+            "webhook plugin MUST fail closed without WEBHOOK_SECRET"
+        );
+        let wh_err = String::from_utf8_lossy(&wh_no_auth.stderr);
+        assert!(
+            wh_err.contains("WEBHOOK_SECRET") && wh_err.contains("WEBHOOK_ALLOW_UNSIGNED"),
+            "unexpected webhook no-auth stderr: {wh_err}"
+        );
+
+        // 2. Webhook NEVER allows unsigned on non-loopback bind (0.0.0.0) even with WEBHOOK_ALLOW_UNSIGNED=1!
+        let wh_non_loopback = tokio::process::Command::new(&node_bin)
+            .arg(&webhook_script)
+            .env_clear()
+            .env("PATH", &path_env)
+            .env("WEBHOOK_HOST", "0.0.0.0")
+            .env("WEBHOOK_ALLOW_UNSIGNED", "1")
+            .output()
+            .await
+            .expect("run webhook non-loopback unsigned");
+        assert!(
+            !wh_non_loopback.status.success(),
+            "webhook plugin MUST reject unsigned mode on 0.0.0.0"
+        );
+        let wh_nl_err = String::from_utf8_lossy(&wh_non_loopback.stderr);
+        assert!(
+            wh_nl_err.contains("non-loopback"),
+            "unexpected webhook non-loopback stderr: {wh_nl_err}"
+        );
+
+        // 3. Prometheus refuses to boot without Bearer/Basic/HMAC auth.
+        let prom_no_auth = tokio::process::Command::new(&node_bin)
+            .arg(&prom_script)
+            .env_clear()
+            .env("PATH", &path_env)
+            .output()
+            .await
+            .expect("run prometheus without auth");
+        assert!(
+            !prom_no_auth.status.success(),
+            "prometheus plugin MUST fail closed without auth"
+        );
+        let prom_err = String::from_utf8_lossy(&prom_no_auth.stderr);
+        assert!(
+            prom_err.contains("PROMETHEUS_BEARER_TOKEN")
+                && prom_err.contains("PROMETHEUS_BASIC_AUTH")
+                && prom_err.contains("PROMETHEUS_ALLOW_UNSIGNED"),
+            "unexpected prometheus no-auth stderr: {prom_err}"
+        );
+
+        // 4. Prometheus NEVER allows unsigned on non-loopback bind (0.0.0.0) even with PROMETHEUS_ALLOW_UNSIGNED=1!
+        let prom_non_loopback = tokio::process::Command::new(&node_bin)
+            .arg(&prom_script)
+            .env_clear()
+            .env("PATH", &path_env)
+            .env("PROMETHEUS_HOST", "0.0.0.0")
+            .env("PROMETHEUS_ALLOW_UNSIGNED", "1")
+            .output()
+            .await
+            .expect("run prometheus non-loopback unsigned");
+        assert!(
+            !prom_non_loopback.status.success(),
+            "prometheus plugin MUST reject unsigned mode on 0.0.0.0"
+        );
+        let prom_nl_err = String::from_utf8_lossy(&prom_non_loopback.stderr);
+        assert!(
+            prom_nl_err.contains("non-loopback"),
+            "unexpected prometheus non-loopback stderr: {prom_nl_err}"
+        );
+
+        // 5. Prometheus accepts PROMETHEUS_BASIC_AUTH (and rejects invalid Basic credentials 401).
+        let tmp = TempDir::new().unwrap();
+        let node = open_test_node("prom-basic-node", tmp.path());
+        let host = UnifiedNodeAdapterHost::new(Arc::clone(&node));
+        let port = pick_free_loopback_port().await;
+
+        let mut cfg = SubprocessConfig::new(
+            "prom-basic",
+            AdapterKind::Source,
+            node_bin,
+            vec![prom_script.to_string_lossy().into_owned()],
+            vec!["alerts".to_string()],
+        );
+        cfg.env.insert("PROMETHEUS_HOST".into(), "127.0.0.1".into());
+        cfg.env.insert("PROMETHEUS_PORT".into(), port.to_string());
+        cfg.env.insert("PROMETHEUS_PATH".into(), "/alerts".into());
+        cfg.env.insert("PROMETHEUS_TOPIC".into(), "alerts".into());
+        cfg.env
+            .insert("PROMETHEUS_BASIC_AUTH".into(), "prom:s3cr3t!".into());
+
+        let supervisor = SubprocessSupervisor::new(cfg);
+        supervisor.start(Arc::clone(&host) as _).await.unwrap();
+        wait_for_http_ready(
+            &format!("http://127.0.0.1:{port}/health"),
+            Duration::from_secs(10),
+        )
+        .await;
+
+        let client = HttpClient::new().unwrap();
+        let alerts_url = format!("http://127.0.0.1:{port}/alerts");
+        let payload = serde_json::to_vec(&json!({
+            "alerts": [{
+                "status": "firing",
+                "fingerprint": "fp-basic-1",
+                "labels": { "alertname": "DiskFull", "severity": "critical" },
+                "startsAt": "2026-11-24T12:00:00Z"
+            }]
+        }))
+        .unwrap();
+
+        let bad_req = Request::builder()
+            .method(Method::POST)
+            .uri(&alerts_url)
+            .header(CONTENT_TYPE, "application/json")
+            .header(AUTHORIZATION, "Basic d3Jvbmc6Y3JlZHM=")
+            .body(full_body(payload.clone()))
+            .unwrap();
+        assert_eq!(
+            client.request(bad_req).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // base64("prom:s3cr3t!") == "cHJvbTpzM2NyM3Qh"
+        let ok_req = Request::builder()
+            .method(Method::POST)
+            .uri(&alerts_url)
+            .header(CONTENT_TYPE, "application/json")
+            .header(AUTHORIZATION, "Basic cHJvbTpzM2NyM3Qh")
+            .body(full_body(payload))
+            .unwrap();
+        assert_eq!(
+            client.request(ok_req).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let _ = host.wait_for_event_count(1, Duration::from_secs(5)).await;
+
+        let _ = supervisor.stop().await;
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn real_slack_bridge_fail_closed_unseen_channel_and_no_cross_channel_reaction() {
+        let Some(node_bin) = find_binary("node") else {
+            eprintln!("SKIP real_slack_bridge_fail_closed_unseen_channel_and_no_cross_channel_reaction: `node` not on PATH");
+            return;
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let plugin_script = repo_root().join("plugins/slack/index.mjs");
+        let app_file = tmp.path().join("slack.app");
+        let bot_file = tmp.path().join("slack.bot");
+        fs::write(&app_file, "xapp-iso-1").unwrap();
+        fs::write(&bot_file, "xoxb-iso-2").unwrap();
+
+        let auth_ok = Arc::new(AtomicBool::new(false));
+        let auth_srv = Arc::clone(&auth_ok);
+        let mock_slack = MockHttpServer::start(move |req: MockRequest| {
+            let auth_flag = Arc::clone(&auth_srv);
+            async move {
+                if req.path.ends_with("/auth.test") {
+                    auth_flag.store(true, Ordering::SeqCst);
+                    return MockResponse::json(
+                        StatusCode::OK,
+                        &json!({ "ok": true, "user_id": "U_BOT", "team_id": "T_ISO" }),
+                    );
+                }
+                MockResponse::json(
+                    StatusCode::OK,
+                    &json!({ "ok": false, "error": "paused_for_test" }),
+                )
+            }
+        })
+        .await;
+
+        let node = open_test_node("slack-iso-node", tmp.path());
+        let host = UnifiedNodeAdapterHost::new(Arc::clone(&node));
+
+        // Configure ONLY SLACK_ALLOWED_USERS (no SLACK_ALLOWED_CHANNELS, no SLACK_DEFAULT_CHANNEL):
+        // posting to an unseen channel MUST fail closed!
+        let mut cfg = SubprocessConfig::new(
+            "slack-iso",
+            AdapterKind::Bridge,
+            node_bin,
+            vec![plugin_script.to_string_lossy().into_owned()],
+            vec!["pm".to_string()],
+        );
+        cfg.env.insert(
+            "SLACK_APP_TOKEN_FILE".into(),
+            app_file.to_string_lossy().into_owned(),
+        );
+        cfg.env.insert(
+            "SLACK_BOT_TOKEN_FILE".into(),
+            bot_file.to_string_lossy().into_owned(),
+        );
+        cfg.env.insert("SLACK_TARGET".into(), "pm".into());
+        cfg.env.insert("SLACK_ALLOWED_USERS".into(), "U_ALICE".into());
+        cfg.env.insert("SLACK_API_BASE".into(), mock_slack.base_url());
+
+        let supervisor = SubprocessSupervisor::new(cfg);
+        supervisor.start(Arc::clone(&host) as _).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !auth_ok.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for Slack auth.test"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let unseen_err = supervisor
+            .post(
+                "pm",
+                BTreeMap::from([
+                    ("channel".to_string(), json!("C_RANDOM_UNSEEN")),
+                    ("text".to_string(), json!("Exfil attempt")),
+                ]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("unseen Slack channel MUST fail closed");
+        assert!(
+            matches!(&unseen_err, AdapterError::RequestFailed(msg) if msg.contains("not an allowed or previously seen")),
+            "expected fail-closed unseen channel error, got {unseen_err:?}"
+        );
+
+        let _ = supervisor.stop().await;
+        node.shutdown();
+    }
+
+    // ========================================================================
+    // 7. Bridge Fail-Closed Outbound Recipients & Per-Chat Isolation (B3 & B4)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn real_telegram_bridge_fail_closed_unseen_chat_and_no_cross_chat_reaction_fallback() {
+        let Some(node_bin) = find_binary("node") else {
+            eprintln!("SKIP real_telegram_bridge_fail_closed_unseen_chat_and_no_cross_chat_reaction_fallback: `node` not on PATH");
+            return;
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let token_file = tmp.path().join("tg.token");
+        fs::write(&token_file, "123456:TG_ISO_TEST_TOKEN").unwrap();
+
+        let delivered = Arc::new(AtomicBool::new(false));
+        let delivered_srv = Arc::clone(&delivered);
+        let mock_tg = MockHttpServer::start(move |req: MockRequest| {
+            let del = Arc::clone(&delivered_srv);
+            async move {
+                if req.path.ends_with("/getUpdates") {
+                    if !del.swap(true, Ordering::SeqCst) {
+                        return MockResponse::json(
+                            StatusCode::OK,
+                            &json!({
+                                "ok": true,
+                                "result": [
+                                    {
+                                        "update_id": 201,
+                                        "message": {
+                                            "message_id": 10,
+                                            "date": 1764000010,
+                                            "chat": { "id": 11111, "type": "private" },
+                                            "from": { "id": 42, "username": "alice" },
+                                            "text": "Chat A msg"
+                                        }
+                                    },
+                                    {
+                                        "update_id": 202,
+                                        "message": {
+                                            "message_id": 20,
+                                            "date": 1764000011,
+                                            "chat": { "id": 22222, "type": "group" },
+                                            "from": { "id": 42, "username": "alice" },
+                                            "text": "Chat B msg"
+                                        }
+                                    }
+                                ]
+                            }),
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    return MockResponse::json(StatusCode::OK, &json!({ "ok": true, "result": [] }));
+                }
+                if req.path.ends_with("/sendMessage") {
+                    return MockResponse::json(
+                        StatusCode::OK,
+                        &json!({ "ok": true, "result": { "message_id": 500 } }),
+                    );
+                }
+                if req.path.ends_with("/setMessageReaction") {
+                    return MockResponse::json(StatusCode::OK, &json!({ "ok": true, "result": true }));
+                }
+                MockResponse::json(StatusCode::NOT_FOUND, &json!({ "ok": false }))
+            }
+        })
+        .await;
+
+        let node = open_test_node("tg-iso-node", tmp.path());
+        let host = UnifiedNodeAdapterHost::new(Arc::clone(&node));
+        let plugin_script = repo_root().join("plugins/telegram/index.mjs");
+
+        // Configure ONLY TELEGRAM_ALLOWED_USERS (no TELEGRAM_ALLOWED_CHATS, no TELEGRAM_DEFAULT_CHAT),
+        // matching the documented config in docs/plugins.md!
+        let mut cfg = SubprocessConfig::new(
+            "tg-iso",
+            AdapterKind::Bridge,
+            node_bin,
+            vec![plugin_script.to_string_lossy().into_owned()],
+            vec!["personal".to_string()],
+        );
+        cfg.env.insert(
+            "TELEGRAM_BOT_TOKEN_FILE".into(),
+            token_file.to_string_lossy().into_owned(),
+        );
+        cfg.env.insert("TELEGRAM_TARGET".into(), "personal".into());
+        cfg.env.insert("TELEGRAM_ALLOWED_USERS".into(), "42".into());
+        cfg.env.insert("TELEGRAM_API_BASE".into(), mock_tg.base_url());
+
+        let supervisor = SubprocessSupervisor::new(cfg);
+        supervisor.start(Arc::clone(&host) as _).await.unwrap();
+        let _ = host.wait_for_event_count(2, Duration::from_secs(10)).await;
+
+        // 1. Outbound to UNSEEN chat `999999` MUST fail closed even without TELEGRAM_ALLOWED_CHATS!
+        let unseen_err = supervisor
+            .post(
+                "personal",
+                BTreeMap::from([
+                    ("chatId".to_string(), json!("999999")),
+                    ("text".to_string(), json!("Exfil attempt")),
+                ]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("unseen Telegram chat MUST fail closed");
+        assert!(
+            matches!(&unseen_err, AdapterError::RequestFailed(msg) if msg.contains("not an allowed or previously seen")),
+            "expected unseen chat fail-closed error, got {unseen_err:?}"
+        );
+
+        // 2. Omitting `chatId` when >1 chat has been seen (and no default) MUST fail clearly!
+        let ambiguous_err = supervisor
+            .post(
+                "personal",
+                BTreeMap::from([("text".to_string(), json!("Which chat?"))]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("ambiguous omitted chatId MUST fail");
+        assert!(
+            matches!(&ambiguous_err, AdapterError::RequestFailed(msg) if msg.contains("explicit chatId")),
+            "expected explicit chatId error, got {ambiguous_err:?}"
+        );
+
+        // 3. Explicit chatId for seen chat `11111` reacts strictly to chat `11111`'s message 10 (NOT chat 22222's message 20)!
+        let rxn_a = supervisor
+            .post(
+                "personal",
+                BTreeMap::from([
+                    ("chatId".to_string(), json!("11111")),
+                    ("reaction".to_string(), json!("👍")),
+                ]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("reaction in chat A must succeed");
+        assert_eq!(rxn_a["reactedMessageId"], json!(10));
+
+        let _ = supervisor.stop().await;
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn real_whatsapp_bridge_isolates_per_recipient_reactions_and_requires_explicit_to_when_ambiguous() {
+        let Some(node_bin) = find_binary("node") else {
+            eprintln!("SKIP real_whatsapp_bridge_isolates_per_recipient_reactions_and_requires_explicit_to_when_ambiguous: `node` not on PATH");
+            return;
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let plugin_script = repo_root().join("plugins/whatsapp/index.mjs");
+        let app_secret = "wa-iso-secret-2026";
+        let app_secret_file = tmp.path().join("wa.secret");
+        let access_token_file = tmp.path().join("wa.token");
+        fs::write(&app_secret_file, app_secret).unwrap();
+        fs::write(&access_token_file, "wa-token-iso").unwrap();
+
+        let mock_wa = MockHttpServer::start(|_req: MockRequest| async move {
+            MockResponse::json(
+                StatusCode::OK,
+                &json!({ "messaging_product": "whatsapp", "messages": [{ "id": "wamid.OUT" }] }),
+            )
+        })
+        .await;
+
+        let node = open_test_node("wa-iso-node", tmp.path());
+        let host = UnifiedNodeAdapterHost::new(Arc::clone(&node));
+        let port = pick_free_loopback_port().await;
+
+        let mut cfg = SubprocessConfig::new(
+            "wa-iso",
+            AdapterKind::Bridge,
+            node_bin,
+            vec![plugin_script.to_string_lossy().into_owned()],
+            vec!["whatsapp".to_string()],
+        );
+        cfg.env.insert("WHATSAPP_HOST".into(), "127.0.0.1".into());
+        cfg.env.insert("WHATSAPP_PORT".into(), port.to_string());
+        cfg.env.insert("WHATSAPP_PATH".into(), "/whatsapp".into());
+        cfg.env.insert("WHATSAPP_TARGET".into(), "whatsapp".into());
+        cfg.env.insert("WHATSAPP_PHONE_NUMBER_ID".into(), "987654321".into());
+        cfg.env.insert(
+            "WHATSAPP_ALLOWED_NUMBERS".into(),
+            "+15551111111,+15552222222,+15553333333".into(),
+        );
+        cfg.env.insert(
+            "WHATSAPP_APP_SECRET_FILE".into(),
+            app_secret_file.to_string_lossy().into_owned(),
+        );
+        cfg.env.insert(
+            "WHATSAPP_ACCESS_TOKEN_FILE".into(),
+            access_token_file.to_string_lossy().into_owned(),
+        );
+        cfg.env.insert("WHATSAPP_API_BASE".into(), mock_wa.base_url());
+
+        let supervisor = SubprocessSupervisor::new(cfg);
+        supervisor.start(Arc::clone(&host) as _).await.unwrap();
+        wait_for_http_ready(
+            &format!("http://127.0.0.1:{port}/health"),
+            Duration::from_secs(10),
+        )
+        .await;
+
+        let client = HttpClient::new().unwrap();
+        let body = serde_json::to_vec(&json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "metadata": { "phone_number_id": "987654321" },
+                        "messages": [
+                            { "from": "15551111111", "id": "wamid.A1", "timestamp": "1764000001", "type": "text", "text": { "body": "Hi from A" } },
+                            { "from": "15552222222", "id": "wamid.B2", "timestamp": "1764000002", "type": "text", "text": { "body": "Hi from B" } }
+                        ]
+                    }
+                }]
+            }]
+        }))
+        .unwrap();
+        let sig = compute_hmac_sha256_header(app_secret.as_bytes(), &body);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("http://127.0.0.1:{port}/whatsapp"))
+            .header(CONTENT_TYPE, "application/json")
+            .header("x-hub-signature-256", sig)
+            .body(full_body(body))
+            .unwrap();
+        assert_eq!(client.request(req).await.unwrap().status(), StatusCode::OK);
+        let _ = host.wait_for_event_count(2, Duration::from_secs(5)).await;
+
+        // 1. Omitting `to` when 2 recipients were seen without default MUST fail!
+        let ambig = supervisor
+            .post(
+                "whatsapp",
+                BTreeMap::from([("text".to_string(), json!("Ambiguous reply"))]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("omitted recipient must fail when multiple recipients seen");
+        assert!(
+            matches!(&ambig, AdapterError::RequestFailed(msg) if msg.contains("explicit recipient")),
+            "unexpected error: {ambig:?}"
+        );
+
+        // 2. Reacting to allowlisted recipient C (who never sent a message) without replyTo MUST fail
+        //    instead of falling back to global lastMessageId from A/B!
+        let no_cross = supervisor
+            .post(
+                "whatsapp",
+                BTreeMap::from([
+                    ("to".to_string(), json!("15553333333")),
+                    ("reaction".to_string(), json!("👍")),
+                ]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("must NOT fall back to another recipient's message_id");
+        assert!(
+            matches!(&no_cross, AdapterError::RequestFailed(msg) if msg.contains("15553333333")),
+            "unexpected error: {no_cross:?}"
+        );
+
+        let _ = supervisor.stop().await;
+        node.shutdown();
+    }
+
+    // ========================================================================
+    // 8. SubprocessSupervisor Stderr Capture, Secret Redaction & CrashLoopBackOff (B5)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn supervisor_captures_redacted_stderr_log_and_trips_crash_loop_circuit_breaker() {
+        let Some(python_bin) = find_binary("python3") else {
+            eprintln!("SKIP supervisor_captures_redacted_stderr_log_and_trips_crash_loop_circuit_breaker: `python3` not on PATH");
+            return;
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let log_path = tmp.path().join("logs").join("plugin-crashloop.log");
+        let secret_val = "sk_live_SUPER_SENSITIVE_TOKEN_987654321";
+
+        let script = r#"
+import os, sys
+tok = os.environ.get("MY_BOT_TOKEN", "")
+sys.stderr.write(f"fatal auth failure using token={tok} on startup\n")
+sys.stderr.flush()
+sys.exit(1)
+"#;
+
+        let node = open_test_node("crash-node", tmp.path());
+        let host = UnifiedNodeAdapterHost::new(Arc::clone(&node));
+
+        let mut cfg = SubprocessConfig::new(
+            "crashloop",
+            AdapterKind::Bridge,
+            python_bin,
+            vec!["-u".to_string(), "-c".to_string(), script.to_string()],
+            vec!["ops".to_string()],
+        );
+        cfg.env.insert("MY_BOT_TOKEN".to_string(), secret_val.to_string());
+        cfg.redacted_values.push(secret_val.to_string());
+        cfg.stderr_log_path = Some(log_path.clone());
+        cfg.initial_backoff = Duration::from_millis(15);
+        cfg.max_backoff = Duration::from_millis(30);
+        cfg.rapid_crash_window = Duration::from_secs(5);
+        cfg.max_rapid_crashes = 3;
+
+        let supervisor = SubprocessSupervisor::new(cfg);
+        supervisor.start(Arc::clone(&host) as _).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !supervisor.is_crash_loop_backoff() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for CrashLoopBackOff; health={:?} restarts={}",
+                supervisor.health(),
+                supervisor.restart_count()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // Circuit breaker stopped hot-looping after 3 rapid crashes (2 restarts after initial attempt).
+        let restarts_at_trip = supervisor.restart_count();
+        assert_eq!(restarts_at_trip, 2, "expected 2 restarts before 3rd crash trips breaker");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            supervisor.restart_count(),
+            restarts_at_trip,
+            "supervisor MUST stop respawning once in CrashLoopBackOff"
+        );
+
+        // Health & last_error carry CrashLoopBackOff + redacted stderr error, NEVER the raw secret!
+        let health = supervisor.health();
+        match &health {
+            AdapterHealth::Degraded(msg) => {
+                assert!(msg.contains("CrashLoopBackOff"), "expected CrashLoopBackOff in {msg}");
+                assert!(msg.contains("fatal auth failure"), "expected stderr detail in {msg}");
+                assert!(msg.contains("[REDACTED]"), "expected [REDACTED] in {msg}");
+                assert!(!msg.contains(secret_val), "raw secret leaked into health: {msg}");
+            }
+            other => panic!("expected Degraded(CrashLoopBackOff), got {other:?}"),
+        }
+
+        let recent = supervisor.recent_stderr();
+        assert!(!recent.is_empty(), "expected captured stderr lines");
+        assert!(recent.iter().any(|l| l.contains("[REDACTED]")));
+        for line in &recent {
+            assert!(!line.contains(secret_val), "raw secret leaked in recent_stderr: {line}");
+        }
+
+        // Bounded per-plugin log file exists with 0600 permissions and redacted content!
+        let log_content = fs::read_to_string(&log_path).expect("read plugin stderr log");
+        assert!(log_content.contains("fatal auth failure"));
+        assert!(log_content.contains("[REDACTED]"));
+        assert!(log_content.contains("CrashLoopBackOff"));
+        assert!(
+            !log_content.contains(secret_val),
+            "raw secret leaked into plugin stderr log: {log_content}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&log_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "plugin stderr log must be 0600, got {mode:o}");
+        }
 
         let _ = supervisor.stop().await;
         node.shutdown();
