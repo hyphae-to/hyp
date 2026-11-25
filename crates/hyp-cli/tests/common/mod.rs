@@ -9,7 +9,7 @@
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -20,9 +20,20 @@ pub fn hyp_bin() -> &'static str {
     env!("CARGO_BIN_EXE_hyp")
 }
 
+/// Path to the repository's `plugins/` directory for offline SHA-256 verified CLI tests.
+pub fn repo_plugins_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root")
+        .join("plugins")
+}
+
 /// Constructs a `Command` for the compiled `hyp` binary with complete environment
 /// isolation so live user config, sockets, Keychain, and ambient `HYPHAE_*` variables
-/// can never leak into tests.
+/// can never leak into tests. Sets `HYPHAE_PLUGINS_DIR` to the local repo `plugins/`
+/// directory so `hyp setup` / `hyp plugin` exercise real compile-time SHA-256 verification
+/// completely offline (tests wanting offline-failure or tarball behavior can remove/override it).
 pub fn isolated_cmd(home: &Path) -> Command {
     let mut cmd = Command::new(hyp_bin());
     cmd.env("HOME", home)
@@ -30,6 +41,9 @@ pub fn isolated_cmd(home: &Path) -> Command {
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("HYPHAE_SECRET_BACKEND", "file")
         .env("HYPHAE_NO_OPEN", "1")
+        .env("HYPHAE_PLUGINS_DIR", repo_plugins_dir())
+        .env_remove("HYPHAE_PLUGINS_ARCHIVE")
+        .env_remove("HYPHAE_PLUGINS_URL")
         .env_remove("HYPHAE_CONFIG")
         .env_remove("HYPHAE_STATE_DIR")
         .env_remove("HYPHAE_CONFIG_DIR")

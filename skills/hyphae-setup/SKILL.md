@@ -385,15 +385,20 @@ hyp deploy check --url https://<hostname> --json
 3. **Compiled-in pure-Rust event sources** (`sources[]` in `~/.config/hyphae/node.json` — zero Node/Python needed):
    - `github-public` (deduplicated ETag poller with multi-owner `repoTokens` + optional GitHub App webhook), `github-webhook`, `prometheus-webhook`, `webhook-stream`.
    - Reference secrets strictly as `{ "secret": "<name>" }`.
-4. **Optional external chat bridges & sources (`telegram`, `slack`, `whatsapp`, `webhook`, `prometheus`) — ALWAYS install via `hyp plugin install`**:
+4. **Optional external chat bridges & harness UI mods (`telegram`, `slack`, `whatsapp`, `webhook`, `prometheus`, `claude-panel`, `claude-code`, `herdr-mod`) — ALWAYS manage via `hyp plugin`**:
    - **NEVER** point `node.json` `plugins[]` at a local git checkout (e.g., `plugins/telegram/index.mjs` inside a workspace repository — checkouts move, get deleted, and are not SHA-256 verified against the installed `hyp` binary).
-   - **ALWAYS** run `hyp plugin install <telegram|slack|whatsapp|webhook|prometheus> --json` first. It downloads the version-matched release artifact (`hyp-vX.Y.Z-plugins.tar.gz`), unpacks safely, verifies every file (`sdk/client.mjs` + `<name>/index.mjs`) in constant time against compile-time pinned SHA-256 digests, and atomically installs them into `~/.config/hyphae/plugins/`:
+   - **ALWAYS** run `hyp plugin install <name> --json` (or `hyp plugin update --all --json` after upgrades). `hyp` downloads the version-matched release artifact (`hyp-vX.Y.Z-plugins.tar.gz`) once into its local verified cache (`~/.config/hyphae/plugins-cache/`), unpacks safely, verifies every file in constant time against compile-time pinned SHA-256 / `treeSha256` digests, records receipts in `~/.config/hyphae/plugins/installed.json`, and atomically installs bridges into `~/.config/hyphae/plugins/` and harness UI mods into their target harness paths (`claude-panel`, `herdr-mod`):
      ```sh
      hyp plugin list --json
      hyp plugin install telegram --json
      hyp plugin install slack --json
+     hyp plugin install claude-panel --json
+     hyp plugin install herdr-mod --json
+     hyp plugin update --all --json
      hyp plugin verify --json
      ```
+   - Offline/air-gapped installs work identically with `--archive <path-to-plugins.tar.gz>` or `--from-dir <plugins-dir>` (and `hyp setup --plugins-dir` / `--plugins-archive`). If `hyp setup` runs offline without a local cache/archive, pure-Rust harness config still succeeds and prompts `hyp plugin install claude-panel` / `hyp plugin install herdr-mod`.
+   - `hyp update` automatically runs `hyp plugin update --all` after replacing the binary (pass `--no-plugins` to opt out); locally modified plugins are never clobbered without `--force`.
    - Wire `~/.config/hyphae/node.json` `plugins[]` using the exact **`data.nodePath`** (absolute `node` binary path, falling back to `"node"` only if `null`) as `"command"` and **`data.plugins[0].scriptPath`** (`~/.config/hyphae/plugins/<name>/index.mjs`) as `"args"`:
      ```json
      {

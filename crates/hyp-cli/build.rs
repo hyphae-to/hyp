@@ -1,24 +1,113 @@
-//! Zero-dependency compile-time SHA-256 pinning for official external Hyphae plugins.
+//! Zero-dependency compile-time SHA-256 & tree-digest pinning for ALL official
+//! non-Rust Hyphae plugins and harness UI mods.
 //!
-//! Instead of embedding external plugin JS sources inside the static `hyp` binary,
-//! `build.rs` pins only the LF-normalized FIPS 180-4 SHA-256 digest of each of the
-//! 6 official runtime files (~400 bytes total). `hyp plugin install` / `verify`
-//! downloads `hyp-vX.Y.Z-plugins.tar.gz` (or reads `--archive` / `--from-dir`) and
-//! verifies every file in constant time against these pinned digests before writing
-//! a single byte to `<state_dir>/plugins/`.
+//! Instead of embedding JS/TS/TSX/SVG/PNG plugin assets inside the static `hyp` binary,
+//! `build.rs` pins ONLY the FIPS 180-4 SHA-256 digest of each official file (LF-normalized
+//! for UTF-8 text files, raw bytes for binary assets like `.png`) plus a deterministic
+//! per-plugin `tree_sha256` (SHA-256 over lexicographically sorted `"{rel_path}\0{sha256}\n"`
+//! lines). `hyp plugin install/update/verify` and `hyp setup` verify every file in constant
+//! time against these pinned digests before writing a single byte to disk.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
-const PLUGIN_FILES: &[(&str, &str)] = &[
-    ("sdk", "sdk/client.mjs"),
-    ("telegram", "telegram/index.mjs"),
-    ("slack", "slack/index.mjs"),
-    ("whatsapp", "whatsapp/index.mjs"),
-    ("webhook", "webhook/index.mjs"),
-    ("prometheus", "prometheus/index.mjs"),
+#[derive(Clone, Copy)]
+enum SpecKind {
+    Bridge,
+    Harness,
+}
+
+impl SpecKind {
+    const fn rust_variant(self) -> &'static str {
+        match self {
+            Self::Bridge => "PluginKind::Bridge",
+            Self::Harness => "PluginKind::Harness",
+        }
+    }
+}
+
+struct BuildPluginSpec {
+    id: &'static str,
+    kind: SpecKind,
+    /// `(rel_path_under_plugins_dir, is_binary)`
+    files: &'static [(&'static str, bool)],
+}
+
+const PLUGIN_SPECS: &[BuildPluginSpec] = &[
+    BuildPluginSpec {
+        id: "sdk",
+        kind: SpecKind::Bridge,
+        files: &[("sdk/client.mjs", false), ("sdk/client.py", false)],
+    },
+    BuildPluginSpec {
+        id: "telegram",
+        kind: SpecKind::Bridge,
+        files: &[("telegram/index.mjs", false)],
+    },
+    BuildPluginSpec {
+        id: "slack",
+        kind: SpecKind::Bridge,
+        files: &[("slack/index.mjs", false)],
+    },
+    BuildPluginSpec {
+        id: "whatsapp",
+        kind: SpecKind::Bridge,
+        files: &[("whatsapp/index.mjs", false)],
+    },
+    BuildPluginSpec {
+        id: "webhook",
+        kind: SpecKind::Bridge,
+        files: &[("webhook/index.mjs", false)],
+    },
+    BuildPluginSpec {
+        id: "prometheus",
+        kind: SpecKind::Bridge,
+        files: &[("prometheus/index.mjs", false)],
+    },
+    BuildPluginSpec {
+        id: "claude-panel",
+        kind: SpecKind::Harness,
+        files: &[
+            ("claude-code/hooks/register.tsx", false),
+            ("claude-code/hooks/state.ts", false),
+        ],
+    },
+    BuildPluginSpec {
+        id: "claude-code",
+        kind: SpecKind::Harness,
+        files: &[
+            ("claude-code/.claude-plugin/plugin.json", false),
+            ("claude-code/.claude-plugin/icon.png", true),
+            ("claude-code/.mcp.json", false),
+            ("claude-code/hooks/hooks.json", false),
+            ("claude-code/hooks/register.tsx", false),
+            ("claude-code/hooks/state.ts", false),
+            ("claude-code/commands/hyphae.md", false),
+            ("claude-code/commands/hyphae-focus.md", false),
+            ("claude-code/commands/hyphae-mute.md", false),
+            ("claude-code/commands/hyphae-subs.md", false),
+            ("claude-code/skills/hyphae/SKILL.md", false),
+            ("claude-code/README.md", false),
+        ],
+    },
+    BuildPluginSpec {
+        id: "herdr-mod",
+        kind: SpecKind::Harness,
+        files: &[
+            ("herdr-mod/mods/hyphae-pane/mod.json", false),
+            ("herdr-mod/mods/hyphae-pane/main.js", false),
+            ("herdr-mod/mods/hyphae-pane/pill.js", false),
+            ("herdr-mod/mods/hyphae-pane/shared-client.js", false),
+            ("herdr-mod/mods/hyphae-pane/hyphae.svg", false),
+            ("herdr-mod/mods/hyphae-panel/mod.json", false),
+            ("herdr-mod/mods/hyphae-panel/main.js", false),
+            ("herdr-mod/mods/hyphae-panel/shared-client.js", false),
+            ("herdr-mod/mods/hyphae-panel/hyphae.svg", false),
+        ],
+    },
 ];
 
 const SHA256_H_INIT: [u32; 8] = [
@@ -131,6 +220,21 @@ fn normalize_crlf(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Computes deterministic per-plugin `tree_sha256` over lexicographically sorted
+/// `"{rel_path}\0{file_sha256}\n"` lines.
+fn compute_tree_sha256(entries: &[(&str, &str)]) -> String {
+    let mut sorted: Vec<(&str, &str)> = entries.to_vec();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    let mut buf = Vec::new();
+    for (rel_path, digest) in sorted {
+        buf.extend_from_slice(rel_path.as_bytes());
+        buf.push(0x00);
+        buf.extend_from_slice(digest.as_bytes());
+        buf.push(b'\n');
+    }
+    sha256_hex(&buf)
+}
+
 fn main() {
     // Compile-time FIPS 180-4 self-check against official NIST vectors.
     assert_eq!(
@@ -151,34 +255,136 @@ fn main() {
         .join("..")
         .join("plugins");
 
+    // Hash every unique official plugin file once, keeping track of canonical owner & binary flag.
+    let mut file_digests: BTreeMap<&'static str, (String, bool)> = BTreeMap::new();
+    let mut unique_files_ordered: Vec<(&'static str, &'static str, bool)> = Vec::new();
+    let mut seen_rel: BTreeSet<&'static str> = BTreeSet::new();
+
+    for spec in PLUGIN_SPECS {
+        for &(rel_path, is_binary) in spec.files {
+            if let Some((_, prev_binary)) = file_digests.get(rel_path) {
+                assert_eq!(
+                    *prev_binary, is_binary,
+                    "conflicting is_binary flag for {rel_path}"
+                );
+                continue;
+            }
+            println!("cargo:rerun-if-changed=../../plugins/{rel_path}");
+            let full_path = plugins_root.join(rel_path);
+            let raw = fs::read(&full_path).unwrap_or_else(|e| {
+                panic!(
+                    "failed to read official plugin file {}: {e}",
+                    full_path.display()
+                )
+            });
+            let digest = if is_binary {
+                sha256_hex(&raw)
+            } else {
+                sha256_hex(&normalize_crlf(&raw))
+            };
+            file_digests.insert(rel_path, (digest, is_binary));
+            if seen_rel.insert(rel_path) {
+                unique_files_ordered.push((spec.id, rel_path, is_binary));
+            }
+        }
+    }
+
     let mut generated = String::from(
         "// Auto-generated by crates/hyp-cli/build.rs — DO NOT EDIT.\n\
+         #[allow(dead_code)]\n\
+         #[derive(Debug, Clone, Copy, PartialEq, Eq)]\n\
+         pub enum PluginKind {\n\
+             Bridge,\n\
+             Harness,\n\
+         }\n\n\
+         #[allow(dead_code)]\n\
+         impl PluginKind {\n\
+             pub const fn as_str(self) -> &'static str {\n\
+                 match self {\n\
+                     Self::Bridge => \"bridge\",\n\
+                     Self::Harness => \"harness\",\n\
+                 }\n\
+             }\n\
+         }\n\n\
+         #[allow(dead_code)]\n\
          #[derive(Debug, Clone, Copy, PartialEq, Eq)]\n\
          pub struct PinnedPluginFile {\n\
              pub plugin: &'static str,\n\
              pub rel_path: &'static str,\n\
              pub sha256: &'static str,\n\
+             pub is_binary: bool,\n\
          }\n\n\
+         #[allow(dead_code)]\n\
+         #[derive(Debug, Clone, Copy, PartialEq, Eq)]\n\
+         pub struct PinnedPluginSpec {\n\
+             pub id: &'static str,\n\
+             pub kind: PluginKind,\n\
+             pub tree_sha256: &'static str,\n\
+             pub files: &'static [PinnedPluginFile],\n\
+         }\n\n\
+         #[allow(dead_code)]\n\
          pub const PINNED_PLUGIN_FILES: &[PinnedPluginFile] = &[\n",
     );
 
-    for &(plugin, rel_path) in PLUGIN_FILES {
-        println!("cargo:rerun-if-changed=../../plugins/{rel_path}");
-        let full_path = plugins_root.join(rel_path);
-        let raw = fs::read(&full_path).unwrap_or_else(|e| {
-            panic!(
-                "failed to read official plugin file {}: {e}",
-                full_path.display()
-            )
-        });
-        let normalized = normalize_crlf(&raw);
-        let digest = sha256_hex(&normalized);
+    for (owner, rel_path, is_binary) in &unique_files_ordered {
+        let (digest, _) = file_digests
+            .get(rel_path)
+            .expect("digest computed for unique file");
         let _ = writeln!(
             &mut generated,
-            "    PinnedPluginFile {{\n        plugin: {plugin:?},\n        rel_path: {rel_path:?},\n        sha256: {digest:?},\n    }},"
+            "    PinnedPluginFile {{\n\
+             \x20       plugin: {owner:?},\n\
+             \x20       rel_path: {rel_path:?},\n\
+             \x20       sha256: {digest:?},\n\
+             \x20       is_binary: {is_binary},\n\
+             \x20   }},"
         );
     }
+    generated.push_str("];\n\n");
 
+    generated.push_str("#[allow(dead_code)]\npub const PINNED_PLUGINS: &[PinnedPluginSpec] = &[\n");
+    for spec in PLUGIN_SPECS {
+        let mut sorted_files: Vec<(&'static str, bool, &str)> = spec
+            .files
+            .iter()
+            .map(|&(rel_path, is_binary)| {
+                let (digest, _) = file_digests.get(rel_path).expect("digest exists");
+                (rel_path, is_binary, digest.as_str())
+            })
+            .collect();
+        sorted_files.sort_by(|a, b| a.0.cmp(b.0));
+
+        let tree_pairs: Vec<(&str, &str)> = sorted_files
+            .iter()
+            .map(|&(rel_path, _, digest)| (rel_path, digest))
+            .collect();
+        let tree_sha256 = compute_tree_sha256(&tree_pairs);
+
+        let _ = writeln!(
+            &mut generated,
+            "    PinnedPluginSpec {{\n\
+             \x20       id: {:?},\n\
+             \x20       kind: {},\n\
+             \x20       tree_sha256: {:?},\n\
+             \x20       files: &[",
+            spec.id,
+            spec.kind.rust_variant(),
+            tree_sha256
+        );
+        for (rel_path, is_binary, digest) in sorted_files {
+            let _ = writeln!(
+                &mut generated,
+                "            PinnedPluginFile {{\n\
+                 \x20               plugin: {:?},\n\
+                 \x20               rel_path: {:?},\n\
+                 \x20               sha256: {:?},\n\
+                 \x20               is_binary: {},\n\
+                 \x20           }},",
+                spec.id, rel_path, digest, is_binary
+            );
+        }
+        generated.push_str("        ],\n    },\n");
+    }
     generated.push_str("];\n");
 
     let dest = Path::new(&out_dir).join("plugin_checksums.rs");

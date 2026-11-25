@@ -265,17 +265,6 @@ const CLAUDE_SLASH_COMMANDS: [(&str, &str); 4] = [
     ("hyphae-mute.md", CLAUDE_CMD_HYPHAE_MUTE),
 ];
 
-const CLAUDE_PANEL_REGISTER_TSX: &str =
-    include_str!("../../../plugins/claude-code/hooks/register.tsx");
-const CLAUDE_PANEL_STATE_TS: &str =
-    include_str!("../../../plugins/claude-code/hooks/state.ts");
-const CLAUDE_PANEL_MANIFEST_JSON: &str = concat!(
-    "{\n  \"name\": \"hyphae-panel\",\n  \"version\": \"",
-    env!("CARGO_PKG_VERSION"),
-    "\",\n  \"description\": \"Native Hyphae live mesh side-panel mod (/hyphae-panel) for Claude Code.\",\n  \"author\": { \"name\": \"Hyphae\" },\n  \"license\": \"MIT\",\n  \"repository\": \"https://github.com/hyphae-to/hyp\"\n}\n"
-);
-const CLAUDE_PANEL_HOOKS_JSON: &str = "{\n  \"modules\": [\"./register.tsx\"]\n}\n";
-
 #[derive(Args)]
 pub struct SetupArgs {
     /// Target harness: all, auto, or one/comma-separated of claude,codex,antigravity,cursor,opencode,gemini,openclaw,herdr,t3
@@ -335,6 +324,12 @@ pub struct SetupArgs {
     /// Explicit opt-in for `hyp setup --harness herdr --mod` to replace a customized `pane.header.content.mod`
     #[arg(long)]
     pub force_layout: bool,
+    /// Local plugins directory for verified harness UI plugin installation (overrides HYPHAE_PLUGINS_DIR)
+    #[arg(long, value_name = "DIR")]
+    pub plugins_dir: Option<PathBuf>,
+    /// Local plugins .tar.gz archive for verified harness UI plugin installation (overrides HYPHAE_PLUGINS_ARCHIVE)
+    #[arg(long, value_name = "FILE")]
+    pub plugins_archive: Option<PathBuf>,
     /// Output structured JSON envelope
     #[arg(long)]
     pub json: bool,
@@ -396,6 +391,12 @@ pub struct OnboardArgs {
     /// Skip installing Claude Code slash commands (~/.claude/commands/hyphae*.md) during onboarding
     #[arg(long)]
     pub no_commands: bool,
+    /// Local plugins directory for verified harness UI plugin installation (overrides HYPHAE_PLUGINS_DIR)
+    #[arg(long, value_name = "DIR")]
+    pub plugins_dir: Option<PathBuf>,
+    /// Local plugins .tar.gz archive for verified harness UI plugin installation (overrides HYPHAE_PLUGINS_ARCHIVE)
+    #[arg(long, value_name = "FILE")]
+    pub plugins_archive: Option<PathBuf>,
     /// Output structured JSON envelope
     #[arg(long)]
     pub json: bool,
@@ -460,6 +461,16 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
             "CONFLICTING_FLAGS",
             "`--no-skills` and `--refresh-skills` are mutually exclusive",
             Some("Pass either `--no-skills` to skip skills or `--refresh-skills` to update them.".to_string()),
+        );
+    }
+    if args.plugins_dir.is_some() && args.plugins_archive.is_some() {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "CONFLICTING_FLAGS",
+            "`--plugins-dir` and `--plugins-archive` are mutually exclusive",
+            Some("Specify at most one of `--plugins-dir` or `--plugins-archive`.".to_string()),
         );
     }
     if args.interactive {
@@ -625,6 +636,8 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
         no_skills: args.no_skills,
         no_commands: args.no_commands,
         dry_run: args.dry_run,
+        plugins_dir: args.plugins_dir.as_deref(),
+        plugins_archive: args.plugins_archive.as_deref(),
     };
 
     for kind in targets {
@@ -639,7 +652,16 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
         } else if args.refresh_skills {
             refresh_harness_skill_only(kind, &home, &claude_profiles, &skill_ctx, args.dry_run)
         } else {
-            configure_harness(kind, &home, &bin_path, &config_path, setup_opts, &skill_ctx)
+            configure_harness(
+                kind,
+                &home,
+                &bin_path,
+                &config_path,
+                setup_opts,
+                &skill_ctx,
+                &mut warnings,
+                &mut extra_next,
+            )
         };
         match step_res {
             Ok(mut outcome) => {
@@ -659,6 +681,9 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
                         } else {
                             None
                         },
+                        state_dir: Some(state_dir.clone()),
+                        plugins_dir: args.plugins_dir.clone(),
+                        plugins_archive: args.plugins_archive.clone(),
                     };
                     match crate::herdr_mod::install_herdr_mod(&home, mod_opts) {
                         Ok(mod_res) => {
@@ -668,13 +693,20 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
                             extra_next.extend(mod_res.next.iter().cloned());
                             herdr_mod_outcome = Some(mod_res);
                         }
-                        Err(e) => {
+                        Err(err) if err.is_offline_download => {
+                            warnings.push(format!(
+                                "Skipped native Herdr mod (herdr-mod): release download unavailable while offline ({}). Pure-Rust Herdr config (~/.config/herdr/hyphae.json) was configured normally.",
+                                err.message
+                            ));
+                            extra_next.push("hyp plugin install herdr-mod".to_string());
+                        }
+                        Err(err) => {
                             return emit_error(
                                 cmd,
                                 as_json,
                                 EXIT_ERROR,
                                 "HERDR_MOD_FAILED",
-                                format!("Failed to install Herdr mod: {e}"),
+                                format!("Failed to install Herdr mod: {}", err.message),
                                 None,
                             );
                         }
@@ -771,6 +803,17 @@ pub fn run_onboard(args: OnboardArgs) -> ExitCode {
     let cmd = "onboard";
     let as_json = args.json;
 
+    if args.plugins_dir.is_some() && args.plugins_archive.is_some() {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "CONFLICTING_FLAGS",
+            "`--plugins-dir` and `--plugins-archive` are mutually exclusive",
+            Some("Specify at most one of `--plugins-dir` or `--plugins-archive`.".to_string()),
+        );
+    }
+
     let Some(home) = resolve_home_dir(args.home.as_deref()) else {
         return emit_error(
             cmd,
@@ -821,6 +864,17 @@ fn run_onboard_deterministic(
 ) -> ExitCode {
     let cmd = "onboard";
     let as_json = args.json;
+
+    if args.plugins_dir.is_some() && args.plugins_archive.is_some() {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "CONFLICTING_FLAGS",
+            "`--plugins-dir` and `--plugins-archive` are mutually exclusive",
+            Some("Specify at most one of `--plugins-dir` or `--plugins-archive`.".to_string()),
+        );
+    }
 
     let profile = args.profile.to_node_profile();
     let node_id = args.node_id.unwrap_or_else(default_node_id);
@@ -1108,6 +1162,8 @@ fn run_onboard_deterministic(
         no_skills: opt_no_skills,
         no_commands: opt_no_commands,
         dry_run: false,
+        plugins_dir: args.plugins_dir.as_deref(),
+        plugins_archive: args.plugins_archive.as_deref(),
     };
     let mut configured_harnesses = Vec::new();
     let mut herdr_mod_outcome: Option<crate::herdr_mod::HerdrModInstallOutcome> = None;
@@ -1120,6 +1176,8 @@ fn run_onboard_deterministic(
             &config_path,
             onboard_setup_opts,
             &skill_ctx,
+            &mut warnings,
+            &mut extra_next,
         ) {
             Ok(mut outcome) => {
                 if kind == HarnessKind::Herdr && opt_install_mod {
@@ -1134,6 +1192,9 @@ fn run_onboard_deterministic(
                         } else {
                             None
                         },
+                        state_dir: Some(state_dir.clone()),
+                        plugins_dir: args.plugins_dir.clone(),
+                        plugins_archive: args.plugins_archive.clone(),
                     };
                     match crate::herdr_mod::install_herdr_mod(&home, mod_opts) {
                         Ok(mod_res) => {
@@ -1143,8 +1204,11 @@ fn run_onboard_deterministic(
                             extra_next.extend(mod_res.next.iter().cloned());
                             herdr_mod_outcome = Some(mod_res);
                         }
-                        Err(e) => {
-                            warnings.push(format!("Skipped Herdr mod install: {e}"));
+                        Err(err) => {
+                            warnings.push(format!("Skipped Herdr mod install: {}", err.message));
+                            if err.is_offline_download {
+                                extra_next.push("hyp plugin install herdr-mod".to_string());
+                            }
                         }
                     }
                 }
@@ -2105,6 +2169,8 @@ struct SetupOptions<'a> {
     no_skills: bool,
     no_commands: bool,
     dry_run: bool,
+    plugins_dir: Option<&'a Path>,
+    plugins_archive: Option<&'a Path>,
 }
 
 fn maybe_install_harness_runtime_skills(
@@ -2673,6 +2739,7 @@ fn inspect_statusline_path(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn configure_harness(
     kind: HarnessKind,
     home: &Path,
@@ -2680,10 +2747,12 @@ fn configure_harness(
     config_path: &Path,
     opts: SetupOptions<'_>,
     skill_ctx: &SetupSkillContext,
+    warnings: &mut Vec<String>,
+    extra_next: &mut Vec<String>,
 ) -> Result<HarnessSetupOutcome, String> {
     match kind {
         HarnessKind::Antigravity => setup_antigravity(home, bin, opts, skill_ctx),
-        HarnessKind::Claude => setup_claude(home, bin, opts, skill_ctx),
+        HarnessKind::Claude => setup_claude(home, bin, opts, skill_ctx, warnings, extra_next),
         HarnessKind::Codex => setup_codex(home, bin, opts, skill_ctx),
         HarnessKind::Cursor => setup_cursor(home, bin, opts, skill_ctx),
         HarnessKind::Opencode => setup_opencode(home, bin, opts, skill_ctx),
@@ -2849,6 +2918,8 @@ fn setup_claude(
     bin: &str,
     opts: SetupOptions<'_>,
     skill_ctx: &SetupSkillContext,
+    warnings: &mut Vec<String>,
+    extra_next: &mut Vec<String>,
 ) -> Result<HarnessSetupOutcome, String> {
     let socket = opts.socket;
     let dry_run = opts.dry_run;
@@ -2864,14 +2935,6 @@ fn setup_claude(
     let mut seen_mcp = BTreeSet::new();
     let mut seen_settings = BTreeSet::new();
     let mut seen_commands = BTreeSet::new();
-    let mut seen_panel = BTreeSet::new();
-
-    let panel_files: [(&str, &str); 4] = [
-        (".claude-plugin/plugin.json", CLAUDE_PANEL_MANIFEST_JSON),
-        ("hooks/hooks.json", CLAUDE_PANEL_HOOKS_JSON),
-        ("hooks/register.tsx", CLAUDE_PANEL_REGISTER_TSX),
-        ("hooks/state.ts", CLAUDE_PANEL_STATE_TS),
-    ];
 
     for profile in opts.claude_profiles {
         // 1. Profile-local `.claude.json` (distinct per CLAUDE_CONFIG_DIR profile!).
@@ -2980,7 +3043,7 @@ fn setup_claude(
             files.push(settings_file.display().to_string());
         }
 
-        // 3. Slash commands & UI-only native Claude Code side-panel mod (`/hyphae-panel`).
+        // 3. Slash commands (pure Markdown, zero JS/TS).
         if !opts.no_commands {
             let commands_dir = profile.commands_dir();
             if seen_commands.insert(canonical_dedup_key(&commands_dir)) {
@@ -2990,25 +3053,48 @@ fn setup_claude(
                     files.push(cmd_path.display().to_string());
                 }
             }
+        }
+    }
 
-            let panel_root = profile.panel_dir();
-            if seen_panel.insert(canonical_dedup_key(&panel_root)) {
-                for (rel, content) in panel_files {
-                    let target = panel_root.join(rel);
-                    maybe_write_text(&target, content, false, dry_run)?;
-                    files.push(target.display().to_string());
+    // 4. UI-only native Claude Code side-panel mod (`claude-panel`) via unified verified plugin manager.
+    if !opts.no_commands {
+        match crate::plugin_cmd::install_claude_panel_for_profiles(
+            opts.state_dir,
+            opts.claude_profiles,
+            crate::plugin_cmd::PluginSourceOverrides {
+                archive: opts.plugins_archive,
+                from_dir: opts.plugins_dir,
+                url: None,
+            },
+            dry_run,
+        ) {
+            Ok(report) => {
+                files.extend(report.files);
+                let default_panel_key =
+                    canonical_dedup_key(&home.join(".claude").join("skills").join("hyphae-panel"));
+                for panel_root in &report.target_paths {
+                    if canonical_dedup_key(panel_root) == default_panel_key {
+                        notes.push(
+                            "Installed native Claude Code plugin (live status indicator + /hyphae-panel) under ~/.claude/skills/hyphae-panel/ (activates on next Claude session)."
+                                .to_string(),
+                        );
+                    } else {
+                        notes.push(format!(
+                            "Installed native Claude Code side-panel mod (/hyphae-panel) under {}/.",
+                            panel_root.display()
+                        ));
+                    }
                 }
-                if profile.is_default_home {
-                    notes.push(
-                        "Installed native Claude Code plugin (live status indicator + /hyphae-panel) under ~/.claude/skills/hyphae-panel/ (activates on next Claude session)."
-                            .to_string(),
-                    );
-                } else {
-                    notes.push(format!(
-                        "Installed native Claude Code side-panel mod (/hyphae-panel) under {}/.",
-                        panel_root.display()
-                    ));
-                }
+            }
+            Err(err) if err.is_offline_download_error() => {
+                warnings.push(format!(
+                    "Skipped Claude Code side-panel mod (claude-panel): release download unavailable while offline ({}). Pure-Rust Claude MCP, hooks, slash commands, and skills were configured normally.",
+                    err.message
+                ));
+                extra_next.push("hyp plugin install claude-panel".to_string());
+            }
+            Err(err) => {
+                return Err(format!("Failed to install claude-panel: {err}"));
             }
         }
     }

@@ -168,6 +168,10 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub config: Option<PathBuf>,
 
+    /// Skip automatic post-upgrade sync of installed official plugins (`hyp plugin update --all`)
+    #[arg(long)]
+    pub no_plugins: bool,
+
     /// Output structured JSON envelope
     #[arg(long)]
     pub json: bool,
@@ -1176,6 +1180,18 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
             .set_metadata(META_UPDATE_CHECKED_AT, &now.to_string());
     }
 
+    let mut next = vec!["hyp version --json".to_string()];
+
+    // 5. Post-upgrade selective plugin sync (best-effort, non-fatal if offline, skippable via `--no-plugins`).
+    let plugins_sync = run_post_upgrade_plugin_sync(
+        &target_bin,
+        &dir,
+        args.config.as_deref(),
+        args.no_plugins,
+        &mut warnings,
+        &mut next,
+    );
+
     let remote_failed = fleet_plan
         .iter()
         .any(|p| p.outcome.as_deref().is_some_and(|o| o.starts_with("FAILED")));
@@ -1203,12 +1219,13 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
                 "signatureVerified": true,
                 "smokeCheckPassed": true,
                 "smokeVersion": swap_res.smoke_version,
+                "pluginsSync": plugins_sync,
                 "fleetAll": args.all,
                 "fleetPlan": fleet_plan,
                 "rolloutOrder": rollout_order,
             })),
             warnings,
-            next: vec!["hyp version --json".to_string()],
+            next,
             error: if ok {
                 None
             } else {
@@ -1233,16 +1250,192 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
         if let Some(ref b) = swap_res.backup_path {
             println!("      Backup:  {}", b.display());
         }
+        if let Some(summary_str) = plugins_sync.get("summary").and_then(Value::as_str) {
+            println!("      Plugins: {summary_str}");
+        }
         if args.all {
             print_fleet_table(&fleet_plan);
         }
         print_warnings(&warnings);
+        print_next_steps(&next);
     }
 
     if ok {
         ExitCode::from(EXIT_OK)
     } else {
         ExitCode::from(EXIT_ERROR)
+    }
+}
+
+/// Invokes `<new_hyp> plugin update --all --json` after a successful binary swap so installed
+/// bridges and harness UI mods stay selectively synced. Strictly best-effort & non-fatal (offline
+/// or modified plugins produce clear warnings and actionable `next` commands without failing the
+/// binary upgrade).
+fn run_post_upgrade_plugin_sync(
+    new_bin: &Path,
+    state_dir: &Path,
+    config_path: Option<&Path>,
+    no_plugins: bool,
+    warnings: &mut Vec<String>,
+    next: &mut Vec<String>,
+) -> Value {
+    if no_plugins {
+        let has_receipts = crate::plugin_cmd::receipts_file_path(state_dir).is_file();
+        if has_receipts {
+            next.push("hyp plugin update --all".to_string());
+        }
+        return json!({
+            "skipped": true,
+            "reason": "no_plugins_flag",
+            "summary": "skipped (--no-plugins)",
+            "updated": [],
+            "upToDate": [],
+            "modified": [],
+        });
+    }
+
+    let mut cmd = Command::new(new_bin);
+    cmd.args(["plugin", "update", "--all", "--state-dir"])
+        .arg(state_dir);
+    if let Some(cfg) = config_path {
+        cmd.arg("--config").arg(cfg);
+    }
+    cmd.arg("--json");
+
+    match cmd.output() {
+        Ok(out) => {
+            if let Ok(parsed) = serde_json::from_slice::<Value>(&out.stdout) {
+                if parsed.get("ok") == Some(&Value::Bool(true)) {
+                    let data = parsed.get("data");
+                    let updated: Vec<String> = data
+                        .and_then(|d| d.get("updated"))
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let up_to_date: Vec<String> = data
+                        .and_then(|d| d.get("upToDate"))
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let modified: Vec<String> = data
+                        .and_then(|d| d.get("modified"))
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let corrupt: Vec<String> = data
+                        .and_then(|d| d.get("corrupt"))
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if let Some(plugin_warnings) =
+                        parsed.get("warnings").and_then(Value::as_array)
+                    {
+                        for w in plugin_warnings {
+                            if let Some(s) = w.as_str() {
+                                warnings.push(format!("plugin sync: {s}"));
+                            }
+                        }
+                    }
+                    if let Some(hints) = data
+                        .and_then(|d| d.get("reloadHints"))
+                        .and_then(Value::as_array)
+                    {
+                        for h in hints {
+                            if let Some(s) = h.as_str() {
+                                let owned = s.to_string();
+                                if !next.contains(&owned) {
+                                    next.push(owned);
+                                }
+                            }
+                        }
+                    }
+                    let summary = if updated.is_empty() && modified.is_empty() && corrupt.is_empty()
+                    {
+                        if up_to_date.is_empty() {
+                            "none installed (0 downloads)".to_string()
+                        } else {
+                            format!("{} up to date (0 downloads)", up_to_date.len())
+                        }
+                    } else {
+                        format!(
+                            "{} updated, {} up to date, {} modified skipped",
+                            updated.len(),
+                            up_to_date.len(),
+                            modified.len()
+                        )
+                    };
+                    return json!({
+                        "skipped": false,
+                        "ok": true,
+                        "summary": summary,
+                        "updated": updated,
+                        "upToDate": up_to_date,
+                        "modified": modified,
+                        "corrupt": corrupt,
+                    });
+                }
+                let err_msg = parsed
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("plugin sync returned non-ok status");
+                warnings.push(format!(
+                    "Post-upgrade plugin sync did not complete ({err_msg}); run `hyp plugin update --all` manually."
+                ));
+                next.push("hyp plugin update --all".to_string());
+                json!({
+                    "skipped": false,
+                    "ok": false,
+                    "summary": format!("deferred ({err_msg})"),
+                    "error": err_msg,
+                })
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                let detail = if stderr.is_empty() {
+                    format!("exit status {:?}", out.status.code())
+                } else {
+                    stderr
+                };
+                warnings.push(format!(
+                    "Post-upgrade plugin sync skipped ({detail}); run `hyp plugin update --all` manually."
+                ));
+                next.push("hyp plugin update --all".to_string());
+                json!({
+                    "skipped": false,
+                    "ok": false,
+                    "summary": format!("deferred ({detail})"),
+                    "error": detail,
+                })
+            }
+        }
+        Err(e) => {
+            warnings.push(format!(
+                "Failed to invoke post-upgrade plugin sync ({e}); run `hyp plugin update --all` manually."
+            ));
+            next.push("hyp plugin update --all".to_string());
+            json!({
+                "skipped": false,
+                "ok": false,
+                "summary": format!("deferred ({e})"),
+                "error": e.to_string(),
+            })
+        }
     }
 }
 
@@ -1917,5 +2110,41 @@ mod tests {
             .0,
             "ROLLBACK_DETECTED"
         );
+    }
+
+    #[test]
+    fn no_plugins_flag_skips_post_upgrade_sync_and_hints_when_receipts_exist() {
+        use clap::Parser;
+        use tempfile::TempDir;
+
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            args: UpdateArgs,
+        }
+
+        let parsed = Wrapper::try_parse_from(["update", "--no-plugins", "--json"])
+            .expect("parse --no-plugins");
+        assert!(parsed.args.no_plugins);
+
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        let receipts_path = crate::plugin_cmd::receipts_file_path(&state_dir);
+        fs::create_dir_all(receipts_path.parent().unwrap()).unwrap();
+        fs::write(&receipts_path, "{\"schemaVersion\":1,\"installed\":{}}\n").unwrap();
+
+        let mut warnings = Vec::new();
+        let mut next = Vec::new();
+        let sync = run_post_upgrade_plugin_sync(
+            Path::new("/nonexistent/hyp"),
+            &state_dir,
+            None,
+            true,
+            &mut warnings,
+            &mut next,
+        );
+        assert_eq!(sync["skipped"], true);
+        assert!(warnings.is_empty());
+        assert!(next.iter().any(|s| s == "hyp plugin update --all"));
     }
 }

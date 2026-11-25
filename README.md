@@ -207,7 +207,7 @@ hyp onboard [--profile local|router|p2p] [--node-id <id>] [--join <file|->] [--h
 hyp node start [--profile local|router|p2p] [--bind <ip:port>] [--config <path>]   # alias: hyp daemon
 hyp service [install | status | restart | stop]
 hyp setup [--harness auto|all|claude,codex,herdr,...] [--interactive] [--statusline | --restore-statusline] [--mod] [--no-skills] [--no-commands]
-hyp plugin [list | install <name|all> | verify | remove <name|all>]                   # checksum-verified external chat/webhook bridge plugins
+hyp plugin [list | install <name|all> | update [<name>|--all] | verify [<name>] | remove <name|all>]  # verified bridges & harness UI mods
 hyp inspect [--session <id>] [--all] [--watch] [--json]                             # non-blocking session & stream inspector
 hyp session <focus|mute|unmute|rule|unsubscribe|leave> ...                          # quick thread delivery & subscription controls
 hyp ui [--session <id>]                                                             # pure-Rust interactive terminal inspector (!hyp ui)
@@ -223,7 +223,7 @@ hyp secret [set <name> [--web] | list | delete <name>]
 hyp gate [init | propose | lock | review | log]                                     # anthropic supports --auth-header x-api-key|bearer
 hyp inbox [approve <receipt> | reject <receipt> [--mute]]
 hyp kv [get | set | delete | list]                                                  # CAS via --expected-version
-hyp update [check | channel | dismiss] | hyp update [--channel stable|nightly] [--all] [--dry-run]
+hyp update [check | channel | dismiss] | hyp update [--channel stable|nightly] [--all] [--no-plugins] [--dry-run]
 hyp uninstall [--latest] [--dry-run] [--yes] [--keep-binary] [--keep-state]         # or `curl -fsSL https://hyphae.to/uninstall.sh | sh`
 hyp wait [--stream] [--timeout <sec>] | hyp watch
 ```

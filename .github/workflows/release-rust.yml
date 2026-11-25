@@ -232,11 +232,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout release commit (for official external plugins archive)
+      - name: Checkout release commit (with tag history for change-aware plugin manifest)
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare.outputs.git_sha }}
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: Download all target archives
         uses: actions/download-artifact@v4
@@ -245,43 +245,20 @@ jobs:
           merge-multiple: true
           path: dist
 
-      - name: Package official external plugins archive (LF-normalized)
+      - name: Package official non-Rust plugins archive & detect changed plugins
+        id: plugins
         shell: bash
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
-          STAGE="$(mktemp -d)"
-          trap 'rm -rf "$STAGE"' EXIT
-          for rel in \
-            sdk/client.mjs \
-            telegram/index.mjs \
-            slack/index.mjs \
-            whatsapp/index.mjs \
-            webhook/index.mjs \
-            prometheus/index.mjs
-          do
-            if [ ! -f "plugins/${rel}" ]; then
-              echo "Missing official plugin file: plugins/${rel}" >&2
-              exit 1
-            fi
-            mkdir -p "${STAGE}/$(dirname "$rel")"
-            node -e '
-              const fs = require("node:fs");
-              const raw = fs.readFileSync(process.argv[1]);
-              const norm = Buffer.from(raw.toString("binary").replace(/\r\n/g, "\n"), "binary");
-              fs.writeFileSync(process.argv[2], norm);
-            ' "plugins/${rel}" "${STAGE}/${rel}"
-            chmod 0644 "${STAGE}/${rel}"
-          done
-          tar --format=ustar -C "$STAGE" -czf "dist/hyp-${TAG}-plugins.tar.gz" \
-            sdk/client.mjs \
-            telegram/index.mjs \
-            slack/index.mjs \
-            whatsapp/index.mjs \
-            webhook/index.mjs \
-            prometheus/index.mjs
-          ls -lh "dist/hyp-${TAG}-plugins.tar.gz"
+          node scripts/pack-plugins.mjs \
+            --tag "${TAG}" \
+            --out-dir dist \
+            --notes-out dist/changed-plugins.md \
+            --github-output "${GITHUB_OUTPUT}"
+          ls -lh "dist/hyp-${TAG}-plugins.tar.gz" dist/plugins-manifest.json
+          cat dist/changed-plugins.md
 
       - name: Generate and verify SHA256SUMS.txt & canonical release-manifest.json
         shell: bash
@@ -403,15 +380,37 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
-      - name: Upload archives, SHA256SUMS.txt & release-manifest.json to GitHub Release
+      - name: Tag Claude Code plugin release (only when claude-code treeSha256 changed)
+        if: needs.prepare.outputs.dry_run != 'true' && startsWith(github.ref, 'refs/tags/v') && steps.plugins.outputs.changed_claude_code == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          GIT_SHA: ${{ needs.prepare.outputs.git_sha }}
+        run: |
+          set -euo pipefail
+          PLUGIN_TAG="hyphae--${TAG}"
+          if gh api "repos/${REPO}/git/ref/tags/${PLUGIN_TAG}" >/dev/null 2>&1; then
+            echo "Claude Code plugin tag ${PLUGIN_TAG} already exists; skipping."
+          else
+            gh api -X POST "repos/${REPO}/git/refs" \
+              -f ref="refs/tags/${PLUGIN_TAG}" \
+              -f sha="${GIT_SHA}" >/dev/null
+            echo "Created Claude Code plugin tag ${PLUGIN_TAG} at ${GIT_SHA}."
+          fi
+
+      - name: Upload archives, SHA256SUMS.txt, plugins-manifest.json & release-manifest.json to GitHub Release
         if: needs.prepare.outputs.dry_run != 'true' && startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           name: Hyphae ${{ needs.prepare.outputs.tag }}
           prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          body_path: dist/changed-plugins.md
           generate_release_notes: true
           files: |
             dist/hyp-*
             dist/SHA256SUMS.txt
+            dist/plugins-manifest.json
             dist/release-manifest.json

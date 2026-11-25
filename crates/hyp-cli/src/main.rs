@@ -203,7 +203,7 @@ enum Commands {
         #[command(subcommand)]
         command: pair::PairCommand,
     },
-    /// Manage verified external chat & webhook bridge plugins (`list`, `install`, `verify`, `remove`)
+    /// Manage verified non-Rust bridges & harness UI mods (`list`, `install`, `update`, `verify`, `remove`)
     Plugin {
         #[command(subcommand)]
         command: plugin_cmd::PluginCommand,
