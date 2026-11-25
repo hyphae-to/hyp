@@ -391,6 +391,11 @@ textarea {
   resize: vertical;
 }
 
+textarea.auto-expand {
+  overflow-y: hidden;
+  resize: none;
+}
+
 input:focus,
 textarea:focus {
   border-color: var(--gold);
@@ -401,6 +406,62 @@ input:disabled,
 textarea:disabled {
   opacity: 0.48;
   cursor: not-allowed;
+}
+
+/* Encrypted Directive Draft Panel */
+.enc-draft-panel {
+  background: var(--surface-inset);
+  border: 1px solid var(--gold-border);
+  border-radius: var(--radius-md);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.enc-draft-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.enc-draft-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--gold-bright);
+  background: var(--gold-dim);
+  border: 1px solid var(--gold-border);
+}
+
+.enc-draft-copy {
+  margin: 0;
+  font-size: 0.88rem;
+  color: var(--cream);
+  line-height: 1.45;
+}
+
+.draft-context {
+  background: var(--surface-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.draft-context-text {
+  font-size: 0.84rem;
+  color: var(--cream-soft);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .checkbox-row {
@@ -422,6 +483,13 @@ textarea:disabled {
   margin: 2px 0 0;
   accent-color: var(--gold);
   flex-shrink: 0;
+}
+
+.checkbox-row.warn-confirm {
+  background: var(--gold-dim);
+  border-color: var(--gold-border);
+  color: #fef3c7;
+  font-weight: 600;
 }
 
 .checkbox-row.danger-confirm {

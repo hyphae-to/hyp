@@ -3,11 +3,14 @@
  *
  * Security invariants:
  * - Immediately parses `window.location.hash` into RAM and scrubs the URL bar via `history.replaceState`.
- * - Never pre-fills payload inputs (ignores any `proposedText` or `body` in URL fragments).
- * - Derives Ed25519 signing seed strictly in RAM via WebAuthn Passkey + PRF -> HKDF-SHA256.
+ * - Hard-ignores any plaintext `proposedText`, `draft`, or `body` in URL fragments.
+ * - Accepts optional HPKE-encrypted `encDraft` (`human.draft.v1`) ONLY on `kind === "directive"`
+ *   (hard-ignored on `kind === "secret"`), decryptable strictly after Face ID / Touch ID.
+ * - Derives Ed25519 signing seed & companion X25519 draft key strictly in RAM via WebAuthn Passkey + PRF -> HKDF-SHA256.
  * - Verifies `NodeCertV1` (`hcert1_`) against the derived human authority pubkey before sealing.
  * - Hard-blocks `kind === "secret"` drops on unverified nodes or reserved system secret names.
- * - Zeroes ephemeral seeds and wipes form inputs immediately after sealing (or on page unload).
+ * - Zeroes ephemeral seeds and wipes form inputs immediately after sealing, on reset/skip, on `pagehide`,
+ *   or on `visibilitychange` when hidden.
  * - Falls back cleanly to 1-tap offline `hdrop1_` copy if the Drop Relay is unreachable.
  */
 
@@ -16,9 +19,12 @@ import {
   base64urlEncode,
   decodeOkpJwkBytes,
   derivePrfEd25519Seed,
+  derivePrfX25519Keypair,
   ed25519KeypairFromSeed,
+  HUMAN_DRAFT_SUITE,
   isReservedSecretName,
   MAX_PADDED_PLAINTEXT,
+  openHumanDraft,
   prfEvalInput,
   randomBytes,
   sasFingerprint,
@@ -62,6 +68,40 @@ export function isLoopbackCallbackUrl(rawUrl) {
   }
 }
 
+function parseOptionalEncDraft(rawDraft) {
+  if (!rawDraft || typeof rawDraft !== "object" || Array.isArray(rawDraft)) {
+    return null;
+  }
+  if (rawDraft.v !== 1 || rawDraft.suite !== HUMAN_DRAFT_SUITE) {
+    return null;
+  }
+  if (
+    typeof rawDraft.recipientKid !== "string" ||
+    rawDraft.recipientKid.length === 0 ||
+    typeof rawDraft.enc !== "string" ||
+    typeof rawDraft.ct !== "string"
+  ) {
+    return null;
+  }
+  try {
+    const encBytes = base64urlDecode(rawDraft.enc);
+    const ctBytes = base64urlDecode(rawDraft.ct);
+    if (encBytes.length !== 32 || ctBytes.length < 16) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  // Strict field whitelist — strip any extra smuggled keys.
+  return {
+    v: 1,
+    suite: HUMAN_DRAFT_SUITE,
+    recipientKid: rawDraft.recipientKid,
+    enc: rawDraft.enc,
+    ct: rawDraft.ct,
+  };
+}
+
 export function parseFragmentString(rawHash) {
   const hash = typeof rawHash === "string" ? rawHash.replace(/^#/, "").trim() : "";
   if (!hash) {
@@ -80,7 +120,8 @@ export function parseFragmentString(rawHash) {
   if (!raw || typeof raw !== "object") {
     throw new Error("Drop invite fragment must be a JSON object");
   }
-  // Deliberately whitelist fields — NEVER read or preserve `proposedText` or `body`!
+  // Deliberately whitelist fields — HARD-IGNORE plaintext `proposedText`, `draft`, or `body`!
+  // Accept HPKE `encDraft` ONLY on `kind === "directive"` (HARD-IGNORE on `kind === "secret"`).
   if (raw.v !== 1) {
     throw new Error(`Unsupported drop invite version: ${raw.v}`);
   }
@@ -109,6 +150,8 @@ export function parseFragmentString(rawHash) {
     expiresAtMs = parsed;
   }
 
+  const encDraft = raw.kind === "directive" ? parseOptionalEncDraft(raw.encDraft) : null;
+
   const fragment = {
     v: 1,
     dropId: typeof raw.dropId === "string" ? raw.dropId : "",
@@ -125,6 +168,7 @@ export function parseFragmentString(rawHash) {
     humanId: typeof raw.humanId === "string" ? raw.humanId.trim() : "",
     prfSalt: typeof raw.prfSalt === "string" ? raw.prfSalt.trim() : "",
     authEpoch: Number.isInteger(raw.authEpoch) && raw.authEpoch >= 1 ? raw.authEpoch : null,
+    encDraft,
   };
 
   return { mode: "drop", fragment };
@@ -396,12 +440,16 @@ function initEnrollMode(payload) {
     btn.textContent = "Waiting for FaceID / TouchID…";
     let prfOut = null;
     let seed = null;
+    let encKp = null;
     try {
       const enrolled = await enrollPasskeyWithPrf(humanId, prfSalt);
       prfOut = enrolled.prfOut;
       seed = await derivePrfEd25519Seed(prfOut, humanId, authEpoch);
       const { publicKeyBytes, publicJwk, kid } = await ed25519KeypairFromSeed(seed);
+      encKp = await derivePrfX25519Keypair(prfOut, humanId, authEpoch);
+
       const sas = await sasFingerprint(publicKeyBytes);
+      const encSas = await sasFingerprint(encKp.publicKeyBytes);
 
       savePublicHint(humanId, {
         prfSalt,
@@ -416,6 +464,8 @@ function initEnrollMode(payload) {
         authEpoch,
         prfSalt,
         jwk: publicJwk,
+        encJwk: encKp.publicJwk,
+        encKid: encKp.kid,
         credentialId: enrolled.credentialId,
         rpId: enrolled.rpId,
       };
@@ -423,6 +473,8 @@ function initEnrollMode(payload) {
 
       $("enrollKid").textContent = kid;
       $("enrollFingerprint").textContent = `${sas.formatted} (${sas.phrase})`;
+      $("enrollEncKid").textContent = encKp.kid;
+      $("enrollEncFingerprint").textContent = `${encSas.formatted} (${encSas.phrase})`;
       $("enrollBundleBox").textContent = lastBundleJson;
       $("enrollResultBlock").classList.remove("hidden");
 
@@ -432,13 +484,13 @@ function initEnrollMode(payload) {
         $("enrollBannerBody"),
         "verified",
         "PASSKEY ENROLLED",
-        "Public Ed25519 JWK derived cleanly; ephemeral private seed wiped from RAM."
+        "Public Ed25519 signing JWK and companion X25519 draft JWK derived cleanly; ephemeral private seeds wiped from RAM."
       );
 
       if (callbackUrl) {
         $("btnSendEnrollCallback").classList.remove("hidden");
       }
-      btn.textContent = "Re-derive Public Key";
+      btn.textContent = "Re-derive Public Keys";
     } catch (err) {
       setBanner(
         $("enrollBanner"),
@@ -448,17 +500,18 @@ function initEnrollMode(payload) {
         "ENROLLMENT FAILED",
         err instanceof Error ? err.message : "Could not enroll Passkey"
       );
-      btn.textContent = "Create Passkey & Derive Public Key";
+      btn.textContent = "Create Passkey & Derive Public Keys";
     } finally {
       if (prfOut) zeroize(prfOut);
       if (seed) zeroize(seed);
+      if (encKp && encKp.privateKeyBytes) zeroize(encKp.privateKeyBytes);
       btn.disabled = false;
     }
   });
 
   $("btnCopyEnrollBundle").addEventListener("click", () => {
     if (lastBundleJson) {
-      copyText(lastBundleJson, $("btnCopyEnrollBundle"), "Copy Public JWK & Salt");
+      copyText(lastBundleJson, $("btnCopyEnrollBundle"), "Copy Public JWKs & Salt");
     }
   });
 
@@ -486,7 +539,7 @@ function initEnrollMode(payload) {
         $("enrollBannerBody"),
         "verified",
         "SENT TO LOCAL HYP CLI",
-        "Your laptop CLI received the public Ed25519 JWK and PRF salt."
+        "Your laptop CLI received your public Ed25519 signing JWK, companion X25519 draft JWK, and PRF salt."
       );
       btn.textContent = "Sent to Local hyp CLI";
     } catch (err) {
@@ -496,12 +549,25 @@ function initEnrollMode(payload) {
         $("enrollBannerBody"),
         "warn",
         "CALLBACK UNREACHABLE",
-        `${err instanceof Error ? err.message : "Failed to reach loopback CLI"} — copy the Public JWK & Salt above instead.`
+        `${err instanceof Error ? err.message : "Failed to reach loopback CLI"} — copy the Public JWKs & Salt above instead.`
       );
       btn.disabled = false;
       btn.textContent = "Retry Send to Local hyp CLI";
     }
   });
+}
+
+function autoSizeTextarea(el) {
+  if (!el) return;
+  el.style.height = "auto";
+  const nextHeight = Math.max(el.scrollHeight + 2, 112);
+  el.style.height = `${nextHeight}px`;
+}
+
+function formatDirectiveStats(text) {
+  const charCount = [...text].length;
+  const lineCount = text.length === 0 ? 0 : text.split("\n").length;
+  return `${charCount} ${charCount === 1 ? "char" : "chars"} · ${lineCount} ${lineCount === 1 ? "line" : "lines"}`;
 }
 
 async function initDropMode(fragment) {
@@ -510,9 +576,9 @@ async function initDropMode(fragment) {
   const isSecret = fragment.kind === "secret";
   const hasRelay = Boolean(fragment.relay && fragment.dropId && fragment.postCap);
 
-  // Ephemeral RAM state (strictly wiped after seal or pagehide)
+  // Ephemeral RAM state (strictly wiped on send, reset, skip, pagehide, or hidden tab)
   const state = {
-    seed32: null,
+    unlockedEdSeed: null,
     humanId: "",
     authEpoch: 1,
     certVerified: false,
@@ -520,22 +586,95 @@ async function initDropMode(fragment) {
     hardBlocked: false,
     expired: false,
     lastHdrop1: "",
+    activeEncDraft: !isSecret && fragment.encDraft ? fragment.encDraft : null,
+    draftLoaded: false,
   };
 
-  function wipeSecretRam() {
-    if (state.seed32) {
-      zeroize(state.seed32);
-      state.seed32 = null;
+  function wipeSecretRam({ clearDraft = false } = {}) {
+    if (state.unlockedEdSeed) {
+      zeroize(state.unlockedEdSeed);
+      state.unlockedEdSeed = null;
     }
     state.certVerified = false;
+    state.draftLoaded = false;
+    if (clearDraft) {
+      state.activeEncDraft = null;
+    }
     $("inputSecretValue").value = "";
     $("inputDirectiveValue").value = "";
+    $("inputDirectiveValue").style.height = "";
     $("inputSecretValue").type = "password";
     $("btnToggleReveal").textContent = "Reveal";
+    $("draftApproveCheck").checked = false;
+    $("chkManualSasConfirm").checked = false;
+    $("draftWarningBanner").classList.add("hidden");
+    $("draftContextRow").classList.add("hidden");
+    $("draftContextText").textContent = "";
+    $("draftApproveRow").classList.add("hidden");
   }
 
-  window.addEventListener("pagehide", wipeSecretRam);
-  window.addEventListener("beforeunload", wipeSecretRam);
+  function applyFreshWriteHeadings() {
+    $("unlockCardTitle").textContent = "Unlock Authority & Verify Node";
+    $("unlockCardLead").textContent =
+      "Tap below to authenticate with your Passkey and verify the target node certificate in RAM.";
+    $("sealStepLabel").textContent = "Step 2 · Type or Paste Fresh";
+    if (isSecret) {
+      $("sealCardTitle").textContent = `Enter Secret: ${fragment.secretName || "—"}`;
+      $("sealCardLead").textContent =
+        "Drop links never pre-fill secrets. Type or paste directly here; plaintext is sealed in your browser and immediately wiped.";
+    } else {
+      $("sealCardTitle").textContent = "Write Verified Directive";
+      $("sealCardLead").textContent =
+        "Drop links never pre-fill plaintext payloads. Type or paste directly here; plaintext is sealed in your browser and immediately wiped.";
+    }
+  }
+
+  function applyEncDraftLockedUi() {
+    $("unlockCardTitle").textContent = "Unlock Encrypted Draft";
+    $("unlockCardLead").textContent =
+      "Face ID / Touch ID decrypts the draft and prepares your signing key in a single tap.";
+    $("encDraftPanelText").textContent =
+      `Encrypted directive draft from ${fragment.nodeId} — only readable after Face ID / Touch ID.`;
+    $("encDraftPanel").classList.remove("hidden");
+    $("btnUnlockPasskey").classList.add("hidden");
+    $("btnLockClear").classList.add("hidden");
+    $("stepSealCard").classList.add("hidden");
+    $("directiveInputGroup").classList.add("hidden");
+  }
+
+  function lockAndResetUi({ clearDraft = false } = {}) {
+    wipeSecretRam({ clearDraft });
+    $("btnLockClear").classList.add("hidden");
+    $("sasConfirmRow").classList.add("hidden");
+    $("certStatusBanner").classList.add("hidden");
+    if (state.activeEncDraft && !isSecret) {
+      applyEncDraftLockedUi();
+    } else {
+      applyFreshWriteHeadings();
+      $("encDraftPanel").classList.add("hidden");
+      $("btnUnlockPasskey").classList.remove("hidden");
+      $("stepSealCard").classList.remove("hidden");
+      if (isSecret) {
+        $("secretInputGroup").classList.remove("hidden");
+      } else {
+        $("directiveInputGroup").classList.remove("hidden");
+      }
+    }
+    syncSealControls();
+  }
+
+  window.addEventListener("pagehide", () => wipeSecretRam({ clearDraft: true }));
+  window.addEventListener("beforeunload", () => wipeSecretRam({ clearDraft: true }));
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden" && (state.unlockedEdSeed || state.draftLoaded)) {
+      lockAndResetUi({ clearDraft: false });
+    }
+  });
+  window.addEventListener("resize", () => {
+    if (!isSecret && !$("directiveInputGroup").classList.contains("hidden")) {
+      autoSizeTextarea($("inputDirectiveValue"));
+    }
+  });
 
   // Render target metadata
   $("dropTitle").textContent = isSecret ? "Zero-Knowledge Secret Drop" : "Verified Human Directive";
@@ -556,10 +695,12 @@ async function initDropMode(fragment) {
     $("metaSecretRow").classList.remove("hidden");
     $("metaSecretName").textContent = fragment.secretName || "(missing)";
     $("secretInputGroup").classList.remove("hidden");
-    $("sealCardTitle").textContent = `Enter Secret: ${fragment.secretName || "—"}`;
+    applyFreshWriteHeadings();
+  } else if (state.activeEncDraft) {
+    applyEncDraftLockedUi();
   } else {
     $("directiveInputGroup").classList.remove("hidden");
-    $("sealCardTitle").textContent = "Write Verified Directive";
+    applyFreshWriteHeadings();
   }
 
   // Validate secret name & reserved system-key denylist up front
@@ -653,7 +794,7 @@ async function initDropMode(fragment) {
   }
 
   function syncSealControls() {
-    const unlocked = Boolean(state.seed32);
+    const unlocked = Boolean(state.unlockedEdSeed);
     const allowedByCert = state.certVerified || (!isSecret && $("chkManualSasConfirm").checked);
     const canEdit = unlocked && !state.hardBlocked && !state.expired && allowedByCert;
 
@@ -661,6 +802,8 @@ async function initDropMode(fragment) {
     $("btnToggleReveal").disabled = !canEdit;
     $("chkOverwriteSecret").disabled = !canEdit;
     $("inputDirectiveValue").disabled = !canEdit;
+    $("btnUnlockDraft").disabled = state.hardBlocked || state.expired;
+    $("btnUnlockPasskey").disabled = state.hardBlocked || state.expired;
 
     const activeVal = isSecret ? $("inputSecretValue").value : $("inputDirectiveValue").value;
     const byteLen = utf8Bytes(activeVal).length;
@@ -668,17 +811,22 @@ async function initDropMode(fragment) {
     if (isSecret) {
       $("secretByteCount").textContent = `${byteLen} B`;
     } else {
-      $("directiveByteCount").textContent = `${byteLen} / ${maxBodyBytes} B`;
+      $("directiveByteCount").textContent = formatDirectiveStats(activeVal);
     }
 
-    const canSubmit = canEdit && byteLen > 0 && byteLen <= maxBodyBytes;
+    const draftApproved = !state.draftLoaded || $("draftApproveCheck").checked;
+    const canSubmit = canEdit && draftApproved && byteLen > 0 && byteLen <= maxBodyBytes;
     $("btnSealSend").disabled = !canSubmit || !hasRelay;
     $("btnSealOffline").disabled = !canSubmit;
   }
 
   $("inputSecretValue").addEventListener("input", syncSealControls);
-  $("inputDirectiveValue").addEventListener("input", syncSealControls);
+  $("inputDirectiveValue").addEventListener("input", () => {
+    autoSizeTextarea($("inputDirectiveValue"));
+    syncSealControls();
+  });
   $("chkManualSasConfirm").addEventListener("change", syncSealControls);
+  $("draftApproveCheck").addEventListener("change", syncSealControls);
 
   $("btnToggleReveal").addEventListener("click", () => {
     const inp = $("inputSecretValue");
@@ -688,19 +836,14 @@ async function initDropMode(fragment) {
   });
 
   $("btnLockClear").addEventListener("click", () => {
-    wipeSecretRam();
-    $("btnLockClear").classList.add("hidden");
-    $("btnUnlockPasskey").classList.remove("hidden");
-    $("sasConfirmRow").classList.add("hidden");
-    $("chkManualSasConfirm").checked = false;
-    $("certStatusBanner").classList.add("hidden");
-    syncSealControls();
+    lockAndResetUi({ clearDraft: false });
   });
 
-  // Step 1: Unlock with Passkey + Verify NodeCertV1
-  $("btnUnlockPasskey").addEventListener("click", async () => {
-    if (state.hardBlocked || state.expired) return;
+  $("btnSkipDraft").addEventListener("click", () => {
+    lockAndResetUi({ clearDraft: true });
+  });
 
+  function readAuthorityInputs() {
     const humanId = $("inputHumanId").value.trim();
     const prfSalt = $("inputPrfSalt").value.trim();
     const authEpoch = parseInt($("inputAuthEpoch").value, 10);
@@ -715,27 +858,115 @@ async function initDropMode(fragment) {
         "MISSING AUTHORITY PARAMETERS",
         "Enter your Human ID, PRF Salt, and Auth Epoch (from `hyp auth init`) before unlocking."
       );
-      return;
+      return null;
     }
+    return { humanId, prfSalt, authEpoch };
+  }
 
-    const btn = $("btnUnlockPasskey");
+  function applyCertVerificationResult(certRes, edSeed, humanId, authEpoch) {
+    if (certRes.ok) {
+      state.unlockedEdSeed = edSeed;
+      state.humanId = humanId;
+      state.authEpoch = authEpoch;
+      state.certVerified = true;
+      state.certReason = "";
+      $("metaCertHint").textContent = "NodeCert verified";
+      $("sasConfirmRow").classList.add("hidden");
+      setBanner(
+        $("certStatusBanner"),
+        $("certStatusTitle"),
+        $("certStatusBody"),
+        "verified",
+        "VERIFIED FLEET NODE",
+        `Node certificate for ${fragment.nodeId} verified by ${certRes.cert.humanId} (epoch ${certRes.cert.authEpoch}).`
+      );
+      return true;
+    }
+    if (isSecret) {
+      // HARD-BLOCK secrets on unverified nodes and immediately wipe seed!
+      zeroize(edSeed);
+      state.unlockedEdSeed = null;
+      state.certVerified = false;
+      state.hardBlocked = true;
+      state.certReason = certRes.message;
+      $("metaCertHint").textContent = "Cert verification failed";
+      setBanner(
+        $("certStatusBanner"),
+        $("certStatusTitle"),
+        $("certStatusBody"),
+        "danger",
+        "UNVERIFIED NODE — SECRET BLOCKED",
+        `${certRes.message}. Secret drops are hard-blocked unless the node holds a valid certificate signed by your Passkey.`
+      );
+      return false;
+    }
+    // Directive on unverified node: allow ONLY with prominent red warning + manual SAS checkbox.
+    state.unlockedEdSeed = edSeed;
+    state.humanId = humanId;
+    state.authEpoch = authEpoch;
+    state.certVerified = false;
+    state.certReason = certRes.message;
+    $("metaCertHint").textContent = "UNVERIFIED NODE";
+    setBanner(
+      $("certStatusBanner"),
+      $("certStatusTitle"),
+      $("certStatusBody"),
+      "danger",
+      "UNVERIFIED NODE WARNING",
+      `${certRes.message}. Compare the SAS fingerprint above directly with ${fragment.nodeId} before confirming.`
+    );
+    $("sasConfirmRow").classList.remove("hidden");
+    return true;
+  }
+
+  // Step 1A: 1-Tap Encrypted Draft Unlock (Single WebAuthn PRF -> X25519 open + Ed25519 RAM seed)
+  $("btnUnlockDraft").addEventListener("click", async () => {
+    if (state.hardBlocked || state.expired || !state.activeEncDraft) return;
+
+    const auth = readAuthorityInputs();
+    if (!auth) return;
+
+    const btn = $("btnUnlockDraft");
     btn.disabled = true;
-    btn.textContent = "Authenticating with Passkey…";
+    btn.textContent = "Unlocking draft with Face ID / Touch ID…";
 
     let prfOut = null;
+    let encKp = null;
+    let edSeed = null;
+    let handedOffSeed = false;
+
     try {
-      const hint = loadPublicHint(humanId);
+      const hint = loadPublicHint(auth.humanId);
       const { prfOut: rawPrf, credentialId } = await evaluatePasskeyPrf(
-        humanId,
-        prfSalt,
+        auth.humanId,
+        auth.prfSalt,
         hint?.credentialId || ""
       );
       prfOut = rawPrf;
 
-      const seed32 = await derivePrfEd25519Seed(prfOut, humanId, authEpoch);
-      const { publicKeyBytes } = await ed25519KeypairFromSeed(seed32);
+      // Derive BOTH companion X25519 keypair and Ed25519 signing seed from the single PRF output.
+      encKp = await derivePrfX25519Keypair(prfOut, auth.humanId, auth.authEpoch);
+      edSeed = await derivePrfEd25519Seed(prfOut, auth.humanId, auth.authEpoch);
 
-      savePublicHint(humanId, { prfSalt, authEpoch, credentialId });
+      // Decrypt & strictly validate the encrypted draft, then immediately zero X25519 private key!
+      let draftPayload;
+      try {
+        draftPayload = await openHumanDraft({
+          encDraft: state.activeEncDraft,
+          recipientPriv32: encKp.privateKeyBytes,
+          expectedNodeId: fragment.nodeId,
+        });
+      } finally {
+        zeroize(encKp.privateKeyBytes);
+        encKp = null;
+      }
+
+      const { publicKeyBytes } = await ed25519KeypairFromSeed(edSeed);
+      savePublicHint(auth.humanId, {
+        prfSalt: auth.prfSalt,
+        authEpoch: auth.authEpoch,
+        credentialId,
+      });
 
       const certRes = await verifyNodeCert(
         fragment.nodeCert,
@@ -745,57 +976,95 @@ async function initDropMode(fragment) {
         Date.now()
       );
 
-      if (certRes.ok) {
-        state.seed32 = seed32;
-        state.humanId = humanId;
-        state.authEpoch = authEpoch;
-        state.certVerified = true;
-        state.certReason = "";
-        $("metaCertHint").textContent = "NodeCert verified";
-        $("sasConfirmRow").classList.add("hidden");
-        setBanner(
-          $("certStatusBanner"),
-          $("certStatusTitle"),
-          $("certStatusBody"),
-          "verified",
-          "VERIFIED FLEET NODE",
-          `Node certificate for ${fragment.nodeId} verified by ${certRes.cert.humanId} (epoch ${certRes.cert.authEpoch}).`
-        );
-        $("btnUnlockPasskey").classList.add("hidden");
-        $("btnLockClear").classList.remove("hidden");
-      } else if (isSecret) {
-        // HARD-BLOCK secrets on unverified nodes and immediately wipe seed!
-        zeroize(seed32);
-        state.seed32 = null;
-        state.certVerified = false;
-        state.hardBlocked = true;
-        state.certReason = certRes.message;
-        $("metaCertHint").textContent = "Cert verification failed";
-        setBanner(
-          $("certStatusBanner"),
-          $("certStatusTitle"),
-          $("certStatusBody"),
-          "danger",
-          "UNVERIFIED NODE — SECRET BLOCKED",
-          `${certRes.message}. Secret drops are hard-blocked unless the node holds a valid certificate signed by your Passkey.`
-        );
+      applyCertVerificationResult(certRes, edSeed, auth.humanId, auth.authEpoch);
+      handedOffSeed = true;
+      state.draftLoaded = true;
+
+      $("encDraftPanel").classList.add("hidden");
+      $("btnUnlockPasskey").classList.add("hidden");
+      $("btnLockClear").classList.remove("hidden");
+
+      $("sealStepLabel").textContent = "Step 2 · Review & Approve Draft";
+      $("sealCardTitle").textContent = "Review Proposed Directive";
+      $("sealCardLead").textContent =
+        "Inspect every line carefully, edit if needed, then tick the approval box to sign with your unlocked Passkey.";
+
+      $("draftWarningBanner").classList.remove("hidden");
+      if (draftPayload.context) {
+        $("draftContextText").textContent = draftPayload.context;
+        $("draftContextRow").classList.remove("hidden");
       } else {
-        // Directive on unverified node: allow ONLY with prominent red warning + manual SAS checkbox.
-        state.seed32 = seed32;
-        state.humanId = humanId;
-        state.authEpoch = authEpoch;
-        state.certVerified = false;
-        state.certReason = certRes.message;
-        $("metaCertHint").textContent = "UNVERIFIED NODE";
-        setBanner(
-          $("certStatusBanner"),
-          $("certStatusTitle"),
-          $("certStatusBody"),
-          "danger",
-          "UNVERIFIED NODE WARNING",
-          `${certRes.message}. Compare the SAS fingerprint above directly with ${fragment.nodeId} before confirming.`
-        );
-        $("sasConfirmRow").classList.remove("hidden");
+        $("draftContextText").textContent = "";
+        $("draftContextRow").classList.add("hidden");
+      }
+
+      $("stepSealCard").classList.remove("hidden");
+      $("directiveInputGroup").classList.remove("hidden");
+      $("draftApproveCheck").checked = false;
+      $("draftApproveRow").classList.remove("hidden");
+
+      const textarea = $("inputDirectiveValue");
+      textarea.value = draftPayload.text;
+      syncSealControls();
+      autoSizeTextarea(textarea);
+    } catch (err) {
+      setBanner(
+        $("certStatusBanner"),
+        $("certStatusTitle"),
+        $("certStatusBody"),
+        "danger",
+        "DRAFT UNLOCK FAILED",
+        `${err instanceof Error ? err.message : "Could not unlock encrypted draft"}. You can retry or skip the draft and write from scratch.`
+      );
+    } finally {
+      if (prfOut) zeroize(prfOut);
+      if (encKp && encKp.privateKeyBytes) zeroize(encKp.privateKeyBytes);
+      if (edSeed && !handedOffSeed) zeroize(edSeed);
+      btn.disabled = state.hardBlocked || state.expired;
+      btn.textContent = "Unlock draft with Face ID / Touch ID";
+    }
+  });
+
+  // Step 1B: Standard Passkey Unlock & NodeCertV1 Verify (Fresh Write / Secret Drops)
+  $("btnUnlockPasskey").addEventListener("click", async () => {
+    if (state.hardBlocked || state.expired) return;
+
+    const auth = readAuthorityInputs();
+    if (!auth) return;
+
+    const btn = $("btnUnlockPasskey");
+    btn.disabled = true;
+    btn.textContent = "Authenticating with Passkey…";
+
+    let prfOut = null;
+    try {
+      const hint = loadPublicHint(auth.humanId);
+      const { prfOut: rawPrf, credentialId } = await evaluatePasskeyPrf(
+        auth.humanId,
+        auth.prfSalt,
+        hint?.credentialId || ""
+      );
+      prfOut = rawPrf;
+
+      const seed32 = await derivePrfEd25519Seed(prfOut, auth.humanId, auth.authEpoch);
+      const { publicKeyBytes } = await ed25519KeypairFromSeed(seed32);
+
+      savePublicHint(auth.humanId, {
+        prfSalt: auth.prfSalt,
+        authEpoch: auth.authEpoch,
+        credentialId,
+      });
+
+      const certRes = await verifyNodeCert(
+        fragment.nodeCert,
+        publicKeyBytes,
+        fragment.nodeId,
+        fragment.encJwk,
+        Date.now()
+      );
+
+      const allowed = applyCertVerificationResult(certRes, seed32, auth.humanId, auth.authEpoch);
+      if (allowed) {
         $("btnUnlockPasskey").classList.add("hidden");
         $("btnLockClear").classList.remove("hidden");
       }
@@ -811,19 +1080,51 @@ async function initDropMode(fragment) {
       );
     } finally {
       if (prfOut) zeroize(prfOut);
-      btn.disabled = false;
+      btn.disabled = state.hardBlocked || state.expired;
       btn.textContent = "Unlock with Passkey (FaceID / TouchID)";
     }
   });
 
-  // Step 2: Sign, Seal & Send (or Offline Copy)
+  // Step 2: Sign, Seal & Send (or Offline Copy) — reuses unlockedEdSeed with NO second biometric tap
   async function executeSeal(sendToRelay) {
-    if (!state.seed32 || state.hardBlocked || state.expired) return;
+    if (state.hardBlocked || state.expired) return;
     if (isSecret && !state.certVerified) return;
     if (!isSecret && !state.certVerified && !$("chkManualSasConfirm").checked) return;
+    if (state.draftLoaded && !$("draftApproveCheck").checked) return;
 
     const rawBody = isSecret ? $("inputSecretValue").value : $("inputDirectiveValue").value;
     if (!rawBody) return;
+
+    // Use volatile unlockedEdSeed from Step 1 if present; otherwise authenticate via Passkey PRF once.
+    let signingSeed = state.unlockedEdSeed;
+    let ephemeralPrfOut = null;
+    let signingHumanId = state.humanId;
+    let signingAuthEpoch = state.authEpoch;
+
+    if (!signingSeed) {
+      const auth = readAuthorityInputs();
+      if (!auth) return;
+      try {
+        const hint = loadPublicHint(auth.humanId);
+        const { prfOut } = await evaluatePasskeyPrf(auth.humanId, auth.prfSalt, hint?.credentialId || "");
+        ephemeralPrfOut = prfOut;
+        signingSeed = await derivePrfEd25519Seed(prfOut, auth.humanId, auth.authEpoch);
+        signingHumanId = auth.humanId;
+        signingAuthEpoch = auth.authEpoch;
+      } catch (err) {
+        setBanner(
+          $("sealActionBanner"),
+          $("sealActionTitle"),
+          $("sealActionBody"),
+          "danger",
+          "PASSKEY AUTHENTICATION FAILED",
+          err instanceof Error ? err.message : "Could not authenticate Passkey"
+        );
+        return;
+      } finally {
+        if (ephemeralPrfOut) zeroize(ephemeralPrfOut);
+      }
+    }
 
     $("btnSealSend").disabled = true;
     $("btnSealOffline").disabled = true;
@@ -835,8 +1136,8 @@ async function initDropMode(fragment) {
     const claim = {
       v: 1,
       kind: fragment.kind,
-      humanId: state.humanId,
-      authEpoch: state.authEpoch,
+      humanId: signingHumanId,
+      authEpoch: signingAuthEpoch,
       issuedAt: new Date(nowMs).toISOString(),
       expiresAt: new Date(effectiveExpMs).toISOString(),
       dropId: fragment.dropId || "",
@@ -854,7 +1155,7 @@ async function initDropMode(fragment) {
     try {
       sealed = await sealHumanDrop({
         claim,
-        humanSeed32: state.seed32,
+        humanSeed32: signingSeed,
         recipientEncJwk: fragment.encJwk,
       });
     } catch (err) {
@@ -869,12 +1170,11 @@ async function initDropMode(fragment) {
       syncSealControls();
       return;
     } finally {
-      // Always wipe plaintext input and signing seed immediately after sealing!
-      wipeSecretRam();
-      $("btnLockClear").classList.add("hidden");
-      $("btnUnlockPasskey").classList.remove("hidden");
-      $("sasConfirmRow").classList.add("hidden");
-      $("chkManualSasConfirm").checked = false;
+      if (signingSeed && signingSeed !== state.unlockedEdSeed) {
+        zeroize(signingSeed);
+      }
+      // Always wipe plaintext input, draft, and signing seed immediately after sealing!
+      lockAndResetUi({ clearDraft: true });
     }
 
     state.lastHdrop1 = sealed.hdrop1;
