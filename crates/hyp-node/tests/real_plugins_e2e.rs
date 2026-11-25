@@ -42,10 +42,11 @@ mod unix_tests {
     use hyp_store::{DeliveryMode, now_ms};
 
     fn repo_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
             .expect("resolve repository root")
+            .to_path_buf()
     }
 
     fn find_binary(name: &str) -> Option<String> {
@@ -2455,10 +2456,11 @@ mod loopback_tcp_parity_tests {
     use hyp_store::{DeliveryMode, now_ms};
 
     fn repo_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
             .expect("resolve repository root")
+            .to_path_buf()
     }
 
     fn find_binary(name: &str) -> Option<String> {

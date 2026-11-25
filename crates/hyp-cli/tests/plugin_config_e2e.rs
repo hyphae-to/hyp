@@ -30,10 +30,11 @@ mod plugin_config_e2e {
     }
 
     fn repo_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
             .expect("resolve repo root")
+            .to_path_buf()
     }
 
     fn find_binary(name: &str) -> Option<String> {
@@ -642,7 +643,17 @@ while True:
                     Err(_) if Instant::now() < deadline => {
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
-                    Err(e) => panic!("webhook plugin unreachable: {e}"),
+                    Err(e) => {
+                        let plugin_log = fs::read_to_string(
+                            state_dir.join("logs").join("plugin-webhook.log"),
+                        )
+                        .unwrap_or_else(|_| "<missing>".to_string());
+                        let status_json = fs::read_to_string(state_dir.join("node.status.json"))
+                            .unwrap_or_else(|_| "<missing>".to_string());
+                        panic!(
+                            "webhook plugin unreachable: {e}\nplugin-webhook.log:\n{plugin_log}\nnode.status.json:\n{status_json}"
+                        );
+                    }
                 }
             };
             assert_eq!(
