@@ -18,11 +18,11 @@ use clap::{Args, Subcommand, ValueEnum};
 use hyp_crypto::keystore::{SecretStore, validate_secret_name};
 use hyp_node::engine::NodeProfile;
 use hyp_node::gates::policy::{
-    DEFAULT_HTTP_CLASSIFIER_THRESHOLD, DEFAULT_STAGE2_BUSY_RETRY_MS, DEFAULT_STAGE2_MAX_CONCURRENT,
-    DEFAULT_STAGE2_MAX_INPUT_CHARS, DEFAULT_STAGE2_MAX_OUTPUT_TOKENS,
-    DEFAULT_STAGE2_MIN_ALLOW_CONFIDENCE, DEFAULT_STAGE2_TIMEOUT_MS, FilterAdapterConfig,
-    FilterPluginConfig, SecurityGateConfig, Stage2ErrorAction, Stage2Matchers, TrustTier,
-    sign_gate_policy, verify_gate_policy_sig,
+    AnthropicAuthHeader, DEFAULT_HTTP_CLASSIFIER_THRESHOLD, DEFAULT_STAGE2_BUSY_RETRY_MS,
+    DEFAULT_STAGE2_MAX_CONCURRENT, DEFAULT_STAGE2_MAX_INPUT_CHARS,
+    DEFAULT_STAGE2_MAX_OUTPUT_TOKENS, DEFAULT_STAGE2_MIN_ALLOW_CONFIDENCE,
+    DEFAULT_STAGE2_TIMEOUT_MS, FilterAdapterConfig, FilterPluginConfig, SecurityGateConfig,
+    Stage2ErrorAction, Stage2Matchers, TrustTier, sign_gate_policy, verify_gate_policy_sig,
 };
 use hyp_store::{
     GateAuditQuery, GateDecision as StoreGateDecision, MuteRuleInput, NodeDb, StoreError, now_ms,
@@ -82,6 +82,23 @@ impl CliGateLogDecision {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CliAnthropicAuthHeader {
+    #[value(name = "x-api-key")]
+    XApiKey,
+    #[value(name = "bearer")]
+    Bearer,
+}
+
+impl CliAnthropicAuthHeader {
+    pub const fn to_policy(self) -> AnthropicAuthHeader {
+        match self {
+            Self::XApiKey => AnthropicAuthHeader::XApiKey,
+            Self::Bearer => AnthropicAuthHeader::Bearer,
+        }
+    }
+}
+
 #[derive(Args)]
 pub struct GateInitArgs {
     /// Guardrail / classifier adapter type
@@ -93,6 +110,9 @@ pub struct GateInitArgs {
     /// Optional classifier/API base URL (required for http-classifier; defaults to Ollama for openai-compat)
     #[arg(long)]
     pub base_url: Option<String>,
+    /// Anthropic authentication header format (x-api-key default, or bearer for custom proxies; --adapter anthropic only)
+    #[arg(long, value_enum)]
+    pub auth_header: Option<CliAnthropicAuthHeader>,
     /// Model identifier (e.g. claude-haiku-4-5, gemini-2.5-flash-lite, qwen2.5:3b)
     #[arg(long)]
     pub model: Option<String>,
@@ -125,6 +145,7 @@ pub struct GateInitArgs {
 #[derive(Subcommand)]
 pub enum GateCommand {
     /// Configure a Local Security Gate filter adapter in node.json (never plaintext API keys!)
+    #[command(alias = "add")]
     Init(GateInitArgs),
     /// Stage an unsigned gate policy proposal for human inspection before `gate lock`
     Propose(GateInitArgs),
@@ -223,6 +244,8 @@ pub struct GateFilterSummary {
     pub target: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_secret: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_header: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -358,6 +381,7 @@ fn summarize_filter_plugin(cfg: &FilterPluginConfig) -> GateFilterSummary {
         FilterAdapterConfig::Anthropic {
             model,
             api_key_secret,
+            auth_header,
             ..
         } => GateFilterSummary {
             id: cfg.id.clone(),
@@ -365,6 +389,7 @@ fn summarize_filter_plugin(cfg: &FilterPluginConfig) -> GateFilterSummary {
             enabled: cfg.enabled,
             target: Some(model.clone()),
             api_key_secret: api_key_secret.clone(),
+            auth_header: Some(auth_header.as_str().to_string()),
         },
         FilterAdapterConfig::OpenAiCompat {
             base_url,
@@ -377,6 +402,7 @@ fn summarize_filter_plugin(cfg: &FilterPluginConfig) -> GateFilterSummary {
             enabled: cfg.enabled,
             target: Some(format!("{model} @ {base_url}")),
             api_key_secret: api_key_secret.clone(),
+            auth_header: None,
         },
         FilterAdapterConfig::Google {
             model,
@@ -388,6 +414,7 @@ fn summarize_filter_plugin(cfg: &FilterPluginConfig) -> GateFilterSummary {
             enabled: cfg.enabled,
             target: Some(model.clone()),
             api_key_secret: api_key_secret.clone(),
+            auth_header: None,
         },
         FilterAdapterConfig::LakeraGuard {
             base_url,
@@ -399,6 +426,7 @@ fn summarize_filter_plugin(cfg: &FilterPluginConfig) -> GateFilterSummary {
             enabled: cfg.enabled,
             target: Some(base_url.clone()),
             api_key_secret: api_key_secret.clone(),
+            auth_header: None,
         },
         FilterAdapterConfig::HttpClassifier {
             url,
@@ -410,6 +438,7 @@ fn summarize_filter_plugin(cfg: &FilterPluginConfig) -> GateFilterSummary {
             enabled: cfg.enabled,
             target: Some(url.clone()),
             api_key_secret: api_key_secret.clone(),
+            auth_header: None,
         },
         FilterAdapterConfig::Subprocess { command, .. } => GateFilterSummary {
             id: cfg.id.clone(),
@@ -417,6 +446,7 @@ fn summarize_filter_plugin(cfg: &FilterPluginConfig) -> GateFilterSummary {
             enabled: cfg.enabled,
             target: Some(command.clone()),
             api_key_secret: None,
+            auth_header: None,
         },
     }
 }
@@ -466,6 +496,13 @@ pub fn run_inbox(command: InboxCommand) -> ExitCode {
 }
 
 fn build_filter_plugin_from_args(args: &GateInitArgs) -> Result<FilterPluginConfig, String> {
+    if args.auth_header.is_some() && args.adapter != CliGateAdapter::Anthropic {
+        return Err(format!(
+            "--auth-header is only supported for --adapter anthropic (got --adapter {})",
+            args.adapter.as_str()
+        ));
+    }
+
     if let Some(ref secret_name) = args.secret {
         if looks_like_raw_api_key(secret_name) {
             return Err(
@@ -500,6 +537,10 @@ fn build_filter_plugin_from_args(args: &GateInitArgs) -> Result<FilterPluginConf
                     .unwrap_or_else(|| "anthropic-api-key".to_string()),
             ),
             base_url: args.base_url.clone(),
+            auth_header: args
+                .auth_header
+                .map(CliAnthropicAuthHeader::to_policy)
+                .unwrap_or_default(),
             policy_notes,
         },
         CliGateAdapter::OpenAiCompat => FilterAdapterConfig::OpenAiCompat {
@@ -1381,5 +1422,75 @@ fn run_inbox_reject(
             emit_error(cmd, as_json, EXIT_ERROR, "INVALID_RECEIPT_STATE", m, None)
         }
         Err(e) => emit_error(cmd, as_json, EXIT_ERROR, "REJECT_FAILED", e.to_string(), None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_args(adapter: CliGateAdapter, auth_header: Option<CliAnthropicAuthHeader>) -> GateInitArgs {
+        GateInitArgs {
+            adapter,
+            id: None,
+            base_url: Some("https://ai-gateway.internal".to_string()),
+            auth_header,
+            model: Some("claude-haiku-4-5".to_string()),
+            secret: Some("proxy-api-token".to_string()),
+            command: None,
+            args: Vec::new(),
+            policy_notes: None,
+            config: None,
+            state_dir: None,
+            lock: false,
+            json: true,
+        }
+    }
+
+    #[test]
+    fn anthropic_auth_header_defaults_to_x_api_key_and_accepts_bearer() {
+        let default_plugin =
+            build_filter_plugin_from_args(&base_args(CliGateAdapter::Anthropic, None)).unwrap();
+        match default_plugin.adapter {
+            FilterAdapterConfig::Anthropic { auth_header, .. } => {
+                assert_eq!(auth_header, AnthropicAuthHeader::XApiKey);
+            }
+            other => panic!("expected Anthropic adapter, got {other:?}"),
+        }
+
+        let bearer_plugin = build_filter_plugin_from_args(&base_args(
+            CliGateAdapter::Anthropic,
+            Some(CliAnthropicAuthHeader::Bearer),
+        ))
+        .unwrap();
+        match &bearer_plugin.adapter {
+            FilterAdapterConfig::Anthropic { auth_header, .. } => {
+                assert_eq!(*auth_header, AnthropicAuthHeader::Bearer);
+            }
+            other => panic!("expected Anthropic adapter, got {other:?}"),
+        }
+        let summary = summarize_filter_plugin(&bearer_plugin);
+        assert_eq!(summary.auth_header.as_deref(), Some("bearer"));
+    }
+
+    #[test]
+    fn auth_header_rejects_non_anthropic_adapters_cleanly() {
+        for adapter in [
+            CliGateAdapter::Google,
+            CliGateAdapter::OpenAiCompat,
+            CliGateAdapter::LakeraGuard,
+            CliGateAdapter::HttpClassifier,
+            CliGateAdapter::Subprocess,
+        ] {
+            let err = build_filter_plugin_from_args(&base_args(
+                adapter,
+                Some(CliAnthropicAuthHeader::Bearer),
+            ))
+            .expect_err("non-anthropic adapter must reject --auth-header");
+            assert!(
+                err.contains("--auth-header is only supported for --adapter anthropic"),
+                "unexpected error for {adapter:?}: {err}"
+            );
+        }
     }
 }

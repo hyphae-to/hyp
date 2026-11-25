@@ -245,11 +245,53 @@ hyp deploy check --url https://<hostname> --json
   *(Always offer **`https://spore.hyphae.to`** first as the ready-to-use public blind relay — zero setup, 100% RAM-only Cloudflare Durable Object, E2EE ciphertext only — alongside self-hosted private relay options: Cloudflare Workers `workers/drop-relay/`, `hyp deploy init drop-relay`, or local Tailscale Serve. Use `hyp drop ingest` reading stdin for offline/air-gapped `hdrop1_` envelopes.)*
 
 ### F. Configure Event Streams & External Chat Bridges
-1. **Capture required tokens out-of-band** (never in chat, never in CLI argv) — **always give the user the exact step-by-step instructions to create each token**:
-   - **`github-public-token`** *(optional for public repos: unauthenticated polling works up to 60 req/hr; a PAT raises the limit to 5,000 req/hr or unlocks private repos)*:
-     1. Open **`https://github.com/settings/personal-access-tokens/new`** (Fine-grained personal access token).
-     2. Choose *"Public Repositories (read-only)"* (or select specific repos) with minimal read-only permissions (`Metadata: Read`, `Issues: Read`, `Pull requests: Read`, and `Actions: Read` if watching CI).
-     3. Click **Generate token**, then paste it **only** into the localhost form opened by `hyp secret set github-public-token --web`.
+1. **GitHub Event Streams — Choose Webhook (Hub Node) vs. Poll (Local Node) BEFORE minting any token**:
+   - Always explain the topology distinction and material trade-offs clearly before asking for any GitHub secret:
+     - **Hub / Server Node (`profile: router` — VPS, Fly.io, Docker + Caddy, Cloudflare Tunnel, or Tailscale Funnel) -> Webhook (`github-webhook`) — RECOMMENDED whenever possible**:
+       - Real-time (`<1–2s` latency), delivers **every** event type including live GitHub Actions CI pass/fail (`workflow_run`, `check_run`) and rich payloads.
+       - **Zero GitHub PAT required** (uses a shared HMAC-SHA256 webhook signing secret only, stored via `hyp secret set github-webhook-secret --web`).
+       - Hub Nodes are the natural place to terminate GitHub webhooks once and fan normalized CloudEvents out over E2EE streams to paired developer laptops.
+     - **Local Node (`profile: local` — laptop behind NAT) -> Polling (`github-public` + `repoTokens`) — zero-infra fallback**:
+       - Works directly on a laptop behind NAT with **zero public URL** or hub required.
+       - ~30s average / 60s max delay; conditional ETag `304 Not Modified` consumes **0** quota (5,000 req/hr per owner token via `repoTokens`; 60 req/hr unauthenticated for public repos).
+       - **Important trade-off**: GitHub's REST `/events` API does **NOT** emit GitHub Actions CI events (`workflow_run` / `check_run`) — only repository activity (pushes, PRs, issues, comments, reviews, releases).
+   - **If the user picks Polling (`github-public`)**, explicitly ask WHICH repos/accounts they want to watch BEFORE creating tokens:
+     1. **Public repos only** (works unauthenticated up to 60 req/hr; optional PAT raises quota to 5,000 req/hr),
+     2. Their **personal GitHub account** (`<user>/*`), and/or
+     3. **One or more GitHub organizations** (`<org>/*`, plus optional exact `owner/repo` overrides).
+     - Explain **why**: GitHub fine-grained PATs are scoped to a **single resource owner** (one personal account OR one organization). Hyphae's `sources[].repoTokens` seamlessly coalesces all of them into **one single `github-public` source** (precedence: exact `owner/repo` -> `owner/*` -> optional default `githubToken` -> unauthenticated) and **never leaks** one org's token when polling another owner or third-party public repos.
+     - Walk the user through generating one fine-grained PAT per personal/org resource owner:
+       1. Open **`https://github.com/settings/personal-access-tokens/new`** (Fine-grained personal access token).
+       2. Pick the **Resource owner** (their personal account or specific GitHub organization) and choose target repositories with minimal read-only permissions (`Metadata: Read`, `Issues: Read`, `Pull requests: Read`, and `Contents: Read` if needed).
+       3. Click **Generate token**, then store each token **only** via the localhost form:
+          ```sh
+          hyp secret set github-<user>-token --web
+          hyp secret set github-<org>-token --web
+          ```
+     - Configure a **single** `github-public` source in `~/.config/hyphae/node.json` with `repoTokens` (and `"allowPrivateWithToken": true` for private repos on your local node):
+       ```json
+       {
+         "sources": [
+           {
+             "id": "github-public",
+             "kind": "github-public",
+             "topic": "github",
+             "enabled": true,
+             "allowPrivateWithToken": true,
+             "minPollIntervalSeconds": 60,
+             "graceWindowSeconds": 300,
+             "maxActivePollers": 100,
+             "repoTokens": {
+               "<user>/*": { "secret": "github-<user>-token" },
+               "<org>/*": { "secret": "github-<org>-token" },
+               "<org>/<special-repo>": { "secret": "github-<org>-special-token" }
+             }
+           }
+         ]
+       }
+       ```
+       *(Omit `githubToken` if you want unrelated third-party public repos to poll unauthenticated without sending any personal/org PAT. Never add duplicate enabled `github-public` entries — consolidate all tokens into `sources[0].repoTokens`.)*
+2. **Capture external chat bridge tokens out-of-band** (never in chat, never in CLI argv) — **always give the user the exact step-by-step instructions to create each token**:
    - **`telegram-bot-token`** + **`TELEGRAM_ALLOWED_USERS`** *(required for `plugins/telegram`)*:
      1. Open **`https://t.me/BotFather`** *(print QR code + URL for phone!)*, send `/newbot`, choose a display name and `@...bot` username, and copy the `123456:ABC...` token into `hyp secret set telegram-bot-token --web`.
      2. Get the user's numeric Telegram ID for `TELEGRAM_ALLOWED_USERS` by messaging **`https://t.me/userinfobot`** (or `@raw_data_bot`) — never leave `TELEGRAM_ALLOWED_USERS` empty (fail-closed!).
@@ -259,33 +301,32 @@ hyp deploy check --url https://<hostname> --json
      3. Under **OAuth & Permissions**, add Bot Token Scopes (`app_mentions:read`, `chat:write`, `im:history`, `im:read`, `im:write`, `channels:history`, `channels:read`), click **Install to Workspace**, and store the **Bot User OAuth Token** (`xoxb-...`) via `hyp secret set slack-bot-token --web`.
      4. Under **Event Subscriptions**, enable events and subscribe to `app_mention` + `message.im` (and `message.channels` if desired). Find your Slack Member ID (`U...`) via Profile → `⋮` → *Copy member ID*.
    ```sh
-   hyp secret set github-public-token --web
    hyp secret set slack-app-token --web
    hyp secret set slack-bot-token --web
    hyp secret set telegram-bot-token --web
    hyp secret list --json
    ```
-2. **Compiled-in pure-Rust event sources** (`sources[]` in `~/.config/hyphae/node.json` — zero Node/Python needed):
-   - `github-public` (deduplicated ETag poller + optional GitHub App webhook), `github-webhook`, `prometheus-webhook`, `webhook-stream`.
+3. **Compiled-in pure-Rust event sources** (`sources[]` in `~/.config/hyphae/node.json` — zero Node/Python needed):
+   - `github-public` (deduplicated ETag poller with multi-owner `repoTokens` + optional GitHub App webhook), `github-webhook`, `prometheus-webhook`, `webhook-stream`.
    - Reference secrets strictly as `{ "secret": "<name>" }`.
-3. **Optional external chat bridges** (`plugins/slack`, `plugins/telegram`, `plugins/whatsapp`, `plugins/webhook`, `plugins/prometheus`):
+4. **Optional external chat bridges** (`plugins/slack`, `plugins/telegram`, `plugins/whatsapp`, `plugins/webhook`, `plugins/prometheus`):
    - Supervised over fd-3 JSON-RPC 2.0 by `hyp daemon`; always configure explicit allowlists (`SLACK_ALLOWED_USERS` / `SLACK_ALLOWED_CHANNELS`, `TELEGRAM_ALLOWED_USERS` / `TELEGRAM_ALLOWED_CHATS`, etc.) and reference tokens via `{ "secret": "<name>" }`.
-4. Restart the background daemon after editing `node.json` (`hyp service restart --json`), then verify with `hyp doctor --json`.
+5. Restart the background daemon after editing `node.json` (`hyp service restart --json`), then verify with `hyp doctor --json`.
 
 ### G. Propose & Lock a Local Security Gate
 1. Store the classifier API key out-of-band (skip for local Ollama `openai-compat` or local `subprocess` plugins) and tell the user where to get it:
    - Direct Anthropic: **`https://console.anthropic.com/settings/keys`** -> **Create Key** -> paste only into `hyp secret set anthropic-api-key --web`.
-   - Company proxy / LiteLLM / Bedrock gateway: ask for their proxy `--base-url`, `--model`, and store their proxy token via `hyp secret set <name> --web`.
+   - Company proxy / LiteLLM / Bedrock gateway: ask for their proxy `--base-url`, `--model`, whether the proxy expects `x-api-key` (default) or `Authorization: Bearer` (`--auth-header bearer`), and store their proxy token via `hyp secret set <name> --web`.
    ```sh
    hyp secret set anthropic-api-key --web
    ```
-2. Stage a proposal for human inspection (adapters: `anthropic`, `openai-compat`, `google`, `lakera-guard`, `http-classifier`, `subprocess`). If the user uses a custom gateway/proxy (company API proxy, LiteLLM, Cloudflare AI Gateway, Bedrock proxy), pass `--base-url <url>` and `--model <model>` alongside their `--secret <name>`:
+2. Stage a proposal for human inspection (adapters: `anthropic`, `openai-compat`, `google`, `lakera-guard`, `http-classifier`, `subprocess`). If the user uses a custom gateway/proxy (company API proxy, LiteLLM, Cloudflare AI Gateway, Bedrock proxy), pass `--base-url <url>`, `--model <model>`, and `--auth-header bearer` (when the gateway expects `Authorization: Bearer <token>` instead of `x-api-key`) alongside `--secret <name>`:
    ```sh
    hyp gate propose --adapter anthropic --secret anthropic-api-key --json
-   # Or with a custom Anthropic-compatible gateway / proxy URL:
-   hyp gate propose --adapter anthropic --base-url https://ai-gateway.company.internal --secret company-anthropic-token --model claude-haiku-4-5 --json
+   # Or with a custom Anthropic-compatible gateway / proxy URL using Bearer auth:
+   hyp gate propose --adapter anthropic --base-url https://ai-gateway.company.internal --auth-header bearer --secret company-anthropic-token --model claude-haiku-4-5 --json
    ```
-3. **Summarize the staged proposal** (`adapter`, `model`, `base_url`, `secret`, `on_error`) for the human before asking them to lock the tamper-evident signature (`gate_policy_sig`, binding `human_authorities_digest` when human keys are enrolled — `hyp gate lock` automatically applies staged `gate.proposed.json` into `node.json` and signs it):
+3. **Summarize the staged proposal** (`adapter`, `model`, `base_url`, `auth_header`, `secret`, `on_error`) for the human before asking them to lock the tamper-evident signature (`gate_policy_sig`, binding `human_authorities_digest` when human keys are enrolled — `hyp gate lock` automatically applies staged `gate.proposed.json` into `node.json` and signs it):
    ```sh
    hyp gate init --adapter anthropic --secret anthropic-api-key --lock
    # Or apply & sign staged gate.proposed.json / an edited gate block:

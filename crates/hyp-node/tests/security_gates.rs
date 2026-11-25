@@ -2367,3 +2367,189 @@ async fn anti_tamper_signed_gate_policy_fails_closed_on_base_url_or_policy_notes
         assert!(!serde_json::to_string(row).unwrap().contains(body_canary));
     }
 }
+
+#[tokio::test]
+async fn anthropic_auth_header_x_api_key_bearer_backwards_compat_and_policy_sig() {
+    use hyp_node::gates::policy::AnthropicAuthHeader;
+
+    let (tmp, db) = open_ephemeral_db();
+    let secrets = file_secret_store(&tmp);
+    secrets
+        .set("anthropic-direct-key", "hyphae_anth_tok_direct_1111")
+        .unwrap();
+    secrets
+        .set("anthropic-proxy-key", "hyphae_anth_tok_proxy_2222")
+        .unwrap();
+    let t0 = 1_700_000_000_000i64;
+
+    // 1. Backwards compatibility: existing node.json without `auth_header` deserializes as XApiKey.
+    let legacy_adapter_json = json!({
+        "type": "anthropic",
+        "model": "claude-haiku-4-5",
+        "api_key_secret": "anthropic-direct-key"
+    });
+    let legacy_adapter: FilterAdapterConfig =
+        serde_json::from_value(legacy_adapter_json).expect("legacy anthropic JSON must parse");
+    match legacy_adapter {
+        FilterAdapterConfig::Anthropic { auth_header, .. } => {
+            assert_eq!(auth_header, AnthropicAuthHeader::XApiKey);
+        }
+        other => panic!("expected Anthropic variant, got {other:?}"),
+    }
+
+    let legacy_stage2_json = json!({
+        "enabled": true,
+        "provider": { "provider": "anthropic" },
+        "model": "claude-haiku-4-5",
+        "max_input_chars": 16384,
+        "max_output_tokens": 160,
+        "timeout_ms": 4000,
+        "max_concurrent": 4,
+        "min_allow_confidence": 0.75,
+        "busy_retry_after_ms": 1000
+    });
+    let legacy_s2: Stage2Config =
+        serde_json::from_value(legacy_stage2_json).expect("legacy stage2 JSON must parse");
+    assert_eq!(legacy_s2.auth_header, AnthropicAuthHeader::XApiKey);
+
+    // Explicit kebab-case deserialization for both variants.
+    assert_eq!(
+        serde_json::from_value::<AnthropicAuthHeader>(json!("x-api-key")).unwrap(),
+        AnthropicAuthHeader::XApiKey
+    );
+    assert_eq!(
+        serde_json::from_value::<AnthropicAuthHeader>(json!("bearer")).unwrap(),
+        AnthropicAuthHeader::Bearer
+    );
+
+    // 2. XApiKey (default): sends `x-api-key` + `anthropic-version`, ZERO `authorization` header.
+    let srv_xkey = MockLlmServer::start(MockBehavior::StaticJson {
+        status: StatusCode::OK,
+        body: anthropic_verdict_response("allow", 0.96, "direct x-api-key ok"),
+    })
+    .await;
+    let mut cfg_xkey = SecurityGateConfig::default();
+    cfg_xkey.filters.push(FilterPluginConfig {
+        id: "anthropic-xkey".into(),
+        enabled: true,
+        matchers: Stage2Matchers {
+            trust_tiers: vec![TrustTier::Peer],
+            ..Stage2Matchers::default()
+        },
+        on_error: Stage2ErrorAction::Quarantine,
+        max_concurrent: 4,
+        busy_retry_after_ms: 250,
+        adapter: FilterAdapterConfig::Anthropic {
+            model: "claude-haiku-4-5".into(),
+            temperature: 0.0,
+            max_output_tokens: 160,
+            timeout_ms: 2_000,
+            max_input_chars: 16_384,
+            min_allow_confidence: 0.75,
+            api_key_secret: Some("anthropic-direct-key".into()),
+            base_url: Some(srv_xkey.base_url()),
+            auth_header: AnthropicAuthHeader::XApiKey,
+            policy_notes: String::new(),
+        },
+    });
+    let p_xkey =
+        SecurityGatePipeline::new(cfg_xkey.clone(), Arc::clone(&db), Some(Arc::clone(&secrets)))
+            .unwrap();
+    let eval_xkey = p_xkey
+        .evaluate_inbound(
+            &make_inbound_dm("anth-1", "peer@a", "peer@a/dev", TrustTier::Peer, "review PR"),
+            t0,
+        )
+        .await
+        .unwrap();
+    assert!(eval_xkey.decision.is_allow());
+    let cap_xkey = srv_xkey.captured();
+    assert_eq!(cap_xkey.len(), 1);
+    assert_eq!(cap_xkey[0].path, "/v1/messages");
+    assert_eq!(
+        cap_xkey[0].headers.get("anthropic-version").map(String::as_str),
+        Some("2023-06-01")
+    );
+    assert_eq!(
+        cap_xkey[0].headers.get("x-api-key").map(String::as_str),
+        Some("hyphae_anth_tok_direct_1111")
+    );
+    assert!(
+        !cap_xkey[0].headers.contains_key("authorization"),
+        "XApiKey mode must NOT send Authorization header"
+    );
+
+    // 3. Bearer mode (custom proxy): sends `authorization: Bearer <key>` + `anthropic-version`, ZERO `x-api-key`!
+    let srv_bearer = MockLlmServer::start(MockBehavior::StaticJson {
+        status: StatusCode::OK,
+        body: anthropic_verdict_response("allow", 0.94, "proxy bearer ok"),
+    })
+    .await;
+    let mut cfg_bearer = SecurityGateConfig::default();
+    cfg_bearer.filters.push(FilterPluginConfig {
+        id: "anthropic-proxy".into(),
+        enabled: true,
+        matchers: Stage2Matchers {
+            trust_tiers: vec![TrustTier::Peer],
+            ..Stage2Matchers::default()
+        },
+        on_error: Stage2ErrorAction::Quarantine,
+        max_concurrent: 4,
+        busy_retry_after_ms: 250,
+        adapter: FilterAdapterConfig::Anthropic {
+            model: "claude-haiku-4-5".into(),
+            temperature: 0.0,
+            max_output_tokens: 160,
+            timeout_ms: 2_000,
+            max_input_chars: 16_384,
+            min_allow_confidence: 0.75,
+            api_key_secret: Some("anthropic-proxy-key".into()),
+            base_url: Some(srv_bearer.base_url()),
+            auth_header: AnthropicAuthHeader::Bearer,
+            policy_notes: String::new(),
+        },
+    });
+    let p_bearer =
+        SecurityGatePipeline::new(cfg_bearer, Arc::clone(&db), Some(Arc::clone(&secrets))).unwrap();
+    let eval_bearer = p_bearer
+        .evaluate_inbound(
+            &make_inbound_dm("anth-2", "peer@b", "peer@b/dev", TrustTier::Peer, "status ok"),
+            t0 + 10,
+        )
+        .await
+        .unwrap();
+    assert!(eval_bearer.decision.is_allow());
+    let cap_bearer = srv_bearer.captured();
+    assert_eq!(cap_bearer.len(), 1);
+    assert_eq!(cap_bearer[0].path, "/v1/messages");
+    assert_eq!(
+        cap_bearer[0].headers.get("anthropic-version").map(String::as_str),
+        Some("2023-06-01")
+    );
+    assert_eq!(
+        cap_bearer[0].headers.get("authorization").map(String::as_str),
+        Some("Bearer hyphae_anth_tok_proxy_2222")
+    );
+    assert!(
+        !cap_bearer[0].headers.contains_key("x-api-key"),
+        "Bearer mode must NOT send x-api-key header"
+    );
+
+    // 4. Tamper-evident `gate_policy_sig` binds `auth_header`: mutating XApiKey -> Bearer fails verification!
+    let mut signed_cfg = cfg_xkey;
+    signed_cfg.require_signed_policy = true;
+    let sig = sign_gate_policy(&signed_cfg, &secrets).unwrap();
+    assert!(verify_gate_policy_sig(&signed_cfg, &sig, &secrets).is_ok());
+
+    if let FilterAdapterConfig::Anthropic {
+        ref mut auth_header,
+        ..
+    } = signed_cfg.filters[0].adapter
+    {
+        *auth_header = AnthropicAuthHeader::Bearer;
+    }
+    assert!(
+        verify_gate_policy_sig(&signed_cfg, &sig, &secrets).is_err(),
+        "mutating auth_header after signing MUST invalidate gate_policy_sig"
+    );
+}
