@@ -11,6 +11,10 @@ use crate::config_file::{
     write_atomic_file, write_atomic_json,
 };
 use crate::node_cmd::CliNodeProfile;
+use crate::pair::{
+    LiveHandshakeError, OnboardJoinResult, live_join_url_for_onboard, live_pair_am2_for_onboard,
+    live_pair_hp2p1_for_onboard,
+};
 use crate::service;
 use crate::skill_render::{
     HostOrchestratorHints, SkillCapabilities, SkillProfile, SkillTargetHarness, SkillWriteOutcome,
@@ -25,7 +29,9 @@ use crate::ui::{
 use crate::wizard;
 use clap::Args;
 use hyp_crypto::compat_v1::parse_pairing_code_v1;
-use hyp_crypto::pairing::{AM2_PREFIX, HP2P1_PREFIX, decode_am2, decode_hp2p1};
+use hyp_crypto::pairing::{
+    AM2_PREFIX, HP2P1_PREFIX, decode_am2, decode_hp2p1, validate_endpoint_origin,
+};
 use hyp_harness::hooks::shell_quote_cli;
 use hyp_harness::protocol::HarnessKind;
 use hyp_node::engine::NodeProfile;
@@ -418,45 +424,10 @@ fn run_onboard_deterministic(args: OnboardArgs, home: PathBuf) -> ExitCode {
         .local()
         .set_metadata("node_version", env!("CARGO_PKG_VERSION"));
 
-    if let Some(ref staged) = staged_join {
-        // Store raw pairing token securely in SecretStore (NEVER plaintext in node.json or node.sqlite!).
-        if let Err(e) = secrets.set("staged-join-token", &staged.raw_token) {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "KEYSTORE_ERROR",
-                format!("Failed to stage join token in SecretStore: {e}"),
-                None,
-            );
-        }
-        if let Some(ref peer_id) = staged.peer_node_id {
-            if is_valid_node_id(peer_id) && peer_id != LOCAL_NODE_ID {
-                let _ = db.peers().upsert_peer(
-                    &PeerInput {
-                        peer_id: peer_id.clone(),
-                        endpoint: staged.endpoint.clone(),
-                        profile: if staged.format == "hp2p1" {
-                            PeerProfile::P2p
-                        } else {
-                            PeerProfile::Router
-                        },
-                        trust_tier: if staged.format == "hp2p1" {
-                            TrustTier::Peer
-                        } else {
-                            TrustTier::Org
-                        },
-                        status: PeerStatus::Pending,
-                        scopes: staged.scopes.clone(),
-                        auth_credential_ref: Some("staged-join-token".to_string()),
-                    },
-                    now_ms(),
-                );
-            }
-        }
-    }
+    let mut live_join_outcome: Option<OnboardJoinResult> = None;
+    let mut deferred_join_cmd: Option<String> = None;
 
-    // 4. Write/merge node.json (preserving any existing user config sections).
+    // 4. Write/merge node.json BEFORE running live join so publicUrl/stateDir exist if needed.
     let mut cfg_map = match read_json_object_or_empty(&config_path) {
         Ok(m) => m,
         Err(e) => {
@@ -485,6 +456,129 @@ fn run_onboard_deterministic(args: OnboardArgs, home: PathBuf) -> ExitCode {
 
     if let Err(e) = write_atomic_json(&config_path, &Value::Object(cfg_map), true) {
         return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
+    }
+
+    let using_default_paths = args.state_dir.is_none() && args.home.is_none();
+    let state_flag_suffix = if using_default_paths {
+        String::new()
+    } else {
+        format!(" --state-dir {}", state_dir.display())
+    };
+
+    if let Some(ref staged) = staged_join {
+        let handshake_res: Option<Result<OnboardJoinResult, LiveHandshakeError>> = match staged.format {
+            "hp2p1" => Some(live_pair_hp2p1_for_onboard(
+                &staged.raw_token,
+                &state_dir,
+                &node_id,
+                &keys,
+                &db,
+                &secrets,
+            )),
+            "am2" => Some(live_pair_am2_for_onboard(
+                &staged.raw_token,
+                &node_id,
+                &keys,
+                &db,
+                &secrets,
+            )),
+            "url" => Some(live_join_url_for_onboard(
+                &staged.raw_token,
+                &node_id,
+                &keys,
+                &db,
+                &mut warnings,
+            )),
+            _ => None,
+        };
+
+        match handshake_res {
+            Some(Ok(outcome)) => {
+                live_join_outcome = Some(outcome);
+            }
+            Some(Err(LiveHandshakeError::Rejected { code, message })) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    code,
+                    message,
+                    Some(
+                        "Verify the pairing invite is valid, unexpired, and not already claimed."
+                            .to_string(),
+                    ),
+                );
+            }
+            Some(Err(LiveHandshakeError::Unreachable(reason))) => {
+                let target_ep = staged.endpoint.as_deref().unwrap_or(&staged.raw_token);
+                warnings.push(format!(
+                    "Peer '{}' was unreachable during onboarding ({reason}); pairing has NOT completed yet.",
+                    target_ep
+                ));
+                if staged.format != "url" {
+                    // Preserve SecretStore staging for offline test compatibility, never plaintext.
+                    if let Err(e) = secrets.set("staged-join-token", &staged.raw_token) {
+                        return emit_error(
+                            cmd,
+                            as_json,
+                            EXIT_ERROR,
+                            "KEYSTORE_ERROR",
+                            format!("Failed to stage join token in SecretStore: {e}"),
+                            None,
+                        );
+                    }
+                    if let Some(ref peer_id) = staged.peer_node_id {
+                        if is_valid_node_id(peer_id) && peer_id != LOCAL_NODE_ID {
+                            let _ = db.peers().upsert_peer(
+                                &PeerInput {
+                                    peer_id: peer_id.clone(),
+                                    endpoint: staged.endpoint.clone(),
+                                    profile: if staged.format == "hp2p1" {
+                                        PeerProfile::P2p
+                                    } else {
+                                        PeerProfile::Router
+                                    },
+                                    trust_tier: if staged.format == "hp2p1" {
+                                        TrustTier::Peer
+                                    } else {
+                                        TrustTier::Org
+                                    },
+                                    status: PeerStatus::Pending,
+                                    scopes: staged.scopes.clone(),
+                                    auth_credential_ref: Some("staged-join-token".to_string()),
+                                },
+                                now_ms(),
+                            );
+                        }
+                    }
+                }
+                deferred_join_cmd = Some(if staged.format == "url" {
+                    format!("hyp pair join {target_ep}{state_flag_suffix}")
+                } else if let Some(ref path) = staged.source_file {
+                    format!("hyp pair accept --token-file {path}{state_flag_suffix}")
+                } else {
+                    format!("hyp pair accept --token-file <token-file>{state_flag_suffix}")
+                });
+            }
+            None => {
+                // Legacy v1 `t3mp1_` token without router URL: stage in SecretStore and guide user to v2 pairing.
+                if let Err(e) = secrets.set("staged-join-token", &staged.raw_token) {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "KEYSTORE_ERROR",
+                        format!("Failed to stage join token in SecretStore: {e}"),
+                        None,
+                    );
+                }
+                deferred_join_cmd = Some(if let Some(ref path) = staged.source_file {
+                    format!("hyp pair accept --token-file {path}{state_flag_suffix}")
+                } else {
+                    format!("hyp pair accept --token-file <token-file>{state_flag_suffix}")
+                });
+            }
+        }
     }
 
     // 5. Run harness setup for detected (or requested) harnesses under --home.
@@ -516,7 +610,6 @@ fn run_onboard_deterministic(args: OnboardArgs, home: PathBuf) -> ExitCode {
 
     // 6. Auto-install & start background daemon OS service on real default workstation onboarding
     //    (never touches live LaunchAgents/systemd when --no-start, --home, --state-dir, CI, or HYPHAE_NO_SERVICE=1).
-    let using_default_paths = args.state_dir.is_none() && args.home.is_none();
     let ci_active = std::env::var("CI").ok().is_some_and(|v| !v.is_empty());
     let no_service_env = std::env::var("HYPHAE_NO_SERVICE").ok().as_deref() == Some("1");
     let daemon_auto = if !args.no_start && using_default_paths && !ci_active && !no_service_env {
@@ -564,24 +657,35 @@ fn run_onboard_deterministic(args: OnboardArgs, home: PathBuf) -> ExitCode {
             ));
         }
     }
-    if staged_join.is_some() {
-        next.insert(
-            0,
-            "Staged join token stored securely in SecretStore ('staged-join-token'); start your node to activate the peer link."
-                .to_string(),
-        );
+    if let Some(ref retry_cmd) = deferred_join_cmd {
+        next.insert(0, retry_cmd.clone());
     }
 
-    let staged_json = staged_join.as_ref().map(|s| {
-        json!({
-            "format": s.format,
-            "peerNodeId": s.peer_node_id,
-            "endpoint": s.endpoint,
-            "kid": s.kid,
-            "scopes": s.scopes,
-            "secretRef": "staged-join-token",
+    let staged_json = if let Some(ref live) = live_join_outcome {
+        Some(json!({
+            "format": live.format,
+            "peerNodeId": live.peer_id,
+            "endpoint": live.endpoint,
+            "kid": live.kid,
+            "scopes": live.scopes,
+            "paired": true,
+            "enrolled": live.enrolled,
+            "status": "active",
+        }))
+    } else {
+        staged_join.as_ref().map(|s| {
+            json!({
+                "format": s.format,
+                "peerNodeId": s.peer_node_id,
+                "endpoint": s.endpoint,
+                "kid": s.kid,
+                "scopes": s.scopes,
+                "paired": false,
+                "status": "pending",
+                "secretRef": if s.format == "url" { Value::Null } else { Value::String("staged-join-token".to_string()) },
+            })
         })
-    });
+    };
 
     let daemon_json = daemon_auto.as_ref().map(|d| {
         json!({
@@ -634,9 +738,14 @@ fn run_onboard_deterministic(args: OnboardArgs, home: PathBuf) -> ExitCode {
         println!("      JWK kid:     {kid}");
         println!("      Fingerprint: {fingerprint}");
         println!("      Secrets:     {}", secrets.backend().as_str());
-        if let Some(ref s) = staged_join {
+        if let Some(ref live) = live_join_outcome {
             println!(
-                "      Staged Join: {} (endpoint={}, secretRef=staged-join-token)",
+                "      Paired Peer: {} ({}, endpoint={}, status=active)",
+                live.peer_id, live.format, live.endpoint
+            );
+        } else if let Some(ref s) = staged_join {
+            println!(
+                "      Pending Join: {} (endpoint={}, status=pending)",
                 s.format,
                 s.endpoint.as_deref().unwrap_or("-")
             );
@@ -743,12 +852,43 @@ struct StagedJoin {
     kid: Option<String>,
     scopes: Vec<String>,
     raw_token: String,
+    source_file: Option<String>,
 }
 
 fn read_and_stage_join_token(
     source: &str,
     warnings: &mut Vec<String>,
 ) -> Result<StagedJoin, (u8, &'static str, String, Option<String>)> {
+    let trimmed_source = source.trim();
+    if trimmed_source.starts_with("https://") || trimmed_source.starts_with("http://") {
+        validate_endpoint_origin(trimmed_source).map_err(|e| {
+            (
+                EXIT_USAGE,
+                "INVALID_ENDPOINT",
+                format!("Invalid --join URL '{trimmed_source}': {e}"),
+                Some(
+                    "Use an https:// URL (or loopback http://127.0.0.1 for local testing)."
+                        .to_string(),
+                ),
+            )
+        })?;
+        let base_url = trimmed_source
+            .trim_end_matches('/')
+            .strip_suffix("/v1/manifest")
+            .unwrap_or(trimmed_source.trim_end_matches('/'))
+            .to_string();
+        return Ok(StagedJoin {
+            format: "url",
+            peer_node_id: None,
+            endpoint: Some(base_url.clone()),
+            kid: None,
+            scopes: Vec::new(),
+            raw_token: base_url,
+            source_file: None,
+        });
+    }
+
+    let mut source_file: Option<String> = None;
     let raw = if source == "-" {
         let mut buf = String::new();
         io::stdin()
@@ -795,6 +935,7 @@ fn read_and_stage_join_token(
                 None,
             )
         })?;
+        source_file = Some(source.to_string());
         let mut buf = String::new();
         file.take(MAX_JOIN_TOKEN_BYTES + 1)
             .read_to_string(&mut buf)
@@ -844,6 +985,7 @@ fn read_and_stage_join_token(
             kid,
             scopes: offer.offered_scopes,
             raw_token: token,
+            source_file,
         })
     } else if token.starts_with(AM2_PREFIX) {
         let invite = decode_am2(&token).map_err(|e| {
@@ -862,6 +1004,33 @@ fn read_and_stage_join_token(
             kid,
             scopes: Vec::new(),
             raw_token: token,
+            source_file,
+        })
+    } else if token.starts_with("https://") || token.starts_with("http://") {
+        validate_endpoint_origin(&token).map_err(|e| {
+            (
+                EXIT_USAGE,
+                "INVALID_ENDPOINT",
+                format!("Invalid join URL '{token}': {e}"),
+                Some(
+                    "Use an https:// URL (or loopback http://127.0.0.1 for local testing)."
+                        .to_string(),
+                ),
+            )
+        })?;
+        let base_url = token
+            .trim_end_matches('/')
+            .strip_suffix("/v1/manifest")
+            .unwrap_or(token.trim_end_matches('/'))
+            .to_string();
+        Ok(StagedJoin {
+            format: "url",
+            peer_node_id: None,
+            endpoint: Some(base_url.clone()),
+            kid: None,
+            scopes: Vec::new(),
+            raw_token: base_url,
+            source_file,
         })
     } else if token.starts_with("t3mp1_") {
         let parsed = parse_pairing_code_v1(&token).map_err(|e| {
@@ -880,12 +1049,14 @@ fn read_and_stage_join_token(
             kid: Some(parsed.admin_fingerprint),
             scopes: Vec::new(),
             raw_token: token,
+            source_file,
         })
     } else {
         Err((
             EXIT_ERROR,
             "INVALID_TOKEN",
-            "Unrecognized pairing token format (expected hp2p1_, am2_, or t3mp1_)".to_string(),
+            "Unrecognized pairing token format (expected hp2p1_, am2_, https:// URL, or t3mp1_)"
+                .to_string(),
             None,
         ))
     }
@@ -1352,7 +1523,7 @@ fn setup_antigravity(
         &json!({
             "command": bin,
             "args": ["node", "start"],
-            "restart_policy": "always"
+            "restart_policy": "on-failure"
         }),
         false,
         dry_run,
@@ -1753,7 +1924,7 @@ fn setup_opencode(
         .cloned()
         .unwrap_or_default();
     let mut cmd_arr = vec![Value::String(bin.to_string())];
-    cmd_arr.extend(mcp_args(socket, &[]));
+    cmd_arr.extend(mcp_args(socket, &["--backend", "opencode", "--ephemeral"]));
     mcp.insert(
         "hyphae".to_string(),
         json!({

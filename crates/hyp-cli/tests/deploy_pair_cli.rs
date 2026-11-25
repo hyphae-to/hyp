@@ -13,8 +13,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use common::{ManagedProcess, isolated_cmd};
 use hyp_crypto::compat_v1::issue_grant_v1;
 use hyp_crypto::keys::{Ed25519KeyPair, NodeIdentityKeys};
+use hyp_crypto::keystore::{SecretBackend, SecretStore};
 use hyp_crypto::pairing::{AdminInviteV2, create_p2p_offer, encode_am2, encode_hp2p1};
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
+use hyp_node::engine::{NodeConfig, NodeProfile as EngineNodeProfile, UnifiedNode};
 use hyp_proto::address::NodeId;
 use hyp_proto::manifest::{
     AdvertisedResources, AdvertisedTopic, CapabilityToken, ManifestIdentity, ManifestPolicy,
@@ -23,10 +25,12 @@ use hyp_proto::manifest::{
 use hyp_proto::scopes::EscalationConfig;
 use hyp_store::{KeyUse, NodeDb, PeerProfile, PeerStatus, TrustTier};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -40,7 +44,8 @@ fn scrubbed_cmd() -> Command {
         .env_remove("HYPHAE_SOCKET")
         .env_remove("AGENTS_MESH_SOCKET")
         .env_remove("HYPHAE_RELEASE_PUBKEY")
-        .env_remove("HYPHAE_DISABLE_AUTO_UPDATE");
+        .env_remove("HYPHAE_DISABLE_AUTO_UPDATE")
+        .env_remove("HYPHAE_DROP_PORTAL_URL");
     cmd
 }
 
@@ -267,11 +272,61 @@ fn deploy_init_all_six_providers_overwrite_guard_and_config_check() {
             assert!(caddy.contains(domain));
         }
         if expected_files.contains(&"hyphae-node.service") {
-            let unit = fs::read_to_string(out_dir.join("hyphae-node.service")).unwrap();
+            let unit = fs::read_to_string(out_dir.join("hyphae-node.service"))
+                .unwrap()
+                .replace("\r\n", "\n");
             assert!(unit.contains("StateDirectory=hyphae"));
             assert!(unit.contains("ProtectSystem=strict"));
             assert!(unit.contains("NoNewPrivileges=yes"));
             assert!(unit.contains("StateDirectoryMode=0700"));
+        }
+        if expected_files.contains(&"Dockerfile") {
+            let dockerfile = fs::read_to_string(out_dir.join("Dockerfile"))
+                .unwrap()
+                .replace("\r\n", "\n");
+            assert!(dockerfile.contains("ARG HYP_VERSION=v0.5.0"));
+            assert!(dockerfile.contains("ARG TARGETARCH"));
+            assert!(dockerfile.contains("x86_64-unknown-linux-musl"));
+            assert!(dockerfile.contains("aarch64-unknown-linux-musl"));
+            assert!(dockerfile.contains("https://github.com/hyphae-to/hyp/releases/download/${HYP_VERSION}"));
+            assert!(dockerfile.contains("SHA256SUMS.txt"));
+            assert!(dockerfile.contains("sha256sum -c --ignore-missing"));
+            assert!(dockerfile.contains("USER 10001:10001"));
+            assert!(dockerfile.contains("ENTRYPOINT [\"/usr/local/bin/hyp\"]"));
+            assert!(
+                !dockerfile.contains("COPY Cargo.toml") && !dockerfile.contains("COPY crates"),
+                "Dockerfile for {provider} must work standalone without repo source tree"
+            );
+        }
+        if matches!(provider, "vps" | "public-node") {
+            let readme = fs::read_to_string(out_dir.join("README.md"))
+                .unwrap()
+                .replace("\r\n", "\n");
+            let useradd_pos = readme
+                .find("sudo useradd -r -s /usr/sbin/nologin hyphae || true")
+                .unwrap_or_else(|| panic!("{provider} README missing useradd step:\n{readme}"));
+            let bin_pos = readme
+                .find("/usr/local/bin/hyp")
+                .unwrap_or_else(|| panic!("{provider} README missing /usr/local/bin/hyp install:\n{readme}"));
+            let dirs_pos = readme
+                .find("sudo mkdir -p /var/lib/hyphae /etc/hyphae && sudo chown -R hyphae:hyphae /var/lib/hyphae /etc/hyphae && sudo chmod 0700 /var/lib/hyphae")
+                .unwrap_or_else(|| panic!("{provider} README missing /var/lib/hyphae setup:\n{readme}"));
+            let systemctl_pos = readme
+                .find("systemctl enable --now")
+                .unwrap_or_else(|| panic!("{provider} README missing systemctl enable --now:\n{readme}"));
+            assert!(useradd_pos < systemctl_pos, "{provider} useradd must precede systemctl");
+            assert!(bin_pos < systemctl_pos, "{provider} /usr/local/bin/hyp must precede systemctl");
+            assert!(dirs_pos < systemctl_pos, "{provider} mkdir/chown must precede systemctl");
+
+            let next_steps: Vec<&str> = env["next"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            assert!(next_steps.iter().any(|s| s.contains("useradd -r -s /usr/sbin/nologin hyphae")));
+            assert!(next_steps.iter().any(|s| s.contains("/usr/local/bin/hyp")));
+            assert!(next_steps.iter().any(|s| s.contains("chmod 0700 /var/lib/hyphae")));
         }
         if expected_files.contains(&"fly.toml") {
             let fly = fs::read_to_string(out_dir.join("fly.toml")).unwrap();
@@ -1025,6 +1080,7 @@ fn pair_accept_p2p_and_team_persists_peers_keys_grants_and_rejects_tampered_or_e
         .args([
             "pair",
             "accept",
+            "--offline",
             "--state-dir",
             accepter_state.path().to_str().unwrap(),
             "--node-id",
@@ -1056,6 +1112,16 @@ fn pair_accept_p2p_and_team_persists_peers_keys_grants_and_rejects_tampered_or_e
     let accept_env: Value = serde_json::from_slice(&accept_out.stdout).unwrap();
     assert_eq!(accept_env["ok"], true);
     assert_eq!(accept_env["command"], "pair accept");
+    assert_eq!(accept_env["data"]["offline"], true);
+    assert_eq!(accept_env["data"]["handshakeCompleted"], false);
+    assert!(
+        accept_env["next"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str() == Some("hyp service restart")),
+        "pair accept must recommend hyp service restart: {accept_env}"
+    );
     assert_eq!(accept_env["data"]["mode"], "p2p");
     assert_eq!(accept_env["data"]["format"], "hp2p1");
     assert_eq!(accept_env["data"]["nodeId"], "bob@laptop");
@@ -1152,6 +1218,7 @@ fn pair_accept_p2p_and_team_persists_peers_keys_grants_and_rejects_tampered_or_e
         .args([
             "pair",
             "accept",
+            "--offline",
             "--state-dir",
             accepter_state.path().to_str().unwrap(),
             "--node-id",
@@ -1506,4 +1573,710 @@ fn pair_join_verifies_live_rust_node_manifest_rejects_tampered_and_supports_offl
         .expect("offline peer persisted");
     assert_eq!(off_peer.trust_tier, TrustTier::Guest);
     assert_eq!(off_peer.endpoint.as_deref(), Some("https://public.hyphae.to"));
+    assert!(
+        off_env["next"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str() == Some("hyp service restart")),
+        "pair join must recommend hyp service restart: {off_env}"
+    );
+}
+
+fn peer_auth_secret_name(peer_id: &str) -> String {
+    let hash = hex::encode(Sha256::digest(peer_id.as_bytes()));
+    format!("peer-auth-{}", &hash[..12])
+}
+
+#[test]
+fn pair_live_p2p_handshake_single_use_replay_and_onboard_join() {
+    let alice_dir = tempfile::tempdir().unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    let charlie_dir = tempfile::tempdir().unwrap();
+    let offline_onboard_dir = tempfile::tempdir().unwrap();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // 1. Start Node A (`UnifiedNode` bound on 127.0.0.1:0 sharing Node A's state_dir & SecretStore).
+    let (node_a, alice_endpoint, server_handle) = rt.block_on(async {
+        let mut cfg = NodeConfig::new(
+            NodeId::new("alice@macbook").unwrap(),
+            EngineNodeProfile::P2p,
+            alice_dir.path(),
+        );
+        cfg.secret_backend = Some(SecretBackend::File);
+        let node = UnifiedNode::open(cfg).expect("open Node A");
+        let (addr, handle) = Arc::clone(&node)
+            .serve("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("serve Node A HTTP");
+        (node, format!("http://{addr}"), handle)
+    });
+
+    // 2. Run compiled `hyp pair invite --mode p2p` as a SEPARATE CLI process using Node A's state_dir!
+    let inv_out = isolated_cmd(alice_dir.path())
+        .args([
+            "pair",
+            "invite",
+            "--mode",
+            "p2p",
+            "--node-id",
+            "alice@macbook",
+            "--endpoint",
+            &alice_endpoint,
+            "--grant",
+            "dm:*,files:send=25mb",
+            "--request",
+            "dm:send,dm:receive",
+            "--state-dir",
+            alice_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run hyp pair invite --mode p2p");
+    assert_eq!(
+        inv_out.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&inv_out.stdout),
+        String::from_utf8_lossy(&inv_out.stderr)
+    );
+    let inv_env: Value = serde_json::from_slice(&inv_out.stdout).unwrap();
+    let hp2p1_token = inv_env["data"]["token"].as_str().unwrap().to_string();
+    let alice_kid = inv_env["data"]["kid"].as_str().unwrap().to_string();
+    let alice_enc_kid = inv_env["data"]["encryptionKid"].as_str().unwrap().to_string();
+    assert!(hp2p1_token.starts_with("hp2p1_"));
+
+    let token_file = bob_dir.path().join("p2p.token");
+    fs::write(&token_file, format!("{hp2p1_token}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    // 3. Run compiled `hyp pair accept --token-file` for Node B -> REAL live HTTP POST /v1/p2p/pair/<offerId>!
+    let accept_out = isolated_cmd(bob_dir.path())
+        .args([
+            "pair",
+            "accept",
+            "--token-file",
+            token_file.to_str().unwrap(),
+            "--node-id",
+            "bob@laptop",
+            "--state-dir",
+            bob_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run live hyp pair accept");
+    assert_eq!(
+        accept_out.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&accept_out.stdout),
+        String::from_utf8_lossy(&accept_out.stderr)
+    );
+    let accept_env: Value = serde_json::from_slice(&accept_out.stdout).unwrap();
+    assert_eq!(accept_env["ok"], true);
+    assert_eq!(accept_env["data"]["handshakeCompleted"], true);
+    assert_eq!(accept_env["data"]["offline"], false);
+    assert_eq!(accept_env["data"]["peerId"], "alice@macbook");
+    assert!(
+        accept_env["next"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str() == Some("hyp service restart"))
+    );
+
+    // Assert BOTH Node A's DB and Node B's DB have each other as Active peers with pinned JWKs
+    // and Node B persisted the server-issued `authCredential` in SecretStore!
+    {
+        let db_a = NodeDb::open(alice_dir.path().join("node.sqlite")).unwrap();
+        let bob_on_a = db_a
+            .peers()
+            .get_peer("bob@laptop")
+            .unwrap()
+            .expect("Node A must have Bob persisted as Active peer");
+        assert_eq!(bob_on_a.status, PeerStatus::Active);
+        assert_eq!(bob_on_a.profile, PeerProfile::P2p);
+        assert_eq!(
+            db_a.peers()
+                .list_peer_keys("bob@laptop", Some(KeyUse::Signing), true)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db_a.peers()
+                .list_peer_keys("bob@laptop", Some(KeyUse::Encryption), true)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let db_b = NodeDb::open(bob_dir.path().join("node.sqlite")).unwrap();
+        let alice_on_b = db_b
+            .peers()
+            .get_peer("alice@macbook")
+            .unwrap()
+            .expect("Node B must have Alice persisted as Active peer");
+        assert_eq!(alice_on_b.status, PeerStatus::Active);
+        assert_eq!(alice_on_b.profile, PeerProfile::P2p);
+        assert!(alice_on_b.manifest_json.is_some());
+        let expected_cred_ref = peer_auth_secret_name("alice@macbook");
+        assert_eq!(
+            alice_on_b.auth_credential_ref.as_deref(),
+            Some(expected_cred_ref.as_str())
+        );
+
+        let b_sign_keys = db_b
+            .peers()
+            .list_peer_keys("alice@macbook", Some(KeyUse::Signing), true)
+            .unwrap();
+        assert_eq!(b_sign_keys.len(), 1);
+        assert_eq!(b_sign_keys[0].kid, alice_kid);
+        let b_enc_keys = db_b
+            .peers()
+            .list_peer_keys("alice@macbook", Some(KeyUse::Encryption), true)
+            .unwrap();
+        assert_eq!(b_enc_keys.len(), 1);
+        assert_eq!(b_enc_keys[0].kid, alice_enc_kid);
+
+        let b_secrets = SecretStore::new(bob_dir.path(), SecretBackend::File);
+        let auth_cred = b_secrets
+            .get(&expected_cred_ref)
+            .expect("authCredential must be saved in Node B SecretStore");
+        assert!(!auth_cred.trim().is_empty());
+        assert_ne!(&*auth_cred, hp2p1_token.as_str());
+    }
+
+    // 4. Single-use replay rejection: running `hyp pair accept` a SECOND time MUST fail closed!
+    let replay_dir = tempfile::tempdir().unwrap();
+    let replay_out = isolated_cmd(replay_dir.path())
+        .args([
+            "pair",
+            "accept",
+            "--token-file",
+            token_file.to_str().unwrap(),
+            "--node-id",
+            "replay@laptop",
+            "--state-dir",
+            replay_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run replay hyp pair accept");
+    assert_ne!(
+        replay_out.status.code(),
+        Some(0),
+        "single-use hp2p1_ replay MUST fail closed! stdout={}",
+        String::from_utf8_lossy(&replay_out.stdout)
+    );
+    let replay_env: Value = serde_json::from_slice(&replay_out.stdout).unwrap();
+    assert_eq!(replay_env["ok"], false);
+
+    // 5. Also verify `hyp onboard --join <token-file>` completes a live P2P handshake against Node A!
+    let inv2_out = isolated_cmd(alice_dir.path())
+        .args([
+            "pair",
+            "invite",
+            "--mode",
+            "p2p",
+            "--node-id",
+            "alice@macbook",
+            "--endpoint",
+            &alice_endpoint,
+            "--preset",
+            "member",
+            "--state-dir",
+            alice_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(inv2_out.status.code(), Some(0));
+    let inv2_env: Value = serde_json::from_slice(&inv2_out.stdout).unwrap();
+    let token2_file = charlie_dir.path().join("charlie.token");
+    fs::write(
+        &token2_file,
+        format!("{}\n", inv2_env["data"]["token"].as_str().unwrap()),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&token2_file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let onboard_live = isolated_cmd(charlie_dir.path())
+        .args([
+            "onboard",
+            "--yes",
+            "--no-start",
+            "--node-id",
+            "charlie@workstation",
+            "--join",
+            token2_file.to_str().unwrap(),
+            "--state-dir",
+            charlie_dir.path().to_str().unwrap(),
+            "--home",
+            charlie_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run hyp onboard --join live");
+    assert_eq!(
+        onboard_live.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&onboard_live.stdout),
+        String::from_utf8_lossy(&onboard_live.stderr)
+    );
+    let onboard_json: Value = serde_json::from_slice(&onboard_live.stdout).unwrap();
+    assert_eq!(onboard_json["ok"], true);
+    assert_eq!(onboard_json["data"]["stagedJoin"]["paired"], true);
+    assert_eq!(onboard_json["data"]["stagedJoin"]["status"], "active");
+    let db_c = NodeDb::open(charlie_dir.path().join("node.sqlite")).unwrap();
+    assert_eq!(
+        db_c.peers().get_peer("alice@macbook").unwrap().unwrap().status,
+        PeerStatus::Active
+    );
+
+    // Shut down Node A and verify unreachable `hyp onboard --join` warns & emits exact `hyp pair accept --token-file`!
+    server_handle.abort();
+    node_a.shutdown();
+    drop(node_a);
+
+    let inv3_out = isolated_cmd(alice_dir.path())
+        .args([
+            "pair",
+            "invite",
+            "--mode",
+            "p2p",
+            "--node-id",
+            "alice@macbook",
+            "--endpoint",
+            &alice_endpoint,
+            "--preset",
+            "member",
+            "--state-dir",
+            alice_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(inv3_out.status.code(), Some(0));
+    let inv3_env: Value = serde_json::from_slice(&inv3_out.stdout).unwrap();
+    let unreachable_token_file = offline_onboard_dir.path().join("unreachable.token");
+    fs::write(
+        &unreachable_token_file,
+        format!("{}\n", inv3_env["data"]["token"].as_str().unwrap()),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&unreachable_token_file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let onboard_offline = isolated_cmd(offline_onboard_dir.path())
+        .args([
+            "onboard",
+            "--yes",
+            "--no-start",
+            "--node-id",
+            "dave@offline",
+            "--join",
+            unreachable_token_file.to_str().unwrap(),
+            "--state-dir",
+            offline_onboard_dir.path().to_str().unwrap(),
+            "--home",
+            offline_onboard_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run hyp onboard --join unreachable");
+    assert_eq!(onboard_offline.status.code(), Some(0));
+    let off_onboard_json: Value = serde_json::from_slice(&onboard_offline.stdout).unwrap();
+    assert_eq!(off_onboard_json["ok"], true);
+    assert_eq!(off_onboard_json["data"]["stagedJoin"]["paired"], false);
+    assert!(
+        !off_onboard_json["warnings"].as_array().unwrap().is_empty(),
+        "unreachable onboard --join must emit a warning: {off_onboard_json}"
+    );
+    let next_list: Vec<&str> = off_onboard_json["next"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        next_list
+            .iter()
+            .any(|s| s.contains("hyp pair accept --token-file")),
+        "unreachable onboard --join must suggest `hyp pair accept --token-file`: {next_list:?}"
+    );
+    assert!(
+        !next_list
+            .iter()
+            .any(|s| s.contains("start your node to activate")),
+        "onboard --join must NEVER emit misleading staged-join-token activation prose: {next_list:?}"
+    );
+}
+
+#[test]
+fn node_cmd_admin_key_and_live_am2_pair_accept() {
+    let hub_dir = tempfile::tempdir().unwrap();
+    let hub_b64_dir = tempfile::tempdir().unwrap();
+    let client_dir = tempfile::tempdir().unwrap();
+    let client_b64_dir = tempfile::tempdir().unwrap();
+
+    // 1. Invalid pairing.adminKey in node.json MUST fail closed with CONFIG_ERROR!
+    let bad_cfg_path = hub_dir.path().join("bad-admin.json");
+    fs::write(
+        &bad_cfg_path,
+        serde_json::to_string_pretty(&json!({
+            "v": 2,
+            "nodeId": "bad-hub",
+            "profile": "router",
+            "stateDir": hub_dir.path().to_str().unwrap(),
+            "listen": { "bind": "127.0.0.1:0" },
+            "pairing": { "adminKey": "not-a-valid-ed25519-key" }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let bad_start = isolated_cmd(hub_dir.path())
+        .args([
+            "node",
+            "start",
+            "--config",
+            bad_cfg_path.to_str().unwrap(),
+            "--no-local-socket",
+            "--json",
+        ])
+        .output()
+        .expect("run node start with bad adminKey");
+    assert_eq!(bad_start.status.code(), Some(1));
+    let bad_env: Value = serde_json::from_slice(&bad_start.stdout).unwrap();
+    assert_eq!(bad_env["ok"], false);
+    assert_eq!(bad_env["error"]["code"], "CONFIG_ERROR");
+
+    // 2. Mint an am2_ invite (creates Hub's Admin-CA key & persists signed GrantV2 in Hub's SQLite),
+    //    then configure Hub's `node.json` with `pairing.adminKey` as an OKP Ed25519 JWK object,
+    //    start compiled `hyp node start`, and run LIVE `hyp pair accept`!
+    let pre_inv = isolated_cmd(hub_dir.path())
+        .args([
+            "pair",
+            "invite",
+            "--mode",
+            "team",
+            "--node-id",
+            "acme-hub",
+            "--endpoint",
+            "http://127.0.0.1:1",
+            "--peer",
+            "setup-probe@laptop",
+            "--preset",
+            "member",
+            "--state-dir",
+            hub_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(pre_inv.status.code(), Some(0));
+    let pre_env: Value = serde_json::from_slice(&pre_inv.stdout).unwrap();
+    let admin_jwk = pre_env["data"]["adminJwk"].clone();
+    let admin_x = admin_jwk["x"].as_str().expect("adminJwk.x").to_string();
+    assert_eq!(admin_x.len(), 43);
+
+    let hub_cfg_path = hub_dir.path().join("node.json");
+    fs::write(
+        &hub_cfg_path,
+        serde_json::to_string_pretty(&json!({
+            "v": 2,
+            "nodeId": "acme-hub",
+            "profile": "router",
+            "stateDir": hub_dir.path().to_str().unwrap(),
+            "listen": { "bind": "127.0.0.1:0" },
+            "pairing": {
+                "adminCa": true,
+                "adminKey": admin_jwk
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut hub_cmd = isolated_cmd(hub_dir.path());
+    hub_cmd
+        .args([
+            "node",
+            "start",
+            "--config",
+            hub_cfg_path.to_str().unwrap(),
+            "--no-local-socket",
+            "--json",
+        ])
+        .stdin(Stdio::null());
+    let mut hub_proc = ManagedProcess::spawn("acme-hub (JWK adminKey)", &mut hub_cmd);
+    let hub_startup = hub_proc.read_json_line(Duration::from_secs(10));
+    assert_eq!(hub_startup["ok"], true, "hub startup: {hub_startup}");
+    let hub_endpoint = hub_startup["data"]["endpoint"]
+        .as_str()
+        .expect("hub endpoint")
+        .to_string();
+
+    let team_inv = isolated_cmd(hub_dir.path())
+        .args([
+            "pair",
+            "invite",
+            "--mode",
+            "team",
+            "--node-id",
+            "acme-hub",
+            "--endpoint",
+            &hub_endpoint,
+            "--peer",
+            "bob@laptop",
+            "--preset",
+            "member",
+            "--state-dir",
+            hub_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(team_inv.status.code(), Some(0));
+    let team_inv_env: Value = serde_json::from_slice(&team_inv.stdout).unwrap();
+    let am2_token = team_inv_env["data"]["token"].as_str().unwrap().to_string();
+    let am2_file = client_dir.path().join("team.token");
+    fs::write(&am2_file, format!("{am2_token}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&am2_file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let live_accept = isolated_cmd(client_dir.path())
+        .args([
+            "pair",
+            "accept",
+            "--token-file",
+            am2_file.to_str().unwrap(),
+            "--node-id",
+            "bob@laptop",
+            "--state-dir",
+            client_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run live am2_ hyp pair accept");
+    assert_eq!(
+        live_accept.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&live_accept.stdout),
+        String::from_utf8_lossy(&live_accept.stderr)
+    );
+    let acc_env: Value = serde_json::from_slice(&live_accept.stdout).unwrap();
+    assert_eq!(acc_env["ok"], true);
+    assert_eq!(acc_env["data"]["handshakeCompleted"], true);
+    assert_eq!(acc_env["data"]["peerId"], "acme-hub");
+
+    // Verify BOTH Hub DB and Client DB have Active peers, pinned JWKs, and Client saved `authCredential`!
+    {
+        let hub_db = NodeDb::open(hub_dir.path().join("node.sqlite")).unwrap();
+        let bob_on_hub = hub_db
+            .peers()
+            .get_peer("bob@laptop")
+            .unwrap()
+            .expect("Hub must have Bob active after POST /v1/pair");
+        assert_eq!(bob_on_hub.status, PeerStatus::Active);
+        assert_eq!(
+            hub_db
+                .peers()
+                .list_peer_keys("bob@laptop", Some(KeyUse::Signing), true)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let client_db = NodeDb::open(client_dir.path().join("node.sqlite")).unwrap();
+        let hub_on_client = client_db
+            .peers()
+            .get_peer("acme-hub")
+            .unwrap()
+            .expect("Client must have acme-hub active after POST /v1/pair");
+        assert_eq!(hub_on_client.status, PeerStatus::Active);
+        assert!(hub_on_client.manifest_json.is_some());
+        let expected_cred_ref = peer_auth_secret_name("acme-hub");
+        assert_eq!(
+            hub_on_client.auth_credential_ref.as_deref(),
+            Some(expected_cred_ref.as_str())
+        );
+        let client_secrets = SecretStore::new(client_dir.path(), SecretBackend::File);
+        assert!(!client_secrets.get(&expected_cred_ref).unwrap().is_empty());
+        assert_eq!(
+            client_db
+                .peers()
+                .list_peer_keys("acme-hub", Some(KeyUse::Signing), true)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            client_db
+                .peers()
+                .list_peer_keys("acme-hub", Some(KeyUse::Admin), true)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    // Single-use replay of `am2_` MUST fail closed!
+    let replay_am2 = isolated_cmd(client_dir.path())
+        .args([
+            "pair",
+            "accept",
+            "--token-file",
+            am2_file.to_str().unwrap(),
+            "--node-id",
+            "bob@laptop",
+            "--state-dir",
+            client_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_ne!(replay_am2.status.code(), Some(0));
+    let _ = hub_proc.shutdown_gracefully();
+
+    // 3. Also verify 43-char base64url string format for `pairing.adminKey` in `node.json`!
+    let pre_b64 = isolated_cmd(hub_b64_dir.path())
+        .args([
+            "pair",
+            "invite",
+            "--mode",
+            "team",
+            "--node-id",
+            "acme-b64-hub",
+            "--endpoint",
+            "http://127.0.0.1:1",
+            "--peer",
+            "probe@laptop",
+            "--preset",
+            "member",
+            "--state-dir",
+            hub_b64_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(pre_b64.status.code(), Some(0));
+    let b64_admin_x = serde_json::from_slice::<Value>(&pre_b64.stdout).unwrap()["data"]["adminJwk"]
+        ["x"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let b64_cfg_path = hub_b64_dir.path().join("node.json");
+    fs::write(
+        &b64_cfg_path,
+        serde_json::to_string_pretty(&json!({
+            "v": 2,
+            "nodeId": "acme-b64-hub",
+            "profile": "router",
+            "stateDir": hub_b64_dir.path().to_str().unwrap(),
+            "listen": { "bind": "127.0.0.1:0" },
+            "pairing": {
+                "adminCa": true,
+                "adminKey": b64_admin_x
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut b64_cmd = isolated_cmd(hub_b64_dir.path());
+    b64_cmd
+        .args([
+            "node",
+            "start",
+            "--config",
+            b64_cfg_path.to_str().unwrap(),
+            "--no-local-socket",
+            "--json",
+        ])
+        .stdin(Stdio::null());
+    let mut b64_proc = ManagedProcess::spawn("acme-b64-hub (43-char adminKey)", &mut b64_cmd);
+    let b64_startup = b64_proc.read_json_line(Duration::from_secs(10));
+    assert_eq!(b64_startup["ok"], true, "b64 hub startup: {b64_startup}");
+    let b64_endpoint = b64_startup["data"]["endpoint"].as_str().unwrap().to_string();
+
+    let b64_inv = isolated_cmd(hub_b64_dir.path())
+        .args([
+            "pair",
+            "invite",
+            "--mode",
+            "team",
+            "--node-id",
+            "acme-b64-hub",
+            "--endpoint",
+            &b64_endpoint,
+            "--peer",
+            "carol@laptop",
+            "--preset",
+            "member",
+            "--state-dir",
+            hub_b64_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(b64_inv.status.code(), Some(0));
+    let b64_token = serde_json::from_slice::<Value>(&b64_inv.stdout).unwrap()["data"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b64_file = client_b64_dir.path().join("b64.token");
+    fs::write(&b64_file, format!("{b64_token}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&b64_file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let b64_accept = isolated_cmd(client_b64_dir.path())
+        .args([
+            "pair",
+            "accept",
+            "--token-file",
+            b64_file.to_str().unwrap(),
+            "--node-id",
+            "carol@laptop",
+            "--state-dir",
+            client_b64_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let _ = b64_proc.shutdown_gracefully();
+    assert_eq!(
+        b64_accept.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&b64_accept.stdout),
+        String::from_utf8_lossy(&b64_accept.stderr)
+    );
+    let b64_acc_env: Value = serde_json::from_slice(&b64_accept.stdout).unwrap();
+    assert_eq!(b64_acc_env["data"]["handshakeCompleted"], true);
 }

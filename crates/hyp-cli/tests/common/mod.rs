@@ -36,7 +36,8 @@ pub fn isolated_cmd(home: &Path) -> Command {
         .env_remove("HYPHAE_SOCKET")
         .env_remove("AGENTS_MESH_SOCKET")
         .env_remove("HYPHAE_RELEASE_PUBKEY")
-        .env_remove("HYPHAE_DISABLE_AUTO_UPDATE");
+        .env_remove("HYPHAE_DISABLE_AUTO_UPDATE")
+        .env_remove("HYPHAE_DROP_PORTAL_URL");
     cmd
 }
 
