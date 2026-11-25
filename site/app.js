@@ -59,7 +59,7 @@ document.getElementById("heroCopyBtn")?.addEventListener("click", (e) => {
 renderHeroInstall();
 
 // ============================================================================
-// 1B. HERO SIGNAL BUS (Multi-Source -> Exposure Control -> Multi-Machine Agents)
+// 1B. HERO SIGNAL BUS (Multi-Source -> Hyphae Wire -> Multi-Machine Agents)
 // ============================================================================
 (function initSignalBus() {
   const stage = document.getElementById("signalBusStage");
@@ -71,13 +71,8 @@ renderHeroInstall();
   const outLines = [0, 1, 2].map((i) => document.getElementById(`sbOut${i}`));
   const outPulses = [0, 1, 2].map((i) => document.getElementById(`sbOutPulse${i}`));
 
-  const tiers = {
-    interrupt: document.getElementById("sbTierInterrupt"),
-    queue: document.getElementById("sbTierQueue"),
-    notify: document.getElementById("sbTierNotify"),
-    mute: document.getElementById("sbTierMute"),
-  };
   const core = document.getElementById("sbCore");
+  const valveRing = document.getElementById("sbValveRing");
   const ruleEl = document.getElementById("sbRouteRule");
   const captionEl = document.getElementById("sbCaption");
   const playBtn = document.getElementById("sbPlayBtn");
@@ -95,11 +90,9 @@ renderHeroInstall();
       dur: 5000,
       srcIdx: 0,
       tone: "coral",
-      litTiers: ["interrupt"],
-      softTiers: ["notify", "mute"],
-      rule: "github.ci → interrupt (@claude) · notify (@review)",
+      rule: "github.ci → claude@laptop · zero polling",
       caption:
-        "<strong>Standardized event:</strong> GitHub CI failure wakes <code>Claude Code · laptop</code> immediately while teammate stays undisturbed in <code>notify</code>.",
+        "<strong>Standardized event:</strong> GitHub CI failure wakes <code>Claude Code · laptop</code> immediately while teammate gets a 1-line digest.",
       out: [
         { cls: "coral", state: "lit" },
         { cls: "", state: "off" },
@@ -109,20 +102,20 @@ renderHeroInstall();
         {
           cardCls: "is-coral",
           stateCls: "coral",
-          state: "⚡ Interrupt",
-          msg: "Woken immediately · PR #412 failing check in auth.rs",
+          state: "⚡ Woken",
+          msg: "PR #412 failing check in auth.rs · pushed immediately",
         },
         {
           cardCls: "is-muted",
           stateCls: "slate",
-          state: "Muted · 0 wakes",
+          state: "0 wakes",
           msg: "Not subscribed to checkout-api · 0 tokens spent",
         },
         {
           cardCls: "is-amber",
           stateCls: "amber",
-          state: "Notify · digest",
-          msg: "1-line digest queued for next turn (Focus Mode)",
+          state: "1-line digest",
+          msg: "Summary queued for next turn · active work undisturbed",
         },
       ],
     },
@@ -130,9 +123,7 @@ renderHeroInstall();
       dur: 5000,
       srcIdx: 1,
       tone: "olive",
-      litTiers: ["queue"],
-      softTiers: [],
-      rule: "alex@macbook → E2EE HPKE · queue on idle",
+      rule: "alex@macbook → codex@linux-ci · HPKE E2EE",
       caption:
         "<strong>Messaging is a signal too:</strong> Encrypted team DMs wake idle agents across laptops &amp; build servers — zero polling loops.",
       out: [
@@ -150,8 +141,8 @@ renderHeroInstall();
         {
           cardCls: "is-olive",
           stateCls: "olive",
-          state: "⚡ Woken (queue)",
-          msg: "@alex: review auth.rs diff & run cargo test on linux-ci-02",
+          state: "⚡ Woken",
+          msg: "@alex: review auth.rs diff & run cargo test on linux-ci",
         },
         {
           cardCls: "is-olive-soft",
@@ -165,8 +156,6 @@ renderHeroInstall();
       dur: 5000,
       srcIdx: 2,
       tone: "moss",
-      litTiers: ["interrupt"],
-      softTiers: [],
       rule: "passkey.drop → OS Keychain · hyp exec --env",
       caption:
         "<strong>Human approvals &amp; secrets:</strong> Face ID Passkey drop seals into OS Keychain and injects via <code>hyp exec</code> — never in LLM context.",
@@ -185,13 +174,13 @@ renderHeroInstall();
         {
           cardCls: "is-idle",
           stateCls: "slate",
-          state: "Idle · 0 polling",
-          msg: "Scoped to laptop node only · zero relay plaintext",
+          state: "Scoped",
+          msg: "Pinned to laptop node only · zero relay plaintext",
         },
         {
           cardCls: "is-idle",
           stateCls: "slate",
-          state: "Idle · 0 polling",
+          state: "Untouched",
           msg: "Blind relay auto-wipes ciphertext within 15 min",
         },
       ],
@@ -200,11 +189,9 @@ renderHeroInstall();
       dur: 5200,
       srcIdx: 3,
       tone: "amber",
-      litTiers: ["notify"],
-      softTiers: ["mute"],
-      rule: "cron.triage → notify (@review) · mute (@codex)",
+      rule: "hyp.emit → antigravity@team · 09:00 cron",
       caption:
-        "<strong>Exact exposure control:</strong> Scheduled cron &amp; noisy alerts land as <code>notify</code> digests or stay <code>muted</code> — zero hijacked sessions.",
+        "<strong>Scheduled &amp; noisy feeds:</strong> OS cron triggers and alerts normalize onto the same bus — waking only subscribed threads.",
       out: [
         { cls: "amber", state: "soft" },
         { cls: "", state: "off" },
@@ -214,20 +201,20 @@ renderHeroInstall();
         {
           cardCls: "is-amber",
           stateCls: "amber",
-          state: "Notify · 1 line",
+          state: "1-line digest",
           msg: "09:00 triage digest attached to next turn",
         },
         {
           cardCls: "is-muted",
           stateCls: "slate",
-          state: "Muted · 0 wakes",
-          msg: "Archived silently · 0 wakes during active build",
+          state: "0 wakes",
+          msg: "Archived silently · active build uninterrupted",
         },
         {
           cardCls: "is-amber",
           stateCls: "amber",
-          state: "Notify · digest",
-          msg: "Morning cron queued · 3 open PRs ready in hyp_inbox",
+          state: "⚡ Ready",
+          msg: "Morning cron delivered · 3 open PRs ready in hyp_inbox",
         },
       ],
     },
@@ -268,15 +255,8 @@ renderHeroInstall();
       el.setAttribute("class", `sb-pulse ${spec.cls} ${activeCls}`.trim());
     });
 
-    if (core) {
-      core.className = `sb-core tone-${b.tone}`;
-    }
-
-    Object.entries(tiers).forEach(([name, el]) => {
-      if (!el) return;
-      el.classList.toggle("is-lit", b.litTiers.includes(name));
-      el.classList.toggle("is-soft", b.softTiers.includes(name));
-    });
+    if (core) core.className = `sb-hub-medallion tone-${b.tone}`;
+    if (valveRing) valveRing.className = `sb-valve-ring tone-${b.tone}`;
 
     if (ruleEl) {
       ruleEl.textContent = b.rule;
@@ -336,6 +316,193 @@ renderHeroInstall();
 
   renderBeat(beatIdx);
   schedule();
+})();
+
+// ============================================================================
+// 1C. INTERACTIVE USE CASE SHOWCASE (#use-cases)
+// ============================================================================
+(function initUseCaseShowcase() {
+  const root = document.getElementById("ucShowcase");
+  if (!root) return;
+
+  const tabs = Array.from(root.querySelectorAll(".uc-tab[data-uc]"));
+  const card = document.getElementById("ucStageCard");
+  const badgeEl = document.getElementById("ucStageBadge");
+  const titleEl = document.getElementById("ucStageTitle");
+  const leadEl = document.getElementById("ucStageLead");
+  const fromEl = document.getElementById("ucFlowFrom");
+  const midLabelEl = document.getElementById("ucFlowMidLabel");
+  const toEl = document.getElementById("ucFlowTo");
+  const termLabelEl = document.getElementById("ucTermLabel");
+  const termCodeEl = document.getElementById("ucTermCode");
+  const copyBtn = document.getElementById("ucCopyBtn");
+  const chipsEl = document.getElementById("ucChips");
+  const actionLinkEl = document.getElementById("ucActionLink");
+
+  const KEY_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8.5" cy="14.5" r="4"/><path d="M11.5 11.5 20 3"/><path d="m17 6 2.5 2.5"/><path d="m14.5 8.5 2 2"/></svg>`;
+
+  const WORKFLOWS = {
+    team: {
+      tone: "olive",
+      badge: "Direct P2P · Team Hub (Beta)",
+      title: "Coordinate agents across laptops and build servers",
+      lead: "Pair two machines directly over Tailscale or LAN with zero server, or self-host a blind Team Hub for shared <code>#channels</code>, scoped invites, and live revocation.",
+      from: { kind: "avatar", src: "./assets/sprite-alex.jpg?v=2", title: "alex@macbook", sub: "Claude · sends E2EE DM" },
+      mid: "HPKE E2EE",
+      to: { kind: "avatar", src: "./assets/sprite-alice.jpg?v=2", title: "codex@linux-ci", sub: "Wakes · audits & replies" },
+      termLabel: "Pair directly or spin up a hub",
+      code: `# Direct P2P pairing (zero server)\nhyp onboard\n# Or self-host a blind Team Hub (Beta):\nhyp deploy init tailscale`,
+      copy: "hyp onboard",
+      chips: ["Tailscale / LAN", "HPKE E2EE", "#channels & KV", "Live revoke"],
+      link: { text: "See 7-step team walkthrough ↓", href: "#walkthrough", openWalkthrough: true },
+    },
+    events: {
+      tone: "amber",
+      badge: "Standardized Event Streams",
+      title: "Wake only the right agent from CI, alerts, or OS cron",
+      lead: "GitHub PRs, Prometheus webhooks, and local <code>hyp emit</code> schedules normalize onto one CloudEvents bus with server-side filters and burst caps — zero polling loops.",
+      from: { kind: "icon", src: "./assets/icons/github.svg", title: "GitHub / Cron / Alerts", sub: "Normalized CloudEvents" },
+      mid: "Filter + Tier",
+      to: { kind: "icon", src: "./assets/icons/claude.svg", title: "Subscribed session", sub: "Wakes or queues 1-line digest" },
+      termLabel: "Schedule a local wake from cron, launchd, systemd, or schtasks",
+      code: `# Emit a structured signal to local.schedule\nhyp emit --label morning-triage \\\n  --note "Review open PRs"`,
+      copy: 'hyp emit --label morning-triage --note "Review open PRs"',
+      chips: ["GitHub & Prometheus", "launchd / systemd / schtasks", "Zero polling"],
+      link: { text: "Try the live delivery simulator ↓", href: "#streams" },
+    },
+    drops: {
+      tone: "moss",
+      badge: "Passkey + Keychain + hyp exec",
+      title: "Hand an agent a secret or approval from your phone",
+      lead: "Seal credentials with Face ID / Touch ID on <a class=\"card-inline-link\" href=\"./drop/\">hyphae.to/drop ↗</a>. Secret bytes land straight in your OS Keychain — never in LLM prompts — and inject via <code>hyp exec --env</code> with live output redaction.",
+      from: { kind: "glyph", svg: KEY_SVG, title: "Phone · Face ID", sub: "WebAuthn Passkey + PRF" },
+      mid: "Blind Relay ≤15m",
+      to: { kind: "icon", src: "./assets/icons/openai.svg", title: "OS Keychain → hyp exec", sub: "Child env only · stdout redacted" },
+      termLabel: "Request a secret drop and inject it safely",
+      code: `hyp drop create --kind secret --secret-name stripe-key\nhyp exec --env STRIPE_KEY=stripe-key -- ./deploy.sh`,
+      copy: "hyp drop create --kind secret --secret-name stripe-key",
+      chips: ["OS Keychain", "Passkey + PRF", "Live Redaction"],
+      link: { text: "Open Drop Portal ↗", href: "./drop/" },
+    },
+    local: {
+      tone: "olive",
+      badge: "Zero Setup · Local Daemon",
+      title: "Let Claude Code, Codex, and OpenCode work together",
+      lead: "Every harness on your laptop shares one local SQLite inbox over 4 MCP tools and 2.7 ms hooks. Ask one session to assign a code review to another — idle sessions wake automatically.",
+      from: { kind: "icon", src: "./assets/icons/claude.svg", title: "Claude Code · @builder", sub: "Asks @reviewer to check diff" },
+      mid: "Local IPC",
+      to: { kind: "icon", src: "./assets/icons/openai.svg", title: "Codex · @reviewer", sub: "Wakes · audits · wakes builder" },
+      termLabel: "Prompt in Claude Code after hyp onboard",
+      code: `# In Claude Code:\n"Join the Hyphae mesh as builder, then ask codex\n to review my last commit and reply when done."`,
+      copy: "Join the Hyphae mesh as builder, then ask codex to review my last commit and reply when done.",
+      chips: ["Claude Code", "Codex", "Antigravity", "Herdr", "OpenCode"],
+      link: { text: "See supported harnesses ↓", href: "#how-it-works" },
+    },
+    bridges: {
+      tone: "amber",
+      badge: "Beta · External Bridges",
+      title: "Message live coding sessions from Slack, Telegram, or WhatsApp",
+      lead: "Install SHA-256 verified bridges with <code>hyp plugin install</code> on macOS, Linux, or Windows. Bot tokens stay in your OS Keychain, sender allowlists fail closed, and topics stay local-only by default.",
+      from: { kind: "icon", src: "./assets/icons/telegram.svg", title: "Slack · Telegram · WhatsApp", sub: "Allowlisted private chat" },
+      mid: "Local Bridge",
+      to: { kind: "icon", src: "./assets/icons/herdr.png", title: "Linked agent session", sub: "Replies & emoji reactions" },
+      termLabel: "Install a verified bridge and store its token out-of-band",
+      code: `hyp plugin install telegram\nhyp secret set telegram-bot-token --web`,
+      copy: "hyp plugin install telegram && hyp secret set telegram-bot-token --web",
+      chips: ["macOS · Linux · Windows", "SHA-256 pinned", "Local-only topics"],
+      link: { text: "Read chat bridges guide ↗", href: "https://github.com/hyphae-to/hyp/blob/main/docs/guides/chat-bridges.md", external: true },
+    },
+  };
+
+  function renderNode(el, spec) {
+    if (!el || !spec) return;
+    let icoHtml = "";
+    if (spec.kind === "glyph") {
+      icoHtml = `<span class="uc-flow-ico glyph" aria-hidden="true">${spec.svg}</span>`;
+    } else if (spec.kind === "avatar") {
+      icoHtml = `<span class="uc-flow-ico avatar"><img src="${esc(spec.src)}" alt="" /></span>`;
+    } else {
+      icoHtml = `<span class="uc-flow-ico"><img src="${esc(spec.src)}" alt="" /></span>`;
+    }
+    el.innerHTML = `${icoHtml}<span class="uc-flow-copy"><strong>${esc(spec.title)}</strong><small>${esc(spec.sub)}</small></span>`;
+  }
+
+  function formatCode(raw) {
+    return raw
+      .split("\n")
+      .map((line) => (line.trimStart().startsWith("#") ? `<span class="uc-c">${esc(line)}</span>` : esc(line)))
+      .join("\n");
+  }
+
+  let activeKey = "team";
+
+  function selectWorkflow(key) {
+    const wf = WORKFLOWS[key] || WORKFLOWS.team;
+    activeKey = key in WORKFLOWS ? key : "team";
+
+    tabs.forEach((btn) => {
+      const isAct = btn.dataset.uc === activeKey;
+      btn.classList.toggle("is-active", isAct);
+      btn.setAttribute("aria-selected", isAct ? "true" : "false");
+    });
+
+    if (card) card.className = `uc-stage tone-${wf.tone}`;
+    if (badgeEl) badgeEl.textContent = wf.badge;
+    if (titleEl) titleEl.textContent = wf.title;
+    if (leadEl) leadEl.innerHTML = wf.lead;
+    renderNode(fromEl, wf.from);
+    if (midLabelEl) midLabelEl.textContent = wf.mid;
+    renderNode(toEl, wf.to);
+    if (termLabelEl) termLabelEl.textContent = wf.termLabel;
+    if (termCodeEl) termCodeEl.innerHTML = formatCode(wf.code);
+    if (chipsEl) chipsEl.innerHTML = wf.chips.map((c) => `<span>${esc(c)}</span>`).join("");
+
+    if (actionLinkEl && wf.link) {
+      actionLinkEl.textContent = wf.link.text;
+      actionLinkEl.setAttribute("href", wf.link.href);
+      if (wf.link.external) {
+        actionLinkEl.setAttribute("target", "_blank");
+        actionLinkEl.setAttribute("rel", "noreferrer");
+      } else {
+        actionLinkEl.removeAttribute("target");
+        actionLinkEl.removeAttribute("rel");
+      }
+      actionLinkEl.dataset.openWalkthrough = wf.link.openWalkthrough ? "1" : "";
+    }
+  }
+
+  tabs.forEach((btn, idx) => {
+    btn.addEventListener("click", () => selectWorkflow(btn.dataset.uc));
+    btn.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown" || e.key === "ArrowRight") {
+        e.preventDefault();
+        const next = tabs[(idx + 1) % tabs.length];
+        next.focus();
+        selectWorkflow(next.dataset.uc);
+      } else if (e.key === "ArrowUp" || e.key === "ArrowLeft") {
+        e.preventDefault();
+        const prev = tabs[(idx - 1 + tabs.length) % tabs.length];
+        prev.focus();
+        selectWorkflow(prev.dataset.uc);
+      }
+    });
+  });
+
+  copyBtn?.addEventListener("click", () => {
+    const wf = WORKFLOWS[activeKey];
+    if (!wf) return;
+    navigator.clipboard?.writeText(wf.copy).catch(() => {});
+    copyBtn.textContent = "Copied";
+    setTimeout(() => { copyBtn.textContent = "Copy"; }, 1300);
+  });
+
+  actionLinkEl?.addEventListener("click", () => {
+    if (actionLinkEl.dataset.openWalkthrough === "1" && !walkthroughOpen) {
+      setWalkthroughOpen(true);
+    }
+  });
+
+  selectWorkflow("team");
 })();
 
 // ============================================================================
