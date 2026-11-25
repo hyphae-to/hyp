@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "hyphae": {
+      "command": "hyp",
+      "args": ["mcp", "--backend", "claude"]
+    }
+  }
+}

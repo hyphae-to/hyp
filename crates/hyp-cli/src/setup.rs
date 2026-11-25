@@ -7,8 +7,8 @@
 
 use crate::config_file::{
     ensure_dir, ensure_v2_node_json_defaults, open_secret_store, profile_as_str,
-    read_json_object_or_empty, resolve_config_path_for_write, resolve_home_dir, resolve_state_dir,
-    write_atomic_file, write_atomic_json,
+    read_json_object_or_empty, read_json_value, resolve_config_path_for_write, resolve_home_dir,
+    resolve_state_dir, write_atomic_file, write_atomic_json,
 };
 use crate::node_cmd::CliNodeProfile;
 use crate::pair::{
@@ -46,6 +46,22 @@ use std::process::ExitCode;
 
 const MAX_JOIN_TOKEN_BYTES: u64 = 64 * 1024;
 
+const CLAUDE_CMD_HYPHAE: &str =
+    include_str!("../../../plugins/claude-code/commands/hyphae.md");
+const CLAUDE_CMD_HYPHAE_SUBS: &str =
+    include_str!("../../../plugins/claude-code/commands/hyphae-subs.md");
+const CLAUDE_CMD_HYPHAE_FOCUS: &str =
+    include_str!("../../../plugins/claude-code/commands/hyphae-focus.md");
+const CLAUDE_CMD_HYPHAE_MUTE: &str =
+    include_str!("../../../plugins/claude-code/commands/hyphae-mute.md");
+
+const CLAUDE_SLASH_COMMANDS: [(&str, &str); 4] = [
+    ("hyphae.md", CLAUDE_CMD_HYPHAE),
+    ("hyphae-subs.md", CLAUDE_CMD_HYPHAE_SUBS),
+    ("hyphae-focus.md", CLAUDE_CMD_HYPHAE_FOCUS),
+    ("hyphae-mute.md", CLAUDE_CMD_HYPHAE_MUTE),
+];
+
 #[derive(Args)]
 pub struct SetupArgs {
     /// Target harness: all, auto, or one/comma-separated of claude,codex,antigravity,cursor,opencode,gemini,openclaw,herdr,t3
@@ -57,13 +73,13 @@ pub struct SetupArgs {
     /// Override home directory (defaults to $HOME; ideal for isolated testing)
     #[arg(long)]
     pub home: Option<PathBuf>,
-    /// Explicit state/config directory (used by T3 adapter config)
+    /// Explicit state/config directory (used by T3 adapter config and statusLine chain backups)
     #[arg(long)]
     pub state_dir: Option<PathBuf>,
     /// Explicit node.json path (used by T3 adapter config)
     #[arg(long)]
     pub config: Option<PathBuf>,
-    /// Explicit connector.sock path to embed in hook/MCP commands
+    /// Explicit connector.sock path to embed in hook/MCP/statusLine commands
     #[arg(long)]
     pub socket: Option<PathBuf>,
     /// Plan changes without writing or modifying any files on disk
@@ -75,6 +91,12 @@ pub struct SetupArgs {
     /// Overwrite runtime SKILL.md files even when they contain <!-- hyphae:unmanaged -->
     #[arg(long)]
     pub force_skills: bool,
+    /// Configure non-destructive live statusLine for Claude Code / Antigravity CLI (chains any existing custom statusLine)
+    #[arg(long)]
+    pub statusline: bool,
+    /// Restore previously chained statusLine (or remove Hyphae statusLine) and delete the chain backup file
+    #[arg(long)]
+    pub restore_statusline: bool,
     /// Output structured JSON envelope
     #[arg(long)]
     pub json: bool,
@@ -146,9 +168,38 @@ pub struct HarnessDiagnostic {
     pub fix: Option<String>,
 }
 
+/// Diagnostic state of a configured `statusLine` entry for Claude Code or Antigravity CLI.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusLineDiagnostic {
+    pub harness: String,
+    pub settings_path: String,
+    pub configured: bool,
+    pub chained: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_file_exists: Option<bool>,
+    pub detail: String,
+}
+
 pub fn run_setup(args: SetupArgs) -> ExitCode {
     let cmd = "setup";
     let as_json = args.json;
+    if args.statusline && args.restore_statusline {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "CONFLICTING_FLAGS",
+            "`--statusline` and `--restore-statusline` are mutually exclusive",
+            Some(
+                "Pass either `--statusline` to enable or `--restore-statusline` to restore."
+                    .to_string(),
+            ),
+        );
+    }
+
     let Some(home) = resolve_home_dir(args.home.as_deref()) else {
         return emit_error(
             cmd,
@@ -187,6 +238,11 @@ pub fn run_setup(args: SetupArgs) -> ExitCode {
         args.state_dir.as_deref(),
         Some(&home),
     );
+    let state_dir = resolve_state_dir(
+        args.state_dir.as_deref(),
+        args.config.as_deref(),
+        Some(&home),
+    );
     let socket_str = args.socket.as_ref().map(|p| p.display().to_string());
 
     let skill_ctx = SetupSkillContext::detect(
@@ -208,19 +264,20 @@ pub fn run_setup(args: SetupArgs) -> ExitCode {
         ));
     }
 
+    let setup_opts = SetupOptions {
+        socket: socket_str.as_deref(),
+        state_dir: &state_dir,
+        statusline: args.statusline,
+        dry_run: args.dry_run,
+    };
+
     for kind in targets {
-        let step_res = if args.refresh_skills {
+        let step_res = if args.restore_statusline {
+            restore_harness_statusline_only(kind, &home, &state_dir, args.dry_run)
+        } else if args.refresh_skills {
             refresh_harness_skill_only(kind, &home, &skill_ctx, args.dry_run)
         } else {
-            configure_harness(
-                kind,
-                &home,
-                &bin_path,
-                &config_path,
-                socket_str.as_deref(),
-                &skill_ctx,
-                args.dry_run,
-            )
+            configure_harness(kind, &home, &bin_path, &config_path, setup_opts, &skill_ctx)
         };
         match step_res {
             Ok(outcome) => results.push(outcome),
@@ -598,9 +655,22 @@ fn run_onboard_deterministic(args: OnboardArgs, home: PathBuf) -> ExitCode {
         args.home.is_none(),
         false,
     );
+    let onboard_setup_opts = SetupOptions {
+        socket: None,
+        state_dir: &state_dir,
+        statusline: false,
+        dry_run: false,
+    };
     let mut configured_harnesses = Vec::new();
     for kind in targets {
-        match configure_harness(kind, &home, &bin_path, &config_path, None, &skill_ctx, false) {
+        match configure_harness(
+            kind,
+            &home,
+            &bin_path,
+            &config_path,
+            onboard_setup_opts,
+            &skill_ctx,
+        ) {
             Ok(outcome) => configured_harnesses.push(outcome),
             Err(e) => {
                 warnings.push(format!("Skipped harness '{}' setup: {e}", kind.as_str()));
@@ -1419,35 +1489,517 @@ fn refresh_harness_skill_only(
     })
 }
 
+#[derive(Clone, Copy)]
+struct SetupOptions<'a> {
+    socket: Option<&'a str>,
+    state_dir: &'a Path,
+    statusline: bool,
+    dry_run: bool,
+}
+
+#[derive(Clone, Copy)]
+enum StatusLineHarness {
+    Claude,
+    Antigravity,
+}
+
+impl StatusLineHarness {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Antigravity => "antigravity",
+        }
+    }
+
+    fn settings_path(self, home: &Path) -> PathBuf {
+        match self {
+            Self::Claude => home.join(".claude").join("settings.json"),
+            Self::Antigravity => home
+                .join(".gemini")
+                .join("antigravity-cli")
+                .join("settings.json"),
+        }
+    }
+
+    fn chain_file_path(self, state_dir: &Path) -> PathBuf {
+        match self {
+            Self::Claude => state_dir.join("claude-statusline-chain.json"),
+            Self::Antigravity => state_dir.join("antigravity-statusline-chain.json"),
+        }
+    }
+
+    fn build_statusline_value(self, cmd: String) -> Value {
+        match self {
+            Self::Claude => json!({
+                "type": "command",
+                "command": cmd,
+                "refreshInterval": 5
+            }),
+            Self::Antigravity => json!({
+                "command": cmd,
+                "stack_with_default": true
+            }),
+        }
+    }
+}
+
+/// Splits a POSIX-style shell command line into words, honoring single quotes,
+/// double quotes, and backslash escapes without panicking on malformed input.
+fn split_shell_words(cmd: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_word = false;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = cmd.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if in_double {
+            if ch == '"' {
+                in_double = false;
+            } else if ch == '\\' {
+                if let Some(&next) = chars.peek() {
+                    if matches!(next, '"' | '\\' | '$' | '`') {
+                        current.push(chars.next().unwrap_or(ch));
+                    } else {
+                        current.push('\\');
+                    }
+                } else {
+                    current.push('\\');
+                }
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' => {
+                in_single = true;
+                in_word = true;
+            }
+            '"' => {
+                in_double = true;
+                in_word = true;
+            }
+            '\\' => {
+                in_word = true;
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+            }
+            c => {
+                in_word = true;
+                current.push(c);
+            }
+        }
+    }
+
+    if in_word {
+        words.push(current);
+    }
+    words
+}
+
+fn is_hyphae_statusline_command(cmd: &str) -> bool {
+    let words = split_shell_words(cmd);
+    if words.len() < 2 || words[1] != "statusline" {
+        return false;
+    }
+    let bin_name = Path::new(&words[0])
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&words[0])
+        .to_ascii_lowercase();
+    let is_hyp_bin = bin_name == "hyp" || bin_name == "hyp.exe";
+    is_hyp_bin || words.iter().any(|w| w == "--harness")
+}
+
+fn is_hyphae_statusline_value(val: &Value) -> bool {
+    let Some(cmd) = val.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    is_hyphae_statusline_command(cmd)
+}
+
+/// Extracts the path passed to `--chain-file <path>` (or `--chain-file=<path>`) inside a
+/// Hyphae `statusLine.command` string.
+pub fn parse_chain_file_from_command(cmd: &str) -> Option<PathBuf> {
+    let words = split_shell_words(cmd);
+    let mut idx = 0;
+    while idx < words.len() {
+        let w = &words[idx];
+        if w == "--chain-file" {
+            if let Some(next) = words.get(idx + 1) {
+                if !next.is_empty() {
+                    return Some(PathBuf::from(next));
+                }
+            }
+            return None;
+        }
+        if let Some(rest) = w.strip_prefix("--chain-file=") {
+            if !rest.is_empty() {
+                return Some(PathBuf::from(rest));
+            }
+            return None;
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn statusline_command(
+    bin: &str,
+    harness: &str,
+    socket: Option<&str>,
+    chain_file: Option<&Path>,
+) -> String {
+    let mut parts = vec![
+        shell_quote_cli(bin),
+        "statusline".to_string(),
+        "--harness".to_string(),
+        harness.to_string(),
+    ];
+    if let Some(sock) = socket {
+        parts.push("--socket".to_string());
+        parts.push(shell_quote_cli(sock));
+    }
+    if let Some(chain) = chain_file {
+        parts.push("--chain-file".to_string());
+        parts.push(shell_quote_cli(&chain.display().to_string()));
+    }
+    parts.join(" ")
+}
+
+fn configure_statusline_in_doc(
+    settings_doc: &mut Map<String, Value>,
+    target: StatusLineHarness,
+    bin: &str,
+    opts: SetupOptions<'_>,
+    files: &mut Vec<String>,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
+    let default_chain_path = target.chain_file_path(opts.state_dir);
+    let existing = settings_doc
+        .get("statusLine")
+        .filter(|v| !v.is_null())
+        .cloned();
+
+    match existing {
+        None => {
+            let cmd = statusline_command(bin, target.as_str(), opts.socket, None);
+            settings_doc.insert(
+                "statusLine".to_string(),
+                target.build_statusline_value(cmd),
+            );
+            notes.push(format!(
+                "Configured Hyphae live statusLine for {}.",
+                target.as_str()
+            ));
+        }
+        Some(ref existing_val) if is_hyphae_statusline_value(existing_val) => {
+            let existing_chain = existing_val
+                .get("command")
+                .and_then(Value::as_str)
+                .and_then(parse_chain_file_from_command);
+            let chain_to_keep = match existing_chain {
+                Some(p) => Some(p),
+                None if default_chain_path.exists() => Some(default_chain_path.clone()),
+                None => None,
+            };
+            let cmd = statusline_command(
+                bin,
+                target.as_str(),
+                opts.socket,
+                chain_to_keep.as_deref(),
+            );
+            settings_doc.insert(
+                "statusLine".to_string(),
+                target.build_statusline_value(cmd),
+            );
+            if let Some(ref cp) = chain_to_keep {
+                notes.push(format!(
+                    "Updated Hyphae statusLine idempotently (preserved existing --chain-file {}).",
+                    cp.display()
+                ));
+            } else {
+                notes.push(format!(
+                    "Updated Hyphae live statusLine for {} idempotently.",
+                    target.as_str()
+                ));
+            }
+        }
+        Some(custom_val) => {
+            maybe_write_json(&default_chain_path, &custom_val, true, opts.dry_run)?;
+            files.push(default_chain_path.display().to_string());
+            let cmd = statusline_command(
+                bin,
+                target.as_str(),
+                opts.socket,
+                Some(&default_chain_path),
+            );
+            settings_doc.insert(
+                "statusLine".to_string(),
+                target.build_statusline_value(cmd),
+            );
+            notes.push(format!(
+                "Preserved existing {} statusLine in {} (0600) and chained via --chain-file.",
+                target.as_str(),
+                default_chain_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn restore_statusline(
+    target: StatusLineHarness,
+    home: &Path,
+    state_dir: &Path,
+    dry_run: bool,
+) -> Result<HarnessSetupOutcome, String> {
+    let settings_file = target.settings_path(home);
+    let default_chain_path = target.chain_file_path(state_dir);
+    let mut files = Vec::new();
+    let mut notes = Vec::new();
+
+    if !settings_file.exists() {
+        notes.push(format!(
+            "No {} found; nothing to restore.",
+            settings_file.display()
+        ));
+        return Ok(HarnessSetupOutcome {
+            harness: target.as_str().to_string(),
+            dry_run,
+            files,
+            notes,
+        });
+    }
+
+    let mut settings_doc = read_json_object_or_empty(&settings_file)?;
+    let existing = settings_doc
+        .get("statusLine")
+        .filter(|v| !v.is_null())
+        .cloned();
+
+    match existing {
+        None => {
+            notes.push(format!(
+                "No statusLine entry present in {}; nothing to restore.",
+                settings_file.display()
+            ));
+        }
+        Some(ref existing_val) if !is_hyphae_statusline_value(existing_val) => {
+            notes.push(format!(
+                "Existing statusLine in {} is not managed by Hyphae; left untouched.",
+                settings_file.display()
+            ));
+        }
+        Some(hyphae_val) => {
+            let referenced_chain = hyphae_val
+                .get("command")
+                .and_then(Value::as_str)
+                .and_then(parse_chain_file_from_command);
+            let chain_path = referenced_chain
+                .clone()
+                .unwrap_or_else(|| default_chain_path.clone());
+
+            if chain_path.exists() {
+                let original = read_json_value(&chain_path)?;
+                settings_doc.insert("statusLine".to_string(), original);
+                maybe_write_json(&settings_file, &Value::Object(settings_doc), false, dry_run)?;
+                if !dry_run {
+                    fs::remove_file(&chain_path).map_err(|e| {
+                        format!(
+                            "failed to remove restored chain file {}: {e}",
+                            chain_path.display()
+                        )
+                    })?;
+                }
+                files.push(settings_file.display().to_string());
+                notes.push(format!(
+                    "Restored original {} statusLine from {} and removed chain file.",
+                    target.as_str(),
+                    chain_path.display()
+                ));
+            } else if let Some(missing_chain) = referenced_chain {
+                settings_doc.remove("statusLine");
+                maybe_write_json(&settings_file, &Value::Object(settings_doc), false, dry_run)?;
+                files.push(settings_file.display().to_string());
+                notes.push(format!(
+                    "Chained statusLine backup {} was missing; removed Hyphae statusLine entry from {}.",
+                    missing_chain.display(),
+                    settings_file.display()
+                ));
+            } else {
+                settings_doc.remove("statusLine");
+                maybe_write_json(&settings_file, &Value::Object(settings_doc), false, dry_run)?;
+                files.push(settings_file.display().to_string());
+                notes.push(format!(
+                    "Removed Hyphae statusLine entry from {}.",
+                    settings_file.display()
+                ));
+            }
+        }
+    }
+
+    Ok(HarnessSetupOutcome {
+        harness: target.as_str().to_string(),
+        dry_run,
+        files,
+        notes,
+    })
+}
+
+fn restore_harness_statusline_only(
+    kind: HarnessKind,
+    home: &Path,
+    state_dir: &Path,
+    dry_run: bool,
+) -> Result<HarnessSetupOutcome, String> {
+    match kind {
+        HarnessKind::Claude => restore_statusline(StatusLineHarness::Claude, home, state_dir, dry_run),
+        HarnessKind::Antigravity => {
+            restore_statusline(StatusLineHarness::Antigravity, home, state_dir, dry_run)
+        }
+        other => Ok(HarnessSetupOutcome {
+            harness: other.as_str().to_string(),
+            dry_run,
+            files: Vec::new(),
+            notes: vec![format!(
+                "Harness '{}' does not manage a Hyphae statusLine entry.",
+                other.as_str()
+            )],
+        }),
+    }
+}
+
+/// Inspects `statusLine` configuration & chain-file health for Claude Code and Antigravity CLI
+/// under `home` for `hyp doctor` and `hyp status`.
+pub fn detect_statusline_statuses(home: &Path) -> Vec<StatusLineDiagnostic> {
+    [StatusLineHarness::Claude, StatusLineHarness::Antigravity]
+        .into_iter()
+        .map(|target| inspect_statusline_target(target, home))
+        .collect()
+}
+
+fn inspect_statusline_target(target: StatusLineHarness, home: &Path) -> StatusLineDiagnostic {
+    let settings_path = target.settings_path(home);
+    let settings_str = settings_path.display().to_string();
+
+    let sl_val = fs::read_to_string(&settings_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|doc| doc.get("statusLine").cloned())
+        .filter(|v| !v.is_null());
+
+    let Some(sl) = sl_val else {
+        return StatusLineDiagnostic {
+            harness: target.as_str().to_string(),
+            settings_path: settings_str,
+            configured: false,
+            chained: false,
+            chain_file: None,
+            chain_file_exists: None,
+            detail: "Not configured".to_string(),
+        };
+    };
+
+    if !is_hyphae_statusline_value(&sl) {
+        return StatusLineDiagnostic {
+            harness: target.as_str().to_string(),
+            settings_path: settings_str,
+            configured: false,
+            chained: false,
+            chain_file: None,
+            chain_file_exists: None,
+            detail: format!(
+                "Custom non-Hyphae statusLine present (run `hyp setup --harness {} --statusline` to chain safely)",
+                target.as_str()
+            ),
+        };
+    }
+
+    let chain_path = sl
+        .get("command")
+        .and_then(Value::as_str)
+        .and_then(parse_chain_file_from_command);
+
+    if let Some(cp) = chain_path {
+        let exists = cp.exists();
+        let detail = if exists {
+            format!("Configured (chained via {})", cp.display())
+        } else {
+            format!(
+                "Configured, but chained statusLine file is missing: {}",
+                cp.display()
+            )
+        };
+        StatusLineDiagnostic {
+            harness: target.as_str().to_string(),
+            settings_path: settings_str,
+            configured: true,
+            chained: true,
+            chain_file: Some(cp.display().to_string()),
+            chain_file_exists: Some(exists),
+            detail,
+        }
+    } else {
+        StatusLineDiagnostic {
+            harness: target.as_str().to_string(),
+            settings_path: settings_str.clone(),
+            configured: true,
+            chained: false,
+            chain_file: None,
+            chain_file_exists: None,
+            detail: format!("Configured ({settings_str})"),
+        }
+    }
+}
+
 fn configure_harness(
     kind: HarnessKind,
     home: &Path,
     bin: &str,
     config_path: &Path,
-    socket: Option<&str>,
+    opts: SetupOptions<'_>,
     skill_ctx: &SetupSkillContext,
-    dry_run: bool,
 ) -> Result<HarnessSetupOutcome, String> {
     match kind {
-        HarnessKind::Antigravity => setup_antigravity(home, bin, socket, skill_ctx, dry_run),
-        HarnessKind::Claude => setup_claude(home, bin, socket, skill_ctx, dry_run),
-        HarnessKind::Codex => setup_codex(home, bin, socket, skill_ctx, dry_run),
-        HarnessKind::Cursor => setup_cursor(home, bin, socket, skill_ctx, dry_run),
-        HarnessKind::Opencode => setup_opencode(home, bin, socket, skill_ctx, dry_run),
-        HarnessKind::Gemini => setup_gemini(home, bin, socket, skill_ctx, dry_run),
-        HarnessKind::Openclaw => setup_openclaw(home, bin, socket, skill_ctx, dry_run),
-        HarnessKind::Herdr => setup_herdr(home, bin, socket, skill_ctx, dry_run),
-        HarnessKind::T3 => setup_t3(home, bin, config_path, socket, skill_ctx, dry_run),
+        HarnessKind::Antigravity => setup_antigravity(home, bin, opts, skill_ctx),
+        HarnessKind::Claude => setup_claude(home, bin, opts, skill_ctx),
+        HarnessKind::Codex => setup_codex(home, bin, opts.socket, skill_ctx, opts.dry_run),
+        HarnessKind::Cursor => setup_cursor(home, bin, opts.socket, skill_ctx, opts.dry_run),
+        HarnessKind::Opencode => setup_opencode(home, bin, opts.socket, skill_ctx, opts.dry_run),
+        HarnessKind::Gemini => setup_gemini(home, bin, opts.socket, skill_ctx, opts.dry_run),
+        HarnessKind::Openclaw => setup_openclaw(home, bin, opts.socket, skill_ctx, opts.dry_run),
+        HarnessKind::Herdr => setup_herdr(home, bin, opts.socket, skill_ctx, opts.dry_run),
+        HarnessKind::T3 => setup_t3(home, bin, config_path, opts.socket, skill_ctx, opts.dry_run),
     }
 }
 
 fn setup_antigravity(
     home: &Path,
     bin: &str,
-    socket: Option<&str>,
+    opts: SetupOptions<'_>,
     skill_ctx: &SetupSkillContext,
-    dry_run: bool,
 ) -> Result<HarnessSetupOutcome, String> {
+    let socket = opts.socket;
+    let dry_run = opts.dry_run;
     let plugin_dir = home
         .join(".gemini")
         .join("config")
@@ -1560,6 +2112,26 @@ fn setup_antigravity(
         &mut notes,
     )?;
 
+    if opts.statusline {
+        let agy_settings_file = StatusLineHarness::Antigravity.settings_path(home);
+        let mut agy_settings_doc = read_json_object_or_empty(&agy_settings_file)?;
+        configure_statusline_in_doc(
+            &mut agy_settings_doc,
+            StatusLineHarness::Antigravity,
+            bin,
+            opts,
+            &mut files,
+            &mut notes,
+        )?;
+        maybe_write_json(
+            &agy_settings_file,
+            &Value::Object(agy_settings_doc),
+            false,
+            dry_run,
+        )?;
+        files.push(agy_settings_file.display().to_string());
+    }
+
     Ok(HarnessSetupOutcome {
         harness: "antigravity".to_string(),
         dry_run,
@@ -1571,10 +2143,11 @@ fn setup_antigravity(
 fn setup_claude(
     home: &Path,
     bin: &str,
-    socket: Option<&str>,
+    opts: SetupOptions<'_>,
     skill_ctx: &SetupSkillContext,
-    dry_run: bool,
 ) -> Result<HarnessSetupOutcome, String> {
+    let socket = opts.socket;
+    let dry_run = opts.dry_run;
     let mcp_file = home.join(".claude.json");
     let settings_file = home.join(".claude").join("settings.json");
 
@@ -1659,16 +2232,36 @@ fn setup_claude(
         ),
     );
     settings_doc.insert("hooks".to_string(), Value::Object(hooks));
-    maybe_write_json(&settings_file, &Value::Object(settings_doc), false, dry_run)?;
 
     let mut files = vec![
         mcp_file.display().to_string(),
         settings_file.display().to_string(),
     ];
     let mut notes = vec![
-        "Claude MCP, hooks, and tailored runtime skill configured (existing settings preserved)."
+        "Claude MCP, hooks, slash commands, and tailored runtime skill configured (existing settings preserved)."
             .to_string(),
     ];
+
+    if opts.statusline {
+        configure_statusline_in_doc(
+            &mut settings_doc,
+            StatusLineHarness::Claude,
+            bin,
+            opts,
+            &mut files,
+            &mut notes,
+        )?;
+    }
+
+    maybe_write_json(&settings_file, &Value::Object(settings_doc), false, dry_run)?;
+
+    let commands_dir = home.join(".claude").join("commands");
+    for (filename, content) in CLAUDE_SLASH_COMMANDS {
+        let cmd_path = commands_dir.join(filename);
+        maybe_write_text(&cmd_path, content, false, dry_run)?;
+        files.push(cmd_path.display().to_string());
+    }
+
     install_harness_runtime_skills(
         HarnessKind::Claude,
         home,
@@ -2272,6 +2865,43 @@ mod tests {
         assert_eq!(
             format_default_node_id("Alice", "Alice's MacBook Pro.local"),
             "alice@alice-s-macbook-pro"
+        );
+    }
+
+    #[test]
+    fn statusline_command_detection_and_chain_file_parsing_handle_quotes_and_spaces() {
+        assert!(is_hyphae_statusline_command(
+            "/opt/hyphae/bin/hyp statusline --harness claude"
+        ));
+        assert!(is_hyphae_statusline_command(
+            "'/Users/a b/hyp' statusline --harness antigravity --chain-file '/tmp/my state/antigravity-statusline-chain.json'"
+        ));
+        assert!(!is_hyphae_statusline_command("my-custom-bar --git"));
+        assert!(!is_hyphae_statusline_command(
+            "echo \"hyp statusline --harness claude\""
+        ));
+
+        assert_eq!(
+            parse_chain_file_from_command(
+                "/usr/local/bin/hyp statusline --harness claude --chain-file /tmp/chain.json"
+            ),
+            Some(PathBuf::from("/tmp/chain.json"))
+        );
+        assert_eq!(
+            parse_chain_file_from_command(
+                "hyp statusline --harness claude --chain-file '/tmp/dir with space/a'\\''b.json'"
+            ),
+            Some(PathBuf::from("/tmp/dir with space/a'b.json"))
+        );
+        assert_eq!(
+            parse_chain_file_from_command(
+                "hyp statusline --harness claude --chain-file=/tmp/eq-chain.json"
+            ),
+            Some(PathBuf::from("/tmp/eq-chain.json"))
+        );
+        assert_eq!(
+            parse_chain_file_from_command("hyp statusline --harness claude"),
+            None
         );
     }
 }
