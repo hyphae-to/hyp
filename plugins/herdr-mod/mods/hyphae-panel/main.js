@@ -9,7 +9,7 @@
 // payloads, zero wakeup notes, zero quarantined content; quarantine directs human
 // to `hyp gate review` in terminal).
 
-import { View, div, svg } from "gpui-kit";
+import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
 import {
   focused,
@@ -384,10 +384,10 @@ export default class HyphaePanel extends View {
       .border_color(t.border)
       .bg(t.chrome || t.surface || t.background)
       .child(
-        svg("mods/hyphae-panel/hyphae.svg")
-          .size(14)
+        image("mods/hyphae-panel/hyphae.svg")
+          .w(16)
+          .h(16)
           .flex_none()
-          .text_color(entry?.enrolled ? sage : t.muted)
       )
       .child(
         div()

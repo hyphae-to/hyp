@@ -566,6 +566,7 @@ test("pill.js renderHyphaePill integrates cleanly and dispatches dock vs overlay
             }
             export const div = () => makeEl("div");
             export const svg = (p) => makeEl("svg", { path: p });
+            export const image = (p) => makeEl("image", { path: p });
           `,
         };
       }

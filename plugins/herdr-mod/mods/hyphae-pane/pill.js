@@ -9,7 +9,7 @@
 // Returns `null` when the terminal is unenrolled and has 0 subscriptions, 0 queued
 // items, and 0 quarantined items so plain shells stay visually clean.
 
-import { div, svg } from "gpui-kit";
+import { div, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
 import { layout, openOverlay, run, setShared } from "herdr";
 import {
@@ -72,7 +72,7 @@ export function openHyphaeInspector({ terminal, entry }) {
  * @param {string | null} opts.terminal - Terminal address (`"t4g"` or `"solace/t4g"`).
  * @param {object | null} opts.entry - Session summary object from `ui/state.json`.
  * @param {boolean | "compact" | "medium" | "wide"} [opts.compact=false] - Width density mode.
- * @param {string} [opts.iconPath="mods/hyphae-pane/hyphae.svg"] - Tinted SVG path under Herdr home.
+ * @param {string} [opts.iconPath="mods/hyphae-pane/hyphae.svg"] - SVG logo path under Herdr home.
  * @param {(ctx: { terminal: string | null, entry: object | null }, cx: any) => void} [opts.onClick]
  */
 export function renderHyphaePill({
@@ -103,28 +103,23 @@ export function renderHyphaePill({
 
   let pillBg = withAlpha(sage, "1c");
   let pillBorder = withAlpha(sage, "48");
-  let glyphColor = sage;
   let textColor = t.foreground;
 
   if (m.tone === "alert") {
     pillBg = withAlpha(alert, "24");
     pillBorder = withAlpha(alert, "66");
-    glyphColor = alert;
     textColor = alert;
   } else if (m.tone === "queued") {
     pillBg = withAlpha(amber, "26");
     pillBorder = withAlpha(amber, "66");
-    glyphColor = amber;
     textColor = amber;
   } else if (m.tone === "focus") {
     pillBg = withAlpha(focusTint, "20");
     pillBorder = withAlpha(focusTint, "55");
-    glyphColor = focusTint;
     textColor = t.foreground;
   } else if (m.tone === "muted") {
     pillBg = t.raised || t.surface;
     pillBorder = t.border;
-    glyphColor = t.dim;
     textColor = t.muted;
   }
 
@@ -161,7 +156,7 @@ export function renderHyphaePill({
     .hover((s) => s.bg(t.hover).border_color(t.accent))
     .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
     .on_click(handleClick)
-    .child(svg(iconPath).size(11).flex_none().text_color(glyphColor))
+    .child(image(iconPath).w(14).h(14).flex_none())
     .child(
       div()
         .flex_none()
