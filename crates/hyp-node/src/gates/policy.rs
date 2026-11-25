@@ -463,6 +463,25 @@ pub enum Stage2ErrorAction {
     Block,
 }
 
+/// Authentication header format for Anthropic Messages API requests (`x-api-key` default for
+/// direct Anthropic API; `bearer` for corporate/proxy gateways expecting `Authorization: Bearer`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AnthropicAuthHeader {
+    #[default]
+    XApiKey,
+    Bearer,
+}
+
+impl AnthropicAuthHeader {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::XApiKey => "x-api-key",
+            Self::Bearer => "bearer",
+        }
+    }
+}
+
 /// LLM classifier provider wire protocol supported by Stage 2 (§5.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "kebab-case")]
@@ -584,6 +603,9 @@ pub struct Stage2Config {
     /// Optional base URL override for `Anthropic`, `Google`, or `OpenAi` (e.g. proxy or local test server).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url_override: Option<String>,
+    /// Authentication header format for `LlmProvider::Anthropic` (`x-api-key` default, or `bearer` for proxies).
+    #[serde(default)]
+    pub auth_header: AnthropicAuthHeader,
     /// Classifier model identifier (e.g. `claude-haiku-4-5`, `gemini-2.5-flash-lite`, `gpt-4.1-nano`).
     pub model: String,
     /// Sampling temperature (default: `0.0` deterministic).
@@ -625,6 +647,7 @@ impl Default for Stage2Config {
                 base_url: "http://127.0.0.1:11434/v1".to_string(),
             },
             base_url_override: None,
+            auth_header: AnthropicAuthHeader::default(),
             model: "qwen2.5:3b".to_string(),
             temperature: 0.0,
             api_key_secret: None,
@@ -799,6 +822,8 @@ pub enum FilterAdapterConfig {
         api_key_secret: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base_url: Option<String>,
+        #[serde(default)]
+        auth_header: AnthropicAuthHeader,
         #[serde(default)]
         policy_notes: String,
     },

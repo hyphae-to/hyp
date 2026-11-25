@@ -44,9 +44,28 @@ Reference secrets in `node.json` strictly as `{ "secret": "<name>" }`.
 
 ## 3. Compiled-In Rust Event Sources (`sources[]` in `node.json`)
 
-### A. `github-public` — Demand-Driven Deduplicated ETag Poller (+ Optional `<1s` GitHub App Push)
+### Choosing GitHub Ingestion: Webhook (`github-webhook`) vs. Polling (`github-public`)
 
-Compiled directly into `hyp` (`crates/hyp-node/src/adapters/github_public.rs`). Used both on read-only public nodes (`hyp deploy init public-node`) and locally on developer machines:
+Pick the transport that matches your node topology:
+
+| Mode | Best Node Topology | Latency | Event Coverage | Auth / Secrets |
+| --- | --- | --- | --- | --- |
+| **Webhook (`github-webhook`) — Recommended whenever possible** | **Hub / Server Node (`profile: router`)** on a VPS, Fly.io, Docker + Caddy, Cloudflare Tunnel, or Tailscale Funnel | Real-time (`<1–2s`) | **All GitHub events**, including live CI pass/fail (`workflow_run`, `check_run`) and full payloads | **Zero GitHub PAT** — shared HMAC-SHA256 webhook secret only (`X-Hub-Signature-256`) |
+| **Polling (`github-public` + `repoTokens`) — Zero-infra NAT fallback** | **Local Node (`profile: local`)** on a laptop behind NAT (or public read-only node) with no public webhook URL | ~30s avg / 60s max (`304 Not Modified` uses 0 quota) | Repo activity only (pushes, PRs, issues, comments, reviews, releases) — **GitHub's `/events` API does NOT emit `workflow_run` / `check_run` CI events** | Optional per-owner/per-repo fine-grained PATs via `repoTokens` (5,000 req/hr per owner token; 60 req/hr unauthenticated for public repos) |
+
+> **Rule of thumb:** **Hub Nodes (`profile: router`) are the natural place to terminate `github-webhook` deliveries** once and fan normalized CloudEvents out over E2EE streams to every paired laptop. Use **`github-public` + `repoTokens`** as the zero-infra fallback on a **Local Node (`profile: local`)** behind NAT when you don't have (or don't want to expose) a hub or public HTTPS endpoint yet.
+
+### A. `github-public` — Demand-Driven Deduplicated ETag Poller (+ Multi-Owner `repoTokens` & Optional `<1s` GitHub App Push)
+
+Compiled directly into `hyp` (`crates/hyp-node/src/adapters/github_public.rs`). Used both on read-only public nodes (`hyp deploy init public-node`) and locally on developer machines behind NAT.
+
+Because GitHub fine-grained PATs are scoped to a **single resource owner** (one personal account OR one organization), `sources[].repoTokens` lets you coalesce personal repos, multiple organizations, exact per-repo overrides, and unauthenticated public repos inside **one single `github-public` source** — never leaking one org's token to another owner or third-party public repos:
+
+```sh
+# Store one fine-grained read-only PAT per personal account / GitHub org out-of-band:
+hyp secret set github-alice-token --web
+hyp secret set github-acme-token --web
+```
 
 ```json
 {
@@ -56,17 +75,25 @@ Compiled directly into `hyp` (`crates/hyp-node/src/adapters/github_public.rs`). 
       "kind": "github-public",
       "topic": "github",
       "enabled": true,
+      "allowPrivateWithToken": true,
       "minPollIntervalSeconds": 60,
       "graceWindowSeconds": 300,
-      "githubToken": { "secret": "github-public-token" },
+      "maxActivePollers": 100,
+      "repoTokens": {
+        "alice/*": { "secret": "github-alice-token" },
+        "acme/*": { "secret": "github-acme-token" },
+        "acme/special": { "secret": "github-acme-special-token" }
+      },
       "appWebhookSecret": { "secret": "github-app-webhook-secret" }
     }
   ]
 }
 ```
 
-- **1 poller per distinct `owner/repo`**: Regardless of subscriber count, conditional `If-None-Match` polls returning `304 Not Modified` consume **0** GitHub API quota, adaptively back off on idle repos, and tear down after `graceWindowSeconds` when active subscribers drop to `0`.
-- **Optional GitHub PAT**: Without `github-public-token`, runs in unauthenticated public GitHub mode (60 req/hr); storing a PAT via stdin raises limits to 5,000 req/hr. On non-`publicReadOnly` private/local nodes, setting `"allowPrivateWithToken": true` permits watching private repos with your own token.
+- **Strict token scoping & precedence**: For each `owner/repo`, Hyphae resolves the token in strict specificity order: (1) exact `owner/repo` in `repoTokens`, (2) owner wildcard `owner/*` in `repoTokens` (bare `owner` also normalizes to `owner/*`), (3) optional fallback `githubToken`, (4) `None` (unauthenticated public mode — zero `Authorization` header sent). Invalid or overly broad patterns (`*`, `*/*`, `..`, empty) and raw plaintext strings fail closed at startup. Missing secrets in `repoTokens` emit an isolated startup warning without crashing the daemon or blocking already-configured owners.
+- **Single `github-public` source**: Consolidate all GitHub tokens into `sources[0].repoTokens`; if multiple enabled `github-public` entries exist, only the first is active and Hyphae emits a startup warning.
+- **1 poller per distinct `owner/repo` + bounded rate-limit hardening**: Regardless of subscriber count, conditional `If-None-Match` polls returning `304 Not Modified` consume **0** GitHub API quota, adaptively back off on idle repos, enforce bounded backoff on HTTP `403`/`429` (`Retry-After` and `X-RateLimit-Remaining: 0` + `X-RateLimit-Reset`), cap concurrent active pollers at `maxActivePollers` (default `100`), and tear down after `graceWindowSeconds` when active subscribers drop to `0`.
+- **Private repo access**: On non-`publicReadOnly` local/private nodes, setting `"allowPrivateWithToken": true` permits watching a private repo **only** when `token_for_repo(repo)` resolves a matching token (unmatched orgs/private repos still fail closed!).
 - **Optional `<1s` GitHub App webhooks**: Setting `appWebhookSecret` enables HMAC-verified `POST /v1/webhooks/github-app` (returns `404` when unconfigured, `401` on invalid `X-Hub-Signature-256`).
 
 ### B. `github-webhook`, `prometheus-webhook` & `webhook-stream` (`crates/hyp-node/src/adapters/webhooks.rs`)

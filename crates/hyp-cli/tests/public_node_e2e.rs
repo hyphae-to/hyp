@@ -1258,3 +1258,232 @@ async fn guest_pair_disabled_rate_limit_cumulative_repo_cap_and_github_app_webho
     pub_node.shutdown();
     pub_srv.abort();
 }
+
+// ============================================================================
+// E2E Test 3: `repoTokens` Multi-Owner Startup Isolation, Plaintext Fail-Closed,
+//             Duplicate Source Warning & `hyp gate propose --auth-header`
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn node_start_repo_tokens_warnings_plaintext_fail_closed_and_gate_auth_header_cli() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+
+    // Populate ONLY `github-bowd-token`; omit `github-bayfold-token` to verify warning isolation.
+    let store = SecretStore::new(&state_dir, SecretBackend::File);
+    store
+        .set("github-bowd-token", "hyphae_gh_tok_cli_bowd_999")
+        .unwrap();
+
+    // 1. Valid `repoTokens` + missing secondary secret + duplicate enabled `github-public` source.
+    let node_json_path = tmp.path().join("node.json");
+    let cfg_doc = json!({
+        "nodeId": "dev@local-multi",
+        "profile": "local",
+        "stateDir": state_dir.to_str().unwrap(),
+        "sources": [
+            {
+                "id": "github-public",
+                "kind": "github-public",
+                "topic": "github",
+                "enabled": true,
+                "allowPrivateWithToken": true,
+                "maxActivePollers": 25,
+                "repoTokens": {
+                    "bowd/*": { "secret": "github-bowd-token" },
+                    "bayfold/*": { "secret": "github-bayfold-token" }
+                }
+            },
+            {
+                "id": "github-public-dup",
+                "kind": "github-public",
+                "topic": "github",
+                "enabled": true,
+                "githubToken": { "secret": "github-bowd-token" }
+            }
+        ]
+    });
+    fs::write(
+        &node_json_path,
+        serde_json::to_string_pretty(&cfg_doc).unwrap(),
+    )
+    .unwrap();
+
+    let mut child = Command::new(hyp_bin())
+        .args([
+            "node",
+            "start",
+            "--config",
+            node_json_path.to_str().unwrap(),
+            "--no-local-socket",
+            "--json",
+        ])
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .env("HOME", tmp.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hyp node start with repoTokens");
+
+    let mut startup_line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut startup_line)
+        .expect("read startup JSON line");
+    let mut guard = ChildGuard::new(child);
+
+    let startup_env: Value = serde_json::from_str(startup_line.trim())
+        .unwrap_or_else(|e| panic!("invalid startup JSON '{startup_line}': {e}"));
+    assert_eq!(startup_env["ok"], true, "startup_env={startup_env}");
+    assert_eq!(startup_env["data"]["githubPublicEnabled"], true);
+    assert_eq!(
+        startup_env["data"]["githubPublicTokenScopes"],
+        json!(["bowd/*"])
+    );
+    assert!(
+        !startup_line.contains("hyphae_gh_tok_cli_bowd_999"),
+        "raw GitHub token must NEVER appear in startup JSON!"
+    );
+
+    let warnings: Vec<&str> = startup_env["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("github-bayfold-token") && w.contains("bayfold/*")),
+        "expected isolated missing-secret warning for bayfold/*, got {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("Multiple enabled github-public sources found")
+                && w.contains("sources[0].repoTokens")),
+        "expected duplicate github-public source warning, got {warnings:?}"
+    );
+
+    // Stop cleanly via SIGTERM.
+    let pid = startup_env["data"]["pid"].as_u64().unwrap();
+    let mut running_child = guard.take().unwrap();
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+        let exit_status = running_child.wait().expect("wait for exit");
+        assert_eq!(exit_status.code(), Some(0));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        let _ = running_child.kill();
+        let _ = running_child.wait();
+    }
+
+    // 2. Plaintext token string in `repoTokens` MUST fail closed!
+    let bad_node_json = tmp.path().join("node-bad.json");
+    fs::write(
+        &bad_node_json,
+        serde_json::to_string_pretty(&json!({
+            "nodeId": "dev@local-bad",
+            "profile": "local",
+            "stateDir": state_dir.to_str().unwrap(),
+            "sources": [{
+                "kind": "github-public",
+                "enabled": true,
+                "repoTokens": {
+                    "bayfold/*": "hyphae_gh_tok_raw_plaintext_nope"
+                }
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let bad_out = Command::new(hyp_bin())
+        .args([
+            "node",
+            "start",
+            "--config",
+            bad_node_json.to_str().unwrap(),
+            "--no-local-socket",
+            "--json",
+        ])
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .env("HOME", tmp.path())
+        .output()
+        .expect("run hyp node start with plaintext repoTokens");
+    assert_ne!(bad_out.status.code(), Some(0), "plaintext repoTokens must fail closed");
+    let bad_env: Value = serde_json::from_slice(&bad_out.stdout).unwrap();
+    assert_eq!(bad_env["ok"], false);
+    assert_eq!(bad_env["error"]["code"], "CONFIG_ERROR");
+
+    // 3. `hyp gate propose --adapter anthropic --auth-header bearer` persists `auth_header: "bearer"`,
+    //    and non-anthropic `--auth-header bearer` fails cleanly with exit code 2!
+    let gate_cfg_path = tmp.path().join("gate-node.json");
+    let gate_state_dir = tmp.path().join("gate-state");
+    fs::create_dir_all(&gate_state_dir).unwrap();
+    let prop_out = Command::new(hyp_bin())
+        .args([
+            "gate",
+            "propose",
+            "--adapter",
+            "anthropic",
+            "--base-url",
+            "https://ai-gateway.company.internal",
+            "--auth-header",
+            "bearer",
+            "--secret",
+            "company-anthropic-token",
+            "--model",
+            "claude-haiku-4-5",
+            "--config",
+            gate_cfg_path.to_str().unwrap(),
+            "--state-dir",
+            gate_state_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .env("HOME", tmp.path())
+        .output()
+        .expect("run hyp gate propose --auth-header bearer");
+    assert_eq!(
+        prop_out.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&prop_out.stdout),
+        String::from_utf8_lossy(&prop_out.stderr)
+    );
+    let prop_env: Value = serde_json::from_slice(&prop_out.stdout).unwrap();
+    assert_eq!(prop_env["ok"], true);
+    assert_eq!(
+        prop_env["data"]["gate"]["filters"][0]["adapter"]["auth_header"],
+        "bearer"
+    );
+
+    let bad_gate = Command::new(hyp_bin())
+        .args([
+            "gate",
+            "propose",
+            "--adapter",
+            "google",
+            "--auth-header",
+            "bearer",
+            "--config",
+            gate_cfg_path.to_str().unwrap(),
+            "--state-dir",
+            gate_state_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .env("HOME", tmp.path())
+        .output()
+        .expect("run hyp gate propose --adapter google --auth-header bearer");
+    assert_eq!(bad_gate.status.code(), Some(2));
+    let bad_gate_env: Value = serde_json::from_slice(&bad_gate.stdout).unwrap();
+    assert_eq!(bad_gate_env["ok"], false);
+    assert_eq!(bad_gate_env["error"]["code"], "INVALID_GATE_CONFIG");
+}

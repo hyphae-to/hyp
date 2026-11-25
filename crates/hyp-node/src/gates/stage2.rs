@@ -35,8 +35,9 @@ use tokio::sync::Semaphore;
 use zeroize::Zeroizing;
 
 use crate::gates::policy::{
-    GateDecision, GateError, InboundContext, LlmProvider, MAX_POLICY_NOTES_CHARS,
-    MAX_VERDICT_REASON_CHARS, Stage2Config, Stage2ErrorAction, format_quarantine_notice,
+    AnthropicAuthHeader, GateDecision, GateError, InboundContext, LlmProvider,
+    MAX_POLICY_NOTES_CHARS, MAX_VERDICT_REASON_CHARS, Stage2Config, Stage2ErrorAction,
+    format_quarantine_notice,
 };
 
 pub(crate) const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
@@ -345,7 +346,12 @@ impl Stage2Guard {
                     .header("content-type", "application/json")
                     .header("anthropic-version", "2023-06-01");
                 if let Some(key) = api_key {
-                    builder = builder.header("x-api-key", key);
+                    builder = match self.config.auth_header {
+                        AnthropicAuthHeader::XApiKey => builder.header("x-api-key", key),
+                        AnthropicAuthHeader::Bearer => {
+                            builder.header("authorization", format!("Bearer {key}"))
+                        }
+                    };
                 }
                 builder
                     .body(Full::new(Bytes::from(payload)))

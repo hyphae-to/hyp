@@ -17,6 +17,7 @@ use hyp_crypto::keys::OkpJwk as CryptoOkpJwk;
 use hyp_crypto::keystore::{SecretBackend, validate_secret_name};
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
 use hyp_harness::daemon::{DeliveryRetryConfig, LocalDaemon, LocalDaemonConfig};
+use hyp_node::adapters::github_public::normalize_repo_token_pattern;
 use hyp_node::adapters::{
     AdapterKind, GitHubPublicAdapter, GitHubPublicConfig, HelloMode, SubprocessConfig,
 };
@@ -621,18 +622,20 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         }
 
         // Attach and start demand-driven `github-public` adapter BEFORE serving HTTP!
-        let github_public_enabled = if let Some(gh_cfg) = github_public_cfg {
-            let adapter = Arc::new(
-                GitHubPublicAdapter::new(gh_cfg)
-                    .map_err(|e| format!("Failed to initialize github-public adapter: {e}"))?,
-            );
-            node.attach_github_public(adapter)
-                .await
-                .map_err(|e| format!("Failed to attach github-public adapter: {e}"))?;
-            true
-        } else {
-            false
-        };
+        let (github_public_enabled, github_public_token_scopes) =
+            if let Some(gh_cfg) = github_public_cfg {
+                let scopes = gh_cfg.configured_token_scopes();
+                let adapter = Arc::new(
+                    GitHubPublicAdapter::new(gh_cfg)
+                        .map_err(|e| format!("Failed to initialize github-public adapter: {e}"))?,
+                );
+                node.attach_github_public(adapter)
+                    .await
+                    .map_err(|e| format!("Failed to attach github-public adapter: {e}"))?;
+                (true, scopes)
+            } else {
+                (false, Vec::new())
+            };
         let guest_pairing_enabled = node.config().guest_pairing.enabled;
 
         let gate_pipeline = if start_local_daemon || start_local_ingest {
@@ -815,6 +818,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             "configPath": loaded.as_ref().map(|c| c.path.display().to_string()),
             "guestPairingEnabled": guest_pairing_enabled,
             "githubPublicEnabled": github_public_enabled,
+            "githubPublicTokenScopes": github_public_token_scopes,
             "dropRelayEnabled": drop_relay_enabled,
             "dropRelayUrl": drop_relay_url,
             "connectedPeers": connected_peers,
@@ -879,7 +883,16 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                 println!("      Guest Pair:  enabled (POST /v1/guest/pair -> guest-ro)");
             }
             if github_public_enabled {
-                println!("      GitHub Pub:  enabled (demand-driven ETag poller)");
+                if github_public_token_scopes.is_empty() {
+                    println!(
+                        "      GitHub Pub:  enabled (demand-driven ETag poller, unauthenticated)"
+                    );
+                } else {
+                    println!(
+                        "      GitHub Pub:  enabled (demand-driven ETag poller, tokenScopes=[{}])",
+                        github_public_token_scopes.join(", ")
+                    );
+                }
             }
             if drop_relay_enabled {
                 println!(
@@ -1181,6 +1194,9 @@ fn parse_github_public_source(
         .as_array()
         .ok_or_else(|| "sources must be a JSON array".to_string())?;
 
+    let mut active_cfg: Option<GitHubPublicConfig> = None;
+    let mut extra_enabled = 0usize;
+
     for entry in arr {
         let Some(obj) = entry.as_object() else {
             continue;
@@ -1189,6 +1205,11 @@ fn parse_github_public_source(
             continue;
         }
         if obj.get("enabled").and_then(Value::as_bool) == Some(false) {
+            continue;
+        }
+
+        if active_cfg.is_some() {
+            extra_enabled += 1;
             continue;
         }
 
@@ -1221,6 +1242,19 @@ fn parse_github_public_source(
         if let Some(grace) = obj.get("graceWindowSeconds").and_then(Value::as_u64) {
             cfg.teardown_grace = Duration::from_secs(grace);
         }
+        if let Some(max_pollers_val) = obj.get("maxActivePollers") {
+            if !max_pollers_val.is_null() {
+                let Some(n) = max_pollers_val.as_u64() else {
+                    return Err(
+                        "sources[].maxActivePollers must be a positive integer".to_string()
+                    );
+                };
+                if n == 0 {
+                    return Err("sources[].maxActivePollers must be >= 1".to_string());
+                }
+                cfg.max_active_pollers = usize::try_from(n).unwrap_or(usize::MAX);
+            }
+        }
         if !public_read_only {
             if let Some(allow_priv) = obj.get("allowPrivateWithToken").and_then(Value::as_bool) {
                 cfg.allow_private_with_token = allow_priv;
@@ -1240,6 +1274,44 @@ fn parse_github_public_source(
                         return Err(format!(
                             "failed to load GitHub token secret '{secret_name}': {e}"
                         ));
+                    }
+                }
+            }
+        }
+
+        if let Some(repo_tokens_val) = obj.get("repoTokens") {
+            if !repo_tokens_val.is_null() {
+                let repo_tokens_obj = repo_tokens_val.as_object().ok_or_else(|| {
+                    "sources[].repoTokens must be a JSON object mapping \"owner/*\" or \"owner/repo\" to { \"secret\": \"<name>\" }".to_string()
+                })?;
+                let mut seen_patterns: HashSet<String> = HashSet::new();
+                for (raw_pattern, secret_val) in repo_tokens_obj {
+                    let canonical =
+                        normalize_repo_token_pattern(raw_pattern).map_err(|e| {
+                            format!("invalid sources[].repoTokens pattern '{raw_pattern}': {e}")
+                        })?;
+                    if !seen_patterns.insert(canonical.clone()) {
+                        return Err(format!(
+                            "duplicate normalized sources[].repoTokens pattern '{canonical}' (from '{raw_pattern}')"
+                        ));
+                    }
+                    let field_label = format!("sources[].repoTokens['{raw_pattern}']");
+                    if let Some(secret_name) = parse_secret_ref_name(secret_val, &field_label)? {
+                        match secrets.get(&secret_name) {
+                            Ok(secret) => {
+                                cfg.repo_tokens.insert(canonical, secret);
+                            }
+                            Err(CryptoError::SecretNotFound(_)) => {
+                                warnings.push(format!(
+                                    "Secret '{secret_name}' for github-public repoTokens['{canonical}'] is not set; repos matching '{canonical}' will fall back to default/unauthenticated mode until `hyp secret set {secret_name} --web` is configured."
+                                ));
+                            }
+                            Err(e) => {
+                                return Err(format!(
+                                    "failed to load GitHub token secret '{secret_name}' for {field_label}: {e}"
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -1265,10 +1337,17 @@ fn parse_github_public_source(
             }
         }
 
-        return Ok(Some(cfg));
+        active_cfg = Some(cfg);
     }
 
-    Ok(None)
+    if extra_enabled > 0 {
+        warnings.push(
+            "Multiple enabled github-public sources found; only the first is active. Consolidate multiple GitHub tokens into sources[0].repoTokens (e.g. { \"owner/*\": { \"secret\": \"...\" } })."
+                .to_string(),
+        );
+    }
+
+    Ok(active_cfg)
 }
 
 fn parse_delivery_retry_fields(
@@ -1814,5 +1893,135 @@ mod plugin_runtime {
         for sup in plugins {
             let _ = sup.stop().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyp_crypto::keystore::{SecretBackend, SecretStore};
+
+    #[test]
+    fn parse_github_public_source_repo_tokens_missing_secret_isolation_and_duplicate_warning() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let secrets = SecretStore::new(tmp.path(), SecretBackend::File);
+        secrets
+            .set("github-bowd-token", "hyphae_gh_tok_bowd_1")
+            .unwrap();
+        secrets
+            .set("github-bayfold-special", "hyphae_gh_tok_special_2")
+            .unwrap();
+        // Intentionally omit `github-missing-org-token` to test startup warning isolation!
+
+        let sources = json!([
+            {
+                "id": "github-public",
+                "kind": "github-public",
+                "topic": "github",
+                "enabled": true,
+                "allowPrivateWithToken": true,
+                "maxActivePollers": 42,
+                "repoTokens": {
+                    "Bowd": { "secret": "github-bowd-token" },
+                    "bayfold/Special": { "secret": "github-bayfold-special" },
+                    "missing-org/*": { "secret": "github-missing-org-token" }
+                }
+            },
+            {
+                "id": "github-public-extra",
+                "kind": "github-public",
+                "topic": "github",
+                "enabled": true,
+                "githubToken": { "secret": "github-bowd-token" }
+            }
+        ]);
+
+        let mut warnings = Vec::new();
+        let cfg = parse_github_public_source(&sources, &secrets, false, &mut warnings)
+            .expect("valid repoTokens with missing secondary secret should succeed")
+            .expect("expected active github-public config");
+
+        assert!(cfg.allow_private_with_token);
+        assert_eq!(cfg.max_active_pollers, 42);
+        assert_eq!(cfg.token_for_repo("bowd/app"), Some("hyphae_gh_tok_bowd_1"));
+        assert_eq!(
+            cfg.token_for_repo("bayfold/special"),
+            Some("hyphae_gh_tok_special_2")
+        );
+        assert_eq!(cfg.token_for_repo("missing-org/repo"), None);
+        assert_eq!(cfg.token_for_repo("oss/public"), None);
+        assert_eq!(
+            cfg.configured_token_scopes(),
+            vec!["bayfold/special".to_string(), "bowd/*".to_string()]
+        );
+
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("github-missing-org-token") && w.contains("missing-org/*")),
+            "expected isolated missing-secret warning, got {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("Multiple enabled github-public sources found")
+                && w.contains("sources[0].repoTokens")),
+            "expected duplicate github-public source warning, got {warnings:?}"
+        );
+        // Never leak raw secret material into warnings.
+        for w in &warnings {
+            assert!(!w.contains("hyphae_gh_tok_"));
+        }
+    }
+
+    #[test]
+    fn parse_github_public_source_rejects_plaintext_and_invalid_repo_token_patterns() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let secrets = SecretStore::new(tmp.path(), SecretBackend::File);
+
+        // 1. Plaintext token string in repoTokens MUST fail closed!
+        let plaintext_sources = json!([
+            {
+                "kind": "github-public",
+                "enabled": true,
+                "repoTokens": {
+                    "bayfold/*": "hyphae_gh_tok_plaintext_forbidden"
+                }
+            }
+        ]);
+        let mut warnings = Vec::new();
+        let err = parse_github_public_source(&plaintext_sources, &secrets, false, &mut warnings)
+            .expect_err("plaintext repoTokens value must fail closed");
+        assert!(
+            err.contains("plaintext credentials are forbidden"),
+            "unexpected error: {err}"
+        );
+
+        // 2. Global wildcards & traversal patterns MUST fail closed!
+        for bad_pat in ["*", "*/*", "../bad", "owner/..", ""] {
+            let bad_sources = json!([
+                {
+                    "kind": "github-public",
+                    "enabled": true,
+                    "repoTokens": {
+                        bad_pat: { "secret": "github-bowd-token" }
+                    }
+                }
+            ]);
+            let err = parse_github_public_source(&bad_sources, &secrets, false, &mut warnings)
+                .expect_err("invalid repoTokens pattern must fail closed");
+            assert!(
+                err.contains("invalid sources[].repoTokens pattern"),
+                "pattern {bad_pat:?} error: {err}"
+            );
+        }
+
+        // 3. Invalid maxActivePollers (0) fails closed.
+        let bad_cap = json!([
+            {
+                "kind": "github-public",
+                "enabled": true,
+                "maxActivePollers": 0
+            }
+        ]);
+        assert!(parse_github_public_source(&bad_cap, &secrets, false, &mut warnings).is_err());
     }
 }

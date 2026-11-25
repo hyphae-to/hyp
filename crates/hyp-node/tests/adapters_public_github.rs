@@ -446,6 +446,7 @@ async fn public_hyphae_github_public_e2e_etag_50_subs_app_upgrade_and_teardown()
         teardown_grace: Duration::from_millis(100),
         app_webhook_secret: Some(Zeroizing::new(app_secret.to_string())),
         http_timeout: Duration::from_secs(5),
+        ..GitHubPublicConfig::default()
     };
 
     let adapter = GitHubPublicAdapter::new(cfg).expect("build GitHubPublicAdapter");
@@ -1698,4 +1699,397 @@ async fn prometheus_and_generic_webhook_normalization_and_hmac_mutations() {
 
     prom.stop().await.unwrap();
     generic.stop().await.unwrap();
+}
+
+// ============================================================================
+// Multi-Owner `repoTokens` Isolation, Private+Public Coalescing & Poller Cap
+// ============================================================================
+
+#[derive(Default)]
+struct MultiTokenMockState {
+    requests: Mutex<Vec<(String, Option<String>)>>,
+    rate_limit_once: Mutex<bool>,
+}
+
+async fn handle_multi_token_github(
+    state: Arc<MultiTokenMockState>,
+    req: Request<Incoming>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let path = req.uri().path().to_string();
+    let auth = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+    let if_none_match = req
+        .headers()
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    state.requests.lock().await.push((path.clone(), auth.clone()));
+
+    let required_auth_for = |repo: &str| -> Option<&'static str> {
+        match repo {
+            "bowd/personal-priv" => Some("Bearer hyphae_gh_tok_bowd_a"),
+            "bayfold/org-priv" => Some("Bearer hyphae_gh_tok_bayfold_b"),
+            "bayfold/special" => Some("Bearer hyphae_gh_tok_bayfold_special_c"),
+            _ => None,
+        }
+    };
+
+    if let Some(rest) = path.strip_prefix("/repos/") {
+        if let Some(repo_raw) = rest.strip_suffix("/events") {
+            let repo = repo_raw.to_ascii_lowercase();
+            if let Some(expected) = required_auth_for(&repo) {
+                if auth.as_deref() != Some(expected) {
+                    return Ok(Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Full::new(Bytes::from(r#"{"message":"Not Found"}"#)))
+                        .unwrap());
+                }
+            } else if repo != "oss/public-repo" {
+                return Ok(Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Full::new(Bytes::from(r#"{"message":"Not Found"}"#)))
+                    .unwrap());
+            }
+
+            if repo == "oss/public-repo" {
+                let mut rl = state.rate_limit_once.lock().await;
+                if *rl {
+                    *rl = false;
+                    return Ok(Response::builder()
+                        .status(StatusCode::TOO_MANY_REQUESTS)
+                        .header("retry-after", "1")
+                        .header("x-ratelimit-remaining", "0")
+                        .body(Full::new(Bytes::from(r#"{"message":"rate limited"}"#)))
+                        .unwrap());
+                }
+            }
+
+            if if_none_match.is_some() {
+                return Ok(Response::builder()
+                    .status(StatusCode::NOT_MODIFIED)
+                    .header(header::ETAG, format!("\"etag-{repo}\""))
+                    .header("x-ratelimit-remaining", "4999")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap());
+            }
+
+            let evt_id = format!("evt-{}", repo.replace('/', "-"));
+            let payload = json!([{
+                "id": evt_id,
+                "type": "IssuesEvent",
+                "repo": { "name": repo },
+                "actor": { "login": "octocat", "type": "User" },
+                "created_at": "2026-11-25T08:00:00Z",
+                "payload": {
+                    "action": "opened",
+                    "issue": {
+                        "number": 7,
+                        "title": format!("Event from {repo}"),
+                        "html_url": format!("https://github.com/{repo}/issues/7"),
+                        "state": "open",
+                        "body": "scoped token test",
+                        "labels": [],
+                        "assignees": []
+                    }
+                }
+            }]);
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ETAG, format!("\"etag-{repo}\""))
+                .header("x-ratelimit-remaining", "4999")
+                .body(Full::new(Bytes::from(payload.to_string())))
+                .unwrap());
+        }
+
+        // Repo visibility metadata: GET /repos/{owner}/{repo}
+        let repo = rest.to_ascii_lowercase();
+        let (status, body) = match repo.as_str() {
+            "bowd/personal-priv" | "bayfold/org-priv" | "bayfold/special" => {
+                let expected = required_auth_for(&repo).unwrap();
+                if auth.as_deref() == Some(expected) {
+                    (
+                        StatusCode::OK,
+                        json!({
+                            "full_name": repo,
+                            "private": true,
+                            "visibility": "private"
+                        }),
+                    )
+                } else {
+                    (StatusCode::NOT_FOUND, json!({ "message": "Not Found" }))
+                }
+            }
+            "oss/public-repo" => (
+                StatusCode::OK,
+                json!({
+                    "full_name": "oss/public-repo",
+                    "private": false,
+                    "visibility": "public"
+                }),
+            ),
+            "other-org/priv" => (
+                // Even if metadata came back 200 private, adapter MUST still fail closed when
+                // `token_for_repo("other-org/priv")` is None!
+                StatusCode::OK,
+                json!({
+                    "full_name": "other-org/priv",
+                    "private": true,
+                    "visibility": "private"
+                }),
+            ),
+            _ => (StatusCode::NOT_FOUND, json!({ "message": "Not Found" })),
+        };
+        return Ok(Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(body.to_string())))
+            .unwrap());
+    }
+
+    Ok(Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(Full::new(Bytes::new()))
+        .unwrap())
+}
+
+#[tokio::test]
+async fn multi_owner_repo_tokens_strict_isolation_coalescing_pattern_validation_and_poller_cap() {
+    use hyp_node::adapters::github_public::normalize_repo_token_pattern;
+
+    // 1. Pattern validation rejects `*`, `*/*`, `../bad`, empty fail-closed.
+    for bad in ["*", "*/*", "*/repo", "../bad", "owner/..", "", "   ", "a/b/c"] {
+        assert!(
+            normalize_repo_token_pattern(bad).is_err(),
+            "pattern {bad:?} must fail closed"
+        );
+    }
+
+    // Start local multi-token mock GitHub server.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = Arc::new(MultiTokenMockState {
+        requests: Mutex::new(Vec::new()),
+        rate_limit_once: Mutex::new(true),
+    });
+    let bg_state = Arc::clone(&state);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accept = listener.accept() => {
+                    let Ok((stream, _)) = accept else { break };
+                    let st = Arc::clone(&bg_state);
+                    tokio::spawn(async move {
+                        let io = TokioIo::new(stream);
+                        let svc = service_fn(move |req| {
+                            let st_req = Arc::clone(&st);
+                            async move { handle_multi_token_github(st_req, req).await }
+                        });
+                        let _ = http1::Builder::new().serve_connection(io, svc).await;
+                    });
+                }
+            }
+        }
+    });
+
+    // Store 3 distinct owner/repo tokens in an isolated file SecretStore (ZERO default `github_token`!).
+    let tmp = tempfile::tempdir().unwrap();
+    let store = SecretStore::new(tmp.path(), SecretBackend::File);
+    store
+        .set("gh-bowd", "hyphae_gh_tok_bowd_a")
+        .unwrap();
+    store
+        .set("gh-bayfold", "hyphae_gh_tok_bayfold_b")
+        .unwrap();
+    store
+        .set("gh-bayfold-special", "hyphae_gh_tok_bayfold_special_c")
+        .unwrap();
+
+    let mut cfg = GitHubPublicConfig {
+        api_base_url: format!("http://{addr}"),
+        github_token: None, // intentionally omitted to assert ZERO auth on public/unmatched repos!
+        allow_private_with_token: true,
+        base_poll_interval: Duration::from_millis(25),
+        min_poll_interval: Duration::from_millis(10),
+        teardown_grace: Duration::ZERO,
+        max_active_pollers: 10,
+        ..GitHubPublicConfig::default()
+    };
+    cfg.with_repo_token_from_store("Bowd", &store, "gh-bowd")
+        .unwrap()
+        .with_repo_token_from_store("Bayfold/*", &store, "gh-bayfold")
+        .unwrap()
+        .with_repo_token_from_store("bayfold/Special", &store, "gh-bayfold-special")
+        .unwrap();
+
+    assert_eq!(
+        cfg.configured_token_scopes(),
+        vec![
+            "bayfold/*".to_string(),
+            "bayfold/special".to_string(),
+            "bowd/*".to_string(),
+        ]
+    );
+
+    let host = RecordingHost::new();
+    let adapter = GitHubPublicAdapter::new(cfg).unwrap();
+    adapter.start(host.clone()).await.unwrap();
+
+    // 2. Visibility validation:
+    //    - bowd/personal-priv, bayfold/org-priv, bayfold/special, oss/public-repo -> ALL pass!
+    //    - other-org/priv -> FAILS CLOSED (no matching token -> even with allow_private_with_token: true)!
+    for ok_repo in [
+        "bowd/personal-priv",
+        "bayfold/org-priv",
+        "bayfold/special",
+        "oss/public-repo",
+    ] {
+        let diags = adapter
+            .validate_subscription("github", &[exact_repo_filter(ok_repo)])
+            .await;
+        assert!(
+            diags.is_empty(),
+            "expected {ok_repo} to validate cleanly, got {diags:?}"
+        );
+    }
+
+    let diag_other = adapter
+        .validate_subscription("github", &[exact_repo_filter("other-org/priv")])
+        .await;
+    assert_eq!(diag_other.len(), 1);
+    assert_eq!(diag_other[0].severity, DiagnosticSeverity::Error);
+    assert_eq!(diag_other[0].code, DiagnosticCode::RepoNotFoundOrPrivate);
+    assert!(
+        diag_other[0]
+            .remediation
+            .as_deref()
+            .unwrap_or("")
+            .contains("sources[].repoTokens"),
+        "remediation should reference v2 repoTokens: {:?}",
+        diag_other[0]
+    );
+
+    // 3. Coalesce all 4 accessible repos (3 private across 2 owners + 1 public) into ONE adapter!
+    let subs: Vec<CompiledSubscription> = [
+        "bowd/personal-priv",
+        "bayfold/org-priv",
+        "bayfold/special",
+        "oss/public-repo",
+    ]
+    .iter()
+    .enumerate()
+    .map(|(idx, repo)| CompiledSubscription {
+        id: format!("sub-multi-{idx}"),
+        subscriber: "local".to_string(),
+        topic: "github".to_string(),
+        filters: vec![exact_repo_filter(repo)],
+        coalesce_seconds: 0,
+    })
+    .collect();
+    host.set_subscribers(subs.clone()).await;
+    adapter.on_subscriptions_changed("github", &subs).await;
+    assert_eq!(adapter.stats().await.active_pollers, 4);
+
+    // Wait until all 4 repos publish their CloudEvent (including `oss/public-repo` recovering after HTTP 429!).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let evs = host.events().await;
+        let ids: Vec<&str> = evs.iter().map(|(_, e)| e.id.as_str()).collect();
+        if ids.contains(&"evt-bowd-personal-priv")
+            && ids.contains(&"evt-bayfold-org-priv")
+            && ids.contains(&"evt-bayfold-special")
+            && ids.contains(&"evt-oss-public-repo")
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for multi-owner events; got {ids:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // 4. STRICT SECURITY INVARIANT: inspect EVERY recorded HTTP request on the mock server!
+    let recorded = state.requests.lock().await.clone();
+    assert!(!recorded.is_empty());
+    for (path, auth_hdr) in &recorded {
+        if path.starts_with("/repos/bowd/personal-priv") {
+            assert_eq!(
+                auth_hdr.as_deref(),
+                Some("Bearer hyphae_gh_tok_bowd_a"),
+                "bowd/personal-priv got wrong auth header on {path}: {auth_hdr:?}"
+            );
+        } else if path.starts_with("/repos/bayfold/org-priv") {
+            assert_eq!(
+                auth_hdr.as_deref(),
+                Some("Bearer hyphae_gh_tok_bayfold_b"),
+                "bayfold/org-priv got wrong auth header on {path}: {auth_hdr:?}"
+            );
+        } else if path.starts_with("/repos/bayfold/special") {
+            assert_eq!(
+                auth_hdr.as_deref(),
+                Some("Bearer hyphae_gh_tok_bayfold_special_c"),
+                "bayfold/special must receive exact override token on {path}: {auth_hdr:?}"
+            );
+        } else if path.starts_with("/repos/oss/public-repo") {
+            assert_eq!(
+                *auth_hdr, None,
+                "CRITICAL LEAK: public repo {path} must receive ZERO Authorization header, got {auth_hdr:?}"
+            );
+        } else if path.starts_with("/repos/other-org/priv") {
+            assert_eq!(
+                *auth_hdr, None,
+                "CRITICAL LEAK: unmatched private repo {path} must receive ZERO Authorization header, got {auth_hdr:?}"
+            );
+        }
+    }
+
+    adapter.stop().await.unwrap();
+
+    // 5. Verify `max_active_pollers` hard cap (cap = 2 prevents spawning 3rd poller & fails validation).
+    let mut cap_cfg = GitHubPublicConfig {
+        api_base_url: format!("http://{addr}"),
+        allow_private_with_token: true,
+        base_poll_interval: Duration::from_secs(60),
+        min_poll_interval: Duration::from_secs(60),
+        teardown_grace: Duration::ZERO,
+        max_active_pollers: 2,
+        ..GitHubPublicConfig::default()
+    };
+    cap_cfg
+        .with_repo_token_from_store("bowd/*", &store, "gh-bowd")
+        .unwrap()
+        .with_repo_token_from_store("bayfold/*", &store, "gh-bayfold")
+        .unwrap()
+        .with_repo_token_from_store("bayfold/special", &store, "gh-bayfold-special")
+        .unwrap();
+    let cap_adapter = GitHubPublicAdapter::new(cap_cfg).unwrap();
+    cap_adapter.start(host.clone()).await.unwrap();
+
+    cap_adapter
+        .on_subscriptions_changed("github", &subs[..3])
+        .await;
+    assert_eq!(
+        cap_adapter.stats().await.active_pollers,
+        2,
+        "max_active_pollers=2 MUST cap spawned pollers at 2"
+    );
+
+    let diag_cap = cap_adapter
+        .validate_subscription("github", &[exact_repo_filter("oss/public-repo")])
+        .await;
+    assert_eq!(diag_cap.len(), 1);
+    assert_eq!(diag_cap[0].severity, DiagnosticSeverity::Error);
+    assert_eq!(diag_cap[0].code, DiagnosticCode::UnmonitoredRepo);
+
+    cap_adapter.stop().await.unwrap();
+    let _ = shutdown_tx.send(());
 }

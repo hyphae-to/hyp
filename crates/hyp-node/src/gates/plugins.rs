@@ -31,8 +31,8 @@ use tokio::sync::Semaphore;
 use zeroize::Zeroizing;
 
 use crate::gates::policy::{
-    FilterAdapterConfig, FilterPluginConfig, FilterPluginKind, GateDecision, GateError,
-    InboundContext, LlmProvider, Stage2Config, Stage2ErrorAction, Stage2Matchers,
+    AnthropicAuthHeader, FilterAdapterConfig, FilterPluginConfig, FilterPluginKind, GateDecision,
+    GateError, InboundContext, LlmProvider, Stage2Config, Stage2ErrorAction, Stage2Matchers,
     format_quarantine_notice,
 };
 use crate::gates::stage2::{
@@ -79,6 +79,7 @@ pub fn build_filter_plugin(config: &FilterPluginConfig) -> Result<Arc<dyn Filter
             min_allow_confidence,
             api_key_secret,
             base_url,
+            auth_header,
             policy_notes,
         } => {
             let s2 = Stage2Config {
@@ -86,6 +87,7 @@ pub fn build_filter_plugin(config: &FilterPluginConfig) -> Result<Arc<dyn Filter
                 matchers: config.matchers.clone(),
                 provider: LlmProvider::Anthropic,
                 base_url_override: base_url.clone(),
+                auth_header: *auth_header,
                 model: model.clone(),
                 temperature: *temperature,
                 api_key_secret: api_key_secret.clone(),
@@ -124,6 +126,7 @@ pub fn build_filter_plugin(config: &FilterPluginConfig) -> Result<Arc<dyn Filter
                     base_url: base_url.clone(),
                 },
                 base_url_override: None,
+                auth_header: AnthropicAuthHeader::default(),
                 model: model.clone(),
                 temperature: *temperature,
                 api_key_secret: api_key_secret.clone(),
@@ -160,6 +163,7 @@ pub fn build_filter_plugin(config: &FilterPluginConfig) -> Result<Arc<dyn Filter
                 matchers: config.matchers.clone(),
                 provider: LlmProvider::Google,
                 base_url_override: base_url.clone(),
+                auth_header: AnthropicAuthHeader::default(),
                 model: model.clone(),
                 temperature: *temperature,
                 api_key_secret: api_key_secret.clone(),
