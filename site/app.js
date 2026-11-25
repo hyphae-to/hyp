@@ -59,114 +59,242 @@ document.getElementById("heroCopyBtn")?.addEventListener("click", (e) => {
 renderHeroInstall();
 
 // ============================================================================
-// 1B. HERO TWO-AGENT LOOP (20-second loop: Claude Code <-> idle Codex)
+// 1B. HERO SIGNAL BUS (Multi-Source -> Exposure Control -> Multi-Machine Agents)
 // ============================================================================
-(function initTwoAgentLoop() {
-  const stage = document.getElementById("twoAgentStage");
+(function initSignalBus() {
+  const stage = document.getElementById("signalBusStage");
   if (!stage) return;
 
-  const leftTerm = document.getElementById("taLeftTerm");
-  const rightTerm = document.getElementById("taRightTerm");
-  const leftState = document.getElementById("taLeftState");
-  const rightState = document.getElementById("taRightState");
-  const wireFwd = document.getElementById("taWireFwd");
-  const wireRev = document.getElementById("taWireRev");
-  const pkt = document.getElementById("taPacket");
-  const pktLabel = document.getElementById("taPacketLabel");
-  const playBtn = document.getElementById("taPlayBtn");
-  const beatBtns = Array.from(document.querySelectorAll("[data-ta-beat]"));
+  const sources = [0, 1, 2, 3].map((i) => document.getElementById(`sbSrc${i}`));
+  const inLines = [0, 1, 2, 3].map((i) => document.getElementById(`sbIn${i}`));
+  const inPulses = [0, 1, 2, 3].map((i) => document.getElementById(`sbInPulse${i}`));
+  const outLines = [0, 1, 2].map((i) => document.getElementById(`sbOut${i}`));
+  const outPulses = [0, 1, 2].map((i) => document.getElementById(`sbOutPulse${i}`));
 
-  const lines = {
-    L1: document.getElementById("taL1"),
-    L2: document.getElementById("taL2"),
-    L3: document.getElementById("taL3"),
-    L4: document.getElementById("taL4"),
-    R1: document.getElementById("taR1"),
-    R2: document.getElementById("taR2"),
-    R3: document.getElementById("taR3"),
-    R4: document.getElementById("taR4"),
+  const tiers = {
+    interrupt: document.getElementById("sbTierInterrupt"),
+    queue: document.getElementById("sbTierQueue"),
+    notify: document.getElementById("sbTierNotify"),
+    mute: document.getElementById("sbTierMute"),
   };
+  const core = document.getElementById("sbCore");
+  const ruleEl = document.getElementById("sbRouteRule");
+  const captionEl = document.getElementById("sbCaption");
+  const playBtn = document.getElementById("sbPlayBtn");
+  const beatBtns = Array.from(document.querySelectorAll("#sbBeats [data-sb-beat]"));
+  const allTriggerBtns = Array.from(stage.querySelectorAll("[data-sb-beat]"));
+
+  const agents = [0, 1, 2].map((i) => ({
+    card: document.getElementById(`sbAgent${i}`),
+    state: document.getElementById(`sbAgentState${i}`),
+    msg: document.getElementById(`sbAgentMsg${i}`),
+  }));
 
   const BEATS = [
     {
-      dur: 4800,
-      leftActive: true,
-      rightActive: false,
-      leftState: { txt: "Sending", cls: "active" },
-      rightState: { txt: "Idle", cls: "" },
-      show: ["L1", "L2", "R1"],
-      wire: "fwd",
-      packet: { label: "hyp_send → codex", dir: "fwd" },
-    },
-    {
-      dur: 4600,
-      leftActive: false,
-      rightActive: true,
-      leftState: { txt: "Idle · 0 polling", cls: "" },
-      rightState: { txt: "Woken by push", cls: "wake" },
-      show: ["L1", "L2", "L3", "R1", "R2"],
-      wire: "fwd-soft",
-      packet: null,
+      dur: 5000,
+      srcIdx: 0,
+      tone: "coral",
+      litTiers: ["interrupt"],
+      softTiers: ["notify", "mute"],
+      rule: "github.ci → interrupt (@claude) · notify (@review)",
+      caption:
+        "<strong>Standardized event:</strong> GitHub CI failure wakes <code>Claude Code · laptop</code> immediately while teammate stays undisturbed in <code>notify</code>.",
+      out: [
+        { cls: "coral", state: "lit" },
+        { cls: "", state: "off" },
+        { cls: "amber", state: "soft" },
+      ],
+      agents: [
+        {
+          cardCls: "is-coral",
+          stateCls: "coral",
+          state: "⚡ Interrupt",
+          msg: "Woken immediately · PR #412 failing check in auth.rs",
+        },
+        {
+          cardCls: "is-muted",
+          stateCls: "slate",
+          state: "Muted · 0 wakes",
+          msg: "Not subscribed to checkout-api · 0 tokens spent",
+        },
+        {
+          cardCls: "is-amber",
+          stateCls: "amber",
+          state: "Notify · digest",
+          msg: "1-line digest queued for next turn (Focus Mode)",
+        },
+      ],
     },
     {
       dur: 5000,
-      leftActive: false,
-      rightActive: true,
-      leftState: { txt: "Idle · 0 polling", cls: "" },
-      rightState: { txt: "Reviewing diff", cls: "active" },
-      show: ["L1", "L2", "L3", "R1", "R2", "R3", "R4"],
-      wire: "rev",
-      packet: { label: "reply → wake claude", dir: "rev" },
+      srcIdx: 1,
+      tone: "olive",
+      litTiers: ["queue"],
+      softTiers: [],
+      rule: "alex@macbook → E2EE HPKE · queue on idle",
+      caption:
+        "<strong>Messaging is a signal too:</strong> Encrypted team DMs wake idle agents across laptops &amp; build servers — zero polling loops.",
+      out: [
+        { cls: "", state: "off" },
+        { cls: "olive", state: "lit" },
+        { cls: "olive", state: "soft" },
+      ],
+      agents: [
+        {
+          cardCls: "is-idle",
+          stateCls: "slate",
+          state: "Idle · 0 polling",
+          msg: "Unrelated session · untouched",
+        },
+        {
+          cardCls: "is-olive",
+          stateCls: "olive",
+          state: "⚡ Woken (queue)",
+          msg: "@alex: review auth.rs diff & run cargo test on linux-ci-02",
+        },
+        {
+          cardCls: "is-olive-soft",
+          stateCls: "olive",
+          state: "Synced · E2EE",
+          msg: "Patch thread relayed via blind Team Hub (ciphertext only)",
+        },
+      ],
     },
     {
-      dur: 5600,
-      leftActive: true,
-      rightActive: false,
-      leftState: { txt: "Woken ✓", cls: "wake" },
-      rightState: { txt: "Idle", cls: "" },
-      show: ["L1", "L2", "L3", "L4", "R1", "R2", "R3", "R4"],
-      wire: "both-soft",
-      packet: null,
+      dur: 5000,
+      srcIdx: 2,
+      tone: "moss",
+      litTiers: ["interrupt"],
+      softTiers: [],
+      rule: "passkey.drop → OS Keychain · hyp exec --env",
+      caption:
+        "<strong>Human approvals &amp; secrets:</strong> Face ID Passkey drop seals into OS Keychain and injects via <code>hyp exec</code> — never in LLM context.",
+      out: [
+        { cls: "moss", state: "lit" },
+        { cls: "", state: "off" },
+        { cls: "", state: "off" },
+      ],
+      agents: [
+        {
+          cardCls: "is-moss",
+          stateCls: "moss",
+          state: "✓ Keychain ready",
+          msg: "STRIPE_KEY stored in OS Keychain · hyp exec redacts output",
+        },
+        {
+          cardCls: "is-idle",
+          stateCls: "slate",
+          state: "Idle · 0 polling",
+          msg: "Scoped to laptop node only · zero relay plaintext",
+        },
+        {
+          cardCls: "is-idle",
+          stateCls: "slate",
+          state: "Idle · 0 polling",
+          msg: "Blind relay auto-wipes ciphertext within 15 min",
+        },
+      ],
+    },
+    {
+      dur: 5200,
+      srcIdx: 3,
+      tone: "amber",
+      litTiers: ["notify"],
+      softTiers: ["mute"],
+      rule: "cron.triage → notify (@review) · mute (@codex)",
+      caption:
+        "<strong>Exact exposure control:</strong> Scheduled cron &amp; noisy alerts land as <code>notify</code> digests or stay <code>muted</code> — zero hijacked sessions.",
+      out: [
+        { cls: "amber", state: "soft" },
+        { cls: "", state: "off" },
+        { cls: "amber", state: "lit" },
+      ],
+      agents: [
+        {
+          cardCls: "is-amber",
+          stateCls: "amber",
+          state: "Notify · 1 line",
+          msg: "09:00 triage digest attached to next turn",
+        },
+        {
+          cardCls: "is-muted",
+          stateCls: "slate",
+          state: "Muted · 0 wakes",
+          msg: "Archived silently · 0 wakes during active build",
+        },
+        {
+          cardCls: "is-amber",
+          stateCls: "amber",
+          state: "Notify · digest",
+          msg: "Morning cron queued · 3 open PRs ready in hyp_inbox",
+        },
+      ],
     },
   ];
 
   const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
-  let beatIdx = reduced ? BEATS.length - 1 : 0;
+  let beatIdx = 0;
   let playing = !reduced;
   let timer = null;
 
   function renderBeat(idx) {
     const b = BEATS[idx] || BEATS[0];
-    leftTerm?.classList.toggle("is-active", b.leftActive);
-    rightTerm?.classList.toggle("is-active", b.rightActive);
 
-    if (leftState) {
-      leftState.textContent = b.leftState.txt;
-      leftState.className = `ta-state ${b.leftState.cls}`.trim();
-    }
-    if (rightState) {
-      rightState.textContent = b.rightState.txt;
-      rightState.className = `ta-state ${b.rightState.cls}`.trim();
-    }
-
-    Object.entries(lines).forEach(([k, el]) => {
+    sources.forEach((el, i) => {
       if (!el) return;
-      el.classList.toggle("show", b.show.includes(k));
+      el.classList.toggle("is-active", i === b.srcIdx);
+      el.setAttribute("aria-pressed", i === b.srcIdx ? "true" : "false");
     });
 
-    wireFwd?.classList.toggle("lit", b.wire === "fwd");
-    wireFwd?.classList.toggle("soft", b.wire === "fwd-soft" || b.wire === "both-soft");
-    wireRev?.classList.toggle("lit", b.wire === "rev");
-    wireRev?.classList.toggle("soft", b.wire === "both-soft");
+    inLines.forEach((el, i) => {
+      if (!el) return;
+      el.classList.toggle("is-lit", i === b.srcIdx);
+    });
+    inPulses.forEach((el, i) => {
+      if (!el) return;
+      el.classList.toggle("is-lit", !reduced && i === b.srcIdx);
+    });
 
-    if (pkt && pktLabel) {
-      pkt.classList.remove("fly-fwd", "fly-rev");
-      if (b.packet && !reduced) {
-        pktLabel.textContent = b.packet.label;
-        void pkt.offsetWidth;
-        pkt.classList.add(b.packet.dir === "rev" ? "fly-rev" : "fly-fwd");
-      }
+    outLines.forEach((el, i) => {
+      if (!el) return;
+      const spec = b.out[i];
+      el.setAttribute("class", `sb-path-live ${spec.cls} ${spec.state === "lit" ? "is-lit" : spec.state === "soft" ? "is-soft" : ""}`.trim());
+    });
+    outPulses.forEach((el, i) => {
+      if (!el) return;
+      const spec = b.out[i];
+      const activeCls = !reduced && spec.state === "lit" ? "is-lit" : !reduced && spec.state === "soft" ? "is-soft" : "";
+      el.setAttribute("class", `sb-pulse ${spec.cls} ${activeCls}`.trim());
+    });
+
+    if (core) {
+      core.className = `sb-core tone-${b.tone}`;
     }
+
+    Object.entries(tiers).forEach(([name, el]) => {
+      if (!el) return;
+      el.classList.toggle("is-lit", b.litTiers.includes(name));
+      el.classList.toggle("is-soft", b.softTiers.includes(name));
+    });
+
+    if (ruleEl) {
+      ruleEl.textContent = b.rule;
+      ruleEl.className = `sb-rule-readout ${b.tone}`;
+    }
+
+    agents.forEach((a, i) => {
+      const spec = b.agents[i];
+      if (!spec) return;
+      if (a.card) a.card.className = `sb-agent ${spec.cardCls}`.trim();
+      if (a.state) {
+        a.state.textContent = spec.state;
+        a.state.className = `sb-state ${spec.stateCls}`.trim();
+      }
+      if (a.msg) a.msg.textContent = spec.msg;
+    });
+
+    if (captionEl) captionEl.innerHTML = b.caption;
 
     beatBtns.forEach((btn, i) => {
       btn.classList.toggle("active", i === idx);
@@ -184,9 +312,9 @@ renderHeroInstall();
     }, BEATS[beatIdx].dur);
   }
 
-  beatBtns.forEach((btn) => {
+  allTriggerBtns.forEach((btn) => {
     btn.addEventListener("click", () => {
-      beatIdx = Number(btn.dataset.taBeat) || 0;
+      beatIdx = Number(btn.dataset.sbBeat) || 0;
       renderBeat(beatIdx);
       schedule();
     });
@@ -198,7 +326,6 @@ renderHeroInstall();
       playing = !playing;
       playBtn.textContent = playing ? "Pause" : "Play";
       if (playing) {
-        if (beatIdx === BEATS.length - 1) beatIdx = 0;
         renderBeat(beatIdx);
         schedule();
       } else if (timer) {
@@ -1246,12 +1373,10 @@ if (new URLSearchParams(window.location.search).get("chapter") !== null) {
 })();
 
 // ============================================================================
-// 3. INTERACTIVE LOCAL NODE DELIVERY SIMULATOR (#streams)
+// 3. INTERACTIVE LOCAL NODE DELIVERY SIMULATOR (#streams — always visible)
 // ============================================================================
 (function initControlGate() {
   const shell = document.getElementById("gateShell");
-  const toggleBtn = document.getElementById("gateSimToggle");
-  const toggleLabel = document.getElementById("gateSimToggleLabel");
   const viewport = document.getElementById("gateViewport");
   const stage = document.getElementById("gateStage");
   const packetsHost = document.getElementById("gatePackets");
@@ -1262,14 +1387,17 @@ if (new URLSearchParams(window.location.search).get("chapter") !== null) {
   const LOGICAL_W = 1120;
   const LOGICAL_H = 488;
   const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
-  let simOpen = false;
+  let simInView = true;
   let gateBundlesBuilt = false;
 
   function fitGateStage() {
-    if (!simOpen || window.innerWidth <= 760) return;
+    if (window.innerWidth <= 760) {
+      viewport.style.height = "";
+      return;
+    }
     const availW = viewport.clientWidth || 0;
     if (availW <= 0) return;
-    const scale = Math.min(1.06, availW / LOGICAL_W);
+    const scale = Math.min(1, availW / LOGICAL_W);
     const offsetX = Math.max(0, (availW - LOGICAL_W * scale) / 2);
     stage.style.transform = `translateX(${offsetX.toFixed(1)}px) scale(${scale.toFixed(4)})`;
     viewport.style.height = `${Math.round(LOGICAL_H * scale)}px`;
@@ -1373,7 +1501,6 @@ if (new URLSearchParams(window.location.search).get("chapter") !== null) {
   const params = new URLSearchParams(window.location.search);
   const urlPhaseRaw = params.get("t");
   const fixedPhase = urlPhaseRaw !== null && !Number.isNaN(Number(urlPhaseRaw)) ? Number(urlPhaseRaw) : null;
-  const hasSimParam = ["t", "public", "focus", "ci", "alice", "deploys", "guard"].some((k) => params.has(k));
 
   let gateState = { ...DEFAULT_STATE };
   if (params.get("public") === "1") gateState.publicLinked = true;
@@ -1663,7 +1790,7 @@ if (new URLSearchParams(window.location.search).get("chapter") !== null) {
       rulePillCls = "amber";
     }
 
-    // Honest simulation counts (no fake benchmark percentage)
+    // Deterministic simulation counts (no synthetic percentage)
     let deliveredLabel = "Delivery";
     let deliveredText = "quiet · 0 wakes";
     let blockedLabel = "Stopped";
@@ -1933,10 +2060,12 @@ if (new URLSearchParams(window.location.search).get("chapter") !== null) {
 
   let pausedElapsed = 0;
   let cycleStart = performance.now();
+  let lastRenderFrame = null;
 
   function startGatePackets(sc) {
     if (gateRaf) cancelAnimationFrame(gateRaf);
-    if (!packetsHost || !simOpen) return;
+    gateRaf = null;
+    if (!packetsHost) return;
     packetsHost.innerHTML = "";
     shieldArc?.classList.remove("hit-amber", "hit-coral");
 
@@ -2108,13 +2237,20 @@ if (new URLSearchParams(window.location.search).get("chapter") !== null) {
       }
     }
 
+    lastRenderFrame = renderFrame;
     if (fixedPhase !== null || !gatePlaying) {
       renderFrame(fixedPhase !== null ? fixedPhase * CYCLE_MS : pausedElapsed || 0.48 * CYCLE_MS);
       return;
     }
 
+    renderFrame(pausedElapsed);
+    if (!simInView) return;
+
     function tick(now) {
-      if (!simOpen) return;
+      if (!simInView) {
+        gateRaf = null;
+        return;
+      }
       pausedElapsed = now - cycleStart;
       renderFrame(pausedElapsed);
       gateRaf = requestAnimationFrame(tick);
@@ -2345,29 +2481,20 @@ if (new URLSearchParams(window.location.search).get("chapter") !== null) {
     renderControlCenter();
   }
 
-  function setSimOpen(open) {
-    simOpen = open;
-    shell.hidden = !open;
-    shell.classList.toggle("is-collapsed", !open);
-    toggleBtn?.setAttribute("aria-expanded", open ? "true" : "false");
-    toggleBtn?.classList.toggle("is-open", open);
-    if (toggleLabel) {
-      toggleLabel.textContent = open
-        ? "Hide delivery simulator"
-        : "Try the interactive delivery simulator";
+  function resumeGateLoop() {
+    if (!gatePlaying || fixedPhase !== null || gateRaf || !lastRenderFrame || !simInView) return;
+    cycleStart = performance.now() - pausedElapsed;
+    function tick(now) {
+      if (!simInView) {
+        gateRaf = null;
+        return;
+      }
+      pausedElapsed = now - cycleStart;
+      lastRenderFrame(pausedElapsed);
+      gateRaf = requestAnimationFrame(tick);
     }
-    if (open) {
-      requestAnimationFrame(() => {
-        ensureGateBundles();
-        fitGateStage();
-        renderControlCenter();
-      });
-    } else if (gateRaf) {
-      cancelAnimationFrame(gateRaf);
-    }
+    gateRaf = requestAnimationFrame(tick);
   }
-
-  toggleBtn?.addEventListener("click", () => setSimOpen(!simOpen));
 
   shell.addEventListener("click", (e) => {
     const ciStep = e.target.closest("[data-ci]");
@@ -2411,9 +2538,27 @@ if (new URLSearchParams(window.location.search).get("chapter") !== null) {
     renderControlCenter();
   });
 
-  if (hasSimParam) {
-    setSimOpen(true);
+  if (typeof IntersectionObserver !== "undefined") {
+    const io = new IntersectionObserver(
+      (entries) => {
+        const visible = entries.some((entry) => entry.isIntersecting);
+        simInView = visible;
+        if (visible) {
+          fitGateStage();
+          resumeGateLoop();
+        } else if (gateRaf) {
+          cancelAnimationFrame(gateRaf);
+          gateRaf = null;
+        }
+      },
+      { rootMargin: "160px 0px" }
+    );
+    io.observe(shell);
   }
+
+  ensureGateBundles();
+  fitGateStage();
+  renderControlCenter();
 })();
 
 // ============================================================================

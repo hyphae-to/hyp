@@ -4,21 +4,21 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Hyphae (hyp) — One wire under every agent</title>
-  <meta name="description" content="Hyphae lets your coding agents message and wake each other — across Claude Code, Codex, and whatever else you run, on one laptop or many. One small binary. No polling loops. End-to-end encrypted between machines." />
+  <meta name="description" content="A standardized real-time event and messaging bus for coding agents. Unify CI/GitHub events, alerts, cron triggers, Passkey secrets, and cross-machine team messages over one encrypted wire with per-agent exposure control." />
   <link rel="canonical" href="https://hyphae.to/" />
   <link rel="icon" type="image/png" href="./assets/logo-hyphae.png" />
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://hyphae.to/" />
   <meta property="og:title" content="Hyphae (hyp) — One wire under every agent" />
-  <meta property="og:description" content="Hyphae lets your coding agents message and wake each other — across Claude Code, Codex, and whatever else you run, on one laptop or many. One small binary. No polling loops. End-to-end encrypted between machines." />
+  <meta property="og:description" content="A standardized real-time event and messaging bus for coding agents. Unify CI/GitHub events, alerts, cron triggers, Passkey secrets, and cross-machine team messages over one encrypted wire with per-agent exposure control." />
   <meta property="og:image" content="https://hyphae.to/assets/social-card.jpg" />
   <meta property="og:image:width" content="1280" />
   <meta property="og:image:height" content="640" />
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:title" content="Hyphae (hyp) — One wire under every agent" />
-  <meta name="twitter:description" content="Hyphae lets your coding agents message and wake each other — across Claude Code, Codex, and whatever else you run, on one laptop or many. One small binary. No polling loops. End-to-end encrypted between machines." />
+  <meta name="twitter:description" content="A standardized real-time event and messaging bus for coding agents. Unify CI/GitHub events, alerts, cron triggers, Passkey secrets, and cross-machine team messages over one encrypted wire with per-agent exposure control." />
   <meta name="twitter:image" content="https://hyphae.to/assets/social-card.jpg" />
-  <link rel="stylesheet" href="./styles.css?v=18" />
+  <link rel="stylesheet" href="./styles.css?v=19" />
 </head>
 <body>
   <header id="siteHeader" class="header-dark">
@@ -54,12 +54,12 @@
       <canvas class="story-canvas" id="sporeCanvas" aria-hidden="true"></canvas>
 
       <div class="wrap story-band-inner hero-stack">
-        <!-- HERO TOP: Instant 5-second clarity (renders identically with JS off) -->
+        <!-- HERO TOP: Standardized Real-Time Signal Bus Thesis + Static HTML Install -->
         <div id="cta-install" class="hero-cta-strip hero-top">
           <div class="hero-cta-copy">
             <h1>One wire under <em>every</em> agent.</h1>
             <p class="hero-sub">
-              Hyphae lets your coding agents message and wake each other — across Claude Code, Codex, and whatever else you run, on one laptop or many. One small binary. No polling loops. End-to-end encrypted between machines.
+              A standardized real-time event and messaging layer for coding agents. Unify CI/GitHub events, alerts, cron triggers, human approvals and secrets, and cross-machine team messages over one encrypted protocol — where every agent controls its exact exposure (<code>interrupt</code>, <code>queue</code>, <code>notify</code>, <code>mute</code>) across laptops, servers, and teams.
             </p>
             <div class="hero-secondary-links">
               <a class="hero-inline-link" href="#walkthrough" id="jumpWalkthroughBtn">See the multi-machine team incident walkthrough (Beta) ↓</a>
@@ -92,99 +92,183 @@
           </div>
         </div>
 
-        <!-- HERO LEAD VISUAL: Tight 20-Second Two-Agent Loop (Claude Code <-> Codex on one laptop) -->
-        <div class="two-agent-stage" id="twoAgentStage" aria-label="Two-agent demo: Claude Code asks idle Codex to review a diff on one laptop">
-          <div class="ta-grid">
-            <!-- Left Terminal: Claude Code -->
-            <div class="ta-term is-active" id="taLeftTerm">
-              <div class="ta-chrome">
-                <span class="ta-dots" aria-hidden="true"><i></i><i></i><i></i></span>
-                <span class="ta-tool">
-                  <img src="./assets/icons/claude.svg" alt="" />
-                  <strong>Claude Code</strong>
-                  <span class="ta-handle">@claude · laptop</span>
-                </span>
-                <span class="ta-state active" id="taLeftState">Active</span>
+        <!-- HERO LEAD VISUAL: Multi-Source Signal Bus -> Exposure Control -> Team/Multi-Machine Agents -->
+        <div class="signal-bus-stage" id="signalBusStage" aria-label="Interactive architecture diagram: standardized real-time signals routed through Hyphae Wire exposure control to agents across machines and teams">
+          <div class="sb-grid">
+            <!-- LEFT COLUMN: Any Source, Standardized -->
+            <div class="sb-col sb-sources" role="group" aria-label="Real-time signal sources">
+              <div class="sb-col-head">
+                <span class="sb-col-kicker">Any Source · Standardized</span>
               </div>
-              <div class="ta-body">
-                <div class="ta-line ta-prompt show" id="taL1">
-                  <span class="ta-sigil">you ›</span>
-                  <span>ask codex to review this diff</span>
-                </div>
-                <div class="ta-line ta-toolcall show" id="taL2">
-                  <span class="ta-badge olive">hyp_send</span>
-                  <code>to: "codex", body: "review auth.rs diff"</code>
-                </div>
-                <div class="ta-line ta-muted show" id="taL3">
-                  <span>✓ delivered to local node · session idle (0 polling)</span>
-                </div>
-                <div class="ta-line ta-wake show" id="taL4">
-                  <span class="ta-badge chartreuse">⚡ woken</span>
-                  <span><strong>@codex:</strong> Found 1 edge case in <code>verify_sig</code> (L84) — nonce replay window. Patch ready.</span>
-                </div>
+              <div class="sb-source-list">
+                <button class="sb-source is-active" id="sbSrc0" data-sb-beat="0" type="button">
+                  <span class="sb-ico"><img src="./assets/icons/github.svg" alt="" /></span>
+                  <span class="sb-src-copy">
+                    <strong>GitHub CI / PR</strong>
+                    <small>pr.checks_failed · checkout-api #412</small>
+                  </span>
+                  <span class="sb-tag coral">event</span>
+                </button>
+
+                <button class="sb-source" id="sbSrc1" data-sb-beat="1" type="button">
+                  <span class="sb-ico avatar"><img src="./assets/sprite-alex.jpg?v=2" alt="" /></span>
+                  <span class="sb-src-copy">
+                    <strong>Teammate Agent</strong>
+                    <small>alex@macbook · review auth.rs diff</small>
+                  </span>
+                  <span class="sb-tag olive">E2EE DM</span>
+                </button>
+
+                <button class="sb-source" id="sbSrc2" data-sb-beat="2" type="button">
+                  <span class="sb-ico glyph moss" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8.5" cy="14.5" r="4"/><path d="M11.5 11.5 20 3"/><path d="m17 6 2.5 2.5"/><path d="m14.5 8.5 2 2"/></svg>
+                  </span>
+                  <span class="sb-src-copy">
+                    <strong>Phone Passkey Drop</strong>
+                    <small>hyphae.to/drop · Face ID → Keychain</small>
+                  </span>
+                  <span class="sb-tag moss">Passkey</span>
+                </button>
+
+                <button class="sb-source" id="sbSrc3" data-sb-beat="3" type="button">
+                  <span class="sb-ico"><img src="./assets/icons/prometheus.svg" alt="" /></span>
+                  <span class="sb-src-copy">
+                    <strong>Cron / Alert</strong>
+                    <small>hyp emit · 09:00 triage &amp; alerts</small>
+                  </span>
+                  <span class="sb-tag amber">hyp emit</span>
+                </button>
               </div>
             </div>
 
-            <!-- Center Organic Mycelium Wire -->
-            <div class="ta-wire" aria-hidden="true">
-              <svg class="ta-wire-svg" viewBox="0 0 180 120" fill="none" preserveAspectRatio="none">
-                <path class="ta-strand-bg" d="M 4 42 C 52 24, 128 60, 176 42" />
-                <path class="ta-strand-bg" d="M 4 78 C 52 96, 128 60, 176 78" />
-                <path class="ta-strand-live" id="taWireFwd" d="M 4 42 C 52 24, 128 60, 176 42" />
-                <path class="ta-strand-live amber" id="taWireRev" d="M 176 78 C 128 60, 52 96, 4 78" />
+            <!-- LEFT SVG SIGNAL ROUTING BRIDGE -->
+            <div class="sb-wire sb-wire-in" aria-hidden="true">
+              <svg viewBox="0 0 60 320" fill="none" preserveAspectRatio="none">
+                <path class="sb-path-bg" vector-effect="non-scaling-stroke" d="M 0 68 C 24 68, 34 148, 60 152" />
+                <path class="sb-path-bg" vector-effect="non-scaling-stroke" d="M 0 134 C 24 134, 34 156, 60 158" />
+                <path class="sb-path-bg" vector-effect="non-scaling-stroke" d="M 0 202 C 24 202, 34 166, 60 164" />
+                <path class="sb-path-bg" vector-effect="non-scaling-stroke" d="M 0 268 C 24 268, 34 176, 60 170" />
+
+                <path class="sb-path-live coral is-lit" id="sbIn0" vector-effect="non-scaling-stroke" d="M 0 68 C 24 68, 34 148, 60 152" />
+                <path class="sb-path-live olive" id="sbIn1" vector-effect="non-scaling-stroke" d="M 0 134 C 24 134, 34 156, 60 158" />
+                <path class="sb-path-live moss" id="sbIn2" vector-effect="non-scaling-stroke" d="M 0 202 C 24 202, 34 166, 60 164" />
+                <path class="sb-path-live amber" id="sbIn3" vector-effect="non-scaling-stroke" d="M 0 268 C 24 268, 34 176, 60 170" />
+
+                <path class="sb-pulse coral is-lit" id="sbInPulse0" pathLength="100" vector-effect="non-scaling-stroke" d="M 0 68 C 24 68, 34 148, 60 152" />
+                <path class="sb-pulse olive" id="sbInPulse1" pathLength="100" vector-effect="non-scaling-stroke" d="M 0 134 C 24 134, 34 156, 60 158" />
+                <path class="sb-pulse moss" id="sbInPulse2" pathLength="100" vector-effect="non-scaling-stroke" d="M 0 202 C 24 202, 34 166, 60 164" />
+                <path class="sb-pulse amber" id="sbInPulse3" pathLength="100" vector-effect="non-scaling-stroke" d="M 0 268 C 24 268, 34 176, 60 170" />
               </svg>
-              <div class="ta-node-pill">
-                <span class="ta-live-dot"></span>
-                <span>Local Node</span>
+            </div>
+
+            <!-- CENTER COLUMN: Hyphae Wire + Exposure Control -->
+            <div class="sb-col sb-center">
+              <div class="sb-col-head center">
+                <span class="sb-col-kicker">Hyphae Wire · Exposure Control</span>
               </div>
-              <div class="ta-packet" id="taPacket">
-                <span class="ta-pkt-dot"></span>
-                <span id="taPacketLabel">hyp_send → codex</span>
+              <div class="sb-core" id="sbCore">
+                <span class="sb-port left" aria-hidden="true"></span>
+                <span class="sb-port right" aria-hidden="true"></span>
+                <div class="sb-core-top">
+                  <span class="sb-core-badge">
+                    <span class="sb-live-dot" aria-hidden="true"></span>
+                    HYPHAE WIRE
+                  </span>
+                  <span class="sb-proto-tag">CloudEvents · HPKE E2EE</span>
+                </div>
+
+                <div class="sb-core-emblem">
+                  <img src="./assets/node-hub.webp?v=1" alt="" />
+                  <div class="sb-core-copy">
+                    <strong>Unified Signal Bus</strong>
+                    <small>Zero polling · source-agnostic</small>
+                  </div>
+                </div>
+
+                <div class="sb-tiers" aria-label="Exposure control tiers">
+                  <span class="sb-tier coral is-lit" id="sbTierInterrupt"><i></i>interrupt</span>
+                  <span class="sb-tier olive" id="sbTierQueue"><i></i>queue</span>
+                  <span class="sb-tier amber is-soft" id="sbTierNotify"><i></i>notify</span>
+                  <span class="sb-tier slate is-soft" id="sbTierMute"><i></i>mute</span>
+                </div>
+
+                <div class="sb-rule-readout coral" id="sbRouteRule">
+                  github.ci → interrupt (@claude) · notify (@review)
+                </div>
               </div>
             </div>
 
-            <!-- Right Terminal: Codex -->
-            <div class="ta-term" id="taRightTerm">
-              <div class="ta-chrome">
-                <span class="ta-dots" aria-hidden="true"><i></i><i></i><i></i></span>
-                <span class="ta-tool">
-                  <img src="./assets/icons/openai.svg" alt="" />
-                  <strong>Codex</strong>
-                  <span class="ta-handle">@codex · laptop</span>
-                </span>
-                <span class="ta-state" id="taRightState">Idle</span>
+            <!-- RIGHT SVG SIGNAL ROUTING BRIDGE -->
+            <div class="sb-wire sb-wire-out" aria-hidden="true">
+              <svg viewBox="0 0 60 320" fill="none" preserveAspectRatio="none">
+                <path class="sb-path-bg" vector-effect="non-scaling-stroke" d="M 0 152 C 26 148, 36 80, 60 80" />
+                <path class="sb-path-bg" vector-effect="non-scaling-stroke" d="M 0 162 C 26 162, 36 172, 60 172" />
+                <path class="sb-path-bg" vector-effect="non-scaling-stroke" d="M 0 172 C 26 176, 36 262, 60 262" />
+
+                <path class="sb-path-live coral is-lit" id="sbOut0" vector-effect="non-scaling-stroke" d="M 0 152 C 26 148, 36 80, 60 80" />
+                <path class="sb-path-live" id="sbOut1" vector-effect="non-scaling-stroke" d="M 0 162 C 26 162, 36 172, 60 172" />
+                <path class="sb-path-live amber is-soft" id="sbOut2" vector-effect="non-scaling-stroke" d="M 0 172 C 26 176, 36 262, 60 262" />
+
+                <path class="sb-pulse coral is-lit" id="sbOutPulse0" pathLength="100" vector-effect="non-scaling-stroke" d="M 0 152 C 26 148, 36 80, 60 80" />
+                <path class="sb-pulse" id="sbOutPulse1" pathLength="100" vector-effect="non-scaling-stroke" d="M 0 162 C 26 162, 36 172, 60 172" />
+                <path class="sb-pulse amber is-soft" id="sbOutPulse2" pathLength="100" vector-effect="non-scaling-stroke" d="M 0 172 C 26 176, 36 262, 60 262" />
+              </svg>
+            </div>
+
+            <!-- RIGHT COLUMN: Any Agent, Anywhere -->
+            <div class="sb-col sb-agents" aria-label="Target coding agents across machines">
+              <div class="sb-col-head">
+                <span class="sb-col-kicker">Any Agent · Anywhere</span>
               </div>
-              <div class="ta-body">
-                <div class="ta-line ta-muted show" id="taR1">
-                  <span>idle · waiting on push hook (0 tokens/min)</span>
+              <div class="sb-agent-list">
+                <div class="sb-agent is-coral" id="sbAgent0">
+                  <div class="sb-agent-head">
+                    <span class="sb-agent-id">
+                      <img src="./assets/icons/claude.svg" alt="" />
+                      <span><strong>Claude Code</strong><em>· laptop</em></span>
+                    </span>
+                    <span class="sb-state coral" id="sbAgentState0">⚡ Interrupt</span>
+                  </div>
+                  <div class="sb-agent-msg" id="sbAgentMsg0">Woken immediately · PR #412 failing check in auth.rs</div>
                 </div>
-                <div class="ta-line ta-wake show" id="taR2">
-                  <span class="ta-badge amber">⚡ woken</span>
-                  <span><strong>@claude:</strong> review <code>auth.rs</code> diff</span>
+
+                <div class="sb-agent is-muted" id="sbAgent1">
+                  <div class="sb-agent-head">
+                    <span class="sb-agent-id">
+                      <img src="./assets/icons/openai.svg" alt="" />
+                      <span><strong>Codex</strong><em>· build server</em></span>
+                    </span>
+                    <span class="sb-state slate" id="sbAgentState1">Muted · 0 wakes</span>
+                  </div>
+                  <div class="sb-agent-msg" id="sbAgentMsg1">Not subscribed to checkout-api · 0 tokens spent</div>
                 </div>
-                <div class="ta-line ta-muted show" id="taR3">
-                  <span>→ auditing 38 changed lines in <code>auth.rs</code>…</span>
-                </div>
-                <div class="ta-line ta-toolcall show" id="taR4">
-                  <span class="ta-badge olive">hyp_send</span>
-                  <code>to: "claude", body: "Found 1 edge case in verify_sig (L84)…"</code>
+
+                <div class="sb-agent is-amber" id="sbAgent2">
+                  <div class="sb-agent-head">
+                    <span class="sb-agent-id">
+                      <img src="./assets/icons/antigravity.svg" alt="" />
+                      <span><strong>Antigravity</strong><em>· teammate</em></span>
+                    </span>
+                    <span class="sb-state amber" id="sbAgentState2">Notify · digest</span>
+                  </div>
+                  <div class="sb-agent-msg" id="sbAgentMsg2">1-line digest queued for next turn (Focus Mode)</div>
                 </div>
               </div>
             </div>
           </div>
 
-          <div class="ta-foot">
-            <p class="ta-caption">
-              <strong>No polling. No copy-paste. Zero servers required.</strong>
+          <div class="ta-foot sb-foot">
+            <p class="ta-caption" id="sbCaption">
+              <strong>Standardized event:</strong> GitHub CI failure wakes <code>Claude Code · laptop</code> immediately while teammate stays undisturbed in <code>notify</code>.
             </p>
             <div class="ta-controls">
-              <div class="ta-beats" id="taBeats" role="group" aria-label="Demo steps">
-                <button class="ta-beat active" data-ta-beat="0" type="button">1. Send</button>
-                <button class="ta-beat" data-ta-beat="1" type="button">2. Wake</button>
-                <button class="ta-beat" data-ta-beat="2" type="button">3. Review</button>
-                <button class="ta-beat" data-ta-beat="3" type="button">4. Reply</button>
+              <div class="ta-beats" id="sbBeats" role="group" aria-label="Signal examples">
+                <button class="ta-beat active" data-sb-beat="0" type="button">1. CI Alert</button>
+                <button class="ta-beat" data-sb-beat="1" type="button">2. Team DM</button>
+                <button class="ta-beat" data-sb-beat="2" type="button">3. Passkey Drop</button>
+                <button class="ta-beat" data-sb-beat="3" type="button">4. Cron / Noise</button>
               </div>
-              <button class="story-play-btn" id="taPlayBtn" type="button">Pause</button>
+              <button class="story-play-btn" id="sbPlayBtn" type="button">Pause</button>
             </div>
           </div>
         </div>
@@ -300,29 +384,29 @@ hyp secret set telegram-bot-token --web</code></pre>
     </section>
 
     <!-- =================================================================== -->
-    <!-- HOW IT WORKS: Honest 3-Tier Harness Table + Unified Node Architecture -->
+    <!-- HOW IT WORKS: 3-Tier Harness Support + Unified Node Architecture    -->
     <!-- =================================================================== -->
     <section id="how-it-works" class="arch-section">
       <div class="wrap arch-wrap">
         <div class="section-intro arch-intro">
           <span class="spec-num">How it works</span>
-          <h2>One local node. Honest support across your tools.</h2>
+          <h2>Works with your tools.</h2>
           <p>
-            One ~8 MiB binary runs as a local daemon, wires each coding tool through native hooks and 4 MCP tools, and routes messages through an inbox with delivery rules — locally on one laptop or encrypted to other nodes.
+            One ~8 MiB binary runs as a local daemon, wires each coding tool through native hooks and 4 MCP tools, and routes standardized signals through an inbox with delivery rules — locally on one laptop or encrypted across servers and teams.
           </p>
         </div>
 
-        <!-- Honest 3-Tier Harness Support Table -->
+        <!-- 3-Tier Harness Support Matrix -->
         <div class="harness-tier-shell" aria-label="Harness support tiers">
           <div class="ht-header">
-            <h3>Harness support by tier</h3>
+            <h3>Supported harnesses</h3>
             <span class="ht-platform-note">macOS &amp; Linux full · Windows core (no chat bridges)</span>
           </div>
           <div class="ht-grid">
             <div class="ht-row ht-full">
               <div class="ht-tier">
                 <span class="ht-pill full">Full</span>
-                <p>Works out of the box: identity, push wakeups, status UI</p>
+                <p>Identity, push wakeups, and status UI out of the box</p>
               </div>
               <div class="ht-tools">
                 <span class="ht-chip"><img src="./assets/icons/claude.svg" alt="" />Claude Code</span>
@@ -335,8 +419,8 @@ hyp secret set telegram-bot-token --web</code></pre>
 
             <div class="ht-row ht-limits">
               <div class="ht-tier">
-                <span class="ht-pill limits">Works with limits</span>
-                <p>Messages arrive at tool and turn boundaries</p>
+                <span class="ht-pill limits">Hook / Turn-Boundary</span>
+                <p>Signals deliver cleanly at tool and turn boundaries</p>
               </div>
               <div class="ht-tools">
                 <span class="ht-chip"><img src="./assets/icons/cursor.svg" alt="" />Cursor</span>
@@ -347,7 +431,7 @@ hyp secret set telegram-bot-token --web</code></pre>
             <div class="ht-row ht-exp">
               <div class="ht-tier">
                 <span class="ht-pill exp">Experimental</span>
-                <p>MCP tools + skill; hook and wake support evolving</p>
+                <p>MCP tools + skill ready; push hook integration evolving</p>
               </div>
               <div class="ht-tools">
                 <span class="ht-chip"><img src="./assets/icons/openclaw.svg" alt="" />OpenClaw</span>
@@ -719,9 +803,9 @@ hyp secret set telegram-bot-token --web</code></pre>
     </section>
 
     <!-- =================================================================== -->
-    <!-- DELIVERY CONTROL GATE: Renamed + Simulator honestly badged          -->
+    <!-- DELIVERY CONTROL GATE: Exposure Tiers + Live Interactive Simulator  -->
     <!-- =================================================================== -->
-    <section id="streams" class="dark-band">
+    <section id="streams" class="dark-band streams-band">
       <div class="wrap">
         <h2>You decide what <em>interrupts your agent.</em></h2>
         <p class="dark-sub">
@@ -748,21 +832,11 @@ hyp secret set telegram-bot-token --web</code></pre>
           </div>
         </div>
 
-        <!-- Clean Toggle Bar for Interactive Simulation -->
-        <div class="sim-disclosure-bar">
-          <button class="sim-toggle-btn" id="gateSimToggle" type="button" aria-expanded="false" aria-controls="gateShell">
-            <span class="sim-pill">Simulation</span>
-            <span id="gateSimToggleLabel">Try the interactive delivery simulator</span>
-            <span class="sim-chev" aria-hidden="true">▾</span>
-          </button>
-          <span class="sim-hint">Toggle Focus Mode, burst caps, injection guards &amp; public feeds</span>
-        </div>
-
-        <!-- LIVING INTERACTIVE LOCAL NODE CONTROL CENTER (Collapsed until toggled) -->
-        <div class="gate-shell is-collapsed" id="gateShell" hidden>
+        <!-- LIVING INTERACTIVE LOCAL NODE CONTROL CENTER (Visible & playable by default) -->
+        <div class="gate-shell" id="gateShell">
           <div class="gate-sim-banner">
             <span class="sim-pill">Simulation</span>
-            <span>Interactive model of local delivery rules — toggle controls below to see which packets wake your agent and which are held back.</span>
+            <span>Interactive model of local delivery rules — toggle Focus Mode, burst caps, injection guards &amp; public feeds below.</span>
           </div>
 
           <!-- Desktop / Laptop proportional 1120x488 living mycelial stage -->
@@ -987,46 +1061,198 @@ hyp secret set telegram-bot-token --web</code></pre>
     </section>
 
     <!-- =================================================================== -->
-    <!-- SECURITY BOUNDARY & HONEST 4-ROW COMPARISON                         -->
+    <!-- SECURITY ARCHITECTURE & 5-ROW COMPARISON                            -->
     <!-- =================================================================== -->
     <section id="security" class="section section-white">
       <div class="wrap">
         <div class="section-intro">
-          <span class="spec-num">Security &amp; Threat Model</span>
-          <h2>Honest about the boundary.</h2>
+          <span class="spec-num">Security Architecture</span>
+          <h2>Security</h2>
+          <p>
+            Cryptographic isolation between nodes, Passkey secret injection outside LLM context, two-stage inbound screening, and a clear local OS boundary.
+          </p>
         </div>
 
-        <div class="sec-boundary-card">
-          <blockquote class="sec-quote">
-            Hyphae treats everything arriving from the network as untrusted and screens it before your agent sees it. It does not try to defend against an agent that already has a shell as your OS user — nothing running as you can. If you want that boundary, run untrusted agents as a separate OS user or in a container.
-          </blockquote>
-          <div class="sec-pillars">
-            <div class="sec-pillar">
-              <strong>End-to-end encrypted between nodes · hubs relay ciphertext</strong>
-              <p>Direct P2P DMs, <code>#channels</code>, Shared KV, and file drops stay encrypted node-to-node. Chat bridges hand plaintext to Slack, Telegram, or WhatsApp at the edge, and optional cloud prompt-injection classifiers inspect decrypted text via the provider you choose.</p>
+        <div class="sec-arch-grid">
+          <!-- Visual 1: End-to-End Encryption Between Nodes -->
+          <article class="sec-card sec-e2ee">
+            <div class="sec-card-head">
+              <span class="sec-card-kicker olive">01 · Node-to-Node Crypto</span>
+              <h3>End-to-End Encryption Between Nodes</h3>
             </div>
-            <div class="sec-pillar">
-              <strong>Blind Drop Relay (ciphertext only, wiped within 15 min)</strong>
-              <p>Phone-to-agent secrets and directives from <a class="card-inline-link" href="./drop/">hyphae.to/drop</a> are Passkey-signed and HPKE-sealed in your browser. Secrets write directly to your OS Keychain and run via <code>hyp exec --env</code> — never pasted into chat.</p>
+
+            <div class="sec-viz viz-e2ee" aria-label="Diagram showing Node A HPKE sealing ciphertext through a blind Team Hub to Node B">
+              <div class="sv-node">
+                <span class="sv-node-dot olive"></span>
+                <strong>Node A</strong>
+                <small>HPKE Seal · Ed25519</small>
+              </div>
+              <div class="sv-tunnel" aria-hidden="true">
+                <div class="sv-wire-line"><span class="sv-pulse olive"></span></div>
+                <div class="sv-blind-hub">
+                  <span class="sv-hub-title">Team Hub · Blind Relay</span>
+                  <code class="sv-cipher">0x8f4a…c2e9 · ciphertext</code>
+                </div>
+                <div class="sv-wire-line"><span class="sv-pulse olive delay"></span></div>
+              </div>
+              <div class="sv-node">
+                <span class="sv-node-dot olive"></span>
+                <strong>Node B</strong>
+                <small>Verify Sig · Open</small>
+              </div>
             </div>
-            <div class="sec-pillar">
-              <strong>Inbound screening &amp; OS-level isolation</strong>
-              <p>Pluggable prompt-injection guards screen untrusted external messages before delivery. To contain a shell-capable agent itself, isolate it under a dedicated OS user or container.</p>
+
+            <ul class="sec-spec-list">
+              <li><strong>HPKE X25519 + AES-256-GCM</strong> (RFC 9180) with <strong>Ed25519</strong> sender and caller verification.</li>
+              <li><strong>Blind Team Hubs</strong> route ciphertext only — servers never hold decryption keys for DMs, <code>#channels</code>, or Shared KV.</li>
+              <li><strong>Anti-downgrade signed manifests</strong> reject tampered policies or silent cipher downgrade attempts.</li>
+            </ul>
+          </article>
+
+          <!-- Visual 2: Passkey Phone Drops & hyp exec -->
+          <article class="sec-card sec-drop">
+            <div class="sec-card-head">
+              <span class="sec-card-kicker moss">02 · Zero-Context Secrets</span>
+              <h3>Passkey Phone Drops &amp; <code>hyp exec</code></h3>
             </div>
-          </div>
-          <div class="sec-actions">
-            <a class="btn-pill btn-olive" href="https://github.com/hyphae-to/hyp/blob/main/docs/security/threat-model.md" target="_blank" rel="noreferrer">Read the threat model ↗</a>
-            <a class="card-inline-link" href="https://github.com/hyphae-to/hyp/blob/main/docs/security/hardening.md" target="_blank" rel="noreferrer">OS-user &amp; container hardening guide ↗</a>
-          </div>
+
+            <div class="sec-viz viz-drop" aria-label="Diagram showing Face ID Passkey sealing on phone, blind 15-minute relay, OS Keychain write, and hyp exec child injection with redaction">
+              <div class="sv-pipe">
+                <div class="sv-step">
+                  <span class="sv-step-ico moss" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2" width="10" height="20" rx="2"/><path d="M12 18h.01"/></svg>
+                  </span>
+                  <strong>Phone</strong>
+                  <small>Face ID · PRF</small>
+                </div>
+                <span class="sv-arrow" aria-hidden="true"><i class="sv-flow moss"></i></span>
+                <div class="sv-step">
+                  <span class="sv-step-ico amber" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+                  </span>
+                  <strong>Blind Relay</strong>
+                  <small>≤15 min TTL</small>
+                </div>
+                <span class="sv-arrow" aria-hidden="true"><i class="sv-flow moss d1"></i></span>
+                <div class="sv-step">
+                  <span class="sv-step-ico olive" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8.5" cy="14.5" r="4"/><path d="M11.5 11.5 20 3"/><path d="m17 6 2.5 2.5"/></svg>
+                  </span>
+                  <strong>OS Keychain</strong>
+                  <small>macOS / Linux</small>
+                </div>
+                <span class="sv-arrow" aria-hidden="true"><i class="sv-flow moss d2"></i></span>
+                <div class="sv-step">
+                  <span class="sv-step-ico dark" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg>
+                  </span>
+                  <strong>hyp exec</strong>
+                  <small>--env + redact</small>
+                </div>
+              </div>
+              <div class="sv-redact-bar">
+                <span class="sv-redact-pill">LLM Context: <code>[REDACTED]</code></span>
+                <span class="sv-redact-note">Streaming stdout/stderr scrubbing keeps secrets out of prompts</span>
+              </div>
+            </div>
+
+            <ul class="sec-spec-list">
+              <li>Seal secrets on <a class="card-inline-link" href="./drop/">hyphae.to/drop ↗</a> with <strong>Face ID / Touch ID Passkey + PRF</strong>; blind relay auto-wipes within 15 min.</li>
+              <li>Writes directly to <strong>OS Keychain</strong> / Secret Service (<code>0600</code> fallback on headless Linux) — never in CLI argv or plaintext config.</li>
+              <li><code>hyp exec --env</code> injects into the child environment with live stdout/stderr redaction.</li>
+            </ul>
+          </article>
+
+          <!-- Visual 3: Inbound Security Gate & Quarantine -->
+          <article class="sec-card sec-gate">
+            <div class="sec-card-head">
+              <span class="sec-card-kicker amber">03 · Inbound Screening</span>
+              <h3>Inbound Security Gate &amp; Quarantine</h3>
+            </div>
+
+            <div class="sec-viz viz-gate" aria-label="Diagram showing two-stage inbound security gate with deterministic rules, LLM classifier, clean inbox path, and metadata-only quarantine with TTY approval">
+              <div class="sv-gate-flow">
+                <div class="sv-gate-in">
+                  <strong>Untrusted Wire</strong>
+                  <small>PRs · P2P · Webhooks</small>
+                </div>
+                <div class="sv-gate-stages">
+                  <div class="sv-stage-box">
+                    <span class="sv-stage-num">S1</span>
+                    <div>
+                      <strong>Deterministic Gate</strong>
+                      <small>Rules · burst caps · DLP</small>
+                    </div>
+                  </div>
+                  <div class="sv-stage-box">
+                    <span class="sv-stage-num amber">S2</span>
+                    <div>
+                      <strong>LLM Classifier</strong>
+                      <small>Pluggable injection guard</small>
+                    </div>
+                  </div>
+                </div>
+                <div class="sv-gate-outs">
+                  <div class="sv-out-chip pass">
+                    <i></i>
+                    <span><strong>Clean</strong> → Agent Inbox</span>
+                  </div>
+                  <div class="sv-out-chip quar">
+                    <i></i>
+                    <span><strong>Quarantine</strong> · metadata-only</span>
+                    <em>TTY lock / approve</em>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <ul class="sec-spec-list">
+              <li><strong>Stage 1</strong> enforces deterministic rules, rate limits, and DLP locally before any model sees the payload.</li>
+              <li><strong>Stage 2</strong> runs a pluggable LLM prompt-injection classifier across untrusted external sources.</li>
+              <li>Blocked items emit <strong>metadata-only quarantine notices</strong> and require <strong>interactive TTY confirmation</strong> to lock or approve.</li>
+            </ul>
+          </article>
+
+          <!-- Visual 4: Local OS Boundary -->
+          <article class="sec-card sec-boundary">
+            <div class="sec-card-head">
+              <span class="sec-card-kicker slate">04 · Threat Boundary</span>
+              <h3>Local OS Boundary</h3>
+            </div>
+
+            <div class="sec-viz viz-boundary" aria-label="Diagram distinguishing Hyphae network screening from local OS user and container isolation">
+              <div class="sv-zone wire-zone">
+                <span class="sv-zone-tag olive">Screened by Hyphae</span>
+                <strong>Network · Peers · Streams · Drops</strong>
+                <small>HPKE crypto · signatures · 2-stage inbound gate</small>
+              </div>
+              <div class="sv-wall" aria-hidden="true">
+                <span>OS Process Boundary</span>
+              </div>
+              <div class="sv-zone os-zone">
+                <span class="sv-zone-tag amber">Hard Local Isolation</span>
+                <strong>Separate OS User / Container</strong>
+                <small>Contains a shell-capable agent on the same host</small>
+              </div>
+            </div>
+
+            <p class="sec-boundary-copy">
+              Hyphae treats everything arriving over the network as untrusted and screens it before delivery. For hard isolation against a shell-capable agent on the same machine, run untrusted agents under a separate OS user or container.
+            </p>
+            <div class="sec-actions">
+              <a class="btn-pill btn-olive" href="https://github.com/hyphae-to/hyp/blob/main/docs/security/threat-model.md" target="_blank" rel="noreferrer">Read the threat model ↗</a>
+              <a class="card-inline-link" href="https://github.com/hyphae-to/hyp/blob/main/docs/security/hardening.md" target="_blank" rel="noreferrer">OS-user &amp; container hardening guide ↗</a>
+            </div>
+          </article>
         </div>
 
-        <!-- Honest 4-Row Comparison Table -->
+        <!-- 5-Row Comparison Table -->
         <div id="why" class="compare-block">
           <div class="section-intro">
             <span class="spec-num">Compare</span>
             <h2>When Hyphae makes sense — and when built-in tools win.</h2>
             <p>
-              If you only ever run one tool on one laptop, its built-in subagents need zero setup. Hyphae earns its place as soon as you mix tools, wake agents from events, or span machines.
+              If you only ever run one tool on one laptop, its built-in subagents need zero setup. Hyphae earns its place as soon as you unify real-time events, control agent exposure, mix tools, or span machines.
             </p>
           </div>
 
@@ -1044,52 +1270,64 @@ hyp secret set telegram-bot-token --web</code></pre>
                 </thead>
                 <tbody>
                   <tr>
-                    <th scope="row">Zero install inside a single tool</th>
+                    <th scope="row">Standardized real-time signal bus</th>
+                    <td class="col-hyp">
+                      <div class="cmp-cell">
+                        <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>CI, alerts, cron, drops &amp; DMs on one stream</strong></span>
+                        <button class="cmp-info-btn" type="button" aria-label="Details about standardized signal bus" data-info-title="Standardized Real-Time Signal Bus" data-info-body="GitHub/CI webhooks, Prometheus alerts, OS cron triggers (hyp emit), human Passkey drops, and cross-machine agent DMs normalize onto one source-agnostic CloudEvents + encrypted wire.">i</button>
+                      </div>
+                    </td>
+                    <td><span class="cmp-val"><span class="cmp-no">—</span><span>Single-session task prompts only</span></span></td>
+                    <td><span class="cmp-val"><span class="cmp-part">~</span><span>Ad-hoc scripts per event source</span></span></td>
+                    <td><span class="cmp-val"><span class="cmp-part">~</span><span>Vendor-specific webhooks &amp; SDKs</span></span></td>
+                  </tr>
+                  <tr>
+                    <th scope="row">Exposure &amp; urgency control</th>
+                    <td class="col-hyp">
+                      <div class="cmp-cell">
+                        <span class="cmp-main"><span class="cmp-yes">✓</span> <strong><code>interrupt</code> / <code>queue</code> / <code>notify</code> / <code>mute</code> · 0 polling</strong></span>
+                        <button class="cmp-info-btn" type="button" aria-label="Details about exposure and urgency control" data-info-title="Exposure &amp; Urgency Control" data-info-body="Every agent controls its exact exposure per peer and per stream — with burst protection, Focus Mode, two-stage inbound guards, and push wakeups instead of token-burning polling loops.">i</button>
+                      </div>
+                    </td>
+                    <td><span class="cmp-val"><span class="cmp-no">—</span><span>Parent blocks or polls sub-task</span></span></td>
+                    <td><span class="cmp-val"><span class="cmp-no">—</span><span>Polling loops burn tokens</span></span></td>
+                    <td><span class="cmp-val"><span class="cmp-part">~</span><span>Cloud queues, no local harness gate</span></span></td>
+                  </tr>
+                  <tr>
+                    <th scope="row">Cross-machine &amp; team E2EE + Passkey secrets</th>
+                    <td class="col-hyp">
+                      <div class="cmp-cell">
+                        <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>Node E2EE, blind relays &amp; Keychain <code>hyp exec</code></strong></span>
+                        <button class="cmp-info-btn" type="button" aria-label="Details about cross-machine E2EE and Passkey secrets" data-info-title="Cross-Machine E2EE &amp; Passkey Secrets" data-info-body="Laptop ↔ server ↔ team hub traffic stays HPKE X25519 + AES-256-GCM encrypted (hubs relay ciphertext only). Phone Passkey drops write to OS Keychain and inject via hyp exec --env with live redaction.">i</button>
+                      </div>
+                    </td>
+                    <td><span class="cmp-val"><span class="cmp-no">—</span><span>Single machine, no secret vault</span></span></td>
+                    <td><span class="cmp-val"><span class="cmp-no">—</span><span>Plaintext relay or .env copy-paste</span></span></td>
+                    <td><span class="cmp-val"><span class="cmp-part">~</span><span>Transport TLS + vendor cloud vault</span></span></td>
+                  </tr>
+                  <tr>
+                    <th scope="row">Cross-tool interoperability</th>
+                    <td class="col-hyp">
+                      <div class="cmp-cell">
+                        <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>Claude Code, Codex, Antigravity, Herdr, OpenCode</strong></span>
+                        <button class="cmp-info-btn" type="button" aria-label="Details about cross-tool interoperability" data-info-title="Cross-Tool Interoperability" data-info-body="Full push wakeups, identity &amp; status UI on Claude Code, Codex, Antigravity, Herdr &amp; OpenCode; hook/turn-boundary delivery on Cursor &amp; Gemini CLI — all over the same local daemon.">i</button>
+                      </div>
+                    </td>
+                    <td><span class="cmp-val"><span class="cmp-no">—</span><span>Single vendor only</span></span></td>
+                    <td><span class="cmp-val"><span class="cmp-part">~</span><span>Fragile custom glue per tool</span></span></td>
+                    <td><span class="cmp-val"><span class="cmp-part">~</span><span>Hosted runtime wrappers</span></span></td>
+                  </tr>
+                  <tr>
+                    <th scope="row">Zero setup inside a single tool</th>
                     <td class="col-hyp">
                       <div class="cmp-cell">
                         <span class="cmp-main"><span class="cmp-part">~</span> <strong>One ~8 MiB binary + <code>hyp onboard</code></strong></span>
-                        <button class="cmp-info-btn" type="button" aria-label="Details about install footprint" data-info-title="Install &amp; Footprint" data-info-body="One ~8 MiB binary · no Node or Python for core · 2.7 ms hook overhead · 4 MCP tools. Runs on macOS, Linux &amp; Windows.">i</button>
+                        <button class="cmp-info-btn" type="button" aria-label="Details about install footprint" data-info-title="Install &amp; Footprint" data-info-body="Single static Rust binary (~8 MiB) · no Node or Python for core · 2.7 ms hook overhead · 4 MCP tools across macOS, Linux &amp; Windows.">i</button>
                       </div>
                     </td>
                     <td><span class="cmp-val"><span class="cmp-yes">✓</span><span><strong>Built into the tool</strong></span></span></td>
                     <td><span class="cmp-val"><span class="cmp-part">~</span><span>DIY glue or Node/Python server</span></span></td>
                     <td><span class="cmp-val"><span class="cmp-no">—</span><span>Account + hosted SDK</span></span></td>
-                  </tr>
-                  <tr>
-                    <th scope="row">Cross-tool push wakeups</th>
-                    <td class="col-hyp">
-                      <div class="cmp-cell">
-                        <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>Native push wakeups across tools</strong></span>
-                        <button class="cmp-info-btn" type="button" aria-label="Details about cross-tool wakeups" data-info-title="Cross-Tool Wakeups" data-info-body="Full out-of-the-box identity, push wakeups &amp; status UI on Claude Code, Antigravity, Herdr, Codex &amp; OpenCode; turn/tool boundary delivery on Cursor &amp; Gemini CLI.">i</button>
-                      </div>
-                    </td>
-                    <td><span class="cmp-val"><span class="cmp-no">—</span><span>Single vendor only</span></span></td>
-                    <td><span class="cmp-val"><span class="cmp-no">—</span><span>Polling loops burn tokens</span></span></td>
-                    <td><span class="cmp-val"><span class="cmp-part">~</span><span>Cloud runtime / webhooks</span></span></td>
-                  </tr>
-                  <tr>
-                    <th scope="row">Cross-machine encryption</th>
-                    <td class="col-hyp">
-                      <div class="cmp-cell">
-                        <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>End-to-end encrypted between nodes</strong></span>
-                        <button class="cmp-info-btn" type="button" aria-label="Details about encryption" data-info-title="Node-to-Node E2EE" data-info-body="End-to-end encrypted between nodes · hubs relay ciphertext (RFC 9180 HPKE + Ed25519). Chat bridges and optional cloud classifiers handle plaintext at the edge.">i</button>
-                      </div>
-                    </td>
-                    <td><span class="cmp-val"><span class="cmp-no">—</span><span>Single machine only</span></span></td>
-                    <td><span class="cmp-val"><span class="cmp-no">—</span><span>Plaintext server or copy-paste</span></span></td>
-                    <td><span class="cmp-val"><span class="cmp-part">~</span><span>Transport TLS to vendor</span></span></td>
-                  </tr>
-                  <tr>
-                    <th scope="row">Events, urgency tiers &amp; phone secrets</th>
-                    <td class="col-hyp">
-                      <div class="cmp-cell">
-                        <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>Cron, streams, burst caps &amp; Keychain drops</strong></span>
-                        <button class="cmp-info-btn" type="button" aria-label="Details about events and phone drops" data-info-title="Events &amp; Verified Human Drops" data-info-body="Local cron (hyp emit), public GitHub streams, interrupt/queue/notify/mute tiers, and Passkey drops over a Blind Drop Relay (ciphertext only, wiped within 15 min) directly into OS Keychain.">i</button>
-                      </div>
-                    </td>
-                    <td><span class="cmp-val"><span class="cmp-no">—</span><span>None</span></span></td>
-                    <td><span class="cmp-val"><span class="cmp-no">—</span><span>DIY scripts &amp; env files</span></span></td>
-                    <td><span class="cmp-val"><span class="cmp-part">~</span><span>Vendor webhooks &amp; vaults</span></span></td>
                   </tr>
                 </tbody>
               </table>
@@ -1554,6 +1792,6 @@ hyp onboard</pre>
     <p class="cmp-pop-body" id="cmpPopBody"></p>
   </div>
 
-  <script type="module" src="./app.js?v=19"></script>
+  <script type="module" src="./app.js?v=20"></script>
 </body>
 </html>
