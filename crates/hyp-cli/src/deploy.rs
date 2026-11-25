@@ -885,6 +885,7 @@ fn build_node_json(
             "listen": {
                 "bind": bind,
                 "behindReverseProxy": behind_reverse_proxy,
+                "trustedProxies": ["127.0.0.1/32", "::1/128"],
                 "publicUrl": format!("https://{domain}")
             },
             "policy": {
@@ -910,6 +911,7 @@ fn build_node_json(
             "listen": {
                 "bind": bind,
                 "behindReverseProxy": behind_reverse_proxy,
+                "trustedProxies": ["127.0.0.1/32", "::1/128"],
                 "publicUrl": format!("https://{domain}")
             },
             "policy": {
@@ -963,6 +965,7 @@ fn build_node_json(
             "listen": {
                 "bind": bind,
                 "behindReverseProxy": behind_reverse_proxy,
+                "trustedProxies": ["127.0.0.1/32", "::1/128"],
                 "publicUrl": format!("https://{domain}")
             },
             "policy": {
@@ -995,6 +998,7 @@ fn build_node_json(
             "listen": {
                 "bind": bind,
                 "behindReverseProxy": behind_reverse_proxy,
+                "trustedProxies": ["127.0.0.1/32", "::1/128"],
                 "publicUrl": format!("https://{domain}")
             },
             "policy": {
@@ -1012,7 +1016,7 @@ fn build_node_json(
                 {
                     "id": "github-webhook",
                     "kind": "github-webhook",
-                    "topic": "github",
+                    "topic": "github-webhooks",
                     "enabled": false,
                     "webhookSecret": { "secret": "github-webhook-secret" }
                 }
@@ -1026,7 +1030,7 @@ fn build_node_json(
                     "Ask the administrator of '{node_id}' for an updated am2_ grant or scope upgrade."
                 ),
                 "byScope": {
-                    "stream:subscribe=github": "Request GitHub repo stream access from your Hyphae node admin."
+                    "stream:subscribe=github-webhooks": "Request GitHub webhook stream access from your Hyphae node admin."
                 }
             }
         })
@@ -1136,8 +1140,59 @@ fn uses_team_admin_ca(provider: DeployProvider, profile: DeployProfile) -> bool 
         && profile == DeployProfile::Router
 }
 
-fn render_dockerfile(port: u16) -> String {
-    r#"# syntax=docker/dockerfile:1
+fn render_dockerfile(port: u16, fly_mount_entrypoint: bool) -> String {
+    let runtime_tail = if fly_mount_entrypoint {
+        r#"# Fly.io mounts [[mounts]] volumes (/var/lib/hyphae) root-owned (0755 root:root) on boot.
+# Ensure /var/lib/hyphae is owned by UID 10001:10001 (mode 0700) and immediately drop
+# privileges via util-linux `setpriv` (Essential on Debian) before exec'ing `hyp`.
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'STATE_DIR="${HYPHAE_STATE_DIR:-/var/lib/hyphae}"' \
+    'if [ "$(id -u)" = "0" ]; then' \
+    '  mkdir -p "$STATE_DIR"' \
+    '  chown -R 10001:10001 "$STATE_DIR"' \
+    '  chmod 0700 "$STATE_DIR"' \
+    '  export HOME=/var/lib/hyphae' \
+    '  exec setpriv --reuid=10001 --regid=10001 --init-groups /usr/local/bin/hyp "$@"' \
+    'fi' \
+    'exec /usr/local/bin/hyp "$@"' \
+    > /usr/local/bin/hyphae-entrypoint.sh \
+    && chmod 0755 /usr/local/bin/hyphae-entrypoint.sh
+
+ENV HOME=/var/lib/hyphae \
+    HYPHAE_SECRET_BACKEND=file \
+    HYPHAE_STATE_DIR=/var/lib/hyphae \
+    HYPHAE_CONFIG=/etc/hyphae/node.json
+
+WORKDIR /var/lib/hyphae
+EXPOSE __PORT__
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["setpriv", "--reuid=10001", "--regid=10001", "--init-groups", "/usr/local/bin/hyp", "deploy", "check", "--url", "http://127.0.0.1:__PORT__", "--json"]
+
+ENTRYPOINT ["/usr/local/bin/hyphae-entrypoint.sh"]
+CMD ["node", "start", "--config", "/etc/hyphae/node.json", "--no-local-socket"]
+"#
+    } else {
+        r#"ENV HYPHAE_SECRET_BACKEND=file \
+    HYPHAE_STATE_DIR=/var/lib/hyphae \
+    HYPHAE_CONFIG=/etc/hyphae/node.json
+
+USER 10001:10001
+WORKDIR /var/lib/hyphae
+EXPOSE __PORT__
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/hyp", "deploy", "check", "--url", "http://127.0.0.1:__PORT__", "--json"]
+
+ENTRYPOINT ["/usr/local/bin/hyp"]
+CMD ["node", "start", "--config", "/etc/hyphae/node.json", "--no-local-socket"]
+"#
+    };
+
+    format!(
+        r#"# syntax=docker/dockerfile:1
 # Hyphae v2 standalone runtime image (SHA-256 verified release binary, non-root UID 10001)
 # Uses debian:bookworm-slim (glibc + ca-certificates) so both x86_64-unknown-linux-musl
 # and aarch64-unknown-linux-gnu official release binaries execute cleanly.
@@ -1148,22 +1203,22 @@ ARG TARGETARCH
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl tar \
     && rm -rf /var/lib/apt/lists/* \
-    && ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
-    && case "${ARCH}" in \
+    && ARCH="${{TARGETARCH:-$(dpkg --print-architecture)}}" \
+    && case "${{ARCH}}" in \
          amd64) HYP_TARGET="x86_64-unknown-linux-musl" ;; \
          arm64) HYP_TARGET="aarch64-unknown-linux-gnu" ;; \
-         *) echo "Unsupported TARGETARCH: ${ARCH}" >&2; exit 1 ;; \
+         *) echo "Unsupported TARGETARCH: ${{ARCH}}" >&2; exit 1 ;; \
        esac \
-    && ARCHIVE="hyp-${HYP_VERSION}-${HYP_TARGET}.tar.gz" \
-    && BASE_URL="https://github.com/hyphae-to/hyp/releases/download/${HYP_VERSION}" \
+    && ARCHIVE="hyp-${{HYP_VERSION}}-${{HYP_TARGET}}.tar.gz" \
+    && BASE_URL="https://github.com/hyphae-to/hyp/releases/download/${{HYP_VERSION}}" \
     && cd /tmp \
-    && curl -fsSL --proto '=https' --tlsv1.2 "${BASE_URL}/${ARCHIVE}" -o "${ARCHIVE}" \
-    && curl -fsSL --proto '=https' --tlsv1.2 "${BASE_URL}/SHA256SUMS.txt" -o SHA256SUMS.txt \
-    && grep -E "[ *]${ARCHIVE}$" SHA256SUMS.txt >/dev/null \
+    && curl -fsSL --proto '=https' --tlsv1.2 "${{BASE_URL}}/${{ARCHIVE}}" -o "${{ARCHIVE}}" \
+    && curl -fsSL --proto '=https' --tlsv1.2 "${{BASE_URL}}/SHA256SUMS.txt" -o SHA256SUMS.txt \
+    && grep -E "[ *]${{ARCHIVE}}$" SHA256SUMS.txt >/dev/null \
     && sha256sum -c --ignore-missing SHA256SUMS.txt \
-    && tar -xzf "${ARCHIVE}" -C /tmp \
+    && tar -xzf "${{ARCHIVE}}" -C /tmp \
     && install -m 0755 /tmp/hyp /usr/local/bin/hyp \
-    && rm -rf "/tmp/${ARCHIVE}" /tmp/SHA256SUMS.txt /tmp/hyp
+    && rm -rf "/tmp/${{ARCHIVE}}" /tmp/SHA256SUMS.txt /tmp/hyp
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -1183,20 +1238,8 @@ COPY --from=downloader /usr/local/bin/hyp /usr/local/bin/hyp
 COPY --chown=10001:10001 node.json /etc/hyphae/node.json
 RUN chmod 0640 /etc/hyphae/node.json
 
-ENV HYPHAE_SECRET_BACKEND=file \
-    HYPHAE_STATE_DIR=/var/lib/hyphae \
-    HYPHAE_CONFIG=/etc/hyphae/node.json
-
-USER 10001:10001
-WORKDIR /var/lib/hyphae
-EXPOSE __PORT__
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["/usr/local/bin/hyp", "deploy", "check", "--url", "http://127.0.0.1:__PORT__", "--json"]
-
-ENTRYPOINT ["/usr/local/bin/hyp"]
-CMD ["node", "start", "--config", "/etc/hyphae/node.json", "--no-local-socket"]
-"#
+{runtime_tail}"#
+    )
     .replace("__HYP_VERSION__", env!("CARGO_PKG_VERSION"))
     .replace("__PORT__", &port.to_string())
 }
@@ -1395,13 +1438,13 @@ fn render_kit_readme(
                 "printf '%s\\n' \"$ADMIN_JWK\" | docker compose exec -T hyphae-node hyp secret set hyphae-admin-pubkey\ndocker compose restart hyphae-node".to_string()
             }
             DeployProvider::Fly => format!(
-                "printf '%s\\n' \"$ADMIN_JWK\" | flyctl ssh console -a {app_name} -C \"sh -c 'cat | hyp secret set hyphae-admin-pubkey'\"\nflyctl apps restart {app_name}"
+                "printf '%s\\n' \"$ADMIN_JWK\" | flyctl ssh console -a {app_name} -C \"sh -c 'cat | env HOME=/var/lib/hyphae HYPHAE_SECRET_BACKEND=file HYPHAE_STATE_DIR=/var/lib/hyphae setpriv --reuid=10001 --regid=10001 --init-groups /usr/local/bin/hyp secret set hyphae-admin-pubkey --state-dir /var/lib/hyphae'\"\nflyctl apps restart {app_name}"
             ),
-            DeployProvider::Vps => {
+            DeployProvider::Vps | DeployProvider::Tailscale | DeployProvider::Cloudflare => {
                 "printf '%s\\n' \"$ADMIN_JWK\" | sudo -u hyphae env HYPHAE_SECRET_BACKEND=file /usr/local/bin/hyp secret set hyphae-admin-pubkey --state-dir /var/lib/hyphae".to_string()
             }
             _ => {
-                "printf '%s\\n' \"$ADMIN_JWK\" | hyp secret set hyphae-admin-pubkey --state-dir /var/lib/hyphae".to_string()
+                "printf '%s\\n' \"$ADMIN_JWK\" | sudo -u hyphae env HYPHAE_SECRET_BACKEND=file /usr/local/bin/hyp secret set hyphae-admin-pubkey --state-dir /var/lib/hyphae".to_string()
             }
         };
         out.push_str(&format!(
@@ -1755,7 +1798,7 @@ fn build_provider_artifacts(
                 GeneratedArtifact {
                     rel_path: "Dockerfile",
                     description: "Standalone release-binary image (non-root UID 10001, baked node.json, manifest healthcheck)",
-                    content: render_dockerfile(port),
+                    content: render_dockerfile(port, false),
                     executable: false,
                 },
                 GeneratedArtifact {
@@ -1826,8 +1869,8 @@ fn build_provider_artifacts(
                 },
                 GeneratedArtifact {
                     rel_path: "Dockerfile",
-                    description: "Standalone release-binary image (non-root UID 10001, baked node.json, manifest healthcheck)",
-                    content: render_dockerfile(port),
+                    description: "Standalone release-binary image (Fly mount ownership entrypoint + setpriv drop to UID 10001:10001, baked node.json)",
+                    content: render_dockerfile(port, true),
                     executable: false,
                 },
                 GeneratedArtifact {
@@ -1868,7 +1911,7 @@ fn build_provider_artifacts(
                 GeneratedArtifact {
                     rel_path: "Dockerfile",
                     description: "Standalone release-binary image (non-root UID 10001, baked node.json, manifest healthcheck)",
-                    content: render_dockerfile(port),
+                    content: render_dockerfile(port, false),
                     executable: false,
                 },
                 GeneratedArtifact {
@@ -1907,7 +1950,7 @@ fn build_provider_artifacts(
                 GeneratedArtifact {
                     rel_path: "Dockerfile",
                     description: "Standalone release-binary image (non-root UID 10001, baked node.json)",
-                    content: render_dockerfile(port),
+                    content: render_dockerfile(port, false),
                     executable: false,
                 },
                 GeneratedArtifact {
@@ -1965,7 +2008,7 @@ fn build_init_next_steps(
             let mut steps = vec![format!("hyp deploy check --config {dir}/node.json")];
             if team_admin_ca {
                 steps.push(
-                    "hyp secret set hyphae-admin-pubkey --state-dir /var/lib/hyphae <<< '<public adminJwk JSON from admin laptop>'  # enables am2_ pairing on first boot (private Admin-CA key stays on laptop)".to_string(),
+                    "sudo -u hyphae env HYPHAE_SECRET_BACKEND=file /usr/local/bin/hyp secret set hyphae-admin-pubkey --state-dir /var/lib/hyphae <<< '<public adminJwk JSON from admin laptop>'  # enables am2_ pairing on first boot (private Admin-CA key stays on laptop)".to_string(),
                 );
             }
             steps.push(format!(
@@ -2026,7 +2069,7 @@ fn build_init_next_steps(
             ];
             if team_admin_ca {
                 steps.push(
-                    "hyp secret set hyphae-admin-pubkey --state-dir /var/lib/hyphae <<< '<public adminJwk JSON from admin laptop>'  # enables am2_ pairing on first boot (private Admin-CA key stays on laptop)".to_string(),
+                    "sudo -u hyphae env HYPHAE_SECRET_BACKEND=file /usr/local/bin/hyp secret set hyphae-admin-pubkey --state-dir /var/lib/hyphae <<< '<public adminJwk JSON from admin laptop>'  # enables am2_ pairing on first boot (private Admin-CA key stays on laptop)".to_string(),
                 );
             }
             steps.push(format!(
@@ -2049,7 +2092,7 @@ fn build_init_next_steps(
             ];
             if team_admin_ca {
                 steps.push(format!(
-                    "flyctl ssh console -a {app_name} -C \"sh -c 'cat | hyp secret set hyphae-admin-pubkey'\" <<< '<public adminJwk JSON from admin laptop>' && flyctl apps restart {app_name}  # enables am2_ pairing (private Admin-CA key stays on laptop)"
+                    "flyctl ssh console -a {app_name} -C \"sh -c 'cat | env HOME=/var/lib/hyphae HYPHAE_SECRET_BACKEND=file HYPHAE_STATE_DIR=/var/lib/hyphae setpriv --reuid=10001 --regid=10001 --init-groups /usr/local/bin/hyp secret set hyphae-admin-pubkey --state-dir /var/lib/hyphae'\" <<< '<public adminJwk JSON from admin laptop>' && flyctl apps restart {app_name}  # enables am2_ pairing (private Admin-CA key stays on laptop)"
                 ));
             }
             steps.push(format!(

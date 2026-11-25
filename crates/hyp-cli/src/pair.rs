@@ -2388,6 +2388,57 @@ fn check_existing_signing_pin(
     Ok(())
 }
 
+fn normalize_endpoint_for_pin(endpoint: &str) -> String {
+    endpoint.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+/// Fail-closed pin guard (`N2`): refuses re-pointing an existing non-revoked peer to a different
+/// `PeerProfile` (e.g. `Router` -> `P2p`) or a different `endpoint`.
+///
+/// Prevents crafted `hp2p1_` / `am2_` tokens (especially under `--offline`) from hijacking an
+/// already-paired hub or peer's profile/endpoint by reusing its public key.
+fn check_existing_peer_pin(
+    db: &NodeDb,
+    peer_id: &str,
+    expected_profile: PeerProfile,
+    expected_endpoint: &str,
+) -> Result<(), (&'static str, String)> {
+    let existing = db.peers().get_peer(peer_id).map_err(|e| {
+        (
+            "DB_ERROR",
+            format!("Failed to query existing peer '{peer_id}': {e}"),
+        )
+    })?;
+    let Some(peer) = existing else {
+        return Ok(());
+    };
+    if peer.status == PeerStatus::Revoked {
+        return Ok(());
+    }
+    if peer.profile != expected_profile {
+        return Err((
+            "PEER_PROFILE_CONFLICT",
+            format!(
+                "Peer '{peer_id}' is already paired with profile '{}' and cannot be changed to '{}' without revoking it first (`hyp pair revoke {peer_id}`).",
+                peer.profile.as_str(),
+                expected_profile.as_str()
+            ),
+        ));
+    }
+    if let Some(ref existing_ep) = peer.endpoint {
+        if normalize_endpoint_for_pin(existing_ep) != normalize_endpoint_for_pin(expected_endpoint)
+        {
+            return Err((
+                "PEER_ENDPOINT_CONFLICT",
+                format!(
+                    "Peer '{peer_id}' is already pinned to endpoint '{existing_ep}' and cannot be re-pointed to '{expected_endpoint}' without revoking it first (`hyp pair revoke {peer_id}`)."
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Live HTTP Pairing Handshakes (`hp2p1_` & `am2_`, shared with `onboard --join`)
 // ============================================================================
@@ -3307,6 +3358,21 @@ fn accept_hp2p1(
         if let Err((code, msg)) = check_existing_signing_pin(db, &offer.node_id, &kid) {
             return emit_error(cmd, as_json, EXIT_ERROR, code, msg, None);
         }
+        if let Err((code, msg)) =
+            check_existing_peer_pin(db, &offer.node_id, PeerProfile::P2p, &offer.endpoint)
+        {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                code,
+                msg,
+                Some(format!(
+                    "Revoke the existing peer first with `hyp pair revoke {}` before re-pairing to a different profile or endpoint.",
+                    offer.node_id
+                )),
+            );
+        }
     }
 
     let local_node_id = match resolve_local_node_id(
@@ -4001,6 +4067,31 @@ fn accept_am2(
         }
     };
 
+    if let Some(ref db) = existing_db {
+        let preflight_peer_id = raw_hub_node_id
+            .map(ToOwned::to_owned)
+            .or_else(|| derive_peer_id_from_url(&invite.router).ok());
+        if let Some(ref candidate_peer_id) = preflight_peer_id {
+            if let Err((code, msg)) = check_existing_peer_pin(
+                db,
+                candidate_peer_id,
+                PeerProfile::Router,
+                &invite.router,
+            ) {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    code,
+                    msg,
+                    Some(format!(
+                        "Revoke the existing peer first with `hyp pair revoke {candidate_peer_id}` before re-pairing to a different profile or endpoint."
+                    )),
+                );
+            }
+        }
+    }
+
     // Execute live HTTP `POST <invite.router>/v1/pair` handshake unless `--offline` is set!
     let live_res = if offline {
         warnings.push(
@@ -4070,6 +4161,23 @@ fn accept_am2(
             }
         }
     };
+
+    if let Some(ref db) = existing_db {
+        if let Err((code, msg)) =
+            check_existing_peer_pin(db, &peer_id, PeerProfile::Router, &invite.router)
+        {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                code,
+                msg,
+                Some(format!(
+                    "Revoke the existing peer first with `hyp pair revoke {peer_id}` before re-pairing to a different profile or endpoint."
+                )),
+            );
+        }
+    }
 
     if let Some(ref live) = live_res {
         scopes = live.verified_grant.scopes.clone();
@@ -4468,6 +4576,8 @@ pub(crate) fn live_pair_hp2p1_for_onboard(
     let enc_kid = encryption_pk.kid();
     check_existing_signing_pin(db, &offer.node_id, &kid)
         .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
+    check_existing_peer_pin(db, &offer.node_id, PeerProfile::P2p, &offer.endpoint)
+        .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
 
     let expanded_offered = if offer.offered_scopes.is_empty() {
         Vec::new()
@@ -4714,6 +4824,8 @@ pub(crate) fn live_pair_am2_for_onboard(
     )?;
 
     check_existing_signing_pin(db, &live.hub_node_id, &live.hub_signing_pk.kid())
+        .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
+    check_existing_peer_pin(db, &live.hub_node_id, PeerProfile::Router, &invite.router)
         .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
 
     let cred_ref = credential_secret_name("peer-auth", &live.hub_node_id);
@@ -6518,5 +6630,199 @@ mod tests {
             true,
         );
         assert_eq!(forced, ExitCode::from(EXIT_OK));
+    }
+
+    #[test]
+    fn n2_refuses_repointing_existing_router_or_p2p_peer_via_hp2p1_or_am2() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let now = now_ms();
+
+        // Seed an existing active Router hub peer (`acme-team`) pinned to `https://hub.acme.example`
+        // and its real public signing key (`hub_keys`).
+        let hub_keys = NodeIdentityKeys::generate().unwrap();
+        let hub_sign_jwk_json = serde_json::to_string(&hub_keys.signing_jwk()).unwrap();
+        let db = NodeDb::open(state.join("node.sqlite")).unwrap();
+        db.peers()
+            .upsert_peer(
+                &PeerInput {
+                    peer_id: "acme-team".to_string(),
+                    endpoint: Some("https://hub.acme.example".to_string()),
+                    profile: PeerProfile::Router,
+                    trust_tier: StoreTrustTier::Org,
+                    status: PeerStatus::Active,
+                    scopes: vec!["dm:*".to_string()],
+                    auth_credential_ref: Some("peer-auth-acme".to_string()),
+                },
+                now,
+            )
+            .unwrap();
+        db.peers()
+            .upsert_peer_key(
+                &PeerKeyInput {
+                    peer_id: "acme-team".to_string(),
+                    kid: hub_keys.kid(),
+                    key_use: KeyUse::Signing,
+                    jwk_json: hub_sign_jwk_json,
+                    status: KeyStatus::Active,
+                    expires_at: None,
+                },
+                now,
+            )
+            .unwrap();
+
+        // 1. Direct pin guard checks:
+        //    - Same Router profile & same endpoint (even with trailing slash) -> OK
+        assert!(check_existing_peer_pin(
+            &db,
+            "acme-team",
+            PeerProfile::Router,
+            "https://hub.acme.example/"
+        )
+        .is_ok());
+
+        //    - Profile change (Router -> P2p) -> PEER_PROFILE_CONFLICT
+        let profile_err = check_existing_peer_pin(
+            &db,
+            "acme-team",
+            PeerProfile::P2p,
+            "https://hub.acme.example",
+        )
+        .unwrap_err();
+        assert_eq!(profile_err.0, "PEER_PROFILE_CONFLICT");
+
+        //    - Endpoint change on same Router profile -> PEER_ENDPOINT_CONFLICT
+        let endpoint_err = check_existing_peer_pin(
+            &db,
+            "acme-team",
+            PeerProfile::Router,
+            "https://evil.attacker.example",
+        )
+        .unwrap_err();
+        assert_eq!(endpoint_err.0, "PEER_ENDPOINT_CONFLICT");
+
+        drop(db);
+
+        // 2. End-to-end offline attack: attacker crafts an unsigned `hp2p1_` carrying the hub's
+        //    real public keys (`hub_keys`, bypassing `check_existing_signing_pin`!) to re-point
+        //    `acme-team` to `https://evil.attacker.example` as a P2p peer.
+        let future_exp = format_rfc3339_millis(now_unix_ms() + 3_600_000);
+        let forged_offer = create_p2p_offer(
+            "offer-n2-hijack",
+            "acme-team",
+            "https://evil.attacker.example",
+            &hub_keys,
+            vec!["dm:send".to_string(), "dm:receive".to_string()],
+            vec![],
+            &future_exp,
+        )
+        .unwrap();
+        let forged_hp2p1 = encode_hp2p1(&forged_offer).unwrap();
+
+        let code = accept_hp2p1(
+            &forged_hp2p1,
+            Some(state.to_path_buf()),
+            Some("bob@laptop".to_string()),
+            None,
+            true,
+            Vec::new(),
+            true,
+        );
+        assert_eq!(
+            code,
+            ExitCode::from(EXIT_ERROR),
+            "N2: hp2p1_ --offline must refuse re-pointing an existing Router peer"
+        );
+
+        // Confirm SQLite record is 100% untouched (still Router, still https://hub.acme.example).
+        let db_check = NodeDb::open(state.join("node.sqlite")).unwrap();
+        let hub_after = db_check.peers().get_peer("acme-team").unwrap().unwrap();
+        assert_eq!(hub_after.profile, PeerProfile::Router);
+        assert_eq!(
+            hub_after.endpoint.as_deref(),
+            Some("https://hub.acme.example")
+        );
+
+        // 3. Also test `accept_am2 --offline` cannot re-point `acme-team` to a different router URL!
+        let admin_kp = Ed25519KeyPair::generate().unwrap();
+        let issued = issue_grant_v1(&admin_kp, "bob@laptop", &["messages:send"], 3_600_000, now_unix_ms())
+            .unwrap();
+        let hijacked_am2_val = json!({
+            "v": 2,
+            "router": "https://evil-hub.attacker.example",
+            "nodeId": "acme-team",
+            "peerId": "bob@laptop",
+            "adminJwk": admin_kp.to_jwk(),
+            "pairingCode": issued.code,
+            "requireE2ee": true,
+            "scopes": ["dm:send", "dm:receive"]
+        });
+        let hijacked_am2 = format!(
+            "{AM2_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&hijacked_am2_val).unwrap())
+        );
+        drop(db_check);
+
+        let am2_code = accept_am2(
+            &hijacked_am2,
+            Some(state.to_path_buf()),
+            Some("bob@laptop".to_string()),
+            None,
+            true,
+            Vec::new(),
+            true,
+        );
+        assert_eq!(
+            am2_code,
+            ExitCode::from(EXIT_ERROR),
+            "N2: am2_ --offline must refuse re-pointing an existing Router peer's endpoint"
+        );
+
+        let db_check2 = NodeDb::open(state.join("node.sqlite")).unwrap();
+        let hub_after2 = db_check2.peers().get_peer("acme-team").unwrap().unwrap();
+        assert_eq!(
+            hub_after2.endpoint.as_deref(),
+            Some("https://hub.acme.example")
+        );
+
+        // 4. Same-profile P2p peer cannot be re-pointed to a new endpoint either!
+        let alice_keys = NodeIdentityKeys::generate().unwrap();
+        db_check2
+            .peers()
+            .upsert_peer(
+                &PeerInput {
+                    peer_id: "alice@macbook".to_string(),
+                    endpoint: Some("https://alice.tailnet.ts.net".to_string()),
+                    profile: PeerProfile::P2p,
+                    trust_tier: StoreTrustTier::Peer,
+                    status: PeerStatus::Active,
+                    scopes: vec!["dm:send".to_string()],
+                    auth_credential_ref: Some("peer-auth-alice".to_string()),
+                },
+                now,
+            )
+            .unwrap();
+        let p2p_ep_err = check_existing_peer_pin(
+            &db_check2,
+            "alice@macbook",
+            PeerProfile::P2p,
+            "https://evil.attacker.example",
+        )
+        .unwrap_err();
+        assert_eq!(p2p_ep_err.0, "PEER_ENDPOINT_CONFLICT");
+
+        // 5. After explicitly revoking `acme-team`, re-pairing to a new endpoint/profile is allowed!
+        db_check2
+            .peers()
+            .set_peer_status("acme-team", PeerStatus::Revoked, now + 1)
+            .unwrap();
+        assert!(check_existing_peer_pin(
+            &db_check2,
+            "acme-team",
+            PeerProfile::P2p,
+            "https://new.acme.example"
+        )
+        .is_ok());
+        assert!(alice_keys.kid().len() > 10);
     }
 }

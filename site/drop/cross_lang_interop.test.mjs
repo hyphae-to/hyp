@@ -75,6 +75,168 @@ function runHyp(hypBin, env, args, stdinText = undefined) {
   return res;
 }
 
+const PY_PTY_DRIVER = `
+import errno, fcntl, json, os, pty, select, subprocess, sys, termios, time
+
+cfg = json.loads(sys.stdin.read())
+argv = cfg["argv"]
+stdin_data = cfg.get("stdinData")
+tty_reply = cfg.get("ttyReply")
+timeout = float(cfg.get("timeoutSecs", 20.0))
+
+master_fd, slave_fd = pty.openpty()
+
+def setup_child():
+    os.setsid()
+    fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+
+stdin_pipe_r = None
+stdin_pipe_w = None
+if stdin_data is not None:
+    stdin_pipe_r, stdin_pipe_w = os.pipe()
+    child_stdin = stdin_pipe_r
+else:
+    child_stdin = slave_fd
+
+stdout_r, stdout_w = os.pipe()
+
+proc = subprocess.Popen(
+    argv,
+    stdin=child_stdin,
+    stdout=stdout_w,
+    stderr=slave_fd,
+    preexec_fn=setup_child,
+    close_fds=True,
+)
+os.close(slave_fd)
+os.close(stdout_w)
+if stdin_pipe_r is not None:
+    os.close(stdin_pipe_r)
+if stdin_pipe_w is not None:
+    raw = stdin_data.encode("utf-8")
+    view = memoryview(raw)
+    while view:
+        written = os.write(stdin_pipe_w, view)
+        view = view[written:]
+    os.close(stdin_pipe_w)
+
+os.set_blocking(master_fd, False)
+os.set_blocking(stdout_r, False)
+
+tty_buf = bytearray()
+stdout_buf = bytearray()
+replied = False
+deadline = time.monotonic() + timeout
+stdout_open = True
+tty_open = True
+
+def drain_fd(fd, target):
+    try:
+        while True:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                return False
+            target.extend(chunk)
+    except OSError as e:
+        if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+            return True
+        if e.errno == errno.EIO:
+            return False
+        raise
+
+while stdout_open or tty_open or proc.poll() is None:
+    now = time.monotonic()
+    if now >= deadline:
+        proc.kill()
+        proc.wait()
+        sys.stderr.write(
+            f"PTY driver timed out after {timeout}s; tty={tty_buf.decode('utf-8', 'replace')!r}\\n"
+        )
+        sys.exit(124)
+
+    watch = []
+    if tty_open:
+        watch.append(master_fd)
+    if stdout_open:
+        watch.append(stdout_r)
+
+    if watch:
+        rlist, _, _ = select.select(watch, [], [], min(0.05, max(0.005, deadline - now)))
+    else:
+        rlist = []
+        time.sleep(0.01)
+
+    if master_fd in rlist:
+        tty_open = drain_fd(master_fd, tty_buf)
+    if stdout_r in rlist:
+        stdout_open = drain_fd(stdout_r, stdout_buf)
+
+    if not replied and b"[y/N]:" in tty_buf:
+        replied = True
+        if tty_reply is not None:
+            os.write(master_fd, tty_reply.encode("utf-8"))
+        else:
+            os.write(master_fd, b"\\x04")
+
+    if proc.poll() is not None and not rlist:
+        if tty_open:
+            tty_open = drain_fd(master_fd, tty_buf)
+        if stdout_open:
+            stdout_open = drain_fd(stdout_r, stdout_buf)
+        if not tty_open and not stdout_open:
+            break
+        time.sleep(0.01)
+        if tty_open:
+            tty_open = drain_fd(master_fd, tty_buf)
+        if stdout_open:
+            stdout_open = drain_fd(stdout_r, stdout_buf)
+        break
+
+exit_code = proc.wait()
+os.close(master_fd)
+os.close(stdout_r)
+sys.stdout.write(json.dumps({
+    "code": exit_code,
+    "stdout": stdout_buf.decode("utf-8", errors="replace"),
+    "tty": tty_buf.decode("utf-8", errors="replace"),
+}))
+`;
+
+/**
+ * Drives a security-sensitive `hyp` subcommand (such as `hyp auth add`, guarded by `#10`/`H1`
+ * interactive TTY confirmation) inside a real POSIX PTY via Python 3 stdlib `pty`, piping
+ * `stdinText` to stdin while answering `[y/N]:` on the controlling `/dev/tty` and keeping
+ * `--json` stdout cleanly separated.
+ */
+function runHypInPty(hypBin, env, args, stdinText = undefined, ttyReply = "y\n") {
+  const payload = JSON.stringify({
+    argv: [hypBin, ...args],
+    stdinData: stdinText ?? null,
+    ttyReply: ttyReply ?? null,
+    timeoutSecs: 20.0,
+  });
+  const pyRes = spawnSync("python3", ["-c", PY_PTY_DRIVER], {
+    env,
+    input: payload,
+    encoding: "utf8",
+    timeout: 25_000,
+  });
+  if (pyRes.error) {
+    throw pyRes.error;
+  }
+  assert.equal(
+    pyRes.status,
+    0,
+    `POSIX PTY driver failed (exit=${pyRes.status}):\nstdout=${pyRes.stdout}\nstderr=${pyRes.stderr}`,
+  );
+  const parsed = JSON.parse(pyRes.stdout);
+  return {
+    status: parsed.code,
+    stdout: parsed.stdout,
+    stderr: parsed.tty,
+  };
+}
+
 function parseJsonStdout(res, label) {
   assert.equal(
     res.status,
@@ -202,26 +364,27 @@ describe("Cross-language Verified Human Drops interop (JS <-> Rust hyp CLI)", ()
       encKid: humanEncKp.kid,
       nodeCert: jsSignedHcert1,
     };
-    const addRes = runHyp(
-      hypBin,
-      isoEnv,
-      [
-        "auth",
-        "add",
-        "--human-id",
-        humanId,
-        "--label",
-        "js-passkey-interop",
-        "--role",
-        "signer",
-        "--state-dir",
-        stateDir,
-        "--config",
-        configPath,
-        "--json",
-      ],
-      JSON.stringify(enrollmentBundle),
-    );
+    const addArgs = [
+      "auth",
+      "add",
+      "--human-id",
+      humanId,
+      "--label",
+      "js-passkey-interop",
+      "--role",
+      "signer",
+      "--state-dir",
+      stateDir,
+      "--config",
+      configPath,
+      "--json",
+    ];
+    // Confirm non-TTY invocation fails closed (`#10`/`H1`), then enroll via real POSIX PTY.
+    const nonTtyRes = runHyp(hypBin, isoEnv, addArgs, JSON.stringify(enrollmentBundle));
+    assert.equal(nonTtyRes.status, 2, "non-TTY hyp auth add must fail closed with INTERACTIVE_TTY_REQUIRED");
+    assert.equal(JSON.parse(nonTtyRes.stdout).error.code, "INTERACTIVE_TTY_REQUIRED");
+
+    const addRes = runHypInPty(hypBin, isoEnv, addArgs, JSON.stringify(enrollmentBundle), "y\n");
     const addJson = parseJsonStdout(addRes, "hyp auth add (JS Passkey bundle + hcert1_)");
     assert.equal(addJson.data.kid, humanEdKp.kid);
     assert.equal(addJson.data.encKid, humanEncKp.kid);

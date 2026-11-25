@@ -161,8 +161,21 @@ fn all_seven_providers_generate_valid_uid10001_readable_configs_and_boot_cleanly
             "{provider}: invalid SocketAddr '{expected_bind}'"
         );
         assert_eq!(cfg_val["listen"]["behindReverseProxy"], true);
+        assert_eq!(
+            cfg_val["listen"]["trustedProxies"],
+            serde_json::json!(["127.0.0.1/32", "::1/128"]),
+            "{provider}: proxied node.json must declare loopback trustedProxies"
+        );
         assert_eq!(cfg_val["listen"]["publicUrl"], format!("https://{domain}"));
         assert_eq!(cfg_val["stateDir"], "/var/lib/hyphae");
+        if matches!(provider, "docker" | "fly" | "vps" | "tailscale" | "cloudflare") {
+            assert_eq!(
+                cfg_val["sources"][0]["topic"], "github-webhooks",
+                "{provider}: Team Hub webhook source must use isolated topic 'github-webhooks'"
+            );
+        } else if provider == "public-node" {
+            assert_eq!(cfg_val["sources"][0]["topic"], "github");
+        }
 
         // 3. Verify `hyp deploy check --config` exits 0 with zero FAIL checks.
         let check_out = isolated_cmd(home)
@@ -265,7 +278,21 @@ fn fly_and_drop_relay_kits_bind_0000_copy_node_json_and_honor_custom_ports() {
     );
     assert!(fly_df.contains("chown 10001:10001 /var/lib/hyphae /etc/hyphae"));
     assert!(fly_df.contains("chmod 0700 /var/lib/hyphae"));
-    assert!(fly_df.contains("USER 10001:10001"));
+    assert!(
+        fly_df.contains("/usr/local/bin/hyphae-entrypoint.sh")
+            && fly_df.contains("chown -R 10001:10001")
+            && fly_df.contains("chmod 0700")
+            && fly_df.contains("exec setpriv --reuid=10001 --regid=10001 --init-groups /usr/local/bin/hyp"),
+        "OR2: Fly Dockerfile must fix root-owned [[mounts]] volume and drop to UID 10001:10001 via setpriv:\n{fly_df}"
+    );
+    assert!(
+        fly_df.contains("ENTRYPOINT [\"/usr/local/bin/hyphae-entrypoint.sh\"]"),
+        "OR2: Fly Dockerfile must invoke hyphae-entrypoint.sh:\n{fly_df}"
+    );
+    assert!(
+        !fly_df.contains("USER 10001:10001"),
+        "OR2: Fly Dockerfile must start as root briefly to chown mounted volume before dropping via setpriv:\n{fly_df}"
+    );
     assert!(fly_df.contains("CMD [\"node\", \"start\", \"--config\", \"/etc/hyphae/node.json\", \"--no-local-socket\"]"));
 
     // 2. Fly kit with `--enable-drop-relay`
@@ -668,6 +695,33 @@ fn d8_team_hub_kits_document_admin_pubkey_and_live_hub_loads_it_on_first_boot() 
                 && readme.contains(".data.adminJwk"),
             "{provider} README missing Admin-CA public key provisioning guide:\n{readme}"
         );
+        // OR3: verify correct non-root target user for admin-pubkey provisioning on Fly & systemd kits!
+        if provider == "fly" {
+            assert!(
+                readme.contains("setpriv --reuid=10001 --regid=10001"),
+                "OR3: Fly README must drop to UID 10001 via setpriv for hyp secret set:\n{readme}"
+            );
+            assert!(
+                next_steps
+                    .iter()
+                    .any(|s| s.contains("setpriv --reuid=10001 --regid=10001")
+                        && s.contains("hyp secret set hyphae-admin-pubkey")),
+                "OR3: Fly next steps must drop to UID 10001 via setpriv: {next_steps:?}"
+            );
+        } else if matches!(provider, "vps" | "tailscale" | "cloudflare") {
+            assert!(
+                readme.contains("sudo -u hyphae")
+                    && readme.contains("HYPHAE_SECRET_BACKEND=file")
+                    && readme.contains("hyp secret set hyphae-admin-pubkey --state-dir /var/lib/hyphae"),
+                "OR3: {provider} README must run secret set as hyphae user:\n{readme}"
+            );
+            assert!(
+                next_steps.iter().any(|s| s.contains("sudo -u hyphae")
+                    && s.contains("HYPHAE_SECRET_BACKEND=file")
+                    && s.contains("hyp secret set hyphae-admin-pubkey --state-dir /var/lib/hyphae")),
+                "OR3: {provider} next steps must run secret set as hyphae user: {next_steps:?}"
+            );
+        }
     }
 
     // 2. Non-Team-Hub kits (`public-node`, `drop-relay`, and `--profile p2p`) must NOT emit

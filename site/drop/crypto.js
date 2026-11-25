@@ -72,16 +72,29 @@ export const RESERVED_SECRET_PREFIXES = Object.freeze([
   "human-admin-",
   "human-authority-",
   "auth-token-",
+  "staged-join-token-",
+  "pair-",
+  "p2p-offer-",
 ]);
 
-const RESERVED_SECRET_EXACT = new Set([
+export const RESERVED_SECRET_NAMES = Object.freeze([
   "admin-ca",
   "gate-policy",
+  "gate-policy-hmac",
+  "gate_policy_hmac",
   "gate-policy-hmac-key",
   "human-admin",
   "human-authority",
   "auth-token",
+  "t3-auth-token",
+  "t3-session-token",
+  "staged-join-token",
+  "openclaw-hooks-token",
+  "hyphae-admin-pubkey",
+  "daemon-session-token-key",
 ]);
+
+const RESERVED_SECRET_EXACT = new Set(RESERVED_SECRET_NAMES);
 
 // ============================================================================
 // Byte & Random Utilities

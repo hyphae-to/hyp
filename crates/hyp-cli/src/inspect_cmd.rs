@@ -725,7 +725,19 @@ fn run_inspect_watch_mode(
                 res = read_bounded_line_async(&mut reader, MAX_SOCKET_LINE_BYTES) => {
                     match res {
                         Ok(Some(line)) => Some(line),
-                        Ok(None) => return ExitCode::from(EXIT_OK),
+                        Ok(None) => {
+                            return emit_error(
+                                "inspect",
+                                as_json,
+                                EXIT_ERROR,
+                                "WATCH_DISCONNECTED",
+                                "Local Hyphae daemon closed the inspect.watch stream unexpectedly",
+                                Some(
+                                    "Check daemon status with `hyp status` or restart with `hyp service restart`."
+                                        .to_string(),
+                                ),
+                            );
+                        }
                         Err(e) => {
                             return emit_error(
                                 "inspect",
@@ -938,5 +950,53 @@ mod tests {
         assert_eq!(format_age_ms(1_000_000, 1_180_000), "3m");
         assert_eq!(format_age_ms(1_000_000, 8_200_000), "2h");
         assert_eq!(format_age_ms(0, 1_000_000), "-");
+    }
+
+    #[test]
+    fn u8_watch_mode_returns_error_exit_code_on_unexpected_daemon_disconnect() {
+        use std::io::BufRead;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+        let addr_file = dir.path().join("mock-disconnect.addr");
+        std::fs::write(&addr_file, format!("{addr}\n")).unwrap();
+
+        let srv = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept client");
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            // Send one valid snapshot frame, then close socket abruptly (unexpected daemon EOF).
+            let mut writer = stream;
+            let frame = json!({
+                "type": "inspect.snapshot",
+                "rev": 1,
+                "updatedAt": 1_750_000_000_000i64,
+                "daemon": { "online": true, "nodeId": "alice@test", "version": "0.7.0", "profile": "local", "peersOnline": 0, "quarantinedGlobal": 0 },
+                "sessions": []
+            });
+            let _ = writeln!(writer, "{frame}");
+            let _ = writer.flush();
+            drop(writer);
+        });
+
+        let args = InspectArgs {
+            session: None,
+            herdr_terminal: None,
+            herdr_created_ms: None,
+            handle: None,
+            all: true,
+            watch: true,
+            socket: Some(addr_file),
+            json: true,
+        };
+        let code = run_inspect(&args);
+        srv.join().unwrap();
+        assert_eq!(
+            code,
+            ExitCode::from(EXIT_ERROR),
+            "U8: inspect --watch must return non-zero EXIT_ERROR when daemon disconnects unexpectedly"
+        );
     }
 }

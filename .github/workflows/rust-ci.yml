@@ -217,6 +217,15 @@ jobs:
             exit 1
           fi
 
+      - name: Verify bidirectional JS <-> Rust Verified Human Drops interop (H19)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          cargo build -p hyp-cli --locked
+          node --test site/drop/cross_lang_interop.test.mjs
+
       - name: Build release binary (hyp)
         if: needs.lint-site-and-plugins.outputs.skip_release_build != 'true'
         run: cargo build --release --locked -p hyp-cli
