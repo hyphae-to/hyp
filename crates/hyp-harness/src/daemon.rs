@@ -3136,8 +3136,23 @@ impl LocalDaemonInner {
             .ok_or_else(|| ("invalid_request".into(), "Expected destination 'to'".into()))?;
         let handle = self.require_session_handle(session_id)?;
 
+        let reaction_present = match args.get("reaction") {
+            None | Some(Value::Null) => false,
+            Some(Value::String(_)) => true,
+            Some(_) => {
+                return Err(("invalid_request".into(), "Expected string 'reaction'".into()));
+            }
+        };
+
         // File transfer path
         if let Some(files_val) = args.get("files").and_then(Value::as_array) {
+            if reaction_present {
+                return Err((
+                    "invalid_request".into(),
+                    "Reactions are only supported on external chat bridge destinations (<bridge>:<target>)"
+                        .into(),
+                ));
+            }
             let paths: Vec<PathBuf> = files_val
                 .iter()
                 .filter_map(Value::as_str)
@@ -3182,6 +3197,36 @@ impl LocalDaemonInner {
             }));
         }
 
+        // Local bridge `<plugin>:<target>`
+        if is_bridge_destination(to) {
+            let (raw_plugin, raw_target) = to.split_once(':').ok_or_else(|| {
+                (
+                    "invalid_request".into(),
+                    format!("Invalid bridge destination '{to}'"),
+                )
+            })?;
+            let (text, reaction) = parse_bridge_text_and_reaction(args)?;
+            return self
+                .send_to_bridge(
+                    session_id,
+                    &handle,
+                    raw_plugin,
+                    raw_target,
+                    text,
+                    reaction,
+                    args,
+                )
+                .await;
+        }
+
+        if reaction_present {
+            return Err((
+                "invalid_request".into(),
+                "Reactions are only supported on external chat bridge destinations (<bridge>:<target>)"
+                    .into(),
+            ));
+        }
+
         let text = args
             .get("text")
             .and_then(Value::as_str)
@@ -3193,19 +3238,6 @@ impl LocalDaemonInner {
             ch_args.insert("channel".into(), json!(to));
             ch_args.insert("text".into(), json!(text));
             return self.tool_channel_post(session_id, &ch_args).await;
-        }
-
-        // Local bridge `<plugin>:<target>`
-        if is_bridge_destination(to) {
-            let (raw_plugin, raw_target) = to.split_once(':').ok_or_else(|| {
-                (
-                    "invalid_request".into(),
-                    format!("Invalid bridge destination '{to}'"),
-                )
-            })?;
-            return self
-                .send_to_bridge(session_id, &handle, raw_plugin, raw_target, text, args)
-                .await;
         }
 
         // Direct DM `<node>/<handle>`
@@ -4081,15 +4113,15 @@ impl LocalDaemonInner {
         args: &Map<String, Value>,
     ) -> Result<Value, (String, String)> {
         let (plugin, target) = parse_bridge_plugin_target(args)?;
-        let text = args
-            .get("text")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ("invalid_request".into(), "Expected 'text'".into()))?;
         let handle = self.require_session_handle(session_id)?;
-        self.send_to_bridge(session_id, &handle, &plugin, &target, text, args)
-            .await
+        let (text, reaction) = parse_bridge_text_and_reaction(args)?;
+        self.send_to_bridge(
+            session_id, &handle, &plugin, &target, text, reaction, args,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_to_bridge(
         &self,
         session_id: &str,
@@ -4097,6 +4129,7 @@ impl LocalDaemonInner {
         raw_plugin: &str,
         raw_target: &str,
         text: &str,
+        reaction: Option<&str>,
         args: &Map<String, Value>,
     ) -> Result<Value, (String, String)> {
         let plugin = raw_plugin.trim().to_ascii_lowercase();
@@ -4144,7 +4177,14 @@ impl LocalDaemonInner {
         }
 
         // Enforce Stage 1 Outbound DLP BEFORE invoking any external chat bridge!
-        self.check_outbound_gate(session_id, &full_dest, "to.hyphae.bridge.v1", text)?;
+        if !text.is_empty() {
+            self.check_outbound_gate(session_id, &full_dest, "to.hyphae.bridge.v1", text)?;
+        }
+        if let Some(rxn) = reaction {
+            if !rxn.is_empty() {
+                self.check_outbound_gate(session_id, &full_dest, "to.hyphae.bridge.v1", rxn)?;
+            }
+        }
 
         let mut meta = Map::new();
         meta.insert("sessionId".into(), json!(session_id));
@@ -4154,6 +4194,15 @@ impl LocalDaemonInner {
         }
         if let Some(thread_ts) = args.get("threadTs") {
             meta.insert("threadTs".into(), thread_ts.clone());
+        }
+        if let Some(chat_id) = args.get("chatId").filter(|v| !v.is_null()) {
+            meta.insert("chatId".into(), chat_id.clone());
+        }
+        if let Some(rxn) = reaction {
+            meta.insert("reaction".into(), json!(rxn));
+        }
+        if let Some(remove) = args.get("remove").and_then(Value::as_bool) {
+            meta.insert("remove".into(), json!(remove));
         }
 
         let response = poster.post(&plugin, target, text, &meta).await?;
@@ -5352,6 +5401,50 @@ fn parse_bridge_plugin_target(
     };
 
     Ok((plugin, target))
+}
+
+const MAX_BRIDGE_REACTION_CHARS: usize = 32;
+
+fn validate_bridge_reaction(raw: &str) -> Result<&str, (String, String)> {
+    if raw.chars().count() > MAX_BRIDGE_REACTION_CHARS {
+        return Err((
+            "invalid_request".into(),
+            format!("Reaction must be at most {MAX_BRIDGE_REACTION_CHARS} characters"),
+        ));
+    }
+    if raw.chars().any(char::is_control) {
+        return Err((
+            "invalid_request".into(),
+            "Reaction must not contain control characters".into(),
+        ));
+    }
+    Ok(raw)
+}
+
+fn parse_bridge_text_and_reaction(
+    args: &Map<String, Value>,
+) -> Result<(&str, Option<&str>), (String, String)> {
+    let text = match args.get("text") {
+        None | Some(Value::Null) => "",
+        Some(Value::String(s)) => s.as_str(),
+        Some(_) => {
+            return Err(("invalid_request".into(), "Expected string 'text'".into()));
+        }
+    };
+    let reaction = match args.get("reaction") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(validate_bridge_reaction(s.as_str())?),
+        Some(_) => {
+            return Err(("invalid_request".into(), "Expected string 'reaction'".into()));
+        }
+    };
+    if text.trim().is_empty() && reaction.is_none() {
+        return Err((
+            "invalid_request".into(),
+            "Expected non-empty 'text' or 'reaction'".into(),
+        ));
+    }
+    Ok((text, reaction))
 }
 
 fn node_err_tuple(err: hyp_node::engine::NodeError) -> (String, String) {

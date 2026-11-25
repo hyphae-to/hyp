@@ -158,16 +158,43 @@ if (!allowedNumbers && !allowAll) {
 let lastFrom = null;
 let lastPhoneNumberId = configuredPhoneNumberId;
 let lastMessageId = null;
+const lastMessageIdByRecipient = new Map();
 
 const mesh = new MeshPluginClient({
   onDeliveryFailed: (msg) =>
     console.error(`whatsapp plugin delivery_failed target=${msg.target} reason=${msg.reason}`),
 });
 
+async function sendWhatsAppMessage(phoneNumberId, payload) {
+  const endpoint = `${apiBase}/${encodeURIComponent(phoneNumberId)}/messages`;
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`,
+      "content-type": "application/json; charset=utf-8",
+    },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(15_000),
+  });
+  const respText = await res.text();
+  let json = null;
+  try {
+    json = respText ? JSON.parse(respText) : null;
+  } catch {}
+  if (!res.ok) {
+    const detail = json?.error?.message || respText.slice(0, 300) || `HTTP ${res.status}`;
+    throw new Error(`WhatsApp Cloud API POST failed (${res.status}): ${detail}`);
+  }
+  return json;
+}
+
 mesh.onPost(async (params) => {
+  const hasReaction = typeof params?.reaction === "string";
+  const reaction = hasReaction ? params.reaction.trim() : "";
   const rawText = typeof params?.text === "string" ? params.text : "";
-  if (rawText.trim().length === 0) {
-    throw new Error("WhatsApp post requires non-empty text");
+  const hasText = rawText.trim().length > 0;
+  if (!hasReaction && !hasText) {
+    throw new Error("WhatsApp post requires non-empty text or reaction");
   }
   if (!accessToken) {
     throw new Error("WHATSAPP_ACCESS_TOKEN (or WHATSAPP_ACCESS_TOKEN_FILE) is not configured");
@@ -194,40 +221,51 @@ mesh.onPost(async (params) => {
   }
 
   const replyTo = typeof params?.replyTo === "string" && params.replyTo.trim() ? params.replyTo.trim() : undefined;
-  const payload = {
-    messaging_product: "whatsapp",
-    recipient_type: "individual",
-    to: recipient,
-    type: "text",
-    text: { preview_url: false, body: rawText },
-    ...(replyTo ? { context: { message_id: replyTo } } : {}),
-  };
 
-  const endpoint = `${apiBase}/${encodeURIComponent(phoneNumberId)}/messages`;
-  const res = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${accessToken}`,
-      "content-type": "application/json; charset=utf-8",
-    },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(15_000),
-  });
-  const respText = await res.text();
-  let json = null;
-  try {
-    json = respText ? JSON.parse(respText) : null;
-  } catch {}
-  if (!res.ok) {
-    const detail = json?.error?.message || respText.slice(0, 300) || `HTTP ${res.status}`;
-    throw new Error(`WhatsApp Cloud API POST failed (${res.status}): ${detail}`);
+  let targetMsgId;
+  let reactionJson = null;
+  if (hasReaction) {
+    targetMsgId = replyTo ?? lastMessageIdByRecipient.get(recipient) ?? lastMessageId;
+    if (!targetMsgId) {
+      throw new Error("No WhatsApp message_id specified via replyTo and no recent inbound message to react to");
+    }
+    reactionJson = await sendWhatsAppMessage(phoneNumberId, {
+      messaging_product: "whatsapp",
+      recipient_type: "individual",
+      to: recipient,
+      type: "reaction",
+      reaction: {
+        message_id: targetMsgId,
+        emoji: reaction,
+      },
+    });
+  }
+
+  let textJson = null;
+  if (hasText) {
+    textJson = await sendWhatsAppMessage(phoneNumberId, {
+      messaging_product: "whatsapp",
+      recipient_type: "individual",
+      to: recipient,
+      type: "text",
+      text: { preview_url: false, body: rawText },
+      ...(replyTo ? { context: { message_id: replyTo } } : {}),
+    });
   }
 
   return {
     ok: true,
     to: recipient,
-    messageId: json?.messages?.[0]?.id ?? null,
     phoneNumberId,
+    ...(hasReaction
+      ? {
+          reacted: true,
+          reaction,
+          reactedMessageId: targetMsgId,
+          reactionMessageId: reactionJson?.messages?.[0]?.id ?? null,
+        }
+      : {}),
+    ...(hasText ? { messageId: textJson?.messages?.[0]?.id ?? null } : {}),
   };
 });
 
@@ -345,7 +383,16 @@ const server = createServer(async (req, res) => {
         const fromValue = fromRaw || fromNorm;
         lastFrom = fromValue;
         if (phoneNumberId) lastPhoneNumberId = phoneNumberId;
-        if (typeof msg.id === "string" && msg.id.trim()) lastMessageId = msg.id.trim();
+        if (typeof msg.id === "string" && msg.id.trim()) {
+          const cleanMsgId = msg.id.trim();
+          lastMessageId = cleanMsgId;
+          if (fromNorm) {
+            lastMessageIdByRecipient.set(fromNorm, cleanMsgId);
+            if (lastMessageIdByRecipient.size > 1000) {
+              lastMessageIdByRecipient.delete(lastMessageIdByRecipient.keys().next().value);
+            }
+          }
+        }
 
         const tsNum =
           msg.timestamp !== undefined && msg.timestamp !== null && String(msg.timestamp).trim() !== ""
