@@ -21,20 +21,20 @@ use clap::{Subcommand, ValueEnum};
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full};
 use hyp_crypto::human::{
-    HumanAudience, HumanClaimV1, HumanDropKind, HumanRevocationPayloadV1, SecretDropSpec,
-    SignedHumanRevocationV1, encode_hdrop1, is_reserved_secret_name, seal_human_drop,
-    sign_human_revocation,
+    HumanAudience, HumanClaimV1, HumanDropKind, HumanRevocationPayloadV1, NodeCertPayloadV1,
+    SecretDropSpec, SignedHumanRevocationV1, SignedNodeCertV1, decode_hcert1, encode_hdrop1,
+    is_reserved_secret_name, seal_human_drop, sign_human_revocation, verify_node_cert,
 };
 use hyp_crypto::jcs::to_canonical_json;
-use hyp_crypto::keys::{Ed25519KeyPair, OkpJwk, X25519PublicKey};
+use hyp_crypto::keys::{Ed25519KeyPair, Ed25519PublicKey, OkpJwk, X25519PublicKey};
 use hyp_crypto::keystore::{SecretStore, validate_secret_name};
-use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
+use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms, parse_rfc3339_millis};
 use hyp_node::engine::{NodeConfig, NodeProfile, UnifiedNode};
 use hyp_node::gates::policy::{SecurityGateConfig, sign_gate_policy, verify_gate_policy_sig};
 use hyp_proto::address::{LOCAL_NODE_ID, NodeId, is_valid_handle, is_valid_node_id};
 use hyp_store::{
-    HumanAuthorityInput, HumanAuthorityRecord, HumanAuthorityRole, HumanAuthorityStatus, KeyUse,
-    NodeDb, now_ms,
+    HumanAuthorityInput, HumanAuthorityRecord, HumanAuthorityRole, HumanAuthorityStatus,
+    HumanNodeCertInput, KeyUse, NodeDb, now_ms,
 };
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
@@ -465,6 +465,100 @@ fn random_b64url(len: usize) -> Result<String, String> {
     Ok(URL_SAFE_NO_PAD.encode(&buf))
 }
 
+fn parse_optional_enc_jwk(val: Option<&Value>) -> Result<Option<(String, String)>, String> {
+    let Some(raw) = val else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let jwk: OkpJwk = serde_json::from_value(raw.clone())
+        .map_err(|e| format!("malformed encJwk OKP object: {e}"))?;
+    if jwk.kty != "OKP" || jwk.crv != "X25519" {
+        return Err(format!(
+            "encJwk must be OKP/X25519, got {}/{}",
+            jwk.kty, jwk.crv
+        ));
+    }
+    let pk = jwk
+        .to_x25519()
+        .map_err(|e| format!("invalid X25519 public key in encJwk: {e}"))?;
+    let canonical =
+        to_canonical_json(&jwk).map_err(|e| format!("failed to canonicalize encJwk: {e}"))?;
+    Ok(Some((canonical, pk.kid())))
+}
+
+struct VerifiedEnrolledNodeCert {
+    signed: SignedNodeCertV1,
+    payload: NodeCertPayloadV1,
+    issued_at_ms: i64,
+    expires_at_ms: i64,
+    armored: String,
+}
+
+fn validate_enrolled_node_cert(
+    raw_hcert1: &str,
+    authority_pk: &Ed25519PublicKey,
+    expected_human_id: &str,
+    expected_node_id: &str,
+    expected_sign_x: &str,
+    expected_enc_x: &str,
+    min_auth_epoch: u64,
+) -> Result<VerifiedEnrolledNodeCert, String> {
+    let trimmed = raw_hcert1.trim();
+    let signed = decode_hcert1(trimmed).map_err(|e| format!("invalid nodeCert hcert1_: {e}"))?;
+    let payload = verify_node_cert(&signed, authority_pk, now_ms(), min_auth_epoch)
+        .map_err(|e| format!("nodeCert verification failed: {e}"))?;
+    if payload.node_id != expected_node_id {
+        return Err(format!(
+            "nodeCert nodeId '{}' does not match local node '{}'",
+            payload.node_id, expected_node_id
+        ));
+    }
+    if payload.signing_jwk.x != expected_sign_x {
+        return Err("nodeCert signingJwk does not match local node Ed25519 key".to_string());
+    }
+    if payload.encryption_jwk.x != expected_enc_x {
+        return Err("nodeCert encryptionJwk does not match local node X25519 key".to_string());
+    }
+    if payload.human_id != expected_human_id {
+        return Err(format!(
+            "nodeCert humanId '{}' does not match enrolled humanId '{expected_human_id}'",
+            payload.human_id
+        ));
+    }
+    let issued_at_ms = parse_rfc3339_millis(&payload.issued_at)
+        .map_err(|e| format!("invalid nodeCert issuedAt: {e}"))?;
+    let expires_at_ms = parse_rfc3339_millis(&payload.expires_at)
+        .map_err(|e| format!("invalid nodeCert expiresAt: {e}"))?;
+    Ok(VerifiedEnrolledNodeCert {
+        signed,
+        payload,
+        issued_at_ms,
+        expires_at_ms,
+        armored: trimmed.to_string(),
+    })
+}
+
+fn persist_verified_node_cert(
+    db: &NodeDb,
+    cert: &VerifiedEnrolledNodeCert,
+) -> Result<(), String> {
+    let signed_json = to_canonical_json(&cert.signed)
+        .map_err(|e| format!("failed to serialize verified nodeCert: {e}"))?;
+    db.human()
+        .put_node_cert(&HumanNodeCertInput {
+            node_id: cert.payload.node_id.clone(),
+            human_kid: cert.payload.human_kid.clone(),
+            auth_epoch: cert.payload.auth_epoch,
+            signed_json,
+            issued_at: cert.issued_at_ms,
+            expires_at: cert.expires_at_ms,
+        })
+        .map_err(|e| format!("failed to persist verified nodeCert: {e}"))?;
+    Ok(())
+}
+
 fn open_local_unified_node(
     state_dir: &Path,
     config_path: &Path,
@@ -611,38 +705,8 @@ fn run_auth_init(
         }
     };
 
-    let (_signed_cert, hcert1) = match node.issue_node_cert(&admin_kp, &kid, 365) {
-        Ok(res) => res,
-        Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "CERTIFY_FAILED",
-                format!("Failed to certify local node: {e}"),
-                None,
-            );
-        }
-    };
-
-    let mut gate_resigned = {
-        let db = node.db();
-        match sync_gate_policy_digest_if_locked(&config_write, &state_dir, &db, &secrets) {
-            Ok(b) => b,
-            Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    "GATE_POLICY_SYNC_FAILED",
-                    e,
-                    None,
-                );
-            }
-        }
-    };
-
     let mut web_enrolled: Option<Value> = None;
+    let mut passkey_hcert1: Option<String> = None;
     if web {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -660,9 +724,14 @@ fn run_auth_init(
                 );
             }
         };
+        let node_sign_jwk = node.identity().signing_jwk();
+        let node_enc_jwk = node.identity().encryption_jwk();
         let enrolled = match rt.block_on(enroll_passkey_via_web(
             &human_id,
             min_epoch,
+            node.node_id().as_str(),
+            &node_sign_jwk,
+            &node_enc_jwk,
             port,
             timeout_secs,
             no_open,
@@ -690,7 +759,7 @@ fn run_auth_init(
                     label: enrolled.label.clone(),
                     role: HumanAuthorityRole::Signer,
                     jwk_json: enrolled.jwk_json.clone(),
-                    enc_jwk_json: None,
+                    enc_jwk_json: enrolled.enc_jwk_json.clone(),
                     prf_salt: Some(enrolled.prf_salt.clone()),
                     auth_epoch: enrolled.auth_epoch,
                 },
@@ -702,32 +771,61 @@ fn run_auth_init(
                 }
             }
         };
-        gate_resigned = {
+        if let Some(ref verified_cert) = enrolled.node_cert {
             let db = node.db();
-            match sync_gate_policy_digest_if_locked(&config_write, &state_dir, &db, &secrets) {
-                Ok(b) => b || gate_resigned,
-                Err(e) => {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
-                        "GATE_POLICY_SYNC_FAILED",
-                        e,
-                        None,
-                    );
-                }
+            if let Err(e) = persist_verified_node_cert(&db, verified_cert) {
+                return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None);
             }
-        };
+            passkey_hcert1 = Some(verified_cert.armored.clone());
+        }
         web_enrolled = Some(json!({
             "humanId": signer_rec.human_id,
             "kid": signer_rec.kid,
             "role": signer_rec.role.as_str(),
             "label": signer_rec.label,
+            "encKey": signer_rec.enc_jwk_json.is_some(),
+            "encKid": enrolled.enc_kid,
             "prfSalt": signer_rec.prf_salt,
             "authEpoch": signer_rec.auth_epoch,
             "credentialId": enrolled.credential_id,
+            "nodeCertSigned": enrolled.node_cert.is_some(),
         }));
     }
+
+    let hcert1 = if let Some(cert_token) = passkey_hcert1 {
+        cert_token
+    } else {
+        match node.issue_node_cert(&admin_kp, &kid, 365) {
+            Ok((_signed_cert, token)) => token,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "CERTIFY_FAILED",
+                    format!("Failed to certify local node: {e}"),
+                    None,
+                );
+            }
+        }
+    };
+
+    let gate_resigned = {
+        let db = node.db();
+        match sync_gate_policy_digest_if_locked(&config_write, &state_dir, &db, &secrets) {
+            Ok(b) => b,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "GATE_POLICY_SYNC_FAILED",
+                    e,
+                    None,
+                );
+            }
+        }
+    };
 
     let digest = {
         let db = node.db();
@@ -882,17 +980,31 @@ fn run_auth_add(
         }
     };
 
-    // Accept either a raw OKP JWK or a site/drop enrollment bundle `{ jwk/publicJwk, prfSalt?, authEpoch?, kid? }`.
-    let (jwk_val, bundle_prf_salt, bundle_epoch, expected_kid) = if let Some(obj) = parsed.as_object() {
+    // Accept either a raw OKP JWK or a site/drop enrollment bundle
+    // `{ jwk/publicJwk, encJwk?, nodeCert?, prfSalt?, authEpoch?, kid? }`.
+    let (
+        jwk_val,
+        bundle_enc_jwk_val,
+        bundle_node_cert,
+        bundle_prf_salt,
+        bundle_epoch,
+        expected_kid,
+    ) = if let Some(obj) = parsed.as_object() {
         if let Some(inner) = obj.get("jwk").or_else(|| obj.get("publicJwk")) {
             (
                 inner.clone(),
+                obj.get("encJwk").cloned(),
+                obj.get("nodeCert")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToOwned::to_owned),
                 obj.get("prfSalt").and_then(Value::as_str).map(ToOwned::to_owned),
                 obj.get("authEpoch").and_then(Value::as_u64),
                 obj.get("kid").and_then(Value::as_str).map(ToOwned::to_owned),
             )
         } else {
-            (parsed, None, None, None)
+            (parsed, None, None, None, None, None)
         }
     } else {
         return emit_error(
@@ -918,16 +1030,33 @@ fn run_auth_add(
             );
         }
     };
-    if let Err(e) = jwk.to_ed25519() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
-            "INVALID_JWK",
-            format!("Public key must be a valid OKP Ed25519 JWK: {e}"),
-            None,
-        );
-    }
+    let authority_ed_pk = match jwk.to_ed25519() {
+        Ok(pk) => pk,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "INVALID_JWK",
+                format!("Public key must be a valid OKP Ed25519 JWK: {e}"),
+                None,
+            );
+        }
+    };
+    let (enc_jwk_json, enc_kid) = match parse_optional_enc_jwk(bundle_enc_jwk_val.as_ref()) {
+        Ok(Some((canon, ekid))) => (Some(canon), Some(ekid)),
+        Ok(None) => (None, None),
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "INVALID_ENC_JWK",
+                e,
+                None,
+            );
+        }
+    };
     let kid = match jwk.thumbprint() {
         Ok(k) => k,
         Err(e) => {
@@ -959,6 +1088,8 @@ fn run_auth_add(
     };
 
     let state_dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
+    let config_read =
+        resolve_config_path_for_read(config_arg.as_deref(), state_dir_arg.as_deref(), None);
     let config_write =
         resolve_config_path_for_write(config_arg.as_deref(), state_dir_arg.as_deref(), None);
     if let Err(e) = ensure_dir(&state_dir, true) {
@@ -972,6 +1103,54 @@ fn run_auth_add(
     let min_epoch = db.human().min_auth_epoch().unwrap_or(1);
     let effective_epoch = auth_epoch_arg.or(bundle_epoch).unwrap_or(min_epoch).max(min_epoch);
     let effective_prf_salt = prf_salt_arg.or(bundle_prf_salt);
+    let secrets = open_secret_store(&state_dir, state_dir_arg.is_some());
+
+    // Validate optional Passkey-signed `nodeCert` (`hcert1_`) BEFORE mutating DB so invalid bundles
+    // fail closed cleanly.
+    let verified_bundle_cert = if let Some(ref raw_cert) = bundle_node_cert {
+        let loaded = if config_read.exists() {
+            load_node_or_legacy_config(&config_read).ok()
+        } else {
+            None
+        };
+        let local_node_id = resolve_effective_node_id(loaded.as_ref(), Some(&db));
+        let local_identity = match secrets.load_or_create_node_keys(&local_node_id) {
+            Ok(keys) => keys,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "NODE_KEY_ERROR",
+                    format!("Failed to load local node identity keys: {e}"),
+                    None,
+                );
+            }
+        };
+        match validate_enrolled_node_cert(
+            raw_cert,
+            &authority_ed_pk,
+            &human_id,
+            &local_node_id,
+            &local_identity.signing_jwk().x,
+            &local_identity.encryption_jwk().x,
+            min_epoch,
+        ) {
+            Ok(cert) => Some(cert),
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_USAGE,
+                    "INVALID_NODE_CERT",
+                    e,
+                    None,
+                );
+            }
+        }
+    } else {
+        None
+    };
 
     let rec = match db.human().upsert_authority(
         &HumanAuthorityInput {
@@ -980,7 +1159,7 @@ fn run_auth_add(
             label: trimmed_label.to_string(),
             role: role.to_store_role(),
             jwk_json: canonical_jwk_json,
-            enc_jwk_json: None,
+            enc_jwk_json,
             prf_salt: effective_prf_salt,
             auth_epoch: effective_epoch,
         },
@@ -990,7 +1169,15 @@ fn run_auth_add(
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
     };
 
-    let secrets = open_secret_store(&state_dir, state_dir_arg.is_some());
+    let node_cert_stored = if let Some(ref cert) = verified_bundle_cert {
+        if let Err(e) = persist_verified_node_cert(&db, cert) {
+            return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None);
+        }
+        true
+    } else {
+        false
+    };
+
     let gate_resigned = match sync_gate_policy_digest_if_locked(&config_write, &state_dir, &db, &secrets)
     {
         Ok(b) => b,
@@ -1016,6 +1203,9 @@ fn run_auth_add(
                 "role": rec.role.as_str(),
                 "label": rec.label,
                 "authEpoch": rec.auth_epoch,
+                "encKey": rec.enc_jwk_json.is_some(),
+                "encKid": enc_kid,
+                "nodeCertStored": node_cert_stored,
                 "prfSalt": rec.prf_salt,
                 "status": rec.status.as_str(),
                 "authoritiesDigest": digest,
@@ -1033,7 +1223,13 @@ fn run_auth_add(
             rec.role.as_str(),
             rec.kid
         );
-        println!("      Label: {}", rec.label);
+        println!("      Label:    {}", rec.label);
+        if let Some(ref ekid) = enc_kid {
+            println!("      Enc Key:  yes (encKid={ekid})");
+        }
+        if node_cert_stored {
+            println!("      NodeCert: verified & stored Passkey-signed hcert1_");
+        }
         if gate_resigned {
             println!("      Gate Sig: re-signed with updated human_authorities_digest");
         }
@@ -1050,6 +1246,9 @@ struct AuthListRow {
     label: String,
     auth_epoch: u64,
     status: String,
+    enc_key: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enc_kid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prf_salt: Option<String>,
     created_at: i64,
@@ -1059,6 +1258,11 @@ struct AuthListRow {
 
 impl From<HumanAuthorityRecord> for AuthListRow {
     fn from(r: HumanAuthorityRecord) -> Self {
+        let enc_kid = r
+            .enc_jwk_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<OkpJwk>(raw).ok())
+            .and_then(|jwk| jwk.thumbprint().ok());
         Self {
             kid: r.kid,
             human_id: r.human_id,
@@ -1066,6 +1270,8 @@ impl From<HumanAuthorityRecord> for AuthListRow {
             label: r.label,
             auth_epoch: r.auth_epoch,
             status: r.status.as_str().to_string(),
+            enc_key: r.enc_jwk_json.is_some(),
+            enc_kid,
             prf_salt: r.prf_salt,
             created_at: r.created_at,
             revoked_at: r.revoked_at,
@@ -1132,15 +1338,21 @@ fn run_auth_list(all: bool, state_dir_arg: Option<PathBuf>, as_json: bool) -> Ex
         } else {
             println!();
             println!(
-                "{:<16}  {:<18}  {:<8}  {:<6}  {:<8}  Label",
-                "Kid", "Human ID", "Role", "Epoch", "Status"
+                "{:<16}  {:<18}  {:<8}  {:<6}  {:<8}  {:<6}  Label",
+                "Kid", "Human ID", "Role", "Epoch", "Status", "EncKey"
             );
-            println!("{}", "-".repeat(86));
+            println!("{}", "-".repeat(94));
             for r in &rows {
                 let short_kid: String = r.kid.chars().take(16).collect();
                 println!(
-                    "{:<16}  {:<18}  {:<8}  {:<6}  {:<8}  {}",
-                    short_kid, r.human_id, r.role, r.auth_epoch, r.status, r.label
+                    "{:<16}  {:<18}  {:<8}  {:<6}  {:<8}  {:<6}  {}",
+                    short_kid,
+                    r.human_id,
+                    r.role,
+                    r.auth_epoch,
+                    r.status,
+                    if r.enc_key { "yes" } else { "no" },
+                    r.label
                 );
             }
         }
@@ -1755,7 +1967,7 @@ fn resolve_authority_by_kid_or_prefix<'a>(
     Err(format!("human authority kid '{query}' not found"))
 }
 
-fn select_local_signing_authority(
+pub(crate) fn select_local_signing_authority(
     db: &NodeDb,
     secrets: &SecretStore,
     kid_arg: Option<&str>,
@@ -1818,15 +2030,21 @@ struct WebEnrolledAuthority {
     kid: String,
     label: String,
     jwk_json: String,
+    enc_jwk_json: Option<String>,
+    enc_kid: Option<String>,
     prf_salt: String,
     auth_epoch: u64,
     credential_id: Option<String>,
+    node_cert: Option<VerifiedEnrolledNodeCert>,
 }
 
 struct WebEnrollState {
     default_human_id: String,
     default_prf_salt: String,
     default_auth_epoch: u64,
+    node_id: String,
+    node_sign_jwk_x: String,
+    node_enc_jwk_x: String,
     csrf_token: String,
     done_tx: Mutex<Option<oneshot::Sender<Result<WebEnrolledAuthority, String>>>>,
 }
@@ -1896,9 +2114,13 @@ fn json_enroll_response(
     resp
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn enroll_passkey_via_web(
     human_id: &str,
     auth_epoch: u64,
+    node_id: &str,
+    node_sign_jwk: &OkpJwk,
+    node_enc_jwk: &OkpJwk,
     port: u16,
     timeout_secs: u64,
     no_open: bool,
@@ -1922,6 +2144,9 @@ async fn enroll_passkey_via_web(
         "prfSalt": prf_salt,
         "callbackUrl": callback_url,
         "csrfToken": csrf_token,
+        "nodeId": node_id,
+        "nodeSignJwk": node_sign_jwk,
+        "nodeEncJwk": node_enc_jwk,
     });
     let canon = to_canonical_json(&enroll_payload)
         .map_err(|e| format!("failed to encode enrollment fragment: {e}"))?;
@@ -1935,6 +2160,9 @@ async fn enroll_passkey_via_web(
         default_human_id: human_id.to_string(),
         default_prf_salt: prf_salt,
         default_auth_epoch: auth_epoch,
+        node_id: node_id.to_string(),
+        node_sign_jwk_x: node_sign_jwk.x.clone(),
+        node_enc_jwk_x: node_enc_jwk.x.clone(),
         csrf_token,
         done_tx: Mutex::new(Some(done_tx)),
     });
@@ -2113,13 +2341,24 @@ async fn handle_enroll_callback(
             );
         }
     };
-    if jwk.to_ed25519().is_err() {
+    let Ok(authority_ed_pk) = jwk.to_ed25519() else {
         return json_enroll_response(
             StatusCode::BAD_REQUEST,
             origin.as_deref(),
             json!({ "ok": false, "error": "invalid_ed25519_jwk" }),
         );
-    }
+    };
+    let (enc_jwk_json, enc_kid) = match parse_optional_enc_jwk(obj.get("encJwk")) {
+        Ok(Some((canon, ekid))) => (Some(canon), Some(ekid)),
+        Ok(None) => (None, None),
+        Err(msg) => {
+            return json_enroll_response(
+                StatusCode::BAD_REQUEST,
+                origin.as_deref(),
+                json!({ "ok": false, "error": "invalid_enc_jwk", "message": msg }),
+            );
+        }
+    };
     let Ok(kid) = jwk.thumbprint() else {
         return json_enroll_response(
             StatusCode::BAD_REQUEST,
@@ -2177,14 +2416,49 @@ async fn handle_enroll_callback(
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned);
 
+    let node_cert = match obj.get("nodeCert") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(raw_cert)) if !raw_cert.trim().is_empty() => {
+            match validate_enrolled_node_cert(
+                raw_cert,
+                &authority_ed_pk,
+                &human_id,
+                &state.node_id,
+                &state.node_sign_jwk_x,
+                &state.node_enc_jwk_x,
+                state.default_auth_epoch,
+            ) {
+                Ok(cert) => Some(cert),
+                Err(msg) => {
+                    return json_enroll_response(
+                        StatusCode::BAD_REQUEST,
+                        origin.as_deref(),
+                        json!({ "ok": false, "error": "invalid_node_cert", "message": msg }),
+                    );
+                }
+            }
+        }
+        Some(Value::String(_)) => None,
+        Some(_) => {
+            return json_enroll_response(
+                StatusCode::BAD_REQUEST,
+                origin.as_deref(),
+                json!({ "ok": false, "error": "invalid_node_cert", "message": "nodeCert must be an hcert1_ string" }),
+            );
+        }
+    };
+
     let enrolled = WebEnrolledAuthority {
         human_id,
         kid: kid.clone(),
         label,
         jwk_json,
+        enc_jwk_json,
+        enc_kid,
         prf_salt,
         auth_epoch,
         credential_id,
+        node_cert,
     };
 
     if let Ok(mut guard) = state.done_tx.lock() {

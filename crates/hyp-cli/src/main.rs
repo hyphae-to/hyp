@@ -1,5 +1,5 @@
 //! `hyp` — Hyphae v2 native CLI (`hook`, `mcp`, `wait`, `watch`, `node`/`daemon`, `onboard`,
-//! `setup`, `status`, `doctor`, `secret`, `gate`, `inbox`, `kv`, `wakeup`, `auth`, `drop`,
+//! `setup`, `status`, `doctor`, `secret`, `gate`, `inbox`, `kv`, `emit`, `auth`, `drop`,
 //! `relay`, `update`, `deploy`, `pair`, `version`).
 //!
 //! Performance note: `hyp hook` intercepts `std::env::args()` BEFORE constructing `clap`
@@ -9,6 +9,7 @@ mod auth_cmd;
 mod config_file;
 mod deploy;
 mod drop_cmd;
+mod emit_cmd;
 mod gate_cmd;
 mod kv_cmd;
 mod node_cmd;
@@ -20,7 +21,6 @@ mod skill_render;
 mod status_doctor;
 mod ui;
 mod update;
-mod wakeup_cmd;
 mod wizard;
 
 use clap::{Parser, Subcommand};
@@ -40,7 +40,7 @@ use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE};
 #[derive(Parser)]
 #[command(
     name = "hyp",
-    about = "Hyphae v2 native CLI (hook, mcp, wait, watch, node, onboard, setup, status, doctor, secret, gate, inbox, kv, wakeup, auth, drop, relay, update, deploy, pair, version)",
+    about = "Hyphae v2 native CLI (hook, mcp, wait, watch, node, onboard, setup, status, doctor, secret, gate, inbox, kv, emit, auth, drop, relay, update, deploy, pair, version)",
     version
 )]
 struct Cli {
@@ -165,11 +165,8 @@ enum Commands {
         #[command(subcommand)]
         command: kv_cmd::KvCommand,
     },
-    /// Durable local wakeup scheduler & OS trigger commands (`enable`, `disable`, `set`, `list`, `cancel`, `fire`, `emit`)
-    Wakeup {
-        #[command(subcommand)]
-        command: wakeup_cmd::WakeupCommand,
-    },
+    /// Emit a CloudEvent v1.0 (or stdin JSON) to the local ingest socket (ideal for cron/systemd/launchd)
+    Emit(emit_cmd::EmitArgs),
     /// Tier 1 Ed25519 Human Authority management, node certification (`hcert1_`), and drop signing (`hdrop1_`)
     Auth {
         #[command(subcommand)]
@@ -467,7 +464,7 @@ fn main() -> ExitCode {
         Commands::Gate { command } => gate_cmd::run_gate(command),
         Commands::Inbox { command } => gate_cmd::run_inbox(command),
         Commands::Kv { command } => kv_cmd::run_kv(command),
-        Commands::Wakeup { command } => wakeup_cmd::run_wakeup(command),
+        Commands::Emit(args) => emit_cmd::run_emit(args),
         Commands::Auth { command } => auth_cmd::run_auth(command),
         Commands::Drop { command } => drop_cmd::run_drop(command),
         Commands::Relay { command } => drop_cmd::run_relay(command),

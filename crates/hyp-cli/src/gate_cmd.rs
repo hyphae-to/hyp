@@ -668,8 +668,7 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
         let next = vec![
             format!("Review proposed policy at {}", proposal_path.display()),
             format!(
-                "Approve & lock as human: hyp gate init --adapter {} --config {} --state-dir {} --lock",
-                args.adapter.as_str(),
+                "Approve & lock as human: hyp gate lock --config {} --state-dir {}",
                 config_path.display(),
                 state_dir.display()
             ),
@@ -852,7 +851,8 @@ fn run_gate_lock(
     let cmd = "gate lock";
     let dir = resolve_state_dir(state_dir.as_deref(), config.as_deref(), None);
     let config_path = resolve_config_path_for_read(config.as_deref(), state_dir.as_deref(), None);
-    if !config_path.exists() {
+    let proposal_path = dir.join("gate.proposed.json");
+    if !config_path.exists() && !proposal_path.exists() {
         return emit_error(
             cmd,
             as_json,
@@ -867,6 +867,14 @@ fn run_gate_lock(
         Ok(m) => m,
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None),
     };
+    if !config_path.exists() {
+        let node_id = cfg_map
+            .get("nodeId")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(default_node_id);
+        ensure_v2_node_json_defaults(&mut cfg_map, &node_id, NodeProfile::Local, &dir);
+    }
 
     let mut gate_cfg: SecurityGateConfig = match cfg_map.get("gate") {
         Some(v) => match serde_json::from_value(v.clone()) {
@@ -884,6 +892,53 @@ fn run_gate_lock(
         },
         None => SecurityGateConfig::default(),
     };
+
+    // Merge staged `gate.proposed.json` (from `hyp gate propose`) BEFORE binding
+    // `human_authorities_digest` and signing `gate_policy_sig`, then delete the proposal file.
+    let mut merged_proposal = false;
+    if proposal_path.exists() {
+        let raw_proposal = match std::fs::read_to_string(&proposal_path) {
+            Ok(s) => s,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "IO_ERROR",
+                    format!(
+                        "Failed to read staged gate proposal {}: {e}",
+                        proposal_path.display()
+                    ),
+                    None,
+                );
+            }
+        };
+        let mut proposed_cfg: SecurityGateConfig = match serde_json::from_str(&raw_proposal) {
+            Ok(g) => g,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "INVALID_GATE_CONFIG",
+                    format!("Malformed staged gate proposal {}: {e}", proposal_path.display()),
+                    None,
+                );
+            }
+        };
+        // Preserve any already-configured filters not replaced by the proposal.
+        for existing_filter in gate_cfg.filters {
+            if !proposed_cfg
+                .filters
+                .iter()
+                .any(|f| f.id == existing_filter.id)
+            {
+                proposed_cfg.filters.push(existing_filter);
+            }
+        }
+        gate_cfg = proposed_cfg;
+        merged_proposal = true;
+    }
 
     if let Err(e) = gate_cfg.stage2.validate() {
         return emit_error(cmd, as_json, EXIT_ERROR, "INVALID_GATE_CONFIG", e.to_string(), None);
@@ -933,26 +988,38 @@ fn run_gate_lock(
     if let Err(e) = write_atomic_json(&config_path, &Value::Object(cfg_map), true) {
         return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
     }
+    if merged_proposal {
+        let _ = std::fs::remove_file(&proposal_path);
+    }
 
-    let next = vec![format!(
-        "hyp doctor --config {} --state-dir {}",
-        config_path.display(),
-        dir.display()
-    )];
+    let next = vec![
+        "hyp service restart".to_string(),
+        format!(
+            "hyp doctor --config {} --state-dir {}",
+            config_path.display(),
+            dir.display()
+        ),
+    ];
     if as_json {
         let envelope = JsonEnvelope {
             ok: true,
             command: cmd.to_string(),
             summary: Some(format!(
-                "Locked and signed gate_policy_sig for {} ({} filter(s))",
+                "Locked and signed gate_policy_sig for {} ({} filter(s){})",
                 config_path.display(),
-                gate_cfg.filters.len()
+                gate_cfg.filters.len(),
+                if merged_proposal {
+                    ", merged gate.proposed.json"
+                } else {
+                    ""
+                }
             )),
             data: Some(json!({
                 "configPath": config_path.display().to_string(),
                 "stateDir": dir.display().to_string(),
                 "gatePolicySig": "OK",
                 "requireSignedPolicy": true,
+                "mergedProposal": merged_proposal,
                 "filterCount": gate_cfg.filters.len(),
                 "policySigningSecret": gate_cfg.policy_signing_secret,
                 "humanAuthoritiesDigest": gate_cfg.human_authorities_digest,
@@ -968,6 +1035,9 @@ fn run_gate_lock(
             config_path.display(),
             gate_cfg.policy_signing_secret
         );
+        if merged_proposal {
+            println!("      Merged & removed staged proposal {}", proposal_path.display());
+        }
         print_next_steps(&next);
     }
     ExitCode::from(EXIT_OK)

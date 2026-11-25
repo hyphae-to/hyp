@@ -15,14 +15,13 @@ use clap::{Args, Subcommand, ValueEnum};
 use hyp_crypto::CryptoError;
 use hyp_crypto::keystore::{SecretBackend, validate_secret_name};
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
-use hyp_harness::daemon::{LocalDaemon, LocalDaemonConfig, WakeupDaemonConfig, WakeupMcpToolMode};
-use hyp_harness::protocol::HarnessKind;
+use hyp_harness::daemon::{DeliveryRetryConfig, LocalDaemon, LocalDaemonConfig};
 use hyp_node::adapters::{
     AdapterKind, GitHubPublicAdapter, GitHubPublicConfig, HelloMode, SubprocessConfig,
 };
 use hyp_node::engine::{
-    DropRelayConfig, E2eePolicy, EscalationConfig, GuestPairingConfig, NodeConfig, NodeProfile,
-    TopicConfig, UnifiedNode,
+    DropRelayConfig, E2eePolicy, EscalationConfig, GuestPairingConfig, LocalIngestConfig,
+    LocalIngestServer, NodeConfig, NodeProfile, TopicConfig, UnifiedNode,
 };
 use hyp_node::gates::{SecurityGateConfig, SecurityGatePipeline};
 use hyp_proto::address::{
@@ -216,8 +215,9 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
 
     let mut startup_warnings: Vec<String> = Vec::new();
     let mut github_public_cfg: Option<GitHubPublicConfig> = None;
-    let mut wakeup_cfg = WakeupDaemonConfig::default();
+    let mut delivery_retry_cfg = DeliveryRetryConfig::default();
     let mut parsed_plugins: Vec<SubprocessConfig> = Vec::new();
+    let mut skipped_plugin_statuses: Vec<Value> = Vec::new();
 
     if let Some(ref cfg) = loaded {
         node_cfg.require_pairing = cfg.require_pairing;
@@ -226,6 +226,58 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         } else {
             E2eePolicy::Prefer
         };
+
+        // Parse optional `localIngest` policy (default enabled: true!).
+        if let Some(li_val) = cfg.raw.get("localIngest") {
+            match serde_json::from_value::<LocalIngestConfig>(li_val.clone()) {
+                Ok(li) => {
+                    let bare_default = li
+                        .default_topic
+                        .strip_prefix("local.")
+                        .unwrap_or(li.default_topic.as_str());
+                    if !is_valid_topic(bare_default) {
+                        return emit_error(
+                            cmd,
+                            as_json,
+                            EXIT_ERROR,
+                            "CONFIG_ERROR",
+                            format!(
+                                "Invalid localIngest.defaultTopic '{}' in {}",
+                                li.default_topic,
+                                cfg.path.display()
+                            ),
+                            None,
+                        );
+                    }
+                    node_cfg.local_ingest = li;
+                }
+                Err(e) => {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "CONFIG_ERROR",
+                        format!("Invalid localIngest config in {}: {e}", cfg.path.display()),
+                        None,
+                    );
+                }
+            }
+        }
+
+        // Parse optional `deliveryRetry` (with legacy fallbacks `codexResume`, `herdrSpawnAllowlist`).
+        match parse_delivery_retry_config(&cfg.raw) {
+            Ok(dr_cfg) => delivery_retry_cfg = dr_cfg,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "CONFIG_ERROR",
+                    format!("Invalid deliveryRetry config in {}: {e}", cfg.path.display()),
+                    None,
+                );
+            }
+        }
 
         // Parse optional `dropRelay` (RAM-only Blind Drop Relay) and `dropRelayUrl`.
         if let Some(dr_val) = cfg.raw.get("dropRelay") {
@@ -369,29 +421,20 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                     );
                 }
             }
-
-            // Parse optional `kind == "wakeup"` source entry into `WakeupDaemonConfig`.
-            match parse_wakeup_source(sources_val) {
-                Ok(Some(w_cfg)) => wakeup_cfg = w_cfg,
-                Ok(None) => {}
-                Err(e) => {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
-                        "CONFIG_ERROR",
-                        format!("Invalid wakeup source in {}: {e}", cfg.path.display()),
-                        Some("Verify sources[] entry with kind == \"wakeup\" in node.json.".to_string()),
-                    );
-                }
-            }
         }
 
-        // Parse optional `plugins[]` external bridge/source subprocess entries (fail closed on
-        // invalid schema or missing secret references).
+        // Parse optional `plugins[]` external bridge/source subprocess entries.
+        // Fault isolation: if a single plugin references a missing secret, emit a warning and
+        // skip that plugin instead of aborting the entire daemon.
         if let Some(plugins_val) = cfg.raw.get("plugins") {
             if !plugins_val.is_null() {
-                match parse_plugins_config(plugins_val, cfg.path.parent(), &secrets) {
+                match parse_plugins_config(
+                    plugins_val,
+                    cfg.path.parent(),
+                    &secrets,
+                    &mut startup_warnings,
+                    &mut skipped_plugin_statuses,
+                ) {
                     Ok(plugins) => {
                         for p in &plugins {
                             match p.kind {
@@ -440,8 +483,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                             "CONFIG_ERROR",
                             format!("Invalid plugins config in {}: {e}", cfg.path.display()),
                             Some(
-                                "Verify plugins[] in node.json and ensure referenced secrets are set via `hyp secret set <name>`."
-                                    .to_string(),
+                                "Verify plugins[] schema in node.json.".to_string(),
                             ),
                         );
                     }
@@ -467,12 +509,12 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         node_cfg.drop_relay.max_memory_mb = max_mb;
     }
 
-    let wakeup_enabled = wakeup_cfg.enabled;
     let drop_relay_enabled = node_cfg.drop_relay.enabled;
     let drop_relay_url = node_cfg.drop_relay_url.clone();
 
     let start_local_daemon = !args.no_local_socket
         && (matches!(profile, NodeProfile::Local | NodeProfile::P2p) || args.socket.is_some());
+    let start_local_ingest = node_cfg.local_ingest.enabled && !args.no_local_socket;
     let explicit_socket = args.socket.clone();
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -527,7 +569,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         };
         let guest_pairing_enabled = node.config().guest_pairing.enabled;
 
-        let local_daemon = if start_local_daemon {
+        let gate_pipeline = if start_local_daemon || start_local_ingest {
             let gate_cfg: SecurityGateConfig = match loaded.as_ref().and_then(|c| c.raw.get("gate"))
             {
                 Some(gate_val) => serde_json::from_value(gate_val.clone())
@@ -549,16 +591,35 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                         .to_string(),
                 );
             }
+            Some(pipeline)
+        } else {
+            None
+        };
+
+        let local_daemon = if start_local_daemon {
             let local_cfg = LocalDaemonConfig {
                 socket_path: explicit_socket,
                 auto_detect_transports: true,
-                wakeup: wakeup_cfg,
+                delivery_retry: delivery_retry_cfg,
                 ..Default::default()
             };
-            let daemon = LocalDaemon::start(Arc::clone(&node), Some(pipeline), local_cfg)
+            let daemon = LocalDaemon::start(Arc::clone(&node), gate_pipeline.clone(), local_cfg)
                 .await
                 .map_err(|e| format!("Failed to start local harness IPC daemon: {e}"))?;
             Some(Arc::new(daemon))
+        } else {
+            None
+        };
+
+        let local_ingest_server = if start_local_ingest {
+            let srv = LocalIngestServer::start(
+                Arc::clone(&node),
+                gate_pipeline.clone(),
+                node.config().local_ingest.clone(),
+            )
+            .await
+            .map_err(|e| format!("Failed to start local ingest server: {e}"))?;
+            Some(srv)
         } else {
             None
         };
@@ -567,16 +628,16 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         // + outbound BridgePosters into `LocalDaemon`. On non-Unix platforms (e.g. Windows),
         // warn cleanly without breaking compilation or startup.
         #[cfg(unix)]
-        let (running_plugins, plugin_statuses) = plugin_runtime::start_plugins(
+        let (running_plugins, mut plugin_statuses) = plugin_runtime::start_plugins(
             parsed_plugins,
             &node,
             local_daemon.as_ref(),
             &mut startup_warnings,
         )
-        .await?;
+        .await;
 
         #[cfg(not(unix))]
-        let plugin_statuses: Vec<Value> = {
+        let mut plugin_statuses: Vec<Value> = {
             let mut statuses = Vec::with_capacity(parsed_plugins.len());
             if !parsed_plugins.is_empty() {
                 let ids: Vec<String> = parsed_plugins.iter().map(|p| p.id.clone()).collect();
@@ -595,6 +656,10 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             }
             statuses
         };
+        if !skipped_plugin_statuses.is_empty() {
+            skipped_plugin_statuses.extend(plugin_statuses);
+            plugin_statuses = skipped_plugin_statuses;
+        }
 
         let mut bound_addr: Option<SocketAddr> = None;
         let mut server_handle = None;
@@ -663,6 +728,9 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         let socket_path_str = local_daemon
             .as_ref()
             .map(|d| d.socket_path().display().to_string());
+        let local_ingest_socket_str = local_ingest_server
+            .as_ref()
+            .map(|s| s.endpoint_path().display().to_string());
 
         write_atomic_file(&pid_path, format!("{pid}\n").as_bytes(), true)?;
         let status_doc = json!({
@@ -675,11 +743,12 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             "bind": bound_addr.map(|a| a.to_string()),
             "endpoint": endpoint,
             "socketPath": socket_path_str,
+            "localIngestEnabled": local_ingest_server.is_some(),
+            "localIngestSocket": local_ingest_socket_str,
             "stateDir": state_dir.display().to_string(),
             "configPath": loaded.as_ref().map(|c| c.path.display().to_string()),
             "guestPairingEnabled": guest_pairing_enabled,
             "githubPublicEnabled": github_public_enabled,
-            "wakeupEnabled": wakeup_enabled,
             "dropRelayEnabled": drop_relay_enabled,
             "dropRelayUrl": drop_relay_url,
             "connectedPeers": connected_peers,
@@ -730,6 +799,11 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             } else {
                 println!("      Local IPC:   disabled");
             }
+            if let Some(ref ingest_sock) = local_ingest_socket_str {
+                println!("      Local Ingest: {ingest_sock}");
+            } else {
+                println!("      Local Ingest: disabled");
+            }
             if let Some(addr) = bound_addr {
                 println!("      Peer HTTP:   http://{addr} (GET /v1/manifest, GET /v1/health)");
             } else {
@@ -740,9 +814,6 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             }
             if github_public_enabled {
                 println!("      GitHub Pub:  enabled (demand-driven ETag poller)");
-            }
-            if wakeup_enabled {
-                println!("      Wakeup:      enabled");
             }
             if drop_relay_enabled {
                 println!(
@@ -783,6 +854,10 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
 
         #[cfg(unix)]
         plugin_runtime::stop_plugins(running_plugins).await;
+
+        if let Some(ingest_srv) = local_ingest_server {
+            ingest_srv.stop().await;
+        }
 
         if let Some(daemon) = local_daemon {
             match Arc::try_unwrap(daemon) {
@@ -1022,85 +1097,86 @@ fn parse_github_public_source(
     Ok(None)
 }
 
-fn parse_wakeup_source(sources_val: &Value) -> Result<Option<WakeupDaemonConfig>, String> {
-    let arr = sources_val
-        .as_array()
-        .ok_or_else(|| "sources must be a JSON array".to_string())?;
+fn parse_delivery_retry_fields(
+    obj: &serde_json::Map<String, Value>,
+    cfg: &mut DeliveryRetryConfig,
+) -> Result<(), String> {
+    if let Some(arr) = obj
+        .get("holdRetryBackoffMs")
+        .or_else(|| obj.get("hold_retry_backoff_ms"))
+        .and_then(Value::as_array)
+    {
+        let mut backoff = Vec::with_capacity(arr.len());
+        for item in arr {
+            let ms = item.as_u64().ok_or_else(|| {
+                "deliveryRetry.holdRetryBackoffMs entries must be non-negative integers".to_string()
+            })?;
+            backoff.push(ms);
+        }
+        if !backoff.is_empty() {
+            cfg.hold_retry_backoff_ms = backoff;
+        }
+    }
+    if let Some(max_att) = obj
+        .get("holdRetryMaxAttempts")
+        .or_else(|| obj.get("hold_retry_max_attempts"))
+        .and_then(Value::as_u64)
+    {
+        cfg.hold_retry_max_attempts = max_att.min(u32::MAX as u64) as u32;
+    }
+    if let Some(resume) = obj
+        .get("codexResume")
+        .or_else(|| obj.get("codex_resume"))
+        .and_then(Value::as_bool)
+    {
+        cfg.codex_resume = resume;
+    }
+    if let Some(arr) = obj
+        .get("herdrSpawnAllowlist")
+        .or_else(|| obj.get("herdr_spawn_allowlist"))
+        .and_then(Value::as_array)
+    {
+        let mut allow = Vec::with_capacity(arr.len());
+        for item in arr {
+            let s = item.as_str().ok_or_else(|| {
+                "deliveryRetry.herdrSpawnAllowlist entries must be strings".to_string()
+            })?;
+            allow.push(s.to_string());
+        }
+        cfg.herdr_spawn_allowlist = allow;
+    }
+    Ok(())
+}
 
-    for entry in arr {
-        let Some(obj) = entry.as_object() else {
-            continue;
-        };
-        if obj.get("kind").and_then(Value::as_str) != Some("wakeup") {
-            continue;
-        }
-        let mut cfg = WakeupDaemonConfig {
-            enabled: obj.get("enabled").and_then(Value::as_bool).unwrap_or(true),
-            ..WakeupDaemonConfig::default()
-        };
-        if let Some(mode) = obj.get("mcpTool").and_then(Value::as_str) {
-            cfg.mcp_tool_mode = match mode {
-                "auto" => WakeupMcpToolMode::Auto,
-                "always" => WakeupMcpToolMode::Always,
-                "never" => WakeupMcpToolMode::Never,
-                other => {
-                    return Err(format!(
-                        "invalid wakeup mcpTool '{other}' (expected auto, always, or never)"
-                    ));
+fn parse_delivery_retry_config(raw: &Value) -> Result<DeliveryRetryConfig, String> {
+    let mut cfg = DeliveryRetryConfig::default();
+    let Some(root) = raw.as_object() else {
+        return Ok(cfg);
+    };
+
+    // Legacy fallback: honor retry/revival fields from older `sources[kind="wakeup"]` entries.
+    if let Some(sources) = root.get("sources").and_then(Value::as_array) {
+        for entry in sources {
+            if let Some(obj) = entry.as_object() {
+                if obj.get("kind").and_then(Value::as_str) == Some("wakeup") {
+                    parse_delivery_retry_fields(obj, &mut cfg)?;
                 }
-            };
-        }
-        if let Some(arr) = obj.get("denyBackends").and_then(Value::as_array) {
-            let mut denied = Vec::with_capacity(arr.len());
-            for item in arr {
-                let s = item
-                    .as_str()
-                    .ok_or_else(|| "wakeup.denyBackends entries must be strings".to_string())?;
-                let kind = s
-                    .parse::<HarnessKind>()
-                    .map_err(|e| format!("invalid harness '{s}' in wakeup.denyBackends: {e}"))?;
-                denied.push(kind);
-            }
-            cfg.deny_backends = denied;
-        }
-        if let Some(arr) = obj.get("holdRetryBackoffMs").and_then(Value::as_array) {
-            let mut backoff = Vec::with_capacity(arr.len());
-            for item in arr {
-                let ms = item
-                    .as_u64()
-                    .ok_or_else(|| "wakeup.holdRetryBackoffMs entries must be positive integers".to_string())?;
-                backoff.push(ms);
-            }
-            if !backoff.is_empty() {
-                cfg.hold_retry_backoff_ms = backoff;
             }
         }
-        if let Some(max_att) = obj.get("holdRetryMaxAttempts").and_then(Value::as_u64) {
-            cfg.hold_retry_max_attempts = max_att.min(u32::MAX as u64) as u32;
-        }
-        if let Some(resume) = obj.get("codexResume").and_then(Value::as_bool) {
-            cfg.codex_resume = resume;
-        }
-        if let Some(arr) = obj.get("herdrSpawnAllowlist").and_then(Value::as_array) {
-            let mut allow = Vec::with_capacity(arr.len());
-            for item in arr {
-                let s = item
-                    .as_str()
-                    .ok_or_else(|| "wakeup.herdrSpawnAllowlist entries must be strings".to_string())?;
-                allow.push(s.to_string());
-            }
-            cfg.herdr_spawn_allowlist = allow;
-        }
-        if let Some(screen_ext) = obj.get("screenExternalNotes").and_then(Value::as_bool) {
-            cfg.screen_external_notes = screen_ext;
-        }
-        if let Some(screen_agent) = obj.get("screenAgentNotes").and_then(Value::as_bool) {
-            cfg.screen_agent_notes = screen_agent;
-        }
-        return Ok(Some(cfg));
     }
 
-    Ok(None)
+    // Legacy fallback: top-level `codexResume` / `herdrSpawnAllowlist` / retry keys.
+    parse_delivery_retry_fields(root, &mut cfg)?;
+
+    // Primary v0.5.0 `deliveryRetry` object takes precedence.
+    if let Some(dr_val) = root.get("deliveryRetry") {
+        let obj = dr_val
+            .as_object()
+            .ok_or_else(|| "deliveryRetry must be a JSON object".to_string())?;
+        parse_delivery_retry_fields(obj, &mut cfg)?;
+    }
+
+    Ok(cfg)
 }
 
 const fn plugin_kind_str(kind: AdapterKind) -> &'static str {
@@ -1113,12 +1189,15 @@ const fn plugin_kind_str(kind: AdapterKind) -> &'static str {
 }
 
 /// Parses and validates `plugins[]` from `node.json`, resolving any `{ "secret": "<name>" }`
-/// references in `env` via `SecretStore` (failing closed on malformed entries or missing secrets,
-/// and never exposing resolved secret values in error messages).
+/// references in `env` via `SecretStore` (isolating per-plugin missing secrets to warnings so a
+/// single misconfigured chat bridge never aborts the entire daemon, and never exposing resolved
+/// secret values in error messages).
 fn parse_plugins_config(
     plugins_val: &Value,
     config_dir: Option<&Path>,
     secrets: &hyp_crypto::SecretStore,
+    warnings: &mut Vec<String>,
+    skipped_statuses: &mut Vec<Value>,
 ) -> Result<Vec<SubprocessConfig>, String> {
     let arr = plugins_val
         .as_array()
@@ -1235,6 +1314,7 @@ fn parse_plugins_config(
         };
 
         let mut env_map: BTreeMap<String, String> = BTreeMap::new();
+        let mut secret_skip_reason: Option<String> = None;
         if let Some(env_val) = obj.get("env") {
             if !env_val.is_null() {
                 let env_obj = env_val
@@ -1270,14 +1350,16 @@ fn parse_plugins_config(
                                     env_map.insert(env_key.clone(), (*secret).clone());
                                 }
                                 Err(CryptoError::SecretNotFound(_)) => {
-                                    return Err(format!(
+                                    secret_skip_reason = Some(format!(
                                         "plugins[{id}].env.{env_key} references missing secret '{secret_name}'; run `hyp secret set {secret_name}`"
                                     ));
+                                    break;
                                 }
                                 Err(e) => {
-                                    return Err(format!(
+                                    secret_skip_reason = Some(format!(
                                         "failed to load secret '{secret_name}' for plugins[{id}].env.{env_key}: {e}"
                                     ));
+                                    break;
                                 }
                             }
                         }
@@ -1289,6 +1371,20 @@ fn parse_plugins_config(
                     }
                 }
             }
+        }
+
+        if let Some(reason) = secret_skip_reason {
+            warnings.push(format!(
+                "Skipping plugin '{id}' (daemon continuing): {reason}"
+            ));
+            skipped_statuses.push(json!({
+                "id": id,
+                "kind": plugin_kind_str(kind),
+                "targets": targets,
+                "status": "skipped",
+                "error": reason,
+            }));
+            continue;
         }
 
         let mut cfg = SubprocessConfig::new(id, kind, exec, args, targets);
@@ -1482,7 +1578,7 @@ mod plugin_runtime {
         node: &Arc<UnifiedNode>,
         local_daemon: Option<&Arc<LocalDaemon>>,
         startup_warnings: &mut Vec<String>,
-    ) -> Result<(Vec<Arc<SubprocessSupervisor>>, Vec<Value>), String> {
+    ) -> (Vec<Arc<SubprocessSupervisor>>, Vec<Value>) {
         let mut started: Vec<Arc<SubprocessSupervisor>> = Vec::with_capacity(configs.len());
         let mut statuses: Vec<Value> = Vec::with_capacity(configs.len());
 
@@ -1499,8 +1595,17 @@ mod plugin_runtime {
             });
 
             if let Err(err) = sup.start(host).await {
-                stop_plugins(started).await;
-                return Err(format!("Failed to start plugin '{plugin_id}': {err}"));
+                startup_warnings.push(format!(
+                    "Plugin '{plugin_id}' failed to start and was skipped (daemon continuing): {err}"
+                ));
+                statuses.push(json!({
+                    "id": plugin_id,
+                    "kind": plugin_kind_str(kind),
+                    "targets": targets,
+                    "status": "failed",
+                    "error": err.to_string(),
+                }));
+                continue;
             }
 
             if kind == AdapterKind::Bridge {
@@ -1528,7 +1633,7 @@ mod plugin_runtime {
             started.push(sup);
         }
 
-        Ok((started, statuses))
+        (started, statuses)
     }
 
     pub(super) async fn stop_plugins(plugins: Vec<Arc<SubprocessSupervisor>>) {

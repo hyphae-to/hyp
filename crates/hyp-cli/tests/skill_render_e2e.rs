@@ -177,10 +177,32 @@ fn setup_all_harnesses_installs_tailored_skills_idempotently_and_honors_dry_run(
             );
         }
 
-        // Default node.json has no bridge/kv/wakeup -> 0 optional tool mentions
+        // Default node.json has no bridge/kv -> 0 optional tool mentions, never removed hyp_wakeup
         assert!(!text.contains("`hyp_bridge`"));
         assert!(!text.contains("`hyp_kv`"));
-        assert!(!text.contains("`hyp_wakeup`"));
+        assert!(!text.contains("hyp_wakeup"));
+        assert!(!text.contains("hyp wakeup"));
+
+        // Local schedule tip appears ONLY on the 7 CLI harnesses without native scheduling
+        let expect_local_sched = matches!(
+            expected_profile,
+            "herdr" | "codex" | "claude" | "t3" | "cursor" | "opencode" | "gemini"
+        );
+        assert_eq!(
+            text.contains("local.schedule"),
+            expect_local_sched,
+            "local.schedule mismatch in {rel}:\n{text}"
+        );
+        assert_eq!(
+            text.contains("hyp emit"),
+            expect_local_sched,
+            "hyp emit mismatch in {rel}:\n{text}"
+        );
+        assert_eq!(
+            text.contains("ingest.sock"),
+            expect_local_sched,
+            "ingest.sock mismatch in {rel}:\n{text}"
+        );
 
         first_snapshots.push((p, text));
     }
@@ -274,7 +296,7 @@ fn setup_adapts_transport_to_host_orchestrators_and_node_json_capabilities() {
     assert!(codex_solo.contains("hyp wait --session codex:<id>"));
     assert!(!codex_solo.contains("Monitor"));
 
-    // 2. Enable Herdr dir + plugins[] + kvNamespaces[] + sources[kind="wakeup"] in node.json!
+    // 2. Enable Herdr dir + plugins[] + kvNamespaces[] in node.json!
     fs::create_dir_all(home.join(".config/herdr")).unwrap();
     fs::write(
         state_dir.join("node.json"),
@@ -284,10 +306,7 @@ fn setup_adapts_transport_to_host_orchestrators_and_node_json_capabilities() {
             "plugins": [
                 { "id": "slack", "kind": "bridge", "exec": "/bin/true", "targets": ["ops"] }
             ],
-            "kvNamespaces": ["shared"],
-            "sources": [
-                { "id": "wakeup", "kind": "wakeup", "enabled": true }
-            ]
+            "kvNamespaces": ["shared"]
         }))
         .unwrap(),
     )
@@ -311,25 +330,29 @@ fn setup_adapts_transport_to_host_orchestrators_and_node_json_capabilities() {
         .unwrap();
     assert_eq!(out_caps.status.code(), Some(0));
 
-    // Claude & Codex switched to dual-with-push AND received all 3 conditional tools!
+    // Claude & Codex switched to dual-with-push AND received bridge + kv + local.schedule tip!
     let claude_dual = read_lf(&home.join(".claude/skills/hyphae/SKILL.md"));
     assert!(claude_dual.contains("transport=claude-or-push"));
-    assert!(claude_dual.contains("caps=bridge,kv,wakeup"));
+    assert!(claude_dual.contains("caps=bridge,kv"));
     assert!(claude_dual.contains("`hyp_bridge`"));
     assert!(claude_dual.contains("`hyp_kv`"));
-    assert!(claude_dual.contains("`hyp_wakeup`"));
+    assert!(claude_dual.contains("local.schedule"));
+    assert!(claude_dual.contains("hyp emit"));
+    assert!(!claude_dual.contains("hyp_wakeup"));
     assert!(estimated_tokens(&claude_dual) <= MAX_TOKENS);
 
     let codex_dual = read_lf(&home.join(".codex/skills/hyphae/SKILL.md"));
     assert!(codex_dual.contains("transport=codex-or-push"));
-    assert!(codex_dual.contains("caps=bridge,kv,wakeup"));
+    assert!(codex_dual.contains("caps=bridge,kv"));
     assert!(codex_dual.contains("`hyp_bridge`"));
     assert!(codex_dual.contains("`hyp_kv`"));
-    assert!(codex_dual.contains("`hyp_wakeup`"));
+    assert!(codex_dual.contains("local.schedule"));
+    assert!(codex_dual.contains("hyp emit"));
+    assert!(!codex_dual.contains("hyp_wakeup"));
     assert!(!codex_dual.contains("Monitor"));
     assert!(estimated_tokens(&codex_dual) <= MAX_TOKENS);
 
-    // OpenClaw & Antigravity receive bridge + kv, but MUST suppress `hyp_wakeup` by default!
+    // OpenClaw & Antigravity receive bridge + kv, and MUST stay free of local OS schedule clutter!
     for (rel, profile) in [
         (".openclaw/skills/hyphae/SKILL.md", "openclaw"),
         (
@@ -343,8 +366,8 @@ fn setup_adapts_transport_to_host_orchestrators_and_node_json_capabilities() {
         assert!(txt.contains("`hyp_bridge`"), "{rel}:\n{txt}");
         assert!(txt.contains("`hyp_kv`"), "{rel}:\n{txt}");
         assert!(
-            !txt.contains("hyp_wakeup"),
-            "{profile} must suppress hyp_wakeup by default:\n{txt}"
+            !txt.contains("hyp_wakeup") && !txt.contains("local.schedule") && !txt.contains("hyp emit"),
+            "{profile} must suppress local schedule clutter:\n{txt}"
         );
     }
 

@@ -1339,6 +1339,21 @@ fn render_kit_readme(
     for (idx, step) in next.iter().enumerate() {
         out.push_str(&format!("{}. `{step}`\n", idx + 1));
     }
+    if provider == DeployProvider::DropRelay {
+        out.push_str(
+            "\n## Cloudflare Workers + RAM-Only Durable Object (30-Second Edge Deploy)\n\n\
+             Prefer zero-ops global edge hosting instead of running a VPS/container? Deploy the\n\
+             zero-dependency Cloudflare Workers kit directly from `workers/drop-relay/`:\n\n\
+             - **RAM-only `DropSlotDO`**: never touches Durable Object persistent storage; every\n\
+               ciphertext `Uint8Array` is zeroized in RAM on burn or TTL expiry.\n\
+             - **Private / Team mode (`DROP_AUTH_MODE = \"private\"`, default fail-closed)**:\n\
+               set `DROP_CAP_HMAC_KEY` and `ALLOWED_NODE_KEYS` via `npx wrangler secret put`, then\n\
+               run `cd workers/drop-relay && npx wrangler deploy`.\n\
+             - **Public mode (`DROP_AUTH_MODE = \"open\"`, e.g. `drop.hyphae.to`)**: accepts\n\
+               `Hyphae-Ed25519` requests carrying `X-Hyphae-Public-Key` with per-IP & per-key\n\
+               quotas.\n",
+        );
+    }
     out
 }
 

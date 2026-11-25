@@ -1,10 +1,10 @@
-//! Compiled-binary E2E tests for Hyphae v0.4.0 CLI surface:
-//! - `hyp wakeup` (`enable`, `disable`, `set`, `list`, `cancel`, `fire`, `emit`)
-//! - `hyp auth` (`init`, `init --web`, `add`, `list`, `revoke`, `certify-node`, `sign`)
-//! - `hyp drop` (`create`, `wait`, `ingest`) & `hyp relay` (`set`, `status`)
-//! - `hyp deploy init drop-relay` & `--enable-drop-relay` & fail-closed `deploy check`
-//! - `hyp gate lock` binding `human_authorities_digest` + tamper/replay/revocation fail-closed
-//! - Cross-language `site/drop/crypto.js` + `site/drop/drop.js` -> compiled Rust `hyp drop ingest`
+//! Compiled-binary E2E tests for Hyphae v0.5.0 CLI surface:
+//! - `hyp emit` (flag mode, stdin JSON mode, `--sign` Ed25519 `hyphaesig`, `LocalIngestServer` socket)
+//! - `hyp auth` (`init`, `init --web` with `encJwk` + Passkey `nodeCert`, `add`, `list`, `revoke`, `certify-node`, `sign`)
+//! - `hyp drop` (`create` with HPKE `encDraft`, zero-flag `wait` via `last_drop.json`, `ingest`) & `hyp relay` (`set`, `status`)
+//! - `hyp deploy init drop-relay` (including Cloudflare Workers kit README) & `--enable-drop-relay` & fail-closed `deploy check`
+//! - `hyp gate propose` -> `hyp gate lock` merging `gate.proposed.json` + `human_authorities_digest` binding
+//! - Cross-language Rust -> JS (`encDraft` open) & JS -> Rust (`hdrop1_` ingest) interop
 //!
 //! Security & isolation invariants:
 //! - Uses `tempfile::TempDir`, `HYPHAE_SECRET_BACKEND=file`, isolated `HOME`, and loopback `127.0.0.1:0`.
@@ -15,8 +15,13 @@ mod common;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use common::{ManagedProcess, isolated_cmd, parse_json_stdout};
-use hyp_crypto::keys::Ed25519KeyPair;
+use hyp_crypto::human::{
+    NodeCertPayloadV1, derive_prf_ed25519_keypair, derive_prf_x25519_keypair, encode_hcert1,
+    sign_node_cert,
+};
+use hyp_crypto::keys::{Ed25519KeyPair, OkpJwk, X25519KeyPair};
 use hyp_crypto::keystore::{SecretBackend, SecretStore};
+use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
 use hyp_store::{GateAuditQuery, NodeDb};
 use serde_json::{Value, json};
 use std::fs;
@@ -71,57 +76,21 @@ fn find_node_v20_plus() -> Option<PathBuf> {
 }
 
 // ============================================================================
-// 1. `hyp wakeup`: enable -> set (timer + cron) -> list -> cancel -> disable
+// 1. `hyp emit`: live `LocalIngestServer` socket (unsigned, stdin JSON, `--sign`)
 // ============================================================================
 
 #[test]
-fn cli_wakeup_enable_set_list_cancel_disable_json() {
+fn cli_emit_to_live_node_local_ingest_socket_unsigned_and_signed() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path();
     let state_dir = home.join("state");
-    let config_path = state_dir.join("node.json");
+    fs::create_dir_all(&state_dir).unwrap();
     let state_str = state_dir.to_str().unwrap();
-    let cfg_str = config_path.to_str().unwrap();
 
-    // 1. Enable wakeup source with `--mcp-tool auto`
-    let enable_out = isolated_cmd(home)
+    // 1. Offline `hyp emit` returns crisp INGEST_OFFLINE + next `hyp node start`.
+    let offline_out = isolated_cmd(home)
         .args([
-            "wakeup",
-            "enable",
-            "--mcp-tool",
-            "auto",
-            "--config",
-            cfg_str,
-            "--state-dir",
-            state_str,
-            "--json",
-        ])
-        .output()
-        .expect("run wakeup enable");
-    assert_eq!(enable_out.status.code(), Some(0));
-    let enable_json = parse_json_stdout(&enable_out);
-    assert_eq!(enable_json["ok"], true);
-    assert_eq!(enable_json["data"]["enabled"], true);
-    assert_eq!(enable_json["data"]["mcpTool"], "auto");
-
-    let cfg_val: Value =
-        serde_json::from_str(&fs::read_to_string(&config_path).unwrap().replace("\r\n", "\n"))
-            .unwrap();
-    let sources = cfg_val["sources"].as_array().unwrap();
-    let wakeup_src = sources
-        .iter()
-        .find(|s| s["kind"] == "wakeup")
-        .expect("sources[kind='wakeup'] exists");
-    assert_eq!(wakeup_src["enabled"], true);
-    assert_eq!(wakeup_src["mcpTool"], "auto");
-
-    // 2. Schedule one-shot timer (`--in 5m`)
-    let set_timer = isolated_cmd(home)
-        .args([
-            "wakeup",
-            "set",
-            "--in",
-            "5m",
+            "emit",
             "--label",
             "ci-watch",
             "--note",
@@ -130,147 +99,449 @@ fn cli_wakeup_enable_set_list_cancel_disable_json() {
             state_str,
             "--json",
         ])
+        .stdin(Stdio::null())
         .output()
-        .expect("run wakeup set timer");
-    assert_eq!(
-        set_timer.status.code(),
-        Some(0),
-        "stderr={}",
-        String::from_utf8_lossy(&set_timer.stderr)
-    );
-    let timer_json = parse_json_stdout(&set_timer);
-    assert_eq!(timer_json["ok"], true);
-    let timer_id = timer_json["data"]["wakeup"]["id"]
-        .as_str()
-        .expect("timer wakeup id")
-        .to_string();
-    assert_eq!(timer_json["data"]["wakeup"]["label"], "ci-watch");
-    assert_eq!(timer_json["data"]["wakeup"]["trigger"], "timer");
-
-    // 3. Schedule 5-field cron (`--cron "0 9 * * 1-5" --timezone local`)
-    let set_cron = isolated_cmd(home)
-        .args([
-            "wakeup",
-            "set",
-            "--cron",
-            "0 9 * * 1-5",
-            "--timezone",
-            "local",
-            "--label",
-            "standup",
-            "--note",
-            "daily",
-            "--state-dir",
-            state_str,
-            "--json",
-        ])
-        .output()
-        .expect("run wakeup set cron");
-    assert_eq!(
-        set_cron.status.code(),
-        Some(0),
-        "stderr={}",
-        String::from_utf8_lossy(&set_cron.stderr)
-    );
-    let cron_json = parse_json_stdout(&set_cron);
-    assert_eq!(cron_json["ok"], true);
-    assert_eq!(cron_json["data"]["wakeup"]["trigger"], "cron");
-    assert_eq!(cron_json["data"]["wakeup"]["cron"], "0 9 * * 1-5");
-
-    // 4. List active wakeups -> 2 active
-    let list_out = isolated_cmd(home)
-        .args(["wakeup", "list", "--state-dir", state_str, "--json"])
-        .output()
-        .expect("run wakeup list");
-    assert_eq!(list_out.status.code(), Some(0));
-    let list_json = parse_json_stdout(&list_out);
-    assert_eq!(list_json["ok"], true);
-    assert_eq!(list_json["data"]["count"], 2);
-    assert_eq!(list_json["data"]["wakeups"].as_array().unwrap().len(), 2);
-
-    // 5. Cancel timer wakeup
-    let cancel_out = isolated_cmd(home)
-        .args([
-            "wakeup",
-            "cancel",
-            &timer_id,
-            "--state-dir",
-            state_str,
-            "--json",
-        ])
-        .output()
-        .expect("run wakeup cancel");
-    assert_eq!(cancel_out.status.code(), Some(0));
-    let cancel_json = parse_json_stdout(&cancel_out);
-    assert_eq!(cancel_json["ok"], true);
-    assert_eq!(cancel_json["data"]["cancelled"], true);
-
-    // Verify only 1 active remains
-    let list_after = isolated_cmd(home)
-        .args(["wakeup", "list", "--state-dir", state_str, "--json"])
-        .output()
-        .expect("run wakeup list after cancel");
-    assert_eq!(list_after.status.code(), Some(0));
-    let list_after_json = parse_json_stdout(&list_after);
-    assert_eq!(list_after_json["data"]["count"], 1);
-
-    // 6. Disable wakeup source
-    let disable_out = isolated_cmd(home)
-        .args([
-            "wakeup",
-            "disable",
-            "--config",
-            cfg_str,
-            "--state-dir",
-            state_str,
-            "--json",
-        ])
-        .output()
-        .expect("run wakeup disable");
-    assert_eq!(disable_out.status.code(), Some(0));
-    let disable_json = parse_json_stdout(&disable_out);
-    assert_eq!(disable_json["ok"], true);
-    assert_eq!(disable_json["data"]["enabled"], false);
-
-    let cfg_val2: Value =
-        serde_json::from_str(&fs::read_to_string(&config_path).unwrap().replace("\r\n", "\n"))
-            .unwrap();
-    let wakeup_src2 = cfg_val2["sources"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|s| s["kind"] == "wakeup")
-        .unwrap();
-    assert_eq!(wakeup_src2["enabled"], false);
-
-    // 7. `wakeup fire` when daemon offline returns crisp DAEMON_OFFLINE + next `hyp node start`
-    let fire_offline = isolated_cmd(home)
-        .args([
-            "wakeup",
-            "fire",
-            "--to",
-            "dev",
-            "--label",
-            "adhoc",
-            "--note",
-            "ping",
-            "--state-dir",
-            state_str,
-            "--json",
-        ])
-        .output()
-        .expect("run wakeup fire offline");
-    assert_eq!(fire_offline.status.code(), Some(1));
-    let fire_json = parse_json_stdout(&fire_offline);
-    assert_eq!(fire_json["ok"], false);
-    assert_eq!(fire_json["error"]["code"], "DAEMON_OFFLINE");
+        .expect("run emit offline");
+    assert_eq!(offline_out.status.code(), Some(1));
+    let offline_json = parse_json_stdout(&offline_out);
+    assert_eq!(offline_json["ok"], false);
+    assert_eq!(offline_json["error"]["code"], "INGEST_OFFLINE");
     assert!(
-        fire_json["next"]
+        offline_json["next"]
             .as_array()
             .unwrap()
             .iter()
             .any(|s| s.as_str() == Some("hyp node start"))
     );
+
+    // 2. Start compiled `hyp node start` (default `localIngest.enabled == true`!).
+    let mut node_cmd = isolated_cmd(home);
+    node_cmd.args([
+        "node",
+        "start",
+        "--profile",
+        "local",
+        "--state-dir",
+        state_str,
+        "--json",
+    ]);
+    let mut node_proc = ManagedProcess::spawn("hyp node start (local ingest)", &mut node_cmd);
+    let startup = node_proc.read_json_line(Duration::from_secs(10));
+    assert_eq!(startup["ok"], true, "startup={startup}");
+    assert_eq!(startup["data"]["localIngestEnabled"], true);
+    let ingest_sock_str = startup["data"]["localIngestSocket"]
+        .as_str()
+        .expect("localIngestSocket path present in startup JSON");
+    let ingest_sock_path = Path::new(ingest_sock_str);
+    assert!(
+        ingest_sock_path.exists(),
+        "local ingest endpoint must exist at {}",
+        ingest_sock_path.display()
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(ingest_sock_str.ends_with("ingest.sock"));
+        let mode = fs::metadata(ingest_sock_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "ingest.sock must enforce strictly 0600 perms, got {:o}",
+            mode
+        );
+    }
+
+    // 3. Unsigned flag-mode `hyp emit --label ci-watch --note "check build" --json`.
+    let emit_out = isolated_cmd(home)
+        .args([
+            "emit",
+            "--label",
+            "ci-watch",
+            "--note",
+            "check build",
+            "--state-dir",
+            state_str,
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run emit unsigned");
+    assert_eq!(
+        emit_out.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&emit_out.stdout),
+        String::from_utf8_lossy(&emit_out.stderr)
+    );
+    let emit_json = parse_json_stdout(&emit_out);
+    assert_eq!(emit_json["ok"], true);
+    assert_eq!(emit_json["data"]["topic"], "local.schedule");
+    assert_eq!(emit_json["data"]["decision"], "allow");
+    assert_eq!(emit_json["data"]["trustTier"], "external-webhook");
+
+    // 4. Stdin compact JSON mode (`{"label":"cron-stdin","note":"nightly"}`).
+    let stdin_emit = run_hyp_with_stdin(
+        home,
+        &["emit", "--state-dir", state_str, "--json"],
+        r#"{"label":"cron-stdin","note":"nightly"}"#,
+    );
+    assert_eq!(
+        stdin_emit.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&stdin_emit.stderr)
+    );
+    let stdin_json = parse_json_stdout(&stdin_emit);
+    assert_eq!(stdin_json["ok"], true);
+    assert_eq!(stdin_json["data"]["topic"], "local.schedule");
+    assert_eq!(stdin_json["data"]["decision"], "allow");
+
+    // 5. `hyp auth init` + `hyp emit --sign --label prod-op --note "signed trigger" --json`.
+    let auth_out = isolated_cmd(home)
+        .args([
+            "auth",
+            "init",
+            "--human-id",
+            "bogdan",
+            "--label",
+            "laptop-admin",
+            "--state-dir",
+            state_str,
+            "--json",
+        ])
+        .output()
+        .expect("run auth init");
+    assert_eq!(auth_out.status.code(), Some(0));
+
+    let signed_out = isolated_cmd(home)
+        .args([
+            "emit",
+            "--sign",
+            "--label",
+            "prod-op",
+            "--note",
+            "signed trigger",
+            "--state-dir",
+            state_str,
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run emit --sign");
+    assert_eq!(
+        signed_out.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&signed_out.stdout),
+        String::from_utf8_lossy(&signed_out.stderr)
+    );
+    let signed_json = parse_json_stdout(&signed_out);
+    assert_eq!(signed_json["ok"], true);
+    assert_eq!(signed_json["data"]["topic"], "local.schedule");
+    assert_eq!(signed_json["data"]["decision"], "allow");
+    assert_eq!(signed_json["data"]["trustTier"], "human-verified");
+    assert_eq!(signed_json["data"]["verifiedHumanId"], "bogdan");
+
+    // 6. Verify `hyp status --json` reports `data.localIngest.enabled == true` & `socketExists == true`.
+    let status_out = isolated_cmd(home)
+        .args(["status", "--state-dir", state_str, "--json"])
+        .output()
+        .expect("run status");
+    assert_eq!(status_out.status.code(), Some(0));
+    let status_json = parse_json_stdout(&status_out);
+    assert_eq!(status_json["data"]["localIngest"]["enabled"], true);
+    assert_eq!(status_json["data"]["localIngest"]["socketExists"], true);
+    assert_eq!(status_json["data"]["localIngest"]["defaultTopic"], "schedule");
+    assert_eq!(status_json["data"]["localIngest"]["routesCount"], 1);
+
+    node_proc.shutdown_gracefully();
+}
+
+// ============================================================================
+// 1b. `hyp drop create --draft` (HPKE `encDraft`) & Cross-Language Rust -> JS Open
+// ============================================================================
+
+#[test]
+fn cli_drop_create_encrypted_draft_and_cross_language_rust_to_js_open() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let state_dir = home.join("state");
+    let state_str = state_dir.to_str().unwrap();
+
+    // 1. Initialize local admin (no companion X25519 `encJwk` yet).
+    let init_out = isolated_cmd(home)
+        .args([
+            "auth",
+            "init",
+            "--human-id",
+            "bogdan",
+            "--label",
+            "laptop-admin",
+            "--state-dir",
+            state_str,
+            "--json",
+        ])
+        .output()
+        .expect("run auth init");
+    assert_eq!(init_out.status.code(), Some(0));
+
+    // 2. Without any enrolled X25519 `encJwk`, `--draft` MUST fail closed (NEVER downgrade to plaintext!).
+    let no_enc_out = isolated_cmd(home)
+        .args([
+            "drop",
+            "create",
+            "--kind",
+            "directive",
+            "--draft",
+            "Approve deploy v0.5.0 to eu-1",
+            "--offline",
+            "--state-dir",
+            state_str,
+            "--json",
+        ])
+        .output()
+        .expect("run drop create draft without encJwk");
+    assert_ne!(no_enc_out.status.code(), Some(0));
+    let no_enc_json = parse_json_stdout(&no_enc_out);
+    assert_eq!(no_enc_json["ok"], false);
+    assert_eq!(no_enc_json["error"]["code"], "NO_HUMAN_ENC_KEY");
+    assert!(
+        no_enc_json["next"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str() == Some("hyp auth init --web"))
+    );
+
+    // 3. Enroll Passkey-PRF authority WITH companion X25519 `encJwk` via `hyp auth add` stdin bundle!
+    let mut prf_out = [0u8; 32];
+    for (idx, slot) in prf_out.iter_mut().enumerate() {
+        *slot = ((idx * 11 + 5) & 0xff) as u8;
+    }
+    let human_id = "bogdan";
+    let auth_epoch = 1u64;
+    let prf_salt = "salt-draft-interop-v050";
+    let passkey_ed = derive_prf_ed25519_keypair(&prf_out, human_id, auth_epoch).unwrap();
+    let passkey_x = derive_prf_x25519_keypair(&prf_out, human_id, auth_epoch).unwrap();
+
+    let bundle_json = serde_json::to_string(&json!({
+        "v": 1,
+        "humanId": human_id,
+        "kid": passkey_ed.kid(),
+        "jwk": passkey_ed.to_jwk(),
+        "encJwk": passkey_x.to_jwk(),
+        "prfSalt": prf_salt,
+        "authEpoch": auth_epoch,
+    }))
+    .unwrap();
+    let add_out = run_hyp_with_stdin(
+        home,
+        &[
+            "auth",
+            "add",
+            "--human-id",
+            human_id,
+            "--label",
+            "iphone-passkey",
+            "--role",
+            "signer",
+            "--state-dir",
+            state_str,
+            "--json",
+        ],
+        &bundle_json,
+    );
+    assert_eq!(
+        add_out.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&add_out.stdout),
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+    let add_json = parse_json_stdout(&add_out);
+    assert_eq!(add_json["ok"], true);
+    assert_eq!(add_json["data"]["encKey"], true);
+    assert_eq!(add_json["data"]["encKid"], passkey_x.kid());
+
+    // Confirm `hyp auth list --json` and `hyp status --json` reflect the enrolled `encKey`.
+    let list_out = isolated_cmd(home)
+        .args(["auth", "list", "--state-dir", state_str, "--json"])
+        .output()
+        .expect("run auth list");
+    assert_eq!(list_out.status.code(), Some(0));
+    let list_json = parse_json_stdout(&list_out);
+    let auths = list_json["data"]["authorities"].as_array().unwrap();
+    assert!(
+        auths
+            .iter()
+            .any(|a| a["kid"] == passkey_ed.kid() && a["encKey"] == true && a["encKid"] == passkey_x.kid()),
+        "expected encKey=true in auth list: {list_json}"
+    );
+    let st_out = isolated_cmd(home)
+        .args(["status", "--state-dir", state_str, "--json"])
+        .output()
+        .expect("run status");
+    assert_eq!(st_out.status.code(), Some(0));
+    let st_json = parse_json_stdout(&st_out);
+    assert_eq!(st_json["data"]["humanDrops"]["hasEncJwkCount"], 1);
+
+    // 4. Create directive drop with encrypted draft + context!
+    let draft_text = "Approve deploy v0.5.0 to eu-1";
+    let draft_ctx = "PR #412";
+    let create_out = isolated_cmd(home)
+        .args([
+            "drop",
+            "create",
+            "--kind",
+            "directive",
+            "--draft",
+            draft_text,
+            "--context",
+            draft_ctx,
+            "--offline",
+            "--state-dir",
+            state_str,
+            "--json",
+        ])
+        .output()
+        .expect("run drop create with encrypted draft");
+    assert_eq!(
+        create_out.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&create_out.stdout),
+        String::from_utf8_lossy(&create_out.stderr)
+    );
+    let create_json = parse_json_stdout(&create_out);
+    assert_eq!(create_json["ok"], true);
+    assert_eq!(create_json["data"]["hasEncDraft"], true);
+    let drop_url = create_json["data"]["url"].as_str().unwrap();
+    assert!(
+        drop_url.starts_with("https://hyphae.to/drop#drop="),
+        "expected #drop= URL, got: {drop_url}"
+    );
+    assert!(!drop_url.contains("Approve deploy"));
+    assert!(!drop_url.contains("PR #412"));
+
+    let raw_hash = drop_url.split_once('#').unwrap().1;
+    let b64 = raw_hash.strip_prefix("drop=").unwrap();
+    let frag_bytes = URL_SAFE_NO_PAD.decode(b64).unwrap();
+    let frag_str = String::from_utf8(frag_bytes).unwrap();
+    assert!(!frag_str.contains("Approve deploy"));
+    assert!(!frag_str.contains("PR #412"));
+    let frag: Value = serde_json::from_str(&frag_str).unwrap();
+    assert_eq!(frag["encDraft"]["v"], 1);
+    assert_eq!(frag["encDraft"]["suite"], "human.draft.v1");
+    assert_eq!(frag["encDraft"]["recipientKid"], passkey_x.kid());
+    assert!(frag.get("draft").is_none());
+    assert!(frag.get("proposedText").is_none());
+
+    // 5. Fail-closed guards: `--kind secret --draft` AND BiDi `\u{202E}` MUST fail closed!
+    let secret_draft = isolated_cmd(home)
+        .args([
+            "drop",
+            "create",
+            "--kind",
+            "secret",
+            "--secret-name",
+            "demo",
+            "--draft",
+            "nope",
+            "--offline",
+            "--state-dir",
+            state_str,
+            "--json",
+        ])
+        .output()
+        .expect("run secret drop with draft");
+    assert_ne!(secret_draft.status.code(), Some(0));
+    let secret_draft_json = parse_json_stdout(&secret_draft);
+    assert_eq!(secret_draft_json["ok"], false);
+    assert_eq!(
+        secret_draft_json["error"]["code"],
+        "DRAFT_FORBIDDEN_FOR_SECRET"
+    );
+
+    let bidi_draft = isolated_cmd(home)
+        .args([
+            "drop",
+            "create",
+            "--kind",
+            "directive",
+            "--draft",
+            "\u{202E}bad",
+            "--offline",
+            "--state-dir",
+            state_str,
+            "--json",
+        ])
+        .output()
+        .expect("run bidi draft");
+    assert_ne!(bidi_draft.status.code(), Some(0));
+    let bidi_json = parse_json_stdout(&bidi_draft);
+    assert_eq!(bidi_json["ok"], false);
+    assert_eq!(bidi_json["error"]["code"], "INVALID_DRAFT");
+
+    // 6. LIVE CROSS-LANGUAGE RUST -> JS INTEROP TEST (`site/drop/drop.js` + `site/drop/crypto.js`)!
+    let Some(node_bin) = find_node_v20_plus() else {
+        return;
+    };
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let crypto_js = repo_root.join("site").join("drop").join("crypto.js");
+    let drop_js = repo_root.join("site").join("drop").join("drop.js");
+    assert!(crypto_js.exists(), "missing {}", crypto_js.display());
+    assert!(drop_js.exists(), "missing {}", drop_js.display());
+
+    let prf_arr: Vec<u8> = prf_out.to_vec();
+    let script = format!(
+        r##"
+import {{ pathToFileURL }} from "node:url";
+const cryptoMod = await import(pathToFileURL({crypto_path}).href);
+const dropMod = await import(pathToFileURL({drop_path}).href);
+
+const urlStr = {url_str};
+const hashIdx = urlStr.indexOf("#");
+if (hashIdx === -1) throw new Error("missing hash fragment");
+const parsed = dropMod.parseFragmentString(urlStr.slice(hashIdx));
+if (parsed.mode !== "drop") throw new Error("expected drop mode");
+if (!parsed.fragment.encDraft || parsed.fragment.encDraft.suite !== "human.draft.v1") {{
+  throw new Error("missing human.draft.v1 encDraft in parsed fragment");
+}}
+
+const prfOut = new Uint8Array({prf_json});
+const encKp = await cryptoMod.derivePrfX25519Keypair(prfOut, {human_id_json}, {auth_epoch});
+const opened = await cryptoMod.openHumanDraft({{
+  encDraft: parsed.fragment.encDraft,
+  recipientPriv32: encKp.privateKeyBytes,
+  expectedNodeId: parsed.fragment.nodeId,
+}});
+process.stdout.write(JSON.stringify(opened));
+"##,
+        crypto_path = serde_json::to_string(crypto_js.to_str().unwrap()).unwrap(),
+        drop_path = serde_json::to_string(drop_js.to_str().unwrap()).unwrap(),
+        url_str = serde_json::to_string(drop_url).unwrap(),
+        prf_json = serde_json::to_string(&prf_arr).unwrap(),
+        human_id_json = serde_json::to_string(human_id).unwrap(),
+        auth_epoch = auth_epoch,
+    );
+
+    let js_out = Command::new(&node_bin)
+        .args(["--input-type=module", "-e", &script])
+        .output()
+        .expect("run node JS encDraft interop");
+    assert!(
+        js_out.status.success(),
+        "node JS encDraft open failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&js_out.stdout),
+        String::from_utf8_lossy(&js_out.stderr)
+    );
+    let opened: Value = serde_json::from_slice(&js_out.stdout).expect("valid JSON from node");
+    assert_eq!(opened["text"], draft_text);
+    assert_eq!(opened["context"], draft_ctx);
 }
 
 // ============================================================================
@@ -341,8 +612,8 @@ fn cli_auth_init_certify_sign_and_drop_ingest_secret_zero_leak() {
             .starts_with("hcert1_")
     );
 
-    // 4. Pipe secret via stdin into `hyp auth sign --kind secret --secret-name stripe-api-key --json`
-    let secret_plaintext = "sk-prod-topsecret-987654";
+    // 4. Pipe secret via stdin into `hyp auth sign --kind secret --secret-name demo-api-key --json`
+    let secret_plaintext = "hyphae_zk_test_value_001";
     let sign_out = run_hyp_with_stdin(
         home,
         &[
@@ -351,7 +622,7 @@ fn cli_auth_init_certify_sign_and_drop_ingest_secret_zero_leak() {
             "--kind",
             "secret",
             "--secret-name",
-            "stripe-api-key",
+            "demo-api-key",
             "--state-dir",
             state_str,
             "--json",
@@ -398,14 +669,14 @@ fn cli_auth_init_certify_sign_and_drop_ingest_secret_zero_leak() {
     let ingest_json = parse_json_stdout(&ingest_out);
     assert_eq!(ingest_json["ok"], true);
     assert_eq!(ingest_json["data"]["kind"], "secret");
-    assert_eq!(ingest_json["data"]["secretName"], "stripe-api-key");
+    assert_eq!(ingest_json["data"]["secretName"], "demo-api-key");
     assert_eq!(ingest_json["data"]["humanId"], "bogdan");
 
-    // 6. Verify SecretStore::get("stripe-api-key") == secret_plaintext
+    // 6. Verify SecretStore::get("demo-api-key") == secret_plaintext
     let store = SecretStore::new(&state_dir, SecretBackend::File);
     let stored = store
-        .get("stripe-api-key")
-        .expect("stripe-api-key stored in SecretStore");
+        .get("demo-api-key")
+        .expect("demo-api-key stored in SecretStore");
     assert_eq!(&*stored, secret_plaintext);
 
     // 7. Scan raw `node.sqlite` (+ WAL/SHM if present) bytes to prove ZERO occurrence of secret!
@@ -771,6 +1042,15 @@ fn cli_deploy_init_drop_relay_and_relay_set_validation() {
     assert!(unit.contains("NoNewPrivileges=yes"));
     assert!(unit.contains("MemoryMax="));
 
+    let readme = fs::read_to_string(kit_dir.join("README.md"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    assert!(
+        readme.contains("workers/drop-relay/"),
+        "drop-relay README must mention workers/drop-relay/: {readme}"
+    );
+    assert!(readme.contains("DropSlotDO"));
+
     // 2. `hyp deploy check --config <tmp>/node.json --json` exits 0
     let check_out = isolated_cmd(home)
         .args([
@@ -933,7 +1213,7 @@ fn cli_drop_create_offline_and_cross_language_browser_js_to_rust_ingest() {
     assert_eq!(create_json["ok"], true);
     assert_eq!(create_json["data"]["mode"], "offline");
     let url = create_json["data"]["url"].as_str().unwrap();
-    assert!(url.starts_with("https://hyphae.to/drop#"));
+    assert!(url.starts_with("https://hyphae.to/drop#drop="));
     assert!(!url.contains("proposedText"));
     assert!(
         create_json["data"]["nodeCert"]
@@ -942,9 +1222,12 @@ fn cli_drop_create_offline_and_cross_language_browser_js_to_rust_ingest() {
             .starts_with("hcert1_")
     );
 
-    // Decode base64url `#fragment` and verify fields match `site/drop/drop.js`
+    // Decode base64url `#drop=<fragment>` and verify fields match `site/drop/drop.js`
     let raw_hash = url.split_once('#').unwrap().1;
-    let frag_bytes = URL_SAFE_NO_PAD.decode(raw_hash).expect("valid base64url fragment");
+    let frag_b64 = raw_hash.strip_prefix("drop=").unwrap_or(raw_hash);
+    let frag_bytes = URL_SAFE_NO_PAD
+        .decode(frag_b64)
+        .expect("valid base64url fragment");
     let frag: Value = serde_json::from_slice(&frag_bytes).expect("valid JSON fragment");
     assert_eq!(frag["v"], 1);
     assert_eq!(frag["kind"], "directive");
@@ -1072,7 +1355,7 @@ process.stdout.write(JSON.stringify({{ publicJwk, kid, hdrop1: sealed.hdrop1 }})
     assert_eq!(ingest_json["data"]["role"], "signer");
     assert_eq!(ingest_json["data"]["kind"], "directive");
 
-    // Confirm `hyp status --json` and `hyp doctor --json` reflect the enrolled authorities & wakeup state
+    // Confirm `hyp status --json` and `hyp doctor --json` reflect the enrolled authorities & localIngest state
     let status_out = isolated_cmd(home)
         .args(["status", "--state-dir", state_str, "--json"])
         .output()
@@ -1081,11 +1364,11 @@ process.stdout.write(JSON.stringify({{ publicJwk, kid, hdrop1: sealed.hdrop1 }})
     let status_json = parse_json_stdout(&status_out);
     assert_eq!(status_json["data"]["humanDrops"]["activeAuthorities"], 2);
     assert_eq!(status_json["data"]["humanDrops"]["hasNodeCert"], true);
-    assert_eq!(status_json["data"]["wakeup"]["enabled"], false);
+    assert_eq!(status_json["data"]["localIngest"]["enabled"], true);
 }
 
 // ============================================================================
-// 6. Bonus: `auth init --web` loopback callback CSRF/CORS + live Drop Relay `drop wait`
+// 6. `auth init --web` (`encJwk` + Passkey `nodeCert`) + live Drop Relay zero-flag `drop wait`
 // ============================================================================
 
 #[test]
@@ -1131,10 +1414,37 @@ fn cli_auth_init_web_callback_csrf_cors_and_live_relay_drop_wait() {
     let callback_url = payload["callbackUrl"].as_str().unwrap().to_string();
     let csrf_token = payload["csrfToken"].as_str().unwrap().to_string();
     assert_eq!(payload["humanId"], "web-user");
+    let enrolled_node_id = payload["nodeId"]
+        .as_str()
+        .expect("#enroll= must include nodeId")
+        .to_string();
+    let enrolled_sign_jwk: OkpJwk =
+        serde_json::from_value(payload["nodeSignJwk"].clone()).expect("#enroll= nodeSignJwk");
+    let enrolled_enc_jwk: OkpJwk =
+        serde_json::from_value(payload["nodeEncJwk"].clone()).expect("#enroll= nodeEncJwk");
 
     let phone_kp = Ed25519KeyPair::generate().unwrap();
     let phone_jwk = phone_kp.to_jwk();
     let phone_kid = phone_kp.kid();
+    let phone_enc_kp = X25519KeyPair::generate().unwrap();
+    let phone_enc_jwk = phone_enc_kp.to_jwk();
+    let phone_enc_kid = phone_enc_kp.kid();
+
+    // Sign NodeCertV1 (`hcert1_`) with the enrolled phone Passkey Ed25519 key!
+    let now = now_unix_ms();
+    let cert_payload = NodeCertPayloadV1 {
+        v: 1,
+        node_id: enrolled_node_id,
+        signing_jwk: enrolled_sign_jwk,
+        encryption_jwk: enrolled_enc_jwk,
+        human_id: "web-user".to_string(),
+        human_kid: phone_kid.clone(),
+        auth_epoch: 1,
+        issued_at: format_rfc3339_millis(now),
+        expires_at: format_rfc3339_millis(now + 365 * 86_400_000),
+    };
+    let passkey_signed_cert = sign_node_cert(&cert_payload, &phone_kp).unwrap();
+    let passkey_hcert1 = encode_hcert1(&passkey_signed_cert).unwrap();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1171,7 +1481,7 @@ fn cli_auth_init_web_callback_csrf_cors_and_live_relay_drop_wait() {
         let resp = client.request(bad_csrf_req).await.unwrap();
         assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
 
-        // Valid Origin + valid CSRF enrolls the Passkey signer!
+        // Valid Origin + valid CSRF enrolls the Passkey signer WITH `encJwk` and Passkey-signed `nodeCert`!
         let good_req = http::Request::builder()
             .method(http::Method::POST)
             .uri(&callback_url)
@@ -1184,6 +1494,8 @@ fn cli_auth_init_web_callback_csrf_cors_and_live_relay_drop_wait() {
                     "humanId": "web-user",
                     "kid": phone_kid,
                     "jwk": phone_jwk,
+                    "encJwk": phone_enc_jwk,
+                    "nodeCert": passkey_hcert1,
                     "label": "iphone-passkey",
                     "credentialId": "cred-123"
                 }))
@@ -1205,10 +1517,14 @@ fn cli_auth_init_web_callback_csrf_cors_and_live_relay_drop_wait() {
     assert_eq!(out_json["ok"], true);
     assert_eq!(out_json["data"]["webEnrolled"]["kid"], phone_kid);
     assert_eq!(out_json["data"]["webEnrolled"]["role"], "signer");
+    assert_eq!(out_json["data"]["webEnrolled"]["encKey"], true);
+    assert_eq!(out_json["data"]["webEnrolled"]["encKid"], phone_enc_kid);
+    assert_eq!(out_json["data"]["webEnrolled"]["nodeCertSigned"], true);
+    assert_eq!(out_json["data"]["nodeCert"], passkey_hcert1);
 
     // 2. Start a live local router node with `--enable-drop-relay` on 127.0.0.1:0,
     //    allocate drop slot via `hyp drop create`, post sealed secret via relay HTTP,
-    //    and receive + burn via `hyp drop wait`!
+    //    and receive + burn via zero-flag `hyp drop wait` (auto-reading `last_drop.json`)!
     let mut node_cmd = isolated_cmd(home);
     node_cmd.args([
         "node",
@@ -1275,14 +1591,25 @@ fn cli_auth_init_web_callback_csrf_cors_and_live_relay_drop_wait() {
     let cl_json = parse_json_stdout(&create_live);
     let drop_id = cl_json["data"]["dropId"].as_str().unwrap().to_string();
     let url = cl_json["data"]["url"].as_str().unwrap();
-    let frag_bytes = URL_SAFE_NO_PAD
-        .decode(url.split_once('#').unwrap().1)
-        .unwrap();
+    let raw_hash = url.split_once('#').unwrap().1;
+    let frag_b64 = raw_hash.strip_prefix("drop=").unwrap_or(raw_hash);
+    let frag_bytes = URL_SAFE_NO_PAD.decode(frag_b64).unwrap();
     let frag: Value = serde_json::from_slice(&frag_bytes).unwrap();
     let post_cap = frag["postCap"].as_str().unwrap().to_string();
+    assert_eq!(frag["nodeCert"], passkey_hcert1);
+
+    // Verify `<state_dir>/last_drop.json` was persisted atomically (0600 on Unix)!
+    let last_drop_path = state_dir.join("last_drop.json");
+    assert!(last_drop_path.exists(), "last_drop.json must be written on online drop create");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&last_drop_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "last_drop.json must be 0600, got {:o}", mode);
+    }
 
     // Sign secret bound to `drop_id` via `hyp auth sign --drop-id <drop_id>`
-    let relay_secret = "super-secret-relay-value-42";
+    let relay_secret = "hyphae_zk_relay_test_value_042";
     let signed = run_hyp_with_stdin(
         home,
         &[
@@ -1329,23 +1656,20 @@ fn cli_auth_init_web_callback_csrf_cors_and_live_relay_drop_wait() {
         assert_eq!(resp.status(), http::StatusCode::CREATED);
     });
 
-    // Receive, verify, store in SecretStore, and burn via `hyp drop wait`!
+    // Receive, verify, store in SecretStore, and burn via zero-flag `hyp drop wait` (reads `last_drop.json`!)
     let wait_out = isolated_cmd(home)
         .args([
             "drop",
             "wait",
-            "--relay",
-            &relay_endpoint,
-            "--drop-id",
-            &drop_id,
             "--timeout",
             "10",
             "--state-dir",
             state_str,
             "--json",
         ])
+        .stdin(Stdio::null())
         .output()
-        .expect("run drop wait");
+        .expect("run zero-flag drop wait");
     assert_eq!(
         wait_out.status.code(),
         Some(0),
@@ -1358,9 +1682,95 @@ fn cli_auth_init_web_callback_csrf_cors_and_live_relay_drop_wait() {
     assert_eq!(wait_json["ok"], true);
     assert_eq!(wait_json["data"]["secretName"], "relay-e2e-key");
     assert_eq!(wait_json["data"]["relayAck"]["slotClosed"], true);
+    assert!(
+        !last_drop_path.exists(),
+        "last_drop.json must be removed after successful ingest & burn"
+    );
 
     let store = SecretStore::new(&state_dir, SecretBackend::File);
     assert_eq!(&*store.get("relay-e2e-key").unwrap(), relay_secret);
 
     node_proc.shutdown_gracefully();
+}
+
+// ============================================================================
+// 7. `hyp gate propose` -> `hyp gate lock` merges `gate.proposed.json` & cleans up
+// ============================================================================
+
+#[test]
+fn cli_gate_propose_then_lock_merges_and_cleans_proposal() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let state_dir = home.join("state");
+    let config_path = state_dir.join("node.json");
+    let state_str = state_dir.to_str().unwrap();
+    let cfg_str = config_path.to_str().unwrap();
+
+    // 1. Stage a proposed filter via `hyp gate propose`
+    let prop_out = isolated_cmd(home)
+        .args([
+            "gate",
+            "propose",
+            "--adapter",
+            "openai-compat",
+            "--id",
+            "local-ollama-guard",
+            "--config",
+            cfg_str,
+            "--state-dir",
+            state_str,
+            "--json",
+        ])
+        .output()
+        .expect("run gate propose");
+    assert_eq!(prop_out.status.code(), Some(0));
+    let proposal_path = state_dir.join("gate.proposed.json");
+    assert!(proposal_path.exists(), "gate.proposed.json must exist after propose");
+
+    // 2. Lock via `hyp gate lock` -> merges `gate.proposed.json` into `node.json`, signs, and removes proposal!
+    let lock_out = isolated_cmd(home)
+        .args([
+            "gate",
+            "lock",
+            "--config",
+            cfg_str,
+            "--state-dir",
+            state_str,
+            "--json",
+        ])
+        .output()
+        .expect("run gate lock");
+    assert_eq!(
+        lock_out.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&lock_out.stdout),
+        String::from_utf8_lossy(&lock_out.stderr)
+    );
+    let lock_json = parse_json_stdout(&lock_out);
+    assert_eq!(lock_json["ok"], true);
+    assert_eq!(lock_json["data"]["mergedProposal"], true);
+    assert_eq!(lock_json["data"]["filterCount"], 1);
+    assert_eq!(lock_json["data"]["gatePolicySig"], "OK");
+    assert!(
+        lock_json["next"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str() == Some("hyp service restart")),
+        "gate lock must recommend hyp service restart: {lock_json}"
+    );
+    assert!(
+        !proposal_path.exists(),
+        "gate.proposed.json must be deleted after gate lock"
+    );
+
+    let cfg_val: Value = serde_json::from_str(
+        &fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("\r\n", "\n"),
+    )
+    .unwrap();
+    assert_eq!(cfg_val["gate"]["require_signed_policy"], true);
+    assert_eq!(cfg_val["gate"]["filters"][0]["id"], "local-ollama-guard");
 }

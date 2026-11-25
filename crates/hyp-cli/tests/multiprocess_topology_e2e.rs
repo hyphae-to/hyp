@@ -2314,7 +2314,8 @@ fn node_json_plugins_boot_wiring_secret_resolution_and_bridge_roundtrip() {
     let receiver = MockCallbackReceiver::start();
     let webhook_secret = "whsec-test-plugin-boot-99112233";
 
-    // Negative fail-closed test: missing secret reference in `plugins[].env` MUST fail startup!
+    // Fault-isolation test: missing secret reference in `plugins[].env` MUST warn and skip
+    // only that plugin without aborting the entire `hyp daemon`!
     let bad_cfg_path = tmp.path().join("bad-node.json");
     fs::write(
         &bad_cfg_path,
@@ -2337,27 +2338,29 @@ fn node_json_plugins_boot_wiring_secret_resolution_and_bridge_roundtrip() {
         .unwrap(),
     )
     .unwrap();
-    let bad_out = isolated_cmd(&home)
-        .args([
-            "daemon",
-            "--config",
-            bad_cfg_path.to_str().unwrap(),
-            "--json",
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert_eq!(bad_out.status.code(), Some(1));
-    let bad_json = parse_json_stdout(&bad_out);
-    assert_eq!(bad_json["ok"], false);
-    assert_eq!(bad_json["error"]["code"], "CONFIG_ERROR");
+    let mut isolated_daemon_cmd = isolated_cmd(&home);
+    isolated_daemon_cmd.args([
+        "daemon",
+        "--config",
+        bad_cfg_path.to_str().unwrap(),
+        "--json",
+    ]);
+    let mut isolated_daemon = ManagedProcess::spawn("hyp daemon missing-secret plugin", &mut isolated_daemon_cmd);
+    let bad_json = isolated_daemon.read_json_line(Duration::from_secs(10));
+    assert_eq!(bad_json["ok"], true, "daemon must stay up when one plugin misses a secret: {bad_json}");
+    let warnings = bad_json["warnings"].as_array().expect("startup warnings array");
     assert!(
-        bad_json["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("missing-webhook-secret"),
-        "expected missing secret reference in error: {bad_json}"
+        warnings.iter().any(|w| {
+            w.as_str()
+                .is_some_and(|s| s.contains("missing-webhook-secret"))
+        }),
+        "expected missing secret reference in warnings: {bad_json}"
     );
+    let plugins_arr = bad_json["data"]["plugins"].as_array().expect("plugins statuses");
+    assert_eq!(plugins_arr.len(), 1);
+    assert_eq!(plugins_arr[0]["id"], "webhook");
+    assert_eq!(plugins_arr[0]["status"], "skipped");
+    isolated_daemon.shutdown_gracefully();
 
     // Store real secret in `SecretStore` (file backend, 0600) and write valid `node.json`.
     let secrets = SecretStore::new(&state_dir, SecretBackend::File);
@@ -2777,7 +2780,8 @@ fn v1_to_v2_sqlite_upgrade_via_compiled_hyp_doctor_creates_backup() {
             )
             .unwrap();
 
-        // Roll schema strictly back to frozen v0.2.0 schema v1 (`0001_initial_v2.sql` shape).
+        // Roll schema strictly back to frozen v0.2.0 schema v1 (`0001_initial_v2.sql` shape),
+        // dropping v5 (`human_authorities.enc_jwk_json`), v4 (`human_*`), v3 (`wakeups`), and v2.
         db.connection()
             .execute_batch(
                 "DROP INDEX IF EXISTS human_authorities_kid;
