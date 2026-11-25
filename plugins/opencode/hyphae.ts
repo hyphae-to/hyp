@@ -84,9 +84,11 @@ function runMeshHook(
     };
 
     try {
+      const runViaNode =
+        process.platform === "win32" && /\.(?:mjs|cjs|js)$/i.test(HYP_BIN);
       const child = execFile(
-        HYP_BIN,
-        argv,
+        runViaNode ? process.execPath : HYP_BIN,
+        runViaNode ? [HYP_BIN, ...argv] : argv,
         {
           timeout: HOOK_TIMEOUT_MS,
           maxBuffer: MAX_BUFFER_BYTES,

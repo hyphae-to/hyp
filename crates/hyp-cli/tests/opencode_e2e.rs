@@ -610,11 +610,11 @@ async fn opencode_real_plugin_verifies_caller_drains_messages_and_feeds_tui_agai
             .contains("second ping while idle")
     );
     assert_eq!(prompts[1]["path"]["id"], "ses-live-1");
+    let arm_text = prompts[1]["body"]["parts"][0]["text"].as_str().unwrap();
     assert!(
-        prompts[1]["body"]["parts"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("hyp wait --session opencode:ses-live-1")
+        arm_text.contains("wait --session opencode:ses-live-1")
+            && (arm_text.contains("hyp ") || arm_text.contains("hyp.exe")),
+        "expected waiter arm prompt to reference hyp wait --session opencode:ses-live-1, got: {arm_text}"
     );
 
     // Step 8: Wait for LocalDaemon's debounced metadata-only `ui/state.json` projector
