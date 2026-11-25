@@ -5183,12 +5183,12 @@ fn build_banner_lines_at_tick(
     if term_rows < 20 || term_cols < 32 || content_w < 24 {
         return Vec::new();
     }
-    let banner_h = if term_rows >= 34 {
-        12
+    let art_h = if term_rows >= 34 {
+        11
     } else if term_rows >= 28 {
-        10
-    } else {
         9
+    } else {
+        8
     };
     let banner_w = term_cols.saturating_sub(4).min(92);
     if banner_w < 24 {
@@ -5199,15 +5199,27 @@ fn build_banner_lines_at_tick(
         DEFAULT_TOTAL_FRAMES,
         anim_tick,
         banner_w,
-        banner_h,
+        art_h,
         color_mode,
     );
 
     let left_pad = " ".repeat(term_cols.saturating_sub(banner_w) / 2);
-    let mut lines = Vec::with_capacity(banner_h);
+    let mut lines = Vec::with_capacity(art_h + 1);
     for art_row in art.lines() {
         lines.push(format!("{left_pad}{art_row}"));
     }
+
+    // Dimmed plain-text version centered directly underneath the animated HYPHAE wordmark.
+    let ver_label = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let ver_pad = " ".repeat(term_cols.saturating_sub(ver_label.chars().count()) / 2);
+    let ver_styled = match color_mode {
+        ColorMode::Plain => ver_label,
+        _ => format!(
+            "\x1b[2m{}\x1b[0m",
+            paint_styled_text(color_mode, RGB_UI_MUTED, false, &ver_label)
+        ),
+    };
+    lines.push(format!("{ver_pad}{ver_styled}"));
     lines
 }
 
@@ -5394,7 +5406,7 @@ pub fn render_main_menu(
     selected: usize,
     existing_node_id: Option<&str>,
     is_legacy_v1: bool,
-    in_herdr_env: Option<&str>,
+    _in_herdr_env: Option<&str>,
     term_rows: usize,
     term_cols: usize,
     color_mode: ColorMode,
@@ -5413,47 +5425,19 @@ pub fn render_main_menu(
         lines.push(String::new());
     }
 
-    let version = env!("CARGO_PKG_VERSION");
-    let header_title = if let Some(node_id) = existing_node_id {
+    let prompt_line = if let Some(node_id) = existing_node_id {
         let legacy = if is_legacy_v1 { " · legacy v1" } else { "" };
-        format!("hyphae v{version} · configure existing node ({node_id}{legacy})")
+        format!("Who should guide setup? ({node_id}{legacy})")
     } else {
-        format!("hyphae v{version} · interactive onboarding")
+        "Who should guide setup?".to_string()
     };
-    lines.push(format!(
-        "{left_pad}{}",
-        paint_styled_text(
-            color_mode,
-            RGB_PULSE_IVORY,
-            true,
-            &truncate_chars(&header_title, content_w)
-        )
-    ));
-    if let Some(herdr_id) = in_herdr_env.filter(|s| !s.trim().is_empty()) {
-        let note = format!(
-            "Herdr ({}) · via herdr opens a new tab · in terminal runs here",
-            herdr_id.trim()
-        );
-        lines.push(format!(
-            "{left_pad}{}",
-            paint_styled_text(
-                color_mode,
-                RGB_NODE_AMBER,
-                false,
-                &truncate_chars(&note, content_w)
-            )
-        ));
-    }
     lines.push(format!(
         "{left_pad}{}",
         paint_styled_text(
             color_mode,
             RGB_HYPHAE_SAGE,
             false,
-            &truncate_chars(
-                "Who should guide setup? (configures your node & all detected agents)",
-                content_w
-            )
+            &truncate_chars(&prompt_line, content_w)
         )
     ));
     lines.push(String::new());
@@ -8096,14 +8080,9 @@ fn run_numbered_fallback_wizard(
         );
         println!("  Config: {}", existing.config_path.display());
     } else {
-        println!("hyphae v{version} · interactive setup");
+        println!("hyphae v{version}");
     }
-    if let Some(herdr_id) = in_herdr_env.filter(|s| !s.trim().is_empty()) {
-        println!(
-            "  Herdr ({}) · templates launch & attach directly",
-            herdr_id.trim()
-        );
-    }
+    let _ = in_herdr_env;
 
     let label_w = main_items
         .iter()
@@ -8118,7 +8097,7 @@ fn run_numbered_fallback_wizard(
 
     loop {
         println!();
-        println!("Who should guide setup? (configures your node & all detected agents)");
+        println!("Who should guide setup?");
         for (idx, item) in main_items.iter().enumerate() {
             println!(
                 "  {:>2}) {:label_w$}  {:tag_w$}  {}",
@@ -8775,9 +8754,14 @@ mod tests {
             assert_eq!(strip_ansi(&p35), plain);
         }
 
-        // Borderless fullscreen menu header banner must have zero outer box chrome.
+        // Borderless fullscreen menu header banner must have zero outer box chrome and
+        // include the plain-text version centered directly under the HYPHAE wordmark.
         let banner = build_banner_lines_at_tick(30, 80, 76, ColorMode::Plain, 0);
         assert_eq!(banner.len(), 10);
+        assert_eq!(
+            banner.last().map(|s| s.trim()),
+            Some(format!("v{}", env!("CARGO_PKG_VERSION")).as_str())
+        );
         let banner_text = banner.join("\n");
         assert!(banner_text.chars().any(is_braille_char));
         assert!(
@@ -9224,8 +9208,16 @@ mod tests {
             }
             let joined = stripped.join("\n");
             assert!(
-                joined.contains("Herdr (t1b)"),
-                "expected Herdr header note when inside Herdr env"
+                joined.contains("Who should guide setup?"),
+                "expected clean setup prompt in main menu:\n{joined}"
+            );
+            assert!(
+                joined.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+                "expected version directly under animated banner:\n{joined}"
+            );
+            assert!(
+                !joined.contains("Herdr (t1b)") && !joined.contains("interactive onboarding"),
+                "header must stay minimal without extra Herdr/onboarding banner lines:\n{joined}"
             );
             let expected_label = &items[selected].label;
             assert!(
