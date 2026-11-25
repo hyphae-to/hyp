@@ -316,7 +316,7 @@ fn onboard_and_setup_all_nine_harnesses_in_isolated_home() {
     .unwrap();
     assert_eq!(
         opencode_cfg["mcp"]["hyphae"]["command"],
-        json!([fake_bin, "mcp", "--backend", "opencode", "--ephemeral"])
+        json!([fake_bin, "mcp", "--backend", "opencode"])
     );
 
     let agy_sidecar: Value = serde_json::from_str(
