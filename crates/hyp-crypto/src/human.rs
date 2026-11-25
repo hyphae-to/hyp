@@ -52,6 +52,24 @@ pub const HUMAN_PRF_INPUT_PREFIX: &str = "hyphae/v2/human-prf-input\n";
 /// Salt for HKDF-SHA256 derivation of a Passkey `prf` Ed25519 seed.
 pub const HUMAN_PRF_HKDF_SALT: &[u8] = b"hyphae/v2/human-prf-ed25519";
 
+/// Salt for HKDF-SHA256 derivation of a companion Passkey `prf` X25519 encryption key.
+pub const HUMAN_PRF_X25519_SALT: &[u8] = b"hyphae/v2/human-prf-x25519";
+
+/// Wire cipher suite identifier for encrypted directive drafts (`encDraft` in `#drop=`).
+pub const HUMAN_DRAFT_SUITE: &str = "human.draft.v1";
+
+/// Prefix for RFC 9180 HPKE `info` binding of encrypted human directive drafts.
+pub const HUMAN_DRAFT_INFO_PREFIX: &[u8] = b"hyphae/v2/human-draft\n";
+
+/// Maximum Unicode scalar value count for an encrypted directive draft body.
+pub const MAX_HUMAN_DRAFT_CHARS: usize = 512;
+
+/// Maximum Unicode scalar value count for an optional encrypted directive draft context label.
+pub const MAX_HUMAN_DRAFT_CONTEXT_CHARS: usize = 160;
+
+/// Domain separation prefix for attached Ed25519 signatures over local ingested events (`hyphaesig`).
+pub const LOCAL_EVENT_SIG_DOMAIN: &[u8] = b"hyphae/v2/local-event\n";
+
 /// Armored prefix for offline/copy-paste sealed drops (`hdrop1_<base64url(JCS)>`).
 pub const HDROP1_PREFIX: &str = "hdrop1_";
 
@@ -211,6 +229,38 @@ pub struct SignedHumanRevocationV1 {
     pub sig: String,
 }
 
+/// Plaintext payload sealed inside `EncryptedHumanDraftV1` (`encDraft` in `#drop=` links).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HumanDraftPayloadV1 {
+    pub v: u8,
+    pub node_id: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    pub created_at: String,
+}
+
+impl Zeroize for HumanDraftPayloadV1 {
+    fn zeroize(&mut self) {
+        self.text.zeroize();
+        if let Some(ctx) = &mut self.context {
+            ctx.zeroize();
+        }
+    }
+}
+
+/// HPKE-sealed directive draft prefill (`human.draft.v1`) encrypted to the human's Passkey-PRF X25519 key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncryptedHumanDraftV1 {
+    pub v: u8,
+    pub suite: String,
+    pub recipient_kid: String,
+    pub enc: String,
+    pub ct: String,
+}
+
 // ============================================================================
 // Context Builders, PRF Derivation & Denylist Helpers
 // ============================================================================
@@ -250,21 +300,7 @@ pub fn human_prf_input(human_id: &str, prf_salt: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Deterministically derives an Ed25519 signing keypair from a 32-byte WebAuthn `prf` output:
-/// ```text
-/// ed25519_seed = HKDF-SHA256(
-///     salt = "hyphae/v2/human-prf-ed25519",
-///     ikm  = prf_output_32,
-///     info = humanId || "\n" || authEpoch_u64_be,
-///     L    = 32
-/// )
-/// ```
-/// Matches `site/drop/crypto.js` byte-for-byte.
-pub fn derive_prf_ed25519_keypair(
-    prf_output_32: &[u8; 32],
-    human_id: &str,
-    auth_epoch: u64,
-) -> Result<Ed25519KeyPair, CryptoError> {
+fn build_prf_hkdf_info(human_id: &str, auth_epoch: u64) -> Result<Vec<u8>, CryptoError> {
     if !is_valid_human_id(human_id) {
         return Err(CryptoError::InvalidKey(format!(
             "invalid humanId '{human_id}'"
@@ -280,11 +316,54 @@ pub fn derive_prf_ed25519_keypair(
     info.extend_from_slice(human_id.as_bytes());
     info.push(b'\n');
     info.extend_from_slice(&auth_epoch.to_be_bytes());
+    Ok(info)
+}
 
+/// Deterministically derives an Ed25519 signing keypair from a 32-byte WebAuthn `prf` output:
+/// ```text
+/// ed25519_seed = HKDF-SHA256(
+///     salt = "hyphae/v2/human-prf-ed25519",
+///     ikm  = prf_output_32,
+///     info = humanId || "\n" || authEpoch_u64_be,
+///     L    = 32
+/// )
+/// ```
+/// Matches `site/drop/crypto.js` byte-for-byte.
+pub fn derive_prf_ed25519_keypair(
+    prf_output_32: &[u8; 32],
+    human_id: &str,
+    auth_epoch: u64,
+) -> Result<Ed25519KeyPair, CryptoError> {
+    let info = build_prf_hkdf_info(human_id, auth_epoch)?;
     let derived = hkdf_sha256(HUMAN_PRF_HKDF_SALT, prf_output_32, &info, 32)?;
     let mut seed = Zeroizing::new([0u8; 32]);
     seed.copy_from_slice(&derived);
     Ed25519KeyPair::from_seed(*seed)
+}
+
+/// Deterministically derives a companion X25519 encryption keypair from a 32-byte WebAuthn `prf`
+/// output:
+/// ```text
+/// x25519_seed = HKDF-SHA256(
+///     salt = "hyphae/v2/human-prf-x25519",
+///     ikm  = prf_output_32,
+///     info = humanId || "\n" || authEpoch_u64_be,
+///     L    = 32
+/// )
+/// ```
+/// Uses the exact same HKDF `info` construction as [`derive_prf_ed25519_keypair`]; only the salt
+/// distinguishes Ed25519 vs X25519, so rotating `auth_epoch` rotates both keys together.
+/// Matches `site/drop/crypto.js` byte-for-byte.
+pub fn derive_prf_x25519_keypair(
+    prf_output_32: &[u8; 32],
+    human_id: &str,
+    auth_epoch: u64,
+) -> Result<X25519KeyPair, CryptoError> {
+    let info = build_prf_hkdf_info(human_id, auth_epoch)?;
+    let derived = hkdf_sha256(HUMAN_PRF_X25519_SALT, prf_output_32, &info, 32)?;
+    let mut seed = Zeroizing::new([0u8; 32]);
+    seed.copy_from_slice(&derived);
+    X25519KeyPair::from_bytes(*seed)
 }
 
 /// Fail-closed case-insensitive denylist rejecting Hyphae internal system secret names.
@@ -872,4 +951,241 @@ pub fn verify_human_revocation(
         ));
     }
     Ok(rev)
+}
+
+// ============================================================================
+// Encrypted Directive Drafts (`human.draft.v1`) & Local Event Signatures (`hyphaesig`)
+// ============================================================================
+
+fn is_forbidden_draft_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0000}'..='\u{0008}'
+            | '\u{000B}'..='\u{001F}'
+            | '\u{007F}'..='\u{009F}'
+            | '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202F}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Strictly validates human directive draft text fail-closed:
+/// - Non-empty after trimming.
+/// - Unicode scalar count `<= MAX_HUMAN_DRAFT_CHARS` (512).
+/// - Rejects C0/C1 control characters (other than `\n` and `\t`), `\r`, BiDi overrides/isolates,
+///   and zero-width / invisible formatting characters.
+pub fn validate_draft_text(text: &str) -> Result<(), CryptoError> {
+    if text.trim().is_empty() {
+        return Err(CryptoError::InvalidEnvelope(
+            "human draft text must not be empty".into(),
+        ));
+    }
+    let char_count = text.chars().count();
+    if char_count > MAX_HUMAN_DRAFT_CHARS {
+        return Err(CryptoError::InvalidEnvelope(format!(
+            "human draft text length {char_count} exceeds maximum {MAX_HUMAN_DRAFT_CHARS} chars"
+        )));
+    }
+    for ch in text.chars() {
+        if is_forbidden_draft_char(ch) {
+            return Err(CryptoError::InvalidEnvelope(format!(
+                "human draft text contains forbidden control or invisible character U+{:04X}",
+                ch as u32
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Builds the exact RFC 9180 HPKE `info` bytes for `human.draft.v1`:
+/// `"hyphae/v2/human-draft\n" || nodeId || "\n" || recipientKid`.
+pub fn human_draft_hpke_info(node_id: &str, recipient_kid: &str) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(HUMAN_DRAFT_INFO_PREFIX.len() + node_id.len() + 1 + recipient_kid.len());
+    out.extend_from_slice(HUMAN_DRAFT_INFO_PREFIX);
+    out.extend_from_slice(node_id.as_bytes());
+    out.push(b'\n');
+    out.extend_from_slice(recipient_kid.as_bytes());
+    out
+}
+
+/// Builds the exact RFC 9180 HPKE `aad` bytes for `human.draft.v1`:
+/// `JCS({ "v": 1, "suite": "human.draft.v1", "nodeId": nodeId, "recipientKid": recipientKid })`.
+pub fn human_draft_hpke_aad(node_id: &str, recipient_kid: &str) -> Result<Vec<u8>, CryptoError> {
+    let aad = to_canonical_json(&serde_json::json!({
+        "v": 1,
+        "suite": HUMAN_DRAFT_SUITE,
+        "nodeId": node_id,
+        "recipientKid": recipient_kid,
+    }))?;
+    Ok(aad.into_bytes())
+}
+
+fn validate_draft_payload(payload: &HumanDraftPayloadV1) -> Result<(), CryptoError> {
+    if payload.v != 1 {
+        return Err(CryptoError::InvalidEnvelope(format!(
+            "unsupported HumanDraftPayloadV1 version {} (expected 1)",
+            payload.v
+        )));
+    }
+    if !is_valid_node_id(&payload.node_id) {
+        return Err(CryptoError::InvalidEnvelope(format!(
+            "invalid HumanDraftPayloadV1 nodeId '{}'",
+            payload.node_id
+        )));
+    }
+    validate_draft_text(&payload.text)?;
+    if let Some(context) = &payload.context {
+        validate_draft_text(context)?;
+        let ctx_chars = context.chars().count();
+        if ctx_chars > MAX_HUMAN_DRAFT_CONTEXT_CHARS {
+            return Err(CryptoError::InvalidEnvelope(format!(
+                "human draft context length {ctx_chars} exceeds maximum {MAX_HUMAN_DRAFT_CONTEXT_CHARS} chars"
+            )));
+        }
+    }
+    let _ = parse_rfc3339_millis(&payload.created_at).map_err(|_| {
+        CryptoError::InvalidEnvelope(format!(
+            "invalid HumanDraftPayloadV1 createdAt '{}'",
+            payload.created_at
+        ))
+    })?;
+    Ok(())
+}
+
+/// Validates, JCS-canonicalizes, bucket-pads, and HPKE-seals a `HumanDraftPayloadV1` to the
+/// human's companion Passkey-PRF X25519 encryption key.
+pub fn seal_human_draft(
+    payload: &HumanDraftPayloadV1,
+    recipient_enc_pk: &X25519PublicKey,
+) -> Result<EncryptedHumanDraftV1, CryptoError> {
+    validate_draft_payload(payload)?;
+
+    let recipient_kid = recipient_enc_pk.kid();
+    let info = human_draft_hpke_info(&payload.node_id, &recipient_kid);
+    let aad = human_draft_hpke_aad(&payload.node_id, &recipient_kid)?;
+
+    let jcs = Zeroizing::new(to_canonical_json(payload)?);
+    let padded = pad_bucket(jcs.as_bytes())?;
+    let (enc_bytes, ct_bytes) = hpke::seal_base(recipient_enc_pk, &info, &aad, &padded)?;
+
+    Ok(EncryptedHumanDraftV1 {
+        v: 1,
+        suite: HUMAN_DRAFT_SUITE.to_string(),
+        recipient_kid,
+        enc: URL_SAFE_NO_PAD.encode(enc_bytes),
+        ct: URL_SAFE_NO_PAD.encode(&ct_bytes),
+    })
+}
+
+/// Opens and strictly validates an `EncryptedHumanDraftV1` fail-closed using the human's
+/// Passkey-PRF X25519 keypair and expected `nodeId`.
+pub fn open_human_draft(
+    draft: &EncryptedHumanDraftV1,
+    recipient_enc_kp: &X25519KeyPair,
+    expected_node_id: &str,
+) -> Result<HumanDraftPayloadV1, CryptoError> {
+    if !is_valid_node_id(expected_node_id) {
+        return Err(CryptoError::InvalidEnvelope(format!(
+            "invalid expected_node_id '{expected_node_id}'"
+        )));
+    }
+    if draft.v != 1 || draft.suite != HUMAN_DRAFT_SUITE {
+        return Err(CryptoError::InvalidEnvelope(format!(
+            "unsupported human draft envelope v={} suite={}",
+            draft.v, draft.suite
+        )));
+    }
+
+    let expected_kid = recipient_enc_kp.kid();
+    if draft.recipient_kid != expected_kid {
+        return Err(CryptoError::InvalidEnvelope(
+            "encrypted draft recipientKid does not match recipient X25519 key".into(),
+        ));
+    }
+
+    let enc_bytes = decode_raw_key_32(&draft.enc)
+        .map_err(|e| CryptoError::InvalidEnvelope(format!("invalid draft enc: {e}")))?;
+    let ct_bytes = URL_SAFE_NO_PAD
+        .decode(&draft.ct)
+        .map_err(|e| CryptoError::InvalidEnvelope(format!("invalid draft ct base64url: {e}")))?;
+    if ct_bytes.is_empty() {
+        return Err(CryptoError::InvalidEnvelope(
+            "encrypted human draft ciphertext must not be empty".into(),
+        ));
+    }
+
+    let info = human_draft_hpke_info(expected_node_id, &expected_kid);
+    let aad = human_draft_hpke_aad(expected_node_id, &expected_kid)?;
+    let padded = hpke::open_base(&enc_bytes, recipient_enc_kp, &info, &aad, &ct_bytes)?;
+    let plain_bytes = unpad_bucket(&padded)?;
+
+    let payload: HumanDraftPayloadV1 = serde_json::from_slice(&plain_bytes)?;
+    validate_draft_payload(&payload)?;
+    if payload.node_id != expected_node_id {
+        return Err(CryptoError::InvalidEnvelope(format!(
+            "draft payload nodeId '{}' does not match expected '{expected_node_id}'",
+            payload.node_id
+        )));
+    }
+
+    Ok(payload)
+}
+
+/// Signs canonical CloudEvent JSON under `LOCAL_EVENT_SIG_DOMAIN` and formats the RFC-clean
+/// `hyphaesig` CloudEvents string extension attribute: `"ed25519:<kid>:<b64url>"`.
+pub fn sign_local_ingest_event(signer: &Ed25519KeyPair, canonical_event_json: &str) -> String {
+    format!(
+        "ed25519:{}:{}",
+        signer.kid(),
+        sign_with_domain(signer, LOCAL_EVENT_SIG_DOMAIN, canonical_event_json.as_bytes())
+    )
+}
+
+/// Strictly verifies a `hyphaesig` extension attribute (`"ed25519:<kid>:<b64url>"`) over
+/// `canonical_event_json` under `LOCAL_EVENT_SIG_DOMAIN`, returning the verified signer `kid`.
+pub fn verify_local_ingest_event(
+    sig_attr: &str,
+    canonical_event_json: &str,
+    lookup_pk: impl FnOnce(&str) -> Option<Ed25519PublicKey>,
+) -> Result<String, CryptoError> {
+    let mut parts = sig_attr.split(':');
+    let scheme = parts.next();
+    let kid = parts.next();
+    let sig_b64 = parts.next();
+    let extra = parts.next();
+
+    if scheme != Some("ed25519") || extra.is_some() {
+        return Err(CryptoError::InvalidSignature(
+            "invalid hyphaesig format (expected 'ed25519:<kid>:<b64url>')".into(),
+        ));
+    }
+    let kid = kid.unwrap_or("");
+    let sig_b64 = sig_b64.unwrap_or("");
+    if !is_valid_token_id(kid, false) || sig_b64.is_empty() {
+        return Err(CryptoError::InvalidSignature(
+            "invalid kid or signature in hyphaesig attribute".into(),
+        ));
+    }
+
+    let pk = lookup_pk(kid).ok_or_else(|| {
+        CryptoError::InvalidSignature(format!(
+            "unknown or revoked local event signer kid '{kid}'"
+        ))
+    })?;
+    if pk.kid() != kid {
+        return Err(CryptoError::InvalidSignature(
+            "local event signer kid does not match public key thumbprint".into(),
+        ));
+    }
+
+    verify_with_domain(
+        &pk,
+        LOCAL_EVENT_SIG_DOMAIN,
+        canonical_event_json.as_bytes(),
+        sig_b64,
+    )?;
+    Ok(kid.to_string())
 }

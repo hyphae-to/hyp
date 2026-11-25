@@ -18,11 +18,16 @@ use tempfile::TempDir;
 const SCHEMA_V1_SQL: &str = include_str!("../migrations/0001_initial_v2.sql");
 const SCHEMA_V2_SQL: &str = include_str!("../migrations/0002_discovery_and_routes.sql");
 const SCHEMA_V3_SQL: &str = include_str!("../migrations/0003_wakeups.sql");
+const SCHEMA_V4_SQL: &str = include_str!("../migrations/0004_human_authority.sql");
 
 const T0: i64 = 1_795_554_000_000;
 
 fn sample_jwk(x: &str) -> String {
     format!(r#"{{"crv":"Ed25519","kty":"OKP","x":"{x}"}}"#)
+}
+
+fn sample_enc_jwk(x: &str) -> String {
+    format!(r#"{{"crv":"X25519","kty":"OKP","x":"{x}"}}"#)
 }
 
 fn sample_authority(
@@ -37,6 +42,7 @@ fn sample_authority(
         label: format!("{human_id}-{kid}"),
         role,
         jwk_json: sample_jwk(&format!("key_{kid}")),
+        enc_jwk_json: None,
         prf_salt: if role == HumanAuthorityRole::Signer {
             Some(format!("salt_{kid}"))
         } else {
@@ -159,6 +165,22 @@ fn seed_db_at_version(path: &Path, version: i64) {
             "INSERT INTO wakeups (id, target_session_id, label, note, trigger_kind, next_fire_at, created_at, updated_at)
              VALUES ('wk-v3', 'sess-1', 'check', 'run check', 'timer', ?1, ?2, ?2)",
             params![T0 + 60_000, T0 + 2],
+        )
+        .unwrap();
+    }
+
+    if version >= 4 {
+        conn.execute_batch(SCHEMA_V4_SQL).unwrap();
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (4, ?1)",
+            params![T0 + 3],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO human_authorities
+                (human_id, kid, label, role, jwk_json, prf_salt, auth_epoch, status, created_at)
+             VALUES ('bogdan', 'kid_v4_legacy', 'v4-passkey', 'signer', ?1, 'salt_v4', 1, 'active', ?2)",
+            params![sample_jwk("v4_legacy_key"), T0 + 3],
         )
         .unwrap();
     }
@@ -356,6 +378,26 @@ fn authorities_digest_is_order_independent_and_detects_every_mutation() {
     assert_ne!(d_jwk, prev, "jwk_json tamper must change digest");
     prev = d_jwk;
 
+    // 2b. Set & mutate enc_jwk_json (both legitimate upgrade and raw SQLite tampering)
+    assert!(
+        db_a.human()
+            .update_authority_enc_jwk("kid_a", &sample_enc_jwk("enc_legit_1"), T0 + 5)
+            .unwrap()
+    );
+    let d_enc_set = db_a.human().authorities_digest().unwrap();
+    assert_ne!(d_enc_set, prev, "setting enc_jwk_json must change digest");
+    prev = d_enc_set;
+
+    db_a.connection()
+        .execute(
+            "UPDATE human_authorities SET enc_jwk_json = '{\"crv\":\"X25519\",\"kty\":\"OKP\",\"x\":\"EVIL_ENC\"}' WHERE kid = 'kid_a'",
+            [],
+        )
+        .unwrap();
+    let d_enc_tamper = db_a.human().authorities_digest().unwrap();
+    assert_ne!(d_enc_tamper, prev, "enc_jwk_json tamper must change digest");
+    prev = d_enc_tamper;
+
     // 3. Mutate auth_epoch via raw SQLite tampering
     db_a.connection()
         .execute(
@@ -534,47 +576,174 @@ fn node_certs_anti_rollback_and_mailbox_human_auth_json_attachment() {
 }
 
 #[test]
-fn full_v1_v2_v3_to_v4_migration_parity_backups_and_zero_data_loss() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, 4);
+fn enc_jwk_lifecycle_preferred_lookup_and_revocation_guard() {
+    let db = NodeDb::open_in_memory().unwrap();
+    let human = db.human();
+
+    // Empty store -> None
+    assert_eq!(human.get_preferred_human_enc_jwk(None).unwrap(), None);
+    assert_eq!(human.get_preferred_human_enc_jwk(Some("bogdan")).unwrap(), None);
+
+    // Enroll authority without enc_jwk_json -> preferred lookup still None
+    let a1 = sample_authority("bogdan", "kid_no_enc", HumanAuthorityRole::Admin, 1);
+    let r1 = human.upsert_authority(&a1, T0).unwrap();
+    assert_eq!(r1.enc_jwk_json, None);
+    assert_eq!(human.get_preferred_human_enc_jwk(None).unwrap(), None);
+    assert_eq!(human.list_active_authorities().unwrap().len(), 1);
+
+    // Enroll authority WITH enc_jwk_json for alice at T0 + 10
+    let mut a2 = sample_authority("alice", "kid_alice_enc", HumanAuthorityRole::Signer, 1);
+    a2.enc_jwk_json = Some(sample_enc_jwk("alice_x25519_1"));
+    let r2 = human.upsert_authority(&a2, T0 + 10).unwrap();
+    assert_eq!(
+        r2.enc_jwk_json.as_deref(),
+        Some(sample_enc_jwk("alice_x25519_1").as_str())
+    );
+    assert_eq!(
+        human.get_preferred_human_enc_jwk(None).unwrap().unwrap().kid,
+        "kid_alice_enc"
+    );
+    assert_eq!(
+        human
+            .get_preferred_human_enc_jwk(Some("alice"))
+            .unwrap()
+            .unwrap()
+            .kid,
+        "kid_alice_enc"
+    );
+    assert_eq!(
+        human.get_preferred_human_enc_jwk(Some("bogdan")).unwrap(),
+        None
+    );
+
+    // Upgrade bogdan's existing active authority (created_at = T0) with enc_jwk_json
+    assert!(
+        human
+            .update_authority_enc_jwk("kid_no_enc", &sample_enc_jwk("bogdan_x25519_old"), T0 + 20)
+            .unwrap()
+    );
+    // For bogdan specifically, returns kid_no_enc; globally alice (created_at = T0 + 10 > T0) is newer!
+    assert_eq!(
+        human
+            .get_preferred_human_enc_jwk(Some("bogdan"))
+            .unwrap()
+            .unwrap()
+            .kid,
+        "kid_no_enc"
+    );
+    assert_eq!(
+        human.get_preferred_human_enc_jwk(None).unwrap().unwrap().kid,
+        "kid_alice_enc"
+    );
+
+    // Enroll newer bogdan authority WITH enc_jwk_json at T0 + 50 -> becomes newest globally & for bogdan
+    let mut a3 = sample_authority("bogdan", "kid_bogdan_new", HumanAuthorityRole::Signer, 2);
+    a3.enc_jwk_json = Some(sample_enc_jwk("bogdan_x25519_new"));
+    human.upsert_authority(&a3, T0 + 50).unwrap();
+    assert_eq!(
+        human.get_preferred_human_enc_jwk(None).unwrap().unwrap().kid,
+        "kid_bogdan_new"
+    );
+    assert_eq!(
+        human
+            .get_preferred_human_enc_jwk(Some("bogdan"))
+            .unwrap()
+            .unwrap()
+            .kid,
+        "kid_bogdan_new"
+    );
+
+    // Even newer bogdan authority WITHOUT enc_jwk_json is ignored by preferred_enc_jwk lookup
+    let a4 = sample_authority("bogdan", "kid_bogdan_no_enc2", HumanAuthorityRole::Signer, 3);
+    human.upsert_authority(&a4, T0 + 100).unwrap();
+    assert_eq!(
+        human
+            .get_preferred_human_enc_jwk(Some("bogdan"))
+            .unwrap()
+            .unwrap()
+            .kid,
+        "kid_bogdan_new"
+    );
+
+    // Revoking kid_bogdan_new falls back cleanly to kid_no_enc (for bogdan) and kid_alice_enc (globally),
+    // AND refuses to update enc_jwk_json on the revoked key!
+    human
+        .revoke_authority_monotonic("bogdan", "kid_bogdan_new", 2, r#"{"r":1}"#, T0 + 150)
+        .unwrap();
+    assert!(
+        !human
+            .update_authority_enc_jwk("kid_bogdan_new", &sample_enc_jwk("revoked_attempt"), T0 + 160)
+            .unwrap()
+    );
+    assert!(
+        !human
+            .update_authority_enc_jwk("kid_missing", &sample_enc_jwk("missing"), T0 + 160)
+            .unwrap()
+    );
+    assert!(
+        human
+            .update_authority_enc_jwk("kid_no_enc", "not-a-json-object", T0 + 160)
+            .is_err()
+    );
+    assert_eq!(
+        human
+            .get_preferred_human_enc_jwk(Some("bogdan"))
+            .unwrap()
+            .unwrap()
+            .kid,
+        "kid_no_enc"
+    );
+    assert_eq!(
+        human.get_preferred_human_enc_jwk(None).unwrap().unwrap().kid,
+        "kid_alice_enc"
+    );
+}
+
+#[test]
+fn full_v1_v2_v3_v4_to_v5_migration_parity_backups_and_zero_data_loss() {
+    assert_eq!(CURRENT_SCHEMA_VERSION, 5);
     let dir = TempDir::new().unwrap();
 
     let v1_path = dir.path().join("from-v1").join("node.sqlite");
     let v2_path = dir.path().join("from-v2").join("node.sqlite");
     let v3_path = dir.path().join("from-v3").join("node.sqlite");
-    let fresh_path = dir.path().join("fresh-v4").join("node.sqlite");
+    let v4_path = dir.path().join("from-v4").join("node.sqlite");
+    let fresh_path = dir.path().join("fresh-v5").join("node.sqlite");
 
     seed_db_at_version(&v1_path, 1);
     seed_db_at_version(&v2_path, 2);
     seed_db_at_version(&v3_path, 3);
+    seed_db_at_version(&v4_path, 4);
 
     let db_v1 = NodeDb::open(&v1_path).unwrap();
     let db_v2 = NodeDb::open(&v2_path).unwrap();
     let db_v3 = NodeDb::open(&v3_path).unwrap();
+    let db_v4 = NodeDb::open(&v4_path).unwrap();
     let db_fresh = NodeDb::open(&fresh_path).unwrap();
 
     let fresh_cols = snapshot_tables_and_columns(db_fresh.connection());
     let fresh_idx = snapshot_indexes(db_fresh.connection());
 
-    for (from_ver, db) in [(1i64, &db_v1), (2, &db_v2), (3, &db_v3)] {
-        assert_eq!(db.schema_version().unwrap(), 4);
+    for (from_ver, db) in [(1i64, &db_v1), (2, &db_v2), (3, &db_v3), (4, &db_v4)] {
+        assert_eq!(db.schema_version().unwrap(), 5);
         let applied: Vec<i64> = db
             .applied_migrations()
             .unwrap()
             .into_iter()
             .map(|(v, _)| v)
             .collect();
-        assert_eq!(applied, vec![1, 2, 3, 4]);
+        assert_eq!(applied, vec![1, 2, 3, 4, 5]);
 
-        // Bit-for-bit structural schema parity with fresh v4
+        // Bit-for-bit structural schema parity with fresh v5
         assert_eq!(
             snapshot_tables_and_columns(db.connection()),
             fresh_cols,
-            "v{from_ver}->v4 tables/columns must match fresh v4"
+            "v{from_ver}->v5 tables/columns must match fresh v5"
         );
         assert_eq!(
             snapshot_indexes(db.connection()),
             fresh_idx,
-            "v{from_ver}->v4 indexes must match fresh v4"
+            "v{from_ver}->v5 indexes must match fresh v5"
         );
 
         // Backup exists, 0600 perms, genuine snapshot at `from_ver`
@@ -582,7 +751,7 @@ fn full_v1_v2_v3_to_v4_migration_parity_backups_and_zero_data_loss() {
         assert_eq!(backups.len(), 1);
         let bak_name = backups[0].file_name().unwrap().to_str().unwrap();
         assert!(
-            bak_name.starts_with(&format!("node.sqlite.v{from_ver}-to-v4-"))
+            bak_name.starts_with(&format!("node.sqlite.v{from_ver}-to-v5-"))
                 && bak_name.ends_with(".bak"),
             "unexpected backup name: {bak_name}"
         );
@@ -599,13 +768,14 @@ fn full_v1_v2_v3_to_v4_migration_parity_backups_and_zero_data_loss() {
         assert_eq!(mb[0].receipt, "rcpt-legacy");
         assert_eq!(db.human().get_mailbox_human_auth("rcpt-legacy").unwrap(), None);
 
-        // Post-migration v4 operations work immediately
-        db.human()
-            .upsert_authority(
-                &sample_authority("bogdan", "kid_post_mig", HumanAuthorityRole::Admin, 1),
-                T0 + 100,
-            )
-            .unwrap();
+        // Post-migration v5 operations work immediately (including enc_jwk_json!)
+        let mut post_auth = sample_authority("bogdan", "kid_post_mig", HumanAuthorityRole::Admin, 1);
+        post_auth.enc_jwk_json = Some(sample_enc_jwk("post_mig_x25519"));
+        let stored = db.human().upsert_authority(&post_auth, T0 + 100).unwrap();
+        assert_eq!(
+            stored.enc_jwk_json.as_deref(),
+            Some(sample_enc_jwk("post_mig_x25519").as_str())
+        );
         assert!(
             db.human()
                 .consume_claim_nonce(
@@ -619,9 +789,33 @@ fn full_v1_v2_v3_to_v4_migration_parity_backups_and_zero_data_loss() {
         );
     }
 
-    // Verify v3 wakeup survived v3->v4 untouched
+    // Verify v4 authority survived v4->v5 untouched with enc_jwk_json = None and can be upgraded in-place!
+    let legacy_v4 = db_v4
+        .human()
+        .get_active_authority_by_kid("kid_v4_legacy")
+        .unwrap()
+        .expect("v4 human authority must survive v4->v5 migration");
+    assert_eq!(legacy_v4.human_id, "bogdan");
+    assert_eq!(legacy_v4.enc_jwk_json, None);
+    assert!(
+        db_v4
+            .human()
+            .update_authority_enc_jwk("kid_v4_legacy", &sample_enc_jwk("upgraded_v4_x25519"), T0 + 200)
+            .unwrap()
+    );
+    let upgraded_v4 = db_v4
+        .human()
+        .get_active_authority_by_kid("kid_v4_legacy")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        upgraded_v4.enc_jwk_json.as_deref(),
+        Some(sample_enc_jwk("upgraded_v4_x25519").as_str())
+    );
+
+    // Verify v3 wakeup survived v3->v5 untouched
     assert!(db_v3.wakeups().get_wakeup("wk-v3").unwrap().is_some());
-    // Verify v2 peer_route survived v2->v4 untouched
+    // Verify v2 peer_route survived v2->v5 untouched
     assert_eq!(
         db_v2.peers().get_peer_route("bob@lap").unwrap().unwrap().via_peer,
         "acme-hub"

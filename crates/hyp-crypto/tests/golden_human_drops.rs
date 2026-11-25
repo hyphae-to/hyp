@@ -4,13 +4,17 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hyp_crypto::e2ee::pad_bucket;
 use hyp_crypto::human::{
-    decode_hcert1, decode_hdrop1, derive_prf_ed25519_keypair, encode_hcert1, encode_hdrop1,
+    decode_hcert1, decode_hdrop1, derive_prf_ed25519_keypair, derive_prf_x25519_keypair,
+    encode_hcert1, encode_hdrop1, human_draft_hpke_aad, human_draft_hpke_info,
     human_drop_hpke_aad, human_drop_hpke_info, human_prf_input, is_reserved_secret_name,
-    open_human_drop, seal_human_drop, sign_human_claim, sign_human_revocation, sign_node_cert,
-    verify_human_revocation, verify_node_cert, HumanAudience, HumanClaimV1, HumanDropEnvelopeV1,
-    HumanDropKind, HumanRevocationPayloadV1, NodeCertPayloadV1, SecretDropSpec,
-    SignedHumanClaimV1, CLOCK_SKEW_MS, HCERT1_PREFIX, HDROP1_PREFIX, HUMAN_CLAIM_DOMAIN,
-    HUMAN_DROP_SUITE_V1, HUMAN_PRF_HKDF_SALT, MAX_CLAIM_TTL_MS,
+    open_human_draft, open_human_drop, seal_human_draft, seal_human_drop, sign_human_claim,
+    sign_human_revocation, sign_local_ingest_event, sign_node_cert, validate_draft_text,
+    verify_human_revocation, verify_local_ingest_event, verify_node_cert, EncryptedHumanDraftV1,
+    HumanAudience, HumanClaimV1, HumanDraftPayloadV1, HumanDropEnvelopeV1, HumanDropKind,
+    HumanRevocationPayloadV1, NodeCertPayloadV1, SecretDropSpec, SignedHumanClaimV1,
+    CLOCK_SKEW_MS, HCERT1_PREFIX, HDROP1_PREFIX, HUMAN_CLAIM_DOMAIN, HUMAN_DRAFT_SUITE,
+    HUMAN_DROP_SUITE_V1, HUMAN_PRF_HKDF_SALT, HUMAN_PRF_X25519_SALT, LOCAL_EVENT_SIG_DOMAIN,
+    MAX_CLAIM_TTL_MS, MAX_HUMAN_DRAFT_CHARS, MAX_HUMAN_DRAFT_CONTEXT_CHARS,
 };
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::rfc3339::{format_rfc3339_millis, parse_rfc3339_millis};
@@ -653,4 +657,384 @@ fn reserved_secret_names_fail_closed_case_insensitively_on_seal_and_open() {
     let mut bad_sec = sample_secret_claim(&human, &node_enc, "", "stripe-prod-key");
     bad_sec.secret_spec = None;
     assert!(seal_human_drop(&bad_sec, &human, &node_enc.public_key()).is_err());
+}
+
+// ============================================================================
+// 4. Companion Passkey-PRF X25519 Derivation, Encrypted Drafts (`human.draft.v1`),
+//    BiDi/Control Guards, and Local Event Signatures (`hyphaesig`)
+// ============================================================================
+
+#[test]
+fn golden_prf_x25519_derivation_differential_and_parity_vectors() {
+    // 1. Existing golden PRF seed (`0x01..=0x20`, `human_id = "bogdan"`, `auth_epoch = 1`)
+    let prf_output: [u8; 32] = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
+        0x1f, 0x20,
+    ];
+    let mut info_bogdan = Vec::new();
+    info_bogdan.extend_from_slice(b"bogdan\n");
+    info_bogdan.extend_from_slice(&1u64.to_be_bytes());
+    let expected_x25519_seed =
+        reference_hkdf_sha256_32(HUMAN_PRF_X25519_SALT, &prf_output, &info_bogdan);
+
+    let xkp = derive_prf_x25519_keypair(&prf_output, "bogdan", 1).unwrap();
+    let edkp = derive_prf_ed25519_keypair(&prf_output, "bogdan", 1).unwrap();
+    assert_eq!(xkp.secret_bytes(), &expected_x25519_seed);
+    assert_ne!(
+        xkp.secret_bytes(),
+        edkp.seed_bytes(),
+        "X25519 salt must domain-separate seed from Ed25519 seed"
+    );
+    assert_eq!(xkp.to_jwk().kty, "OKP");
+    assert_eq!(xkp.to_jwk().crv, "X25519");
+
+    // Deterministic, epoch-rotated, and humanId-separated
+    let xkp_again = derive_prf_x25519_keypair(&prf_output, "bogdan", 1).unwrap();
+    assert_eq!(xkp.public_key_bytes(), xkp_again.public_key_bytes());
+    assert_eq!(xkp.kid(), xkp_again.kid());
+
+    let xkp_epoch2 = derive_prf_x25519_keypair(&prf_output, "bogdan", 2).unwrap();
+    assert_ne!(xkp.public_key_bytes(), xkp_epoch2.public_key_bytes());
+    assert_ne!(xkp.kid(), xkp_epoch2.kid());
+
+    let xkp_other = derive_prf_x25519_keypair(&prf_output, "alice", 1).unwrap();
+    assert_ne!(xkp.public_key_bytes(), xkp_other.public_key_bytes());
+
+    // Fail closed on invalid inputs (exact same guards as Ed25519 derivation)
+    assert!(derive_prf_x25519_keypair(&prf_output, "bogdan", 0).is_err());
+    assert!(derive_prf_x25519_keypair(&prf_output, "", 1).is_err());
+    assert!(derive_prf_x25519_keypair(&prf_output, "bad\nhuman", 1).is_err());
+    assert!(derive_prf_x25519_keypair(&prf_output, "UPPER", 1).is_err());
+
+    // 2. Cross-language parity vector (`[0x42; 32]`, `"bogdan@laptop"`, `auth_epoch = 1`)
+    let prf_42 = [0x42u8; 32];
+    let mut info_laptop = Vec::new();
+    info_laptop.extend_from_slice(b"bogdan@laptop\n");
+    info_laptop.extend_from_slice(&1u64.to_be_bytes());
+    let expected_seed_42 = reference_hkdf_sha256_32(HUMAN_PRF_X25519_SALT, &prf_42, &info_laptop);
+    let xkp_42 = derive_prf_x25519_keypair(&prf_42, "bogdan@laptop", 1).unwrap();
+    assert_eq!(xkp_42.secret_bytes(), &expected_seed_42);
+
+    // Frozen golden vectors for bit-exact cross-language parity with site/drop/crypto.js
+    assert_eq!(
+        hex::encode(xkp.secret_bytes()),
+        "099d665826cff6a44e236c8fe3e081d4428b4ee28cf1a3898b8ef4c269b3417b"
+    );
+    assert_eq!(
+        xkp.public_key_b64(),
+        "v90neJzK8qwdSLUnQKSLzaaU6Psjp4-YXBYsYL-ZOyg"
+    );
+    assert_eq!(xkp.kid(), "Exkxfg7cKbR9aacvUy5mFbxVkoQhIimxzkqwFZUBoZc");
+
+    assert_eq!(
+        hex::encode(xkp_42.secret_bytes()),
+        "e5695da5aa539c847fc6bd6948102582935dae6810b1ca8d035028dad1bb77c9"
+    );
+    assert_eq!(
+        xkp_42.public_key_b64(),
+        "4_7PQWSFgghH68INaJ0SKEI3CO1GyTaE6xCu9OsLZHQ"
+    );
+    assert_eq!(xkp_42.kid(), "HyMwO2TH1gWVhnrHJu00SczRe_mSYojkebEvLp5X2hw");
+}
+
+#[test]
+fn encrypted_human_draft_roundtrip_and_mutated_inputs_fail_closed() {
+    let prf_42 = [0x42u8; 32];
+    let human_enc = derive_prf_x25519_keypair(&prf_42, "bogdan@laptop", 1).unwrap();
+    let other_enc = derive_prf_x25519_keypair(&prf_42, "bogdan@laptop", 2).unwrap();
+
+    // Exact HPKE info and AAD byte formatting
+    let info = human_draft_hpke_info("prod@eu-1", &human_enc.kid());
+    assert_eq!(
+        info,
+        format!("hyphae/v2/human-draft\nprod@eu-1\n{}", human_enc.kid()).into_bytes()
+    );
+    let aad = human_draft_hpke_aad("prod@eu-1", &human_enc.kid()).unwrap();
+    assert_eq!(
+        String::from_utf8(aad).unwrap(),
+        format!(
+            "{{\"nodeId\":\"prod@eu-1\",\"recipientKid\":\"{}\",\"suite\":\"human.draft.v1\",\"v\":1}}",
+            human_enc.kid()
+        )
+    );
+
+    // 1. Roundtrip with context, newline, tab, and Unicode
+    let draft_payload = HumanDraftPayloadV1 {
+        v: 1,
+        node_id: "prod@eu-1".to_string(),
+        text: "Approve deploy of release v0.5.0:\n\t- Verify canary metrics ✓".to_string(),
+        context: Some("Deploy gate · eu-1".to_string()),
+        created_at: format_rfc3339_millis(T0),
+    };
+    let sealed = seal_human_draft(&draft_payload, &human_enc.public_key()).unwrap();
+    assert_eq!(sealed.v, 1);
+    assert_eq!(sealed.suite, HUMAN_DRAFT_SUITE);
+    assert_eq!(sealed.recipient_kid, human_enc.kid());
+
+    // Wire JSON MUST NOT leak plaintext draft text, context, or nodeId!
+    let wire_json = to_canonical_json(&sealed).unwrap();
+    assert!(!wire_json.contains("Approve deploy"));
+    assert!(!wire_json.contains("Deploy gate"));
+    assert!(!wire_json.contains("prod@eu-1"));
+
+    // Power-of-2 bucket padding + 16-byte AES-256-GCM tag
+    let raw_ct = URL_SAFE_NO_PAD.decode(&sealed.ct).unwrap();
+    assert!((raw_ct.len() - 16).is_power_of_two());
+
+    let opened = open_human_draft(&sealed, &human_enc, "prod@eu-1").unwrap();
+    assert_eq!(opened, draft_payload);
+
+    // 2. Roundtrip without optional context
+    let no_ctx = HumanDraftPayloadV1 {
+        v: 1,
+        node_id: "prod@eu-1".to_string(),
+        text: "Rotate session tokens.".to_string(),
+        context: None,
+        created_at: format_rfc3339_millis(T0),
+    };
+    let sealed_no_ctx = seal_human_draft(&no_ctx, &human_enc.public_key()).unwrap();
+    assert_eq!(
+        open_human_draft(&sealed_no_ctx, &human_enc, "prod@eu-1").unwrap(),
+        no_ctx
+    );
+
+    // 3. Mutated valid inputs ALL fail closed:
+    // 3a. 1-bit flip in `enc`
+    for (idx, mask) in [(0, 0x01), (16, 0x08), (31, 0x80)] {
+        let mut mutated = sealed.clone();
+        mutated.enc = flip_b64_bit(&mutated.enc, idx, mask);
+        assert!(
+            open_human_draft(&mutated, &human_enc, "prod@eu-1").is_err(),
+            "1-bit flip in draft enc[{idx}] must fail closed"
+        );
+    }
+
+    // 3b. 1-bit flip in `ct` (ciphertext & AEAD tag)
+    for idx in [0, 32, raw_ct.len() - 17, raw_ct.len() - 1] {
+        let mut mutated = sealed.clone();
+        mutated.ct = flip_b64_bit(&mutated.ct, idx, 0x01);
+        assert!(
+            open_human_draft(&mutated, &human_enc, "prod@eu-1").is_err(),
+            "1-bit flip in draft ct[{idx}] must fail closed"
+        );
+    }
+
+    // 3c. Wrong expected `nodeId` fails HPKE info/AAD check
+    assert!(open_human_draft(&sealed, &human_enc, "staging@us-1").is_err());
+
+    // 3d. Wrong `recipientKid` or wrong recipient keypair fails closed
+    let mut wrong_kid = sealed.clone();
+    wrong_kid.recipient_kid = other_enc.kid();
+    assert!(open_human_draft(&wrong_kid, &human_enc, "prod@eu-1").is_err());
+    assert!(open_human_draft(&sealed, &other_enc, "prod@eu-1").is_err());
+
+    // 3e. Wrong version or suite fails closed
+    let mut bad_ver = sealed.clone();
+    bad_ver.v = 2;
+    assert!(open_human_draft(&bad_ver, &human_enc, "prod@eu-1").is_err());
+    let mut bad_suite = sealed.clone();
+    bad_suite.suite = "human.drop.v1".to_string();
+    assert!(open_human_draft(&bad_suite, &human_enc, "prod@eu-1").is_err());
+
+    // 3f. Malicious sender manually sealing mismatched inner `nodeId` or BiDi payload fails closed on open!
+    let malicious_node = HumanDraftPayloadV1 {
+        v: 1,
+        node_id: "evil@node".to_string(),
+        text: "Valid text".to_string(),
+        context: None,
+        created_at: format_rfc3339_millis(T0),
+    };
+    let padded_bad_node = pad_bucket(to_canonical_json(&malicious_node).unwrap().as_bytes()).unwrap();
+    let (enc_m, ct_m) = hpke::seal_base(
+        &human_enc.public_key(),
+        &human_draft_hpke_info("prod@eu-1", &human_enc.kid()),
+        &human_draft_hpke_aad("prod@eu-1", &human_enc.kid()).unwrap(),
+        &padded_bad_node,
+    )
+    .unwrap();
+    let crafted_bad_node = EncryptedHumanDraftV1 {
+        v: 1,
+        suite: HUMAN_DRAFT_SUITE.to_string(),
+        recipient_kid: human_enc.kid(),
+        enc: URL_SAFE_NO_PAD.encode(enc_m),
+        ct: URL_SAFE_NO_PAD.encode(ct_m),
+    };
+    assert!(matches!(
+        open_human_draft(&crafted_bad_node, &human_enc, "prod@eu-1"),
+        Err(CryptoError::InvalidEnvelope(_))
+    ));
+
+    let malicious_bidi = HumanDraftPayloadV1 {
+        v: 1,
+        node_id: "prod@eu-1".to_string(),
+        text: "Approve \u{202E}evil".to_string(),
+        context: None,
+        created_at: format_rfc3339_millis(T0),
+    };
+    let padded_bidi = pad_bucket(to_canonical_json(&malicious_bidi).unwrap().as_bytes()).unwrap();
+    let (enc_b, ct_b) = hpke::seal_base(
+        &human_enc.public_key(),
+        &human_draft_hpke_info("prod@eu-1", &human_enc.kid()),
+        &human_draft_hpke_aad("prod@eu-1", &human_enc.kid()).unwrap(),
+        &padded_bidi,
+    )
+    .unwrap();
+    let crafted_bidi = EncryptedHumanDraftV1 {
+        v: 1,
+        suite: HUMAN_DRAFT_SUITE.to_string(),
+        recipient_kid: human_enc.kid(),
+        enc: URL_SAFE_NO_PAD.encode(enc_b),
+        ct: URL_SAFE_NO_PAD.encode(ct_b),
+    };
+    assert!(matches!(
+        open_human_draft(&crafted_bidi, &human_enc, "prod@eu-1"),
+        Err(CryptoError::InvalidEnvelope(_))
+    ));
+}
+
+#[test]
+fn validate_draft_text_enforces_length_bidi_invisible_and_control_guards() {
+    let human_enc = X25519KeyPair::from_bytes([0x51; 32]).unwrap();
+
+    // Valid edge cases: exact 512 ASCII chars, exact 512 multibyte chars, newline & tab
+    let exact_512 = "a".repeat(MAX_HUMAN_DRAFT_CHARS);
+    assert!(validate_draft_text(&exact_512).is_ok());
+    let exact_512_unicode = "✓".repeat(MAX_HUMAN_DRAFT_CHARS);
+    assert!(validate_draft_text(&exact_512_unicode).is_ok());
+    assert!(validate_draft_text("line 1\n\tline 2").is_ok());
+
+    // Overflow: 513 chars fails closed
+    let over_513 = "a".repeat(MAX_HUMAN_DRAFT_CHARS + 1);
+    assert!(validate_draft_text(&over_513).is_err());
+
+    // Empty / whitespace-only fails closed
+    assert!(validate_draft_text("").is_err());
+    assert!(validate_draft_text("   \n\t  ").is_err());
+
+    // Every forbidden BiDi, invisible, CR, and C0/C1 control char fails closed
+    let forbidden_chars = [
+        '\u{0000}', '\u{0007}', '\u{0008}', '\u{000B}', '\u{000C}', '\u{000D}', '\u{001B}',
+        '\u{001F}', '\u{007F}', '\u{0080}', '\u{0085}', '\u{009F}', '\u{061C}', '\u{200B}',
+        '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{2028}', '\u{2029}', '\u{202A}',
+        '\u{202D}', '\u{202E}', '\u{202F}', '\u{2060}', '\u{2066}', '\u{2069}', '\u{FEFF}',
+    ];
+    for ch in forbidden_chars {
+        let bad = format!("hello{ch}world");
+        assert!(
+            validate_draft_text(&bad).is_err(),
+            "forbidden char U+{:04X} must be rejected",
+            ch as u32
+        );
+    }
+
+    // Context length & BiDi enforcement on seal_human_draft
+    let ok_ctx = HumanDraftPayloadV1 {
+        v: 1,
+        node_id: "prod@eu-1".to_string(),
+        text: "Proceed".to_string(),
+        context: Some("c".repeat(MAX_HUMAN_DRAFT_CONTEXT_CHARS)),
+        created_at: format_rfc3339_millis(T0),
+    };
+    assert!(seal_human_draft(&ok_ctx, &human_enc.public_key()).is_ok());
+
+    let over_ctx = HumanDraftPayloadV1 {
+        context: Some("c".repeat(MAX_HUMAN_DRAFT_CONTEXT_CHARS + 1)),
+        ..ok_ctx.clone()
+    };
+    assert!(seal_human_draft(&over_ctx, &human_enc.public_key()).is_err());
+
+    let bidi_ctx = HumanDraftPayloadV1 {
+        context: Some("ctx\u{200B}hidden".to_string()),
+        ..ok_ctx
+    };
+    assert!(seal_human_draft(&bidi_ctx, &human_enc.public_key()).is_err());
+}
+
+#[test]
+fn local_ingest_event_signature_roundtrip_and_tamper_rejection() {
+    let signer = Ed25519KeyPair::from_seed([0x61; 32]).unwrap();
+    let other = Ed25519KeyPair::from_seed([0x62; 32]).unwrap();
+
+    let canonical_event = r#"{"data":{"text":"Run nightly check"},"datacontenttype":"application/json","id":"ev-local-1","source":"cron/nightly","specversion":"1.0","type":"to.hyphae.local.v1"}"#;
+
+    let sig_attr = sign_local_ingest_event(&signer, canonical_event);
+    assert!(sig_attr.starts_with(&format!("ed25519:{}:", signer.kid())));
+    assert_eq!(sig_attr.len(), 8 + 43 + 1 + 86);
+
+    // Valid verification returns verified kid
+    let verified_kid = verify_local_ingest_event(&sig_attr, canonical_event, |kid| {
+        assert_eq!(kid, signer.kid());
+        Some(signer.public_key())
+    })
+    .unwrap();
+    assert_eq!(verified_kid, signer.kid());
+
+    // 1-bit flip in signature fails closed
+    let parts: Vec<&str> = sig_attr.split(':').collect();
+    let tampered_sig = format!(
+        "ed25519:{}:{}",
+        parts[1],
+        flip_b64_bit(parts[2], 0, 0x01)
+    );
+    assert!(matches!(
+        verify_local_ingest_event(&tampered_sig, canonical_event, |_| Some(signer.public_key())),
+        Err(CryptoError::InvalidSignature(_))
+    ));
+
+    // 1-byte mutation in canonical event JSON fails closed
+    let tampered_event = canonical_event.replace("nightly", "nightlY");
+    assert!(matches!(
+        verify_local_ingest_event(&sig_attr, &tampered_event, |_| Some(signer.public_key())),
+        Err(CryptoError::InvalidSignature(_))
+    ));
+
+    // Unknown / revoked key fails closed
+    assert!(matches!(
+        verify_local_ingest_event(&sig_attr, canonical_event, |_| None),
+        Err(CryptoError::InvalidSignature(_))
+    ));
+
+    // Mismatched public key returned by lookup fails closed
+    assert!(matches!(
+        verify_local_ingest_event(&sig_attr, canonical_event, |_| Some(other.public_key())),
+        Err(CryptoError::InvalidSignature(_))
+    ));
+
+    // Cross-domain attack: signature computed under HUMAN_CLAIM_DOMAIN instead of LOCAL_EVENT_SIG_DOMAIN fails closed!
+    let mut wrong_domain_msg = Vec::new();
+    wrong_domain_msg.extend_from_slice(HUMAN_CLAIM_DOMAIN);
+    wrong_domain_msg.extend_from_slice(canonical_event.as_bytes());
+    let wrong_domain_attr = format!(
+        "ed25519:{}:{}",
+        signer.kid(),
+        URL_SAFE_NO_PAD.encode(signer.sign_raw(&wrong_domain_msg))
+    );
+    assert!(matches!(
+        verify_local_ingest_event(&wrong_domain_attr, canonical_event, |_| Some(
+            signer.public_key()
+        )),
+        Err(CryptoError::InvalidSignature(_))
+    ));
+    assert_eq!(LOCAL_EVENT_SIG_DOMAIN, b"hyphae/v2/local-event\n");
+
+    // Malformed extension formats all fail closed
+    for malformed in [
+        "",
+        "ed25519",
+        "ed25519:onlytwo",
+        "ed25519::sig",
+        "ed25519:validkid:",
+        "rsa:validkid:sig",
+        "ed25519:bad kid:sig",
+        &format!("{sig_attr}:extra"),
+    ] {
+        assert!(
+            matches!(
+                verify_local_ingest_event(malformed, canonical_event, |_| Some(signer.public_key())),
+                Err(CryptoError::InvalidSignature(_))
+            ),
+            "malformed hyphaesig '{malformed}' must fail closed"
+        );
+    }
 }

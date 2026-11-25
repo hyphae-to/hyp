@@ -311,7 +311,7 @@ fn create_seeded_v1_db(path: &Path, enable_wal: bool) {
 
 #[test]
 fn registry_invariants_and_invalid_registry_rejection() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, 4);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 5);
     assert_eq!(MIGRATIONS.len() as i64, CURRENT_SCHEMA_VERSION);
     let mut names = HashSet::new();
     for (idx, m) in MIGRATIONS.iter().enumerate() {
@@ -387,12 +387,13 @@ fn differential_schema_and_data_parity_v1_migrated_equals_fresh_v2() {
     let applied_migrated = migrated.applied_migrations().unwrap();
     assert_eq!(
         applied_migrated.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
-        vec![1, 2, 3, 4]
+        vec![1, 2, 3, 4, 5]
     );
     assert_eq!(applied_migrated[0].1, T0);
     assert!(applied_migrated[1].1 >= T0);
     assert!(applied_migrated[2].1 >= T0);
     assert!(applied_migrated[3].1 >= T0);
+    assert!(applied_migrated[4].1 >= T0);
 
     // 3. All seeded v1 rows survive untouched; handles default to `description: None`.
     let peer = migrated.peers().get_peer("acme-team").unwrap().unwrap();
@@ -648,7 +649,7 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
     let mut failing_sql_migrations = MIGRATIONS.to_vec();
     failing_sql_migrations.push(Migration {
         version: next_ver,
-        name: "0005_broken_sql",
+        name: "0006_broken_sql",
         disable_foreign_keys: false,
         kind: MigrationKind::Sql(
             "CREATE TABLE partial_should_rollback (id INTEGER PRIMARY KEY);
@@ -680,7 +681,7 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
     let mut failing_fn_migrations = MIGRATIONS.to_vec();
     failing_fn_migrations.push(Migration {
         version: next_ver,
-        name: "0005_broken_fn",
+        name: "0006_broken_fn",
         disable_foreign_keys: false,
         kind: MigrationKind::Fn(failing_fn),
     });
@@ -703,7 +704,7 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
     let mut fk_violation_migrations = MIGRATIONS.to_vec();
     fk_violation_migrations.push(Migration {
         version: next_ver,
-        name: "0005_fk_orphan",
+        name: "0006_fk_orphan",
         disable_foreign_keys: true,
         kind: MigrationKind::Sql(
             "INSERT INTO publisher_grants (publisher_id, topic) VALUES ('ghost-pub', 'alerts');",
@@ -735,7 +736,7 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
     let mut fk_rebuild_ok = MIGRATIONS.to_vec();
     fk_rebuild_ok.push(Migration {
         version: next_ver,
-        name: "0005_rebuild_publishers_ok",
+        name: "0006_rebuild_publishers_ok",
         disable_foreign_keys: true,
         kind: MigrationKind::Sql(
             "CREATE TABLE publishers_new (

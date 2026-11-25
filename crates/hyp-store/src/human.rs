@@ -102,6 +102,8 @@ pub struct HumanAuthorityInput {
     pub label: String,
     pub role: HumanAuthorityRole,
     pub jwk_json: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enc_jwk_json: Option<String>,
     pub prf_salt: Option<String>,
     pub auth_epoch: u64,
 }
@@ -114,6 +116,8 @@ pub struct HumanAuthorityRecord {
     pub label: String,
     pub role: HumanAuthorityRole,
     pub jwk_json: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enc_jwk_json: Option<String>,
     pub prf_salt: Option<String>,
     pub auth_epoch: u64,
     pub status: HumanAuthorityStatus,
@@ -167,6 +171,9 @@ impl<'a> HumanAuthorityStore<'a> {
         validate_token_id("kid", &input.kid)?;
         validate_label(&input.label)?;
         validate_json_object("jwk_json", &input.jwk_json)?;
+        if let Some(enc_jwk) = &input.enc_jwk_json {
+            validate_json_object("enc_jwk_json", enc_jwk)?;
+        }
         if let Some(salt) = &input.prf_salt {
             validate_token_id("prf_salt", salt)?;
         }
@@ -206,12 +213,13 @@ impl<'a> HumanAuthorityStore<'a> {
 
         tx.conn().execute(
             "INSERT INTO human_authorities
-                (human_id, kid, label, role, jwk_json, prf_salt, auth_epoch, status, created_at, revoked_at, revocation_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, NULL, NULL)
+                (human_id, kid, label, role, jwk_json, enc_jwk_json, prf_salt, auth_epoch, status, created_at, revoked_at, revocation_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, NULL, NULL)
              ON CONFLICT(human_id, kid) DO UPDATE SET
                 label = excluded.label,
                 role = excluded.role,
                 jwk_json = excluded.jwk_json,
+                enc_jwk_json = excluded.enc_jwk_json,
                 prf_salt = excluded.prf_salt,
                 auth_epoch = excluded.auth_epoch",
             params![
@@ -220,6 +228,7 @@ impl<'a> HumanAuthorityStore<'a> {
                 input.label,
                 input.role.as_str(),
                 input.jwk_json,
+                input.enc_jwk_json,
                 input.prf_salt,
                 epoch_i64,
                 created_at,
@@ -233,6 +242,7 @@ impl<'a> HumanAuthorityStore<'a> {
             label: input.label.clone(),
             role: input.role,
             jwk_json: input.jwk_json.clone(),
+            enc_jwk_json: input.enc_jwk_json.clone(),
             prf_salt: input.prf_salt.clone(),
             auth_epoch: input.auth_epoch,
             status: HumanAuthorityStatus::Active,
@@ -254,7 +264,7 @@ impl<'a> HumanAuthorityStore<'a> {
         self.db
             .conn()
             .query_row(
-                "SELECT human_id, kid, label, role, jwk_json, prf_salt, auth_epoch, status,
+                "SELECT human_id, kid, label, role, jwk_json, enc_jwk_json, prf_salt, auth_epoch, status,
                         created_at, revoked_at, revocation_json
                  FROM human_authorities
                  WHERE kid = ?1 AND status = 'active'
@@ -275,7 +285,7 @@ impl<'a> HumanAuthorityStore<'a> {
         self.db
             .conn()
             .query_row(
-                "SELECT human_id, kid, label, role, jwk_json, prf_salt, auth_epoch, status,
+                "SELECT human_id, kid, label, role, jwk_json, enc_jwk_json, prf_salt, auth_epoch, status,
                         created_at, revoked_at, revocation_json
                  FROM human_authorities
                  WHERE human_id = ?1 AND kid = ?2",
@@ -286,15 +296,20 @@ impl<'a> HumanAuthorityStore<'a> {
             .map_err(StoreError::from)
     }
 
+    /// Lists enrolled active human authorities deterministically ordered by `(human_id ASC, kid ASC)`.
+    pub fn list_active_authorities(&self) -> StoreResult<Vec<HumanAuthorityRecord>> {
+        self.list_authorities(false)
+    }
+
     /// Lists enrolled human authorities deterministically ordered by `(human_id ASC, kid ASC)`.
     pub fn list_authorities(&self, include_revoked: bool) -> StoreResult<Vec<HumanAuthorityRecord>> {
         let sql = if include_revoked {
-            "SELECT human_id, kid, label, role, jwk_json, prf_salt, auth_epoch, status,
+            "SELECT human_id, kid, label, role, jwk_json, enc_jwk_json, prf_salt, auth_epoch, status,
                     created_at, revoked_at, revocation_json
              FROM human_authorities
              ORDER BY human_id ASC, kid ASC"
         } else {
-            "SELECT human_id, kid, label, role, jwk_json, prf_salt, auth_epoch, status,
+            "SELECT human_id, kid, label, role, jwk_json, enc_jwk_json, prf_salt, auth_epoch, status,
                     created_at, revoked_at, revocation_json
              FROM human_authorities
              WHERE status = 'active'
@@ -305,6 +320,70 @@ impl<'a> HumanAuthorityStore<'a> {
             .query_map([], row_to_authority)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Upgrades an active human authority key with its companion X25519 encryption JWK.
+    ///
+    /// Returns `Ok(true)` if an active authority with `kid` was updated, or `Ok(false)` if
+    /// `kid` does not exist or has been revoked.
+    pub fn update_authority_enc_jwk(
+        &self,
+        kid: &str,
+        enc_jwk_json: &str,
+        _now_ms: i64,
+    ) -> StoreResult<bool> {
+        validate_token_id("kid", kid)?;
+        validate_json_object("enc_jwk_json", enc_jwk_json)?;
+
+        let tx = self.db.immediate_tx()?;
+        let changed = tx.conn().execute(
+            "UPDATE human_authorities
+             SET enc_jwk_json = ?1
+             WHERE kid = ?2 AND status = 'active'",
+            params![enc_jwk_json, kid],
+        )?;
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
+    /// Returns the most recently added active human authority matching optional `human_id`
+    /// that has a companion X25519 encryption key (`enc_jwk_json IS NOT NULL`).
+    pub fn get_preferred_human_enc_jwk(
+        &self,
+        human_id: Option<&str>,
+    ) -> StoreResult<Option<HumanAuthorityRecord>> {
+        if let Some(hid) = human_id {
+            validate_human_id(hid)?;
+            self.db
+                .conn()
+                .query_row(
+                    "SELECT human_id, kid, label, role, jwk_json, enc_jwk_json, prf_salt, auth_epoch, status,
+                            created_at, revoked_at, revocation_json
+                     FROM human_authorities
+                     WHERE status = 'active' AND enc_jwk_json IS NOT NULL AND human_id = ?1
+                     ORDER BY created_at DESC, auth_epoch DESC, kid DESC
+                     LIMIT 1",
+                    params![hid],
+                    row_to_authority,
+                )
+                .optional()
+                .map_err(StoreError::from)
+        } else {
+            self.db
+                .conn()
+                .query_row(
+                    "SELECT human_id, kid, label, role, jwk_json, enc_jwk_json, prf_salt, auth_epoch, status,
+                            created_at, revoked_at, revocation_json
+                     FROM human_authorities
+                     WHERE status = 'active' AND enc_jwk_json IS NOT NULL
+                     ORDER BY created_at DESC, auth_epoch DESC, kid DESC
+                     LIMIT 1",
+                    [],
+                    row_to_authority,
+                )
+                .optional()
+                .map_err(StoreError::from)
+        }
     }
 
     /// Returns the strictly monotonic minimum accepted `auth_epoch` (defaults to `1`).
@@ -357,12 +436,12 @@ impl<'a> HumanAuthorityStore<'a> {
     }
 
     /// Computes a canonical SHA-256 hex digest over sorted
-    /// `(human_id, kid, role, jwk_json, auth_epoch, status)` plus `min_auth_epoch`
+    /// `(human_id, kid, role, jwk_json, enc_jwk_json, auth_epoch, status)` plus `min_auth_epoch`
     /// for binding into `gate_policy_sig`.
     pub fn authorities_digest(&self) -> StoreResult<String> {
         let min_epoch = read_min_auth_epoch(self.db.conn())?;
         let mut stmt = self.db.conn().prepare(
-            "SELECT human_id, kid, role, jwk_json, auth_epoch, status
+            "SELECT human_id, kid, role, jwk_json, enc_jwk_json, auth_epoch, status
              FROM human_authorities
              ORDER BY human_id ASC, kid ASC",
         )?;
@@ -372,13 +451,15 @@ impl<'a> HumanAuthorityStore<'a> {
                 let kid: String = row.get(1)?;
                 let role: String = row.get(2)?;
                 let jwk_json: String = row.get(3)?;
-                let auth_epoch: i64 = row.get(4)?;
-                let status: String = row.get(5)?;
+                let enc_jwk_json: Option<String> = row.get(4)?;
+                let auth_epoch: i64 = row.get(5)?;
+                let status: String = row.get(6)?;
                 Ok(json!({
                     "humanId": human_id,
                     "kid": kid,
                     "role": role,
                     "jwkJson": jwk_json,
+                    "encJwkJson": enc_jwk_json,
                     "authEpoch": auth_epoch,
                     "status": status,
                 }))
@@ -588,17 +669,17 @@ fn read_min_auth_epoch(conn: &rusqlite::Connection) -> StoreResult<u64> {
 
 fn row_to_authority(row: &rusqlite::Row<'_>) -> rusqlite::Result<HumanAuthorityRecord> {
     let role_raw: String = row.get(3)?;
-    let epoch_i64: i64 = row.get(6)?;
-    let status_raw: String = row.get(7)?;
+    let epoch_i64: i64 = row.get(7)?;
+    let status_raw: String = row.get(8)?;
 
     let role = HumanAuthorityRole::parse(&role_raw).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
     })?;
     let status = HumanAuthorityStatus::parse(&status_raw).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
+        rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
     })?;
     let auth_epoch = u64::try_from(epoch_i64).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Integer, Box::new(e))
+        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Integer, Box::new(e))
     })?;
 
     Ok(HumanAuthorityRecord {
@@ -607,12 +688,13 @@ fn row_to_authority(row: &rusqlite::Row<'_>) -> rusqlite::Result<HumanAuthorityR
         label: row.get(2)?,
         role,
         jwk_json: row.get(4)?,
-        prf_salt: row.get(5)?,
+        enc_jwk_json: row.get(5)?,
+        prf_salt: row.get(6)?,
         auth_epoch,
         status,
-        created_at: row.get(8)?,
-        revoked_at: row.get(9)?,
-        revocation_json: row.get(10)?,
+        created_at: row.get(9)?,
+        revoked_at: row.get(10)?,
+        revocation_json: row.get(11)?,
     })
 }
 

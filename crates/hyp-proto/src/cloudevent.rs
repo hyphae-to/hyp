@@ -22,6 +22,8 @@ pub const TYPE_TRANSFER_V1: &str = "to.hyphae.transfer.v1";
 pub const TYPE_NODE_MANIFEST: &str = "to.hyphae.node.manifest";
 pub const TYPE_NODE_DIRECTORY: &str = "to.hyphae.node.directory";
 pub const TYPE_WAKEUP_V1: &str = "to.hyphae.wakeup.v1";
+pub const TYPE_SCHEDULED_MESSAGE_V1: &str = "to.hyphae.scheduled.v1";
+pub const TYPE_LOCAL_EVENT_V1: &str = "to.hyphae.local.v1";
 pub const TYPE_HUMAN_DROP_V1: &str = "to.hyphae.human.drop.v1";
 pub const TYPE_HUMAN_SECRET_STORED_V1: &str = "to.hyphae.human.secret.stored.v1";
 pub const TYPE_HUMAN_REVOCATION_V1: &str = "to.hyphae.human.revocation.v1";
@@ -37,6 +39,8 @@ pub const EXT_TRACESTATE: &str = "tracestate";
 pub const EXT_ORIGIN: &str = "hyphaeorigin";
 pub const EXT_VIA: &str = "hyphaevia";
 pub const EXT_HOPS: &str = "hyphaehops";
+/// Optional attached Ed25519 signature over local ingested events (`"ed25519:<kid>:<b64url>"`).
+pub const EXT_LOCAL_EVENT_SIG: &str = "hyphaesig";
 
 // ---- Size & multi-hop limits ----
 
@@ -1055,5 +1059,32 @@ mod tests {
         let minus5 = parse_rfc3339_utc_nanos("2026-06-15T05:00:00-05:00").unwrap();
         assert_eq!(utc, plus2);
         assert_eq!(utc, minus5);
+    }
+
+    #[test]
+    fn local_ingest_constants_and_hyphaesig_extension_validate() {
+        assert_eq!(TYPE_WAKEUP_V1, "to.hyphae.wakeup.v1");
+        assert_eq!(TYPE_SCHEDULED_MESSAGE_V1, "to.hyphae.scheduled.v1");
+        assert_eq!(TYPE_LOCAL_EVENT_V1, "to.hyphae.local.v1");
+        assert_eq!(EXT_LOCAL_EVENT_SIG, "hyphaesig");
+        assert!(is_extension_name(EXT_LOCAL_EVENT_SIG));
+
+        let sig_attr = format!("ed25519:{}:{}", "A".repeat(43), "B".repeat(86));
+        assert!(sig_attr.len() <= MAX_ATTRIBUTE_CHARS);
+        let ev = json!({
+            "specversion": "1.0",
+            "id": "local-ev-1",
+            "source": "cron/daily-digest",
+            "type": TYPE_LOCAL_EVENT_V1,
+            "datacontenttype": CONTENT_TYPE_JSON,
+            "hyphaesig": sig_attr,
+            "data": { "text": "Run morning check" }
+        });
+        let (parsed, _) = check_cloudevent_v2(&ev).unwrap();
+        assert_eq!(parsed.event_type, TYPE_LOCAL_EVENT_V1);
+        assert_eq!(
+            parsed.get_attribute(EXT_LOCAL_EVENT_SIG),
+            Some(Value::String(sig_attr))
+        );
     }
 }
