@@ -5,7 +5,7 @@
 - **Status:** Draft Proposal
 - **Author:** Hyphae Architecture
 - **Target Runtime:** Hyphae v2 (`hyp`, Rust 1.87+ / `edition = "2024"`, 6-crate workspace + static `site/drop/`)
-- **Related Docs:** [architecture-v2.md](architecture-v2.md), [security.md](security.md), [public-node.md](public-node.md)
+- **Related Docs:** [architecture.md](../internals/architecture.md), [threat-model.md](../security/threat-model.md), [public-node.md](../guides/public-node.md)
 
 ---
 

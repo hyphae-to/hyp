@@ -5,7 +5,7 @@
 - **Status**: Draft (Design Ready for Implementation)
 - **Authors**: Hyphae Engineering
 - **Target Crates**: `hyp-store`, `hyp-proto`, `hyp-node`, `hyp-harness`, `hyp-cli`, `skills/`
-- **Related Docs**: [architecture-v2.md](architecture-v2.md), [plugins.md](plugins.md), [security.md](security.md), [onboarding.md](onboarding.md)
+- **Related Docs**: [architecture.md](../internals/architecture.md), [plugins.md](../reference/plugins.md), [threat-model.md](../security/threat-model.md), [getting-started.md](../getting-started.md)
 
 ---
 
