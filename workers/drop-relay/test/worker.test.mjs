@@ -1,10 +1,12 @@
 /**
  * Comprehensive zero-dependency Node 24 test suite for `workers/drop-relay/src/index.mjs`.
  *
- * Uses an in-memory mock `DurableObjectNamespace` executing the REAL `DropSlotDO` class
- * so every HTTP/SSE route, capability token, Ed25519 signature, CORS/PNA policy, rate limit,
- * pre-body rejection, late-subscriber SSE catch-up, and RAM buffer zeroization is verified
- * end-to-end without external dependencies or network sockets.
+ * Uses realistic storage-backed mock `DurableObjectNamespace` harnesses executing the REAL
+ * `DropSlotDO` and `RateLimiterDO` classes (including simulated isolate eviction, cold-start
+ * hydration via `blockConcurrencyWhile`, and `alarm()` hard-wipe) so every HTTP/SSE route,
+ * capability token, Ed25519 signature, CORS/PNA policy, durable & fallback rate limit,
+ * pre-body rejection, late-subscriber SSE catch-up, storage wipe, and RAM zeroization is
+ * verified end-to-end without external dependencies or network sockets.
  */
 
 import test from "node:test";
@@ -15,6 +17,7 @@ import { dirname, join } from "node:path";
 
 import {
   DropSlotDO,
+  RateLimiterDO,
   DROP_CAP_PREFIX,
   DROP_CAP_DOMAIN,
   DROP_CAP_HEADER,
@@ -44,42 +47,149 @@ const TEST_HMAC_KEY_PREV = "hyphae-prev-hmac-secret-key-fedcba9876543210";
 const BASE_NOW_MS = 1_750_000_000_000;
 
 // ============================================================================
-// Test Helpers: Mock DurableObjectNamespace, Ed25519 Signer, SSE Reader
+// Test Helpers: Storage-Backed Mock DurableObjectNamespace, Ed25519 Signer, SSE
 // ============================================================================
 
 /**
- * In-memory mock `DurableObjectNamespace` executing the real `DropSlotDO` class.
- * Deliberately provides a `ctx` whose `storage` getter throws if ever accessed,
- * proving at runtime that `DropSlotDO` is 100% RAM-only.
+ * Realistic in-memory mock `DurableObjectNamespace` executing a real DO class
+ * (`DropSlotDO` or `RateLimiterDO`) with per-object persistent storage (using
+ * `structuredClone` to mirror Cloudflare DO storage isolation), `blockConcurrencyWhile`,
+ * `setAlarm` / `deleteAlarm`, simulated isolate eviction (`evict` / `evictAll`),
+ * and alarm dispatch (`triggerAlarm`).
  */
-function createMockDurableObjectNamespace({ now, keepaliveMs = 25_000 } = {}) {
-  /** @type {Map<string, DropSlotDO>} */
+function createMockDurableObjectNamespace(
+  DoClass = DropSlotDO,
+  { now, keepaliveMs = 25_000, enableStorage = true } = {}
+) {
+  /** @type {Map<string, any>} */
   const instances = new Map();
+  /** @type {Map<string, { kv: Map<string, unknown>, alarmAtMs: number | null }>} */
+  const persisted = new Map();
+  /** @type {Map<string, Promise<void>>} */
+  const concurrencyGates = new Map();
   let envRef = null;
 
-  const forbiddenCtx = {
-    get storage() {
-      throw new Error("VIOLATION: DropSlotDO must NEVER access ctx.storage!");
-    },
-  };
+  function ensureStore(key) {
+    let state = persisted.get(key);
+    if (!state) {
+      state = { kv: new Map(), alarmAtMs: null };
+      persisted.set(key, state);
+    }
+    return state;
+  }
+
+  function makeCtx(key) {
+    if (!enableStorage) {
+      return {};
+    }
+    const store = ensureStore(key);
+    const storage = {
+      async get(k) {
+        if (!store.kv.has(k)) return undefined;
+        return structuredClone(store.kv.get(k));
+      },
+      async put(k, v) {
+        store.kv.set(k, structuredClone(v));
+      },
+      async delete(k) {
+        if (Array.isArray(k)) {
+          let count = 0;
+          for (const item of k) {
+            if (store.kv.delete(item)) count += 1;
+          }
+          return count;
+        }
+        return store.kv.delete(k);
+      },
+      async deleteAll() {
+        store.kv.clear();
+      },
+      async setAlarm(scheduledTime) {
+        store.alarmAtMs =
+          scheduledTime instanceof Date ? scheduledTime.getTime() : Number(scheduledTime);
+      },
+      async getAlarm() {
+        return store.alarmAtMs;
+      },
+      async deleteAlarm() {
+        store.alarmAtMs = null;
+      },
+    };
+
+    return {
+      storage,
+      blockConcurrencyWhile(fn) {
+        const prev = concurrencyGates.get(key) ?? Promise.resolve();
+        const next = prev.then(() => fn());
+        concurrencyGates.set(
+          key,
+          next.catch(() => {})
+        );
+        return next;
+      },
+    };
+  }
+
+  function getOrCreateInstance(key) {
+    let instance = instances.get(key);
+    if (!instance) {
+      const ctx = makeCtx(key);
+      instance = new DoClass(ctx, envRef ?? {}, { now, keepaliveMs });
+      instances.set(key, instance);
+    }
+    return instance;
+  }
 
   return {
     instances,
+    persisted,
     bindEnv(env) {
       envRef = env;
     },
     idFromName(name) {
       return { name: String(name), toString: () => String(name) };
     },
+    /** Simulates Cloudflare evicting an idle DO isolate while keeping `ctx.storage` intact. */
+    evict(key) {
+      const inst = instances.get(key);
+      if (inst && inst.expiryTimer) {
+        clearTimeout(inst.expiryTimer);
+        inst.expiryTimer = null;
+      }
+      if (inst && inst.subscribers) {
+        for (const sub of Array.from(inst.subscribers)) {
+          inst._closeSubscriber?.(sub);
+        }
+      }
+      instances.delete(key);
+      concurrencyGates.delete(key);
+    },
+    evictAll() {
+      for (const key of Array.from(instances.keys())) {
+        this.evict(key);
+      }
+    },
+    /** Simulates Cloudflare firing the DO's scheduled alarm (waking a cold DO if evicted). */
+    async triggerAlarm(key) {
+      const store = ensureStore(key);
+      store.alarmAtMs = null;
+      const instance = getOrCreateInstance(key);
+      const gate = concurrencyGates.get(key);
+      if (gate) await gate;
+      if (typeof instance.alarm === "function") {
+        await instance.alarm();
+      }
+    },
+    getStorageState(key) {
+      return ensureStore(key);
+    },
     get(id) {
       const key = typeof id === "string" ? id : id.name;
-      let instance = instances.get(key);
-      if (!instance) {
-        instance = new DropSlotDO(forbiddenCtx, envRef ?? {}, { now, keepaliveMs });
-        instances.set(key, instance);
-      }
       return {
-        fetch: (input, init) => {
+        fetch: async (input, init) => {
+          const instance = getOrCreateInstance(key);
+          const gate = concurrencyGates.get(key);
+          if (gate) await gate;
           const req = input instanceof Request ? input : new Request(input, init);
           return instance.fetch(req);
         },
@@ -144,9 +254,12 @@ async function generateEd25519Identity(nodeId) {
 }
 
 /**
- * Helper to create a test harness with deterministic clock and real `DropSlotDO`.
+ * Helper to create a test harness with deterministic clock and real `DropSlotDO` + `RateLimiterDO`.
  */
-function createTestHarness(envOverrides = {}, { initialNowMs = BASE_NOW_MS, keepaliveMs = 25_000 } = {}) {
+function createTestHarness(
+  envOverrides = {},
+  { initialNowMs = BASE_NOW_MS, keepaliveMs = 25_000, enableStorage = true, bindRateLimiter = true } = {}
+) {
   let nowMs = initialNowMs;
   const now = () => nowMs;
   const setNow = (nextMs) => {
@@ -156,7 +269,14 @@ function createTestHarness(envOverrides = {}, { initialNowMs = BASE_NOW_MS, keep
     nowMs += deltaMs;
   };
 
-  const dropSlotNs = createMockDurableObjectNamespace({ now, keepaliveMs });
+  const dropSlotNs = createMockDurableObjectNamespace(DropSlotDO, {
+    now,
+    keepaliveMs,
+    enableStorage,
+  });
+  const rateLimiterNs = bindRateLimiter
+    ? createMockDurableObjectNamespace(RateLimiterDO, { now, enableStorage })
+    : null;
   const env = {
     DROP_AUTH_MODE: "private",
     DROP_CAP_HMAC_KEY: TEST_HMAC_KEY,
@@ -168,15 +288,18 @@ function createTestHarness(envOverrides = {}, { initialNowMs = BASE_NOW_MS, keep
     MAX_ITEMS_PER_DROP: "16",
     MAX_SSE_STREAMS_PER_DROP: "2",
     DROP_SLOT: dropSlotNs,
+    ...(rateLimiterNs ? { RATE_LIMITER: rateLimiterNs } : {}),
     ...envOverrides,
   };
   dropSlotNs.bindEnv(env);
+  if (rateLimiterNs) rateLimiterNs.bindEnv(env);
   const app = createWorkerApp({ now });
 
   return {
     app,
     env,
     dropSlotNs,
+    rateLimiterNs,
     now,
     setNow,
     advanceMs,
@@ -1360,20 +1483,527 @@ test("HTTP-level HMAC key rotation (DROP_CAP_HMAC_KEY_PREV) & query-string signa
   harness.dropSlotNs.instances.get(dropId)?._destroySlot({ markExpired: false });
 });
 
-test("static invariants: src/index.mjs never accesses DO storage and never calls console.*", () => {
+// ============================================================================
+// 9. H8: Durable Object Storage Persistence Across Eviction & Alarm Hard-Wipe
+// ============================================================================
+
+test("H8: DropSlotDO persists encrypted ciphertext across isolate eviction, wipes on burn-close, and supports chunked >96 KiB payloads", async () => {
+  const alice = await generateEd25519Identity("alice@macbook");
+  const harness = createTestHarness({
+    DROP_AUTH_MODE: "private",
+    ALLOWED_NODE_KEYS: JSON.stringify({ "alice@macbook": alice.pubB64 }),
+    MAX_PAYLOAD_BYTES: "262144",
+  });
+
+  // 1) Allocate slot with burnAfterRead=true
+  const createBody = new TextEncoder().encode(
+    JSON.stringify({ ttlSeconds: 600, maxItems: 3, burnAfterRead: true })
+  );
+  const createHeaders = await alice.signHeaders({
+    method: "POST",
+    pathAndQuery: "/v1/drops",
+    bodyBytes: createBody,
+  });
+  const createResp = await harness.fetch("/v1/drops", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...createHeaders },
+    body: createBody,
+  });
+  assert.equal(createResp.status, 201);
+  const { dropId, postCap, subCap, expiresAtMs } = await createResp.json();
+
+  // Verify slot metadata & alarm were persisted immediately in DO storage
+  const storageState = harness.dropSlotNs.getStorageState(dropId);
+  assert.equal(storageState.kv.has("slot:meta"), true);
+  assert.equal(storageState.alarmAtMs, expiresAtMs, "DO alarm must be set to slot expiresAtMs");
+
+  // 2) Evict idle DO BEFORE any ciphertext is posted -> cold reload accepts POST /v1/drops/{id}!
+  harness.dropSlotNs.evict(dropId);
+  assert.equal(harness.dropSlotNs.instances.has(dropId), false);
+
+  const cipher1 = "hdrop1_sealed_envelope_survives_isolate_eviction_001";
+  const post1 = await harness.fetch(`/v1/drops/${dropId}`, {
+    method: "POST",
+    headers: { [DROP_CAP_HEADER]: postCap },
+    body: cipher1,
+  });
+  assert.equal(post1.status, 201);
+  assert.deepEqual(await post1.json(), { seq: 1, expiresAtMs });
+
+  // Also post a large >96 KiB binary encrypted payload to exercise multi-chunk storage!
+  const largeCipher = new Uint8Array(130_000);
+  for (let i = 0; i < largeCipher.length; i += 1) {
+    largeCipher[i] = (i * 31 + 7) & 0xff;
+  }
+  const post2 = await harness.fetch(`/v1/drops/${dropId}`, {
+    method: "POST",
+    headers: { [DROP_CAP_HEADER]: postCap },
+    body: largeCipher,
+  });
+  assert.equal(post2.status, 201);
+  assert.deepEqual(await post2.json(), { seq: 2, expiresAtMs });
+  assert.equal(storageState.kv.has("slot:item:1"), true);
+  assert.equal(storageState.kv.has("slot:item:2"), true);
+  assert.equal(storageState.kv.has("slot:item:2:c:0"), true);
+  assert.equal(storageState.kv.has("slot:item:2:c:1"), true);
+
+  // 3) Evict DO isolate AGAIN before the target node subscribes!
+  harness.dropSlotNs.evict(dropId);
+  assert.equal(harness.dropSlotNs.instances.has(dropId), false);
+
+  // Cold-reloaded DO hydrates BOTH encrypted items (including chunked binary) and streams them via SSE!
+  const streamResp = await harness.fetch(`/v1/drops/${dropId}/stream`, {
+    method: "GET",
+    headers: { [DROP_CAP_HEADER]: subCap },
+  });
+  assert.equal(streamResp.status, 200);
+  const reader = streamResp.body.getReader();
+  const sseState = { buf: "", done: false };
+  const expectedLargeB64 = base64UrlEncode(largeCipher);
+  await readSseUntil(
+    reader,
+    sseState,
+    (s) => s.includes(cipher1) && s.includes(expectedLargeB64)
+  );
+  assert.ok(sseState.buf.includes(`id: 1\nevent: drop\ndata: ${cipher1}\n\n`));
+  assert.ok(sseState.buf.includes(`id: 2\nevent: drop\ndata: ${expectedLargeB64}\n\n`));
+  await reader.cancel();
+
+  // 4) Partial burn seq=1 -> removes item #1 from storage while keeping item #2 across eviction!
+  const ack1 = await harness.fetch(`/v1/drops/${dropId}/ack`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", [DROP_CAP_HEADER]: subCap },
+    body: JSON.stringify({ seq: 1, burn: true }),
+  });
+  assert.equal(ack1.status, 200);
+  assert.equal((await ack1.json()).slotClosed, false);
+  assert.equal(storageState.kv.has("slot:item:1"), false, "burned item #1 must be deleted from DO storage");
+  assert.equal(storageState.kv.has("slot:item:2"), true, "unburned item #2 must remain in DO storage");
+
+  // Evict again and verify item #1 does not resurrect, while item #2 still hydrates!
+  harness.dropSlotNs.evict(dropId);
+  const streamAfterPartial = await harness.fetch(`/v1/drops/${dropId}/stream`, {
+    method: "GET",
+    headers: { [DROP_CAP_HEADER]: subCap },
+  });
+  assert.equal(streamAfterPartial.status, 200);
+  const reader2 = streamAfterPartial.body.getReader();
+  const sseState2 = { buf: "", done: false };
+  await readSseUntil(reader2, sseState2, (s) => s.includes(expectedLargeB64));
+  assert.equal(sseState2.buf.includes(cipher1), false);
+  await reader2.cancel();
+
+  // 5) Final burn-after-read ack -> wipes ALL storage keys & cancels alarm!
+  const ack2 = await harness.fetch(`/v1/drops/${dropId}/ack`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", [DROP_CAP_HEADER]: subCap },
+    body: JSON.stringify({ seq: 2, burn: true }),
+  });
+  assert.equal(ack2.status, 200);
+  assert.equal((await ack2.json()).slotClosed, true);
+  assert.equal(storageState.kv.size, 0, "burn-after-read close must wipe all DO storage via deleteAll()");
+  assert.equal(storageState.alarmAtMs, null, "burn-after-read close must cancel DO alarm");
+});
+
+test("H8: DropSlotDO alarm() hard-wipes storage (returning 410/404) & cold-wake past TTL immediately wipes storage (410)", async () => {
+  const alice = await generateEd25519Identity("alice@macbook");
+  const harness = createTestHarness({
+    DROP_AUTH_MODE: "open",
+  });
+
+  // Scenario A: Create slot, post ciphertext, evict isolate, then fire Cloudflare DO alarm()
+  const c1Headers = await alice.signHeaders({
+    method: "POST",
+    pathAndQuery: "/v1/drops",
+    bodyBytes: new TextEncoder().encode(JSON.stringify({ ttlSeconds: 300 })),
+    includePublicKeyHeader: true,
+  });
+  const c1Resp = await harness.fetch("/v1/drops", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...c1Headers },
+    body: JSON.stringify({ ttlSeconds: 300 }),
+  });
+  assert.equal(c1Resp.status, 201);
+  const slotA = await c1Resp.json();
+
+  const pA = await harness.fetch(`/v1/drops/${slotA.dropId}`, {
+    method: "POST",
+    headers: { [DROP_CAP_HEADER]: slotA.postCap },
+    body: "hdrop1_alarm_wiped_ciphertext",
+  });
+  assert.equal(pA.status, 201);
+  const storeA = harness.dropSlotNs.getStorageState(slotA.dropId);
+  assert.ok(storeA.kv.size >= 2);
+  assert.equal(storeA.alarmAtMs, slotA.expiresAtMs);
+
+  // Evict isolate, advance clock to expiry, and trigger DO alarm()
+  harness.dropSlotNs.evict(slotA.dropId);
+  harness.advanceMs(300_000);
+  await harness.dropSlotNs.triggerAlarm(slotA.dropId);
+
+  // Storage must be 100% empty after alarm()
+  assert.equal(storeA.kv.size, 0, "alarm() must unconditionally wipe all DO storage via deleteAll()");
+  assert.equal(harness.dropSlotNs.instances.get(slotA.dropId)?.slot, null);
+
+  // Warm isolate after alarm returns 410 Gone for creator auth AND for expired capability
+  const postAfterAlarm = await harness.fetch(`/v1/drops/${slotA.dropId}`, {
+    method: "POST",
+    headers: { [DROP_CAP_HEADER]: slotA.postCap },
+    body: "too-late",
+  });
+  assert.equal(postAfterAlarm.status, 410);
+
+  const creatorWarmHeaders = await alice.signHeaders({
+    method: "GET",
+    pathAndQuery: `/v1/drops/${slotA.dropId}/stream`,
+    ts: harness.now(),
+    includePublicKeyHeader: true,
+  });
+  const warmStream = await harness.fetch(`/v1/drops/${slotA.dropId}/stream`, {
+    method: "GET",
+    headers: creatorWarmHeaders,
+  });
+  assert.equal(warmStream.status, 410);
+
+  // After subsequent eviction (empty storage, zero residue), creator auth sees 404 Not Found
+  harness.dropSlotNs.evict(slotA.dropId);
+  const creatorColdHeaders = await alice.signHeaders({
+    method: "GET",
+    pathAndQuery: `/v1/drops/${slotA.dropId}/stream`,
+    ts: harness.now(),
+    includePublicKeyHeader: true,
+  });
+  const coldStream = await harness.fetch(`/v1/drops/${slotA.dropId}/stream`, {
+    method: "GET",
+    headers: creatorColdHeaders,
+  });
+  assert.equal(coldStream.status, 404);
+
+  // Scenario B: Cold wake past TTL BEFORE alarm() has run -> hydration immediately deletes all storage & returns 410!
+  const c2Body = new TextEncoder().encode(JSON.stringify({ ttlSeconds: 120 }));
+  const c2Headers = await alice.signHeaders({
+    method: "POST",
+    pathAndQuery: "/v1/drops",
+    bodyBytes: c2Body,
+    ts: harness.now(),
+    includePublicKeyHeader: true,
+  });
+  const c2Resp = await harness.fetch("/v1/drops", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...c2Headers },
+    body: c2Body,
+  });
+  assert.equal(c2Resp.status, 201);
+  const slotB = await c2Resp.json();
+
+  const pB = await harness.fetch(`/v1/drops/${slotB.dropId}`, {
+    method: "POST",
+    headers: { [DROP_CAP_HEADER]: slotB.postCap },
+    body: "hdrop1_expired_before_alarm",
+  });
+  assert.equal(pB.status, 201);
+  const storeB = harness.dropSlotNs.getStorageState(slotB.dropId);
+  assert.ok(storeB.kv.size >= 2);
+
+  // Evict DO, advance clock past TTL WITHOUT calling alarm(), and send a creator request
+  harness.dropSlotNs.evict(slotB.dropId);
+  harness.advanceMs(120_000);
+  const lateCreatorHeaders = await alice.signHeaders({
+    method: "GET",
+    pathAndQuery: `/v1/drops/${slotB.dropId}/stream`,
+    ts: harness.now(),
+    includePublicKeyHeader: true,
+  });
+  const expiredWake = await harness.fetch(`/v1/drops/${slotB.dropId}/stream`, {
+    method: "GET",
+    headers: lateCreatorHeaders,
+  });
+  assert.equal(expiredWake.status, 410, "cold wake past expiresAtMs must return 410 Gone");
+  assert.equal((await expiredWake.json()).error, "drop_expired");
+  assert.equal(storeB.kv.size, 0, "cold wake past TTL must immediately wipe storage via deleteAll()");
+});
+
+test("H8 backwards-compat: DropSlotDO operates cleanly when mock ctx omits storage", async () => {
+  const alice = await generateEd25519Identity("alice@macbook");
+  const harness = createTestHarness(
+    {
+      DROP_AUTH_MODE: "private",
+      ALLOWED_NODE_KEYS: JSON.stringify({ "alice@macbook": alice.pubB64 }),
+    },
+    { enableStorage: false, bindRateLimiter: false }
+  );
+
+  const createHeaders = await alice.signHeaders({
+    method: "POST",
+    pathAndQuery: "/v1/drops",
+  });
+  const createResp = await harness.fetch("/v1/drops", {
+    method: "POST",
+    headers: createHeaders,
+  });
+  assert.equal(createResp.status, 201);
+  const { dropId, postCap, subCap } = await createResp.json();
+
+  const postResp = await harness.fetch(`/v1/drops/${dropId}`, {
+    method: "POST",
+    headers: { [DROP_CAP_HEADER]: postCap },
+    body: "hdrop1_ram_fallback_ok",
+  });
+  assert.equal(postResp.status, 201);
+
+  const streamResp = await harness.fetch(`/v1/drops/${dropId}/stream`, {
+    method: "GET",
+    headers: { [DROP_CAP_HEADER]: subCap },
+  });
+  assert.equal(streamResp.status, 200);
+  const reader = streamResp.body.getReader();
+  const state = { buf: "", done: false };
+  await readSseUntil(reader, state, (s) => s.includes("hdrop1_ram_fallback_ok"));
+  await reader.cancel();
+
+  await harness.dropSlotNs.instances.get(dropId)?._destroySlot({ markExpired: false });
+});
+
+// ============================================================================
+// 10. H3: Open Mode Per-IP Key-Rotation Defense, Durable RateLimiterDO & Allowlist Alias
+// ============================================================================
+
+test("H3: open mode blocks single-IP Ed25519 key-rotation bypass (burst 5/min & hourly 20/hr) durably across isolate restarts", async () => {
+  const attackerIp = "198.51.100.77";
+  const harness = createTestHarness({
+    DROP_AUTH_MODE: "open",
+    CREATES_PER_HOUR_PER_NODE: "10",
+    CREATES_PER_HOUR_PER_IP: "10",
+    CREATES_PER_MINUTE_PER_IP: "5",
+  });
+
+  // 1) Attacker rotates a brand-new Ed25519 keypair on EVERY request from the same IP!
+  for (let i = 1; i <= 5; i += 1) {
+    const freshKey = await generateEd25519Identity(`bot-${i}@attacker`);
+    const headers = await freshKey.signHeaders({
+      method: "POST",
+      pathAndQuery: "/v1/drops",
+      ts: harness.now(),
+      includePublicKeyHeader: true,
+    });
+    const resp = await harness.fetch("/v1/drops", {
+      method: "POST",
+      headers: { ...headers, "CF-Connecting-IP": attackerIp },
+    });
+    assert.equal(resp.status, 201, `burst create #${i} should succeed`);
+  }
+
+  // 6th request within the same minute with a 6th brand-new Ed25519 key MUST be blocked (429)!
+  const key6 = await generateEd25519Identity("bot-6@attacker");
+  const key6Headers = await key6.signHeaders({
+    method: "POST",
+    pathAndQuery: "/v1/drops",
+    ts: harness.now(),
+    includePublicKeyHeader: true,
+  });
+  const blockedBurst = await harness.fetch("/v1/drops", {
+    method: "POST",
+    headers: { ...key6Headers, "CF-Connecting-IP": attackerIp },
+  });
+  assert.equal(blockedBurst.status, 429);
+  assert.ok(Number(blockedBurst.headers.get("Retry-After")) >= 1);
+  const burstProblem = await blockedBurst.json();
+  assert.equal(burstProblem.error, "drop_rate_limited");
+  assert.match(burstProblem.detail, /per-IP burst/);
+
+  // 2) Simulate a brand-new Cloudflare Worker PoP isolate + RateLimiterDO eviction:
+  //    durable RateLimiterDO MUST still block key #7 from the same IP!
+  harness.rateLimiterNs.evictAll();
+  const secondPopApp = createWorkerApp({ now: harness.now });
+  const key7 = await generateEd25519Identity("bot-7@attacker");
+  const key7Headers = await key7.signHeaders({
+    method: "POST",
+    pathAndQuery: "/v1/drops",
+    ts: harness.now(),
+    includePublicKeyHeader: true,
+  });
+  const blockedAcrossPop = await secondPopApp.fetch(
+    new Request("https://drop.hyphae.test/v1/drops", {
+      method: "POST",
+      headers: { ...key7Headers, "CF-Connecting-IP": attackerIp },
+    }),
+    harness.env,
+    {}
+  );
+  assert.equal(blockedAcrossPop.status, 429, "RateLimiterDO must enforce per-IP burst across PoP restarts");
+
+  // Privacy invariant: RateLimiterDO keys & persisted storage must NEVER contain raw IP or pubkeys!
+  for (const [doName, state] of harness.rateLimiterNs.persisted.entries()) {
+    assert.equal(doName.includes(attackerIp), false, "DO name must be HMAC-blinded (zero raw IP)");
+    assert.equal(doName.includes(key6.pubB64), false, "DO name must be HMAC-blinded (zero raw pubkey)");
+    assert.match(doName, /^rl:(ip|creator):[0-9a-f]{32}$/);
+    const serialized = JSON.stringify(Array.from(state.kv.entries()));
+    assert.equal(serialized.includes(attackerIp), false);
+    assert.equal(serialized.includes(key6.pubB64), false);
+  }
+
+  // 3) Advance past 1-minute burst window -> 5 more fresh keys succeed (total 10/hr), then #11 hits hourly IP cap!
+  harness.advanceMs(61_000);
+  for (let i = 8; i <= 12; i += 1) {
+    const freshKey = await generateEd25519Identity(`bot-${i}@attacker`);
+    const headers = await freshKey.signHeaders({
+      method: "POST",
+      pathAndQuery: "/v1/drops",
+      ts: harness.now(),
+      includePublicKeyHeader: true,
+    });
+    const resp = await harness.fetch("/v1/drops", {
+      method: "POST",
+      headers: { ...headers, "CF-Connecting-IP": attackerIp },
+    });
+    assert.equal(resp.status, 201, `second burst create #${i} should succeed up to 10/hr`);
+  }
+
+  // Advance another minute so burst resets, yet hourly cap (10/hr) STILL blocks fresh key #13!
+  harness.advanceMs(61_000);
+  const key13 = await generateEd25519Identity("bot-13@attacker");
+  const key13Headers = await key13.signHeaders({
+    method: "POST",
+    pathAndQuery: "/v1/drops",
+    ts: harness.now(),
+    includePublicKeyHeader: true,
+  });
+  const blockedHourly = await harness.fetch("/v1/drops", {
+    method: "POST",
+    headers: { ...key13Headers, "CF-Connecting-IP": attackerIp },
+  });
+  assert.equal(blockedHourly.status, 429);
+  const hourlyProblem = await blockedHourly.json();
+  assert.match(hourlyProblem.detail, /per-IP hourly/);
+
+  // 4) Trigger RateLimiterDO alarms -> persisted rate-limit buckets are completely wiped!
+  for (const doName of Array.from(harness.rateLimiterNs.persisted.keys())) {
+    await harness.rateLimiterNs.triggerAlarm(doName);
+    assert.equal(harness.rateLimiterNs.getStorageState(doName).kv.size, 0);
+  }
+  harness.dropSlotNs.evictAll();
+});
+
+test("H3: isolate fallback (no RATE_LIMITER binding) enforces per-IP key-rotation burst + global guardrail, and allowlist/DROP_ALLOWED_KEYS aliases work", async () => {
+  // 1) In-isolate fallback without RATE_LIMITER DO binding
+  const fallbackHarness = createTestHarness(
+    {
+      DROP_AUTH_MODE: "open",
+      CREATES_PER_MINUTE_PER_IP: "2",
+      CREATES_PER_HOUR_PER_IP: "10",
+      CREATES_PER_MINUTE_GLOBAL: "3",
+    },
+    { bindRateLimiter: false }
+  );
+
+  // Two distinct keys from IP A succeed; 3rd distinct key from IP A hits per-IP burst (2/min)
+  for (let i = 1; i <= 2; i += 1) {
+    const id = await generateEd25519Identity(`ipA-${i}@node`);
+    const r = await fallbackHarness.fetch("/v1/drops", {
+      method: "POST",
+      headers: {
+        ...(await id.signHeaders({
+          method: "POST",
+          pathAndQuery: "/v1/drops",
+          includePublicKeyHeader: true,
+        })),
+        "CF-Connecting-IP": "203.0.113.1",
+      },
+    });
+    assert.equal(r.status, 201);
+  }
+  const ipA3 = await generateEd25519Identity("ipA-3@node");
+  const rIpABlocked = await fallbackHarness.fetch("/v1/drops", {
+    method: "POST",
+    headers: {
+      ...(await ipA3.signHeaders({
+        method: "POST",
+        pathAndQuery: "/v1/drops",
+        includePublicKeyHeader: true,
+      })),
+      "CF-Connecting-IP": "203.0.113.1",
+    },
+  });
+  assert.equal(rIpABlocked.status, 429);
+  assert.match((await rIpABlocked.json()).detail, /per-IP burst/);
+
+  // IP B succeeds once (global count = 3), then IP C hits global burst guardrail (3/min)!
+  const ipB = await generateEd25519Identity("ipB@node");
+  const rIpB = await fallbackHarness.fetch("/v1/drops", {
+    method: "POST",
+    headers: {
+      ...(await ipB.signHeaders({
+        method: "POST",
+        pathAndQuery: "/v1/drops",
+        includePublicKeyHeader: true,
+      })),
+      "CF-Connecting-IP": "203.0.113.2",
+    },
+  });
+  assert.equal(rIpB.status, 201);
+
+  const ipC = await generateEd25519Identity("ipC@node");
+  const rGlobalBlocked = await fallbackHarness.fetch("/v1/drops", {
+    method: "POST",
+    headers: {
+      ...(await ipC.signHeaders({
+        method: "POST",
+        pathAndQuery: "/v1/drops",
+        includePublicKeyHeader: true,
+      })),
+      "CF-Connecting-IP": "203.0.113.3",
+    },
+  });
+  assert.equal(rGlobalBlocked.status, 429);
+  assert.match((await rGlobalBlocked.json()).detail, /global drop creation burst/);
+  fallbackHarness.dropSlotNs.evictAll();
+
+  // 2) `DROP_AUTH_MODE = "allowlist"` + `DROP_ALLOWED_KEYS` alias (enterprise self-hosted mode)
+  const alice = await generateEd25519Identity("alice@corp");
+  const rogue = await generateEd25519Identity("rogue@ext");
+  const allowlistHarness = createTestHarness({
+    DROP_AUTH_MODE: "allowlist",
+    DROP_ALLOWED_KEYS: JSON.stringify({ "alice@corp": alice.pubB64 }),
+  });
+
+  const okResp = await allowlistHarness.fetch("/v1/drops", {
+    method: "POST",
+    headers: await alice.signHeaders({ method: "POST", pathAndQuery: "/v1/drops" }),
+  });
+  assert.equal(okResp.status, 201);
+
+  const denyResp = await allowlistHarness.fetch("/v1/drops", {
+    method: "POST",
+    headers: await rogue.signHeaders({ method: "POST", pathAndQuery: "/v1/drops" }),
+  });
+  assert.equal(denyResp.status, 403);
+  allowlistHarness.dropSlotNs.evictAll();
+});
+
+test("static invariants: src/index.mjs never calls console.* and implements alarm-driven storage.deleteAll()", () => {
   const source = readFileSync(INDEX_PATH, "utf8");
   // Strip block comments and line comments before checking code invariants
   const codeOnly = source
     .replace(/\/\*[\s\S]*?\*\//g, "")
     .replace(/\/\/.*$/gm, "");
   assert.equal(
-    /\.storage\b/.test(codeOnly),
-    false,
-    "DropSlotDO must NEVER reference .storage (strictly RAM-only)"
-  );
-  assert.equal(
     /\bconsole\s*\.\s*(log|info|debug|warn|error|trace)\b/.test(codeOnly),
     false,
     "Worker must NEVER log via console.* to avoid leaking drop metadata"
+  );
+  assert.equal(
+    /async\s+alarm\s*\(\s*\)/.test(codeOnly),
+    true,
+    "Durable Objects must implement async alarm() for TTL hard-wipe"
+  );
+  assert.equal(
+    /\.deleteAll\s*\(\s*\)/.test(codeOnly),
+    true,
+    "Durable Objects must wipe persisted ciphertext/metadata via storage.deleteAll()"
+  );
+  assert.equal(
+    /\.setAlarm\s*\(/.test(codeOnly),
+    true,
+    "Durable Objects must arm TTL hard-delete alarms via storage.setAlarm()"
   );
 });
