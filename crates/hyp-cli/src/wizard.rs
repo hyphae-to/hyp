@@ -25,7 +25,6 @@ use serde_json::json;
 use std::collections::BTreeSet;
 use std::f64::consts::PI;
 use std::ffi::OsStr;
-#[cfg(unix)]
 use std::fs;
 #[cfg(unix)]
 use std::io::{BufReader, Read};
@@ -54,15 +53,15 @@ const RGB_NODE_AMBER: (u8, u8, u8) = (236, 206, 132);
 
 // Fullscreen TUI botanical chrome palette.
 const RGB_UI_MUTED: (u8, u8, u8) = (128, 148, 138);
-#[cfg(unix)]
+#[cfg_attr(not(unix), allow(dead_code))]
 const RGB_UI_BORDER: (u8, u8, u8) = (84, 116, 98);
-#[cfg(unix)]
+#[cfg_attr(not(unix), allow(dead_code))]
 const RGB_UI_HIGHLIGHT_BG: (u8, u8, u8) = (36, 56, 46);
-#[cfg(unix)]
+#[cfg_attr(not(unix), allow(dead_code))]
 const RGB_UI_TAG_LAUNCH: (u8, u8, u8) = (158, 214, 168);
-#[cfg(unix)]
+#[cfg_attr(not(unix), allow(dead_code))]
 const RGB_UI_TAG_GUIDE: (u8, u8, u8) = (236, 206, 132);
-#[cfg(unix)]
+#[cfg_attr(not(unix), allow(dead_code))]
 const RGB_UI_TAG_LOCAL: (u8, u8, u8) = (146, 176, 164);
 
 /// Terminal color rendering capability.
@@ -213,11 +212,12 @@ impl LaunchableHarness {
 }
 
 /// Non-launchable Desktop/IDE/GUI/daemon harnesses (or CLI harnesses whose binary is not on PATH)
-/// handled cleanly via Path B (install `hyphae-setup` skill + interactive copy-paste guide).
+/// handled cleanly via Path B (install `hyphae-setup` skill + interactive copy-paste / deep-link guide).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ManualGuideHarness {
     ClaudeDesktop,
     CodexDesktop,
+    OpenCodeDesktop,
     CursorIde,
     Openclaw,
     T3,
@@ -229,6 +229,7 @@ impl ManualGuideHarness {
         match self {
             Self::ClaudeDesktop => HarnessKind::Claude,
             Self::CodexDesktop => HarnessKind::Codex,
+            Self::OpenCodeDesktop => HarnessKind::Opencode,
             Self::CursorIde => HarnessKind::Cursor,
             Self::Openclaw => HarnessKind::Openclaw,
             Self::T3 => HarnessKind::T3,
@@ -240,6 +241,7 @@ impl ManualGuideHarness {
         match self {
             Self::ClaudeDesktop => "claude-desktop",
             Self::CodexDesktop => "codex-desktop",
+            Self::OpenCodeDesktop => "opencode-desktop",
             Self::CursorIde => "cursor",
             Self::Openclaw => "openclaw",
             Self::T3 => "t3",
@@ -251,6 +253,7 @@ impl ManualGuideHarness {
         match self {
             Self::ClaudeDesktop => "Claude Desktop",
             Self::CodexDesktop => "Codex Desktop",
+            Self::OpenCodeDesktop => "OpenCode Desktop",
             Self::CursorIde => "Cursor (IDE)",
             Self::Openclaw => "OpenClaw",
             Self::T3 => "T3 Code",
@@ -262,6 +265,7 @@ impl ManualGuideHarness {
         match raw.trim().to_ascii_lowercase().as_str() {
             "claude-desktop" | "claude_desktop" => Some(Self::ClaudeDesktop),
             "codex-desktop" | "codex_desktop" => Some(Self::CodexDesktop),
+            "opencode-desktop" | "opencode_desktop" => Some(Self::OpenCodeDesktop),
             "cursor-ide" | "cursor_ide" => Some(Self::CursorIde),
             "openclaw" => Some(Self::Openclaw),
             "t3" | "t3-code" | "t3code" => Some(Self::T3),
@@ -273,6 +277,7 @@ impl ManualGuideHarness {
         match self {
             Self::ClaudeDesktop => LaunchableHarness::Claude.primary_skill_path(home),
             Self::CodexDesktop => LaunchableHarness::Codex.primary_skill_path(home),
+            Self::OpenCodeDesktop => LaunchableHarness::Opencode.primary_skill_path(home),
             Self::CursorIde => LaunchableHarness::Cursor.primary_skill_path(home),
             Self::Openclaw => home
                 .join(".openclaw")
@@ -292,6 +297,12 @@ impl ManualGuideHarness {
         match self {
             Self::ClaudeDesktop => Vec::new(),
             Self::CodexDesktop => LaunchableHarness::Codex.extra_skill_paths(home),
+            Self::OpenCodeDesktop => vec![
+                home.join(".agents")
+                    .join("skills")
+                    .join("hyphae-setup")
+                    .join("SKILL.md"),
+            ],
             Self::CursorIde => Vec::new(),
             Self::Openclaw => Vec::new(),
             // T3 Code spawns Claude and Codex sessions; install into all 3 skill locations.
@@ -314,6 +325,7 @@ impl ManualGuideHarness {
         match self {
             Self::ClaudeDesktop => "Open Claude Desktop and start a new chat.".to_string(),
             Self::CodexDesktop => "Open Codex Desktop and start a new thread.".to_string(),
+            Self::OpenCodeDesktop => "Open OpenCode Desktop and start a new session.".to_string(),
             Self::CursorIde => "Open Cursor and start a new Cursor Agent thread.".to_string(),
             Self::Openclaw => "Open OpenClaw and start a new thread/session.".to_string(),
             Self::T3 => "Open T3 Code and start a new thread/session.".to_string(),
@@ -323,7 +335,20 @@ impl ManualGuideHarness {
         }
     }
 
-    /// Optional MCP config hint & snippet (used for Claude Desktop's `claude_desktop_config.json`).
+    /// Step 1 instruction shown immediately after updating a Desktop app's MCP configuration.
+    pub fn restart_instruction(self) -> String {
+        match self {
+            Self::ClaudeDesktop => {
+                "Restart Claude Desktop so it loads the hyphae MCP server.".to_string()
+            }
+            Self::CodexDesktop => {
+                "Restart Codex Desktop so it loads the hyphae MCP server.".to_string()
+            }
+            other => other.open_instruction(),
+        }
+    }
+
+    /// Optional MCP config hint & snippet (used for Claude Desktop & Codex Desktop).
     pub fn mcp_config_note(self, home: &Path) -> Option<(PathBuf, &'static str)> {
         match self {
             Self::ClaudeDesktop => {
@@ -332,12 +357,18 @@ impl ManualGuideHarness {
                     r#"{ "mcpServers": { "hyphae": { "command": "hyp", "args": ["mcp"] } } }"#;
                 Some((path, snippet))
             }
+            Self::CodexDesktop => {
+                let path = codex_desktop_config_path(home);
+                let snippet = "[mcp_servers.hyphae]\ncommand = \"hyp\"\nargs = [\"mcp\"]";
+                Some((path, snippet))
+            }
             _ => None,
         }
     }
 }
 
-/// Platform-appropriate `claude_desktop_config.json` path under `home` (or `%APPDATA%` on Windows).
+/// Platform-appropriate `claude_desktop_config.json` path under `home` (or `%APPDATA%` on Windows
+/// when `%APPDATA%` lives inside `home`, keeping isolated `--home <tmp>` tests hermetic).
 pub fn claude_desktop_config_path(home: &Path) -> PathBuf {
     #[cfg(target_os = "macos")]
     {
@@ -349,9 +380,12 @@ pub fn claude_desktop_config_path(home: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         if let Some(appdata) = std::env::var_os("APPDATA") {
-            return PathBuf::from(appdata)
-                .join("Claude")
-                .join("claude_desktop_config.json");
+            let appdata_path = PathBuf::from(appdata);
+            if appdata_path.starts_with(home) {
+                return appdata_path
+                    .join("Claude")
+                    .join("claude_desktop_config.json");
+            }
         }
         home.join("AppData")
             .join("Roaming")
@@ -366,21 +400,459 @@ pub fn claude_desktop_config_path(home: &Path) -> PathBuf {
     }
 }
 
+/// Codex Desktop / CLI TOML config path (`~/.codex/config.toml`).
+pub fn codex_desktop_config_path(home: &Path) -> PathBuf {
+    home.join(".codex").join("config.toml")
+}
+
+/// Preview plan for an interactive confirm-before-write Desktop MCP configuration update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopMcpPlan {
+    pub harness: ManualGuideHarness,
+    pub config_path: PathBuf,
+    pub already_configured: bool,
+    pub preview_lines: Vec<String>,
+}
+
+/// Outcome of applying a Desktop MCP configuration update.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopMcpApplyResult {
+    pub config_path: PathBuf,
+    pub created: bool,
+    pub already_configured: bool,
+}
+
+/// MCP config status displayed on the `ManualGuide` handoff screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DesktopMcpStatus {
+    NotApplicable,
+    Applied(PathBuf),
+    AlreadyConfigured(PathBuf),
+    Skipped,
+}
+
+fn command_points_to_hyp(cmd: &str, cli_bin: &str) -> bool {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed == cli_bin.trim() {
+        return true;
+    }
+    let basename = trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(trimmed)
+        .to_ascii_lowercase();
+    basename == "hyp" || basename == "hyp.exe"
+}
+
+fn claude_mcp_servers_has_hyphae(
+    servers: &serde_json::Map<String, serde_json::Value>,
+    cli_bin: &str,
+) -> bool {
+    let Some(entry) = servers.get("hyphae").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    let cmd_ok = entry
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|cmd| command_points_to_hyp(cmd, cli_bin));
+    if !cmd_ok {
+        return false;
+    }
+    entry
+        .get("args")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|args| {
+            args.first()
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|a| a == "mcp")
+        })
+}
+
+fn codex_toml_is_hyphae_table_header(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('[') || trimmed.starts_with("[[") {
+        return false;
+    }
+    let Some(close_idx) = trimmed.find(']') else {
+        return false;
+    };
+    let trailing = trimmed[close_idx + 1..].trim();
+    if !trailing.is_empty() && !trailing.starts_with('#') {
+        return false;
+    }
+    let inner: String = trimmed[1..close_idx]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    matches!(
+        inner.as_str(),
+        "mcp_servers.hyphae" | "mcp_servers.\"hyphae\"" | "mcp_servers.'hyphae'"
+    )
+}
+
+fn codex_toml_has_hyphae_mcp(raw: &str) -> bool {
+    raw.lines().any(codex_toml_is_hyphae_table_header)
+}
+
+fn upsert_toml_block_local(source: &str, marker: &str, block: &str) -> String {
+    let begin = format!("# >>> {marker} >>>");
+    let end = format!("# <<< {marker} <<<");
+    let wrapped = format!("{begin}\n{}\n{end}\n", block.trim());
+    if let (Some(start_idx), Some(end_idx)) = (source.find(&begin), source.find(&end)) {
+        if end_idx > start_idx {
+            let after_end = &source[end_idx + end.len()..];
+            let after = after_end
+                .strip_prefix("\r\n")
+                .or_else(|| after_end.strip_prefix('\n'))
+                .unwrap_or(after_end);
+            return format!("{}{}{}", &source[..start_idx], wrapped, after);
+        }
+    }
+    let sep = if source.is_empty() || source.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    let blank = if source.trim().is_empty() { "" } else { "\n" };
+    format!("{source}{sep}{blank}{wrapped}")
+}
+
+fn upsert_codex_hyphae_toml(source: &str, cli_bin: &str) -> String {
+    let cmd_toml = serde_json::to_string(cli_bin).unwrap_or_else(|_| "\"hyp\"".to_string());
+    let toml_block = format!(
+        "[mcp_servers.hyphae]\ncommand = {cmd_toml}\nargs = [\"mcp\"]\nenv_vars = [\"CODEX_HOME\", \"HYPHAE_SOCKET\"]"
+    );
+
+    let begin = "# >>> hyphae >>>";
+    let end = "# <<< hyphae <<<";
+    if let (Some(start_idx), Some(end_idx)) = (source.find(begin), source.find(end)) {
+        if end_idx > start_idx {
+            return upsert_toml_block_local(source, "hyphae", &toml_block);
+        }
+    }
+
+    // If an unmarked `[mcp_servers.hyphae]` table already exists, replace it cleanly in place
+    // so we never write duplicate TOML table headers.
+    let lines: Vec<&str> = source.lines().collect();
+    if let Some(start_line) = lines
+        .iter()
+        .position(|line| codex_toml_is_hyphae_table_header(line))
+    {
+        let mut end_line = lines.len();
+        for (idx, line) in lines.iter().enumerate().skip(start_line + 1) {
+            if line.trim_start().starts_with('[') {
+                end_line = idx;
+                break;
+            }
+        }
+        let mut before = lines[..start_line].to_vec();
+        while before.last().is_some_and(|l| l.trim().is_empty()) {
+            before.pop();
+        }
+        let mut after = lines[end_line..].to_vec();
+        while after.first().is_some_and(|l| l.trim().is_empty()) {
+            after.remove(0);
+        }
+
+        let mut out = String::new();
+        if !before.is_empty() {
+            out.push_str(&before.join("\n"));
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!("{begin}\n{toml_block}\n{end}\n"));
+        if !after.is_empty() {
+            out.push('\n');
+            out.push_str(&after.join("\n"));
+            out.push('\n');
+        }
+        return out;
+    }
+
+    upsert_toml_block_local(source, "hyphae", &toml_block)
+}
+
+/// Inspects the target Desktop app MCP configuration file and builds a safe confirm-before-write
+/// preview plan for Claude Desktop (`claude_desktop_config.json`) and Codex Desktop (`~/.codex/config.toml`).
+pub fn inspect_desktop_mcp_plan(
+    harness: ManualGuideHarness,
+    home: &Path,
+    cli_bin: &str,
+) -> Option<DesktopMcpPlan> {
+    match harness {
+        ManualGuideHarness::ClaudeDesktop => {
+            let config_path = claude_desktop_config_path(home);
+            let already_configured = if config_path.exists() {
+                fs::read_to_string(&config_path)
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                    .and_then(|val| {
+                        val.get("mcpServers")
+                            .and_then(serde_json::Value::as_object)
+                            .map(|servers| claude_mcp_servers_has_hyphae(servers, cli_bin))
+                    })
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            let cmd_json = serde_json::to_string(cli_bin).unwrap_or_else(|_| "\"hyp\"".to_string());
+            let preview_lines = vec![
+                "Merge mcpServers.hyphae (preserves existing servers):".to_string(),
+                "{".to_string(),
+                "  \"mcpServers\": {".to_string(),
+                format!("    \"hyphae\": {{ \"command\": {cmd_json}, \"args\": [\"mcp\"] }}"),
+                "  }".to_string(),
+                "}".to_string(),
+            ];
+            Some(DesktopMcpPlan {
+                harness,
+                config_path,
+                already_configured,
+                preview_lines,
+            })
+        }
+        ManualGuideHarness::CodexDesktop => {
+            let config_path = codex_desktop_config_path(home);
+            let already_configured = if config_path.exists() {
+                fs::read_to_string(&config_path)
+                    .ok()
+                    .is_some_and(|raw| codex_toml_has_hyphae_mcp(&raw))
+            } else {
+                false
+            };
+            let cmd_toml = serde_json::to_string(cli_bin).unwrap_or_else(|_| "\"hyp\"".to_string());
+            let preview_lines = vec![
+                "Add [mcp_servers.hyphae] section (preserves existing Codex settings):".to_string(),
+                "[mcp_servers.hyphae]".to_string(),
+                format!("command = {cmd_toml}"),
+                "args = [\"mcp\"]".to_string(),
+                "env_vars = [\"CODEX_HOME\", \"HYPHAE_SOCKET\"]".to_string(),
+            ];
+            Some(DesktopMcpPlan {
+                harness,
+                config_path,
+                already_configured,
+                preview_lines,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Atomically merges the Hyphae MCP server entry into Claude Desktop's `claude_desktop_config.json`
+/// or Codex Desktop's `~/.codex/config.toml`, preserving all existing user settings and failing
+/// closed on malformed JSON.
+pub fn apply_desktop_mcp_config(
+    harness: ManualGuideHarness,
+    home: &Path,
+    cli_bin: &str,
+) -> Result<DesktopMcpApplyResult, String> {
+    match harness {
+        ManualGuideHarness::ClaudeDesktop => {
+            let config_path = claude_desktop_config_path(home);
+            let existed = config_path.exists();
+            let mut doc: serde_json::Map<String, serde_json::Value> = if existed {
+                let raw = fs::read_to_string(&config_path)
+                    .map_err(|e| format!("failed to read {}: {e}", config_path.display()))?;
+                match serde_json::from_str::<serde_json::Value>(&raw) {
+                    Ok(serde_json::Value::Object(map)) => map,
+                    Ok(_) => {
+                        return Err(format!(
+                            "refusing to overwrite {}: expected top-level JSON object",
+                            config_path.display()
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "refusing to overwrite malformed JSON in {}: {e}",
+                            config_path.display()
+                        ));
+                    }
+                }
+            } else {
+                serde_json::Map::new()
+            };
+
+            let mut servers = match doc.get("mcpServers") {
+                None | Some(serde_json::Value::Null) => serde_json::Map::new(),
+                Some(serde_json::Value::Object(map)) => map.clone(),
+                Some(_) => {
+                    return Err(format!(
+                        "refusing to modify {}: 'mcpServers' must be a JSON object",
+                        config_path.display()
+                    ));
+                }
+            };
+
+            let already_configured = claude_mcp_servers_has_hyphae(&servers, cli_bin);
+            servers.insert(
+                "hyphae".to_string(),
+                json!({
+                    "command": cli_bin,
+                    "args": ["mcp"]
+                }),
+            );
+            doc.insert(
+                "mcpServers".to_string(),
+                serde_json::Value::Object(servers),
+            );
+
+            let mut text = serde_json::to_string_pretty(&serde_json::Value::Object(doc))
+                .map_err(|e| format!("failed to serialize {}: {e}", config_path.display()))?;
+            text.push('\n');
+            write_atomic_file(&config_path, text.as_bytes(), false)?;
+
+            Ok(DesktopMcpApplyResult {
+                config_path,
+                created: !existed,
+                already_configured,
+            })
+        }
+        ManualGuideHarness::CodexDesktop => {
+            let config_path = codex_desktop_config_path(home);
+            let existed = config_path.exists();
+            let existing_toml = if existed {
+                fs::read_to_string(&config_path)
+                    .map_err(|e| format!("failed to read {}: {e}", config_path.display()))?
+            } else {
+                String::new()
+            };
+            let already_configured = codex_toml_has_hyphae_mcp(&existing_toml);
+            let next_toml = upsert_codex_hyphae_toml(&existing_toml, cli_bin);
+            write_atomic_file(&config_path, next_toml.as_bytes(), false)?;
+
+            Ok(DesktopMcpApplyResult {
+                config_path,
+                created: !existed,
+                already_configured,
+            })
+        }
+        other => Err(format!(
+            "automatic MCP config update is not supported for {}",
+            other.display_name()
+        )),
+    }
+}
+
+/// RFC 3986 percent-encoding for URI query parameters (encodes everything except unreserved
+/// `ALPHA / DIGIT / "-" / "." / "_" / "~"`).
+pub fn percent_encode_uri_component(input: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(input.len() + input.len() / 4);
+    for &b in input.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
+fn percent_encode_uri_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let normalized = raw.replace('\\', "/");
+    normalized
+        .split('/')
+        .filter(|seg| !seg.is_empty())
+        .map(percent_encode_uri_component)
+        .collect::<Vec<String>>()
+        .join("/")
+}
+
+fn sanitize_http_url(raw: Option<&str>) -> Option<String> {
+    let candidate = raw?.trim();
+    if candidate.is_empty()
+        || candidate.chars().any(char::is_whitespace)
+        || candidate.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let low = candidate.to_ascii_lowercase();
+    if low.starts_with("http://") || low.starts_with("https://") {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
+}
+
+/// Builds a Desktop / IDE deep-link URL for one-key `[o] Open in App` handoff.
+pub fn build_manual_guide_deeplink(
+    harness: ManualGuideHarness,
+    prompt: &str,
+    cwd: Option<&Path>,
+    opencode_server_url: Option<&str>,
+    t3_url: Option<&str>,
+) -> Option<String> {
+    match harness {
+        ManualGuideHarness::ClaudeDesktop => Some(format!(
+            "claude://claude.ai/new?q={}",
+            percent_encode_uri_component(prompt)
+        )),
+        ManualGuideHarness::CodexDesktop => Some(format!(
+            "codex://threads/new?prompt={}",
+            percent_encode_uri_component(prompt)
+        )),
+        ManualGuideHarness::OpenCodeDesktop => {
+            if let Some(url) = sanitize_http_url(opencode_server_url) {
+                return Some(url);
+            }
+            let encoded_prompt = percent_encode_uri_component(prompt);
+            if let Some(dir) = cwd.filter(|p| !p.as_os_str().is_empty()) {
+                let dir_str = dir.to_string_lossy();
+                Some(format!(
+                    "opencode://new-session?directory={}&prompt={encoded_prompt}",
+                    percent_encode_uri_component(&dir_str)
+                ))
+            } else {
+                Some(format!("opencode://new-session?prompt={encoded_prompt}"))
+            }
+        }
+        ManualGuideHarness::T3 => {
+            if let Some(url) = sanitize_http_url(t3_url) {
+                Some(url)
+            } else {
+                Some("t3code://".to_string())
+            }
+        }
+        ManualGuideHarness::CursorIde => {
+            if let Some(dir) = cwd.filter(|p| !p.as_os_str().is_empty()) {
+                let encoded_path = percent_encode_uri_path(dir);
+                if encoded_path.is_empty() {
+                    Some("cursor://".to_string())
+                } else {
+                    Some(format!("cursor://file/{encoded_path}"))
+                }
+            } else {
+                Some("cursor://".to_string())
+            }
+        }
+        ManualGuideHarness::Openclaw | ManualGuideHarness::ConfigOnlyCli(_) => None,
+    }
+}
+
 /// Hermetically detected Desktop / IDE applications on the host.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DetectedDesktopApps {
     pub claude_desktop: bool,
     pub codex_desktop: bool,
+    pub opencode_desktop: bool,
     pub cursor_ide: bool,
 }
 
-/// Pure, hermetic Desktop/IDE detector accepting explicit `home`, optional macOS `apps_dir`
-/// (e.g. `Some("/Applications")` in live runs, `None` or a tempdir in tests), and optional
-/// Windows `appdata_dir` (e.g. `Some("%APPDATA%")`).
-pub fn detect_desktop_apps_in(
+/// Pure, hermetic Desktop/IDE detector accepting explicit `home`, optional macOS `apps_dir`,
+/// optional Windows `appdata_dir` / `local_appdata_dir`, and optional `opencode_server_url`.
+pub fn detect_desktop_apps_in_with_env(
     home: &Path,
     apps_dir: Option<&Path>,
     appdata_dir: Option<&Path>,
+    local_appdata_dir: Option<&Path>,
+    opencode_server_url: Option<&str>,
 ) -> DetectedDesktopApps {
     let claude_desktop = home
         .join("Library")
@@ -395,6 +867,17 @@ pub fn detect_desktop_apps_in(
     let codex_desktop = home.join("Applications").join("Codex.app").exists()
         || apps_dir.is_some_and(|a| a.join("Codex.app").exists());
 
+    let opencode_desktop = home.join("Applications").join("OpenCode.app").exists()
+        || apps_dir.is_some_and(|a| a.join("OpenCode.app").exists())
+        || appdata_dir.is_some_and(|a| a.join("OpenCode").exists())
+        || local_appdata_dir.is_some_and(|a| a.join("OpenCode").exists())
+        || home
+            .join("AppData")
+            .join("Local")
+            .join("OpenCode")
+            .exists()
+        || sanitize_http_url(opencode_server_url).is_some();
+
     let cursor_ide = home.join(".cursor").exists()
         || home.join("Applications").join("Cursor.app").exists()
         || apps_dir.is_some_and(|a| a.join("Cursor.app").exists());
@@ -402,14 +885,39 @@ pub fn detect_desktop_apps_in(
     DetectedDesktopApps {
         claude_desktop,
         codex_desktop,
+        opencode_desktop,
         cursor_ide,
     }
 }
 
-fn host_desktop_probe_dirs(explicit_home: bool) -> (Option<PathBuf>, Option<PathBuf>) {
+/// Pure, hermetic Desktop/IDE detector accepting explicit `home`, optional macOS `apps_dir`
+/// (e.g. `Some("/Applications")` in live runs, `None` or a tempdir in tests), and optional
+/// Windows `appdata_dir` (e.g. `Some("%APPDATA%")`).
+#[allow(dead_code)]
+pub fn detect_desktop_apps_in(
+    home: &Path,
+    apps_dir: Option<&Path>,
+    appdata_dir: Option<&Path>,
+) -> DetectedDesktopApps {
+    detect_desktop_apps_in_with_env(home, apps_dir, appdata_dir, None, None)
+}
+
+struct HostDesktopProbe {
+    apps_dir: Option<PathBuf>,
+    appdata_dir: Option<PathBuf>,
+    local_appdata_dir: Option<PathBuf>,
+    opencode_server_url: Option<String>,
+}
+
+fn host_desktop_probe(explicit_home: bool) -> HostDesktopProbe {
     if explicit_home {
-        // Hermetic mode: never inspect host `/Applications` or host `%APPDATA%` when `--home` is overridden.
-        return (None, None);
+        // Hermetic mode: never inspect host `/Applications`, `%APPDATA%`, or ambient env when `--home` is overridden.
+        return HostDesktopProbe {
+            apps_dir: None,
+            appdata_dir: None,
+            local_appdata_dir: None,
+            opencode_server_url: None,
+        };
     }
 
     #[cfg(target_os = "macos")]
@@ -422,7 +930,19 @@ fn host_desktop_probe_dirs(explicit_home: bool) -> (Option<PathBuf>, Option<Path
     #[cfg(not(windows))]
     let appdata_dir: Option<PathBuf> = None;
 
-    (apps_dir, appdata_dir)
+    #[cfg(windows)]
+    let local_appdata_dir = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let local_appdata_dir: Option<PathBuf> = None;
+
+    let opencode_server_url = std::env::var("OPENCODE_SERVER_URL").ok();
+
+    HostDesktopProbe {
+        apps_dir,
+        appdata_dir,
+        local_appdata_dir,
+        opencode_server_url,
+    }
 }
 
 /// Herdr launch template discovered via `hc templates --json`.
@@ -505,12 +1025,16 @@ pub enum MainMenuAction {
         hc_bin: PathBuf,
         templates: Vec<HerdrTemplate>,
     },
+    LaunchHerdrTemplate {
+        hc_bin: PathBuf,
+        template: HerdrTemplate,
+    },
     LaunchCli(LaunchableHarness),
     ManualGuide(ManualGuideHarness),
     QuickLocalSetup,
 }
 
-#[cfg(unix)]
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TagTone {
     Launch,
@@ -527,11 +1051,13 @@ pub struct MainMenuItem {
     pub action: MainMenuAction,
 }
 
-#[cfg(unix)]
+#[cfg_attr(not(unix), allow(dead_code))]
 impl MainMenuItem {
     fn tag_tone(&self) -> TagTone {
         match self.action {
-            MainMenuAction::HerdrTemplates { .. } | MainMenuAction::LaunchCli(_) => TagTone::Launch,
+            MainMenuAction::HerdrTemplates { .. }
+            | MainMenuAction::LaunchHerdrTemplate { .. }
+            | MainMenuAction::LaunchCli(_) => TagTone::Launch,
             MainMenuAction::ManualGuide(_) => TagTone::Guide,
             MainMenuAction::QuickLocalSetup => TagTone::Local,
         }
@@ -634,6 +1160,17 @@ fn no_color_enabled() -> bool {
     std::env::var("NO_COLOR")
         .ok()
         .is_some_and(|v| !v.is_empty())
+}
+
+fn wizard_anim_disabled(no_anim_flag: bool) -> bool {
+    no_anim_flag
+        || no_color_enabled()
+        || std::env::var("HYPHAE_WIZARD_NO_ANIM")
+            .ok()
+            .is_some_and(|v| {
+                let t = v.trim();
+                !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
+            })
 }
 
 /// Parses `stty size` output (`"rows cols"`) into `Some((rows, cols))`, rejecting zero/malformed values.
@@ -843,24 +1380,32 @@ impl RawTtyGuard {
         }
     }
 
-    fn read_key(&mut self) -> io::Result<KeyEvent> {
+    /// Reads one key event with a ~100ms POSIX `stty raw -echo min 0 time 1` timeout.
+    /// Returns `Ok(None)` on idle tick so the live banner can advance pulses with zero `unsafe`.
+    fn read_key_timeout(&mut self) -> io::Result<Option<KeyEvent>> {
         let mut buf = [0u8; 8];
-        loop {
-            match self.tty.read(&mut buf) {
-                Ok(0) => continue,
-                Ok(n) => {
-                    let mut total = n;
-                    // If a lone ESC arrived, give the terminal one VTIME=1 (100ms) window
-                    // to deliver the remainder of an arrow-key escape sequence (`[A`/`OA`).
-                    if total == 1 && buf[0] == 0x1b {
-                        if let Ok(extra) = self.tty.read(&mut buf[1..]) {
-                            total += extra;
-                        }
+        match self.tty.read(&mut buf) {
+            Ok(0) => Ok(None),
+            Ok(n) => {
+                let mut total = n;
+                // If a lone ESC arrived, give the terminal one VTIME=1 (100ms) window
+                // to deliver the remainder of an arrow-key escape sequence (`[A`/`OA`).
+                if total == 1 && buf[0] == 0x1b {
+                    if let Ok(extra) = self.tty.read(&mut buf[1..]) {
+                        total += extra;
                     }
-                    return Ok(parse_key_bytes(&buf[..total]));
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
+                Ok(Some(parse_key_bytes(&buf[..total])))
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn read_key(&mut self) -> io::Result<KeyEvent> {
+        loop {
+            if let Some(key) = self.read_key_timeout()? {
+                return Ok(key);
             }
         }
     }
@@ -1037,12 +1582,26 @@ pub fn render_mycelium_frame(
     height: usize,
     color_mode: ColorMode,
 ) -> String {
+    render_mycelium_frame_at_phase(frame_idx, total_frames, 0, width, height, color_mode)
+}
+
+/// Renders a dot-matrix mycelium frame at an additional continuous pulse `phase_tick` (for live
+/// ~10 FPS menu banner animation without advancing intro growth).
+pub fn render_mycelium_frame_at_phase(
+    frame_idx: usize,
+    total_frames: usize,
+    phase_tick: usize,
+    width: usize,
+    height: usize,
+    color_mode: ColorMode,
+) -> String {
     if width == 0 || height == 0 {
         return String::new();
     }
 
     let denom = total_frames.saturating_sub(1).max(1) as f64;
     let p = (frame_idx.min(total_frames.saturating_sub(1)) as f64) / denom;
+    let phase_shift = (phase_tick as f64) * 0.045;
 
     let mut grid = vec![Cell::default(); width * height];
 
@@ -1119,7 +1678,7 @@ pub fn render_mycelium_frame(
         let max_step = ((primary_steps as f64) * growth).ceil() as usize;
         let pulse_phase = if p > 0.65 {
             let speed = 1.75;
-            let raw = (p - 0.65) * speed + (i as f64) * 0.19;
+            let raw = (p - 0.65) * speed + phase_shift + (i as f64) * 0.19;
             Some(raw.fract())
         } else {
             None
@@ -1175,7 +1734,7 @@ pub fn render_mycelium_frame(
                 cy + (mid_raw.1 - cy) * 1.24,
             );
             let ring_pulse_u = if p > 0.74 {
-                Some(((p - 0.74) * 2.15 + (i as f64) * 0.27).fract())
+                Some(((p - 0.74) * 2.15 + phase_shift * 1.15 + (i as f64) * 0.27).fract())
             } else {
                 None
             };
@@ -1225,7 +1784,7 @@ pub fn render_mycelium_frame(
                     cy + (mid_raw.1 - cy) * 1.38,
                 );
                 let chord_pulse_u = if p > 0.78 {
-                    Some(((p - 0.78) * 1.9 + (i as f64) * 0.33).fract())
+                    Some(((p - 0.78) * 1.9 + phase_shift * 0.95 + (i as f64) * 0.33).fract())
                 } else {
                     None
                 };
@@ -1352,7 +1911,8 @@ pub fn render_mycelium_frame(
         let arrive = smoothstep(0.48 + delay, 0.66 + delay, p);
         if arrive > 0.01 {
             let burst = gaussian(p - (0.58 + delay), 0.085) * 0.45;
-            let steady_breathe = 0.08 * ((p * 2.0 * PI) + (i as f64)).sin();
+            let steady_breathe =
+                0.08 * ((p * 2.0 * PI) + phase_shift * 2.0 * PI + (i as f64)).sin();
             let node_intensity = (arrive * 0.92 + burst + steady_breathe).clamp(0.0, 1.15);
             let (nx, ny) = outer_nodes[i];
             splat_point(
@@ -1482,7 +2042,7 @@ fn fg_color(mode: ColorMode, rgb: (u8, u8, u8)) -> String {
     }
 }
 
-#[cfg(unix)]
+#[cfg_attr(not(unix), allow(dead_code))]
 fn style_reset(mode: ColorMode) -> &'static str {
     match mode {
         ColorMode::Plain => "",
@@ -1514,7 +2074,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     out
 }
 
-#[cfg(unix)]
+#[cfg_attr(not(unix), allow(dead_code))]
 fn wrap_words(text: &str, max_width: usize) -> Vec<String> {
     if max_width == 0 {
         return vec![text.to_string()];
@@ -1585,7 +2145,8 @@ fn compose_fullscreen_anim_frame(
     let left_pad = term_cols.saturating_sub(canvas_w) / 2;
     let pad_str = " ".repeat(left_pad);
 
-    let mut buf = String::with_capacity(term_rows * (term_cols + 12));
+    let mut buf = String::with_capacity(term_rows * (term_cols + 12) + 32);
+    buf.push_str("\x1b[?2026h\x1b[H");
     let mut row = 1usize;
 
     while row <= top_pad && row <= term_rows {
@@ -1633,6 +2194,7 @@ fn compose_fullscreen_anim_frame(
         row += 1;
     }
 
+    buf.push_str("\x1b[?2026l");
     buf
 }
 
@@ -1695,7 +2257,7 @@ fn play_fullscreen_intro_on_alt_screen(
 
 /// Plays the fullscreen mycelium intro animation cleanly (entering & leaving alt-screen).
 pub fn play_mycelium_animation(no_anim: bool) {
-    if no_anim || no_color_enabled() || !io::stdout().is_terminal() {
+    if wizard_anim_disabled(no_anim) || !io::stdout().is_terminal() {
         return;
     }
     let (term_rows, term_cols) = detect_terminal_size();
@@ -1880,22 +2442,118 @@ pub fn parse_herdr_templates_json(raw: &str) -> Vec<HerdrTemplate> {
         .collect()
 }
 
+fn output_retrying_busy(cmd: &mut Command) -> io::Result<std::process::Output> {
+    for attempt in 0..5 {
+        match cmd.output() {
+            Err(e) if e.kind() == io::ErrorKind::ExecutableFileBusy && attempt < 4 => {
+                thread::sleep(Duration::from_millis(15));
+            }
+            other => return other,
+        }
+    }
+    cmd.output()
+}
+
+fn status_retrying_busy(cmd: &mut Command) -> io::Result<std::process::ExitStatus> {
+    for attempt in 0..5 {
+        match cmd.status() {
+            Err(e) if e.kind() == io::ErrorKind::ExecutableFileBusy && attempt < 4 => {
+                thread::sleep(Duration::from_millis(15));
+            }
+            other => return other,
+        }
+    }
+    cmd.status()
+}
+
 /// Discovers Herdr launch templates by invoking `hc templates --json`.
 /// Returns an empty list on any error, offline Herdr, or malformed JSON (never panics).
 pub fn discover_herdr_templates(hc_bin: &Path) -> Vec<HerdrTemplate> {
-    let Ok(out) = Command::new(hc_bin)
-        .args(["templates", "--json"])
+    let mut cmd = Command::new(hc_bin);
+    cmd.args(["templates", "--json"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-    else {
+        .stderr(Stdio::null());
+    let Ok(out) = output_retrying_busy(&mut cmd) else {
         return Vec::new();
     };
     if !out.status.success() {
         return Vec::new();
     }
     parse_herdr_templates_json(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn detect_herdr_terminal_from_values(
+    hc_terminal_id: Option<&str>,
+    herdr_terminal_id: Option<&str>,
+) -> Option<String> {
+    let pick = |raw: Option<&str>| -> Option<String> {
+        let trimmed = raw?.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    };
+    pick(hc_terminal_id).or_else(|| pick(herdr_terminal_id))
+}
+
+/// Detects whether the current terminal session is running inside a Herdr terminal
+/// (`HC_TERMINAL_ID`, then `HERDR_TERMINAL_ID`).
+pub fn detect_herdr_terminal_from_env() -> Option<String> {
+    let hc_id = std::env::var("HC_TERMINAL_ID").ok();
+    let herdr_id = std::env::var("HERDR_TERMINAL_ID").ok();
+    detect_herdr_terminal_from_values(hc_id.as_deref(), herdr_id.as_deref())
+}
+
+fn validate_herdr_terminal_address(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('-')
+        || trimmed.chars().any(char::is_whitespace)
+        || trimmed.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Parses `hc run --bg --json` output (`RunResult { address: "t4h", ... }`), ignoring any leading
+/// non-JSON log lines and rejecting empty, flag-like (`-bad`), or whitespace-containing addresses.
+pub fn parse_herdr_run_address_json(raw: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct HerdrRunResult {
+        address: Option<String>,
+    }
+
+    let try_parse = |candidate: &str| -> Option<String> {
+        let parsed = serde_json::from_str::<HerdrRunResult>(candidate.trim()).ok()?;
+        let addr = parsed.address?;
+        validate_herdr_terminal_address(&addr)
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(addr) = try_parse(trimmed) {
+        return Some(addr);
+    }
+
+    let mut offset = 0usize;
+    for line in raw.split_inclusive('\n') {
+        let candidate = line.trim();
+        if candidate.starts_with('{') {
+            if let Some(addr) = try_parse(candidate) {
+                return Some(addr);
+            }
+            if let Some(addr) = try_parse(&raw[offset..]) {
+                return Some(addr);
+            }
+        }
+        offset += line.len();
+    }
+    None
 }
 
 /// Infers which coding harness a Herdr template runs from its `name` and `command`
@@ -1930,18 +2588,37 @@ pub fn infer_harness_from_herdr_template(
     }
 }
 
-/// Builds the exact `hc run <template_name> <prompt>` command for launching an agent via Herdr.
+/// Builds the exact `hc run --bg --outlive-parent --label app=hyphae --json <template> <prompt>`
+/// command for launching an agent via Herdr without blocking on headless input prompts.
 pub fn build_herdr_template_launch_command(
     hc_bin: &Path,
     template_name: &str,
     prompt: &str,
 ) -> Command {
     let mut cmd = Command::new(hc_bin);
-    cmd.args(["run", template_name, prompt]);
+    cmd.args([
+        "run",
+        "--bg",
+        "--outlive-parent",
+        "--label",
+        "app=hyphae",
+        "--json",
+        template_name,
+        prompt,
+    ]);
+    cmd
+}
+
+/// Builds the interactive `hc attach <terminal_address>` command with inherited TTY stdio.
+pub fn build_herdr_attach_command(hc_bin: &Path, terminal_address: &str) -> Command {
+    let mut cmd = Command::new(hc_bin);
+    cmd.args(["attach", terminal_address]);
+    attach_interactive_stdio(&mut cmd);
     cmd
 }
 
 /// Builds the filtered main menu containing ONLY options actually detected/available on this machine.
+#[allow(dead_code)]
 pub fn build_main_menu_items(
     diagnostics: &[HarnessDiagnostic],
     launchables: &[(LaunchableHarness, PathBuf)],
@@ -1950,24 +2627,63 @@ pub fn build_main_menu_items(
     desktop_apps: DetectedDesktopApps,
     existing_node_id: Option<&str>,
 ) -> Vec<MainMenuItem> {
+    build_main_menu_items_with_env(
+        diagnostics,
+        launchables,
+        hc_bin,
+        herdr_templates,
+        desktop_apps,
+        existing_node_id,
+        None,
+    )
+}
+
+/// Herdr-environment-aware main menu builder:
+/// - When `in_herdr_env.is_some()` (already inside a Herdr terminal) and templates exist, each
+///   discovered Herdr template is surfaced directly at the top (`LaunchHerdrTemplate`) with zero
+///   extra submenu hop.
+/// - When `in_herdr_env.is_none()` (standard terminal), templates stay cleanly grouped under `Herdr`.
+pub fn build_main_menu_items_with_env(
+    diagnostics: &[HarnessDiagnostic],
+    launchables: &[(LaunchableHarness, PathBuf)],
+    hc_bin: Option<&Path>,
+    herdr_templates: &[HerdrTemplate],
+    desktop_apps: DetectedDesktopApps,
+    existing_node_id: Option<&str>,
+    in_herdr_env: Option<&str>,
+) -> Vec<MainMenuItem> {
     let mut items = Vec::new();
     let find_diag = |name: &str| diagnostics.iter().find(|d| d.harness == name);
     let cli_on_path = |lh: LaunchableHarness| launchables.iter().any(|(h, _)| *h == lh);
 
     // 1. Herdr prominently at the top when `hc` is present and has >= 1 template.
     if let Some(hc_path) = hc_bin.filter(|_| !herdr_templates.is_empty()) {
-        items.push(MainMenuItem {
-            label: "Herdr".to_string(),
-            tag: "templates",
-            subtitle: format!(
-                "Launch via Herdr templates ({} available) · native tab wakeup",
-                herdr_templates.len()
-            ),
-            action: MainMenuAction::HerdrTemplates {
-                hc_bin: hc_path.to_path_buf(),
-                templates: herdr_templates.to_vec(),
-            },
-        });
+        if in_herdr_env.is_some() {
+            for tmpl in herdr_templates {
+                items.push(MainMenuItem {
+                    label: tmpl.display_title().to_string(),
+                    tag: "herdr",
+                    subtitle: tmpl.display_subtitle(),
+                    action: MainMenuAction::LaunchHerdrTemplate {
+                        hc_bin: hc_path.to_path_buf(),
+                        template: tmpl.clone(),
+                    },
+                });
+            }
+        } else {
+            items.push(MainMenuItem {
+                label: "Herdr".to_string(),
+                tag: "templates",
+                subtitle: format!(
+                    "Launch via Herdr templates ({} available) · native tab wakeup",
+                    herdr_templates.len()
+                ),
+                action: MainMenuAction::HerdrTemplates {
+                    hc_bin: hc_path.to_path_buf(),
+                    templates: herdr_templates.to_vec(),
+                },
+            });
+        }
     }
 
     // 2. Detected launchable CLI harnesses on PATH (`auto-launch`).
@@ -1991,7 +2707,7 @@ pub fn build_main_menu_items(
         items.push(MainMenuItem {
             label: ManualGuideHarness::ClaudeDesktop.display_name().to_string(),
             tag: "install skill + guide",
-            subtitle: "Install skill + claude_desktop_config.json MCP snippet".to_string(),
+            subtitle: "Install skill + configure Claude Desktop MCP".to_string(),
             action: MainMenuAction::ManualGuide(ManualGuideHarness::ClaudeDesktop),
         });
     }
@@ -2002,15 +2718,26 @@ pub fn build_main_menu_items(
         desktop_apps.codex_desktop || (!cli_on_path(LaunchableHarness::Codex) && codex_diag_detected);
     if show_codex_desktop {
         let subtitle = if desktop_apps.codex_desktop {
-            "Install skill + paste prompt in Codex Desktop".to_string()
+            "Install skill + configure Codex Desktop MCP".to_string()
         } else {
-            "CLI 'codex' not on PATH · install skill + paste prompt".to_string()
+            "CLI 'codex' not on PATH · install skill + configure Codex MCP".to_string()
         };
         items.push(MainMenuItem {
             label: ManualGuideHarness::CodexDesktop.display_name().to_string(),
             tag: "install skill + guide",
             subtitle,
             action: MainMenuAction::ManualGuide(ManualGuideHarness::CodexDesktop),
+        });
+    }
+
+    if desktop_apps.opencode_desktop {
+        items.push(MainMenuItem {
+            label: ManualGuideHarness::OpenCodeDesktop
+                .display_name()
+                .to_string(),
+            tag: "install skill + guide",
+            subtitle: "Install skill + open in OpenCode Desktop".to_string(),
+            action: MainMenuAction::ManualGuide(ManualGuideHarness::OpenCodeDesktop),
         });
     }
 
@@ -2024,7 +2751,7 @@ pub fn build_main_menu_items(
         items.push(MainMenuItem {
             label: ManualGuideHarness::CursorIde.display_name().to_string(),
             tag: "install skill + guide",
-            subtitle: format!("Install skill + paste prompt in Cursor Agent{suffix}"),
+            subtitle: format!("Install skill + open in Cursor Agent{suffix}"),
             action: MainMenuAction::ManualGuide(ManualGuideHarness::CursorIde),
         });
     }
@@ -2060,8 +2787,10 @@ pub fn build_main_menu_items(
         if cli_on_path(lh) {
             continue;
         }
-        // Codex and Cursor config-only cases are already surfaced as Codex Desktop / Cursor (IDE).
-        if matches!(lh, LaunchableHarness::Codex | LaunchableHarness::Cursor) {
+        // Codex, Cursor, and OpenCode Desktop cases are surfaced as dedicated Desktop/IDE entries.
+        if matches!(lh, LaunchableHarness::Codex | LaunchableHarness::Cursor)
+            || (lh == LaunchableHarness::Opencode && desktop_apps.opencode_desktop)
+        {
             continue;
         }
         if let Some(diag) = find_diag(lh.id()).filter(|d| d.detected || d.configured) {
@@ -2094,6 +2823,7 @@ pub fn build_main_menu_items(
 /// Hermetic candidate detector taking explicit `home`, optional `config_path`, `PATH`,
 /// optional macOS `apps_dir`, and optional Windows `appdata_dir` so unit tests never leak
 /// host `/Applications`, `%APPDATA%`, or ambient `PATH`.
+#[allow(dead_code)]
 pub fn detect_candidates_in(
     home: &Path,
     config_path: Option<&Path>,
@@ -2101,6 +2831,31 @@ pub fn detect_candidates_in(
     apps_dir: Option<&Path>,
     appdata_dir: Option<&Path>,
     existing_node_id: Option<&str>,
+) -> Vec<MainMenuItem> {
+    detect_candidates_in_with_env(
+        home,
+        config_path,
+        path_var,
+        apps_dir,
+        appdata_dir,
+        None,
+        None,
+        existing_node_id,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn detect_candidates_in_with_env(
+    home: &Path,
+    config_path: Option<&Path>,
+    path_var: Option<&OsStr>,
+    apps_dir: Option<&Path>,
+    appdata_dir: Option<&Path>,
+    local_appdata_dir: Option<&Path>,
+    opencode_server_url: Option<&str>,
+    existing_node_id: Option<&str>,
+    in_herdr_env: Option<&str>,
 ) -> Vec<MainMenuItem> {
     let diagnostics = detect_harness_statuses(home, config_path);
     let launchables: Vec<(LaunchableHarness, PathBuf)> = LaunchableHarness::ALL
@@ -2112,15 +2867,22 @@ pub fn detect_candidates_in(
         .as_deref()
         .map(discover_herdr_templates)
         .unwrap_or_default();
-    let desktop_apps = detect_desktop_apps_in(home, apps_dir, appdata_dir);
+    let desktop_apps = detect_desktop_apps_in_with_env(
+        home,
+        apps_dir,
+        appdata_dir,
+        local_appdata_dir,
+        opencode_server_url,
+    );
 
-    build_main_menu_items(
+    build_main_menu_items_with_env(
         &diagnostics,
         &launchables,
         hc_bin.as_deref(),
         &herdr_templates,
         desktop_apps,
         existing_node_id,
+        in_herdr_env,
     )
 }
 
@@ -2419,6 +3181,7 @@ pub fn build_manual_guide_prompt(
     match harness {
         ManualGuideHarness::ClaudeDesktop
         | ManualGuideHarness::CodexDesktop
+        | ManualGuideHarness::OpenCodeDesktop
         | ManualGuideHarness::CursorIde => {
             "Set up Hyphae on this machine using the hyphae-setup skill".to_string()
         }
@@ -2485,6 +3248,163 @@ fn copy_text_to_clipboard(text: &str) -> Result<&'static str, String> {
     Err("No clipboard utility found (copy the prompt above manually).".to_string())
 }
 
+/// Launches a desktop deep link or HTTP URL using the native OS opener without shell interpolation.
+fn open_url_in_os(url: &str) -> Result<&'static str, String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().any(char::is_control)
+        || trimmed.chars().any(char::is_whitespace)
+    {
+        return Err("refusing to open invalid URL".to_string());
+    }
+    if std::env::var("HYPHAE_NO_OPEN").ok().as_deref() == Some("1") {
+        return Ok("noop");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("open")
+            .arg(trimmed)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| format!("failed launching 'open': {e}"))?;
+        if status.success() {
+            Ok("open")
+        } else {
+            Err(format!("'open' exited with status {status}"))
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let status = Command::new("xdg-open")
+            .arg(trimmed)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| format!("failed launching 'xdg-open': {e}"))?;
+        if status.success() {
+            Ok("xdg-open")
+        } else {
+            Err(format!("'xdg-open' exited with status {status}"))
+        }
+    }
+    #[cfg(windows)]
+    {
+        let status = Command::new("cmd")
+            .args(["/C", "start", ""])
+            .arg(trimmed)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| format!("failed launching 'cmd /C start': {e}"))?;
+        if status.success() {
+            Ok("cmd")
+        } else {
+            Err(format!("'cmd /C start' exited with status {status}"))
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err("URL opening is unsupported on this platform".to_string())
+    }
+}
+
+/// Copies the onboarding prompt to clipboard first (cold-start fallback) and opens the app deep link.
+fn trigger_open_in_app(harness: ManualGuideHarness, prompt: &str, deeplink: &str) -> String {
+    let copied = copy_text_to_clipboard(prompt).is_ok();
+    match open_url_in_os(deeplink) {
+        Ok(_) if copied => format!(
+            "✓ Opened {} (prompt also copied to clipboard!)",
+            harness.display_name()
+        ),
+        Ok(_) => format!(
+            "✓ Opened {} (copy prompt above if needed)",
+            harness.display_name()
+        ),
+        Err(err) if copied => format!(
+            "✓ Copied prompt · could not launch {} ({err})",
+            harness.display_name()
+        ),
+        Err(err) => format!(
+            "Could not launch {} ({err}); copy prompt above manually.",
+            harness.display_name()
+        ),
+    }
+}
+
+fn resolve_wizard_cli_bin(explicit_bin: Option<&Path>) -> String {
+    if let Some(p) = explicit_bin {
+        return p.display().to_string();
+    }
+    std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "hyp".to_string())
+}
+
+fn resolve_t3_url_from_home(home: &Path, existing_node: Option<&ExistingNodeInfo>) -> Option<String> {
+    let t3_file = home.join(".t3").join("hyphae.json");
+    if let Ok(raw) = fs::read_to_string(&t3_file) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(url) = val
+                .get("hyphae")
+                .and_then(|h| h.get("url"))
+                .and_then(serde_json::Value::as_str)
+            {
+                if let Some(clean) = sanitize_http_url(Some(url)) {
+                    return Some(clean);
+                }
+            }
+        }
+    }
+    if let Some(node) = existing_node {
+        if let Ok(raw) = fs::read_to_string(&node.config_path) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(url) = val
+                    .get("t3")
+                    .and_then(|t| t.get("url"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    if let Some(clean) = sanitize_http_url(Some(url)) {
+                        return Some(clean);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn resolve_manual_guide_deeplink(
+    harness: ManualGuideHarness,
+    prompt: &str,
+    home: &Path,
+    explicit_home: bool,
+    existing_node: Option<&ExistingNodeInfo>,
+) -> Option<String> {
+    let cwd = std::env::current_dir().ok();
+    let opencode_url = if explicit_home {
+        None
+    } else {
+        std::env::var("OPENCODE_SERVER_URL").ok()
+    };
+    let t3_url = if harness == ManualGuideHarness::T3 {
+        resolve_t3_url_from_home(home, existing_node)
+    } else {
+        None
+    };
+    build_manual_guide_deeplink(
+        harness,
+        prompt,
+        cwd.as_deref(),
+        opencode_url.as_deref(),
+        t3_url.as_deref(),
+    )
+}
+
 fn attach_interactive_stdio(cmd: &mut Command) {
     cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
     // Attach `/dev/tty` for stdin when launched from a piped script like `curl | sh` in a TTY.
@@ -2512,7 +3432,7 @@ fn spawn_interactive_harness(
     cmd.args(&spec.args);
     attach_interactive_stdio(&mut cmd);
 
-    match cmd.status() {
+    match status_retrying_busy(&mut cmd) {
         Ok(status) => match status.code() {
             Some(code) => ExitCode::from((code.clamp(0, 255)) as u8),
             None => ExitCode::from(EXIT_ERROR),
@@ -2539,23 +3459,125 @@ fn spawn_herdr_template(
     as_json: bool,
 ) -> ExitCode {
     let mut cmd = build_herdr_template_launch_command(hc_bin, template_name, prompt);
-    attach_interactive_stdio(&mut cmd);
+    cmd.stdin(Stdio::null());
 
-    match cmd.status() {
+    let output = match output_retrying_busy(&mut cmd) {
+        Ok(out) => out,
+        Err(e) => {
+            return emit_error(
+                "onboard",
+                as_json,
+                EXIT_ERROR,
+                "HERDR_LAUNCH_FAILED",
+                format!(
+                    "Failed to launch Herdr template '{template_name}' via {}: {e}",
+                    hc_bin.display()
+                ),
+                Some(
+                    "Run `hc templates` to verify Herdr, or `hyp onboard --yes` for local CLI setup."
+                        .to_string(),
+                ),
+            );
+        }
+    };
+
+    if !output.status.success() {
+        let stderr_raw = String::from_utf8_lossy(&output.stderr);
+        let stderr_snippet = truncate_chars(stderr_raw.trim(), 240);
+        let detail = if stderr_snippet.is_empty() {
+            let stdout_raw = String::from_utf8_lossy(&output.stdout);
+            let stdout_snippet = truncate_chars(stdout_raw.trim(), 240);
+            if stdout_snippet.is_empty() {
+                format!(
+                    "Herdr exited with status {} while launching template '{template_name}'",
+                    output
+                        .status
+                        .code()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "signal".to_string())
+                )
+            } else {
+                format!("Herdr failed launching template '{template_name}': {stdout_snippet}")
+            }
+        } else {
+            format!("Herdr failed launching template '{template_name}': {stderr_snippet}")
+        };
+        return emit_error(
+            "onboard",
+            as_json,
+            EXIT_ERROR,
+            "HERDR_LAUNCH_FAILED",
+            detail,
+            Some(
+                "Run `hc templates` to verify Herdr, or `hyp onboard --yes` for local CLI setup."
+                    .to_string(),
+            ),
+        );
+    }
+
+    let stdout_raw = String::from_utf8_lossy(&output.stdout);
+    let Some(address) = parse_herdr_run_address_json(&stdout_raw) else {
+        let snippet = truncate_chars(stdout_raw.trim(), 200);
+        return emit_error(
+            "onboard",
+            as_json,
+            EXIT_ERROR,
+            "HERDR_LAUNCH_FAILED",
+            format!(
+                "Herdr launched template '{template_name}' but returned no valid terminal address (stdout: {snippet})"
+            ),
+            Some("Run `hc list` to inspect running Herdr terminals.".to_string()),
+        );
+    };
+
+    let next = vec![format!("hc attach {address}")];
+    let summary = format!(
+        "Launched Herdr template '{template_name}' in terminal {address}"
+    );
+
+    if as_json {
+        let envelope = JsonEnvelope {
+            ok: true,
+            command: "onboard".to_string(),
+            summary: Some(summary),
+            data: Some(json!({
+                "mode": "herdr_launch",
+                "template": template_name,
+                "terminal": address,
+            })),
+            warnings: Vec::new(),
+            next,
+            error: None,
+        };
+        print_json(&envelope);
+        return ExitCode::from(EXIT_OK);
+    }
+
+    if !io::stdout().is_terminal() {
+        println!("OK    {summary}");
+        println!("      Template: {template_name}");
+        println!("      Terminal: {address}");
+        print_next_steps(&next);
+        return ExitCode::from(EXIT_OK);
+    }
+
+    println!("Launched Herdr terminal {address} — attaching (Ctrl+\\ to detach)...");
+    let mut attach_cmd = build_herdr_attach_command(hc_bin, &address);
+    match status_retrying_busy(&mut attach_cmd) {
         Ok(status) => match status.code() {
             Some(code) => ExitCode::from((code.clamp(0, 255)) as u8),
             None => ExitCode::from(EXIT_ERROR),
         },
         Err(e) => emit_error(
             "onboard",
-            as_json,
+            false,
             EXIT_ERROR,
             "HERDR_LAUNCH_FAILED",
             format!(
-                "Failed to launch Herdr template '{template_name}' via {}: {e}",
+                "Launched Herdr terminal '{address}', but failed to attach via {}: {e}",
                 hc_bin.display()
             ),
-            Some("Run `hc templates` to verify Herdr, or `hyp onboard --yes` for local CLI setup.".to_string()),
+            Some(format!("Attach manually with: hc attach {address}")),
         ),
     }
 }
@@ -2597,6 +3619,7 @@ fn install_and_handoff_cli(
     home: &Path,
     explicit_home: bool,
     existing_node: Option<&ExistingNodeInfo>,
+    cli_bin: &str,
     as_json: bool,
 ) -> ExitCode {
     // If the CLI binary is not on PATH, seamlessly fall back to Path B (install skill + guide)
@@ -2612,6 +3635,7 @@ fn install_and_handoff_cli(
             home,
             explicit_home,
             existing_node,
+            cli_bin,
             as_json,
         );
     };
@@ -2691,7 +3715,7 @@ fn install_and_handoff_herdr(
         print_installed_skills_banner(&installed);
         println!();
         println!(
-            "Launching Herdr template '{}' ({} run {})...",
+            "Launching Herdr template '{}' ({} run --bg --outlive-parent {})...",
             template.display_title(),
             hc_bin.display(),
             template.name
@@ -2711,7 +3735,33 @@ fn install_manual_guide_skills(
     explicit_home: bool,
 ) -> Result<(PathBuf, Vec<InstalledSkillEntry>), String> {
     let targets = collect_skill_targets_with_primary(Some(harness.kind()), home, explicit_home);
-    let installed = install_setup_skill_for_harnesses(home, &targets)?;
+    let mut installed = install_setup_skill_for_harnesses(home, &targets)?;
+
+    // Ensure harness-specific extra cross-tool skill paths (e.g. OpenCode Desktop `~/.agents`)
+    // are also written and recorded cleanly without duplicates.
+    let mut already_recorded: BTreeSet<String> = BTreeSet::new();
+    for item in &installed {
+        already_recorded.insert(item.path.clone());
+        for extra in &item.extra_paths {
+            already_recorded.insert(extra.clone());
+        }
+    }
+    for extra in harness.extra_skill_paths(home) {
+        let extra_str = extra.display().to_string();
+        if already_recorded.insert(extra_str.clone()) {
+            write_atomic_file(&extra, HYPHAE_SETUP_SKILL_MD.as_bytes(), false)?;
+            if let Some(first) = installed.first_mut() {
+                first.extra_paths.push(extra_str);
+            } else {
+                installed.push(InstalledSkillEntry {
+                    harness: harness.id().to_string(),
+                    path: extra_str,
+                    extra_paths: Vec::new(),
+                });
+            }
+        }
+    }
+
     Ok((harness.primary_skill_path(home), installed))
 }
 
@@ -2721,6 +3771,8 @@ fn print_manual_guide_plain(
     primary_skill: &Path,
     installed: &[InstalledSkillEntry],
     prompt: &str,
+    mcp_status: &DesktopMcpStatus,
+    deeplink: Option<&str>,
 ) {
     println!();
     println!(
@@ -2732,17 +3784,41 @@ fn print_manual_guide_plain(
             println!("      + {extra}");
         }
     }
-    if let Some((cfg_path, snippet)) = harness.mcp_config_note(home) {
-        println!();
-        println!("MCP config ({}):", cfg_path.display());
-        println!("  {snippet}");
+    match mcp_status {
+        DesktopMcpStatus::Applied(cfg_path) => {
+            println!("OK    Updated MCP config at {}", cfg_path.display());
+        }
+        DesktopMcpStatus::AlreadyConfigured(cfg_path) => {
+            println!("OK    MCP config already configured at {}", cfg_path.display());
+        }
+        DesktopMcpStatus::Skipped | DesktopMcpStatus::NotApplicable => {
+            if let Some((cfg_path, snippet)) = harness.mcp_config_note(home) {
+                println!();
+                println!("MCP config ({}):", cfg_path.display());
+                for line in snippet.lines() {
+                    println!("  {line}");
+                }
+            }
+        }
     }
     println!();
     println!("Next steps for {}:", harness.display_name());
-    println!("  1. {}", harness.open_instruction());
-    println!("  2. Paste this prompt:");
+    let step1 = match mcp_status {
+        DesktopMcpStatus::Applied(_) => harness.restart_instruction(),
+        _ => harness.open_instruction(),
+    };
+    println!("  1. {step1}");
+    if matches!(mcp_status, DesktopMcpStatus::Applied(_)) && deeplink.is_some() {
+        println!("  2. Paste this prompt into a new chat (or press [o] to open prefilled):");
+    } else {
+        println!("  2. Paste this prompt:");
+    }
     println!();
     println!("     {prompt}");
+    if let Some(url) = deeplink {
+        println!();
+        println!("  Deep link: {url}");
+    }
     println!();
 }
 
@@ -2751,6 +3827,7 @@ fn install_and_emit_manual_guide(
     home: &Path,
     explicit_home: bool,
     existing_node: Option<&ExistingNodeInfo>,
+    cli_bin: &str,
     as_json: bool,
 ) -> ExitCode {
     let (primary_skill, installed) = match install_manual_guide_skills(harness, home, explicit_home)
@@ -2762,13 +3839,25 @@ fn install_and_emit_manual_guide(
     };
 
     let prompt = build_manual_guide_prompt(harness, existing_node.map(|n| n.node_id.as_str()));
+    let deeplink =
+        resolve_manual_guide_deeplink(harness, &prompt, home, explicit_home, existing_node);
+    let mcp_plan = inspect_desktop_mcp_plan(harness, home, cli_bin);
+    let mcp_status = match &mcp_plan {
+        Some(plan) if plan.already_configured => {
+            DesktopMcpStatus::AlreadyConfigured(plan.config_path.clone())
+        }
+        Some(_) => DesktopMcpStatus::Skipped,
+        None => DesktopMcpStatus::NotApplicable,
+    };
     let mcp_note = harness.mcp_config_note(home);
     let mut steps = vec![harness.open_instruction()];
-    if let Some((ref cfg_path, _)) = mcp_note {
-        steps.push(format!(
-            "Add the Hyphae MCP server entry to {} (or run `hyp setup` for CLI hooks).",
-            cfg_path.display()
-        ));
+    if !matches!(mcp_status, DesktopMcpStatus::AlreadyConfigured(_)) {
+        if let Some((ref cfg_path, _)) = mcp_note {
+            steps.push(format!(
+                "Add the Hyphae MCP server entry to {} (or run `hyp setup` for CLI hooks).",
+                cfg_path.display()
+            ));
+        }
     }
     steps.push(format!("Paste this prompt: {prompt}"));
 
@@ -2784,13 +3873,22 @@ fn install_and_emit_manual_guide(
             "prompt": prompt,
             "steps": steps,
         });
-        if let Some((cfg_path, snippet)) = mcp_note {
-            if let Some(obj) = data.as_object_mut() {
+        if let Some(obj) = data.as_object_mut() {
+            if let Some((cfg_path, snippet)) = mcp_note {
                 obj.insert(
                     "mcpConfigPath".to_string(),
                     json!(cfg_path.display().to_string()),
                 );
                 obj.insert("mcpSnippet".to_string(), json!(snippet));
+            }
+            if let Some(ref plan) = mcp_plan {
+                obj.insert(
+                    "mcpAlreadyConfigured".to_string(),
+                    json!(plan.already_configured),
+                );
+            }
+            if let Some(ref url) = deeplink {
+                obj.insert("deeplink".to_string(), json!(url));
             }
         }
         let envelope = JsonEnvelope {
@@ -2809,13 +3907,119 @@ fn install_and_emit_manual_guide(
         return ExitCode::from(EXIT_OK);
     }
 
-    print_manual_guide_plain(harness, home, &primary_skill, &installed, &prompt);
+    print_manual_guide_plain(
+        harness,
+        home,
+        &primary_skill,
+        &installed,
+        &prompt,
+        &mcp_status,
+        deeplink.as_deref(),
+    );
     ExitCode::from(EXIT_OK)
 }
 
 // ============================================================================
-// Fullscreen Arrow-Key TUI Renderer & State Machine
+// Fullscreen Arrow-Key TUI Renderer, Viewport Scrolling & State Machine
 // ============================================================================
+
+/// Computed visible viewport slice for scrollable TUI lists (`start..end` plus hidden counts).
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollWindow {
+    pub start: usize,
+    pub end: usize,
+    pub above: usize,
+    pub below: usize,
+}
+
+/// Computes a bounded visible slice of `0..total` inside `max_rows` (including room for
+/// `↑ N more` / `↓ M more` scroll hints) while ALWAYS keeping `selected` visible.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn compute_scroll_window(total: usize, selected: usize, max_rows: usize) -> ScrollWindow {
+    if total == 0 || max_rows == 0 {
+        return ScrollWindow {
+            start: 0,
+            end: 0,
+            above: 0,
+            below: 0,
+        };
+    }
+    let sel = selected.min(total - 1);
+    if total <= max_rows {
+        return ScrollWindow {
+            start: 0,
+            end: total,
+            above: 0,
+            below: 0,
+        };
+    }
+    if max_rows == 1 {
+        return ScrollWindow {
+            start: sel,
+            end: sel + 1,
+            above: 0,
+            below: 0,
+        };
+    }
+    if max_rows == 2 {
+        if sel == 0 {
+            return ScrollWindow {
+                start: 0,
+                end: 1,
+                above: 0,
+                below: total - 1,
+            };
+        }
+        return ScrollWindow {
+            start: sel,
+            end: sel + 1,
+            above: sel,
+            below: 0,
+        };
+    }
+
+    let edge_visible = max_rows - 1;
+    let mid_visible = max_rows - 2;
+    let half = mid_visible / 2;
+
+    if sel <= half {
+        let end = edge_visible.min(total);
+        return ScrollWindow {
+            start: 0,
+            end,
+            above: 0,
+            below: total.saturating_sub(end),
+        };
+    }
+    let bottom_threshold = total.saturating_sub(edge_visible - half);
+    if sel >= bottom_threshold {
+        let start = total.saturating_sub(edge_visible);
+        return ScrollWindow {
+            start,
+            end: total,
+            above: start,
+            below: 0,
+        };
+    }
+
+    let max_start = total.saturating_sub(mid_visible + 1).max(1);
+    let start = sel.saturating_sub(half).clamp(1, max_start);
+    let end = (start + mid_visible).min(total.saturating_sub(1));
+    ScrollWindow {
+        start,
+        end,
+        above: start,
+        below: total.saturating_sub(end),
+    }
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+fn safe_content_width(term_cols: usize, max_w: usize) -> usize {
+    let available = term_cols.saturating_sub(2).max(1);
+    let preferred = term_cols.saturating_sub(4).min(max_w);
+    preferred.min(available).max(1)
+}
 
 #[cfg(unix)]
 enum WizardScreen {
@@ -2829,11 +4033,25 @@ enum WizardScreen {
         main_selected: usize,
         allow_back: bool,
     },
+    DesktopMcpConfirm {
+        harness: ManualGuideHarness,
+        plan: DesktopMcpPlan,
+        primary_skill: PathBuf,
+        installed: Vec<InstalledSkillEntry>,
+        prompt: String,
+        deeplink: Option<String>,
+        selected_option: usize,
+        error_status: Option<String>,
+        main_selected: usize,
+        allow_back: bool,
+    },
     ManualGuide {
         harness: ManualGuideHarness,
         primary_skill: PathBuf,
         installed: Vec<InstalledSkillEntry>,
         prompt: String,
+        mcp_status: DesktopMcpStatus,
+        deeplink: Option<String>,
         selected_action: usize,
         copied_status: Option<String>,
         main_selected: usize,
@@ -2855,14 +4073,22 @@ enum TuiResolution {
         primary_skill: PathBuf,
         installed: Vec<InstalledSkillEntry>,
         prompt: String,
+        mcp_status: DesktopMcpStatus,
+        deeplink: Option<String>,
     },
     Error(String),
 }
 
 /// Composes a bordered compact dot-matrix mycelium banner for the top of the fullscreen menu.
-#[cfg(unix)]
-fn build_banner_lines(term_rows: usize, term_cols: usize, color_mode: ColorMode) -> Vec<String> {
-    if term_rows < 20 || term_cols < 44 {
+#[cfg_attr(not(unix), allow(dead_code))]
+fn build_banner_lines_at_tick(
+    term_rows: usize,
+    term_cols: usize,
+    content_w: usize,
+    color_mode: ColorMode,
+    anim_tick: usize,
+) -> Vec<String> {
+    if term_rows < 20 || term_cols < 44 || content_w < 30 {
         return Vec::new();
     }
     let banner_h = if term_rows >= 34 {
@@ -2872,10 +4098,15 @@ fn build_banner_lines(term_rows: usize, term_cols: usize, color_mode: ColorMode)
     } else {
         7
     };
-    let banner_w = term_cols.saturating_sub(10).clamp(36, 66);
-    let art = render_mycelium_frame(
+    let max_banner_w = content_w.saturating_sub(4).min(66);
+    if max_banner_w < 24 {
+        return Vec::new();
+    }
+    let banner_w = max_banner_w;
+    let art = render_mycelium_frame_at_phase(
         DEFAULT_TOTAL_FRAMES - 1,
         DEFAULT_TOTAL_FRAMES,
+        anim_tick,
         banner_w,
         banner_h,
         color_mode,
@@ -2884,7 +4115,8 @@ fn build_banner_lines(term_rows: usize, term_cols: usize, color_mode: ColorMode)
     let border_fg = fg_color(color_mode, RGB_UI_BORDER);
     let reset = style_reset(color_mode);
     let horiz = "─".repeat(banner_w + 2);
-    let left_pad = " ".repeat(term_cols.saturating_sub(banner_w + 4) / 2);
+    let box_outer_w = banner_w + 4;
+    let left_pad = " ".repeat(term_cols.saturating_sub(box_outer_w) / 2);
 
     let mut lines = Vec::with_capacity(banner_h + 2);
     lines.push(format!("{left_pad}{border_fg}╭{horiz}╮{reset}"));
@@ -2897,7 +4129,7 @@ fn build_banner_lines(term_rows: usize, term_cols: usize, color_mode: ColorMode)
     lines
 }
 
-#[cfg(unix)]
+#[cfg_attr(not(unix), allow(dead_code))]
 fn format_menu_row(
     selected: bool,
     label: &str,
@@ -2907,15 +4139,28 @@ fn format_menu_row(
     left_pad: &str,
     color_mode: ColorMode,
 ) -> String {
-    let inner_w = box_width.saturating_sub(2).max(20);
+    let inner_w = box_width.saturating_sub(2).max(16);
     let prefix = if selected { " ❯ " } else { "   " };
     let tag_text = tag.map(|(t, _)| format!("[{t}]")).unwrap_or_default();
 
-    let label_max = (inner_w / 2).clamp(14, 26);
+    let prefix_len = 3usize;
+    let label_max = if tag.is_some() {
+        (inner_w / 2)
+            .clamp(12, 28)
+            .min(inner_w.saturating_sub(4).max(1))
+    } else {
+        let sub_reserve = if subtitle.is_empty() {
+            0
+        } else {
+            subtitle.chars().count().min(22) + 4
+        };
+        inner_w
+            .saturating_sub(prefix_len + sub_reserve + 1)
+            .max((inner_w / 2).min(inner_w.saturating_sub(prefix_len).max(1)))
+    };
     let label_str = truncate_chars(label, label_max);
     let label_len = label_str.chars().count();
     let tag_len = tag_text.chars().count();
-    let prefix_len = 3usize;
     let used = prefix_len + label_len + if tag_len > 0 { 2 + tag_len } else { 0 };
     let rem_for_sub = inner_w.saturating_sub(used + 3);
     let sub_str = if rem_for_sub >= 6 && !subtitle.is_empty() {
@@ -3010,7 +4255,8 @@ fn format_menu_row(
 
 #[cfg(unix)]
 fn flush_screen_lines(lines: &[String], term_rows: usize) {
-    let mut frame = String::with_capacity(term_rows * 96);
+    let mut frame = String::with_capacity(term_rows * 96 + 32);
+    frame.push_str("\x1b[?2026h\x1b[H");
     for row_idx in 0..term_rows {
         let row_num = row_idx + 1;
         use std::fmt::Write as _;
@@ -3020,37 +4266,44 @@ fn flush_screen_lines(lines: &[String], term_rows: usize) {
             let _ = write!(frame, "\x1b[{row_num};1H\x1b[K");
         }
     }
+    frame.push_str("\x1b[J\x1b[?2026l");
     let mut out = io::stdout().lock();
     let _ = out.write_all(frame.as_bytes());
     let _ = out.flush();
 }
 
-#[cfg(unix)]
-fn render_main_screen(
+/// Pure, cross-platform main menu frame composer with bounded viewport scrolling (`↑ N more` /
+/// `↓ M more`), safe left-margin clamping, Herdr-environment header context, and living pulse tick.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub fn render_main_menu(
     items: &[MainMenuItem],
     selected: usize,
-    existing_node: Option<&ExistingNodeInfo>,
+    existing_node_id: Option<&str>,
+    is_legacy_v1: bool,
+    in_herdr_env: Option<&str>,
     term_rows: usize,
     term_cols: usize,
     color_mode: ColorMode,
-) {
-    let content_w = term_cols.saturating_sub(4).clamp(40, 84);
+    anim_tick: usize,
+) -> Vec<String> {
+    if term_rows == 0 {
+        return Vec::new();
+    }
+    let content_w = safe_content_width(term_cols, 76);
     let left_pad = " ".repeat(term_cols.saturating_sub(content_w) / 2);
     let mut lines = Vec::new();
 
-    let banner = build_banner_lines(term_rows, term_cols, color_mode);
+    let banner = build_banner_lines_at_tick(term_rows, term_cols, content_w, color_mode, anim_tick);
     lines.extend(banner);
     if !lines.is_empty() {
         lines.push(String::new());
     }
 
     let version = env!("CARGO_PKG_VERSION");
-    let header_title = if let Some(existing) = existing_node {
-        let legacy = if existing.is_legacy_v1 { " · legacy v1" } else { "" };
-        format!(
-            "hyphae v{version} · configure existing node ({}{legacy})",
-            existing.node_id
-        )
+    let header_title = if let Some(node_id) = existing_node_id {
+        let legacy = if is_legacy_v1 { " · legacy v1" } else { "" };
+        format!("hyphae v{version} · configure existing node ({node_id}{legacy})")
     } else {
         format!("hyphae v{version} · interactive onboarding")
     };
@@ -3063,6 +4316,18 @@ fn render_main_screen(
             &truncate_chars(&header_title, content_w)
         )
     ));
+    if let Some(herdr_id) = in_herdr_env.filter(|s| !s.trim().is_empty()) {
+        let note = format!("Herdr ({}) · templates launch & attach directly", herdr_id.trim());
+        lines.push(format!(
+            "{left_pad}{}",
+            paint_styled_text(
+                color_mode,
+                RGB_NODE_AMBER,
+                false,
+                &truncate_chars(&note, content_w)
+            )
+        ));
+    }
     lines.push(format!(
         "{left_pad}{}",
         paint_styled_text(
@@ -3077,19 +4342,25 @@ fn render_main_screen(
     ));
     lines.push(String::new());
 
-    // Compute visible window for tiny terminals.
-    let footer_reserve = 3usize;
-    let avail_rows = term_rows.saturating_sub(lines.len() + footer_reserve).max(3);
-    let start = if items.len() <= avail_rows {
-        0
-    } else if selected + 1 > avail_rows {
-        (selected + 1 - avail_rows).min(items.len() - avail_rows)
-    } else {
-        0
-    };
-    let end = (start + avail_rows).min(items.len());
+    // Reserve exact footer height (blank line + keybinding line) so total never overflows `term_rows`.
+    let footer_lines = 2usize;
+    let avail_rows = term_rows.saturating_sub(lines.len() + footer_lines).max(1);
+    let win = compute_scroll_window(items.len(), selected, avail_rows);
 
-    for (idx, item) in items.iter().enumerate().take(end).skip(start) {
+    if win.above > 0 {
+        let hint = format!("   ↑ {} more", win.above);
+        lines.push(format!(
+            "{left_pad}{}",
+            paint_styled_text(
+                color_mode,
+                RGB_UI_MUTED,
+                false,
+                &truncate_chars(&hint, content_w)
+            )
+        ));
+    }
+
+    for (idx, item) in items.iter().enumerate().take(win.end).skip(win.start) {
         lines.push(format_menu_row(
             idx == selected,
             &item.label,
@@ -3101,6 +4372,19 @@ fn render_main_screen(
         ));
     }
 
+    if win.below > 0 {
+        let hint = format!("   ↓ {} more", win.below);
+        lines.push(format!(
+            "{left_pad}{}",
+            paint_styled_text(
+                color_mode,
+                RGB_UI_MUTED,
+                false,
+                &truncate_chars(&hint, content_w)
+            )
+        ));
+    }
+
     lines.push(String::new());
     let footer = truncate_chars("↑/↓ move · Enter select · q quit", content_w);
     lines.push(format!(
@@ -3108,28 +4392,69 @@ fn render_main_screen(
         paint_styled_text(color_mode, RGB_UI_MUTED, false, &footer)
     ));
 
+    if lines.len() > term_rows {
+        lines.truncate(term_rows);
+    }
+
     // Vertically center only if there is comfortable extra space.
     let top_pad = term_rows.saturating_sub(lines.len()) / 3;
     let mut padded = vec![String::new(); top_pad];
     padded.extend(lines);
-    flush_screen_lines(&padded, term_rows);
+    padded
 }
 
 #[cfg(unix)]
-fn render_herdr_screen(
+#[allow(clippy::too_many_arguments)]
+fn render_main_screen(
+    items: &[MainMenuItem],
+    selected: usize,
+    existing_node: Option<&ExistingNodeInfo>,
+    in_herdr_env: Option<&str>,
+    term_rows: usize,
+    term_cols: usize,
+    color_mode: ColorMode,
+    anim_tick: usize,
+) {
+    let lines = render_main_menu(
+        items,
+        selected,
+        existing_node.map(|n| n.node_id.as_str()),
+        existing_node.is_some_and(|n| n.is_legacy_v1),
+        in_herdr_env,
+        term_rows,
+        term_cols,
+        color_mode,
+        anim_tick,
+    );
+    flush_screen_lines(&lines, term_rows);
+}
+
+/// Pure, cross-platform Herdr template picker frame composer with bounded viewport scrolling.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn render_herdr_templates(
     templates: &[HerdrTemplate],
     selected: usize,
     allow_back: bool,
     term_rows: usize,
     term_cols: usize,
     color_mode: ColorMode,
-) {
-    let content_w = term_cols.saturating_sub(4).clamp(40, 84);
+    anim_tick: usize,
+) -> Vec<String> {
+    if term_rows == 0 {
+        return Vec::new();
+    }
+    let content_w = safe_content_width(term_cols, 76);
     let left_pad = " ".repeat(term_cols.saturating_sub(content_w) / 2);
     let mut lines = Vec::new();
 
     if term_rows >= 26 {
-        lines.extend(build_banner_lines(term_rows.min(27), term_cols, color_mode));
+        lines.extend(build_banner_lines_at_tick(
+            term_rows.min(27),
+            term_cols,
+            content_w,
+            color_mode,
+            anim_tick,
+        ));
         if !lines.is_empty() {
             lines.push(String::new());
         }
@@ -3145,7 +4470,7 @@ fn render_herdr_screen(
         )
     ));
     let sub = format!(
-        "{} template(s) from `hc templates --json` · Enter launches via `hc run <template>`",
+        "{} template(s) from `hc templates --json` · Enter launches & attaches via `hc run --bg`",
         templates.len()
     );
     lines.push(format!(
@@ -3160,18 +4485,24 @@ fn render_herdr_screen(
     lines.push(String::new());
 
     let total_entries = templates.len() + usize::from(allow_back);
-    let footer_reserve = 3usize;
-    let avail_rows = term_rows.saturating_sub(lines.len() + footer_reserve).max(3);
-    let start = if total_entries <= avail_rows {
-        0
-    } else if selected + 1 > avail_rows {
-        (selected + 1 - avail_rows).min(total_entries - avail_rows)
-    } else {
-        0
-    };
-    let end = (start + avail_rows).min(total_entries);
+    let footer_lines = 2usize;
+    let avail_rows = term_rows.saturating_sub(lines.len() + footer_lines).max(1);
+    let win = compute_scroll_window(total_entries, selected, avail_rows);
 
-    for idx in start..end {
+    if win.above > 0 {
+        let hint = format!("   ↑ {} more", win.above);
+        lines.push(format!(
+            "{left_pad}{}",
+            paint_styled_text(
+                color_mode,
+                RGB_UI_MUTED,
+                false,
+                &truncate_chars(&hint, content_w)
+            )
+        ));
+    }
+
+    for idx in win.start..win.end {
         if let Some(tmpl) = templates.get(idx) {
             lines.push(format_menu_row(
                 idx == selected,
@@ -3195,6 +4526,19 @@ fn render_herdr_screen(
         }
     }
 
+    if win.below > 0 {
+        let hint = format!("   ↓ {} more", win.below);
+        lines.push(format!(
+            "{left_pad}{}",
+            paint_styled_text(
+                color_mode,
+                RGB_UI_MUTED,
+                false,
+                &truncate_chars(&hint, content_w)
+            )
+        ));
+    }
+
     lines.push(String::new());
     let hint = if allow_back {
         "↑/↓ move · Enter launch · ←/Esc back · q quit"
@@ -3203,16 +4547,47 @@ fn render_herdr_screen(
     };
     lines.push(format!(
         "{left_pad}{}",
-        paint_styled_text(color_mode, RGB_UI_MUTED, false, &truncate_chars(hint, content_w))
+        paint_styled_text(
+            color_mode,
+            RGB_UI_MUTED,
+            false,
+            &truncate_chars(hint, content_w)
+        )
     ));
+
+    if lines.len() > term_rows {
+        lines.truncate(term_rows);
+    }
 
     let top_pad = term_rows.saturating_sub(lines.len()) / 3;
     let mut padded = vec![String::new(); top_pad];
     padded.extend(lines);
-    flush_screen_lines(&padded, term_rows);
+    padded
 }
 
 #[cfg(unix)]
+fn render_herdr_screen(
+    templates: &[HerdrTemplate],
+    selected: usize,
+    allow_back: bool,
+    term_rows: usize,
+    term_cols: usize,
+    color_mode: ColorMode,
+    anim_tick: usize,
+) {
+    let lines = render_herdr_templates(
+        templates,
+        selected,
+        allow_back,
+        term_rows,
+        term_cols,
+        color_mode,
+        anim_tick,
+    );
+    flush_screen_lines(&lines, term_rows);
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
 fn display_compact_path(path: &Path, home: &Path) -> String {
     if let Ok(rel) = path.strip_prefix(home) {
         return format!("~/{}", rel.display());
@@ -3220,24 +4595,197 @@ fn display_compact_path(path: &Path, home: &Path) -> String {
     path.display().to_string()
 }
 
+/// Pure, cross-platform Desktop MCP confirmation screen composer (Claude Desktop & Codex Desktop).
+#[cfg_attr(not(unix), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub fn render_desktop_mcp_confirm(
+    harness: ManualGuideHarness,
+    home: &Path,
+    plan: &DesktopMcpPlan,
+    primary_skill: &Path,
+    selected_option: usize,
+    error_status: Option<&str>,
+    allow_back: bool,
+    term_rows: usize,
+    term_cols: usize,
+    color_mode: ColorMode,
+) -> Vec<String> {
+    if term_rows == 0 {
+        return Vec::new();
+    }
+    let content_w = safe_content_width(term_cols, 78);
+    let left_pad = " ".repeat(term_cols.saturating_sub(content_w) / 2);
+    let inner_card_w = content_w.saturating_sub(4).max(20);
+    let border_fg = fg_color(color_mode, RGB_UI_BORDER);
+    let reset = style_reset(color_mode);
+    let horiz = "─".repeat(inner_card_w + 2);
+
+    let mut lines = Vec::new();
+
+    let title = format!("{} · Confirm MCP Config Update", harness.display_name());
+    lines.push(format!(
+        "{left_pad}{}",
+        paint_styled_text(
+            color_mode,
+            RGB_PULSE_IVORY,
+            true,
+            &truncate_chars(&title, content_w)
+        )
+    ));
+    let skill_ok = format!(
+        "✓ Installed hyphae-setup skill to {}",
+        display_compact_path(primary_skill, home)
+    );
+    lines.push(format!(
+        "{left_pad}{}",
+        paint_styled_text(
+            color_mode,
+            RGB_UI_TAG_LAUNCH,
+            false,
+            &truncate_chars(&skill_ok, content_w)
+        )
+    ));
+    lines.push(String::new());
+
+    lines.push(format!("{left_pad}{border_fg}╭{horiz}╮{reset}"));
+
+    let card_row = |plain_text: &str, rgb: (u8, u8, u8), bold: bool| -> String {
+        let clipped = truncate_chars(plain_text, inner_card_w);
+        let pad_r = " ".repeat(inner_card_w.saturating_sub(clipped.chars().count()));
+        let styled = paint_styled_text(color_mode, rgb, bold, &clipped);
+        format!("{left_pad}{border_fg}│{reset} {styled}{pad_r} {border_fg}│{reset}")
+    };
+
+    let target_label = format!("File: {}", display_compact_path(&plan.config_path, home));
+    for wrapped in wrap_words(&target_label, inner_card_w) {
+        lines.push(card_row(&wrapped, RGB_NODE_AMBER, true));
+    }
+    lines.push(card_row(
+        "Existing servers & settings are preserved.",
+        RGB_HYPHAE_SAGE,
+        false,
+    ));
+    lines.push(card_row("", RGB_UI_MUTED, false));
+
+    for (idx, preview) in plan.preview_lines.iter().enumerate() {
+        let rgb = if idx == 0 {
+            RGB_UI_MUTED
+        } else {
+            RGB_PULSE_IVORY
+        };
+        lines.push(card_row(preview, rgb, false));
+    }
+
+    lines.push(format!("{left_pad}{border_fg}╰{horiz}╯{reset}"));
+
+    if let Some(err) = error_status {
+        lines.push(format!(
+            "{left_pad}{}",
+            paint_styled_text(
+                color_mode,
+                RGB_NODE_AMBER,
+                true,
+                &truncate_chars(&format!("WARN  {err}"), content_w)
+            )
+        ));
+    } else {
+        lines.push(String::new());
+    }
+
+    let options = [
+        ("Apply MCP config & continue", "merge safely"),
+        ("Skip config write (I'll edit manually)", "show snippet"),
+    ];
+    for (idx, (label, sub)) in options.iter().enumerate() {
+        lines.push(format_menu_row(
+            idx == selected_option,
+            label,
+            None,
+            sub,
+            content_w,
+            &left_pad,
+            color_mode,
+        ));
+    }
+
+    lines.push(String::new());
+    let footer = if allow_back {
+        "↑/↓ move · Enter select · ←/Esc back · q quit"
+    } else {
+        "↑/↓ move · Enter select · q quit"
+    };
+    lines.push(format!(
+        "{left_pad}{}",
+        paint_styled_text(
+            color_mode,
+            RGB_UI_MUTED,
+            false,
+            &truncate_chars(footer, content_w)
+        )
+    ));
+
+    if lines.len() > term_rows {
+        lines.truncate(term_rows);
+    }
+
+    let top_pad = term_rows.saturating_sub(lines.len()) / 3;
+    let mut padded = vec![String::new(); top_pad];
+    padded.extend(lines);
+    padded
+}
+
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
-fn render_manual_guide_screen(
+fn render_desktop_mcp_confirm_screen(
+    harness: ManualGuideHarness,
+    home: &Path,
+    plan: &DesktopMcpPlan,
+    primary_skill: &Path,
+    selected_option: usize,
+    error_status: Option<&str>,
+    allow_back: bool,
+    term_rows: usize,
+    term_cols: usize,
+    color_mode: ColorMode,
+) {
+    let lines = render_desktop_mcp_confirm(
+        harness,
+        home,
+        plan,
+        primary_skill,
+        selected_option,
+        error_status,
+        allow_back,
+        term_rows,
+        term_cols,
+        color_mode,
+    );
+    flush_screen_lines(&lines, term_rows);
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub fn render_manual_guide(
     harness: ManualGuideHarness,
     home: &Path,
     primary_skill: &Path,
     installed: &[InstalledSkillEntry],
     prompt: &str,
+    mcp_status: &DesktopMcpStatus,
+    deeplink: Option<&str>,
     selected_action: usize,
     copied_status: Option<&str>,
     allow_back: bool,
     term_rows: usize,
     term_cols: usize,
     color_mode: ColorMode,
-) {
-    let content_w = term_cols.saturating_sub(4).clamp(44, 82);
+) -> Vec<String> {
+    if term_rows == 0 {
+        return Vec::new();
+    }
+    let content_w = safe_content_width(term_cols, 78);
     let left_pad = " ".repeat(term_cols.saturating_sub(content_w) / 2);
-    let inner_card_w = content_w.saturating_sub(4).max(32);
+    let inner_card_w = content_w.saturating_sub(4).max(20);
     let border_fg = fg_color(color_mode, RGB_UI_BORDER);
     let reset = style_reset(color_mode);
     let horiz = "─".repeat(inner_card_w + 2);
@@ -3270,11 +4818,42 @@ fn render_manual_guide_screen(
         )
     ));
 
+    match mcp_status {
+        DesktopMcpStatus::Applied(cfg_path) => {
+            let msg = format!("✓ Updated {}", display_compact_path(cfg_path, home));
+            lines.push(format!(
+                "{left_pad}{}",
+                paint_styled_text(
+                    color_mode,
+                    RGB_UI_TAG_LAUNCH,
+                    true,
+                    &truncate_chars(&msg, content_w)
+                )
+            ));
+        }
+        DesktopMcpStatus::AlreadyConfigured(cfg_path) => {
+            let msg = format!(
+                "✓ MCP config already configured at {}",
+                display_compact_path(cfg_path, home)
+            );
+            lines.push(format!(
+                "{left_pad}{}",
+                paint_styled_text(
+                    color_mode,
+                    RGB_UI_TAG_LAUNCH,
+                    false,
+                    &truncate_chars(&msg, content_w)
+                )
+            ));
+        }
+        DesktopMcpStatus::Skipped | DesktopMcpStatus::NotApplicable => {}
+    }
+
     // Show any additional cross-tool paths (e.g. Claude + Codex for T3 Code).
     let mut extras_shown = 0usize;
     for item in installed {
         for extra in &item.extra_paths {
-            if extras_shown >= 3 {
+            if extras_shown >= 2 {
                 break;
             }
             let extra_line = format!("  + {}", display_compact_path(Path::new(extra), home));
@@ -3302,9 +4881,21 @@ fn render_manual_guide_screen(
         format!("{left_pad}{border_fg}│{reset} {styled}{pad_r} {border_fg}│{reset}")
     };
 
-    let step1 = format!("1. {}", harness.open_instruction());
-    lines.push(card_row(&step1, RGB_HYPHAE_SAGE, false));
-    lines.push(card_row("2. Paste this prompt:", RGB_HYPHAE_SAGE, false));
+    let step1 = match mcp_status {
+        DesktopMcpStatus::Applied(_) => format!("1. {}", harness.restart_instruction()),
+        _ => format!("1. {}", harness.open_instruction()),
+    };
+    for wrapped in wrap_words(&step1, inner_card_w) {
+        lines.push(card_row(&wrapped, RGB_HYPHAE_SAGE, false));
+    }
+    let step2 = if matches!(mcp_status, DesktopMcpStatus::Applied(_)) && deeplink.is_some() {
+        "2. Then press [o] to open prefilled chat (or [c] to copy):"
+    } else if deeplink.is_some() {
+        "2. Press [o] to open in app, or paste this prompt:"
+    } else {
+        "2. Paste this prompt:"
+    };
+    lines.push(card_row(step2, RGB_HYPHAE_SAGE, false));
     lines.push(card_row("", RGB_UI_MUTED, false));
 
     for wrapped in wrap_words(prompt, inner_card_w.saturating_sub(2)) {
@@ -3312,15 +4903,22 @@ fn render_manual_guide_screen(
         lines.push(card_row(&indented, RGB_PULSE_IVORY, true));
     }
 
-    if let Some((cfg_path, snippet)) = harness.mcp_config_note(home) {
-        lines.push(card_row("", RGB_UI_MUTED, false));
-        let cfg_hdr = format!("MCP config ({}):", display_compact_path(&cfg_path, home));
-        for wrapped in wrap_words(&cfg_hdr, inner_card_w) {
-            lines.push(card_row(&wrapped, RGB_NODE_AMBER, false));
-        }
-        for wrapped in wrap_words(snippet, inner_card_w.saturating_sub(2)) {
-            let indented = format!("  {wrapped}");
-            lines.push(card_row(&indented, RGB_UI_MUTED, false));
+    if matches!(
+        mcp_status,
+        DesktopMcpStatus::Skipped | DesktopMcpStatus::NotApplicable
+    ) {
+        if let Some((cfg_path, snippet)) = harness.mcp_config_note(home) {
+            lines.push(card_row("", RGB_UI_MUTED, false));
+            let cfg_hdr = format!("MCP config ({}):", display_compact_path(&cfg_path, home));
+            for wrapped in wrap_words(&cfg_hdr, inner_card_w) {
+                lines.push(card_row(&wrapped, RGB_NODE_AMBER, false));
+            }
+            for snippet_line in snippet.lines() {
+                for wrapped in wrap_words(snippet_line, inner_card_w.saturating_sub(2)) {
+                    let indented = format!("  {wrapped}");
+                    lines.push(card_row(&indented, RGB_UI_MUTED, false));
+                }
+            }
         }
     }
 
@@ -3340,11 +4938,18 @@ fn render_manual_guide_screen(
         lines.push(String::new());
     }
 
-    let mut actions: Vec<(&str, &str)> = vec![("[c] Copy prompt to clipboard", "copy")];
-    if allow_back {
-        actions.push(("[←] Back to harness list", "return"));
+    let mut actions: Vec<(String, &'static str)> = Vec::new();
+    if deeplink.is_some() {
+        actions.push((
+            format!("[o] Open in {}", harness.display_name()),
+            "copy prompt + launch app",
+        ));
     }
-    actions.push(("[Enter / q] Done", "exit wizard"));
+    actions.push(("[c] Copy prompt to clipboard".to_string(), "copy"));
+    if allow_back {
+        actions.push(("[←] Back to harness list".to_string(), "return"));
+    }
+    actions.push(("[Enter / q] Done".to_string(), "exit wizard"));
 
     for (idx, (label, sub)) in actions.iter().enumerate() {
         lines.push(format_menu_row(
@@ -3359,10 +4964,11 @@ fn render_manual_guide_screen(
     }
 
     lines.push(String::new());
-    let footer = if allow_back {
-        "c copy · ↑/↓ move · ←/Esc back · Enter/q done"
-    } else {
-        "c copy · ↑/↓ move · Enter/q done"
+    let footer = match (deeplink.is_some(), allow_back) {
+        (true, true) => "o open · c copy · ↑/↓ move · ←/Esc back · Enter/q done",
+        (true, false) => "o open · c copy · ↑/↓ move · Enter/q done",
+        (false, true) => "c copy · ↑/↓ move · ←/Esc back · Enter/q done",
+        (false, false) => "c copy · ↑/↓ move · Enter/q done",
     };
     lines.push(format!(
         "{left_pad}{}",
@@ -3374,20 +4980,123 @@ fn render_manual_guide_screen(
         )
     ));
 
+    if lines.len() > term_rows {
+        lines.truncate(term_rows);
+    }
+
     let top_pad = term_rows.saturating_sub(lines.len()) / 3;
     let mut padded = vec![String::new(); top_pad];
     padded.extend(lines);
-    flush_screen_lines(&padded, term_rows);
+    padded
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn render_manual_guide_screen(
+    harness: ManualGuideHarness,
+    home: &Path,
+    primary_skill: &Path,
+    installed: &[InstalledSkillEntry],
+    prompt: &str,
+    mcp_status: &DesktopMcpStatus,
+    deeplink: Option<&str>,
+    selected_action: usize,
+    copied_status: Option<&str>,
+    allow_back: bool,
+    term_rows: usize,
+    term_cols: usize,
+    color_mode: ColorMode,
+) {
+    let lines = render_manual_guide(
+        harness,
+        home,
+        primary_skill,
+        installed,
+        prompt,
+        mcp_status,
+        deeplink,
+        selected_action,
+        copied_status,
+        allow_back,
+        term_rows,
+        term_cols,
+        color_mode,
+    );
+    flush_screen_lines(&lines, term_rows);
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn build_initial_manual_guide_screen(
+    harness: ManualGuideHarness,
+    home: &Path,
+    explicit_home: bool,
+    existing_node: Option<&ExistingNodeInfo>,
+    cli_bin: &str,
+    primary_skill: PathBuf,
+    installed: Vec<InstalledSkillEntry>,
+    main_selected: usize,
+    allow_back: bool,
+) -> WizardScreen {
+    let prompt = build_manual_guide_prompt(harness, existing_node.map(|n| n.node_id.as_str()));
+    let deeplink =
+        resolve_manual_guide_deeplink(harness, &prompt, home, explicit_home, existing_node);
+
+    if let Some(plan) = inspect_desktop_mcp_plan(harness, home, cli_bin) {
+        if !plan.already_configured {
+            return WizardScreen::DesktopMcpConfirm {
+                harness,
+                plan,
+                primary_skill,
+                installed,
+                prompt,
+                deeplink,
+                selected_option: 0,
+                error_status: None,
+                main_selected,
+                allow_back,
+            };
+        }
+        return WizardScreen::ManualGuide {
+            harness,
+            primary_skill,
+            installed,
+            prompt,
+            mcp_status: DesktopMcpStatus::AlreadyConfigured(plan.config_path),
+            deeplink,
+            selected_action: 0,
+            copied_status: None,
+            main_selected,
+            allow_back,
+        };
+    }
+
+    WizardScreen::ManualGuide {
+        harness,
+        primary_skill,
+        installed,
+        prompt,
+        mcp_status: DesktopMcpStatus::NotApplicable,
+        deeplink,
+        selected_action: 0,
+        copied_status: None,
+        main_selected,
+        allow_back,
+    }
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn run_fullscreen_tui_loop(
     initial_screen: WizardScreen,
     main_items: &[MainMenuItem],
     home: &Path,
     explicit_home: bool,
     existing_node: Option<&ExistingNodeInfo>,
+    in_herdr_env: Option<&str>,
+    cli_bin: &str,
     play_intro: bool,
+    animate_banner: bool,
 ) -> Option<TuiResolution> {
     let color_mode = detect_color_mode();
     let (mut term_rows, mut term_cols) = detect_terminal_size();
@@ -3413,22 +5122,27 @@ fn run_fullscreen_tui_loop(
         return None;
     }
 
+    let live_anim = animate_banner && color_mode != ColorMode::Plain;
+    let mut anim_tick: usize = 0;
     let mut screen = initial_screen;
     let resolution = loop {
         let (r, c) = detect_terminal_size();
         term_rows = r;
         term_cols = c;
 
-        match &screen {
+        let has_live_banner = match &screen {
             WizardScreen::Main { selected } => {
                 render_main_screen(
                     main_items,
                     *selected,
                     existing_node,
+                    in_herdr_env,
                     term_rows,
                     term_cols,
                     color_mode,
+                    anim_tick,
                 );
+                true
             }
             WizardScreen::HerdrTemplates {
                 templates,
@@ -3443,13 +5157,40 @@ fn run_fullscreen_tui_loop(
                     term_rows,
                     term_cols,
                     color_mode,
+                    anim_tick,
                 );
+                term_rows >= 26
+            }
+            WizardScreen::DesktopMcpConfirm {
+                harness,
+                plan,
+                primary_skill,
+                selected_option,
+                error_status,
+                allow_back,
+                ..
+            } => {
+                render_desktop_mcp_confirm_screen(
+                    *harness,
+                    home,
+                    plan,
+                    primary_skill,
+                    *selected_option,
+                    error_status.as_deref(),
+                    *allow_back,
+                    term_rows,
+                    term_cols,
+                    color_mode,
+                );
+                false
             }
             WizardScreen::ManualGuide {
                 harness,
                 primary_skill,
                 installed,
                 prompt,
+                mcp_status,
+                deeplink,
                 selected_action,
                 copied_status,
                 allow_back,
@@ -3461,6 +5202,8 @@ fn run_fullscreen_tui_loop(
                     primary_skill,
                     installed,
                     prompt,
+                    mcp_status,
+                    deeplink.as_deref(),
                     *selected_action,
                     copied_status.as_deref(),
                     *allow_back,
@@ -3468,12 +5211,24 @@ fn run_fullscreen_tui_loop(
                     term_cols,
                     color_mode,
                 );
+                false
             }
-        }
+        };
 
-        let key = match raw.read_key() {
-            Ok(k) => k,
-            Err(e) => break TuiResolution::Error(format!("Failed reading TTY input: {e}")),
+        let key = if live_anim && has_live_banner {
+            match raw.read_key_timeout() {
+                Ok(Some(k)) => k,
+                Ok(None) => {
+                    anim_tick = anim_tick.wrapping_add(1);
+                    continue;
+                }
+                Err(e) => break TuiResolution::Error(format!("Failed reading TTY input: {e}")),
+            }
+        } else {
+            match raw.read_key() {
+                Ok(k) => k,
+                Err(e) => break TuiResolution::Error(format!("Failed reading TTY input: {e}")),
+            }
         };
 
         match &mut screen {
@@ -3508,26 +5263,29 @@ fn run_fullscreen_tui_loop(
                                     allow_back: true,
                                 };
                             }
+                            MainMenuAction::LaunchHerdrTemplate { hc_bin, template } => {
+                                break TuiResolution::LaunchHerdr {
+                                    hc_bin: hc_bin.clone(),
+                                    template: template.clone(),
+                                };
+                            }
                             MainMenuAction::LaunchCli(lh) => {
                                 break TuiResolution::LaunchCli(*lh);
                             }
                             MainMenuAction::ManualGuide(mh) => {
                                 match install_manual_guide_skills(*mh, home, explicit_home) {
                                     Ok((primary_skill, installed)) => {
-                                        let prompt = build_manual_guide_prompt(
+                                        screen = build_initial_manual_guide_screen(
                                             *mh,
-                                            existing_node.map(|n| n.node_id.as_str()),
-                                        );
-                                        screen = WizardScreen::ManualGuide {
-                                            harness: *mh,
+                                            home,
+                                            explicit_home,
+                                            existing_node,
+                                            cli_bin,
                                             primary_skill,
                                             installed,
-                                            prompt,
-                                            selected_action: 0,
-                                            copied_status: None,
-                                            main_selected: idx,
-                                            allow_back: true,
-                                        };
+                                            idx,
+                                            true,
+                                        );
                                     }
                                     Err(e) => break TuiResolution::Error(e),
                                 }
@@ -3586,19 +5344,107 @@ fn run_fullscreen_tui_loop(
                     _ => {}
                 }
             }
+            WizardScreen::DesktopMcpConfirm {
+                harness,
+                primary_skill,
+                installed,
+                prompt,
+                deeplink,
+                selected_option,
+                error_status,
+                main_selected,
+                allow_back,
+                ..
+            } => match key {
+                KeyEvent::Up | KeyEvent::Down => {
+                    *selected_option = 1 - (*selected_option % 2);
+                }
+                KeyEvent::Left | KeyEvent::Back => {
+                    if *allow_back {
+                        let prev = *main_selected;
+                        screen = WizardScreen::Main { selected: prev };
+                    } else {
+                        break TuiResolution::Cancel;
+                    }
+                }
+                KeyEvent::Cancel => {
+                    break TuiResolution::Cancel;
+                }
+                KeyEvent::Enter => {
+                    if *selected_option == 0 {
+                        match apply_desktop_mcp_config(*harness, home, cli_bin) {
+                            Ok(applied) => {
+                                let next_harness = *harness;
+                                let next_skill = primary_skill.clone();
+                                let next_installed = installed.clone();
+                                let next_prompt = prompt.clone();
+                                let next_deeplink = deeplink.clone();
+                                let next_main = *main_selected;
+                                let next_back = *allow_back;
+                                screen = WizardScreen::ManualGuide {
+                                    harness: next_harness,
+                                    primary_skill: next_skill,
+                                    installed: next_installed,
+                                    prompt: next_prompt,
+                                    mcp_status: DesktopMcpStatus::Applied(applied.config_path),
+                                    deeplink: next_deeplink,
+                                    selected_action: 0,
+                                    copied_status: None,
+                                    main_selected: next_main,
+                                    allow_back: next_back,
+                                };
+                            }
+                            Err(err) => {
+                                *error_status = Some(err);
+                                *selected_option = 1;
+                            }
+                        }
+                    } else {
+                        let next_harness = *harness;
+                        let next_skill = primary_skill.clone();
+                        let next_installed = installed.clone();
+                        let next_prompt = prompt.clone();
+                        let next_deeplink = deeplink.clone();
+                        let next_main = *main_selected;
+                        let next_back = *allow_back;
+                        screen = WizardScreen::ManualGuide {
+                            harness: next_harness,
+                            primary_skill: next_skill,
+                            installed: next_installed,
+                            prompt: next_prompt,
+                            mcp_status: DesktopMcpStatus::Skipped,
+                            deeplink: next_deeplink,
+                            selected_action: 0,
+                            copied_status: None,
+                            main_selected: next_main,
+                            allow_back: next_back,
+                        };
+                    }
+                }
+                _ => {}
+            },
             WizardScreen::ManualGuide {
                 harness,
                 primary_skill,
                 installed,
                 prompt,
+                mcp_status,
+                deeplink,
                 selected_action,
                 copied_status,
                 main_selected,
                 allow_back,
             } => {
-                let action_count = if *allow_back { 3 } else { 2 };
-                let back_idx = if *allow_back { Some(1usize) } else { None };
-                let done_idx = action_count - 1;
+                let has_open = deeplink.is_some();
+                let open_idx = if has_open { Some(0usize) } else { None };
+                let copy_idx = usize::from(has_open);
+                let back_idx = if *allow_back {
+                    Some(copy_idx + 1)
+                } else {
+                    None
+                };
+                let done_idx = copy_idx + 1 + usize::from(*allow_back);
+                let action_count = done_idx + 1;
 
                 match key {
                     KeyEvent::Up => {
@@ -3606,6 +5452,11 @@ fn run_fullscreen_tui_loop(
                     }
                     KeyEvent::Down => {
                         *selected_action = (*selected_action + 1) % action_count;
+                    }
+                    KeyEvent::Char('o') | KeyEvent::Char('O') => {
+                        if let Some(url) = deeplink.as_deref() {
+                            *copied_status = Some(trigger_open_in_app(*harness, prompt, url));
+                        }
                     }
                     KeyEvent::Char('c') | KeyEvent::Char('C') => {
                         *copied_status = match copy_text_to_clipboard(prompt) {
@@ -3623,6 +5474,8 @@ fn run_fullscreen_tui_loop(
                                 primary_skill: primary_skill.clone(),
                                 installed: installed.clone(),
                                 prompt: prompt.clone(),
+                                mcp_status: mcp_status.clone(),
+                                deeplink: deeplink.clone(),
                             };
                         }
                     }
@@ -3632,10 +5485,16 @@ fn run_fullscreen_tui_loop(
                             primary_skill: primary_skill.clone(),
                             installed: installed.clone(),
                             prompt: prompt.clone(),
+                            mcp_status: mcp_status.clone(),
+                            deeplink: deeplink.clone(),
                         };
                     }
                     KeyEvent::Enter => {
-                        if *selected_action == 0 {
+                        if Some(*selected_action) == open_idx {
+                            if let Some(url) = deeplink.as_deref() {
+                                *copied_status = Some(trigger_open_in_app(*harness, prompt, url));
+                            }
+                        } else if *selected_action == copy_idx {
                             *copied_status = match copy_text_to_clipboard(prompt) {
                                 Ok(_) => Some("✓ Copied to clipboard!".to_string()),
                                 Err(msg) => Some(msg),
@@ -3649,6 +5508,8 @@ fn run_fullscreen_tui_loop(
                                 primary_skill: primary_skill.clone(),
                                 installed: installed.clone(),
                                 prompt: prompt.clone(),
+                                mcp_status: mcp_status.clone(),
+                                deeplink: deeplink.clone(),
                             };
                         }
                     }
@@ -3670,12 +5531,14 @@ fn execute_tui_resolution(
     home: &Path,
     explicit_home: bool,
     existing_node: Option<&ExistingNodeInfo>,
+    cli_bin: &str,
 ) -> WizardOutcome {
     match resolution {
         TuiResolution::Cancel => WizardOutcome::Finished(ExitCode::from(EXIT_OK)),
         TuiResolution::RunLocalCliSetup => WizardOutcome::RunLocalCliSetup,
         TuiResolution::LaunchCli(lh) => {
-            let code = install_and_handoff_cli(lh, home, explicit_home, existing_node, false);
+            let code =
+                install_and_handoff_cli(lh, home, explicit_home, existing_node, cli_bin, false);
             WizardOutcome::Finished(code)
         }
         TuiResolution::LaunchHerdr { hc_bin, template } => {
@@ -3694,8 +5557,18 @@ fn execute_tui_resolution(
             primary_skill,
             installed,
             prompt,
+            mcp_status,
+            deeplink,
         } => {
-            print_manual_guide_plain(harness, home, &primary_skill, &installed, &prompt);
+            print_manual_guide_plain(
+                harness,
+                home,
+                &primary_skill,
+                &installed,
+                &prompt,
+                &mcp_status,
+                deeplink.as_deref(),
+            );
             WizardOutcome::Finished(ExitCode::from(EXIT_OK))
         }
         TuiResolution::Error(msg) => WizardOutcome::Finished(emit_error(
@@ -3804,11 +5677,153 @@ fn run_numbered_herdr_fallback(
     }
 }
 
+enum PlainMcpConfirmOutcome {
+    Status(DesktopMcpStatus),
+    Back,
+    Quit,
+}
+
+fn run_plain_tty_desktop_mcp_confirm(
+    harness: ManualGuideHarness,
+    home: &Path,
+    cli_bin: &str,
+    allow_back: bool,
+) -> PlainMcpConfirmOutcome {
+    let Some(plan) = inspect_desktop_mcp_plan(harness, home, cli_bin) else {
+        return PlainMcpConfirmOutcome::Status(DesktopMcpStatus::NotApplicable);
+    };
+    if plan.already_configured {
+        return PlainMcpConfirmOutcome::Status(DesktopMcpStatus::AlreadyConfigured(
+            plan.config_path,
+        ));
+    }
+
+    println!();
+    println!("{} · Confirm MCP Config Update", harness.display_name());
+    println!("  File: {}", plan.config_path.display());
+    println!("  Existing servers & settings are preserved.");
+    println!();
+    for line in &plan.preview_lines {
+        println!("    {line}");
+    }
+    println!();
+    println!("  [1] Apply MCP config & continue");
+    println!("  [2] Skip config write (I'll edit manually)");
+    if allow_back {
+        println!("  [b] Back");
+    }
+    println!("  [q] Quit");
+    println!();
+
+    loop {
+        let reply = match read_tty_line("Selection [1]: ") {
+            Ok(Some(line)) => line.trim().to_ascii_lowercase(),
+            Ok(None) => return PlainMcpConfirmOutcome::Quit,
+            Err(_) => return PlainMcpConfirmOutcome::Status(DesktopMcpStatus::Skipped),
+        };
+        if reply.is_empty() || matches!(reply.as_str(), "1" | "y" | "yes" | "apply") {
+            match apply_desktop_mcp_config(harness, home, cli_bin) {
+                Ok(res) => {
+                    return PlainMcpConfirmOutcome::Status(DesktopMcpStatus::Applied(
+                        res.config_path,
+                    ));
+                }
+                Err(err) => {
+                    println!("WARN  {err}");
+                    return PlainMcpConfirmOutcome::Status(DesktopMcpStatus::Skipped);
+                }
+            }
+        }
+        if matches!(reply.as_str(), "2" | "n" | "no" | "skip") {
+            return PlainMcpConfirmOutcome::Status(DesktopMcpStatus::Skipped);
+        }
+        if allow_back && matches!(reply.as_str(), "b" | "back") {
+            return PlainMcpConfirmOutcome::Back;
+        }
+        if matches!(reply.as_str(), "q" | "quit") {
+            return PlainMcpConfirmOutcome::Quit;
+        }
+        println!("Invalid choice '{reply}'. Enter 1, 2, or 'q' to quit.");
+    }
+}
+
+fn run_plain_tty_manual_guide(
+    harness: ManualGuideHarness,
+    home: &Path,
+    explicit_home: bool,
+    existing_node: Option<&ExistingNodeInfo>,
+    cli_bin: &str,
+    allow_back: bool,
+) -> Option<WizardOutcome> {
+    let (primary_skill, installed) = match install_manual_guide_skills(harness, home, explicit_home)
+    {
+        Ok(res) => res,
+        Err(e) => {
+            return Some(WizardOutcome::Finished(emit_error(
+                "onboard",
+                false,
+                EXIT_ERROR,
+                "SKILL_INSTALL_FAILED",
+                e,
+                None,
+            )));
+        }
+    };
+
+    let mcp_status = match run_plain_tty_desktop_mcp_confirm(harness, home, cli_bin, allow_back) {
+        PlainMcpConfirmOutcome::Status(st) => st,
+        PlainMcpConfirmOutcome::Back => return None,
+        PlainMcpConfirmOutcome::Quit => {
+            return Some(WizardOutcome::Finished(ExitCode::from(EXIT_OK)));
+        }
+    };
+
+    let prompt = build_manual_guide_prompt(harness, existing_node.map(|n| n.node_id.as_str()));
+    let deeplink =
+        resolve_manual_guide_deeplink(harness, &prompt, home, explicit_home, existing_node);
+    print_manual_guide_plain(
+        harness,
+        home,
+        &primary_skill,
+        &installed,
+        &prompt,
+        &mcp_status,
+        deeplink.as_deref(),
+    );
+
+    let action_prompt = match (deeplink.is_some(), allow_back) {
+        (true, true) => {
+            "Press [o] to open app, [c] to copy prompt, [b] to go back, or Enter to finish: "
+        }
+        (true, false) => "Press [o] to open app, [c] to copy prompt, or Enter to finish: ",
+        (false, true) => "Press [c] to copy prompt, [b] to go back, or Enter to finish: ",
+        (false, false) => "Press [c] to copy prompt, or Enter to finish: ",
+    };
+    if let Ok(Some(ans)) = read_tty_line(action_prompt) {
+        let low = ans.trim().to_ascii_lowercase();
+        if low == "o" {
+            if let Some(url) = deeplink.as_deref() {
+                println!("{}", trigger_open_in_app(harness, &prompt, url));
+            }
+        } else if low == "c" {
+            match copy_text_to_clipboard(&prompt) {
+                Ok(_) => println!("OK    Copied prompt to clipboard."),
+                Err(msg) => println!("WARN  {msg}"),
+            }
+        } else if allow_back && (low == "b" || low == "back") {
+            return None;
+        }
+    }
+    Some(WizardOutcome::Finished(ExitCode::from(EXIT_OK)))
+}
+
 fn run_numbered_fallback_wizard(
     args: &OnboardArgs,
     home: &Path,
     main_items: &[MainMenuItem],
     existing_node: Option<&ExistingNodeInfo>,
+    in_herdr_env: Option<&str>,
+    cli_bin: &str,
 ) -> WizardOutcome {
     play_mycelium_animation(args.no_anim);
 
@@ -3823,6 +5838,12 @@ fn run_numbered_fallback_wizard(
         println!("  Config: {}", existing.config_path.display());
     } else {
         println!("hyphae v{version} · interactive setup");
+    }
+    if let Some(herdr_id) = in_herdr_env.filter(|s| !s.trim().is_empty()) {
+        println!(
+            "  Herdr ({}) · templates launch & attach directly",
+            herdr_id.trim()
+        );
     }
 
     loop {
@@ -3890,9 +5911,10 @@ fn run_numbered_fallback_wizard(
                     return outcome;
                 }
             }
-            MainMenuAction::LaunchCli(lh) => {
-                let code = install_and_handoff_cli(
-                    *lh,
+            MainMenuAction::LaunchHerdrTemplate { hc_bin, template } => {
+                let code = install_and_handoff_herdr(
+                    hc_bin,
+                    template,
                     home,
                     args.home.is_some(),
                     existing_node,
@@ -3900,39 +5922,27 @@ fn run_numbered_fallback_wizard(
                 );
                 return WizardOutcome::Finished(code);
             }
+            MainMenuAction::LaunchCli(lh) => {
+                let code = install_and_handoff_cli(
+                    *lh,
+                    home,
+                    args.home.is_some(),
+                    existing_node,
+                    cli_bin,
+                    false,
+                );
+                return WizardOutcome::Finished(code);
+            }
             MainMenuAction::ManualGuide(mh) => {
-                match install_manual_guide_skills(*mh, home, args.home.is_some()) {
-                    Ok((primary_skill, installed)) => {
-                        let prompt = build_manual_guide_prompt(
-                            *mh,
-                            existing_node.map(|n| n.node_id.as_str()),
-                        );
-                        print_manual_guide_plain(*mh, home, &primary_skill, &installed, &prompt);
-                        if let Ok(Some(ans)) =
-                            read_tty_line("Press [c] to copy prompt, [b] to go back, or Enter to finish: ")
-                        {
-                            let low = ans.trim().to_ascii_lowercase();
-                            if low == "c" {
-                                match copy_text_to_clipboard(&prompt) {
-                                    Ok(_) => println!("OK    Copied prompt to clipboard."),
-                                    Err(msg) => println!("WARN  {msg}"),
-                                }
-                            } else if low == "b" || low == "back" {
-                                continue;
-                            }
-                        }
-                        return WizardOutcome::Finished(ExitCode::from(EXIT_OK));
-                    }
-                    Err(e) => {
-                        return WizardOutcome::Finished(emit_error(
-                            "onboard",
-                            false,
-                            EXIT_ERROR,
-                            "SKILL_INSTALL_FAILED",
-                            e,
-                            None,
-                        ));
-                    }
+                if let Some(outcome) = run_plain_tty_manual_guide(
+                    *mh,
+                    home,
+                    args.home.is_some(),
+                    existing_node,
+                    cli_bin,
+                    true,
+                ) {
+                    return outcome;
                 }
             }
             MainMenuAction::QuickLocalSetup => return WizardOutcome::RunLocalCliSetup,
@@ -3972,42 +5982,59 @@ pub fn run_interactive_wizard(args: &OnboardArgs, home: &Path) -> WizardOutcome 
     let existing_node = detect_existing_node(args, home);
     let config_opt = existing_node.as_ref().map(|n| n.config_path.as_path());
     let path_var = std::env::var_os("PATH");
-    let (apps_dir, appdata_dir) = host_desktop_probe_dirs(args.home.is_some());
+    let probe = host_desktop_probe(args.home.is_some());
+    let herdr_env = detect_herdr_terminal_from_env();
+    let cli_bin = resolve_wizard_cli_bin(args.bin.as_deref());
 
-    let main_items = detect_candidates_in(
+    let main_items = detect_candidates_in_with_env(
         home,
         config_opt,
         path_var.as_deref(),
-        apps_dir.as_deref(),
-        appdata_dir.as_deref(),
+        probe.apps_dir.as_deref(),
+        probe.appdata_dir.as_deref(),
+        probe.local_appdata_dir.as_deref(),
+        probe.opencode_server_url.as_deref(),
         existing_node.as_ref().map(|n| n.node_id.as_str()),
+        herdr_env.as_deref(),
     );
 
     #[cfg(unix)]
     {
-        let play_intro = !args.no_anim && !no_color_enabled() && io::stdout().is_terminal();
+        let animate = !wizard_anim_disabled(args.no_anim) && io::stdout().is_terminal();
         if let Some(resolution) = run_fullscreen_tui_loop(
             WizardScreen::Main { selected: 0 },
             &main_items,
             home,
             args.home.is_some(),
             existing_node.as_ref(),
-            play_intro,
+            herdr_env.as_deref(),
+            &cli_bin,
+            animate,
+            animate,
         ) {
             return execute_tui_resolution(
                 resolution,
                 home,
                 args.home.is_some(),
                 existing_node.as_ref(),
+                &cli_bin,
             );
         }
     }
 
-    run_numbered_fallback_wizard(args, home, &main_items, existing_node.as_ref())
+    run_numbered_fallback_wizard(
+        args,
+        home,
+        &main_items,
+        existing_node.as_ref(),
+        herdr_env.as_deref(),
+        &cli_bin,
+    )
 }
 
 /// Entrypoint for `hyp onboard --assist [HARNESS]`.
 pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> WizardOutcome {
+    let cli_bin = resolve_wizard_cli_bin(args.bin.as_deref());
     let trimmed = assist_target.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
         if io::stdout().is_terminal() && !args.json {
@@ -4021,6 +6048,7 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
                 home,
                 args.home.is_some(),
                 existing_node.as_ref(),
+                &cli_bin,
                 args.json,
             );
             return WizardOutcome::Finished(code);
@@ -4041,6 +6069,7 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
                     home,
                     args.home.is_some(),
                     existing_node.as_ref(),
+                    &cli_bin,
                     args.json,
                 );
                 return WizardOutcome::Finished(code);
@@ -4089,7 +6118,7 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
             }
             #[cfg(unix)]
             if io::stdout().is_terminal() && !args.json {
-                let play_intro = !args.no_anim && !no_color_enabled();
+                let animate = !wizard_anim_disabled(args.no_anim);
                 if let Some(resolution) = run_fullscreen_tui_loop(
                     WizardScreen::HerdrTemplates {
                         hc_bin: hc_bin.clone(),
@@ -4102,13 +6131,17 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
                     home,
                     args.home.is_some(),
                     existing_node.as_ref(),
-                    play_intro,
+                    None,
+                    &cli_bin,
+                    animate,
+                    animate,
                 ) {
                     return execute_tui_resolution(
                         resolution,
                         home,
                         args.home.is_some(),
                         existing_node.as_ref(),
+                        &cli_bin,
                     );
                 }
             }
@@ -4170,7 +6203,8 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
         return WizardOutcome::Finished(code);
     }
 
-    // 2. Non-launchable manual guide harnesses: `--assist claude-desktop|codex-desktop|cursor-ide|openclaw|t3`.
+    // 2. Non-launchable manual guide harnesses:
+    //    `--assist claude-desktop|codex-desktop|opencode-desktop|cursor-ide|openclaw|t3`.
     if let Some(guide_harness) = ManualGuideHarness::parse_alias(trimmed) {
         let existing_node = detect_existing_node(args, home);
 
@@ -4178,33 +6212,35 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
         if io::stdout().is_terminal() && !args.json {
             match install_manual_guide_skills(guide_harness, home, args.home.is_some()) {
                 Ok((primary_skill, installed)) => {
-                    let prompt = build_manual_guide_prompt(
+                    let initial = build_initial_manual_guide_screen(
                         guide_harness,
-                        existing_node.as_ref().map(|n| n.node_id.as_str()),
+                        home,
+                        args.home.is_some(),
+                        existing_node.as_ref(),
+                        &cli_bin,
+                        primary_skill,
+                        installed,
+                        0,
+                        false,
                     );
-                    let play_intro = !args.no_anim && !no_color_enabled();
+                    let animate = !wizard_anim_disabled(args.no_anim);
                     if let Some(resolution) = run_fullscreen_tui_loop(
-                        WizardScreen::ManualGuide {
-                            harness: guide_harness,
-                            primary_skill,
-                            installed,
-                            prompt,
-                            selected_action: 0,
-                            copied_status: None,
-                            main_selected: 0,
-                            allow_back: false,
-                        },
+                        initial,
                         &[],
                         home,
                         args.home.is_some(),
                         existing_node.as_ref(),
-                        play_intro,
+                        None,
+                        &cli_bin,
+                        animate,
+                        animate,
                     ) {
                         return execute_tui_resolution(
                             resolution,
                             home,
                             args.home.is_some(),
                             existing_node.as_ref(),
+                            &cli_bin,
                         );
                     }
                 }
@@ -4221,11 +6257,26 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
             }
         }
 
+        if io::stdout().is_terminal() && !args.json {
+            if let Some(outcome) = run_plain_tty_manual_guide(
+                guide_harness,
+                home,
+                args.home.is_some(),
+                existing_node.as_ref(),
+                &cli_bin,
+                false,
+            ) {
+                return outcome;
+            }
+            return WizardOutcome::Finished(ExitCode::from(EXIT_OK));
+        }
+
         let code = install_and_emit_manual_guide(
             guide_harness,
             home,
             args.home.is_some(),
             existing_node.as_ref(),
+            &cli_bin,
             args.json,
         );
         return WizardOutcome::Finished(code);
@@ -4239,7 +6290,7 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
             EXIT_USAGE,
             "INVALID_ASSIST_HARNESS",
             format!(
-                "Unsupported --assist harness '{trimmed}' (expected auto, herdr:<template>, claude, claude-desktop, codex, codex-desktop, agy/antigravity, opencode, cursor/cursor-agent, gemini, openclaw, or t3)"
+                "Unsupported --assist harness '{trimmed}' (expected auto, herdr:<template>, claude, claude-desktop, codex, codex-desktop, opencode-desktop, agy/antigravity, opencode, cursor/cursor-agent, gemini, openclaw, or t3)"
             ),
             Some("Example: hyp onboard --assist claude".to_string()),
         ));
@@ -4254,6 +6305,7 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
         home,
         args.home.is_some(),
         existing_node.as_ref(),
+        &cli_bin,
         args.json,
     );
     WizardOutcome::Finished(code)
@@ -4449,7 +6501,7 @@ mod tests {
             None
         );
 
-        // Launch command builder.
+        // Launch command builder (`hc run --bg --outlive-parent --label app=hyphae --json`).
         let hc_path = Path::new("/usr/local/bin/hc");
         let prompt = "Load and follow hyphae-setup";
         let cmd = build_herdr_template_launch_command(hc_path, "claude-gateway", prompt);
@@ -4459,9 +6511,61 @@ mod tests {
             args,
             vec![
                 OsStr::new("run"),
+                OsStr::new("--bg"),
+                OsStr::new("--outlive-parent"),
+                OsStr::new("--label"),
+                OsStr::new("app=hyphae"),
+                OsStr::new("--json"),
                 OsStr::new("claude-gateway"),
                 OsStr::new(prompt),
             ]
+        );
+
+        // Attach command builder (`hc attach <address>`).
+        let attach_cmd = build_herdr_attach_command(hc_path, "t4h");
+        assert_eq!(attach_cmd.get_program(), OsStr::new("/usr/local/bin/hc"));
+        let attach_args: Vec<&OsStr> = attach_cmd.get_args().collect();
+        assert_eq!(attach_args, vec![OsStr::new("attach"), OsStr::new("t4h")]);
+    }
+
+    #[test]
+    fn herdr_run_address_json_parser_handles_logs_and_rejects_flag_injection() {
+        assert_eq!(
+            parse_herdr_run_address_json(r#"{"address":"t4h","template":"claude-gateway"}"#),
+            Some("t4h".to_string())
+        );
+        assert_eq!(
+            parse_herdr_run_address_json(r#"{"address":"  t9x  "}"#),
+            Some("t9x".to_string())
+        );
+        // Leading non-JSON log lines followed by single-line JSON.
+        assert_eq!(
+            parse_herdr_run_address_json(
+                "[hc] starting daemon...\n[hc] ready\n{\"address\":\"t4h\"}\n"
+            ),
+            Some("t4h".to_string())
+        );
+        // Leading non-JSON log line followed by multi-line pretty JSON.
+        assert_eq!(
+            parse_herdr_run_address_json("[hc] warning: slow start\n{\n  \"address\": \"t7b\"\n}\n"),
+            Some("t7b".to_string())
+        );
+
+        // Malformed, missing, empty, flag-injection, or whitespace-injected addresses MUST fail closed.
+        assert_eq!(parse_herdr_run_address_json(""), None);
+        assert_eq!(parse_herdr_run_address_json("{bad json"), None);
+        assert_eq!(parse_herdr_run_address_json(r#"{"id":"t4h"}"#), None);
+        assert_eq!(parse_herdr_run_address_json(r#"{"address":""}"#), None);
+        assert_eq!(parse_herdr_run_address_json(r#"{"address":"   "}"#), None);
+        assert_eq!(parse_herdr_run_address_json(r#"{"address":"-bad"}"#), None);
+        assert_eq!(parse_herdr_run_address_json(r#"{"address":"--exec"}"#), None);
+        assert_eq!(
+            parse_herdr_run_address_json(r#"{"address":"t4h --bad"}"#),
+            None
+        );
+        assert_eq!(
+            parse_herdr_run_address_json("{\"address\":\"t4h\\nbad\"}"),
+            None
         );
     }
 
@@ -4526,6 +6630,7 @@ mod tests {
             DetectedDesktopApps {
                 claude_desktop: true,
                 codex_desktop: true,
+                opencode_desktop: false,
                 cursor_ide: true,
             },
             None,
@@ -4559,6 +6664,574 @@ mod tests {
             None,
         );
         assert!(without_herdr.iter().all(|i| i.label != "Herdr"));
+    }
+
+    #[test]
+    fn main_menu_surfaces_herdr_templates_directly_when_inside_herdr_env() {
+        assert_eq!(
+            detect_herdr_terminal_from_values(Some(" t1b "), Some("t9z")),
+            Some("t1b".to_string())
+        );
+        assert_eq!(
+            detect_herdr_terminal_from_values(Some("   "), Some("t9z")),
+            Some("t9z".to_string())
+        );
+        assert_eq!(detect_herdr_terminal_from_values(None, None), None);
+
+        let launchables = vec![
+            (LaunchableHarness::Claude, PathBuf::from("/usr/bin/claude")),
+            (LaunchableHarness::Codex, PathBuf::from("/usr/bin/codex")),
+        ];
+        let templates = vec![
+            HerdrTemplate {
+                name: "claude-gateway".to_string(),
+                description: "Claude (Gateway)".to_string(),
+                command: "claude-gateway".to_string(),
+            },
+            HerdrTemplate {
+                name: "codex-gateway".to_string(),
+                description: "Codex (Gateway)".to_string(),
+                command: "codex-gateway --no-daemon".to_string(),
+            },
+        ];
+
+        // Inside Herdr (`Some("t1b")`): templates surfaced directly at the top with tag `"herdr"`.
+        let inside = build_main_menu_items_with_env(
+            &[],
+            &launchables,
+            Some(Path::new("/usr/local/bin/hc")),
+            &templates,
+            DetectedDesktopApps::default(),
+            None,
+            Some("t1b"),
+        );
+        assert_eq!(inside[0].label, "Claude (Gateway)");
+        assert_eq!(inside[0].tag, "herdr");
+        assert!(matches!(
+            inside[0].action,
+            MainMenuAction::LaunchHerdrTemplate { ref template, .. } if template.name == "claude-gateway"
+        ));
+        assert_eq!(inside[1].label, "Codex (Gateway)");
+        assert_eq!(inside[1].tag, "herdr");
+        assert!(matches!(
+            inside[1].action,
+            MainMenuAction::LaunchHerdrTemplate { ref template, .. } if template.name == "codex-gateway"
+        ));
+        assert_eq!(inside[2].label, "Claude Code");
+        assert_eq!(inside[3].label, "Codex");
+        assert!(inside.iter().all(|i| !matches!(i.action, MainMenuAction::HerdrTemplates { .. })));
+
+        // Outside Herdr (`None`): templates stay cleanly grouped under single `"Herdr"` entry.
+        let outside = build_main_menu_items_with_env(
+            &[],
+            &launchables,
+            Some(Path::new("/usr/local/bin/hc")),
+            &templates,
+            DetectedDesktopApps::default(),
+            None,
+            None,
+        );
+        assert_eq!(outside[0].label, "Herdr");
+        assert!(matches!(
+            outside[0].action,
+            MainMenuAction::HerdrTemplates { ref templates, .. } if templates.len() == 2
+        ));
+        assert_eq!(outside[1].label, "Claude Code");
+    }
+
+    #[test]
+    fn viewport_windowing_bounds_frame_height_and_keeps_selected_visible() {
+        let mut items = Vec::new();
+        for idx in 1..=8 {
+            items.push(MainMenuItem {
+                label: format!("Template {idx:02}"),
+                tag: "herdr",
+                subtitle: format!("tmpl-{idx:02}"),
+                action: MainMenuAction::LaunchHerdrTemplate {
+                    hc_bin: PathBuf::from("/usr/local/bin/hc"),
+                    template: HerdrTemplate {
+                        name: format!("tmpl-{idx:02}"),
+                        description: format!("Template {idx:02}"),
+                        command: "claude".to_string(),
+                    },
+                },
+            });
+        }
+        for lh in [
+            LaunchableHarness::Claude,
+            LaunchableHarness::Codex,
+            LaunchableHarness::Opencode,
+            LaunchableHarness::Gemini,
+        ] {
+            items.push(MainMenuItem {
+                label: lh.display_name().to_string(),
+                tag: "auto-launch",
+                subtitle: lh.binary_name().to_string(),
+                action: MainMenuAction::LaunchCli(lh),
+            });
+        }
+        items.push(MainMenuItem {
+            label: "Claude Desktop".to_string(),
+            tag: "install skill + guide",
+            subtitle: "Install skill + configure Claude Desktop MCP".to_string(),
+            action: MainMenuAction::ManualGuide(ManualGuideHarness::ClaudeDesktop),
+        });
+        items.push(MainMenuItem {
+            label: "Quick local setup here".to_string(),
+            tag: "local cli",
+            subtitle: "Local node, keys, detected harnesses & background service".to_string(),
+            action: MainMenuAction::QuickLocalSetup,
+        });
+        assert_eq!(items.len(), 14);
+
+        for selected in 0..items.len() {
+            let lines = render_main_menu(
+                &items,
+                selected,
+                Some("alice@workstation"),
+                false,
+                Some("t1b"),
+                24,
+                80,
+                ColorMode::Plain,
+                0,
+            );
+            assert!(
+                lines.len() <= 24,
+                "selected={selected}: frame overflowed 24 rows (got {})",
+                lines.len()
+            );
+            let stripped: Vec<String> = lines.iter().map(|l| strip_ansi(l)).collect();
+            for (row_idx, row) in stripped.iter().enumerate() {
+                assert!(
+                    row.chars().count() <= 80,
+                    "selected={selected} row {row_idx} exceeded 80 cols: {row:?}"
+                );
+            }
+            let joined = stripped.join("\n");
+            assert!(
+                joined.contains("Herdr (t1b)"),
+                "expected Herdr header note when inside Herdr env"
+            );
+            let expected_label = &items[selected].label;
+            assert!(
+                stripped
+                    .iter()
+                    .any(|row| row.contains('❯') && row.contains(expected_label.as_str())),
+                "selected={selected} ('{expected_label}') must be highlighted and visible:\n{joined}"
+            );
+            let has_up_hint = stripped
+                .iter()
+                .any(|row| row.contains("↑ ") && row.contains(" more"));
+            let has_down_hint = stripped
+                .iter()
+                .any(|row| row.contains("↓ ") && row.contains(" more"));
+            if selected == 0 {
+                assert!(has_down_hint, "missing ↓ hint at top:\n{joined}");
+                assert!(!has_up_hint, "unexpected ↑ hint at top:\n{joined}");
+            } else if selected == 7 {
+                assert!(
+                    has_up_hint && has_down_hint,
+                    "expected both ↑ and ↓ hints in middle:\n{joined}"
+                );
+            } else if selected == items.len() - 1 {
+                assert!(has_up_hint, "missing ↑ hint at bottom:\n{joined}");
+                assert!(!has_down_hint, "unexpected ↓ hint at bottom:\n{joined}");
+            }
+        }
+
+        // Narrow terminal left/right clamping check: header must NEVER overflow narrow width.
+        let narrow = render_main_menu(
+            &items,
+            0,
+            Some("alice@very-long-workstation-hostname"),
+            true,
+            Some("t1b"),
+            18,
+            34,
+            ColorMode::Plain,
+            0,
+        );
+        assert!(narrow.len() <= 18);
+        for (row_idx, line) in narrow.iter().enumerate() {
+            let plain = strip_ansi(line);
+            assert!(
+                plain.chars().count() <= 34,
+                "narrow row {row_idx} exceeded 34 cols: {plain:?}"
+            );
+        }
+
+        // Herdr template picker viewport scrolling check on 24 rows.
+        let templates: Vec<HerdrTemplate> = (1..=12)
+            .map(|i| HerdrTemplate {
+                name: format!("tmpl-{i:02}"),
+                description: format!("Herdr Agent {i:02}"),
+                command: "claude".to_string(),
+            })
+            .collect();
+        let herdr_mid = render_herdr_templates(&templates, 6, true, 24, 80, ColorMode::Plain, 0);
+        assert!(herdr_mid.len() <= 24);
+        let herdr_text = herdr_mid
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(herdr_text.contains("❯") && herdr_text.contains("Herdr Agent 07"));
+
+        // Living pulse phase produces distinct settled frames across advancing ticks.
+        let f0 = render_mycelium_frame_at_phase(
+            DEFAULT_TOTAL_FRAMES - 1,
+            DEFAULT_TOTAL_FRAMES,
+            0,
+            60,
+            9,
+            ColorMode::TrueColor,
+        );
+        let f6 = render_mycelium_frame_at_phase(
+            DEFAULT_TOTAL_FRAMES - 1,
+            DEFAULT_TOTAL_FRAMES,
+            6,
+            60,
+            9,
+            ColorMode::TrueColor,
+        );
+        assert_ne!(f0, f6, "advancing phase ticks must animate bioluminescent pulses");
+    }
+
+    #[test]
+    fn desktop_mcp_config_claude_desktop_merges_preserves_and_fails_closed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let cli_bin = "/usr/local/bin/hyp";
+
+        // 1. Missing file: plan reports not yet configured.
+        let plan0 = inspect_desktop_mcp_plan(ManualGuideHarness::ClaudeDesktop, home, cli_bin)
+            .expect("claude desktop plan");
+        assert!(!plan0.already_configured);
+        assert_eq!(plan0.config_path, claude_desktop_config_path(home));
+        assert!(
+            plan0
+                .preview_lines
+                .iter()
+                .any(|l| l.contains("mcpServers") && l.contains("preserves existing"))
+        );
+
+        // 2. Pre-existing config with another MCP server + top-level user keys.
+        fs::create_dir_all(plan0.config_path.parent().unwrap()).unwrap();
+        fs::write(
+            &plan0.config_path,
+            r#"{
+  "globalShortcut": "Cmd+Space",
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    }
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let applied = apply_desktop_mcp_config(ManualGuideHarness::ClaudeDesktop, home, cli_bin)
+            .expect("apply claude desktop mcp");
+        assert!(!applied.created);
+        assert!(!applied.already_configured);
+        assert_eq!(applied.config_path, plan0.config_path);
+
+        let updated: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&plan0.config_path).unwrap()).unwrap();
+        assert_eq!(updated["globalShortcut"], "Cmd+Space");
+        assert_eq!(updated["mcpServers"]["filesystem"]["command"], "npx");
+        assert_eq!(updated["mcpServers"]["hyphae"]["command"], cli_bin);
+        assert_eq!(updated["mcpServers"]["hyphae"]["args"], json!(["mcp"]));
+
+        // 3. Second inspection detects `already_configured == true`.
+        let plan1 = inspect_desktop_mcp_plan(ManualGuideHarness::ClaudeDesktop, home, cli_bin)
+            .expect("claude desktop plan 2");
+        assert!(plan1.already_configured);
+
+        // 4. Malformed JSON MUST fail closed without clobbering user's file!
+        let corrupt = "{ \"mcpServers\": BROKEN_JSON";
+        fs::write(&plan0.config_path, corrupt).unwrap();
+        let err = apply_desktop_mcp_config(ManualGuideHarness::ClaudeDesktop, home, cli_bin)
+            .expect_err("malformed JSON must fail closed");
+        assert!(err.contains("malformed JSON"), "unexpected error: {err}");
+        assert_eq!(
+            fs::read_to_string(&plan0.config_path).unwrap(),
+            corrupt,
+            "corrupt user file must remain untouched"
+        );
+
+        // 5. Non-object `mcpServers` field also fails closed without clobbering.
+        let bad_field = r#"{ "mcpServers": ["not-an-object"] }"#;
+        fs::write(&plan0.config_path, bad_field).unwrap();
+        let err2 = apply_desktop_mcp_config(ManualGuideHarness::ClaudeDesktop, home, cli_bin)
+            .expect_err("non-object mcpServers must fail closed");
+        assert!(err2.contains("mcpServers"), "unexpected error: {err2}");
+        assert_eq!(fs::read_to_string(&plan0.config_path).unwrap(), bad_field);
+    }
+
+    #[test]
+    fn desktop_mcp_config_codex_desktop_preserves_toml_and_is_idempotent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let cli_bin = "/opt/homebrew/bin/hyp";
+
+        let plan0 = inspect_desktop_mcp_plan(ManualGuideHarness::CodexDesktop, home, cli_bin)
+            .expect("codex desktop plan");
+        assert!(!plan0.already_configured);
+        assert_eq!(plan0.config_path, codex_desktop_config_path(home));
+        assert!(
+            plan0
+                .preview_lines
+                .iter()
+                .any(|l| l.contains("[mcp_servers.hyphae]"))
+        );
+
+        // Commented-out header must NOT falsely report already_configured.
+        fs::create_dir_all(plan0.config_path.parent().unwrap()).unwrap();
+        let initial_toml = "model = \"gpt-5\"\n# [mcp_servers.hyphae]\n\n[mcp_servers.context7]\ncommand = \"npx\"\nargs = [\"-y\", \"@upstash/context7-mcp\"]\n";
+        fs::write(&plan0.config_path, initial_toml).unwrap();
+        assert!(
+            !inspect_desktop_mcp_plan(ManualGuideHarness::CodexDesktop, home, cli_bin)
+                .unwrap()
+                .already_configured
+        );
+
+        let res1 = apply_desktop_mcp_config(ManualGuideHarness::CodexDesktop, home, cli_bin)
+            .expect("apply codex mcp");
+        assert!(!res1.created);
+        assert!(!res1.already_configured);
+
+        let written = fs::read_to_string(&plan0.config_path)
+            .unwrap()
+            .replace("\r\n", "\n");
+        assert!(written.contains("model = \"gpt-5\""));
+        assert!(written.contains("[mcp_servers.context7]"));
+        assert!(written.contains("# >>> hyphae >>>"));
+        assert!(written.contains("[mcp_servers.hyphae]"));
+        assert!(written.contains("command = \"/opt/homebrew/bin/hyp\""));
+        assert!(written.contains("args = [\"mcp\"]"));
+        assert!(written.contains("env_vars = [\"CODEX_HOME\", \"HYPHAE_SOCKET\"]"));
+        assert!(written.contains("# <<< hyphae <<<"));
+
+        // Second inspection detects `already_configured == true`, second apply stays idempotent.
+        let plan1 = inspect_desktop_mcp_plan(ManualGuideHarness::CodexDesktop, home, cli_bin)
+            .expect("codex desktop plan 2");
+        assert!(plan1.already_configured);
+        let res2 = apply_desktop_mcp_config(ManualGuideHarness::CodexDesktop, home, cli_bin)
+            .expect("apply codex mcp 2");
+        assert!(res2.already_configured);
+        let written2 = fs::read_to_string(&plan0.config_path)
+            .unwrap()
+            .replace("\r\n", "\n");
+        assert_eq!(
+            written2.matches("[mcp_servers.hyphae]").count(),
+            2, // 1 commented line + 1 active managed header (no duplicate active sections!)
+            "unexpected duplicate headers:\n{written2}"
+        );
+        assert_eq!(
+            written2
+                .lines()
+                .filter(|l| codex_toml_is_hyphae_table_header(l))
+                .count(),
+            1
+        );
+
+        // Replacing an unmarked existing `[mcp_servers.hyphae]` section preserves neighbors without duplicates.
+        let unmarked = "model = \"o3\"\n\n[mcp_servers.hyphae]\ncommand = \"old-hyp\"\nargs = [\"mcp\"]\n\n[mcp_servers.other]\ncommand = \"other\"\n";
+        fs::write(&plan0.config_path, unmarked).unwrap();
+        assert!(
+            inspect_desktop_mcp_plan(ManualGuideHarness::CodexDesktop, home, cli_bin)
+                .unwrap()
+                .already_configured
+        );
+        apply_desktop_mcp_config(ManualGuideHarness::CodexDesktop, home, cli_bin).unwrap();
+        let replaced = fs::read_to_string(&plan0.config_path)
+            .unwrap()
+            .replace("\r\n", "\n");
+        assert!(replaced.contains("model = \"o3\""));
+        assert!(replaced.contains("[mcp_servers.other]"));
+        assert!(replaced.contains("command = \"/opt/homebrew/bin/hyp\""));
+        assert!(!replaced.contains("old-hyp"));
+        assert_eq!(
+            replaced
+                .lines()
+                .filter(|l| codex_toml_is_hyphae_table_header(l))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn manual_guide_deeplinks_rfc3986_and_opencode_desktop_detection() {
+        let prompt = "Set up Hyphae? yes & check /home/a b=1#top";
+        let encoded = percent_encode_uri_component(prompt);
+        assert_eq!(
+            encoded,
+            "Set%20up%20Hyphae%3F%20yes%20%26%20check%20%2Fhome%2Fa%20b%3D1%23top"
+        );
+
+        let cwd = Path::new("/Users/alice/my project?v=1&ok=2");
+
+        // 1. Claude Desktop
+        assert_eq!(
+            build_manual_guide_deeplink(ManualGuideHarness::ClaudeDesktop, prompt, Some(cwd), None, None),
+            Some(format!("claude://claude.ai/new?q={encoded}"))
+        );
+
+        // 2. Codex Desktop
+        assert_eq!(
+            build_manual_guide_deeplink(ManualGuideHarness::CodexDesktop, prompt, Some(cwd), None, None),
+            Some(format!("codex://threads/new?prompt={encoded}"))
+        );
+
+        // 3. OpenCode Desktop (with cwd, without cwd, with OPENCODE_SERVER_URL, and unsafe scheme rejected)
+        assert_eq!(
+            build_manual_guide_deeplink(
+                ManualGuideHarness::OpenCodeDesktop,
+                prompt,
+                Some(cwd),
+                Some("http://127.0.0.1:4096"),
+                None,
+            ),
+            Some("http://127.0.0.1:4096".to_string())
+        );
+        let expected_dir = percent_encode_uri_component(&cwd.to_string_lossy());
+        assert_eq!(
+            build_manual_guide_deeplink(
+                ManualGuideHarness::OpenCodeDesktop,
+                prompt,
+                Some(cwd),
+                Some("javascript:alert(1)"),
+                None,
+            ),
+            Some(format!(
+                "opencode://new-session?directory={expected_dir}&prompt={encoded}"
+            ))
+        );
+        assert_eq!(
+            build_manual_guide_deeplink(
+                ManualGuideHarness::OpenCodeDesktop,
+                prompt,
+                None,
+                None,
+                None,
+            ),
+            Some(format!("opencode://new-session?prompt={encoded}"))
+        );
+
+        // 4. T3 Code
+        assert_eq!(
+            build_manual_guide_deeplink(
+                ManualGuideHarness::T3,
+                prompt,
+                Some(cwd),
+                None,
+                Some("http://127.0.0.1:3773"),
+            ),
+            Some("http://127.0.0.1:3773".to_string())
+        );
+        assert_eq!(
+            build_manual_guide_deeplink(ManualGuideHarness::T3, prompt, Some(cwd), None, None),
+            Some("t3code://".to_string())
+        );
+
+        // 5. Cursor IDE
+        assert_eq!(
+            build_manual_guide_deeplink(ManualGuideHarness::CursorIde, prompt, Some(cwd), None, None),
+            Some("cursor://file/Users/alice/my%20project%3Fv%3D1%26ok%3D2".to_string())
+        );
+        assert_eq!(
+            build_manual_guide_deeplink(ManualGuideHarness::CursorIde, prompt, None, None, None),
+            Some("cursor://".to_string())
+        );
+
+        // 6. OpenClaw -> None (clipboard copy only)
+        assert_eq!(
+            build_manual_guide_deeplink(ManualGuideHarness::Openclaw, prompt, Some(cwd), None, None),
+            None
+        );
+
+        // OpenCodeDesktop detection (macOS Applications, Windows LOCALAPPDATA, OPENCODE_SERVER_URL)
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let apps = tmp.path().join("Applications");
+        let local_appdata = tmp.path().join("LocalAppData");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&apps).unwrap();
+        fs::create_dir_all(&local_appdata).unwrap();
+
+        assert!(!detect_desktop_apps_in(&home, Some(&apps), None).opencode_desktop);
+        assert!(
+            detect_desktop_apps_in_with_env(
+                &home,
+                Some(&apps),
+                None,
+                Some(&local_appdata),
+                Some("http://127.0.0.1:4096")
+            )
+            .opencode_desktop
+        );
+        fs::create_dir_all(apps.join("OpenCode.app")).unwrap();
+        assert!(detect_desktop_apps_in(&home, Some(&apps), None).opencode_desktop);
+
+        let menu = detect_candidates_in(&home, None, Some(OsStr::new("")), Some(&apps), None, None);
+        assert!(menu.iter().any(|m| {
+            m.label == "OpenCode Desktop"
+                && matches!(m.action, MainMenuAction::ManualGuide(ManualGuideHarness::OpenCodeDesktop))
+        }));
+
+        // Confirm & ManualGuide renderers fit cleanly inside 24 rows and display key guidance.
+        let plan = inspect_desktop_mcp_plan(ManualGuideHarness::ClaudeDesktop, &home, "/usr/local/bin/hyp")
+            .unwrap();
+        let confirm_lines = render_desktop_mcp_confirm(
+            ManualGuideHarness::ClaudeDesktop,
+            &home,
+            &plan,
+            &ManualGuideHarness::ClaudeDesktop.primary_skill_path(&home),
+            0,
+            None,
+            true,
+            24,
+            80,
+            ColorMode::Plain,
+        );
+        assert!(confirm_lines.len() <= 24);
+        let confirm_text = confirm_lines
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(confirm_text.contains("Existing servers & settings are preserved."));
+        assert!(confirm_text.contains("Apply MCP config & continue"));
+        assert!(confirm_text.contains("Skip config write"));
+
+        let guide_lines = render_manual_guide(
+            ManualGuideHarness::ClaudeDesktop,
+            &home,
+            &ManualGuideHarness::ClaudeDesktop.primary_skill_path(&home),
+            &[],
+            "Set up Hyphae on this machine using the hyphae-setup skill",
+            &DesktopMcpStatus::Applied(plan.config_path.clone()),
+            Some("claude://claude.ai/new?q=test"),
+            0,
+            None,
+            true,
+            24,
+            80,
+            ColorMode::Plain,
+        );
+        assert!(guide_lines.len() <= 24);
+        let guide_text = guide_lines
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(guide_text.contains("✓ Updated"));
+        assert!(guide_text.contains("Restart Claude Desktop"));
+        assert!(guide_text.contains("[o] Open in Claude Desktop"));
     }
 
     #[test]
