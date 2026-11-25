@@ -13,6 +13,8 @@
 
 mod common;
 
+#[cfg(unix)]
+use common::run_hyp_in_pty;
 use common::{ManagedProcess, hyp_bin as hyp_rs_bin, isolated_cmd, parse_json_stdout};
 use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full};
@@ -26,9 +28,10 @@ use hyp_proto::manifest::{
     AdvertisedResources, CapabilityToken, ManifestIdentity, ManifestPolicy, NodeManifestPayload,
     NodeProfile, OkpCurve, OkpJwk, ProtocolRange, SignedNodeManifest,
 };
+#[cfg(unix)]
+use hyp_store::{GateState, MailboxInsert, MailboxKind};
 use hyp_store::{
-    GateState, MailboxInsert, MailboxKind, ManifestCacheUpdate, NodeDb, PeerInput, PeerProfile,
-    PeerStatus, TrustTier, now_ms,
+    ManifestCacheUpdate, NodeDb, PeerInput, PeerProfile, PeerStatus, TrustTier, now_ms,
 };
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
@@ -545,6 +548,7 @@ fn secret_stdin_and_web_out_of_band_capture() {
 // 3. Gate init/lock -> doctor OK -> disk tamper -> doctor FAIL -> review/approve/reject/log
 // ============================================================================
 
+#[cfg(unix)]
 #[test]
 fn gate_init_lock_tamper_review_approve_reject_and_audit_log() {
     let tmp = tempfile::tempdir().unwrap();
@@ -585,9 +589,10 @@ fn gate_init_lock_tamper_review_approve_reject_and_audit_log() {
         .unwrap();
     assert_eq!(onb.status.code(), Some(0));
 
-    // `gate init --adapter anthropic --lock`
-    let init_out = isolated_cmd(&home)
-        .args([
+    // `gate init --adapter anthropic --lock` (confirmed via interactive POSIX PTY)
+    let init_out = run_hyp_in_pty(
+        &home,
+        &[
             "gate",
             "init",
             "--adapter",
@@ -602,11 +607,12 @@ fn gate_init_lock_tamper_review_approve_reject_and_audit_log() {
             state_dir.to_str().unwrap(),
             "--lock",
             "--json",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(init_out.status.code(), Some(0));
-    let init_json = parse_json_stdout(&init_out);
+        ],
+        None,
+        Some("y\n"),
+    );
+    assert_eq!(init_out.code, 0, "pty tty={}", init_out.tty);
+    let init_json = init_out.parse_json();
     assert_eq!(init_json["ok"], true);
     assert_eq!(init_json["data"]["locked"], true);
     assert_eq!(init_json["data"]["gatePolicySig"], "OK");
@@ -664,18 +670,14 @@ fn gate_init_lock_tamper_review_approve_reject_and_audit_log() {
             .contains("gate_policy_tampered")
     );
 
-    // Re-lock via `gate lock` -> doctor returns OK again
-    let lock_out = isolated_cmd(&home)
-        .args([
-            "gate",
-            "lock",
-            "--state-dir",
-            state_dir.to_str().unwrap(),
-            "--json",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(lock_out.status.code(), Some(0));
+    // Re-lock via `gate lock` (confirmed via interactive POSIX PTY) -> doctor returns OK again
+    let lock_out = run_hyp_in_pty(
+        &home,
+        &["gate", "lock", "--state-dir", state_dir.to_str().unwrap(), "--json"],
+        None,
+        Some("y\n"),
+    );
+    assert_eq!(lock_out.code, 0, "pty tty={}", lock_out.tty);
 
     // Seed 2 quarantined mailbox items in node.sqlite
     let db = NodeDb::open(state_dir.join("node.sqlite")).unwrap();
@@ -739,25 +741,28 @@ fn gate_init_lock_tamper_review_approve_reject_and_audit_log() {
     let rev_json = parse_json_stdout(&rev_out);
     assert_eq!(rev_json["data"]["count"], 2);
 
-    // `inbox approve <r1>` releases to session pending inbox
-    let app_out = isolated_cmd(&home)
-        .args([
+    // `inbox approve <r1>` releases to session pending inbox (confirmed via interactive POSIX PTY)
+    let app_out = run_hyp_in_pty(
+        &home,
+        &[
             "inbox",
             "approve",
             &r1,
             "--state-dir",
             state_dir.to_str().unwrap(),
             "--json",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(app_out.status.code(), Some(0));
-    let app_json = parse_json_stdout(&app_out);
+        ],
+        None,
+        Some("y\n"),
+    );
+    assert_eq!(app_out.code, 0, "pty tty={}", app_out.tty);
+    let app_json = app_out.parse_json();
     assert_eq!(app_json["data"]["gateState"], "pending");
 
-    // `inbox reject <r2> --mute` drops item AND installs global mute rule
-    let rej_out = isolated_cmd(&home)
-        .args([
+    // `inbox reject <r2> --mute` drops item AND installs global mute rule (confirmed via interactive POSIX PTY)
+    let rej_out = run_hyp_in_pty(
+        &home,
+        &[
             "inbox",
             "reject",
             &r2,
@@ -765,11 +770,12 @@ fn gate_init_lock_tamper_review_approve_reject_and_audit_log() {
             "--state-dir",
             state_dir.to_str().unwrap(),
             "--json",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(rej_out.status.code(), Some(0));
-    let rej_json = parse_json_stdout(&rej_out);
+        ],
+        None,
+        Some("y\n"),
+    );
+    assert_eq!(rej_out.code, 0, "pty tty={}", rej_out.tty);
+    let rej_json = rej_out.parse_json();
     assert_eq!(rej_json["data"]["gateState"], "rejected");
     assert_eq!(rej_json["data"]["muted"], true);
     assert_eq!(rej_json["data"]["mutedPattern"], "evil@peer/spammer");
