@@ -71,6 +71,7 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: workers/drop-relay
+          wranglerVersion: "4"
           command: deploy --env production
 
       - name: Smoke-test GET https://spore.hyphae.to/v1/health

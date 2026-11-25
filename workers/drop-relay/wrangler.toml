@@ -26,10 +26,9 @@ class_name = "DropSlotDO"
 
 [[migrations]]
 tag = "v1"
-# Standard Durable Object migration (no SQLite storage provisioned; works on Workers Paid).
-# If deploying on the Workers Free tier, replace `new_classes` with `new_sqlite_classes`
-# (DropSlotDO still never reads or writes any persistent storage).
-new_classes = ["DropSlotDO"]
+# Works on BOTH Cloudflare Workers Free and Paid plans (DropSlotDO still NEVER reads
+# or writes ctx.storage — every ciphertext lives strictly in volatile isolate RAM).
+new_sqlite_classes = ["DropSlotDO"]
 
 [vars]
 # Auth mode for POST /v1/drops slot creation:
