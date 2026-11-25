@@ -58,7 +58,7 @@ impl InboxStateFilter {
             "muted" | "mute" => Ok(Self::Muted),
             "delivered" | "read" => Ok(Self::Delivered),
             "all" => Ok(Self::All),
-            "quarantined" | "quarantine" | "rejected" => {
+            "quarantined" | "quarantine" | "rejected" | "blocked" | "block" => {
                 Err(DeliveryError::ForbiddenState(raw.trim().to_string()))
             }
             other => Err(DeliveryError::InvalidState(other.to_string())),
@@ -171,6 +171,12 @@ pub struct InboxItemView {
     pub text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub human_verified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_human_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_human_kid: Option<String>,
 }
 
 /// Paginated response returned by [`query_inbox`].
@@ -304,10 +310,8 @@ pub fn muted_count(db: &NodeDb, session_id: &str) -> Result<usize, DeliveryError
     let receipts = load_receipt_index(db, META_MUTED_INDEX_PREFIX, session_id)?;
     let mut count = 0usize;
     for r in receipts {
-        if let Some(entry) = db.local().get_mailbox_entry(&r)? {
-            if entry.session_id == session_id
-                && !matches!(entry.gate_state, GateState::Quarantined | GateState::Rejected)
-            {
+        if let Ok(Some(entry)) = db.local().get_mailbox_entry(&r) {
+            if entry.session_id == session_id && entry.gate_state == GateState::Delivered {
                 count += 1;
             }
         }
@@ -387,28 +391,32 @@ pub fn query_inbox(
     let mut seen_receipts: HashSet<String> = HashSet::new();
 
     if !query.ids.is_empty() {
-        // Explicit receipt lookup (strictly scoped to `session_id` and NEVER exposing quarantined/rejected!).
+        // Explicit receipt lookup (strictly scoped to `session_id` and NEVER exposing
+        // quarantined, blocked, or rejected rows even when `state == "all"`!).
         for id in &query.ids {
-            if let Some(entry) = db.local().get_mailbox_entry(id)? {
-                if entry.session_id != session_id {
-                    continue;
-                }
-                if matches!(entry.gate_state, GateState::Quarantined | GateState::Rejected) {
-                    continue;
-                }
-                let item_state = classify_entry_state(&entry, &muted_set);
-                if state_matches_filter(item_state, query.state)
-                    && seen_receipts.insert(entry.receipt.clone())
-                {
-                    candidates.push((item_state, entry));
-                }
+            let entry = match db.local().get_mailbox_entry(id) {
+                Ok(Some(e)) => e,
+                Ok(None) => continue,
+                Err(hyp_store::StoreError::InvalidInput(_)) => continue,
+                Err(e) => return Err(e.into()),
+            };
+            if entry.session_id != session_id || !is_agent_visible_gate_state(entry.gate_state) {
+                continue;
+            }
+            let Some(item_state) = classify_entry_state(&entry, &muted_set) else {
+                continue;
+            };
+            if state_matches_filter(item_state, query.state)
+                && seen_receipts.insert(entry.receipt.clone())
+            {
+                candidates.push((item_state, entry));
             }
         }
     } else {
         if matches!(query.state, InboxStateFilter::Unread | InboxStateFilter::All) {
             let pending = db.local().peek_inbox(session_id, 10_000)?;
             for entry in pending {
-                if matches!(entry.gate_state, GateState::Quarantined | GateState::Rejected) {
+                if entry.gate_state != GateState::Pending {
                     continue;
                 }
                 if seen_receipts.insert(entry.receipt.clone()) {
@@ -418,15 +426,17 @@ pub fn query_inbox(
         }
         if matches!(query.state, InboxStateFilter::Muted | InboxStateFilter::All) {
             for r in &muted_receipts {
-                if let Some(entry) = db.local().get_mailbox_entry(r)? {
-                    if entry.session_id != session_id
-                        || matches!(entry.gate_state, GateState::Quarantined | GateState::Rejected)
-                    {
-                        continue;
-                    }
-                    if seen_receipts.insert(entry.receipt.clone()) {
-                        candidates.push((InboxItemState::Muted, entry));
-                    }
+                let entry = match db.local().get_mailbox_entry(r) {
+                    Ok(Some(e)) => e,
+                    Ok(None) => continue,
+                    Err(hyp_store::StoreError::InvalidInput(_)) => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                if entry.session_id != session_id || entry.gate_state != GateState::Delivered {
+                    continue;
+                }
+                if seen_receipts.insert(entry.receipt.clone()) {
+                    candidates.push((InboxItemState::Muted, entry));
                 }
             }
         }
@@ -435,16 +445,20 @@ pub fn query_inbox(
                 if muted_set.contains(r) {
                     continue;
                 }
-                if let Some(entry) = db.local().get_mailbox_entry(r)? {
-                    if entry.session_id != session_id
-                        || entry.gate_state != GateState::Delivered
-                        || entry.gate_reason.as_deref() == Some("muted")
-                    {
-                        continue;
-                    }
-                    if seen_receipts.insert(entry.receipt.clone()) {
-                        candidates.push((InboxItemState::Delivered, entry));
-                    }
+                let entry = match db.local().get_mailbox_entry(r) {
+                    Ok(Some(e)) => e,
+                    Ok(None) => continue,
+                    Err(hyp_store::StoreError::InvalidInput(_)) => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                if entry.session_id != session_id
+                    || entry.gate_state != GateState::Delivered
+                    || entry.gate_reason.as_deref() == Some("muted")
+                {
+                    continue;
+                }
+                if seen_receipts.insert(entry.receipt.clone()) {
+                    candidates.push((InboxItemState::Delivered, entry));
                 }
             }
         }
@@ -510,6 +524,8 @@ pub fn query_inbox(
     let items: Vec<InboxItemView> = page
         .into_iter()
         .map(|(st, entry, parsed)| {
+            let (human_verified, verified_human_id, verified_human_kid) =
+                read_human_verified_meta(db, &entry.receipt);
             let (text, preview) = if query.summary_only {
                 (None, Some(make_preview(&entry.text)))
             } else {
@@ -527,6 +543,9 @@ pub fn query_inbox(
                 received_at: entry.received_at,
                 text,
                 preview,
+                human_verified,
+                verified_human_id,
+                verified_human_kid,
             }
         })
         .collect();
@@ -546,13 +565,55 @@ pub fn query_inbox(
     })
 }
 
-fn classify_entry_state(entry: &MailboxEntry, muted_set: &HashSet<String>) -> InboxItemState {
-    if entry.gate_state == GateState::Pending {
-        InboxItemState::Unread
-    } else if muted_set.contains(&entry.receipt) || entry.gate_reason.as_deref() == Some("muted") {
-        InboxItemState::Muted
-    } else {
-        InboxItemState::Delivered
+/// Strict allowlist of mailbox gate states visible to agent MCP queries (`G12`).
+const fn is_agent_visible_gate_state(state: GateState) -> bool {
+    matches!(state, GateState::Pending | GateState::Delivered)
+}
+
+fn read_human_verified_meta(
+    db: &NodeDb,
+    receipt: &str,
+) -> (bool, Option<String>, Option<String>) {
+    let raw = match db.human().get_mailbox_human_auth(receipt) {
+        Ok(Some(raw)) => raw,
+        _ => return (false, None, None),
+    };
+    let Ok(val) = serde_json::from_str::<Value>(&raw) else {
+        return (false, None, None);
+    };
+    let Some(obj) = val.as_object() else {
+        return (false, None, None);
+    };
+    let human_id = obj
+        .get("humanId")
+        .or_else(|| obj.get("human_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    let human_kid = obj
+        .get("kid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    (true, human_id, human_kid)
+}
+
+fn classify_entry_state(
+    entry: &MailboxEntry,
+    muted_set: &HashSet<String>,
+) -> Option<InboxItemState> {
+    match entry.gate_state {
+        GateState::Pending => Some(InboxItemState::Unread),
+        GateState::Delivered => {
+            if muted_set.contains(&entry.receipt) || entry.gate_reason.as_deref() == Some("muted") {
+                Some(InboxItemState::Muted)
+            } else {
+                Some(InboxItemState::Delivered)
+            }
+        }
+        GateState::Quarantined | GateState::Rejected => None,
     }
 }
 

@@ -63,16 +63,27 @@ pub struct OutboundEvaluation {
     pub categories: Vec<String>,
 }
 
+/// Cached `gate_policy_sig` verification state keyed by `(config_hash, human_authorities_digest)`.
+/// Avoids shelling out to OS Keychain / re-reading `SecretStore` on every inbound message while
+/// immediately re-verifying fail-closed whenever `human_authorities_digest` changes in SQLite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PolicySigCacheEntry {
+    config_hash: String,
+    human_authorities_digest: String,
+}
+
 /// Unified Local Security Gate pipeline backed by [`Stage1Engine`], [`Stage2Guard`],
 /// composable [`FilterPlugin`] chain, [`NodeDb`], and an optional [`SecretStore`].
 #[derive(Clone)]
 pub struct SecurityGatePipeline {
     config: SecurityGateConfig,
+    config_hash: String,
     stage1: Arc<Stage1Engine>,
     stage2: Stage2Guard,
     filters: Vec<Arc<dyn FilterPlugin>>,
     db: Arc<Mutex<NodeDb>>,
     secrets: Option<Arc<SecretStore>>,
+    policy_sig_cache: Arc<Mutex<Option<PolicySigCacheEntry>>>,
 }
 
 impl std::fmt::Debug for SecurityGatePipeline {
@@ -106,13 +117,19 @@ impl SecurityGatePipeline {
                 fcfg.validate()?;
             }
         }
+        let config_bytes = serde_json::to_vec(&config).map_err(|e| {
+            GateError::InvalidConfig(format!("failed to hash security gate config: {e}"))
+        })?;
+        let config_hash = sha256_hex(&config_bytes);
         Ok(Self {
             config,
+            config_hash,
             stage1,
             stage2,
             filters,
             db,
             secrets,
+            policy_sig_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -137,6 +154,11 @@ impl SecurityGatePipeline {
 
     /// Verifies tamper-evident policy signature & `human_authorities_digest` fail-closed
     /// whenever `require_signed_policy` is `true` OR `policy_signature` is present.
+    ///
+    /// Caches successful `gate_policy_sig` verification in memory keyed by
+    /// `(config_hash, live human_authorities_digest)` so repeated inbound evaluations do not
+    /// re-invoke `SecretStore` / OS Keychain subprocesses while still failing closed immediately
+    /// whenever `human_authorities` in `node.sqlite` changes.
     pub fn verify_policy_integrity(&self) -> Result<(), GateError> {
         if !self.config.require_signed_policy && self.config.policy_signature.is_none() {
             return Ok(());
@@ -146,23 +168,51 @@ impl SecurityGatePipeline {
                 "require_signed_policy is true but policy_signature is missing".to_string(),
             )
         })?;
-        let store = self.secrets.as_deref().ok_or_else(|| {
-            GateError::PolicySignature("policy signing SecretStore unavailable".to_string())
-        })?;
-        verify_gate_policy_sig(&self.config, sig, store)?;
+
+        let live_digest = {
+            let db = self
+                .db
+                .lock()
+                .map_err(|_| GateError::LockPoisoned("node_db mutex poisoned".to_string()))?;
+            db.human().authorities_digest()?
+        };
+
         if let Some(ref expected_digest) = self.config.human_authorities_digest {
-            let actual = {
-                let db = self
-                    .db
-                    .lock()
-                    .map_err(|_| GateError::LockPoisoned("node_db mutex poisoned".to_string()))?;
-                db.human().authorities_digest()?
-            };
-            if actual != *expected_digest {
+            if live_digest != *expected_digest {
+                if let Ok(mut cache) = self.policy_sig_cache.lock() {
+                    *cache = None;
+                }
                 return Err(GateError::PolicySignature(
                     "human_authorities_digest mismatch with node.sqlite".to_string(),
                 ));
             }
+        }
+
+        if let Ok(cache) = self.policy_sig_cache.lock() {
+            if let Some(ref cached) = *cache {
+                if cached.config_hash == self.config_hash
+                    && cached.human_authorities_digest == live_digest
+                {
+                    return Ok(());
+                }
+            }
+        }
+
+        let store = self.secrets.as_deref().ok_or_else(|| {
+            GateError::PolicySignature("policy signing SecretStore unavailable".to_string())
+        })?;
+        if let Err(err) = verify_gate_policy_sig(&self.config, sig, store) {
+            if let Ok(mut cache) = self.policy_sig_cache.lock() {
+                *cache = None;
+            }
+            return Err(err);
+        }
+
+        if let Ok(mut cache) = self.policy_sig_cache.lock() {
+            *cache = Some(PolicySigCacheEntry {
+                config_hash: self.config_hash.clone(),
+                human_authorities_digest: live_digest,
+            });
         }
         Ok(())
     }
