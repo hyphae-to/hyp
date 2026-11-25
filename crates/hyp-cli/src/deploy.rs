@@ -3187,9 +3187,16 @@ mod tests {
                 loaded.public_url.as_deref(),
                 Some(format!("https://{domain}").as_str())
             );
-            assert_eq!(
-                loaded.state_dir.as_deref(),
-                Some(Path::new("/var/lib/hyphae"))
+            let raw_json: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&node_path).unwrap()).unwrap();
+            assert_eq!(raw_json["stateDir"], "/var/lib/hyphae");
+            assert!(
+                loaded
+                    .state_dir
+                    .as_deref()
+                    .is_some_and(|p| p.ends_with("var/lib/hyphae")),
+                "expected state_dir ending with var/lib/hyphae, got {:?}",
+                loaded.state_dir
             );
 
             #[cfg(unix)]
