@@ -28,6 +28,7 @@ use hyp_proto::cloudevent::CloudEvent;
 use hyp_proto::filter::{DiagnosticCode, DiagnosticSeverity, Filter, matches_filters};
 use hyp_proto::rpc::EventKeyRef;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
@@ -1676,7 +1677,7 @@ async fn prometheus_and_generic_webhook_normalization_and_hmac_mutations() {
     );
     generic.ingest_webhook(&h_good, &ce_body).await.unwrap();
 
-    // 2. Plain JSON wrapping
+    // 2. Plain JSON wrapping (B8: ignores unsigned X-Delivery-Id, derives deterministic SHA-256)
     let raw_body = serde_json::to_vec(&json!({ "pipeline": "nightly", "status": "passed" })).unwrap();
     let raw_sig = compute_hmac_sha256_header(b"ci-secret", &raw_body);
     let mut h_wrap = HeaderMap::new();
@@ -1687,14 +1688,25 @@ async fn prometheus_and_generic_webhook_normalization_and_hmac_mutations() {
     h_wrap.insert("x-delivery-id", HeaderValue::from_static("wrap-42"));
     generic.ingest_webhook(&h_wrap, &raw_body).await.unwrap();
 
+    let expected_ce_id = format!("wh-{}", hex::encode(Sha256::digest(&ce_body)));
+    let expected_wrap_id = format!("wh-{}", hex::encode(Sha256::digest(&raw_body)));
+
     let all = host.events().await;
     assert_eq!(all.len(), 4);
-    assert_eq!(all[2].1.id, "ce-pass-1");
+    assert_eq!(all[2].1.id, expected_ce_id);
     assert_eq!(all[2].1.event_type, "com.ci.deploy.finished");
     assert_eq!(all[2].1.source, "ci/custom");
-    assert_eq!(all[3].1.id, "wrap-42");
+    assert_eq!(
+        all[2].1.extensions.get("hyphaesourcekind").and_then(Value::as_str),
+        Some("external-webhook")
+    );
+    assert_eq!(all[3].1.id, expected_wrap_id);
     assert_eq!(all[3].1.event_type, "com.ci.build");
     assert_eq!(all[3].1.source, "ci/buildkite");
+    assert_eq!(
+        all[3].1.extensions.get("hyphaesourcekind").and_then(Value::as_str),
+        Some("external-webhook")
+    );
     assert_eq!(all[3].1.data.as_ref().unwrap()["pipeline"], "nightly");
 
     prom.stop().await.unwrap();

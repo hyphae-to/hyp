@@ -435,13 +435,20 @@ impl<'a> HumanAuthorityStore<'a> {
         Ok(effective_min)
     }
 
-    /// Computes a canonical SHA-256 hex digest over sorted
-    /// `(human_id, kid, role, jwk_json, enc_jwk_json, auth_epoch, status)` plus `min_auth_epoch`
-    /// for binding into `gate_policy_sig`.
+    /// Computes a canonical SHA-256 hex digest over sorted enrolled authority identity tuples
+    /// `(human_id, kid, role, jwk_json, enc_jwk_json, auth_epoch)` for binding into
+    /// `gate_policy_sig`.
+    ///
+    /// **N3 invariant:** Intentionally excludes strictly-monotonic revocation state (`status`,
+    /// `revoked_at`, `revocation_json`) and `metadata['human.min_auth_epoch']`. Because revoked
+    /// keys can NEVER be resurrected (`upsert_authority` fails closed on `status = 'revoked'`),
+    /// digesting the enrolled identity tuples detects every unauthorized key injection, deletion,
+    /// role escalation, JWK swap, or row `auth_epoch` tamper while allowing cryptographically
+    /// verified mesh revocations (`to.hyphae.human.revocation.v1`) to take effect without
+    /// bricking a locked Security Gate.
     pub fn authorities_digest(&self) -> StoreResult<String> {
-        let min_epoch = read_min_auth_epoch(self.db.conn())?;
         let mut stmt = self.db.conn().prepare(
-            "SELECT human_id, kid, role, jwk_json, enc_jwk_json, auth_epoch, status
+            "SELECT human_id, kid, role, jwk_json, enc_jwk_json, auth_epoch
              FROM human_authorities
              ORDER BY human_id ASC, kid ASC",
         )?;
@@ -453,7 +460,6 @@ impl<'a> HumanAuthorityStore<'a> {
                 let jwk_json: String = row.get(3)?;
                 let enc_jwk_json: Option<String> = row.get(4)?;
                 let auth_epoch: i64 = row.get(5)?;
-                let status: String = row.get(6)?;
                 Ok(json!({
                     "humanId": human_id,
                     "kid": kid,
@@ -461,13 +467,11 @@ impl<'a> HumanAuthorityStore<'a> {
                     "jwkJson": jwk_json,
                     "encJwkJson": enc_jwk_json,
                     "authEpoch": auth_epoch,
-                    "status": status,
                 }))
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
         let payload = json!({
-            "minAuthEpoch": min_epoch,
             "authorities": entries,
         });
         let canon = canonical_json(&payload);

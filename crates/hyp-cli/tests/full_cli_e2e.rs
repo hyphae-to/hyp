@@ -1593,8 +1593,9 @@ fn self_update_signed_manifest_atomic_swap_rollback_tamper_and_fleet_all() {
     assert_eq!(broken_json["data"]["originalPreserved"], true);
     assert_eq!(fs::read(&target_bin).unwrap(), sentinel_original);
 
-    // (a) Happy-path `--all` updates eligible remote peer FIRST, skips public.hyphae.to,
-    // verifies Ed25519 + SHA-256 + smoke check, and atomically swaps `--target-bin`!
+    // (a) Happy-path `--all` accepts `--all` cleanly while skipping all remote peers with zero
+    // remote `/v1/node/update` POSTs (cut from v0.7.0), verifies Ed25519 + SHA-256 + smoke check,
+    // and atomically swaps `--target-bin`!
     let ok_out = isolated_cmd(&home)
         .args([
             "update",
@@ -1626,16 +1627,28 @@ fn self_update_signed_manifest_atomic_swap_rollback_tamper_and_fleet_all() {
     assert_eq!(ok_json["data"]["smokeCheckPassed"], true);
     assert_eq!(ok_json["data"]["pluginsSync"]["skipped"], false);
     assert_eq!(ok_json["data"]["pluginsSync"]["ok"], true);
+    assert_eq!(ok_json["data"]["rolloutOrder"], json!(["local"]));
+    let fleet_plan = ok_json["data"]["fleetPlan"]
+        .as_array()
+        .expect("fleetPlan array");
+    assert_eq!(fleet_plan.len(), 2);
+    for entry in fleet_plan {
+        assert_eq!(entry["eligibility"], "SKIPPED");
+        assert_eq!(entry["outcome"], "SKIPPED");
+        assert!(
+            entry["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("planned for a future release")),
+            "unexpected fleet skip reason: {entry}"
+        );
+    }
     assert_eq!(
-        ok_json["data"]["rolloutOrder"],
-        json!(["devbox-eu", "local"])
+        eligible_hits.load(Ordering::SeqCst),
+        0,
+        "remote /v1/node/update is cut from v0.7.0 and must receive zero POSTs"
     );
-    assert_eq!(eligible_hits.load(Ordering::SeqCst), 1);
     assert_eq!(public_hits.load(Ordering::SeqCst), 0);
-    assert!(
-        remote_updated_before_local.load(Ordering::SeqCst),
-        "remote eligible peer must be updated BEFORE local binary swap!"
-    );
+    assert!(!remote_updated_before_local.load(Ordering::SeqCst));
 
     // Verify swapped binary actually runs `version --json` cleanly!
     let swapped_ver = Command::new(&target_bin)

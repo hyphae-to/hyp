@@ -1206,7 +1206,8 @@ fn live_tampered_gate_policy_daemon_lockdown_and_human_approve_wakeup() {
     assert_eq!(rev_json["data"]["count"], 1, "review JSON: {rev_json}");
     let q_item = &rev_json["data"]["items"][0];
     assert_eq!(q_item["reason"], "gate_policy_tampered");
-    assert_eq!(q_item["originNode"], "ext-hub");
+    // Verified sender node (`ext@peer`) is preserved instead of attributing the relaying hub (`ext-hub`).
+    assert_eq!(q_item["originNode"], "ext@peer");
     assert_eq!(q_item["sessionId"], "claude:sec-s1");
     assert!(
         q_item.get("text").is_none(),

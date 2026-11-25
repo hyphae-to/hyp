@@ -755,7 +755,8 @@ async fn p1_2_put_keys_rejects_self_signed_guest_unpinned_and_allows_authorized_
         alice_v3.signing.kid()
     );
 
-    // (g) LEGITIMATE ROTATION #3: Admin-CA recovery rotation signed by `admin_ca`!
+    // (g) N1 + LEGITIMATE ROTATION #3: Stale pre-rotation bearer token is now invalidated (401),
+    //     while Admin-CA recovery rotation signed by `admin_ca` authenticated under active `K_v3` succeeds!
     let alice_v4 = NodeIdentityKeys::generate().unwrap();
     let rot_v4_payload = KeyRegPayloadV2 {
         v: 2,
@@ -768,13 +769,32 @@ async fn p1_2_put_keys_rejects_self_signed_guest_unpinned_and_allows_authorized_
         encryption_jwk: alice_v4.encryption_jwk(),
         proof: admin_ca.sign_jcs("key-reg", &rot_v4_payload).unwrap(),
     };
-    let req_v4 = Request::builder()
+    let admin_rot_bytes = serde_json::to_vec(&admin_rot).unwrap();
+    let req_v4_stale_bearer = Request::builder()
         .method(Method::PUT)
         .uri(format!("{hub_url}/v1/keys"))
         .header(CONTENT_TYPE, "application/json")
         .header(AUTHORIZATION, format!("Bearer {}", alice_bearer.as_str()))
-        .body(full_body(serde_json::to_vec(&admin_rot).unwrap()))
+        .body(full_body(admin_rot_bytes.clone()))
         .unwrap();
+    assert_eq!(
+        client
+            .request(req_v4_stale_bearer)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED,
+        "N1: pre-rotation bearer token must be rejected with 401 after key rotation"
+    );
+
+    let alice_auth_v3 = Ed25519AuthBuilder::new("alice@macbook", &alice_v3.signing);
+    let req_v4 = alice_auth_v3.sign_request(
+        Method::PUT,
+        &hub_url,
+        "/v1/keys",
+        Some(Bytes::from(admin_rot_bytes)),
+        Some("application/json"),
+    );
     assert_eq!(client.request(req_v4).await.unwrap().status(), StatusCode::OK);
     assert_eq!(
         hub.lookup_peer_signing_key("alice@macbook")

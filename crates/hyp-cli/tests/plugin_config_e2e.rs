@@ -579,7 +579,9 @@ mod unix_plugin_config_e2e {
             let sub_resp = client.request(sub_req).await.unwrap();
             assert_eq!(sub_resp.status(), StatusCode::OK);
 
-            // 3. Deliver a private message to the local webhook bridge plugin!
+            // 3a. BR1: Before any local session is linked to `webhook:personal`, delivering an
+            //     inbound bridge message MUST fail closed with 503 Unavailable (NEVER 202 Stored)
+            //     so bridge plugins do NOT advance offsets and silently drop the user's message!
             let priv_body = json!({
                 "from": "alice",
                 "text": "TOP_SECRET_LOCAL_BRIDGE_DM_B9"
@@ -595,7 +597,7 @@ mod unix_plugin_config_e2e {
             };
             let wh_url = format!("http://127.0.0.1:{webhook_port}/webhook");
             let deadline = Instant::now() + Duration::from_secs(15);
-            let wh_resp = loop {
+            let unlinked_resp = loop {
                 let req = Request::builder()
                     .method(Method::POST)
                     .uri(&wh_url)
@@ -611,13 +613,54 @@ mod unix_plugin_config_e2e {
                     Err(e) => panic!("webhook plugin unreachable: {e}"),
                 }
             };
+            assert_eq!(
+                unlinked_resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "BR1: unlinked local bridge target must return 503 Unavailable instead of 202 Stored"
+            );
+
+            // 3b. Link a local session to `webhook:personal`, then replay the EXACT SAME payload:
+            //     must succeed with 202 Accepted (proving failed unlinked delivery did NOT poison
+            //     local dedup) and deliver to the linked local session!
+            {
+                let db = hyp_store::NodeDb::open(state_dir.join("node.sqlite")).unwrap();
+                let now = hyp_store::now_ms();
+                db.local()
+                    .register_session("sess-local-b9", "{}", now)
+                    .unwrap();
+                db.local()
+                    .add_bridge_link(&hyp_store::BridgeLink {
+                        plugin: "webhook".to_string(),
+                        target: "personal".to_string(),
+                        session_id: "sess-local-b9".to_string(),
+                        linked_at: now,
+                        linked_by: "test".to_string(),
+                    })
+                    .unwrap();
+            }
+            let linked_req = Request::builder()
+                .method(Method::POST)
+                .uri(&wh_url)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-webhook-signature-256", &sig)
+                .body(Full::new(Bytes::from(priv_body)))
+                .unwrap();
+            let wh_resp = client.request(linked_req).await.unwrap();
             assert_eq!(wh_resp.status(), StatusCode::ACCEPTED);
         });
 
-        // 4. Verify EventStore has ZERO batches queued for `observer@remote` on topic `"webhook"`!
+        // 4. Verify local linked session received the private bridge DM AND EventStore has ZERO
+        //    batches queued for `observer@remote` on topic `"webhook"`!
         thread::sleep(Duration::from_millis(200));
         {
             let db = hyp_store::NodeDb::open(state_dir.join("node.sqlite")).unwrap();
+            let local_items = db.local().peek_inbox("sess-local-b9", 10).unwrap();
+            assert!(
+                local_items
+                    .iter()
+                    .any(|m| m.text.contains("TOP_SECRET_LOCAL_BRIDGE_DM_B9")),
+                "linked local session should receive private bridge message: {local_items:?}"
+            );
             let now = hyp_store::now_ms();
             let _ = db.events().tick(now);
             let batches = db.events().claim_due_batches("observer@remote", now).unwrap();

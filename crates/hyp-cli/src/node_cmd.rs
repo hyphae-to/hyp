@@ -24,17 +24,15 @@ use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync};
 use hyp_node::adapters::github_public::normalize_repo_token_pattern;
 use hyp_node::adapters::supervisor::is_secret_like_env_key;
 use hyp_node::adapters::{
-    AdapterKind, BoxFuture as AdapterBoxFuture, GenericWebhookAdapter, GenericWebhookConfig,
-    GitHubPublicAdapter, GitHubPublicConfig, GitHubWebhookAdapter, GitHubWebhookConfig, HelloMode,
+    AdapterKind, GenericWebhookAdapter, GenericWebhookConfig, GitHubPublicAdapter,
+    GitHubPublicConfig, GitHubWebhookAdapter, GitHubWebhookConfig, HelloMode,
     PrometheusWebhookAdapter, PrometheusWebhookConfig, SubprocessConfig,
 };
-use hyp_node::engine::config::ForwardingPolicy;
-use hyp_node::engine::node::RemoteUpdateHandler;
-use hyp_node::engine::peer_link::NodeUpdateRequest;
+use hyp_node::engine::config::{ForwardingPolicy, validate_trusted_proxy_cidr};
 use hyp_node::engine::{
     DropRelayConfig, E2eePolicy, EscalationConfig, GuestPairingConfig, LocalIngestConfig,
-    LocalIngestServer, NodeConfig, NodeError, NodeProfile, PeerReconcileReport, TopicConfig,
-    UnifiedNode, normalize_drop_portal_url,
+    LocalIngestServer, NodeConfig, NodeProfile, PeerReconcileReport, TopicConfig, UnifiedNode,
+    normalize_drop_portal_url,
 };
 use hyp_node::gates::{SecurityGateConfig, SecurityGatePipeline};
 use hyp_proto::address::{
@@ -593,7 +591,13 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             }
 
             match parse_webhook_sources(sources_val, &secrets) {
-                Ok(parsed) => {
+                Ok(mut parsed) => {
+                    filter_colliding_webhook_sources(
+                        &mut parsed,
+                        node_cfg.guest_pairing.enabled,
+                        github_public_cfg.as_ref().map(|g| g.topic.as_str()),
+                        &mut startup_warnings,
+                    );
                     for gh in &parsed.github {
                         if !node_cfg.topics.iter().any(|t| t.topic == gh.topic) {
                             node_cfg.topics.push(TopicConfig {
@@ -810,14 +814,6 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             node.attach_generic_webhook(adapter)
                 .await
                 .map_err(|e| format!("Failed to attach webhook-stream adapter: {e}"))?;
-        }
-
-        // Wire opt-in authenticated remote self-update (`POST /v1/node/update`, `node.self-update.v1`).
-        if node.config().allow_remote_update {
-            node.set_remote_update_handler(Some(Arc::new(DetachedSelfUpdateHandler {
-                state_dir: state_dir.clone(),
-                config_path: has_explicit_config.then(|| config_path.clone()),
-            })));
         }
 
         let guest_pairing_enabled = node.config().guest_pairing.enabled;
@@ -1499,88 +1495,135 @@ struct ParsedWebhookSources {
     generic: Vec<GenericWebhookConfig>,
 }
 
-struct DetachedSelfUpdateHandler {
-    state_dir: PathBuf,
-    config_path: Option<PathBuf>,
+/// Guest topic collision guard: refuses (with a clear startup warning + skip) wiring any webhook
+/// adapter onto topic `"github"` when `guestPairing.enabled == true` or onto any topic already
+/// owned by a `github-public` source.
+fn filter_colliding_webhook_sources(
+    parsed: &mut ParsedWebhookSources,
+    guest_pairing_enabled: bool,
+    github_public_topic: Option<&str>,
+    warnings: &mut Vec<String>,
+) {
+    let collision_reason = |topic: &str| -> Option<&'static str> {
+        if topic == "github" && guest_pairing_enabled {
+            return Some("guestPairing is enabled on topic 'github'");
+        }
+        if let Some(gh_pub_topic) = github_public_topic {
+            if topic == gh_pub_topic {
+                return Some("a github-public source already owns this topic");
+            }
+        }
+        None
+    };
+
+    parsed.github.retain(|cfg| {
+        if let Some(reason) = collision_reason(&cfg.topic) {
+            warnings.push(format!(
+                "Skipping github-webhook source '{}' on topic '{}': {reason}; configure a distinct private topic.",
+                cfg.id, cfg.topic
+            ));
+            false
+        } else {
+            true
+        }
+    });
+    parsed.prometheus.retain(|cfg| {
+        if let Some(reason) = collision_reason(&cfg.topic) {
+            warnings.push(format!(
+                "Skipping prometheus-webhook source '{}' on topic '{}': {reason}; configure a distinct private topic.",
+                cfg.id, cfg.topic
+            ));
+            false
+        } else {
+            true
+        }
+    });
+    parsed.generic.retain(|cfg| {
+        if let Some(reason) = collision_reason(&cfg.topic) {
+            warnings.push(format!(
+                "Skipping webhook-stream source '{}' on topic '{}': {reason}; configure a distinct private topic.",
+                cfg.id, cfg.topic
+            ));
+            false
+        } else {
+            true
+        }
+    });
 }
 
-impl RemoteUpdateHandler for DetachedSelfUpdateHandler {
-    fn trigger_update<'a>(
-        &'a self,
-        req: NodeUpdateRequest,
-    ) -> AdapterBoxFuture<'a, Result<(), NodeError>> {
-        Box::pin(async move {
-            let exe = std::env::current_exe().map_err(|e| {
-                NodeError::Http(format!("failed to resolve current hyp executable: {e}"))
-            })?;
-            let state_dir = self.state_dir.clone();
-            let config_path = self.config_path.clone();
-            tokio::spawn(async move {
-                // Allow the HTTP 202 Accepted response to flush cleanly before starting swap/restart.
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                let mut cmd = std::process::Command::new(&exe);
-                cmd.arg("update")
-                    .arg("--yes")
-                    .arg("--json")
-                    .arg("--state-dir")
-                    .arg(&state_dir);
-                if let Some(ref cfg_path) = config_path {
-                    cmd.arg("--config").arg(cfg_path);
-                }
-                if let Some(ref ch) = req.channel {
-                    cmd.arg("--channel").arg(ch);
-                }
-                if let Some(ref ver) = req.target_version {
-                    cmd.arg("--version").arg(ver);
-                }
-                if let Some(ref manifest_url) = req.manifest_url {
-                    cmd.arg("--manifest-url").arg(manifest_url);
-                }
-                cmd.stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null());
-                if let Err(err) = cmd.spawn() {
-                    eprintln!("hyphae: failed to spawn remote self-update worker: {err}");
-                }
-            });
-            Ok(())
-        })
+fn parse_trusted_proxies_array(val: &Value, field: &str) -> Result<Vec<String>, String> {
+    let arr = val
+        .as_array()
+        .ok_or_else(|| format!("{field} must be an array of IP/CIDR strings"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let s = item
+            .as_str()
+            .ok_or_else(|| format!("{field} entries must be IP/CIDR strings"))?
+            .trim();
+        let _ = validate_trusted_proxy_cidr(s)
+            .map_err(|e| format!("invalid entry in {field}: {e}"))?;
+        out.push(s.to_string());
     }
+    Ok(out)
 }
 
 fn parse_node_runtime_policies(raw: &Value, node_cfg: &mut NodeConfig) -> Result<(), String> {
     if let Some(fwd_val) = raw.get("forwarding") {
         if !fwd_val.is_null() {
+            if fwd_val.get("maxHops").and_then(Value::as_u64) == Some(0) {
+                return Err(
+                    "invalid forwarding policy: forwarding.maxHops must be >= 1 (default 2, max 4)"
+                        .to_string(),
+                );
+            }
             let fp: ForwardingPolicy = serde_json::from_value(fwd_val.clone())
                 .map_err(|e| format!("invalid forwarding policy: {e}"))?;
+            if fp.max_hops == 0 {
+                return Err(
+                    "invalid forwarding policy: forwarding.maxHops must be >= 1 (default 2, max 4)"
+                        .to_string(),
+                );
+            }
             node_cfg.forwarding = fp;
         }
     }
 
-    let listen_proxy = match raw.get("listen").and_then(|l| l.get("behindReverseProxy")) {
-        Some(v) if !v.is_null() => Some(
-            v.as_bool()
-                .ok_or_else(|| "listen.behindReverseProxy must be a boolean".to_string())?,
-        ),
+    // H7: Prefer explicit `trustedProxies` CIDR list (top-level overrides `listen.trustedProxies`).
+    // For backwards compatibility with existing configs that only set `behindReverseProxy: true`,
+    // map strictly to loopback-only `["127.0.0.1/32", "::1/128"]` (NEVER trusting RFC1918/VPC peers).
+    let listen_trusted = match raw.get("listen").and_then(|l| l.get("trustedProxies")) {
+        Some(v) if !v.is_null() => Some(parse_trusted_proxies_array(v, "listen.trustedProxies")?),
         _ => None,
     };
-    let top_proxy = match raw.get("behindReverseProxy") {
-        Some(v) if !v.is_null() => Some(
-            v.as_bool()
-                .ok_or_else(|| "behindReverseProxy must be a boolean".to_string())?,
-        ),
+    let top_trusted = match raw.get("trustedProxies") {
+        Some(v) if !v.is_null() => Some(parse_trusted_proxies_array(v, "trustedProxies")?),
         _ => None,
     };
-    if let Some(val) = top_proxy.or(listen_proxy) {
-        node_cfg.behind_reverse_proxy = val;
-    }
 
-    if let Some(aru_val) = raw.get("allowRemoteUpdate") {
-        if !aru_val.is_null() {
-            let val = aru_val
-                .as_bool()
-                .ok_or_else(|| "allowRemoteUpdate must be a boolean".to_string())?;
-            node_cfg.allow_remote_update = val;
+    if let Some(list) = top_trusted.or(listen_trusted) {
+        node_cfg.trusted_proxies = list;
+    } else {
+        let listen_proxy = match raw.get("listen").and_then(|l| l.get("behindReverseProxy")) {
+            Some(v) if !v.is_null() => Some(
+                v.as_bool()
+                    .ok_or_else(|| "listen.behindReverseProxy must be a boolean".to_string())?,
+            ),
+            _ => None,
+        };
+        let top_proxy = match raw.get("behindReverseProxy") {
+            Some(v) if !v.is_null() => Some(
+                v.as_bool()
+                    .ok_or_else(|| "behindReverseProxy must be a boolean".to_string())?,
+            ),
+            _ => None,
+        };
+        if let Some(val) = top_proxy.or(listen_proxy) {
+            node_cfg.trusted_proxies = if val {
+                vec!["127.0.0.1/32".to_string(), "::1/128".to_string()]
+            } else {
+                Vec::new()
+            };
         }
     }
 
@@ -2670,7 +2713,6 @@ mod plugin_runtime {
         AdapterError, AdapterHealth, AdapterKind, BoxFuture as AdapterBoxFuture, NodeAdapter,
         NodeAdapterHost, PublishErrorCode, PublishOutcome, PublishStatus, SubprocessSupervisor,
     };
-    use hyp_node::engine::node::BridgePostHandler;
     use hyp_node::engine::{NodeError, UnifiedNode};
     use hyp_proto::address::{LOCAL_NODE_ID, is_valid_topic};
     use hyp_proto::cloudevent::CloudEvent as ProtoCloudEvent;
@@ -2698,6 +2740,10 @@ mod plugin_runtime {
                 order: VecDeque::new(),
                 seen: HashSet::new(),
             }
+        }
+
+        fn contains(&self, source: &str, id: &str) -> bool {
+            self.seen.contains(&(source.to_string(), id.to_string()))
         }
 
         /// Returns `true` if `(source, id)` is newly inserted; `false` if already seen.
@@ -2845,30 +2891,53 @@ mod plugin_runtime {
                 // Keep private local chat bridge messages strictly local-only unless the user
                 // explicitly exposed the bridge topic in `node.json` (`topics[]` or `exposeTopic: true`).
                 if self.kind == AdapterKind::Bridge && !self.expose_topic {
-                    let is_new = self
+                    let already_seen = self
                         .local_dedup
                         .lock()
                         .expect("local bridge dedup lock poisoned")
-                        .insert(event.source.clone(), event.id.clone());
-                    if !is_new {
+                        .contains(&event.source, &event.id);
+                    if already_seen {
                         return Ok(PublishOutcome {
                             status: PublishStatus::Duplicate,
                             matched: 0,
                         });
                     }
-                    let mut matched = 0usize;
-                    if let Some(daemon) = self.daemon.as_ref().and_then(Weak::upgrade) {
-                        let rendered = render_bridge_cloudevent(&event);
-                        if let Ok(delivered) = daemon
-                            .deliver_bridge_inbound(&self.plugin_id, to, &event.id, &rendered)
-                            .await
-                        {
-                            matched = delivered;
-                        }
+                    let Some(daemon) = self.daemon.as_ref().and_then(Weak::upgrade) else {
+                        return Err(AdapterError::PublishFailed {
+                            code: PublishErrorCode::Unavailable,
+                            message: format!(
+                                "local daemon unavailable for bridge '{}:{}'",
+                                self.plugin_id, to
+                            ),
+                        });
+                    };
+                    let rendered = render_bridge_cloudevent(&event);
+                    let delivered = daemon
+                        .deliver_bridge_inbound(&self.plugin_id, to, &event.id, &rendered)
+                        .await
+                        .map_err(|err| AdapterError::PublishFailed {
+                            code: PublishErrorCode::Unavailable,
+                            message: format!(
+                                "bridge inbound delivery failed for '{}:{}': {err}",
+                                self.plugin_id, to
+                            ),
+                        })?;
+                    if delivered == 0 {
+                        return Err(AdapterError::PublishFailed {
+                            code: PublishErrorCode::Unavailable,
+                            message: format!(
+                                "no local session is linked to bridge '{}:{}'; refusing to drop inbound message",
+                                self.plugin_id, to
+                            ),
+                        });
                     }
+                    self.local_dedup
+                        .lock()
+                        .expect("local bridge dedup lock poisoned")
+                        .insert(event.source.clone(), event.id.clone());
                     return Ok(PublishOutcome {
                         status: PublishStatus::Stored,
-                        matched,
+                        matched: delivered,
                     });
                 }
 
@@ -3075,55 +3144,6 @@ mod plugin_runtime {
         }
     }
 
-    struct NodeRemoteBridgeHandler {
-        bridges: BTreeMap<String, (Vec<String>, Arc<SubprocessSupervisor>)>,
-    }
-
-    impl BridgePostHandler for NodeRemoteBridgeHandler {
-        fn post_bridge<'a>(
-            &'a self,
-            plugin: &'a str,
-            target: &'a str,
-            text: &'a str,
-            reply_to: Option<&'a str>,
-        ) -> AdapterBoxFuture<'a, Result<Option<String>, NodeError>> {
-            Box::pin(async move {
-                let Some((targets, supervisor)) = self.bridges.get(plugin) else {
-                    return Err(NodeError::NotFound(format!(
-                        "bridge plugin '{plugin}' is not running on this node"
-                    )));
-                };
-                if !targets.is_empty() && !targets.iter().any(|t| t == "*" || t == target) {
-                    return Err(NodeError::BadRequest(format!(
-                        "bridge target '{plugin}:{target}' is not in configured targets allowlist"
-                    )));
-                }
-                let mut params: BTreeMap<String, Value> = BTreeMap::new();
-                params.insert("text".to_string(), Value::String(text.to_string()));
-                if let Some(reply) = reply_to {
-                    if !reply.trim().is_empty() {
-                        params.insert("reply_to".to_string(), Value::String(reply.to_string()));
-                    }
-                }
-                let val = supervisor
-                    .post(target, params, DEFAULT_PLUGIN_POST_TIMEOUT)
-                    .await
-                    .map_err(|err| NodeError::Http(format!("bridge post failed: {err}")))?;
-                let message_id = val
-                    .get("message_id")
-                    .or_else(|| val.get("messageId"))
-                    .or_else(|| val.get("id"))
-                    .or_else(|| val.get("ts"))
-                    .and_then(|v| match v {
-                        Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
-                        Value::Number(n) => Some(n.to_string()),
-                        _ => None,
-                    });
-                Ok(message_id)
-            })
-        }
-    }
-
     pub(super) async fn start_plugins(
         plugins: Vec<ParsedPlugin>,
         skipped_statuses: Vec<Value>,
@@ -3134,8 +3154,6 @@ mod plugin_runtime {
     ) -> (Vec<Arc<SubprocessSupervisor>>, Arc<PluginStatusRegistry>) {
         let registry = Arc::new(PluginStatusRegistry::new(skipped_statuses, status_doc));
         let mut started: Vec<Arc<SubprocessSupervisor>> = Vec::with_capacity(plugins.len());
-        let mut remote_bridges: BTreeMap<String, (Vec<String>, Arc<SubprocessSupervisor>)> =
-            BTreeMap::new();
 
         for parsed in plugins {
             let cfg = parsed.config;
@@ -3176,7 +3194,6 @@ mod plugin_runtime {
             let register_poster = kind == AdapterKind::Bridge
                 || (plugin_id == "webhook" && parsed.has_webhook_post_url);
             if register_poster {
-                remote_bridges.insert(plugin_id.clone(), (targets.clone(), Arc::clone(&sup)));
                 if let Some(daemon) = local_daemon {
                     daemon.register_bridge_poster_with_targets(
                         &plugin_id,
@@ -3187,7 +3204,7 @@ mod plugin_runtime {
                     );
                 } else {
                     startup_warnings.push(format!(
-                        "Bridge plugin '{plugin_id}' started without local IPC socket; available for remote POST /v1/bridges/post (sessions require local socket)."
+                        "Bridge plugin '{plugin_id}' started without local IPC socket; local sessions require local socket."
                     ));
                 }
             }
@@ -3204,12 +3221,6 @@ mod plugin_runtime {
                 log_path: live_log.as_ref(),
             });
             started.push(sup);
-        }
-
-        if !remote_bridges.is_empty() {
-            node.set_bridge_post_handler(Some(Arc::new(NodeRemoteBridgeHandler {
-                bridges: remote_bridges,
-            })));
         }
 
         (started, registry)
@@ -3292,7 +3303,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_node_runtime_policies_loads_forwarding_reverse_proxy_and_remote_update() {
+    fn parse_node_runtime_policies_loads_forwarding_trusted_proxies_and_guest_collision_guard() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut cfg = NodeConfig::router(NodeId::new("hub-1").unwrap(), tmp.path());
         let raw = json!({
@@ -3302,22 +3313,58 @@ mod tests {
                     { "fromPeer": "alice@laptop", "toPeer": "bob@server", "topic": "dm" }
                 ]
             },
-            "listen": { "behindReverseProxy": true },
-            "allowRemoteUpdate": true
+            "listen": { "behindReverseProxy": true }
         });
         parse_node_runtime_policies(&raw, &mut cfg).expect("valid policies");
         assert!(cfg.forwarding.permits("alice@laptop", "bob@server", "dm"));
         assert!(!cfg.forwarding.permits("eve@other", "bob@server", "dm"));
-        assert!(cfg.behind_reverse_proxy);
-        assert!(cfg.allow_remote_update);
+        // H7: backwards-compat behindReverseProxy=true maps STRICTLY to loopback-only CIDRs!
+        assert_eq!(cfg.trusted_proxies, vec!["127.0.0.1/32", "::1/128"]);
 
-        // Top-level behindReverseProxy also works and overrides listen.behindReverseProxy.
+        // Explicit trustedProxies overrides behindReverseProxy and supports IPv4/IPv6 CIDRs.
+        let raw_cidr = json!({
+            "trustedProxies": ["10.0.0.1/32", "fd00::1/128"],
+            "listen": { "behindReverseProxy": false }
+        });
+        parse_node_runtime_policies(&raw_cidr, &mut cfg).expect("explicit trustedProxies");
+        assert_eq!(cfg.trusted_proxies, vec!["10.0.0.1/32", "fd00::1/128"]);
+
+        // Invalid CIDR fails closed!
+        let bad_cidr = json!({
+            "trustedProxies": ["10.0.0.1/99"]
+        });
+        assert!(parse_node_runtime_policies(&bad_cidr, &mut cfg).is_err());
+
+        // forwarding.maxHops: 0 fails closed!
+        let bad_hops = json!({
+            "forwarding": { "maxHops": 0 }
+        });
+        assert!(parse_node_runtime_policies(&bad_hops, &mut cfg).is_err());
+
+        // Top-level behindReverseProxy: false clears loopback fallback when trustedProxies omitted.
         let raw_override = json!({
             "behindReverseProxy": false,
             "listen": { "behindReverseProxy": true }
         });
         parse_node_runtime_policies(&raw_override, &mut cfg).expect("override");
-        assert!(!cfg.behind_reverse_proxy);
+        assert!(cfg.trusted_proxies.is_empty());
+
+        // Guest topic collision guard skips webhook adapters colliding with guestPairing / github-public!
+        let mut parsed = ParsedWebhookSources {
+            github: vec![
+                GitHubWebhookConfig::new("gh-public-collide", "github", "sec1"),
+                GitHubWebhookConfig::new("gh-private", "github-private", "sec2"),
+            ],
+            prometheus: vec![PrometheusWebhookConfig::new("prom-collide", "github")],
+            generic: vec![GenericWebhookConfig::new("gen-ok", "ci")],
+        };
+        let mut warnings = Vec::new();
+        filter_colliding_webhook_sources(&mut parsed, true, Some("github"), &mut warnings);
+        assert_eq!(parsed.github.len(), 1);
+        assert_eq!(parsed.github[0].id, "gh-private");
+        assert!(parsed.prometheus.is_empty());
+        assert_eq!(parsed.generic.len(), 1);
+        assert_eq!(warnings.len(), 2);
     }
 
     #[test]

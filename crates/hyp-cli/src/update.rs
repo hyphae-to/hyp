@@ -12,9 +12,8 @@
 
 use crate::config_file::{
     build_http_client, ct_eq, default_node_id, ensure_v2_node_json_defaults,
-    load_node_or_legacy_config, open_secret_store, read_json_object_or_empty,
-    resolve_config_path_for_read, resolve_config_path_for_write, resolve_state_dir,
-    write_atomic_json,
+    load_node_or_legacy_config, read_json_object_or_empty, resolve_config_path_for_read,
+    resolve_config_path_for_write, resolve_state_dir, write_atomic_json,
 };
 use crate::ui::{
     CliError, EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json,
@@ -22,17 +21,14 @@ use crate::ui::{
 };
 use clap::{Args, Subcommand, ValueEnum};
 use http::{Method, Request, header};
-use http_body_util::{BodyExt, Empty, Full};
-use hyp_crypto::NodeIdentityKeys;
+use http_body_util::{BodyExt, Empty};
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keys::Ed25519PublicKey;
 use hyp_crypto::pairing::validate_endpoint_origin;
 use hyp_crypto::rfc3339::parse_rfc3339_millis;
 use hyp_crypto::transfer::{TarUnpackOptions, unpack_tar_gz};
 use hyp_node::engine::NodeProfile;
-use hyp_node::engine::peer_link::http_auth_signing_input;
-use hyp_proto::manifest::{NodeManifestPayload, SignedNodeManifest};
-use hyp_store::{NodeDb, PeerRecord, PeerStatus, TrustTier, now_ms};
+use hyp_store::{NodeDb, PeerRecord, now_ms};
 use hyper::body::Bytes;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -71,8 +67,6 @@ pub const META_UPDATE_INSTALLED_PUBLISHED_AT: &str = "update_installed_published
 const MAX_MANIFEST_BYTES: usize = 512 * 1024;
 const MAX_ARCHIVE_BYTES: usize = 128 * 1024 * 1024;
 const HTTP_TIMEOUT_SECS: u64 = 30;
-const REMOTE_UPDATE_CAPABILITY: &str = "node.self-update.v1";
-const REMOTE_UPDATE_SCOPE: &str = "node:update";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -298,7 +292,6 @@ pub struct CachedUpdateStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum FleetEligibility {
-    Eligible,
     Skipped,
 }
 
@@ -1051,98 +1044,20 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
     let mut warnings: Vec<String> = Vec::new();
 
     if args.all {
-        let mut peer_auth_refs: BTreeMap<String, Option<String>> = BTreeMap::new();
         if let Some(ref db) = db {
             if let Ok(peers) = db.peers().list_peers(None) {
                 for peer in &peers {
-                    peer_auth_refs
-                        .insert(peer.peer_id.clone(), peer.auth_credential_ref.clone());
-                    fleet_plan.push(classify_fleet_peer(peer));
+                    let mut entry = classify_fleet_peer(peer);
+                    entry.outcome = Some("SKIPPED".to_string());
+                    fleet_plan.push(entry);
                 }
             }
         }
-        let local_node_id = db
-            .as_ref()
-            .and_then(|d| d.local().get_metadata("node_id").ok().flatten())
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| {
-                let cfg_path = resolve_config_path_for_read(
-                    args.config.as_deref(),
-                    args.state_dir.as_deref(),
-                    None,
-                );
-                load_node_or_legacy_config(&cfg_path)
-                    .ok()
-                    .and_then(|c| c.node_id)
-            })
-            .unwrap_or_else(default_node_id);
-        let secrets = open_secret_store(&dir, args.state_dir.is_some());
-        let local_identity = if args.dry_run {
-            None
-        } else {
-            match secrets.load_or_create_node_keys(&local_node_id) {
-                Ok(keys) => Some(keys),
-                Err(e) => {
-                    warnings.push(format!(
-                        "Failed to load local Ed25519 identity key for signed remote updates: {e}"
-                    ));
-                    None
-                }
-            }
-        };
-
-        // Trigger eligible remote peers FIRST (before upgrading local node!).
-        for entry in &mut fleet_plan {
-            if entry.eligibility != FleetEligibility::Eligible {
-                entry.outcome = Some("SKIPPED".to_string());
-                continue;
-            }
-            if args.dry_run {
-                entry.outcome = Some("PLANNED".to_string());
-                rollout_order.push(entry.peer_id.clone());
-                continue;
-            }
-            let Some(ref ep) = entry.endpoint else {
-                entry.outcome = Some("SKIPPED".to_string());
-                continue;
-            };
-            let Some(ref identity) = local_identity else {
-                entry.outcome = Some("FAILED: local Ed25519 identity key unavailable".to_string());
-                warnings.push(format!(
-                    "Remote peer '{}' update skipped: local Ed25519 identity key unavailable",
-                    entry.peer_id
-                ));
-                continue;
-            };
-            let peer_bearer = peer_auth_refs
-                .get(&entry.peer_id)
-                .and_then(|r| r.as_deref())
-                .and_then(|secret_name| secrets.get(secret_name).ok())
-                .or_else(|| {
-                    let fallback = format!(
-                        "peer-auth-{}",
-                        &hex::encode(Sha256::digest(entry.peer_id.as_bytes()))[..12]
-                    );
-                    secrets.get(&fallback).ok()
-                });
-            match rt.block_on(trigger_remote_peer_update(
-                ep,
-                &local_node_id,
-                identity,
-                peer_bearer.as_deref().map(String::as_str),
-                channel,
-                &manifest.version,
-                &manifest_url,
-            )) {
-                Ok(()) => {
-                    entry.outcome = Some("UPDATED".to_string());
-                    rollout_order.push(entry.peer_id.clone());
-                }
-                Err(e) => {
-                    entry.outcome = Some(format!("FAILED: {e}"));
-                    warnings.push(format!("Remote peer '{}' update failed: {e}", entry.peer_id));
-                }
-            }
+        if !fleet_plan.is_empty() {
+            warnings.push(format!(
+                "Remote fleet self-update is planned for a future release; skipped {} remote peer(s) and updating local node only.",
+                fleet_plan.len()
+            ));
         }
     }
 
@@ -1608,7 +1523,6 @@ fn print_fleet_table(plan: &[FleetPeerPlan]) {
         println!(
             "{:<10}  {:<22}  {:<10}  {}",
             match p.eligibility {
-                FleetEligibility::Eligible => "ELIGIBLE",
                 FleetEligibility::Skipped => "SKIPPED",
             },
             p.peer_id,
@@ -1618,89 +1532,18 @@ fn print_fleet_table(plan: &[FleetPeerPlan]) {
     }
 }
 
-/// Classifies a paired peer for `hyp update --all`:
-/// ONLY peers with `PeerStatus::Active`, reachable `endpoint`, `node:update` scope, AND
-/// `node.self-update.v1` advertised capability are `ELIGIBLE`. Public guest hubs (`public.hyphae.to`)
-/// and teammate peers without `node:update` are cleanly `SKIPPED`.
+/// Classifies a paired peer for `hyp update --all`.
+///
+/// Remote fleet self-update (`POST /v1/node/update`) is not shipped in `v0.7.0`, so every remote
+/// peer is cleanly classified as `SKIPPED` without issuing any remote HTTP request.
 pub fn classify_fleet_peer(peer: &PeerRecord) -> FleetPeerPlan {
-    if peer.status != PeerStatus::Active {
-        return FleetPeerPlan {
-            peer_id: peer.peer_id.clone(),
-            endpoint: peer.endpoint.clone(),
-            eligibility: FleetEligibility::Skipped,
-            reason: format!("peer status is '{}'", peer.status.as_str()),
-            outcome: None,
-        };
-    }
-
-    if peer.trust_tier == TrustTier::Guest {
-        return FleetPeerPlan {
-            peer_id: peer.peer_id.clone(),
-            endpoint: peer.endpoint.clone(),
-            eligibility: FleetEligibility::Skipped,
-            reason: "guest read-only peer (no node:update management scope)".to_string(),
-            outcome: None,
-        };
-    }
-
-    let has_scope = peer
-        .scopes
-        .iter()
-        .any(|s| s == REMOTE_UPDATE_SCOPE || s.starts_with("node:update="));
-    if !has_scope {
-        return FleetPeerPlan {
-            peer_id: peer.peer_id.clone(),
-            endpoint: peer.endpoint.clone(),
-            eligibility: FleetEligibility::Skipped,
-            reason: "missing 'node:update' scope".to_string(),
-            outcome: None,
-        };
-    }
-
-    let has_cap = peer
-        .manifest_json
-        .as_deref()
-        .map(manifest_advertises_self_update)
-        .unwrap_or(false);
-    if !has_cap {
-        return FleetPeerPlan {
-            peer_id: peer.peer_id.clone(),
-            endpoint: peer.endpoint.clone(),
-            eligibility: FleetEligibility::Skipped,
-            reason: "peer manifest does not advertise 'node.self-update.v1'".to_string(),
-            outcome: None,
-        };
-    }
-
-    if peer.endpoint.as_deref().is_none_or(|e| e.trim().is_empty()) {
-        return FleetPeerPlan {
-            peer_id: peer.peer_id.clone(),
-            endpoint: None,
-            eligibility: FleetEligibility::Skipped,
-            reason: "peer has no reachable endpoint".to_string(),
-            outcome: None,
-        };
-    }
-
     FleetPeerPlan {
         peer_id: peer.peer_id.clone(),
         endpoint: peer.endpoint.clone(),
-        eligibility: FleetEligibility::Eligible,
-        reason: "active peer with node:update scope + node.self-update.v1 capability".to_string(),
+        eligibility: FleetEligibility::Skipped,
+        reason: "remote fleet self-update is planned for a future release".to_string(),
         outcome: None,
     }
-}
-
-fn manifest_advertises_self_update(raw: &str) -> bool {
-    let payload: Option<NodeManifestPayload> = serde_json::from_str::<SignedNodeManifest>(raw)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s.payload).ok())
-        .or_else(|| serde_json::from_str(raw).ok());
-    payload.is_some_and(|m| {
-        m.capabilities
-            .iter()
-            .any(|c| c.as_str() == REMOTE_UPDATE_CAPABILITY)
-    })
 }
 
 async fn fetch_signed_manifest(url: &str) -> Result<SignedReleaseManifest, (&'static str, String)> {
@@ -1758,77 +1601,6 @@ async fn download_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>, (&'stati
         }
     }
     Ok(out)
-}
-
-async fn trigger_remote_peer_update(
-    endpoint: &str,
-    local_node_id: &str,
-    identity: &NodeIdentityKeys,
-    peer_bearer_token: Option<&str>,
-    channel: UpdateChannel,
-    version: &str,
-    manifest_url: &str,
-) -> Result<(), String> {
-    validate_endpoint_origin(endpoint)
-        .map_err(|e| format!("unsafe peer endpoint '{endpoint}': {e}"))?;
-    let url = format!("{}/v1/node/update", endpoint.trim_end_matches('/'));
-    let uri: http::Uri = url
-        .parse()
-        .map_err(|e| format!("invalid remote update URI '{url}': {e}"))?;
-    let path_and_query = uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/v1/node/update");
-    let body = serde_json::to_vec(&json!({
-        "channel": channel.as_str(),
-        "targetVersion": version,
-        "version": version,
-        "manifestUrl": manifest_url,
-    }))
-    .map_err(|e| format!("JSON serialize failed: {e}"))?;
-
-    let body_sha = hex::encode(Sha256::digest(&body));
-    let ts = now_ms();
-    let mut nonce_bytes = [0u8; 12];
-    SystemRandom::new()
-        .fill(&mut nonce_bytes)
-        .map_err(|_| "OS CSPRNG failure generating auth nonce".to_string())?;
-    let nonce = hex::encode(nonce_bytes);
-    let signing_input = http_auth_signing_input("POST", path_and_query, ts, &nonce, &body_sha);
-    let sig = identity.signing.sign_domain_b64("http-auth", &signing_input);
-    let auth_header = match peer_bearer_token.filter(|t| !t.trim().is_empty()) {
-        Some(tok) => format!("Bearer {}", tok.trim()),
-        None => format!(
-            "Hyphae-Ed25519 node=\"{local_node_id}\",ts=\"{ts}\",nonce=\"{nonce}\",sig=\"{sig}\""
-        ),
-    };
-
-    let client = build_http_client::<Full<Bytes>>()?;
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri(&uri)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(
-            header::USER_AGENT,
-            format!("hyp/{}", env!("CARGO_PKG_VERSION")),
-        )
-        .header(header::AUTHORIZATION, auth_header)
-        .header("x-hyphae-node", local_node_id)
-        .header("x-hyphae-timestamp", ts.to_string())
-        .header("x-hyphae-nonce", &nonce)
-        .header("x-hyphae-sig", &sig)
-        .body(Full::new(Bytes::from(body)))
-        .map_err(|e| format!("failed to construct remote update request: {e}"))?;
-
-    let resp = tokio::time::timeout(Duration::from_secs(HTTP_TIMEOUT_SECS), client.request(req))
-        .await
-        .map_err(|_| format!("POST {url} timed out"))?
-        .map_err(|e| format!("POST {url} failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("POST {url} returned HTTP {}", resp.status().as_u16()));
-    }
-    Ok(())
 }
 
 struct SwapSuccess {

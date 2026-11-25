@@ -2842,6 +2842,8 @@ async fn chaos_webhook_transfer_and_subprocess_adapter_to_gated_node_e2e() {
     );
     prom_wh.ingest_webhook(&prom_hdrs, &prom_body).await.unwrap();
 
+    let expected_gh_id = format!("gh-{}", hyp_store::sha256_hex(&gh_body));
+
     // Wait for BOTH webhook CloudEvents (whether coalesced into 1 batch or delivered in 2 batches)!
     let mut rx_wh = alice.subscribe_local_inbox();
     let mut arrived_wh_events: Vec<CloudEvent> = Vec::new();
@@ -2867,7 +2869,7 @@ async fn chaos_webhook_transfer_and_subprocess_adapter_to_gated_node_e2e() {
                 .local()
                 .acknowledge_inbox("sess-raw", &refs, now_ms());
         }
-        if arrived_wh_events.iter().any(|e| e.id == "ops-gh-88")
+        if arrived_wh_events.iter().any(|e| e.id == expected_gh_id)
             && arrived_wh_events
                 .iter()
                 .any(|e| serde_json::to_string(&e.data).unwrap().contains("CheckoutErrorBudget"))
