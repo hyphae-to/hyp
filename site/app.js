@@ -25,64 +25,8 @@ function esc(s) {
   window.addEventListener("resize", syncHeaderTheme, { passive: true });
 })();
 
-// Proportional 1200x590 stage scaling driven by real rendered container geometry:
-// - Mobile (<= 760px): natural vertical flow
-// - Mode A (Laptop / Standard Desktop, > 760px and < 990px tall or < 1100px wide):
-//   Header + Hero #1 = exact 100svh; animation stays <= 1.0x centered in .hero-stage-center
-// - Mode B (Big / Tall Desktop, >= 1100px wide and >= 990px tall):
-//   Header + Hero #1 + Divider + Hero #2 = exact 100svh; animation scales smoothly up to 1.28x
-(function initResponsiveStage() {
-  const header = document.getElementById("siteHeader");
-  const stageCenter = document.getElementById("heroStageCenter");
-  const controlsDock = document.getElementById("heroControlsDock");
-  const ctaStrip = document.getElementById("cta-install");
-  const viewport = document.getElementById("storyViewport");
-  const stage = document.getElementById("storyStage");
-  if (!viewport || !stage) return;
-
-  const LOGICAL_W = 1200;
-  const LOGICAL_H = 590;
-
-  function fitStage() {
-    const vw = window.innerWidth || 1280;
-    const vh = window.innerHeight || 900;
-    const headerH = header ? header.offsetHeight : 68;
-    document.documentElement.style.setProperty("--header-h", `${headerH}px`);
-
-    const availW = (stageCenter ? stageCenter.clientWidth : viewport.clientWidth) || LOGICAL_W;
-    const isMobile = vw <= 760;
-    const isBigScreen = vw >= 1100 && vh >= 990;
-
-    let scale;
-    if (isMobile) {
-      scale = Math.min(1, availW / LOGICAL_W);
-    } else {
-      const dockH = controlsDock ? controlsDock.offsetHeight : 112;
-      const ctaH = isBigScreen && ctaStrip ? ctaStrip.offsetHeight : 0;
-      const stagePadY = 28; // 12px top + 12px bottom + 4px safety margin
-      const availH = Math.max(240, vh - headerH - dockH - ctaH - stagePadY);
-      const maxScale = isBigScreen ? 1.28 : 1.0;
-      scale = Math.min(maxScale, availW / LOGICAL_W, availH / LOGICAL_H);
-    }
-
-    const offsetX = Math.max(0, (availW - LOGICAL_W * scale) / 2);
-    stage.style.transform = `translateX(${offsetX.toFixed(1)}px) scale(${scale.toFixed(4)})`;
-    viewport.style.height = `${Math.round(LOGICAL_H * scale)}px`;
-  }
-
-  fitStage();
-  if (typeof ResizeObserver !== "undefined") {
-    const ro = new ResizeObserver(fitStage);
-    if (stageCenter) ro.observe(stageCenter);
-    else ro.observe(viewport);
-    if (controlsDock) ro.observe(controlsDock);
-    if (ctaStrip) ro.observe(ctaStrip);
-  }
-  window.addEventListener("resize", fitStage, { passive: true });
-})();
-
 // ============================================================================
-// 1. HERO INSTALL SWITCHER
+// 1. HERO INSTALL SWITCHER (Pre-rendered in HTML; JS enhances tabs & copy)
 // ============================================================================
 const HERO_CMDS = {
   unix: "curl -fsSL https://hyphae.to/install.sh | sh",
@@ -92,10 +36,13 @@ const HERO_CMDS = {
 
 let activeHeroInstall = "unix";
 function renderHeroInstall() {
-  document.getElementById("heroInstallCmd").textContent = HERO_CMDS[activeHeroInstall];
-  document.querySelectorAll("#heroInstallTabs .it-btn").forEach((b) =>
-    b.classList.toggle("active", b.dataset.hi === activeHeroInstall)
-  );
+  const cmdEl = document.getElementById("heroInstallCmd");
+  if (cmdEl) cmdEl.textContent = HERO_CMDS[activeHeroInstall];
+  document.querySelectorAll("#heroInstallTabs .it-btn").forEach((b) => {
+    const active = b.dataset.hi === activeHeroInstall;
+    b.classList.toggle("active", active);
+    b.setAttribute("aria-selected", active ? "true" : "false");
+  });
 }
 document.querySelectorAll("#heroInstallTabs .it-btn").forEach((b) => {
   b.addEventListener("click", () => {
@@ -103,7 +50,7 @@ document.querySelectorAll("#heroInstallTabs .it-btn").forEach((b) => {
     renderHeroInstall();
   });
 });
-document.getElementById("heroCopyBtn").addEventListener("click", (e) => {
+document.getElementById("heroCopyBtn")?.addEventListener("click", (e) => {
   navigator.clipboard?.writeText(HERO_CMDS[activeHeroInstall]).catch(() => {});
   const btn = e.currentTarget;
   btn.textContent = "Copied";
@@ -112,13 +59,166 @@ document.getElementById("heroCopyBtn").addEventListener("click", (e) => {
 renderHeroInstall();
 
 // ============================================================================
-// 2. PANORAMIC 7-CHAPTER HERO STORY DIORAMA (Causal staged reveals + living mycelium)
+// 1B. HERO TWO-AGENT LOOP (20-second loop: Claude Code <-> idle Codex)
+// ============================================================================
+(function initTwoAgentLoop() {
+  const stage = document.getElementById("twoAgentStage");
+  if (!stage) return;
+
+  const leftTerm = document.getElementById("taLeftTerm");
+  const rightTerm = document.getElementById("taRightTerm");
+  const leftState = document.getElementById("taLeftState");
+  const rightState = document.getElementById("taRightState");
+  const wireFwd = document.getElementById("taWireFwd");
+  const wireRev = document.getElementById("taWireRev");
+  const pkt = document.getElementById("taPacket");
+  const pktLabel = document.getElementById("taPacketLabel");
+  const playBtn = document.getElementById("taPlayBtn");
+  const beatBtns = Array.from(document.querySelectorAll("[data-ta-beat]"));
+
+  const lines = {
+    L1: document.getElementById("taL1"),
+    L2: document.getElementById("taL2"),
+    L3: document.getElementById("taL3"),
+    L4: document.getElementById("taL4"),
+    R1: document.getElementById("taR1"),
+    R2: document.getElementById("taR2"),
+    R3: document.getElementById("taR3"),
+    R4: document.getElementById("taR4"),
+  };
+
+  const BEATS = [
+    {
+      dur: 4800,
+      leftActive: true,
+      rightActive: false,
+      leftState: { txt: "Sending", cls: "active" },
+      rightState: { txt: "Idle", cls: "" },
+      show: ["L1", "L2", "R1"],
+      wire: "fwd",
+      packet: { label: "hyp_send → codex", dir: "fwd" },
+    },
+    {
+      dur: 4600,
+      leftActive: false,
+      rightActive: true,
+      leftState: { txt: "Idle · 0 polling", cls: "" },
+      rightState: { txt: "Woken by push", cls: "wake" },
+      show: ["L1", "L2", "L3", "R1", "R2"],
+      wire: "fwd-soft",
+      packet: null,
+    },
+    {
+      dur: 5000,
+      leftActive: false,
+      rightActive: true,
+      leftState: { txt: "Idle · 0 polling", cls: "" },
+      rightState: { txt: "Reviewing diff", cls: "active" },
+      show: ["L1", "L2", "L3", "R1", "R2", "R3", "R4"],
+      wire: "rev",
+      packet: { label: "reply → wake claude", dir: "rev" },
+    },
+    {
+      dur: 5600,
+      leftActive: true,
+      rightActive: false,
+      leftState: { txt: "Woken ✓", cls: "wake" },
+      rightState: { txt: "Idle", cls: "" },
+      show: ["L1", "L2", "L3", "L4", "R1", "R2", "R3", "R4"],
+      wire: "both-soft",
+      packet: null,
+    },
+  ];
+
+  const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  let beatIdx = reduced ? BEATS.length - 1 : 0;
+  let playing = !reduced;
+  let timer = null;
+
+  function renderBeat(idx) {
+    const b = BEATS[idx] || BEATS[0];
+    leftTerm?.classList.toggle("is-active", b.leftActive);
+    rightTerm?.classList.toggle("is-active", b.rightActive);
+
+    if (leftState) {
+      leftState.textContent = b.leftState.txt;
+      leftState.className = `ta-state ${b.leftState.cls}`.trim();
+    }
+    if (rightState) {
+      rightState.textContent = b.rightState.txt;
+      rightState.className = `ta-state ${b.rightState.cls}`.trim();
+    }
+
+    Object.entries(lines).forEach(([k, el]) => {
+      if (!el) return;
+      el.classList.toggle("show", b.show.includes(k));
+    });
+
+    wireFwd?.classList.toggle("lit", b.wire === "fwd");
+    wireFwd?.classList.toggle("soft", b.wire === "fwd-soft" || b.wire === "both-soft");
+    wireRev?.classList.toggle("lit", b.wire === "rev");
+    wireRev?.classList.toggle("soft", b.wire === "both-soft");
+
+    if (pkt && pktLabel) {
+      pkt.classList.remove("fly-fwd", "fly-rev");
+      if (b.packet && !reduced) {
+        pktLabel.textContent = b.packet.label;
+        void pkt.offsetWidth;
+        pkt.classList.add(b.packet.dir === "rev" ? "fly-rev" : "fly-fwd");
+      }
+    }
+
+    beatBtns.forEach((btn, i) => {
+      btn.classList.toggle("active", i === idx);
+      btn.classList.toggle("passed", i < idx);
+    });
+  }
+
+  function schedule() {
+    if (timer) clearTimeout(timer);
+    if (!playing) return;
+    timer = setTimeout(() => {
+      beatIdx = (beatIdx + 1) % BEATS.length;
+      renderBeat(beatIdx);
+      schedule();
+    }, BEATS[beatIdx].dur);
+  }
+
+  beatBtns.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      beatIdx = Number(btn.dataset.taBeat) || 0;
+      renderBeat(beatIdx);
+      schedule();
+    });
+  });
+
+  if (playBtn) {
+    playBtn.textContent = playing ? "Pause" : "Play";
+    playBtn.addEventListener("click", () => {
+      playing = !playing;
+      playBtn.textContent = playing ? "Pause" : "Play";
+      if (playing) {
+        if (beatIdx === BEATS.length - 1) beatIdx = 0;
+        renderBeat(beatIdx);
+        schedule();
+      } else if (timer) {
+        clearTimeout(timer);
+      }
+    });
+  }
+
+  renderBeat(beatIdx);
+  schedule();
+})();
+
+// ============================================================================
+// 2. PANORAMIC 7-CHAPTER INCIDENT WALKTHROUGH (Collapsible Beta Diorama)
 // ============================================================================
 const CHAPTERS = [
   {
     durationMs: 5800,
     tip: "1 · Alex joins Team Node -> peers bloom one by one",
-    caption: "<strong>1/7</strong> · <strong>Alex</strong> (Claude in Herdr) joins the <strong>Team Node</strong> — immediately unlocking <code>#channels</code>, streams, <strong>Alice's Codex</strong> (OpenClaw), and <strong>Jack's ops &amp; release mgr</strong> (T3 Code).",
+    caption: "<strong>1/7</strong> · <strong>Alex</strong> (Claude in Herdr) joins the <strong>Team Node</strong> — immediately unlocking <code>#channels</code>, streams, <strong>Alice's Codex</strong>, and <strong>Jack's ops &amp; release mgr</strong>.",
     visible: ["ent-alex", "ent-node"],
     dim: [],
     spotlight: ["ent-alex"],
@@ -541,12 +641,14 @@ const CHAPTERS = [
   },
 ];
 
-// Procedurally weave companion hyphal strands + forked lateral rootlets around every main strand
 const SVG_NS = "http://www.w3.org/2000/svg";
 const strandLengths = new Map();
 const hyphaBundleMap = new Map();
+let bundlesBuilt = false;
 
 function buildOrganicHyphaBundles() {
+  if (bundlesBuilt) return;
+  bundlesBuilt = true;
   const host = document.getElementById("hyphaBundles");
   document.querySelectorAll(".myc-strand").forEach((path, idx) => {
     const len = path.getTotalLength();
@@ -599,7 +701,6 @@ function buildOrganicHyphaBundles() {
       subPaths.push(w);
     }
 
-    // Add 2-4 delicate forked lateral rootlets + spore tips along the strand
     const twigFracs = len > 240 ? [0.24, 0.48, 0.72, 0.86] : [0.34, 0.68];
     twigFracs.forEach((f, ti) => {
       const d = f * len;
@@ -641,7 +742,6 @@ function buildOrganicHyphaBundles() {
     hyphaBundleMap.set(path.id, { group: g, subPaths: meta });
   });
 }
-buildOrganicHyphaBundles();
 
 function setStrandState(id, state) {
   const path = document.getElementById(id);
@@ -661,18 +761,46 @@ function setStrandState(id, state) {
   }
 }
 
-const vineMain = document.getElementById("tlVineMain");
-const vineSub = document.getElementById("tlVineSub");
-const vineMainLen = vineMain ? vineMain.getTotalLength() : 1000;
-const vineSubLen = vineSub ? vineSub.getTotalLength() : 1000;
-if (vineMain) { vineMain.style.strokeDasharray = `${vineMainLen}`; vineMain.style.strokeDashoffset = `${vineMainLen}`; }
-if (vineSub) { vineSub.style.strokeDasharray = `${vineSubLen}`; vineSub.style.strokeDashoffset = `${vineSubLen}`; }
+function fitWalkthroughStage() {
+  const stageCenter = document.getElementById("heroStageCenter");
+  const viewport = document.getElementById("storyViewport");
+  const stage = document.getElementById("storyStage");
+  if (!viewport || !stage) return;
+  const availW = (stageCenter ? stageCenter.clientWidth : viewport.clientWidth) || 0;
+  if (availW <= 0) return;
 
+  const LOGICAL_W = 1200;
+  const LOGICAL_H = 590;
+  const scale = Math.min(1, availW / LOGICAL_W);
+  const offsetX = Math.max(0, (availW - LOGICAL_W * scale) / 2);
+  stage.style.transform = `translateX(${offsetX.toFixed(1)}px) scale(${scale.toFixed(4)})`;
+  viewport.style.height = `${Math.round(LOGICAL_H * scale)}px`;
+}
+
+let vineMainLen = 1000;
+let vineSubLen = 1000;
 let chapterIdx = 0;
-let storyPlaying = true;
+let storyPlaying = false;
 let storyTimer = null;
 let pktRaf = null;
 let stagedTimers = [];
+let walkthroughOpen = false;
+let forceSettled = new URLSearchParams(window.location.search).get("settled") === "1";
+
+function initVineLengths() {
+  const vineMain = document.getElementById("tlVineMain");
+  const vineSub = document.getElementById("tlVineSub");
+  if (vineMain) {
+    vineMainLen = vineMain.getTotalLength() || 1000;
+    vineMain.style.strokeDasharray = `${vineMainLen}`;
+    vineMain.style.strokeDashoffset = `${vineMainLen}`;
+  }
+  if (vineSub) {
+    vineSubLen = vineSub.getTotalLength() || 1000;
+    vineSub.style.strokeDasharray = `${vineSubLen}`;
+    vineSub.style.strokeDashoffset = `${vineSubLen}`;
+  }
+}
 
 function clearStagedTimers() {
   for (const t of stagedTimers) clearTimeout(t);
@@ -683,11 +811,6 @@ function easeInOutQuad(t) {
   return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
 }
 
-/**
- * Plays ONE-SHOT sequential labeled message packets along the exact SVG paths.
- * Stays fully visible all the way to the destination (0..100% of strand), then
- * absorbs right at the target with a crisp arrival pulse.
- */
 function playWirePackets(specs) {
   if (pktRaf) cancelAnimationFrame(pktRaf);
   const host = document.getElementById("wirePackets");
@@ -710,6 +833,7 @@ function playWirePackets(specs) {
 
   const startTime = performance.now();
   function tick(now) {
+    if (!walkthroughOpen) return;
     const elapsed = now - startTime;
     let anyPending = false;
 
@@ -723,7 +847,6 @@ function playWirePackets(specs) {
       const raw = Math.min(1, local / item.dur);
       if (raw < 1) anyPending = true;
 
-      // Emerge cleanly from sender's rim and land squarely at receiver's rim (full visible travel)
       const inset = Math.min(0.14, 34 / item.len);
       const travel = inset + easeInOutQuad(raw) * (1 - inset * 2);
       const t = item.reverse ? 1 - travel : travel;
@@ -766,28 +889,18 @@ function playWirePackets(specs) {
 
 function applyStage(st) {
   if (st.addVisible) {
-    st.addVisible.forEach((id) => {
-      const el = document.getElementById(id);
-      if (el) el.classList.add("visible");
-    });
+    st.addVisible.forEach((id) => document.getElementById(id)?.classList.add("visible"));
   }
   if (st.undim) {
-    st.undim.forEach((id) => {
-      const el = document.getElementById(id);
-      if (el) el.classList.remove("dim");
-    });
+    st.undim.forEach((id) => document.getElementById(id)?.classList.remove("dim"));
   }
   if (st.spotlight) {
     ["ent-alex", "ent-node", "ent-alice", "ent-ops", "ent-release"].forEach((id) => {
-      const el = document.getElementById(id);
-      if (el) el.classList.toggle("spotlight", st.spotlight.includes(id));
+      document.getElementById(id)?.classList.toggle("spotlight", st.spotlight.includes(id));
     });
   }
   if (st.alertHit) {
-    st.alertHit.forEach((id) => {
-      const el = document.getElementById(id);
-      if (el) el.classList.add("alert-hit");
-    });
+    st.alertHit.forEach((id) => document.getElementById(id)?.classList.add("alert-hit"));
   }
   if (st.hideStrands) {
     st.hideStrands.forEach((id) => setStrandState(id, "hidden"));
@@ -797,43 +910,41 @@ function applyStage(st) {
   }
   if (st.caps) {
     ["cap-ch", "cap-dep", "cap-gh", "cap-pr"].forEach((id) => {
-      const el = document.getElementById(id);
-      if (el) el.classList.toggle("lit", st.caps.includes(id));
+      document.getElementById(id)?.classList.toggle("lit", st.caps.includes(id));
     });
   }
   if (st.coralCaps) {
     ["cap-ch", "cap-dep", "cap-gh", "cap-pr"].forEach((id) => {
-      const el = document.getElementById(id);
-      if (el) el.classList.toggle("lit-coral", st.coralCaps.includes(id));
+      document.getElementById(id)?.classList.toggle("lit-coral", st.coralCaps.includes(id));
     });
   }
   if (st.subs) {
     ["sub-alex-pr", "sub-alex-dep", "sub-alice-pr", "sub-alice-dep", "sub-ops-dep", "sub-rel-pr"].forEach((id) => {
-      const el = document.getElementById(id);
-      if (el) el.classList.toggle("show", st.subs.includes(id));
+      document.getElementById(id)?.classList.toggle("show", st.subs.includes(id));
     });
   }
   if (st.addSubs) {
-    st.addSubs.forEach((id) => {
-      const el = document.getElementById(id);
-      if (el) el.classList.add("show");
-    });
+    st.addSubs.forEach((id) => document.getElementById(id)?.classList.add("show"));
   }
   if (st.filterTag !== undefined) {
     document.getElementById("filterTag")?.classList.toggle("show", Boolean(st.filterTag));
   }
   if (st.ghActive !== undefined) {
     const ghEl = document.getElementById("ent-gh");
-    ghEl.classList.toggle("active-amber", st.ghActive === "amber");
-    ghEl.classList.toggle("active-coral", st.ghActive === "coral");
-    ghEl.classList.toggle("active-green", st.ghActive === "green");
+    if (ghEl) {
+      ghEl.classList.toggle("active-amber", st.ghActive === "amber");
+      ghEl.classList.toggle("active-coral", st.ghActive === "coral");
+      ghEl.classList.toggle("active-green", st.ghActive === "green");
+    }
   }
   if (st.ghTitle) document.getElementById("ghTitle").textContent = st.ghTitle;
   if (st.ghSub) document.getElementById("ghSub").textContent = st.ghSub;
   if (st.promState !== undefined) {
     const promEl = document.getElementById("ent-prom");
-    promEl.classList.toggle("active-coral", st.promState === "coral");
-    promEl.classList.toggle("active-green", st.promState === "green");
+    if (promEl) {
+      promEl.classList.toggle("active-coral", st.promState === "coral");
+      promEl.classList.toggle("active-green", st.promState === "green");
+    }
   }
   if (st.promSub) document.getElementById("promSub").textContent = st.promSub;
   if (st.subagentText) document.getElementById("subagentText").textContent = st.subagentText;
@@ -861,12 +972,12 @@ function applyStage(st) {
 }
 
 function updateVineProgress() {
+  const vineMain = document.getElementById("tlVineMain");
+  const vineSub = document.getElementById("tlVineSub");
   const frac = CHAPTERS.length > 1 ? chapterIdx / (CHAPTERS.length - 1) : 1;
   if (vineMain) vineMain.style.strokeDashoffset = `${(vineMainLen * (1 - frac)).toFixed(1)}`;
   if (vineSub) vineSub.style.strokeDashoffset = `${(vineSubLen * (1 - frac)).toFixed(1)}`;
 }
-
-let forceSettled = new URLSearchParams(window.location.search).get("settled") === "1";
 
 function renderChapter() {
   clearStagedTimers();
@@ -886,30 +997,33 @@ function renderChapter() {
   });
 
   const ghEl = document.getElementById("ent-gh");
-  ghEl.classList.toggle("active-amber", ch.ghActive === "amber");
-  ghEl.classList.toggle("active-coral", ch.ghActive === "coral");
-  ghEl.classList.toggle("active-green", ch.ghActive === "green");
+  if (ghEl) {
+    ghEl.classList.toggle("active-amber", ch.ghActive === "amber");
+    ghEl.classList.toggle("active-coral", ch.ghActive === "coral");
+    ghEl.classList.toggle("active-green", ch.ghActive === "green");
+  }
   document.getElementById("ghTitle").textContent = ch.ghTitle;
   document.getElementById("ghSub").textContent = ch.ghSub;
   if (ch.ccAction) document.getElementById("ccAction").textContent = ch.ccAction;
 
   const promEl = document.getElementById("ent-prom");
-  promEl.classList.toggle("active-coral", ch.promState === "coral");
-  promEl.classList.toggle("active-green", ch.promState === "green");
+  if (promEl) {
+    promEl.classList.toggle("active-coral", ch.promState === "coral");
+    promEl.classList.toggle("active-green", ch.promState === "green");
+  }
   document.getElementById("promSub").textContent = ch.promSub;
-  document.getElementById("filterTag").classList.toggle("show", Boolean(ch.filterTag));
+  document.getElementById("filterTag")?.classList.toggle("show", Boolean(ch.filterTag));
 
   if (ch.subagentText) document.getElementById("subagentText").textContent = ch.subagentText;
   if (ch.slackMsg) document.getElementById("slackDmMsg").innerHTML = ch.slackMsg;
 
-  // Dynamic subscription & #deploys channel badges under each agent
   ["sub-alex-pr", "sub-alex-dep", "sub-alice-pr", "sub-alice-dep", "sub-ops-dep", "sub-rel-pr"].forEach((id) => {
-    const el = document.getElementById(id);
-    if (el) el.classList.toggle("show", (ch.subs || []).includes(id));
+    document.getElementById(id)?.classList.toggle("show", (ch.subs || []).includes(id));
   });
 
   ["cap-ch", "cap-dep", "cap-gh", "cap-pr"].forEach((id) => {
     const el = document.getElementById(id);
+    if (!el) return;
     el.classList.toggle("lit", (ch.caps || []).includes(id));
     el.classList.toggle("lit-coral", (ch.coralCaps || []).includes(id));
   });
@@ -922,6 +1036,7 @@ function renderChapter() {
 
   ["bub-alex", "bub-alice", "bub-ops", "bub-release"].forEach((id) => {
     const el = document.getElementById(id);
+    if (!el) return;
     const spec = ch.bubbles[id];
     if (spec) {
       el.textContent = spec.text;
@@ -934,6 +1049,7 @@ function renderChapter() {
 
   ["rip-alex", "rip-node", "rip-alice", "rip-ops", "rip-release"].forEach((id) => {
     const el = document.getElementById(id);
+    if (!el) return;
     el.classList.remove("fire");
     if (ch.ripples.includes(id)) {
       void el.offsetWidth;
@@ -941,7 +1057,6 @@ function renderChapter() {
     }
   });
 
-  // In-scene subtitle + single-line mycelial timeline
   document.getElementById("storyCaption").innerHTML = ch.caption;
   updateVineProgress();
 
@@ -981,10 +1096,9 @@ function renderChapter() {
 
 function resetStoryTimer() {
   if (storyTimer) clearTimeout(storyTimer);
-  if (!storyPlaying) return;
+  if (!storyPlaying || !walkthroughOpen) return;
   const isLast = chapterIdx >= CHAPTERS.length - 1;
   if (isLast) {
-    // Stop cleanly at the end instead of auto-looping; show Play again CTA
     storyTimer = setTimeout(() => {
       storyPlaying = false;
       const playBtn = document.getElementById("storyPlayBtn");
@@ -1004,14 +1118,63 @@ function resetStoryTimer() {
 function replayStory() {
   chapterIdx = 0;
   storyPlaying = true;
-  document.getElementById("storyPlayBtn").textContent = "Pause";
+  const playBtn = document.getElementById("storyPlayBtn");
+  if (playBtn) playBtn.textContent = "Pause";
   renderChapter();
   resetStoryTimer();
 }
 
+function setWalkthroughOpen(open) {
+  const body = document.getElementById("walkthroughBody");
+  const toggle = document.getElementById("walkthroughToggle");
+  const label = document.getElementById("walkthroughToggleLabel");
+  if (!body || !toggle) return;
+
+  walkthroughOpen = open;
+  body.hidden = !open;
+  toggle.setAttribute("aria-expanded", open ? "true" : "false");
+  toggle.classList.toggle("is-open", open);
+  if (label) label.textContent = open ? "Hide 7-step story" : "Expand 7-step story";
+
+  if (open) {
+    requestAnimationFrame(() => {
+      fitWalkthroughStage();
+      buildOrganicHyphaBundles();
+      initVineLengths();
+      const urlChapter = new URLSearchParams(window.location.search).get("chapter");
+      const hasUrlCh = urlChapter !== null && Number.isInteger(Number(urlChapter)) && Number(urlChapter) >= 0 && Number(urlChapter) < CHAPTERS.length;
+      if (hasUrlCh) {
+        chapterIdx = Number(urlChapter);
+        storyPlaying = false;
+        const playBtn = document.getElementById("storyPlayBtn");
+        if (playBtn) playBtn.textContent = "Play";
+      } else {
+        storyPlaying = !window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+        const playBtn = document.getElementById("storyPlayBtn");
+        if (playBtn) playBtn.textContent = storyPlaying ? "Pause" : "Play";
+      }
+      renderChapter();
+      resetStoryTimer();
+    });
+  } else {
+    storyPlaying = false;
+    clearStagedTimers();
+    if (storyTimer) clearTimeout(storyTimer);
+    if (pktRaf) cancelAnimationFrame(pktRaf);
+  }
+}
+
+document.getElementById("walkthroughToggle")?.addEventListener("click", () => {
+  setWalkthroughOpen(!walkthroughOpen);
+});
+
+document.getElementById("jumpWalkthroughBtn")?.addEventListener("click", () => {
+  if (!walkthroughOpen) setWalkthroughOpen(true);
+});
+
 document.getElementById("storyReplayBtn")?.addEventListener("click", replayStory);
 
-document.getElementById("storyPlayBtn").addEventListener("click", (e) => {
+document.getElementById("storyPlayBtn")?.addEventListener("click", (e) => {
   if (!storyPlaying && chapterIdx === CHAPTERS.length - 1) {
     replayStory();
     return;
@@ -1021,24 +1184,33 @@ document.getElementById("storyPlayBtn").addEventListener("click", (e) => {
   resetStoryTimer();
 });
 
-document.getElementById("storyPrevBtn").addEventListener("click", () => {
+document.getElementById("storyPrevBtn")?.addEventListener("click", () => {
   chapterIdx = (chapterIdx - 1 + CHAPTERS.length) % CHAPTERS.length;
   renderChapter();
   resetStoryTimer();
 });
 
-document.getElementById("storyNextBtn").addEventListener("click", () => {
+document.getElementById("storyNextBtn")?.addEventListener("click", () => {
   chapterIdx = (chapterIdx + 1) % CHAPTERS.length;
   renderChapter();
   resetStoryTimer();
 });
 
+window.addEventListener("resize", () => {
+  if (walkthroughOpen) fitWalkthroughStage();
+}, { passive: true });
+
+if (new URLSearchParams(window.location.search).get("chapter") !== null) {
+  setWalkthroughOpen(true);
+}
+
+// Floating organic spore canvas behind hero
 (function initSporeCanvas() {
   const canvas = document.getElementById("sporeCanvas");
   if (!canvas || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
   const ctx = canvas.getContext("2d");
   let w = 0, h = 0;
-  const motes = Array.from({ length: 30 }, () => ({
+  const motes = Array.from({ length: 28 }, () => ({
     x: Math.random(),
     y: Math.random(),
     r: 1 + Math.random() * 1.6,
@@ -1073,40 +1245,36 @@ document.getElementById("storyNextBtn").addEventListener("click", () => {
   requestAnimationFrame(draw);
 })();
 
-const urlChapter = new URLSearchParams(window.location.search).get("chapter");
-if (urlChapter !== null && Number.isInteger(Number(urlChapter)) && Number(urlChapter) >= 0 && Number(urlChapter) < CHAPTERS.length) {
-  chapterIdx = Number(urlChapter);
-  storyPlaying = false;
-  document.getElementById("storyPlayBtn").textContent = "Play";
-}
-renderChapter();
-resetStoryTimer();
-
 // ============================================================================
-// 3. INTERACTIVE LOCAL NODE CONTROL CENTER (#streams)
+// 3. INTERACTIVE LOCAL NODE DELIVERY SIMULATOR (#streams)
 // ============================================================================
 (function initControlGate() {
+  const shell = document.getElementById("gateShell");
+  const toggleBtn = document.getElementById("gateSimToggle");
+  const toggleLabel = document.getElementById("gateSimToggleLabel");
   const viewport = document.getElementById("gateViewport");
   const stage = document.getElementById("gateStage");
   const packetsHost = document.getElementById("gatePackets");
   const mobileHost = document.getElementById("gateMobile");
   const shieldArc = document.getElementById("gateShieldArc");
-  if (!viewport || !stage) return;
+  if (!shell || !viewport || !stage) return;
 
   const LOGICAL_W = 1120;
   const LOGICAL_H = 488;
   const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  let simOpen = false;
+  let gateBundlesBuilt = false;
 
   function fitGateStage() {
-    if (window.innerWidth <= 760) return;
-    const availW = viewport.clientWidth || LOGICAL_W;
+    if (!simOpen || window.innerWidth <= 760) return;
+    const availW = viewport.clientWidth || 0;
+    if (availW <= 0) return;
     const scale = Math.min(1.06, availW / LOGICAL_W);
     const offsetX = Math.max(0, (availW - LOGICAL_W * scale) / 2);
     stage.style.transform = `translateX(${offsetX.toFixed(1)}px) scale(${scale.toFixed(4)})`;
     viewport.style.height = `${Math.round(LOGICAL_H * scale)}px`;
   }
 
-  fitGateStage();
   if (typeof ResizeObserver !== "undefined") {
     new ResizeObserver(fitGateStage).observe(viewport);
   }
@@ -1117,91 +1285,95 @@ resetStoryTimer();
     { name: "OSS PRs", sub: "anthropics/claude-code", linkedSub: "anthropics/claude-code", cls: "amber" },
     { name: "CI Burst (×12)", sub: "flaky retries", cls: "amber-muted" },
     { name: "#deploys", sub: "build room", cls: "olive" },
-    { name: "Direct P2P · bob@laptop", sub: "HPKE · diff.patch", cls: "moss" },
+    { name: "Direct P2P · bob@laptop", sub: "E2EE · diff.patch", cls: "moss" },
   ];
 
-  // Build braided companion hyphae once (tight hugging weave on unified #g-out)
   const gateBundles = new Map();
-  const gateHost = document.getElementById("gateBundles");
-  document.querySelectorAll(".gate-strand").forEach((path, idx) => {
-    if (!gateHost) return;
-    const isUnified = path.id === "g-out";
-    const len = path.getTotalLength();
-    const g = document.createElementNS(SVG_NS, "g");
-    const cls = ["amber-muted", "amber", "coral", "olive", "moss", "peer"].find((c) => path.classList.contains(c)) || "";
-    g.setAttribute("class", `gate-bundle ${cls}`.trim());
+  function ensureGateBundles() {
+    if (gateBundlesBuilt) return;
+    gateBundlesBuilt = true;
+    const gateHost = document.getElementById("gateBundles");
+    document.querySelectorAll(".gate-strand").forEach((path, idx) => {
+      if (!gateHost) return;
+      const isUnified = path.id === "g-out";
+      const len = path.getTotalLength();
+      const g = document.createElementNS(SVG_NS, "g");
+      const cls = ["amber-muted", "amber", "coral", "olive", "moss", "peer"].find((c) => path.classList.contains(c)) || "";
+      g.setAttribute("class", `gate-bundle ${cls}`.trim());
 
-    const steps = Math.max(10, Math.min(24, Math.round(len / 18)));
-    const amp = isUnified ? 2.8 : Math.min(6.4, Math.max(3.6, len * 0.022));
-    const seed = (idx + 2) * 1.43;
-    const ptsA = [];
-    const ptsB = [];
-    for (let i = 0; i <= steps; i++) {
-      const f = i / steps;
-      const d = f * len;
-      const p = path.getPointAtLength(d);
-      const pN = path.getPointAtLength(Math.min(len, d + 2));
-      const pP = path.getPointAtLength(Math.max(0, d - 2));
-      const dx = pN.x - pP.x;
-      const dy = pN.y - pP.y;
-      const mag = Math.hypot(dx, dy) || 1;
-      const nx = -dy / mag;
-      const ny = dx / mag;
-      const env = Math.sin(f * Math.PI);
-      const offA = env * Math.sin(f * Math.PI * (isUnified ? 4.2 : 3) + seed) * amp;
-      const offB = env * Math.cos(f * Math.PI * (isUnified ? 5.2 : 4.1) - seed) * (amp * 0.58);
-      ptsA.push(`${(p.x + nx * offA).toFixed(1)} ${(p.y + ny * offA).toFixed(1)}`);
-      ptsB.push(`${(p.x + nx * offB).toFixed(1)} ${(p.y + ny * offB).toFixed(1)}`);
-    }
-
-    for (const [pts, wcls] of [[ptsA, "gb-weave"], [ptsB, "gb-weave fine"]]) {
-      const w = document.createElementNS(SVG_NS, "path");
-      w.setAttribute("class", wcls);
-      w.setAttribute("d", `M ${pts[0]} L ${pts.slice(1).join(" L ")}`);
-      g.appendChild(w);
-    }
-
-    if (!isUnified) {
-      [0.34, 0.68].forEach((f, ti) => {
+      const steps = Math.max(10, Math.min(24, Math.round(len / 18)));
+      const amp = isUnified ? 2.8 : Math.min(6.4, Math.max(3.6, len * 0.022));
+      const seed = (idx + 2) * 1.43;
+      const ptsA = [];
+      const ptsB = [];
+      for (let i = 0; i <= steps; i++) {
+        const f = i / steps;
         const d = f * len;
         const p = path.getPointAtLength(d);
-        const pN = path.getPointAtLength(Math.min(len, d + 3));
-        const dx = pN.x - p.x;
-        const dy = pN.y - p.y;
+        const pN = path.getPointAtLength(Math.min(len, d + 2));
+        const pP = path.getPointAtLength(Math.max(0, d - 2));
+        const dx = pN.x - pP.x;
+        const dy = pN.y - pP.y;
         const mag = Math.hypot(dx, dy) || 1;
-        const tx = dx / mag;
-        const ty = dy / mag;
-        const side = (ti + idx) % 2 === 0 ? 1 : -1;
-        const nx = -ty * side;
-        const ny = tx * side;
-        const reach = 14;
-        const c1x = p.x + tx * 6 + nx * 7;
-        const c1y = p.y + ty * 6 + ny * 7;
-        const ex = p.x + tx * 11 + nx * reach;
-        const ey = p.y + ty * 11 + ny * reach;
-        const twig = document.createElementNS(SVG_NS, "path");
-        twig.setAttribute("class", "gb-twig");
-        twig.setAttribute("d", `M ${p.x.toFixed(1)} ${p.y.toFixed(1)} Q ${c1x.toFixed(1)} ${c1y.toFixed(1)}, ${ex.toFixed(1)} ${ey.toFixed(1)}`);
-        g.appendChild(twig);
-      });
-    }
+        const nx = -dy / mag;
+        const ny = dx / mag;
+        const env = Math.sin(f * Math.PI);
+        const offA = env * Math.sin(f * Math.PI * (isUnified ? 4.2 : 3) + seed) * amp;
+        const offB = env * Math.cos(f * Math.PI * (isUnified ? 5.2 : 4.1) - seed) * (amp * 0.58);
+        ptsA.push(`${(p.x + nx * offA).toFixed(1)} ${(p.y + ny * offA).toFixed(1)}`);
+        ptsB.push(`${(p.x + nx * offB).toFixed(1)} ${(p.y + ny * offB).toFixed(1)}`);
+      }
 
-    gateHost.appendChild(g);
-    gateBundles.set(path.id, g);
-  });
+      for (const [pts, wcls] of [[ptsA, "gb-weave"], [ptsB, "gb-weave fine"]]) {
+        const w = document.createElementNS(SVG_NS, "path");
+        w.setAttribute("class", wcls);
+        w.setAttribute("d", `M ${pts[0]} L ${pts.slice(1).join(" L ")}`);
+        g.appendChild(w);
+      }
+
+      if (!isUnified) {
+        [0.34, 0.68].forEach((f, ti) => {
+          const d = f * len;
+          const p = path.getPointAtLength(d);
+          const pN = path.getPointAtLength(Math.min(len, d + 3));
+          const dx = pN.x - p.x;
+          const dy = pN.y - p.y;
+          const mag = Math.hypot(dx, dy) || 1;
+          const tx = dx / mag;
+          const ty = dy / mag;
+          const side = (ti + idx) % 2 === 0 ? 1 : -1;
+          const nx = -ty * side;
+          const ny = tx * side;
+          const reach = 14;
+          const c1x = p.x + tx * 6 + nx * 7;
+          const c1y = p.y + ty * 6 + ny * 7;
+          const ex = p.x + tx * 11 + nx * reach;
+          const ey = p.y + ty * 11 + ny * reach;
+          const twig = document.createElementNS(SVG_NS, "path");
+          twig.setAttribute("class", "gb-twig");
+          twig.setAttribute("d", `M ${p.x.toFixed(1)} ${p.y.toFixed(1)} Q ${c1x.toFixed(1)} ${c1y.toFixed(1)}, ${ex.toFixed(1)} ${ey.toFixed(1)}`);
+          g.appendChild(twig);
+        });
+      }
+
+      gateHost.appendChild(g);
+      gateBundles.set(path.id, g);
+    });
+  }
 
   const DEFAULT_STATE = {
-    publicLinked: false, // Multi-node pairing: Private Team Node (acme-team) active by default; click to link public.hyphae.to!
-    ciMode: "burst",     // "burst" (Burst cap: noisy -> notify) -> "unsub" (0 wire!) -> "all" (unthrottled flood)
-    aliceMode: "queue",  // 3-tier delivery urgency: "queue" (idle) -> "interrupt" (urgent VIP) -> "notify" (inbox) -> "mute"
-    deploysMode: "mute", // "mute" (deflect at shield) -> "notify" (inbox) -> "queue" (idle)
-    guard: true,         // Pluggable prompt-injection guard ON <-> OFF
-    focus: false,        // Focus Mode (* -> notify): holds all non-VIP sources in local inbox
+    publicLinked: false,
+    ciMode: "burst",
+    aliceMode: "queue",
+    deploysMode: "mute",
+    guard: true,
+    focus: false,
   };
 
   const params = new URLSearchParams(window.location.search);
   const urlPhaseRaw = params.get("t");
   const fixedPhase = urlPhaseRaw !== null && !Number.isNaN(Number(urlPhaseRaw)) ? Number(urlPhaseRaw) : null;
+  const hasSimParam = ["t", "public", "focus", "ci", "alice", "deploys", "guard"].some((k) => params.has(k));
 
   let gateState = { ...DEFAULT_STATE };
   if (params.get("public") === "1") gateState.publicLinked = true;
@@ -1245,11 +1417,10 @@ resetStoryTimer();
     let leakedInject = false;
     let noisyFlood = false;
 
-    // Row 0: Team Node (acme) · DM @alice (queue | interrupt | notify | mute)
     const aliceEff = st.aliceMode === "mute"
       ? "mute"
       : st.aliceMode === "interrupt"
-      ? "interrupt" // VIP interrupt breaks through Focus Mode!
+      ? "interrupt"
       : st.focus
       ? "notify"
       : st.aliceMode;
@@ -1283,7 +1454,6 @@ resetStoryTimer();
       packets.push({ path: "g-in-0", cls: "", label: "DM @alice", phase: 0.02, dur: 1160, startT: 0.14, endT: 0.78, rippleNode: "green" });
     }
 
-    // Row 1: public.hyphae.to · GitHub OSS (starts UNLINKED -> 0 wire! Click "Public Node" to light up!)
     let src1;
     if (!st.publicLinked) {
       unsubOrUnlinked += 1;
@@ -1320,7 +1490,6 @@ resetStoryTimer();
       }
     }
 
-    // Row 2: CI Burst (x12) ("burst" = Burst cap: noisy -> notify | "unsub" = 0 wire! | "all" = flood)
     let src2;
     if (st.ciMode === "unsub") {
       unsubOrUnlinked += 1;
@@ -1352,7 +1521,6 @@ resetStoryTimer();
       packets.push({ path: "g-in-2", cls: "amber", label: "CI burst ×12", phase: 0.08, dur: 1120, startT: 0.14, endT: 0.78 });
     }
 
-    // Row 3: #deploys · chatter ("mute" | "notify" | "queue")
     const deploysEff = st.deploysMode === "mute" ? "mute" : st.focus ? "notify" : st.deploysMode;
     let src3;
     if (deploysEff === "mute") {
@@ -1379,16 +1547,12 @@ resetStoryTimer();
       packets.push({ path: "g-in-3", cls: "moss", label: "#deploys ok", phase: 0.16, dur: 1180, startT: 0.14, endT: 0.78 });
     }
 
-    // Row 4: Direct P2P · bob@laptop (saved directly to disk outside LLM prompt)
     const src4 = { state: "pass", badge: "→ disk", strand: "active" };
     if (st.focus) notifyItems.push("diff.patch");
     else queuedItems.push("P2P diff");
     packets.push({ path: "g-in-4", cls: "moss", label: "🔒 P2P diff.patch", phase: 0.04, dur: 1180, startT: 0.14, endT: 0.78 });
-
-    // Subtle personal Slack/Telegram bridge pulse on #g-in-5
     packets.push({ path: "g-in-5", cls: "moss", label: "Slack · writer", phase: 0.48, dur: 1320, startT: 0.16, endT: 0.76 });
 
-    // Compute ONE single unified right-hand strand (#g-out) output reflecting 3-tier urgency!
     const hasInterrupt = interruptItems.length > 0;
     const hasQueued = queuedItems.length > 0;
     const hasNotify = notifyItems.length > 0;
@@ -1398,7 +1562,6 @@ resetStoryTimer();
     if (hasInterrupt || leakedInject) outTone = "urgent";
     else if (st.focus || (!hasQueued && hasNotify)) outTone = "notify-mode";
 
-    // Merge chip above Local Node
     const firstPassIn = packets.find((p) => !p.deflect);
     if (firstPassIn) {
       if (st.focus && hasInterrupt) {
@@ -1478,7 +1641,6 @@ resetStoryTimer();
       }
     }
 
-    // Center Local Node subtitle & rule pill
     const nodeSubText = st.publicLinked
       ? "acme-team + public.hyphae.to"
       : "acme-team · Keychain";
@@ -1501,7 +1663,7 @@ resetStoryTimer();
       rulePillCls = "amber";
     }
 
-    // Dynamic telemetry calculations (kept concise so #gateMeter never wraps or overflows)
+    // Honest simulation counts (no fake benchmark percentage)
     let deliveredLabel = "Delivery";
     let deliveredText = "quiet · 0 wakes";
     let blockedLabel = "Stopped";
@@ -1511,8 +1673,10 @@ resetStoryTimer();
     if (unsubOrUnlinked > 0 && stopParts.length < 2) stopParts.push(`${unsubOrUnlinked} off`);
     let blockedText = stopParts.length ? stopParts.join(" · ") : "0 stopped";
     let blockedCls = burstCapped > 0 || droppedCount > 0 ? "amber" : "";
-    let savedLabel = "Context saved";
-    let barPct = 94;
+
+    let savedLabel = "Simulation";
+    let savedValue = "11 of 12 held back";
+    let barPct = 92;
     let barDanger = false;
     let foot = "Delivers on idle · P2P → disk";
 
@@ -1521,15 +1685,18 @@ resetStoryTimer();
       blockedLabel = "Guard";
       blockedText = "1 inject leaked!";
       blockedCls = "coral";
-      savedLabel = "Prompt safety";
-      barPct = 26;
+      savedLabel = "Simulation";
+      savedValue = "1 inject leaked";
+      barPct = 24;
       barDanger = true;
-      foot = "Enable Guard to block injections";
+      foot = "Enable Guard to screen inbound text";
     } else if (st.focus) {
       deliveredText = hasInterrupt ? "⚡ 1 VIP + 1 digest" : `1-line digest (${notifyItems.length})`;
       blockedLabel = "Held";
       blockedText = `${notifyItems.length} notify · ${burstCapped + droppedCount} stopped`;
-      barPct = Math.min(99, 95 + (st.ciMode !== "all" ? 2 : 0) + (st.deploysMode === "mute" ? 1 : 0));
+      const heldTotal = st.ciMode === "unsub" ? 12 : st.ciMode === "burst" ? 11 : 12;
+      savedValue = `${heldTotal} of 12 held back`;
+      barPct = Math.round((heldTotal / 12) * 100);
       foot = hasInterrupt
         ? "VIP @alice breaks through Focus"
         : "Held in inbox · 1-line digest";
@@ -1544,16 +1711,17 @@ resetStoryTimer();
         deliveredText = `notify (${notifyItems.length} digest)`;
       }
 
-      let score = 50;
-      if (st.ciMode === "burst") score += 26;
-      if (st.ciMode === "unsub") score += 29;
-      if (st.deploysMode === "mute") score += 11;
-      if (st.deploysMode === "notify") score += 8;
-      if (st.aliceMode === "notify" || st.aliceMode === "mute") score += 4;
-      if (st.guard) score += 4;
-      if (!st.publicLinked) score += 3;
-      if (noisyFlood) score = Math.min(score, 40);
-      barPct = Math.max(24, Math.min(99, score));
+      if (st.ciMode === "burst") {
+        savedValue = "11 of 12 held back";
+        barPct = 92;
+      } else if (st.ciMode === "unsub") {
+        savedValue = "12 of 12 unsubscribed";
+        barPct = 100;
+      } else if (noisyFlood) {
+        savedValue = "0 of 12 held back";
+        barPct = 18;
+        barDanger = true;
+      }
 
       foot = hasInterrupt
         ? "Urgent interrupt wakes now"
@@ -1584,6 +1752,7 @@ resetStoryTimer();
       blockedText,
       blockedCls,
       savedLabel,
+      savedValue,
       barPct,
       barDanger,
       foot,
@@ -1694,7 +1863,7 @@ resetStoryTimer();
       </div>
       <div class="gm-mob-node" style="flex-direction:column; align-items:stretch;">
         <div style="display:flex; align-items:center; gap:11px;">
-          <img class="gate-local-node-img" src="./assets/node-hub.png?v=7" alt="Local Hyphae Node" />
+          <img class="gate-local-node-img" src="./assets/node-hub.webp?v=1" alt="Local Hyphae Node" />
           <div class="gm-mob-node-body">
             <strong>Your Local Node</strong>
             <span>${esc(sc.rulePillText)}</span>
@@ -1755,7 +1924,7 @@ resetStoryTimer();
         <div class="gm-row"><span>${esc(sc.deliveredLabel)}</span><strong class="${sc.leakedInject || sc.hasInterrupt ? "coral" : ""}">${esc(sc.deliveredText)}</strong></div>
         <div class="gm-row"><span>${esc(sc.blockedLabel)}</span><strong class="${esc(sc.blockedCls)}">${esc(sc.blockedText)}</strong></div>
         <div class="gm-bar-wrap">
-          <div class="gm-bar-head"><span>${esc(sc.savedLabel)}</span><strong>${sc.barPct}%</strong></div>
+          <div class="gm-bar-head"><span>${esc(sc.savedLabel)}</span><strong>${esc(sc.savedValue)}</strong></div>
           <div class="gm-bar"><span class="${sc.barDanger ? "danger" : ""}" style="width:${sc.barPct}%"></span></div>
         </div>
       </div>
@@ -1767,7 +1936,7 @@ resetStoryTimer();
 
   function startGatePackets(sc) {
     if (gateRaf) cancelAnimationFrame(gateRaf);
-    if (!packetsHost) return;
+    if (!packetsHost || !simOpen) return;
     packetsHost.innerHTML = "";
     shieldArc?.classList.remove("hit-amber", "hit-coral");
 
@@ -1781,7 +1950,6 @@ resetStoryTimer();
       return { ...spec, el, path, len: path.getTotalLength(), lastCycle: -1 };
     }).filter(Boolean);
 
-    // Strictly ONE reusable drop chip & ONE merge chip — prevents ghost/overlapping double text!
     const dropTagEl = document.createElement("div");
     dropTagEl.className = "gate-drop-tag";
     dropTagEl.style.opacity = "0";
@@ -1946,6 +2114,7 @@ resetStoryTimer();
     }
 
     function tick(now) {
+      if (!simOpen) return;
       pausedElapsed = now - cycleStart;
       renderFrame(pausedElapsed);
       gateRaf = requestAnimationFrame(tick);
@@ -1965,7 +2134,6 @@ resetStoryTimer();
       valveEl.className = `gate-valve-ring ${modeCls}`.trim();
     }
 
-    // Sync macOS Control Center tiles directly under Local Node
     const pubBtn = document.getElementById("ctlPublicLink");
     const pubState = document.getElementById("ctlPublicState");
     if (pubBtn) {
@@ -2009,7 +2177,6 @@ resetStoryTimer();
       if (depState) depState.textContent = cur.txt;
     }
 
-    // Sync macOS Slider-Style CI Burst Cap Bar
     const ciCard = document.getElementById("ctlCiCard");
     const ciState = document.getElementById("ctlCiState");
     const ciFill = document.getElementById("ctlCiFill");
@@ -2031,7 +2198,6 @@ resetStoryTimer();
       });
     }
 
-    // Sync Right macOS Focus Tile
     const focusBtn = document.getElementById("gateFocusBtn");
     const focusState = document.getElementById("gateFocusState");
     if (focusBtn) {
@@ -2040,7 +2206,6 @@ resetStoryTimer();
     }
     if (focusState) focusState.textContent = gateState.focus ? "All → notify" : "Off · normal delivery";
 
-    // Sync Right Telemetry Meter
     const gmDelLbl = document.getElementById("gmDeliveredLabel");
     const gmDel = document.getElementById("gmDelivered");
     const gmBlkLbl = document.getElementById("gmBlockedLabel");
@@ -2060,14 +2225,13 @@ resetStoryTimer();
       gmBlk.className = sc.blockedCls || "";
     }
     if (gmSavLbl) gmSavLbl.textContent = sc.savedLabel;
-    if (gmSav) gmSav.textContent = `${sc.barPct}%`;
+    if (gmSav) gmSav.textContent = sc.savedValue;
     if (gmBar) {
       gmBar.style.width = `${sc.barPct}%`;
       gmBar.classList.toggle("danger", sc.barDanger);
     }
     if (gmFt) gmFt.textContent = sc.foot;
 
-    // Sync Left Nested Parent-Node Groups & Status Monitors (by data-src index!)
     document.querySelectorAll("#gateSources .gate-src[data-src]").forEach((el) => {
       const idx = Number(el.dataset.src);
       const st = sc.sources[idx];
@@ -2082,7 +2246,6 @@ resetStoryTimer();
       }
     });
 
-    // Sync Public Node nested group shell + #hyp-releases read-only feed row
     const pubGroup = document.getElementById("gatePublicGroup");
     const pubGroupStatus = document.getElementById("ggPubStatus");
     const relRow = document.getElementById("gateRelRow");
@@ -2098,7 +2261,6 @@ resetStoryTimer();
     }
     if (relBadge) relBadge.textContent = gateState.publicLinked ? "notify" : "unlinked";
 
-    // Sync SVG strands & companion weaves
     Object.entries(sc.strands).forEach(([id, state]) => {
       const p = document.getElementById(id);
       if (p) {
@@ -2166,8 +2328,8 @@ resetStoryTimer();
     switch (key) {
       case "publicLinked":
         lastCmd = gateState.publicLinked
-          ? "hyp pair join public.hyphae.to"
-          : "hyp pair leave public.hyphae.to";
+          ? "hyp pair join https://public.hyphae.to"
+          : "hyp pair revoke public.hyphae.to";
         break;
       case "guard":
         lastCmd = gateState.guard
@@ -2183,7 +2345,31 @@ resetStoryTimer();
     renderControlCenter();
   }
 
-  document.getElementById("gateShell")?.addEventListener("click", (e) => {
+  function setSimOpen(open) {
+    simOpen = open;
+    shell.hidden = !open;
+    shell.classList.toggle("is-collapsed", !open);
+    toggleBtn?.setAttribute("aria-expanded", open ? "true" : "false");
+    toggleBtn?.classList.toggle("is-open", open);
+    if (toggleLabel) {
+      toggleLabel.textContent = open
+        ? "Hide delivery simulator"
+        : "Try the interactive delivery simulator";
+    }
+    if (open) {
+      requestAnimationFrame(() => {
+        ensureGateBundles();
+        fitGateStage();
+        renderControlCenter();
+      });
+    } else if (gateRaf) {
+      cancelAnimationFrame(gateRaf);
+    }
+  }
+
+  toggleBtn?.addEventListener("click", () => setSimOpen(!simOpen));
+
+  shell.addEventListener("click", (e) => {
     const ciStep = e.target.closest("[data-ci]");
     if (ciStep) {
       const val = ciStep.dataset.ci;
@@ -2211,7 +2397,7 @@ resetStoryTimer();
     handleToggle(btn.dataset.toggle);
   });
 
-  document.getElementById("gateShell")?.addEventListener("keydown", (e) => {
+  shell.addEventListener("keydown", (e) => {
     if (e.key !== "Enter" && e.key !== " ") return;
     const roleBtn = e.target.closest('[data-toggle][role="button"]');
     if (!roleBtn) return;
@@ -2225,14 +2411,16 @@ resetStoryTimer();
     renderControlCenter();
   });
 
-  renderControlCenter();
+  if (hasSimParam) {
+    setSimOpen(true);
+  }
 })();
 
 // ============================================================================
 // 4. TOPOLOGY CARD COPY BUTTONS (#topologies)
 // ============================================================================
 const TOPO_SNIPPETS = {
-  p2p: "hyp pair invite --mode p2p",
+  p2p: "hyp onboard",
   team: "hyp deploy init tailscale",
   public: "hyp pair join https://public.hyphae.to",
 };
@@ -2353,32 +2541,27 @@ document.querySelectorAll("[data-copy-topo]").forEach((btn) => {
 })();
 
 // ============================================================================
-// 5. QUICK START TABS
+// 5. INSTALL TABS (OS-only: macOS / Linux and Windows)
 // ============================================================================
 const QS = {
-  unix: `# Install ~8 MiB verified Rust binary & launch onboarding
-curl -fsSL https://hyphae.to/install.sh | sh`,
-  win: `# Install ~8 MiB verified Rust binary & launch onboarding (PowerShell)
-irm https://hyphae.to/install.ps1 | iex`,
-  deploy: `# Generate a Hub kit (tailscale/docker/fly)
-hyp deploy init tailscale
+  unix: {
+    code: `# 1. Install the binary (checksum verified)
+curl -fsSL https://hyphae.to/install.sh | sh
 
-# Create a P2P invite or inspect scopes
-hyp pair invite --mode p2p
-hyp pair inspect <<< "$TOKEN"
+# 2. Wire your coding tools and start the local daemon
+hyp onboard`,
+    copy: "curl -fsSL https://hyphae.to/install.sh | sh && hyp onboard",
+    note: "macOS & Linux: full support including native daemon, OS Keychain / Secret Service, and optional chat bridges.",
+  },
+  win: {
+    code: `# 1. Install the binary (checksum verified, PowerShell)
+irm https://hyphae.to/install.ps1 | iex
 
-# Enable a prompt-injection guard
-hyp gate init --adapter anthropic`,
-  drops: `# Pair phone Passkey & send an HPKE-encrypted directive draft
-hyp auth init --web
-hyp relay set https://spore.hyphae.to
-hyp drop create --kind directive --draft "Approve canary rollout"
-
-# Or self-host your own 256 MiB RAM-only Drop Relay in 60s
-hyp deploy init drop-relay --domain drop.example.com
-
-# Trigger local.schedule from cron / systemd / launchd
-hyp emit --label morning-triage --note "Review open PRs"`,
+# 2. Wire your coding tools and start the scheduled service
+hyp onboard`,
+    copy: "irm https://hyphae.to/install.ps1 | iex; hyp onboard",
+    note: "Windows: supports core hyp, MCP, hooks, schtasks service & uninstall.ps1. Chat bridges require macOS, Linux, or WSL.",
+  },
 };
 
 function formatQsHtml(raw) {
@@ -2399,16 +2582,26 @@ function formatQsHtml(raw) {
 
 let activeQs = "unix";
 function renderQs() {
-  document.getElementById("qsPre").innerHTML = formatQsHtml(QS[activeQs]);
-  document.querySelectorAll("#qsTabs .it-btn").forEach((b) =>
-    b.classList.toggle("active", b.dataset.qs === activeQs)
-  );
+  const item = QS[activeQs] || QS.unix;
+  const pre = document.getElementById("qsPre");
+  const note = document.getElementById("qsOsNote");
+  if (pre) pre.innerHTML = formatQsHtml(item.code);
+  if (note) note.textContent = item.note;
+  document.querySelectorAll("#qsTabs .it-btn").forEach((b) => {
+    const active = b.dataset.qs === activeQs;
+    b.classList.toggle("active", active);
+    b.setAttribute("aria-selected", active ? "true" : "false");
+  });
 }
 document.querySelectorAll("#qsTabs .it-btn").forEach((b) => {
-  b.addEventListener("click", () => { activeQs = b.dataset.qs; renderQs(); });
+  b.addEventListener("click", () => {
+    activeQs = b.dataset.qs;
+    renderQs();
+  });
 });
-document.getElementById("qsCopyBtn").addEventListener("click", (e) => {
-  navigator.clipboard?.writeText(QS[activeQs]).catch(() => {});
+document.getElementById("qsCopyBtn")?.addEventListener("click", (e) => {
+  const item = QS[activeQs] || QS.unix;
+  navigator.clipboard?.writeText(item.copy).catch(() => {});
   const btn = e.currentTarget;
   btn.textContent = "Copied";
   setTimeout(() => { btn.textContent = "Copy"; }, 1300);

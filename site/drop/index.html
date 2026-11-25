@@ -32,10 +32,13 @@
         <span class="brand-sep" aria-hidden="true">·</span>
         <span class="brand-area">drop</span>
       </a>
-      <span class="e2ee-pill" title="Strict CSP · Zero CDN · Client-Side HPKE">
-        <span class="pill-dot" aria-hidden="true"></span>
-        E2EE
-      </span>
+      <div class="context-badges">
+        <a class="brand" href="https://hyphae.to" rel="noreferrer"><span class="brand-area">What is this?</span></a>
+        <span class="e2ee-pill" title="Strict CSP · Zero CDN · Client-Side HPKE">
+          <span class="pill-dot" aria-hidden="true"></span>
+          E2EE
+        </span>
+      </div>
     </header>
 
     <!-- =================================================================== -->
@@ -89,7 +92,7 @@
           <span class="feature-num">03</span>
           <div>
             <strong>RFC 9180 HPKE + Blind Relay</strong>
-            Power-of-2 bucket padding sealed to the target X25519 key, with 1-tap offline <code>hdrop1_</code> fallback.
+            Blind relay · ciphertext deleted within 15 min. Power-of-2 bucket padding sealed to your node's X25519 key, with 1-tap offline <code>hdrop1_</code> fallback.
           </div>
         </li>
       </ul>
@@ -176,15 +179,15 @@
           <div class="auth-grid">
             <div class="field">
               <label class="field-label-sm" for="inputHumanId">Human ID</label>
-              <input id="inputHumanId" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="e.g. bogdan" />
+              <input id="inputHumanId" type="text" autocomplete="off" aria-autocomplete="none" autocapitalize="none" spellcheck="false" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" data-protonpass-ignore="true" data-form-type="other" placeholder="e.g. bogdan" />
             </div>
             <div class="field">
               <label class="field-label-sm" for="inputAuthEpoch">Epoch</label>
-              <input id="inputAuthEpoch" type="number" min="1" step="1" value="1" />
+              <input id="inputAuthEpoch" type="number" min="1" step="1" value="1" autocomplete="off" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" data-form-type="other" />
             </div>
             <div class="field span-2">
               <label class="field-label-sm" for="inputPrfSalt">PRF Salt (base64url)</label>
-              <input id="inputPrfSalt" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Saved at enrollment or embedded in link" />
+              <input id="inputPrfSalt" type="text" autocomplete="off" aria-autocomplete="none" autocapitalize="none" spellcheck="false" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" data-protonpass-ignore="true" data-form-type="other" placeholder="Saved at enrollment or embedded in link" />
             </div>
           </div>
         </div>
@@ -279,11 +282,18 @@
           <div class="input-row">
             <input
               id="inputSecretValue"
-              type="password"
+              class="secret-masked"
+              type="text"
               autocomplete="off"
+              aria-autocomplete="none"
               autocorrect="off"
               autocapitalize="off"
               spellcheck="false"
+              data-1p-ignore="true"
+              data-lpignore="true"
+              data-bwignore="true"
+              data-protonpass-ignore="true"
+              data-form-type="other"
               placeholder="Paste secret value…"
               disabled
             />
@@ -537,8 +547,8 @@
     </section>
 
     <footer class="footer">
-      <span>Fragment scrubbed on load · Zero analytics · Zero third-party scripts</span>
-      <a href="https://hyphae.to" rel="noreferrer">hyphae.to</a>
+      <span>Blind relay · ciphertext deleted within 15 min · Fragment scrubbed on load · Zero analytics</span>
+      <a href="https://hyphae.to" rel="noreferrer">What is Hyphae? · hyphae.to</a>
     </footer>
   </main>
 

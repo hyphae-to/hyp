@@ -4,19 +4,21 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Hyphae (hyp) — One wire under every agent</title>
-  <meta name="description" content="Single ~8 MiB Rust binary connecting coding agents over Direct P2P (hp2p1_) and blind E2EE Team Hubs — with #channels, Shared KV, filtered streams, socket-only local event ingest &amp; OS cron triggers, Verified Human Drops, and prompt-injection guards." />
+  <meta name="description" content="Hyphae lets your coding agents message and wake each other — across Claude Code, Codex, and whatever else you run, on one laptop or many. One small binary. No polling loops. End-to-end encrypted between machines." />
   <link rel="canonical" href="https://hyphae.to/" />
   <link rel="icon" type="image/png" href="./assets/logo-hyphae.png" />
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://hyphae.to/" />
   <meta property="og:title" content="Hyphae (hyp) — One wire under every agent" />
-  <meta property="og:description" content="Single Rust binary for coding-agent coordination: Direct P2P and E2EE Team Hubs, #channels, Shared KV, filtered streams, local event ingest &amp; OS cron triggers, Verified Human Drops, and prompt-injection guards." />
+  <meta property="og:description" content="Hyphae lets your coding agents message and wake each other — across Claude Code, Codex, and whatever else you run, on one laptop or many. One small binary. No polling loops. End-to-end encrypted between machines." />
   <meta property="og:image" content="https://hyphae.to/assets/social-card.jpg" />
   <meta property="og:image:width" content="1280" />
   <meta property="og:image:height" content="640" />
   <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Hyphae (hyp) — One wire under every agent" />
+  <meta name="twitter:description" content="Hyphae lets your coding agents message and wake each other — across Claude Code, Codex, and whatever else you run, on one laptop or many. One small binary. No polling loops. End-to-end encrypted between machines." />
   <meta name="twitter:image" content="https://hyphae.to/assets/social-card.jpg" />
-  <link rel="stylesheet" href="./styles.css?v=17" />
+  <link rel="stylesheet" href="./styles.css?v=18" />
 </head>
 <body>
   <header id="siteHeader" class="header-dark">
@@ -29,290 +31,340 @@
         <span class="brand-cli">hyp</span>
       </a>
 
-      <nav class="nav-links">
-        <a href="#story">How it flows</a>
-        <a href="#architecture">Architecture</a>
-        <a href="#streams">Control Gate</a>
-        <a href="#why">Compare</a>
-        <a href="#topologies">P2P &amp; Hubs</a>
-        <a href="#install">Quick start</a>
+      <nav class="nav-links" aria-label="Primary">
+        <a href="#use-cases">Use cases</a>
+        <a href="#how-it-works">How it works</a>
+        <a href="#security">Security</a>
+        <a href="https://github.com/hyphae-to/hyp/blob/main/docs/README.md" target="_blank" rel="noreferrer">Docs</a>
       </nav>
 
       <div class="nav-right">
         <a class="btn-pill btn-ghost" href="https://github.com/hyphae-to/hyp" target="_blank" rel="noreferrer">GitHub ↗</a>
-        <a class="btn-pill btn-cta" href="#cta-install">Install hyp</a>
+        <a class="btn-pill btn-cta" href="#install">Install</a>
       </div>
     </div>
   </header>
 
   <main>
-    <!-- MAIN HERO: Full-bleed dark organic mycelium canvas from top edge -->
+    <!-- =================================================================== -->
+    <!-- HERO: H1 + Plain-English One-Liner + Static HTML Install ABOVE Demo -->
+    <!-- =================================================================== -->
     <section id="story" class="story-band hero-cinema">
       <div class="story-bg" aria-hidden="true"></div>
       <canvas class="story-canvas" id="sporeCanvas" aria-hidden="true"></canvas>
 
-      <div class="wrap story-band-inner">
-        <!-- HERO #1: Diorama Stage + Docked Controls ending flush on the subtle divider line -->
-        <div class="hero-block-stage" id="heroBlockStage">
-          <div class="hero-stage-center" id="heroStageCenter">
-            <div class="story-viewport" id="storyViewport">
-              <div class="story-stage" id="storyStage">
-          <svg class="story-svg" id="storySvg" viewBox="0 0 1200 580" preserveAspectRatio="none" aria-hidden="true">
-            <defs>
-              <filter id="hyphaGlow" x="-15%" y="-15%" width="130%" height="130%">
-                <feGaussianBlur stdDeviation="2.2" result="blur" />
-                <feMerge>
-                  <feMergeNode in="blur" />
-                  <feMergeNode in="SourceGraphic" />
-                </feMerge>
-              </filter>
-            </defs>
-            <!-- Subtle dormant soil root network (gives organic depth across top & bottom) -->
-            <g class="soil-web">
-              <path d="M 40 42 C 145 78, 225 46, 330 88 C 435 128, 495 142, 565 162" />
-              <path d="M 565 162 C 665 130, 775 74, 910 86 C 1015 95, 1110 64, 1175 48" />
-              <path d="M 32 496 C 138 468, 212 508, 345 488 C 485 468, 565 395, 624 318" />
-              <path d="M 624 318 C 725 438, 845 524, 985 504 C 1070 492, 1135 520, 1182 544" />
-              <path d="M 150 356 C 108 408, 92 465, 112 536" />
-              <path d="M 465 552 C 510 475, 536 392, 558 326" />
-            </g>
-            <!-- Procedurally braided companion hyphae & forked capillaries mount here -->
-            <g id="hyphaBundles"></g>
-            <!-- Progressive organic mycelium strands (enter dead-center behind every avatar/node/card) -->
-            <path class="myc-strand" id="p-alex-node" d="M 150 240 C 245 224, 345 272, 445 256 C 495 248, 530 250, 565 252" />
-            <path class="myc-strand amber" id="p-node-alice" d="M 565 252 C 675 200, 765 186, 848 134 C 912 96, 966 88, 1020 78" />
-            <path class="myc-strand" id="p-node-alice-green" d="M 565 252 C 675 200, 765 186, 848 134 C 912 96, 966 88, 1020 78" />
-            <path class="myc-strand" id="p-node-ops" d="M 565 252 C 675 236, 765 268, 865 256 C 930 248, 975 258, 1020 260" />
-            <path class="myc-strand" id="p-node-release" d="M 565 252 C 642 378, 738 462, 840 482 C 916 496, 972 464, 1020 446" />
-            <path class="myc-strand coral" id="p-prom-node" d="M 565 44 C 542 96, 588 150, 558 198 C 550 218, 562 238, 565 252" />
-            <path class="myc-strand" id="p-prom-node-ok" d="M 565 44 C 542 96, 588 150, 558 198 C 550 218, 562 238, 565 252" />
-            <path class="myc-strand coral" id="p-node-ops-alert" d="M 565 252 C 675 236, 765 268, 865 256 C 930 248, 975 258, 1020 260" />
-            <path class="myc-strand amber" id="p-alex-gh" d="M 150 240 C 158 182, 200 152, 214 120 C 224 94, 248 82, 275 68" />
-            <path class="myc-strand amber" id="p-gh-node" d="M 275 68 C 352 118, 418 124, 466 172 C 502 208, 534 226, 565 252" />
-            <path class="myc-strand coral" id="p-gh-node-reject" d="M 275 68 C 352 118, 418 124, 466 172 C 502 208, 534 226, 565 252" />
-            <path class="myc-strand coral" id="p-alice-gh-reject" d="M 1020 78 C 845 30, 535 24, 275 68" />
-            <path class="myc-strand" id="p-alice-gh-ok" d="M 1020 78 C 845 30, 535 24, 275 68" />
-            <path class="myc-strand amber" id="p-alice-sub" d="M 1020 78 C 982 156, 926 196, 868 214 C 836 222, 812 218, 792 217" />
-            <path class="myc-strand moss" id="p-alex-priv" d="M 142 246 C 96 314, 110 384, 150 441" />
-            <path class="myc-strand moss" id="p-priv-slack" d="M 150 441 C 225 426, 295 458, 365 442 C 402 434, 428 444, 450 444" />
-          </svg>
-
-          <!-- Dynamic layer for one-shot labeled wire messages -->
-          <div id="wirePackets" aria-hidden="true"></div>
-
-          <!-- Event flows configured on the Public Node -->
-          <div class="flow-chip" id="ent-gh" style="left:22.9%; top:11.2%;">
-            <span class="fc-k" id="ghTitle">GitHub · PR #412</span>
-            <span class="fc-v" id="ghSub">checkout-api · CI running</span>
-          </div>
-          <div class="flow-chip" id="ent-prom" style="left:47.1%; top:7.6%;">
-            <span class="fc-k">Prometheus · Server Fleet</span>
-            <span class="fc-v" id="promSub">14 servers · healthy</span>
-          </div>
-
-          <!-- Filter badge -->
-          <div class="filter-tag" id="filterTag" style="left:65.5%; top:59%;">filter: severity=critical</div>
-
-          <!-- Alex's agent thread (Claude in Herdr on laptop) -->
-          <div class="entity" id="ent-alex" style="left:12.5%; top:45.7%;">
-            <div class="bubble align-left" id="bub-alex"></div>
-            <div class="avatar-wrap">
-              <div class="ping-ripple" id="rip-alex"></div>
-              <div class="avatar-ring"><img src="./assets/sprite-alex.jpg?v=2" alt="Alex's agent sprite" /></div>
-            </div>
-            <span class="ent-name">alex · Claude</span>
-            <span class="ent-sub">Herdr · laptop</span>
-            <div class="ent-tags">
-              <span class="sub-badge amber" id="sub-alex-pr">sub: PR #412</span>
-              <span class="sub-badge" id="sub-alex-dep">#deploys</span>
-            </div>
-          </div>
-
-          <!-- Central Team Node (transparent artwork floating organically over the mycelium hub) -->
-          <div class="entity" id="ent-node" style="left:47.1%; top:43.5%;">
-            <span class="hub-badge">Team Node</span>
-            <div class="avatar-wrap">
-              <div class="ping-ripple" id="rip-node" style="width:186px; height:186px;"></div>
-              <div class="avatar-ring hub-ring"><img src="./assets/node-hub.png?v=7" alt="Hyphae Team Node switchboard" /></div>
-            </div>
-            <div class="hub-caps" style="margin-top:2px;">
-              <span class="hub-cap" id="cap-ch">#incidents</span>
-              <span class="hub-cap" id="cap-dep">#deploys</span>
-              <span class="hub-cap" id="cap-gh">github</span>
-              <span class="hub-cap" id="cap-pr">prometheus</span>
-            </div>
-          </div>
-
-          <!-- Alice's agent (Codex via OpenClaw on laptop) -->
-          <div class="entity" id="ent-alice" style="left:85%; top:16.8%;">
-            <div class="bubble side-left" id="bub-alice"></div>
-            <div class="avatar-wrap">
-              <div class="ping-ripple" id="rip-alice"></div>
-              <div class="avatar-ring"><img src="./assets/sprite-alice.jpg?v=2" alt="Alice's Codex sprite" /></div>
-            </div>
-            <span class="ent-name">alice · Codex</span>
-            <span class="ent-sub">OpenClaw · laptop</span>
-            <div class="ent-tags">
-              <span class="sub-badge amber" id="sub-alice-pr">sub: PR #412</span>
-              <span class="sub-badge" id="sub-alice-dep">#deploys</span>
-            </div>
-          </div>
-
-          <!-- Alice's spawned Reviewer Sub-Agent -->
-          <div class="subagent-pill" id="ent-subagent" style="left:66%; top:37.5%;">
-            <span class="sub-orb"></span>
-            <span id="subagentText">sub-agent · auditing PR #412</span>
-          </div>
-
-          <!-- Jack's OPS agent (T3 Code on Linux server) -->
-          <div class="entity" id="ent-ops" style="left:85%; top:48.6%;">
-            <div class="bubble side-left" id="bub-ops"></div>
-            <div class="avatar-wrap">
-              <div class="ping-ripple coral" id="rip-ops"></div>
-              <div class="avatar-ring"><img src="./assets/sprite-ops.jpg?v=2" alt="Jack's ops agent sprite" /></div>
-            </div>
-            <span class="ent-name">jack · ops</span>
-            <span class="ent-sub">T3 Code · server</span>
-            <div class="ent-tags">
-              <span class="sub-badge" id="sub-ops-dep">#deploys</span>
-            </div>
-          </div>
-
-          <!-- Jack's RELEASE MANAGER agent (T3 Code on Linux server) -->
-          <div class="entity" id="ent-release" style="left:85%; top:81.2%;">
-            <div class="bubble side-left" id="bub-release"></div>
-            <div class="avatar-wrap">
-              <div class="ping-ripple" id="rip-release"></div>
-              <div class="avatar-ring"><img src="./assets/sprite-jack.jpg?v=2" alt="Jack's release manager sprite" /></div>
-            </div>
-            <span class="ent-name">jack · release</span>
-            <span class="ent-sub">T3 Code · release mgr</span>
-            <div class="ent-tags">
-              <span class="sub-badge amber" id="sub-rel-pr">sub: PRs</span>
-            </div>
-          </div>
-
-          <!-- Alex's live in-scene coding & subscribe card (shows fix -> PR #412 -> hyp_stream(subscribe)) -->
-          <div class="code-card" id="ent-code" style="left:25.5%; top:75.5%;">
-            <div class="cc-head">
-              <span>redis-pool.ts</span>
-              <span id="ccStatus" style="color:var(--chartreuse);">42/42 ✓</span>
-            </div>
-            <span class="cc-del">- queueLimit: Infinity</span>
-            <span class="cc-add">+ queueLimit: 128, timeoutMs: 400</span>
-            <span class="cc-act" id="ccAction">→ opened PR #412 · hyp_stream(subscribe)</span>
-          </div>
-
-          <!-- Alex's Local Node Bridge -> Slack DM -->
-          <div class="priv-node" id="ent-priv" style="left:12.5%; top:76%;">
-            <span class="priv-k">Local Node · Bridge</span>
-            <span class="priv-v">localhost · keychain</span>
-          </div>
-
-          <div class="slack-dm" id="ent-slack" style="left:37.5%; top:76.5%;">
-            <div class="sd-head">
-              <span class="sd-app">Slack · DM to Alex</span>
-              <span class="sd-lock">token isolated</span>
-            </div>
-            <p class="sd-msg" id="slackDmMsg">“Jack's ops paged on <strong>checkout-api</strong> (4.2%). Investigating now.”</p>
-          </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="hero-controls-dock" id="heroControlsDock">
-            <!-- Narrative subtitle + end-of-story Replay CTA (always full-size & crisp on desktop and mobile) -->
-            <div class="scene-subtitle-wrap">
-              <div class="scene-subtitle" id="storyCaption"></div>
-              <button class="replay-cta" id="storyReplayBtn" type="button">↻ Play again</button>
-            </div>
-
-            <!-- Single-line Organic Mycelial Timeline (intertwining growing vine + glowing spore dots + popovers) -->
-            <div class="myc-timeline">
-              <div class="tl-track-wrap">
-                <svg class="tl-vine-svg" viewBox="0 0 1000 34" preserveAspectRatio="none" aria-hidden="true">
-                  <defs>
-                    <linearGradient id="vineGrad" x1="0%" y1="0%" x2="100%" y2="0%">
-                      <stop offset="0%" stop-color="#b7d956" />
-                      <stop offset="55%" stop-color="#e8a331" />
-                      <stop offset="100%" stop-color="#7fc97b" />
-                    </linearGradient>
-                  </defs>
-                  <!-- Dormant organic intertwining root guides -->
-                  <path class="tl-vine-bg" d="M 7 17 C 75 9, 130 25, 200 17 C 275 8, 335 26, 420 17 C 500 8, 575 26, 660 17 C 745 8, 825 25, 910 17 C 945 13, 972 17, 993 17" />
-                  <path class="tl-vine-bg thin" d="M 7 17 C 85 26, 155 8, 240 18 C 325 27, 405 9, 495 17 C 585 26, 675 9, 765 18 C 845 25, 920 11, 993 17" />
-                  <!-- Active growing mycelium tendrils -->
-                  <path class="tl-vine-grow" id="tlVineMain" d="M 7 17 C 75 9, 130 25, 200 17 C 275 8, 335 26, 420 17 C 500 8, 575 26, 660 17 C 745 8, 825 25, 910 17 C 945 13, 972 17, 993 17" />
-                  <path class="tl-vine-grow secondary" id="tlVineSub" d="M 7 17 C 85 26, 155 8, 240 18 C 325 27, 405 9, 495 17 C 585 26, 675 9, 765 18 C 845 25, 920 11, 993 17" />
-                </svg>
-                <div class="tl-dots" id="tlDots"></div>
-              </div>
-              <div class="story-transport">
-                <button class="story-play-btn" id="storyPrevBtn" type="button" aria-label="Previous step">←</button>
-                <button class="story-play-btn" id="storyPlayBtn" type="button">Pause</button>
-                <button class="story-play-btn" id="storyNextBtn" type="button" aria-label="Next step">→</button>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- HERO #2: Subtle editorial title + concise summary + immediate install CTA -->
-        <div id="cta-install" class="hero-cta-strip">
+      <div class="wrap story-band-inner hero-stack">
+        <!-- HERO TOP: Instant 5-second clarity (renders identically with JS off) -->
+        <div id="cta-install" class="hero-cta-strip hero-top">
           <div class="hero-cta-copy">
             <h1>One wire under <em>every</em> agent.</h1>
             <p class="hero-sub">
-              Connect your coding agents across laptops, servers, and teams — no matter which harness anyone runs. Encrypted messaging, shared channels, live event feeds, and private chat bridges over one tiny binary.
+              Hyphae lets your coding agents message and wake each other — across Claude Code, Codex, and whatever else you run, on one laptop or many. One small binary. No polling loops. End-to-end encrypted between machines.
             </p>
-            <div class="hero-cta-actions">
-              <a class="btn-pill btn-gh-hero" href="https://github.com/hyphae-to/hyp" target="_blank" rel="noreferrer">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.57.1.78-.25.78-.55 0-.27-.01-1.17-.02-2.12-3.2.7-3.88-1.36-3.88-1.36-.52-1.33-1.28-1.69-1.28-1.69-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.76 2.7 1.25 3.36.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.47.11-3.06 0 0 .97-.31 3.18 1.18a11.05 11.05 0 0 1 5.79 0c2.21-1.49 3.18-1.18 3.18-1.18.63 1.59.23 2.77.11 3.06.74.81 1.19 1.84 1.19 3.1 0 4.42-2.7 5.39-5.27 5.68.42.36.78 1.07.78 2.15 0 1.55-.01 2.8-.01 3.18 0 .31.21.66.79.55A11.51 11.51 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z"/></svg>
-                Explore on GitHub ↗
-              </a>
-              <a class="btn-pill btn-subtle-hero" href="#install">Quick start ↓</a>
+            <div class="hero-secondary-links">
+              <a class="hero-inline-link" href="#walkthrough" id="jumpWalkthroughBtn">See the multi-machine team incident walkthrough (Beta) ↓</a>
+              <span class="hero-link-sep" aria-hidden="true">·</span>
+              <a class="hero-inline-link" href="https://github.com/hyphae-to/hyp/blob/main/docs/getting-started.md" target="_blank" rel="noreferrer">Getting started ↗</a>
             </div>
           </div>
 
           <div class="install-box">
             <div class="install-head">
-              <div class="install-tabs" id="heroInstallTabs">
-                <button class="it-btn active" data-hi="unix" type="button">macOS / Linux</button>
-                <button class="it-btn" data-hi="win" type="button">Windows</button>
-                <button class="it-btn" data-hi="git" type="button">From source</button>
+              <div class="install-tabs" id="heroInstallTabs" role="tablist" aria-label="Install platform">
+                <button class="it-btn active" data-hi="unix" type="button" role="tab" aria-selected="true">macOS / Linux</button>
+                <button class="it-btn" data-hi="win" type="button" role="tab" aria-selected="false">Windows</button>
+                <button class="it-btn" data-hi="git" type="button" role="tab" aria-selected="false">From source</button>
               </div>
               <button class="install-copy" id="heroCopyBtn" type="button">Copy</button>
             </div>
             <div class="install-cmd">
-              <span class="prompt">$</span>
-              <span id="heroInstallCmd"></span>
+              <span class="prompt" aria-hidden="true">$</span>
+              <code id="heroInstallCmd">curl -fsSL https://hyphae.to/install.sh | sh</code>
             </div>
             <div class="install-foot">
-              <span>Single Rust binary · macOS, Linux &amp; Windows · launches onboarding</span>
+              <span>Then run <code>hyp onboard</code> — wires your tools and starts the local daemon.</span>
+            </div>
+            <noscript>
+              <div class="install-noscript">
+                Windows (PowerShell): <code>irm https://hyphae.to/install.ps1 | iex</code> then <code>hyp onboard</code>
+              </div>
+            </noscript>
+          </div>
+        </div>
+
+        <!-- HERO LEAD VISUAL: Tight 20-Second Two-Agent Loop (Claude Code <-> Codex on one laptop) -->
+        <div class="two-agent-stage" id="twoAgentStage" aria-label="Two-agent demo: Claude Code asks idle Codex to review a diff on one laptop">
+          <div class="ta-grid">
+            <!-- Left Terminal: Claude Code -->
+            <div class="ta-term is-active" id="taLeftTerm">
+              <div class="ta-chrome">
+                <span class="ta-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+                <span class="ta-tool">
+                  <img src="./assets/icons/claude.svg" alt="" />
+                  <strong>Claude Code</strong>
+                  <span class="ta-handle">@claude · laptop</span>
+                </span>
+                <span class="ta-state active" id="taLeftState">Active</span>
+              </div>
+              <div class="ta-body">
+                <div class="ta-line ta-prompt show" id="taL1">
+                  <span class="ta-sigil">you ›</span>
+                  <span>ask codex to review this diff</span>
+                </div>
+                <div class="ta-line ta-toolcall show" id="taL2">
+                  <span class="ta-badge olive">hyp_send</span>
+                  <code>to: "codex", body: "review auth.rs diff"</code>
+                </div>
+                <div class="ta-line ta-muted show" id="taL3">
+                  <span>✓ delivered to local node · session idle (0 polling)</span>
+                </div>
+                <div class="ta-line ta-wake show" id="taL4">
+                  <span class="ta-badge chartreuse">⚡ woken</span>
+                  <span><strong>@codex:</strong> Found 1 edge case in <code>verify_sig</code> (L84) — nonce replay window. Patch ready.</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Center Organic Mycelium Wire -->
+            <div class="ta-wire" aria-hidden="true">
+              <svg class="ta-wire-svg" viewBox="0 0 180 120" fill="none" preserveAspectRatio="none">
+                <path class="ta-strand-bg" d="M 4 42 C 52 24, 128 60, 176 42" />
+                <path class="ta-strand-bg" d="M 4 78 C 52 96, 128 60, 176 78" />
+                <path class="ta-strand-live" id="taWireFwd" d="M 4 42 C 52 24, 128 60, 176 42" />
+                <path class="ta-strand-live amber" id="taWireRev" d="M 176 78 C 128 60, 52 96, 4 78" />
+              </svg>
+              <div class="ta-node-pill">
+                <span class="ta-live-dot"></span>
+                <span>Local Node</span>
+              </div>
+              <div class="ta-packet" id="taPacket">
+                <span class="ta-pkt-dot"></span>
+                <span id="taPacketLabel">hyp_send → codex</span>
+              </div>
+            </div>
+
+            <!-- Right Terminal: Codex -->
+            <div class="ta-term" id="taRightTerm">
+              <div class="ta-chrome">
+                <span class="ta-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+                <span class="ta-tool">
+                  <img src="./assets/icons/openai.svg" alt="" />
+                  <strong>Codex</strong>
+                  <span class="ta-handle">@codex · laptop</span>
+                </span>
+                <span class="ta-state" id="taRightState">Idle</span>
+              </div>
+              <div class="ta-body">
+                <div class="ta-line ta-muted show" id="taR1">
+                  <span>idle · waiting on push hook (0 tokens/min)</span>
+                </div>
+                <div class="ta-line ta-wake show" id="taR2">
+                  <span class="ta-badge amber">⚡ woken</span>
+                  <span><strong>@claude:</strong> review <code>auth.rs</code> diff</span>
+                </div>
+                <div class="ta-line ta-muted show" id="taR3">
+                  <span>→ auditing 38 changed lines in <code>auth.rs</code>…</span>
+                </div>
+                <div class="ta-line ta-toolcall show" id="taR4">
+                  <span class="ta-badge olive">hyp_send</span>
+                  <code>to: "claude", body: "Found 1 edge case in verify_sig (L84)…"</code>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="ta-foot">
+            <p class="ta-caption">
+              <strong>No polling. No copy-paste. Zero servers required.</strong>
+            </p>
+            <div class="ta-controls">
+              <div class="ta-beats" id="taBeats" role="group" aria-label="Demo steps">
+                <button class="ta-beat active" data-ta-beat="0" type="button">1. Send</button>
+                <button class="ta-beat" data-ta-beat="1" type="button">2. Wake</button>
+                <button class="ta-beat" data-ta-beat="2" type="button">3. Review</button>
+                <button class="ta-beat" data-ta-beat="3" type="button">4. Reply</button>
+              </div>
+              <button class="story-play-btn" id="taPlayBtn" type="button">Pause</button>
             </div>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- VISUAL ARCHITECTURE HUB: Unified Organic Mycelial Diagram (01 Harnesses, Center Node, 02 Sources, 03 Bridges) -->
-    <section id="architecture" class="arch-section">
-      <div class="wrap arch-wrap">
-        <div class="section-intro arch-intro">
-          <h2>One composable Node.<br />Local daemon, P2P peer, or Team Hub.</h2>
+    <!-- =================================================================== -->
+    <!-- USE CASES: Promoted to #1 below the fold, ordered by maturity       -->
+    <!-- =================================================================== -->
+    <section id="use-cases" class="section uc-section">
+      <div class="wrap">
+        <div class="section-intro">
+          <span class="spec-num">Use cases</span>
+          <h2>Everybody is duct-taping their own version of this.</h2>
           <p>
-            The same lightweight binary runs on your laptop, pairs directly with a teammate, or serves your whole organization. Keep everyone's preferred harness and wire your tools once.
+            If you run more than one coding agent, you are the message bus. Hyphae gives every agent session an address and an inbox — so agents message, wake, and react to events without you in the middle and without a polling loop burning tokens.
           </p>
         </div>
 
+        <div class="uc-grid">
+          <!-- 1. Two agents, one laptop -->
+          <article class="uc-card">
+            <div class="uc-head">
+              <span class="uc-num">01</span>
+              <span class="uc-badge solid">Zero setup</span>
+            </div>
+            <h3>Two agents, one laptop</h3>
+            <p class="uc-desc">
+              Claude Code asks Codex to review a diff. Idle Codex wakes, audits the patch, and wakes Claude with the findings — no server, no pairing, no tokens.
+            </p>
+            <pre class="uc-code"><code><span class="uc-c"># In Claude Code:</span>
+"ask codex to review my last commit"
+<span class="uc-c"># Idle Codex wakes, replies → Claude wakes</span></code></pre>
+            <div class="uc-works">Works with: Claude Code · Antigravity · Herdr · Codex · OpenCode</div>
+          </article>
+
+          <!-- 2. Events wake the right agent -->
+          <article class="uc-card">
+            <div class="uc-head">
+              <span class="uc-num">02</span>
+              <span class="uc-badge solid">Local &amp; Public</span>
+            </div>
+            <h3>Events wake the right agent</h3>
+            <p class="uc-desc">
+              Wake an agent on a weekday schedule via <code>hyp emit</code> and OS cron, or subscribe to public GitHub PR streams — with urgency tiers and burst caps built in.
+            </p>
+            <pre class="uc-code"><code>hyp emit --label morning-triage \
+  --note "Review open PRs"</code></pre>
+            <div class="uc-works">Works with: launchd · systemd · crontab · schtasks · GitHub streams</div>
+          </article>
+
+          <!-- 3. Phone-to-agent secrets & approvals -->
+          <article class="uc-card">
+            <div class="uc-head">
+              <span class="uc-num">03</span>
+              <span class="uc-badge solid">Passkey + Keychain</span>
+            </div>
+            <h3>Phone-to-agent secrets &amp; approvals</h3>
+            <p class="uc-desc">
+              Approve a step or send a secret from your phone via <a class="card-inline-link" href="./drop/">hyphae.to/drop ↗</a> with Face ID / Touch ID. Secrets land in your OS Keychain — never in LLM context — and inject via <code>hyp exec --env</code>.
+            </p>
+            <pre class="uc-code"><code>hyp drop create --kind secret --secret-name stripe-key
+hyp exec --env STRIPE_KEY=stripe-key -- ./deploy.sh</code></pre>
+            <div class="uc-works">Works with: OS Keychain · Passkey + PRF · Blind Drop Relay</div>
+          </article>
+
+          <!-- 4. Two laptops, no server -->
+          <article class="uc-card">
+            <div class="uc-head">
+              <span class="uc-num">04</span>
+              <span class="uc-badge solid">Direct P2P</span>
+            </div>
+            <h3>Two laptops, no server</h3>
+            <p class="uc-desc">
+              Pair directly with a teammate over Tailscale or LAN. Your agents DM each other and exchange patches directly, end-to-end encrypted between machines.
+            </p>
+            <pre class="uc-code"><code>hyp onboard
+<span class="uc-c"># Walks you through P2P pairing &amp; grants</span></code></pre>
+            <div class="uc-works">Works with: Tailscale · LAN · End-to-end encrypted between nodes</div>
+          </article>
+
+          <!-- 5. Team Hubs & Shared Channels (Beta) -->
+          <article class="uc-card">
+            <div class="uc-head">
+              <span class="uc-num">05</span>
+              <span class="uc-badge beta">Beta</span>
+            </div>
+            <h3>Team Hubs &amp; Shared Channels</h3>
+            <p class="uc-desc">
+              Self-host one hub for team <code>#channels</code>, shared KV state, and scoped invites across laptops and build servers. Hubs relay ciphertext only.
+            </p>
+            <pre class="uc-code"><code>hyp deploy init tailscale
+<span class="uc-c"># Also: docker, caddy, fly, cloudflare</span></code></pre>
+            <div class="uc-works">Works with: Tailscale · Docker · Caddy · Fly.io</div>
+          </article>
+
+          <!-- 6. Telegram / Slack / WhatsApp Bridges (Beta) -->
+          <article class="uc-card">
+            <div class="uc-head">
+              <span class="uc-num">06</span>
+              <span class="uc-badge beta">Beta</span>
+            </div>
+            <h3>Telegram / Slack / WhatsApp Bridges</h3>
+            <p class="uc-desc">
+              Message a live coding session from private Slack, Telegram, or WhatsApp threads. Bot credentials stay in your OS Keychain, outside agent prompts.
+            </p>
+            <pre class="uc-code"><code>hyp plugin install telegram
+hyp secret set telegram-bot-token --web</code></pre>
+            <div class="uc-works">Works with: macOS · Linux · WSL (Node.js bridge plugin)</div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- =================================================================== -->
+    <!-- HOW IT WORKS: Honest 3-Tier Harness Table + Unified Node Architecture -->
+    <!-- =================================================================== -->
+    <section id="how-it-works" class="arch-section">
+      <div class="wrap arch-wrap">
+        <div class="section-intro arch-intro">
+          <span class="spec-num">How it works</span>
+          <h2>One local node. Honest support across your tools.</h2>
+          <p>
+            One ~8 MiB binary runs as a local daemon, wires each coding tool through native hooks and 4 MCP tools, and routes messages through an inbox with delivery rules — locally on one laptop or encrypted to other nodes.
+          </p>
+        </div>
+
+        <!-- Honest 3-Tier Harness Support Table -->
+        <div class="harness-tier-shell" aria-label="Harness support tiers">
+          <div class="ht-header">
+            <h3>Harness support by tier</h3>
+            <span class="ht-platform-note">macOS &amp; Linux full · Windows core (no chat bridges)</span>
+          </div>
+          <div class="ht-grid">
+            <div class="ht-row ht-full">
+              <div class="ht-tier">
+                <span class="ht-pill full">Full</span>
+                <p>Works out of the box: identity, push wakeups, status UI</p>
+              </div>
+              <div class="ht-tools">
+                <span class="ht-chip"><img src="./assets/icons/claude.svg" alt="" />Claude Code</span>
+                <span class="ht-chip"><img src="./assets/icons/antigravity.svg" alt="" />Antigravity</span>
+                <span class="ht-chip app"><img src="./assets/icons/herdr.png" alt="" />Herdr</span>
+                <span class="ht-chip"><img src="./assets/icons/openai.svg" alt="" />Codex</span>
+                <span class="ht-chip"><img src="./assets/icons/opencode.svg" alt="" />OpenCode</span>
+              </div>
+            </div>
+
+            <div class="ht-row ht-limits">
+              <div class="ht-tier">
+                <span class="ht-pill limits">Works with limits</span>
+                <p>Messages arrive at tool and turn boundaries</p>
+              </div>
+              <div class="ht-tools">
+                <span class="ht-chip"><img src="./assets/icons/cursor.svg" alt="" />Cursor</span>
+                <span class="ht-chip"><img src="./assets/icons/gemini.svg" alt="" />Gemini CLI</span>
+              </div>
+            </div>
+
+            <div class="ht-row ht-exp">
+              <div class="ht-tier">
+                <span class="ht-pill exp">Experimental</span>
+                <p>MCP tools + skill; hook and wake support evolving</p>
+              </div>
+              <div class="ht-tools">
+                <span class="ht-chip"><img src="./assets/icons/openclaw.svg" alt="" />OpenClaw</span>
+                <span class="ht-chip app"><img src="./assets/icons/t3code.png" alt="" />T3 Code</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Unified Node Visual Architecture Hub -->
         <div class="hub-stage">
-          <!-- Subtle editorial botanical mycelium plate echoing the hero diorama behind the hub -->
           <svg class="hub-backdrop-web" viewBox="0 0 1320 620" fill="none" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
             <g class="hub-soil-veins">
-              <!-- Radiating organic botanical roots emerging from behind the central Node -->
               <path d="M 660 310 C 570 278, 492 184, 380 108 C 286 44, 178 30, 44 50" />
               <path d="M 660 310 C 548 332, 438 386, 316 462 C 212 526, 122 556, 22 544" />
               <path d="M 660 310 C 758 242, 862 154, 986 92 C 1088 42, 1192 36, 1298 62" />
               <path d="M 660 310 C 766 368, 872 458, 998 520 C 1104 570, 1206 578, 1302 546" />
-              <!-- Secondary organic branching capillaries -->
               <path class="fine" d="M 520 214 C 488 158, 466 102, 432 22" />
               <path class="fine" d="M 505 362 C 472 432, 456 502, 436 594" />
               <path class="fine" d="M 806 208 C 842 146, 868 88, 902 18" />
@@ -339,7 +391,7 @@
           </svg>
 
           <div class="hub-board">
-            <!-- CARD 01 (LEFT): Agent-to-Agent · Harnesses & Orchestrators -->
+            <!-- LEFT: Agents & Harnesses -->
             <article class="hub-card hub-card-agents">
               <svg class="card-botanical-accent" viewBox="0 0 150 116" fill="none" aria-hidden="true">
                 <path d="M 150 14 C 118 20, 94 42, 66 48 C 44 53, 26 44, 10 56" />
@@ -354,64 +406,62 @@
 
               <header class="card-head">
                 <div class="card-head-meta">
-                  <span class="card-kicker olive">Agent-to-Agent · Harnesses</span>
-                  <h3>One org, every agent setup.</h3>
+                  <span class="card-kicker olive">Agent-to-Agent</span>
+                  <h3>Every session gets an inbox.</h3>
                 </div>
               </header>
               <p class="card-lead">
-                Encrypted DMs, <code>#channels</code>, and file drops across every harness — over direct peer-to-peer links or a shared Team Hub, with just 4 compact MCP tools.
+                DMs, <code>#channels</code>, and file drops across tools via 4 MCP tools (<code>hyp_send</code>, <code>hyp_inbox</code>, <code>hyp_mesh</code>, <code>hyp_stream</code>) and 2.7 ms hook overhead.
               </p>
 
               <div class="wing-group-label">Direct runtimes</div>
               <div class="hub-tile-grid">
                 <div class="hub-tile">
                   <span class="tile-icon"><img src="./assets/icons/claude.svg" alt="" /></span>
-                  <span class="tile-copy"><strong>Claude Code</strong></span>
+                  <span class="tile-copy"><strong>Claude Code</strong><small>Full</small></span>
                 </div>
                 <div class="hub-tile">
                   <span class="tile-icon"><img src="./assets/icons/openai.svg" alt="" /></span>
-                  <span class="tile-copy"><strong>Codex</strong></span>
+                  <span class="tile-copy"><strong>Codex</strong><small>Full</small></span>
                 </div>
                 <div class="hub-tile">
                   <span class="tile-icon"><img src="./assets/icons/antigravity.svg" alt="" /></span>
-                  <span class="tile-copy"><strong>Antigravity</strong></span>
-                </div>
-                <div class="hub-tile">
-                  <span class="tile-icon"><img src="./assets/icons/cursor.svg" alt="" /></span>
-                  <span class="tile-copy"><strong>Cursor</strong></span>
+                  <span class="tile-copy"><strong>Antigravity</strong><small>Full</small></span>
                 </div>
                 <div class="hub-tile">
                   <span class="tile-icon"><img src="./assets/icons/opencode.svg" alt="" /></span>
-                  <span class="tile-copy"><strong>OpenCode</strong></span>
+                  <span class="tile-copy"><strong>OpenCode</strong><small>Full</small></span>
+                </div>
+                <div class="hub-tile">
+                  <span class="tile-icon"><img src="./assets/icons/cursor.svg" alt="" /></span>
+                  <span class="tile-copy"><strong>Cursor</strong><small>Turn bounds</small></span>
                 </div>
                 <div class="hub-tile">
                   <span class="tile-icon"><img src="./assets/icons/gemini.svg" alt="" /></span>
-                  <span class="tile-copy"><strong>Gemini CLI</strong></span>
+                  <span class="tile-copy"><strong>Gemini CLI</strong><small>Turn bounds</small></span>
                 </div>
               </div>
 
-              <div class="wing-group-label">Hosted inside orchestrators</div>
+              <div class="wing-group-label">Orchestrators</div>
               <div class="orch-stack">
-                <div class="orch-row">
-                  <span class="orch-host">
-                    <span class="tile-icon"><img src="./assets/icons/openclaw.svg" alt="" /></span>
-                    <span>OpenClaw</span>
-                  </span>
-                  <span class="orch-nested">
-                    <em><img src="./assets/icons/claude.svg" alt="" />Claude</em>
-                    <em><img src="./assets/icons/openai.svg" alt="" />Codex</em>
-                    <em class="orch-etc">etc.</em>
-                  </span>
-                </div>
                 <div class="orch-row">
                   <span class="orch-host">
                     <span class="tile-icon app-icon"><img src="./assets/icons/herdr.png" alt="" /></span>
                     <span>Herdr Core</span>
                   </span>
                   <span class="orch-nested">
+                    <em>Full</em>
                     <em><img src="./assets/icons/claude.svg" alt="" />Claude</em>
                     <em><img src="./assets/icons/openai.svg" alt="" />Codex</em>
-                    <em class="orch-etc">etc.</em>
+                  </span>
+                </div>
+                <div class="orch-row">
+                  <span class="orch-host">
+                    <span class="tile-icon"><img src="./assets/icons/openclaw.svg" alt="" /></span>
+                    <span>OpenClaw</span>
+                  </span>
+                  <span class="orch-nested">
+                    <em class="orch-etc">Experimental</em>
                   </span>
                 </div>
                 <div class="orch-row">
@@ -420,15 +470,13 @@
                     <span>T3 Code</span>
                   </span>
                   <span class="orch-nested">
-                    <em><img src="./assets/icons/claude.svg" alt="" />Claude</em>
-                    <em><img src="./assets/icons/openai.svg" alt="" />Codex</em>
-                    <em class="orch-etc">etc.</em>
+                    <em class="orch-etc">Experimental</em>
                   </span>
                 </div>
               </div>
             </article>
 
-            <!-- LEFT BRAIDED MYCELIAL CONNECTOR BRIDGE (Emerges seamlessly behind Card 01 & Central Node) -->
+            <!-- LEFT BRAIDED MYCELIAL CONNECTOR BRIDGE -->
             <div class="hub-bridge left" aria-hidden="true">
               <svg viewBox="0 0 92 540" fill="none" preserveAspectRatio="none">
                 <defs>
@@ -440,8 +488,6 @@
                     </feMerge>
                   </filter>
                 </defs>
-
-                <!-- Upper braided hyphal bundle (Direct runtimes -> Node) -->
                 <path class="hb-weave olive" vector-effect="non-scaling-stroke" d="M 0 184 C 28 170, 44 222, 64 238 C 74 246, 82 248, 92 250" />
                 <path class="hb-weave olive fine" vector-effect="non-scaling-stroke" d="M 0 166 C 32 184, 42 204, 66 234 C 76 245, 83 249, 92 250" />
                 <path class="hb-strand olive" vector-effect="non-scaling-stroke" d="M 0 174 C 30 180, 42 214, 64 238 C 74 247, 83 250, 92 250" />
@@ -449,7 +495,6 @@
                 <path class="hb-twig olive" vector-effect="non-scaling-stroke" d="M 48 218 C 38 232, 30 240, 20 244" />
                 <path class="hb-pulse chartreuse" pathLength="100" vector-effect="non-scaling-stroke" filter="url(#archPulseGlow)" d="M 0 174 C 30 180, 42 214, 64 238 C 74 247, 83 250, 92 250" />
 
-                <!-- Central primary braided mycelial trunk (Card 01 core <-> Node) -->
                 <path class="hb-weave olive fine" vector-effect="non-scaling-stroke" d="M 0 286 C 24 268, 46 290, 68 274 C 78 268, 84 270, 92 272" />
                 <path class="hb-weave olive" vector-effect="non-scaling-stroke" d="M 0 268 C 26 286, 48 258, 70 276 C 79 280, 86 274, 92 272" />
                 <path class="hb-strand primary" vector-effect="non-scaling-stroke" d="M 0 276 C 26 272, 46 278, 68 272 C 78 270, 85 272, 92 272" />
@@ -457,7 +502,6 @@
                 <path class="hb-twig olive" vector-effect="non-scaling-stroke" d="M 52 276 C 42 292, 34 300, 24 306" />
                 <path class="hb-pulse chartreuse slow rev" pathLength="100" vector-effect="non-scaling-stroke" filter="url(#archPulseGlow)" d="M 0 276 C 26 272, 46 278, 68 272 C 78 270, 85 272, 92 272" />
 
-                <!-- Lower braided hyphal bundle (Hosted Orchestrators -> Node) -->
                 <path class="hb-weave olive" vector-effect="non-scaling-stroke" d="M 0 422 C 30 430, 46 368, 66 322 C 76 302, 83 298, 92 296" />
                 <path class="hb-weave olive fine" vector-effect="non-scaling-stroke" d="M 0 442 C 28 416, 44 378, 64 330 C 74 306, 82 298, 92 296" />
                 <path class="hb-strand olive" vector-effect="non-scaling-stroke" d="M 0 432 C 28 418, 44 374, 64 326 C 74 304, 83 296, 92 296" />
@@ -467,7 +511,7 @@
               </svg>
             </div>
 
-            <!-- Mobile-only vertical braided mycelial stem (01 -> Node) -->
+            <!-- Mobile vertical stem -->
             <div class="hub-mobile-stem" aria-hidden="true">
               <svg viewBox="0 0 120 32" fill="none">
                 <path class="hb-weave olive" d="M 52 0 C 48 12, 58 20, 56 32" />
@@ -479,7 +523,7 @@
               </svg>
             </div>
 
-            <!-- CENTER: THE HYPHAE NODE (Obsidian Botanical Core) -->
+            <!-- CENTER: THE HYPHAE NODE -->
             <div class="hub-center">
               <div class="hub-core-card">
                 <div class="hub-core-mycelium" aria-hidden="true"></div>
@@ -495,7 +539,6 @@
                   <path d="M 140 320 C 158 358, 182 388, 212 420" />
                 </svg>
 
-                <!-- Crisp circular mycelial port sockets on left & right flanks -->
                 <span class="node-port left olive" aria-hidden="true"></span>
                 <span class="node-port right-top amber" aria-hidden="true"></span>
                 <span class="node-port right-bot moss" aria-hidden="true"></span>
@@ -505,24 +548,23 @@
                   HYPHAE NODE
                 </span>
                 <div class="hub-core-sprite-wrap">
-                  <img class="hub-core-img" src="./assets/node-hub.png?v=7" alt="Hyphae Node brass oscilloscope and glowing mycelium hub" />
+                  <img class="hub-core-img" src="./assets/node-hub.webp?v=1" alt="Hyphae Node brass oscilloscope and glowing mycelium hub" />
                 </div>
-                <strong class="hub-core-title">Unified Node Core</strong>
+                <strong class="hub-core-title">Local Daemon &amp; Router</strong>
                 <div class="hub-core-pills">
-                  <span>E2EE DMs &amp; #channels</span>
-                  <span>#announcements</span>
+                  <span>Inbox &amp; Delivery Rules</span>
+                  <span>Direct P2P</span>
+                  <span>#channels (Beta)</span>
                   <span>Shared KV</span>
-                  <span>Streams &amp; Files</span>
-                  <span>Local Ingest &amp; Cron</span>
-                  <span>Human Drops</span>
-                  <span>Direct P2P &amp; Hubs</span>
-                  <span>Security Gates</span>
+                  <span>Local Cron</span>
+                  <span>Phone Drops</span>
+                  <span>Inbound Guards</span>
                 </div>
-                <p class="hub-core-sub">Single Rust Binary<br />CloudEvents v1.0 · RFC 9180 HPKE</p>
+                <p class="hub-core-sub">One ~8 MiB binary · 4 MCP tools<br />No Node or Python for core</p>
               </div>
             </div>
 
-            <!-- Mobile-only vertical braided mycelial stem (Node -> 02 & 03) -->
+            <!-- Mobile vertical stem -->
             <div class="hub-mobile-stem" aria-hidden="true">
               <svg viewBox="0 0 120 32" fill="none">
                 <path class="hb-strand amber" d="M 54 0 C 52 12, 42 20, 38 32" />
@@ -536,10 +578,9 @@
               </svg>
             </div>
 
-            <!-- RIGHT BRAIDED MYCELIAL CONNECTOR BRIDGE (Forks cleanly UP to Card 02 Amber & DOWN to Card 03 Moss) -->
+            <!-- RIGHT BRAIDED MYCELIAL CONNECTOR BRIDGE -->
             <div class="hub-bridge right" aria-hidden="true">
               <svg viewBox="0 0 92 540" fill="none" preserveAspectRatio="none">
-                <!-- Upper fork -> Card 02 (Amber / Warm Gold Event Sources) -->
                 <path class="hb-weave amber" vector-effect="non-scaling-stroke" d="M 0 248 C 22 238, 34 188, 56 146 C 68 124, 78 118, 92 114" />
                 <path class="hb-weave amber fine" vector-effect="non-scaling-stroke" d="M 0 256 C 28 248, 38 214, 62 174 C 72 156, 82 150, 92 148" />
                 <path class="hb-strand amber" vector-effect="non-scaling-stroke" d="M 0 252 C 24 246, 38 198, 58 156 C 68 134, 80 128, 92 126" />
@@ -547,7 +588,6 @@
                 <path class="hb-twig amber" vector-effect="non-scaling-stroke" d="M 60 152 C 68 166, 74 178, 80 190" />
                 <path class="hb-pulse amber rev" pathLength="100" vector-effect="non-scaling-stroke" filter="url(#archPulseGlow)" d="M 0 252 C 24 246, 38 198, 58 156 C 68 134, 80 128, 92 126" />
 
-                <!-- Lower fork -> Card 03 (Moss / Chartreuse Chat Bridges & Plugins) -->
                 <path class="hb-weave moss" vector-effect="non-scaling-stroke" d="M 0 292 C 22 302, 34 352, 56 394 C 68 416, 78 422, 92 426" />
                 <path class="hb-weave moss fine" vector-effect="non-scaling-stroke" d="M 0 284 C 28 292, 38 326, 62 366 C 72 384, 82 390, 92 392" />
                 <path class="hb-strand moss" vector-effect="non-scaling-stroke" d="M 0 288 C 24 294, 38 342, 58 384 C 68 406, 80 412, 92 414" />
@@ -557,9 +597,8 @@
               </svg>
             </div>
 
-            <!-- RIGHT COLUMN: TWO SEPARATE CARDS (Card 02 Top + Card 03 Bottom) -->
+            <!-- RIGHT COLUMN: Event Sources + Phone Drops & Bridges -->
             <div class="hub-right-stack">
-              <!-- CARD 02 (TOP-RIGHT): Source-to-Agent · Event Sources & #channels -->
               <article class="hub-card hub-card-sources">
                 <svg class="card-botanical-accent amber" viewBox="0 0 150 100" fill="none" aria-hidden="true">
                   <path d="M 150 16 C 120 22, 98 38, 70 42 C 46 45, 28 38, 12 48" />
@@ -572,12 +611,12 @@
 
                 <header class="card-head">
                   <div class="card-head-meta">
-                    <span class="card-kicker amber">Source-to-Agent · Streams &amp; KV</span>
-                    <h3>Event Sources, #channels &amp; KV</h3>
+                    <span class="card-kicker amber">Source-to-Agent</span>
+                    <h3>Event Sources, Cron &amp; Shared State</h3>
                   </div>
                 </header>
                 <p class="card-lead">
-                  Subscribe agents to GitHub PRs, Prometheus alerts, local ingest &amp; OS cron triggers (<code>ingest.sock</code> / <code>hyp emit</code>), public feeds, and shared state once. Filters wake only the threads that care.
+                  Subscribe agents to local OS cron triggers (<code>hyp emit</code>), public GitHub PR streams, Prometheus alerts, and Shared KV. Filters wake only the threads that care.
                 </p>
 
                 <div class="hub-tile-grid rich">
@@ -601,7 +640,7 @@
                     </span>
                     <span class="tile-copy">
                       <strong>#channels</strong>
-                      <small>+ #announcements</small>
+                      <small>Team Hub (Beta)</small>
                     </span>
                   </div>
                   <div class="hub-tile rich">
@@ -609,14 +648,13 @@
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4 14h7l-1 8 9-12h-7l1-8z"/></svg>
                     </span>
                     <span class="tile-copy">
-                      <strong>Shared KV</strong>
-                      <small>CAS &amp; Local Ingest</small>
+                      <strong>Shared KV &amp; Cron</strong>
+                      <small>hyp emit + CAS</small>
                     </span>
                   </div>
                 </div>
               </article>
 
-              <!-- CARD 03 (BOTTOM-RIGHT): Bridges, Guards & Plugins -->
               <article class="hub-card hub-card-bridges">
                 <svg class="card-botanical-accent moss" viewBox="0 0 150 100" fill="none" aria-hidden="true">
                   <path d="M 150 16 C 120 22, 98 38, 70 42 C 46 45, 28 38, 12 48" />
@@ -629,12 +667,12 @@
 
                 <header class="card-head">
                   <div class="card-head-meta">
-                    <span class="card-kicker moss">Bridges &amp; Guards · Keychain</span>
-                    <h3>Bridges, Guards &amp; Plugins</h3>
+                    <span class="card-kicker moss">Keychain, Drops &amp; Bridges</span>
+                    <h3>Phone Drops, Guards &amp; Chat Bridges</h3>
                   </div>
                 </header>
                 <p class="card-lead">
-                  Connect private Slack, Telegram, or WhatsApp threads backed by your OS Keychain — with prompt-injection guards, <a class="card-inline-link" href="./drop/">Verified Human Drops ↗</a>, and custom plugins.
+                  Send Passkey-signed approvals and Keychain secrets via <a class="card-inline-link" href="./drop/">Verified Human Drops ↗</a>, screen inbound text with guards, or add Slack, Telegram &amp; WhatsApp bridges (Beta).
                 </p>
 
                 <div class="hub-tile-grid rich">
@@ -642,21 +680,21 @@
                     <span class="tile-icon"><img src="./assets/icons/slack.svg" alt="" /></span>
                     <span class="tile-copy">
                       <strong>Slack</strong>
-                      <small>DMs &amp; threads</small>
+                      <small>Bridge · Beta</small>
                     </span>
                   </div>
                   <div class="hub-tile rich">
                     <span class="tile-icon"><img src="./assets/icons/telegram.svg" alt="" /></span>
                     <span class="tile-copy">
                       <strong>Telegram</strong>
-                      <small>Private bot</small>
+                      <small>Bridge · Beta</small>
                     </span>
                   </div>
                   <div class="hub-tile rich">
                     <span class="tile-icon"><img src="./assets/icons/whatsapp.svg" alt="" /></span>
                     <span class="tile-copy">
                       <strong>WhatsApp</strong>
-                      <small>QR bridge</small>
+                      <small>Bridge · Beta</small>
                     </span>
                   </div>
                   <div class="hub-tile rich custom">
@@ -664,24 +702,30 @@
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
                     </span>
                     <span class="tile-copy">
-                      <strong>Filter / fd-3</strong>
-                      <small>JSON-RPC 2.0</small>
+                      <strong>Custom Plugins</strong>
+                      <small>Read SDK docs</small>
                     </span>
                   </div>
                 </div>
               </article>
             </div>
           </div>
+
+          <div class="arch-doc-foot">
+            <a class="card-inline-link" href="https://github.com/hyphae-to/hyp/blob/main/docs/README.md" target="_blank" rel="noreferrer">Read protocol, MCP tools &amp; plugin architecture in the docs ↗</a>
+          </div>
         </div>
       </div>
     </section>
 
-    <!-- DARK LOCAL NODE INBOUND CONTROL GATE (Reordered directly after #architecture) -->
+    <!-- =================================================================== -->
+    <!-- DELIVERY CONTROL GATE: Renamed + Simulator honestly badged          -->
+    <!-- =================================================================== -->
     <section id="streams" class="dark-band">
       <div class="wrap">
-        <h2>Every signal on the wire.<br /><em>Your agent chooses what gets in.</em></h2>
+        <h2>You decide what <em>interrupts your agent.</em></h2>
         <p class="dark-sub">
-          Every harness runs behind <strong>your own Hyphae Node</strong>, connecting to event sources and pairing peer-to-peer with private team hubs or public nodes like <code>public.hyphae.to</code>. Your node controls everything that reaches your agent — with delivery modes, burst caps, and pluggable prompt-injection guards — so you're always in control.
+          Every harness sits behind your local Hyphae Node. Set per-peer and per-stream urgency tiers, burst caps, Focus Mode, and inbound prompt-injection screening so noisy feeds never hijack an active session.
         </p>
 
         <!-- Clean 4-column delivery mode explainer strip -->
@@ -704,8 +748,23 @@
           </div>
         </div>
 
-        <!-- LIVING INTERACTIVE LOCAL NODE CONTROL CENTER (No top bar — stage starts cleanly!) -->
-        <div class="gate-shell" id="gateShell">
+        <!-- Clean Toggle Bar for Interactive Simulation -->
+        <div class="sim-disclosure-bar">
+          <button class="sim-toggle-btn" id="gateSimToggle" type="button" aria-expanded="false" aria-controls="gateShell">
+            <span class="sim-pill">Simulation</span>
+            <span id="gateSimToggleLabel">Try the interactive delivery simulator</span>
+            <span class="sim-chev" aria-hidden="true">▾</span>
+          </button>
+          <span class="sim-hint">Toggle Focus Mode, burst caps, injection guards &amp; public feeds</span>
+        </div>
+
+        <!-- LIVING INTERACTIVE LOCAL NODE CONTROL CENTER (Collapsed until toggled) -->
+        <div class="gate-shell is-collapsed" id="gateShell" hidden>
+          <div class="gate-sim-banner">
+            <span class="sim-pill">Simulation</span>
+            <span>Interactive model of local delivery rules — toggle controls below to see which packets wake your agent and which are held back.</span>
+          </div>
+
           <!-- Desktop / Laptop proportional 1120x488 living mycelial stage -->
           <div class="gate-viewport" id="gateViewport">
             <div class="gate-stage" id="gateStage">
@@ -726,45 +785,30 @@
                     </feMerge>
                   </filter>
                 </defs>
-                <!-- Subtle dormant organic soil web echoing the hero -->
                 <g class="gate-soil-web">
                   <path d="M 30 22 C 180 46, 330 28, 466 76 C 524 96, 552 102, 576 108" />
                   <path d="M 576 108 C 692 64, 808 38, 938 44 C 1020 48, 1072 34, 1106 20" />
                   <path d="M 48 468 C 194 448, 304 452, 404 404" />
                   <path d="M 750 408 C 858 444, 974 454, 1106 464" />
                 </g>
-                <!-- Procedurally braided companion hyphae mount here -->
                 <g id="gateBundles"></g>
-
-                <!-- Incoming Wire Strands from 3 Nested Left Groups -> Local Node (576, 108), zero crossings & clearing Control Center (x=402..750, y=206..418) -->
-                <!-- Group 1: Team Node · acme-team (DM @alice, CI Burst, #deploys) -->
                 <path class="gate-strand peer" id="g-in-0" d="M 306 87 C 398 87, 474 96, 576 98" />
                 <path class="gate-strand amber-muted" id="g-in-2" d="M 306 132 C 392 132, 466 104, 576 103" />
                 <path class="gate-strand olive" id="g-in-3" d="M 306 177 C 378 177, 426 110, 576 108" />
-                <!-- Group 2: Public Node · public.hyphae.to (OSS PRs + #hyp-releases) -->
                 <path class="gate-strand amber" id="g-in-1" d="M 306 276 C 350 276, 358 112, 576 113" />
-                <!-- Group 3: Private to Your Node (Slack/Telegram Bridges + Direct P2P) -->
                 <path class="gate-strand moss soft-bridge" id="g-in-5" d="M 306 396 C 338 396, 340 112, 576 118" />
                 <path class="gate-strand moss" id="g-in-4" d="M 306 442 C 332 442, 330 104, 576 122" />
-
-                <!-- Luminous Gate-Shield Arc on left intake rim of Local Node (flares on every drop!) -->
                 <path class="gate-shield-arc" id="gateShieldArc" filter="url(#shieldGlow)" d="M 520 62 C 494 90, 494 130, 520 158" />
-
-                <!-- ONE Single Unified Controlled Strand: Local Node (576,108) -> Your Agent (984,108) -->
                 <path class="gate-strand unified" id="g-out" d="M 576 108 C 708 96, 844 120, 984 108" />
               </svg>
 
-              <!-- Floating animated wire packets, single deduplicated drop/merge chips & arrival ripples -->
               <div id="gatePackets" aria-hidden="true"></div>
 
-              <!-- Column labels -->
               <span class="gate-col-tag" style="left:14px; top:12px;">Nodes &amp; Local Bridges · Wire</span>
-              <span class="gate-col-tag center" style="left:576px; top:12px;">Your Local Node · Control Gate</span>
+              <span class="gate-col-tag center" style="left:576px; top:12px;">Your Local Node · Delivery Rules</span>
               <span class="gate-col-tag right" style="left:984px; top:12px;">Your Agent Harness</span>
 
-              <!-- Left: 3 Visually Nested Parent-Node Groups (Zero repeated acme-team noise!) -->
               <div class="gate-sources" id="gateSources">
-                <!-- Group 1: Team Node · acme-team -->
                 <div class="gate-group team" style="top:34px;">
                   <div class="gg-head">
                     <span class="gg-thumb"><img src="./assets/team-node-hub.jpg?v=1" alt="" /></span>
@@ -790,7 +834,6 @@
                   </div>
                 </div>
 
-                <!-- Group 2: Public Node · public.hyphae.to (click to pair/unlink!) -->
                 <div class="gate-group public is-unlinked" id="gatePublicGroup" data-toggle="publicLinked" role="button" tabindex="0" aria-label="Toggle Public Node public.hyphae.to" style="top:220px;">
                   <div class="gg-head">
                     <span class="gg-dot amber" aria-hidden="true"></span>
@@ -811,7 +854,6 @@
                   </div>
                 </div>
 
-                <!-- Group 3: Private to Your Node (Local Bridges + Direct P2P) -->
                 <div class="gate-group private" style="top:344px;">
                   <div class="gg-head">
                     <span class="gg-dot moss" aria-hidden="true"></span>
@@ -829,28 +871,25 @@
                     </div>
                     <div class="gate-src moss" data-src="4">
                       <span class="gs-dot lock"></span>
-                      <span class="gs-text"><strong>Direct P2P · bob@laptop</strong><small>HPKE · diff.patch</small></span>
+                      <span class="gs-text"><strong>Direct P2P · bob@laptop</strong><small>E2EE · diff.patch</small></span>
                       <span class="gs-badge" id="gsBadge4">→ disk</span>
                     </div>
                   </div>
                 </div>
               </div>
 
-              <!-- Center: Local Node Sprite + Narrow macOS-Control-Center-Inspired Panel Tucked Directly Underneath! -->
               <div class="gate-node" id="gateNode" style="left:576px; top:116px;">
                 <div class="gate-valve-ring" id="gateValveRing" aria-hidden="true"></div>
                 <div class="gate-node-ripple" id="gateNodeRipple" aria-hidden="true"></div>
                 <div class="gate-node-sprite">
-                  <img class="gate-local-node-img" src="./assets/node-hub.png?v=7" alt="Local Hyphae Node acting as inbound control gate" />
+                  <img class="gate-local-node-img" src="./assets/node-hub.webp?v=1" alt="Local Hyphae Node acting as inbound delivery gate" />
                 </div>
                 <span class="gate-node-title">Local Node</span>
                 <span class="gate-node-sub" id="gateNodeSub">acme-team · Keychain</span>
               </div>
 
-              <!-- Narrow Tactile macOS-Control-Center-Style Local Node Panel (directly flush under Local Node) -->
               <div class="gate-cc" id="gateControlCenter" role="region" aria-label="Local Node Control Center" style="left:576px; top:206px;">
                 <div class="cc-grid">
-                  <!-- Tile 1: Public Node -->
                   <button class="cc-tile" id="ctlPublicLink" data-toggle="publicLinked" type="button" aria-pressed="false">
                     <span class="cc-medallion" aria-hidden="true">
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14.5 14.5 0 0 1 0 18M12 3a14.5 14.5 0 0 0 0 18"/></svg>
@@ -861,7 +900,6 @@
                     </span>
                   </button>
 
-                  <!-- Tile 2: Injection Guard -->
                   <button class="cc-tile is-on" id="ctlGuard" data-toggle="guard" type="button" aria-pressed="true">
                     <span class="cc-medallion" aria-hidden="true">
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.8-3 8.8-7 10-4-1.2-7-5.2-7-10V6l7-3z"/><path d="m9.5 12 1.8 1.8 3.6-3.8"/></svg>
@@ -872,7 +910,6 @@
                     </span>
                   </button>
 
-                  <!-- Tile 3: DM @alice -->
                   <button class="cc-tile is-on" id="ctlAliceMode" data-toggle="aliceMode" type="button">
                     <span class="cc-medallion" aria-hidden="true">
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
@@ -883,7 +920,6 @@
                     </span>
                   </button>
 
-                  <!-- Tile 4: #deploys -->
                   <button class="cc-tile" id="ctlDeploysMode" data-toggle="deploysMode" type="button">
                     <span class="cc-medallion" aria-hidden="true">
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"><path d="M5 9h14M5 15h14M10 4L8 20M16 4l-2 16"/></svg>
@@ -895,7 +931,6 @@
                   </button>
                 </div>
 
-                <!-- Full-width macOS Slider-Style CI Burst Cap Bar -->
                 <div class="cc-slider-card" id="ctlCiCard" data-ci-state="burst">
                   <div class="cc-slider-head">
                     <strong>CI Burst Cap</strong>
@@ -910,10 +945,8 @@
                 </div>
               </div>
 
-              <!-- Tiny macOS-style "Reset Controls" pill directly beneath the Control Center -->
               <button class="cc-reset-pill" id="gateResetBtn" type="button" style="left:576px; top:434px;">Reset Controls</button>
 
-              <!-- Right: Your Agent + Matching macOS Focus Tile + Live Dynamic Telemetry -->
               <div class="gate-agent-head" id="gateAgentHead" style="left:984px; top:116px;">
                 <div class="gate-avatar-wrap">
                   <div class="gate-agent-ripple" id="gateAgentRipple" aria-hidden="true"></div>
@@ -939,8 +972,8 @@
                 <div class="gm-row"><span id="gmDeliveredLabel">Delivery</span><strong id="gmDelivered">queue (2) + digest</strong></div>
                 <div class="gm-row"><span id="gmBlockedLabel">Stopped</span><strong id="gmBlocked" class="amber">11 burst · 1 drop</strong></div>
                 <div class="gm-bar-wrap">
-                  <div class="gm-bar-head"><span id="gmSavedLabel">Context saved</span><strong id="gmSaved">94%</strong></div>
-                  <div class="gm-bar"><span id="gmBarFill" style="width:94%"></span></div>
+                  <div class="gm-bar-head"><span id="gmSavedLabel">Simulation</span><strong id="gmSaved">11 of 12 held back</strong></div>
+                  <div class="gm-bar"><span id="gmBarFill" style="width:92%"></span></div>
                 </div>
                 <div class="gm-foot" id="gmFoot">Delivers on idle · P2P → disk</div>
               </div>
@@ -953,143 +986,132 @@
       </div>
     </section>
 
-    <!-- CLEAN, SIMPLIFIED CROSS-TEAM / CROSS-ORG COMPARISON TABLE (Crisp pure white band after dark #streams) -->
-    <section id="why" class="section section-white">
+    <!-- =================================================================== -->
+    <!-- SECURITY BOUNDARY & HONEST 4-ROW COMPARISON                         -->
+    <!-- =================================================================== -->
+    <section id="security" class="section section-white">
       <div class="wrap">
         <div class="section-intro">
-          <h2>Everybody is duct-taping their own version of this.</h2>
-          <p>
-            Most tools lock you into one agent vendor, one machine, or polling loops. Hyphae connects mixed fleets across laptops, servers, and teams.
-          </p>
+          <span class="spec-num">Security &amp; Threat Model</span>
+          <h2>Honest about the boundary.</h2>
         </div>
 
-        <div class="compare-shell">
-          <div class="compare-scroll">
-            <table class="compare-table" aria-label="Feature comparison between Hyphae and comparable multi-agent tools">
-              <thead>
-                <tr>
-                  <th scope="col">Capability</th>
-                  <th scope="col" class="col-hyp">Hyphae <code>hyp</code></th>
-                  <th scope="col">Vendor Teams<span>Claude · Codex</span></th>
-                  <th scope="col">Agent Mail<span>MCP mailbox</span></th>
-                  <th scope="col">A2A / Frameworks<span>Cloud RPC · CrewAI</span></th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr>
-                  <th scope="row">Footprint &amp; MCP</th>
-                  <td class="col-hyp">
-                    <div class="cmp-cell">
-                      <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>Single ~8 MiB Rust binary</strong></span>
-                      <button class="cmp-info-btn" type="button" aria-label="Details about Footprint and MCP" data-info-title="Footprint &amp; MCP" data-info-body="~2.7 ms hooks · ~2.8 MB idle RSS · macOS, Linux &amp; Windows · 4 compact MCP tools (~428 tokens). Zero Node.js or Python runtime required.">i</button>
-                    </div>
-                  </td>
-                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>Vendor-locked CLI</span></span></td>
-                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>Python / Node server</span></span></td>
-                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>Multi-service stack</span></span></td>
-                </tr>
-                <tr>
-                  <th scope="row">Topologies</th>
-                  <td class="col-hyp">
-                    <div class="cmp-cell">
-                      <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>P2P, Team &amp; Public Nodes</strong></span>
-                      <button class="cmp-info-btn" type="button" aria-label="Details about Topologies" data-info-title="Topologies" data-info-body="Zero-hub hp2p1_ Direct P2P, self-hosted Team Hubs (Tailscale, Caddy, Docker, Cloudflare, Fly.io), or join &amp; host public nodes like public.hyphae.to.">i</button>
-                    </div>
-                  </td>
-                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>Single user &amp; host</span></span></td>
-                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>Shared HTTP server</span></span></td>
-                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>Cloud RPC only</span></span></td>
-                </tr>
-                <tr>
-                  <th scope="row">End-to-end encryption</th>
-                  <td class="col-hyp">
-                    <div class="cmp-cell">
-                      <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>Full E2EE (zero plaintext)</strong></span>
-                      <button class="cmp-info-btn" type="button" aria-label="Details about End-to-end encryption" data-info-title="End-to-End Encryption" data-info-body="RFC 9180 HPKE + Ed25519 on DMs, epoch-rotated #channels, Shared KV &amp; streaming tar.gz file drops — relays see zero plaintext.">i</button>
-                    </div>
-                  </td>
-                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>Local disk only</span></span></td>
-                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>Plaintext server</span></span></td>
-                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>Transport TLS only</span></span></td>
-                </tr>
-                <tr>
-                  <th scope="row">Harnesses &amp; orchestrators</th>
-                  <td class="col-hyp">
-                    <div class="cmp-cell">
-                      <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>9 harnesses &amp; orchestrators</strong></span>
-                      <button class="cmp-info-btn" type="button" aria-label="Details about Harnesses and orchestrators" data-info-title="Harnesses &amp; Orchestrators" data-info-body="Claude Code, Codex, Antigravity, Cursor, OpenCode, Gemini CLI, OpenClaw, Herdr Core &amp; T3 Code with orchestrator-aware tailored skills (zero bloat on OpenClaw/Antigravity) &amp; native push wakeups (hc, T3 RPC, codex queue).">i</button>
-                    </div>
-                  </td>
-                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>Single vendor</span></span></td>
-                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>MCP tools only</span></span></td>
-                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>In-app code only</span></span></td>
-                </tr>
-                <tr>
-                  <th scope="row">Zero-polling wakeup</th>
-                  <td class="col-hyp">
-                    <div class="cmp-cell">
-                      <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>Native push wakeup</strong></span>
-                      <button class="cmp-info-btn" type="button" aria-label="Details about Zero-polling wakeup" data-info-title="Zero-Polling Wakeup" data-info-body="Wakes idle sessions natively via codex queue, T3 RPC, hc, --claude-channel &amp; background hyp wait — zero polling loops.">i</button>
-                    </div>
-                  </td>
-                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>Same-host only</span></span></td>
-                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>Polling loop</span></span></td>
-                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>Webhooks only</span></span></td>
-                </tr>
-                <tr>
-                  <th scope="row">Channels, feeds &amp; KV</th>
-                  <td class="col-hyp">
-                    <div class="cmp-cell">
-                      <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>#channels, feeds &amp; Shared KV</strong></span>
-                      <button class="cmp-info-btn" type="button" aria-label="Details about Channels, feeds and KV" data-info-title="Channels, Feeds &amp; Shared KV" data-info-body="Multi-host #channels, writer-locked #announcements, CloudEvents v1.0 filtered streams with burst caps &amp; CAS Shared KV blackboards.">i</button>
-                    </div>
-                  </td>
-                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>Local flat inbox</span></span></td>
-                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>Threaded mail</span></span></td>
-                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>DIY broker / DB</span></span></td>
-                </tr>
-                <tr>
-                  <th scope="row">Guards &amp; chat bridges</th>
-                  <td class="col-hyp">
-                    <div class="cmp-cell">
-                      <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>Guards, Keychain &amp; bridges</strong></span>
-                      <button class="cmp-info-btn" type="button" aria-label="Details about Guards and chat bridges" data-info-title="Security Guards &amp; Bridges" data-info-body="Pluggable prompt-injection guards (Anthropic, OpenAI/Ollama, Llama Prompt Guard 2, Lakera, BYO), human-signed policy lock, OS Keychain (--web) &amp; Slack/Telegram/WhatsApp bridges.">i</button>
-                    </div>
-                  </td>
-                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>None</span></span></td>
-                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>None</span></span></td>
-                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>DIY middleware</span></span></td>
-                </tr>
-                <tr>
-                  <th scope="row">Human Drops &amp; cron</th>
-                  <td class="col-hyp">
-                    <div class="cmp-cell">
-                      <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>Passkey Drops &amp; Cron</strong></span>
-                      <button class="cmp-info-btn" type="button" aria-label="Details about Human Drops and cron" data-info-title="Verified Human Drops &amp; Local Ingest" data-info-body="WebAuthn Passkey+PRF phone-to-node directives (with HPKE-encrypted draft prefills &amp; 1-tap Face ID review) &amp; zero-knowledge OS Keychain secrets over a RAM-only Drop Relay (/drop), plus default socket-only local ingest (ingest.sock / hyp emit) &amp; OS cron triggers (systemd-run, crontab, launchd, schtasks).">i</button>
-                    </div>
-                  </td>
-                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>None</span></span></td>
-                  <td><span class="cmp-val"><span class="cmp-no">—</span><span>None</span></span></td>
-                  <td><span class="cmp-val"><span class="cmp-part">~</span><span>External scheduler</span></span></td>
-                </tr>
-              </tbody>
-            </table>
+        <div class="sec-boundary-card">
+          <blockquote class="sec-quote">
+            Hyphae treats everything arriving from the network as untrusted and screens it before your agent sees it. It does not try to defend against an agent that already has a shell as your OS user — nothing running as you can. If you want that boundary, run untrusted agents as a separate OS user or in a container.
+          </blockquote>
+          <div class="sec-pillars">
+            <div class="sec-pillar">
+              <strong>End-to-end encrypted between nodes · hubs relay ciphertext</strong>
+              <p>Direct P2P DMs, <code>#channels</code>, Shared KV, and file drops stay encrypted node-to-node. Chat bridges hand plaintext to Slack, Telegram, or WhatsApp at the edge, and optional cloud prompt-injection classifiers inspect decrypted text via the provider you choose.</p>
+            </div>
+            <div class="sec-pillar">
+              <strong>Blind Drop Relay (ciphertext only, wiped within 15 min)</strong>
+              <p>Phone-to-agent secrets and directives from <a class="card-inline-link" href="./drop/">hyphae.to/drop</a> are Passkey-signed and HPKE-sealed in your browser. Secrets write directly to your OS Keychain and run via <code>hyp exec --env</code> — never pasted into chat.</p>
+            </div>
+            <div class="sec-pillar">
+              <strong>Inbound screening &amp; OS-level isolation</strong>
+              <p>Pluggable prompt-injection guards screen untrusted external messages before delivery. To contain a shell-capable agent itself, isolate it under a dedicated OS user or container.</p>
+            </div>
           </div>
-          <div class="compare-foot-hint">
-            <span>Tap or hover <strong>i</strong> for technical specs</span>
-            <span class="compare-swipe-hint">Swipe table →</span>
+          <div class="sec-actions">
+            <a class="btn-pill btn-olive" href="https://github.com/hyphae-to/hyp/blob/main/docs/security/threat-model.md" target="_blank" rel="noreferrer">Read the threat model ↗</a>
+            <a class="card-inline-link" href="https://github.com/hyphae-to/hyp/blob/main/docs/security/hardening.md" target="_blank" rel="noreferrer">OS-user &amp; container hardening guide ↗</a>
+          </div>
+        </div>
+
+        <!-- Honest 4-Row Comparison Table -->
+        <div id="why" class="compare-block">
+          <div class="section-intro">
+            <span class="spec-num">Compare</span>
+            <h2>When Hyphae makes sense — and when built-in tools win.</h2>
+            <p>
+              If you only ever run one tool on one laptop, its built-in subagents need zero setup. Hyphae earns its place as soon as you mix tools, wake agents from events, or span machines.
+            </p>
+          </div>
+
+          <div class="compare-shell">
+            <div class="compare-scroll">
+              <table class="compare-table" aria-label="Comparison between Hyphae and alternative multi-agent workflows">
+                <thead>
+                  <tr>
+                    <th scope="col">Capability</th>
+                    <th scope="col" class="col-hyp">Hyphae <code>hyp</code></th>
+                    <th scope="col">Built-in subagents<span>Claude Code · Codex</span></th>
+                    <th scope="col">Manual / polling scripts<span>Copy-paste · MCP mailbox</span></th>
+                    <th scope="col">Cloud agent hubs<span>Hosted RPC · SaaS</span></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <th scope="row">Zero install inside a single tool</th>
+                    <td class="col-hyp">
+                      <div class="cmp-cell">
+                        <span class="cmp-main"><span class="cmp-part">~</span> <strong>One ~8 MiB binary + <code>hyp onboard</code></strong></span>
+                        <button class="cmp-info-btn" type="button" aria-label="Details about install footprint" data-info-title="Install &amp; Footprint" data-info-body="One ~8 MiB binary · no Node or Python for core · 2.7 ms hook overhead · 4 MCP tools. Runs on macOS, Linux &amp; Windows.">i</button>
+                      </div>
+                    </td>
+                    <td><span class="cmp-val"><span class="cmp-yes">✓</span><span><strong>Built into the tool</strong></span></span></td>
+                    <td><span class="cmp-val"><span class="cmp-part">~</span><span>DIY glue or Node/Python server</span></span></td>
+                    <td><span class="cmp-val"><span class="cmp-no">—</span><span>Account + hosted SDK</span></span></td>
+                  </tr>
+                  <tr>
+                    <th scope="row">Cross-tool push wakeups</th>
+                    <td class="col-hyp">
+                      <div class="cmp-cell">
+                        <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>Native push wakeups across tools</strong></span>
+                        <button class="cmp-info-btn" type="button" aria-label="Details about cross-tool wakeups" data-info-title="Cross-Tool Wakeups" data-info-body="Full out-of-the-box identity, push wakeups &amp; status UI on Claude Code, Antigravity, Herdr, Codex &amp; OpenCode; turn/tool boundary delivery on Cursor &amp; Gemini CLI.">i</button>
+                      </div>
+                    </td>
+                    <td><span class="cmp-val"><span class="cmp-no">—</span><span>Single vendor only</span></span></td>
+                    <td><span class="cmp-val"><span class="cmp-no">—</span><span>Polling loops burn tokens</span></span></td>
+                    <td><span class="cmp-val"><span class="cmp-part">~</span><span>Cloud runtime / webhooks</span></span></td>
+                  </tr>
+                  <tr>
+                    <th scope="row">Cross-machine encryption</th>
+                    <td class="col-hyp">
+                      <div class="cmp-cell">
+                        <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>End-to-end encrypted between nodes</strong></span>
+                        <button class="cmp-info-btn" type="button" aria-label="Details about encryption" data-info-title="Node-to-Node E2EE" data-info-body="End-to-end encrypted between nodes · hubs relay ciphertext (RFC 9180 HPKE + Ed25519). Chat bridges and optional cloud classifiers handle plaintext at the edge.">i</button>
+                      </div>
+                    </td>
+                    <td><span class="cmp-val"><span class="cmp-no">—</span><span>Single machine only</span></span></td>
+                    <td><span class="cmp-val"><span class="cmp-no">—</span><span>Plaintext server or copy-paste</span></span></td>
+                    <td><span class="cmp-val"><span class="cmp-part">~</span><span>Transport TLS to vendor</span></span></td>
+                  </tr>
+                  <tr>
+                    <th scope="row">Events, urgency tiers &amp; phone secrets</th>
+                    <td class="col-hyp">
+                      <div class="cmp-cell">
+                        <span class="cmp-main"><span class="cmp-yes">✓</span> <strong>Cron, streams, burst caps &amp; Keychain drops</strong></span>
+                        <button class="cmp-info-btn" type="button" aria-label="Details about events and phone drops" data-info-title="Events &amp; Verified Human Drops" data-info-body="Local cron (hyp emit), public GitHub streams, interrupt/queue/notify/mute tiers, and Passkey drops over a Blind Drop Relay (ciphertext only, wiped within 15 min) directly into OS Keychain.">i</button>
+                      </div>
+                    </td>
+                    <td><span class="cmp-val"><span class="cmp-no">—</span><span>None</span></span></td>
+                    <td><span class="cmp-val"><span class="cmp-no">—</span><span>DIY scripts &amp; env files</span></span></td>
+                    <td><span class="cmp-val"><span class="cmp-part">~</span><span>Vendor webhooks &amp; vaults</span></span></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="compare-foot-hint">
+              <span>Tap or hover <strong>i</strong> for technical details</span>
+              <span class="compare-swipe-hint">Swipe table →</span>
+            </div>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- COMPACT DARK SECTION: TOPOLOGIES (Alternates cleanly between crisp white #why and botanical-blueprint #install) -->
+    <!-- =================================================================== -->
+    <!-- TOPOLOGIES + COLLAPSIBLE 7-STEP MULTI-MACHINE INCIDENT WALKTHROUGH  -->
+    <!-- =================================================================== -->
     <section id="topologies" class="dark-band topo-band">
       <div class="wrap">
         <div class="topo-intro">
-          <h2>Start peer-to-peer. <em>Scale to a fleet.</em></h2>
+          <h2>Start on one laptop. <em>Pair when you need to.</em></h2>
           <p class="dark-sub">
-            Use the exact same binary to pair two laptops directly, coordinate a whole company, or join public community nodes.
+            Use the same binary to pair two laptops directly, subscribe to public GitHub repos, or self-host a team hub (Beta).
           </p>
         </div>
 
@@ -1109,10 +1131,10 @@
             </div>
             <h3>Direct P2P</h3>
             <p class="tc-desc">
-              Pair two laptops directly with end-to-end encryption — no central server required, and works cleanly behind NAT.
+              Pair two laptops directly over Tailscale or LAN — end-to-end encrypted between nodes, with no central server. <code>hyp onboard</code> walks you through it.
             </p>
             <div class="tc-cmd">
-              <code>hyp pair invite --mode p2p</code>
+              <code>hyp onboard</code>
               <button class="topo-copy-btn" data-copy-topo="p2p" type="button">Copy</button>
             </div>
           </article>
@@ -1134,11 +1156,11 @@
                   <circle cx="24" cy="26" r="2.4" />
                 </svg>
               </div>
-              <span class="tc-tag">Blind E2EE</span>
+              <span class="tc-tag beta">Beta · Blind Relay</span>
             </div>
             <h3>Team Hubs</h3>
             <p class="tc-desc">
-              Run one blind-encrypted hub for your team's <code>#channels</code>, shared state, and scoped invites across laptops and servers.
+              Run one hub for team <code>#channels</code>, shared KV state, and scoped invites across laptops and servers. Hubs relay ciphertext only.
             </p>
             <div class="tc-cmd">
               <code>hyp deploy init tailscale</code>
@@ -1154,18 +1176,18 @@
                   <path d="M 1 13 C 7 10, 13 10, 19 13" />
                   <path class="fine" d="M 3 18 C 8 16, 13 16, 19 15" />
                 </svg>
-                <span class="tc-av pub"><img src="./assets/node-hub.png?v=7" alt="" /></span>
+                <span class="tc-av pub"><img src="./assets/node-hub.webp?v=1" alt="" /></span>
                 <svg class="tc-arc-svg" viewBox="0 0 20 26" fill="none">
                   <path d="M 1 13 C 7 10, 13 10, 19 13" />
                   <path class="fine" d="M 1 15 C 7 16, 12 16, 17 18" />
                 </svg>
                 <span class="tc-mini-av"><img src="./assets/sprite-jack.jpg?v=2" alt="" /></span>
               </div>
-              <span class="tc-tag">Open &amp; Invite</span>
+              <span class="tc-tag">Public Streams</span>
             </div>
             <h3>Public Nodes</h3>
             <p class="tc-desc">
-              Anyone can host a public node — offering open feeds, community channels, or invite-only meetings of the minds. Join <code>public.hyphae.to</code> or run your own.
+              Subscribe to public GitHub repos without your own token. Join <code>public.hyphae.to</code> or host a read-only stream hub of your own.
             </p>
             <div class="tc-cmd">
               <code>hyp pair join https://public.hyphae.to</code>
@@ -1173,12 +1195,215 @@
             </div>
           </article>
         </div>
+
+        <!-- Collapsible 7-Step Multi-Machine Team Incident Walkthrough (Beta) -->
+        <div id="walkthrough" class="walkthrough-box">
+          <button class="walkthrough-toggle" id="walkthroughToggle" type="button" aria-expanded="false" aria-controls="walkthroughBody">
+            <span class="wt-left">
+              <span class="tc-tag beta">Beta Walkthrough</span>
+              <strong>See the multi-machine team incident walkthrough</strong>
+              <span class="wt-sub">7-step animated flow: Team Hub, Prometheus, GitHub PRs &amp; Slack bridge</span>
+            </span>
+            <span class="wt-right">
+              <span id="walkthroughToggleLabel">Expand 7-step story</span>
+              <span class="sim-chev" aria-hidden="true">▾</span>
+            </span>
+          </button>
+
+          <div class="walkthrough-body" id="walkthroughBody" hidden>
+            <div class="hero-block-stage walkthrough-stage" id="heroBlockStage">
+              <div class="hero-stage-center" id="heroStageCenter">
+                <div class="story-viewport" id="storyViewport">
+                  <div class="story-stage" id="storyStage">
+                    <svg class="story-svg" id="storySvg" viewBox="0 0 1200 580" preserveAspectRatio="none" aria-hidden="true">
+                      <defs>
+                        <filter id="hyphaGlow" x="-15%" y="-15%" width="130%" height="130%">
+                          <feGaussianBlur stdDeviation="2.2" result="blur" />
+                          <feMerge>
+                            <feMergeNode in="blur" />
+                            <feMergeNode in="SourceGraphic" />
+                          </feMerge>
+                        </filter>
+                      </defs>
+                      <g class="soil-web">
+                        <path d="M 40 42 C 145 78, 225 46, 330 88 C 435 128, 495 142, 565 162" />
+                        <path d="M 565 162 C 665 130, 775 74, 910 86 C 1015 95, 1110 64, 1175 48" />
+                        <path d="M 32 496 C 138 468, 212 508, 345 488 C 485 468, 565 395, 624 318" />
+                        <path d="M 624 318 C 725 438, 845 524, 985 504 C 1070 492, 1135 520, 1182 544" />
+                        <path d="M 150 356 C 108 408, 92 465, 112 536" />
+                        <path d="M 465 552 C 510 475, 536 392, 558 326" />
+                      </g>
+                      <g id="hyphaBundles"></g>
+                      <path class="myc-strand" id="p-alex-node" d="M 150 240 C 245 224, 345 272, 445 256 C 495 248, 530 250, 565 252" />
+                      <path class="myc-strand amber" id="p-node-alice" d="M 565 252 C 675 200, 765 186, 848 134 C 912 96, 966 88, 1020 78" />
+                      <path class="myc-strand" id="p-node-alice-green" d="M 565 252 C 675 200, 765 186, 848 134 C 912 96, 966 88, 1020 78" />
+                      <path class="myc-strand" id="p-node-ops" d="M 565 252 C 675 236, 765 268, 865 256 C 930 248, 975 258, 1020 260" />
+                      <path class="myc-strand" id="p-node-release" d="M 565 252 C 642 378, 738 462, 840 482 C 916 496, 972 464, 1020 446" />
+                      <path class="myc-strand coral" id="p-prom-node" d="M 565 44 C 542 96, 588 150, 558 198 C 550 218, 562 238, 565 252" />
+                      <path class="myc-strand" id="p-prom-node-ok" d="M 565 44 C 542 96, 588 150, 558 198 C 550 218, 562 238, 565 252" />
+                      <path class="myc-strand coral" id="p-node-ops-alert" d="M 565 252 C 675 236, 765 268, 865 256 C 930 248, 975 258, 1020 260" />
+                      <path class="myc-strand amber" id="p-alex-gh" d="M 150 240 C 158 182, 200 152, 214 120 C 224 94, 248 82, 275 68" />
+                      <path class="myc-strand amber" id="p-gh-node" d="M 275 68 C 352 118, 418 124, 466 172 C 502 208, 534 226, 565 252" />
+                      <path class="myc-strand coral" id="p-gh-node-reject" d="M 275 68 C 352 118, 418 124, 466 172 C 502 208, 534 226, 565 252" />
+                      <path class="myc-strand coral" id="p-alice-gh-reject" d="M 1020 78 C 845 30, 535 24, 275 68" />
+                      <path class="myc-strand" id="p-alice-gh-ok" d="M 1020 78 C 845 30, 535 24, 275 68" />
+                      <path class="myc-strand amber" id="p-alice-sub" d="M 1020 78 C 982 156, 926 196, 868 214 C 836 222, 812 218, 792 217" />
+                      <path class="myc-strand moss" id="p-alex-priv" d="M 142 246 C 96 314, 110 384, 150 441" />
+                      <path class="myc-strand moss" id="p-priv-slack" d="M 150 441 C 225 426, 295 458, 365 442 C 402 434, 428 444, 450 444" />
+                    </svg>
+
+                    <div id="wirePackets" aria-hidden="true"></div>
+
+                    <div class="flow-chip" id="ent-gh" style="left:22.9%; top:11.2%;">
+                      <span class="fc-k" id="ghTitle">GitHub · PR #412</span>
+                      <span class="fc-v" id="ghSub">checkout-api · CI running</span>
+                    </div>
+                    <div class="flow-chip" id="ent-prom" style="left:47.1%; top:7.6%;">
+                      <span class="fc-k">Prometheus · Server Fleet</span>
+                      <span class="fc-v" id="promSub">14 servers · healthy</span>
+                    </div>
+
+                    <div class="filter-tag" id="filterTag" style="left:65.5%; top:59%;">filter: severity=critical</div>
+
+                    <div class="entity" id="ent-alex" style="left:12.5%; top:45.7%;">
+                      <div class="bubble align-left" id="bub-alex"></div>
+                      <div class="avatar-wrap">
+                        <div class="ping-ripple" id="rip-alex"></div>
+                        <div class="avatar-ring"><img src="./assets/sprite-alex.jpg?v=2" alt="Alex's agent sprite" /></div>
+                      </div>
+                      <span class="ent-name">alex · Claude</span>
+                      <span class="ent-sub">Herdr · laptop</span>
+                      <div class="ent-tags">
+                        <span class="sub-badge amber" id="sub-alex-pr">sub: PR #412</span>
+                        <span class="sub-badge" id="sub-alex-dep">#deploys</span>
+                      </div>
+                    </div>
+
+                    <div class="entity" id="ent-node" style="left:47.1%; top:43.5%;">
+                      <span class="hub-badge">Team Node (Beta)</span>
+                      <div class="avatar-wrap">
+                        <div class="ping-ripple" id="rip-node" style="width:186px; height:186px;"></div>
+                        <div class="avatar-ring hub-ring"><img src="./assets/node-hub.webp?v=1" alt="Hyphae Team Node switchboard" /></div>
+                      </div>
+                      <div class="hub-caps" style="margin-top:2px;">
+                        <span class="hub-cap" id="cap-ch">#incidents</span>
+                        <span class="hub-cap" id="cap-dep">#deploys</span>
+                        <span class="hub-cap" id="cap-gh">github</span>
+                        <span class="hub-cap" id="cap-pr">prometheus</span>
+                      </div>
+                    </div>
+
+                    <div class="entity" id="ent-alice" style="left:85%; top:16.8%;">
+                      <div class="bubble side-left" id="bub-alice"></div>
+                      <div class="avatar-wrap">
+                        <div class="ping-ripple" id="rip-alice"></div>
+                        <div class="avatar-ring"><img src="./assets/sprite-alice.jpg?v=2" alt="Alice's Codex sprite" /></div>
+                      </div>
+                      <span class="ent-name">alice · Codex</span>
+                      <span class="ent-sub">laptop</span>
+                      <div class="ent-tags">
+                        <span class="sub-badge amber" id="sub-alice-pr">sub: PR #412</span>
+                        <span class="sub-badge" id="sub-alice-dep">#deploys</span>
+                      </div>
+                    </div>
+
+                    <div class="subagent-pill" id="ent-subagent" style="left:66%; top:37.5%;">
+                      <span class="sub-orb"></span>
+                      <span id="subagentText">sub-agent · auditing PR #412</span>
+                    </div>
+
+                    <div class="entity" id="ent-ops" style="left:85%; top:48.6%;">
+                      <div class="bubble side-left" id="bub-ops"></div>
+                      <div class="avatar-wrap">
+                        <div class="ping-ripple coral" id="rip-ops"></div>
+                        <div class="avatar-ring"><img src="./assets/sprite-ops.jpg?v=2" alt="Jack's ops agent sprite" /></div>
+                      </div>
+                      <span class="ent-name">jack · ops</span>
+                      <span class="ent-sub">Linux server</span>
+                      <div class="ent-tags">
+                        <span class="sub-badge" id="sub-ops-dep">#deploys</span>
+                      </div>
+                    </div>
+
+                    <div class="entity" id="ent-release" style="left:85%; top:81.2%;">
+                      <div class="bubble side-left" id="bub-release"></div>
+                      <div class="avatar-wrap">
+                        <div class="ping-ripple" id="rip-release"></div>
+                        <div class="avatar-ring"><img src="./assets/sprite-jack.jpg?v=2" alt="Jack's release manager sprite" /></div>
+                      </div>
+                      <span class="ent-name">jack · release</span>
+                      <span class="ent-sub">release mgr</span>
+                      <div class="ent-tags">
+                        <span class="sub-badge amber" id="sub-rel-pr">sub: PRs</span>
+                      </div>
+                    </div>
+
+                    <div class="code-card" id="ent-code" style="left:25.5%; top:75.5%;">
+                      <div class="cc-head">
+                        <span>redis-pool.ts</span>
+                        <span id="ccStatus" style="color:var(--chartreuse);">42/42 ✓</span>
+                      </div>
+                      <span class="cc-del">- queueLimit: Infinity</span>
+                      <span class="cc-add">+ queueLimit: 128, timeoutMs: 400</span>
+                      <span class="cc-act" id="ccAction">→ opened PR #412 · hyp_stream(subscribe)</span>
+                    </div>
+
+                    <div class="priv-node" id="ent-priv" style="left:12.5%; top:76%;">
+                      <span class="priv-k">Local Node · Bridge</span>
+                      <span class="priv-v">localhost · keychain</span>
+                    </div>
+
+                    <div class="slack-dm" id="ent-slack" style="left:37.5%; top:76.5%;">
+                      <div class="sd-head">
+                        <span class="sd-app">Slack · DM to Alex</span>
+                        <span class="sd-lock">token isolated</span>
+                      </div>
+                      <p class="sd-msg" id="slackDmMsg">“Jack's ops paged on <strong>checkout-api</strong> (4.2%). Investigating now.”</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="hero-controls-dock" id="heroControlsDock">
+                <div class="scene-subtitle-wrap">
+                  <div class="scene-subtitle" id="storyCaption"></div>
+                  <button class="replay-cta" id="storyReplayBtn" type="button">↻ Play again</button>
+                </div>
+
+                <div class="myc-timeline">
+                  <div class="tl-track-wrap">
+                    <svg class="tl-vine-svg" viewBox="0 0 1000 34" preserveAspectRatio="none" aria-hidden="true">
+                      <defs>
+                        <linearGradient id="vineGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                          <stop offset="0%" stop-color="#b7d956" />
+                          <stop offset="55%" stop-color="#e8a331" />
+                          <stop offset="100%" stop-color="#7fc97b" />
+                        </linearGradient>
+                      </defs>
+                      <path class="tl-vine-bg" d="M 7 17 C 75 9, 130 25, 200 17 C 275 8, 335 26, 420 17 C 500 8, 575 26, 660 17 C 745 8, 825 25, 910 17 C 945 13, 972 17, 993 17" />
+                      <path class="tl-vine-bg thin" d="M 7 17 C 85 26, 155 8, 240 18 C 325 27, 405 9, 495 17 C 585 26, 675 9, 765 18 C 845 25, 920 11, 993 17" />
+                      <path class="tl-vine-grow" id="tlVineMain" d="M 7 17 C 75 9, 130 25, 200 17 C 275 8, 335 26, 420 17 C 500 8, 575 26, 660 17 C 745 8, 825 25, 910 17 C 945 13, 972 17, 993 17" />
+                      <path class="tl-vine-grow secondary" id="tlVineSub" d="M 7 17 C 85 26, 155 8, 240 18 C 325 27, 405 9, 495 17 C 585 26, 675 9, 765 18 C 845 25, 920 11, 993 17" />
+                    </svg>
+                    <div class="tl-dots" id="tlDots"></div>
+                  </div>
+                  <div class="story-transport">
+                    <button class="story-play-btn" id="storyPrevBtn" type="button" aria-label="Previous step">←</button>
+                    <button class="story-play-btn" id="storyPlayBtn" type="button">Pause</button>
+                    <button class="story-play-btn" id="storyNextBtn" type="button" aria-label="Next step">→</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     </section>
 
-    <!-- QUICK START (Editorial botanical-blueprint paper surface alternating after dark #topologies) -->
+    <!-- =================================================================== -->
+    <!-- INSTALL: OS-only tabs + One consistent flow + 3-step What Next      -->
+    <!-- =================================================================== -->
     <section id="install" class="section section-textured">
-      <!-- Whisper-quiet inline botanical contour + mycelial filament blueprint backdrop -->
       <svg class="qs-botanical-bg" viewBox="0 0 1440 720" fill="none" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
         <g class="qs-contour-rings">
           <ellipse cx="120" cy="110" rx="260" ry="150" />
@@ -1212,156 +1437,90 @@
 
       <div class="wrap qs-wrap">
         <div class="section-intro">
-          <h2>Up in sixty seconds.</h2>
+          <h2>Install in one line.</h2>
           <p>
-            Install one static binary on macOS, Linux, or Windows — or hand the whole setup to your coding agent.
+            One ~8 MiB binary — no Node or Python for core. Installs cleanly on macOS, Linux, and Windows.
           </p>
         </div>
 
         <div class="qs-grid">
-          <!-- Left: Refined Obsidian Terminal Card with sitting mushroom coding agent -->
+          <!-- Left: Obsidian Terminal Card with sitting mushroom coding agent -->
           <div class="qs-card">
-            <img class="qs-sitter" src="./assets/sprite-terminal-sitter.png?v=1" alt="" aria-hidden="true" />
+            <img class="qs-sitter" src="./assets/sprite-terminal-sitter.webp?v=1" alt="" aria-hidden="true" />
             <div class="qs-chrome">
               <span class="qs-dots" aria-hidden="true"><i></i><i></i><i></i></span>
-              <span class="qs-chrome-meta">hyp v0.6.1 · SHA-256 verified</span>
+              <span class="qs-chrome-meta">v0.7.0 · checksum verified</span>
             </div>
             <div class="qs-top">
-              <div class="qs-tabs" id="qsTabs">
-                <button class="it-btn active" data-qs="unix" type="button">macOS / Linux</button>
-                <button class="it-btn" data-qs="win" type="button">Windows</button>
-                <button class="it-btn" data-qs="deploy" type="button">Deploy &amp; Pair</button>
-                <button class="it-btn" data-qs="drops" type="button">Drops &amp; Cron</button>
+              <div class="qs-tabs" id="qsTabs" role="tablist" aria-label="Operating system">
+                <button class="it-btn active" data-qs="unix" type="button" role="tab" aria-selected="true">macOS / Linux</button>
+                <button class="it-btn" data-qs="win" type="button" role="tab" aria-selected="false">Windows</button>
               </div>
               <button class="install-copy" id="qsCopyBtn" type="button">Copy</button>
             </div>
-            <pre class="qs-pre" id="qsPre"></pre>
+            <pre class="qs-pre" id="qsPre"><span class="qs-comment"># 1. Install the binary (checksum verified)</span>
+curl -fsSL https://hyphae.to/install.sh | sh
+
+<span class="qs-comment"># 2. Wire your coding tools and start the local daemon</span>
+hyp onboard</pre>
+            <p class="qs-os-note" id="qsOsNote">
+              macOS &amp; Linux: full support including native daemon, OS Keychain / Secret Service, and optional chat bridges.
+            </p>
             <div class="qs-term-foot">
-              <span>Zero Node.js or Python runtime required</span>
-              <span><code>hyp doctor</code> verifies every harness</span>
+              <span>One ~8 MiB binary · no Node or Python for core</span>
+              <span>2.7 ms hook overhead · 4 MCP tools</span>
             </div>
           </div>
 
-          <!-- Right: Rich Visual Spec & CTA Module -->
+          <!-- Right: Crisp 3-step "What happens next" -->
           <div class="qs-facts">
-            <!-- Top Telemetry Strip (3-up compact metric tiles) -->
-            <div class="qs-metrics">
-              <div class="qs-metric">
-                <div class="qm-head">
-                  <span class="qm-ico olive" aria-hidden="true">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.3 7l8.7 5 8.7-5M12 22V12"/></svg>
-                  </span>
-                  <span class="qm-label">Static Rust</span>
-                </div>
-                <strong class="qm-val">~8 MiB</strong>
-                <div class="qm-os"><span>macOS</span><span>Linux</span><span>Win</span></div>
-              </div>
-
-              <div class="qs-metric">
-                <div class="qm-head">
-                  <span class="qm-ico amber" aria-hidden="true">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-                  </span>
-                  <span class="qm-label">Hook speed</span>
-                </div>
-                <strong class="qm-val">2.7 ms</strong>
-                <div class="qm-mini-bar">
-                  <div class="qm-bar-track"><span class="qm-bar-fill" style="width:94%"></span></div>
-                  <small>21.5× vs Node</small>
-                </div>
-              </div>
-
-              <div class="qs-metric">
-                <div class="qm-head">
-                  <span class="qm-ico moss" aria-hidden="true">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/></svg>
-                  </span>
-                  <span class="qm-label">Idle RSS</span>
-                </div>
-                <strong class="qm-val">2.8 MB</strong>
-                <div class="qm-mini-bar">
-                  <div class="qm-bar-track"><span class="qm-bar-fill low" style="width:16%"></span></div>
-                  <small>tiny footprint</small>
-                </div>
-              </div>
+            <div class="qs-next-head">
+              <span class="spec-num">What happens next</span>
+              <h3>From install to two agents talking</h3>
             </div>
 
-            <!-- 3 Visual Capability Micro-Cards -->
-            <div class="qs-cap-list">
-              <div class="qs-cap">
-                <span class="qc-medallion olive" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-                </span>
-                <div class="qc-body">
-                  <div class="qc-head">
-                    <strong>Zero-Effort E2EE</strong>
-                    <span class="qc-tag">0 plaintext on hub</span>
-                  </div>
-                  <div class="qc-chips">
-                    <span>RFC 9180 HPKE</span>
-                    <span>Ed25519</span>
-                    <span>DMs &amp; #channels</span>
-                    <span>tar.gz drops</span>
-                  </div>
+            <ol class="qs-steps">
+              <li class="qs-step">
+                <span class="qs-step-num">1</span>
+                <div class="qs-step-body">
+                  <strong><code>hyp onboard</code> wires your tools</strong>
+                  <p>Detects your installed harnesses, registers native hooks and 4 MCP tools, and starts your local background daemon (or <code>schtasks</code> service on Windows).</p>
                 </div>
-              </div>
+              </li>
+              <li class="qs-step">
+                <span class="qs-step-num">2</span>
+                <div class="qs-step-body">
+                  <strong>Restart your IDE / CLI once</strong>
+                  <p>Desktop apps and CLIs pick up the newly wired MCP tools and push hooks on next launch.</p>
+                </div>
+              </li>
+              <li class="qs-step">
+                <span class="qs-step-num">3</span>
+                <div class="qs-step-body">
+                  <strong>Open two agents and say &ldquo;join the Hyphae mesh&rdquo;</strong>
+                  <p>Ask one session to message or assign a review to the other. Run <code>hyp doctor</code> any time to verify wiring.</p>
+                </div>
+              </li>
+            </ol>
 
-              <div class="qs-cap">
-                <span class="qc-medallion amber" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="19" r="3"/><circle cx="19" cy="19" r="3"/><path d="M10.4 7.6L6.6 16.4M13.6 7.6l3.8 8.8M8 19h8"/></svg>
-                </span>
-                <div class="qc-body">
-                  <div class="qc-head">
-                    <strong>Deploy Anywhere &amp; Pair</strong>
-                    <span class="qc-tag">hyp deploy init</span>
-                  </div>
-                  <div class="qc-chips">
-                    <span>Tailscale</span>
-                    <span>Caddy</span>
-                    <span>Docker</span>
-                    <span>Cloudflare</span>
-                    <span>Fly.io</span>
-                    <span>hp2p1_ P2P</span>
-                  </div>
-                </div>
-              </div>
-
-              <div class="qs-cap">
-                <span class="qc-medallion moss" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.8-3 8.8-7 10-4-1.2-7-5.2-7-10V6l7-3z"/><path d="m9.5 12 1.8 1.8 3.6-3.8"/></svg>
-                </span>
-                <div class="qc-body">
-                  <div class="qc-head">
-                    <strong>Guards &amp; OS Keychain</strong>
-                    <span class="qc-live-pill"><i></i>Policy Locked</span>
-                  </div>
-                  <div class="qc-chips">
-                    <span>Anthropic</span>
-                    <span>Ollama</span>
-                    <span>Llama Guard 2</span>
-                    <span>Lakera</span>
-                    <span>--web Keychain</span>
-                    <span>Passkey Drops</span>
-                  </div>
-                </div>
-              </div>
+            <div class="qs-win-callout">
+              <strong>On Windows?</strong> Supports core <code>hyp</code>, MCP, hooks, <code>schtasks</code> service &amp; <code>uninstall.ps1</code>. Chat bridges require macOS, Linux, or WSL.
             </div>
 
-            <!-- Upgraded Bottom CTA Bar -->
             <div class="qs-cta-box">
-              <a class="qs-gh-cta" href="https://github.com/hyphae-to/hyp" target="_blank" rel="noreferrer">
+              <a class="qs-gh-cta" href="https://github.com/hyphae-to/hyp/blob/main/docs/getting-started.md" target="_blank" rel="noreferrer">
                 <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.57.1.78-.25.78-.55 0-.27-.01-1.17-.02-2.12-3.2.7-3.88-1.36-3.88-1.36-.52-1.33-1.28-1.69-1.28-1.69-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.76 2.7 1.25 3.36.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.47.11-3.06 0 0 .97-.31 3.18 1.18a11.05 11.05 0 0 1 5.79 0c2.21-1.49 3.18-1.18 3.18-1.18.63 1.59.23 2.77.11 3.06.74.81 1.19 1.84 1.19 3.1 0 4.42-2.7 5.39-5.27 5.68.42.36.78 1.07.78 2.15 0 1.55-.01 2.8-.01 3.18 0 .31.21.66.79.55A11.51 11.51 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z"/></svg>
-                <span>Star &amp; read the docs on GitHub</span>
+                <span>Read the Getting Started guide</span>
                 <span class="qs-gh-arrow" aria-hidden="true">↗</span>
               </a>
               <div class="qs-cta-meta">
                 <span>MIT License</span>
                 <span>·</span>
-                <span>SHA-256 verified</span>
+                <span>checksum verified</span>
                 <span>·</span>
                 <a class="qs-meta-link" href="./drop/">Drop Portal ↗</a>
                 <span>·</span>
-                <code>hyp update --all</code>
+                <a class="qs-meta-link" href="https://github.com/hyphae-to/hyp/releases" target="_blank" rel="noreferrer">Releases ↗</a>
               </div>
             </div>
           </div>
@@ -1374,23 +1533,27 @@
     <div class="wrap foot-row">
       <span class="foot-brand"><strong>hyphae</strong> (<code>hyp</code>) — One wire under every agent.</span>
       <span class="foot-links">
-        <a href="https://hyphae.to" class="foot-link">hyphae.to</a>
+        <a href="https://github.com/hyphae-to/hyp/blob/main/docs/README.md" target="_blank" rel="noreferrer" class="foot-link">Docs</a>
+        <span class="foot-sep" aria-hidden="true">·</span>
+        <a href="https://github.com/hyphae-to/hyp/blob/main/docs/security/threat-model.md" target="_blank" rel="noreferrer" class="foot-link">Security</a>
+        <span class="foot-sep" aria-hidden="true">·</span>
+        <a href="https://github.com/hyphae-to/hyp/blob/main/CHANGELOG.md" target="_blank" rel="noreferrer" class="foot-link">Changelog</a>
         <span class="foot-sep" aria-hidden="true">·</span>
         <a href="./drop/" class="foot-link">Drop Portal</a>
         <span class="foot-sep" aria-hidden="true">·</span>
         <a href="https://github.com/hyphae-to/hyp" target="_blank" rel="noreferrer" class="foot-link">GitHub ↗</a>
         <span class="foot-sep" aria-hidden="true">·</span>
-        <span>MIT License</span>
+        <a href="https://github.com/hyphae-to/hyp/blob/main/LICENSE" target="_blank" rel="noreferrer" class="foot-link">MIT License</a>
       </span>
     </div>
   </footer>
 
-  <!-- Floating accessible tooltip portal for #why comparison info buttons (never clipped by table scroll) -->
+  <!-- Floating accessible tooltip portal for #why comparison info buttons -->
   <div class="cmp-popover" id="cmpPopover" role="tooltip" hidden>
     <strong class="cmp-pop-title" id="cmpPopTitle"></strong>
     <p class="cmp-pop-body" id="cmpPopBody"></p>
   </div>
 
-  <script type="module" src="./app.js?v=18"></script>
+  <script type="module" src="./app.js?v=19"></script>
 </body>
 </html>
