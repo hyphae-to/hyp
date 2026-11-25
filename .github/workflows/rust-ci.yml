@@ -58,6 +58,7 @@ jobs:
           node --check site/drop/crypto.js
           node --check site/drop/drop.js
           node scripts/test-drop-crypto.mjs
+          node --check scripts/pack-plugins.mjs
           node --check workers/drop-relay/src/index.mjs
           node workers/drop-relay/test/worker.test.mjs
           while IFS= read -r file; do

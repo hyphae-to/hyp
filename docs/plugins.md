@@ -234,34 +234,63 @@ When local bridges are enabled, the conditional `hyp_bridge` tool is advertised 
 - **Live primary handoff**: `hyp_bridge({ action: "handoff", plugin: "slack", target: "pm", handle: "codex-pm" })`
 - **Outbound reply**: `hyp_send({ to: "slack:pm", text: "Fix PR #412 is green.", replyTo: "1732435200.000100" })`
 
-### Installing & Verifying Official Plugins (`hyp plugin`)
+### Installing, Updating & Verifying Official Plugins & Harness Mods (`hyp plugin`)
 
-You do **not** need to clone the Hyphae git repository to run official external bridges or sources. Every tagged GitHub Release publishes a clean archive of the 6 official runtime files (`sdk/client.mjs`, `telegram/index.mjs`, `slack/index.mjs`, `whatsapp/index.mjs`, `webhook/index.mjs`, `prometheus/index.mjs`) as **`hyp-vX.Y.Z-plugins.tar.gz`** (and **`hyp-nightly-plugins.tar.gz`** on the rolling `nightly` release), included in `SHA256SUMS.txt` and covered by the Ed25519-signed `release-manifest.json`.
+You do **not** need to clone the Hyphae git repository to install or update official bridges or harness UI mods. To keep the static `hyp` binary 100% pure Rust (zero embedded JS/TS/TSX/SVG/PNG assets), every tagged GitHub Release publishes a single self-contained POSIX `ustar` archive **`hyp-vX.Y.Z-plugins.tar.gz`** (and **`hyp-nightly-plugins.tar.gz`** on the rolling `nightly` release) together with **`plugins-manifest.json`**, included in `SHA256SUMS.txt` and covered by the Ed25519-signed `release-manifest.json`:
 
-The `hyp` binary itself pins only the LF-normalized SHA-256 digest of each file at compile time (`crates/hyp-cli/build.rs`) without bloating the binary with embedded JS sources. `hyp plugin install` downloads the matching release archive over HTTPS (or reads a local `--archive <path>` / `--from-dir <dir>`), unpacks into a private temporary staging directory (`unpack_tar_gz` rejecting symlinks, path traversal, and > 4 MiB bombs), and verifies every file in constant time against its compile-time pinned digest **before writing a single byte** to `~/.config/hyphae/plugins/`:
+- **Bridges & SDK (`kind: "bridge"`)**: `sdk` (`sdk/client.mjs`, `sdk/client.py`), `telegram`, `slack`, `whatsapp`, `webhook`, `prometheus` -> installed under `~/.config/hyphae/plugins/` (`0700`/`0600`).
+- **Harness UI mods & plugins (`kind: "harness"`)**:
+  - `claude-panel` (`claude-code/hooks/{register.tsx,state.ts}` + minimal UI-only `.claude-plugin/plugin.json` & `hooks/hooks.json`) -> installed into `~/.claude/skills/hyphae-panel/` (and `$CLAUDE_CONFIG_DIR/skills/hyphae-panel/`, symlink-safe).
+  - `claude-code` (full 12-file Claude Code plugin bundle including raw-hashed binary `icon.png`) -> installed under `~/.config/hyphae/plugins/claude-code/`.
+  - `herdr-mod` (`hyphae-pane` + `hyphae-panel` GPUI mods, 9 files) -> installed as real directories under `~/.config/herdr-app/mods/` (FSEvents hot-reload friendly; never touches `keys.json` or custom/symlinked layouts unless run via `hyp setup --harness herdr --mod`).
+
+The `hyp` binary pins only per-file SHA-256 digests (LF-normalized for text files, raw bytes for binary `.png`) and deterministic per-plugin `treeSha256` digests at compile time (`crates/hyp-cli/build.rs`). Every install or update resolves sources in strict precedence order and verifies every required file in constant time **before writing a single byte**:
+
+1. `--archive <path>` / `HYPHAE_PLUGINS_ARCHIVE`
+2. `--from-dir <path>` / `HYPHAE_PLUGINS_DIR`
+3. Local verified tarball cache (`~/.config/hyphae/plugins-cache/hyp-vX.Y.Z-plugins.tar.gz`, `0600`)
+4. HTTPS release asset (`https://github.com/hyphae-to/hyp/releases/download/vX.Y.Z/hyp-vX.Y.Z-plugins.tar.gz`) — saved into the local cache only after constant-time verification succeeds.
+
+Installed plugins record receipts in `~/.config/hyphae/plugins/installed.json` (`0600`). Comparing **on-disk hash (`disk`)**, **receipt hash (`installed`)**, and **binary pinned hash (`pinned`)** powers safe selective updates:
+
+| Condition | Status | `hyp plugin update` Behavior |
+| --- | --- | --- |
+| `disk == pinned` | `up_to_date` | Skips immediately (**0 network calls, 0 disk writes**) |
+| `disk == installed && disk != pinned` | `outdated` | Downloads/reads archive at most once, verifies SHA-256, updates only changed plugins atomically |
+| `disk != pinned && (!installed \|\| disk != installed)` | `modified` | **Refuses to overwrite** by default (protects local edits & pre-receipt legacy installs); requires `--force` |
+| Missing file / symlink tampered | `corrupt` | Fails closed in `hyp plugin verify` & `hyp doctor`; repair with `hyp plugin install <name> --force` |
 
 ```sh
-# List all 5 official plugins, install state, SHA-256 verification status, and detected Node path
+# List all official bridges & harness mods with three-way status (`up_to_date`, `outdated`, `modified`, `corrupt`, `not_installed`)
 hyp plugin list --json
 
-# Download, verify, and atomically install one plugin (or `all`) into ~/.config/hyphae/plugins/
+# Download, verify, and atomically install one plugin/mod (or `all`)
 hyp plugin install telegram --json
-hyp plugin install slack --json
+hyp plugin install claude-panel --json
+hyp plugin install herdr-mod --json
 hyp plugin install all --json
 
+# Selectively update only outdated installed plugins & harness mods (0 downloads if up to date)
+hyp plugin update --all --dry-run --json
+hyp plugin update --all --json
+hyp plugin update telegram --force --json   # overwrite a locally modified plugin explicitly
+
 # Air-gapped / offline verification from a downloaded release tarball or local checkout
-hyp plugin install telegram --archive ./hyp-v0.6.1-plugins.tar.gz --json
-hyp plugin install telegram --from-dir ./plugins --json
+hyp plugin install telegram --archive ./hyp-v0.6.2-plugins.tar.gz --json
+hyp plugin install herdr-mod --from-dir ./plugins --json
 
-# Re-verify every installed official plugin file against compile-time pinned SHA-256 digests
-# (exits 1 if any file was tampered with or corrupted)
+# Re-verify installed plugins & harness mods against compile-time pinned SHA-256 digests
+# (exits 1 if any file is tampered, outdated, or missing)
 hyp plugin verify --json
+hyp plugin verify telegram --json
 
-# Remove one installed plugin (automatically removes sdk/ when the last plugin is removed) or `all`
+# Remove one installed plugin/mod (automatically removes sdk/ when the last bridge is removed) or `all`
 hyp plugin remove telegram --json
 hyp plugin remove all --json
 ```
 
+> **Automatic post-upgrade sync & diagnostics:** `hyp update` automatically runs `<new_hyp> plugin update --all --json` after replacing the binary (pass `--no-plugins` to skip; non-fatal if offline). `hyp doctor` reports `OK` / `WARN` / `FAIL` checks for every installed bridge and harness mod.
+>
 > **Never point `node.json` `plugins[]` at a local git checkout.** Always run `hyp plugin install <name> --json` and wire `node.json` using the returned `data.nodePath` and `data.plugins[0].scriptPath` (`~/.config/hyphae/plugins/<name>/index.mjs`).
 
 ### Included Optional External Scripts (`plugins/`)

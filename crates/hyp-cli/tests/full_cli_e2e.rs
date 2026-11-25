@@ -1606,6 +1606,8 @@ fn self_update_signed_manifest_atomic_swap_rollback_tamper_and_fleet_all() {
     assert_eq!(ok_json["ok"], true);
     assert_eq!(ok_json["data"]["signatureVerified"], true);
     assert_eq!(ok_json["data"]["smokeCheckPassed"], true);
+    assert_eq!(ok_json["data"]["pluginsSync"]["skipped"], false);
+    assert_eq!(ok_json["data"]["pluginsSync"]["ok"], true);
     assert_eq!(
         ok_json["data"]["rolloutOrder"],
         json!(["devbox-eu", "local"])

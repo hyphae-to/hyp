@@ -1,7 +1,8 @@
-//! Embedded native Herdr mod (`hyphae-pane` + `hyphae-panel`) installer for `hyp`.
+//! Verified native Herdr mod (`hyphae-pane` + `hyphae-panel`) installer for `hyp`.
 //!
-//! Embeds the pure-JS GPUI mod assets from `plugins/herdr-mod/mods/` into the
-//! single static `hyp` binary and installs them safely into `~/.config/herdr-app`:
+//! Resolves and constant-time SHA-256 verifies the pure-JS GPUI mod assets through the
+//! unified `hyp plugin` manager (`herdr-mod` in `hyp-vX.Y.Z-plugins.tar.gz` — ZERO embedded
+//! JS/SVG inside the static `hyp` binary!) and wires them safely into `~/.config/herdr-app`:
 //! - Copies mod folders as real directories (never symlinks by default) so macOS
 //!   FSEvents hot-reload picks up updates immediately.
 //! - Merges `cmd-shift-h -> mod.open:hyphae-panel` into `keys.json` only if unbound.
@@ -9,6 +10,8 @@
 //!   customized `pane.header.content.mod`, and Herdr's read-only shipped layouts
 //!   (`main`, `terminals`, `win98`).
 
+use crate::config_file::resolve_state_dir;
+use crate::plugin_cmd::{PluginSourceOverrides, install_herdr_mod_files};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::fs;
@@ -16,24 +19,32 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const HYPHAE_PANE_MOD_JSON: &str =
-    include_str!("../../../plugins/herdr-mod/mods/hyphae-pane/mod.json");
-const HYPHAE_PANE_MAIN_JS: &str =
-    include_str!("../../../plugins/herdr-mod/mods/hyphae-pane/main.js");
-const HYPHAE_PANE_PILL_JS: &str =
-    include_str!("../../../plugins/herdr-mod/mods/hyphae-pane/pill.js");
-const HYPHAE_SHARED_CLIENT_JS: &str =
-    include_str!("../../../plugins/herdr-mod/mods/hyphae-pane/shared-client.js");
-const HYPHAE_SVG: &str = include_str!("../../../plugins/herdr-mod/mods/hyphae-pane/hyphae.svg");
-
-const HYPHAE_PANEL_MOD_JSON: &str =
-    include_str!("../../../plugins/herdr-mod/mods/hyphae-panel/mod.json");
-const HYPHAE_PANEL_MAIN_JS: &str =
-    include_str!("../../../plugins/herdr-mod/mods/hyphae-panel/main.js");
-
 const SHIPPED_LAYOUTS: &[&str] = &["main", "terminals", "win98"];
 const DEFAULT_SHORTCUT_KEY: &str = "cmd-shift-h";
 const DEFAULT_SHORTCUT_ACTION: &str = "mod.open:hyphae-panel";
+
+/// Typed error distinguishing offline/network unavailability (safe warning fallback in `hyp setup`)
+/// from tamper, validation, or filesystem errors (always fail closed).
+#[derive(Debug, Clone)]
+pub struct HerdrModInstallError {
+    pub message: String,
+    pub is_offline_download: bool,
+}
+
+impl HerdrModInstallError {
+    fn fatal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            is_offline_download: false,
+        }
+    }
+}
+
+impl std::fmt::Display for HerdrModInstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
 
 /// Options controlling how `install_herdr_mod` writes mods, keys, and layout wiring.
 #[derive(Debug, Clone, Default)]
@@ -50,6 +61,12 @@ pub struct HerdrModInstallOptions {
     pub dry_run: bool,
     /// Optional explicit override for the Herdr app config directory (`~/.config/herdr-app`).
     pub herdr_home_override: Option<PathBuf>,
+    /// Optional explicit Hyphae state directory for plugin receipt & verified tarball cache.
+    pub state_dir: Option<PathBuf>,
+    /// Optional local plugins directory (`--plugins-dir`).
+    pub plugins_dir: Option<PathBuf>,
+    /// Optional local plugins archive (`--plugins-archive`).
+    pub plugins_archive: Option<PathBuf>,
 }
 
 /// Outcome of the layout wiring step.
@@ -114,18 +131,22 @@ pub fn detect_herdr_app_dir(home: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Installs the embedded `hyphae-pane` and `hyphae-panel` mods into Herdr safely.
+/// Installs the SHA-256 verified `hyphae-pane` and `hyphae-panel` mods into Herdr safely.
 pub fn install_herdr_mod(
     home: &Path,
     opts: HerdrModInstallOptions,
-) -> Result<HerdrModInstallOutcome, String> {
+) -> Result<HerdrModInstallOutcome, HerdrModInstallError> {
     let herdr_home = opts
         .herdr_home_override
         .clone()
         .unwrap_or_else(|| home.join(".config").join("herdr-app"));
+    let state_dir = opts
+        .state_dir
+        .clone()
+        .unwrap_or_else(|| resolve_state_dir(None, None, Some(home)));
 
     if let Some(ref clone_name) = opts.clone_layout {
-        validate_clone_layout_name(clone_name)?;
+        validate_clone_layout_name(clone_name).map_err(HerdrModInstallError::fatal)?;
     }
 
     let mut files = Vec::new();
@@ -133,28 +154,29 @@ pub fn install_herdr_mod(
     let mut notes = Vec::new();
     let mut next = Vec::new();
 
-    // 1. Copy embedded `hyphae-pane` and `hyphae-panel` mod folders (never symlinks).
+    // 1. Resolve, SHA-256 verify, and write `hyphae-pane` + `hyphae-panel` as real directories
+    //    via the unified plugin manager (never embedded JS/SVG in `hyp`, never symlinks).
     let mods_root = herdr_home.join("mods");
-    let pane_files: &[(&str, &str)] = &[
-        ("mod.json", HYPHAE_PANE_MOD_JSON),
-        ("main.js", HYPHAE_PANE_MAIN_JS),
-        ("pill.js", HYPHAE_PANE_PILL_JS),
-        ("shared-client.js", HYPHAE_SHARED_CLIENT_JS),
-        ("hyphae.svg", HYPHAE_SVG),
-    ];
-    let panel_files: &[(&str, &str)] = &[
-        ("mod.json", HYPHAE_PANEL_MOD_JSON),
-        ("main.js", HYPHAE_PANEL_MAIN_JS),
-        ("shared-client.js", HYPHAE_SHARED_CLIENT_JS),
-        ("hyphae.svg", HYPHAE_SVG),
-    ];
-
-    write_mod_bundle(&mods_root.join("hyphae-pane"), pane_files, opts.dry_run, &mut files)?;
-    write_mod_bundle(&mods_root.join("hyphae-panel"), panel_files, opts.dry_run, &mut files)?;
+    let mod_report = install_herdr_mod_files(
+        &state_dir,
+        &herdr_home,
+        PluginSourceOverrides {
+            archive: opts.plugins_archive.as_deref(),
+            from_dir: opts.plugins_dir.as_deref(),
+            url: None,
+        },
+        opts.dry_run,
+    )
+    .map_err(|err| HerdrModInstallError {
+        is_offline_download: err.is_offline_download_error(),
+        message: err.message,
+    })?;
+    files.extend(mod_report.files);
 
     // 2. Merge `cmd-shift-h -> mod.open:hyphae-panel` into `keys.json` only if unbound.
     let keys_path = herdr_home.join("keys.json");
-    let keys_action = merge_keys_json(&keys_path, opts.dry_run, &mut files, &mut notes)?;
+    let keys_action = merge_keys_json(&keys_path, opts.dry_run, &mut files, &mut notes)
+        .map_err(HerdrModInstallError::fatal)?;
 
     // 3. Read active layout from `shared.json` and wire layout safely.
     let shared_path = herdr_home.join("shared.json");
@@ -169,7 +191,8 @@ pub fn install_herdr_mod(
             opts.dry_run,
             &mut files,
             &mut notes,
-        )?
+        )
+        .map_err(HerdrModInstallError::fatal)?
     } else {
         wire_active_layout(
             &herdr_home,
@@ -180,7 +203,8 @@ pub fn install_herdr_mod(
             &mut warnings,
             &mut notes,
             &mut next,
-        )?
+        )
+        .map_err(HerdrModInstallError::fatal)?
     };
 
     // 4. Validate installed mods via `herdr-app check` when available.
@@ -238,36 +262,6 @@ fn validate_clone_layout_name(name: &str) -> Result<(), String> {
         return Err(format!(
             "cannot use shipped Herdr layout name '{trimmed}' as --clone-layout target"
         ));
-    }
-    Ok(())
-}
-
-fn write_mod_bundle(
-    dest_dir: &Path,
-    entries: &[(&str, &str)],
-    dry_run: bool,
-    recorded_files: &mut Vec<String>,
-) -> Result<(), String> {
-    if !dry_run {
-        // If a prior dev-link symlink exists at dest_dir, replace it with a real directory
-        // so macOS FSEvents hot-reload watches file writes directly.
-        if let Ok(meta) = fs::symlink_metadata(dest_dir) {
-            if meta.file_type().is_symlink() {
-                fs::remove_file(dest_dir).map_err(|e| {
-                    format!("failed to remove symlink {}: {e}", dest_dir.display())
-                })?;
-            }
-        }
-        fs::create_dir_all(dest_dir)
-            .map_err(|e| format!("failed to create {}: {e}", dest_dir.display()))?;
-    }
-
-    for (rel_name, contents) in entries {
-        let dest = dest_dir.join(rel_name);
-        if !dry_run {
-            write_file_atomic(&dest, contents.as_bytes())?;
-        }
-        recorded_files.push(dest.display().to_string());
     }
     Ok(())
 }
@@ -790,6 +784,22 @@ mod tests {
         })
     }
 
+    fn repo_plugins_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("plugins")
+    }
+
+    fn test_opts(tmp: &TempDir) -> HerdrModInstallOptions {
+        HerdrModInstallOptions {
+            skip_check: true,
+            state_dir: Some(tmp.path().join("state")),
+            plugins_dir: Some(repo_plugins_dir()),
+            ..Default::default()
+        }
+    }
+
     fn setup_herdr_fixture(tmp: &TempDir, active_layout: &str) -> PathBuf {
         let herdr_home = tmp.path().join(".config").join("herdr-app");
         fs::create_dir_all(herdr_home.join("layouts")).unwrap();
@@ -822,14 +832,7 @@ mod tests {
         fs::write(&external_layout, &original).unwrap();
         symlink(&external_layout, herdr_home.join("layouts").join("herdr-folders.json")).unwrap();
 
-        let outcome = install_herdr_mod(
-            tmp.path(),
-            HerdrModInstallOptions {
-                skip_check: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let outcome = install_herdr_mod(tmp.path(), test_opts(&tmp)).unwrap();
 
         assert_eq!(outcome.layout_action, LayoutAction::SkippedSymlink);
         assert_eq!(fs::read_to_string(&external_layout).unwrap(), original);
@@ -862,14 +865,7 @@ mod tests {
         let custom_link = herdr_home.join("layouts").join("herdr-folders.json");
         symlink(&external_custom, &custom_link).unwrap();
 
-        let skipped = install_herdr_mod(
-            tmp.path(),
-            HerdrModInstallOptions {
-                skip_check: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let skipped = install_herdr_mod(tmp.path(), test_opts(&tmp)).unwrap();
 
         assert_eq!(skipped.layout_action, LayoutAction::SkippedSymlink);
         assert_eq!(fs::read_to_string(&external_custom).unwrap(), original_custom);
@@ -931,8 +927,7 @@ mod tests {
             tmp2.path(),
             HerdrModInstallOptions {
                 patch_layout: true,
-                skip_check: true,
-                ..Default::default()
+                ..test_opts(&tmp2)
             },
         )
         .unwrap();
@@ -961,14 +956,7 @@ mod tests {
         let original = serde_json::to_string_pretty(&sample_layout("fancy-pane")).unwrap();
         fs::write(&layout_path, &original).unwrap();
 
-        let first = install_herdr_mod(
-            tmp.path(),
-            HerdrModInstallOptions {
-                skip_check: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let first = install_herdr_mod(tmp.path(), test_opts(&tmp)).unwrap();
         assert_eq!(first.layout_action, LayoutAction::SkippedCustomHeader);
         assert_eq!(fs::read_to_string(&layout_path).unwrap(), original);
         assert!(first.notes.iter().any(|n| n.contains("fancy-pane")));
@@ -979,8 +967,7 @@ mod tests {
             tmp.path(),
             HerdrModInstallOptions {
                 force: true,
-                skip_check: true,
-                ..Default::default()
+                ..test_opts(&tmp)
             },
         )
         .unwrap();
@@ -1004,14 +991,7 @@ mod tests {
         )
         .unwrap();
 
-        let first = install_herdr_mod(
-            tmp.path(),
-            HerdrModInstallOptions {
-                skip_check: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let first = install_herdr_mod(tmp.path(), test_opts(&tmp)).unwrap();
         assert_eq!(first.layout_action, LayoutAction::Patched);
         assert!(first.backup_path.as_ref().is_some_and(|p| p.is_file()));
 
@@ -1032,14 +1012,7 @@ mod tests {
         );
 
         // Second run must be idempotent and report AlreadyConfigured without duplicating nodes.
-        let second = install_herdr_mod(
-            tmp.path(),
-            HerdrModInstallOptions {
-                skip_check: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let second = install_herdr_mod(tmp.path(), test_opts(&tmp)).unwrap();
         assert_eq!(second.layout_action, LayoutAction::AlreadyConfigured);
         assert!(second.backup_path.is_none());
         let after_second: Value =
@@ -1062,14 +1035,7 @@ mod tests {
         let herdr_home = setup_herdr_fixture(&tmp, "main");
         let main_before = fs::read_to_string(herdr_home.join("layouts/main.json")).unwrap();
 
-        let default_run = install_herdr_mod(
-            tmp.path(),
-            HerdrModInstallOptions {
-                skip_check: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let default_run = install_herdr_mod(tmp.path(), test_opts(&tmp)).unwrap();
         assert_eq!(default_run.layout_action, LayoutAction::SkippedShipped);
         assert_eq!(
             fs::read_to_string(herdr_home.join("layouts/main.json")).unwrap(),
@@ -1082,8 +1048,7 @@ mod tests {
                 tmp.path(),
                 HerdrModInstallOptions {
                     clone_layout: Some("main".to_string()),
-                    skip_check: true,
-                    ..Default::default()
+                    ..test_opts(&tmp)
                 }
             )
             .is_err()
@@ -1093,8 +1058,7 @@ mod tests {
                 tmp.path(),
                 HerdrModInstallOptions {
                     clone_layout: Some("../evil".to_string()),
-                    skip_check: true,
-                    ..Default::default()
+                    ..test_opts(&tmp)
                 }
             )
             .is_err()
@@ -1105,8 +1069,7 @@ mod tests {
             tmp.path(),
             HerdrModInstallOptions {
                 clone_layout: Some("herdr-hyphae".to_string()),
-                skip_check: true,
-                ..Default::default()
+                ..test_opts(&tmp)
             },
         )
         .unwrap();
@@ -1147,14 +1110,7 @@ mod tests {
         )
         .unwrap();
 
-        let added = install_herdr_mod(
-            tmp.path(),
-            HerdrModInstallOptions {
-                skip_check: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let added = install_herdr_mod(tmp.path(), test_opts(&tmp)).unwrap();
         assert_eq!(added.keys_action, "added");
         let keys_after: Value = serde_json::from_str(&fs::read_to_string(&keys_path).unwrap()).unwrap();
         assert_eq!(keys_after["global"]["cmd-shift-h"], "mod.open:hyphae-panel");
@@ -1170,26 +1126,17 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let preserved = install_herdr_mod(
-            tmp.path(),
-            HerdrModInstallOptions {
-                skip_check: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let preserved = install_herdr_mod(tmp.path(), test_opts(&tmp)).unwrap();
         assert_eq!(preserved.keys_action, "preserved");
         let keys_final: Value = serde_json::from_str(&fs::read_to_string(&keys_path).unwrap()).unwrap();
         assert_eq!(keys_final["global"]["cmd-shift-h"], "mod.open:my-history");
     }
 
     #[test]
-    fn dry_run_does_not_mutate_disk_and_embedded_assets_are_non_empty() {
-        assert!(!HYPHAE_PANE_MAIN_JS.trim().is_empty());
-        assert!(!HYPHAE_PANE_PILL_JS.trim().is_empty());
-        assert!(!HYPHAE_SHARED_CLIENT_JS.trim().is_empty());
-        assert!(!HYPHAE_PANEL_MAIN_JS.trim().is_empty());
-        assert!(HYPHAE_SVG.contains("<svg"));
+    fn dry_run_does_not_mutate_disk_and_pinned_herdr_assets_are_present() {
+        let spec = crate::plugin_cmd::pinned_spec_for("herdr-mod").expect("herdr-mod pinned spec");
+        assert_eq!(spec.files.len(), 9);
+        assert_eq!(spec.tree_sha256.len(), 64);
 
         let tmp = TempDir::new().unwrap();
         let herdr_home = tmp.path().join(".config").join("herdr-app");
@@ -1197,8 +1144,7 @@ mod tests {
             tmp.path(),
             HerdrModInstallOptions {
                 dry_run: true,
-                skip_check: true,
-                ..Default::default()
+                ..test_opts(&tmp)
             },
         )
         .unwrap();

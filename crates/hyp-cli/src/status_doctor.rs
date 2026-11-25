@@ -722,6 +722,15 @@ fn run_status_or_doctor(
         })
         .unwrap_or(Value::Null);
 
+    // 7. Installed non-Rust plugins & harness mods integrity / drift checks
+    let plugins_report = crate::plugin_cmd::inspect_plugins_for_doctor(
+        &state_dir,
+        resolved_home.as_deref(),
+        explicit_home,
+        claude_config_dir_arg.as_deref(),
+    );
+    checks.extend(plugins_report.checks.iter().cloned());
+
     let fail_count = checks
         .iter()
         .filter(|c| c.status == CheckStatus::Fail)
@@ -794,6 +803,7 @@ fn run_status_or_doctor(
         "harnesses": harnesses,
         "statusLines": status_lines,
         "herdrMod": herdr_mod_status,
+        "plugins": plugins_report,
         "checks": checks,
     });
 
@@ -888,6 +898,16 @@ fn run_status_or_doctor(
                 .map(|v| format!(" (available: {v})"))
                 .unwrap_or_default()
         );
+        if plugins_report.installed_count > 0 {
+            println!(
+                "  Plugins:  {} installed ({} ok, {} outdated, {} modified, {} corrupt)",
+                plugins_report.installed_count,
+                plugins_report.up_to_date_count,
+                plugins_report.outdated_count,
+                plugins_report.modified_count,
+                plugins_report.corrupt_count
+            );
+        }
         println!();
         println!("Peer Capabilities & Version Skew");
         println!(
