@@ -354,7 +354,8 @@ async fn statusline_unenrolled_hide_vs_dim_and_offline() {
     );
 
     // Offline daemon: hide -> empty stdout; dim -> offline pill; --json -> online: false
-    let missing = dir.path().join("does-not-exist.sock");
+    // Place in a subdirectory so Windows `connector.addr` sibling lookup does not find `dir`'s live daemon!
+    let missing = dir.path().join("offline").join("does-not-exist.sock");
     let missing_str = missing.to_str().unwrap();
 
     let off_hide = run_hyp_with_stdin(
