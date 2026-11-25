@@ -19,6 +19,7 @@ use hyp_crypto::keystore::{
 };
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
 use hyp_crypto::transfer::{TarInputEntry, TarPackOptions, pack_tar_gz};
+#[cfg(unix)]
 use hyp_node::adapters::{
     AdapterError, AdapterHealth, AdapterKind, BoxFuture as AdapterBoxFuture, HelloMode,
     NodeAdapter, NodeAdapterHost, PublishOutcome, PublishStatus, SubprocessConfig,
@@ -28,9 +29,11 @@ use hyp_node::adapters::{
 use hyp_node::engine::{NodeConfig, NodeProfile, UnifiedNode};
 #[cfg(unix)]
 use hyp_proto::address::NodeId;
+#[cfg(unix)]
 use hyp_proto::cloudevent::CloudEvent;
 #[cfg(unix)]
 use hyp_proto::cloudevent::TYPE_HUMAN_REVOCATION_V1;
+#[cfg(unix)]
 use hyp_proto::rpc::EventKeyRef;
 #[cfg(unix)]
 use hyp_store::{
@@ -41,7 +44,9 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use serde_json::{Value, json};
+#[cfg(unix)]
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::fs;
@@ -50,6 +55,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -115,7 +121,7 @@ fn d10_keystore_backend_errors_and_partial_keys_never_silently_regenerate() {
     ));
 
     // 2. Create a valid node identity and record its exact fingerprints.
-    let orig = store.load_or_create_node_keys("d10-node@box").unwrap();
+    let _orig = store.load_or_create_node_keys("d10-node@box").unwrap();
     let (v2_sign, v2_enc) = node_key_secret_names("d10-node@box");
     let sign_path = store.secret_file_path(&v2_sign).unwrap();
     let enc_path = store.secret_file_path(&v2_enc).unwrap();
@@ -139,7 +145,7 @@ fn d10_keystore_backend_errors_and_partial_keys_never_silently_regenerate() {
         fs::set_permissions(&sign_path, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
             store.load_or_create_node_keys("d10-node@box").unwrap().kid(),
-            orig.kid()
+            _orig.kid()
         );
     }
 
@@ -527,8 +533,10 @@ fn r1_auth_mutations_live_reload_locked_gate_and_h4_broadcasts_revocation() {
 // 3. R3 — Supervisor Fresh `{secret}` Resolution on Respawn + `hyp secret` Warnings
 // ============================================================================
 
+#[cfg(unix)]
 struct NoopAdapterHost;
 
+#[cfg(unix)]
 impl NodeAdapterHost for NoopAdapterHost {
     fn publish_event<'a>(
         &'a self,
