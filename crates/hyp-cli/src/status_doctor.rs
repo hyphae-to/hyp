@@ -7,7 +7,7 @@ use crate::config_file::{
     resolve_config_path_for_read, resolve_effective_node_id, resolve_home_dir, resolve_state_dir,
 };
 use crate::drop_cmd::validate_relay_url;
-use crate::gate_cmd::inspect_gate_status;
+use crate::gate_cmd::{inspect_gate_status, sanitize_tty_display};
 use crate::setup::{
     HarnessDiagnostic, StatusLineDiagnostic, detect_harness_statuses, detect_statusline_statuses,
 };
@@ -21,6 +21,8 @@ use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync};
 use hyp_node::engine::{
     DEFAULT_HYPHAE_VERSION, DropRelayConfig, LocalIngestConfig, NodeProfile,
 };
+use hyp_node::gates::policy::{FilterAdapterConfig, LlmProvider, SecurityGateConfig};
+use hyp_node::gates::stage2::validate_classifier_endpoint_url;
 use hyp_proto::manifest::{
     CapabilityToken, NodeManifestPayload, ProtocolRange, SignedNodeManifest,
 };
@@ -99,6 +101,21 @@ pub struct StorageStatusReport {
     pub migration_backups: MigrationBackupsReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// Live external plugin supervisor status parsed from `node.status.json` (`B5`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimePluginStatus {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    pub status: String,
+    pub restarts: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
 }
 
 /// Single row in the Peer Capabilities & Version Skew table (`docs/architecture-v2.md §3.3`).
@@ -360,9 +377,11 @@ fn run_status_or_doctor(
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok());
     let status_path = state_dir.join("node.status.json");
-    let mut socket_path: Option<String> = fs::read_to_string(&status_path)
+    let status_doc: Option<Value> = fs::read_to_string(&status_path)
         .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    let mut socket_path: Option<String> = status_doc
+        .as_ref()
         .and_then(|v| {
             v.get("socketPath")
                 .and_then(serde_json::Value::as_str)
@@ -547,15 +566,20 @@ fn run_status_or_doctor(
         ));
     }
 
+    // Warn (without failing daemon startup) if any *disabled* Stage 2 or filter plugin entry
+    // configures a non-loopback `http://` or invalid classifier endpoint URL (`G17`).
+    checks.extend(collect_disabled_insecure_gate_url_warnings(
+        loaded_cfg.as_ref().map(|c| &c.raw),
+    ));
+
     // 3. Local event ingest socket summary (`localIngest`, default enabled)
     let local_ingest_cfg: LocalIngestConfig = loaded_cfg
         .as_ref()
         .and_then(|c| c.raw.get("localIngest"))
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
-    let recorded_ingest_socket: Option<PathBuf> = fs::read_to_string(&status_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    let recorded_ingest_socket: Option<PathBuf> = status_doc
+        .as_ref()
         .and_then(|v| {
             v.get("localIngestSocket")
                 .and_then(serde_json::Value::as_str)
@@ -795,6 +819,10 @@ fn run_status_or_doctor(
     );
     checks.extend(plugins_report.checks.iter().cloned());
 
+    // 8. Live runtime plugin supervisor health from `node.status.json` (`B5`)
+    let runtime_plugins = extract_runtime_plugin_statuses(status_doc.as_ref());
+    checks.extend(build_runtime_plugin_checks(&runtime_plugins));
+
     let fail_count = checks
         .iter()
         .filter(|c| c.status == CheckStatus::Fail)
@@ -870,6 +898,7 @@ fn run_status_or_doctor(
         "statusLines": status_lines,
         "herdrMod": herdr_mod_status,
         "plugins": plugins_report,
+        "runtimePlugins": runtime_plugins,
         "checks": checks,
     });
 
@@ -986,6 +1015,29 @@ fn run_status_or_doctor(
                 plugins_report.modified_count,
                 plugins_report.corrupt_count
             );
+        }
+        if !runtime_plugins.is_empty() {
+            println!("  Runtime Plugins:");
+            for rp in &runtime_plugins {
+                let tag = match rp.status.as_str() {
+                    "crash_loop_backoff" | "error" => "FAIL",
+                    "degraded" => "WARN",
+                    _ => "OK  ",
+                };
+                let mut extras = vec![format!("restarts={}", rp.restarts)];
+                if let Some(ref err) = rp.last_error {
+                    extras.push(format!("lastError=\"{err}\""));
+                }
+                if let Some(ref lp) = rp.log_path {
+                    extras.push(format!("log={lp}"));
+                }
+                println!(
+                    "    {tag}  {} [{}] ({})",
+                    sanitize_tty_display(&rp.id),
+                    sanitize_tty_display(&rp.status),
+                    extras.join(", ")
+                );
+            }
         }
         println!();
         println!("Peer Capabilities & Version Skew");
@@ -1298,4 +1350,254 @@ fn scan_migration_backups(backups_dir: &Path) -> Vec<PathBuf> {
     }
     entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
     entries.into_iter().map(|e| e.2).collect()
+}
+
+/// Redacts common credential / token patterns and strips terminal control sequences before
+/// surfacing `lastError` text from `node.status.json` in `hyp status` and `hyp doctor`.
+fn redact_plugin_error(raw: &str) -> String {
+    let clean = sanitize_tty_display(raw);
+    let mut out = String::with_capacity(clean.len());
+    let mut redact_next = false;
+    for (idx, token) in clean.split_whitespace().enumerate() {
+        if idx > 0 {
+            out.push(' ');
+        }
+        let redacted = if redact_next {
+            redact_next = false;
+            "[REDACTED]".to_string()
+        } else if token.eq_ignore_ascii_case("bearer") || token.eq_ignore_ascii_case("basic") {
+            redact_next = true;
+            token.to_string()
+        } else if looks_sensitive_token(token) {
+            "[REDACTED]".to_string()
+        } else if let Some((prefix, val)) = token.split_once('=') {
+            if !val.is_empty()
+                && (looks_sensitive_token(val)
+                    || prefix.to_ascii_lowercase().contains("token")
+                    || prefix.to_ascii_lowercase().contains("secret")
+                    || prefix.to_ascii_lowercase().contains("key")
+                    || prefix.to_ascii_lowercase().contains("password"))
+            {
+                format!("{prefix}=[REDACTED]")
+            } else {
+                token.to_string()
+            }
+        } else {
+            token.to_string()
+        };
+        out.push_str(&redacted);
+    }
+    let truncated: String = out.chars().take(240).collect();
+    if out.chars().count() > 240 {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn looks_sensitive_token(tok: &str) -> bool {
+    let trimmed = tok.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | ')' | '('));
+    let prefixes = [
+        "sk-",
+        "ghp_",
+        "gho_",
+        "xoxb-",
+        "xoxp-",
+        "AIza",
+        "AKIA",
+        "am2_",
+        "hp2p1_",
+        "t3mp1_",
+        "hdrop1_",
+    ];
+    if prefixes.iter().any(|p| trimmed.starts_with(p)) {
+        return true;
+    }
+    // Telegram bot tokens: `<digits>:<secret>`
+    if let Some((left, right)) = trimmed.split_once(':') {
+        let digits = left.strip_prefix("bot").unwrap_or(left);
+        if digits.len() >= 6
+            && digits.bytes().all(|b| b.is_ascii_digit())
+            && right.len() >= 16
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn extract_runtime_plugin_statuses(status_doc: Option<&Value>) -> Vec<RuntimePluginStatus> {
+    let Some(arr) = status_doc
+        .and_then(|v| v.get("plugins"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        let Some(obj) = entry.as_object() else {
+            continue;
+        };
+        let id = obj
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("unknown")
+            .to_string();
+        let kind = obj
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let status = obj
+            .get("status")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("unknown")
+            .to_string();
+        let restarts = obj.get("restarts").and_then(Value::as_u64).unwrap_or(0);
+        let last_error = obj
+            .get("lastError")
+            .or_else(|| obj.get("error"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(redact_plugin_error);
+        let log_path = obj
+            .get("logPath")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(sanitize_tty_display);
+        out.push(RuntimePluginStatus {
+            id,
+            kind,
+            status,
+            restarts,
+            last_error,
+            log_path,
+        });
+    }
+    out
+}
+
+fn build_runtime_plugin_checks(plugins: &[RuntimePluginStatus]) -> Vec<CliCheck> {
+    let mut checks = Vec::new();
+    for rp in plugins {
+        let name = format!("plugin:runtime:{}", rp.id);
+        let mut detail_parts = vec![
+            format!("status={}", rp.status),
+            format!("restarts={}", rp.restarts),
+        ];
+        if let Some(ref err) = rp.last_error {
+            detail_parts.push(format!("lastError={err}"));
+        }
+        if let Some(ref lp) = rp.log_path {
+            detail_parts.push(format!("logPath={lp}"));
+        }
+        let detail = detail_parts.join(", ");
+        let fix = rp.log_path.as_ref().map(|lp| {
+            format!("Inspect plugin log at {lp} and restart via `hyp service restart --json`.")
+        }).or_else(|| {
+            Some("Check plugin configuration in node.json and restart via `hyp service restart --json`.".to_string())
+        });
+        match rp.status.as_str() {
+            "crash_loop_backoff" | "error" => {
+                checks.push(CliCheck::fail(name, detail, fix));
+            }
+            "degraded" => {
+                checks.push(CliCheck::warn(name, detail, fix));
+            }
+            "running" => {
+                checks.push(CliCheck::ok(name, detail));
+            }
+            _ => {
+                if rp.last_error.is_some() {
+                    checks.push(CliCheck::warn(name, detail, fix));
+                } else {
+                    checks.push(CliCheck::ok(name, detail));
+                }
+            }
+        }
+    }
+    checks
+}
+
+fn collect_disabled_insecure_gate_url_warnings(raw_config: Option<&Value>) -> Vec<CliCheck> {
+    let Some(gate_val) = raw_config.and_then(|c| c.get("gate")) else {
+        return Vec::new();
+    };
+    let Ok(gate_cfg) = serde_json::from_value::<SecurityGateConfig>(gate_val.clone()) else {
+        return Vec::new();
+    };
+
+    let mut warnings = Vec::new();
+    if !gate_cfg.stage2.enabled {
+        if let Some(ref u) = gate_cfg.stage2.base_url_override {
+            let trimmed = u.trim();
+            if !trimmed.is_empty() {
+                if let Err(err) = validate_classifier_endpoint_url(trimmed) {
+                    warnings.push(CliCheck::warn(
+                        "gate.stage2.disabled_insecure_url",
+                        format!(
+                            "Disabled gate.stage2 base_url_override '{}' is not https:// or loopback http:// ({err})",
+                            sanitize_tty_display(trimmed)
+                        ),
+                        Some("Update gate.stage2.base_url_override to https:// (or loopback http://127.0.0.1) before enabling Stage 2.".to_string()),
+                    ));
+                }
+            }
+        }
+        if let LlmProvider::OpenAiCompatible { ref base_url } = gate_cfg.stage2.provider {
+            let trimmed = base_url.trim();
+            if !trimmed.is_empty() {
+                if let Err(err) = validate_classifier_endpoint_url(trimmed) {
+                    warnings.push(CliCheck::warn(
+                        "gate.stage2.disabled_insecure_url",
+                        format!(
+                            "Disabled gate.stage2 provider base_url '{}' is not https:// or loopback http:// ({err})",
+                            sanitize_tty_display(trimmed)
+                        ),
+                        Some("Update gate.stage2.provider.base_url to https:// (or loopback http://127.0.0.1) before enabling Stage 2.".to_string()),
+                    ));
+                }
+            }
+        }
+    }
+
+    for f in &gate_cfg.filters {
+        if f.enabled {
+            continue;
+        }
+        let candidate_url: Option<&str> = match &f.adapter {
+            FilterAdapterConfig::Anthropic { base_url, .. }
+            | FilterAdapterConfig::Google { base_url, .. } => base_url.as_deref(),
+            FilterAdapterConfig::OpenAiCompat { base_url, .. }
+            | FilterAdapterConfig::LakeraGuard { base_url, .. } => Some(base_url.as_str()),
+            FilterAdapterConfig::HttpClassifier { url, .. } => Some(url.as_str()),
+            FilterAdapterConfig::Subprocess { .. } => None,
+        };
+        if let Some(raw_url) = candidate_url {
+            let trimmed = raw_url.trim();
+            if !trimmed.is_empty() {
+                if let Err(err) = validate_classifier_endpoint_url(trimmed) {
+                    warnings.push(CliCheck::warn(
+                        format!("gate.filter.{}.disabled_insecure_url", f.id),
+                        format!(
+                            "Disabled gate filter '{}' endpoint URL '{}' is not https:// or loopback http:// ({err})",
+                            sanitize_tty_display(&f.id),
+                            sanitize_tty_display(trimmed)
+                        ),
+                        Some(format!(
+                            "Update filter '{}' endpoint URL to https:// (or loopback http://127.0.0.1) before enabling it.",
+                            sanitize_tty_display(&f.id)
+                        )),
+                    ));
+                }
+            }
+        }
+    }
+
+    warnings
 }

@@ -3056,3 +3056,181 @@ fn g17_stage2_guard_and_filter_plugins_reject_non_loopback_http_fail_closed() {
         );
     }
 }
+
+#[test]
+fn wave4c_constant_policy_signing_secret_enforced_fail_closed() {
+    use hyp_node::gates::DEFAULT_POLICY_SIGNING_SECRET;
+
+    let (tmp, db) = open_ephemeral_db();
+    let secrets = file_secret_store(&tmp);
+
+    // 1. Default and empty `policy_signing_secret` pass validation and sign strictly under constant key.
+    let mut default_cfg = SecurityGateConfig::default();
+    assert!(default_cfg.validate().is_ok());
+    let sig_default = sign_gate_policy(&default_cfg, &secrets).unwrap();
+    assert!(verify_gate_policy_sig(&default_cfg, &sig_default, &secrets).is_ok());
+    assert!(
+        secrets.get(DEFAULT_POLICY_SIGNING_SECRET).is_ok(),
+        "key must be stored under constant DEFAULT_POLICY_SIGNING_SECRET"
+    );
+
+    default_cfg.policy_signing_secret = String::new();
+    assert!(default_cfg.validate().is_ok());
+    let sig_empty = sign_gate_policy(&default_cfg, &secrets).unwrap();
+    assert!(verify_gate_policy_sig(&default_cfg, &sig_empty, &secrets).is_ok());
+
+    // 2. Attacker-controlled custom `policy_signing_secret` (even if attacker pre-seeded a valid
+    //    32-byte hex secret under that name!) MUST fail closed in validate(), sign_gate_policy(),
+    //    verify_gate_policy_sig(), and SecurityGatePipeline::new()!
+    secrets
+        .set("attacker-hmac-secret", &"ab".repeat(32))
+        .unwrap();
+    let hijacked = SecurityGateConfig {
+        policy_signing_secret: "attacker-hmac-secret".to_string(),
+        ..Default::default()
+    };
+    assert!(
+        hijacked.validate().is_err(),
+        "SecurityGateConfig::validate must reject non-default policy_signing_secret"
+    );
+    assert!(
+        sign_gate_policy(&hijacked, &secrets).is_err(),
+        "sign_gate_policy must reject non-default policy_signing_secret"
+    );
+    assert!(
+        verify_gate_policy_sig(&hijacked, &sig_default, &secrets).is_err(),
+        "verify_gate_policy_sig must reject non-default policy_signing_secret"
+    );
+    assert!(
+        SecurityGatePipeline::new(hijacked, Arc::clone(&db), Some(Arc::clone(&secrets))).is_err(),
+        "SecurityGatePipeline::new must reject non-default policy_signing_secret"
+    );
+
+    // 3. CamelCase `policySigningSecret` alias in JSON is also caught and rejected fail-closed!
+    let camel_cfg: SecurityGateConfig = serde_json::from_value(json!({
+        "policySigningSecret": "attacker-camel-secret"
+    }))
+    .unwrap();
+    assert_eq!(camel_cfg.policy_signing_secret, "attacker-camel-secret");
+    assert!(camel_cfg.validate().is_err());
+    assert!(verify_gate_policy_sig(&camel_cfg, &sig_default, &secrets).is_err());
+}
+
+#[test]
+fn wave4c_g17_disabled_stage2_and_filters_do_not_abort_startup_while_enabled_fail_closed() {
+    let (_tmp, db) = open_ephemeral_db();
+
+    // Disabled Stage 2 with non-loopback http:// base_url_override and OpenAiCompatible base_url
+    // MUST pass validation and pipeline construction (never crash daemon startup!).
+    let mut disabled_cfg = SecurityGateConfig::default();
+    disabled_cfg.stage2.enabled = false;
+    disabled_cfg.stage2.base_url_override = Some("http://legacy-llm.internal/v1".to_string());
+    disabled_cfg.stage2.provider = LlmProvider::OpenAiCompatible {
+        base_url: "http://legacy-ollama.internal:11434/v1".to_string(),
+    };
+    disabled_cfg.filters = vec![
+        FilterPluginConfig {
+            id: "disabled-anthropic".into(),
+            enabled: false,
+            matchers: Stage2Matchers::default(),
+            on_error: Stage2ErrorAction::Quarantine,
+            max_concurrent: 2,
+            busy_retry_after_ms: 250,
+            adapter: FilterAdapterConfig::Anthropic {
+                model: "claude-haiku-4-5".into(),
+                temperature: 0.0,
+                max_output_tokens: 160,
+                timeout_ms: 2_000,
+                max_input_chars: 16_384,
+                min_allow_confidence: 0.75,
+                api_key_secret: None,
+                base_url: Some("http://legacy-anth.internal".into()),
+                auth_header: Default::default(),
+                policy_notes: String::new(),
+            },
+        },
+        FilterPluginConfig {
+            id: "disabled-openai".into(),
+            enabled: false,
+            matchers: Stage2Matchers::default(),
+            on_error: Stage2ErrorAction::Quarantine,
+            max_concurrent: 2,
+            busy_retry_after_ms: 250,
+            adapter: FilterAdapterConfig::OpenAiCompat {
+                base_url: "http://legacy-openai.internal/v1".into(),
+                model: "qwen2.5:3b".into(),
+                temperature: 0.0,
+                max_output_tokens: 160,
+                timeout_ms: 2_000,
+                max_input_chars: 16_384,
+                min_allow_confidence: 0.75,
+                api_key_secret: None,
+                policy_notes: String::new(),
+            },
+        },
+        FilterPluginConfig {
+            id: "disabled-lakera".into(),
+            enabled: false,
+            matchers: Stage2Matchers::default(),
+            on_error: Stage2ErrorAction::Quarantine,
+            max_concurrent: 2,
+            busy_retry_after_ms: 250,
+            adapter: FilterAdapterConfig::LakeraGuard {
+                base_url: "http://legacy-lakera.internal".into(),
+                api_key_secret: None,
+                project_id: None,
+                timeout_ms: 2_000,
+                max_input_chars: 16_384,
+                on_flagged: Stage2ErrorAction::Quarantine,
+            },
+        },
+        FilterPluginConfig {
+            id: "disabled-http-cls".into(),
+            enabled: false,
+            matchers: Stage2Matchers::default(),
+            on_error: Stage2ErrorAction::Quarantine,
+            max_concurrent: 2,
+            busy_retry_after_ms: 250,
+            adapter: FilterAdapterConfig::HttpClassifier {
+                url: "http://legacy-classifier.internal:8080/classify".into(),
+                api_key_secret: None,
+                auth_header: None,
+                score_field: "score".into(),
+                label_field: "label".into(),
+                flagged_labels: vec![],
+                threshold: 0.80,
+                timeout_ms: 2_000,
+                max_input_chars: 16_384,
+                on_flagged: Stage2ErrorAction::Quarantine,
+            },
+        },
+    ];
+
+    assert!(
+        disabled_cfg.validate().is_ok(),
+        "disabled Stage 2 and disabled filters with http:// URLs must not fail validate()"
+    );
+    let pipeline = SecurityGatePipeline::new(disabled_cfg.clone(), Arc::clone(&db), None)
+        .expect("disabled Stage 2 / filters with http:// URLs must not abort daemon startup");
+    assert_eq!(pipeline.active_filter_count(), 0);
+
+    // Enabling Stage 2 immediately fails closed!
+    let mut enabled_s2 = disabled_cfg.clone();
+    enabled_s2.stage2.enabled = true;
+    assert!(enabled_s2.validate().is_err());
+    assert!(SecurityGatePipeline::new(enabled_s2, Arc::clone(&db), None).is_err());
+
+    // Enabling any single insecure filter immediately fails closed!
+    for idx in 0..disabled_cfg.filters.len() {
+        let mut enabled_f = disabled_cfg.clone();
+        enabled_f.filters[idx].enabled = true;
+        assert!(
+            enabled_f.validate().is_err(),
+            "enabling filter #{idx} with non-loopback http:// must fail validate()"
+        );
+        assert!(
+            SecurityGatePipeline::new(enabled_f, Arc::clone(&db), None).is_err(),
+            "enabling filter #{idx} with non-loopback http:// must fail SecurityGatePipeline::new"
+        );
+    }
+}

@@ -14,7 +14,7 @@ use crate::config_file::{
 };
 use crate::gate_cmd::{
     ConfirmError, emit_confirm_error, is_interactive_tty, require_controlling_tty_confirmation,
-    require_interactive_tty_confirmation,
+    require_interactive_tty_confirmation, sanitize_tty_display,
 };
 use crate::ui::{
     EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
@@ -431,9 +431,9 @@ fn format_auth_init_confirm_summary(
 ) -> Vec<String> {
     let mut lines = vec![
         "Human Admin Authority Initialization Summary".to_string(),
-        format!("  Human ID:   {human_id}"),
-        format!("  Role:       admin"),
-        format!("  Label:      {label}"),
+        format!("  Human ID:   {}", sanitize_tty_display(human_id)),
+        "  Role:       admin".to_string(),
+        format!("  Label:      {}", sanitize_tty_display(label)),
         format!("  Existing:   {existing_authorities} authority record(s) already present"),
     ];
     if gate_locked {
@@ -458,14 +458,14 @@ fn format_auth_add_confirm_summary(
 ) -> Vec<String> {
     let mut lines = vec![
         "Human Authority Enrollment Summary".to_string(),
-        format!("  Human ID:   {human_id}"),
+        format!("  Human ID:   {}", sanitize_tty_display(human_id)),
         format!("  Role:       {}", role.as_str()),
-        format!("  Label:      {label}"),
-        format!("  Key ID:     {kid}"),
+        format!("  Label:      {}", sanitize_tty_display(label)),
+        format!("  Key ID:     {}", sanitize_tty_display(kid)),
         format!("  Auth Epoch: {auth_epoch}"),
     ];
     if let Some(ekid) = enc_kid {
-        lines.push(format!("  Enc Key ID: {ekid}"));
+        lines.push(format!("  Enc Key ID: {}", sanitize_tty_display(ekid)));
     }
     if has_node_cert {
         lines.push("  Node Cert:  verified hcert1_ included".to_string());
@@ -491,10 +491,10 @@ fn format_auth_revoke_confirm_summary(
 ) -> Vec<String> {
     let mut lines = vec![
         "Human Authority Revocation Summary".to_string(),
-        format!("  Human ID:   {}", target.human_id),
+        format!("  Human ID:   {}", sanitize_tty_display(&target.human_id)),
         format!("  Role:       {}", target.role.as_str()),
-        format!("  Label:      {}", target.label),
-        format!("  Key ID:     {}", target.kid),
+        format!("  Label:      {}", sanitize_tty_display(&target.label)),
+        format!("  Key ID:     {}", sanitize_tty_display(&target.kid)),
         format!(
             "  Bump Epoch: {}",
             if bump_epoch {
@@ -511,13 +511,76 @@ fn format_auth_revoke_confirm_summary(
                 "no (local only)"
             }
         ),
-        format!("  Reason:     {reason}"),
+        format!("  Reason:     {}", sanitize_tty_display(reason)),
     ];
     if gate_locked {
         lines.push(
             "  WARNING:    Security Gate is LOCKED; gate_policy_sig will be re-signed with the updated human_authorities_digest."
                 .to_string(),
         );
+    }
+    lines
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_auth_sign_confirm_summary(
+    kind: CliDropKind,
+    human_id: &str,
+    human_kid: &str,
+    auth_epoch: u64,
+    target_node_id: &str,
+    target_handle: Option<&str>,
+    secret_spec: Option<&SecretDropSpec>,
+    drop_id: &str,
+    ttl_secs: u64,
+    body: &str,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "Sign & Seal Verified Human Drop ({})",
+            kind.to_crypto_kind().as_str()
+        ),
+        format!(
+            "  Authority:   {} (kid: {}, epoch: {auth_epoch})",
+            sanitize_tty_display(human_id),
+            sanitize_tty_display(human_kid)
+        ),
+        format!(
+            "  Target Node: {}",
+            sanitize_tty_display(target_node_id)
+        ),
+    ];
+    if let Some(h) = target_handle {
+        lines.push(format!("  Handle:      {}", sanitize_tty_display(h)));
+    }
+    if let Some(spec) = secret_spec {
+        lines.push(format!(
+            "  Secret Name: {} (overwrite: {})",
+            sanitize_tty_display(&spec.name),
+            spec.overwrite
+        ));
+    }
+    lines.push(format!(
+        "  Drop ID:     {}",
+        if drop_id.is_empty() {
+            "offline".to_string()
+        } else {
+            sanitize_tty_display(drop_id)
+        }
+    ));
+    lines.push(format!("  TTL:         {ttl_secs}s"));
+    match kind {
+        CliDropKind::Secret => {
+            lines.push(format!(
+                "  Payload:     [REDACTED SECRET — {} byte(s)]",
+                body.len()
+            ));
+        }
+        CliDropKind::Directive => {
+            let preview: String = sanitize_tty_display(body).chars().take(120).collect();
+            let suffix = if body.chars().count() > 120 { "..." } else { "" };
+            lines.push(format!("  Directive:   {preview}{suffix}"));
+        }
     }
     lines
 }
@@ -983,38 +1046,44 @@ fn run_auth_init(
         None
     };
 
-    // Non-web `auth init` on a node that ALREADY has authorities or a locked Security Gate
-    // requires unskippable interactive TTY confirmation (`#10` / `H1`).
-    // Initial `auth init` on a brand-new unlocked node and `--web` (live Passkey ceremony)
-    // continue seamlessly.
-    if !web {
-        let gate_locked = is_gate_locked(&config_read);
-        let db_path = state_dir.join("node.sqlite");
-        let existing_count = if db_path.exists() {
-            match NodeDb::open(&db_path) {
-                Ok(db) => db
-                    .human()
-                    .list_authorities(true)
-                    .map(|v| v.len())
-                    .unwrap_or(1),
-                Err(_) => 1,
-            }
-        } else {
-            0
-        };
-        if existing_count > 0 || gate_locked {
-            let summary = format_auth_init_confirm_summary(
-                &human_id,
-                trimmed_label,
-                existing_count,
-                gate_locked,
+    // P0 `#5` / `#10`: `auth init` (INCLUDING `--web`!) on a node that ALREADY has at least one
+    // authority or a locked Security Gate requires unskippable interactive TTY confirmation.
+    // Only initial `auth init` on a brand-new, unlocked node with zero authorities proceeds
+    // without prompting.
+    let gate_locked = is_gate_locked(&config_read);
+    let db_path = state_dir.join("node.sqlite");
+    let existing_count = if db_path.exists() {
+        match NodeDb::open(&db_path) {
+            Ok(db) => db
+                .human()
+                .list_authorities(true)
+                .map(|v| v.len())
+                .unwrap_or(1),
+            Err(_) => 1,
+        }
+    } else {
+        0
+    };
+    if existing_count > 0 || gate_locked {
+        let mut summary = format_auth_init_confirm_summary(
+            &human_id,
+            trimmed_label,
+            existing_count,
+            gate_locked,
+        );
+        if web {
+            summary.push(
+                "  Mode:       --web (will also open loopback Passkey+PRF enrollment callback)"
+                    .to_string(),
             );
-            let prompt = format!(
-                "Initialize additional human admin authority '{human_id}' (label: {trimmed_label})? [y/N]: "
-            );
-            if let Err(err) = require_interactive_tty_confirmation(&summary, &prompt) {
-                return emit_confirm_error(cmd, as_json, err);
-            }
+        }
+        let prompt = format!(
+            "Initialize additional human admin authority '{}' (label: {})? [y/N]: ",
+            sanitize_tty_display(&human_id),
+            sanitize_tty_display(trimmed_label)
+        );
+        if let Err(err) = require_interactive_tty_confirmation(&summary, &prompt) {
+            return emit_confirm_error(cmd, as_json, err);
         }
     }
 
@@ -1581,8 +1650,10 @@ fn run_auth_add(
     );
     let kid8: String = kid.chars().take(8).collect();
     let prompt = format!(
-        "Enroll human authority '{human_id}' (role: {}, kid: {kid8})? [y/N]: ",
-        role.to_store_role().as_str()
+        "Enroll human authority '{}' (role: {}, kid: {})? [y/N]: ",
+        sanitize_tty_display(&human_id),
+        role.to_store_role().as_str(),
+        sanitize_tty_display(&kid8)
     );
     if let Err(err) = require_controlling_tty_confirmation(&summary, &prompt) {
         return emit_confirm_error(cmd, as_json, err);
@@ -1938,7 +2009,10 @@ fn run_auth_revoke(
         &reason,
         gate_locked,
     );
-    let prompt = format!("Revoke human authority '{}'? [y/N]: ", target.kid);
+    let prompt = format!(
+        "Revoke human authority '{}'? [y/N]: ",
+        sanitize_tty_display(&target.kid)
+    );
     if let Err(err) = require_interactive_tty_confirmation(&summary, &prompt) {
         return emit_confirm_error(cmd, as_json, err);
     }
@@ -2273,6 +2347,12 @@ fn run_auth_sign(
         }
     };
 
+    // P0: `hyp auth sign` signs with the local admin key and MUST require an interactive human
+    // controlling terminal (blocking non-TTY agent subprocesses before reading stdin or SecretStore).
+    if !io::stderr().is_terminal() {
+        return emit_confirm_error(cmd, as_json, ConfirmError::NotInteractiveTty);
+    }
+
     // Read body strictly from stdin (NEVER argv!) into a bounded buffer.
     let mut raw_body = String::new();
     if let Err(e) = io::stdin()
@@ -2409,6 +2489,35 @@ fn run_auth_sign(
     let issued_at = format_rfc3339_millis(now);
     let expires_at = format_rfc3339_millis(expires_ms);
     let drop_id = drop_id_arg.unwrap_or_default();
+
+    let confirm_summary = format_auth_sign_confirm_summary(
+        kind,
+        &signer_rec.human_id,
+        &signer_rec.kid,
+        auth_epoch,
+        &target_node_id,
+        handle_arg.as_deref(),
+        secret_spec.as_ref(),
+        &drop_id,
+        ttl_secs,
+        &body,
+    );
+    let confirm_prompt = format!(
+        "Sign & seal {} drop for node '{}'? [y/N]: ",
+        kind.to_crypto_kind().as_str(),
+        sanitize_tty_display(&target_node_id)
+    );
+    if let Err(err) = require_controlling_tty_confirmation(&confirm_summary, &confirm_prompt) {
+        let mut body_wipe = body;
+        // SAFETY: overwriting plaintext buffer with zeroes before immediately clearing/dropping.
+        unsafe {
+            for b in body_wipe.as_bytes_mut() {
+                std::ptr::write_volatile(b, 0);
+            }
+        }
+        body_wipe.clear();
+        return emit_confirm_error(cmd, as_json, err);
+    }
 
     let mut claim = HumanClaimV1 {
         v: 1,
@@ -2799,16 +2908,16 @@ async fn handle_enroll_callback(
         .and_then(|v| v.to_str().ok())
         .map(ToOwned::to_owned);
 
-    // Fail closed on untrusted browser Origin headers (allow strictly the configured portal origin or absent Origin).
-    if let Some(ref orig) = origin {
-        if orig != allowed {
-            return json_enroll_response(
-                StatusCode::FORBIDDEN,
-                None,
-                allowed,
-                json!({ "ok": false, "error": "origin_not_allowed" }),
-            );
-        }
+    // P0 `#5`: Fail closed on missing OR mismatched Origin headers!
+    // Require exact match with the configured Drop Portal origin so local scripts cannot POST
+    // a spoofed JWK without an Origin header.
+    if origin.as_deref() != Some(allowed) {
+        return json_enroll_response(
+            StatusCode::FORBIDDEN,
+            None,
+            allowed,
+            json!({ "ok": false, "error": "origin_not_allowed" }),
+        );
     }
 
     let path = req.uri().path().to_string();

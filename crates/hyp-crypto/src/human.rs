@@ -93,11 +93,15 @@ const RESERVED_SECRET_PREFIXES: &[&str] = &[
     "human-authority-",
     "auth-token-",
     "staged-join-token-",
+    "pair-",
+    "p2p-offer-",
 ];
 
 const RESERVED_SECRET_EXACT: &[&str] = &[
     "admin-ca",
     "gate-policy",
+    "gate-policy-hmac",
+    "gate_policy_hmac",
     "gate-policy-hmac-key",
     "human-admin",
     "human-authority",
@@ -105,6 +109,9 @@ const RESERVED_SECRET_EXACT: &[&str] = &[
     "t3-auth-token",
     "t3-session-token",
     "staged-join-token",
+    "openclaw-hooks-token",
+    "hyphae-admin-pubkey",
+    "daemon-session-token-key",
 ];
 
 /// Supported MVP sealed drop kinds (`directive` or `secret`).

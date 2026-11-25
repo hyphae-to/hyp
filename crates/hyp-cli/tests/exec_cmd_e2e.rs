@@ -19,9 +19,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use clap::{CommandFactory, Parser, Subcommand};
 use exec_cmd::{
-    ExecArgs, RedactionRuleSet, StreamScrubber, build_redaction_patterns, parse_env_binding,
-    run_exec, run_exec_with_writers, scrub_stream, validate_env_var_name,
-    validate_exec_secret_name,
+    ExecArgs, RedactionRuleSet, StreamScrubber, build_redaction_patterns,
+    collect_node_config_secret_names, parse_env_binding, run_exec, run_exec_with_writers,
+    scrub_stream, validate_env_var_name, validate_exec_secret_name,
 };
 use hyp_crypto::keystore::{SecretBackend, SecretStore};
 use hyp_node::engine::http_util::percent_encode;
@@ -512,10 +512,17 @@ fn run_exec_fails_closed_on_missing_secret_reserved_secret_dangerous_env_and_dup
     for reserved in [
         "node-ed25519-key",
         "gate-policy-hmac-key",
+        "gate-policy-hmac",
+        "gate_policy_hmac",
         "staged-join-token",
         "human-admin-1234",
         "node-sign-deadbeef1234",
         "node-x25519-key",
+        "openclaw-hooks-token",
+        "hyphae-admin-pubkey",
+        "daemon-session-token-key",
+        "pair-custom-node",
+        "p2p-offer-abcdef",
     ] {
         let out = CaptureWriter::new();
         let err = CaptureWriter::new();
@@ -605,6 +612,167 @@ fn run_exec_fails_closed_on_missing_secret_reserved_secret_dangerous_env_and_dup
         !err_text.contains(&state_dir.display().to_string()),
         "error message leaked state_dir path: {err_text}"
     );
+}
+
+#[test]
+fn wave4c_exec_blocks_hyphae_infrastructure_secrets_referenced_in_node_json() {
+    use hyp_crypto::human::is_reserved_secret_name;
+
+    // Verify new reserved names/prefixes in hyp-crypto::human::is_reserved_secret_name
+    for reserved in [
+        "openclaw-hooks-token",
+        "hyphae-admin-pubkey",
+        "daemon-session-token-key",
+        "gate-policy-hmac",
+        "gate_policy_hmac",
+        "pair-alice-laptop",
+        "p2p-offer-12345678",
+    ] {
+        assert!(
+            is_reserved_secret_name(reserved),
+            "expected '{reserved}' to be reserved in hyp_crypto::human"
+        );
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    let cfg_path = state_dir.join("node.json");
+
+    let node_cfg = serde_json::json!({
+        "v": 2,
+        "nodeId": "exec-iso@box",
+        "plugins": [
+            {
+                "id": "telegram",
+                "command": "node",
+                "args": ["/tmp/tg.mjs"],
+                "targets": ["personal"],
+                "env": {
+                    "TELEGRAM_BOT_TOKEN": { "secret": "tg-bot-token" }
+                }
+            }
+        ],
+        "sources": [
+            {
+                "id": "gh-webhooks",
+                "kind": "github-webhook",
+                "webhookSecret": { "secret": "gh-webhook-hmac" },
+                "repoTokens": {
+                    "acme/*": { "secret": "gh-repo-pat" }
+                }
+            }
+        ],
+        "gate": {
+            "stage2": {
+                "enabled": false,
+                "api_key_secret": "stage2-llm-key"
+            },
+            "filters": [
+                {
+                    "id": "ant-guard",
+                    "enabled": true,
+                    "adapter": {
+                        "type": "anthropic",
+                        "model": "claude-haiku-4-5",
+                        "api_key_secret": "classifier-anthropic-cred"
+                    }
+                }
+            ]
+        },
+        "pairing": {
+            "adminKey": { "secret": "org-pairing-admin" }
+        },
+        "t3": {
+            "url": "http://127.0.0.1:3773",
+            "tokenSecret": "custom-t3-secret"
+        },
+        "openclaw": {
+            "url": "http://127.0.0.1:18789",
+            "tokenSecret": "custom-openclaw-secret"
+        }
+    });
+    fs::write(&cfg_path, serde_json::to_string_pretty(&node_cfg).unwrap()).unwrap();
+
+    let collected = collect_node_config_secret_names(&node_cfg);
+    let blocked_infra = [
+        "tg-bot-token",
+        "gh-webhook-hmac",
+        "gh-repo-pat",
+        "stage2-llm-key",
+        "classifier-anthropic-cred",
+        "org-pairing-admin",
+        "custom-t3-secret",
+        "custom-openclaw-secret",
+    ];
+    for name in blocked_infra {
+        assert!(
+            collected.contains(name),
+            "expected '{name}' collected from node.json: {collected:?}"
+        );
+    }
+
+    let store = SecretStore::new(&state_dir, SecretBackend::File);
+    for name in blocked_infra {
+        store.set(name, &format!("infra-secret-val-{name}")).unwrap();
+    }
+    store
+        .set("user-app-stripe-key", "sk-user-app-only-99999")
+        .unwrap();
+
+    // Every secret referenced by node.json infrastructure MUST be refused with RESERVED_CONFIG_SECRET!
+    for name in blocked_infra {
+        let out = CaptureWriter::new();
+        let err = CaptureWriter::new();
+        let code = run_exec_with_writers(
+            ExecArgs {
+                env: vec![format!("STEAL={name}")],
+                state_dir: Some(state_dir.clone()),
+                config: None,
+                command: vec!["echo".to_string(), "should-never-run".to_string()],
+            },
+            out.clone(),
+            err.clone(),
+        );
+        assert_eq!(
+            code,
+            ExitCode::from(ui::EXIT_USAGE),
+            "node.json infra secret '{name}' must fail closed with EXIT_USAGE"
+        );
+        assert!(out.take_bytes().is_empty());
+        let err_text = err.take_string();
+        assert!(
+            err_text.contains("RESERVED_CONFIG_SECRET"),
+            "expected RESERVED_CONFIG_SECRET for '{name}', got: {err_text}"
+        );
+        assert!(
+            !err_text.contains("infra-secret-val-"),
+            "secret value must never leak: {err_text}"
+        );
+    }
+
+    // Unrelated user application secret NOT referenced by node.json still works normally!
+    #[cfg(unix)]
+    {
+        let out = CaptureWriter::new();
+        let err = CaptureWriter::new();
+        let code = run_exec_with_writers(
+            ExecArgs {
+                env: vec!["APP_KEY=user-app-stripe-key".to_string()],
+                state_dir: Some(state_dir),
+                config: None,
+                command: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "printf 'ok=%s' \"$APP_KEY\"".to_string(),
+                ],
+            },
+            out.clone(),
+            err.clone(),
+        );
+        assert_eq!(code, ExitCode::from(0), "stderr={}", err.take_string());
+        assert_eq!(out.take_string(), "ok=[REDACTED:user-app-stripe-key]");
+    }
 }
 
 // ============================================================================

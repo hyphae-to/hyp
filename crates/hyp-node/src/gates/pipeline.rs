@@ -79,7 +79,7 @@ pub struct SecurityGatePipeline {
     config: SecurityGateConfig,
     config_hash: String,
     stage1: Arc<Stage1Engine>,
-    stage2: Stage2Guard,
+    stage2: Option<Stage2Guard>,
     filters: Vec<Arc<dyn FilterPlugin>>,
     db: Arc<Mutex<NodeDb>>,
     secrets: Option<Arc<SecretStore>>,
@@ -99,21 +99,26 @@ impl std::fmt::Debug for SecurityGatePipeline {
 }
 
 impl SecurityGatePipeline {
-    /// Constructs a new [`SecurityGatePipeline`], validating Stage 1 regexes, Stage 2 config,
-    /// and all enabled entries in `config.filters`.
+    /// Constructs a new [`SecurityGatePipeline`], validating constant signing key configuration,
+    /// Stage 1 regexes, Stage 2 config, and all entries in `config.filters`.
     pub fn new(
         config: SecurityGateConfig,
         db: Arc<Mutex<NodeDb>>,
         secrets: Option<Arc<SecretStore>>,
     ) -> Result<Self, GateError> {
+        config.validate()?;
         let stage1 = Arc::new(Stage1Engine::new(config.stage1.clone())?);
-        let stage2 = Stage2Guard::new(config.stage2.clone())?;
+        let stage2 = if config.stage2.enabled {
+            Some(Stage2Guard::new(config.stage2.clone())?)
+        } else {
+            None
+        };
         let mut filters = Vec::with_capacity(config.filters.len());
         for fcfg in &config.filters {
             if fcfg.enabled {
                 filters.push(build_filter_plugin(fcfg)?);
             } else {
-                // Still validate disabled filter configs fail-closed at startup.
+                // Disabled filter configs still pass non-URL invariant validation (`G17` skipped).
                 fcfg.validate()?;
             }
         }
@@ -559,21 +564,23 @@ impl SecurityGatePipeline {
         let mut collected_categories = stage1_out.categories;
 
         if self.config.stage2.enabled && self.config.stage2.matchers.matches(ctx) {
-            let outcome = self.stage2.evaluate(ctx, self.secrets.as_deref()).await;
-            if let Some(short_circuit) = self.handle_filter_outcome(
-                existing_receipt,
-                ctx,
-                &payload_text,
-                &payload_sha256,
-                traceparent.clone(),
-                "stage2",
-                outcome,
-                &mut last_stage,
-                &mut last_confidence,
-                &mut collected_categories,
-                now_ms,
-            )? {
-                return Ok(short_circuit);
+            if let Some(ref stage2) = self.stage2 {
+                let outcome = stage2.evaluate(ctx, self.secrets.as_deref()).await;
+                if let Some(short_circuit) = self.handle_filter_outcome(
+                    existing_receipt,
+                    ctx,
+                    &payload_text,
+                    &payload_sha256,
+                    traceparent.clone(),
+                    "stage2",
+                    outcome,
+                    &mut last_stage,
+                    &mut last_confidence,
+                    &mut collected_categories,
+                    now_ms,
+                )? {
+                    return Ok(short_circuit);
+                }
             }
         }
 
@@ -894,21 +901,23 @@ impl SecurityGatePipeline {
         let mut collected_categories = stage1_out.categories;
 
         if self.config.stage2.enabled && self.config.stage2.matchers.matches(ctx) {
-            let outcome = self.stage2.evaluate(ctx, self.secrets.as_deref()).await;
-            if let Some(short_circuit) = self.handle_filter_outcome(
-                None,
-                ctx,
-                &payload_text,
-                &payload_sha256,
-                traceparent.clone(),
-                "stage2",
-                outcome,
-                &mut last_stage,
-                &mut last_confidence,
-                &mut collected_categories,
-                now_ms,
-            )? {
-                return Ok(short_circuit);
+            if let Some(ref stage2) = self.stage2 {
+                let outcome = stage2.evaluate(ctx, self.secrets.as_deref()).await;
+                if let Some(short_circuit) = self.handle_filter_outcome(
+                    None,
+                    ctx,
+                    &payload_text,
+                    &payload_sha256,
+                    traceparent.clone(),
+                    "stage2",
+                    outcome,
+                    &mut last_stage,
+                    &mut last_confidence,
+                    &mut collected_categories,
+                    now_ms,
+                )? {
+                    return Ok(short_circuit);
+                }
             }
         }
 

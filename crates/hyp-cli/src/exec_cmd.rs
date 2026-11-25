@@ -18,7 +18,8 @@
 //! - Direct `Command::new(program).args(args)` execution with ZERO shell invocation.
 
 use crate::config_file::{
-    load_node_or_legacy_config, open_secret_store, resolve_config_path_for_read, resolve_state_dir,
+    load_node_or_legacy_config, open_secret_store, read_json_value, resolve_config_path_for_read,
+    resolve_state_dir,
 };
 use crate::ui::{EXIT_ERROR, EXIT_USAGE};
 use base64::Engine as _;
@@ -28,6 +29,7 @@ use hyp_crypto::CryptoError;
 use hyp_crypto::human::is_reserved_secret_name;
 use hyp_crypto::keystore::validate_secret_name;
 use hyp_node::engine::http_util::percent_encode;
+use serde_json::Value;
 use std::collections::HashSet;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -101,6 +103,42 @@ const RESERVED_EXEC_SECRET_EXACT: &[&str] = &[
     "staged-join-token",
     "t3-auth-token",
     "t3-session-token",
+    "openclaw-hooks-token",
+    "hyphae-admin-pubkey",
+    "daemon-session-token-key",
+    "gate-policy-hmac",
+    "gate_policy_hmac",
+];
+
+/// Top-level `node.json` sections whose referenced secrets belong to Hyphae infrastructure
+/// (bridges, sources, Security Gate, pairing, T3, OpenClaw) and MUST NOT be exposed to `hyp exec`.
+const INFRA_CONFIG_SECTIONS: &[&str] = &["plugins", "sources", "gate", "pairing", "t3", "openclaw"];
+
+/// String field keys inside Hyphae infrastructure config sections that carry `SecretStore` names.
+const INFRA_SECRET_STRING_KEYS: &[&str] = &[
+    "secret",
+    "secretName",
+    "secret_name",
+    "tokenSecret",
+    "token_secret",
+    "policySigningSecret",
+    "policy_signing_secret",
+    "api_key_secret",
+    "apiKeySecret",
+    "webhookSecret",
+    "webhook_secret",
+    "bearerSecret",
+    "bearer_secret",
+    "passwordSecret",
+    "password_secret",
+    "signingSecret",
+    "signing_secret",
+    "authTokenSecret",
+    "auth_token_secret",
+    "hooksTokenSecret",
+    "hooks_token_secret",
+    "adminKeySecret",
+    "admin_key_secret",
 ];
 
 const RESERVED_EXEC_SECRET_PREFIXES: &[&str] = &[
@@ -631,10 +669,51 @@ fn write_exec_error(
     ExitCode::from(exit_code)
 }
 
+fn collect_secret_names_recursive(val: &Value, out: &mut HashSet<String>) {
+    match val {
+        Value::Object(map) => {
+            for (k, v) in map {
+                if INFRA_SECRET_STRING_KEYS.contains(&k.as_str()) {
+                    if let Some(s) = v.as_str() {
+                        let trimmed = s.trim();
+                        if !trimmed.is_empty() {
+                            out.insert(trimmed.to_ascii_lowercase());
+                        }
+                    }
+                }
+                collect_secret_names_recursive(v, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_secret_names_recursive(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collects every `SecretStore` secret name referenced inside Hyphae infrastructure sections
+/// (`plugins[]`, `sources[]`, `gate`, `pairing`, `t3`, `openclaw`) of a `node.json` document,
+/// whether via `{ "secret": "<name>" }` objects or string secret-reference keys (`secretName`,
+/// `tokenSecret`, `policySigningSecret`, `api_key_secret`, etc.).
+pub fn collect_node_config_secret_names(root: &Value) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let Some(obj) = root.as_object() else {
+        return out;
+    };
+    for section in INFRA_CONFIG_SECTIONS {
+        if let Some(sec_val) = obj.get(*section) {
+            collect_secret_names_recursive(sec_val, &mut out);
+        }
+    }
+    out
+}
+
 fn resolve_exec_state_dir(
     state_dir_arg: Option<&Path>,
     config_arg: Option<&Path>,
-) -> Result<(PathBuf, bool), String> {
+) -> Result<(PathBuf, bool, Vec<Value>), String> {
     if let Some(cfg_path) = config_arg {
         if !cfg_path.exists() {
             return Err("Specified --config file does not exist".to_string());
@@ -648,21 +727,42 @@ fn resolve_exec_state_dir(
         } else {
             resolve_state_dir(None, Some(cfg_path), None)
         };
-        return Ok((dir, true));
+        let mut docs = vec![loaded.raw];
+        let state_cfg = resolve_config_path_for_read(None, Some(&dir), None);
+        if state_cfg.exists() && state_cfg != cfg_path {
+            if let Ok(extra_doc) = read_json_value(&state_cfg) {
+                docs.push(extra_doc);
+            }
+        }
+        return Ok((dir, true, docs));
     }
 
     if let Some(sd) = state_dir_arg {
-        return Ok((sd.to_path_buf(), true));
+        let mut docs = Vec::new();
+        let state_cfg = resolve_config_path_for_read(None, Some(sd), None);
+        if state_cfg.exists() {
+            let doc = read_json_value(&state_cfg).map_err(|_| {
+                "node.json in --state-dir is not valid JSON (failing closed on secret isolation)"
+                    .to_string()
+            })?;
+            docs.push(doc);
+        }
+        return Ok((sd.to_path_buf(), true, docs));
     }
 
     let default_cfg = resolve_config_path_for_read(None, None, None);
+    let mut docs = Vec::new();
     let cfg_for_resolve = if default_cfg.exists() {
+        let doc = read_json_value(&default_cfg).map_err(|_| {
+            "Default node.json is not valid JSON (failing closed on secret isolation)".to_string()
+        })?;
+        docs.push(doc);
         Some(default_cfg.as_path())
     } else {
         None
     };
     let dir = resolve_state_dir(None, cfg_for_resolve, None);
-    Ok((dir, false))
+    Ok((dir, false, docs))
 }
 
 /// Runs `hyp exec` writing scrubbed child stdout/stderr (and fail-closed pre-spawn diagnostics)
@@ -732,14 +832,34 @@ where
         bindings.push(binding);
     }
 
-    // 2. Resolve SecretStore without leaking local filesystem paths on missing/unreadable secrets.
-    let (state_dir, explicit_dir) =
+    // 2. Resolve SecretStore & inspect node.json to isolate Hyphae infrastructure secrets fail-closed.
+    let (state_dir, explicit_dir, config_docs) =
         match resolve_exec_state_dir(args.state_dir.as_deref(), args.config.as_deref()) {
             Ok(v) => v,
             Err(msg) => {
                 return write_exec_error(&mut stderr_writer, EXIT_ERROR, "CONFIG_ERROR", &msg, None);
             }
         };
+    let mut infra_config_secrets: HashSet<String> = HashSet::new();
+    for doc in &config_docs {
+        infra_config_secrets.extend(collect_node_config_secret_names(doc));
+    }
+    for binding in &bindings {
+        if infra_config_secrets.contains(&binding.secret_name.to_ascii_lowercase()) {
+            return write_exec_error(
+                &mut stderr_writer,
+                EXIT_USAGE,
+                "RESERVED_CONFIG_SECRET",
+                &format!(
+                    "Secret '{}' is referenced by Hyphae infrastructure config in node.json (plugins/sources/gate/pairing/t3/openclaw) and is blocked from `hyp exec`",
+                    binding.secret_name
+                ),
+                Some(
+                    "Store application secrets under a distinct name not referenced by Hyphae infrastructure config.",
+                ),
+            );
+        }
+    }
     let store = open_secret_store(&state_dir, explicit_dir);
 
     // 3. Load every requested secret into `Zeroizing<String>` (returned directly by `SecretStore::get`).

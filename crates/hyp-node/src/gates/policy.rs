@@ -709,14 +709,12 @@ impl Stage2Config {
                 ))
             })?;
         }
-        if let Some(ref base_override) = self.base_url_override {
-            if self.enabled || !base_override.trim().is_empty() {
+        if self.enabled {
+            if let Some(ref base_override) = self.base_url_override {
                 crate::gates::stage2::validate_classifier_endpoint_url(base_override)
                     .map_err(GateError::InvalidConfig)?;
             }
-        }
-        if let LlmProvider::OpenAiCompatible { ref base_url } = self.provider {
-            if self.enabled || !base_url.trim().is_empty() {
+            if let LlmProvider::OpenAiCompatible { ref base_url } = self.provider {
                 crate::gates::stage2::validate_classifier_endpoint_url(base_url)
                     .map_err(GateError::InvalidConfig)?;
             }
@@ -974,8 +972,8 @@ impl FilterAdapterConfig {
                 ..
             } => {
                 check_secret(api_key_secret)?;
-                if let Some(url) = base_url {
-                    if enabled || !url.trim().is_empty() {
+                if enabled {
+                    if let Some(url) = base_url {
                         crate::gates::stage2::validate_classifier_endpoint_url(url).map_err(
                             |e| GateError::InvalidConfig(format!("filter '{id}' base_url: {e}")),
                         )?;
@@ -1013,7 +1011,7 @@ impl FilterAdapterConfig {
                 ..
             } => {
                 check_secret(api_key_secret)?;
-                if enabled || !base_url.trim().is_empty() {
+                if enabled {
                     crate::gates::stage2::validate_classifier_endpoint_url(base_url).map_err(
                         |e| GateError::InvalidConfig(format!("filter '{id}' base_url: {e}")),
                     )?;
@@ -1052,7 +1050,7 @@ impl FilterAdapterConfig {
                         "filter '{id}' lakera base_url must be non-empty"
                     )));
                 }
-                if enabled || !base_url.trim().is_empty() {
+                if enabled {
                     crate::gates::stage2::validate_classifier_endpoint_url(base_url).map_err(
                         |e| GateError::InvalidConfig(format!("filter '{id}' lakera base_url: {e}")),
                     )?;
@@ -1082,7 +1080,7 @@ impl FilterAdapterConfig {
                         "filter '{id}' http-classifier url must be non-empty"
                     )));
                 }
-                if enabled || !url.trim().is_empty() {
+                if enabled {
                     crate::gates::stage2::validate_classifier_endpoint_url(url).map_err(|e| {
                         GateError::InvalidConfig(format!("filter '{id}' http-classifier url: {e}"))
                     })?;
@@ -1142,8 +1140,9 @@ pub struct SecurityGateConfig {
     /// if the policy was mutated without human re-signing.
     #[serde(default)]
     pub require_signed_policy: bool,
-    /// `SecretStore` key name holding the policy signing HMAC key (default: `"gate-policy-hmac-key"`).
-    #[serde(default = "default_policy_signing_secret")]
+    /// `SecretStore` key name holding the policy signing HMAC key (MUST be empty or constant
+    /// [`DEFAULT_POLICY_SIGNING_SECRET`]; custom overrides are rejected fail-closed).
+    #[serde(default = "default_policy_signing_secret", alias = "policySigningSecret")]
     pub policy_signing_secret: String,
     /// Optional canonical SHA-256 hex digest of `human_authorities` + `min_auth_epoch` bound into
     /// `policy_signature` so unauthorized SQLite modifications fail closed (`gate_policy_tampered`).
@@ -1152,6 +1151,34 @@ pub struct SecurityGateConfig {
     /// Tamper-evident signature over canonical RFC 8785 JCS of this gate policy (`"hmac-sha256:<hex>"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_signature: Option<String>,
+}
+
+impl SecurityGateConfig {
+    /// Validates the complete Local Security Gate configuration fail-closed.
+    ///
+    /// - Rejects any non-default `policy_signing_secret` value (only empty or
+    ///   [`DEFAULT_POLICY_SIGNING_SECRET`] is permitted, defeating signing key redirection).
+    /// - Validates Stage 2 and all filter plugins (applying `G17` endpoint URL checks strictly
+    ///   when `enabled == true` so disabled configs never abort daemon startup).
+    pub fn validate(&self) -> Result<(), GateError> {
+        validate_constant_policy_signing_secret(&self.policy_signing_secret)
+            .map_err(GateError::InvalidConfig)?;
+        self.stage2.validate()?;
+        for f in &self.filters {
+            f.validate()?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_constant_policy_signing_secret(secret_name: &str) -> Result<(), String> {
+    if secret_name.is_empty() || secret_name == DEFAULT_POLICY_SIGNING_SECRET {
+        Ok(())
+    } else {
+        Err(format!(
+            "gate.policy_signing_secret cannot be overridden (only constant '{DEFAULT_POLICY_SIGNING_SECRET}' is permitted)"
+        ))
+    }
 }
 
 impl Default for SecurityGateConfig {
@@ -1207,20 +1234,19 @@ fn canonical_policy_jcs(config: &SecurityGateConfig) -> Result<String, GateError
 }
 
 /// Computes a tamper-evident domain-separated HMAC-SHA256 signature over the canonical RFC 8785 JCS
-/// representation of `config` (excluding `policy_signature`), using the key stored in `secrets`.
+/// representation of `config` (excluding `policy_signature`), strictly keyed by the hardcoded
+/// constant [`DEFAULT_POLICY_SIGNING_SECRET`] in `secrets`.
 ///
-/// Auto-generates and stores a 256-bit key in `secrets` under `config.policy_signing_secret` if
-/// one does not already exist.
+/// Fails closed if `config.policy_signing_secret` attempts to redirect to a non-default secret
+/// name. Auto-generates and stores a 256-bit key in `secrets` under
+/// [`DEFAULT_POLICY_SIGNING_SECRET`] if one does not already exist.
 pub fn sign_gate_policy(
     config: &SecurityGateConfig,
     secrets: &SecretStore,
 ) -> Result<String, GateError> {
-    let secret_name = if config.policy_signing_secret.trim().is_empty() {
-        DEFAULT_POLICY_SIGNING_SECRET
-    } else {
-        config.policy_signing_secret.as_str()
-    };
-    let key_hex = ensure_policy_signing_key(secrets, secret_name)?;
+    validate_constant_policy_signing_secret(&config.policy_signing_secret)
+        .map_err(GateError::PolicySignature)?;
+    let key_hex = ensure_policy_signing_key(secrets, DEFAULT_POLICY_SIGNING_SECRET)?;
     let key_bytes = Zeroizing::new(
         hex::decode(key_hex.as_bytes())
             .map_err(|_| GateError::PolicySignature("policy signing key is not valid hex".into()))?,
@@ -1235,24 +1261,19 @@ pub fn sign_gate_policy(
     Ok(format!("{POLICY_SIG_PREFIX}{}", hex::encode(tag)))
 }
 
-/// Verifies a tamper-evident gate policy signature in constant time against `secrets`.
+/// Verifies a tamper-evident gate policy signature in constant time against `secrets` using
+/// strictly the hardcoded constant [`DEFAULT_POLICY_SIGNING_SECRET`].
 ///
-/// Fails closed if the signing key is missing, `sig` is malformed, or ANY field of `config`
-/// (`stage1`, `stage2`, `filters[]`, endpoints, models, `policy_notes`, `on_error`, etc.) was
-/// modified after human signing.
+/// Fails closed if `config.policy_signing_secret` was overridden to any non-default value, if the
+/// signing key is missing, `sig` is malformed, or ANY field of `config` (`stage1`, `stage2`,
+/// `filters[]`, endpoints, models, `policy_notes`, `on_error`, etc.) was modified after signing.
 pub fn verify_gate_policy_sig(
     config: &SecurityGateConfig,
     sig: &str,
     secrets: &SecretStore,
 ) -> Result<(), GateError> {
-    let secret_name = if config.policy_signing_secret.trim().is_empty() {
-        DEFAULT_POLICY_SIGNING_SECRET
-    } else {
-        config.policy_signing_secret.as_str()
-    };
-    validate_secret_name(secret_name).map_err(|e| {
-        GateError::PolicySignature(format!("invalid policy signing secret name: {e}"))
-    })?;
+    validate_constant_policy_signing_secret(&config.policy_signing_secret)
+        .map_err(GateError::PolicySignature)?;
     let Some(sig_hex) = sig.trim().strip_prefix(POLICY_SIG_PREFIX) else {
         return Err(GateError::PolicySignature(
             "missing or unsupported policy signature prefix".to_string(),
@@ -1266,7 +1287,7 @@ pub fn verify_gate_policy_sig(
         ));
     }
 
-    let key_hex = secrets.get(secret_name).map_err(|e| {
+    let key_hex = secrets.get(DEFAULT_POLICY_SIGNING_SECRET).map_err(|e| {
         GateError::PolicySignature(format!("policy signing key unavailable: {e}"))
     })?;
     let key_bytes = Zeroizing::new(

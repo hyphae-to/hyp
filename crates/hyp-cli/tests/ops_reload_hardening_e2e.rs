@@ -94,6 +94,12 @@ fn d10_keystore_backend_errors_and_partial_keys_never_silently_regenerate() {
             .unwrap()
             .is_none()
     );
+    // OR1: exit 1 with empty stdout & empty stderr is genuine NotFound on Linux secret-tool!
+    assert!(
+        classify_linux_secret_service_output("node-sign-abc", Some(1), b"", "")
+            .unwrap()
+            .is_none()
+    );
     assert!(matches!(
         classify_linux_secret_service_output(
             "node-sign-abc",
@@ -101,6 +107,10 @@ fn d10_keystore_backend_errors_and_partial_keys_never_silently_regenerate() {
             b"",
             "secret-tool: Cannot autolaunch D-Bus without X11 $DISPLAY"
         ),
+        Err(CryptoError::Keystore(_))
+    ));
+    assert!(matches!(
+        classify_linux_secret_service_output("node-sign-abc", Some(2), b"", ""),
         Err(CryptoError::Keystore(_))
     ));
 
@@ -1357,46 +1367,73 @@ fn h6_h18_drop_wait_reconnects_with_last_event_id_ignores_junk_and_r6_relay_set_
     let init_json = parse_json_stdout(&init_out);
     let node_id = init_json["data"]["nodeId"].as_str().unwrap().to_string();
 
-    // 3. Produce a VALID sealed `hdrop1_` via `hyp auth sign` AND an INVALID forged `hdrop1_`
+    // 3. Produce a VALID sealed `hdrop1_` via `hyp auth sign` (PTY on Unix) AND an INVALID forged `hdrop1_`
     //    signed by an unenrolled attacker key!
-    let mut sign_proc = isolated_cmd(&home)
-        .args([
-            "auth",
-            "sign",
-            "--kind",
-            "directive",
-            "--drop-id",
-            "drop-e2e-reconnect",
-            "--state-dir",
-            state_str,
-            "--json",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn hyp auth sign");
-    sign_proc
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"Approve production rollout #42")
-        .unwrap();
-    let sign_out = sign_proc.wait_with_output().unwrap();
-    assert_eq!(
-        sign_out.status.code(),
-        Some(0),
-        "stderr={}",
-        String::from_utf8_lossy(&sign_out.stderr)
-    );
-    let valid_hdrop1 = parse_json_stdout(&sign_out)["data"]["token"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    // Forge a syntactically valid `hdrop1_` signed by an UNTRUSTED attacker key.
     let store = SecretStore::file_only(&state_dir);
     let node_keys = store.load_or_create_node_keys(&node_id).unwrap();
+    #[cfg(unix)]
+    let valid_hdrop1 = {
+        let sign_pty = run_hyp_in_pty(
+            &home,
+            &[
+                "auth",
+                "sign",
+                "--kind",
+                "directive",
+                "--drop-id",
+                "drop-e2e-reconnect",
+                "--state-dir",
+                state_str,
+                "--json",
+            ],
+            Some("Approve production rollout #42"),
+            Some("y\n"),
+        );
+        assert_eq!(
+            sign_pty.code, 0,
+            "stdout={} tty={}",
+            sign_pty.stdout, sign_pty.tty
+        );
+        sign_pty.parse_json()["data"]["token"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    #[cfg(not(unix))]
+    let valid_hdrop1 = {
+        let admin_kid = init_json["data"]["kid"].as_str().unwrap();
+        let admin_secret = init_json["data"]["secretName"].as_str().unwrap();
+        let raw_pkcs8 = store.get(admin_secret).unwrap();
+        let admin_kp = Ed25519KeyPair::from_pkcs8_b64(&raw_pkcs8).unwrap();
+        let now_s = now_unix_ms();
+        let valid_claim = HumanClaimV1 {
+            v: 1,
+            claim_id: "valid-claim-001".to_string(),
+            human_id: "alice".to_string(),
+            human_kid: admin_kid.to_string(),
+            auth_epoch: 1,
+            kind: HumanDropKind::Directive,
+            drop_id: "drop-e2e-reconnect".to_string(),
+            audience: HumanAudience {
+                node_id: node_id.clone(),
+                node_enc_kid: node_keys.encryption.kid(),
+                handle: None,
+            },
+            secret_spec: None,
+            body: "Approve production rollout #42".to_string(),
+            issued_at: format_rfc3339_millis(now_s),
+            expires_at: format_rfc3339_millis(now_s + 300_000),
+        };
+        let valid_env = seal_human_drop(
+            &valid_claim,
+            &admin_kp,
+            &node_keys.encryption.public_key(),
+        )
+        .unwrap();
+        encode_hdrop1(&valid_env).unwrap()
+    };
+
+    // Forge a syntactically valid `hdrop1_` signed by an UNTRUSTED attacker key.
     let attacker_kp = Ed25519KeyPair::generate().unwrap();
     let now = now_unix_ms();
     let forged_claim = HumanClaimV1 {
@@ -1658,5 +1695,191 @@ fn d7_release_workflow_fails_closed_when_signing_key_missing_on_v_tags() {
         pubkey.len(),
         43,
         "DEFAULT_RELEASE_PUBKEY_B64 must be a 43-char base64url Ed25519 key"
+    );
+}
+
+// ============================================================================
+// 8. Wave 4C — `hyp status`/`hyp doctor` Runtime Plugin Health (`B5`) & Disabled `G17` WARN
+// ============================================================================
+
+#[test]
+fn wave4c_status_and_doctor_surface_plugin_health_and_disabled_g17_warnings() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let state_dir = home.join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    let state_str = state_dir.to_str().unwrap();
+
+    // 1. Write `node.json` with a *disabled* Stage 2 and *disabled* HTTP classifier pointing to
+    //    non-loopback `http://` URLs — MUST NOT crash or fail `hyp doctor`, MUST emit `WARN`!
+    fs::write(
+        state_dir.join("node.json"),
+        serde_json::to_string_pretty(&json!({
+            "version": 2,
+            "nodeId": "doc-check@box",
+            "profile": "local",
+            "gate": {
+                "stage2": {
+                    "enabled": false,
+                    "provider": { "provider": "open-ai-compatible", "base_url": "http://legacy-ollama.internal:11434/v1" },
+                    "base_url_override": "http://legacy-llm.internal/v1",
+                    "model": "qwen2.5:3b",
+                    "max_input_chars": 16384,
+                    "max_output_tokens": 160,
+                    "timeout_ms": 4000,
+                    "max_concurrent": 4,
+                    "min_allow_confidence": 0.75,
+                    "busy_retry_after_ms": 1000
+                },
+                "filters": [
+                    {
+                        "id": "old-http-cls",
+                        "enabled": false,
+                        "adapter": {
+                            "type": "http-classifier",
+                            "url": "http://legacy-classifier.internal:8080/classify"
+                        }
+                    }
+                ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Doctor passes (exit 0) while surfacing WARN checks for the disabled insecure http:// URLs!
+    let doc_disabled = isolated_cmd(home)
+        .args(["doctor", "--state-dir", state_str, "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        doc_disabled.status.code(),
+        Some(0),
+        "disabled insecure gate URLs must WARN without failing doctor! stdout={}",
+        String::from_utf8_lossy(&doc_disabled.stdout)
+    );
+    let doc_disabled_json = parse_json_stdout(&doc_disabled);
+    let disabled_checks = doc_disabled_json["data"]["checks"].as_array().unwrap();
+    assert!(
+        disabled_checks.iter().any(|c| {
+            c["name"] == "gate.stage2.disabled_insecure_url" && c["status"] == "warn"
+        }),
+        "expected gate.stage2.disabled_insecure_url WARN: {doc_disabled_json}"
+    );
+    assert!(
+        disabled_checks.iter().any(|c| {
+            c["name"] == "gate.filter.old-http-cls.disabled_insecure_url" && c["status"] == "warn"
+        }),
+        "expected gate.filter.old-http-cls.disabled_insecure_url WARN: {doc_disabled_json}"
+    );
+
+    // 2. Write `node.status.json` containing degraded, crash_loop_backoff, error, and running
+    //    runtime plugins (including an unredacted token canary in lastError to verify redaction!).
+    let raw_token_canary = "sk-live-secret9876543210";
+    let bearer_canary = "eyJhbGciOiJIUzI1NiJ9.supersecret";
+    let log_path = state_dir.join("logs").join("plugin-telegram.log");
+    fs::write(
+        state_dir.join("node.status.json"),
+        serde_json::to_string_pretty(&json!({
+            "nodeId": "doc-check@box",
+            "plugins": [
+                {
+                    "id": "telegram",
+                    "kind": "bridge",
+                    "status": "crash_loop_backoff",
+                    "restarts": 7,
+                    "lastError": format!("auth failed with token={raw_token_canary} Bearer {bearer_canary}"),
+                    "logPath": log_path.display().to_string()
+                },
+                {
+                    "id": "slack",
+                    "kind": "bridge",
+                    "status": "degraded",
+                    "restarts": 2,
+                    "lastError": "reconnect backoff",
+                    "logPath": state_dir.join("logs").join("plugin-slack.log").display().to_string()
+                },
+                {
+                    "id": "discord",
+                    "kind": "bridge",
+                    "status": "error",
+                    "restarts": 0,
+                    "error": "missing secret discord-bot-token"
+                },
+                {
+                    "id": "github",
+                    "kind": "source",
+                    "status": "running",
+                    "restarts": 0
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // `hyp status --json` and TTY both surface runtime plugin statuses, restarts, redacted lastError, and logPath!
+    let st_json_out = isolated_cmd(home)
+        .args(["status", "--state-dir", state_str, "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(st_json_out.status.code(), Some(0));
+    let st_stdout = String::from_utf8_lossy(&st_json_out.stdout);
+    assert!(
+        !st_stdout.contains(raw_token_canary) && !st_stdout.contains(bearer_canary),
+        "raw token leaked in status --json: {st_stdout}"
+    );
+    let st_json = parse_json_stdout(&st_json_out);
+    let rt_plugins = st_json["data"]["runtimePlugins"].as_array().unwrap();
+    assert_eq!(rt_plugins.len(), 4);
+    let tg = rt_plugins.iter().find(|p| p["id"] == "telegram").unwrap();
+    assert_eq!(tg["status"], "crash_loop_backoff");
+    assert_eq!(tg["restarts"], 7);
+    assert!(tg["lastError"].as_str().unwrap().contains("[REDACTED]"));
+    assert_eq!(tg["logPath"], log_path.display().to_string());
+
+    let st_tty_out = isolated_cmd(home)
+        .args(["status", "--state-dir", state_str])
+        .output()
+        .unwrap();
+    assert_eq!(st_tty_out.status.code(), Some(0));
+    let st_tty = String::from_utf8_lossy(&st_tty_out.stdout);
+    assert!(st_tty.contains("Runtime Plugins:"), "tty={st_tty}");
+    assert!(st_tty.contains("telegram [crash_loop_backoff]"), "tty={st_tty}");
+    assert!(st_tty.contains("restarts=7"), "tty={st_tty}");
+    assert!(st_tty.contains("slack [degraded]"), "tty={st_tty}");
+    assert!(st_tty.contains("discord [error]"), "tty={st_tty}");
+    assert!(!st_tty.contains(raw_token_canary) && !st_tty.contains(bearer_canary));
+
+    // `hyp doctor --json` surfaces FAIL for crash_loop_backoff & error, WARN for degraded, OK for running!
+    let doc_out = isolated_cmd(home)
+        .args(["doctor", "--state-dir", state_str, "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        doc_out.status.code(),
+        Some(1),
+        "doctor must fail when plugins are in crash_loop_backoff/error: {}",
+        String::from_utf8_lossy(&doc_out.stdout)
+    );
+    let doc_stdout = String::from_utf8_lossy(&doc_out.stdout);
+    assert!(!doc_stdout.contains(raw_token_canary) && !doc_stdout.contains(bearer_canary));
+    let doc_json = parse_json_stdout(&doc_out);
+    let checks = doc_json["data"]["checks"].as_array().unwrap();
+    assert!(
+        checks.iter().any(|c| c["name"] == "plugin:runtime:telegram" && c["status"] == "fail"),
+        "checks={checks:?}"
+    );
+    assert!(
+        checks.iter().any(|c| c["name"] == "plugin:runtime:discord" && c["status"] == "fail"),
+        "checks={checks:?}"
+    );
+    assert!(
+        checks.iter().any(|c| c["name"] == "plugin:runtime:slack" && c["status"] == "warn"),
+        "checks={checks:?}"
+    );
+    assert!(
+        checks.iter().any(|c| c["name"] == "plugin:runtime:github" && c["status"] == "ok"),
+        "checks={checks:?}"
     );
 }
