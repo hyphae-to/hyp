@@ -45,6 +45,7 @@ Options:
 Environment overrides:
   HYPHAE_INSTALL_DIR           Binary directory (default: $HOME/.local/bin)
   HERDR_APP_HOME               Herdr desktop app directory (default: $XDG_CONFIG_HOME/herdr-app)
+  CLAUDE_CONFIG_DIR            Optional Claude Code profile directory to also clean
 EOF
 }
 
@@ -119,6 +120,41 @@ if [ -n "$REAL_HOME" ] && [ "${HOME%/}" = "${REAL_HOME%/}" ]; then
   IS_REAL_HOME=1
 fi
 
+canonical_dir() {
+  [ -d "$1" ] || return 1
+  (cd -P -- "$1" 2>/dev/null && pwd -P)
+}
+
+# Optional extra Claude Code profile directory via CLAUDE_CONFIG_DIR.
+# Hermetic guard: when HOME is isolated (IS_REAL_HOME=0, e.g. tests), ignore any
+# inherited host CLAUDE_CONFIG_DIR that resolves outside the isolated HOME.
+CLAUDE_PROFILE_DIR=""
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  _ccd_trimmed="${CLAUDE_CONFIG_DIR%/}"
+  [ -n "$_ccd_trimmed" ] || _ccd_trimmed="/"
+  if [ -d "$_ccd_trimmed" ]; then
+    _ccd_real="$(canonical_dir "$_ccd_trimmed" || true)"
+    _home_real="$(canonical_dir "$HOME" || printf '%s' "${HOME%/}")"
+    _default_claude_dir="${HOME%/}/.claude"
+    _default_claude_real="$(canonical_dir "$_default_claude_dir" 2>/dev/null || printf '%s' "$_default_claude_dir")"
+    _ccd_allow=0
+    if [ "$IS_REAL_HOME" -eq 1 ]; then
+      _ccd_allow=1
+    elif [ -n "$_ccd_real" ] && [ -n "$_home_real" ]; then
+      case "$_ccd_real" in
+        "${_home_real%/}/"*)
+          _ccd_allow=1
+          ;;
+      esac
+    fi
+    if [ "$_ccd_allow" -eq 1 ] && [ "$_ccd_trimmed" != "$_default_claude_dir" ]; then
+      if [ -z "$_ccd_real" ] || { [ "$_ccd_real" != "$_default_claude_real" ] && [ "$_ccd_real" != "$_home_real" ]; }; then
+        CLAUDE_PROFILE_DIR="$_ccd_trimmed"
+      fi
+    fi
+  fi
+fi
+
 # ---------------------------------------------------------------------------
 # Portable newline-delimited list helpers (macOS bash 3.2 + POSIX sh / dash)
 # ---------------------------------------------------------------------------
@@ -174,6 +210,7 @@ run_config_cleaner() {
     HYPHAE_CONFIG_HOME="$CONFIG_HOME" \
     HYPHAE_STATE_HOME="$STATE_HOME" \
     HYPHAE_HERDR_APP_DIR="$HERDR_APP_DIR" \
+    HYPHAE_CLAUDE_CONFIG_DIR="$CLAUDE_PROFILE_DIR" \
     HYPHAE_OS_NAME="$OS_NAME" \
     python3 - <<'PYEOF'
 import glob
@@ -190,6 +227,7 @@ home = os.environ["HYPHAE_HOME"]
 config_home = os.environ["HYPHAE_CONFIG_HOME"]
 state_home = os.environ["HYPHAE_STATE_HOME"]
 herdr_app_dir = os.environ["HYPHAE_HERDR_APP_DIR"]
+claude_config_dir = os.environ.get("HYPHAE_CLAUDE_CONFIG_DIR", "").strip()
 os_name = os.environ["HYPHAE_OS_NAME"]
 
 HYPHAE_HOOK_NAMES = {
@@ -367,7 +405,7 @@ def remove_nested_key(doc, parents, key):
 
 
 def atomic_write_text(path, text):
-    target = os.path.realpath(path) if os.path.islink(path) else path
+    target = os.path.realpath(path)
     parent = os.path.dirname(target) or "."
     orig_mode = stat.S_IMODE(os.stat(target).st_mode)
     fd, tmp_path = tempfile.mkstemp(prefix=".hyp-uninstall-", suffix=".tmp", dir=parent)
@@ -419,28 +457,42 @@ def process_statusline_in_doc(doc, harness, path):
     return True
 
 
+def canonical_key(p):
+    try:
+        if os.path.exists(p):
+            return os.path.realpath(p)
+    except OSError:
+        pass
+    return os.path.normpath(p)
+
+
 def dedup_paths(paths):
     seen = set()
     out = []
     for p in paths:
-        norm = os.path.normpath(p)
-        if norm not in seen:
-            seen.add(norm)
+        if not p:
+            continue
+        key = canonical_key(p)
+        if key not in seen:
+            seen.add(key)
             out.append(p)
     return out
 
 
-# 1. Claude Code ~/.claude/settings.json (statusLine FIRST, then hooks)
-claude_settings = os.path.join(home, ".claude", "settings.json")
-if os.path.isfile(claude_settings):
-    doc = load_json_object(claude_settings)
-    if doc is not None:
-        sl_changed = process_statusline_in_doc(doc, "claude", claude_settings)
-        hooks_removed = clean_hooks_object(doc)
-        if hooks_removed > 0:
-            emit("EDIT", claude_settings, f"remove {hooks_removed} Hyphae hook entry/entries")
-        if mode == "apply" and (sl_changed or hooks_removed > 0):
-            save_json_object(claude_settings, doc)
+# 1. Claude Code ~/.claude/settings.json (+ $CLAUDE_CONFIG_DIR/settings.json) (statusLine FIRST, then hooks)
+claude_settings_files = [os.path.join(home, ".claude", "settings.json")]
+if claude_config_dir:
+    claude_settings_files.append(os.path.join(claude_config_dir, "settings.json"))
+for claude_settings in dedup_paths(claude_settings_files):
+    if os.path.isfile(claude_settings):
+        doc = load_json_object(claude_settings)
+        if doc is not None:
+            sl_changed = process_statusline_in_doc(doc, "claude", claude_settings)
+            hooks_removed = clean_hooks_object(doc)
+            if hooks_removed > 0:
+                emit("EDIT", claude_settings, f"remove {hooks_removed} Hyphae hook entry/entries")
+            if mode == "apply" and (sl_changed or hooks_removed > 0):
+                save_json_object(claude_settings, doc)
 
 # 2. Antigravity CLI ~/.gemini/antigravity-cli/settings.json (statusLine FIRST)
 agy_settings = os.path.join(home, ".gemini", "antigravity-cli", "settings.json")
@@ -451,8 +503,10 @@ if os.path.isfile(agy_settings):
         if mode == "apply" and sl_changed:
             save_json_object(agy_settings, doc)
 
-# 3. Claude CLI ~/.claude.json + Claude Desktop claude_desktop_config.json
+# 3. Claude CLI ~/.claude.json (+ $CLAUDE_CONFIG_DIR/.claude.json) + Claude Desktop claude_desktop_config.json
 claude_mcp_files = [os.path.join(home, ".claude.json")]
+if claude_config_dir:
+    claude_mcp_files.append(os.path.join(claude_config_dir, ".claude.json"))
 if os_name == "Darwin":
     claude_mcp_files.append(
         os.path.join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json")
@@ -691,6 +745,7 @@ PYEOF
     HYPHAE_CONFIG_HOME="$CONFIG_HOME" \
     HYPHAE_STATE_HOME="$STATE_HOME" \
     HYPHAE_HERDR_APP_DIR="$HERDR_APP_DIR" \
+    HYPHAE_CLAUDE_CONFIG_DIR="$CLAUDE_PROFILE_DIR" \
     HYPHAE_OS_NAME="$OS_NAME" \
     node - <<'JSEOF'
 const crypto = require("crypto");
@@ -702,6 +757,7 @@ const home = process.env.HYPHAE_HOME;
 const configHome = process.env.HYPHAE_CONFIG_HOME;
 const stateHome = process.env.HYPHAE_STATE_HOME;
 const herdrAppDir = process.env.HYPHAE_HERDR_APP_DIR;
+const claudeConfigDir = (process.env.HYPHAE_CLAUDE_CONFIG_DIR || "").trim();
 const osName = process.env.HYPHAE_OS_NAME;
 
 const HYPHAE_HOOK_NAMES = new Set([
@@ -920,9 +976,7 @@ function removeNestedKey(doc, parents, key) {
 function atomicWriteText(targetPath, text) {
   let target = targetPath;
   try {
-    if (fs.lstatSync(targetPath).isSymbolicLink()) {
-      target = fs.realpathSync(targetPath);
-    }
+    target = fs.realpathSync(targetPath);
   } catch {}
   const origMode = fs.statSync(target).mode & 0o7777;
   const parent = path.dirname(target) || ".";
@@ -980,22 +1034,34 @@ function processStatuslineInDoc(doc, harness, p) {
   return true;
 }
 
+function canonicalKey(p) {
+  try {
+    if (fs.existsSync(p)) return fs.realpathSync(p);
+  } catch {}
+  return path.normalize(p);
+}
+
 function dedupPaths(list) {
   const seen = new Set();
   const out = [];
   for (const p of list) {
-    const norm = path.normalize(p);
-    if (!seen.has(norm)) {
-      seen.add(norm);
+    if (!p) continue;
+    const key = canonicalKey(p);
+    if (!seen.has(key)) {
+      seen.add(key);
       out.push(p);
     }
   }
   return out;
 }
 
-// 1. Claude Code ~/.claude/settings.json
-const claudeSettings = path.join(home, ".claude", "settings.json");
-if (isFile(claudeSettings)) {
+// 1. Claude Code ~/.claude/settings.json (+ $CLAUDE_CONFIG_DIR/settings.json)
+const claudeSettingsFiles = [path.join(home, ".claude", "settings.json")];
+if (claudeConfigDir) {
+  claudeSettingsFiles.push(path.join(claudeConfigDir, "settings.json"));
+}
+for (const claudeSettings of dedupPaths(claudeSettingsFiles)) {
+  if (!isFile(claudeSettings)) continue;
   const doc = loadJsonObject(claudeSettings);
   if (doc) {
     const slChanged = processStatuslineInDoc(doc, "claude", claudeSettings);
@@ -1019,8 +1085,11 @@ if (isFile(agySettings)) {
   }
 }
 
-// 3. Claude CLI & Claude Desktop MCP configs
+// 3. Claude CLI (+ $CLAUDE_CONFIG_DIR/.claude.json) & Claude Desktop MCP configs
 const claudeMcpFiles = [path.join(home, ".claude.json")];
+if (claudeConfigDir) {
+  claudeMcpFiles.push(path.join(claudeConfigDir, ".claude.json"));
+}
 if (osName === "Darwin") {
   claudeMcpFiles.push(
     path.join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json")
@@ -1345,11 +1414,33 @@ fi
 STANDALONE_HARNESS_PATHS=""
 SKILL_DIRS_TO_REMOVE=""
 if [ "$KEEP_HARNESSES" -eq 0 ]; then
+  # Clean Claude Code slash commands across ~/.claude/commands and optional $CLAUDE_CONFIG_DIR/commands,
+  # deduplicating canonical directories so symlinked command folders are never unlinked or scanned twice.
+  _seen_cmd_dirs=""
+  _claude_cmd_dirs="$HOME/.claude/commands"
+  if [ -n "$CLAUDE_PROFILE_DIR" ]; then
+    _claude_cmd_dirs="${_claude_cmd_dirs}
+${CLAUDE_PROFILE_DIR}/commands"
+  fi
+  while IFS= read -r _cmd_dir; do
+    [ -n "$_cmd_dir" ] || continue
+    [ -d "$_cmd_dir" ] || continue
+    _cmd_real="$(canonical_dir "$_cmd_dir" || printf '%s' "$_cmd_dir")"
+    if list_contains "$_seen_cmd_dirs" "$_cmd_real"; then
+      continue
+    fi
+    _seen_cmd_dirs="$(list_append_unique "$_seen_cmd_dirs" "$_cmd_real")"
+    for _cmd_name in hyphae.md hyphae-subs.md hyphae-focus.md hyphae-mute.md; do
+      _p="${_cmd_dir}/${_cmd_name}"
+      if [ -e "$_p" ] || [ -L "$_p" ]; then
+        STANDALONE_HARNESS_PATHS="$(list_append_unique "$STANDALONE_HARNESS_PATHS" "$_p")"
+      fi
+    done
+  done <<EOF
+$_claude_cmd_dirs
+EOF
+
   for _p in \
-    "$HOME/.claude/commands/hyphae.md" \
-    "$HOME/.claude/commands/hyphae-subs.md" \
-    "$HOME/.claude/commands/hyphae-focus.md" \
-    "$HOME/.claude/commands/hyphae-mute.md" \
     "$HOME/.gemini/config/plugins/hyphae" \
     "$CONFIG_HOME/opencode/plugins/hyphae.ts" \
     "$HOME/.config/opencode/plugins/hyphae.ts" \
@@ -1366,27 +1457,44 @@ if [ "$KEEP_HARNESSES" -eq 0 ]; then
     fi
   done
 
-  for _skill_root in \
-    "$HOME/.claude/skills" \
-    "$HOME/.codex/skills" \
-    "$HOME/.agents/skills" \
-    "$HOME/.gemini/config/skills" \
-    "$HOME/.gemini/skills" \
-    "$CONFIG_HOME/opencode/skills" \
-    "$HOME/.config/opencode/skills" \
-    "$HOME/.cursor/skills" \
-    "$HOME/.openclaw/skills" \
-    "$CONFIG_HOME/herdr/skills" \
-    "$HOME/.config/herdr/skills" \
-    "$HOME/.t3/skills"
-  do
+  # Clean installed Hyphae skill subdirectories across harness roots + optional $CLAUDE_CONFIG_DIR/skills.
+  # Deduplicate canonical parent dirs so symlinked roots (e.g. $CLAUDE_CONFIG_DIR/skills -> ~/.claude/skills)
+  # are never unlinked themselves and each hyphae* subdirectory is targeted once.
+  _seen_skill_roots=""
+  _skill_roots="$HOME/.claude/skills"
+  if [ -n "$CLAUDE_PROFILE_DIR" ]; then
+    _skill_roots="${_skill_roots}
+${CLAUDE_PROFILE_DIR}/skills"
+  fi
+  _skill_roots="${_skill_roots}
+$HOME/.codex/skills
+$HOME/.agents/skills
+$HOME/.gemini/config/skills
+$HOME/.gemini/skills
+$CONFIG_HOME/opencode/skills
+$HOME/.config/opencode/skills
+$HOME/.cursor/skills
+$HOME/.openclaw/skills
+$CONFIG_HOME/herdr/skills
+$HOME/.config/herdr/skills
+$HOME/.t3/skills"
+  while IFS= read -r _skill_root; do
+    [ -n "$_skill_root" ] || continue
+    [ -d "$_skill_root" ] || continue
+    _root_real="$(canonical_dir "$_skill_root" || printf '%s' "$_skill_root")"
+    if list_contains "$_seen_skill_roots" "$_root_real"; then
+      continue
+    fi
+    _seen_skill_roots="$(list_append_unique "$_seen_skill_roots" "$_root_real")"
     for _skill_name in hyphae hyphae-setup hyphae-schedule hyphae-panel; do
       _s="${_skill_root}/${_skill_name}"
       if [ -e "$_s" ] || [ -L "$_s" ]; then
         SKILL_DIRS_TO_REMOVE="$(list_append_unique "$SKILL_DIRS_TO_REMOVE" "$_s")"
       fi
     done
-  done
+  done <<EOF
+$_skill_roots
+EOF
 fi
 
 DIRS_TO_REMOVE=""
@@ -1481,7 +1589,11 @@ TOTAL=$((
   + C_BINS
 ))
 
-printf 'Hyphae uninstall plan (HOME=%s)\n' "$HOME"
+if [ -n "$CLAUDE_PROFILE_DIR" ]; then
+  printf 'Hyphae uninstall plan (HOME=%s, CLAUDE_CONFIG_DIR=%s)\n' "$HOME" "$CLAUDE_PROFILE_DIR"
+else
+  printf 'Hyphae uninstall plan (HOME=%s)\n' "$HOME"
+fi
 printf '==================================================\n'
 
 if [ "$TOTAL" -eq 0 ]; then
