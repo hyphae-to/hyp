@@ -17,6 +17,7 @@ use crate::ui::{
 };
 use crate::update::read_cached_update_status;
 use clap::Args;
+use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync};
 use hyp_node::engine::{
     DEFAULT_HYPHAE_VERSION, DropRelayConfig, LocalIngestConfig, NodeProfile,
 };
@@ -31,6 +32,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 #[derive(Args)]
 pub struct StatusArgs {
@@ -352,13 +354,13 @@ fn run_status_or_doctor(
         (None, None)
     };
 
-    // Daemon PID & local IPC socket status
+    // Daemon PID, local IPC socket status, and live binary version skew check (`daemon.status`).
     let pid_path = state_dir.join("node.pid");
     let running_pid: Option<u32> = fs::read_to_string(&pid_path)
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok());
     let status_path = state_dir.join("node.status.json");
-    let socket_path: Option<String> = fs::read_to_string(&status_path)
+    let mut socket_path: Option<String> = fs::read_to_string(&status_path)
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         .and_then(|v| {
@@ -377,6 +379,68 @@ fn run_status_or_doctor(
                 "daemon.socket",
                 format!("Recorded local IPC socket missing: {sock}"),
                 Some("Restart `hyp node start` to recreate the local IPC socket.".to_string()),
+            ));
+        }
+    }
+
+    let probe_socket_candidate: Option<PathBuf> = socket_path
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+        .or_else(|| {
+            let default_sock = state_dir.join(DEFAULT_SOCKET_FILENAME);
+            if default_sock.exists() {
+                Some(default_sock)
+            } else {
+                None
+            }
+        });
+
+    let mut daemon_binary_version: Option<String> = None;
+    let mut daemon_pid: Option<u64> = None;
+    if let Some(ref probe_sock) = probe_socket_candidate {
+        let resp = daemon_rpc_sync(
+            probe_sock,
+            &json!({ "type": "daemon.status" }),
+            Duration::from_millis(500),
+        );
+        if resp.ok {
+            if socket_path.is_none() {
+                socket_path = Some(probe_sock.display().to_string());
+                checks.push(CliCheck::ok(
+                    "daemon.socket",
+                    format!("Local IPC ready at {}", probe_sock.display()),
+                ));
+            }
+            if let Some(ref res) = resp.result {
+                daemon_binary_version = res
+                    .get("binaryVersion")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToOwned::to_owned);
+                daemon_pid = res
+                    .get("pid")
+                    .and_then(Value::as_u64)
+                    .or_else(|| running_pid.map(u64::from));
+            }
+        }
+    }
+
+    if let Some(ref daemon_ver) = daemon_binary_version {
+        let cli_ver = env!("CARGO_PKG_VERSION");
+        if daemon_ver != cli_ver {
+            checks.push(CliCheck::warn(
+                "DAEMON_VERSION_SKEW",
+                format!(
+                    "Running daemon binaryVersion ({daemon_ver}) differs from CLI binaryVersion ({cli_ver}); restart the daemon to activate the updated binary."
+                ),
+                Some("hyp service restart --json".to_string()),
+            ));
+        } else {
+            checks.push(CliCheck::ok(
+                "daemon.version",
+                format!("Running daemon binaryVersion matches CLI ({daemon_ver})"),
             ));
         }
     }
@@ -783,6 +847,8 @@ fn run_status_or_doctor(
             "profile": profile_as_str(profile),
             "version": DEFAULT_HYPHAE_VERSION,
             "binaryVersion": env!("CARGO_PKG_VERSION"),
+            "daemonBinaryVersion": daemon_binary_version,
+            "daemonPid": daemon_pid,
             "protocol": PROTOCOL_VERSION,
             "kid": kid,
             "fingerprint": fingerprint,
@@ -854,6 +920,19 @@ fn run_status_or_doctor(
         }
         if let Some(ref sock) = socket_path {
             println!("  Local IPC: {sock}");
+        }
+        if daemon_binary_version.is_some() || daemon_pid.is_some() {
+            let pid_str = daemon_pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let ver_str = daemon_binary_version.as_deref().unwrap_or("-");
+            let skew_note = match daemon_binary_version.as_deref() {
+                Some(v) if v != env!("CARGO_PKG_VERSION") => {
+                    format!(" [WARN: skew vs CLI {}]", env!("CARGO_PKG_VERSION"))
+                }
+                _ => String::new(),
+            };
+            println!("  Daemon:   pid={pid_str}, bin={ver_str}{skew_note}");
         }
         if let Some(v) = storage_status.schema_version {
             println!(

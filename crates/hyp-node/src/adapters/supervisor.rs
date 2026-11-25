@@ -73,8 +73,13 @@ pub enum HelloMode {
     LegacyV1,
 }
 
+/// Per-spawn environment resolver invoked before every child spawn/respawn to freshly resolve
+/// dynamic values (such as `{ "secret": "<name>" }` references from `SecretStore`).
+pub type EnvResolver =
+    Arc<dyn Fn() -> Result<BTreeMap<String, String>, String> + Send + Sync>;
+
 /// Configuration for a supervised fd-3 subprocess adapter.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SubprocessConfig {
     pub id: String,
     pub kind: AdapterKind,
@@ -85,6 +90,10 @@ pub struct SubprocessConfig {
     pub targets: Vec<String>,
     /// Explicit plugin configuration environment variables (merged on top of the safe allowlist).
     pub env: BTreeMap<String, String>,
+    /// Optional per-spawn dynamic environment resolver (re-invoked on every spawn & respawn,
+    /// e.g. to freshly load `{ "secret": "<name>" }` references from `SecretStore` and refresh
+    /// stderr redaction needles).
+    pub env_resolver: Option<EnvResolver>,
     /// Protocol negotiation mode (`Auto` supports both JSON-RPC 2.0 v2 and legacy v1).
     pub hello_mode: HelloMode,
     /// Grace window in `HelloMode::Auto` before sending a legacy v1 hello to silent children.
@@ -109,6 +118,32 @@ pub struct SubprocessConfig {
     pub rapid_crash_window: Duration,
     /// Number of consecutive rapid crashes that trips the circuit breaker into `CrashLoopBackOff` (default: 5; `0` disables).
     pub max_rapid_crashes: u32,
+}
+
+impl std::fmt::Debug for SubprocessConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubprocessConfig")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("exec", &self.exec)
+            .field("args", &self.args)
+            .field("cwd", &self.cwd)
+            .field("targets", &self.targets)
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .field("has_env_resolver", &self.env_resolver.is_some())
+            .field("hello_mode", &self.hello_mode)
+            .field("auto_hello_grace", &self.auto_hello_grace)
+            .field("initial_backoff", &self.initial_backoff)
+            .field("max_backoff", &self.max_backoff)
+            .field("reset_after", &self.reset_after)
+            .field("kill_timeout", &self.kill_timeout)
+            .field("stderr_log_path", &self.stderr_log_path)
+            .field("max_stderr_log_bytes", &self.max_stderr_log_bytes)
+            .field("redacted_values_count", &self.redacted_values.len())
+            .field("rapid_crash_window", &self.rapid_crash_window)
+            .field("max_rapid_crashes", &self.max_rapid_crashes)
+            .finish()
+    }
 }
 
 /// Default bounded per-plugin stderr log file size (1 MiB).
@@ -146,6 +181,7 @@ impl SubprocessConfig {
             cwd: None,
             targets,
             env: BTreeMap::new(),
+            env_resolver: None,
             hello_mode: HelloMode::Auto,
             auto_hello_grace: Duration::from_millis(50),
             initial_backoff: Duration::from_secs(1),
@@ -168,13 +204,23 @@ pub fn build_isolated_env(
     config: &SubprocessConfig,
     parent_env: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
+    build_isolated_env_with(config, parent_env, &config.env)
+}
+
+/// Same as [`build_isolated_env`], using an explicit resolved plugin environment map (e.g. after
+/// running `config.env_resolver` on spawn/respawn).
+pub fn build_isolated_env_with(
+    config: &SubprocessConfig,
+    parent_env: &BTreeMap<String, String>,
+    plugin_env: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     for &key in ALLOWED_PARENT_ENV {
         if let Some(val) = parent_env.get(key) {
             env.insert(key.to_string(), val.clone());
         }
     }
-    for (k, v) in &config.env {
+    for (k, v) in plugin_env {
         env.insert(k.clone(), v.clone());
     }
     env.insert("HYPHAE_FD".to_string(), "3".to_string());
@@ -561,7 +607,7 @@ mod unix_runtime {
 
     use super::{
         ActiveConnection, HelloMode, PROTO_JSONRPC_V2, PROTO_LEGACY_V1, PROTO_UNKNOWN, PendingMap,
-        SubprocessConfig, SupervisorInner, build_isolated_env, is_secret_like_env_key,
+        SubprocessConfig, SupervisorInner, build_isolated_env_with, is_secret_like_env_key,
     };
 
     const MAX_OUTPUT_LINE_BYTES: usize = 2 * 1024;
@@ -571,15 +617,19 @@ mod unix_runtime {
     const MAX_RUN_STDERR_TAIL: usize = 4;
     const MAX_STDERR_SUMMARY_CHARS: usize = 400;
 
-    fn collect_redacted_secrets(config: &SubprocessConfig) -> Vec<String> {
+    fn collect_redacted_secrets(
+        config: &SubprocessConfig,
+        active_env: &std::collections::BTreeMap<String, String>,
+        extra_redacted: &[String],
+    ) -> Vec<String> {
         let mut secrets: Vec<String> = Vec::new();
-        for val in &config.redacted_values {
+        for val in config.redacted_values.iter().chain(extra_redacted.iter()) {
             let trimmed = val.trim();
             if trimmed.len() >= 4 && !secrets.iter().any(|s| s == trimmed) {
                 secrets.push(trimmed.to_string());
             }
         }
-        for (k, v) in &config.env {
+        for (k, v) in active_env {
             if is_secret_like_env_key(k) {
                 let trimmed = v.trim();
                 if trimmed.len() >= 4 && !secrets.iter().any(|s| s == trimmed) {
@@ -712,7 +762,10 @@ mod unix_runtime {
         fn kill(pid: i32, sig: i32) -> i32;
     }
 
-    fn spawn_with_fd3(config: &SubprocessConfig) -> std::io::Result<(Child, TokioUnixStream)> {
+    fn spawn_with_fd3(
+        config: &SubprocessConfig,
+        plugin_env: &std::collections::BTreeMap<String, String>,
+    ) -> std::io::Result<(Child, TokioUnixStream)> {
         let (parent_sock, child_sock) = StdUnixStream::pair()?;
         parent_sock.set_nonblocking(true)?;
         child_sock.set_nonblocking(false)?;
@@ -721,7 +774,7 @@ mod unix_runtime {
             .parent_env_override
             .clone()
             .unwrap_or_else(|| std::env::vars().collect());
-        let env = build_isolated_env(config, &parent_env);
+        let env = build_isolated_env_with(config, &parent_env, plugin_env);
 
         let mut cmd = Command::new(&config.exec);
         cmd.args(&config.args)
@@ -785,12 +838,38 @@ mod unix_runtime {
         mut first_ready: Option<Arc<Notify>>,
     ) {
         let mut backoff = inner.config.initial_backoff;
-        let redacted_secrets = Arc::new(collect_redacted_secrets(&inner.config));
         let mut consecutive_rapid_crashes: u32 = 0;
 
         while inner.stopping.load(Ordering::Acquire) == 0 {
             let started_at = Instant::now();
-            let spawned = spawn_with_fd3(&inner.config);
+            let mut spawn_env = inner.config.env.clone();
+            let mut extra_redacted: Vec<String> = Vec::new();
+            let mut resolve_error: Option<String> = None;
+
+            if let Some(ref resolver) = inner.config.env_resolver {
+                match resolver() {
+                    Ok(resolved) => {
+                        for (k, v) in resolved {
+                            extra_redacted.push(v.clone());
+                            spawn_env.insert(k, v);
+                        }
+                    }
+                    Err(e) => {
+                        resolve_error = Some(e);
+                    }
+                }
+            }
+
+            let redacted_secrets = Arc::new(collect_redacted_secrets(
+                &inner.config,
+                &spawn_env,
+                &extra_redacted,
+            ));
+
+            let spawned = match resolve_error {
+                Some(err) => Err(std::io::Error::other(format!("secret env resolution failed: {err}"))),
+                None => spawn_with_fd3(&inner.config, &spawn_env),
+            };
 
             let (mut child, stream) = match spawned {
                 Ok(pair) => pair,

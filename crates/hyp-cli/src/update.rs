@@ -172,6 +172,10 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub no_plugins: bool,
 
+    /// Skip automatic restart of an installed background daemon service after binary swap
+    #[arg(long)]
+    pub no_restart: bool,
+
     /// Output structured JSON envelope
     #[arg(long)]
     pub json: bool,
@@ -1192,6 +1196,15 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
         &mut next,
     );
 
+    // 6. Auto-restart managed background daemon service unless `--no-restart` or `HYPHAE_NO_SERVICE_RESTART=1`.
+    let service_restart = run_post_upgrade_service_restart(
+        args.state_dir.as_deref(),
+        args.no_restart,
+        &mut warnings,
+        &mut next,
+    );
+    let service_restarted = service_restart.restarted;
+
     let remote_failed = fleet_plan
         .iter()
         .any(|p| p.outcome.as_deref().is_some_and(|o| o.starts_with("FAILED")));
@@ -1220,6 +1233,8 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
                 "smokeCheckPassed": true,
                 "smokeVersion": swap_res.smoke_version,
                 "pluginsSync": plugins_sync,
+                "serviceRestarted": service_restarted,
+                "serviceRestart": service_restart,
                 "fleetAll": args.all,
                 "fleetPlan": fleet_plan,
                 "rolloutOrder": rollout_order,
@@ -1253,6 +1268,7 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
         if let Some(summary_str) = plugins_sync.get("summary").and_then(Value::as_str) {
             println!("      Plugins: {summary_str}");
         }
+        println!("      Service: {}", service_restart.detail);
         if args.all {
             print_fleet_table(&fleet_plan);
         }
@@ -1265,6 +1281,61 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
     } else {
         ExitCode::from(EXIT_ERROR)
     }
+}
+
+fn env_disables_service_restart() -> bool {
+    std::env::var("HYPHAE_NO_SERVICE_RESTART")
+        .ok()
+        .is_some_and(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+}
+
+fn run_post_upgrade_service_restart(
+    state_dir_arg: Option<&Path>,
+    no_restart: bool,
+    warnings: &mut Vec<String>,
+    next: &mut Vec<String>,
+) -> crate::service::ServiceRestartOutcome {
+    let restart_cmd = "hyp service restart --json".to_string();
+    if no_restart || env_disables_service_restart() {
+        let reason = if no_restart {
+            "no_restart_flag"
+        } else {
+            "env_disabled"
+        };
+        if !next.contains(&restart_cmd) {
+            next.push(restart_cmd);
+        }
+        return crate::service::ServiceRestartOutcome {
+            attempted: false,
+            installed: false,
+            restarted: false,
+            skipped: true,
+            skip_reason: Some(reason.to_string()),
+            error: None,
+            detail: format!("skipped ({reason})"),
+        };
+    }
+
+    let outcome = crate::service::restart_if_installed(None, state_dir_arg);
+    if let Some(ref err) = outcome.error {
+        warnings.push(format!(
+            "Binary updated, but automatic background service restart failed ({err}); run `hyp service restart --json`."
+        ));
+        if !next.contains(&restart_cmd) {
+            next.push(restart_cmd);
+        }
+    } else if outcome.skipped {
+        warnings.push(outcome.detail.clone());
+        if !next.contains(&restart_cmd) {
+            next.push(restart_cmd);
+        }
+    }
+    outcome
 }
 
 /// Invokes `<new_hyp> plugin update --all --json` after a successful binary swap so installed
@@ -2085,7 +2156,8 @@ mod tests {
 
         // Tampered signature -> fail closed
         let mut bad_sig = signed.clone();
-        bad_sig.sig = format!("A{}", &signed.sig[1..]);
+        let replacement = if signed.sig.starts_with('A') { 'B' } else { 'A' };
+        bad_sig.sig = format!("{replacement}{}", &signed.sig[1..]);
         assert!(
             verify_release_manifest(
                 &bad_sig,

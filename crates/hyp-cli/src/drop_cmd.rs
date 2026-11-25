@@ -16,6 +16,7 @@ use crate::config_file::{
 };
 use crate::ui::{
     EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
+    print_warnings,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -57,6 +58,7 @@ const MAX_RELAY_JSON_BYTES: usize = 64 * 1024;
 const MAX_DROP_TTL_SECS: u64 = 900;
 const RELAY_HTTP_TIMEOUT_SECS: u64 = 15;
 const RELAY_PROBE_TIMEOUT_SECS: u64 = 4;
+const DROP_WAIT_BACKOFF_MS: &[u64] = &[500, 1_000, 2_000, 5_000];
 
 #[derive(Subcommand)]
 pub enum DropCommand {
@@ -1210,7 +1212,7 @@ fn run_drop_wait(
         overwrite,
         timeout_secs,
     )) {
-        Ok((ingested, ack_resp)) => {
+        Ok((ingested, ack_resp, warnings)) => {
             if used_saved_last {
                 let _ = std::fs::remove_file(&last_drop_path);
             }
@@ -1221,6 +1223,7 @@ fn run_drop_wait(
                 Some(&relay_url),
                 Some(&effective_drop_id),
                 ack_resp.as_ref(),
+                warnings,
             )
         }
         Err(e) => emit_error(cmd, as_json, EXIT_ERROR, "DROP_WAIT_FAILED", e, None),
@@ -1235,96 +1238,211 @@ async fn wait_and_ingest_drop(
     gate: Option<&SecurityGatePipeline>,
     overwrite: bool,
     timeout_secs: u64,
-) -> Result<(IngestedHumanDrop, Option<AckDropResponse>), String> {
+) -> Result<(IngestedHumanDrop, Option<AckDropResponse>, Vec<String>), String> {
     let client = build_http_client::<Full<Bytes>>()?;
     let encoded_id = percent_encode(drop_id);
     let stream_path = format!("/v1/drops/{encoded_id}/stream");
     let stream_url = format!("{relay_base}{stream_path}");
 
-    let mut req_builder = Request::builder()
-        .method(Method::GET)
-        .uri(&stream_url)
-        .header(header::ACCEPT, "text/event-stream");
-    if let Some(cap) = sub_cap {
-        req_builder = req_builder.header(DROP_CAP_HEADER, cap);
-    } else {
-        let auth = build_ed25519_auth_header(
-            node.node_id().as_str(),
-            node.identity(),
-            "GET",
-            &stream_path,
-            b"",
-        )?;
-        req_builder = req_builder
-            .header(header::AUTHORIZATION, auth)
-            .header("x-hyphae-node", node.node_id().as_str())
-            .header("X-Hyphae-Public-Key", node.identity().signing_jwk().x);
-    }
-    let req = req_builder
-        .body(Full::new(Bytes::new()))
-        .map_err(|e| format!("failed to build SSE stream request: {e}"))?;
-
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs.max(1));
-    let resp = tokio::time::timeout_at(deadline, client.request(req))
-        .await
-        .map_err(|_| format!("timed out waiting for Drop Relay connection ({timeout_secs}s)"))?
-        .map_err(|e| format!("GET {stream_url} failed: {e}"))?;
+    let mut last_event_id: Option<String> = None;
+    let mut backoff_idx: usize = 0;
+    let mut warnings: Vec<String> = Vec::new();
+    let mut accepted: Option<(u64, IngestedHumanDrop)> = None;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err_bytes = collect_bounded_body(resp.into_body(), MAX_RELAY_JSON_BYTES)
-            .await
-            .unwrap_or_default();
-        return Err(format!(
-            "Drop Relay SSE stream returned HTTP {}: {}",
-            status.as_u16(),
-            String::from_utf8_lossy(&err_bytes).trim()
-        ));
-    }
-
-    let mut body = resp.into_body();
-    let mut parser = SseParser::new();
-
-    let mut received: Option<(u64, HumanDropEnvelopeV1)> = None;
-    while received.is_none() {
-        let frame_res = tokio::time::timeout_at(deadline, body.frame())
-            .await
-            .map_err(|_| format!("timed out after {timeout_secs}s waiting for drop '{drop_id}'"))?;
-        let Some(frame_res) = frame_res else {
+    while accepted.is_none() {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
             return Err(format!(
-                "Drop Relay SSE stream for '{drop_id}' closed before a drop arrived"
+                "timed out after {timeout_secs}s waiting for drop '{drop_id}'"
             ));
+        }
+
+        let mut req_builder = Request::builder()
+            .method(Method::GET)
+            .uri(&stream_url)
+            .header(header::ACCEPT, "text/event-stream");
+        if let Some(ref cursor) = last_event_id {
+            req_builder = req_builder.header("Last-Event-ID", cursor.as_str());
+        }
+        if let Some(cap) = sub_cap {
+            req_builder = req_builder.header(DROP_CAP_HEADER, cap);
+        } else {
+            let auth = build_ed25519_auth_header(
+                node.node_id().as_str(),
+                node.identity(),
+                "GET",
+                &stream_path,
+                b"",
+            )?;
+            req_builder = req_builder
+                .header(header::AUTHORIZATION, auth)
+                .header("x-hyphae-node", node.node_id().as_str())
+                .header("X-Hyphae-Public-Key", node.identity().signing_jwk().x);
+        }
+        let req = req_builder
+            .body(Full::new(Bytes::new()))
+            .map_err(|e| format!("failed to build SSE stream request: {e}"))?;
+
+        let resp = match tokio::time::timeout_at(deadline, client.request(req)).await {
+            Err(_) => {
+                return Err(format!(
+                    "timed out after {timeout_secs}s waiting for drop '{drop_id}'"
+                ));
+            }
+            Ok(Err(_transport_err)) => {
+                let delay = Duration::from_millis(
+                    DROP_WAIT_BACKOFF_MS[backoff_idx.min(DROP_WAIT_BACKOFF_MS.len() - 1)],
+                );
+                backoff_idx = backoff_idx.saturating_add(1);
+                let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if rem.is_zero() {
+                    return Err(format!(
+                        "timed out after {timeout_secs}s waiting for drop '{drop_id}'"
+                    ));
+                }
+                tokio::time::sleep(delay.min(rem)).await;
+                continue;
+            }
+            Ok(Ok(resp)) => resp,
         };
-        let frame = frame_res.map_err(|e| format!("SSE stream read error: {e}"))?;
-        if let Some(data) = frame.data_ref() {
-            for ev in parser.feed(data) {
-                if ev.event.as_deref() == Some("drop") {
-                    let seq = ev
-                        .id
-                        .as_deref()
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(1);
-                    let trimmed = ev.data.trim();
-                    let env: HumanDropEnvelopeV1 = if trimmed.starts_with("hdrop1_") {
-                        decode_hdrop1(trimmed)
-                            .map_err(|e| format!("invalid hdrop1_ in SSE event: {e}"))?
-                    } else {
-                        serde_json::from_str(trimmed).map_err(|e| {
-                            format!("invalid HumanDropEnvelopeV1 JSON in SSE event: {e}")
-                        })?
-                    };
-                    received = Some((seq, env));
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_bytes = collect_bounded_body(resp.into_body(), MAX_RELAY_JSON_BYTES)
+                .await
+                .unwrap_or_default();
+            // Terminal client/slot errors (400/401/403/404/410) fail closed immediately;
+            // transient server/rate-limit errors (429/5xx) reconnect with bounded backoff.
+            if status.is_client_error() && status.as_u16() != 429 {
+                return Err(format!(
+                    "Drop Relay SSE stream returned HTTP {}: {}",
+                    status.as_u16(),
+                    String::from_utf8_lossy(&err_bytes).trim()
+                ));
+            }
+            let delay = Duration::from_millis(
+                DROP_WAIT_BACKOFF_MS[backoff_idx.min(DROP_WAIT_BACKOFF_MS.len() - 1)],
+            );
+            backoff_idx = backoff_idx.saturating_add(1);
+            let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if rem.is_zero() {
+                return Err(format!(
+                    "timed out after {timeout_secs}s waiting for drop '{drop_id}'"
+                ));
+            }
+            tokio::time::sleep(delay.min(rem)).await;
+            continue;
+        }
+
+        let mut body = resp.into_body();
+        let mut parser = SseParser::new();
+        let mut received_any_event = false;
+
+        loop {
+            let frame_res = match tokio::time::timeout_at(deadline, body.frame()).await {
+                Err(_) => {
+                    return Err(format!(
+                        "timed out after {timeout_secs}s waiting for drop '{drop_id}'"
+                    ));
+                }
+                Ok(res) => res,
+            };
+            let Some(frame_res) = frame_res else {
+                // Stream closed cleanly before a valid drop arrived -> reconnect with backoff.
+                break;
+            };
+            let Ok(frame) = frame_res else {
+                // Mid-stream transport error -> reconnect with backoff & Last-Event-ID.
+                break;
+            };
+            if let Some(data) = frame.data_ref() {
+                for ev in parser.feed(data) {
+                    received_any_event = true;
+                    if let Some(ref ev_id) = ev.id {
+                        let trimmed_id = ev_id.trim();
+                        if !trimmed_id.is_empty() {
+                            last_event_id = Some(trimmed_id.to_string());
+                        }
+                    } else if let Some(parsed_id) = parser.last_event_id() {
+                        let trimmed_id = parsed_id.trim();
+                        if !trimmed_id.is_empty() {
+                            last_event_id = Some(trimmed_id.to_string());
+                        }
+                    }
+
+                    if ev.event.as_deref() == Some("drop") {
+                        let seq = ev
+                            .id
+                            .as_deref()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(1);
+                        let trimmed = ev.data.trim();
+                        let decoded_env: Result<HumanDropEnvelopeV1, String> =
+                            if trimmed.starts_with("hdrop1_") {
+                                decode_hdrop1(trimmed)
+                                    .map_err(|e| format!("invalid hdrop1_ in SSE event: {e}"))
+                            } else {
+                                serde_json::from_str(trimmed).map_err(|e| {
+                                    format!("invalid HumanDropEnvelopeV1 JSON in SSE event: {e}")
+                                })
+                            };
+
+                        let envelope = match decoded_env {
+                            Ok(env) => env,
+                            Err(err) => {
+                                let msg = format!(
+                                    "Ignored invalid drop item (seq={seq}) in slot '{drop_id}': {err}"
+                                );
+                                eprintln!("WARN  {msg}");
+                                warnings.push(msg);
+                                continue;
+                            }
+                        };
+
+                        match node.ingest_human_drop(&envelope, gate, overwrite).await {
+                            Ok(ingested) => {
+                                accepted = Some((seq, ingested));
+                                break;
+                            }
+                            Err(err) => {
+                                let msg = format!(
+                                    "Ignored unverified drop item (seq={seq}) in slot '{drop_id}': {err}"
+                                );
+                                eprintln!("WARN  {msg}");
+                                warnings.push(msg);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                if accepted.is_some() {
                     break;
                 }
             }
         }
+
+        if accepted.is_some() {
+            break;
+        }
+
+        if received_any_event {
+            backoff_idx = 0;
+        }
+        let delay = Duration::from_millis(
+            DROP_WAIT_BACKOFF_MS[backoff_idx.min(DROP_WAIT_BACKOFF_MS.len() - 1)],
+        );
+        backoff_idx = backoff_idx.saturating_add(1);
+        let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if rem.is_zero() {
+            return Err(format!(
+                "timed out after {timeout_secs}s waiting for drop '{drop_id}'"
+            ));
+        }
+        tokio::time::sleep(delay.min(rem)).await;
     }
 
-    let (seq, envelope) = received.ok_or_else(|| "no drop received".to_string())?;
-    let ingested = node
-        .ingest_human_drop(&envelope, gate, overwrite)
-        .await
-        .map_err(|e| format!("failed to ingest drop '{drop_id}': {e}"))?;
+    let (seq, ingested) = accepted.ok_or_else(|| "no valid drop received".to_string())?;
 
     // Burn drop ciphertext from Drop Relay RAM immediately after verified ingestion.
     let ack_path = format!("/v1/drops/{encoded_id}/ack");
@@ -1369,7 +1487,7 @@ async fn wait_and_ingest_drop(
         None
     };
 
-    Ok((ingested, ack_resp))
+    Ok((ingested, ack_resp, warnings))
 }
 
 fn run_drop_ingest(
@@ -1445,7 +1563,7 @@ fn run_drop_ingest(
     };
 
     match rt.block_on(node.ingest_human_drop_token(&token, gate.as_ref(), overwrite)) {
-        Ok(ingested) => emit_ingested_drop_ok(cmd, as_json, &ingested, None, None, None),
+        Ok(ingested) => emit_ingested_drop_ok(cmd, as_json, &ingested, None, None, None, Vec::new()),
         Err(e) => emit_error(cmd, as_json, EXIT_ERROR, "DROP_INGEST_FAILED", e.to_string(), None),
     }
 }
@@ -1457,6 +1575,7 @@ fn emit_ingested_drop_ok(
     relay_url: Option<&str>,
     drop_id: Option<&str>,
     ack: Option<&AckDropResponse>,
+    warnings: Vec<String>,
 ) -> ExitCode {
     // SECURITY: NEVER print secret values — only metadata!
     let summary = if let Some(ref sec_name) = ingested.secret_name {
@@ -1492,7 +1611,7 @@ fn emit_ingested_drop_ok(
                 "dropId": drop_id,
                 "relayAck": ack,
             })),
-            warnings: Vec::new(),
+            warnings,
             next: Vec::new(),
             error: None,
         };
@@ -1509,6 +1628,7 @@ fn emit_ingested_drop_ok(
         if let Some(seq) = ingested.audit_seq {
             println!("      Audit Seq: #{seq}");
         }
+        print_warnings(&warnings);
     }
     ExitCode::from(EXIT_OK)
 }
@@ -1554,7 +1674,12 @@ fn run_relay_set(
         return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
     }
 
+    let warnings = vec![
+        "If a Hyphae daemon is running, restart it (`hyp service restart --json`) so it picks up the updated dropRelayUrl."
+            .to_string(),
+    ];
     let next = vec![
+        "hyp service restart --json".to_string(),
         format!("hyp relay status --config {}", config_path.display()),
         format!(
             "hyp drop create --kind directive --config {}",
@@ -1575,7 +1700,7 @@ fn run_relay_set(
                 "configPath": config_path.display().to_string(),
                 "stateDir": state_dir.display().to_string(),
             })),
-            warnings: Vec::new(),
+            warnings,
             next,
             error: None,
         };
@@ -1585,6 +1710,7 @@ fn run_relay_set(
             "OK    Set dropRelayUrl = {normalized} in {}",
             config_path.display()
         );
+        print_warnings(&warnings);
         print_next_steps(&next);
     }
     ExitCode::from(EXIT_OK)
