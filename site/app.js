@@ -2995,3 +2995,98 @@ document.getElementById("qsCopyBtn")?.addEventListener("click", (e) => {
   setTimeout(() => { btn.textContent = "Copy"; }, 1300);
 });
 renderQs();
+
+// ============================================================================
+// 6. SECURITY SECTION: Unified Flow Dynamic Tendrils (always-lit)
+// ============================================================================
+(function initSecurityUnified() {
+  const board = document.getElementById("secUnifiedBoard");
+  const wiresSvg = document.getElementById("secUniWires");
+  if (!board || !wiresSvg) return;
+
+  const TONES = { e2ee: "olive", passkey: "moss", sign: "amber", gate: "coral" };
+
+  function drawUnifiedWires() {
+    if (window.innerWidth <= 1080) {
+      wiresSvg.innerHTML = "";
+      return;
+    }
+    const bRect = board.getBoundingClientRect();
+    if (bRect.width <= 0 || bRect.height <= 0) return;
+    wiresSvg.setAttribute("viewBox", `0 0 ${bRect.width.toFixed(1)} ${bRect.height.toFixed(1)}`);
+
+    const pairs = [
+      { key: "e2ee", side: "left" },
+      { key: "gate", side: "left" },
+      { key: "sign", side: "right" },
+      { key: "passkey", side: "right" },
+    ];
+
+    const parts = [];
+    pairs.forEach(({ key, side }, idx) => {
+      const card = board.querySelector(`.sec-uni-card[data-sec="${key}"]`);
+      const port = card?.querySelector(".sec-uni-port");
+      const lens = board.querySelector(`.sec-lens[data-sec="${key}"]`);
+      if (!card || !lens) return;
+      const cRect = card.getBoundingClientRect();
+      const pRect = port ? port.getBoundingClientRect() : null;
+      const lRect = lens.getBoundingClientRect();
+
+      const x1 = pRect
+        ? pRect.left + pRect.width * 0.5 - bRect.left
+        : (side === "left" ? cRect.right : cRect.left) - bRect.left;
+      const y1 = pRect
+        ? pRect.top + pRect.height * 0.5 - bRect.top
+        : cRect.top + cRect.height * 0.5 - bRect.top;
+
+      const lcx = lRect.left + lRect.width * 0.5 - bRect.left;
+      const lcy = lRect.top + lRect.height * 0.5 - bRect.top;
+      const lrx = lRect.width * 0.5;
+      const lry = lRect.height * 0.5;
+
+      let x2, y2, dMain, dWeave;
+      if (key === "e2ee") {
+        // Arch cleanly UP over the Peer Node's vacuum tubes onto the 10:30 o'clock rim of Lens 1 (Blind Hub)
+        const angle = -2.42; // ~-139 deg (upper-left shoulder of Blind Hub lens)
+        x2 = lcx + Math.cos(angle) * lrx;
+        y2 = lcy + Math.sin(angle) * lry;
+        const dx = x2 - x1;
+        const archTop = Math.min(y1, y2) - 48;
+        const c1x = x1 + dx * 0.32;
+        const c2x = x1 + dx * 0.72;
+        dMain = `M ${x1.toFixed(1)} ${y1.toFixed(1)} C ${c1x.toFixed(1)} ${archTop.toFixed(1)}, ${c2x.toFixed(1)} ${(archTop - 8).toFixed(1)}, ${x2.toFixed(1)} ${y2.toFixed(1)}`;
+        dWeave = `M ${x1.toFixed(1)} ${(y1 + 2.5).toFixed(1)} C ${c1x.toFixed(1)} ${(archTop + 8).toFixed(1)}, ${c2x.toFixed(1)} ${(archTop - 14).toFixed(1)}, ${x2.toFixed(1)} ${y2.toFixed(1)}`;
+      } else {
+        const angle = Math.atan2(y1 - lcy, x1 - lcx);
+        x2 = lcx + Math.cos(angle) * lrx;
+        y2 = lcy + Math.sin(angle) * lry;
+        const dx = x2 - x1;
+        const c1x = x1 + dx * 0.44;
+        const c2x = x1 + dx * 0.68;
+        const wave = idx % 2 === 0 ? -12 : 12;
+        dMain = `M ${x1.toFixed(1)} ${y1.toFixed(1)} C ${c1x.toFixed(1)} ${(y1 + wave * 0.4).toFixed(1)}, ${c2x.toFixed(1)} ${(y2 - wave * 0.4).toFixed(1)}, ${x2.toFixed(1)} ${y2.toFixed(1)}`;
+        dWeave = `M ${x1.toFixed(1)} ${(y1 + 2.5).toFixed(1)} C ${c1x.toFixed(1)} ${(y1 - wave * 0.5).toFixed(1)}, ${c2x.toFixed(1)} ${(y2 + wave * 0.5).toFixed(1)}, ${x2.toFixed(1)} ${y2.toFixed(1)}`;
+      }
+
+      const tone = TONES[key] || "olive";
+      const delay = (-idx * 1.1).toFixed(1);
+
+      parts.push(
+        `<g class="sec-uni-wire-group tone-${tone}" data-sec="${key}">` +
+          `<path class="sec-uni-wire-weave" d="${dWeave}" />` +
+          `<path class="sec-uni-wire-base" d="${dMain}" />` +
+          `<path class="sec-uni-wire-pulse" pathLength="100" style="animation-delay:${delay}s" d="${dMain}" />` +
+          `<circle class="sec-uni-wire-dot" cx="${x2.toFixed(1)}" cy="${y2.toFixed(1)}" r="3.4" />` +
+        `</g>`
+      );
+    });
+    wiresSvg.innerHTML = parts.join("");
+  }
+
+  if (typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(drawUnifiedWires).observe(board);
+  }
+  window.addEventListener("resize", drawUnifiedWires, { passive: true });
+  window.addEventListener("load", drawUnifiedWires, { passive: true });
+  requestAnimationFrame(drawUnifiedWires);
+})();
