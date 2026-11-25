@@ -15,8 +15,9 @@ use crate::config_file::{
     load_node_or_legacy_config, resolve_config_path_for_read, write_atomic_file,
 };
 use crate::setup::{
-    HarnessDiagnostic, OnboardArgs, canonical_dedup_key, default_node_id, detect_harness_statuses,
-    resolve_claude_profiles,
+    HarnessDiagnostic, OnboardArgs, OpenClawDeliveryMode, apply_openclaw_config,
+    canonical_dedup_key, default_node_id, detect_harness_statuses,
+    read_openclaw_hyphae_preferences, resolve_claude_profiles,
 };
 use crate::ui::{
     EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
@@ -430,6 +431,9 @@ impl ManualGuideHarness {
             }
             Self::CodexDesktop => {
                 "Restart Codex Desktop so it loads the hyphae MCP server.".to_string()
+            }
+            Self::Openclaw => {
+                "Reload or restart OpenClaw so it loads the Hyphae plugin & MCP server.".to_string()
             }
             other => other.open_instruction(),
         }
@@ -1092,6 +1096,8 @@ pub struct SetupSelection {
     pub install_statusline: bool,
     pub install_claude_commands: bool,
     pub install_herdr_mod: bool,
+    pub openclaw_delivery: OpenClawDeliveryMode,
+    pub openclaw_prompt_injection: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -5309,6 +5315,21 @@ enum WizardScreen {
         state: SetupToggleState,
         main_selected: usize,
     },
+    OpenClawLocalSetup {
+        state: OpenClawConfigState,
+        toggle_state: SetupToggleState,
+        main_selected: usize,
+    },
+    OpenClawAssistConfig {
+        state: OpenClawConfigState,
+        primary_skill: PathBuf,
+        installed: Vec<InstalledSkillEntry>,
+        prompt: String,
+        deeplink: Option<String>,
+        error_status: Option<String>,
+        main_selected: usize,
+        allow_back: bool,
+    },
     HerdrTemplates {
         hc_bin: PathBuf,
         templates: Vec<HerdrTemplate>,
@@ -6374,6 +6395,8 @@ pub struct SetupToggleState {
     pub install_claude_commands: bool,
     pub install_herdr_mod: bool,
     pub herdr_app_detected: bool,
+    pub openclaw_delivery: OpenClawDeliveryMode,
+    pub openclaw_prompt_injection: bool,
     pub cursor: usize,
     pub show_dry_run_preview: bool,
 }
@@ -6411,6 +6434,8 @@ impl SetupToggleState {
             install_claude_commands: true,
             install_herdr_mod: herdr_app_detected && herdr_checked,
             herdr_app_detected,
+            openclaw_delivery: OpenClawDeliveryMode::Gateway,
+            openclaw_prompt_injection: false,
             cursor: 0,
             show_dry_run_preview: false,
         }
@@ -6444,7 +6469,11 @@ impl SetupToggleState {
         } else {
             crate::herdr_mod::detect_herdr_app_dir(home).is_some()
         };
-        Self::from_detection(&detected, herdr_app_detected)
+        let mut state = Self::from_detection(&detected, herdr_app_detected);
+        let (oc_delivery, oc_pi) = read_openclaw_hyphae_preferences(home);
+        state.openclaw_delivery = oc_delivery;
+        state.openclaw_prompt_injection = oc_pi;
+        state
     }
 
     /// Overrides the checked harness checkboxes (e.g. from `--harness` pre-selection in `hyp setup -i`).
@@ -6544,6 +6573,8 @@ impl SetupToggleState {
             install_statusline: self.install_statusline,
             install_claude_commands: self.install_claude_commands,
             install_herdr_mod: self.install_herdr_mod,
+            openclaw_delivery: self.openclaw_delivery,
+            openclaw_prompt_injection: self.openclaw_prompt_injection,
         }
     }
 
@@ -6639,7 +6670,15 @@ impl SetupToggleState {
                     }
                 }
                 HarnessKind::Openclaw => {
-                    preview.push("openclaw: ~/.openclaw/openclaw.json".to_string());
+                    preview.push(
+                        "openclaw: ~/.openclaw/{openclaw.json, extensions/hyphae/{openclaw.plugin.json, index.js}}"
+                            .to_string(),
+                    );
+                    preview.push(format!(
+                        "  + mode: delivery={}, prompt-injection={} (messages still received via nudges/hyp_inbox when off)",
+                        sel.openclaw_delivery.as_str(),
+                        if sel.openclaw_prompt_injection { "on" } else { "off" }
+                    ));
                     if sel.install_skills {
                         preview.push("  + skill: ~/.openclaw/skills/hyphae/SKILL.md".to_string());
                     }
@@ -6773,6 +6812,399 @@ pub fn apply_setup_toggle_text_input(
         state.toggle_index(idx);
     }
     Ok(SetupToggleAction::Continue)
+}
+
+// ============================================================================
+// OpenClaw Delivery Mode & Prompt Injection Onboarding Step
+// ============================================================================
+
+/// Explicit reassurance shown in all OpenClaw onboarding screens & prompts.
+pub const OPENCLAW_PROMPT_INJECTION_REASSURANCE: &str = "Even with prompt injection OFF, you will still receive all Hyphae messages (via Gateway wake nudges and hyp_inbox).";
+
+/// Mutable state for the dedicated OpenClaw delivery mode & prompt-injection step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenClawConfigState {
+    pub delivery: OpenClawDeliveryMode,
+    pub prompt_injection: bool,
+    pub cursor: usize,
+}
+
+/// Pure result of processing a keyboard or text input on [`OpenClawConfigState`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenClawConfigAction {
+    Continue,
+    Apply {
+        delivery: OpenClawDeliveryMode,
+        prompt_injection: bool,
+    },
+    Back,
+    Cancel,
+}
+
+impl OpenClawConfigState {
+    pub const OPTION_COUNT: usize = 2;
+
+    pub fn new(delivery: OpenClawDeliveryMode, prompt_injection: bool) -> Self {
+        Self {
+            delivery,
+            prompt_injection,
+            cursor: 0,
+        }
+    }
+
+    pub fn from_home(home: &Path) -> Self {
+        let (delivery, prompt_injection) = read_openclaw_hyphae_preferences(home);
+        Self::new(delivery, prompt_injection)
+    }
+
+    pub fn move_up(&mut self) {
+        self.cursor = (self.cursor + Self::OPTION_COUNT - 1) % Self::OPTION_COUNT;
+    }
+
+    pub fn move_down(&mut self) {
+        self.cursor = (self.cursor + 1) % Self::OPTION_COUNT;
+    }
+
+    pub fn toggle_delivery(&mut self) {
+        self.delivery = match self.delivery {
+            OpenClawDeliveryMode::Gateway => OpenClawDeliveryMode::Inbox,
+            OpenClawDeliveryMode::Inbox => OpenClawDeliveryMode::Gateway,
+        };
+    }
+
+    pub fn toggle_prompt_injection(&mut self) {
+        self.prompt_injection = !self.prompt_injection;
+    }
+
+    pub fn toggle_current(&mut self) {
+        match self.cursor {
+            0 => self.toggle_delivery(),
+            _ => self.toggle_prompt_injection(),
+        }
+    }
+}
+
+/// Pure keyboard dispatcher for the OpenClaw Delivery & Prompt Injection onboarding screen.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn handle_openclaw_config_key(
+    state: &mut OpenClawConfigState,
+    key: KeyEvent,
+    allow_back: bool,
+) -> OpenClawConfigAction {
+    match key {
+        KeyEvent::Up => {
+            state.move_up();
+            OpenClawConfigAction::Continue
+        }
+        KeyEvent::Down => {
+            state.move_down();
+            OpenClawConfigAction::Continue
+        }
+        KeyEvent::Char(' ') | KeyEvent::Right => {
+            state.toggle_current();
+            OpenClawConfigAction::Continue
+        }
+        KeyEvent::Char('1') => {
+            state.cursor = 0;
+            state.toggle_delivery();
+            OpenClawConfigAction::Continue
+        }
+        KeyEvent::Char('2') => {
+            state.cursor = 1;
+            state.toggle_prompt_injection();
+            OpenClawConfigAction::Continue
+        }
+        KeyEvent::Enter => OpenClawConfigAction::Apply {
+            delivery: state.delivery,
+            prompt_injection: state.prompt_injection,
+        },
+        KeyEvent::Back | KeyEvent::Left | KeyEvent::Char('b') | KeyEvent::Char('B') => {
+            if allow_back {
+                OpenClawConfigAction::Back
+            } else {
+                OpenClawConfigAction::Cancel
+            }
+        }
+        KeyEvent::Cancel | KeyEvent::Char('q') | KeyEvent::Char('Q') => {
+            OpenClawConfigAction::Cancel
+        }
+        _ => OpenClawConfigAction::Continue,
+    }
+}
+
+/// Pure parser for the numbered/text OpenClaw configuration fallback prompt.
+pub fn apply_openclaw_config_text_input(
+    state: &mut OpenClawConfigState,
+    raw_input: &str,
+    allow_back: bool,
+) -> Result<OpenClawConfigAction, String> {
+    let trimmed = raw_input.trim();
+    if trimmed.is_empty() {
+        return Ok(OpenClawConfigAction::Apply {
+            delivery: state.delivery,
+            prompt_injection: state.prompt_injection,
+        });
+    }
+    let low = trimmed.to_ascii_lowercase();
+    match low.as_str() {
+        "q" | "quit" | "cancel" => Ok(OpenClawConfigAction::Cancel),
+        "b" | "back" => Ok(if allow_back {
+            OpenClawConfigAction::Back
+        } else {
+            OpenClawConfigAction::Cancel
+        }),
+        "1" => {
+            state.toggle_delivery();
+            Ok(OpenClawConfigAction::Continue)
+        }
+        "gateway" => {
+            state.delivery = OpenClawDeliveryMode::Gateway;
+            Ok(OpenClawConfigAction::Continue)
+        }
+        "inbox" => {
+            state.delivery = OpenClawDeliveryMode::Inbox;
+            Ok(OpenClawConfigAction::Continue)
+        }
+        "2" => {
+            state.toggle_prompt_injection();
+            Ok(OpenClawConfigAction::Continue)
+        }
+        "on" | "yes" | "true" => {
+            state.prompt_injection = true;
+            Ok(OpenClawConfigAction::Continue)
+        }
+        "off" | "no" | "false" => {
+            state.prompt_injection = false;
+            Ok(OpenClawConfigAction::Continue)
+        }
+        _ => Err(format!(
+            "Invalid choice '{trimmed}'. Enter 1 (toggle delivery), 2 (toggle prompt injection), 'gateway', 'inbox', 'on', 'off', 'b', 'q', or Enter to apply."
+        )),
+    }
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub fn render_openclaw_config_screen(
+    state: &OpenClawConfigState,
+    home: &Path,
+    error_status: Option<&str>,
+    allow_back: bool,
+    term_rows: usize,
+    term_cols: usize,
+    color_mode: ColorMode,
+) -> Vec<String> {
+    if term_rows == 0 {
+        return Vec::new();
+    }
+    let content_w = safe_content_width(term_cols, 78);
+    let left_pad = " ".repeat(term_cols.saturating_sub(content_w) / 2);
+    let inner_card_w = content_w.saturating_sub(4).max(16);
+    let border_fg = fg_color(color_mode, RGB_UI_BORDER);
+    let reset = style_reset(color_mode);
+    let horiz = "─".repeat(inner_card_w + 2);
+
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "{left_pad}{}",
+        paint_styled_text(
+            color_mode,
+            RGB_PULSE_IVORY,
+            true,
+            &truncate_chars("OpenClaw · Delivery Mode & Prompt Injection", content_w)
+        )
+    ));
+    let sub = format!(
+        "Plugin: {}",
+        display_compact_path(&home.join(".openclaw").join("extensions").join("hyphae"), home)
+    );
+    lines.push(format!(
+        "{left_pad}{}",
+        paint_styled_text(
+            color_mode,
+            RGB_UI_MUTED,
+            false,
+            &truncate_chars(&sub, content_w)
+        )
+    ));
+    lines.push(String::new());
+
+    let card_row = |plain_text: &str, rgb: (u8, u8, u8), bold: bool| -> String {
+        let clipped = truncate_chars(plain_text, inner_card_w);
+        let pad_r = " ".repeat(inner_card_w.saturating_sub(clipped.chars().count()));
+        let styled = paint_styled_text(color_mode, rgb, bold, &clipped);
+        format!("{left_pad}{border_fg}│{reset} {styled}{pad_r} {border_fg}│{reset}")
+    };
+
+    lines.push(format!("{left_pad}{border_fg}╭{horiz}╮{reset}"));
+    let delivery_summary = match state.delivery {
+        OpenClawDeliveryMode::Gateway => {
+            "Delivery: Gateway webhook wakeups (/hooks/agent) + hyp_inbox"
+        }
+        OpenClawDeliveryMode::Inbox => {
+            "Delivery: Turn-start / hyp_inbox only (no Gateway webhook)"
+        }
+    };
+    for wrapped in wrap_words(delivery_summary, inner_card_w) {
+        lines.push(card_row(&wrapped, RGB_PULSE_IVORY, true));
+    }
+    let pi_summary = if state.prompt_injection {
+        "Prompt injection: ON (allowPromptModification + allowConversationAccess)"
+    } else {
+        "Prompt injection: OFF (zero prompt mutation)"
+    };
+    for wrapped in wrap_words(pi_summary, inner_card_w) {
+        lines.push(card_row(&wrapped, RGB_HYPHAE_SAGE, false));
+    }
+    lines.push(card_row("", RGB_UI_MUTED, false));
+    for wrapped in wrap_words(OPENCLAW_PROMPT_INJECTION_REASSURANCE, inner_card_w) {
+        lines.push(card_row(&wrapped, RGB_NODE_AMBER, true));
+    }
+    lines.push(format!("{left_pad}{border_fg}╰{horiz}╯{reset}"));
+
+    if let Some(err) = error_status {
+        lines.push(format!(
+            "{left_pad}{}",
+            paint_styled_text(
+                color_mode,
+                RGB_NODE_AMBER,
+                true,
+                &truncate_chars(&format!("WARN  {err}"), content_w)
+            )
+        ));
+    } else {
+        lines.push(String::new());
+    }
+
+    let delivery_tag = match state.delivery {
+        OpenClawDeliveryMode::Gateway => "gateway",
+        OpenClawDeliveryMode::Inbox => "inbox",
+    };
+    let delivery_desc = match state.delivery {
+        OpenClawDeliveryMode::Gateway => "wakes idle OpenClaw via /hooks/agent",
+        OpenClawDeliveryMode::Inbox => "turn-start / hyp_inbox only",
+    };
+    let pi_desc = if state.prompt_injection {
+        "ON — injects unread Hyphae messages via before_prompt_build"
+    } else {
+        "OFF — zero prompt mutation (nudges + hyp_inbox active)"
+    };
+
+    lines.push(format_toggle_row(
+        state.cursor == 0,
+        state.delivery == OpenClawDeliveryMode::Gateway,
+        "Delivery mode",
+        Some(delivery_tag),
+        delivery_desc,
+        16,
+        8,
+        content_w,
+        &left_pad,
+        color_mode,
+    ));
+    lines.push(format_toggle_row(
+        state.cursor == 1,
+        state.prompt_injection,
+        "Prompt injection",
+        Some(if state.prompt_injection { "ON" } else { "OFF" }),
+        pi_desc,
+        16,
+        8,
+        content_w,
+        &left_pad,
+        color_mode,
+    ));
+
+    lines.push(String::new());
+    let back_hint = if allow_back {
+        "Esc/b back · q quit"
+    } else {
+        "Esc/q cancel"
+    };
+    let footer = format!("↑/↓ move · Space toggle · Enter apply · {back_hint}");
+    lines.push(format!(
+        "{left_pad}{}",
+        paint_styled_text(
+            color_mode,
+            RGB_UI_MUTED,
+            false,
+            &truncate_chars(&footer, content_w)
+        )
+    ));
+
+    if lines.len() > term_rows {
+        lines.truncate(term_rows);
+    }
+    let top_pad = term_rows.saturating_sub(lines.len()) / 3;
+    let mut padded = vec![String::new(); top_pad];
+    padded.extend(lines);
+    padded
+}
+
+#[cfg(unix)]
+fn render_openclaw_config_fullscreen(
+    state: &OpenClawConfigState,
+    home: &Path,
+    error_status: Option<&str>,
+    allow_back: bool,
+    term_rows: usize,
+    term_cols: usize,
+    color_mode: ColorMode,
+) {
+    let lines = render_openclaw_config_screen(
+        state,
+        home,
+        error_status,
+        allow_back,
+        term_rows,
+        term_cols,
+        color_mode,
+    );
+    flush_screen_lines(&lines, term_rows);
+}
+
+fn run_plain_tty_openclaw_config(
+    state: &mut OpenClawConfigState,
+    allow_back: bool,
+) -> Result<OpenClawConfigAction, String> {
+    loop {
+        println!();
+        println!("OpenClaw · Delivery Mode & Prompt Injection");
+        println!(
+            "  [1] Delivery mode: {}",
+            state.delivery.display_label()
+        );
+        println!(
+            "  [2] Prompt injection (before_prompt_build): [{}] {}",
+            if state.prompt_injection { "x" } else { " " },
+            if state.prompt_injection {
+                "ON (automatically injects unread Hyphae messages at turn start)"
+            } else {
+                "OFF (zero prompt mutation)"
+            }
+        );
+        println!();
+        println!("  Note: {OPENCLAW_PROMPT_INJECTION_REASSURANCE}");
+        println!();
+        let back_str = if allow_back {
+            "[b] back, [q] quit"
+        } else {
+            "[q] cancel"
+        };
+        println!(
+            "Commands: [1] toggle delivery, [2] toggle prompt injection, [Enter] apply, {back_str}"
+        );
+        let reply = match read_tty_line("Choice or Enter to apply: ") {
+            Ok(Some(line)) => line,
+            Ok(None) => return Ok(OpenClawConfigAction::Cancel),
+            Err(e) => return Err(format!("Failed reading interactive selection: {e}")),
+        };
+        match apply_openclaw_config_text_input(state, &reply, allow_back) {
+            Ok(OpenClawConfigAction::Continue) => {}
+            Ok(action) => return Ok(action),
+            Err(msg) => println!("{msg}"),
+        }
+    }
 }
 
 fn harness_toggle_display(kind: HarnessKind) -> (&'static str, &'static str) {
@@ -7379,6 +7811,9 @@ fn run_plain_tty_setup_toggle(
 
 /// Standalone interactive harness & component toggle screen entrypoint for `hyp setup --interactive`.
 ///
+/// When OpenClaw is selected, advances to the dedicated OpenClaw Delivery Mode & Prompt Injection
+/// step before returning `Ok(Some(selection))`.
+///
 /// Returns `Ok(Some(selection))` when confirmed with `Enter`, or `Ok(None)` when cancelled with
 /// `Esc`/`b`/`q` (guaranteed zero files written).
 pub fn run_setup_toggle_interactive(
@@ -7393,8 +7828,41 @@ pub fn run_setup_toggle_interactive(
             if let Ok(mut raw) = RawTtyGuard::enter(false) {
                 let live_anim = !wizard_anim_disabled(false) && color_mode != ColorMode::Plain;
                 let mut anim_tick: usize = 0;
+                let mut in_openclaw_step = false;
+                let mut oc_state = OpenClawConfigState::new(
+                    state.openclaw_delivery,
+                    state.openclaw_prompt_injection,
+                );
                 let outcome = loop {
                     let (term_rows, term_cols) = detect_terminal_size();
+                    if in_openclaw_step {
+                        render_openclaw_config_fullscreen(
+                            &oc_state, home, None, true, term_rows, term_cols, color_mode,
+                        );
+                        let key = match raw.read_key() {
+                            Ok(k) => k,
+                            Err(e) => break Err(format!("Failed reading TTY input: {e}")),
+                        };
+                        match handle_openclaw_config_key(&mut oc_state, key, true) {
+                            OpenClawConfigAction::Continue => {}
+                            OpenClawConfigAction::Apply {
+                                delivery,
+                                prompt_injection,
+                            } => {
+                                state.openclaw_delivery = delivery;
+                                state.openclaw_prompt_injection = prompt_injection;
+                                break Ok(Some(state.to_selection()));
+                            }
+                            OpenClawConfigAction::Back => {
+                                state.openclaw_delivery = oc_state.delivery;
+                                state.openclaw_prompt_injection = oc_state.prompt_injection;
+                                in_openclaw_step = false;
+                            }
+                            OpenClawConfigAction::Cancel => break Ok(None),
+                        }
+                        continue;
+                    }
+
                     let has_live_banner = term_rows >= 33 && !state.show_dry_run_preview;
                     render_setup_toggle_fullscreen(
                         &state,
@@ -7423,7 +7891,17 @@ pub fn run_setup_toggle_interactive(
                     };
                     match handle_setup_toggle_key(&mut state, key, false) {
                         SetupToggleAction::Continue => {}
-                        SetupToggleAction::Apply(sel) => break Ok(Some(sel)),
+                        SetupToggleAction::Apply(sel) => {
+                            if sel.harnesses.contains(&HarnessKind::Openclaw) {
+                                oc_state = OpenClawConfigState::new(
+                                    state.openclaw_delivery,
+                                    state.openclaw_prompt_injection,
+                                );
+                                in_openclaw_step = true;
+                            } else {
+                                break Ok(Some(sel));
+                            }
+                        }
                         SetupToggleAction::Back | SetupToggleAction::Cancel => break Ok(None),
                     }
                 };
@@ -7435,10 +7913,40 @@ pub fn run_setup_toggle_interactive(
         }
     }
 
-    match run_plain_tty_setup_toggle(&mut state, home, false, false)? {
-        SetupToggleAction::Apply(sel) => Ok(Some(sel)),
-        SetupToggleAction::Back | SetupToggleAction::Cancel | SetupToggleAction::Continue => {
-            Ok(None)
+    loop {
+        match run_plain_tty_setup_toggle(&mut state, home, false, false)? {
+            SetupToggleAction::Apply(mut sel) => {
+                if sel.harnesses.contains(&HarnessKind::Openclaw) {
+                    let mut oc_state = OpenClawConfigState::new(
+                        state.openclaw_delivery,
+                        state.openclaw_prompt_injection,
+                    );
+                    match run_plain_tty_openclaw_config(&mut oc_state, true)? {
+                        OpenClawConfigAction::Apply {
+                            delivery,
+                            prompt_injection,
+                        } => {
+                            state.openclaw_delivery = delivery;
+                            state.openclaw_prompt_injection = prompt_injection;
+                            sel.openclaw_delivery = delivery;
+                            sel.openclaw_prompt_injection = prompt_injection;
+                            return Ok(Some(sel));
+                        }
+                        OpenClawConfigAction::Back => {
+                            state.openclaw_delivery = oc_state.delivery;
+                            state.openclaw_prompt_injection = oc_state.prompt_injection;
+                            continue;
+                        }
+                        OpenClawConfigAction::Cancel | OpenClawConfigAction::Continue => {
+                            return Ok(None);
+                        }
+                    }
+                }
+                return Ok(Some(sel));
+            }
+            SetupToggleAction::Back | SetupToggleAction::Cancel | SetupToggleAction::Continue => {
+                return Ok(None);
+            }
         }
     }
 }
@@ -7459,6 +7967,19 @@ fn build_initial_manual_guide_screen(
     let prompt = build_manual_guide_prompt(harness, existing_node.map(|n| n.node_id.as_str()));
     let deeplink =
         resolve_manual_guide_deeplink(harness, &prompt, home, explicit_home, existing_node);
+
+    if harness == ManualGuideHarness::Openclaw {
+        return WizardScreen::OpenClawAssistConfig {
+            state: OpenClawConfigState::from_home(home),
+            primary_skill,
+            installed,
+            prompt,
+            deeplink,
+            error_status: None,
+            main_selected,
+            allow_back,
+        };
+    }
 
     if let Some(plan) = inspect_desktop_mcp_plan(harness, home, cli_bin) {
         if !plan.already_configured {
@@ -7575,6 +8096,29 @@ fn run_fullscreen_tui_loop(
                     anim_tick,
                 );
                 term_rows >= 33 && !state.show_dry_run_preview
+            }
+            WizardScreen::OpenClawLocalSetup { state, .. } => {
+                render_openclaw_config_fullscreen(
+                    state, home, None, true, term_rows, term_cols, color_mode,
+                );
+                false
+            }
+            WizardScreen::OpenClawAssistConfig {
+                state,
+                error_status,
+                allow_back,
+                ..
+            } => {
+                render_openclaw_config_fullscreen(
+                    state,
+                    home,
+                    error_status.as_deref(),
+                    *allow_back,
+                    term_rows,
+                    term_cols,
+                    color_mode,
+                );
+                false
             }
             WizardScreen::HerdrTemplates {
                 templates,
@@ -7749,13 +8293,116 @@ fn run_fullscreen_tui_loop(
             } => match handle_setup_toggle_key(state, key, true) {
                 SetupToggleAction::Continue => {}
                 SetupToggleAction::Apply(selection) => {
-                    break TuiResolution::RunLocalCliSetupWithSelection(selection);
+                    if selection.harnesses.contains(&HarnessKind::Openclaw) {
+                        let oc_state = OpenClawConfigState::new(
+                            state.openclaw_delivery,
+                            state.openclaw_prompt_injection,
+                        );
+                        let saved_toggle = state.clone();
+                        let saved_main = *main_selected;
+                        screen = WizardScreen::OpenClawLocalSetup {
+                            state: oc_state,
+                            toggle_state: saved_toggle,
+                            main_selected: saved_main,
+                        };
+                    } else {
+                        break TuiResolution::RunLocalCliSetupWithSelection(selection);
+                    }
                 }
                 SetupToggleAction::Back => {
                     let prev = *main_selected;
                     screen = WizardScreen::Main { selected: prev };
                 }
                 SetupToggleAction::Cancel => {
+                    break TuiResolution::Cancel;
+                }
+            },
+            WizardScreen::OpenClawLocalSetup {
+                state,
+                toggle_state,
+                main_selected,
+            } => match handle_openclaw_config_key(state, key, true) {
+                OpenClawConfigAction::Continue => {}
+                OpenClawConfigAction::Apply {
+                    delivery,
+                    prompt_injection,
+                } => {
+                    let mut next_toggle = toggle_state.clone();
+                    next_toggle.openclaw_delivery = delivery;
+                    next_toggle.openclaw_prompt_injection = prompt_injection;
+                    break TuiResolution::RunLocalCliSetupWithSelection(next_toggle.to_selection());
+                }
+                OpenClawConfigAction::Back => {
+                    let mut prev_toggle = toggle_state.clone();
+                    prev_toggle.openclaw_delivery = state.delivery;
+                    prev_toggle.openclaw_prompt_injection = state.prompt_injection;
+                    let prev_main = *main_selected;
+                    screen = WizardScreen::LocalSetupConfig {
+                        state: prev_toggle,
+                        main_selected: prev_main,
+                    };
+                }
+                OpenClawConfigAction::Cancel => {
+                    break TuiResolution::Cancel;
+                }
+            },
+            WizardScreen::OpenClawAssistConfig {
+                state,
+                primary_skill,
+                installed,
+                prompt,
+                deeplink,
+                error_status,
+                main_selected,
+                allow_back,
+            } => match handle_openclaw_config_key(state, key, *allow_back) {
+                OpenClawConfigAction::Continue => {}
+                OpenClawConfigAction::Apply {
+                    delivery,
+                    prompt_injection,
+                } => {
+                    let node_cfg_opt = existing_node.map(|n| n.config_path.as_path());
+                    match apply_openclaw_config(
+                        home,
+                        cli_bin,
+                        None,
+                        node_cfg_opt,
+                        delivery,
+                        prompt_injection,
+                        false,
+                    ) {
+                        Ok(_) => {
+                            let next_skill = primary_skill.clone();
+                            let next_installed = installed.clone();
+                            let next_prompt = prompt.clone();
+                            let next_deeplink = deeplink.clone();
+                            let next_main = *main_selected;
+                            let next_back = *allow_back;
+                            screen = WizardScreen::ManualGuide {
+                                harness: ManualGuideHarness::Openclaw,
+                                primary_skill: next_skill,
+                                installed: next_installed,
+                                prompt: next_prompt,
+                                mcp_status: DesktopMcpStatus::Applied(
+                                    home.join(".openclaw").join("openclaw.json"),
+                                ),
+                                deeplink: next_deeplink,
+                                selected_action: 0,
+                                copied_status: None,
+                                main_selected: next_main,
+                                allow_back: next_back,
+                            };
+                        }
+                        Err(err) => {
+                            *error_status = Some(err);
+                        }
+                    }
+                }
+                OpenClawConfigAction::Back => {
+                    let prev = *main_selected;
+                    screen = WizardScreen::Main { selected: prev };
+                }
+                OpenClawConfigAction::Cancel => {
                     break TuiResolution::Cancel;
                 }
             },
@@ -8247,11 +8894,40 @@ fn run_plain_tty_manual_guide(
         }
     };
 
-    let mcp_status = match run_plain_tty_desktop_mcp_confirm(harness, home, cli_bin, allow_back) {
-        PlainMcpConfirmOutcome::Status(st) => st,
-        PlainMcpConfirmOutcome::Back => return None,
-        PlainMcpConfirmOutcome::Quit => {
-            return Some(WizardOutcome::Finished(ExitCode::from(EXIT_OK)));
+    let mcp_status = if harness == ManualGuideHarness::Openclaw {
+        let mut oc_state = OpenClawConfigState::from_home(home);
+        match run_plain_tty_openclaw_config(&mut oc_state, allow_back) {
+            Ok(OpenClawConfigAction::Apply {
+                delivery,
+                prompt_injection,
+            }) => match apply_openclaw_config(
+                home,
+                cli_bin,
+                None,
+                existing_node.map(|n| n.config_path.as_path()),
+                delivery,
+                prompt_injection,
+                false,
+            ) {
+                Ok(_) => DesktopMcpStatus::Applied(home.join(".openclaw").join("openclaw.json")),
+                Err(err) => {
+                    println!("WARN  {err}");
+                    DesktopMcpStatus::Skipped
+                }
+            },
+            Ok(OpenClawConfigAction::Back) => return None,
+            Ok(OpenClawConfigAction::Cancel | OpenClawConfigAction::Continue) => {
+                return Some(WizardOutcome::Finished(ExitCode::from(EXIT_OK)));
+            }
+            Err(_) => DesktopMcpStatus::Skipped,
+        }
+    } else {
+        match run_plain_tty_desktop_mcp_confirm(harness, home, cli_bin, allow_back) {
+            PlainMcpConfirmOutcome::Status(st) => st,
+            PlainMcpConfirmOutcome::Back => return None,
+            PlainMcpConfirmOutcome::Quit => {
+                return Some(WizardOutcome::Finished(ExitCode::from(EXIT_OK)));
+            }
         }
     };
 
@@ -8438,27 +9114,73 @@ fn run_numbered_fallback_wizard(
                     args.home.is_some(),
                     args.claude_config_dir.as_deref(),
                 );
-                match run_plain_tty_setup_toggle(&mut toggle_state, home, true, true) {
-                    Ok(SetupToggleAction::Apply(selection)) => {
-                        return WizardOutcome::RunLocalCliSetupWithSelection(selection);
-                    }
-                    Ok(SetupToggleAction::Back) => {}
-                    Ok(SetupToggleAction::Cancel) | Ok(SetupToggleAction::Continue) => {
-                        println!("Cancelled.");
-                        return WizardOutcome::Finished(ExitCode::from(EXIT_OK));
-                    }
-                    Err(e) => {
-                        return WizardOutcome::Finished(emit_error(
-                            "onboard",
-                            false,
-                            EXIT_ERROR,
-                            "TTY_READ_ERROR",
-                            e,
-                            Some(
-                                "Re-run with `hyp onboard --yes` for non-interactive setup."
-                                    .to_string(),
-                            ),
-                        ));
+                loop {
+                    match run_plain_tty_setup_toggle(&mut toggle_state, home, true, true) {
+                        Ok(SetupToggleAction::Apply(mut selection)) => {
+                            if selection.harnesses.contains(&HarnessKind::Openclaw) {
+                                let mut oc_state = OpenClawConfigState::new(
+                                    toggle_state.openclaw_delivery,
+                                    toggle_state.openclaw_prompt_injection,
+                                );
+                                match run_plain_tty_openclaw_config(&mut oc_state, true) {
+                                    Ok(OpenClawConfigAction::Apply {
+                                        delivery,
+                                        prompt_injection,
+                                    }) => {
+                                        selection.openclaw_delivery = delivery;
+                                        selection.openclaw_prompt_injection = prompt_injection;
+                                        return WizardOutcome::RunLocalCliSetupWithSelection(
+                                            selection,
+                                        );
+                                    }
+                                    Ok(OpenClawConfigAction::Back) => {
+                                        toggle_state.openclaw_delivery = oc_state.delivery;
+                                        toggle_state.openclaw_prompt_injection =
+                                            oc_state.prompt_injection;
+                                        continue;
+                                    }
+                                    Ok(
+                                        OpenClawConfigAction::Cancel
+                                        | OpenClawConfigAction::Continue,
+                                    ) => {
+                                        println!("Cancelled.");
+                                        return WizardOutcome::Finished(ExitCode::from(EXIT_OK));
+                                    }
+                                    Err(e) => {
+                                        return WizardOutcome::Finished(emit_error(
+                                            "onboard",
+                                            false,
+                                            EXIT_ERROR,
+                                            "TTY_READ_ERROR",
+                                            e,
+                                            Some(
+                                                "Re-run with `hyp onboard --yes` for non-interactive setup."
+                                                    .to_string(),
+                                            ),
+                                        ));
+                                    }
+                                }
+                            }
+                            return WizardOutcome::RunLocalCliSetupWithSelection(selection);
+                        }
+                        Ok(SetupToggleAction::Back) => break,
+                        Ok(SetupToggleAction::Cancel) | Ok(SetupToggleAction::Continue) => {
+                            println!("Cancelled.");
+                            return WizardOutcome::Finished(ExitCode::from(EXIT_OK));
+                        }
+                        Err(e) => {
+                            return WizardOutcome::Finished(emit_error(
+                                "onboard",
+                                false,
+                                EXIT_ERROR,
+                                "TTY_READ_ERROR",
+                                e,
+                                Some(
+                                    "Re-run with `hyp onboard --yes` for non-interactive setup."
+                                        .to_string(),
+                                ),
+                            ));
+                        }
                     }
                 }
             }
@@ -8491,6 +9213,9 @@ pub fn should_launch_interactive_wizard(args: &OnboardArgs, stdout_is_tty: bool)
         || args.install_mod
         || args.no_skills
         || args.no_commands
+        || args.openclaw_delivery.is_some()
+        || args.openclaw_prompt_injection
+        || args.no_openclaw_prompt_injection
         || args.profile != crate::node_cmd::CliNodeProfile::Local
     {
         return false;
@@ -10112,6 +10837,8 @@ mod tests {
                 install_statusline: true,
                 install_claude_commands: true,
                 install_herdr_mod: true,
+                openclaw_delivery: OpenClawDeliveryMode::Gateway,
+                openclaw_prompt_injection: false,
             }
         );
     }
@@ -10196,6 +10923,8 @@ mod tests {
                 install_statusline: true,
                 install_claude_commands: true,
                 install_herdr_mod: true,
+                openclaw_delivery: OpenClawDeliveryMode::Gateway,
+                openclaw_prompt_injection: false,
             })
         );
     }
@@ -10392,5 +11121,167 @@ mod tests {
             joined.contains("node.json"),
             "T3 preview should reference node.json t3 block:\n{joined}"
         );
+    }
+
+    #[test]
+    fn openclaw_config_step_state_machine_text_fallback_and_viewport_ansi_parity() {
+        let mut st = OpenClawConfigState::new(OpenClawDeliveryMode::Gateway, false);
+        assert_eq!(st.cursor, 0);
+
+        // Space on row 0 toggles Gateway -> Inbox -> Gateway.
+        assert_eq!(
+            handle_openclaw_config_key(&mut st, KeyEvent::Char(' '), true),
+            OpenClawConfigAction::Continue
+        );
+        assert_eq!(st.delivery, OpenClawDeliveryMode::Inbox);
+        assert_eq!(
+            handle_openclaw_config_key(&mut st, KeyEvent::Char(' '), true),
+            OpenClawConfigAction::Continue
+        );
+        assert_eq!(st.delivery, OpenClawDeliveryMode::Gateway);
+
+        // Down moves to row 1 (Prompt injection); Space toggles OFF -> ON.
+        assert_eq!(
+            handle_openclaw_config_key(&mut st, KeyEvent::Down, true),
+            OpenClawConfigAction::Continue
+        );
+        assert_eq!(st.cursor, 1);
+        assert_eq!(
+            handle_openclaw_config_key(&mut st, KeyEvent::Char(' '), true),
+            OpenClawConfigAction::Continue
+        );
+        assert!(st.prompt_injection);
+
+        // Number shortcuts 1 / 2 toggle directly.
+        handle_openclaw_config_key(&mut st, KeyEvent::Char('1'), true);
+        assert_eq!(st.delivery, OpenClawDeliveryMode::Inbox);
+        handle_openclaw_config_key(&mut st, KeyEvent::Char('2'), true);
+        assert!(!st.prompt_injection);
+
+        // Enter applies chosen values.
+        assert_eq!(
+            handle_openclaw_config_key(&mut st, KeyEvent::Enter, true),
+            OpenClawConfigAction::Apply {
+                delivery: OpenClawDeliveryMode::Inbox,
+                prompt_injection: false,
+            }
+        );
+
+        // Back / Cancel respect allow_back.
+        assert_eq!(
+            handle_openclaw_config_key(&mut st, KeyEvent::Back, true),
+            OpenClawConfigAction::Back
+        );
+        assert_eq!(
+            handle_openclaw_config_key(&mut st, KeyEvent::Back, false),
+            OpenClawConfigAction::Cancel
+        );
+        assert_eq!(
+            handle_openclaw_config_key(&mut st, KeyEvent::Cancel, true),
+            OpenClawConfigAction::Cancel
+        );
+
+        // Plain TTY text fallback parser.
+        let mut txt_st = OpenClawConfigState::new(OpenClawDeliveryMode::Gateway, false);
+        assert_eq!(
+            apply_openclaw_config_text_input(&mut txt_st, "inbox", true).unwrap(),
+            OpenClawConfigAction::Continue
+        );
+        assert_eq!(txt_st.delivery, OpenClawDeliveryMode::Inbox);
+        assert_eq!(
+            apply_openclaw_config_text_input(&mut txt_st, "on", true).unwrap(),
+            OpenClawConfigAction::Continue
+        );
+        assert!(txt_st.prompt_injection);
+        assert_eq!(
+            apply_openclaw_config_text_input(&mut txt_st, "", true).unwrap(),
+            OpenClawConfigAction::Apply {
+                delivery: OpenClawDeliveryMode::Inbox,
+                prompt_injection: true,
+            }
+        );
+        assert_eq!(
+            apply_openclaw_config_text_input(&mut txt_st, "b", true).unwrap(),
+            OpenClawConfigAction::Back
+        );
+        assert_eq!(
+            apply_openclaw_config_text_input(&mut txt_st, "q", true).unwrap(),
+            OpenClawConfigAction::Cancel
+        );
+        assert!(apply_openclaw_config_text_input(&mut txt_st, "invalid-opt", true).is_err());
+
+        // Differential viewport rendering: Plain == Ansi256 == TrueColor stripped text,
+        // zero column overflow, and explicit reassurance copy always rendered.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        for (rows, cols) in [(24usize, 80usize), (20, 64), (36, 110)] {
+            for pi in [false, true] {
+                let render_st = OpenClawConfigState::new(OpenClawDeliveryMode::Gateway, pi);
+                let plain = render_openclaw_config_screen(
+                    &render_st,
+                    home,
+                    None,
+                    true,
+                    rows,
+                    cols,
+                    ColorMode::Plain,
+                );
+                let ansi256 = render_openclaw_config_screen(
+                    &render_st,
+                    home,
+                    None,
+                    true,
+                    rows,
+                    cols,
+                    ColorMode::Ansi256,
+                );
+                let tc = render_openclaw_config_screen(
+                    &render_st,
+                    home,
+                    None,
+                    true,
+                    rows,
+                    cols,
+                    ColorMode::TrueColor,
+                );
+                assert!(plain.len() <= rows);
+                assert_eq!(plain.len(), ansi256.len());
+                assert_eq!(plain.len(), tc.len());
+                for (idx, ((p, a), t)) in plain
+                    .iter()
+                    .zip(ansi256.iter())
+                    .zip(tc.iter())
+                    .enumerate()
+                {
+                    let sp = strip_ansi(p);
+                    let sa = strip_ansi(a);
+                    let st_line = strip_ansi(t);
+                    assert_eq!(sp, sa, "Plain vs Ansi256 mismatch row {idx}");
+                    assert_eq!(sp, st_line, "Plain vs TrueColor mismatch row {idx}");
+                    assert!(
+                        sp.chars().count() <= cols,
+                        "row {idx} overflowed {cols} cols: {sp:?}"
+                    );
+                }
+                let full_text = plain
+                    .iter()
+                    .map(|l| strip_ansi(l))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let collapsed = full_text.split_whitespace().collect::<Vec<_>>().join(" ");
+                assert!(
+                    collapsed.contains("Even with prompt injection OFF")
+                        && collapsed.contains("hyp_inbox"),
+                    "expected explicit reassurance copy in rendered screen ({cols}x{rows}):\n{collapsed}"
+                );
+            }
+        }
+
+        // Dry-run preview includes OpenClaw extension files + delivery/prompt-injection mode.
+        let toggle = SetupToggleState::from_detection(&[HarnessKind::Openclaw], false);
+        let preview = toggle.build_dry_run_preview(home, false).join("\n");
+        assert!(preview.contains("extensions/hyphae"), "preview={preview}");
+        assert!(preview.contains("delivery=gateway"), "preview={preview}");
+        assert!(preview.contains("prompt-injection=off"), "preview={preview}");
     }
 }

@@ -529,7 +529,7 @@ fn render_transport_layer(target: SkillTargetHarness, transport: TransportHintMo
             target.session_prefix()
         ),
         TransportHintMode::OpenClawEphemeral => "## Wakeup Transport\n\
-             - Gateway hooks (`openclaw-hooks-token` in SecretStore) push metadata wakeups automatically. Without hooks, check `hyp_inbox` once at the start of each gateway turn (never poll in a loop)."
+             - Gateway hooks (`openclaw-hooks-token`) push wake nudges; the plugin optionally injects at turn start. Even with prompt injection OFF, messages arrive via nudges and `hyp_inbox` (never poll)."
             .to_string(),
         TransportHintMode::DesktopPassive => "## Wakeup Transport\n\
              - Passive MCP mode (no shell hooks or background waiters). Read messages via `hyp_inbox` only on user turns; never poll in a loop."

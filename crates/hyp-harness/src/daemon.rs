@@ -412,6 +412,12 @@ struct ClassifiedItemMeta {
     channel: Option<String>,
     is_announcement: bool,
     notified: bool,
+    /// True when this pending item was only announced by a metadata-only wake nudge
+    /// (e.g. OpenClaw Gateway `/hooks/agent`) and has NOT yet been delivered inline or
+    /// digested as a Focus Mode `Notify` footer. Allows turn-start `before_prompt_build`
+    /// (`mailbox.drain` with `includeNudged: true`) to deliver it with its original urgency
+    /// while preventing `flush_session` (`include_nudged: false`) from re-nudging in a loop.
+    nudge_pending: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1281,6 +1287,7 @@ impl LocalDaemon {
                 channel: classification.parsed.channel,
                 is_announcement,
                 notified: false,
+                nudge_pending: false,
             },
         );
         self.inner.bump_ui_rev();
@@ -2642,6 +2649,19 @@ impl LocalDaemonInner {
 
         let is_announcement =
             self.is_announcement_channel(classification.parsed.channel.as_deref());
+        // If the daemon restarted after a metadata-only wake nudge (`sessions.backend_json.nudgePending`),
+        // preserve `nudge_pending = true` for notified non-`Notify` items so the woken turn's
+        // `before_prompt_build` hook can still drain them cleanly with original urgency.
+        let nudge_pending = if entry.notified && classification.effective_urgency != DeliveryUrgency::Notify {
+            let db = self.node.db();
+            db.local()
+                .get_session(session_id)
+                .ok()
+                .flatten()
+                .is_some_and(|s| backend_json_flag_true(&s.backend_json, "nudgePending"))
+        } else {
+            false
+        };
         self.record_item_meta(
             session_id,
             entry.receipt,
@@ -2654,6 +2674,7 @@ impl LocalDaemonInner {
                 channel: classification.parsed.channel,
                 is_announcement,
                 notified: entry.notified,
+                nudge_pending,
             },
         );
         Some(classification.effective_urgency)
@@ -2773,14 +2794,29 @@ impl LocalDaemonInner {
 
     /// Builds a token-budgeted [`PackedDeliveryBatch`] for `session_id` from pending unread items.
     ///
-    /// - Excludes already-notified `Notify`-tier items when there are NO unnotified items and NO
-    ///   `Interrupt`/`Queue` items (prevents re-emitting identical `notify` digests in a loop).
+    /// - Excludes already-notified items (including nudge-pending items) so push transports and
+    ///   Focus Mode digests NEVER re-emit in a loop.
     /// - Strictly returns `None` when zero eligible unread items exist (even if `muted_count > 0`!).
     /// - **Security invariant (G3/G4):** When a `SecurityGatePipeline` is active, ONLY gate-cleared
     ///   rows (`reviewed_at IS NOT NULL OR human_auth_json IS NOT NULL`) are ever packed or delivered.
     async fn build_batch_for_session(
         self: &Arc<Self>,
         session_id: &str,
+    ) -> Option<PackedDeliveryBatch> {
+        self.build_batch_for_session_with_options(session_id, false)
+            .await
+    }
+
+    /// Builds a token-budgeted [`PackedDeliveryBatch`] for `session_id`, optionally including
+    /// `nudge_pending` items that were previously announced via a metadata-only wake nudge
+    /// (e.g. OpenClaw Gateway `/hooks/agent`) and are now being drained by a turn-start hook
+    /// (`before_prompt_build`). Genuine Focus Mode `Notify` digests and already-spilled/truncated
+    /// previews (`notified == true && !nudge_pending`) stay in the footer band and are NEVER
+    /// re-dumped even when `include_nudged == true`.
+    async fn build_batch_for_session_with_options(
+        self: &Arc<Self>,
+        session_id: &str,
+        include_nudged: bool,
     ) -> Option<PackedDeliveryBatch> {
         self.reconcile_session_inbox(session_id).await;
 
@@ -2829,19 +2865,22 @@ impl LocalDaemonInner {
                 continue;
             }
             let burst_demoted = meta.is_some_and(|m| m.burst_demoted);
+            let is_nudge_pending = meta.is_some_and(|m| m.nudge_pending);
             let already_notified = entry.notified || meta.is_some_and(|m| m.notified);
+            let treat_as_deliverable = !already_notified || (include_nudged && is_nudge_pending);
 
-            if !already_notified {
+            if treat_as_deliverable {
                 any_unnotified = true;
             }
 
             // Items already notified in an earlier digest or truncated preview stay in the unread
             // footer band (Notify) when a newer unnotified item arrives so they are never re-dumped
-            // or re-truncated in a loop.
-            let effective_urgency = if already_notified {
-                DeliveryUrgency::Notify
-            } else {
+            // or re-truncated in a loop. Nudge-pending items drained with `include_nudged = true`
+            // retain their original classified urgency.
+            let effective_urgency = if treat_as_deliverable {
                 urgency
+            } else {
+                DeliveryUrgency::Notify
             };
 
             let parsed = hyp_node::delivery::ParsedMailboxSource::from_entry(&entry);
@@ -2918,7 +2957,7 @@ impl LocalDaemonInner {
         }
 
         let mut sources_delivered: HashSet<String> = HashSet::new();
-        {
+        let any_nudge_left = {
             let mut guard = self.item_meta.lock().expect("item_meta lock poisoned");
             if let Some(map) = guard.get_mut(session_id) {
                 for id in &batch.inline_ids {
@@ -2929,10 +2968,17 @@ impl LocalDaemonInner {
                 for id in batch.spilled_ids.iter().chain(batch.truncated_ids.iter()) {
                     if let Some(m) = map.get_mut(id) {
                         m.notified = true;
+                        m.nudge_pending = false;
                         sources_delivered.insert(m.burst_source_key.clone());
                     }
                 }
+                map.values().any(|m| m.nudge_pending)
+            } else {
+                false
             }
+        };
+        if !any_nudge_left {
+            self.set_session_nudge_pending_flag(session_id, false, now);
         }
         for src in sources_delivered {
             self.delivery.record_delivery(session_id, &src, now);
@@ -2942,9 +2988,28 @@ impl LocalDaemonInner {
         self.bump_ui_rev();
     }
 
+    fn set_session_nudge_pending_flag(&self, session_id: &str, nudge_pending: bool, now: i64) {
+        let db = self.node.db();
+        let current = db
+            .local()
+            .get_session(session_id)
+            .ok()
+            .flatten()
+            .is_some_and(|s| backend_json_flag_true(&s.backend_json, "nudgePending"));
+        if current == nudge_pending {
+            return;
+        }
+        let mut patch = Map::new();
+        patch.insert("nudgePending".into(), json!(nudge_pending));
+        let _ = db
+            .local()
+            .merge_session_backend(session_id, &Value::Object(patch), now);
+    }
+
     /// Records a metadata-only wake nudge (e.g. OpenClaw Gateway hooks): marks pending items as
-    /// `notified = 1` so we never re-nudge in a loop, while preserving all items as `unread` in
-    /// SQLite so the woken agent reads and acknowledges them via `hyp_inbox`.
+    /// `notified = 1` AND `nudge_pending = true` so `flush_session` never re-nudges in a loop,
+    /// while preserving all items as `unread` in SQLite so the woken agent either drains them via
+    /// `before_prompt_build` (`includeNudged: true`) or reads and acknowledges them via `hyp_inbox`.
     fn mark_batch_notified(&self, session_id: &str, batch: &PackedDeliveryBatch) {
         let now = now_ms();
         {
@@ -2963,11 +3028,13 @@ impl LocalDaemonInner {
                 {
                     if let Some(m) = map.get_mut(id) {
                         m.notified = true;
+                        m.nudge_pending = true;
                         sources_notified.insert(m.burst_source_key.clone());
                     }
                 }
             }
         }
+        self.set_session_nudge_pending_flag(session_id, true, now);
         for src in sources_notified {
             self.delivery.record_delivery(session_id, &src, now);
         }
@@ -4713,11 +4780,19 @@ impl LocalDaemonInner {
         // Clean up in-memory item_meta for acknowledged receipts, and cancel any pending
         // Tier 3 Hold retries if the session's pending inbox is now empty.
         if result.acked_count > 0 {
-            let mut guard = self.item_meta.lock().expect("item_meta lock poisoned");
-            if let Some(map) = guard.get_mut(session_id) {
-                for item in &result.items {
-                    map.remove(&item.receipt);
+            let any_nudge_left = {
+                let mut guard = self.item_meta.lock().expect("item_meta lock poisoned");
+                if let Some(map) = guard.get_mut(session_id) {
+                    for item in &result.items {
+                        map.remove(&item.receipt);
+                    }
+                    map.values().any(|m| m.nudge_pending)
+                } else {
+                    false
                 }
+            };
+            if result.unread_count == 0 || !any_nudge_left {
+                self.set_session_nudge_pending_flag(session_id, false, now_ms());
             }
             if result.unread_count == 0 {
                 self.cancel_hold_retry(session_id);
@@ -6912,34 +6987,37 @@ fn maybe_spawn_transport_probe(
         }
 
         // Priority 3: OpenClaw Gateway Webhook Push (`X2`: fail-closed on missing SecretStore token
-        // or unreachable `/hooks/*` endpoint; honors optional `node.json` `"openclaw"` block).
+        // or unreachable `/hooks/*` endpoint; honors optional `node.json` `"openclaw"` block,
+        // including `enabled: false` / `deliveryMode: "inbox"` opt-out).
         if !attached && is_openclaw && daemon_arc.current_transport_priority(&sid) < PRIORITY_OPENCLAW
         {
             let oc_cfg = node_json
                 .as_ref()
                 .map(OpenClawNodeConfig::from_node_json)
                 .unwrap_or_default();
-            let mut target = oc_cfg.to_target();
-            target.state_dir = Some(daemon_arc.node.config().state_dir.clone());
-            target.secret_backend = daemon_arc.node.config().secret_backend;
-            target.handle = daemon_arc
-                .node
-                .db()
-                .local()
-                .get_session(&sid)
-                .ok()
-                .flatten()
-                .and_then(|s| s.handle);
+            if oc_cfg.gateway_push_enabled() {
+                let mut target = oc_cfg.to_target();
+                target.state_dir = Some(daemon_arc.node.config().state_dir.clone());
+                target.secret_backend = daemon_arc.node.config().secret_backend;
+                target.handle = daemon_arc
+                    .node
+                    .db()
+                    .local()
+                    .get_session(&sid)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.handle);
 
-            let probe = probe_openclaw_gateway(&target, DEFAULT_OPENCLAW_PROBE_TIMEOUT).await;
-            if probe.ok
-                && daemon_arc.attach_transport_if_higher_priority(
-                    &sid,
-                    Arc::new(OpenClawTransport::new(target)),
-                    PRIORITY_OPENCLAW,
-                )
-            {
-                attached = true;
+                let probe = probe_openclaw_gateway(&target, DEFAULT_OPENCLAW_PROBE_TIMEOUT).await;
+                if probe.ok
+                    && daemon_arc.attach_transport_if_higher_priority(
+                        &sid,
+                        Arc::new(OpenClawTransport::new(target)),
+                        PRIORITY_OPENCLAW,
+                    )
+                {
+                    attached = true;
+                }
             }
         }
 
@@ -7075,6 +7153,98 @@ fn handle_call_start(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> 
     }
 }
 
+fn resolve_openclaw_drain_session(
+    daemon: &LocalDaemonInner,
+    session_id: &str,
+    packet: &Map<String, Value>,
+) -> Option<String> {
+    let db = daemon.node.db();
+    if db.local().get_session(session_id).ok().flatten().is_some() {
+        return Some(session_id.to_string());
+    }
+
+    let is_openclaw_hook = packet
+        .get("harness")
+        .and_then(Value::as_str)
+        .is_some_and(|h| h.eq_ignore_ascii_case("openclaw"));
+    if !is_openclaw_hook {
+        return None;
+    }
+
+    let qualify_openclaw = |raw: &str| -> Option<String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let qualified = if trimmed.starts_with("openclaw:") {
+            trimmed.to_string()
+        } else {
+            format!("openclaw:{trimmed}")
+        };
+        is_valid_session_id(&qualified).then_some(qualified)
+    };
+
+    if let Some(sk) = packet
+        .get("sessionKey")
+        .and_then(Value::as_str)
+        .and_then(qualify_openclaw)
+    {
+        if db.local().get_session(&sk).ok().flatten().is_some() {
+            return Some(sk);
+        }
+    }
+
+    let agent_id_raw = packet
+        .get("agentId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(aid_sid) = agent_id_raw.and_then(qualify_openclaw) {
+        if db.local().get_session(&aid_sid).ok().flatten().is_some() {
+            return Some(aid_sid);
+        }
+    }
+
+    // Deterministic fail-closed fallback strictly scoped to enrolled `openclaw:*` sessions
+    // (covers ephemeral OpenClaw MCP sessions created via `hyp mcp --backend openclaw --ephemeral`
+    // whose generated UUID differs from OpenClaw's hook `ctx.sessionId`). NEVER leaks or touches
+    // non-OpenClaw sessions, and fails closed (`None`) whenever multiple OpenClaw sessions are
+    // ambiguous!
+    let openclaw_sessions: Vec<_> = db
+        .local()
+        .list_sessions()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| s.id.starts_with("openclaw:"))
+        .collect();
+
+    if let Some(aid) = agent_id_raw {
+        let matching_agent: Vec<_> = openclaw_sessions
+            .iter()
+            .filter(|s| {
+                s.handle.as_deref() == Some(aid)
+                    || serde_json::from_str::<Value>(&s.backend_json)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("openclawAgentId")
+                                .and_then(Value::as_str)
+                                .map(|a| a == aid)
+                        })
+                        .unwrap_or(false)
+            })
+            .collect();
+        if matching_agent.len() == 1 {
+            return Some(matching_agent[0].id.clone());
+        }
+    }
+
+    if openclaw_sessions.len() == 1 {
+        return Some(openclaw_sessions[0].id.clone());
+    }
+
+    None
+}
+
 async fn handle_mailbox_drain(
     daemon: &Arc<LocalDaemonInner>,
     packet: &Map<String, Value>,
@@ -7087,29 +7257,33 @@ async fn handle_mailbox_drain(
         return json!({ "ok": false, "error": "invalid_session" });
     };
 
-    if let Err(err) = daemon.verify_optional_session_token(session_id, packet) {
+    let Some(target_session_id) = resolve_openclaw_drain_session(daemon, session_id, packet) else {
+        // Still verify optional sessionToken if caller supplied one (fail closed on bad token).
+        if let Err(err) = daemon.verify_optional_session_token(session_id, packet) {
+            return json!({ "ok": false, "error": err });
+        }
+        return json!({ "ok": true, "result": { "items": [] } });
+    };
+
+    if let Err(err) = daemon.verify_optional_session_token(&target_session_id, packet) {
         return json!({ "ok": false, "error": err });
     }
 
-    let session_exists = daemon
-        .node
-        .db()
-        .local()
-        .get_session(session_id)
-        .ok()
-        .flatten()
-        .is_some();
-    if !session_exists {
-        return json!({ "ok": true, "result": { "items": [] } });
-    }
+    let include_nudged = packet
+        .get("includeNudged")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
-    match daemon.build_batch_for_session(session_id).await {
+    match daemon
+        .build_batch_for_session_with_options(&target_session_id, include_nudged)
+        .await
+    {
         None => {
-            daemon.cancel_hold_retry(session_id);
+            daemon.cancel_hold_retry(&target_session_id);
             json!({ "ok": true, "result": { "items": [] } })
         }
         Some(batch) => {
-            daemon.commit_delivered_batch(session_id, &batch);
+            daemon.commit_delivered_batch(&target_session_id, &batch);
             json!({
                 "ok": true,
                 "result": {

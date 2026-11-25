@@ -418,7 +418,7 @@ fast_mode = true
         );
         write_file(&h.join(".config/opencode/plugins/hyphae.ts"), "export default {};\n");
 
-        // OpenClaw openclaw.json (matches setup_openclaw's mcp.servers.hyphae schema!)
+        // OpenClaw openclaw.json + official plugin directory
         write_json(
             &h.join(".openclaw/openclaw.json"),
             &json!({
@@ -428,8 +428,30 @@ fast_mode = true
                         "weather": { "command": "weather-mcp", "args": [] },
                         "hyphae": { "command": "hyp", "args": ["mcp", "--backend", "openclaw", "--ephemeral"] }
                     }
+                },
+                "plugins": {
+                    "allow": ["weather-ext", "hyphae"],
+                    "entries": {
+                        "weather-ext": { "enabled": true },
+                        "hyphae": {
+                            "enabled": true,
+                            "hooks": {
+                                "allowPromptModification": true,
+                                "allowConversationAccess": true
+                            },
+                            "config": { "hypBin": "hyp", "deliveryMode": "gateway", "promptInjection": true }
+                        }
+                    }
                 }
             }),
+        );
+        write_file(
+            &h.join(".openclaw/extensions/hyphae/openclaw.plugin.json"),
+            "{\"id\":\"hyphae\"}\n",
+        );
+        write_file(
+            &h.join(".openclaw/extensions/hyphae/index.js"),
+            "export default { id: 'hyphae' };\n",
         );
 
         // Herdr & T3 standalone adapter configs
@@ -663,6 +685,9 @@ fast_mode = true
         assert_eq!(openclaw_json["profile"], "default");
         assert!(openclaw_json["mcp"]["servers"].get("hyphae").is_none());
         assert!(openclaw_json["mcp"]["servers"].get("weather").is_some());
+        assert!(openclaw_json["plugins"]["entries"].get("hyphae").is_none());
+        assert!(openclaw_json["plugins"]["entries"].get("weather-ext").is_some());
+        assert_eq!(openclaw_json["plugins"]["allow"], json!(["weather-ext"]));
 
         // 3. Codex config.toml & hooks.json
         let codex_toml = fs::read_to_string(h.join(".codex/config.toml")).unwrap();
@@ -686,6 +711,7 @@ fast_mode = true
             ".claude/commands/hyphae-mute.md",
             ".gemini/config/plugins/hyphae",
             ".config/opencode/plugins/hyphae.ts",
+            ".openclaw/extensions/hyphae",
             ".config/herdr/hyphae.json",
             ".t3/hyphae.json",
             ".config/herdr-app/mods/hyphae-pane",

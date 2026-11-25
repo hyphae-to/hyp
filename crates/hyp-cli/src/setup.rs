@@ -265,6 +265,43 @@ const CLAUDE_SLASH_COMMANDS: [(&str, &str); 4] = [
     ("hyphae-mute.md", CLAUDE_CMD_HYPHAE_MUTE),
 ];
 
+/// OpenClaw message delivery mode chosen during `hyp setup` / `hyp onboard`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenClawDeliveryMode {
+    /// OpenClaw Gateway webhook push wakeups (`/hooks/agent`) + turn-start / `hyp_inbox`.
+    #[default]
+    Gateway,
+    /// Turn-start / `hyp_inbox` only (disables Gateway webhook push wakeups).
+    Inbox,
+}
+
+impl OpenClawDeliveryMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Gateway => "gateway",
+            Self::Inbox => "inbox",
+        }
+    }
+
+    pub const fn display_label(self) -> &'static str {
+        match self {
+            Self::Gateway => "Gateway webhook wakeups (/hooks/agent + hyp_inbox)",
+            Self::Inbox => "Turn-start / hyp_inbox only (no Gateway webhook)",
+        }
+    }
+}
+
 #[derive(Args)]
 pub struct SetupArgs {
     /// Target harness: all, auto, or one/comma-separated of claude,codex,antigravity,cursor,opencode,gemini,openclaw,herdr,t3
@@ -330,6 +367,15 @@ pub struct SetupArgs {
     /// Local plugins .tar.gz archive for verified harness UI plugin installation (overrides HYPHAE_PLUGINS_ARCHIVE)
     #[arg(long, value_name = "FILE")]
     pub plugins_archive: Option<PathBuf>,
+    /// OpenClaw delivery mode: 'gateway' (Gateway webhook wakeups + inbox) or 'inbox' (turn-start / hyp_inbox only)
+    #[arg(long, value_enum)]
+    pub openclaw_delivery: Option<OpenClawDeliveryMode>,
+    /// Enable OpenClaw turn-start prompt injection (`before_prompt_build`, sets allowPromptModification + allowConversationAccess)
+    #[arg(long)]
+    pub openclaw_prompt_injection: bool,
+    /// Disable OpenClaw turn-start prompt injection (zero prompt mutation; messages still arrive via Gateway wake nudges & hyp_inbox)
+    #[arg(long)]
+    pub no_openclaw_prompt_injection: bool,
     /// Output structured JSON envelope
     #[arg(long)]
     pub json: bool,
@@ -397,6 +443,15 @@ pub struct OnboardArgs {
     /// Local plugins .tar.gz archive for verified harness UI plugin installation (overrides HYPHAE_PLUGINS_ARCHIVE)
     #[arg(long, value_name = "FILE")]
     pub plugins_archive: Option<PathBuf>,
+    /// OpenClaw delivery mode: 'gateway' (Gateway webhook wakeups + inbox) or 'inbox' (turn-start / hyp_inbox only)
+    #[arg(long, value_enum)]
+    pub openclaw_delivery: Option<OpenClawDeliveryMode>,
+    /// Enable OpenClaw turn-start prompt injection (`before_prompt_build`, sets allowPromptModification + allowConversationAccess)
+    #[arg(long)]
+    pub openclaw_prompt_injection: bool,
+    /// Disable OpenClaw turn-start prompt injection (zero prompt mutation; messages still arrive via Gateway wake nudges & hyp_inbox)
+    #[arg(long)]
+    pub no_openclaw_prompt_injection: bool,
     /// Output structured JSON envelope
     #[arg(long)]
     pub json: bool,
@@ -471,6 +526,19 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
             "CONFLICTING_FLAGS",
             "`--plugins-dir` and `--plugins-archive` are mutually exclusive",
             Some("Specify at most one of `--plugins-dir` or `--plugins-archive`.".to_string()),
+        );
+    }
+    if args.openclaw_prompt_injection && args.no_openclaw_prompt_injection {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "CONFLICTING_FLAGS",
+            "`--openclaw-prompt-injection` and `--no-openclaw-prompt-injection` are mutually exclusive",
+            Some(
+                "Pass either `--openclaw-prompt-injection` (enable) or `--no-openclaw-prompt-injection` (disable)."
+                    .to_string(),
+            ),
         );
     }
     if args.interactive {
@@ -556,6 +624,15 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
         || args.clone_layout.is_some()
         || args.force_layout;
 
+    let mut openclaw_delivery_override = args.openclaw_delivery;
+    let mut openclaw_prompt_injection_override: Option<bool> = if args.openclaw_prompt_injection {
+        Some(true)
+    } else if args.no_openclaw_prompt_injection {
+        Some(false)
+    } else {
+        None
+    };
+
     if args.interactive {
         let mut toggle_state = wizard::SetupToggleState::from_home_with_claude(
             &home,
@@ -575,6 +652,12 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
         if wants_herdr_mod {
             toggle_state.install_herdr_mod = true;
         }
+        if let Some(delivery) = openclaw_delivery_override {
+            toggle_state.openclaw_delivery = delivery;
+        }
+        if let Some(pi) = openclaw_prompt_injection_override {
+            toggle_state.openclaw_prompt_injection = pi;
+        }
         match wizard::run_setup_toggle_interactive(toggle_state, &home) {
             Ok(Some(selection)) => {
                 targets = selection.harnesses;
@@ -583,6 +666,8 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
                 args.statusline = selection.install_statusline;
                 args.install_mod = selection.install_herdr_mod;
                 wants_herdr_mod = selection.install_herdr_mod;
+                openclaw_delivery_override = Some(selection.openclaw_delivery);
+                openclaw_prompt_injection_override = Some(selection.openclaw_prompt_injection);
             }
             Ok(None) => {
                 println!("Cancelled — no files were written.");
@@ -638,6 +723,8 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
         dry_run: args.dry_run,
         plugins_dir: args.plugins_dir.as_deref(),
         plugins_archive: args.plugins_archive.as_deref(),
+        openclaw_delivery: openclaw_delivery_override,
+        openclaw_prompt_injection: openclaw_prompt_injection_override,
     };
 
     for kind in targets {
@@ -813,6 +900,19 @@ pub fn run_onboard(args: OnboardArgs) -> ExitCode {
             Some("Specify at most one of `--plugins-dir` or `--plugins-archive`.".to_string()),
         );
     }
+    if args.openclaw_prompt_injection && args.no_openclaw_prompt_injection {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "CONFLICTING_FLAGS",
+            "`--openclaw-prompt-injection` and `--no-openclaw-prompt-injection` are mutually exclusive",
+            Some(
+                "Pass either `--openclaw-prompt-injection` (enable) or `--no-openclaw-prompt-injection` (disable)."
+                    .to_string(),
+            ),
+        );
+    }
 
     let Some(home) = resolve_home_dir(args.home.as_deref()) else {
         return emit_error(
@@ -873,6 +973,19 @@ fn run_onboard_deterministic(
             "CONFLICTING_FLAGS",
             "`--plugins-dir` and `--plugins-archive` are mutually exclusive",
             Some("Specify at most one of `--plugins-dir` or `--plugins-archive`.".to_string()),
+        );
+    }
+    if args.openclaw_prompt_injection && args.no_openclaw_prompt_injection {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "CONFLICTING_FLAGS",
+            "`--openclaw-prompt-injection` and `--no-openclaw-prompt-injection` are mutually exclusive",
+            Some(
+                "Pass either `--openclaw-prompt-injection` (enable) or `--no-openclaw-prompt-injection` (disable)."
+                    .to_string(),
+            ),
         );
     }
 
@@ -1123,29 +1236,47 @@ fn run_onboard_deterministic(
         args.home.is_some(),
         args.claude_config_dir.as_deref(),
     );
-    let (targets, opt_statusline, opt_install_mod, opt_no_skills, opt_no_commands) =
-        if let Some(sel) = selection_override {
-            (
-                sel.harnesses,
-                sel.install_statusline,
-                sel.install_herdr_mod,
-                !sel.install_skills,
-                !sel.install_claude_commands,
-            )
-        } else {
-            let harness_spec = args.harness.as_deref().unwrap_or("auto");
-            let targets = match parse_harness_selection(harness_spec, &home, &claude_profiles) {
-                Ok(t) => t,
-                Err(e) => return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_HARNESS", e, None),
-            };
-            (
-                targets,
-                args.statusline,
-                args.install_mod,
-                args.no_skills,
-                args.no_commands,
-            )
+    let (
+        targets,
+        opt_statusline,
+        opt_install_mod,
+        opt_no_skills,
+        opt_no_commands,
+        opt_openclaw_delivery,
+        opt_openclaw_prompt_injection,
+    ) = if let Some(sel) = selection_override {
+        (
+            sel.harnesses,
+            sel.install_statusline,
+            sel.install_herdr_mod,
+            !sel.install_skills,
+            !sel.install_claude_commands,
+            Some(sel.openclaw_delivery),
+            Some(sel.openclaw_prompt_injection),
+        )
+    } else {
+        let harness_spec = args.harness.as_deref().unwrap_or("auto");
+        let targets = match parse_harness_selection(harness_spec, &home, &claude_profiles) {
+            Ok(t) => t,
+            Err(e) => return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_HARNESS", e, None),
         };
+        let pi_override = if args.openclaw_prompt_injection {
+            Some(true)
+        } else if args.no_openclaw_prompt_injection {
+            Some(false)
+        } else {
+            None
+        };
+        (
+            targets,
+            args.statusline,
+            args.install_mod,
+            args.no_skills,
+            args.no_commands,
+            args.openclaw_delivery,
+            pi_override,
+        )
+    };
     let skill_ctx = SetupSkillContext::detect(
         &home,
         &config_path,
@@ -1164,6 +1295,8 @@ fn run_onboard_deterministic(
         dry_run: false,
         plugins_dir: args.plugins_dir.as_deref(),
         plugins_archive: args.plugins_archive.as_deref(),
+        openclaw_delivery: opt_openclaw_delivery,
+        openclaw_prompt_injection: opt_openclaw_prompt_injection,
     };
     let mut configured_harnesses = Vec::new();
     let mut herdr_mod_outcome: Option<crate::herdr_mod::HerdrModInstallOutcome> = None;
@@ -1912,11 +2045,38 @@ pub fn detect_harness_statuses(
                 }
                 HarnessKind::Openclaw => {
                     let p = home.join(".openclaw").join("openclaw.json");
-                    let ok = p.exists()
+                    let plugin_manifest = home
+                        .join(".openclaw")
+                        .join("extensions")
+                        .join("hyphae")
+                        .join("openclaw.plugin.json");
+                    let plugin_entry = home
+                        .join(".openclaw")
+                        .join("extensions")
+                        .join("hyphae")
+                        .join("index.js");
+                    let has_cfg = p.exists()
                         && fs::read_to_string(&p)
                             .map(|s| s.contains("hyphae"))
                             .unwrap_or(false);
-                    (ok, p.display().to_string())
+                    let has_plugin = plugin_manifest.is_file() && plugin_entry.is_file();
+                    let loc = if has_cfg && has_plugin {
+                        let (delivery, pi) = read_openclaw_hyphae_preferences(home);
+                        format!(
+                            "{}, plugin installed, delivery={}, promptInjection={}",
+                            p.display(),
+                            delivery.as_str(),
+                            if pi { "on" } else { "off" }
+                        )
+                    } else if has_cfg {
+                        format!(
+                            "{} (re-run `hyp setup --harness openclaw` to install official plugin)",
+                            p.display()
+                        )
+                    } else {
+                        p.display().to_string()
+                    };
+                    (has_cfg, loc)
                 }
                 HarnessKind::Herdr => {
                     let skill = home
@@ -2203,6 +2363,8 @@ struct SetupOptions<'a> {
     dry_run: bool,
     plugins_dir: Option<&'a Path>,
     plugins_archive: Option<&'a Path>,
+    openclaw_delivery: Option<OpenClawDeliveryMode>,
+    openclaw_prompt_injection: Option<bool>,
 }
 
 fn maybe_install_harness_runtime_skills(
@@ -2789,7 +2951,7 @@ fn configure_harness(
         HarnessKind::Cursor => setup_cursor(home, bin, opts, skill_ctx),
         HarnessKind::Opencode => setup_opencode(home, bin, opts, skill_ctx),
         HarnessKind::Gemini => setup_gemini(home, bin, opts, skill_ctx),
-        HarnessKind::Openclaw => setup_openclaw(home, bin, opts, skill_ctx),
+        HarnessKind::Openclaw => setup_openclaw(home, bin, config_path, opts, skill_ctx),
         HarnessKind::Herdr => setup_herdr(home, bin, opts, skill_ctx),
         HarnessKind::T3 => setup_t3(home, bin, config_path, opts, skill_ctx),
     }
@@ -3588,17 +3750,98 @@ fn setup_gemini(
     })
 }
 
-fn setup_openclaw(
+/// Reads any previously configured OpenClaw delivery mode and prompt-injection preference from
+/// `~/.openclaw/openclaw.json` (used as defaults when re-running `hyp setup` or opening the
+/// interactive OpenClaw onboarding step).
+pub fn read_openclaw_hyphae_preferences(home: &Path) -> (OpenClawDeliveryMode, bool) {
+    let config_file = home.join(".openclaw").join("openclaw.json");
+    let Ok(doc) = read_json_object_or_empty(&config_file) else {
+        return (OpenClawDeliveryMode::Gateway, false);
+    };
+    let entry = doc
+        .get("plugins")
+        .and_then(Value::as_object)
+        .and_then(|p| p.get("entries"))
+        .and_then(Value::as_object)
+        .and_then(|e| e.get("hyphae"))
+        .and_then(Value::as_object);
+    let delivery = entry
+        .and_then(|e| e.get("config"))
+        .and_then(Value::as_object)
+        .and_then(|c| c.get("deliveryMode"))
+        .and_then(Value::as_str)
+        .map(|s| {
+            if s.eq_ignore_ascii_case("inbox") {
+                OpenClawDeliveryMode::Inbox
+            } else {
+                OpenClawDeliveryMode::Gateway
+            }
+        })
+        .unwrap_or(OpenClawDeliveryMode::Gateway);
+    let prompt_injection = entry
+        .and_then(|e| e.get("config"))
+        .and_then(Value::as_object)
+        .and_then(|c| c.get("promptInjection"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            entry
+                .and_then(|e| e.get("hooks"))
+                .and_then(Value::as_object)
+                .and_then(|h| {
+                    h.get("allowPromptModification")
+                        .and_then(Value::as_bool)
+                })
+        })
+        .unwrap_or(false);
+    (delivery, prompt_injection)
+}
+
+/// Core non-destructive OpenClaw plugin + `openclaw.json` + optional `node.json` configurator
+/// shared by `setup_openclaw` (`hyp setup` / `hyp onboard`) and the interactive OpenClaw
+/// onboarding step (`hyp onboard --assist openclaw`).
+pub fn apply_openclaw_config(
     home: &Path,
     bin: &str,
-    opts: SetupOptions<'_>,
-    skill_ctx: &SetupSkillContext,
-) -> Result<HarnessSetupOutcome, String> {
-    let socket = opts.socket;
-    let dry_run = opts.dry_run;
+    socket: Option<&str>,
+    config_path: Option<&Path>,
+    delivery_mode: OpenClawDeliveryMode,
+    prompt_injection: bool,
+    dry_run: bool,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    const OPENCLAW_PLUGIN_MANIFEST: &str =
+        include_str!("../../../plugins/openclaw/openclaw.plugin.json");
+    const OPENCLAW_PLUGIN_INDEX_JS: &str = include_str!("../../../plugins/openclaw/index.js");
+
     let base_dir = home.join(".openclaw");
     let config_file = base_dir.join("openclaw.json");
+    let plugin_dir = base_dir.join("extensions").join("hyphae");
+    let manifest_file = plugin_dir.join("openclaw.plugin.json");
+    let entry_file = plugin_dir.join("index.js");
 
+    // 1. Install official zero-dependency OpenClaw plugin offline into `~/.openclaw/extensions/hyphae/`.
+    maybe_write_text(&manifest_file, OPENCLAW_PLUGIN_MANIFEST, false, dry_run)?;
+    let bin_json = serde_json::to_string(bin).unwrap_or_else(|_| "\"hyp\"".to_string());
+    let mut rendered_index = OPENCLAW_PLUGIN_INDEX_JS.replacen(
+        "const DEFAULT_HYP_BIN = process.env.HYPHAE_BIN || \"hyp\";",
+        &format!("const DEFAULT_HYP_BIN = process.env.HYPHAE_BIN || {bin_json};"),
+        1,
+    );
+    if let Some(sock) = socket {
+        let sock_json = serde_json::to_string(sock).unwrap_or_else(|_| "\"\"".to_string());
+        rendered_index = rendered_index.replacen(
+            "const DEFAULT_HYP_SOCKET = process.env.HYPHAE_SOCKET || \"\";",
+            &format!("const DEFAULT_HYP_SOCKET = process.env.HYPHAE_SOCKET || {sock_json};"),
+            1,
+        );
+    }
+    let plugin_source = format!(
+        "// Auto-generated by hyp setup --harness openclaw (static Rust binary)\n{rendered_index}"
+    );
+    maybe_write_text(&entry_file, &plugin_source, false, dry_run)?;
+
+    // 2. Non-destructively merge `mcp.servers.hyphae` and `plugins.entries.hyphae` into `openclaw.json`
+    //    matching OpenClaw 2026.11+ strict config validation (`allowPromptModification` +
+    //    `allowConversationAccess`, never legacy `allowPromptInjection`).
     let mut doc = read_json_object_or_empty(&config_file)?;
     let mut mcp = doc
         .get("mcp")
@@ -3610,9 +3853,6 @@ fn setup_openclaw(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    // OpenClaw Gateway does not currently expose PreToolUse lifecycle hooks, so `--ephemeral`
-    // remains an explicit opt-in fallback solely for this hookless backend (and NEVER bypasses
-    // failed `_meshCall` token verification on LocalDaemon).
     servers.insert(
         "hyphae".to_string(),
         json!({
@@ -3622,13 +3862,158 @@ fn setup_openclaw(
     );
     mcp.insert("servers".to_string(), Value::Object(servers));
     doc.insert("mcp".to_string(), Value::Object(mcp));
+
+    let mut plugins = doc
+        .get("plugins")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut entries = plugins
+        .get("entries")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let has_other_entries = entries.keys().any(|k| k != "hyphae");
+
+    // Preserve any existing `plugins.allow` entries and append `"hyphae"` if absent.
+    // On a fresh/hyphae-only config, set `plugins.allow = ["hyphae"]` to silence OpenClaw's
+    // empty-allowlist warning; if other third-party plugin entries exist without an allowlist,
+    // leave `plugins.allow` unset so we never block unrelated user extensions.
+    match plugins.get_mut("allow") {
+        Some(Value::Array(allow_arr)) => {
+            if !allow_arr.iter().any(|v| v.as_str() == Some("hyphae")) {
+                allow_arr.push(Value::String("hyphae".to_string()));
+            }
+        }
+        None if !has_other_entries => {
+            plugins.insert("allow".to_string(), json!(["hyphae"]));
+        }
+        _ => {}
+    }
+
+    let mut hyphae_entry = entries
+        .get("hyphae")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    hyphae_entry.insert("enabled".to_string(), Value::Bool(true));
+
+    let mut hooks_cfg = hyphae_entry
+        .get("hooks")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    // Strip legacy renamed key so strict `openclaw config validate` stays 100% clean.
+    hooks_cfg.remove("allowPromptInjection");
+    hooks_cfg.insert(
+        "allowPromptModification".to_string(),
+        Value::Bool(prompt_injection),
+    );
+    hooks_cfg.insert(
+        "allowConversationAccess".to_string(),
+        Value::Bool(prompt_injection),
+    );
+    hyphae_entry.insert("hooks".to_string(), Value::Object(hooks_cfg));
+
+    let mut plugin_cfg = Map::new();
+    plugin_cfg.insert("hypBin".to_string(), Value::String(bin.to_string()));
+    if let Some(sock) = socket {
+        plugin_cfg.insert("socket".to_string(), Value::String(sock.to_string()));
+    }
+    plugin_cfg.insert(
+        "deliveryMode".to_string(),
+        Value::String(delivery_mode.as_str().to_string()),
+    );
+    plugin_cfg.insert("promptInjection".to_string(), Value::Bool(prompt_injection));
+    hyphae_entry.insert("config".to_string(), Value::Object(plugin_cfg));
+
+    entries.insert("hyphae".to_string(), Value::Object(hyphae_entry));
+    plugins.insert("entries".to_string(), Value::Object(entries));
+    doc.insert("plugins".to_string(), Value::Object(plugins));
+
     maybe_write_json(&config_file, &Value::Object(doc), false, dry_run)?;
 
-    let mut files = vec![config_file.display().to_string()];
-    let mut notes = vec![
-        "OpenClaw openclaw.json (--backend openclaw --ephemeral hookless fallback) and tailored orchestrator skill configured. Store `openclaw-hooks-token` via `hyp secret set openclaw-hooks-token` to enable Gateway webhook push wakeups."
-            .to_string(),
+    let mut files = vec![
+        config_file.display().to_string(),
+        manifest_file.display().to_string(),
+        entry_file.display().to_string(),
     ];
+
+    // 3. Persist `openclaw.deliveryMode` in `node.json` when disabling Gateway push (`inbox`)
+    //    or updating an existing `"openclaw"` block so `LocalDaemon` honors the user's choice.
+    if let Some(cfg_path) = config_path {
+        if cfg_path.exists() {
+            let mut node_cfg = read_json_object_or_empty(cfg_path)?;
+            let existing_oc = node_cfg.get("openclaw").and_then(Value::as_object).cloned();
+            let should_update = delivery_mode == OpenClawDeliveryMode::Inbox
+                || existing_oc
+                    .as_ref()
+                    .and_then(|o| o.get("deliveryMode").and_then(Value::as_str))
+                    .is_some_and(|m| !m.eq_ignore_ascii_case(delivery_mode.as_str()));
+            if should_update {
+                let mut oc_block = existing_oc.unwrap_or_default();
+                oc_block.insert(
+                    "deliveryMode".to_string(),
+                    Value::String(delivery_mode.as_str().to_string()),
+                );
+                node_cfg.insert("openclaw".to_string(), Value::Object(oc_block));
+                maybe_write_json(cfg_path, &Value::Object(node_cfg), true, dry_run)?;
+                files.push(cfg_path.display().to_string());
+            }
+        }
+    }
+
+    let mut notes = Vec::new();
+    match delivery_mode {
+        OpenClawDeliveryMode::Gateway => {
+            notes.push(
+                "OpenClaw delivery mode: gateway (Gateway webhook wakeups + hyp_inbox). Store `openclaw-hooks-token` via `hyp secret set openclaw-hooks-token --web` (never plaintext) to enable automatic `/hooks/agent` wake nudges."
+                    .to_string(),
+            );
+        }
+        OpenClawDeliveryMode::Inbox => {
+            notes.push(
+                "OpenClaw delivery mode: inbox (turn-start / hyp_inbox only; Gateway webhook push disabled)."
+                    .to_string(),
+            );
+        }
+    }
+    if prompt_injection {
+        notes.push(
+            "OpenClaw prompt injection (`before_prompt_build`): ON (allowPromptModification=true, allowConversationAccess=true). Even if turned OFF later (`--no-openclaw-prompt-injection`), OpenClaw still receives all Hyphae messages via Gateway wake nudges and `hyp_inbox`."
+                .to_string(),
+        );
+    } else {
+        notes.push(
+            "OpenClaw prompt injection (`before_prompt_build`): OFF (allowPromptModification=false, allowConversationAccess=false — zero prompt mutation). Even with prompt injection OFF, OpenClaw still receives all Hyphae messages via Gateway wake nudges and `hyp_inbox`. Pass `--openclaw-prompt-injection` to enable automatic turn-start context injection."
+                .to_string(),
+        );
+    }
+
+    Ok((files, notes))
+}
+
+fn setup_openclaw(
+    home: &Path,
+    bin: &str,
+    config_path: &Path,
+    opts: SetupOptions<'_>,
+    skill_ctx: &SetupSkillContext,
+) -> Result<HarnessSetupOutcome, String> {
+    let (existing_delivery, existing_pi) = read_openclaw_hyphae_preferences(home);
+    let delivery_mode = opts.openclaw_delivery.unwrap_or(existing_delivery);
+    let prompt_injection = opts.openclaw_prompt_injection.unwrap_or(existing_pi);
+
+    let (mut files, mut notes) = apply_openclaw_config(
+        home,
+        bin,
+        opts.socket,
+        Some(config_path),
+        delivery_mode,
+        prompt_injection,
+        opts.dry_run,
+    )?;
+
     maybe_install_harness_runtime_skills(
         HarnessKind::Openclaw,
         home,
@@ -3640,7 +4025,7 @@ fn setup_openclaw(
 
     Ok(HarnessSetupOutcome {
         harness: "openclaw".to_string(),
-        dry_run,
+        dry_run: opts.dry_run,
         files,
         notes,
     })

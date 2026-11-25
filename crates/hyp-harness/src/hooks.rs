@@ -46,7 +46,8 @@ impl FromStr for HookEvent {
             "pre-tool-use" | "PreToolUse" | "BeforeTool" | "beforeMCPExecution"
             | "before-mcp-execution" => Ok(HookEvent::PreToolUse),
             "post-tool-use" | "PostToolUse" | "AfterTool" => Ok(HookEvent::PostToolUse),
-            "pre-invocation" | "PreInvocation" => Ok(HookEvent::PreInvocation),
+            "pre-invocation" | "PreInvocation" | "before-prompt-build" | "before_prompt_build"
+            | "BeforePromptBuild" => Ok(HookEvent::PreInvocation),
             "stop" | "Stop" | "AfterAgent" => Ok(HookEvent::Stop),
             "session-start" | "SessionStart" => Ok(HookEvent::SessionStart),
             other => Err(format!("Unknown hook event '{other}'")),
@@ -131,6 +132,23 @@ pub fn extract_session_id(harness: HarnessKind, payload: &Map<String, Value>) ->
                 .or_else(|| payload.get("session_id"))
                 .or_else(|| payload.get("sessionId")),
         ),
+        HarnessKind::Openclaw => {
+            for key in [
+                "session_id",
+                "sessionId",
+                "session_key",
+                "sessionKey",
+                "agent_id",
+                "agentId",
+            ] {
+                if let Some(qualified) = qualify_session_id(harness, payload.get(key)) {
+                    if is_valid_session_id(&qualified) {
+                        return Some(qualified);
+                    }
+                }
+            }
+            None
+        }
         _ => qualify_session_id(
             harness,
             payload
@@ -691,6 +709,38 @@ where
             drain_pkt.insert("type".into(), json!("mailbox.drain"));
             drain_pkt.insert("sessionId".into(), json!(session_id));
             drain_pkt.insert("limit".into(), json!(5));
+            if options.harness == HarnessKind::Openclaw {
+                drain_pkt.insert("harness".into(), json!("openclaw"));
+                drain_pkt.insert("includeNudged".into(), json!(true));
+                if let Some(sk) = payload
+                    .get("session_key")
+                    .or_else(|| payload.get("sessionKey"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && s.len() <= 200)
+                {
+                    let qualified = if sk.starts_with("openclaw:") {
+                        sk.to_string()
+                    } else {
+                        format!("openclaw:{sk}")
+                    };
+                    if is_valid_session_id(&qualified) {
+                        drain_pkt.insert("sessionKey".into(), json!(sk));
+                    }
+                }
+                if let Some(aid) = payload
+                    .get("agent_id")
+                    .or_else(|| payload.get("agentId"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && s.len() <= 128)
+                {
+                    let qualified = format!("openclaw:{aid}");
+                    if is_valid_session_id(&qualified) {
+                        drain_pkt.insert("agentId".into(), json!(aid));
+                    }
+                }
+            }
             attach_session_token(&mut drain_pkt, session_token);
             let drained = rpc(&options.socket_path, &Value::Object(drain_pkt));
             let items = drained
@@ -706,14 +756,24 @@ where
                 return json!({});
             }
             let text = format_drained_messages(&items);
-            if options.harness == HarnessKind::Antigravity {
-                return json!({
+            match options.harness {
+                HarnessKind::Antigravity => json!({
                     "injectSteps": [
                         { "systemMessage": { "systemMessage": format!("Incoming hyphae message(s):\n\n{text}") } }
                     ]
-                });
+                }),
+                HarnessKind::Openclaw => {
+                    let framed = if text.contains(UNTRUSTED_PROVENANCE) {
+                        text
+                    } else {
+                        format!("{UNTRUSTED_PROVENANCE}\n\n{text}")
+                    };
+                    json!({
+                        "prependContext": format!("Incoming hyphae message(s):\n\n{framed}")
+                    })
+                }
+                _ => json!({}),
             }
-            json!({})
         }
         HookEvent::Stop => {
             let mut drain_pkt = Map::new();
@@ -1359,5 +1419,115 @@ mod tests {
             &missing_dir_file,
             "claude:ok-1"
         ));
+    }
+
+    #[test]
+    fn openclaw_before_prompt_build_parses_drains_nudged_and_returns_prepend_context() {
+        for raw in ["before-prompt-build", "before_prompt_build", "BeforePromptBuild"] {
+            assert_eq!(
+                raw.parse::<HookEvent>().unwrap(),
+                HookEvent::PreInvocation,
+                "expected {raw} to parse as PreInvocation"
+            );
+        }
+
+        // Session ID extraction order & strict validation
+        assert_eq!(
+            extract_session_id(
+                HarnessKind::Openclaw,
+                json!({"sessionId": "abc-123", "sessionKey": "agent:main:explicit:abc-123", "agentId": "main"})
+                    .as_object()
+                    .unwrap()
+            )
+            .as_deref(),
+            Some("openclaw:abc-123")
+        );
+        assert_eq!(
+            extract_session_id(
+                HarnessKind::Openclaw,
+                json!({"sessionKey": "agent:main:explicit:xyz", "agentId": "main"})
+                    .as_object()
+                    .unwrap()
+            )
+            .as_deref(),
+            Some("openclaw:agent:main:explicit:xyz")
+        );
+        assert_eq!(
+            extract_session_id(
+                HarnessKind::Openclaw,
+                json!({"agentId": "ops"}).as_object().unwrap()
+            )
+            .as_deref(),
+            Some("openclaw:ops")
+        );
+        // Invalid characters fall through to next valid key, or fail closed to None
+        assert_eq!(
+            extract_session_id(
+                HarnessKind::Openclaw,
+                json!({"session_id": "bad id; rm -rf", "agentId": "main"})
+                    .as_object()
+                    .unwrap()
+            )
+            .as_deref(),
+            Some("openclaw:main")
+        );
+        assert_eq!(
+            extract_session_id(
+                HarnessKind::Openclaw,
+                json!({"session_id": "bad\nid"}).as_object().unwrap()
+            ),
+            None
+        );
+
+        let recorded = RefCell::new(Vec::<Value>::new());
+        let res = handle_hook_payload_with(
+            json!({
+                "session_id": "oc-sess-1",
+                "sessionKey": "agent:main:explicit:oc-sess-1",
+                "agentId": "main",
+                "cwd": "/tmp/ws"
+            })
+            .as_object()
+            .unwrap(),
+            &opts(HarnessKind::Openclaw, HookEvent::PreInvocation),
+            |_sock, pkt| {
+                recorded.borrow_mut().push(pkt.clone());
+                DaemonRpcResult::ok(
+                    json!({
+                        "items": [{
+                            "text": format!("hyphae from bob/dev\n{UNTRUSTED_PROVENANCE}\n\"deploy ready\"")
+                        }]
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                )
+            },
+        );
+        let pkts = recorded.borrow();
+        assert_eq!(pkts.len(), 1);
+        assert_eq!(pkts[0]["type"], "mailbox.drain");
+        assert_eq!(pkts[0]["sessionId"], "openclaw:oc-sess-1");
+        assert_eq!(pkts[0]["harness"], "openclaw");
+        assert_eq!(pkts[0]["includeNudged"], true);
+        assert_eq!(pkts[0]["sessionKey"], "agent:main:explicit:oc-sess-1");
+        assert_eq!(pkts[0]["agentId"], "main");
+
+        let ctx = res["prependContext"]
+            .as_str()
+            .expect("prependContext string");
+        assert!(ctx.starts_with("Incoming hyphae message(s):\n\n"));
+        assert!(ctx.contains("deploy ready"));
+        assert!(ctx.contains(UNTRUSTED_PROVENANCE));
+
+        // Empty drain -> `{}`
+        let empty = handle_hook_payload_with(
+            json!({"session_id": "oc-sess-1"}).as_object().unwrap(),
+            &opts(HarnessKind::Openclaw, HookEvent::PreInvocation),
+            |_sock, _| {
+                DaemonRpcResult::ok(json!({"items": []}).as_object().unwrap().clone())
+            },
+        );
+        assert_eq!(empty, json!({}));
     }
 }

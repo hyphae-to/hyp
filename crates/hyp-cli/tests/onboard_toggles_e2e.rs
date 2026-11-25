@@ -492,3 +492,185 @@ fn setup_interactive_rejects_json_and_non_tty_with_exit_usage_and_zero_writes() 
     assert!(!home.join(".claude/settings.json").exists());
     assert!(!state_dir.exists());
 }
+
+#[test]
+fn setup_openclaw_installs_plugin_persists_delivery_and_prompt_injection_and_rejects_conflicts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(home.join(".openclaw")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    // Seed an existing openclaw.json with unrelated provider & MCP server to verify non-destructive merge.
+    fs::write(
+        home.join(".openclaw/openclaw.json"),
+        serde_json::to_string_pretty(&json!({
+            "agents": { "defaults": { "workspace": "/tmp/ws" } },
+            "mcp": { "servers": { "weather": { "command": "weather-mcp", "args": [] } } }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        state_dir.join("node.json"),
+        serde_json::to_string_pretty(&json!({ "v": 2, "nodeId": "oc-test@box" })).unwrap(),
+    )
+    .unwrap();
+
+    // 1. Conflicting `--openclaw-prompt-injection` + `--no-openclaw-prompt-injection` -> EXIT_USAGE (2).
+    let conflict = isolated_cmd(&home)
+        .args([
+            "setup",
+            "--harness",
+            "openclaw",
+            "--openclaw-prompt-injection",
+            "--no-openclaw-prompt-injection",
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(conflict.status.code(), Some(2));
+    assert_eq!(parse_json_stdout(&conflict)["error"]["code"], "CONFLICTING_FLAGS");
+
+    // 2. Default install -> conservative prompt injection OFF, delivery=gateway, plugin files installed.
+    let fake_bin = "/opt/hyphae/bin/hyp";
+    let out_default = isolated_cmd(&home)
+        .args([
+            "setup",
+            "--harness",
+            "openclaw",
+            "--bin",
+            fake_bin,
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(
+        out_default.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out_default.stderr)
+    );
+    let payload_default = parse_json_stdout(&out_default);
+    let notes_str = serde_json::to_string(&payload_default["data"]["harnesses"][0]["notes"]).unwrap();
+    assert!(
+        notes_str.contains("Even with prompt injection OFF") && notes_str.contains("hyp_inbox"),
+        "expected reassurance note: {notes_str}"
+    );
+    assert!(home.join(".openclaw/extensions/hyphae/openclaw.plugin.json").is_file());
+    assert!(home.join(".openclaw/extensions/hyphae/index.js").is_file());
+
+    let oc_cfg: Value =
+        serde_json::from_str(&fs::read_to_string(home.join(".openclaw/openclaw.json")).unwrap())
+            .unwrap();
+    assert_eq!(oc_cfg["agents"]["defaults"]["workspace"], "/tmp/ws");
+    assert!(oc_cfg["mcp"]["servers"]["weather"].is_object());
+    assert_eq!(oc_cfg["mcp"]["servers"]["hyphae"]["command"], fake_bin);
+    assert_eq!(oc_cfg["plugins"]["allow"], json!(["hyphae"]));
+    assert_eq!(oc_cfg["plugins"]["entries"]["hyphae"]["enabled"], true);
+    assert_eq!(
+        oc_cfg["plugins"]["entries"]["hyphae"]["hooks"]["allowPromptModification"],
+        false
+    );
+    assert_eq!(
+        oc_cfg["plugins"]["entries"]["hyphae"]["hooks"]["allowConversationAccess"],
+        false
+    );
+    assert!(
+        oc_cfg["plugins"]["entries"]["hyphae"]["hooks"]
+            .get("allowPromptInjection")
+            .is_none(),
+        "must NEVER emit deprecated allowPromptInjection key"
+    );
+    assert_eq!(
+        oc_cfg["plugins"]["entries"]["hyphae"]["config"]["deliveryMode"],
+        "gateway"
+    );
+    assert_eq!(
+        oc_cfg["plugins"]["entries"]["hyphae"]["config"]["promptInjection"],
+        false
+    );
+
+    // 3. Explicit `--openclaw-delivery inbox --openclaw-prompt-injection` updates openclaw.json + node.json!
+    let out_on = isolated_cmd(&home)
+        .args([
+            "setup",
+            "--harness",
+            "openclaw",
+            "--openclaw-delivery",
+            "inbox",
+            "--openclaw-prompt-injection",
+            "--bin",
+            fake_bin,
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out_on.status.code(), Some(0));
+    let oc_cfg_on: Value =
+        serde_json::from_str(&fs::read_to_string(home.join(".openclaw/openclaw.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        oc_cfg_on["plugins"]["entries"]["hyphae"]["hooks"]["allowPromptModification"],
+        true
+    );
+    assert_eq!(
+        oc_cfg_on["plugins"]["entries"]["hyphae"]["hooks"]["allowConversationAccess"],
+        true
+    );
+    assert_eq!(
+        oc_cfg_on["plugins"]["entries"]["hyphae"]["config"]["deliveryMode"],
+        "inbox"
+    );
+    assert_eq!(
+        oc_cfg_on["plugins"]["entries"]["hyphae"]["config"]["promptInjection"],
+        true
+    );
+    let node_cfg: Value =
+        serde_json::from_str(&fs::read_to_string(state_dir.join("node.json")).unwrap()).unwrap();
+    assert_eq!(node_cfg["openclaw"]["deliveryMode"], "inbox");
+
+    // 4. Re-running `hyp setup --harness openclaw` WITHOUT OpenClaw flags preserves prior choices!
+    let out_rerun = isolated_cmd(&home)
+        .args([
+            "setup",
+            "--harness",
+            "openclaw",
+            "--bin",
+            fake_bin,
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out_rerun.status.code(), Some(0));
+    let oc_cfg_rerun: Value =
+        serde_json::from_str(&fs::read_to_string(home.join(".openclaw/openclaw.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        oc_cfg_rerun["plugins"]["entries"]["hyphae"]["config"]["deliveryMode"],
+        "inbox"
+    );
+    assert_eq!(
+        oc_cfg_rerun["plugins"]["entries"]["hyphae"]["config"]["promptInjection"],
+        true
+    );
+}

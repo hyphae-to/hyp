@@ -1,0 +1,33 @@
+{
+  "id": "hyphae",
+  "name": "Hyphae Mesh",
+  "description": "Hyphae E2EE agent mesh turn-start inbox delivery plugin for OpenClaw.",
+  "version": "1.0.0",
+  "activation": {
+    "onStartup": true,
+    "onCapabilities": ["hook"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "hypBin": {
+        "type": "string",
+        "description": "Path to the static hyp binary (defaults to HYPHAE_BIN or 'hyp')."
+      },
+      "socket": {
+        "type": "string",
+        "description": "Optional explicit Hyphae daemon connector.sock or connector.addr path."
+      },
+      "deliveryMode": {
+        "type": "string",
+        "enum": ["gateway", "inbox"],
+        "description": "OpenClaw delivery mode: 'gateway' (webhook wake nudges + inbox) or 'inbox' (turn-start / hyp_inbox only)."
+      },
+      "promptInjection": {
+        "type": "boolean",
+        "description": "When true, injects unread Hyphae messages at turn start via before_prompt_build. When false, leaves prompts untouched so messages remain unread for hyp_inbox."
+      }
+    }
+  }
+}

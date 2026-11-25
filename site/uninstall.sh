@@ -683,6 +683,19 @@ if os.path.isfile(openclaw_json):
             reasons.append("mcp.servers.hyphae")
         if remove_nested_key(doc, ["mcpServers"], "hyphae"):
             reasons.append("mcpServers.hyphae")
+        if remove_nested_key(doc, ["plugins", "entries"], "hyphae"):
+            reasons.append("plugins.entries.hyphae")
+        plugins_obj = doc.get("plugins")
+        if isinstance(plugins_obj, dict) and isinstance(plugins_obj.get("allow"), list):
+            new_allow = [x for x in plugins_obj["allow"] if x != "hyphae"]
+            if len(new_allow) != len(plugins_obj["allow"]):
+                if new_allow:
+                    plugins_obj["allow"] = new_allow
+                else:
+                    del plugins_obj["allow"]
+                if not plugins_obj:
+                    del doc["plugins"]
+                reasons.append("plugins.allow[hyphae]")
         if reasons:
             emit("EDIT", openclaw_json, "remove " + " + ".join(reasons))
             if mode == "apply":
@@ -1267,6 +1280,16 @@ if (isFile(openclawJson)) {
     const reasons = [];
     if (removeNestedKey(doc, ["mcp", "servers"], "hyphae")) reasons.push("mcp.servers.hyphae");
     if (removeNestedKey(doc, ["mcpServers"], "hyphae")) reasons.push("mcpServers.hyphae");
+    if (removeNestedKey(doc, ["plugins", "entries"], "hyphae")) reasons.push("plugins.entries.hyphae");
+    if (isPlainObject(doc.plugins) && Array.isArray(doc.plugins.allow)) {
+      const nextAllow = doc.plugins.allow.filter((x) => x !== "hyphae");
+      if (nextAllow.length !== doc.plugins.allow.length) {
+        if (nextAllow.length > 0) doc.plugins.allow = nextAllow;
+        else delete doc.plugins.allow;
+        if (Object.keys(doc.plugins).length === 0) delete doc.plugins;
+        reasons.push("plugins.allow[hyphae]");
+      }
+    }
     if (reasons.length > 0) {
       emit("EDIT", openclawJson, "remove " + reasons.join(" + "));
       if (mode === "apply") saveJsonObject(openclawJson, doc);
@@ -1448,6 +1471,7 @@ EOF
     "$HOME/.gemini/config/plugins/hyphae" \
     "$CONFIG_HOME/opencode/plugins/hyphae.ts" \
     "$HOME/.config/opencode/plugins/hyphae.ts" \
+    "$HOME/.openclaw/extensions/hyphae" \
     "$CONFIG_HOME/herdr/hyphae.json" \
     "$HOME/.config/herdr/hyphae.json" \
     "$HOME/.t3/hyphae.json" \

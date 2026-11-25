@@ -1740,3 +1740,382 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
     daemon2.stop().await;
     node2.shutdown();
 }
+
+// ============================================================================
+// 5. OpenClaw `before-prompt-build`: Nudge-Then-Drain, Focus Mode, Restart & Session Isolation
+// ============================================================================
+
+#[tokio::test]
+async fn openclaw_nudge_then_drain_focus_mode_restart_and_fail_closed_session_isolation() {
+    let tmp = TempDir::new().unwrap();
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+
+    let token_val = "oc-nudge-drain-token-987";
+    let post_status = Arc::new(AtomicU16::new(202));
+    let unauth_probe_status = Arc::new(AtomicU16::new(401));
+    let (gw_url, gw_hits, _gw_probes, gw_srv) = spawn_mock_openclaw_gateway(
+        token_val.to_string(),
+        Arc::clone(&post_status),
+        Arc::clone(&unauth_probe_status),
+    )
+    .await;
+
+    fs::write(
+        state_dir.join("node.json"),
+        serde_json::to_string_pretty(&json!({
+            "v": 2,
+            "nodeId": "oc-nudge@box",
+            "openclaw": {
+                "url": gw_url,
+                "hooksPath": "/hooks",
+                "mode": "agent",
+                "agentId": "main"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let store = SecretStore::new(&state_dir, SecretBackend::File);
+    store
+        .set(DEFAULT_OPENCLAW_TOKEN_SECRET, token_val)
+        .unwrap();
+
+    let node = open_local_node("oc-nudge@box", &state_dir);
+    let daemon = LocalDaemon::start(
+        Arc::clone(&node),
+        None,
+        LocalDaemonConfig {
+            auto_detect_transports: true,
+            herdr_bin: Some(tmp.path().join("no-hc").display().to_string()),
+            t3_default_base_dir: Some(tmp.path().join("no-t3")),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let sock = daemon.socket_path().to_path_buf();
+
+    // Enroll one ephemeral OpenClaw session (`openclaw:<uuid>`) and one unrelated Claude session.
+    let mut oc_opts = McpOptions::new(sock.clone());
+    oc_opts.backend = Some(HarnessKind::Openclaw);
+    oc_opts.ephemeral = true;
+    let mut oc_mcp = TestMcpClient::spawn(oc_opts);
+    oc_mcp.initialize().await;
+
+    let (join_txt, join_err) = oc_mcp
+        .call_tool("hyp_mesh", json!({ "action": "join", "handle": "claw" }), None)
+        .await;
+    assert!(!join_err, "openclaw join failed: {join_txt}");
+    let join_val: Value = serde_json::from_str(&join_txt).unwrap();
+    assert_eq!(join_val["hasLiveTransport"], true);
+    let oc_sid = node
+        .db()
+        .local()
+        .session_by_handle("claw")
+        .unwrap()
+        .expect("claw session")
+        .id;
+
+    // Also enroll a Claude session with a pending message so we verify OpenClaw drain NEVER leaks it.
+    let claude_sid = "claude:unrelated-victim";
+    let _ = rpc(
+        &sock,
+        &json!({
+            "type": "session.register",
+            "harness": "claude",
+            "sessionId": claude_sid
+        }),
+    )
+    .await;
+    let _ = daemon
+        .ingest_inbound(InboundItem {
+            session_id: claude_sid.into(),
+            origin_node: "peer@box".into(),
+            item_id: "claude-secret-1".into(),
+            source: "peer@box/dev".into(),
+            text: "CLAUDE_PRIVATE_MUST_NEVER_LEAK_TO_OPENCLAW".into(),
+            kind: MailboxKind::Message,
+            trust_tier: GateTrustTier::Peer,
+        })
+        .await
+        .unwrap();
+
+    // 1. Ingest DM into OpenClaw session -> OpenClawTransport delivers metadata-only wake nudge.
+    let _ = daemon
+        .ingest_inbound(InboundItem {
+            session_id: oc_sid.clone(),
+            origin_node: "peer@box".into(),
+            item_id: "oc-nudge-1".into(),
+            source: "peer@box/dev".into(),
+            text: "NUDGE_THEN_DRAIN_PAYLOAD_101".into(),
+            kind: MailboxKind::Message,
+            trust_tier: GateTrustTier::Peer,
+        })
+        .await
+        .unwrap();
+    let hits_after_nudge = gw_hits.lock().unwrap().len();
+    assert!(hits_after_nudge >= 1, "expected OpenClaw wake nudge");
+    assert_eq!(
+        session_status(&sock, &oc_sid).await["pending"],
+        1,
+        "message must remain pending after metadata-only wake nudge"
+    );
+
+    // Regular mailbox.drain WITHOUT `includeNudged: true` returns empty (push/Stop never loops!).
+    let plain_drain = rpc(
+        &sock,
+        &json!({ "type": "mailbox.drain", "sessionId": oc_sid, "limit": 5 }),
+    )
+    .await;
+    assert!(plain_drain.ok);
+    assert_eq!(
+        plain_drain.result.unwrap()["items"].as_array().unwrap().len(),
+        0,
+        "regular drain without includeNudged must NOT re-emit nudged batch"
+    );
+
+    // 2. OpenClaw `before-prompt-build` hook (with distinct hook sessionId) drains the nudge-pending
+    //    item cleanly via single-OpenClaw-session resolution AND transitions it pending -> delivered!
+    let hook_out = run_hook(
+        &sock,
+        HarnessKind::Openclaw,
+        "before-prompt-build".parse::<HookEvent>().unwrap(),
+        json!({
+            "session_id": "hook-turn-uuid-1",
+            "sessionKey": "agent:main:explicit:hook-turn-uuid-1",
+            "agentId": "main"
+        }),
+    )
+    .await;
+    let prep = hook_out["prependContext"]
+        .as_str()
+        .expect("expected prependContext after wake nudge");
+    assert!(prep.contains("NUDGE_THEN_DRAIN_PAYLOAD_101"), "prep={prep}");
+    assert!(
+        !prep.contains("CLAUDE_PRIVATE_MUST_NEVER_LEAK_TO_OPENCLAW"),
+        "OpenClaw drain leaked non-OpenClaw session!"
+    );
+    assert_eq!(
+        session_status(&sock, &oc_sid).await["pending"],
+        0,
+        "inline drained item must transition pending -> delivered"
+    );
+
+    // Second turn MUST return `{}` (zero duplicates!).
+    let hook_out2 = run_hook(
+        &sock,
+        HarnessKind::Openclaw,
+        HookEvent::PreInvocation,
+        json!({ "session_id": "hook-turn-uuid-2", "agentId": "main" }),
+    )
+    .await;
+    assert_eq!(hook_out2, json!({}));
+
+    // 3. Focus Mode `Notify` digest item (`notified == true && !nudge_pending`) MUST NEVER be
+    //    re-dumped by `before-prompt-build` on subsequent turns!
+    let focus_res = rpc(
+        &sock,
+        &json!({ "type": "session.focus", "sessionId": oc_sid, "enabled": true }),
+    )
+    .await;
+    assert!(focus_res.ok, "session.focus failed: {focus_res:?}");
+    let _ = daemon
+        .ingest_inbound(InboundItem {
+            session_id: oc_sid.clone(),
+            origin_node: "peer@box".into(),
+            item_id: "oc-focus-notify-1".into(),
+            source: "peer@box/dev".into(),
+            text: "FOCUS_MODE_LOW_PRIORITY_NOTE".into(),
+            kind: MailboxKind::Message,
+            trust_tier: GateTrustTier::Peer,
+        })
+        .await
+        .unwrap();
+    // First drain delivers the Focus Mode `Notify` digest (item stays unread & notified=true, nudge_pending=false).
+    let focus_first = run_hook(
+        &sock,
+        HarnessKind::Openclaw,
+        HookEvent::PreInvocation,
+        json!({ "session_id": oc_sid }),
+    )
+    .await;
+    assert!(
+        focus_first["prependContext"].is_string(),
+        "first Focus Mode digest should surface once: {focus_first}"
+    );
+    // Second drain MUST NOT re-dump the already-notified Focus Mode footer!
+    let focus_second = run_hook(
+        &sock,
+        HarnessKind::Openclaw,
+        HookEvent::PreInvocation,
+        json!({ "session_id": oc_sid }),
+    )
+    .await;
+    assert_eq!(
+        focus_second,
+        json!({}),
+        "already-notified Focus Mode Notify item must NEVER re-dump even with includeNudged=true"
+    );
+    // Ack and disable focus mode before restart test.
+    let _ = oc_mcp
+        .call_tool("hyp_inbox", json!({ "ack": true }), None)
+        .await;
+    let _ = rpc(
+        &sock,
+        &json!({ "type": "session.focus", "sessionId": oc_sid, "enabled": false }),
+    )
+    .await;
+
+    // 4. Daemon restart persistence: nudge an item, restart LocalDaemon, and verify `before-prompt-build`
+    //    STILL drains it cleanly via `sessions.backend_json.nudgePending`!
+    let _ = daemon
+        .ingest_inbound(InboundItem {
+            session_id: oc_sid.clone(),
+            origin_node: "peer@box".into(),
+            item_id: "oc-restart-1".into(),
+            source: "peer@box/dev".into(),
+            text: "SURVIVES_DAEMON_RESTART_NUDGE_202".into(),
+            kind: MailboxKind::Message,
+            trust_tier: GateTrustTier::Peer,
+        })
+        .await
+        .unwrap();
+    oc_mcp.close().await;
+    daemon.stop().await;
+    node.shutdown();
+
+    let node2 = open_local_node("oc-nudge@box", &state_dir);
+    let daemon2 = LocalDaemon::start(
+        Arc::clone(&node2),
+        None,
+        LocalDaemonConfig {
+            auto_detect_transports: false,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let sock2 = daemon2.socket_path().to_path_buf();
+
+    let after_restart = run_hook(
+        &sock2,
+        HarnessKind::Openclaw,
+        HookEvent::PreInvocation,
+        json!({ "session_id": "post-restart-hook-id", "agentId": "main" }),
+    )
+    .await;
+    let restart_prep = after_restart["prependContext"]
+        .as_str()
+        .expect("nudge-pending item must survive daemon restart");
+    assert!(
+        restart_prep.contains("SURVIVES_DAEMON_RESTART_NUDGE_202"),
+        "restart_prep={restart_prep}"
+    );
+
+    // 5. Fail-closed ambiguity: with 2 distinct OpenClaw sessions enrolled and an unrecognized
+    //    hook sessionId + non-matching agentId, `before-prompt-build` MUST return `{}`!
+    let oc_sid_2 = "openclaw:second-ambiguous-session";
+    let _ = rpc(
+        &sock2,
+        &json!({
+            "type": "session.register",
+            "harness": "openclaw",
+            "sessionId": oc_sid_2
+        }),
+    )
+    .await;
+    let _ = daemon2
+        .ingest_inbound(InboundItem {
+            session_id: oc_sid_2.into(),
+            origin_node: "peer@box".into(),
+            item_id: "oc-ambig-1".into(),
+            source: "peer@box/dev".into(),
+            text: "MUST_NOT_LEAK_WHEN_AMBIGUOUS".into(),
+            kind: MailboxKind::Message,
+            trust_tier: GateTrustTier::Peer,
+        })
+        .await
+        .unwrap();
+    let ambig = run_hook(
+        &sock2,
+        HarnessKind::Openclaw,
+        HookEvent::PreInvocation,
+        json!({ "session_id": "unknown-third-id", "agentId": "unknown-agent" }),
+    )
+    .await;
+    assert_eq!(
+        ambig,
+        json!({}),
+        "ambiguous multi-session OpenClaw hook drain must fail closed"
+    );
+    // Exact sessionId match still succeeds!
+    let exact = run_hook(
+        &sock2,
+        HarnessKind::Openclaw,
+        HookEvent::PreInvocation,
+        json!({ "session_id": oc_sid_2 }),
+    )
+    .await;
+    assert!(
+        exact["prependContext"]
+            .as_str()
+            .is_some_and(|s| s.contains("MUST_NOT_LEAK_WHEN_AMBIGUOUS")),
+        "exact sessionId match must succeed: {exact}"
+    );
+
+    daemon2.stop().await;
+    node2.shutdown();
+
+    // 6. `deliveryMode: "inbox"` in `node.json` disables Gateway push auto-attachment even when
+    //    a valid `openclaw-hooks-token` and live Gateway exist!
+    fs::write(
+        state_dir.join("node.json"),
+        serde_json::to_string_pretty(&json!({
+            "v": 2,
+            "nodeId": "oc-nudge@box",
+            "openclaw": {
+                "deliveryMode": "inbox",
+                "url": gw_url,
+                "hooksPath": "/hooks",
+                "mode": "agent",
+                "agentId": "main"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let node3 = open_local_node("oc-nudge@box", &state_dir);
+    let daemon3 = LocalDaemon::start(
+        Arc::clone(&node3),
+        None,
+        LocalDaemonConfig {
+            auto_detect_transports: true,
+            herdr_bin: Some(tmp.path().join("no-hc").display().to_string()),
+            t3_default_base_dir: Some(tmp.path().join("no-t3")),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let sock3 = daemon3.socket_path().to_path_buf();
+    let mut oc_inbox_opts = McpOptions::new(sock3.clone());
+    oc_inbox_opts.backend = Some(HarnessKind::Openclaw);
+    oc_inbox_opts.ephemeral = true;
+    let mut oc_inbox_mcp = TestMcpClient::spawn(oc_inbox_opts);
+    oc_inbox_mcp.initialize().await;
+    let (j3_txt, j3_err) = oc_inbox_mcp
+        .call_tool("hyp_mesh", json!({ "action": "join", "handle": "claw-inbox" }), None)
+        .await;
+    assert!(!j3_err, "{j3_txt}");
+    let j3_val: Value = serde_json::from_str(&j3_txt).unwrap();
+    assert_eq!(
+        j3_val["hasLiveTransport"], false,
+        "deliveryMode='inbox' must disable OpenClaw Gateway push transport: {j3_val}"
+    );
+
+    oc_inbox_mcp.close().await;
+    daemon3.stop().await;
+    node3.shutdown();
+    gw_srv.abort();
+}

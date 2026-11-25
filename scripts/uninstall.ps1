@@ -1213,6 +1213,29 @@ function Invoke-HarnessConfigCleaner {
             if (Remove-NestedJsonKey -Doc $doc -Parents @("mcpServers") -Key "hyphae") {
                 $reasons.Add("mcpServers.hyphae")
             }
+            if (Remove-NestedJsonKey -Doc $doc -Parents @("plugins", "entries") -Key "hyphae") {
+                $reasons.Add("plugins.entries.hyphae")
+            }
+            if ((Test-JsonProperty $doc "plugins")) {
+                $pluginsObj = $doc.PSObject.Properties["plugins"].Value
+                if ((Test-JsonObject $pluginsObj) -and (Test-JsonProperty $pluginsObj "allow")) {
+                    $allowVal = $pluginsObj.PSObject.Properties["allow"].Value
+                    if ($allowVal -is [System.Collections.IList]) {
+                        $kept = @($allowVal | Where-Object { $_ -ne "hyphae" })
+                        if ($kept.Count -ne $allowVal.Count) {
+                            if ($kept.Count -gt 0) {
+                                $pluginsObj.PSObject.Properties["allow"].Value = $kept
+                            } else {
+                                $pluginsObj.PSObject.Properties.Remove("allow")
+                            }
+                            if ((@($pluginsObj.PSObject.Properties).Count) -eq 0) {
+                                $doc.PSObject.Properties.Remove("plugins")
+                            }
+                            $reasons.Add("plugins.allow[hyphae]")
+                        }
+                    }
+                }
+            }
             if ($reasons.Count -gt 0) {
                 $edits.Add("${openclawJson}: remove " + ($reasons.ToArray() -join " + "))
                 if ($Mode -eq "apply") {
@@ -1324,6 +1347,7 @@ if (-not $KeepHarnesses) {
         (Join-Path $ConfigHome "opencode\plugins\hyphae.ts"),
         (Join-Path $UserHome ".config\opencode\plugins\hyphae.ts"),
         (Join-Path $AppData "opencode\plugins\hyphae.ts"),
+        (Join-Path $UserHome ".openclaw\extensions\hyphae"),
         (Join-Path $ConfigHome "herdr\hyphae.json"),
         (Join-Path $UserHome ".config\herdr\hyphae.json"),
         (Join-Path $UserHome ".t3\hyphae.json"),

@@ -254,8 +254,10 @@ impl fmt::Debug for OpenClawTarget {
 }
 
 /// Optional `"openclaw"` configuration block parsed from `node.json`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenClawNodeConfig {
+    pub enabled: bool,
+    pub delivery_mode: Option<String>,
     pub url: Option<String>,
     pub hooks_path: Option<String>,
     pub agent_id: Option<String>,
@@ -264,8 +266,23 @@ pub struct OpenClawNodeConfig {
     pub allow_remote: bool,
 }
 
+impl Default for OpenClawNodeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            delivery_mode: None,
+            url: None,
+            hooks_path: None,
+            agent_id: None,
+            mode: None,
+            token_secret: None,
+            allow_remote: false,
+        }
+    }
+}
+
 impl OpenClawNodeConfig {
-    /// Extracts `"openclaw": { "url", "hooksPath", "agentId", "mode", "tokenSecret", "allowRemote" }`
+    /// Extracts `"openclaw": { "enabled", "deliveryMode", "url", "hooksPath", "agentId", "mode", "tokenSecret", "allowRemote" }`
     /// from a parsed `node.json` document.
     pub fn from_node_json(doc: &Value) -> Self {
         let Some(obj) = doc.get("openclaw").and_then(Value::as_object) else {
@@ -278,12 +295,19 @@ impl OpenClawNodeConfig {
                 .filter(|s| !s.is_empty())
                 .map(ToString::to_string)
         };
+        let enabled = obj
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let delivery_mode = clean_str("deliveryMode");
         let mode = clean_str("mode").and_then(|s| s.parse::<OpenClawEndpointMode>().ok());
         let allow_remote = obj
             .get("allowRemote")
             .and_then(Value::as_bool)
             .unwrap_or(false);
         Self {
+            enabled,
+            delivery_mode,
             url: clean_str("url"),
             hooks_path: clean_str("hooksPath"),
             agent_id: clean_str("agentId"),
@@ -291,6 +315,16 @@ impl OpenClawNodeConfig {
             token_secret: clean_str("tokenSecret"),
             allow_remote,
         }
+    }
+
+    /// Returns `true` when OpenClaw Gateway webhook push wakeups are enabled (`enabled != false`
+    /// and `deliveryMode != "inbox"`).
+    pub fn gateway_push_enabled(&self) -> bool {
+        self.enabled
+            && !self
+                .delivery_mode
+                .as_deref()
+                .is_some_and(|m| m.eq_ignore_ascii_case("inbox"))
     }
 
     /// Converts this config into an [`OpenClawTarget`] with defaults applied.
