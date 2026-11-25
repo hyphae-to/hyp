@@ -18,7 +18,7 @@
   <meta name="twitter:title" content="Hyphae (hyp) — One wire under every agent" />
   <meta name="twitter:description" content="A standardized real-time event and messaging bus for coding agents. Unify CI/GitHub events, alerts, cron triggers, Passkey secrets, and cross-machine team messages over one encrypted wire with per-agent exposure control." />
   <meta name="twitter:image" content="https://hyphae.to/assets/social-card.jpg" />
-  <link rel="stylesheet" href="./styles.css?v=27" />
+  <link rel="stylesheet" href="./styles.css?v=28" />
 </head>
 <body>
   <header id="siteHeader" class="header-dark">
@@ -1052,47 +1052,24 @@ hyp deploy init tailscale</pre>
 
         <div class="sec-grid">
           <!-- 1. End-to-End Encrypted Between Nodes -->
-          <div class="sec-pair tone-olive">
-            <div class="sec-spec-card">
-              <span class="sec-node-port" aria-hidden="true"></span>
-              <div class="sec-spec-inner">
-                <div class="sec-spec-head">
-                  <span class="sec-core-badge"><span class="sec-dot" aria-hidden="true"></span>Node ↔ Node</span>
-                </div>
-                <div class="sec-stage-frame">
-                  <img src="./assets/sec-e2ee.webp?v=1" alt="Two brass Hyphae nodes connected by a glowing sealed conduit passing straight through a locked blind relay tower" decoding="async" />
-                  <div class="sec-img-fade" aria-hidden="true"></div>
-                  <svg class="sec-anim-overlay" viewBox="0 0 320 180" fill="none" aria-hidden="true">
-                    <circle class="sec-orb olive" cx="0" cy="0" r="3.4">
-                      <animateMotion dur="2.8s" repeatCount="indefinite" path="M 92 90 L 128 90" />
-                    </circle>
-                    <circle class="sec-orb olive" cx="0" cy="0" r="3.4">
-                      <animateMotion dur="2.8s" begin="1.35s" repeatCount="indefinite" path="M 192 90 L 230 90" />
-                    </circle>
-                    <rect class="sec-lock-glow" x="147" y="75" width="26" height="32" rx="6" />
-                  </svg>
-                </div>
-                <div class="sec-core-pills">
-                  <span>RFC 9180 HPKE</span>
-                  <span>Ed25519 signed</span>
-                  <span>Blind relays</span>
-                </div>
+          <article class="sec-card tone-olive">
+            <div class="sec-card-media">
+              <div class="sec-stage-frame">
+                <img src="./assets/sec-e2ee.webp?v=1" alt="Two brass Hyphae nodes connected by a glowing sealed conduit passing straight through a locked blind relay tower" decoding="async" />
+                <div class="sec-img-fade" aria-hidden="true"></div>
+                <svg class="sec-anim-overlay" viewBox="0 0 320 180" fill="none" aria-hidden="true">
+                  <circle class="sec-orb olive" cx="0" cy="0" r="3.4">
+                    <animateMotion dur="2.8s" repeatCount="indefinite" path="M 92 90 L 128 90" />
+                  </circle>
+                  <circle class="sec-orb olive" cx="0" cy="0" r="3.4">
+                    <animateMotion dur="2.8s" begin="1.35s" repeatCount="indefinite" path="M 192 90 L 230 90" />
+                  </circle>
+                  <rect class="sec-lock-glow" x="147" y="75" width="26" height="32" rx="6" />
+                </svg>
               </div>
             </div>
 
-            <div class="sec-stem" aria-hidden="true">
-              <svg viewBox="0 0 180 28" fill="none">
-                <path class="sec-stem-weave" d="M 80 0 C 78 10, 96 16, 94 28" />
-                <path class="sec-stem-weave fine" d="M 100 0 C 102 10, 84 16, 86 28" />
-                <path class="sec-stem-twig" d="M 86 11 C 74 12, 66 15, 58 19" />
-                <path class="sec-stem-twig" d="M 94 16 C 106 15, 114 12, 122 8" />
-                <path class="sec-stem-main" d="M 90 0 C 86 10, 94 18, 90 28" />
-                <path class="sec-stem-pulse" pathLength="100" d="M 90 0 C 86 10, 94 18, 90 28" />
-                <circle class="sec-stem-dot" cx="90" cy="28" r="3.1" />
-              </svg>
-            </div>
-
-            <article class="sec-copy-card">
+            <div class="sec-card-body">
               <svg class="card-botanical-accent" viewBox="0 0 150 100" fill="none" aria-hidden="true">
                 <path d="M 150 16 C 120 22, 98 38, 70 42 C 46 45, 28 38, 12 48" />
                 <path d="M 106 28 C 96 16, 82 9, 64 7" />
@@ -1106,51 +1083,33 @@ hyp deploy init tailscale</pre>
               <p>
                 DMs, <code>#channels</code>, Shared KV, and file drops stay RFC 9180 HPKE encrypted and Ed25519 signed; relays never hold keys.
               </p>
-            </article>
-          </div>
+              <div class="sec-card-pills">
+                <span>RFC 9180 HPKE</span>
+                <span>Ed25519 signed</span>
+                <span>Blind relays</span>
+              </div>
+            </div>
+          </article>
 
           <!-- 2. Zero-Context Secrets -->
-          <div class="sec-pair tone-moss">
-            <div class="sec-spec-card">
-              <span class="sec-node-port" aria-hidden="true"></span>
-              <div class="sec-spec-inner">
-                <div class="sec-spec-head">
-                  <span class="sec-core-badge"><span class="sec-dot" aria-hidden="true"></span>Phone → Keychain</span>
-                </div>
-                <div class="sec-stage-frame">
-                  <img src="./assets/sec-passkey.webp?v=1" alt="Smartphone Face ID key beam going straight into a brass Keychain vault and command runner while the mushroom coding agent works separately behind glass" decoding="async" />
-                  <div class="sec-img-fade" aria-hidden="true"></div>
-                  <svg class="sec-anim-overlay" viewBox="0 0 320 180" fill="none" aria-hidden="true">
-                    <circle class="sec-bio-pulse" cx="50" cy="90" r="11" />
-                    <circle class="sec-orb moss" cx="0" cy="0" r="3.3">
-                      <animateMotion dur="2.5s" repeatCount="indefinite" path="M 62 87 L 138 86" />
-                    </circle>
-                    <circle class="sec-orb moss" cx="0" cy="0" r="3.1">
-                      <animateMotion dur="2.5s" begin="1.15s" repeatCount="indefinite" path="M 151 128 C 151 148, 158 153, 178 153 L 246 153" />
-                    </circle>
-                  </svg>
-                </div>
-                <div class="sec-core-pills">
-                  <span>Face ID / Touch ID</span>
-                  <span>OS Keychain</span>
-                  <span>Live redaction</span>
-                </div>
+          <article class="sec-card tone-moss">
+            <div class="sec-card-media">
+              <div class="sec-stage-frame">
+                <img src="./assets/sec-passkey.webp?v=1" alt="Smartphone Face ID key beam going straight into a brass Keychain vault and command runner while the mushroom coding agent works separately behind glass" decoding="async" />
+                <div class="sec-img-fade" aria-hidden="true"></div>
+                <svg class="sec-anim-overlay" viewBox="0 0 320 180" fill="none" aria-hidden="true">
+                  <circle class="sec-bio-pulse" cx="50" cy="90" r="11" />
+                  <circle class="sec-orb moss" cx="0" cy="0" r="3.3">
+                    <animateMotion dur="2.5s" repeatCount="indefinite" path="M 62 87 L 138 86" />
+                  </circle>
+                  <circle class="sec-orb moss" cx="0" cy="0" r="3.1">
+                    <animateMotion dur="2.5s" begin="1.15s" repeatCount="indefinite" path="M 151 128 C 151 148, 158 153, 178 153 L 246 153" />
+                  </circle>
+                </svg>
               </div>
             </div>
 
-            <div class="sec-stem" aria-hidden="true">
-              <svg viewBox="0 0 180 28" fill="none">
-                <path class="sec-stem-weave" d="M 80 0 C 78 10, 96 16, 94 28" />
-                <path class="sec-stem-weave fine" d="M 100 0 C 102 10, 84 16, 86 28" />
-                <path class="sec-stem-twig" d="M 86 11 C 74 12, 66 15, 58 19" />
-                <path class="sec-stem-twig" d="M 94 16 C 106 15, 114 12, 122 8" />
-                <path class="sec-stem-main" d="M 90 0 C 86 10, 94 18, 90 28" />
-                <path class="sec-stem-pulse delay1" pathLength="100" d="M 90 0 C 86 10, 94 18, 90 28" />
-                <circle class="sec-stem-dot" cx="90" cy="28" r="3.1" />
-              </svg>
-            </div>
-
-            <article class="sec-copy-card">
+            <div class="sec-card-body">
               <svg class="card-botanical-accent moss" viewBox="0 0 150 100" fill="none" aria-hidden="true">
                 <path d="M 150 16 C 120 22, 98 38, 70 42 C 46 45, 28 38, 12 48" />
                 <path d="M 106 28 C 96 16, 82 9, 64 7" />
@@ -1164,49 +1123,31 @@ hyp deploy init tailscale</pre>
               <p>
                 Drop credentials from your phone on <a class="card-inline-link" href="./drop/">hyphae.to/drop ↗</a> with Face ID straight into OS Keychain, then inject via <code>hyp exec --env</code> with live stdout redaction.
               </p>
-            </article>
-          </div>
+              <div class="sec-card-pills">
+                <span>Face ID / Touch ID</span>
+                <span>OS Keychain</span>
+                <span>Live redaction</span>
+              </div>
+            </div>
+          </article>
 
           <!-- 3. Passkey-Signed Messages -->
-          <div class="sec-pair tone-amber">
-            <div class="sec-spec-card">
-              <span class="sec-node-port" aria-hidden="true"></span>
-              <div class="sec-spec-inner">
-                <div class="sec-spec-head">
-                  <span class="sec-core-badge"><span class="sec-dot" aria-hidden="true"></span>Human → Agent</span>
-                </div>
-                <div class="sec-stage-frame">
-                  <img src="./assets/sec-sign.webp?v=1" alt="Smartphone stamping a glowing golden cryptographic seal onto a message traveling safely across an untrusted channel to two verifying mushroom agents" decoding="async" />
-                  <div class="sec-img-fade" aria-hidden="true"></div>
-                  <svg class="sec-anim-overlay" viewBox="0 0 320 180" fill="none" aria-hidden="true">
-                    <circle class="sec-orb amber" cx="0" cy="0" r="3.4">
-                      <animateMotion dur="3.1s" repeatCount="indefinite" path="M 64 90 L 160 90 L 208 90" />
-                    </circle>
-                    <circle class="sec-seal-pulse" cx="160" cy="90" r="10" />
-                    <circle class="sec-seal-pulse delay" cx="256" cy="113" r="8" />
-                  </svg>
-                </div>
-                <div class="sec-core-pills">
-                  <span>WebAuthn Passkey</span>
-                  <span>Verified approvals</span>
-                  <span>Handoff-safe</span>
-                </div>
+          <article class="sec-card tone-amber">
+            <div class="sec-card-media">
+              <div class="sec-stage-frame">
+                <img src="./assets/sec-sign.webp?v=1" alt="Smartphone stamping a glowing golden cryptographic seal onto a message traveling safely across an untrusted channel to two verifying mushroom agents" decoding="async" />
+                <div class="sec-img-fade" aria-hidden="true"></div>
+                <svg class="sec-anim-overlay" viewBox="0 0 320 180" fill="none" aria-hidden="true">
+                  <circle class="sec-orb amber" cx="0" cy="0" r="3.4">
+                    <animateMotion dur="3.1s" repeatCount="indefinite" path="M 64 90 L 160 90 L 208 90" />
+                  </circle>
+                  <circle class="sec-seal-pulse" cx="160" cy="90" r="10" />
+                  <circle class="sec-seal-pulse delay" cx="256" cy="113" r="8" />
+                </svg>
               </div>
             </div>
 
-            <div class="sec-stem" aria-hidden="true">
-              <svg viewBox="0 0 180 28" fill="none">
-                <path class="sec-stem-weave" d="M 80 0 C 78 10, 96 16, 94 28" />
-                <path class="sec-stem-weave fine" d="M 100 0 C 102 10, 84 16, 86 28" />
-                <path class="sec-stem-twig" d="M 86 11 C 74 12, 66 15, 58 19" />
-                <path class="sec-stem-twig" d="M 94 16 C 106 15, 114 12, 122 8" />
-                <path class="sec-stem-main" d="M 90 0 C 86 10, 94 18, 90 28" />
-                <path class="sec-stem-pulse delay2" pathLength="100" d="M 90 0 C 86 10, 94 18, 90 28" />
-                <circle class="sec-stem-dot" cx="90" cy="28" r="3.1" />
-              </svg>
-            </div>
-
-            <article class="sec-copy-card">
+            <div class="sec-card-body">
               <svg class="card-botanical-accent amber" viewBox="0 0 150 100" fill="none" aria-hidden="true">
                 <path d="M 150 16 C 120 22, 98 38, 70 42 C 46 45, 28 38, 12 48" />
                 <path d="M 106 28 C 96 16, 82 9, 64 7" />
@@ -1220,56 +1161,38 @@ hyp deploy init tailscale</pre>
               <p>
                 Cryptographically sign directives and approvals so agents verify it&rsquo;s really you — across untrusted chats like Telegram or agent-to-agent handoffs.
               </p>
-            </article>
-          </div>
+              <div class="sec-card-pills">
+                <span>WebAuthn Passkey</span>
+                <span>Verified approvals</span>
+                <span>Handoff-safe</span>
+              </div>
+            </div>
+          </article>
 
           <!-- 4. Two-Stage Inbound Gate -->
-          <div class="sec-pair tone-coral">
-            <div class="sec-spec-card">
-              <span class="sec-node-port" aria-hidden="true"></span>
-              <div class="sec-spec-inner">
-                <div class="sec-spec-head">
-                  <span class="sec-core-badge"><span class="sec-dot" aria-hidden="true"></span>Inbound Filter</span>
-                </div>
-                <div class="sec-stage-frame">
-                  <img src="./assets/sec-gate.webp?v=1" alt="Twin-chamber brass optical gatehouse diverting thorny red spores into a sealed glass quarantine jar while clean glowing green orbs flow to the mushroom agent" decoding="async" />
-                  <div class="sec-img-fade" aria-hidden="true"></div>
-                  <svg class="sec-anim-overlay" viewBox="0 0 320 180" fill="none" aria-hidden="true">
-                    <circle class="sec-orb olive" cx="0" cy="0" r="3.3">
-                      <animateMotion dur="3.2s" repeatCount="indefinite" path="M 8 56 C 48 60, 82 64, 114 65 L 206 65 C 242 64, 274 56, 304 54" />
-                    </circle>
-                    <circle class="sec-orb olive" cx="0" cy="0" r="2.9">
-                      <animateMotion dur="3.2s" begin="1.6s" repeatCount="indefinite" path="M 10 80 C 52 78, 84 68, 114 66 L 206 66 C 240 68, 272 72, 304 72" />
-                    </circle>
-                    <circle class="sec-orb coral" cx="0" cy="0" r="3.6">
-                      <animateMotion dur="2.9s" repeatCount="indefinite" path="M 14 70 C 54 68, 86 65, 114 65 L 146 65 C 156 66, 160 76, 160 96 L 160 144" />
-                    </circle>
-                    <circle class="sec-orb coral" cx="0" cy="0" r="3.1">
-                      <animateMotion dur="2.9s" begin="1.45s" repeatCount="indefinite" path="M 16 86 C 58 84, 88 70, 114 66 L 144 66 C 155 68, 160 78, 160 98 L 160 142" />
-                    </circle>
-                  </svg>
-                </div>
-                <div class="sec-core-pills">
-                  <span>Stage 1 rules</span>
-                  <span>Stage 2 classifier</span>
-                  <span>Quarantine</span>
-                </div>
+          <article class="sec-card tone-coral">
+            <div class="sec-card-media">
+              <div class="sec-stage-frame">
+                <img src="./assets/sec-gate.webp?v=1" alt="Twin-chamber brass optical gatehouse diverting thorny red spores into a sealed glass quarantine jar while clean glowing green orbs flow to the mushroom agent" decoding="async" />
+                <div class="sec-img-fade" aria-hidden="true"></div>
+                <svg class="sec-anim-overlay" viewBox="0 0 320 180" fill="none" aria-hidden="true">
+                  <circle class="sec-orb olive" cx="0" cy="0" r="3.3">
+                    <animateMotion dur="3.2s" repeatCount="indefinite" path="M 8 56 C 48 60, 82 64, 114 65 L 206 65 C 242 64, 274 56, 304 54" />
+                  </circle>
+                  <circle class="sec-orb olive" cx="0" cy="0" r="2.9">
+                    <animateMotion dur="3.2s" begin="1.6s" repeatCount="indefinite" path="M 10 80 C 52 78, 84 68, 114 66 L 206 66 C 240 68, 272 72, 304 72" />
+                  </circle>
+                  <circle class="sec-orb coral" cx="0" cy="0" r="3.6">
+                    <animateMotion dur="2.9s" repeatCount="indefinite" path="M 14 70 C 54 68, 86 65, 114 65 L 146 65 C 156 66, 160 76, 160 96 L 160 144" />
+                  </circle>
+                  <circle class="sec-orb coral" cx="0" cy="0" r="3.1">
+                    <animateMotion dur="2.9s" begin="1.45s" repeatCount="indefinite" path="M 16 86 C 58 84, 88 70, 114 66 L 144 66 C 155 68, 160 78, 160 98 L 160 142" />
+                  </circle>
+                </svg>
               </div>
             </div>
 
-            <div class="sec-stem" aria-hidden="true">
-              <svg viewBox="0 0 180 28" fill="none">
-                <path class="sec-stem-weave" d="M 80 0 C 78 10, 96 16, 94 28" />
-                <path class="sec-stem-weave fine" d="M 100 0 C 102 10, 84 16, 86 28" />
-                <path class="sec-stem-twig" d="M 86 11 C 74 12, 66 15, 58 19" />
-                <path class="sec-stem-twig" d="M 94 16 C 106 15, 114 12, 122 8" />
-                <path class="sec-stem-main" d="M 90 0 C 86 10, 94 18, 90 28" />
-                <path class="sec-stem-pulse delay3" pathLength="100" d="M 90 0 C 86 10, 94 18, 90 28" />
-                <circle class="sec-stem-dot" cx="90" cy="28" r="3.1" />
-              </svg>
-            </div>
-
-            <article class="sec-copy-card">
+            <div class="sec-card-body">
               <svg class="card-botanical-accent coral" viewBox="0 0 150 100" fill="none" aria-hidden="true">
                 <path d="M 150 16 C 120 22, 98 38, 70 42 C 46 45, 28 38, 12 48" />
                 <path d="M 106 28 C 96 16, 82 9, 64 7" />
@@ -1283,8 +1206,13 @@ hyp deploy init tailscale</pre>
               <p>
                 Deterministic Stage 1 rules and pluggable Stage 2 prompt-injection classifiers screen untrusted external messages and quarantine threats before your agent sees them.
               </p>
-            </article>
-          </div>
+              <div class="sec-card-pills">
+                <span>Stage 1 rules</span>
+                <span>Stage 2 classifier</span>
+                <span>Quarantine</span>
+              </div>
+            </div>
+          </article>
         </div>
       </div>
     </section>
