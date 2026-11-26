@@ -254,6 +254,20 @@ pub fn read_json_object_or_empty(path: &Path) -> Result<Map<String, Value>, Stri
     }
 }
 
+/// Reads the explicit agent-facing KV tool setting. Missing values use capability discovery.
+pub fn kv_tool_override(kv: Option<&Value>) -> Result<Option<bool>, &'static str> {
+    match kv {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(enabled)) => Ok(Some(*enabled)),
+        Some(Value::Object(kv)) => match kv.get("enabled") {
+            None => Ok(None),
+            Some(Value::Bool(enabled)) => Ok(Some(*enabled)),
+            _ => Err("kv.enabled must be a boolean"),
+        },
+        _ => Err("kv must be a boolean or an object with an enabled boolean"),
+    }
+}
+
 /// Loads either v2 `node.json` or legacy v1 `connector.json` transparently.
 pub fn load_node_or_legacy_config(path: &Path) -> Result<LoadedNodeFile, String> {
     let raw = read_json_value(path)?;

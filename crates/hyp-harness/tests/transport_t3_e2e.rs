@@ -16,6 +16,10 @@
 //!   - Protocol robustness (interleaved Ping/Pong, fragmented `Exit` frame, unrelated server push events,
 //!     and fail-closed rejection of tampered `Sec-WebSocket-Accept`).
 
+mod common;
+
+use common::test_digest;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -936,14 +940,15 @@ async fn push_transport_secret_store_queue_interrupt_and_fallback_secret_e2e() {
     assert!(idle_t.supports_interrupt());
 
     // 1. Idle thread + Queue -> start_immediately, PushOutcome::Delivered
-    let idle_outcome = idle_t.deliver("wake idle thread", PushMode::Queue).await;
+    let digest = common::source_digest(hyp_store::MailboxKind::Message, "peer@box/dev");
+    let idle_outcome = idle_t.deliver(&digest, PushMode::Queue).await;
     assert_eq!(idle_outcome, PushOutcome::Delivered);
     let last = server.commands().pop().unwrap();
     assert_eq!(last["type"], "message.dispatch");
     assert_eq!(last["createdBy"], "system");
     assert_eq!(last["creationSource"], "mcp");
     assert_eq!(last["threadId"], "thr-idle");
-    assert_eq!(last["text"], "wake idle thread");
+    assert_eq!(last["text"], digest.as_str());
     assert_eq!(last["attachments"], json!([]));
     assert_eq!(last["dispatchMode"], json!({ "type": "start_immediately" }));
     assert!(last["commandId"].as_str().is_some_and(|s| !s.is_empty()));
@@ -952,7 +957,7 @@ async fn push_transport_secret_store_queue_interrupt_and_fallback_secret_e2e() {
     // 2. Active thread + Queue -> queue_after_active, PushOutcome::Delivered
     let steer_t = make_transport("thr-steer");
     let queue_detail = steer_t
-        .deliver_detailed("queued follow-up", PushMode::Queue)
+        .deliver_detailed(&test_digest(), PushMode::Queue)
         .await;
     assert_eq!(queue_detail.outcome, PushOutcome::Delivered);
     assert!(!queue_detail.interrupted);
@@ -967,7 +972,7 @@ async fn push_transport_secret_store_queue_interrupt_and_fallback_secret_e2e() {
 
     // 3. Active thread + Interrupt + supportsActiveSteering=true -> steer_active
     let steer_detail = steer_t
-        .deliver_detailed("urgent steer", PushMode::Interrupt)
+        .deliver_detailed(&test_digest(), PushMode::Interrupt)
         .await;
     assert_eq!(steer_detail.outcome, PushOutcome::Delivered);
     assert!(steer_detail.interrupted);
@@ -985,7 +990,7 @@ async fn push_transport_secret_store_queue_interrupt_and_fallback_secret_e2e() {
     // 4. Active thread + Interrupt + supportsActiveSteering=false -> restart_active
     let restart_t = make_transport("thr-restart");
     let restart_detail = restart_t
-        .deliver_detailed("urgent restart", PushMode::Interrupt)
+        .deliver_detailed(&test_digest(), PushMode::Interrupt)
         .await;
     assert_eq!(restart_detail.outcome, PushOutcome::Delivered);
     assert!(restart_detail.interrupted);
@@ -1016,9 +1021,7 @@ async fn push_transport_secret_store_queue_interrupt_and_fallback_secret_e2e() {
         token_override: None,
     });
     assert_eq!(
-        fallback_t
-            .deliver("via fallback secret", PushMode::Queue)
-            .await,
+        fallback_t.deliver(&test_digest(), PushMode::Queue).await,
         PushOutcome::Delivered
     );
 
@@ -1033,7 +1036,7 @@ async fn error_mapping_covers_auth_failed_missing_secret_unreachable_and_effect_
     let mut bad_auth_target = T3Target::new("thr-idle", &server.url);
     bad_auth_target.token_override = Some("wrong-t3-token".into());
     let bad_auth = T3Transport::new(bad_auth_target)
-        .deliver("hello", PushMode::Queue)
+        .deliver(&test_digest(), PushMode::Queue)
         .await;
     assert_eq!(bad_auth, PushOutcome::hold("t3_auth_failed"));
 
@@ -1049,7 +1052,9 @@ async fn error_mapping_covers_auth_failed_missing_secret_unreachable_and_effect_
         token_override: None,
     });
     assert_eq!(
-        missing_secret_t.deliver("hello", PushMode::Queue).await,
+        missing_secret_t
+            .deliver(&test_digest(), PushMode::Queue)
+            .await,
         PushOutcome::hold("t3_auth_missing")
     );
 
@@ -1058,7 +1063,7 @@ async fn error_mapping_covers_auth_failed_missing_secret_unreachable_and_effect_
     missing_thr_target.token_override = Some("good-t3-token".into());
     assert_eq!(
         T3Transport::new(missing_thr_target)
-            .deliver("hello", PushMode::Queue)
+            .deliver(&test_digest(), PushMode::Queue)
             .await,
         PushOutcome::reject("t3_thread_not_found")
     );
@@ -1068,7 +1073,7 @@ async fn error_mapping_covers_auth_failed_missing_secret_unreachable_and_effect_
     deleted_thr_target.token_override = Some("good-t3-token".into());
     assert_eq!(
         T3Transport::new(deleted_thr_target)
-            .deliver("hello", PushMode::Queue)
+            .deliver(&test_digest(), PushMode::Queue)
             .await,
         PushOutcome::reject("t3_thread_deleted")
     );
@@ -1080,7 +1085,7 @@ async fn error_mapping_covers_auth_failed_missing_secret_unreachable_and_effect_
     archived_thr_target.token_override = Some("good-t3-token".into());
     assert_eq!(
         T3Transport::new(archived_thr_target)
-            .deliver("must not wake archived thread", PushMode::Queue)
+            .deliver(&test_digest(), PushMode::Queue)
             .await,
         PushOutcome::reject("t3_thread_archived")
     );
@@ -1095,7 +1100,7 @@ async fn error_mapping_covers_auth_failed_missing_secret_unreachable_and_effect_
     archived_empty_target.token_override = Some("good-t3-token".into());
     assert_eq!(
         T3Transport::new(archived_empty_target)
-            .deliver("hello unarchived", PushMode::Queue)
+            .deliver(&test_digest(), PushMode::Queue)
             .await,
         PushOutcome::Delivered
     );
@@ -1105,7 +1110,7 @@ async fn error_mapping_covers_auth_failed_missing_secret_unreachable_and_effect_
     bad_url_target.token_override = Some("good-t3-token".into());
     assert_eq!(
         T3Transport::new(bad_url_target)
-            .deliver("hello", PushMode::Queue)
+            .deliver(&test_digest(), PushMode::Queue)
             .await,
         PushOutcome::reject("t3_invalid_server_url")
     );
@@ -1122,7 +1127,7 @@ async fn error_mapping_covers_auth_failed_missing_secret_unreachable_and_effect_
         Duration::from_secs(2),
         Duration::from_secs(2),
     )
-    .deliver("hello", PushMode::Queue)
+    .deliver(&test_digest(), PushMode::Queue)
     .await;
     assert_eq!(unreachable, PushOutcome::hold("t3_server_unreachable"));
 
@@ -1134,7 +1139,7 @@ async fn error_mapping_covers_auth_failed_missing_secret_unreachable_and_effect_
     t500.token_override = Some("good-t3-token".into());
     assert_eq!(
         T3Transport::new(t500)
-            .deliver("hello", PushMode::Queue)
+            .deliver(&test_digest(), PushMode::Queue)
             .await,
         PushOutcome::hold("t3_server_unreachable")
     );
@@ -1151,7 +1156,7 @@ async fn error_mapping_covers_auth_failed_missing_secret_unreachable_and_effect_
     t_proj_die.token_override = Some("good-t3-token".into());
     assert_eq!(
         T3Transport::new(t_proj_die)
-            .deliver("hello", PushMode::Queue)
+            .deliver(&test_digest(), PushMode::Queue)
             .await,
         PushOutcome::hold("t3_projection_unavailable")
     );
@@ -1171,7 +1176,7 @@ async fn error_mapping_covers_auth_failed_missing_secret_unreachable_and_effect_
     t_dispatch_err.token_override = Some("good-t3-token".into());
     assert_eq!(
         T3Transport::new(t_dispatch_err)
-            .deliver("hello", PushMode::Queue)
+            .deliver(&test_digest(), PushMode::Queue)
             .await,
         PushOutcome::reject("t3_dispatch_failed")
     );
@@ -1188,7 +1193,7 @@ async fn websocket_handles_fragmented_exit_interleaved_ping_pong_and_rejects_bad
     let mut target = T3Target::new("thr-idle", &server.url);
     target.token_override = Some("stress-token".into());
     let outcome = T3Transport::new(target)
-        .deliver("fragmented + ping resilience", PushMode::Queue)
+        .deliver(&test_digest(), PushMode::Queue)
         .await;
     assert_eq!(outcome, PushOutcome::Delivered);
     assert!(
@@ -1197,7 +1202,7 @@ async fn websocket_handles_fragmented_exit_interleaved_ping_pong_and_rejects_bad
     );
     assert_eq!(
         server.commands().last().unwrap()["text"],
-        "fragmented + ping resilience"
+        test_digest().as_str()
     );
     server.shutdown().await;
 
@@ -1209,7 +1214,7 @@ async fn websocket_handles_fragmented_exit_interleaved_ping_pong_and_rejects_bad
     let mut bad_target = T3Target::new("thr-idle", &bad_server.url);
     bad_target.token_override = Some("stress-token".into());
     let outcome = T3Transport::new(bad_target)
-        .deliver("must not send on forged upgrade", PushMode::Queue)
+        .deliver(&test_digest(), PushMode::Queue)
         .await;
     assert_eq!(outcome, PushOutcome::hold("t3_server_unreachable"));
     assert!(bad_server.commands().is_empty());

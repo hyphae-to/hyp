@@ -33,7 +33,7 @@ use hyp_harness::hooks::HookEvent;
 use hyp_harness::mcp::McpOptions;
 use hyp_harness::protocol::HarnessKind;
 use hyp_harness::sock::daemon_rpc_async;
-use hyp_harness::transport::{PushMode, PushOutcome, PushTransport, TransportFuture};
+use hyp_harness::transport::{InboxDigest, PushMode, PushOutcome, PushTransport, TransportFuture};
 use hyp_node::delivery::inbox_query::UNTRUSTED_INBOX_PROVENANCE;
 use hyp_node::delivery::{DEFAULT_MIDTURN_QUEUE_DIGEST_SECONDS, DeliveryRule, DeliveryUrgency};
 use hyp_node::engine::{NodeConfig, UnifiedNode};
@@ -42,8 +42,9 @@ use hyp_node::gates::{
 };
 use hyp_proto::address::NodeId;
 use hyp_store::{
-    HumanAuthorityInput, HumanAuthorityRole, MailboxKind, NodeDb, PeerInput, PeerProfile,
-    PeerStatus, TrustTier as StoreTrustTier, now_ms,
+    BridgeLink, DaemonNoticeKind, GateState, HumanAuthorityInput, HumanAuthorityRole,
+    MailboxInsert, MailboxKind, MailboxPutResult, NodeDb, PeerInput, PeerProfile, PeerStatus,
+    TrustTier as StoreTrustTier, now_ms,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -178,8 +179,12 @@ impl PushTransport for DigestCaptureTransport {
         self.supports_int
     }
 
-    fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
-        let msg = text.to_string();
+    fn deliver<'a>(
+        &'a self,
+        text: &'a InboxDigest,
+        mode: PushMode,
+    ) -> TransportFuture<'a, PushOutcome> {
+        let msg = text.as_str().to_string();
         Box::pin(async move {
             self.delivered.lock().unwrap().push((mode, msg));
             self.notify.notify_waiters();
@@ -1376,4 +1381,156 @@ async fn rfc0004_hook_cancels_pending_nudge_and_push_wake_suppresses_duplicate_p
     mcp.close().await;
     daemon.stop().await;
     node.shutdown();
+}
+
+#[tokio::test]
+async fn digest_and_inbox_require_stored_daemon_notice_provenance() {
+    let tmp = TempDir::new().unwrap();
+    let node = open_local_node("notice@box", tmp.path());
+    let daemon = LocalDaemon::start(
+        Arc::clone(&node),
+        None,
+        LocalDaemonConfig {
+            auto_detect_transports: false,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let sock = daemon.socket_path().to_path_buf();
+    let sid = "claude:notice-session";
+
+    {
+        let db = node.db();
+        let local = db.local();
+        let now = now_ms();
+        local
+            .register_session(sid, r#"{"kind":"claude"}"#, now)
+            .unwrap();
+        local
+            .add_bridge_link(&BridgeLink {
+                plugin: "hyphae".into(),
+                target: "system".into(),
+                session_id: sid.into(),
+                linked_at: now,
+                linked_by: "fixture".into(),
+            })
+            .unwrap();
+        for kind in [DaemonNoticeKind::System, DaemonNoticeKind::Wake] {
+            let item_id = match kind {
+                DaemonNoticeKind::System => "daemon-system",
+                DaemonNoticeKind::Wake => "daemon-wake",
+            };
+            assert!(matches!(
+                local
+                    .put_daemon_notice(
+                        sid,
+                        node.node_id().as_str(),
+                        item_id.into(),
+                        "daemon body".into(),
+                        kind,
+                        now
+                    )
+                    .unwrap(),
+                MailboxPutResult::Stored { .. }
+            ));
+        }
+
+        // Ordinary mailbox writes stay untrusted even with the legacy notice fields.
+        for (item_id, origin_node, source, reason) in [
+            ("legacy-source", "peer@box", "hyphae", None),
+            (
+                "legacy-wake",
+                node.node_id().as_str(),
+                "hyphae:system",
+                Some("wake_notice"),
+            ),
+        ] {
+            let MailboxPutResult::Stored { receipt } = local
+                .put_in_mailbox(
+                    &MailboxInsert {
+                        session_id: sid.into(),
+                        origin_node: origin_node.into(),
+                        item_id: item_id.into(),
+                        text: "ordinary body".into(),
+                        kind: MailboxKind::Message,
+                        source: source.into(),
+                        gate_state: GateState::Pending,
+                        gate_reason: reason.map(str::to_string),
+                        traceparent: None,
+                    },
+                    now,
+                )
+                .unwrap()
+            else {
+                panic!("failed storing ordinary test item");
+            };
+            assert!(
+                local
+                    .mark_mailbox_gate_approved(sid, &receipt, None, now)
+                    .unwrap()
+            );
+        }
+    }
+    assert_eq!(
+        daemon
+            .deliver_bridge_inbound("hyphae", "system", "bridge-item", "bridge body")
+            .await
+            .unwrap(),
+        1
+    );
+
+    let output = run_hook(
+        &sock,
+        HarnessKind::Claude,
+        HookEvent::PreInvocation,
+        json!({ "session_id": "notice-session" }),
+    )
+    .await;
+    let digest = extract_hook_context(HarnessKind::Claude, &output).expect("notice digest");
+    assert_eq!(digest.matches("<system ").count(), 1, "{digest}");
+    assert!(
+        digest.contains("<system from=\"hyphae:system\" count=\"2\"/>"),
+        "{digest}"
+    );
+    assert!(
+        digest.contains("<bridge target=\"hyphae:system\" count=\"1\"/>"),
+        "{digest}"
+    );
+    assert!(
+        digest.contains("<dm from=\"hyphae\" count=\"1\"/>"),
+        "{digest}"
+    );
+    assert!(
+        digest.contains("<dm from=\"hyphae:system\" count=\"1\"/>"),
+        "{digest}"
+    );
+    assert!(!digest.contains(" body"), "{digest}");
+
+    let mut mcp = TestMcpClient::spawn(McpOptions::new(sock.clone()));
+    mcp.initialize().await;
+    let (response, is_error) = mcp
+        .call_verified_claude(&sock, "notice-session", "hyp_inbox", json!({}))
+        .await;
+    assert!(!is_error, "{response}");
+    let value: Value = serde_json::from_str(&response).unwrap();
+    let items = value["items"].as_array().unwrap();
+    assert_eq!(items.len(), 5, "{response}");
+    for (item_id, tier) in [
+        ("daemon-system", "self"),
+        ("daemon-wake", "self"),
+        ("legacy-source", "peer"),
+        ("legacy-wake", "peer"),
+        ("bridge-item", "bridge"),
+    ] {
+        let item = items.iter().find(|item| item["itemId"] == item_id).unwrap();
+        assert_eq!(item["trustTier"], tier, "{item}");
+        if tier == "self" {
+            assert!(item.get("untrusted").is_none(), "{item}");
+            assert!(item.get("provenance").is_none(), "{item}");
+        } else {
+            assert_eq!(item["untrusted"], true, "{item}");
+            assert_eq!(item["provenance"], UNTRUSTED_INBOX_PROVENANCE, "{item}");
+        }
+    }
 }

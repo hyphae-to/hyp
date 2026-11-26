@@ -76,6 +76,24 @@ pub enum MailboxPutResult {
     QueueFull,
 }
 
+/// The two notice types emitted directly by the local daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonNoticeKind {
+    System,
+    Wake,
+}
+
+impl DaemonNoticeKind {
+    pub const SOURCE: &str = "hyphae:system";
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system_notice",
+            Self::Wake => "wake_notice",
+        }
+    }
+}
+
 /// Mailbox item record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MailboxEntry {
@@ -93,6 +111,24 @@ pub struct MailboxEntry {
     pub traceparent: Option<String>,
     pub payload_sha256: Option<String>,
     pub reviewed_at: Option<i64>,
+    #[serde(skip)]
+    pub daemon_notice: Option<DaemonNoticeKind>,
+}
+
+impl MailboxEntry {
+    /// Returns stored daemon provenance only for visible notices from this node.
+    pub fn trusted_daemon_notice(&self, local_node_id: &str) -> Option<DaemonNoticeKind> {
+        if self.origin_node == local_node_id
+            && self.kind == MailboxKind::Message
+            && self.source == DaemonNoticeKind::SOURCE
+            && matches!(self.gate_state, GateState::Pending | GateState::Delivered)
+            && self.reviewed_at.is_some()
+        {
+            self.daemon_notice
+        } else {
+            None
+        }
+    }
 }
 
 /// Extended mailbox item record including schema v3 coalescing, TTL, and missed-tick metadata.
@@ -607,14 +643,52 @@ impl<'a> LocalStateStore<'a> {
     /// When `input.gate_state == GateState::Pending` and `opts.coalesce_key` is `Some(key)`,
     /// if a `pending` row already exists for `(session_id, key)`, it is superseded in place
     /// (updating `origin_node`, `item_id`, `text`, `received_at`, `kind`, `source`, `expires_at`,
-    /// resetting `notified = 0`, `reviewed_at = NULL`, `human_auth_json = NULL`, and
-    /// `gate_reason = NULL`, and incrementing `missed_count = missed_count + 1`) while
+    /// resetting `notified = 0`, `reviewed_at = NULL`, `human_auth_json = NULL`,
+    /// `daemon_notice = NULL`, and `gate_reason = NULL`, and incrementing `missed_count = missed_count + 1`) while
     /// reusing the existing receipt so the overwritten payload MUST be re-screened by the
     /// Security Gate and can never inherit an earlier approval or `HumanVerified` badge (`G3`).
     pub fn put_in_mailbox_ex(
         &self,
         input: &MailboxInsert,
         opts: &MailboxPutOptions,
+        now_ms: i64,
+    ) -> StoreResult<MailboxPutResult> {
+        self.put_mailbox_row(input, opts, None, now_ms)
+    }
+
+    /// Atomically inserts a daemon-authored notice and marks it gate-cleared.
+    pub fn put_daemon_notice(
+        &self,
+        session_id: &str,
+        local_node_id: &str,
+        item_id: String,
+        text: String,
+        kind: DaemonNoticeKind,
+        now_ms: i64,
+    ) -> StoreResult<MailboxPutResult> {
+        self.put_mailbox_row(
+            &MailboxInsert {
+                session_id: session_id.to_string(),
+                origin_node: local_node_id.to_string(),
+                item_id,
+                text,
+                kind: MailboxKind::Message,
+                source: DaemonNoticeKind::SOURCE.to_string(),
+                gate_state: GateState::Pending,
+                gate_reason: Some(kind.as_str().to_string()),
+                traceparent: None,
+            },
+            &MailboxPutOptions::default(),
+            Some(kind),
+            now_ms,
+        )
+    }
+
+    fn put_mailbox_row(
+        &self,
+        input: &MailboxInsert,
+        opts: &MailboxPutOptions,
+        daemon_notice: Option<DaemonNoticeKind>,
         now_ms: i64,
     ) -> StoreResult<MailboxPutResult> {
         if input.session_id.is_empty() || input.origin_node.is_empty() || input.item_id.is_empty() {
@@ -676,6 +750,7 @@ impl<'a> LocalStateStore<'a> {
                              gate_reason = NULL,
                              reviewed_at = NULL,
                              human_auth_json = NULL,
+                             daemon_notice = NULL,
                              traceparent = ?7,
                              payload_sha256 = ?8,
                              expires_at = ?9,
@@ -719,8 +794,8 @@ impl<'a> LocalStateStore<'a> {
             "INSERT OR IGNORE INTO mailbox
              (receipt, session_id, origin_node, item_id, text, received_at, kind, source,
               notified, gate_state, gate_reason, traceparent, payload_sha256,
-              coalesce_key, expires_at, missed_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, 0)",
+              coalesce_key, expires_at, missed_count, daemon_notice, reviewed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, 0, ?15, ?16)",
             params![
                 &receipt,
                 &input.session_id,
@@ -736,6 +811,8 @@ impl<'a> LocalStateStore<'a> {
                 &payload_sha256,
                 opts.coalesce_key.as_deref(),
                 opts.expires_at,
+                daemon_notice.map(DaemonNoticeKind::as_str),
+                daemon_notice.map(|_| now_ms),
             ],
         )?;
 
@@ -939,7 +1016,8 @@ impl<'a> LocalStateStore<'a> {
             "UPDATE mailbox
              SET gate_state = ?1,
                  gate_reason = ?2,
-                 reviewed_at = ?3
+                 reviewed_at = ?3,
+                 daemon_notice = NULL
              WHERE session_id = ?4 AND receipt = ?5 AND gate_state = 'pending'",
             params![new_state.as_str(), reason, reviewed_at, session_id, receipt],
         )?;
@@ -1992,6 +2070,12 @@ fn decode_mailbox_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<M
     let traceparent: Option<String> = row.get("traceparent")?;
     let payload_sha256: Option<String> = row.get("payload_sha256")?;
     let reviewed_at: Option<i64> = row.get("reviewed_at")?;
+    let daemon_notice: Option<String> = row.get("daemon_notice")?;
+    let daemon_notice = match daemon_notice.as_deref() {
+        Some("system_notice") => Some(DaemonNoticeKind::System),
+        Some("wake_notice") => Some(DaemonNoticeKind::Wake),
+        _ => None,
+    };
 
     Ok((|| {
         let kind = MailboxKind::parse(&kind_str)?;
@@ -2011,6 +2095,7 @@ fn decode_mailbox_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<M
             traceparent,
             payload_sha256,
             reviewed_at,
+            daemon_notice,
         })
     })())
 }

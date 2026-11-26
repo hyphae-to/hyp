@@ -720,7 +720,7 @@ pub fn runtime_skill_paths(
     }
 }
 
-/// Detects optional capabilities (`plugins[]`, `kvNamespaces[]`)
+/// Detects optional capabilities (`plugins[]`, `kv`, `kvNamespaces[]`)
 /// from a parsed `node.json` document.
 pub fn detect_capabilities_from_node_json(raw: &Value) -> SkillCapabilities {
     let Some(obj) = raw.as_object() else {
@@ -740,19 +740,14 @@ pub fn detect_capabilities_from_node_json(raw: &Value) -> SkillCapabilities {
             })
         });
 
-    let has_kv = obj
-        .get("kvNamespaces")
-        .and_then(Value::as_array)
-        .is_some_and(|arr| !arr.is_empty())
-        || obj
-            .get("kv")
-            .and_then(|v| {
-                v.as_bool().or_else(|| {
-                    v.as_object()
-                        .map(|o| o.get("enabled").and_then(Value::as_bool).unwrap_or(true))
-                })
-            })
-            .unwrap_or(false);
+    let has_kv = match crate::config_file::kv_tool_override(obj.get("kv")) {
+        Ok(Some(enabled)) => enabled,
+        Ok(None) => obj
+            .get("kvNamespaces")
+            .and_then(Value::as_array)
+            .is_some_and(|arr| !arr.is_empty()),
+        Err(_) => false,
+    };
 
     SkillCapabilities { has_bridge, has_kv }
 }

@@ -313,7 +313,7 @@ fn create_seeded_v1_db(path: &Path, enable_wal: bool) {
 
 #[test]
 fn registry_invariants_and_invalid_registry_rejection() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, 8);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 9);
     assert_eq!(MIGRATIONS.len() as i64, CURRENT_SCHEMA_VERSION);
     let mut names = HashSet::new();
     for (idx, m) in MIGRATIONS.iter().enumerate() {
@@ -389,7 +389,7 @@ fn differential_schema_and_data_parity_v1_migrated_equals_fresh_v2() {
     let applied_migrated = migrated.applied_migrations().unwrap();
     assert_eq!(
         applied_migrated.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9]
     );
     assert_eq!(applied_migrated[0].1, T0);
     assert!(applied_migrated[1].1 >= T0);
@@ -1102,4 +1102,28 @@ fn multi_hub_peer_routes_crud_validation_and_revocation_cleanup() {
         )
         .unwrap();
     assert!(db.peers().list_peer_routes().unwrap().is_empty());
+}
+
+#[test]
+fn mailbox_notice_migration_preserves_legacy_items_without_marking_provenance() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("node.sqlite");
+    {
+        let conn = Connection::open(&path).unwrap();
+        run_migrations_with(&conn, None, &MIGRATIONS[..8]).unwrap();
+        conn.execute(
+            "INSERT INTO mailbox
+                 (receipt, session_id, origin_node, item_id, text, received_at, kind, source,
+                  gate_state, gate_reason, reviewed_at)
+             VALUES ('legacy', 'session', 'notice@box', 'legacy-notice', 'legacy body', ?1,
+                     'message', 'hyphae:system', 'pending', 'system_notice', ?1)",
+            params![T0],
+        )
+        .unwrap();
+    }
+    let db = NodeDb::open(&path).unwrap();
+    let entry = db.local().get_mailbox_entry("legacy").unwrap().unwrap();
+    assert_eq!(entry.text, "legacy body");
+    assert_eq!(entry.gate_reason.as_deref(), Some("system_notice"));
+    assert_eq!(entry.trusted_daemon_notice("notice@box"), None);
 }

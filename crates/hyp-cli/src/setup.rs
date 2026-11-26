@@ -6,9 +6,10 @@
 //! and pointing hooks & MCP entries directly to the static Rust `hyp` binary.
 
 use crate::config_file::{
-    ensure_dir, ensure_v2_node_json_defaults, open_secret_store, profile_as_str,
-    read_json_object_or_empty, read_json_value, resolve_config_path_for_write, resolve_home_dir,
-    resolve_state_dir, write_atomic_file, write_atomic_json,
+    ensure_dir, ensure_v2_node_json_defaults, kv_tool_override, open_secret_store, profile_as_str,
+    read_json_object_or_empty, read_json_value, resolve_config_path_for_read,
+    resolve_config_path_for_write, resolve_home_dir, resolve_state_dir, write_atomic_file,
+    write_atomic_json,
 };
 use crate::node_cmd::CliNodeProfile;
 use crate::pair::{
@@ -447,6 +448,12 @@ pub struct OnboardArgs {
     /// Disable OpenClaw turn-start prompt injection (zero prompt mutation; messages still arrive via Gateway wake nudges & hyp_inbox)
     #[arg(long)]
     pub no_openclaw_prompt_injection: bool,
+    /// Expose the shared key-value tool to agents
+    #[arg(long, conflicts_with = "no_kv")]
+    pub kv: bool,
+    /// Hide the shared key-value tool from agents (the default for a new node)
+    #[arg(long)]
+    pub no_kv: bool,
     /// Output structured JSON envelope
     #[arg(long)]
     pub json: bool,
@@ -997,6 +1004,67 @@ fn run_onboard_deterministic(
     let state_dir = resolve_state_dir(args.state_dir.as_deref(), None, Some(&home));
     let config_path = resolve_config_path_for_write(None, args.state_dir.as_deref(), Some(&home));
 
+    let previous_config_path =
+        resolve_config_path_for_read(None, args.state_dir.as_deref(), Some(&home));
+    let existing_config = previous_config_path.exists();
+    let mut cfg_map = match read_json_object_or_empty(&config_path) {
+        Ok(m) => m,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None),
+    };
+    let kv_choice = if args.kv {
+        Some(true)
+    } else if args.no_kv {
+        Some(false)
+    } else {
+        let previous_kv = match kv_tool_override(cfg_map.get("kv")) {
+            Ok(value) => value,
+            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None),
+        };
+        if selection_override.is_some() {
+            let question = "Enable the shared key-value tool for agents?";
+            let prompt = if existing_config {
+                let current = match previous_kv {
+                    Some(true) => "enabled",
+                    Some(false) => "disabled",
+                    None => "automatic discovery",
+                };
+                format!("{question} [y/n, Enter to keep {current}]: ")
+            } else {
+                format!("{question} [y/N]: ")
+            };
+            loop {
+                match wizard::read_tty_line(&prompt) {
+                    Ok(Some(reply)) => match reply.trim().to_ascii_lowercase().as_str() {
+                        "y" | "yes" => break Some(true),
+                        "n" | "no" => break Some(false),
+                        "" => break (!existing_config).then_some(false),
+                        _ => println!("Please enter yes or no."),
+                    },
+                    Ok(None) => return ExitCode::from(EXIT_OK),
+                    Err(e) => {
+                        return emit_error(
+                            cmd,
+                            as_json,
+                            EXIT_ERROR,
+                            "TTY_READ_ERROR",
+                            e.to_string(),
+                            None,
+                        );
+                    }
+                }
+            }
+        } else {
+            (!existing_config).then_some(false)
+        }
+    };
+    if let Some(enabled) = kv_choice {
+        if let Some(Value::Object(kv)) = cfg_map.get_mut("kv") {
+            kv.insert("enabled".into(), Value::Bool(enabled));
+        } else {
+            cfg_map.insert("kv".into(), Value::Bool(enabled));
+        }
+    }
+
     if let Err(e) = ensure_dir(&state_dir, true) {
         return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
     }
@@ -1063,12 +1131,6 @@ fn run_onboard_deterministic(
     let mut deferred_join_cmd: Option<String> = None;
 
     // 4. Write/merge node.json BEFORE running live join so publicUrl/stateDir exist if needed.
-    let mut cfg_map = match read_json_object_or_empty(&config_path) {
-        Ok(m) => m,
-        Err(e) => {
-            return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None);
-        }
-    };
     ensure_v2_node_json_defaults(&mut cfg_map, &node_id, profile, &state_dir);
     cfg_map.insert("nodeId".to_string(), Value::String(node_id.clone()));
     cfg_map.insert(

@@ -4,6 +4,10 @@
 //! E2E tests using a deterministic temporary `hc` executable shim run on Unix
 //! via `#[cfg(unix)]` so Windows builds with zero warnings.
 
+mod common;
+
+use common::test_digest;
+
 use std::time::Duration;
 
 use hyp_harness::transport::herdr::{
@@ -93,7 +97,7 @@ async fn missing_hc_binary_holds_and_probe_returns_none() {
             Duration::from_millis(500),
             Duration::from_millis(500),
         );
-    let outcome = transport.deliver("hello", PushMode::Queue).await;
+    let outcome = transport.deliver(&test_digest(), PushMode::Queue).await;
     assert_eq!(outcome, PushOutcome::hold("herdr_binary_missing"));
 }
 
@@ -102,7 +106,7 @@ async fn invalid_terminal_id_fails_closed_without_spawning() {
     for bad_id in ["", "--json", "-t3", "t3 bad", "t3\nnewline"] {
         let transport = HerdrTransport::new(HerdrTarget::new(bad_id).with_bin("hc"));
         assert_eq!(
-            transport.deliver("msg", PushMode::Interrupt).await,
+            transport.deliver(&test_digest(), PushMode::Interrupt).await,
             PushOutcome::hold("herdr_target_unavailable"),
             "bad terminal_id {bad_id:?} must fail closed"
         );
@@ -421,15 +425,16 @@ esac
         hc.reset_calls();
 
         let transport = HerdrTransport::new(target);
-        let payload = "event line 1\n$HOME 'single' \"double\" `tick`";
-        let outcome = transport.deliver(payload, PushMode::Queue).await;
+        let payload =
+            crate::common::source_digest(hyp_store::MailboxKind::Message, "peer@box/dev & ops");
+        let outcome = transport.deliver(&payload, PushMode::Queue).await;
 
         assert_eq!(outcome, PushOutcome::Delivered);
         assert_eq!(
             hc.recorded_calls(),
             vec![
                 vec!["get", "--json", "t3"],
-                vec!["send", "--json", "--if", "idle", "t3", payload],
+                vec!["send", "--json", "--if", "idle", "t3", payload.as_str()],
             ]
         );
     }
@@ -444,14 +449,14 @@ esac
         hc.reset_calls();
 
         let transport = HerdrTransport::new(target);
-        let outcome = transport.deliver("next task", PushMode::Queue).await;
+        let outcome = transport.deliver(&test_digest(), PushMode::Queue).await;
 
         assert_eq!(outcome, PushOutcome::Delivered);
         assert_eq!(
             hc.recorded_calls(),
             vec![
                 vec!["get", "--json", "t3"],
-                vec!["send", "--json", "t3", "next task"],
+                vec!["send", "--json", "t3", test_digest().as_str()],
             ]
         );
     }
@@ -467,7 +472,7 @@ esac
         hc.reset_calls();
 
         let transport = HerdrTransport::new(target);
-        let outcome = transport.deliver("queued msg", PushMode::Queue).await;
+        let outcome = transport.deliver(&test_digest(), PushMode::Queue).await;
 
         assert_eq!(outcome, PushOutcome::hold("herdr_working"));
         assert_eq!(hc.recorded_calls(), vec![vec!["get", "--json", "t3"]]);
@@ -489,7 +494,7 @@ esac
             bin: hc.bin(),
         };
         let transport = HerdrTransport::new(target.clone());
-        let outcome = transport.deliver("urgent!", PushMode::Interrupt).await;
+        let outcome = transport.deliver(&test_digest(), PushMode::Interrupt).await;
 
         assert_eq!(outcome, PushOutcome::Delivered);
         assert_eq!(
@@ -498,7 +503,14 @@ esac
                 vec!["get", "--json", "t3"],
                 vec!["interrupt", "--json", "--timeout", "8", "t3"],
                 vec!["get", "--json", "t3"],
-                vec!["send", "--json", "--if", "idle", "t3", "urgent!"],
+                vec![
+                    "send",
+                    "--json",
+                    "--if",
+                    "idle",
+                    "t3",
+                    test_digest().as_str()
+                ],
             ]
         );
 
@@ -506,7 +518,7 @@ esac
         hc.reset_calls();
         hc.set_get_seq(1, 0, &nested_json("t3", 100, 4242, "codex", "working"));
         hc.set_get_seq(2, 0, &nested_json("t3", 100, 4242, "codex", "done"));
-        let outcome_done = transport.deliver("urgent-done", PushMode::Interrupt).await;
+        let outcome_done = transport.deliver(&test_digest(), PushMode::Interrupt).await;
         assert_eq!(outcome_done, PushOutcome::Delivered);
         assert_eq!(
             hc.recorded_calls(),
@@ -514,7 +526,7 @@ esac
                 vec!["get", "--json", "t3"],
                 vec!["interrupt", "--json", "--timeout", "8", "t3"],
                 vec!["get", "--json", "t3"],
-                vec!["send", "--json", "t3", "urgent-done"],
+                vec!["send", "--json", "t3", test_digest().as_str()],
             ]
         );
     }
@@ -534,7 +546,7 @@ esac
         // 1. Exit 0 but outcome != "stopped" -> Reject("herdr_interrupt_outcome_unknown")
         hc.set_get_default(0, &nested_json("t3", 100, 4242, "codex", "working"));
         hc.set_interrupt(0, r#"{"outcome":"timeout"}"#);
-        let outcome = transport.deliver("urgent", PushMode::Interrupt).await;
+        let outcome = transport.deliver(&test_digest(), PushMode::Interrupt).await;
         assert_eq!(
             outcome,
             PushOutcome::reject("herdr_interrupt_outcome_unknown")
@@ -550,7 +562,7 @@ esac
         // 2. Non-zero exit even with outcome == "stopped" -> Reject("herdr_interrupt_outcome_unknown")
         hc.reset_calls();
         hc.set_interrupt(1, r#"{"outcome":"stopped"}"#);
-        let outcome = transport.deliver("urgent", PushMode::Interrupt).await;
+        let outcome = transport.deliver(&test_digest(), PushMode::Interrupt).await;
         assert_eq!(
             outcome,
             PushOutcome::reject("herdr_interrupt_outcome_unknown")
@@ -562,7 +574,7 @@ esac
         hc.set_interrupt(0, r#"{"outcome":"stopped"}"#);
         hc.set_get_seq(1, 0, &nested_json("t3", 100, 4242, "codex", "working"));
         hc.set_get_seq(2, 0, &nested_json("t3", 100, 4242, "codex", "working"));
-        let outcome = transport.deliver("urgent", PushMode::Interrupt).await;
+        let outcome = transport.deliver(&test_digest(), PushMode::Interrupt).await;
         assert_eq!(
             outcome,
             PushOutcome::hold_interrupted("herdr_agent_not_ready")
@@ -593,14 +605,14 @@ esac
         hc.set_get_default(0, &nested_json("t3", 100, 4242, "codex", "idle"));
         hc.set_send(9, r#"{"error":"guard_refused"}"#);
         assert_eq!(
-            transport.deliver("msg", PushMode::Queue).await,
+            transport.deliver(&test_digest(), PushMode::Queue).await,
             PushOutcome::hold("herdr_send_guard_refused")
         );
 
         // Exit 10 without interrupt -> Hold { interrupted: false }
         hc.set_send(10, r#"{"error":"draft_in_progress"}"#);
         assert_eq!(
-            transport.deliver("msg", PushMode::Queue).await,
+            transport.deliver(&test_digest(), PushMode::Queue).await,
             PushOutcome::hold("herdr_send_guard_refused")
         );
 
@@ -611,7 +623,7 @@ esac
         hc.set_interrupt(0, r#"{"outcome":"stopped"}"#);
         hc.set_send(9, r#"{}"#);
         assert_eq!(
-            transport.deliver("msg", PushMode::Interrupt).await,
+            transport.deliver(&test_digest(), PushMode::Interrupt).await,
             PushOutcome::hold_interrupted("herdr_send_guard_refused")
         );
 
@@ -619,7 +631,7 @@ esac
         hc.reset_calls();
         hc.set_send(10, r#"{}"#);
         assert_eq!(
-            transport.deliver("msg", PushMode::Interrupt).await,
+            transport.deliver(&test_digest(), PushMode::Interrupt).await,
             PushOutcome::hold_interrupted("herdr_send_guard_refused")
         );
 
@@ -627,7 +639,7 @@ esac
         hc.reset_calls();
         hc.set_send(2, r#"{}"#);
         assert_eq!(
-            transport.deliver("msg", PushMode::Interrupt).await,
+            transport.deliver(&test_digest(), PushMode::Interrupt).await,
             PushOutcome::Reject {
                 reason: "herdr_send_outcome_unknown".into(),
                 interrupted: true,
@@ -637,7 +649,7 @@ esac
         hc.reset_calls();
         hc.set_get_seq(1, 0, &nested_json("t3", 100, 4242, "codex", "idle"));
         assert_eq!(
-            transport.deliver("msg", PushMode::Queue).await,
+            transport.deliver(&test_digest(), PushMode::Queue).await,
             PushOutcome::Reject {
                 reason: "herdr_send_outcome_unknown".into(),
                 interrupted: false,
@@ -663,7 +675,7 @@ esac
         // 1. Recycled PID
         hc.set_get_default(0, &nested_json("t3", 100, 9999, "codex", "idle"));
         assert_eq!(
-            transport.deliver("secret", PushMode::Interrupt).await,
+            transport.deliver(&test_digest(), PushMode::Interrupt).await,
             PushOutcome::hold("herdr_target_unavailable")
         );
         assert_eq!(hc.recorded_calls(), vec![vec!["get", "--json", "t3"]]);
@@ -672,7 +684,7 @@ esac
         hc.reset_calls();
         hc.set_get_default(0, &nested_json("t3", 101, 4242, "codex", "idle"));
         assert_eq!(
-            transport.deliver("secret", PushMode::Interrupt).await,
+            transport.deliver(&test_digest(), PushMode::Interrupt).await,
             PushOutcome::hold("herdr_target_unavailable")
         );
         assert_eq!(hc.recorded_calls(), vec![vec!["get", "--json", "t3"]]);
@@ -681,7 +693,7 @@ esac
         hc.reset_calls();
         hc.set_get_default(0, &nested_json("t3", 100, 4242, "vim", "idle"));
         assert_eq!(
-            transport.deliver("secret", PushMode::Interrupt).await,
+            transport.deliver(&test_digest(), PushMode::Interrupt).await,
             PushOutcome::hold("herdr_target_unavailable")
         );
         assert_eq!(hc.recorded_calls(), vec![vec!["get", "--json", "t3"]]);
@@ -691,7 +703,7 @@ esac
         hc.set_get_seq(1, 0, &nested_json("t3", 100, 4242, "codex", "working"));
         hc.set_get_seq(2, 0, &nested_json("t3", 100, 9999, "codex", "idle"));
         assert_eq!(
-            transport.deliver("secret", PushMode::Interrupt).await,
+            transport.deliver(&test_digest(), PushMode::Interrupt).await,
             PushOutcome::hold_interrupted("herdr_agent_not_ready")
         );
         assert_eq!(
@@ -720,14 +732,21 @@ esac
         hc.reset_calls();
         let transport = HerdrTransport::new(pinned);
         assert_eq!(
-            transport.deliver("hello flat", PushMode::Queue).await,
+            transport.deliver(&test_digest(), PushMode::Queue).await,
             PushOutcome::Delivered
         );
         assert_eq!(
             hc.recorded_calls(),
             vec![
                 vec!["get", "--json", "t5"],
-                vec!["send", "--json", "--if", "idle", "t5", "hello flat"],
+                vec![
+                    "send",
+                    "--json",
+                    "--if",
+                    "idle",
+                    "t5",
+                    test_digest().as_str()
+                ],
             ]
         );
 
@@ -736,7 +755,7 @@ esac
         hc.set_get_seq(1, 0, &flat_json("t5", 5000, 7777, "claude-code", "working"));
         hc.set_get_seq(2, 0, &flat_json("t5", 5000, 7777, "claude-code", "idle"));
         assert_eq!(
-            transport.deliver("urgent flat", PushMode::Interrupt).await,
+            transport.deliver(&test_digest(), PushMode::Interrupt).await,
             PushOutcome::Delivered
         );
         assert_eq!(
@@ -745,7 +764,14 @@ esac
                 vec!["get", "--json", "t5"],
                 vec!["interrupt", "--json", "--timeout", "8", "t5"],
                 vec!["get", "--json", "t5"],
-                vec!["send", "--json", "--if", "idle", "t5", "urgent flat"],
+                vec![
+                    "send",
+                    "--json",
+                    "--if",
+                    "idle",
+                    "t5",
+                    test_digest().as_str()
+                ],
             ]
         );
     }
@@ -766,7 +792,7 @@ esac
         for mode in [PushMode::Queue, PushMode::Interrupt] {
             hc.reset_calls();
             assert_eq!(
-                transport.deliver("msg", mode).await,
+                transport.deliver(&test_digest(), mode).await,
                 PushOutcome::hold("herdr_permission")
             );
             assert_eq!(hc.recorded_calls(), vec![vec!["get", "--json", "t3"]]);
@@ -791,7 +817,7 @@ esac
         hc.set_flag("hang_get");
         let start = Instant::now();
         assert_eq!(
-            transport.deliver("msg", PushMode::Queue).await,
+            transport.deliver(&test_digest(), PushMode::Queue).await,
             PushOutcome::hold("herdr_target_unavailable")
         );
         assert!(
@@ -806,7 +832,7 @@ esac
         hc.set_flag("hang_interrupt");
         let start = Instant::now();
         assert_eq!(
-            transport.deliver("msg", PushMode::Interrupt).await,
+            transport.deliver(&test_digest(), PushMode::Interrupt).await,
             PushOutcome::reject("herdr_interrupt_outcome_unknown")
         );
         assert!(start.elapsed() < Duration::from_secs(3));
@@ -821,7 +847,7 @@ esac
         hc.set_flag("hang_send");
         let start = Instant::now();
         assert_eq!(
-            transport.deliver("msg", PushMode::Interrupt).await,
+            transport.deliver(&test_digest(), PushMode::Interrupt).await,
             PushOutcome::Reject {
                 reason: "herdr_send_outcome_unknown".into(),
                 interrupted: true,
@@ -842,13 +868,13 @@ esac
 
         hc.set_get_default(0, "{truncated json");
         assert_eq!(
-            transport.deliver("msg", PushMode::Queue).await,
+            transport.deliver(&test_digest(), PushMode::Queue).await,
             PushOutcome::hold("herdr_target_unavailable")
         );
 
         hc.set_flag("oversized_get");
         assert_eq!(
-            transport.deliver("msg", PushMode::Queue).await,
+            transport.deliver(&test_digest(), PushMode::Queue).await,
             PushOutcome::hold("herdr_target_unavailable")
         );
     }

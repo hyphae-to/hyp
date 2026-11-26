@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::call_registry::is_valid_session_id;
-use crate::transport::{PushMode, PushOutcome, PushTransport, TransportFuture};
+use crate::transport::{InboxDigest, PushMode, PushOutcome, PushTransport, TransportFuture};
 
 /// Default loopback OpenClaw Gateway base URL.
 pub const DEFAULT_OPENCLAW_URL: &str = "http://127.0.0.1:18789";
@@ -891,12 +891,7 @@ impl OpenClawTransport {
         &self.target
     }
 
-    async fn deliver_digest_inner(
-        &self,
-        digest_xml: &str,
-        batch_id: &str,
-        mode: PushMode,
-    ) -> PushOutcome {
+    async fn deliver_digest_inner(&self, digest: &InboxDigest, batch_id: &str) -> PushOutcome {
         let endpoint_url = match self.target.endpoint_url() {
             Ok(u) => u,
             Err(_) => return PushOutcome::reject(REASON_OPENCLAW_INVALID_URL),
@@ -922,22 +917,11 @@ impl OpenClawTransport {
             Err(_) => return PushOutcome::reject(REASON_OPENCLAW_TOKEN_MISSING),
         };
 
-        // Fail closed: NEVER forward raw untrusted body text to OpenClaw! Only accept a
-        // daemon-rendered `<hyphae-inbox ...>` XML digest; otherwise fall back to a minimal digest.
-        let safe_digest = if super::is_metadata_only_inbox_digest(digest_xml) {
-            digest_xml.trim().to_string()
-        } else {
-            let urgency = match mode {
-                PushMode::Interrupt => "interrupt",
-                PushMode::Queue => "queue",
-            };
-            format!("<hyphae-inbox unread=\"1\" urgency=\"{urgency}\"/>")
-        };
         let effective_agent_id = sanitize_agent_id(&self.target.agent_id);
         let payload = match self.target.endpoint_mode {
             OpenClawEndpointMode::Wake => {
                 let mut obj = Map::new();
-                obj.insert("text".into(), json!(safe_digest));
+                obj.insert("text".into(), json!(digest));
                 obj.insert("mode".into(), json!("now"));
                 obj.insert("agentId".into(), json!(effective_agent_id));
                 if let Some(ref sk) = validated_session_key {
@@ -947,7 +931,7 @@ impl OpenClawTransport {
             }
             OpenClawEndpointMode::Agent => {
                 let mut obj = Map::new();
-                obj.insert("message".into(), json!(safe_digest));
+                obj.insert("message".into(), json!(digest));
                 obj.insert("name".into(), json!("Hyphae"));
                 obj.insert("agentId".into(), json!(effective_agent_id));
                 obj.insert("wakeMode".into(), json!("now"));
@@ -1043,18 +1027,22 @@ impl PushTransport for OpenClawTransport {
         Value::Object(obj)
     }
 
-    fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
+    fn deliver<'a>(
+        &'a self,
+        digest: &'a InboxDigest,
+        _mode: PushMode,
+    ) -> TransportFuture<'a, PushOutcome> {
         let batch_id = uuid_v4();
-        Box::pin(async move { self.deliver_digest_inner(text, &batch_id, mode).await })
+        Box::pin(async move { self.deliver_digest_inner(digest, &batch_id).await })
     }
 
     fn deliver_digest<'a>(
         &'a self,
-        digest_xml: &'a str,
+        digest: &'a InboxDigest,
         batch_id: &'a str,
-        mode: PushMode,
+        _mode: PushMode,
     ) -> TransportFuture<'a, PushOutcome> {
-        Box::pin(async move { self.deliver_digest_inner(digest_xml, batch_id, mode).await })
+        Box::pin(async move { self.deliver_digest_inner(digest, batch_id).await })
     }
 }
 
@@ -1310,11 +1298,7 @@ mod tests {
         let transport = OpenClawTransport::new(target);
         assert_eq!(
             transport
-                .deliver_digest(
-                    "<hyphae-inbox unread=\"1\" urgency=\"queue\"/>",
-                    "b1",
-                    PushMode::Queue
-                )
+                .deliver_digest(&crate::transport::test_digest(), "b1", PushMode::Queue)
                 .await,
             PushOutcome::reject(REASON_OPENCLAW_INVALID_SESSION_KEY)
         );

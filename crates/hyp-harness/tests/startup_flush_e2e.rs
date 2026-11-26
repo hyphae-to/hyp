@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use hyp_crypto::{SecretBackend, SecretStore};
 use hyp_harness::daemon::{LocalDaemon, LocalDaemonConfig};
-use hyp_harness::transport::{PushMode, PushOutcome, PushTransport, TransportFuture};
+use hyp_harness::transport::{InboxDigest, PushMode, PushOutcome, PushTransport, TransportFuture};
 use hyp_node::engine::{NodeConfig, SubscribeRequest, UnifiedNode};
 use hyp_node::gates::SecurityGatePipeline;
 use hyp_node::gates::plugins::{BoxFuture, FilterPlugin};
@@ -95,8 +95,12 @@ impl PushTransport for RecordingTransport {
         true
     }
 
-    fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
-        let text = text.to_string();
+    fn deliver<'a>(
+        &'a self,
+        text: &'a InboxDigest,
+        mode: PushMode,
+    ) -> TransportFuture<'a, PushOutcome> {
+        let text = text.as_str().to_string();
         Box::pin(async move {
             self.delivered.lock().unwrap().push((text, mode));
             self.notify.notify_waiters();

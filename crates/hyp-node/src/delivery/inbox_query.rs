@@ -389,6 +389,27 @@ pub fn query_inbox(
     query: &InboxQuery,
     now_ms: i64,
 ) -> Result<InboxQueryResult, DeliveryError> {
+    query_inbox_inner(db, None, session_id, query, now_ms)
+}
+
+/// Queries the same inbox with the running node's identity for provenance classification.
+pub fn query_inbox_for_node(
+    db: &NodeDb,
+    local_node_id: &str,
+    session_id: &str,
+    query: &InboxQuery,
+    now_ms: i64,
+) -> Result<InboxQueryResult, DeliveryError> {
+    query_inbox_inner(db, Some(local_node_id), session_id, query, now_ms)
+}
+
+fn query_inbox_inner(
+    db: &NodeDb,
+    local_node_id: Option<&str>,
+    session_id: &str,
+    query: &InboxQuery,
+    now_ms: i64,
+) -> Result<InboxQueryResult, DeliveryError> {
     if !query.filter.ce_filters.is_empty() {
         let val = serde_json::to_value(&query.filter.ce_filters)?;
         hyp_proto::filter::validate_filters(&val)
@@ -553,7 +574,7 @@ pub fn query_inbox(
             let (human_verified, verified_human_id, verified_human_kid) =
                 read_human_verified_meta(db, &entry.receipt);
             let (trust_tier, untrusted, provenance) =
-                classify_item_provenance(db, &entry, human_verified);
+                classify_item_provenance(db, local_node_id, &entry, human_verified);
             let (text, preview) = if query.summary_only {
                 (None, Some(make_preview(&entry.text)))
             } else {
@@ -605,21 +626,31 @@ const fn is_agent_visible_gate_state(state: GateState) -> bool {
 /// `hyp_inbox` (RFC 0004).
 fn classify_item_provenance(
     db: &NodeDb,
+    local_node_id: Option<&str>,
     entry: &MailboxEntry,
     human_verified: bool,
 ) -> (String, bool, Option<String>) {
     if human_verified {
         return ("human-verified".to_string(), false, None);
     }
-    if entry.source == "hyphae" {
+    if local_node_id.is_some_and(|id| entry.trusted_daemon_notice(id).is_some()) {
         return ("self".to_string(), false, None);
     }
-    // Events from this node are webhook/plugin ingests; everything else from this node is `self`.
     let is_event = entry.kind == MailboxKind::Event;
-    let own = if is_event { "external-webhook" } else { "self" };
+    let resembles_notice = entry.source == "hyphae" || entry.source.starts_with("hyphae:");
+    let own = if is_event {
+        "external-webhook"
+    } else if resembles_notice {
+        "peer"
+    } else {
+        "self"
+    };
     let tier = if entry.kind == MailboxKind::Plugin {
         "bridge"
-    } else if entry.origin_node == "local" || (is_event && entry.source.starts_with("local.")) {
+    } else if local_node_id == Some(entry.origin_node.as_str())
+        || entry.origin_node == "local"
+        || (is_event && entry.source.starts_with("local."))
+    {
         own
     } else {
         match db.peers().get_peer(&entry.origin_node) {

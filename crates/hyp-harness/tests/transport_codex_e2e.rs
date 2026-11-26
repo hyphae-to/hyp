@@ -5,6 +5,10 @@
 //! (including Windows). Real `#!/bin/sh` subprocess E2E tests are `#[cfg(unix)]`-gated
 //! so Windows builds cleanly with zero warnings.
 
+mod common;
+
+use common::test_digest;
+
 use std::time::Duration;
 
 use hyp_harness::transport::codex::{
@@ -188,7 +192,7 @@ async fn deliver_fails_closed_on_invalid_config_before_spawning() {
     assert!(!bad_thread.supports_interrupt());
     assert_eq!(bad_thread.timeout(), DEFAULT_CODEX_QUEUE_TIMEOUT);
     assert_eq!(
-        bad_thread.deliver("hello", PushMode::Queue).await,
+        bad_thread.deliver(&test_digest(), PushMode::Queue).await,
         PushOutcome::Reject {
             reason: REASON_INVALID_THREAD_ID.to_string(),
             interrupted: false,
@@ -201,7 +205,7 @@ async fn deliver_fails_closed_on_invalid_config_before_spawning() {
             .with_remote("--inject"),
     );
     assert_eq!(
-        bad_remote.deliver("hello", PushMode::Queue).await,
+        bad_remote.deliver(&test_digest(), PushMode::Queue).await,
         PushOutcome::Reject {
             reason: REASON_INVALID_REMOTE.to_string(),
             interrupted: false,
@@ -224,7 +228,7 @@ async fn deliver_missing_binary_returns_hold_codex_binary_missing() {
     .with_timeout(Duration::from_secs(5));
 
     let boxed: Box<dyn PushTransport> = Box::new(transport);
-    let outcome = boxed.deliver("wake up", PushMode::Queue).await;
+    let outcome = boxed.deliver(&test_digest(), PushMode::Queue).await;
     assert_eq!(
         outcome,
         PushOutcome::Hold {
@@ -236,7 +240,7 @@ async fn deliver_missing_binary_returns_hold_codex_binary_missing() {
     // Blank binary string also resolves deterministically to codex_binary_missing across all OSes.
     let empty_bin = CodexQueueTransport::new(CodexQueueTarget::new("thr-empty-bin").with_bin(""));
     assert_eq!(
-        empty_bin.deliver("wake up", PushMode::Queue).await,
+        empty_bin.deliver(&test_digest(), PushMode::Queue).await,
         PushOutcome::Hold {
             reason: REASON_BINARY_MISSING.to_string(),
             interrupted: false,
@@ -321,7 +325,8 @@ mod unix_subprocess_e2e {
         )
         .with_timeout(Duration::from_secs(5));
 
-        let outcome = transport.deliver(&special_message, PushMode::Queue).await;
+        let digest = crate::common::source_digest(hyp_store::MailboxKind::Plugin, &special_message);
+        let outcome = transport.deliver(&digest, PushMode::Queue).await;
         assert_eq!(outcome, PushOutcome::Delivered);
 
         let argv = read_recorded_argv(&record_dir);
@@ -332,7 +337,7 @@ mod unix_subprocess_e2e {
                 "--thread".to_string(),
                 thread_id.to_string(),
                 "--message".to_string(),
-                special_message,
+                digest.as_str().to_string(),
             ]
         );
         assert!(
@@ -352,7 +357,7 @@ mod unix_subprocess_e2e {
         fs::create_dir(&custom_home).expect("mkdir codex home");
         let thread_id = "thr_resume_remote_42";
         let remote_url = "https://codex.acme.internal:8443/queue";
-        let message = "hello from hyphae mesh";
+        let digest = test_digest();
 
         let target = CodexQueueTarget {
             thread_id: thread_id.to_string(),
@@ -363,7 +368,7 @@ mod unix_subprocess_e2e {
         };
 
         let transport = CodexQueueTransport::new(target).with_timeout(Duration::from_secs(5));
-        let outcome = transport.deliver(message, PushMode::Queue).await;
+        let outcome = transport.deliver(&digest, PushMode::Queue).await;
         assert_eq!(outcome, PushOutcome::Delivered);
 
         let argv = read_recorded_argv(&record_dir);
@@ -374,7 +379,7 @@ mod unix_subprocess_e2e {
                 "--thread",
                 thread_id,
                 "--message",
-                message,
+                digest.as_str(),
                 "--resume",
                 "--remote",
                 remote_url,
@@ -415,7 +420,7 @@ mod unix_subprocess_e2e {
             )
             .with_timeout(Duration::from_secs(5));
 
-            let outcome = transport.deliver("ping", PushMode::Queue).await;
+            let outcome = transport.deliver(&test_digest(), PushMode::Queue).await;
             assert_eq!(
                 outcome,
                 PushOutcome::Hold {
@@ -438,7 +443,7 @@ mod unix_subprocess_e2e {
         )
         .with_timeout(Duration::from_secs(5));
         assert_eq!(
-            transport.deliver("ping", PushMode::Queue).await,
+            transport.deliver(&test_digest(), PushMode::Queue).await,
             PushOutcome::Hold {
                 reason: REASON_QUEUE_UNAVAILABLE.to_string(),
                 interrupted: false,
@@ -476,7 +481,7 @@ mod unix_subprocess_e2e {
             )
             .with_timeout(Duration::from_secs(5));
 
-            let outcome = transport.deliver("ping", PushMode::Queue).await;
+            let outcome = transport.deliver(&test_digest(), PushMode::Queue).await;
             assert_eq!(
                 outcome,
                 PushOutcome::Reject {
@@ -496,7 +501,7 @@ mod unix_subprocess_e2e {
         )
         .with_timeout(Duration::from_secs(5));
         assert_eq!(
-            transport.deliver("ping", PushMode::Queue).await,
+            transport.deliver(&test_digest(), PushMode::Queue).await,
             PushOutcome::Reject {
                 reason: REASON_QUEUE_OUTCOME_UNKNOWN.to_string(),
                 interrupted: false,
@@ -520,7 +525,7 @@ mod unix_subprocess_e2e {
         .with_timeout(Duration::from_millis(150));
 
         let started = Instant::now();
-        let outcome = transport.deliver("ping", PushMode::Queue).await;
+        let outcome = transport.deliver(&test_digest(), PushMode::Queue).await;
         let elapsed = started.elapsed();
 
         assert_eq!(
@@ -578,7 +583,7 @@ mod unix_subprocess_e2e {
         )
         .with_timeout(Duration::from_secs(5));
 
-        let outcome = transport.deliver("ping", PushMode::Queue).await;
+        let outcome = transport.deliver(&test_digest(), PushMode::Queue).await;
         assert_eq!(
             outcome,
             PushOutcome::Hold {
@@ -589,30 +594,21 @@ mod unix_subprocess_e2e {
     }
 
     #[tokio::test]
-    async fn e2e_nul_byte_in_message_fails_closed_without_spawning() {
+    async fn e2e_packer_strips_nul_from_metadata_before_subprocess_spawn() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let ran_marker = tmp.path().join("should-not-run");
-        let script = format!("#!/bin/sh\ntouch '{}'\nexit 0\n", ran_marker.display());
-        let shim = write_executable_script(tmp.path(), "codex-nul.sh", &script);
-
+        let record_dir = tmp.path().join("recorded");
+        fs::create_dir(&record_dir).unwrap();
+        let shim = write_recording_shim(tmp.path(), &record_dir);
         let transport = CodexQueueTransport::new(
             CodexQueueTarget::new("thr-nul-check").with_bin(shim.to_string_lossy().into_owned()),
-        )
-        .with_timeout(Duration::from_secs(5));
-
-        let outcome = transport
-            .deliver("prefix\0truncated", PushMode::Queue)
-            .await;
+        );
+        let digest = crate::common::source_digest(hyp_store::MailboxKind::Message, "peer/dev\0");
         assert_eq!(
-            outcome,
-            PushOutcome::Reject {
-                reason: REASON_QUEUE_OUTCOME_UNKNOWN.to_string(),
-                interrupted: false,
-            }
+            transport.deliver(&digest, PushMode::Queue).await,
+            PushOutcome::Delivered
         );
-        assert!(
-            !ran_marker.exists(),
-            "subprocess must not spawn when argv contains an interior NUL byte"
-        );
+        let argv = read_recorded_argv(&record_dir);
+        assert_eq!(argv[4], digest.as_str());
+        assert!(argv[4].contains("from=\"peer/dev\""));
     }
 }

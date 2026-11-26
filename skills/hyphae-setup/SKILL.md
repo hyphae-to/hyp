@@ -77,8 +77,9 @@ This is Mode 1 below in tree form; `ref` names the section with the full recipe 
 {"schema": "hyphae.onboarding/v1", "id": "hyphae-node", "title": "Hyphae node", "summary": "First-time setup of a Hyphae node, its harnesses, topology and optional capabilities.", "kind": "node", "status": "live", "privacy": "private", "start": "inspect", "steps": {
   "inspect": {"type": "run", "command": "hyp version --json && hyp status --json && hyp doctor --json", "capture": "probe", "why": "Decide between first-time onboarding and a configuration change before asking anything.", "ref": "Section 0", "next": "harnesses"},
   "harnesses": {"type": "ask", "var": "harnesses", "multi": true, "question": "Which detected coding harnesses and optional UI components should Hyphae wire?", "ref": "Turn 1, question 1", "options": [{"value": "auto", "label": "Everything detected"}, {"value": "subset", "label": "Let me pick", "description": "Offer the detected harnesses and the UI extras from Turn 1 one by one."}], "next": "topology"},
-  "topology": {"type": "ask", "var": "topology", "question": "How should this node connect to others?", "ref": "Turn 1, question 2", "options": [{"value": "local", "label": "Local only"}, {"value": "p2p", "label": "Direct P2P with another machine"}, {"value": "team", "label": "Team Hub"}, {"value": "public", "label": "Public read-only node"}], "next": "bootstrap"},
-  "bootstrap": {"type": "run", "command": "hyp onboard --yes --profile <profile> --node-id <user@host> --harness <harnesses> --json", "capture": "onboard", "ref": "Step 2.1", "next": "followups"},
+  "topology": {"type": "ask", "var": "topology", "question": "How should this node connect to others?", "ref": "Turn 1, question 2", "options": [{"value": "local", "label": "Local only"}, {"value": "p2p", "label": "Direct P2P with another machine"}, {"value": "team", "label": "Team Hub"}, {"value": "public", "label": "Public read-only node"}], "next": "kv"},
+  "kv": {"type": "ask", "var": "kvFlag", "question": "Enable the shared key-value tool for agents?", "why": "This gives harnesses a tool for reading and updating shared state.", "options": [{"value": "--kv", "label": "Yes"}, {"value": "--no-kv", "label": "No"}], "default": "--no-kv", "next": "bootstrap"},
+  "bootstrap": {"type": "run", "command": "hyp onboard --yes --profile <profile> --node-id <user@host> --harness <harnesses> {{kvFlag}} --json", "capture": "onboard", "ref": "Step 2.1", "next": "followups"},
   "followups": {"type": "human", "text": "Turn each machine-specific item in the onboard output (Herdr layout, T3 token, extra Claude profiles) into a direct question.", "ref": "Step 2.2", "next": {"switch": "topology", "cases": {"local": "capabilities", "p2p": "connect", "team": "connect", "public": "connect"}}},
   "connect": {"type": "human", "text": "Pair with the chosen peer, hub or public node. Tokens go through stdin or a 0600 file, never argv or chat.", "ref": "Connect Chosen Topology", "next": "capabilities"},
   "capabilities": {"type": "ask", "var": "capabilities", "multi": true, "question": "Which optional capabilities do you want to set up now?", "ref": "Step 2.3", "options": [{"value": "streams", "label": "Built-in event streams", "description": "GitHub and Prometheus, compiled into the node. Recipe: Mode 2, section F."}, {"value": "plugins", "label": "Event-source plugins", "description": "AgentMail, Gmail, Google Calendar, Sentry, Vercel, Notion. Each has its own onboarding tree."}, {"value": "bridges", "label": "Chat bridges", "description": "Telegram, Slack, WhatsApp. Recipe: Mode 2, section F."}, {"value": "drops", "label": "Verified Human Drops", "description": "Phone passkey and Blind Drop Relay. Recipe: Mode 2, section E."}, {"value": "gate", "label": "Local Security Gate", "description": "Inbound prompt-injection screening. Recipe: Mode 2, section G."}, {"value": "none", "label": "None for now"}], "next": "plugins"},
@@ -116,7 +117,7 @@ Run the secret-free probes in Section 0 (`hyp version --json`, `hyp status --jso
 
 ### Turn 1 — Core Node, Harnesses & UI Extras + Topology
 
-Ask **2 crisp questions** tailored to what Turn 0 detected (never write files before the user confirms):
+Ask these questions one at a time, tailored to what Turn 0 detected (never write files before the user confirms):
 
 1. **Coding harnesses & optional UI components to enable**:
    - **Harnesses**: Which detected harnesses should Hyphae wire? (`auto` for all detected, `all` for all 9, or a comma-separated subset of `antigravity,claude,codex,cursor,opencode,gemini,openclaw,herdr,t3`.)
@@ -131,6 +132,8 @@ Ask **2 crisp questions** tailored to what Turn 0 detected (never write files be
    - **Team Hub** (`--profile router`, `am2_`) — join an org's E2EE Team Hub or deploy a new one.
    - **Public Read-Only Node** (`guest-ro`) — subscribe to read-only GitHub event streams (e.g., `https://public.hyphae.to` or self-hosted `public-node`).
 
+3. **Shared key-value tool**: Ask “Enable the shared key-value tool for agents?” Present Yes (`--kv`) and No (`--no-kv`, the default). Keep this choice separate from topology and harness selection.
+
 End Turn 1 by explicitly setting expectations:
 > *"Once the base node & harnesses are wired, we'll pick any optional streams, chat bridges, Verified Human Drops, and Security Gate you want."*
 
@@ -141,8 +144,8 @@ End Turn 1 by explicitly setting expectations:
 Running `hyp onboard` interactively opens the borderless high-res 2×4 Unicode Braille organic mycelium & glowing **`HYPHAE`** interactive TUI wizard (picking **Local CLI setup** opens an interactive harness & component toggle checklist before writing any files; when `HC_TERMINAL_ID` is set inside Herdr, discovered Herdr launch templates appear directly on the main menu and launch via `hc run --bg --outlive-parent` + immediate TTY `hc attach <address>`). When driving setup as an agent, pass `--yes` along with only the harnesses and component flags the user opted into:
 
 ```sh
-# Local workstation node with user-selected harnesses & optional UI components
-hyp onboard --yes --profile local --node-id <user@host> --harness auto --json
+# Local workstation node with auto-detected harnesses after the user opts into shared KV
+hyp onboard --yes --profile local --node-id <user@host> --harness auto --kv --json
 
 # Example with explicit harness subset + live statusLine + native Herdr mod (or opt-outs):
 hyp onboard --yes --node-id <user@host> --harness claude,antigravity,herdr --statusline --mod --json
@@ -152,6 +155,8 @@ hyp onboard --yes --node-id <user@host> --harness claude --no-skills --no-comman
 hyp onboard --yes --node-id <user@host> --join - --json <<< "$TOKEN"
 hyp onboard --yes --node-id <user@host> --join /path/to/0600-token-file --json
 ```
+
+Include the selected KV flag in each bootstrap variant above. On an existing node, keep its current KV setting unless the user asks to change it.
 
 Preview or adjust harness wiring & optional components with `hyp setup` (or run `hyp setup --interactive` in a TTY for the toggle checklist):
 
@@ -278,6 +283,8 @@ hyp doctor --json
 Identify what the user wants to change and execute only the targeted workflow:
 
 ### A. Add, Update, or Remove Harnesses, Optional UI Plugins & Skills
+- **Change shared KV tool exposure**: Ask “Enable the shared key-value tool for agents?” if the user requests a change. Set top-level `"kv": true` or `"kv": false` in the active `node.json`, preserving other fields and any KV namespace configuration. If `kv` is already an object, update its `enabled` field. Restart the daemon, refresh the managed runtime skills with `hyp setup --refresh-skills`, and reconnect harness MCP clients.
+
 - **Add or re-wire harnesses & optional components** (idempotent — renders orchestrator-aware tailored `hyphae/SKILL.md` per harness without duplicating native OpenClaw/Antigravity tools, and preserves unrelated user settings; ask which optional components the user wants first):
   ```sh
   hyp setup --harness <name> --dry-run --json

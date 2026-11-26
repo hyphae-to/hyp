@@ -484,3 +484,32 @@ impl TestMcpClient {
         let _ = tokio::time::timeout(Duration::from_secs(3), self.task).await;
     }
 }
+
+pub fn test_digest() -> hyp_node::delivery::InboxDigest {
+    use hyp_node::delivery::{DeliveryUrgency, InboxDigest};
+
+    InboxDigest::count_only(1, DeliveryUrgency::Queue).unwrap()
+}
+
+pub fn source_digest(
+    kind: hyp_store::MailboxKind,
+    source: &str,
+) -> hyp_node::delivery::InboxDigest {
+    use hyp_node::delivery::{DeliveryUrgency, PackableItem, pack_inbox_digest};
+
+    let item = PackableItem {
+        id: "receipt".into(),
+        urgency: DeliveryUrgency::Queue,
+        kind,
+        source: source.into(),
+        channel: None,
+        is_announcement: false,
+        created_at_ms: 0,
+        burst_demoted: false,
+        is_system_notice: false,
+        topic: None,
+        subscription_key: None,
+        human_verified: false,
+    };
+    pack_inbox_digest(None, &[item], 0, &[]).unwrap().rendered
+}

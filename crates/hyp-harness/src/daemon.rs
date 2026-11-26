@@ -37,8 +37,9 @@ use hyp_node::delivery::{
     DEFAULT_MIDTURN_QUEUE_DIGEST_SECONDS, DeliveryEngine, DeliveryError, DeliveryRule,
     DeliveryUrgency, InboxFilter, InboxItemState, InboxItemView, InboxQuery, InboxQueryResult,
     InboxStateFilter, PackableItem, PackedDeliveryBatch, archive_muted_entry,
-    gate_reason_urgency_cap, move_pending_to_muted, muted_count, pack_inbox_digest, query_inbox,
-    record_delivered_receipts, strictest_urgency_cap, urgency_cap_gate_reason,
+    gate_reason_urgency_cap, move_pending_to_muted, muted_count, pack_inbox_digest,
+    query_inbox_for_node, record_delivered_receipts, strictest_urgency_cap,
+    urgency_cap_gate_reason,
 };
 pub use hyp_node::engine::WakeRecoveryConfig;
 use hyp_node::engine::http_util::{HttpClient, SseParser, empty_body, full_body};
@@ -53,9 +54,9 @@ use hyp_node::gates::{
 use hyp_proto::cloudevent::{CONTENT_TYPE_JSON, CloudEvent as ProtoCloudEvent, EXT_TRACEPARENT};
 use hyp_proto::filter::Filter as ProtoFilter;
 use hyp_store::{
-    AckOutcome, BridgeLink, DeliveryMode, GateAuditQuery, GateState, MailboxEntry, MailboxInsert,
-    MailboxKind, MailboxPutResult, PluginTargetHandoff, SubscriptionMeta, WriteModel,
-    format_address, now_ms, parse_address, sha256_hex, uuid_v4,
+    AckOutcome, BridgeLink, DaemonNoticeKind, DeliveryMode, GateAuditQuery, GateState,
+    MailboxEntry, MailboxInsert, MailboxKind, MailboxPutResult, PluginTargetHandoff,
+    SubscriptionMeta, WriteModel, format_address, now_ms, parse_address, sha256_hex, uuid_v4,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -578,7 +579,7 @@ struct ClassifiedItemMeta {
     channel: Option<String>,
     is_announcement: bool,
     notified: bool,
-    /// True ONLY for trusted daemon-generated host sleep/wake notices (`gate_reason == "wake_notice"`).
+    /// True only for trusted daemon-generated host sleep/wake notices.
     /// Renders directly as `[hyphae notice] ...` and NEVER triggers Tier 4 Herdr cold spawns.
     is_wake_notice: bool,
 }
@@ -1584,6 +1585,7 @@ impl LocalDaemon {
             traceparent: None,
             payload_sha256: None,
             reviewed_at: None,
+            daemon_notice: None,
         };
 
         let sub_mode = self
@@ -2832,45 +2834,27 @@ impl LocalDaemonInner {
         text: String,
     ) {
         let now = self.current_time_ms();
-        let stored_receipt = {
+        let stored = {
             let db = self.node.db();
             if db.local().get_session(session_id).ok().flatten().is_none() {
                 return;
             }
-            let res = db.local().put_in_mailbox(
-                &MailboxInsert {
-                    session_id: session_id.to_string(),
-                    origin_node: self.node.node_id().to_string(),
+            matches!(
+                db.local().put_daemon_notice(
+                    session_id,
+                    self.node.node_id().as_str(),
                     item_id,
                     text,
-                    kind: MailboxKind::Message,
-                    source: "hyphae:system".to_string(),
-                    gate_state: GateState::Pending,
-                    gate_reason: Some("system_notice".to_string()),
-                    traceparent: None,
-                },
-                now,
-            );
-            match res {
-                Ok(MailboxPutResult::Stored { receipt }) => {
-                    let _ = db
-                        .local()
-                        .mark_mailbox_gate_approved(session_id, &receipt, None, now);
-                    Some(receipt)
-                }
-                _ => None,
-            }
+                    DaemonNoticeKind::System,
+                    now,
+                ),
+                Ok(MailboxPutResult::Stored { .. })
+            )
         };
-        if stored_receipt.is_some() {
+        if stored {
             self.bump_ui_rev();
             self.flush_session(session_id).await;
         }
-    }
-
-    fn is_trusted_wake_notice_entry(&self, entry: &MailboxEntry) -> bool {
-        entry.origin_node == self.node.node_id().as_str()
-            && entry.source == "hyphae:system"
-            && entry.gate_reason.as_deref() == Some("wake_notice")
     }
 
     /// Enqueues a concise local `[hyphae notice]` for `session_id` after a host sleep/wake
@@ -2897,8 +2881,8 @@ impl LocalDaemonInner {
         // Never stack multiple pending wake notices if the agent hasn't drained the previous one.
         if let Ok(pending) = db.local().peek_inbox(session_id, 500) {
             if pending.iter().any(|entry| {
-                entry.gate_reason.as_deref() == Some("wake_notice")
-                    || entry.item_id.starts_with("system-wake:")
+                entry.trusted_daemon_notice(self.node.node_id().as_str())
+                    == Some(DaemonNoticeKind::Wake)
             }) {
                 return false;
             }
@@ -2907,7 +2891,7 @@ impl LocalDaemonInner {
         // Respect both per-session DeliveryPolicy mutes and persisted global/session mute rules.
         let parsed = hyp_node::delivery::ParsedMailboxSource::parse(
             self.node.node_id().as_str(),
-            "hyphae:system",
+            DaemonNoticeKind::SOURCE,
             MailboxKind::Message,
         );
         let ctx = parsed.as_context();
@@ -2938,29 +2922,17 @@ impl LocalDaemonInner {
             )
         };
 
-        let res = db.local().put_in_mailbox(
-            &MailboxInsert {
-                session_id: session_id.to_string(),
-                origin_node: self.node.node_id().to_string(),
-                item_id: format!("system-wake:{wake_epoch}"),
+        matches!(
+            db.local().put_daemon_notice(
+                session_id,
+                self.node.node_id().as_str(),
+                format!("system-wake:{wake_epoch}"),
                 text,
-                kind: MailboxKind::Message,
-                source: "hyphae:system".to_string(),
-                gate_state: GateState::Pending,
-                gate_reason: Some("wake_notice".to_string()),
-                traceparent: None,
-            },
-            now,
-        );
-        match res {
-            Ok(MailboxPutResult::Stored { receipt }) => {
-                let _ = db
-                    .local()
-                    .mark_mailbox_gate_approved(session_id, &receipt, None, now);
-                true
-            }
-            _ => false,
-        }
+                DaemonNoticeKind::Wake,
+                now,
+            ),
+            Ok(MailboxPutResult::Stored { .. })
+        )
     }
 
     async fn broadcast_wake_hooks(&self, slept_for: Duration) {
@@ -3707,7 +3679,8 @@ impl LocalDaemonInner {
 
         let is_announcement =
             self.is_announcement_channel(classification.parsed.channel.as_deref());
-        let is_wake_notice = self.is_trusted_wake_notice_entry(&entry);
+        let is_wake_notice = entry.trusted_daemon_notice(self.node.node_id().as_str())
+            == Some(DaemonNoticeKind::Wake);
         self.record_item_meta(
             session_id,
             entry.receipt,
@@ -3945,7 +3918,9 @@ impl LocalDaemonInner {
                 .map(|m| m.is_announcement)
                 .unwrap_or_else(|| self.is_announcement_channel(channel.as_deref()));
             let human_verified = human_auth_by_receipt.contains_key(&entry.receipt);
-            let is_system_notice = entry.source == "hyphae" || entry.source.starts_with("hyphae:");
+            let is_system_notice = entry
+                .trusted_daemon_notice(self.node.node_id().as_str())
+                .is_some();
             let (topic, subscription_key) =
                 if matches!(entry.kind, MailboxKind::Event | MailboxKind::Kv) {
                     let qualified_topic = if entry.source.contains('.') {
@@ -4676,7 +4651,7 @@ impl LocalDaemonInner {
                 if tx
                     .send(ChannelDeliverCommand {
                         delivery_id,
-                        text: batch.rendered.clone(),
+                        text: batch.rendered.as_str().to_owned(),
                         ack_tx,
                     })
                     .is_ok()
@@ -4746,7 +4721,7 @@ impl LocalDaemonInner {
                     }
 
                     let batch_id = compute_batch_idempotency_id(session_id, &batch);
-                    let digest_xml = batch.rendered.clone();
+                    let digest_xml = batch.rendered.as_str().to_owned();
                     let delivery_id = self.next_seq();
                     let (ack_tx, ack_rx) = oneshot::channel();
                     let sent = tx
@@ -5042,7 +5017,7 @@ impl LocalDaemonInner {
                     {
                         let spawn_key = format!("herdr-cold:{session_id}:{template}");
                         if self
-                            .try_herdr_cold_spawn(&spawn_key, &template, &batch.rendered)
+                            .try_herdr_cold_spawn(&spawn_key, &template, batch.rendered.as_str())
                             .await
                             .is_delivered()
                         {
@@ -6571,32 +6546,19 @@ impl LocalDaemonInner {
             }
         }
 
-        let (mut result, policy) = {
+        let (result, policy) = {
             let db = self.node.db();
             let now = self.current_time_ms();
+            let local_node_id = self.node.node_id().as_str();
             let res = if gate_active {
-                query_inbox_gate_cleared(&db, session_id, &query, now)
-                    .map_err(delivery_err_tuple)?
+                query_inbox_gate_cleared(&db, local_node_id, session_id, &query, now)
             } else {
-                query_inbox(&db, session_id, &query, now).map_err(delivery_err_tuple)?
-            };
+                query_inbox_for_node(&db, local_node_id, session_id, &query, now)
+            }
+            .map_err(delivery_err_tuple)?;
             let pol = self.delivery.policy(&db, session_id).unwrap_or_default();
             (res, pol)
         };
-
-        let my_node_id = self.node.node_id().as_str();
-        for item in &mut result.items {
-            if !item.human_verified
-                && item.source != "hyphae"
-                && item.origin_node == my_node_id
-                && matches!(
-                    item.kind,
-                    MailboxKind::Message | MailboxKind::Transfer | MailboxKind::Kv
-                )
-            {
-                item.trust_tier = Some("self".to_string());
-            }
-        }
 
         // Clean up in-memory item_meta for acknowledged receipts, reset the mid-turn queue
         // reminder timer when unread queue traffic clears, and cancel any pending Tier 3 Hold retries.
@@ -8362,7 +8324,7 @@ async fn resolve_tool_caller(
                         m.insert("kind".into(), json!(harness.as_str()));
                         m
                     });
-                let _ = daemon.merge_session_backend_and_index(
+                let session = daemon.merge_session_backend_and_index(
                     &session_id,
                     &patch,
                     daemon.current_time_ms(),
@@ -8376,6 +8338,17 @@ async fn resolve_tool_caller(
                         }
                     }
                     let mut hints = ctx.hints.clone();
+                    // Sparse MCP calls must keep T3 hints previously supplied by hooks.
+                    // Another probe may start after the hook's own probe has completed.
+                    if let Ok(session) = session {
+                        let persisted = TransportHints::from_session_backend(
+                            &session_id,
+                            &session.backend_json,
+                        );
+                        hints.t3_url = hints.t3_url.or(persisted.t3_url);
+                        hints.t3_base_dir = hints.t3_base_dir.or(persisted.t3_base_dir);
+                        hints.t3_thread_id = hints.t3_thread_id.or(persisted.t3_thread_id);
+                    }
                     if hints.harness.is_none() {
                         hints.harness = Some(harness);
                     }
@@ -11746,18 +11719,19 @@ fn parse_gate_trust_tier(raw: &str) -> Option<GateTrustTier> {
     }
 }
 
-/// Gate-cleared wrapper around [`query_inbox`] guaranteeing that unscreened raw arrivals and
+/// Gate-cleared wrapper around [`query_inbox_for_node`] guaranteeing that unscreened raw arrivals and
 /// `Hold`-retained rows (`reviewed_at IS NULL AND human_auth_json IS NULL`) are NEVER returned
 /// OR acknowledged by `hyp_inbox` while a `SecurityGatePipeline` is active (G3/G4).
 fn query_inbox_gate_cleared(
     db: &hyp_store::NodeDb,
+    local_node_id: &str,
     session_id: &str,
     query: &InboxQuery,
     now_ms: i64,
 ) -> Result<InboxQueryResult, DeliveryError> {
     let unscreened = db.local().list_unscreened_receipts(session_id, 10_000)?;
     if unscreened.is_empty() {
-        return query_inbox(db, session_id, query, now_ms);
+        return query_inbox_for_node(db, local_node_id, session_id, query, now_ms);
     }
 
     if !query.ids.is_empty() {
@@ -11783,7 +11757,7 @@ fn query_inbox_gate_cleared(
             ids: safe_ids,
             ..query.clone()
         };
-        let mut res = query_inbox(db, session_id, &filtered_query, now_ms)?;
+        let mut res = query_inbox_for_node(db, local_node_id, session_id, &filtered_query, now_ms)?;
         res.unread_count = db.local().pending_count_gate_cleared(session_id)?;
         return Ok(res);
     }
@@ -11803,7 +11777,7 @@ fn query_inbox_gate_cleared(
             ack: false,
             ids: Vec::new(),
         };
-        let page = query_inbox(db, session_id, &page_query, now_ms)?;
+        let page = query_inbox_for_node(db, local_node_id, session_id, &page_query, now_ms)?;
         for item in page.items {
             if !unscreened.contains(&item.receipt) {
                 cleared_all.push(item);
@@ -11836,7 +11810,7 @@ fn query_inbox_gate_cleared(
                 ack: false,
                 ids: Vec::new(),
             };
-            let p = query_inbox(db, session_id, &scan_q, now_ms)?;
+            let p = query_inbox_for_node(db, local_node_id, session_id, &scan_q, now_ms)?;
             for it in p.items {
                 if !unscreened.contains(&it.receipt) {
                     count += 1;
