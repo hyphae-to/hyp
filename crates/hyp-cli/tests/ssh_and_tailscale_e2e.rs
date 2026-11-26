@@ -16,22 +16,34 @@
 
 mod common;
 
-use common::{ManagedProcess, hyp_bin, isolated_cmd, parse_json_stdout};
+#[cfg(unix)]
+use common::{ManagedProcess, hyp_bin};
+use common::{isolated_cmd, parse_json_stdout};
+#[cfg(unix)]
 use hyp_crypto::SecretBackend;
+#[cfg(unix)]
 use hyp_crypto::transfer::TarInputEntry;
+#[cfg(unix)]
 use hyp_node::engine::{KvNamespaceConfig, KvWriteRequest, NodeConfig, UnifiedNode};
+#[cfg(unix)]
 use hyp_proto::address::NodeId;
+#[cfg(unix)]
 use hyp_proto::manifest::{KvMode, KvWriteModel};
 use hyp_proto::scopes::ScopePreset;
-use hyp_store::{
-    MailboxEntry, MailboxKind, NodeDb, PeerInput, PeerProfile, PeerStatus, TrustTier, WriteModel,
-    now_ms,
-};
-use serde_json::{Value, json};
+#[cfg(unix)]
+use hyp_store::{MailboxEntry, MailboxKind, WriteModel};
+use hyp_store::{NodeDb, PeerInput, PeerProfile, PeerStatus, TrustTier, now_ms};
+#[cfg(unix)]
+use serde_json::Value;
+use serde_json::json;
 use std::fs;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
