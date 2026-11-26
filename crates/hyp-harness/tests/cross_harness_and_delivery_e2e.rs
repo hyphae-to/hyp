@@ -26,7 +26,7 @@ use hyp_crypto::{Ed25519KeyPair, SecretBackend};
 use hyp_harness::daemon::{BoxFuture, BridgePoster, InboundItem, LocalDaemon, LocalDaemonConfig};
 use hyp_harness::hooks::HookEvent;
 use hyp_harness::mcp::McpOptions;
-use hyp_harness::protocol::HarnessKind;
+use hyp_harness::protocol::{HarnessKind, UNTRUSTED_PROVENANCE};
 use hyp_harness::sock::{
     MAX_SOCKET_LINE_BYTES, connect_daemon_async, daemon_rpc_async, read_bounded_line_async,
     write_ndjson_line_async,
@@ -297,6 +297,17 @@ async fn suite_1_all_nine_harnesses_live_differential_parity() {
         )
         .await;
         let drained_text = extract_pre_turn_drain_text(*harness, &drain_out);
+        assert!(
+            drained_text.starts_with(&format!(
+                "Incoming hyphae message(s):\n\n{UNTRUSTED_PROVENANCE}\n\n"
+            )),
+            "PreInvocation drain for {raw_id} must start with UNTRUSTED_PROVENANCE: {drained_text:?}"
+        );
+        assert_eq!(
+            drained_text.matches(UNTRUSTED_PROVENANCE).count(),
+            1,
+            "PreInvocation drain for {raw_id} must emit UNTRUSTED_PROVENANCE exactly once: {drained_text:?}"
+        );
 
         let st_after_drain = session_status(&sock, &session_id).await;
 
@@ -347,6 +358,17 @@ async fn suite_1_all_nine_harnesses_live_differential_parity() {
         } else {
             extract_stop_reason(*harness, &stop_drain)
         };
+        assert!(
+            stop_reason.starts_with(&format!(
+                "Incoming hyphae message(s):\n\n{UNTRUSTED_PROVENANCE}\n\n"
+            )),
+            "Stop/turn-boundary drain for {raw_id} must start with UNTRUSTED_PROVENANCE: {stop_reason:?}"
+        );
+        assert_eq!(
+            stop_reason.matches(UNTRUSTED_PROVENANCE).count(),
+            1,
+            "Stop/turn-boundary drain for {raw_id} must emit UNTRUSTED_PROVENANCE exactly once: {stop_reason:?}"
+        );
 
         // 5. Idle Stop hook (no unread, no live transport):
         //    - Herdr, T3, and OpenClaw rely on native push/ephemeral turn orchestration and
