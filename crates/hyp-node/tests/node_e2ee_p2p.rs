@@ -1069,30 +1069,13 @@ async fn adversarial_routing_loops_manifest_rollback_e2ee_downgrade_and_required
         "capability_downgrade_detected"
     );
 
-    // 3C. `E2eePolicy::Required` vs legacy non-E2EE peer fails closed!
+    // 3C. `E2eePolicy::Required` vs a signed non-E2EE peer fails closed!
     let mut strict_dir = TempDir::new().unwrap();
     let mut strict_cfg =
         NodeConfig::local(NodeId::new("strict@laptop").unwrap(), strict_dir.path());
     strict_cfg.secret_backend = Some(SecretBackend::File);
     strict_cfg.e2ee_policy = E2eePolicy::Required;
     let strict_node = UnifiedNode::open(strict_cfg).unwrap();
-
-    // Synthesized legacy v1 peer (404 /v1/manifest) MUST fail closed under Required!
-    let leg_v1_err = strict_node
-        .negotiate_legacy_v1_peer("legacy-ts-hub", true)
-        .unwrap_err();
-    assert!(matches!(
-        leg_v1_err,
-        NodeError::Negotiation(NegotiationError::RequiredCapabilityUnsupported {
-            capability: CapabilityToken::DmE2eeV1,
-            ..
-        })
-    ));
-    assert_eq!(leg_v1_err.to_problem_details().status, 501);
-    assert_eq!(
-        leg_v1_err.to_problem_details().error,
-        "capability_unsupported"
-    );
 
     // Also test a live v2 peer whose manifest omits `dm.e2ee.v1`: fails closed on verification!
     let mut non_e2ee_cfg =

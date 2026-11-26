@@ -6,7 +6,7 @@ Hyphae's test suite is grounded in William M. McKeeman's *Differential Testing f
 
 ## Core Suites Across the 6-Crate Workspace
 
-- **Frozen Golden Interop Vectors:** `crates/hyp-proto/tests/golden_interop.rs` and `crates/hyp-crypto/tests/golden_interop.rs` verify bit-exact RFC 8785 JCS, CloudEvents v1.0, filter ASTs, scopes, Ed25519/X25519, RFC 9180 HPKE, and `t3mp1_`/`seal_v1` interop.
+- **Frozen Golden Interop Vectors:** `crates/hyp-proto/tests/golden_interop.rs` and `crates/hyp-crypto/tests/golden_interop.rs` verify bit-exact RFC 8785 JCS, CloudEvents v1.0, filter ASTs, scopes, Ed25519/X25519, RFC 9180 HPKE, and `t3mp1_` pairing interop.
 - **Reference Specification Oracle vs. WAL SQLite:** `crates/hyp-store/tests/differential_oracle.rs` and `concurrency_wal.rs` drive seeded multi-step stateful sequences against both a pure in-memory reference model and real WAL `node.sqlite`, comparing post-state after every step.
 - **Adversarial & Mutated-Input Suites:** `crates/hyp-crypto/tests/adversarial_mutations.rs` and `crates/hyp-node/tests/security_gates.rs` perturb 1-bit signatures/tags, tamper with `gate_policy_sig`, inject decompression bombs and path traversals, and verify fail-closed security behavior.
 - **Full-Stack Delivery, Chaos & Multi-Node E2E:** `crates/hyp-node/tests/{delivery_policy_e2e,full_stack_chaos_e2e,adapters_public_github,real_plugins_e2e,pairing_revoke_and_drops_e2e,human_drops_and_relay_http_e2e}.rs` test concurrent epoch rotations, hub restarts mid-SSE, bridge `CrashLoopBackOff`, and Drop Relay burn-after-read.

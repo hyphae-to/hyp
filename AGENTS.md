@@ -27,7 +27,7 @@ Our testing approach is grounded in William M. McKeeman's [*Differential Testing
    - Hand-writing expected outputs for every complex interaction does not scale, and regression tests only tell you output *didn't change*, not that it is *correct*.
    - **Differential testing** feeds the exact same inputs or operation sequences to **two or more comparable systems** and flags any crash, hang, or semantic divergence.
    - In Hyphae, our comparable systems and golden oracles include:
-     - **Frozen v1/wire golden vectors**: Bit-exact RFC 8785 JCS, CloudEvents v1.0, filter AST, scopes, Ed25519/X25519, RFC 9180 HPKE, and `t3mp1_`/`seal_v1` interop fixtures (`crates/hyp-proto/tests/golden_interop.rs`, `crates/hyp-crypto/tests/golden_interop.rs`).
+     - **Frozen v1/wire golden vectors**: Bit-exact RFC 8785 JCS, CloudEvents v1.0, filter AST, scopes, Ed25519/X25519, RFC 9180 HPKE, and `t3mp1_` pairing interop fixtures (`crates/hyp-proto/tests/golden_interop.rs`, `crates/hyp-crypto/tests/golden_interop.rs`).
      - **Reference model vs. real SQLite/Engine**: Seeded multi-step stateful sequences verified against a pure in-memory specification oracle *and* against real WAL `node.sqlite` (`crates/hyp-store`) + `UnifiedNode` + `LocalDaemon` + HTTP/SSE servers, comparing post-state after every step.
      - **Cross-harness & protocol parity**: Verifying identical observable delivery, muting, Focus Mode, burst protection, and caller attribution across all 9 harnesses, JSON-RPC 2.0 / fd-3 plugins, and Unix-socket / Windows loopback-TCP IPC.
      - **Old vs. new implementations**: Whenever refactoring a delivery path, CLI renderer, or filter engine, differentially compare old and new across generated inputs before retiring the old path.

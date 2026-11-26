@@ -537,7 +537,7 @@ pub struct PeerTrustHistory {
     pub accept_downgrade: bool,
 }
 
-/// Synthesizes a legacy v1 capability descriptor when `GET /v1/manifest` returns `404` (§3.2.1).
+/// Capability descriptor used for signed-manifest negotiation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerCapabilitiesView {
     pub node_id: NodeId,
@@ -548,7 +548,6 @@ pub struct PeerCapabilitiesView {
     pub expires_at: Option<String>,
     pub capabilities: BTreeSet<CapabilityToken>,
     pub require_e2ee: bool,
-    pub is_legacy_v1: bool,
 }
 
 impl PeerCapabilitiesView {
@@ -562,32 +561,6 @@ impl PeerCapabilitiesView {
             expires_at: Some(manifest.expires_at.clone()),
             capabilities: manifest.capabilities.iter().cloned().collect(),
             require_e2ee: manifest.policy.require_e2ee,
-            is_legacy_v1: false,
-        }
-    }
-
-    /// Synthesizes capabilities for a legacy v1 TypeScript router (`GET /v1/manifest` -> `404`).
-    /// Probing `GET /v1/keys`: `200` -> `[dm.v1, channel.v1, events.v1, transfer.v1]`,
-    /// `404` -> `[dm.v1, channel.v1, events.v1]`.
-    pub fn synthesize_legacy_v1(node_id: NodeId, keys_endpoint_present: bool) -> Self {
-        let mut caps = BTreeSet::from([
-            CapabilityToken::DmV1,
-            CapabilityToken::ChannelV1,
-            CapabilityToken::EventsV1,
-        ]);
-        if keys_endpoint_present {
-            caps.insert(CapabilityToken::TransferV1);
-        }
-        Self {
-            node_id,
-            hyphae_version: LEGACY_V1_VERSION.to_string(),
-            protocol_range: ProtocolRange { min: 1, max: 1 },
-            manifest_version: None,
-            audience: None,
-            expires_at: None,
-            capabilities: caps,
-            require_e2ee: false,
-            is_legacy_v1: true,
         }
     }
 }
@@ -715,34 +688,31 @@ pub fn negotiate_capabilities(
     let peer = remote.node_id.as_str().to_string();
 
     // 1. Audience & expiry checks for signed v2 manifests.
-    if !remote.is_legacy_v1 {
-        if let Some(aud) = &remote.audience {
-            if aud != expected_audience {
-                return Err(NegotiationError::AudienceMismatch {
-                    expected: expected_audience.to_string(),
-                    got: aud.clone(),
-                });
-            }
+    if let Some(aud) = &remote.audience {
+        if aud != expected_audience {
+            return Err(NegotiationError::AudienceMismatch {
+                expected: expected_audience.to_string(),
+                got: aud.clone(),
+            });
         }
-        if let Some(exp_str) = &remote.expires_at {
-            let exp = parse_rfc3339_utc_nanos(exp_str).ok_or_else(|| {
-                NegotiationError::ManifestExpired {
-                    expires_at: exp_str.clone(),
-                    now: now_rfc3339.to_string(),
-                }
+    }
+    if let Some(exp_str) = &remote.expires_at {
+        let exp =
+            parse_rfc3339_utc_nanos(exp_str).ok_or_else(|| NegotiationError::ManifestExpired {
+                expires_at: exp_str.clone(),
+                now: now_rfc3339.to_string(),
             })?;
-            let now = parse_rfc3339_utc_nanos(now_rfc3339).ok_or_else(|| {
-                NegotiationError::ManifestExpired {
-                    expires_at: exp_str.clone(),
-                    now: now_rfc3339.to_string(),
-                }
-            })?;
-            if exp <= now {
-                return Err(NegotiationError::ManifestExpired {
-                    expires_at: exp_str.clone(),
-                    now: now_rfc3339.to_string(),
-                });
+        let now = parse_rfc3339_utc_nanos(now_rfc3339).ok_or_else(|| {
+            NegotiationError::ManifestExpired {
+                expires_at: exp_str.clone(),
+                now: now_rfc3339.to_string(),
             }
+        })?;
+        if exp <= now {
+            return Err(NegotiationError::ManifestExpired {
+                expires_at: exp_str.clone(),
+                now: now_rfc3339.to_string(),
+            });
         }
     }
 
@@ -756,20 +726,6 @@ pub fn negotiate_capabilities(
                 received,
                 last_seen,
             });
-        }
-    } else if history.last_seen_manifest_version.is_some()
-        && remote.is_legacy_v1
-        && !history.accept_downgrade
-    {
-        // A peer that previously spoke signed v2 manifesting as unsigned legacy v1 is a downgrade!
-        let missing: Vec<CapabilityToken> = history
-            .previously_seen_capabilities
-            .iter()
-            .filter(|c| c.is_anti_downgrade_security_cap())
-            .cloned()
-            .collect();
-        if !missing.is_empty() {
-            return Err(NegotiationError::CapabilityDowngradeDetected { peer, missing });
         }
     }
 
@@ -829,11 +785,7 @@ pub fn negotiate_capabilities(
 
     // 7. Operator status & ratchet tracking.
     let mut warnings = Vec::new();
-    if remote.is_legacy_v1 {
-        warnings.push(format!(
-            "Peer '{peer}' is a legacy v1 node (plaintext DMs; will ratchet to E2EE once upgraded)."
-        ));
-    } else if !missing_optional_capabilities.is_empty() {
+    if !missing_optional_capabilities.is_empty() {
         let missing_names: Vec<&str> = missing_optional_capabilities
             .iter()
             .map(CapabilityToken::as_str)
@@ -1091,33 +1043,6 @@ mod tests {
             err2.to_problem_details().error,
             "capability_downgrade_detected"
         );
-
-        // Legacy v1 router: fails under E2eePolicy::Required, warns cleanly under E2eePolicy::Prefer.
-        let legacy =
-            PeerCapabilitiesView::synthesize_legacy_v1(NodeId::new("legacy-ops").unwrap(), true);
-        assert!(
-            negotiate_capabilities(
-                &local,
-                &legacy,
-                "alice@macbook",
-                "2026-01-01T12:00:00Z",
-                E2eePolicy::Required,
-                &PeerTrustHistory::default(),
-            )
-            .is_err()
-        );
-
-        let legacy_ok = negotiate_capabilities(
-            &local,
-            &legacy,
-            "alice@macbook",
-            "2026-01-01T12:00:00Z",
-            E2eePolicy::Prefer,
-            &PeerTrustHistory::default(),
-        )
-        .unwrap();
-        assert_eq!(legacy_ok.agreed_protocol, 1);
-        assert_eq!(legacy_ok.status, NegotiationStatus::Warn);
     }
 
     #[test]

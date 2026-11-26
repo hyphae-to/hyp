@@ -45,8 +45,7 @@ fn open_local_node(node_id: &str, dir: &std::path::Path) -> Arc<UnifiedNode> {
 }
 
 /// Minimal raw HTTP/1.1 mock peer server that simulates:
-/// - `GET /v1/manifest` -> 404 (legacy v1 peer fallback, zero crypto handshake overhead)
-/// - `GET /v1/keys` -> 404
+/// - `GET /v1/manifest` -> a real signed manifest from an isolated peer node
 /// - `PUT /v1/handles` / `GET /v1/handles` -> 200 `{ "handles": [] }`
 /// - `POST /v1/inbox/ack` -> 200 `{ "acked": true }` + records acked IDs
 /// - `GET /v1/inbox`:
@@ -77,6 +76,34 @@ impl MockSsePeer {
             .await
             .expect("bind mock peer");
         let addr = listener.local_addr().unwrap();
+        let manifest_dir = TempDir::new().unwrap();
+        let peer_id = queued_msg.from_addr.split('/').next().unwrap();
+        let caller_id = queued_msg.to_addr.split('/').next().unwrap();
+        let mut config = NodeConfig::router(NodeId::new(peer_id).unwrap(), manifest_dir.path());
+        config.secret_backend = Some(SecretBackend::File);
+        config.e2ee_policy = E2eePolicy::Disabled;
+        config.capabilities_override = Some(vec![
+            hyp_proto::manifest::CapabilityToken::ManifestV1,
+            hyp_proto::manifest::CapabilityToken::DmV1,
+            hyp_proto::manifest::CapabilityToken::ChannelV1,
+            hyp_proto::manifest::CapabilityToken::EventsV1,
+        ]);
+        let manifest_node = UnifiedNode::open(config).unwrap();
+        let caller = hyp_node::engine::AuthenticatedPeer {
+            peer_id: caller_id.to_string(),
+            scopes: hyp_proto::scopes::ScopeSet::from_strings(&["dm:*"]),
+            trust_tier: TrustTier::Peer,
+        };
+        let manifest = Arc::new(
+            serde_json::to_string(
+                &manifest_node
+                    .build_signed_manifest(Some(&caller))
+                    .unwrap()
+                    .0,
+            )
+            .unwrap(),
+        );
+        manifest_node.shutdown();
         let inbox_connections = Arc::new(AtomicUsize::new(0));
         let first_conn_notify = Arc::new(Notify::new());
         let acked_ids = Arc::new(Mutex::new(Vec::new()));
@@ -105,6 +132,7 @@ impl MockSsePeer {
                 let ack_n = Arc::clone(&ack_notify_bg);
                 let beh = Arc::clone(&behavior);
                 let msg = Arc::clone(&queued_msg);
+                let manifest = Arc::clone(&manifest);
 
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 8192];
@@ -119,8 +147,12 @@ impl MockSsePeer {
                     let path = parts.next().unwrap_or("");
 
                     match (method, path) {
-                        ("GET", "/v1/manifest") | ("GET", "/v1/keys") => {
-                            let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        ("GET", "/v1/manifest") => {
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                manifest.len(),
+                                manifest,
+                            );
                             let _ = sock.write_all(resp.as_bytes()).await;
                         }
                         ("PUT", "/v1/handles") | ("GET", "/v1/handles") => {
@@ -247,6 +279,50 @@ fn seed_paired_peer_and_session(node: &UnifiedNode, peer_id: &str, endpoint: &st
             now,
         )
         .unwrap();
+}
+
+#[tokio::test]
+async fn missing_manifest_rejects_peer_without_legacy_key_probe() {
+    let dir = TempDir::new().unwrap();
+    let node = open_local_node("manifest-client@local", dir.path());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let paths = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&paths);
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                let mut chunk = [0u8; 1024];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0, "request ended before its headers");
+                bytes.extend_from_slice(&chunk[..count]);
+                assert!(bytes.len() <= 8192, "unexpectedly large fixture request");
+            }
+            let request = String::from_utf8_lossy(&bytes);
+            observed.lock().unwrap().push(
+                request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            socket
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        }
+    });
+    seed_paired_peer_and_session(&node, "retired@peer", &endpoint);
+    let report = node.reconcile_peers(Duration::from_secs(2)).await;
+    assert_eq!(report.active_peers, 0, "{report:?}");
+    assert_eq!(*paths.lock().unwrap(), vec!["/v1/manifest"]);
+    assert!(node.peer_link("retired@peer").await.is_none());
+    node.shutdown();
+    server.abort();
 }
 
 #[tokio::test]
