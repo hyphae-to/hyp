@@ -7,7 +7,7 @@ Every `hyp` command supports `--json` returning a uniform envelope `{ ok, comman
 ## Onboarding, Setup & Harnesses
 
 ```sh
-hyp onboard [--profile local|router|p2p] [--node-id <id>] [--join <file|->] [--harness <spec>] [--assist [<harness>]] [--install-skill] [--yes] [--json]
+hyp onboard [--profile local|router|p2p] [--node-id <id>] [--join <file|->] [--harness <spec>] [--assist [<harness>]] [--install-skill] [--kv | --no-kv] [--yes] [--json]
 hyp setup [--harness auto|all|claude,codex,...] [--interactive] [--dry-run] [--statusline | --restore-statusline] [--mod] [--claude-config-dir <dir>] [--refresh-skills | --force-skills] [--no-skills] [--no-commands] [--json]
 ```
 

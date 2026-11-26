@@ -32,6 +32,7 @@ hyp onboard
 - Creates your persistent Ed25519 signing and X25519 encryption keys in your OS secret store (macOS Keychain, Linux Secret Service, or `0600` files in `~/.config/hyphae/secrets/`).
 - Writes `~/.config/hyphae/node.json` and initializes `~/.config/hyphae/node.sqlite`.
 - Detects installed harnesses and wires MCP entries, lifecycle hooks, and tailored agent skills.
+- Asks whether to expose the shared key-value tool to agents.
 - Installs and starts the background daemon service (`LaunchAgent` on macOS, `systemd --user` on Linux, or Task Scheduler `schtasks` on Windows).
 
 > **Do not run `hyp node start` after `hyp onboard`:** Onboarding already starts the background service. Running `hyp node start` in parallel will report that a daemon is already running. Use `hyp service status` to check it.
@@ -39,8 +40,10 @@ hyp onboard
 For non-interactive scripting or agent-led onboarding:
 
 ```sh
-hyp onboard --yes --profile local --node-id alice@macbook --harness auto --json
+hyp onboard --yes --profile local --node-id alice@macbook --harness auto --no-kv --json
 ```
+
+Use `--kv` to expose the tool. Omitting both flags leaves it off for a new node and keeps the current setting on an existing node. See the [node configuration reference](reference/node-json.md#shared-key-value-tool-kv).
 
 ---
 

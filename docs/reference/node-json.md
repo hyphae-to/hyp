@@ -28,6 +28,7 @@ Default workstation path: `~/.config/hyphae/node.json` (`0600`). Server path: `/
   "sources": [],
   "localIngest": {},
   "plugins": [],
+  "kv": false,
   "gate": {},
   "dropRelay": {},
   "t3": {},
@@ -73,6 +74,14 @@ Enabled by default even when omitted (`defaultTopic: "schedule"`, accepting `to.
 - `exposeTopic`: Boolean (default **`false`**). Bridge topics stay local-only unless explicitly set to `true`. Source topics are always subscribable by paired peers holding a matching `stream:subscribe` scope.
 - The node adds `HYPHAE_STATE_DIR` (its state directory) to every plugin's environment unless `env` sets it.
 - `env`: Map of string values or `{ "secret": "<name>" }` references.
+
+### Shared Key-Value Tool (`kv`)
+
+`"kv": true` exposes `hyp_kv` in local MCP tool discovery and generated harness skills. `"kv": false` hides it even when KV namespaces are configured or advertised by peers. The setting affects tool discovery and leaves the KV CLI, stored data, peer access rules, and namespace policies intact. The equivalent object form is `"kv": { "enabled": true }`.
+
+Interactive onboarding asks whether to enable the tool. For noninteractive setup, use `hyp onboard --yes --kv` or `hyp onboard --yes --no-kv`. New configurations default to `false`. Rerunning without a choice preserves the current setting. Existing configurations without an explicit choice retain automatic MCP discovery from local namespaces and peer manifests.
+
+After editing `node.json`, restart the daemon and reconnect the MCP client. Run `hyp setup --refresh-skills` to update generated harness skills.
 
 ### Security Gate (`gate`)
 Managed via `hyp gate propose` + `hyp gate lock` (writes `gate_policy_sig` over canonical JCS of `gate` + `human_authorities_digest`). Remote Stage 2 classifier URLs reject non-loopback `http://` fail-closed.
