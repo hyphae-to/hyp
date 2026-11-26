@@ -289,10 +289,9 @@ struct PluginWriter {
 
 impl PluginWriter {
     fn send(&self, wire: String) -> Result<(), mpsc::error::TrySendError<String>> {
-        self.tx.try_send(wire).map_err(|error| {
+        self.tx.try_send(wire).inspect_err(|_| {
             // notify_one retains a permit even before the connection starts polling it.
             self.failed.notify_one();
-            error
         })
     }
 }
