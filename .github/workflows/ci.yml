@@ -1,4 +1,4 @@
-name: Rust CI
+name: CI
 
 on:
   push:
@@ -25,7 +25,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: rust-ci-${{ github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -33,12 +33,13 @@ env:
   HYPHAE_SECRET_BACKEND: file
 
 jobs:
-  lint-site-and-plugins:
-    name: Lint, Parity & Change Detection
+  detect-changes:
+    name: Change Detection
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       run_rust: ${{ steps.changes.outputs.run_rust }}
+      run_js: ${{ steps.changes.outputs.run_js }}
       os_matrix: ${{ steps.changes.outputs.os_matrix }}
       skip_release_build: ${{ steps.changes.outputs.skip_release_build }}
     steps:
@@ -47,24 +48,122 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Detect changed paths for Rust and JS/TS CI
+        id: changes
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          GITHUB_SHA: ${{ github.sha }}
+          INPUT_OS: ${{ inputs.os }}
+          INPUT_SKIP_RELEASE_BUILD: ${{ inputs.skip_release_build }}
+        run: |
+          set -euo pipefail
+          ALL_OS='["ubuntu-latest","macos-latest","windows-latest"]'
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            case "${INPUT_OS:-all}" in
+              ubuntu-latest|macos-latest|windows-latest)
+                OS_MATRIX="[\"${INPUT_OS}\"]"
+                ;;
+              *)
+                OS_MATRIX="$ALL_OS"
+                ;;
+            esac
+            SKIP_REL="${INPUT_SKIP_RELEASE_BUILD:-false}"
+            echo "workflow_dispatch: running full CI (os_matrix=${OS_MATRIX}, skip_release_build=${SKIP_REL})."
+            echo "run_rust=true" >> "$GITHUB_OUTPUT"
+            echo "run_js=true" >> "$GITHUB_OUTPUT"
+            echo "os_matrix=${OS_MATRIX}" >> "$GITHUB_OUTPUT"
+            echo "skip_release_build=${SKIP_REL}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "os_matrix=${ALL_OS}" >> "$GITHUB_OUTPUT"
+          echo "skip_release_build=false" >> "$GITHUB_OUTPUT"
+
+          CHANGED=""
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if git rev-parse --verify HEAD^2 >/dev/null 2>&1; then
+              CHANGED="$(git -c core.quotepath=false diff --name-only HEAD^1 HEAD || true)"
+            elif [ -n "${PR_BASE_SHA:-}" ] && git cat-file -e "${PR_BASE_SHA}^{commit}" 2>/dev/null; then
+              CHANGED="$(git -c core.quotepath=false diff --name-only "${PR_BASE_SHA}" HEAD || true)"
+            fi
+          elif [ "$EVENT_NAME" = "push" ]; then
+            if [ -n "${PUSH_BEFORE_SHA:-}" ] \
+              && [ "$PUSH_BEFORE_SHA" != "0000000000000000000000000000000000000000" ] \
+              && git cat-file -e "${PUSH_BEFORE_SHA}^{commit}" 2>/dev/null; then
+              CHANGED="$(git -c core.quotepath=false diff --name-only "${PUSH_BEFORE_SHA}" "${GITHUB_SHA}" || true)"
+            fi
+          fi
+
+          if [ -z "$CHANGED" ]; then
+            echo "Unable to narrow changed files (initial/force push or empty diff); running Rust and JS CI (fail-safe)."
+            echo "run_rust=true" >> "$GITHUB_OUTPUT"
+            echo "run_js=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          RUN_RUST="false"
+          RUN_JS="false"
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+
+            case "$path" in
+              *.md|LICENSE|docs/*|skills/*|site/index.html|site/styles.css|site/app.js|site/CNAME|site/assets/*|site/join/*|workers/*|itest/*|.github/workflows/pages.yml|.github/workflows/deploy-drop-relay.yml|.oxlintrc.json|package.json|package-lock.json)
+                ;;
+              *)
+                if [ "$RUN_RUST" = "false" ]; then
+                  echo "Rust/runtime/plugin/installer/workflow change detected: $path"
+                  RUN_RUST="true"
+                fi
+                ;;
+            esac
+
+            case "$path" in
+              plugins/*|site/*|workers/*|scripts/*|itest/*|install.sh|uninstall.sh|package.json|package-lock.json|.oxlintrc.json|.github/workflows/ci.yml|*.js|*.mjs|*.cjs|*.ts|*.tsx|*.py|*.sh|*.ps1)
+                if [ "$RUN_JS" = "false" ]; then
+                  echo "JS/TS/plugin/site/script/workflow change detected: $path"
+                  RUN_JS="true"
+                fi
+                ;;
+            esac
+          done <<< "$CHANGED"
+
+          echo "Detected matrix: run_rust=${RUN_RUST}, run_js=${RUN_JS}"
+          echo "run_rust=${RUN_RUST}" >> "$GITHUB_OUTPUT"
+          echo "run_js=${RUN_JS}" >> "$GITHUB_OUTPUT"
+
+  js-lint-and-tests:
+    name: JavaScript / TypeScript (Node 24)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.run_js == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Set up Node.js 24
         uses: actions/setup-node@v4
         with:
           node-version: "24"
           cache: "npm"
 
-      - name: Install JS/TS dev linter (oxlint)
+      - name: Install JS/TS linter (oxlint)
         run: npm ci
 
-      - name: Lint JS/TS, run JS/TS unit tests, syntax-check Python/shell/PowerShell, and verify mirror parity
+      - name: Lint JS/TS (oxlint --deny-warnings)
+        run: npm run lint:js
+
+      - name: Run JS/TS unit test suites
+        run: npm run test:js
+
+      - name: Syntax-check JS, Python, shell, PowerShell, and verify installer mirror parity
         shell: bash
         run: |
           set -euo pipefail
           node --version
           python3 --version
-
-          npm run lint:js
-          npm run test:js
 
           while IFS= read -r file; do
             node --check "$file"
@@ -102,90 +201,18 @@ jobs:
               }
             '
           fi
-          echo "All site, plugin, shell, PowerShell, and installer mirror checks passed."
-
-      - name: Detect whether Rust workspace CI is required
-        id: changes
-        shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PUSH_BEFORE_SHA: ${{ github.event.before }}
-          GITHUB_SHA: ${{ github.sha }}
-          INPUT_OS: ${{ inputs.os }}
-          INPUT_SKIP_RELEASE_BUILD: ${{ inputs.skip_release_build }}
-        run: |
-          set -euo pipefail
-          ALL_OS='["ubuntu-latest","macos-latest","windows-latest"]'
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            case "${INPUT_OS:-all}" in
-              ubuntu-latest|macos-latest|windows-latest)
-                OS_MATRIX="[\"${INPUT_OS}\"]"
-                ;;
-              *)
-                OS_MATRIX="$ALL_OS"
-                ;;
-            esac
-            SKIP_REL="${INPUT_SKIP_RELEASE_BUILD:-false}"
-            echo "workflow_dispatch: running Rust CI for os_matrix=${OS_MATRIX} (skip_release_build=${SKIP_REL})."
-            echo "run_rust=true" >> "$GITHUB_OUTPUT"
-            echo "os_matrix=${OS_MATRIX}" >> "$GITHUB_OUTPUT"
-            echo "skip_release_build=${SKIP_REL}" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "os_matrix=${ALL_OS}" >> "$GITHUB_OUTPUT"
-          echo "skip_release_build=false" >> "$GITHUB_OUTPUT"
-
-          CHANGED=""
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            if git rev-parse --verify HEAD^2 >/dev/null 2>&1; then
-              CHANGED="$(git -c core.quotepath=false diff --name-only HEAD^1 HEAD || true)"
-            elif [ -n "${PR_BASE_SHA:-}" ] && git cat-file -e "${PR_BASE_SHA}^{commit}" 2>/dev/null; then
-              CHANGED="$(git -c core.quotepath=false diff --name-only "${PR_BASE_SHA}" HEAD || true)"
-            fi
-          elif [ "$EVENT_NAME" = "push" ]; then
-            if [ -n "${PUSH_BEFORE_SHA:-}" ] \
-              && [ "$PUSH_BEFORE_SHA" != "0000000000000000000000000000000000000000" ] \
-              && git cat-file -e "${PUSH_BEFORE_SHA}^{commit}" 2>/dev/null; then
-              CHANGED="$(git -c core.quotepath=false diff --name-only "${PUSH_BEFORE_SHA}" "${GITHUB_SHA}" || true)"
-            fi
-          fi
-
-          if [ -z "$CHANGED" ]; then
-            echo "Unable to narrow changed files (initial/force push or empty diff); running Rust CI (fail-safe)."
-            echo "run_rust=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          RUN_RUST="false"
-          while IFS= read -r path; do
-            [ -z "$path" ] && continue
-            case "$path" in
-              *.md|LICENSE|docs/*|skills/*|site/index.html|site/styles.css|site/app.js|site/CNAME|site/assets/*|.github/workflows/pages.yml)
-                ;;
-              *)
-                echo "Code/runtime/plugin/installer/workflow change detected: $path"
-                RUN_RUST="true"
-                break
-                ;;
-            esac
-          done <<< "$CHANGED"
-
-          if [ "$RUN_RUST" = "false" ]; then
-            echo "Only docs/static-site files changed; skipping 3-OS Rust workspace build."
-          fi
-          echo "run_rust=${RUN_RUST}" >> "$GITHUB_OUTPUT"
+          echo "All JS/TS, Python, shell, PowerShell, and installer mirror checks passed."
 
   rust-workspace:
     name: Rust (${{ matrix.os }})
-    needs: lint-site-and-plugins
-    if: needs.lint-site-and-plugins.outputs.run_rust == 'true'
+    needs: detect-changes
+    if: needs.detect-changes.outputs.run_rust == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJson(needs.lint-site-and-plugins.outputs.os_matrix) }}
+        os: ${{ fromJson(needs.detect-changes.outputs.os_matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -204,7 +231,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-workspace
+          shared-key: rust-ci-workspace
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Formatting check (rustfmt)
@@ -241,11 +268,11 @@ jobs:
           node --test site/drop/cross_lang_interop.test.mjs
 
       - name: Build release binary (hyp)
-        if: needs.lint-site-and-plugins.outputs.skip_release_build != 'true'
+        if: needs.detect-changes.outputs.skip_release_build != 'true'
         run: cargo build --release --locked -p hyp-cli
 
       - name: Smoke-test compiled binary (Unix)
-        if: runner.os != 'Windows' && needs.lint-site-and-plugins.outputs.skip_release_build != 'true'
+        if: runner.os != 'Windows' && needs.detect-changes.outputs.skip_release_build != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -254,14 +281,14 @@ jobs:
           python3 -c 'import json, sys; j = json.loads(sys.argv[1]); assert j.get("ok") is True and j.get("command") == "version" and j.get("data", {}).get("version"), j' "$out"
 
       - name: Run installer E2E verification suite (Unix, reusing built binary)
-        if: runner.os != 'Windows' && needs.lint-site-and-plugins.outputs.skip_release_build != 'true'
+        if: runner.os != 'Windows' && needs.detect-changes.outputs.skip_release_build != 'true'
         shell: bash
         env:
           HYPHAE_PREBUILT_BIN: ./target/release/hyp
         run: bash scripts/test-installer.sh
 
       - name: Smoke-test compiled binary (Windows)
-        if: runner.os == 'Windows' && needs.lint-site-and-plugins.outputs.skip_release_build != 'true'
+        if: runner.os == 'Windows' && needs.detect-changes.outputs.skip_release_build != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -273,7 +300,7 @@ jobs:
           }
 
       - name: Verify Windows PowerShell installer & uninstaller (AST, parity & dry-run)
-        if: runner.os == 'Windows' && needs.lint-site-and-plugins.outputs.skip_release_build != 'true'
+        if: runner.os == 'Windows' && needs.detect-changes.outputs.skip_release_build != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"

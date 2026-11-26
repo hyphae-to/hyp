@@ -897,6 +897,7 @@ async fn h6_drop_watcher_reconnects_with_last_event_id_and_surfaces_unrecoverabl
 
     let hits_srv = Arc::clone(&stream_hits);
     let ids_srv = Arc::clone(&seen_last_event_ids);
+    let (release_part_a_tx, release_part_a_rx) = tokio::sync::watch::channel(false);
     let ack_srv = Arc::clone(&ack_count);
     let env_srv = env_json.clone();
     let relay_task = tokio::spawn(async move {
@@ -908,6 +909,7 @@ async fn h6_drop_watcher_reconnects_with_last_event_id_and_surfaces_unrecoverabl
             let ids = Arc::clone(&ids_srv);
             let acks = Arc::clone(&ack_srv);
             let env_payload = env_srv.clone();
+            let mut release_rx = release_part_a_rx.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 8192];
                 let n = stream.read(&mut buf).await.unwrap_or(0);
@@ -951,6 +953,9 @@ async fn h6_drop_watcher_reconnects_with_last_event_id_and_surfaces_unrecoverabl
                         let _ = stream.flush().await;
                         // Abrupt EOF!
                     } else {
+                        // Wait until the setup turn's Stop hook has marked `claude:h6-sess` idle so
+                        // the drop event deterministically pushes via ScriptedTransport (not Stop).
+                        let _ = release_rx.wait_for(|&go| go).await;
                         // Second connection after reconnect: emit the actual sealed drop event!
                         let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
                         let _ = stream.write_all(hdr.as_bytes()).await;
@@ -1021,6 +1026,7 @@ async fn h6_drop_watcher_reconnects_with_last_event_id_and_surfaces_unrecoverabl
         json!({ "session_id": "h6-sess" }),
     )
     .await;
+    let _ = release_part_a_tx.send(true);
 
     // Wait for reconnect + ingest + live metadata-only XML digest delivery to `claude:h6-sess`!
     let delivered = transport
@@ -1073,11 +1079,13 @@ async fn h6_drop_watcher_reconnects_with_last_event_id_and_surfaces_unrecoverabl
     // Part B: Unrecoverable relay error (HTTP 410 Gone) delivers a safe metadata-only notice!
     let gone_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gone_url = format!("http://{}", gone_listener.local_addr().unwrap());
+    let (release_part_b_tx, release_part_b_rx) = tokio::sync::watch::channel(false);
     let gone_task = tokio::spawn(async move {
         loop {
             let Ok((mut stream, _)) = gone_listener.accept().await else {
                 break;
             };
+            let mut release_rx = release_part_b_rx.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 4096];
                 let n = stream.read(&mut buf).await.unwrap_or(0);
@@ -1102,6 +1110,10 @@ async fn h6_drop_watcher_reconnects_with_last_event_id_and_surfaces_unrecoverabl
                     );
                     let _ = stream.write_all(resp.as_bytes()).await;
                 } else {
+                    // Hold HTTP 410 Gone until the Stop hook has marked `claude:h6-sess` idle so
+                    // the watcher's system notice pushes via ScriptedTransport instead of being
+                    // drained synchronously by Stop before ScriptedTransport sees it.
+                    let _ = release_rx.wait_for(|&go| go).await;
                     let resp =
                         "HTTP/1.1 410 Gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                     let _ = stream.write_all(resp.as_bytes()).await;
@@ -1130,6 +1142,7 @@ async fn h6_drop_watcher_reconnects_with_last_event_id_and_surfaces_unrecoverabl
         json!({ "session_id": "h6-sess" }),
     )
     .await;
+    let _ = release_part_b_tx.send(true);
 
     let delivered_after_gone = transport
         .wait_for_delivered(2, Duration::from_secs(5))

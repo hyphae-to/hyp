@@ -17,7 +17,9 @@ use serde_json::Value;
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
@@ -54,6 +56,7 @@ fn normalize_loopback_target(addr: SocketAddr) -> Option<SocketAddr> {
     }
 }
 
+#[cfg(unix)]
 fn resolve_path_relative(raw: &str, base_dir: Option<&Path>) -> PathBuf {
     let p = PathBuf::from(raw);
     if p.is_absolute() {

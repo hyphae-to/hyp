@@ -7,8 +7,11 @@ mod common;
 
 use common::{isolated_cmd, parse_json_stdout};
 use std::fs;
+#[cfg(unix)]
 use std::io::Write;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Stdio;
 use tempfile::TempDir;
 

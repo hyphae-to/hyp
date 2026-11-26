@@ -1990,27 +1990,24 @@ fn read_bounded_file(path: &Path) -> Result<String, String> {
 }
 
 fn short_hostname() -> String {
-    let raw = std::env::var("HOSTNAME")
+    let env_host = std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .ok()
-        .filter(|s| !s.trim().is_empty())
+        .filter(|s| !s.trim().is_empty());
+    #[cfg(unix)]
+    let raw = env_host
         .or_else(|| {
-            #[cfg(unix)]
-            {
-                std::process::Command::new("hostname")
-                    .arg("-s")
-                    .output()
-                    .ok()
-                    .filter(|o| o.status.success())
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    .filter(|s| !s.is_empty())
-            }
-            #[cfg(not(unix))]
-            {
-                None
-            }
+            std::process::Command::new("hostname")
+                .arg("-s")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
         })
         .unwrap_or_else(|| "laptop".to_string());
+    #[cfg(not(unix))]
+    let raw = env_host.unwrap_or_else(|| "laptop".to_string());
     let first = raw.split('.').next().unwrap_or("laptop");
     let cleaned: String = first
         .chars()

@@ -789,12 +789,24 @@ while True:
     /// plugin SDK (`plugins/sdk/client.py`, supporting both Unix fd-3 and Windows loopback-TCP).
     /// Exposes a loopback-only HTTP trigger (`GET /health`, `POST /emit`) so E2E tests can emit
     /// arbitrary CloudEvents (omitting or spoofing `hyphaesourcekind`) on demand.
-    const CROSS_PLATFORM_SOURCE_TRIGGER_PLUGIN_PY: &str = r#"import http.server, json, os, sys, threading
+    const CROSS_PLATFORM_SOURCE_TRIGGER_PLUGIN_PY: &str = r#"import http.server, json, os, socketserver, sys, threading
+sys.stderr.write("trigger-plugin: boot\n")
+sys.stderr.flush()
 sys.path.insert(0, os.environ["SDK_PY_DIR"])
 from client import MeshPluginClient
 
 client = MeshPluginClient()
 port_file = os.environ["TRIGGER_PORT_FILE"]
+sys.stderr.write(f"trigger-plugin: hello_ok targets={client.targets!r} port_file={port_file}\n")
+sys.stderr.flush()
+
+class FastThreadingHTTPServer(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        # Skip http.server.HTTPServer.server_bind's socket.getfqdn("127.0.0.1") reverse-DNS
+        # PTR query (1.0.0.127.in-addr.arpa), which can stall 15-30s on macOS CI runners.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "127.0.0.1"
+        self.server_port = self.server_address[1]
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -830,7 +842,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+srv = FastThreadingHTTPServer(("127.0.0.1", 0), Handler)
 srv.daemon_threads = True
 t = threading.Thread(target=srv.serve_forever, daemon=True)
 t.start()
@@ -838,6 +850,8 @@ tmp_port_file = port_file + ".tmp"
 with open(tmp_port_file, "w", encoding="utf-8") as fh:
     fh.write(str(srv.server_address[1]))
 os.replace(tmp_port_file, port_file)
+sys.stderr.write(f"trigger-plugin: ready port={srv.server_address[1]}\n")
+sys.stderr.flush()
 client._dead.wait()
 srv.shutdown()
 "#;
