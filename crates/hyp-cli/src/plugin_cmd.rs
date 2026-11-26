@@ -4925,11 +4925,11 @@ mod tests {
                 .is_file()
         );
         assert!(
-            home.join(".claude/skills/hyphae-panel/hooks/register.tsx")
+            home.join(".claude/skills/hyp-panel/hooks/register.tsx")
                 .is_file()
         );
         assert!(
-            home.join(".claude/skills/hyphae-panel/.claude-plugin/plugin.json")
+            home.join(".claude/skills/hyp-panel/.claude-plugin/plugin.json")
                 .is_file()
         );
         assert!(
@@ -4980,7 +4980,7 @@ mod tests {
         });
         assert_eq!(rm_all, ExitCode::from(EXIT_OK));
         assert!(!state_dir.join("plugins").exists());
-        assert!(!home.join(".claude/skills/hyphae-panel").exists());
+        assert!(!home.join(".claude/skills/hyp-panel").exists());
         assert!(!home.join(".config/herdr-app/mods/hyphae-pane").exists());
         assert!(!home.join(".config/herdr-app/mods/hyphae-panel").exists());
 
