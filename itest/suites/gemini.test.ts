@@ -49,7 +49,15 @@ test("Compiled hyp: `hyp setup --harness gemini` + BeforeTool _meshCall + AfterT
     assert.equal(settings.tools?.enableHooks, true);
     assert.ok(settings.mcpServers?.hyphae, "mcpServers.hyphae must be configured");
     for (const ev of ["BeforeAgent", "BeforeTool", "AfterTool", "AfterAgent"]) {
-      assert.ok(settings.hooks?.[ev], `Gemini hook ${ev} must be configured`);
+      const groups = settings.hooks?.[ev];
+      assert.ok(Array.isArray(groups) && groups.length > 0, `Gemini hook ${ev} must be configured`);
+      const timeouts = groups.flatMap((g: any) =>
+        (Array.isArray(g?.hooks) ? g.hooks : []).map((hk: any) => hk?.timeout),
+      );
+      assert.ok(
+        timeouts.length > 0 && timeouts.every((ms: unknown) => ms === 10_000),
+        `Gemini hook ${ev} must configure timeout=10000ms (#31), got: ${JSON.stringify(timeouts)}`,
+      );
     }
 
     // Exercise real compiled `hyp hook gemini pre-tool-use` -> injects `_meshCall` -> real `hyp mcp` enrolls!
@@ -121,8 +129,6 @@ test("Real Gemini CLI: BeforeTool enrollment, AfterTool/AfterAgent pauseUntil(ga
         allowBridge: false,
         allowKv: false,
         allowedRoles: ["gemini-main", "gemini-peer"],
-        // ISSUE #23: `crates/hyp-harness/src/hooks.rs` uses v2 packer framing on non-OpenClaw hooks.
-        acceptV2PackerHookFraming: true,
       },
     });
 
@@ -202,9 +208,8 @@ test("Real Gemini CLI: BeforeTool enrollment, AfterTool/AfterAgent pauseUntil(ga
           req.anyMessageContains(interruptPayload) && !req.anyMessageContains(queuePayload),
         assert: (req) => {
           assert.ok(
-            req.rawBody.includes(UNTRUSTED_PROVENANCE_HEADER) ||
-              req.rawBody.includes("[hyphae interrupt ·"),
-            "Gemini interrupt AfterTool injection must carry Hyphae framing",
+            req.rawBody.includes(UNTRUSTED_PROVENANCE_HEADER),
+            `Gemini interrupt AfterTool injection must include explicit '${UNTRUSTED_PROVENANCE_HEADER}'`,
           );
           assert.equal(
             req.rawBody.includes(queuePayload),

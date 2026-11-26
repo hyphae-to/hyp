@@ -1,17 +1,19 @@
 /**
  * Real black-box OpenCode (`opencode`) integration suite.
  *
- * Covers TWO layers cleanly and honestly:
+ * Covers TWO layers cleanly and strictly:
  *  1. Real `opencode run --standalone --auto --format json` (v2.3.2+) wired strictly via
  *     `hyp setup --harness opencode`:
  *       - Verifies `opencode.json` + `~/.config/opencode/plugins/hyphae.ts` generation.
+ *       - Verifies ZERO `PluginModule.LoadError` on OpenCode v2.3.2 (#30).
  *       - Verifies real OpenCode connects to `hyp mcp --backend opencode` and discovers strictly
  *         the 4 core Hyphae tools (`mcp connected server=hyphae tools=4`, visible in Code Mode catalog).
- *       - Explicitly verifies & tracks the NEW-ISSUE breaking change between OpenCode v2.3.2's
- *         v2 plugin schema (`{ id, setup }`) + Code Mode `execute` and Hyphae's v1 `plugins/opencode/hyphae.ts`.
+ *       - Verifies live Code Mode verified caller binding (`hyp_mesh(join)`, `hyp_send`, `hyp_inbox`)
+ *         and strict `UNTRUSTED_PROVENANCE` framing (#23, #30)!
  *  2. Real execution of the EXACT installed `~/.config/opencode/plugins/hyphae.ts` plugin written by
  *     `hyp setup --harness opencode` against the REAL compiled `hyp` binary (`hyp daemon` +
  *     `hyp hook opencode pre-tool-use/post-tool-use/stop` + `hyp mcp --backend opencode`):
+ *       - Verifies v2 default definition export (`{ id: "hyphae", setup(api) }`) alongside v1 factory.
  *       - `tool.execute.before`: injects verified `_meshCall` token -> real `hyp mcp` enrolls
  *         `opencode:<sessionID>` (and fails closed without `_meshCall`!).
  *       - `tool.execute.after`: holds `queue` DM mid-turn, injects `interrupt` DM on BOTH string
@@ -32,7 +34,7 @@ import { HypCli, HypMcpClient } from "../lib/hyp-cli.ts";
 import { LlmShimServer, callTool, emitText } from "../lib/llm-shim/index.ts";
 import { withSandbox } from "../lib/sandbox.ts";
 
-test("Real OpenCode v2.3.2 CLI: hyp setup wiring, 4-tool MCP discovery, Code Mode catalog, and v2 plugin-API regression guard", async (t) => {
+test("Real OpenCode v2.3.2 CLI: hyp setup wiring, zero LoadError, 4-tool MCP discovery, live Code Mode hyp_mesh/hyp_send/hyp_inbox", async (t) => {
   const opencodeBin = resolveOpenCodeBin();
   if (!opencodeBin) {
     t.skip("opencode binary not found (set OPENCODE_BIN)");
@@ -53,6 +55,9 @@ test("Real OpenCode v2.3.2 CLI: hyp setup wiring, 4-tool MCP discovery, Code Mod
       },
     });
 
+    const liveInboundPayload = "OPENCODE_LIVE_V2_DM_PAYLOAD_404";
+    shim.auditors.registerUntrustedPayload("oc-live-dm", liveInboundPayload);
+
     const oc = await OpenCodeHarness.create({
       sandbox,
       hyp,
@@ -68,22 +73,89 @@ test("Real OpenCode v2.3.2 CLI: hyp setup wiring, 4-tool MCP discovery, Code Mod
     assert.ok(pluginSource.includes(hyp.bin), "hyphae.ts must embed compiled HYP_BIN");
     assert.ok(pluginSource.includes(hyp.socketPath), "hyphae.ts must embed sandbox socket path");
 
+    const peer = await hyp.openPeer("alice");
+    const sink = await hyp.openPeer("sink");
+
+    let sawVerifiedJoin = false;
+    let sawVerifiedSend = false;
+    let sawVerifiedInbox = false;
+
     shim.script("opencode", [
       {
         name: "oc-title",
         when: (req) => req.advertisedTools.length === 0,
-        do: () => emitText("OpenCode Probe"),
+        do: () => emitText("OpenCode Live V2"),
       },
       {
         name: "oc-call-mesh-join",
         once: true,
-        when: (req) => req.advertisedTools.some((tool) => tool.canonicalHyphaeName === "hyp_mesh"),
+        when: (req) =>
+          req.advertisedTools.some((tool) => tool.canonicalHyphaeName === "hyp_mesh") &&
+          req.anyMessageContains("Join mesh as oc-cli"),
         do: (req) => callTool(req, "hyp_mesh", { action: "join", handle: "oc-cli" }),
       },
       {
-        name: "oc-finish",
-        when: (req) => req.lastToolResults.length > 0,
+        name: "oc-call-send",
+        once: true,
+        when: (req) => {
+          const r = req.lastToolResult("hyp_mesh");
+          if (r && !r.isError && r.json?.handle === "oc-cli") {
+            sawVerifiedJoin = true;
+            return true;
+          }
+          return false;
+        },
+        do: (req) =>
+          callTool(req, "hyp_send", {
+            to: "sink",
+            text: "OPENCODE_V2_HELLO_SINK",
+          }),
+      },
+      {
+        name: "oc-call-inbox",
+        once: true,
+        when: (req) => {
+          const r = req.lastToolResult("hyp_send");
+          if (r && !r.isError && r.json) {
+            sawVerifiedSend = true;
+            return true;
+          }
+          return false;
+        },
+        do: (req) => callTool(req, "hyp_inbox", { ack: true }),
+      },
+      {
+        name: "oc-finish-enroll",
+        once: true,
+        when: (req) => {
+          const r = req.lastToolResult("hyp_inbox");
+          if (r && !r.isError && r.json) {
+            sawVerifiedInbox = true;
+            return true;
+          }
+          return false;
+        },
         do: () => emitText("OPENCODE_RUN_DONE"),
+      },
+      {
+        name: "oc-ack-live-dm",
+        once: true,
+        when: (req) => req.anyMessageContains(liveInboundPayload),
+        do: (req) =>
+          callTool(req, "hyp_send", {
+            to: "sink",
+            text: `OC_LIVE_DM_ACK:${liveInboundPayload}`,
+          }),
+      },
+      {
+        name: "oc-after-dm-send",
+        when: (req) => Boolean(req.lastToolResult("hyp_send")?.json),
+        do: () => emitText("OPENCODE_DM_ACKED"),
+      },
+      {
+        name: "oc-waiter-reminder",
+        when: (req) => req.anyMessageContains("no background waiter is running yet"),
+        do: () => emitText("OPENCODE_STANDING_BY"),
       },
     ]);
 
@@ -91,7 +163,19 @@ test("Real OpenCode v2.3.2 CLI: hyp setup wiring, 4-tool MCP discovery, Code Mod
     assert.equal(res.exitCode, 0, `opencode run failed: ${res.stderr}`);
     assert.ok(res.sessionId, "opencode run --format json must emit a sessionID");
 
-    // 1. Verify OpenCode connected to our compiled `hyp mcp --backend opencode` and saw strictly 4 core tools!
+    // 1. Strictly assert ZERO PluginModule.LoadError on OpenCode v2.3.2 (#30)!
+    assert.equal(
+      res.stderr.includes("PluginModule.LoadError"),
+      false,
+      `OpenCode v2.3.2 MUST load plugins/hyphae.ts with zero PluginModule.LoadError!\nSTDERR:\n${res.stderr.slice(-2000)}`,
+    );
+    assert.equal(
+      res.stderr.includes("Plugin must export a default definition"),
+      false,
+      `OpenCode v2.3.2 MUST accept v2 default plugin definition!\nSTDERR:\n${res.stderr.slice(-2000)}`,
+    );
+
+    // 2. Verify OpenCode connected to our compiled `hyp mcp --backend opencode` and saw strictly 4 core tools!
     assert.ok(
       res.stderr.includes('message="mcp connected" server=hyphae tools=4'),
       `Expected OpenCode to connect to hyp mcp with 4 core tools, stderr:\n${res.stderr.slice(-2000)}`,
@@ -111,25 +195,38 @@ test("Real OpenCode v2.3.2 CLI: hyp setup wiring, 4-tool MCP discovery, Code Mod
       `Expected strictly 4 core Hyphae tools advertised in OpenCode Code Mode, got: ${JSON.stringify(hyphaeCanonical)}`,
     );
 
-    // 2. Check plugin load outcome on OpenCode v2.3.2:
-    //    NEW-ISSUE: OpenCode v2.3.2 rejects `plugins/opencode/hyphae.ts` default function export with
-    //    `PluginModule.LoadError: Plugin must export a default definition with an id and an effect or setup function`.
-    //    If Hyphae has NOT been updated to OpenCode v2 plugin format yet, assert the exact failure cleanly
-    //    so this test neither hides the bug nor flakes; once fixed, the else branch verifies full live enrollment!
-    const hitV2PluginLoadError = res.stderr.includes(
-      "Plugin must export a default definition with an id and an effect or setup function",
+    // 3. Strictly assert live enrollment + verified Code Mode hyp_mesh / hyp_send / hyp_inbox calls!
+    assert.equal(sawVerifiedJoin, true, "Expected live verified Code Mode hyp_mesh(join) result");
+    assert.equal(sawVerifiedSend, true, "Expected live verified Code Mode hyp_send result");
+    assert.equal(sawVerifiedInbox, true, "Expected live verified Code Mode hyp_inbox result");
+
+    const ins = await hyp.inspect({ handle: "oc-cli" });
+    const row = extractSessionsFromInspect(ins.json)[0];
+    assert.equal(row?.enrolled, true, `Expected live OpenCode enrollment: ${JSON.stringify(ins.json)}`);
+    assert.equal(row?.sessionId, `opencode:${res.sessionId}`);
+
+    const sinkBox1 = await sink.inbox({ ack: true });
+    assert.ok(
+      JSON.stringify(sinkBox1).includes("OPENCODE_V2_HELLO_SINK"),
+      `Expected @sink to receive verified Code Mode hyp_send DM, got: ${JSON.stringify(sinkBox1)}`,
     );
-    if (hitV2PluginLoadError) {
-      const toolTurn = shim.getTurns("opencode").find((tr) => tr.ruleName === "oc-finish");
-      assert.ok(
-        toolTurn?.request.lastToolResults.some((r) => r.text.includes("caller_unverifiable")),
-        "When hyphae.ts fails to load in OpenCode v2.3.2, hyp mcp must fail closed with caller_unverifiable!",
-      );
-    } else {
-      const ins = await hyp.inspect({ handle: "oc-cli" });
-      const row = extractSessionsFromInspect(ins.json)[0];
-      assert.equal(row?.enrolled, true, `Expected live OpenCode enrollment once v2 plugin fix lands: ${JSON.stringify(ins.json)}`);
-    }
+
+    // 4. Send a DM from @alice and resume the same OpenCode session -> verify live `api.session.hook("prompt")`
+    //    delivers it with explicit UNTRUSTED_PROVENANCE framing (#23, #30)!
+    await peer.send("oc-cli", liveInboundPayload);
+    const res2 = await oc.run("Check inbox for alice", {
+      sessionId: res.sessionId,
+      printLogs: true,
+      logLevel: "warn",
+    });
+    assert.equal(res2.exitCode, 0, `opencode resume failed: ${res2.stderr}`);
+    assert.equal(res2.stderr.includes("PluginModule.LoadError"), false);
+
+    const sinkBox2 = await sink.inbox({ ack: true });
+    assert.ok(
+      JSON.stringify(sinkBox2).includes(`OC_LIVE_DM_ACK:${liveInboundPayload}`),
+      `Expected @sink to receive OpenCode reply to live DM, got: ${JSON.stringify(sinkBox2)}`,
+    );
 
     shim.assertAllClean();
   });
@@ -153,7 +250,9 @@ test("Real installed OpenCode plugin (plugins/hyphae.ts) + compiled hyp: tool.ex
 
     // Import the EXACT TypeScript plugin file rendered by `hyp setup --harness opencode`!
     const mod = await import(`${pathToFileURL(installedPluginPath).href}?t=${Date.now()}`);
-    assert.equal(typeof mod.HyphaePlugin, "function", "HyphaePlugin factory must be exported");
+    assert.equal(typeof mod.HyphaePlugin, "function", "HyphaePlugin v1 factory must be exported");
+    assert.equal(mod.default?.id, "hyphae", "default export must be OpenCode v2 plugin definition with id='hyphae'");
+    assert.equal(typeof mod.default?.setup, "function", "default export must expose setup(api)");
 
     const idlePrompts: Array<{ sessionId: string; text: string }> = [];
     const hooks = await mod.HyphaePlugin({

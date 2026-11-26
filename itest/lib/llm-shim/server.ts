@@ -419,11 +419,16 @@ function parseOpenAiChatRequest(
             ? tryParseJson(tc.function.arguments) ?? {}
             : tc?.function?.arguments ?? {};
         // Unwrap OpenClaw `dispatch_action({ id: "mcp:hyphae:hyphae__hyp_mesh", args })`
+        // and OpenCode Code Mode `execute({ code: "return await tools.hyphae.hyp_mesh(...)" })`
         // so `toolNameByCallId` resolves `lastToolResult("hyp_mesh")` cleanly!
-        const effectiveName =
+        let effectiveName =
           name === "dispatch_action" && typeof parsedArgs?.id === "string"
             ? parsedArgs.id
             : name;
+        if (effectiveName === "execute" && typeof parsedArgs?.code === "string") {
+          const m = /\b(tools\.hyphae\.hyp_[a-z0-9_]+)\s*\(/.exec(parsedArgs.code);
+          if (m) effectiveName = m[1];
+        }
         if (id && effectiveName) toolNameByCallId.set(id, effectiveName);
         toolCalls.push({
           id,

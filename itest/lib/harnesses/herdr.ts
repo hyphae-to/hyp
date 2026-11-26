@@ -413,8 +413,7 @@ export const herdrClaudeAdapter: RealHarnessAdapter = {
     nudgeOnlyWake: true,
     midStreamInterrupt: true,
     hookToolBoundaries: true,
-    // ISSUE #23: inner Claude hooks use v2 packer framing.
-    explicitHookProvenance: false,
+    explicitHookProvenance: true,
     supportsMultiTurnSession: true,
   },
 
@@ -512,34 +511,30 @@ export const herdrClaudeAdapter: RealHarnessAdapter = {
       },
 
       async afterDaemonRestart(sessions) {
-        // Re-ping each Herdr session via a lightweight `PreToolUse`/hook or let daemon re-probe on next activity.
-        // Wait briefly for daemon startup readiness.
-        for (const s of sessions) {
-          await options.hyp.exec(
-            ["hook", "claude", "session-start", "--socket", options.hyp.socketPath],
-            {
-              input: JSON.stringify({
-                session_id: s.sessionId.replace(/^claude:/, ""),
-                cwd: options.sandbox.paths.workspaceDir,
-              }),
-              env: { ...herdr.env, HC_TERMINAL_ID: s.nativeId },
-              allowFailure: true,
-            },
-          );
-        }
-        const deadline = Date.now() + 8_000;
+        // Strictly verify automatic startup transport rehydration (#34) — even for sessions
+        // with 0 pending items (e.g. `beta`) — with ZERO manual hook re-ping!
+        const deadline = Date.now() + 10_000;
+        let lastList: any[] = [];
         while (Date.now() < deadline) {
           const ins = await options.hyp.inspect({ all: true, allowFailure: true });
-          const list = extractSessionsFromInspect(ins.json);
+          lastList = extractSessionsFromInspect(ins.json);
           if (
             sessions.every((s) =>
-              list.some((r) => r.handle === s.handle && r.transportKind === "herdr" && r.hasLiveTransport),
+              lastList.some(
+                (r) =>
+                  r.handle === s.handle &&
+                  r.transportKind === "herdr" &&
+                  r.hasLiveTransport === true,
+              ),
             )
           ) {
             return;
           }
           await new Promise((r) => setTimeout(r, 200));
         }
+        throw new Error(
+          `Timed out waiting for automatic Herdr transport rehydration (#34) after daemon restart: ${JSON.stringify(lastList)}`,
+        );
       },
 
       async close() {

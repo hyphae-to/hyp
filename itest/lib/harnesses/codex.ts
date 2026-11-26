@@ -316,8 +316,7 @@ export const codexAdapter: RealHarnessAdapter = {
     nudgeOnlyWake: false,
     midStreamInterrupt: false,
     hookToolBoundaries: true,
-    // ISSUE #23: `crates/hyp-harness/src/hooks.rs` uses v2 packer framing on non-OpenClaw hooks.
-    explicitHookProvenance: false,
+    explicitHookProvenance: true,
     supportsMultiTurnSession: true,
   },
 
@@ -330,10 +329,9 @@ export const codexAdapter: RealHarnessAdapter = {
     if (!codexBin) {
       throw new Error("codex binary not found");
     }
-    // Keep `codex` off `hyp daemon`'s PATH for the one-shot `codex exec` adapter so
-    // `LocalDaemon` does not auto-attach `codex_queue` to exited `codex exec` threads and
-    // race with `codex exec resume`. Live interactive PTY `codex queue --thread` push
-    // wakeups are tested end-to-end in `itest/suites/codex.test.ts`.
+    // Non-interactive `codex exec` rollouts are natively guarded against `codex_queue`
+    // auto-attach (#35). Live interactive PTY `codex queue --thread` push wakeups are
+    // tested end-to-end in `itest/suites/codex.test.ts`.
     await options.hyp.onboard({ nodeId: options.nodeId, noSkills: true, noCommands: true });
     await options.hyp.startDaemon();
     await options.hyp.setup("codex", { noSkills: true, noCommands: true });

@@ -133,7 +133,6 @@ test("Bridges E2E — Telegram: full inbound->Claude->outbound+reaction loop, 42
         allowBridge: true,
         allowKv: false,
         allowedRoles: ["tg-claude"],
-        acceptV2PackerHookFraming: true,
       },
     });
 
@@ -391,7 +390,6 @@ test("Bridges E2E — Slack Socket Mode: auth.test, apps.connections.open, envel
         allowBridge: true,
         allowKv: false,
         allowedRoles: ["slack-claude"],
-        acceptV2PackerHookFraming: true,
       },
     });
 
@@ -625,7 +623,6 @@ test("Bridges E2E — WhatsApp Cloud API: GET verify challenge (403/200), 1-bit 
         allowBridge: true,
         allowKv: false,
         allowedRoles: ["wa-claude"],
-        acceptV2PackerHookFraming: true,
       },
     });
 
@@ -903,14 +900,14 @@ test("Bridges E2E — Blind Spot B2: real Node plugin crash -> CrashLoopBackOff 
       );
       assert.ok(tgEntry.restarts >= 1, `expected telegram restarts >= 1, got ${tgEntry.restarts}`);
     } else if (tgEntry.status === "running") {
-      // NEW-ISSUE: Blind Spot B2 reproduced live on `main`: `plugins/sdk/client.mjs` keeps fd-3
+      // ISSUE #40: Blind Spot B2 reproduced live on `main`: `plugins/sdk/client.mjs` keeps fd-3
       // `createReadStream` open without `uncaughtException`/`unhandledRejection` exit handlers,
       // so a post-`hello` throw in `plugins/telegram/index.mjs:230` leaves the dead plugin stuck
       // as `status: "running"` with `restarts: 0` instead of tripping `CrashLoopBackOff`.
       assert.equal(
         tgEntry.status,
         "running",
-        "observed unpatched B2 hang on main (see NEW-ISSUE report)",
+        "observed unpatched B2 hang on main (ISSUE #40)",
       );
     } else {
       // Node 24 exited cleanly on unhandled top-level await rejection! Verify it tripped CrashLoopBackOff!

@@ -1,13 +1,13 @@
 /**
  * Cross-Harness Differential Parity Matrix (P1–P8, McKeeman Levels 6–7).
  *
- * Runs the EXACT SAME declarative scenario matrix across every available real headless harness:
+ * Runs the EXACT SAME declarative scenario matrix across ALL 6 real headless harnesses:
  *   - OpenClaw Gateway (`openclaw`)
  *   - Claude Code CLI (`claude`)
  *   - Codex CLI (`codex`)
  *   - Herdr (`hc`) + interactive Claude Code (`herdr-claude`)
  *   - Google Gemini CLI (`gemini`)
- *   - OpenCode CLI (`opencode`, tracked transparently with NEW-ISSUE skip until v2 plugin API fix)
+ *   - OpenCode CLI (`opencode`)
  *
  * Extracts a normalized `ObservableTrace` per harness and differentially verifies identical
  * security, delivery, coalescing, Focus Mode, Security Gate, isolation, and restart guarantees:
@@ -156,6 +156,9 @@ function callHarnessProbeTool(
   if (adapterId === "gemini") {
     return callTool(req, "read_file", { file_path: path.basename(sampleFile) });
   }
+  if (adapterId === "opencode") {
+    return callTool(req, "shell", { command: "echo PARITY_P3_PROBE", description: "p3 probe" });
+  }
   return emitText("NO_PROBE_TOOL");
 }
 
@@ -163,6 +166,7 @@ function sawProbeToolResult(adapterId: RealHarnessAdapter["id"], req: CanonicalL
   if (adapterId === "claude") return Boolean(req.lastToolResult("Read"));
   if (adapterId === "codex") return Boolean(req.lastToolResult("exec_command")?.text.includes("PARITY_P3_PROBE"));
   if (adapterId === "gemini") return Boolean(req.lastToolResult("read_file"));
+  if (adapterId === "opencode") return Boolean(req.lastToolResult("shell")?.text.includes("PARITY_P3_PROBE"));
   return false;
 }
 
@@ -189,8 +193,6 @@ async function runParityMatrixForAdapter(adapter: RealHarnessAdapter): Promise<O
         allowKv: false,
         nudgeOnlyRoles: adapter.id === "openclaw" ? [alphaRole] : [],
         allowedRoles: isSharedRole ? [alphaRole] : [alphaRole, betaRole],
-        // ISSUE #23: non-OpenClaw hooks currently use v2 packer framing.
-        acceptV2PackerHookFraming: !adapter.capabilities.explicitHookProvenance,
       },
     });
 
@@ -647,32 +649,21 @@ async function runParityMatrixForAdapter(adapter: RealHarnessAdapter): Promise<O
       await shim.awaitTurn(alphaRole, (t) => t.ruleName === "reply-p4-vip", 25_000);
       await awaitSinkAck(`P4_VIP_ACK:${p4VipMsg}`, `${adapter.id} P4 VIP bypass ACK`);
 
-      // Non-urgent DM MUST STILL be buffered while Focus Mode is active on hook-injected harnesses!
-      // NEW-ISSUE: On nudge-only push harnesses (OpenClaw), `LocalDaemon::flush_session` bundles
-      // Focus-buffered Notify items into the VIP `<hyphae-wake count="2">` nudge and marks them
-      // `notified=true`, so OpenClaw's `hyp_inbox({ ack: true })` pulls BOTH VIP and Focus-buffered
-      // items while Focus Mode is still ON.
-      if (!adapter.capabilities.nudgeOnlyWake) {
-        assert.equal(
-          hasAnyOccurrenceInRole(shim, alphaRole, p4BufMsg, alphaTag),
-          false,
-          `${adapter.id} P4 non-urgent DM must remain buffered while Focus Mode is ON`,
-        );
+      // Non-urgent DM MUST STILL be strictly buffered while Focus Mode is active across ALL harnesses (#32)!
+      assert.equal(
+        hasAnyOccurrenceInRole(shim, alphaRole, p4BufMsg, alphaTag),
+        false,
+        `${adapter.id} P4 non-urgent DM MUST remain buffered while Focus Mode is ON (zero VIP bypass leak, #32)`,
+      );
+
+      if (adapter.capabilities.nativePushWake) {
+        await new Promise((r) => setTimeout(r, 600));
       }
 
-      // Exit Focus Mode -> buffered digest drains cleanly!
+      // Exit Focus Mode -> buffered digest drains automatically on push harnesses (Herdr, OpenClaw)
+      // and cleanly on turn-driven harnesses (#32)!
       await hyp.session(["--session", alpha.sessionId, "focus", "off"]);
-      if (!hasAnyOccurrenceInRole(shim, alphaRole, p4BufMsg, alphaTag)) {
-        if (adapter.id === "herdr-claude") {
-          // NEW-ISSUE: `handle_session_focus(false)` (`crates/hyp-harness/src/daemon.rs:10772-10795`)
-          // neither resets `item_meta.urgency` from `Notify` -> `Queue` nor clears `notified=true`
-          // stamped during the VIP bypass flush, so `flush_session` is a no-op on Herdr when Focus exits.
-          await new Promise((r) => setTimeout(r, 600));
-          await runtime.runTurn(alpha, `${alpha.tag} PULL_INBOX_IF_NEEDED P4_EXIT`);
-        } else {
-          await runtime.deliverPending(alpha, { prompt: `${alpha.tag} PULL_INBOX_IF_NEEDED P4_EXIT` });
-        }
-      }
+      await runtime.deliverPending(alpha, { prompt: `${alpha.tag} PULL_INBOX_IF_NEEDED P4_EXIT` });
       await shim.awaitTurn(alphaRole, (t) => t.ruleName === "reply-p4-buf", 25_000);
       await awaitSinkAck(`P4_BUF_ACK:${p4BufMsg}`, `${adapter.id} P4 post-focus drain ACK`);
 
@@ -852,24 +843,11 @@ async function runParityMatrixForAdapter(adapter: RealHarnessAdapter): Promise<O
         `${adapter.id} P8 unread mailbox item MUST survive daemon SIGTERM + restart!`,
       );
 
-      // Exit Focus Mode -> delivers the persisted pre-restart DM cleanly once!
-      // ISSUE #22: On startup, `LocalDaemon` does not automatically flush pre-existing unread rows
-      // without a state transition or live trigger; turning Focus off triggers `flush_session`.
-      // NEW-ISSUE: `handle_session_focus(false)` does not re-classify Focus-buffered `Notify` items
-      // back to `Queue` in `item_meta`, so if reconnect reconciled while Focus was ON, push harnesses
-      // need an explicit turn to drain the preserved SQLite mailbox item.
+      // Exit Focus Mode -> delivers the persisted pre-restart DM automatically on push harnesses
+      // (after #22 startup flush + #32 Focus exit restore + #34 zero-pending transport rehydration)
+      // and cleanly on turn-driven harnesses!
       await hyp.session(["--session", alpha.sessionId, "focus", "off"]);
-      if (adapter.capabilities.nativePushWake) {
-        const autoPushed = await shim
-          .awaitTurn(alphaRole, (t) => t.ruleName === "reply-p8-restart", 2_500)
-          .then(() => true)
-          .catch(() => false);
-        if (!autoPushed) {
-          await runtime.runTurn(alpha, `${alpha.tag} PULL_INBOX_IF_NEEDED P8_POST_RESTART`);
-        }
-      } else {
-        await runtime.deliverPending(alpha, { prompt: `${alpha.tag} PULL_INBOX_IF_NEEDED P8_POST_RESTART` });
-      }
+      await runtime.deliverPending(alpha, { prompt: `${alpha.tag} PULL_INBOX_IF_NEEDED P8_POST_RESTART` });
       await shim.awaitTurn(alphaRole, (t) => t.ruleName === "reply-p8-restart", 25_000);
       await awaitSinkAck(`P8_ACK:${p8PersistMsg}`, `${adapter.id} P8 post-restart ACK`);
       const restartSurvived = true;

@@ -5,12 +5,14 @@
  * `hyp setup --harness codex` + `[model_providers.fakebrain]` (`wire_api = "responses"`):
  *
  *  1. `codex exec` lifecycle hooks (`SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`),
- *     real `$CODEX_HOME/sessions/.../rollout-<ts>-<uuid>.jsonl` verification, auto-attachment of
- *     `codex_queue` transport, and deterministic mid-turn `pauseUntil(gate)` queue-hold ->
- *     interrupt-inject -> `Stop` flush with zero duplicates!
+ *     real `$CODEX_HOME/sessions/.../rollout-<ts>-<uuid>.jsonl` verification, refusal to auto-attach
+ *     `codex_queue` on non-interactive `codex exec` rollouts (#35), strict `UNTRUSTED_PROVENANCE`
+ *     on Codex `role: "developer"` hook injections (#23), and deterministic mid-turn `pauseUntil(gate)`
+ *     queue-hold -> interrupt-inject -> `Stop` flush with zero duplicates!
  *  2. Live interactive Codex PTY + real `codex queue --thread <uuid>` idle DM wakeup
- *     (metadata-only `<hyphae-wake>` nudge -> `hyp_inbox` -> `hyp_send` reply) AND
- *     Tier 4 cold-revival `deliveryRetry.codexResume` fail-closed (`false`) vs opt-in (`true`)!
+ *     (metadata-only `<hyphae-wake>` nudge -> `hyp_inbox` -> `hyp_send` reply), automatic zero-pending
+ *     transport rehydration across daemon restart (#34), AND Tier 4 cold-revival
+ *     `deliveryRetry.codexResume` fail-closed (`false`) vs opt-in (`true`)!
  */
 
 import assert from "node:assert/strict";
@@ -47,7 +49,7 @@ async function waitForCondition(
   throw new Error(`Timed out after ${timeoutMs}ms waiting for ${label}`);
 }
 
-test("Real Codex CLI: hyp setup, rollout JSONL verification, codex_queue auto-attach, and mid-turn PostToolUse/Stop latch", async (t) => {
+test("Real Codex CLI: hyp setup, rollout JSONL verification, codex exec no auto-attach (#35), strict developer provenance (#23), and mid-turn PostToolUse/Stop latch", async (t) => {
   const codexBin = resolveCodexBin();
   if (!codexBin) {
     t.skip("codex binary not found (set CODEX_BIN)");
@@ -68,8 +70,6 @@ test("Real Codex CLI: hyp setup, rollout JSONL verification, codex_queue auto-at
           allowBridge: false,
           allowKv: false,
           allowedRoles: ["codex-exec"],
-          // ISSUE #23: `crates/hyp-harness/src/hooks.rs` uses v2 packer framing on non-OpenClaw hooks.
-          acceptV2PackerHookFraming: true,
         },
       });
 
@@ -151,9 +151,8 @@ test("Real Codex CLI: hyp setup, rollout JSONL verification, codex_queue auto-at
             req.anyMessageContains(interruptPayload) && !req.anyMessageContains(queuePayload),
           assert: (req) => {
             assert.ok(
-              req.rawBody.includes(UNTRUSTED_PROVENANCE_HEADER) ||
-                req.rawBody.includes("[hyphae interrupt ·"),
-              "Codex interrupt PostToolUse injection must carry Hyphae framing",
+              req.rawBody.includes(UNTRUSTED_PROVENANCE_HEADER),
+              `Codex interrupt PostToolUse injection MUST include explicit '${UNTRUSTED_PROVENANCE_HEADER}' (#23)`,
             );
             assert.equal(
               req.rawBody.includes(queuePayload),
@@ -170,9 +169,8 @@ test("Real Codex CLI: hyp setup, rollout JSONL verification, codex_queue auto-at
           when: (req) => req.anyMessageContains(queuePayload),
           assert: (req) => {
             assert.ok(
-              req.rawBody.includes(UNTRUSTED_PROVENANCE_HEADER) ||
-                req.rawBody.includes("[hyphae ·"),
-              "Codex Stop continuation must carry Hyphae framing",
+              req.rawBody.includes(UNTRUSTED_PROVENANCE_HEADER),
+              `Codex Stop continuation MUST include explicit '${UNTRUSTED_PROVENANCE_HEADER}' (#23)`,
             );
             sawQueueInStopContinuation = true;
           },
@@ -213,10 +211,17 @@ test("Real Codex CLI: hyp setup, rollout JSONL verification, codex_queue auto-at
         rollouts.some((f) => f.includes(threadUuid)),
         `expected real Codex rollout JSONL for ${threadUuid} in ${JSON.stringify(rollouts)}`,
       );
-      assert.equal(
+      // Issue #35: Non-interactive `codex exec` rollouts MUST NOT auto-attach `codex_queue`
+      // even when `codex` is on PATH and the rollout JSONL exists!
+      assert.notEqual(
         sess.transportKind,
         "codex_queue",
-        `expected codex_queue auto-attached after rollout verification, got: ${JSON.stringify(sess)}`,
+        `Non-interactive codex exec MUST NOT auto-attach codex_queue (#35), got: ${JSON.stringify(sess)}`,
+      );
+      assert.equal(
+        sess.hasLiveTransport,
+        false,
+        `Non-interactive codex exec MUST have hasLiveTransport=false (#35), got: ${JSON.stringify(sess)}`,
       );
 
       // Inject a `queue` DM while Codex is mid-turn, then release exec_command #1.
@@ -282,15 +287,15 @@ test("Real Codex CLI: live interactive PTY `codex queue --thread` wakeup + Tier 
           // Note: `<hyphae-wake>` tag itself is strictly audited metadata-only on every role;
           // Codex's `UserPromptSubmit` hook drains queued messages into developer context on submit!
           allowedRoles: ["codex-pty"],
-          // ISSUE #23: Codex hooks use v2 packer framing.
-          acceptV2PackerHookFraming: true,
         },
       });
 
       const liveDmPayload = "CODEX_LIVE_QUEUE_WAKE_SECRET_901";
+      const postRestartDmPayload = "CODEX_POST_RESTART_ZERO_PENDING_WAKE_904";
       const coldStoppedPayload = "CODEX_COLD_FAILCLOSED_902";
       const optInResumePayload = "CODEX_OPTIN_RESUME_903";
       shim.auditors.registerUntrustedPayload("cx-live-wake", liveDmPayload);
+      shim.auditors.registerUntrustedPayload("cx-restart-wake", postRestartDmPayload);
       shim.auditors.registerUntrustedPayload("cx-cold-closed", coldStoppedPayload);
       shim.auditors.registerUntrustedPayload("cx-optin-resume", optInResumePayload);
 
@@ -345,8 +350,26 @@ test("Real Codex CLI: live interactive PTY `codex queue --thread` wakeup + Tier 
             }),
         },
         {
-          name: "pty-wake-read-inbox",
+          name: "pty-reply-after-restart-wake",
           once: true,
+          when: (req) =>
+            req.anyMessageContains(postRestartDmPayload) &&
+            !req.anyMessageContains(`PTY_RESTART_ACK:${postRestartDmPayload}`),
+          assert: (req) => {
+            assert.equal(
+              req.lastUserText.includes(postRestartDmPayload),
+              false,
+              "post-restart codex queue <hyphae-wake> prompt MUST be strictly metadata-only",
+            );
+          },
+          do: (req) =>
+            callTool(req, "hyp_send", {
+              to: "alice",
+              text: `PTY_RESTART_ACK:${postRestartDmPayload}`,
+            }),
+        },
+        {
+          name: "pty-wake-read-inbox",
           when: (req) =>
             req.lastUserText.includes("<hyphae-wake") && req.lastToolResults.length === 0,
           assert: (req) => {
@@ -354,6 +377,11 @@ test("Real Codex CLI: live interactive PTY `codex queue --thread` wakeup + Tier 
               req.lastUserText.includes(liveDmPayload),
               false,
               "codex queue wake nudge MUST be strictly metadata-only prior to hyp_inbox",
+            );
+            assert.equal(
+              req.lastUserText.includes(postRestartDmPayload),
+              false,
+              "post-restart codex queue wake nudge MUST be strictly metadata-only prior to hyp_inbox",
             );
           },
           do: (req) => callTool(req, "hyp_inbox", { ack: true }),
@@ -398,6 +426,35 @@ test("Real Codex CLI: live interactive PTY `codex queue --thread` wakeup + Tier 
         `Expected @alice to receive live Codex PTY reply, got: ${JSON.stringify(aliceInbox)}`,
       );
 
+      // 2b. Issue #34: Restart daemon while interactive Codex PTY is alive with ZERO pending items!
+      //     `LocalDaemon` MUST automatically rehydrate `codex_queue` on startup with ZERO manual
+      //     hook call, and a subsequent DM MUST wake the live PTY immediately!
+      await waitForCondition(async () => {
+        const ins = await hyp.inspect({ handle: "cx-live-pty", allowFailure: true });
+        const row = extractSessionsFromInspect(ins.json)[0];
+        return (row?.counts?.queued ?? 0) === 0;
+      }, 5_000, "zero pending items before daemon restart (#34)");
+
+      await daemon.restart();
+      await waitForCondition(async () => {
+        const ins = await hyp.inspect({ handle: "cx-live-pty", allowFailure: true });
+        const row = extractSessionsFromInspect(ins.json)[0];
+        return row?.transportKind === "codex_queue" && row?.hasLiveTransport === true;
+      }, 10_000, "automatic zero-pending codex_queue rehydration on daemon restart (#34)");
+
+      const turnsBeforeRestartWake = shim.getTurns("codex-pty").length;
+      await sender.send("cx-live-pty", postRestartDmPayload);
+      await shim.awaitTurn(
+        "codex-pty",
+        (turn) => turn.ruleName === "pty-reply-done" && turn.id > turnsBeforeRestartWake,
+        25_000,
+      );
+      const aliceInbox2 = await sender.inbox({ ack: true });
+      assert.ok(
+        JSON.stringify(aliceInbox2).includes(`PTY_RESTART_ACK:${postRestartDmPayload}`),
+        `Expected @alice to receive post-restart live Codex PTY reply (#34), got: ${JSON.stringify(aliceInbox2)}`,
+      );
+
       // 3. Tier 4 Cold Revival Fail-Closed (`deliveryRetry.codexResume: false` default):
       //    Kill the live interactive Codex PTY, send a DM, and prove ZERO cold revival spawns!
       await ptyProc.kill(2_000);
@@ -437,6 +494,8 @@ test("Real Codex CLI: live interactive PTY `codex queue --thread` wakeup + Tier 
       );
 
       // Enable `deliveryRetry.codexResume: true` in node.json and restart daemon!
+      // Issues #22 + #34: Daemon automatically rehydrates `codex_queue` (with `codexResume=true`)
+      // on startup WITHOUT any manual SessionStart hook re-ping AND flushes pending mailbox items!
       const nodeCfg = JSON.parse(fs.readFileSync(hyp.nodeConfigPath, "utf8"));
       nodeCfg.deliveryRetry = {
         ...(nodeCfg.deliveryRetry || {}),
@@ -445,23 +504,13 @@ test("Real Codex CLI: live interactive PTY `codex queue --thread` wakeup + Tier 
       fs.writeFileSync(hyp.nodeConfigPath, JSON.stringify(nodeCfg, null, 2) + "\n");
       await daemon.restart();
 
-      // Re-attach session hints via a lightweight SessionStart hook call (since daemon restarted
-      // and in-memory attached push transports are rehydrated lazily on hook/MCP activity — see ISSUE #22).
-      await hyp.exec(["hook", "codex", "session-start", "--socket", hyp.socketPath], {
-        input: JSON.stringify({
-          session_id: enrolledSess.sessionId.slice("codex:".length),
-          cwd: sandbox.paths.workspaceDir,
-        }),
-        env: codex.env,
-      });
-
-      // Wait briefly for daemon async transport probe to attach `codex_queue` with `resume=true`.
+      // Wait for automatic startup transport rehydration (#34) with ZERO manual hook call!
       try {
         await waitForCondition(async () => {
           const ins = await hyp.inspect({ handle: "cx-live-pty", allowFailure: true });
           const row = extractSessionsFromInspect(ins.json)[0];
           return row?.transportKind === "codex_queue" && row?.hasLiveTransport === true;
-        }, 8_000, "codex_queue re-attach with codexResume=true");
+        }, 10_000, "automatic codex_queue rehydration with codexResume=true (#34)");
       } catch (err) {
         const logData = fs.existsSync(argvLog) ? fs.readFileSync(argvLog, "utf8") : "<no argvLog>";
         const rollouts = findCodexRolloutFiles(codex.codexHome);
@@ -470,7 +519,8 @@ test("Real Codex CLI: live interactive PTY `codex queue --thread` wakeup + Tier 
         );
       }
 
-      // Send DM -> verify daemon passes `--resume` to real `codex queue --thread <uuid>`!
+      // Send another DM (and/or observe startup flush of `coldStoppedPayload`) -> verify daemon passes
+      // `--resume` to real `codex queue --thread <uuid>` with strictly metadata-only nudge!
       const sender2 = await hyp.openPeer("alice-resume");
       await sender2.send("cx-live-pty", optInResumePayload);
       await waitForCondition(
@@ -492,6 +542,7 @@ test("Real Codex CLI: live interactive PTY `codex queue --thread` wakeup + Tier 
             line.includes(enrolledSess.sessionId.slice("codex:".length)) &&
             line.includes("--resume") &&
             line.includes("<hyphae-wake") &&
+            !line.includes(coldStoppedPayload) &&
             !line.includes(optInResumePayload),
         ),
         `Expected real codex queue invocation with --resume and metadata-only wake nudge, got: ${JSON.stringify(recordedCalls)}`,

@@ -194,17 +194,12 @@ export class AuditEngine {
 
     for (const { msgId, marker } of this.untrustedPayloads.values()) {
       // Untrusted data MUST NEVER be spliced into trusted system instructions without provenance.
+      // (Includes Codex CLI `developer`-role hook injections folded into `systemPrompt` — #23.)
       const sysIdx = req.systemPrompt.indexOf(marker);
       if (sysIdx !== -1) {
         const provIdx = req.systemPrompt.indexOf(UNTRUSTED_PROVENANCE_HEADER);
         const hasExplicitSysProv = provIdx !== -1 && provIdx < sysIdx;
-        // ISSUE #23: Codex CLI injects PostToolUse `additionalContext` into a `developer`-role
-        // message (folded into `systemPrompt`) with v2 packer framing (`Incoming hyphae message(s):`).
-        const packerSysIdx = this.config.acceptV2PackerHookFraming
-          ? req.systemPrompt.search(/Incoming hyphae message\(s\):[\s\S]{0,120}\[hyphae(?: interrupt)? · /i)
-          : -1;
-        const hasV2PackerSysFraming = packerSysIdx !== -1 && packerSysIdx < sysIdx;
-        if (!hasExplicitSysProv && !hasV2PackerSysFraming) {
+        if (!hasExplicitSysProv) {
           this.record(
             out,
             req,
@@ -230,9 +225,7 @@ export class AuditEngine {
               tr.text.includes(UNTRUSTED_PROVENANCE_HEADER) ||
               tr.text.includes('"untrusted"') ||
               tr.text.includes('"trustTier"') ||
-              tr.canonicalToolName === "hyp_inbox" ||
-              (this.config.acceptV2PackerHookFraming &&
-                /Incoming hyphae message\(s\):[\s\S]{0,120}\[hyphae(?: interrupt)? · /i.test(tr.text));
+              tr.canonicalToolName === "hyp_inbox";
             if (!hasStructuredProvenance) {
               this.record(
                 out,
@@ -251,11 +244,7 @@ export class AuditEngine {
           if (markerIdx !== -1) {
             const provIdx = msg.text.indexOf(UNTRUSTED_PROVENANCE_HEADER);
             const hasExplicitHeader = provIdx !== -1 && provIdx < markerIdx;
-            const packerIdx = this.config.acceptV2PackerHookFraming
-              ? msg.text.search(/Incoming hyphae message\(s\):[\s\S]{0,120}\[hyphae(?: interrupt)? · /i)
-              : -1;
-            const hasV2PackerFraming = packerIdx !== -1 && packerIdx < markerIdx;
-            if (!hasExplicitHeader && !hasV2PackerFraming) {
+            if (!hasExplicitHeader) {
               this.record(
                 out,
                 req,

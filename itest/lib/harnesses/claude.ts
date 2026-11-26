@@ -275,8 +275,7 @@ export const claudeAdapter: RealHarnessAdapter = {
     nudgeOnlyWake: false,
     midStreamInterrupt: false,
     hookToolBoundaries: true,
-    // ISSUE #23: `crates/hyp-harness/src/hooks.rs` uses v2 packer framing on non-OpenClaw hooks.
-    explicitHookProvenance: false,
+    explicitHookProvenance: true,
     supportsMultiTurnSession: true,
   },
 

@@ -131,20 +131,20 @@ export class GeminiHarness {
         selectedType: "gemini-api-key",
       },
     };
-    // NEW-ISSUE: `crates/hyp-cli/src/setup.rs:3830-3875` writes Gemini hook `"timeout": 10`
-    // assuming seconds (like Claude Code), but `@google/gemini-cli` interprets hook `timeout`
-    // in MILLISECONDS (`10ms`!), killing any `hyp hook gemini ...` invocation that takes >10ms.
-    // Bump sandbox timeouts to 10_000ms so live multi-turn tests exercise real hooks deterministically.
-    if (settings.hooks && typeof settings.hooks === "object") {
-      for (const groups of Object.values(settings.hooks as Record<string, any>)) {
-        if (!Array.isArray(groups)) continue;
-        for (const group of groups) {
-          if (!Array.isArray(group?.hooks)) continue;
-          for (const hk of group.hooks) {
-            if (hk && typeof hk.timeout === "number" && hk.timeout > 0 && hk.timeout < 1000) {
-              hk.timeout = 10_000;
-            }
-          }
+    // Strictly assert `hyp setup --harness gemini` wrote `"timeout": 10000` (ms) on all 4 hooks (#31)!
+    if (options.runSetup !== false) {
+      for (const ev of ["BeforeAgent", "BeforeTool", "AfterTool", "AfterAgent"]) {
+        const groups = settings.hooks?.[ev];
+        if (!Array.isArray(groups) || groups.length === 0) {
+          throw new Error(`hyp setup --harness gemini missing hook '${ev}' in ${settingsPath}`);
+        }
+        const timeouts = groups.flatMap((g: any) =>
+          (Array.isArray(g?.hooks) ? g.hooks : []).map((hk: any) => hk?.timeout),
+        );
+        if (timeouts.length === 0 || timeouts.some((t: unknown) => t !== 10_000)) {
+          throw new Error(
+            `Expected hyp setup --harness gemini to write timeout=10000ms on hook '${ev}', got: ${JSON.stringify(timeouts)}`,
+          );
         }
       }
     }
@@ -273,8 +273,7 @@ export const geminiAdapter: RealHarnessAdapter = {
     nudgeOnlyWake: false,
     midStreamInterrupt: false,
     hookToolBoundaries: true,
-    // ISSUE #23: `crates/hyp-harness/src/hooks.rs` uses v2 packer framing on non-OpenClaw hooks.
-    explicitHookProvenance: false,
+    explicitHookProvenance: true,
     supportsMultiTurnSession: true,
   },
 

@@ -290,7 +290,6 @@ test("Sources E2E — github-public: 200->304->429->200 ETag polling, strict mul
         allowBridge: false,
         allowKv: false,
         allowedRoles: ["ghpub-claude"],
-        acceptV2PackerHookFraming: true,
       },
     });
     shim.auditors.registerUntrustedPayload("gh-pr1", pr1Title);
@@ -480,7 +479,6 @@ test("Sources E2E — github-webhook: valid HMAC -> Claude, 1-bit flip 401, non-
         allowBridge: false,
         allowKv: false,
         allowedRoles: ["ghwh-claude"],
-        acceptV2PackerHookFraming: true,
       },
     });
 
@@ -676,6 +674,8 @@ test("Sources E2E — prometheus-webhook (Rust) vs plugins/prometheus (Node) dif
             PROMETHEUS_PORT: String(nodePromPort),
             PROMETHEUS_PATH: "/alerts",
             PROMETHEUS_TOPIC: "alerts-node",
+            // ISSUE #42: plugins/prometheus requires both Bearer AND Basic if both are set;
+            // configure Bearer + HMAC here until Bearer-OR-Basic parity lands.
             PROMETHEUS_BEARER_TOKEN: { secret: "prom-bearer" },
             PROMETHEUS_WEBHOOK_SECRET: { secret: "prom-hmac" },
           },
@@ -723,7 +723,6 @@ test("Sources E2E — prometheus-webhook (Rust) vs plugins/prometheus (Node) dif
         allowBridge: false,
         allowKv: false,
         allowedRoles: ["prom-claude"],
-        acceptV2PackerHookFraming: true,
       },
     });
 
@@ -912,19 +911,18 @@ test("Sources E2E — prometheus-webhook (Rust) vs plugins/prometheus (Node) dif
       rustInboxStr.includes("external-webhook"),
       "Rust prometheus-webhook CloudEvent must carry hyphaesourcekind=external-webhook",
     );
-    // NEW-ISSUE: Differential parity + Security Gate provenance gap on `main`:
-    //  1) `plugins/prometheus/index.mjs:272-281` omits top-level `alertname`, `severity`, `service`
-    //     CloudEvent extensions (breaking `hyp_stream` filter ASTs on those fields vs Rust adapter).
-    //  2) `crates/hyp-cli/src/node_cmd.rs:3090-3107` (`NodePluginHost::publish_event`) omits
-    //     `hyphaesourcekind = "external-webhook"` on subprocess `kind: "source"` CloudEvents, so
-    //     `value_indicates_external_webhook` (`crates/hyp-harness/src/daemon.rs:7499-7537`) does not
-    //     cap their trust tier to `ExternalWebhook`.
+    // ISSUE #41 & ISSUE #38: Differential parity + Security Gate provenance gaps on `main`:
+    //  - ISSUE #41: `plugins/prometheus/index.mjs:272-281` omits top-level `alertname`, `severity`,
+    //    `service` CloudEvent extensions (breaking `hyp_stream` filter ASTs on those fields vs Rust).
+    //  - ISSUE #38: `crates/hyp-cli/src/node_cmd.rs:3090-3107` (`NodePluginHost::publish_event`) omits
+    //    `hyphaesourcekind = "external-webhook"` on subprocess `kind: "source"` CloudEvents, so
+    //    `value_indicates_external_webhook` does not cap their trust tier to `ExternalWebhook`.
     if (nodeCoalescedText.includes("external-webhook")) {
       assert.ok(nodeCoalescedText.includes("io.prometheus.alert.firing"));
     }
 
     if (b1Observed) {
-      // NEW-ISSUE: Blind Spot B1 reproduced live on `main` (`crates/hyp-cli/src/node_cmd.rs:3090-3128`):
+      // ISSUE #39: Blind Spot B1 reproduced live on `main` (`crates/hyp-cli/src/node_cmd.rs:3090-3128`):
       // `NodePluginHost::publish_event` calls `node.publish_event(&qualified, event)` for `kind: "source"`
       // plugins WITHOUT calling `node.deliver_local_topic_batches(topic, ...)`, so `nodeSubPeer`
       // (`coalesceSeconds: 0` default) received 0 items while `nodeCoalescePeer` (`coalesceSeconds: 1`)
@@ -1012,7 +1010,6 @@ test("Sources E2E — webhook-stream (Rust) vs plugins/webhook (Node) bidirectio
         allowBridge: true,
         allowKv: false,
         allowedRoles: ["whdiff-claude"],
-        acceptV2PackerHookFraming: true,
       },
     });
 
@@ -1234,7 +1231,6 @@ test("Sources E2E — localIngest (ingest.sock / hyp emit): real Claude wake, >6
         allowBridge: false,
         allowKv: false,
         allowedRoles: ["ingest-claude"],
-        acceptV2PackerHookFraming: true,
       },
     });
 
@@ -2013,7 +2009,6 @@ test("SaaS Sources Full Black-Box E2E (B1, B3 AgentMail WS+REST race, Notion han
         allowBridge: false,
         allowKv: false,
         allowedRoles: ["saas-claude"],
-        acceptV2PackerHookFraming: true,
       },
     });
     const liveSentryMarker = "SENTRY_LIVE_CLAUDE_DELIVERY_809";

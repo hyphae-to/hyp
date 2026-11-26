@@ -5,9 +5,9 @@
  * `~/.config/herdr-core` touches!) with a real interactive Claude Code agent inside a Herdr PTY:
  *
  *  1. Identity pinning (`created_ms`, `pid`, `app`) verified via `hc get --json` + `hyp inspect`.
- *  2. Bare-shell fail-closed check: `hc run --bg --name bare-sh /bin/sh` (`status == null`) ->
- *     `hyp mcp --backend herdr` NEVER attaches a live Herdr push transport (mesh text can never
- *     be pasted into a raw shell!).
+ *  2. Bare-shell fail-closed check (#36): `hc run --bg --name bare-sh /bin/sh` (`status == null`) ->
+ *     explicit `hyp mcp --backend herdr` (and `session.register`/`session.start` RPCs) fail closed
+ *     with `herdr_bare_shell_rejected`, enrolling ZERO handle and pasting ZERO bytes into `/bin/sh`!
  *  3. Live `hc send` (`queue`) vs `hc interrupt` (`interrupt`) using deterministic `llm-shim`
  *     `pauseMidStream(gate)` latches:
  *       - `queue` DM holds while Claude is mid-generation and flushes cleanly AFTER turn ends!
@@ -15,8 +15,9 @@
  *         stream!) and delivers metadata-only `<hyphae-wake>` immediately!
  *  4. PID/terminal recycling guard: kill `worker-1` and launch a new terminal -> pinned
  *     `(created_ms, pid, app)` mismatch fails closed with zero unintended paste!
- *  5. Tier 4 `herdrSpawnAllowlist`: verifies allowlisted vs non-allowlisted config & Herdr
- *     template registration (noting runtime cold-spawn wiring status!).
+ *  5. Tier 4 `herdrSpawnAllowlist` (#33): verifies LIVE `flush_session` runtime cold-spawn of
+ *     allowlisted `herdrTemplate` via real `hc run <tpl> <nudge>` (metadata-only nudge, zero raw DM
+ *     body!) while non-allowlisted templates fail closed with zero spawn!
  *  6. GPUI `--mod` safety: `hyp setup --harness herdr --mod --plugins-dir ./plugins` installs
  *     `hyphae-pane` & `hyphae-panel` as real directories (never symlinks) and strictly preserves
  *     both shipped (`main.json`) and symlinked custom layouts!
@@ -24,12 +25,13 @@
 
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import test from "node:test";
 import { resolveClaudeBin } from "../lib/harnesses/claude.ts";
 import { HerdrOrchestrator, resolveHcBin } from "../lib/harnesses/herdr.ts";
 import { extractSessionsFromInspect } from "../lib/harnesses/types.ts";
-import { HypCli, HypMcpClient } from "../lib/hyp-cli.ts";
+import { HypCli, daemonRpc } from "../lib/hyp-cli.ts";
 import {
   LlmShimServer,
   callTool,
@@ -80,8 +82,6 @@ test("Real Herdr (hc) + Claude: identity pinning, bare-shell fail-closed, mid-st
         // Inner Claude Code also fires `UserPromptSubmit` hook when `<hyphae-wake>` is submitted,
         // draining the message directly into `additionalContext` without requiring an extra `hyp_inbox` turn.
         allowedRoles: ["herdr-worker"],
-        // ISSUE #23: inner Claude hooks use v2 packer framing.
-        acceptV2PackerHookFraming: true,
       },
     });
 
@@ -109,15 +109,16 @@ test("Real Herdr (hc) + Claude: identity pinning, bare-shell fail-closed, mid-st
     );
 
     // Attempt enrollment via `hyp mcp --backend herdr --ephemeral` with `HC_TERMINAL_ID=<bareAddr>`:
-    // `probe_herdr_terminal` MUST fail closed (never attach HerdrTransport to a raw shell!).
-    const bareClient = new HypMcpClient(
-      sandbox,
-      hyp.bin,
-      ["mcp", hyp.socketPath, "--backend", "herdr", "--ephemeral"],
-      "herdr-bare-shell-mcp",
-    );
-    // Re-spawn bare-shell MCP client with HC_TERMINAL_ID=bareAddr and HC_SOCKET explicitly set!
-    await bareClient.close();
+    // Issue #36: Explicit `--backend herdr` inside a bare shell MUST fail closed with
+    // `herdr_bare_shell_rejected`, enrolling ZERO handle and pasting ZERO bytes!
+    const bareRegRpc = await daemonRpc(hyp.socketPath, {
+      type: "session.register",
+      sessionId: "herdr:bare-rpc-probe",
+      backend: "herdr",
+      herdrTerminalId: bareAddr,
+    });
+    assert.equal(bareRegRpc.ok, false, `session.register(--backend herdr) on bare shell must fail closed: ${JSON.stringify(bareRegRpc)}`);
+    assert.equal(bareRegRpc.code, "herdr_bare_shell_rejected", `expected herdr_bare_shell_rejected code: ${JSON.stringify(bareRegRpc)}`);
 
     const bareMcpProc = sandbox.reaper.spawn(
       "herdr-bare-mcp-env",
@@ -161,33 +162,33 @@ test("Real Herdr (hc) + Claude: identity pinning, bare-shell fail-closed, mid-st
     await waitForCondition(() => readBareLines().some((m) => m.id === 2), 8_000, "bare MCP join response");
     const bareJoinResp = readBareLines().find((m) => m.id === 2);
     const bareJoinText = (bareJoinResp?.result?.content ?? []).map((c: any) => c.text || "").join("");
-    const bareJoinJson = JSON.parse(bareJoinText || "{}");
+    const bareJoinRaw = JSON.stringify(bareJoinResp);
 
-    // Verify fail-closed: `hasLiveTransport` MUST be `false` and `transport.kind` MUST NOT be `"herdr"`!
-    // NEW-ISSUE check: Note that `hyp_mesh(join)` returns ok=true with `hasLiveTransport: false, transport.kind: "none"`
-    // rather than rejecting enrollment outright when `--backend herdr` runs in a bare shell; critically,
-    // `HerdrTransport` is NEVER attached so zero text can ever be typed into `/bin/sh`!
+    // Strictly verify Issue #36 fail-closed rejection:
     assert.equal(
-      bareJoinJson.hasLiveTransport,
-      false,
-      `Bare shell MUST NEVER attach live Herdr push transport! join=${bareJoinText}`,
+      bareJoinResp?.result?.isError === true || Boolean(bareJoinResp?.error),
+      true,
+      `Explicit --backend herdr in bare shell MUST fail closed! resp=${bareJoinRaw}`,
     );
-    assert.notEqual(
-      bareJoinJson.transport?.kind,
-      "herdr",
-      `Bare shell transport kind MUST NOT be 'herdr': ${bareJoinText}`,
+    assert.ok(
+      bareJoinText.includes("herdr_bare_shell_rejected") ||
+        bareJoinRaw.includes("herdr_bare_shell_rejected"),
+      `Explicit --backend herdr in bare shell MUST return herdr_bare_shell_rejected (#36)! resp=${bareJoinRaw}`,
     );
 
-    // Send a DM to `@bare-shell-attempt` and prove ZERO bytes were typed into the bare `/bin/sh` screen!
-    const probeSender = await hyp.openPeer("bare-probe");
-    await probeSender.send("bare-shell-attempt", "echo BARE_SHELL_PWNED_999");
-    await new Promise((r) => setTimeout(r, 800));
+    // Confirm handle was NEVER enrolled!
+    const insBare = await hyp.inspect({ all: true });
+    const bareEnrolled = extractSessionsFromInspect(insBare.json).some(
+      (s) => s.handle === "bare-shell-attempt",
+    );
+    assert.equal(
+      bareEnrolled,
+      false,
+      `Rejected bare shell MUST NOT enroll handle 'bare-shell-attempt'! inspect=${JSON.stringify(insBare.json)}`,
+    );
+
+    // Confirm bare `/bin/sh` screen NEVER received pasted text!
     const bareScreen = await herdr.read(bareAddr);
-    assert.equal(
-      bareScreen.includes("BARE_SHELL_PWNED_999"),
-      false,
-      `Bare shell screen MUST NEVER receive pasted mesh text! Screen:\n${bareScreen}`,
-    );
     assert.equal(
       bareScreen.includes("<hyphae-wake"),
       false,
@@ -483,11 +484,12 @@ test("Real Herdr (hc): Tier 4 herdrSpawnAllowlist config & GPUI --mod symlink/la
     const hyp = new HypCli(sandbox);
 
     // -------------------------------------------------------------------------
-    // 1. Tier 4 `herdrSpawnAllowlist` template + `node.json` validation
+    // 1. Tier 4 `herdrSpawnAllowlist` (#33): LIVE `flush_session` cold spawn vs fail-closed unlisted template!
     // -------------------------------------------------------------------------
     const tplDir = path.join(sandbox.paths.xdgConfigDir, "herdr-core", "templates");
     fs.mkdirSync(tplDir, { recursive: true });
     const markerFile = path.join(sandbox.paths.tmpDir, "allowlisted-spawned.txt");
+    const blockedMarkerFile = path.join(sandbox.paths.tmpDir, "unlisted-spawned.txt");
     fs.writeFileSync(
       path.join(tplDir, "triage-worker.md"),
       [
@@ -498,14 +500,43 @@ test("Real Herdr (hc): Tier 4 herdrSpawnAllowlist config & GPUI --mod symlink/la
         "Triage worker template",
       ].join("\n") + "\n",
     );
+    fs.writeFileSync(
+      path.join(tplDir, "unlisted-worker.md"),
+      [
+        "---",
+        "name: unlisted-worker",
+        `command: ["/bin/sh", "-c", "printf '%s' \\"$1\\" > ${blockedMarkerFile}", "--"]`,
+        "---",
+        "Unlisted worker template",
+      ].join("\n") + "\n",
+    );
 
-    // Verify real `hc templates --json` recognizes our isolated sandbox template!
+    // Verify real `hc templates --json` recognizes our isolated sandbox templates!
     const tplRes = await herdr.exec(["templates", "--json"], { allowFailure: true });
     assert.equal(
       tplRes.exitCode,
       0,
       `hc templates --json failed: ${tplRes.stderr}`,
     );
+
+    // Transparent recording wrapper around real `hc` in sandbox.paths.binDir so we verify
+    // the exact `hc run <template> <nudge>` argv invoked by `LocalDaemon::flush_session`
+    // while forwarding straight to the real `hc` binary!
+    const hcRunLog = path.join(sandbox.paths.tmpDir, "hc-cold-spawn.log");
+    const hcWrapper = path.join(sandbox.paths.binDir, "hc");
+    fs.writeFileSync(
+      hcWrapper,
+      [
+        "#!/bin/sh",
+        `if [ "$1" = "run" ]; then printf '%s\\n' "$*" >> ${JSON.stringify(hcRunLog)}; fi`,
+        `exec ${JSON.stringify(hcBin)} "$@"`,
+      ].join("\n") + "\n",
+      { mode: 0o700 },
+    );
+    const wrappedHerdrEnv = {
+      ...herdr.env,
+      PATH: `${sandbox.paths.binDir}${path.delimiter}${herdr.env.PATH}`,
+    };
 
     await hyp.onboard({ nodeId: "herdr-mod@local", noSkills: true, noCommands: true });
     const nodeCfg = JSON.parse(fs.readFileSync(hyp.nodeConfigPath, "utf8"));
@@ -516,7 +547,7 @@ test("Real Herdr (hc): Tier 4 herdrSpawnAllowlist config & GPUI --mod symlink/la
     fs.writeFileSync(hyp.nodeConfigPath, JSON.stringify(nodeCfg, null, 2) + "\n");
 
     // Daemon must accept valid `deliveryRetry.herdrSpawnAllowlist` cleanly at startup!
-    await hyp.startDaemon({ env: herdr.env });
+    await hyp.startDaemon({ env: wrappedHerdrEnv });
     const doctorRes = await hyp.doctor({ allowFailure: true });
     assert.ok(doctorRes.json, "hyp doctor --json must parse cleanly with herdrSpawnAllowlist configured");
 
@@ -540,11 +571,106 @@ test("Real Herdr (hc): Tier 4 herdrSpawnAllowlist config & GPUI --mod symlink/la
     );
     assert.notEqual(badStart.exitCode, 0, "Malformed deliveryRetry.herdrSpawnAllowlist must fail closed");
 
-    // NEW-ISSUE: `LocalDaemon::try_herdr_cold_spawn` (`crates/hyp-harness/src/daemon.rs:1167`)
-    // is parsed from `node.json` `deliveryRetry.herdrSpawnAllowlist` but is NOT yet wired into
-    // `flush_session` or any runtime IPC RPC in `daemon.rs` (only invoked by Rust unit tests).
-    // Verify no spurious spawn occurs for an unlisted template either.
-    assert.equal(fs.existsSync(markerFile), false);
+    // Helper: enroll a cold Herdr session (persisting `herdrTemplate`, with NO live terminal attached)
+    // strictly over the daemon Unix socket `mcp.hello` + `tool.call(hyp_mesh join)` protocol.
+    const enrollColdTemplateSession = (
+      clientId: string,
+      template: string,
+      handle: string,
+    ): Promise<any> =>
+      new Promise((resolve, reject) => {
+        const conn = net.createConnection(hyp.socketPath);
+        let buf = "";
+        const timer = setTimeout(() => {
+          conn.destroy();
+          reject(new Error(`Timed out enrolling cold template session '${handle}'`));
+        }, 5_000);
+        conn.on("error", (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+        conn.on("connect", () => {
+          conn.write(
+            `${JSON.stringify({
+              type: "mcp.hello",
+              backend: "herdr",
+              clientId,
+              herdrTemplate: template,
+            })}\n`,
+          );
+          conn.write(
+            `${JSON.stringify({
+              type: "tool.call",
+              id: 1,
+              name: "hyp_mesh",
+              args: { action: "join", handle },
+            })}\n`,
+          );
+        });
+        conn.on("data", (chunk: Buffer) => {
+          buf += chunk.toString("utf8");
+          const nl = buf.indexOf("\n");
+          if (nl !== -1) {
+            clearTimeout(timer);
+            conn.end();
+            try {
+              resolve(JSON.parse(buf.slice(0, nl)));
+            } catch (err) {
+              reject(err);
+            }
+          }
+        });
+      });
+
+    const allowJoin = await enrollColdTemplateSession("cold-allow-1", "triage-worker", "cold-triage");
+    assert.equal(allowJoin.result?.handle, "cold-triage", `cold-triage join failed: ${JSON.stringify(allowJoin)}`);
+    const blockJoin = await enrollColdTemplateSession("cold-block-1", "unlisted-worker", "cold-blocked");
+    assert.equal(blockJoin.result?.handle, "cold-blocked", `cold-blocked join failed: ${JSON.stringify(blockJoin)}`);
+
+    // Send a DM with sensitive marker to BOTH cold sessions:
+    //  - `@cold-triage` (allowlisted `triage-worker`) MUST trigger live Tier 4 `hc run triage-worker <hyphae-wake>` via `flush_session` (#33)!
+    //  - `@cold-blocked` (`unlisted-worker`, NOT in allowlist) MUST fail closed with ZERO spawn!
+    const coldSecretBody = "HERDR_TIER4_UNTRUSTED_BODY_MUST_NOT_LEAK_IN_ARGV_773";
+    const coldSender = await hyp.openPeer("cold-ops");
+    await coldSender.send("cold-blocked", coldSecretBody);
+    await coldSender.send("cold-triage", coldSecretBody);
+
+    await waitForCondition(
+      () => fs.existsSync(hcRunLog) && fs.readFileSync(hcRunLog, "utf8").trim().length > 0,
+      10_000,
+      "live Tier 4 Herdr cold spawn via flush_session (#33)",
+    );
+    await new Promise((r) => setTimeout(r, 400));
+
+    const spawnLines = fs.readFileSync(hcRunLog, "utf8").trim().split(/\r?\n/);
+    assert.equal(
+      spawnLines.length,
+      1,
+      `Expected strictly 1 allowlisted cold spawn (and 0 for unlisted template), got: ${JSON.stringify(spawnLines)}`,
+    );
+    assert.ok(
+      spawnLines[0].startsWith("run triage-worker <hyphae-wake") &&
+        spawnLines[0].includes('handle="cold-triage"'),
+      `Expected metadata-only <hyphae-wake> nudge to allowlisted triage-worker, got: ${spawnLines[0]}`,
+    );
+    assert.equal(
+      spawnLines[0].includes(coldSecretBody),
+      false,
+      `Tier 4 cold spawn argv MUST NEVER leak raw untrusted DM body: ${spawnLines[0]}`,
+    );
+    assert.equal(
+      fs.existsSync(blockedMarkerFile),
+      false,
+      "Non-allowlisted herdrTemplate MUST NEVER be spawned!",
+    );
+
+    // Unread DM must remain preserved in SQLite mailbox (`counts.queued >= 1`) for the spawned agent!
+    const insCold = await hyp.inspect({ handle: "cold-triage" });
+    const coldRow = extractSessionsFromInspect(insCold.json)[0];
+    assert.ok(
+      (coldRow?.counts?.queued ?? 0) >= 1,
+      `Cold-spawned session DM must stay preserved in SQLite mailbox: ${JSON.stringify(coldRow)}`,
+    );
 
     // -------------------------------------------------------------------------
     // 2. GPUI `--mod` safety: real directories (never symlinks) + shipped & symlinked layout protection!

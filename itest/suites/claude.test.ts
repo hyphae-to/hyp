@@ -59,11 +59,6 @@ test("Real Claude Code: verified PreToolUse enrollment, tool-boundary pauseUntil
         allowBridge: false,
         allowKv: false,
         allowedRoles: ["claude-main"],
-        // Tracked finding: `crates/hyp-harness/src/hooks.rs` currently prepends `UNTRUSTED_PROVENANCE`
-        // only for OpenClaw (`PreInvocation`), while Claude/Codex/Gemini/Opencode/Cursor rely on
-        // v2 packer framing (`Incoming hyphae message(s):\n\n[hyphae ...]`). Flip this to `false`
-        // once `hooks.rs` prepends `UNTRUSTED_PROVENANCE` uniformly across all harnesses.
-        acceptV2PackerHookFraming: true,
       },
     });
 
@@ -152,9 +147,8 @@ test("Real Claude Code: verified PreToolUse enrollment, tool-boundary pauseUntil
         when: (req) => req.anyMessageContains(interruptPayload) && !req.anyMessageContains(queuePayload),
         assert: (req) => {
           assert.ok(
-            req.rawBody.includes(UNTRUSTED_PROVENANCE_HEADER) ||
-              req.rawBody.includes("[hyphae interrupt ·"),
-            `Interrupt PostToolUse injection MUST include Hyphae framing`,
+            req.rawBody.includes(UNTRUSTED_PROVENANCE_HEADER),
+            `Interrupt PostToolUse injection MUST include explicit '${UNTRUSTED_PROVENANCE_HEADER}'`,
           );
           assert.equal(
             req.rawBody.includes(queuePayload),
@@ -173,9 +167,8 @@ test("Real Claude Code: verified PreToolUse enrollment, tool-boundary pauseUntil
         when: (req) => req.anyMessageContains(queuePayload),
         assert: (req) => {
           assert.ok(
-            req.rawBody.includes(UNTRUSTED_PROVENANCE_HEADER) ||
-              req.rawBody.includes("[hyphae ·"),
-            `Stop continuation MUST include Hyphae framing`,
+            req.rawBody.includes(UNTRUSTED_PROVENANCE_HEADER),
+            `Stop continuation MUST include explicit '${UNTRUSTED_PROVENANCE_HEADER}'`,
           );
           sawQueueInStopContinuation = true;
         },
@@ -275,7 +268,6 @@ test("Real Claude Code: multi-session isolation (Session A vs Session B sharing 
         allowBridge: false,
         allowKv: false,
         allowedRoles: ["claude-a", "claude-b"],
-        acceptV2PackerHookFraming: true,
       },
     });
 
