@@ -198,8 +198,16 @@ export default class HyphaePane extends View {
           .text_color(t.foreground)
           .child(name)
       )
-      .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(folder(p.cwd)))
+      .child(
+        div()
+          .flex_initial()
+          .min_w(0)
+          .truncate()
+          .text_color(t.dim)
+          .child(folder(p.cwd))
+      )
       .when(Boolean(pill), (el) => el.child(pill))
+      .child(div().flex_1().min_w(0))
       .when(st === "working", (el) =>
         el.child(
           svg("mods/workspace-chrome/spinner.svg")
