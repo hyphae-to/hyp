@@ -116,6 +116,7 @@ pub(crate) struct VerifiedApproval {
     pub kid: String,
     claim_id: String,
     replay_expires_at: i64,
+    commit_expires_at: i64,
     expected_state: Value,
 }
 
@@ -390,7 +391,7 @@ pub(crate) fn execute_approved_operation<T>(
             ));
         }
         let now = now_unix_ms();
-        if now >= parse_rfc3339_millis(&verified.action.exp).map_err(|e| fail(e.to_string()))? {
+        if now >= verified.commit_expires_at {
             return Err(fail("approval expired before commit".into()));
         }
         let original = match std::fs::read(config_write) {
@@ -995,6 +996,7 @@ fn verify_approval_envelope(
         kid: authority.kid,
         claim_id: claim.claim_id,
         replay_expires_at: replay_exp_ms,
+        commit_expires_at: claim_exp_ms.min(action_exp_ms),
         expected_state: Value::Null,
     })
 }
@@ -1312,6 +1314,7 @@ mod commit_tests {
                 kid: "admin_key".into(),
                 claim_id: "commit_claim".into(),
                 replay_expires_at: now_unix_ms() + 300_000,
+                commit_expires_at: now_unix_ms() + 300_000,
                 expected_state: approval_snapshot(config, db).unwrap(),
             },
             policy,
@@ -1326,6 +1329,27 @@ mod commit_tests {
                 |r| r.get(0),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn shorter_claim_lifetime_is_rechecked_after_waiting_for_the_final_writer() {
+        let tmp = TempDir::new().unwrap();
+        let db = NodeDb::open_in_memory().unwrap();
+        let config = tmp.path().join("node.json");
+        std::fs::write(&config, b"{\"nodeId\":\"commit@box\"}").unwrap();
+        let (mut verified, _) = approved(&db, &config, db.human().authorities_digest().unwrap());
+        // The proof was verified while both lifetimes were live. Waiting for the writer
+        // crosses the shorter claim expiry while action and replay retention remain live.
+        verified.commit_expires_at = now_unix_ms() - 1;
+        assert!(parse_rfc3339_millis(&verified.action.exp).unwrap() > now_unix_ms());
+        assert!(verified.replay_expires_at > now_unix_ms());
+        let error = execute_approved_operation::<()>(&config, &config, &db, &verified, || {
+            panic!("expired proof must never reach the mutation")
+        })
+        .unwrap_err();
+        assert!(error.contains("expired before commit"), "{error}");
+        assert_eq!(replay_count(&db), 0);
+        assert!(db.human().get_gate_lock_seal().unwrap().is_none());
     }
 
     #[test]
