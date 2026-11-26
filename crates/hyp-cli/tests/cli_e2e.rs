@@ -758,11 +758,6 @@ fn node_start_parses_kv_namespaces_advertises_manifest_and_mcp_hyp_kv() {
     assert_eq!(bad_env["ok"], false);
     assert_eq!(bad_env["error"]["code"], "CONFIG_ERROR");
 
-    #[cfg(unix)]
-    {
-        let _ = peer_proc.shutdown_gracefully();
-        let _ = hub_proc.shutdown_gracefully();
-    }
-    drop(peer_proc);
-    drop(hub_proc);
+    peer_proc.shutdown_gracefully();
+    hub_proc.shutdown_gracefully();
 }
