@@ -1098,6 +1098,34 @@ async fn kv_cli_authenticates_over_loopback_tcp() {
     .await
     .unwrap();
 
+    let filters = [
+        hyp_store::Filter::All(vec![hyp_store::Filter::exact("ns", "sealed")]),
+        hyp_store::Filter::Not(Box::new(hyp_store::Filter::exact("ns", "test"))),
+        hyp_store::Filter::Any(vec![
+            hyp_store::Filter::exact("ns", "other"),
+            hyp_store::Filter::prefix("key", "watch/"),
+        ]),
+    ];
+    for (index, filter) in filters.into_iter().enumerate() {
+        node.db()
+            .events()
+            .upsert_subscription(
+                &hyp_store::SubscriptionSpec {
+                    id: format!("watch-{index}"),
+                    origin_node: "owner@local".into(),
+                    topic: "kv".into(),
+                    subscriber: "claude:kv-inspect".into(),
+                    filters: vec![filter],
+                    coalesce_seconds: 0,
+                    max_batch_age_ms: None,
+                    max_wakes_per_hour: None,
+                    mode: hyp_store::DeliveryMode::Full,
+                },
+                hyp_store::now_ms(),
+            )
+            .unwrap();
+    }
+
     let unsecured =
         daemon_rpc_async(&socket, &json!({ "type": "sessions.summary" }), RPC_TIMEOUT).await;
     assert!(unsecured.ok);
@@ -1109,6 +1137,8 @@ async fn kv_cli_authenticates_over_loopback_tcp() {
     assert_eq!(namespaces[0]["epoch"], 1);
     assert_eq!(namespaces[0]["memberCount"], 1);
     assert_eq!(namespaces[0]["entryCount"], 1);
+    assert_eq!(namespaces[0]["watchCount"], 3);
+    assert_eq!(namespaces[1]["watchCount"], 1);
     assert_eq!(namespaces[0]["entries"][0]["key"], "note");
     assert_eq!(namespaces[0]["entries"][0]["version"], 1);
     assert!(!inspection.to_string().contains("🔐"));
@@ -1156,6 +1186,68 @@ async fn kv_cli_authenticates_over_loopback_tcp() {
     );
     assert!(
         node.preview_local_kv("sealed", "note")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    node.db()
+        .kv()
+        .set(
+            &hyp_store::KvSetInput {
+                host_node: "owner@local".into(),
+                namespace: "sealed".into(),
+                key: "hidden".into(),
+                value: json!({"encrypted": "opaque"}),
+                content_type: Some(hyp_proto::cloudevent::CONTENT_TYPE_E2EE_JSON.into()),
+                write_model: hyp_store::WriteModel::Owner,
+                owner_id: None,
+                allowlist: None,
+                writer_id: "owner@local".into(),
+                expected_version: None,
+                e2ee_epoch: Some(2),
+                signature: None,
+                ttl_ms: None,
+            },
+            hyp_store::now_ms(),
+        )
+        .unwrap();
+    let self_key = node.identity().encryption.public_key();
+    let (_, own_epoch) = create_epoch_bundle(
+        EpochScope::Kv,
+        "owner@local",
+        "sealed",
+        3,
+        "owner@local",
+        &node.identity().signing,
+        &[EpochMember {
+            node_id: "owner@local",
+            enc_pk: &self_key,
+        }],
+    )
+    .unwrap();
+    node.db()
+        .kv()
+        .put_epoch(
+            &hyp_store::KvEpochInput {
+                host_node: "owner@local".into(),
+                namespace: "sealed".into(),
+                epoch: 3,
+                creator_node_id: "owner@local".into(),
+                key_envelope_json: serde_json::to_string(&own_epoch).unwrap(),
+                members: vec!["owner@local".into()],
+                signature: own_epoch.sig,
+            },
+            hyp_store::now_ms(),
+        )
+        .unwrap();
+    let own_inspection = inspect();
+    let sealed = &own_inspection["data"]["kv"]["namespaces"][0];
+    assert_eq!(sealed["name"], "sealed");
+    assert_eq!(sealed["epoch"], 3);
+    assert_eq!(sealed["entryCount"], 1);
+    assert_eq!(sealed["entries"][0]["key"], "note");
+    assert!(
+        node.preview_local_kv("sealed", "hidden")
             .await
             .unwrap()
             .is_none()

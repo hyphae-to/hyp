@@ -301,16 +301,52 @@ impl UnifiedNode {
 fn watches_namespace(watch: &Subscription, host: &str, namespace: &str) -> bool {
     watch.topic == "kv"
         && (watch.origin_node == host || watch.origin_node == "local")
-        && watch.filters.iter().all(|filter| match filter {
-            Filter::Exact(fields) => fields
-                .get("ns")
-                .is_none_or(|expected| expected == namespace),
-            Filter::Prefix(fields) => fields
-                .get("ns")
-                .is_none_or(|prefix| namespace.starts_with(prefix)),
-            Filter::Suffix(fields) => fields
-                .get("ns")
-                .is_none_or(|suffix| namespace.ends_with(suffix)),
-            _ => true,
-        })
+        && watch
+            .filters
+            .iter()
+            .all(|filter| namespace_match(filter, namespace) != Some(false))
+}
+
+// Other event fields are unknown for a namespace summary. Count a watch if the
+// known namespace does not rule it out, including through nested boolean filters.
+fn namespace_match(filter: &Filter, namespace: &str) -> Option<bool> {
+    let match_fields = |fields: &BTreeMap<String, String>, matches: fn(&str, &str) -> bool| {
+        if let Some(value) = fields.get("ns") {
+            if !matches(namespace, value) {
+                return Some(false);
+            }
+            if fields.len() == 1 {
+                return Some(true);
+            }
+        }
+        fields.is_empty().then_some(true)
+    };
+    match filter {
+        Filter::Exact(fields) => match_fields(fields, |a, b| a == b),
+        Filter::Prefix(fields) => match_fields(fields, |a, b| a.starts_with(b)),
+        Filter::Suffix(fields) => match_fields(fields, |a, b| a.ends_with(b)),
+        Filter::Not(inner) => namespace_match(inner, namespace).map(|matched| !matched),
+        Filter::All(filters) => {
+            let mut result = Some(true);
+            for filter in filters {
+                match namespace_match(filter, namespace) {
+                    Some(false) => return Some(false),
+                    None => result = None,
+                    Some(true) => {}
+                }
+            }
+            result
+        }
+        Filter::Any(filters) => {
+            let mut result = Some(false);
+            for filter in filters {
+                match namespace_match(filter, namespace) {
+                    Some(true) => return Some(true),
+                    None => result = None,
+                    Some(false) => {}
+                }
+            }
+            result
+        }
+    }
 }
