@@ -803,7 +803,7 @@ fn enc_jwk_lifecycle_preferred_lookup_and_revocation_guard() {
 
 #[test]
 fn full_v1_v2_v3_v4_to_v5_migration_parity_backups_and_zero_data_loss() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, 9);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 10);
     let dir = TempDir::new().unwrap();
 
     let v1_path = dir.path().join("from-v1").join("node.sqlite");
@@ -834,7 +834,7 @@ fn full_v1_v2_v3_v4_to_v5_migration_parity_backups_and_zero_data_loss() {
             .into_iter()
             .map(|(v, _)| v)
             .collect();
-        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
         // Bit-for-bit structural schema parity with fresh latest
         assert_eq!(
@@ -985,7 +985,7 @@ fn v6_to_v7_migration_delegation_policy_invite_nonces_and_cascade_peer_revocatio
         .into_iter()
         .map(|(v, _)| v)
         .collect();
-    assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     assert_eq!(
         snapshot_tables_and_columns(db.connection()),
         snapshot_tables_and_columns(fresh.connection())
@@ -1323,7 +1323,7 @@ fn v7_to_v8_migration_gate_lock_seal_anti_rollback_and_approval_nonces() {
         .into_iter()
         .map(|(v, _)| v)
         .collect();
-    assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     assert_eq!(
         snapshot_tables_and_columns(db.connection()),
         snapshot_tables_and_columns(fresh.connection())

@@ -313,7 +313,7 @@ fn create_seeded_v1_db(path: &Path, enable_wal: bool) {
 
 #[test]
 fn registry_invariants_and_invalid_registry_rejection() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, 9);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 10);
     assert_eq!(MIGRATIONS.len() as i64, CURRENT_SCHEMA_VERSION);
     let mut names = HashSet::new();
     for (idx, m) in MIGRATIONS.iter().enumerate() {
@@ -389,7 +389,7 @@ fn differential_schema_and_data_parity_v1_migrated_equals_fresh_v2() {
     let applied_migrated = migrated.applied_migrations().unwrap();
     assert_eq!(
         applied_migrated.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     );
     assert_eq!(applied_migrated[0].1, T0);
     assert!(applied_migrated[1].1 >= T0);
@@ -1126,4 +1126,56 @@ fn mailbox_notice_migration_preserves_legacy_items_without_marking_provenance() 
     assert_eq!(entry.text, "legacy body");
     assert_eq!(entry.gate_reason.as_deref(), Some("system_notice"));
     assert_eq!(entry.trusted_daemon_notice("notice@box"), None);
+}
+
+#[test]
+fn delivery_history_migration_preserves_mailbox_deduplication() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("node.sqlite");
+    {
+        let conn = Connection::open(&path).unwrap();
+        run_migrations_with(&conn, None, &MIGRATIONS[..9]).unwrap();
+        conn.execute(
+            "INSERT INTO mailbox
+                 (receipt, session_id, origin_node, item_id, text, received_at, kind, source)
+             VALUES ('receipt', 'session', 'peer@box', 'item', 'unread body', ?1,
+                     'message', 'peer@box/agent')",
+            params![T0],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO deliveries (origin_node, item_id, state, created_at)
+             VALUES ('peer@box', 'item', 'submitted', ?1)",
+            params![T0],
+        )
+        .unwrap();
+    }
+    let db = NodeDb::open(&path).unwrap();
+    let schema = snapshot_canonical_schema(db.connection());
+    assert!(!schema.table_sql.contains_key("deliveries"));
+    assert!(!schema.indexes.contains_key("deliveries_created"));
+
+    let local = db.local();
+    let entry = local.peek_inbox("session", 10).unwrap().pop().unwrap();
+    assert_eq!(entry.text, "unread body");
+    assert_eq!(
+        local
+            .put_in_mailbox(
+                &hyp_store::MailboxInsert {
+                    session_id: entry.session_id,
+                    origin_node: entry.origin_node,
+                    item_id: entry.item_id,
+                    text: "replay".to_string(),
+                    kind: entry.kind,
+                    source: entry.source,
+                    gate_state: entry.gate_state,
+                    gate_reason: None,
+                    traceparent: None,
+                },
+                T0 + 1,
+            )
+            .unwrap(),
+        hyp_store::MailboxPutResult::Duplicate
+    );
+    assert_eq!(local.pending_count("session").unwrap(), 1);
 }
