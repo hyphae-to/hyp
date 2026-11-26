@@ -25,13 +25,113 @@ fn cli_with_target(home: &Path, target: &str, arguments: &[&str]) -> (i32, Value
     let output = isolated_cmd(home)
         .env_remove("TAILSCALE_BIN")
         .env("FIXTURE", home)
-        .env("FIXTURE_TARGET", target)
+        .env("TAILSCALE_SOCKET", home.join("tailscale.sock"))
         .env("PATH", home)
         .args(["deploy", "webhook", "--local-target", target, "--json"])
         .args(arguments)
         .output()
         .unwrap();
     (output.status.code().unwrap(), parse_json_stdout(&output))
+}
+
+struct TestTailscale {
+    backend_state: &'static str,
+    config: Value,
+    revision: u64,
+    updates: usize,
+    competing_edit: Option<Value>,
+}
+
+impl TestTailscale {
+    fn replace_config(&mut self, config: Value) {
+        self.config = config;
+        self.revision += 1;
+    }
+}
+
+async fn fake_tailscale(
+    home: &Path,
+    backend_state: &'static str,
+    config: Value,
+) -> (
+    std::sync::Arc<std::sync::Mutex<TestTailscale>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use http_body_util::{BodyExt, Full};
+    use hyper::{
+        Method, Request, Response, StatusCode,
+        body::{Bytes, Incoming},
+        server::conn::http1,
+    };
+    use hyper_util::rt::TokioIo;
+    use std::sync::{Arc, Mutex};
+
+    let socket = tokio::net::UnixListener::bind(home.join("tailscale.sock")).unwrap();
+    let state = Arc::new(Mutex::new(TestTailscale {
+        backend_state,
+        config,
+        revision: 0,
+        updates: 0,
+        competing_edit: None,
+    }));
+    let task_state = Arc::clone(&state);
+    let server = tokio::spawn(async move {
+        while let Ok((stream, _)) = socket.accept().await {
+            let state = Arc::clone(&task_state);
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(|request: Request<Incoming>| {
+                    let state = Arc::clone(&state);
+                    async move {
+                        assert_eq!(request.headers()["host"], "local-tailscaled.sock");
+                        let (head, body) = request.into_parts();
+                        let mut response = Response::builder();
+                        let payload = body.collect().await.unwrap().to_bytes();
+                        let mut state = state.lock().unwrap();
+                        let output = match (head.method, head.uri.path()) {
+                            (Method::GET, "/localapi/v0/status") => json!({
+                                "BackendState":state.backend_state,
+                                "Self":{"DNSName":format!("{DNS}."),"CapMap":{
+                                    "https":[], "funnel":[], "https://tailscale.com/cap/funnel-ports?ports=443,8443,10000":[]
+                                }}
+                            }),
+                            (Method::GET, "/localapi/v0/serve-config") => {
+                                response =
+                                    response.header("etag", format!("revision-{}", state.revision));
+                                state.config.clone()
+                            }
+                            (Method::POST, "/localapi/v0/serve-config") => {
+                                if let Some(competing) = state.competing_edit.take() {
+                                    state.replace_config(competing);
+                                }
+                                if head
+                                    .headers
+                                    .get("if-match")
+                                    .and_then(|value| value.to_str().ok())
+                                    == Some(&format!("revision-{}", state.revision))
+                                {
+                                    state.replace_config(serde_json::from_slice(&payload).unwrap());
+                                    state.updates += 1;
+                                } else {
+                                    response = response.status(StatusCode::PRECONDITION_FAILED);
+                                }
+                                Value::Null
+                            }
+                            _ => panic!("unexpected LocalAPI request {}", head.uri),
+                        };
+                        Ok::<_, std::convert::Infallible>(
+                            response
+                                .body(Full::new(Bytes::from(output.to_string())))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (state, server)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -54,43 +154,17 @@ async fn funnel_discovery_activation_and_rerun_leave_private_serve_routes_untouc
         }
     });
     let home = TempDir::new().unwrap();
-    let state = home.path().join("state.json");
     let private = json!({
         "TCP": {"8443":{"HTTPS":true}},
         "Web": {(format!("{DNS}:8443")):{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8790"}}}}
     });
-    fs::write(&state, private.to_string()).unwrap();
-    let mut enabled = private.clone();
-    enabled["TCP"]["10000"] = json!({"HTTPS": true});
-    enabled["Web"][format!("{DNS}:10000")] = json!({"Handlers":{"/sentry":{"Proxy":target}}});
-    enabled["AllowFunnel"] = json!({(format!("{DNS}:10000")): true});
-    fs::write(home.path().join("enabled.json"), enabled.to_string()).unwrap();
-    script(
-        &home.path().join("tailscale"),
-        r#"#!/bin/sh
-case "$1" in
-    status)
-        echo '{"BackendState":"Running","Self":{"DNSName":"hub.tail123.ts.net.","CapMap":{"https":[],"funnel":[],"https://tailscale.com/cap/funnel-ports?ports=443,8443,10000":[]}}}'
-        ;;
-    serve)
-        test "$2 $3" = 'status --json' || exit 9
-        /bin/cat "$FIXTURE/state.json"
-        ;;
-    funnel)
-        echo "$*" >> "$FIXTURE/funnel.log"
-        test "$*" = "funnel --bg --https=10000 --set-path=/sentry $FIXTURE_TARGET" || exit 9
-        /bin/cat "$FIXTURE/enabled.json" > "$FIXTURE/state.json"
-        ;;
-    *) exit 9 ;;
-esac
-"#,
-    );
-
+    let (tailscale, tailscale_server) =
+        fake_tailscale(home.path(), "Running", private.clone()).await;
     let (exit, discover) = cli_with_target(home.path(), &target, &[]);
     assert_eq!(exit, 0, "{discover}");
     assert_eq!(discover["data"]["tailscale"]["status"], "available");
     assert_eq!(discover["data"]["tailscale"]["port"], 10000);
-    assert!(!home.path().join("funnel.log").exists());
+    assert_eq!(tailscale.lock().unwrap().updates, 0);
 
     let (exit, denied) = cli_with_target(
         home.path(),
@@ -99,19 +173,40 @@ esac
     );
     assert_eq!(exit, 1, "{denied}");
     assert_eq!(denied["error"]["code"], "WEBHOOK_ROUTE_UNAVAILABLE");
-    assert!(!home.path().join("funnel.log").exists());
+    assert_eq!(tailscale.lock().unwrap().updates, 0);
 
     let (exit, plan) =
         cli_with_target(home.path(), &target, &["--provider", "tailscale", "--plan"]);
     assert_eq!(exit, 0, "{plan}");
     assert_eq!(plan["data"]["status"], "planned");
-    assert!(!home.path().join("funnel.log").exists());
+    assert_eq!(tailscale.lock().unwrap().updates, 0);
 
     let unrelated = target.replace("/sentry", "/admin");
     let (exit, unrelated) = cli_with_target(home.path(), &unrelated, &["--provider", "tailscale"]);
     assert_eq!(exit, 1, "{unrelated}");
     assert_eq!(unrelated["error"]["code"], "WEBHOOK_ROUTE_UNAVAILABLE");
-    assert!(!home.path().join("funnel.log").exists());
+    assert_eq!(tailscale.lock().unwrap().updates, 0);
+
+    // A separate operator adds a private route after discovery. The LocalAPI
+    // rejects the exact snapshot's ETag and the route remains private.
+    let mut competing = private.clone();
+    competing["TCP"]["10000"] = json!({"HTTPS":true});
+    competing["Web"][format!("{DNS}:10000")] =
+        json!({"Handlers":{"/admin":{"Proxy":"http://127.0.0.1:8788"}}});
+    tailscale.lock().unwrap().competing_edit = Some(competing.clone());
+    let (exit, raced) = cli_with_target(home.path(), &target, &["--provider", "tailscale"]);
+    assert_eq!(exit, 1, "{raced}");
+    assert_eq!(tailscale.lock().unwrap().updates, 0);
+    assert_eq!(tailscale.lock().unwrap().config, competing);
+    assert!(
+        tailscale
+            .lock()
+            .unwrap()
+            .config
+            .get("AllowFunnel")
+            .is_none()
+    );
+    tailscale.lock().unwrap().replace_config(private.clone());
 
     for reused in [false, true] {
         let (exit, configured) =
@@ -124,14 +219,8 @@ esac
             "https://hub.tail123.ts.net:10000/sentry"
         );
     }
-    assert_eq!(
-        fs::read_to_string(home.path().join("funnel.log"))
-            .unwrap()
-            .lines()
-            .count(),
-        1
-    );
-    let after: Value = serde_json::from_str(&fs::read_to_string(state).unwrap()).unwrap();
+    assert_eq!(tailscale.lock().unwrap().updates, 1);
+    let after = tailscale.lock().unwrap().config.clone();
     assert_eq!(
         after["Web"][format!("{DNS}:8443")],
         private["Web"][format!("{DNS}:8443")]
@@ -142,25 +231,25 @@ esac
     let mut legacy = after;
     legacy["Web"][format!("{DNS}:10000")]["Handlers"]["/sentry"]["Proxy"] =
         json!(target.strip_suffix("/sentry").unwrap());
-    fs::write(home.path().join("state.json"), legacy.to_string()).unwrap();
+    tailscale.lock().unwrap().replace_config(legacy);
     let (exit, configured) = cli_with_target(
         home.path(),
         &target,
         &["--provider", "tailscale", "--funnel-port", "10000"],
     );
     assert_eq!(exit, 0, "{configured}");
-    let upgraded: Value =
-        serde_json::from_slice(&fs::read(home.path().join("state.json")).unwrap()).unwrap();
+    let upgraded = tailscale.lock().unwrap().config.clone();
     assert_eq!(
         upgraded["Web"][format!("{DNS}:10000")]["Handlers"]["/sentry"]["Proxy"],
         target
     );
 
     // A clean tailscaled returns JSON null before its first Serve configuration.
-    fs::write(home.path().join("state.json"), "null").unwrap();
+    tailscale.lock().unwrap().replace_config(Value::Null);
     let (exit, clean) = cli_with_target(home.path(), &target, &[]);
     assert_eq!(exit, 0, "{clean}");
     assert_eq!(clean["data"]["tailscale"]["port"], 8443);
+    tailscale_server.abort();
     server.abort();
 }
 
@@ -216,16 +305,10 @@ esac
     assert_eq!(result["data"]["localTarget"], TARGET);
 }
 
-#[test]
-fn funnel_requires_a_running_node_and_capabilities() {
+#[tokio::test(flavor = "multi_thread")]
+async fn funnel_requires_a_running_node_and_capabilities() {
     let home = TempDir::new().unwrap();
-    script(
-        &home.path().join("tailscale"),
-        r#"#!/bin/sh
-test "$1" = status || exit 9
-echo '{"BackendState":"NeedsLogin"}'
-"#,
-    );
+    let (_, server) = fake_tailscale(home.path(), "NeedsLogin", Value::Null).await;
     let (exit, result) = cli(home.path(), &[]);
     assert_eq!(exit, 0, "{result}");
     assert_eq!(result["data"]["tailscale"]["status"], "needsSetup");
@@ -235,4 +318,5 @@ echo '{"BackendState":"NeedsLogin"}'
             .unwrap()
             .contains("sign")
     );
+    server.abort();
 }

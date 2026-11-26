@@ -3,14 +3,15 @@
 use crate::deploy::find_in_path;
 use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json};
 use clap::{Args, ValueEnum};
-use http_body_util::Empty;
-use hyper::{Method, Request, StatusCode, body::Bytes};
+use http_body_util::{BodyExt, Empty, Full, Limited};
+use hyper::{Method, Request, StatusCode, body::Bytes, header};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 const COMMAND: &str = "deploy webhook";
 const FUNNEL_PORTS: [u16; 3] = [8443, 10000, 443];
@@ -123,26 +124,206 @@ async fn run_tool(bin: &Path, args: &[&str]) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|_| "Provider command returned invalid UTF-8.".into())
 }
 
-async fn tailscale_config(bin: &Path) -> Result<Value, String> {
-    let out = run_tool(bin, &["serve", "status", "--json"])
+const TAILSCALE_CONFIG_PATH: &str = "/localapi/v0/serve-config";
+const TAILSCALE_CONNECT_ERROR: &str =
+    "Start tailscaled and run as a Tailscale operator with access to its LocalAPI.";
+
+enum TailscaleApi {
+    #[cfg(unix)]
+    Socket(PathBuf),
+    #[cfg(windows)]
+    Pipe,
+    #[cfg(target_os = "macos")]
+    App {
+        port: u16,
+        authorization: header::HeaderValue,
+    },
+}
+
+struct ServeSnapshot {
+    config: Value,
+    etag: header::HeaderValue,
+}
+
+async fn local_api_request<T>(
+    stream: T,
+    request: Request<Full<Bytes>>,
+) -> Result<(StatusCode, hyper::HeaderMap, Bytes), String>
+where
+    T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
-        .map_err(|_| {
-            "Run `tailscale serve status --json` as the Tailscale operator on this host."
-                .to_string()
-        })?;
-    let config: Value = serde_json::from_str(&out)
-        .map_err(|_| "Use a Tailscale client that reports Serve configuration as JSON.")?;
-    if (!config.is_object() && !config.is_null())
-        || ["TCP", "Web", "AllowFunnel", "Foreground"]
-            .into_iter()
-            .any(|key| {
-                let value = &config[key];
-                !value.is_object() && !value.is_null()
-            })
-    {
-        return Err("Use a Tailscale client that reports Serve configuration as JSON.".into());
+        .map_err(|_| TAILSCALE_CONNECT_ERROR)?;
+    let conn = tokio::spawn(connection);
+    let result = async {
+        let response = sender
+            .send_request(request)
+            .await
+            .map_err(|_| TAILSCALE_CONNECT_ERROR)?;
+        let (head, body) = response.into_parts();
+        let bytes = Limited::new(body, 1024 * 1024)
+            .collect()
+            .await
+            .map_err(|_| "Could not read the bounded Tailscale LocalAPI response.")?
+            .to_bytes();
+        Ok((head.status, head.headers, bytes))
     }
-    Ok(config)
+    .await;
+    conn.abort();
+    result.map_err(str::to_owned)
+}
+
+impl TailscaleApi {
+    async fn open() -> Result<Self, String> {
+        #[cfg(unix)]
+        {
+            if let Some(socket) = std::env::var_os("TAILSCALE_SOCKET") {
+                return Ok(Self::Socket(PathBuf::from(socket)));
+            }
+            let socket = if cfg!(target_os = "macos") {
+                "/var/run/tailscaled.socket"
+            } else {
+                "/var/run/tailscale/tailscaled.sock"
+            };
+            if Path::new(socket).exists() {
+                return Ok(Self::Socket(PathBuf::from(socket)));
+            }
+        }
+        #[cfg(target_os = "macos")]
+        return Self::open_macos_app().await;
+        #[cfg(windows)]
+        return Ok(Self::Pipe);
+        #[cfg(not(any(target_os = "macos", windows)))]
+        Err(TAILSCALE_CONNECT_ERROR.into())
+    }
+
+    // Sandboxed Tailscale for macOS exports a documented, loopback-only LocalAPI credential
+    // via its CLI. Keep it in memory and never report provider output or the Authorization header.
+    #[cfg(target_os = "macos")]
+    async fn open_macos_app() -> Result<Self, String> {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let bin = std::env::var_os("TAILSCALE_BIN")
+            .map(PathBuf::from)
+            .or_else(|| find_in_path("tailscale"))
+            .ok_or(TAILSCALE_CONNECT_ERROR)?;
+        let raw = run_tool(&bin, &["debug", "local-creds"])
+            .await
+            .map_err(|_| TAILSCALE_CONNECT_ERROR)?;
+        let mut words = raw.split_whitespace();
+        let (Some("curl"), Some(arg), Some(url), None) =
+            (words.next(), words.next(), words.next(), words.next())
+        else {
+            return Err(TAILSCALE_CONNECT_ERROR.into());
+        };
+        let token = arg
+            .strip_prefix("-u:")
+            .filter(|token| !token.is_empty())
+            .ok_or(TAILSCALE_CONNECT_ERROR)?;
+        let port = url
+            .strip_prefix("http://localhost:")
+            .and_then(|rest| rest.strip_suffix("/localapi/v0/status"))
+            .and_then(|port| port.parse::<u16>().ok())
+            .filter(|port| *port != 0)
+            .ok_or(TAILSCALE_CONNECT_ERROR)?;
+        let mut authorization = header::HeaderValue::from_str(&format!(
+            "Basic {}",
+            STANDARD.encode(format!(":{token}"))
+        ))
+        .map_err(|_| TAILSCALE_CONNECT_ERROR)?;
+        authorization.set_sensitive(true);
+        Ok(Self::App {
+            port,
+            authorization,
+        })
+    }
+
+    async fn request(
+        &self,
+        path: &str,
+        mutation: Option<(&header::HeaderValue, &Value)>,
+    ) -> Result<(StatusCode, hyper::HeaderMap, Bytes), String> {
+        let mut request = Request::builder()
+            .uri(path)
+            .header(header::HOST, "local-tailscaled.sock");
+        let body = if let Some((etag, payload)) = mutation {
+            request = request
+                .method(Method::POST)
+                .header(header::IF_MATCH, etag)
+                .header(header::CONTENT_TYPE, "application/json");
+            Bytes::from(serde_json::to_vec(payload).expect("JSON route config"))
+        } else {
+            Bytes::new()
+        };
+        #[cfg(target_os = "macos")]
+        if let Self::App { authorization, .. } = self {
+            request = request.header(header::AUTHORIZATION, authorization);
+        }
+        let request = request.body(Full::new(body)).expect("LocalAPI request");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            match self {
+                #[cfg(unix)]
+                Self::Socket(socket) => {
+                    let stream = tokio::net::UnixStream::connect(socket)
+                        .await
+                        .map_err(|_| TAILSCALE_CONNECT_ERROR)?;
+                    local_api_request(stream, request).await
+                }
+                #[cfg(windows)]
+                Self::Pipe => {
+                    let stream = tokio::net::windows::named_pipe::ClientOptions::new()
+                        .open(r"\\.\pipe\ProtectedPrefix\Administrators\Tailscale\tailscaled")
+                        .map_err(|_| TAILSCALE_CONNECT_ERROR)?;
+                    local_api_request(stream, request).await
+                }
+                #[cfg(target_os = "macos")]
+                Self::App { port, .. } => {
+                    let stream = tokio::net::TcpStream::connect(("127.0.0.1", *port))
+                        .await
+                        .map_err(|_| TAILSCALE_CONNECT_ERROR)?;
+                    local_api_request(stream, request).await
+                }
+            }
+        })
+        .await
+        .map_err(|_| TAILSCALE_CONNECT_ERROR.to_owned())?
+    }
+
+    async fn status(&self) -> Result<Value, String> {
+        let (status, _, bytes) = self
+            .request("/localapi/v0/status?peers=false", None)
+            .await?;
+        if status != StatusCode::OK {
+            return Err(TAILSCALE_CONNECT_ERROR.into());
+        }
+        serde_json::from_slice(&bytes).map_err(|_| TAILSCALE_CONNECT_ERROR.into())
+    }
+
+    async fn snapshot(&self) -> Result<ServeSnapshot, String> {
+        let (status, headers, bytes) = self.request(TAILSCALE_CONFIG_PATH, None).await?;
+        if status != StatusCode::OK {
+            return Err(TAILSCALE_CONNECT_ERROR.into());
+        }
+        // A write without a version would let a concurrent operator's Serve route turn public.
+        let etag = headers
+            .get(header::ETAG)
+            .filter(|tag| !tag.is_empty() && tag.as_bytes() != b"*")
+            .cloned()
+            .ok_or("Update Tailscale to a version that provides versioned Serve configuration.")?;
+        let config: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| "Use a Tailscale client that reports Serve configuration as JSON.")?;
+        if (!config.is_object() && !config.is_null())
+            || ["TCP", "Web", "AllowFunnel", "Foreground"]
+                .into_iter()
+                .any(|key| {
+                    let value = &config[key];
+                    !value.is_object() && !value.is_null()
+                })
+        {
+            return Err("Use a Tailscale client that reports Serve configuration as JSON.".into());
+        }
+        Ok(ServeSnapshot { config, etag })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +370,7 @@ fn slot(config: &Value, dns: &str, port: u16, target: &Target) -> Slot {
     });
     if !only_route_at_endpoint
         || config["TCP"][&port_key]["HTTPS"].as_bool() != Some(true)
+        || !config["TCP"][&port_key]["TCPForward"].is_null()
         || config["AllowFunnel"][&endpoint].as_bool() != Some(true)
     {
         return Slot::Occupied;
@@ -196,8 +378,10 @@ fn slot(config: &Value, dns: &str, port: u16, target: &Target) -> Slot {
     let handler = config["Web"][&endpoint]["Handlers"]
         .as_object()
         .filter(|handlers| handlers.len() == 1)
-        .and_then(|handlers| handlers.get(&target.path));
-    match handler.and_then(|handler| handler["Proxy"].as_str()) {
+        .and_then(|handlers| handlers.get(&target.path))
+        .and_then(Value::as_object)
+        .filter(|handler| handler.len() == 1);
+    match handler.and_then(|handler| handler.get("Proxy").and_then(Value::as_str)) {
         Some(proxy) if proxy == target.url => Slot::Reuse,
         // The old SDK mounted this same path but forwarded it to the listener's root.
         Some(proxy) if proxy.trim_end_matches('/') == format!("http://{}", target.authority) => {
@@ -208,7 +392,8 @@ fn slot(config: &Value, dns: &str, port: u16, target: &Target) -> Slot {
 }
 
 struct Funnel {
-    bin: PathBuf,
+    api: TailscaleApi,
+    snapshot: ServeSnapshot,
     dns: String,
     port: u16,
     previous: Slot,
@@ -226,15 +411,8 @@ impl Funnel {
 }
 
 async fn discover_funnel(target: &Target, preferred_port: Option<u16>) -> Result<Funnel, String> {
-    let bin = std::env::var_os("TAILSCALE_BIN")
-        .map(PathBuf::from)
-        .or_else(|| find_in_path("tailscale"))
-        .ok_or("Install Tailscale on the webhook host.")?;
-    let status = run_tool(&bin, &["status", "--json"])
-        .await
-        .map_err(|_| "Start Tailscale and sign the webhook host into its tailnet.".to_string())?;
-    let status: Value = serde_json::from_str(&status)
-        .map_err(|_| "Update the Tailscale client on the webhook host.")?;
+    let api = TailscaleApi::open().await?;
+    let status = api.status().await?;
     if status["BackendState"] != "Running" {
         return Err("Start Tailscale and sign the webhook host into its tailnet.".into());
     }
@@ -290,21 +468,23 @@ async fn discover_funnel(target: &Target, preferred_port: Option<u16>) -> Result
             "Allow an eligible Funnel HTTPS port for this node in the tailnet policy.".into(),
         );
     }
-    let config = tailscale_config(&bin).await?;
+    let snapshot = api.snapshot().await?;
+    let config = &snapshot.config;
     let (port, previous) = ports
         .iter()
         .copied()
-        .map(|port| (port, slot(&config, dns, port, target)))
+        .map(|port| (port, slot(config, dns, port, target)))
         .find(|(_, slot)| matches!(slot, Slot::Reuse | Slot::Legacy))
         .or_else(|| {
             ports
                 .into_iter()
-                .find(|port| slot(&config, dns, *port, target) == Slot::Empty)
+                .find(|port| slot(config, dns, *port, target) == Slot::Empty)
                 .map(|port| (port, Slot::Empty))
         })
         .ok_or("Free a dedicated Funnel HTTPS port or choose another public callback provider.")?;
     Ok(Funnel {
-        bin,
+        api,
+        snapshot,
         dns: dns.to_owned(),
         port,
         previous,
@@ -336,36 +516,30 @@ async fn check_receiver(target: &Target) -> Result<(), String> {
 
 async fn configure_funnel(funnel: &Funnel, target: &Target) -> Result<bool, String> {
     check_receiver(target).await?;
-    let config = tailscale_config(&funnel.bin).await?;
-    match slot(&config, &funnel.dns, funnel.port, target) {
-        Slot::Reuse => return Ok(true),
-        previous
-            if previous == funnel.previous && matches!(previous, Slot::Empty | Slot::Legacy) => {}
+    if funnel.previous == Slot::Reuse {
+        return Ok(true);
+    }
+    let endpoint = format!("{}:{}", funnel.dns, funnel.port);
+    let mut config = funnel.snapshot.config.clone();
+    config["TCP"][funnel.port.to_string()] = json!({"HTTPS": true});
+    config["Web"][&endpoint]["Handlers"][&target.path] = json!({"Proxy": target.url});
+    config["AllowFunnel"][&endpoint] = json!(true);
+    let (status, _, _) = funnel
+        .api
+        .request(
+            TAILSCALE_CONFIG_PATH,
+            Some((&funnel.snapshot.etag, &config)),
+        )
+        .await?;
+    match status {
+        StatusCode::OK => Ok(false),
+        StatusCode::PRECONDITION_FAILED => {
+            Err("Tailscale routing changed. Rerun discovery to check the available ports.".into())
+        }
         _ => {
-            return Err(
-                "Tailscale routing changed. Rerun discovery to select an unused port.".into(),
-            );
+            Err("Run as the Tailscale operator authorized to configure Funnel on this host.".into())
         }
     }
-    run_tool(
-        &funnel.bin,
-        &[
-            "funnel",
-            "--bg",
-            &format!("--https={}", funnel.port),
-            &format!("--set-path={}", target.path),
-            &target.url,
-        ],
-    )
-    .await
-    .map_err(|_| {
-        "Run as the Tailscale operator authorized to configure Funnel on this host.".to_string()
-    })?;
-    let config = tailscale_config(&funnel.bin).await?;
-    if slot(&config, &funnel.dns, funnel.port, target) != Slot::Reuse {
-        return Err("Inspect `tailscale serve status --json`; the expected isolated Funnel route was not verified.".into());
-    }
-    Ok(false)
 }
 
 async fn check_cloudflare(
