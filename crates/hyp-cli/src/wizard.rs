@@ -444,16 +444,16 @@ impl ManualGuideHarness {
     }
 
     /// Optional MCP config hint & snippet (used for Claude Desktop & Codex Desktop).
-    pub fn mcp_config_note(self, home: &Path) -> Option<(PathBuf, &'static str)> {
+    pub fn mcp_config_note(self, home: &Path, cli_bin: &str) -> Option<(PathBuf, String)> {
         match self {
             Self::ClaudeDesktop => {
                 let path = claude_desktop_config_path(home);
                 let snippet = r#"{ "mcpServers": { "hyphae": { "command": "hyp", "args": ["mcp", "--backend", "claude", "--ephemeral"] } } }"#;
-                Some((path, snippet))
+                Some((path, snippet.to_owned()))
             }
             Self::CodexDesktop => {
                 let path = codex_mcp_config_path(home);
-                let snippet = "[mcp_servers.hyphae]\ncommand = \"hyp\"\nargs = [\"mcp\"]";
+                let snippet = CodexMcpConfig::read(&path, cli_bin, None).ok()?.block;
                 Some((path, snippet))
             }
             _ => None,
@@ -4936,9 +4936,11 @@ fn install_manual_guide_skills(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_manual_guide_plain(
     harness: ManualGuideHarness,
     home: &Path,
+    cli_bin: &str,
     primary_skill: &Path,
     installed: &[InstalledSkillEntry],
     prompt: &str,
@@ -4966,7 +4968,7 @@ fn print_manual_guide_plain(
             );
         }
         DesktopMcpStatus::Skipped | DesktopMcpStatus::NotApplicable => {
-            if let Some((cfg_path, snippet)) = harness.mcp_config_note(home) {
+            if let Some((cfg_path, snippet)) = harness.mcp_config_note(home, cli_bin) {
                 println!();
                 println!("MCP config ({}):", cfg_path.display());
                 for line in snippet.lines() {
@@ -5031,7 +5033,7 @@ fn install_and_emit_manual_guide(
         Some(_) => DesktopMcpStatus::Skipped,
         None => DesktopMcpStatus::NotApplicable,
     };
-    let mcp_note = harness.mcp_config_note(home);
+    let mcp_note = harness.mcp_config_note(home, cli_bin);
     let mut steps = vec![harness.open_instruction()];
     if !matches!(mcp_status, DesktopMcpStatus::AlreadyConfigured(_)) {
         if let Some((ref cfg_path, _)) = mcp_note {
@@ -5092,6 +5094,7 @@ fn install_and_emit_manual_guide(
     print_manual_guide_plain(
         harness,
         home,
+        cli_bin,
         &primary_skill,
         &installed,
         &prompt,
@@ -6012,6 +6015,7 @@ fn render_desktop_mcp_confirm_screen(
 pub fn render_manual_guide(
     harness: ManualGuideHarness,
     home: &Path,
+    cli_bin: &str,
     primary_skill: &Path,
     installed: &[InstalledSkillEntry],
     prompt: &str,
@@ -6154,7 +6158,7 @@ pub fn render_manual_guide(
         mcp_status,
         DesktopMcpStatus::Skipped | DesktopMcpStatus::NotApplicable
     ) {
-        if let Some((cfg_path, snippet)) = harness.mcp_config_note(home) {
+        if let Some((cfg_path, snippet)) = harness.mcp_config_note(home, cli_bin) {
             lines.push(card_row("", RGB_UI_MUTED, false));
             let cfg_hdr = format!("MCP config ({}):", display_compact_path(&cfg_path, home));
             for wrapped in wrap_words(&cfg_hdr, inner_card_w) {
@@ -6249,6 +6253,7 @@ pub fn render_manual_guide(
 fn render_manual_guide_screen(
     harness: ManualGuideHarness,
     home: &Path,
+    cli_bin: &str,
     primary_skill: &Path,
     installed: &[InstalledSkillEntry],
     prompt: &str,
@@ -6264,6 +6269,7 @@ fn render_manual_guide_screen(
     let lines = render_manual_guide(
         harness,
         home,
+        cli_bin,
         primary_skill,
         installed,
         prompt,
@@ -8058,6 +8064,7 @@ fn run_fullscreen_tui_loop(
                 render_manual_guide_screen(
                     *harness,
                     home,
+                    cli_bin,
                     primary_skill,
                     installed,
                     prompt,
@@ -8566,6 +8573,7 @@ fn execute_tui_resolution(
             print_manual_guide_plain(
                 harness,
                 home,
+                cli_bin,
                 &primary_skill,
                 &installed,
                 &prompt,
@@ -8820,6 +8828,7 @@ fn run_plain_tty_manual_guide(
     print_manual_guide_plain(
         harness,
         home,
+        cli_bin,
         &primary_skill,
         &installed,
         &prompt,
@@ -10672,6 +10681,7 @@ command = "other"
         let guide_lines = render_manual_guide(
             ManualGuideHarness::ClaudeDesktop,
             &home,
+            "/opt/hyp",
             &ManualGuideHarness::ClaudeDesktop.primary_skill_path(&home),
             &[],
             "Set up Hyphae on this machine using the hyphae-setup skill",
