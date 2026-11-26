@@ -380,6 +380,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
     let mut startup_warnings: Vec<String> = Vec::new();
     let mut github_public_cfg: Option<GitHubPublicConfig> = None;
     let mut webhook_sources = ParsedWebhookSources::default();
+    let mut enable_kv = None;
     let mut delivery_retry_cfg = DeliveryRetryConfig::default();
     let mut wake_recovery_cfg = WakeRecoveryConfig::default();
     let mut midturn_queue_digest_seconds = hyp_node::delivery::DEFAULT_MIDTURN_QUEUE_DIGEST_SECONDS;
@@ -404,6 +405,20 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                 None,
             );
         }
+
+        enable_kv = match crate::config_file::kv_tool_override(cfg.raw.get("kv")) {
+            Ok(enable_kv) => enable_kv,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "CONFIG_ERROR",
+                    format!("Invalid KV tool setting in {}: {e}", cfg.path.display()),
+                    None,
+                );
+            }
+        };
 
         // Parse optional `kvNamespaces[]` (simple strings or structured objects) into
         // `NodeConfig.kv_namespaces` so `/v1/manifest` and `LocalDaemon::has_kv_capability()`
@@ -1012,6 +1027,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             let local_cfg = LocalDaemonConfig {
                 socket_path: explicit_socket,
                 auto_detect_transports: true,
+                enable_kv,
                 delivery_retry: delivery_retry_cfg,
                 wake_recovery: wake_recovery_cfg.clone(),
                 midturn_queue_digest_seconds,

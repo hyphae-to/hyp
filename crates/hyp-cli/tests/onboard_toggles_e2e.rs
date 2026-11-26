@@ -7,10 +7,12 @@
 
 mod common;
 
-use common::{isolated_cmd, parse_json_stdout};
+use common::{ManagedProcess, McpSubprocess, isolated_cmd, parse_json_stdout};
 use serde_json::{Value, json};
 use std::fs;
+use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
 #[test]
 fn setup_claude_no_skills_and_no_commands_writes_only_mcp_and_hooks() {
@@ -680,4 +682,97 @@ fn setup_openclaw_installs_plugin_persists_delivery_and_prompt_injection_and_rej
         oc_cfg_rerun["plugins"]["entries"]["hyphae"]["config"]["promptInjection"],
         true
     );
+}
+
+#[test]
+fn onboard_kv_choice_controls_mcp_tools_and_runtime_skill() {
+    const TIMEOUT: Duration = Duration::from_secs(10);
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let state_dir = tmp.path().join("s");
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    let node_config = state_dir.join("node.json");
+    let runtime_skill = home.join(".claude/skills/hyphae/SKILL.md");
+
+    let onboard = |flags: &[&str]| {
+        let out = isolated_cmd(&home)
+            .args([
+                "onboard",
+                "--yes",
+                "--no-start",
+                "--node-id",
+                "test-kv",
+                "--harness",
+                "claude",
+                "--no-commands",
+                "--state-dir",
+                state_dir.to_str().unwrap(),
+                "--json",
+            ])
+            .args(flags)
+            .output()
+            .unwrap();
+        let response = parse_json_stdout(&out);
+        assert!(out.status.success(), "{response}");
+        serde_json::from_str::<Value>(&fs::read_to_string(&node_config).unwrap()).unwrap()
+    };
+
+    let assert_exposure = |expected| {
+        assert_eq!(
+            fs::read_to_string(&runtime_skill)
+                .unwrap()
+                .contains("`hyp_kv`"),
+            expected,
+        );
+        let mut cmd = isolated_cmd(&home);
+        cmd.args([
+            "daemon",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--json",
+        ]);
+        let mut daemon = ManagedProcess::spawn("KV exposure daemon", &mut cmd);
+        let startup = daemon.read_json_line(TIMEOUT);
+        assert_eq!(startup["ok"], true, "{startup}");
+        let socket = Path::new(startup["data"]["socketPath"].as_str().unwrap());
+        let mut mcp = McpSubprocess::spawn(&home, socket);
+        mcp.initialize(TIMEOUT);
+        let list = mcp.rpc(
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            TIMEOUT,
+        );
+        let tools = list["result"]["tools"].as_array().unwrap();
+        assert_eq!(
+            tools.iter().any(|tool| tool["name"] == "hyp_kv"),
+            expected,
+            "{list}"
+        );
+        assert_eq!(mcp.close(TIMEOUT), Some(0));
+        daemon.shutdown_gracefully();
+    };
+
+    assert_eq!(onboard(&[])["kv"], false);
+    assert_exposure(false);
+
+    assert_eq!(onboard(&["--kv"])["kv"], true);
+    assert_eq!(onboard(&[])["kv"], true);
+    assert_exposure(true);
+
+    let mut config = onboard(&[]);
+    config["kvNamespaces"] = json!(["shared"]);
+    config["kv"] = json!({ "enabled": true, "otherSetting": "preserved" });
+    fs::write(&node_config, serde_json::to_vec(&config).unwrap()).unwrap();
+    let disabled = onboard(&["--no-kv"]);
+    assert_eq!(
+        disabled["kv"],
+        json!({"enabled": false, "otherSetting": "preserved"})
+    );
+    assert_eq!(disabled["kvNamespaces"], json!(["shared"]));
+    assert_eq!(onboard(&[])["kv"], disabled["kv"]);
+    assert_exposure(false);
+
+    config.as_object_mut().unwrap().remove("kv");
+    fs::write(&node_config, serde_json::to_vec(&config).unwrap()).unwrap();
+    assert!(onboard(&[]).get("kv").is_none());
+    assert_exposure(true);
 }

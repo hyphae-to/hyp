@@ -8708,7 +8708,7 @@ fn execute_tui_resolution(
 // Cross-Platform Numbered Line Fallback (Windows & Non-Raw Terminals)
 // ============================================================================
 
-fn read_tty_line(prompt: &str) -> io::Result<Option<String>> {
+pub(crate) fn read_tty_line(prompt: &str) -> io::Result<Option<String>> {
     {
         let mut out = io::stdout().lock();
         out.write_all(prompt.as_bytes())?;
@@ -9219,6 +9219,8 @@ pub fn should_launch_interactive_wizard(args: &OnboardArgs, stdout_is_tty: bool)
         || args.install_mod
         || args.no_skills
         || args.no_commands
+        || args.kv
+        || args.no_kv
         || args.openclaw_delivery.is_some()
         || args.openclaw_prompt_injection
         || args.no_openclaw_prompt_injection

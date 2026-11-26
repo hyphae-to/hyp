@@ -38,16 +38,17 @@ hyp deploy providers --json
 hyp pair guide --json
 ```
 
-Ask 1–2 concise questions to pick:
+Ask these questions one at a time:
 1. **Topology**: Local solo multi-harness (`local`), Direct P2P collaborator (`p2p`, `hp2p1_`), Blind E2EE Team Hub (`router`, `am2_`), and/or read-only Public Node (`public.hyphae.to` or self-hosted via `hyp deploy init public-node`).
 2. **Harnesses**: `auto` (detected), `all`, or a comma-separated subset of `antigravity,claude,codex,cursor,opencode,gemini,openclaw,herdr,t3`.
-3. **Optional**: Internet deployment provider (`tailscale`, `vps`, `docker`, `cloudflare`, `fly`, `public-node`) and optional Local Security Gate classifier (`anthropic`, `openai-compat`, `google`, `lakera-guard`, `http-classifier`, `subprocess`).
+3. **Shared key-value tool**: Ask “Enable the shared key-value tool for agents?” Pass `--kv` for Yes or `--no-kv` for No (the default). If the node already exists, keep its current setting unless the user requests a change.
+4. **Optional**: Internet deployment provider (`tailscale`, `vps`, `docker`, `cloudflare`, `fly`, `public-node`) and optional Local Security Gate classifier (`anthropic`, `openai-compat`, `google`, `lakera-guard`, `http-classifier`, `subprocess`).
 
 ## 3. Bootstrap the Node & Configure Harnesses
 
 ```sh
-# Local workstation node + persistent Ed25519/X25519 keys + node.json + node.sqlite + detected harnesses
-hyp onboard --profile local --node-id alice@macbook --harness auto
+# Local workstation with detected harnesses after the user answers No to shared KV
+hyp onboard --yes --profile local --node-id alice@macbook --harness auto --no-kv
 
 # Or dry-run / explicitly configure specific harnesses
 hyp setup --harness claude,codex,antigravity --dry-run
@@ -56,6 +57,8 @@ hyp setup --harness claude,codex,antigravity
 # Start the unified Node + local IPC daemon (alias: hyp daemon)
 hyp node start
 ```
+
+Carry the selected KV flag into the initial onboarding command if pairing during bootstrap.
 
 ## 4. Pair Across Topologies (Stdin / `--token-file` Only — NEVER CLI Argv!)
 
