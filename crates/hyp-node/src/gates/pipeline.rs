@@ -18,11 +18,11 @@
 use std::sync::{Arc, Mutex};
 
 use hyp_crypto::SecretStore;
+use hyp_proto::jcs::sha256_hex;
 use hyp_store::{
     GateAuditEntry, GateAuditInput, GateAuditQuery, GateDecision as StoreGateDecision,
     GateDirection, GateState, MailboxEntry, MailboxInsert, MailboxPutResult, MuteRuleInput, NodeDb,
 };
-use sha2::{Digest, Sha256};
 
 use crate::delivery::{DeliveryUrgency, urgency_cap_gate_reason};
 use crate::gates::plugins::{FilterPlugin, build_filter_plugin};
@@ -1543,10 +1543,4 @@ impl SecurityGatePipeline {
             .map_err(|_| GateError::LockPoisoned("node_db mutex poisoned".to_string()))?;
         Ok(db.local().append_gate_audit(input, now_ms)?)
     }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
 }
