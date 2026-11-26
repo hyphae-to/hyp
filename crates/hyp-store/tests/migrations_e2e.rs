@@ -256,6 +256,14 @@ fn create_seeded_v1_db(path: &Path, enable_wal: bool) {
     )
     .unwrap();
 
+    conn.execute(
+        "INSERT INTO directory_checkpoints
+        (authority_id, version, root_hash, signed_json, issued_at, recorded_at)
+        VALUES ('issuer', 1, 'root-hash', '{}', ?1, ?1)",
+        params![T0],
+    )
+    .unwrap();
+
     // Seed events, subscriptions, batches, batch_events
     conn.execute(
         "INSERT INTO events (origin_node, topic, publisher, source, event_id, digest, body, bytes, matched, received_at)
@@ -313,7 +321,7 @@ fn create_seeded_v1_db(path: &Path, enable_wal: bool) {
 
 #[test]
 fn registry_invariants_and_invalid_registry_rejection() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, 11);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 12);
     assert_eq!(MIGRATIONS.len() as i64, CURRENT_SCHEMA_VERSION);
     let mut names = HashSet::new();
     for (idx, m) in MIGRATIONS.iter().enumerate() {
@@ -382,6 +390,10 @@ fn differential_schema_and_data_parity_v1_migrated_equals_fresh_v2() {
         migrated_schema, fresh_schema,
         "migrated v1->v2 schema must match fresh v2 schema bit-for-bit"
     );
+
+    for table in ["publishers", "publisher_grants", "directory_checkpoints"] {
+        assert!(!migrated_schema.table_sql.contains_key(table));
+    }
 
     // 2. Version & applied_migrations metadata.
     assert_eq!(migrated.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
@@ -516,6 +528,22 @@ fn differential_schema_and_data_parity_v1_migrated_equals_fresh_v2() {
         .unwrap();
     assert_eq!(bak_ver, 1);
     let bak_schema = snapshot_canonical_schema(&bak_conn);
+    let legacy_topic: String = bak_conn
+        .query_row(
+            "SELECT topic FROM publisher_grants WHERE publisher_id = 'gh-pub'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_topic, "github");
+    let legacy_root_hash: String = bak_conn
+        .query_row(
+            "SELECT root_hash FROM directory_checkpoints WHERE authority_id = 'issuer'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_root_hash, "root-hash");
     assert!(!bak_schema.table_sql.contains_key("peer_routes"));
     assert!(!bak_schema.table_sql.contains_key("wakeups"));
     assert!(!bak_schema.table_sql.contains_key("human_authorities"));
@@ -645,9 +673,15 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
     assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     let next_ver = CURRENT_SCHEMA_VERSION + 1;
 
-    // Seed a publisher + publisher_grants row (FK child -> parent).
-    db.events()
-        .add_publisher("pub-1", "tok-secret-1", &["github"], T0)
+    db.connection()
+        .execute_batch(
+            "CREATE TABLE migration_parent (id TEXT PRIMARY KEY);
+             CREATE TABLE migration_child (
+                parent_id TEXT NOT NULL REFERENCES migration_parent(id)
+             );
+             INSERT INTO migration_parent (id) VALUES ('parent');
+             INSERT INTO migration_child (parent_id) VALUES ('parent');",
+        )
         .unwrap();
 
     // 1. Failing SQL next-version migration must roll back partial DDL atomically.
@@ -711,9 +745,7 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
         version: next_ver,
         name: "0006_fk_orphan",
         disable_foreign_keys: true,
-        kind: MigrationKind::Sql(
-            "INSERT INTO publisher_grants (publisher_id, topic) VALUES ('ghost-pub', 'alerts');",
-        ),
+        kind: MigrationKind::Sql("INSERT INTO migration_child (parent_id) VALUES ('orphan');"),
     });
     let err =
         run_migrations_with(db.connection(), Some(&db_path), &fk_violation_migrations).unwrap_err();
@@ -725,7 +757,7 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
     let orphan_count: i64 = db
         .connection()
         .query_row(
-            "SELECT COUNT(*) FROM publisher_grants WHERE publisher_id = 'ghost-pub'",
+            "SELECT COUNT(*) FROM migration_child WHERE parent_id = 'orphan'",
             [],
             |r| r.get(0),
         )
@@ -744,20 +776,17 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
     let mut fk_rebuild_ok = MIGRATIONS.to_vec();
     fk_rebuild_ok.push(Migration {
         version: next_ver,
-        name: "0006_rebuild_publishers_ok",
+        name: "valid_parent_rebuild",
         disable_foreign_keys: true,
         kind: MigrationKind::Sql(
-            "CREATE TABLE publishers_new (
+            "CREATE TABLE migration_parent_new (
                 id TEXT PRIMARY KEY,
-                token_hash TEXT NOT NULL UNIQUE,
-                created_at INTEGER NOT NULL,
-                revoked_at INTEGER,
                 note TEXT
              );
-             INSERT INTO publishers_new (id, token_hash, created_at, revoked_at, note)
-             SELECT id, token_hash, created_at, revoked_at, 'migrated' FROM publishers;
-             DROP TABLE publishers;
-             ALTER TABLE publishers_new RENAME TO publishers;",
+             INSERT INTO migration_parent_new (id, note)
+             SELECT id, 'migrated' FROM migration_parent;
+             DROP TABLE migration_parent;
+             ALTER TABLE migration_parent_new RENAME TO migration_parent;",
         ),
     });
     run_migrations_with(db.connection(), Some(&db_path), &fk_rebuild_ok).unwrap();
@@ -769,9 +798,11 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
     assert_eq!(fk_enabled_after, 1);
     let note: String = db
         .connection()
-        .query_row("SELECT note FROM publishers WHERE id = 'pub-1'", [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT note FROM migration_parent WHERE id = 'parent'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(note, "migrated");
 }

@@ -803,7 +803,7 @@ fn enc_jwk_lifecycle_preferred_lookup_and_revocation_guard() {
 
 #[test]
 fn full_v1_v2_v3_v4_to_v5_migration_parity_backups_and_zero_data_loss() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, 11);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 12);
     let dir = TempDir::new().unwrap();
 
     let v1_path = dir.path().join("from-v1").join("node.sqlite");

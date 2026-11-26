@@ -169,7 +169,6 @@ pub enum CapabilityToken {
     P2pDirectV1,
     P2pRelayV1,
     KeysPrekeyV1,
-    DirectoryCheckpointV1,
     HumanAuthV1,
     DropRelayV1,
     Other(String),
@@ -198,7 +197,6 @@ impl CapabilityToken {
             Self::P2pDirectV1 => "p2p.direct.v1",
             Self::P2pRelayV1 => "p2p.relay.v1",
             Self::KeysPrekeyV1 => "keys.prekey.v1",
-            Self::DirectoryCheckpointV1 => "directory.checkpoint.v1",
             Self::HumanAuthV1 => "human.auth.v1",
             Self::DropRelayV1 => "drop.relay.v1",
             Self::Other(s) => s.as_str(),
@@ -227,7 +225,6 @@ impl CapabilityToken {
             "p2p.direct.v1" => Self::P2pDirectV1,
             "p2p.relay.v1" => Self::P2pRelayV1,
             "keys.prekey.v1" => Self::KeysPrekeyV1,
-            "directory.checkpoint.v1" => Self::DirectoryCheckpointV1,
             "human.auth.v1" => Self::HumanAuthV1,
             "drop.relay.v1" => Self::DropRelayV1,
             other => {

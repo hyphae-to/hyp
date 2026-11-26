@@ -27,8 +27,8 @@ pub use db::{
 pub use error::{StoreError, StoreResult};
 pub use events::{
     BatchRecord, BatchState, DueBatch, EventCacheStats, EventLimits, EventStore, EventTickReport,
-    IngestResult, Publisher, SUBSCRIPTION_META_PREFIX, StoredTopicStats, Subscription,
-    SubscriptionMeta, SubscriptionSpec, UpstreamPushdown, UpstreamPushdownInput,
+    IngestResult, SUBSCRIPTION_META_PREFIX, StoredTopicStats, Subscription, SubscriptionMeta,
+    SubscriptionSpec, UpstreamPushdown, UpstreamPushdownInput,
 };
 pub use human::{
     GateLockSealRecord, HUMAN_MIN_AUTH_EPOCH_META_KEY, HumanAuthorityInput, HumanAuthorityRecord,
@@ -52,9 +52,8 @@ pub use messages::{
     PostChannelResult, sanitize_handle_description,
 };
 pub use peers::{
-    DirectoryCheckpoint, DirectoryCheckpointInput, GrantInput, GrantRecord, ManifestCacheUpdate,
-    PeerInput, PeerKeyInput, PeerKeyRecord, PeerRecord, PeerRoute, PeerStore, RevocationInput,
-    RevocationRecord,
+    GrantInput, GrantRecord, ManifestCacheUpdate, PeerInput, PeerKeyInput, PeerKeyRecord,
+    PeerRecord, PeerRoute, PeerStore, RevocationInput, RevocationRecord,
 };
 pub use scheduler::{DeadlineBreakdown, TickReport};
 pub use transfers::{

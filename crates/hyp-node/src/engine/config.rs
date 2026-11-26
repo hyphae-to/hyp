@@ -1124,17 +1124,6 @@ fn store_error_to_problem(err: &StoreError) -> ProblemDetails {
                 .collect();
             ProblemDetails::capability_downgrade_detected(peer_id, &tokens)
         }
-        StoreError::CheckpointRollback {
-            authority_id,
-            expected_min,
-            received,
-        } => ProblemDetails::new(
-            "checkpoint_rollback",
-            "checkpoint-rollback",
-            "Directory Checkpoint Rollback",
-            409,
-            format!("Authority '{authority_id}' presented checkpoint {received} < {expected_min}."),
-        ),
         StoreError::EpochConflict { scope, message } => ProblemDetails::new(
             "epoch_conflict",
             "epoch-conflict",

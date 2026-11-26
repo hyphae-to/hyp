@@ -28,7 +28,7 @@ import test from "node:test";
 import { HypCli } from "../lib/hyp-cli.ts";
 import { REPO_ROOT, withSandbox } from "../lib/sandbox.ts";
 
-const CURRENT_SCHEMA_VERSION = 11;
+const CURRENT_SCHEMA_VERSION = 12;
 const MIGRATIONS_DIR = path.join(REPO_ROOT, "crates", "hyp-store", "migrations");
 
 const MIGRATION_FILES: Array<{ version: number; file: string }> = [

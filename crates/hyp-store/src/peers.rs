@@ -1,5 +1,5 @@
 //! Federation, pairing, keys & manifest trust store (`peers`, `grants`, `revocations`,
-//! `peer_keys`, `directory_checkpoints`) with strict monotonic `manifest_version` anti-rollback,
+//! `peer_keys`) with strict monotonic `manifest_version` anti-rollback,
 //! E2EE capability anti-downgrade ratcheting, single-use pairing grant claims, and directory
 //! checkpoint anti-rollback protection.
 
@@ -133,27 +133,6 @@ pub struct PeerKeyRecord {
     pub status: KeyStatus,
     pub registered_at: i64,
     pub expires_at: Option<i64>,
-}
-
-/// Input to record an admin-signed directory anti-rollback checkpoint.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DirectoryCheckpointInput {
-    pub authority_id: String,
-    pub version: i64,
-    pub root_hash: String,
-    pub signed_json: String,
-    pub issued_at: i64,
-}
-
-/// Persisted directory checkpoint record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DirectoryCheckpoint {
-    pub authority_id: String,
-    pub version: i64,
-    pub root_hash: String,
-    pub signed_json: String,
-    pub issued_at: i64,
-    pub recorded_at: i64,
 }
 
 /// Persisted multi-hub route directing traffic for `target_node` through `via_peer`.
@@ -1143,110 +1122,6 @@ impl<'a> PeerStore<'a> {
         Ok(changed > 0)
     }
 
-    // ---- Directory Checkpoints (Anti-Rollback) ----
-
-    /// Records an admin-signed directory checkpoint with strict monotonic `version` anti-rollback
-    /// and equivocation detection (`root_hash` mismatch at an existing version).
-    pub fn record_checkpoint(
-        &self,
-        input: &DirectoryCheckpointInput,
-        now_ms: i64,
-    ) -> StoreResult<DirectoryCheckpoint> {
-        if input.authority_id.is_empty() || input.root_hash.is_empty() {
-            return Err(StoreError::InvalidInput(
-                "authority_id and root_hash must be non-empty".to_string(),
-            ));
-        }
-        if input.version <= 0 {
-            return Err(StoreError::InvalidInput(
-                "checkpoint version must be positive".to_string(),
-            ));
-        }
-
-        let tx = self.db.immediate_tx()?;
-        let latest: Option<DirectoryCheckpoint> = tx
-            .conn()
-            .query_row(
-                "SELECT * FROM directory_checkpoints
-                 WHERE authority_id = ?1
-                 ORDER BY version DESC LIMIT 1",
-                params![&input.authority_id],
-                decode_checkpoint_row,
-            )
-            .optional()?;
-
-        if let Some(prev) = latest {
-            if input.version < prev.version {
-                return Err(StoreError::CheckpointRollback {
-                    authority_id: input.authority_id.clone(),
-                    expected_min: prev.version,
-                    received: input.version,
-                });
-            }
-            if input.version == prev.version {
-                if prev.root_hash == input.root_hash && prev.signed_json == input.signed_json {
-                    tx.commit()?;
-                    return Ok(prev);
-                }
-                return Err(StoreError::CheckpointRollback {
-                    authority_id: input.authority_id.clone(),
-                    expected_min: prev.version + 1,
-                    received: input.version,
-                });
-            }
-        }
-
-        tx.conn().execute(
-            "INSERT INTO directory_checkpoints
-             (authority_id, version, root_hash, signed_json, issued_at, recorded_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                &input.authority_id,
-                input.version,
-                &input.root_hash,
-                &input.signed_json,
-                input.issued_at,
-                now_ms
-            ],
-        )?;
-        let saved = tx.conn().query_row(
-            "SELECT * FROM directory_checkpoints WHERE authority_id = ?1 AND version = ?2",
-            params![&input.authority_id, input.version],
-            decode_checkpoint_row,
-        )?;
-        tx.commit()?;
-        Ok(saved)
-    }
-
-    pub fn latest_checkpoint(
-        &self,
-        authority_id: &str,
-    ) -> StoreResult<Option<DirectoryCheckpoint>> {
-        self.db
-            .conn()
-            .query_row(
-                "SELECT * FROM directory_checkpoints
-                 WHERE authority_id = ?1
-                 ORDER BY version DESC LIMIT 1",
-                params![authority_id],
-                decode_checkpoint_row,
-            )
-            .optional()
-            .map_err(Into::into)
-    }
-
-    pub fn list_checkpoints(&self, authority_id: &str) -> StoreResult<Vec<DirectoryCheckpoint>> {
-        let mut stmt = self.db.conn().prepare(
-            "SELECT * FROM directory_checkpoints
-             WHERE authority_id = ?1
-             ORDER BY version ASC",
-        )?;
-        let rows = stmt
-            .query_map(params![authority_id], decode_checkpoint_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
     // ---- Persisted Multi-Hub Peer Routes ----
 
     /// Persists or updates a multi-hub route directing `target_node` via `via_peer`.
@@ -1457,17 +1332,6 @@ fn decode_peer_key_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<
             expires_at,
         })
     })())
-}
-
-fn decode_checkpoint_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DirectoryCheckpoint> {
-    Ok(DirectoryCheckpoint {
-        authority_id: row.get("authority_id")?,
-        version: row.get("version")?,
-        root_hash: row.get("root_hash")?,
-        signed_json: row.get("signed_json")?,
-        issued_at: row.get("issued_at")?,
-        recorded_at: row.get("recorded_at")?,
-    })
 }
 
 fn decode_peer_route_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PeerRoute> {

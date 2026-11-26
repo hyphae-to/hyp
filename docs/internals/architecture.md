@@ -42,7 +42,7 @@ flowchart LR
 2. **Unified SQLite WAL Store (`crates/hyp-store`, schema v5):** Single `node.sqlite` (`rusqlite` bundled, WAL mode, atomic `BEGIN IMMEDIATE` migrations, exact `next_deadline_ms()` deadline scheduler):
    - **Bus:** `handles`, `events`, `subscriptions`, `batches`, `batch_events`, `upstream_pushdowns`, `channel_members`, `channel_epochs`, `transfers`
    - **Shared KV:** `kv_entries`, `kv_epochs` (owner/shared CAS/allowlist write models + optional `kv.e2ee.v1`)
-   - **Federation:** `peers`, `grants`, `revocations`, `peer_keys`, `directory_checkpoints` *(schema reserved for planned signed checkpoints)*
+   - **Federation:** `peers`, `grants`, `revocations`, `peer_keys`
    - **Local Runtime & Security:** `metadata`, `sessions`, `mailbox`, `muted_sources`, `plugin_targets`, `bridge_links`, immutable `gate_audit` (SQLite triggers)
    - **Human Authority:** `human_authorities` (with schema v5 `enc_jwk_json`), `human_nonces`, `human_node_certs`
 3. **Composable Adapters (`NodeAdapter` in `crates/hyp-node` & `crates/hyp-harness`):**
