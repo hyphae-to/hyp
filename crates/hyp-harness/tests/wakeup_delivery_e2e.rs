@@ -1828,10 +1828,6 @@ impl PushTransport for NudgeRecordingTransport {
         self.supports_interrupt
     }
 
-    fn is_nudge_only(&self) -> bool {
-        true
-    }
-
     fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
         let nudges = Arc::clone(&self.nudges);
         let msg = text.to_string();
@@ -1841,20 +1837,6 @@ impl PushTransport for NudgeRecordingTransport {
         })
     }
 
-    fn deliver_nudge<'a>(
-        &'a self,
-        message_count: usize,
-        handle: Option<&'a str>,
-        _batch_id: &'a str,
-        mode: PushMode,
-    ) -> TransportFuture<'a, PushOutcome> {
-        let nudges = Arc::clone(&self.nudges);
-        let msg = hyp_harness::transport::format_push_wake_nudge(message_count, handle, mode);
-        Box::pin(async move {
-            nudges.lock().unwrap().push((mode, msg));
-            PushOutcome::delivered()
-        })
-    }
 }
 
 #[tokio::test]

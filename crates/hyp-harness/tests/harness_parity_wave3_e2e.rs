@@ -391,7 +391,7 @@ async fn x2_openclaw_transport_delivers_metadata_nudge_enforces_auth_and_detache
         let parsed: Value = serde_json::from_str(&req.body).unwrap();
         assert_eq!(
             parsed["message"],
-            "<hyphae-inbox handle=\"claw\" unread=\"1\" urgency=\"queue\"/>"
+            "<hyphae-inbox unread=\"1\" urgency=\"queue\"/>"
         );
         assert_eq!(parsed["name"], "Hyphae");
         assert_eq!(parsed["agentId"], "coder-main");
@@ -411,7 +411,11 @@ async fn x2_openclaw_transport_delivers_metadata_nudge_enforces_auth_and_detache
     let wake_transport = OpenClawTransport::new(wake_target);
     assert_eq!(
         wake_transport
-            .deliver_nudge(3, Some("claw"), "batch-wake-1", PushMode::Queue)
+            .deliver_digest(
+                "<hyphae-inbox handle=\"claw\" unread=\"3\" urgency=\"queue\"/>",
+                "batch-wake-1",
+                PushMode::Queue,
+            )
             .await,
         PushOutcome::delivered()
     );

@@ -5029,7 +5029,7 @@ impl LocalDaemonInner {
                     }
 
                     let push_mode = if batch.max_urgency == DeliveryUrgency::Interrupt
-                        && (transport.supports_interrupt() || transport.is_nudge_only())
+                        && transport.supports_interrupt()
                     {
                         PushMode::Interrupt
                     } else {

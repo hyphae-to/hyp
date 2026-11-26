@@ -110,10 +110,6 @@ impl PushTransport for RecordingTransport {
         true
     }
 
-    fn is_nudge_only(&self) -> bool {
-        false
-    }
-
     fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
         let text = text.to_string();
         Box::pin(async move {
@@ -159,10 +155,6 @@ impl PushTransport for FlakyHoldTransport {
 
     fn supports_interrupt(&self) -> bool {
         true
-    }
-
-    fn is_nudge_only(&self) -> bool {
-        false
     }
 
     fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {

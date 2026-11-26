@@ -95,10 +95,6 @@ impl PushTransport for RecordingTransport {
         true
     }
 
-    fn is_nudge_only(&self) -> bool {
-        self.nudge_only
-    }
-
     fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
         let text = text.to_string();
         Box::pin(async move {
@@ -108,23 +104,6 @@ impl PushTransport for RecordingTransport {
         })
     }
 
-    fn deliver_nudge<'a>(
-        &'a self,
-        message_count: usize,
-        handle: Option<&'a str>,
-        batch_id: &'a str,
-        mode: PushMode,
-    ) -> TransportFuture<'a, PushOutcome> {
-        let rendered = format!(
-            "nudge:count={message_count}:handle={}:batch={batch_id}",
-            handle.unwrap_or("-")
-        );
-        Box::pin(async move {
-            self.delivered.lock().unwrap().push((rendered, mode));
-            self.notify.notify_waiters();
-            PushOutcome::delivered()
-        })
-    }
 }
 
 /// 1. Restart flush (zero new messages) + strict at-most-once delivery for BOTH inline and

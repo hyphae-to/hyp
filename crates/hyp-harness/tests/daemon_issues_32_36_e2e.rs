@@ -99,10 +99,6 @@ impl PushTransport for RecordingNudgeTransport {
         true
     }
 
-    fn is_nudge_only(&self) -> bool {
-        true
-    }
-
     fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
         let extract_attr = |attr: &str| -> Option<String> {
             let needle = format!("{attr}=\"");
@@ -125,24 +121,6 @@ impl PushTransport for RecordingNudgeTransport {
         })
     }
 
-    fn deliver_nudge<'a>(
-        &'a self,
-        message_count: usize,
-        handle: Option<&'a str>,
-        _batch_id: &'a str,
-        mode: PushMode,
-    ) -> TransportFuture<'a, PushOutcome> {
-        let rec = RecordedNudge {
-            count: message_count,
-            handle: handle.map(ToString::to_string),
-            mode,
-        };
-        Box::pin(async move {
-            self.nudges.lock().unwrap().push(rec);
-            self.notify.notify_waiters();
-            PushOutcome::delivered()
-        })
-    }
 }
 
 // ============================================================================
