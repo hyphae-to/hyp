@@ -37,7 +37,8 @@ pub use node::{
     UnifiedNode, p2p_offer_secret_name,
 };
 pub use peer_link::{
-    ChannelDirectoryEntry, ChannelJoinResponse, ChannelsResponse, GuestPairProofPayload,
+    AuthClaimReply, AuthClaimRequest, ChannelDirectoryEntry, ChannelJoinResponse,
+    ChannelsResponse, DelegatedPairReply, DelegatedPairRequest, GuestPairProofPayload,
     GuestPairReply, GuestPairRequest, HandlesResponse, ManifestFetchOutcome, P2pPairServerReply,
     PairServerReply, PeerAuth, PeerKeyDirectoryEntry, PeerKeysResponse, PeerLink,
     guest_pair_proof_canonical,

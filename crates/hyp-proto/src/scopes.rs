@@ -1373,6 +1373,172 @@ pub struct NotGrantedMcpError {
     pub remote_escalation_note: Option<UntrustedEscalationNote>,
 }
 
+/// Returns `true` if a raw scope token is forbidden in delegated human admission policies
+/// (`*`, `bridge:post`, or `forward:via`).
+pub fn is_forbidden_delegated_scope(raw: &str) -> bool {
+    let s = raw.trim();
+    s == "*"
+        || s == "bridge:post"
+        || s.starts_with("bridge:post=")
+        || s == "forward:via"
+        || s.starts_with("forward:via=")
+}
+
+/// Validates a list of concrete expanded Hyphae v2 scopes for delegated human admission
+/// (`HumanInviteV1` / `human_delegation_policies`) fail-closed:
+/// - Rejects empty lists.
+/// - Rejects literal `"*"`, `bridge:post`, and `forward:via` (both syntactically and post-parse).
+/// - Validates every concrete token via `parse_scope_v2` and deduplicates preserving order.
+pub fn validate_delegated_human_scopes<S: AsRef<str>>(
+    scopes: &[S],
+) -> Result<Vec<String>, ScopeError> {
+    if scopes.is_empty() {
+        return Err(ScopeError::EmptyScopes);
+    }
+    let mut out = Vec::with_capacity(scopes.len());
+    let mut seen = BTreeSet::new();
+    for item in scopes {
+        let s = item.as_ref();
+        if s != s.trim() || s.is_empty() {
+            return Err(ScopeError::InvalidScope {
+                scope: s.to_string(),
+                reason: "scope must be non-empty without surrounding whitespace".to_string(),
+            });
+        }
+        if is_forbidden_delegated_scope(s) {
+            return Err(ScopeError::InvalidScope {
+                scope: s.to_string(),
+                reason: "delegated human admission forbids '*', 'bridge:post', and 'forward:via'"
+                    .to_string(),
+            });
+        }
+        let parsed = parse_scope_v2(s)?;
+        if matches!(
+            parsed,
+            ParsedScopeV2::BridgePost { .. } | ParsedScopeV2::ForwardVia(_)
+        ) {
+            return Err(ScopeError::InvalidScope {
+                scope: s.to_string(),
+                reason: "delegated human admission forbids 'bridge:post' and 'forward:via'"
+                    .to_string(),
+            });
+        }
+        if seen.insert(s.to_string()) {
+            out.push(s.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Expands CLI/preset v2 scopes for delegated human admission while strictly rejecting literal `*`,
+/// `bridge:post`, and `forward:via` fail-closed.
+pub fn expand_delegated_human_scopes<S: AsRef<str>>(
+    input: &[S],
+) -> Result<Vec<String>, ScopeError> {
+    if input.is_empty() {
+        return Err(ScopeError::EmptyScopes);
+    }
+    for item in input {
+        let s = item.as_ref();
+        if is_forbidden_delegated_scope(s) {
+            return Err(ScopeError::InvalidScope {
+                scope: s.to_string(),
+                reason: "delegated human admission forbids '*', 'bridge:post', and 'forward:via'"
+                    .to_string(),
+            });
+        }
+    }
+    let expanded = expand_v2_scopes(input)?;
+    validate_delegated_human_scopes(&expanded)
+}
+
+/// Validates a delegated human `nodePrefix` glob pattern (e.g. `"philip@*"`, `"philip@dev-*"`,
+/// or an exact node ID `"philip@macbook"`).
+///
+/// Fail-closed invariants:
+/// - Rejects empty strings, lengths > 65, `".."`, `"/"`, whitespace, and control characters.
+/// - Rejects bare `"*"` unless `allow_wildcard_all == true`.
+/// - Allows at most one trailing `"*"` wildcard; interior wildcards are rejected.
+/// - Non-wildcard characters must match Hyphae node-ID syntax (`/^[a-z0-9][a-z0-9@._-]*$/`).
+pub fn validate_node_prefix_pattern(
+    pattern: &str,
+    allow_wildcard_all: bool,
+) -> Result<(), String> {
+    if pattern.is_empty() || pattern.len() > 65 {
+        return Err("nodePrefix must be 1..=65 characters".to_string());
+    }
+    if pattern.contains("..") || pattern.contains('/') {
+        return Err("nodePrefix must not contain '..' or '/'".to_string());
+    }
+    if pattern
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err("nodePrefix must not contain control or whitespace characters".to_string());
+    }
+    if pattern == "*" {
+        if allow_wildcard_all {
+            return Ok(());
+        }
+        return Err("bare '*' nodePrefix is forbidden (use '<humanId>@*' instead)".to_string());
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        if prefix.is_empty() || prefix.contains('*') {
+            return Err(
+                "nodePrefix wildcard '*' must appear only once at the end with a non-empty prefix"
+                    .to_string(),
+            );
+        }
+        let b = prefix.as_bytes();
+        if !(b[0].is_ascii_lowercase() || b[0].is_ascii_digit()) {
+            return Err("nodePrefix must start with [a-z0-9]".to_string());
+        }
+        if !b.iter().all(|&c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'@' | b'.' | b'_' | b'-')
+        }) {
+            return Err("nodePrefix contains disallowed characters".to_string());
+        }
+        if prefix == crate::address::LOCAL_NODE_ID {
+            return Err("nodePrefix cannot target reserved 'local'".to_string());
+        }
+        Ok(())
+    } else {
+        if pattern.contains('*') {
+            return Err("nodePrefix wildcard '*' is only allowed as a trailing glob".to_string());
+        }
+        if pattern == crate::address::LOCAL_NODE_ID || !is_valid_node_id(pattern) {
+            return Err(format!("nodePrefix '{pattern}' is not a valid nodeId"));
+        }
+        Ok(())
+    }
+}
+
+/// Checks whether a candidate `node_id` strictly satisfies a validated `node_prefix` pattern.
+///
+/// Fails closed on invalid `node_id`, reserved `"local"`, `".."`, `"/"`, control chars, or
+/// malformed `pattern`.
+pub fn matches_node_prefix(pattern: &str, node_id: &str) -> bool {
+    if node_id == crate::address::LOCAL_NODE_ID
+        || !is_valid_node_id(node_id)
+        || node_id.contains("..")
+        || node_id.contains('/')
+        || node_id.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return false;
+    }
+    if pattern == "*" {
+        return true;
+    }
+    if validate_node_prefix_pattern(pattern, false).is_err() {
+        return false;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        node_id.starts_with(prefix)
+    } else {
+        node_id == pattern
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1523,5 +1689,48 @@ mod tests {
         let guest_drop_set = ScopeSet::from_strings(&guest_with_drop);
         assert!(guest_drop_set.allows_drop_create());
         assert!(!guest_drop_set.may_dm_send("any/handle"));
+    }
+
+    #[test]
+    fn delegated_human_scopes_and_node_prefix_fail_closed() {
+        let member = ScopePreset::Member.expand();
+        let validated = validate_delegated_human_scopes(&member).unwrap();
+        assert_eq!(validated, member);
+
+        let full = ScopePreset::Full.expand();
+        assert!(validate_delegated_human_scopes(&full).is_ok());
+
+        // Literal '*', bridge:post, forward:via, empty, and unknown scopes MUST fail closed.
+        assert!(validate_delegated_human_scopes(&["*"]).is_err());
+        assert!(validate_delegated_human_scopes(&["dm:send", "*"]).is_err());
+        assert!(validate_delegated_human_scopes(&["bridge:post=slack:ops"]).is_err());
+        assert!(validate_delegated_human_scopes(&["forward:via=hub-b"]).is_err());
+        assert!(validate_delegated_human_scopes(&[] as &[&str]).is_err());
+        assert!(expand_delegated_human_scopes(&["*"]).is_err());
+        assert!(expand_delegated_human_scopes(&["bridge:post=slack:*"]).is_err());
+        assert!(expand_delegated_human_scopes(&["forward:via=*"]).is_err());
+        assert!(expand_delegated_human_scopes(&["dm:*", "kv:read=shared/*"]).is_ok());
+
+        // nodePrefix glob validation and matching.
+        assert!(validate_node_prefix_pattern("philip@*", false).is_ok());
+        assert!(validate_node_prefix_pattern("philip@macbook", false).is_ok());
+        assert!(validate_node_prefix_pattern("philip@dev-*", false).is_ok());
+        assert!(validate_node_prefix_pattern("*", false).is_err());
+        assert!(validate_node_prefix_pattern("*", true).is_ok());
+        assert!(validate_node_prefix_pattern("", false).is_err());
+        assert!(validate_node_prefix_pattern("philip@*/*", false).is_err());
+        assert!(validate_node_prefix_pattern("philip@..*", false).is_err());
+        assert!(validate_node_prefix_pattern("phi*lip@mac", false).is_err());
+        assert!(validate_node_prefix_pattern("local", false).is_err());
+        assert!(validate_node_prefix_pattern("philip@mac\n", false).is_err());
+
+        assert!(matches_node_prefix("philip@*", "philip@macbook"));
+        assert!(matches_node_prefix("philip@*", "philip@devbox-2"));
+        assert!(!matches_node_prefix("philip@*", "alice@macbook"));
+        assert!(!matches_node_prefix("philip@*", "philip2@macbook"));
+        assert!(!matches_node_prefix("philip@*", "philip@../evil"));
+        assert!(!matches_node_prefix("philip@*", "local"));
+        assert!(matches_node_prefix("philip@macbook", "philip@macbook"));
+        assert!(!matches_node_prefix("philip@macbook", "philip@macbook2"));
     }
 }

@@ -28,14 +28,20 @@ import {
   base64urlEncode,
   decodeHcert1,
   decodeHdrop1,
+  decodeHjoin1,
+  decodeHpub1,
   derivePrfEd25519Seed,
   derivePrfX25519Keypair,
   ed25519KeypairFromSeed,
   encodeHdrop1,
+  encodeHjoin1,
+  encodeHpub1,
   openHumanDraft,
   randomBytes,
   sealHumanDrop,
+  signHumanInviteClaim,
   signNodeCert,
+  verifyHumanInvite,
   verifyNodeCert,
 } from "./crypto.js";
 
@@ -604,5 +610,229 @@ describe("Cross-language Verified Human Drops interop (JS <-> Rust hyp CLI)", ()
       },
     };
     assert.equal(isEmbeddedInFrame(crossOriginFrame), true);
+  });
+
+  test("Delegated Human-Cert Admission cross-language parity: Rust `hyp auth invite`/`whoami` <-> JS `verifyHumanInvite`/`decodeHpub1`/`encodeHpub1` <-> Rust `hyp auth admit` & `hyp join --stdin`", async () => {
+    const hubDir = join(tmpRoot, "delegated-hub");
+    const hubState = join(hubDir, "state");
+    const hubCfgPath = join(hubDir, "node.json");
+    mkdirSync(hubState, { recursive: true });
+    writeFileSync(
+      hubCfgPath,
+      JSON.stringify({
+        v: 2,
+        nodeId: "interop-hub",
+        profile: "router",
+        stateDir: hubState,
+        listen: { publicUrl: "http://127.0.0.1:1" },
+      }),
+    );
+
+    // 1. Rust `hyp auth invite` mints `hjoin1_` -> JS `verifyHumanInvite` verifies bit-for-bit!
+    const invRes = runHyp(hypBin, isoEnv, [
+      "auth",
+      "invite",
+      "philip",
+      "--hub",
+      "interop-hub",
+      "--endpoint",
+      "http://127.0.0.1:1",
+      "--node-prefix",
+      "philip@*",
+      "--max-devices",
+      "7",
+      "--state-dir",
+      hubState,
+      "--config",
+      hubCfgPath,
+      "--json",
+    ]);
+    const invJson = parseJsonStdout(invRes, "hyp auth invite");
+    const hjoin1 = invJson.data.token;
+    assert.ok(hjoin1.startsWith("hjoin1_"));
+    assert.equal(invJson.data.joinUrl, `https://hyphae.to/join#${hjoin1}`);
+
+    const verified = await verifyHumanInvite(hjoin1);
+    assert.equal(verified.ok, true, `JS verifyHumanInvite failed: ${verified.message}`);
+    assert.equal(verified.invite.hubNodeId, "interop-hub");
+    assert.equal(verified.invite.humanId, "philip");
+    assert.equal(verified.invite.nodePrefix, "philip@*");
+    assert.equal(verified.invite.maxDevices, 7);
+
+    // 1b. 1-bit signature mutation in Rust-minted `hjoin1_` fails closed in JS!
+    const rawEnv = decodeHjoin1(hjoin1);
+    const badSigBytes = base64urlDecode(rawEnv.sig);
+    badSigBytes[badSigBytes.length - 1] ^= 0x01;
+    const tamperedHjoin1 = encodeHjoin1({ ...rawEnv, sig: base64urlEncode(badSigBytes) });
+    const badRes = await verifyHumanInvite(tamperedHjoin1);
+    assert.equal(badRes.ok, false);
+    assert.equal(badRes.reason, "invalid_signature");
+
+    // 2. Rust `hyp auth whoami` emits `hpub1_` -> JS `decodeHpub1` decodes bit-for-bit!
+    const whoRes = runHyp(hypBin, isoEnv, [
+      "auth",
+      "whoami",
+      "--state-dir",
+      stateDir,
+      "--config",
+      configPath,
+      "--json",
+    ]);
+    const whoJson = parseJsonStdout(whoRes, "hyp auth whoami");
+    const rustHpub1 = whoJson.data.hpub1;
+    assert.ok(rustHpub1.startsWith("hpub1_"));
+    const decodedRustCard = decodeHpub1(rustHpub1);
+    assert.equal(decodedRustCard.humanId, humanId);
+    assert.equal(decodedRustCard.signingJwk.crv, "Ed25519");
+
+    // 3. JS `encodeHpub1` -> Rust `hyp auth admit --id` accepts and enrolls!
+    const jsPrf = randomBytes(32);
+    const jsEdSeed = await derivePrfEd25519Seed(jsPrf, "philip", 1);
+    const jsEdKp = await ed25519KeypairFromSeed(jsEdSeed);
+    const jsEncKp = await derivePrfX25519Keypair(jsPrf, "philip", 1);
+    const jsHpub1 = encodeHpub1({
+      v: 1,
+      humanId: "philip",
+      signingJwk: jsEdKp.publicJwk,
+      encJwk: jsEncKp.publicJwk,
+    });
+    const admitRes = runHyp(hypBin, isoEnv, [
+      "auth",
+      "admit",
+      "philip",
+      "--id",
+      jsHpub1,
+      "--node-prefix",
+      "philip@*",
+      "--max-devices",
+      "4",
+      "--state-dir",
+      hubState,
+      "--config",
+      hubCfgPath,
+      "--json",
+    ]);
+    const admitJson = parseJsonStdout(admitRes, "hyp auth admit (JS hpub1_)");
+    assert.equal(admitJson.data.humanId, "philip");
+    assert.equal(admitJson.data.kid, jsEdKp.kid);
+    assert.equal(admitJson.data.nodePrefix, "philip@*");
+    assert.equal(admitJson.data.maxDevices, 4);
+
+    // 4. JS `signHumanInviteClaim` + `signNodeCert` -> Rust `hyp join --stdin` verifies ALL
+    //    cryptographic signatures (fails only at unreachable HTTPS hub network step, NEVER crypto!).
+    const devDir = join(tmpRoot, "delegated-dev");
+    const devState = join(devDir, "state");
+    const devCfg = join(devDir, "node.json");
+    mkdirSync(devState, { recursive: true });
+    const cardRes = runHyp(hypBin, isoEnv, [
+      "join",
+      "--remote",
+      "--print-card",
+      "--node-id",
+      "philip@interop-box",
+      "--state-dir",
+      devState,
+      "--config",
+      devCfg,
+      "--json",
+    ]);
+    const cardJson = parseJsonStdout(cardRes, "hyp join --remote --print-card");
+    const devCard = cardJson.data.deviceCard;
+    const nowMs = Date.now();
+    const claimRes = await signHumanInviteClaim(
+      {
+        inviteId: verified.invite.inviteId,
+        hubNodeId: verified.invite.hubNodeId,
+        humanId: "philip",
+        signingJwk: jsEdKp.publicJwk,
+        encJwk: jsEncKp.publicJwk,
+        prfSalt: "interop-salt",
+        timestamp: new Date(nowMs).toISOString(),
+      },
+      jsEdSeed,
+    );
+    const certRes = await signNodeCert(
+      {
+        nodeId: devCard.nodeId,
+        signingJwk: devCard.ed25519Jwk,
+        encryptionJwk: devCard.x25519Jwk,
+        humanId: "philip",
+        humanKid: jsEdKp.kid,
+        authEpoch: 1,
+        issuedAt: new Date(nowMs).toISOString(),
+        expiresAt: new Date(nowMs + 86_400_000).toISOString(),
+      },
+      jsEdSeed,
+    );
+
+    const bundle = {
+      hjoin1,
+      humanClaim: claimRes.claim,
+      humanClaimSig: claimRes.sig,
+      humanAuthority: {
+        humanId: "philip",
+        signingJwk: jsEdKp.publicJwk,
+        encJwk: jsEncKp.publicJwk,
+        prfSalt: "interop-salt",
+        authEpoch: 1,
+        label: "js-passkey",
+      },
+      nodeCert: certRes.hcert1,
+      hubNodeId: verified.invite.hubNodeId,
+      hubEndpoint: verified.invite.hubEndpoint,
+    };
+
+    // Valid JS signatures pass Rust crypto validation and reach `CLAIM_FAILED` (offline loopback port)
+    const joinRes = runHyp(
+      hypBin,
+      isoEnv,
+      [
+        "join",
+        "--stdin",
+        "--no-setup",
+        "--node-id",
+        "philip@interop-box",
+        "--state-dir",
+        devState,
+        "--config",
+        devCfg,
+        "--json",
+      ],
+      JSON.stringify(bundle),
+    );
+    const joinErrJson = JSON.parse(joinRes.stdout);
+    assert.equal(
+      joinErrJson.error.code,
+      "CLAIM_FAILED",
+      `expected Rust crypto validation to pass and reach CLAIM_FAILED, got: ${joinRes.stdout}`,
+    );
+
+    // 1-bit flip in JS `humanClaimSig` fails immediately at `INVALID_HANDOFF` before any network call!
+    const badClaimSigBytes = base64urlDecode(claimRes.sig);
+    badClaimSigBytes[0] ^= 0x01;
+    const badBundle = { ...bundle, humanClaimSig: base64urlEncode(badClaimSigBytes) };
+    const badJoinRes = runHyp(
+      hypBin,
+      isoEnv,
+      [
+        "join",
+        "--stdin",
+        "--no-setup",
+        "--node-id",
+        "philip@interop-box",
+        "--state-dir",
+        devState,
+        "--config",
+        devCfg,
+        "--json",
+      ],
+      JSON.stringify(badBundle),
+    );
+    const badJoinJson = JSON.parse(badJoinRes.stdout);
+    assert.equal(
+      badJoinJson.error.code,
+      "INVALID_HANDOFF",
+      `expected tampered humanClaimSig to fail closed at INVALID_HANDOFF, got: ${badJoinRes.stdout}`,
+    );
   });
 });

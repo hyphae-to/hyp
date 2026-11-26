@@ -1875,6 +1875,64 @@ fn detect_installed_harnesses(
     found
 }
 
+/// Streamlined auto-setup helper used by `hyp join` when auto-onboarding a brand-new device.
+/// Detects installed coding harnesses under `home` and configures MCP/hooks/skills silently
+/// without printing to stdout.
+pub(crate) fn configure_detected_harnesses_for_join(
+    home: &Path,
+    explicit_home: bool,
+    state_dir: &Path,
+    config_path: &Path,
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    let claude_profiles = resolve_claude_profiles(home, explicit_home, None);
+    let targets = detect_installed_harnesses(home, &claude_profiles);
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let bin_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("hyp"));
+    let bin_str = bin_path.to_string_lossy();
+    let skill_ctx = SetupSkillContext::detect(
+        home,
+        config_path,
+        &targets,
+        !explicit_home,
+        false,
+        &claude_profiles,
+    );
+    let opts = SetupOptions {
+        socket: None,
+        state_dir,
+        claude_profiles: &claude_profiles,
+        statusline: false,
+        no_skills: false,
+        no_commands: false,
+        dry_run: false,
+        plugins_dir: None,
+        plugins_archive: None,
+        openclaw_delivery: None,
+        openclaw_prompt_injection: None,
+    };
+    let mut extra_next = Vec::new();
+    let mut configured = Vec::new();
+    for kind in targets {
+        match configure_harness(
+            kind,
+            home,
+            &bin_str,
+            config_path,
+            opts,
+            &skill_ctx,
+            warnings,
+            &mut extra_next,
+        ) {
+            Ok(_) => configured.push(kind.as_str().to_string()),
+            Err(e) => warnings.push(format!("Skipped harness '{}' setup: {e}", kind.as_str())),
+        }
+    }
+    configured
+}
+
 fn is_harness_detected(
     kind: HarnessKind,
     home: &Path,

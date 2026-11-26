@@ -40,9 +40,11 @@ use hyp_crypto::e2ee::{
     seal_channel_message, seal_dm, seal_kv_entry,
 };
 use hyp_crypto::human::{
-    HumanDropEnvelopeV1, HumanDropKind, HumanRevocationPayloadV1, NodeCertPayloadV1,
-    SignedHumanRevocationV1, SignedNodeCertV1, decode_hdrop1, encode_hcert1,
-    is_reserved_secret_name, open_human_drop, sign_node_cert, verify_human_revocation,
+    DelegatedPairProofV1, HumanDropEnvelopeV1, HumanDropKind, HumanRevocationPayloadV1,
+    NodeCertPayloadV1, SignedHumanRevocationV1, SignedNodeCertV1, decode_hcert1, decode_hdrop1,
+    decode_hjoin1, encode_hcert1, is_reserved_secret_name, node_cert_sha256, open_human_drop,
+    sign_delegated_pair_proof, sign_node_cert, verify_delegated_pair_proof, verify_human_invite,
+    verify_human_invite_claim, verify_human_revocation, verify_node_cert,
 };
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keystore::validate_secret_name;
@@ -80,13 +82,16 @@ use hyp_proto::manifest::{
     PeerCapabilitiesView, PeerTrustHistory, SignedNodeManifest, negotiate_capabilities,
 };
 use hyp_proto::problem::ProblemDetails;
-use hyp_proto::scopes::{ScopePreset, ScopeSet, expand_v2_scopes, extract_confined_values};
+use hyp_proto::scopes::{
+    ScopePreset, ScopeSet, expand_v2_scopes, extract_confined_values, matches_node_prefix,
+    validate_delegated_human_scopes,
+};
 use hyp_store::{
     AckOutcome, ChannelEpoch, ChannelEpochInput, DeliveryMode, DueBatch, EnqueueMessage,
     GateAuditInput, GateDecision as StoreGateDecision, GateDirection, GateState, GrantDirection,
-    GrantInput, GrantRecord, HandleRecord, HumanAuthorityRecord, HumanAuthorityRole,
-    HumanAuthorityStatus, HumanClaimKind, HumanNodeCertInput, IngestResult, KeyStatus, KeyUse,
-    KvDeleteInput,
+    GrantInput, GrantRecord, HandleRecord, HumanAuthorityInput, HumanAuthorityRecord,
+    HumanAuthorityRole, HumanAuthorityStatus, HumanClaimKind, HumanDelegationPolicyInput,
+    HumanNodeCertInput, IngestResult, KeyStatus, KeyUse, KvDeleteInput,
     KvDeleteResult, KvEntry, KvEpoch, KvEpochInput, KvSetInput, MailboxEntry, MailboxInsert,
     MailboxKind, MailboxPutOptions, MailboxPutResult, ManifestCacheUpdate, MessageRecord, NodeDb,
     PeerInput, PeerKeyInput, PeerRecord, PeerStatus, PostChannelInput, PostChannelResult, Session,
@@ -114,12 +119,13 @@ use crate::gates::{
     VerifiedHumanClaim,
 };
 use crate::engine::peer_link::{
-    ChannelDirectoryEntry, ChannelJoinResponse, ChannelPostRequest, GuestPairReply,
-    GuestPairRequest, KeyRegPayloadV2, KvSetBody, MAX_JSON_RESPONSE_BYTES, ManifestFetchOutcome,
-    P2pPairServerReply, PairBindingV2, PairRequestV2, PairServerReply, PeerAuth,
-    PeerKeyDirectoryEntry, PeerLink, PostMessageRequest, PublishEventRequest,
-    PutChannelEpochRequest, PutKeyRequest, PutKvEpochRequest, PutSubscriptionsRequest,
-    SubscriptionInputWire, guest_pair_proof_canonical, http_auth_signing_input, spawn_sse_worker,
+    AuthClaimReply, AuthClaimRequest, ChannelDirectoryEntry, ChannelJoinResponse,
+    ChannelPostRequest, DelegatedPairReply, DelegatedPairRequest, GuestPairReply, GuestPairRequest,
+    KeyRegPayloadV2, KvSetBody, MAX_JSON_RESPONSE_BYTES, ManifestFetchOutcome, P2pPairServerReply,
+    PairBindingV2, PairRequestV2, PairServerReply, PeerAuth, PeerKeyDirectoryEntry, PeerLink,
+    PostMessageRequest, PublishEventRequest, PutChannelEpochRequest, PutKeyRequest,
+    PutKvEpochRequest, PutSubscriptionsRequest, SubscriptionInputWire, guest_pair_proof_canonical,
+    http_auth_signing_input, spawn_sse_worker,
 };
 
 const MANIFEST_TTL_MS: i64 = 24 * 60 * 60 * 1000;
@@ -2686,6 +2692,668 @@ impl UnifiedNode {
             scopes: guest_scopes,
             manifest,
         })
+    }
+
+    // ========================================================================
+    // Delegated Human-Cert Admission (`POST /v1/auth/claim`, `POST /v1/pair/delegated`, Cascade Revoke)
+    // ========================================================================
+
+    /// Server-side handler for `POST /v1/auth/claim` (unauthenticated — authenticated by the
+    /// hub's pinned Org Admin-CA Ed25519 signature on `hjoin1_` + the human's Ed25519 `claimSig`).
+    ///
+    /// Security invariants (fail-closed):
+    /// - Verifies `hjoin1_` against `config.admin_jwk`, `hubNodeId == self.node_id`, optional
+    ///   `hubFingerprint`, disallowed scopes (`*`, `bridge:post`, `forward:via`), and expiry.
+    /// - Verifies `claimSig` over `HumanInviteClaimV1` (±5m replay bound).
+    /// - Anti-hijack: refuses (`409 human_key_mismatch`) if `humanId` already exists with a
+    ///   different Ed25519 signing key or if the matching authority key was revoked.
+    /// - Atomically consumes the single-use `inviteId` nonce in `human_claim_nonces`.
+    pub fn handle_auth_claim_request(
+        &self,
+        req: &AuthClaimRequest,
+    ) -> Result<AuthClaimReply, NodeError> {
+        let admin_proto_jwk = self.config.admin_jwk.as_ref().ok_or_else(|| {
+            NodeError::BadRequest(
+                "this hub has no configured adminJwk for delegated human invite claims".into(),
+            )
+        })?;
+        let admin_pk = proto_jwk_to_crypto(admin_proto_jwk).to_ed25519()?;
+        let now = now_ms();
+
+        let signed_invite = decode_hjoin1(&req.hjoin1).map_err(|e| {
+            NodeError::BadRequest(format!("invalid hjoin1_ invite token: {e}"))
+        })?;
+        let invite = verify_human_invite(&signed_invite, &admin_pk, now).map_err(|e| {
+            NodeError::Unauthorized(format!("hjoin1_ invite verification failed: {e}"))
+        })?;
+
+        if invite.hub_node_id != self.config.node_id.as_str() {
+            return Err(NodeError::Unauthorized(format!(
+                "hjoin1_ invite targets hub '{}', not '{}'",
+                invite.hub_node_id,
+                self.config.node_id.as_str()
+            )));
+        }
+        if let Some(ref pinned_fp) = invite.hub_fingerprint {
+            let local_fp = self.identity.signing.public_key().fingerprint();
+            if !pinned_fp.eq_ignore_ascii_case(&local_fp) {
+                return Err(NodeError::Unauthorized(format!(
+                    "hjoin1_ hubFingerprint '{pinned_fp}' does not match this hub's signing key"
+                )));
+            }
+        }
+
+        if req.claim.invite_id != invite.invite_id {
+            return Err(NodeError::BadRequest(
+                "claim inviteId does not match hjoin1_ inviteId".into(),
+            ));
+        }
+        if req.claim.hub_node_id != invite.hub_node_id {
+            return Err(NodeError::BadRequest(
+                "claim hubNodeId does not match hjoin1_ hubNodeId".into(),
+            ));
+        }
+        if req.claim.human_id != invite.human_id {
+            return Err(NodeError::BadRequest(
+                "claim humanId does not match hjoin1_ humanId".into(),
+            ));
+        }
+
+        let (human_pk, _human_enc_pk) =
+            verify_human_invite_claim(&req.claim, &req.claim_sig, now).map_err(|e| {
+                NodeError::Unauthorized(format!("human invite claim signature invalid: {e}"))
+            })?;
+
+        let kid = human_pk.kid();
+        let fingerprint = human_pk.fingerprint();
+        let jwk_json = to_canonical_json(&req.claim.signing_jwk)?;
+        let enc_jwk_json = match &req.claim.enc_jwk {
+            Some(jwk) => Some(to_canonical_json(jwk)?),
+            None => None,
+        };
+        let label = req
+            .label
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.len() <= 128 && !s.chars().any(char::is_control))
+            .unwrap_or("passkey-delegated")
+            .to_string();
+        let invite_expires_ms = parse_rfc3339_millis(&invite.expires_at)?;
+        let validated_scopes = validate_delegated_human_scopes(&invite.scopes).map_err(|e| {
+            NodeError::BadRequest(format!("invalid delegated invite scopes: {e}"))
+        })?;
+
+        {
+            let db = self.db();
+
+            // Anti-hijack fail-closed: refuse enrolling a different key or resurrecting a revoked key.
+            let existing_for_human = db.human().list_authorities_for_human(&invite.human_id, true)?;
+            for existing in &existing_for_human {
+                if existing.kid != kid {
+                    return Err(NodeError::HumanKeyMismatch(format!(
+                        "human '{}' is already enrolled with a different signing key (kid '{}')",
+                        invite.human_id, existing.kid
+                    )));
+                }
+                if existing.status == HumanAuthorityStatus::Revoked {
+                    return Err(NodeError::HumanKeyMismatch(format!(
+                        "human '{}' key '{}' has been revoked and cannot be re-claimed",
+                        invite.human_id, existing.kid
+                    )));
+                }
+                if existing.jwk_json != jwk_json {
+                    return Err(NodeError::HumanKeyMismatch(format!(
+                        "human '{}' key '{}' JWK mismatch",
+                        invite.human_id, existing.kid
+                    )));
+                }
+            }
+            // Also verify `kid` is not already claimed by a different `human_id`.
+            if let Some(other_owner) = db.human().get_active_authority_by_kid(&kid)? {
+                if other_owner.human_id != invite.human_id {
+                    return Err(NodeError::HumanKeyMismatch(format!(
+                        "signing key kid '{kid}' is already enrolled under human '{}'",
+                        other_owner.human_id
+                    )));
+                }
+            }
+
+            // Atomically consume single-use inviteId nonce (fail closed on replay!).
+            let fresh = db.human().consume_claim_nonce(
+                &invite.invite_id,
+                &admin_pk.kid(),
+                HumanClaimKind::HumanInvite,
+                invite_expires_ms,
+                now,
+            )?;
+            if !fresh {
+                return Err(NodeError::Conflict(format!(
+                    "human invite '{}' has already been claimed (replay rejected)",
+                    invite.invite_id
+                )));
+            }
+
+            let min_epoch = db.human().min_auth_epoch()?;
+            let auth_epoch = existing_for_human
+                .first()
+                .map(|r| r.auth_epoch.max(min_epoch))
+                .unwrap_or(min_epoch);
+
+            db.human()
+                .upsert_authority(
+                    &HumanAuthorityInput {
+                        human_id: invite.human_id.clone(),
+                        kid: kid.clone(),
+                        label,
+                        role: HumanAuthorityRole::Signer,
+                        jwk_json,
+                        enc_jwk_json,
+                        prf_salt: req.claim.prf_salt.clone(),
+                        auth_epoch,
+                    },
+                    now,
+                )
+                .map_err(|e| match e {
+                    StoreError::IdConflict(msg) => NodeError::HumanKeyMismatch(msg),
+                    other => NodeError::Store(other),
+                })?;
+
+            db.human().upsert_delegation_policy(
+                &HumanDelegationPolicyInput {
+                    human_id: invite.human_id.clone(),
+                    node_prefix: invite.node_prefix.clone(),
+                    scopes: validated_scopes.clone(),
+                    max_devices: invite.max_devices,
+                    delegation_enabled: true,
+                },
+                now,
+            )?;
+        }
+
+        Ok(AuthClaimReply {
+            ok: true,
+            hub_node_id: self.config.node_id.to_string(),
+            human_id: invite.human_id,
+            kid,
+            fingerprint,
+            node_prefix: invite.node_prefix,
+            scopes: validated_scopes,
+            max_devices: invite.max_devices,
+        })
+    }
+
+    /// Server-side handler for `POST /v1/pair/delegated` (unauthenticated — authenticated by a
+    /// human-signed `hcert1_` NodeCert from an active enrolled authority with `delegation_enabled`
+    /// plus a live device Ed25519 possession proof `proofSig`).
+    ///
+    /// Security invariants (fail-closed):
+    /// - Authority MUST be `Active` and have `delegation_enabled == true`.
+    /// - Enforces `cert.auth_epoch >= max(min_auth_epoch, authority.auth_epoch)` and cert expiry.
+    /// - Enforces `cert.node_id == req.node_id`, `matches_node_prefix(policy.node_prefix, req.node_id)`,
+    ///   and exact JWK equality between `cert` and `req`.
+    /// - Verifies live `DelegatedPairProofV1` Ed25519 signature (±5m skew) bound to `SHA-256(hcert1)`.
+    /// - Anti-hijack: refuses (`409 peer_key_mismatch`) to overwrite any peer with a different
+    ///   Ed25519 key or admitted under a different authority / non-delegated grant.
+    /// - Enforces `policy.max_devices` across active peers admitted under `human_id` (counting
+    ///   idempotent re-pair of the same `node_id` as 0 new devices).
+    pub fn handle_delegated_pair_request(
+        &self,
+        req: &DelegatedPairRequest,
+    ) -> Result<DelegatedPairReply, NodeError> {
+        if req.node_id == LOCAL_NODE_ID {
+            return Err(NodeError::BadRequest(
+                "nodeId cannot be reserved 'local'".into(),
+            ));
+        }
+        let _ = NodeId::new(&req.node_id)?;
+        if req.node_id == self.config.node_id.as_str() {
+            return Err(NodeError::Conflict(format!(
+                "PEER_ID_CONFLICT: peer nodeId '{}' conflicts with local hub identity",
+                req.node_id
+            )));
+        }
+
+        let device_sign_pk = req.ed25519_jwk.to_ed25519()?;
+        let device_enc_pk = req.x25519_jwk.to_x25519()?;
+        let now = now_ms();
+
+        let signed_cert = decode_hcert1(&req.node_cert)
+            .map_err(|e| NodeError::BadRequest(format!("invalid hcert1_ nodeCert: {e}")))?;
+        let unverified_cert: NodeCertPayloadV1 = serde_json::from_str(&signed_cert.payload)
+            .map_err(|e| NodeError::BadRequest(format!("malformed nodeCert payload: {e}")))?;
+
+        let (authority, policy, min_auth_epoch) = {
+            let db = self.db();
+            let auth = db
+                .human()
+                .get_active_authority_by_human_and_kid(
+                    &unverified_cert.human_id,
+                    &unverified_cert.human_kid,
+                )?
+                .ok_or_else(|| {
+                    NodeError::Unauthorized(format!(
+                        "human authority '{}' kid '{}' is unknown or revoked",
+                        unverified_cert.human_id, unverified_cert.human_kid
+                    ))
+                })?;
+            let pol = db
+                .human()
+                .get_delegation_policy(&auth.human_id)?
+                .filter(|p| p.delegation_enabled)
+                .ok_or_else(|| {
+                    NodeError::Unauthorized(format!(
+                        "delegated admission is disabled for human '{}'",
+                        auth.human_id
+                    ))
+                })?;
+            let min_ep = db.human().min_auth_epoch()?;
+            (auth, pol, min_ep)
+        };
+
+        let authority_jwk: CryptoOkpJwk = serde_json::from_str(&authority.jwk_json)?;
+        let authority_pk = authority_jwk.to_ed25519()?;
+        let required_epoch = min_auth_epoch.max(authority.auth_epoch);
+
+        let cert = verify_node_cert(&signed_cert, &authority_pk, now, required_epoch).map_err(
+            |e| NodeError::Unauthorized(format!("hcert1_ verification failed: {e}")),
+        )?;
+
+        if cert.human_id != authority.human_id {
+            return Err(NodeError::Unauthorized(
+                "nodeCert humanId mismatch against enrolled authority".into(),
+            ));
+        }
+        if cert.node_id != req.node_id {
+            return Err(NodeError::Unauthorized(format!(
+                "nodeCert nodeId '{}' does not match request nodeId '{}'",
+                cert.node_id, req.node_id
+            )));
+        }
+        if !matches_node_prefix(&policy.node_prefix, &req.node_id) {
+            return Err(NodeError::Unauthorized(format!(
+                "nodeId '{}' is outside allowed nodePrefix '{}' for human '{}'",
+                req.node_id, policy.node_prefix, authority.human_id
+            )));
+        }
+        if cert.signing_jwk.to_ed25519()? != device_sign_pk {
+            return Err(NodeError::PeerKeyMismatch(
+                "nodeCert signingJwk does not match request ed25519Jwk".into(),
+            ));
+        }
+        if cert.encryption_jwk.to_x25519()? != device_enc_pk {
+            return Err(NodeError::PeerKeyMismatch(
+                "nodeCert encryptionJwk does not match request x25519Jwk".into(),
+            ));
+        }
+
+        // Verify live device Ed25519 possession proof bound to this hub and SHA-256(hcert1_).
+        let proof = DelegatedPairProofV1 {
+            hub_node_id: self.config.node_id.to_string(),
+            node_id: req.node_id.clone(),
+            ed25519_jwk: req.ed25519_jwk.clone(),
+            x25519_jwk: req.x25519_jwk.clone(),
+            node_cert_sha256: node_cert_sha256(&req.node_cert),
+            timestamp: req.timestamp.clone(),
+        };
+        let _ = verify_delegated_pair_proof(&proof, &req.proof_sig, now).map_err(|e| {
+            NodeError::Unauthorized(format!("delegated pair proofSig invalid: {e}"))
+        })?;
+
+        // Defense-in-depth: validate policy scopes fail-closed before issuing any grant.
+        let granted_scopes = validate_delegated_human_scopes(&policy.scopes).map_err(|e| {
+            NodeError::Unauthorized(format!("delegation policy scopes invalid: {e}"))
+        })?;
+
+        let sign_kid = device_sign_pk.kid();
+        let enc_kid = device_enc_pk.kid();
+        let sign_jwk_json = to_canonical_json(&req.ed25519_jwk)?;
+        let enc_jwk_json = to_canonical_json(&req.x25519_jwk)?;
+        let cert_issued_ms = parse_rfc3339_millis(&cert.issued_at)?;
+        let cert_expires_ms = parse_rfc3339_millis(&cert.expires_at)?;
+        let signed_cert_json = to_canonical_json(&signed_cert)?;
+
+        let keys_rotated = {
+            let db = self.db();
+
+            // Re-check authority & policy inside the DB lock to prevent TOCTOU race with revocation.
+            let live_auth = db
+                .human()
+                .get_active_authority_by_human_and_kid(&authority.human_id, &authority.kid)?;
+            let live_pol = db.human().get_delegation_policy(&authority.human_id)?;
+            if live_auth.is_none() || !live_pol.as_ref().is_some_and(|p| p.delegation_enabled) {
+                return Err(NodeError::Unauthorized(format!(
+                    "human authority '{}' was revoked or delegation disabled",
+                    authority.human_id
+                )));
+            }
+
+            // Anti-hijack fail-closed check against existing peer state.
+            let existing_peer = db.peers().get_peer(&req.node_id)?;
+            let existing_sign_keys =
+                db.peers()
+                    .list_peer_keys(&req.node_id, Some(KeyUse::Signing), true)?;
+            let prev_enc_kid = db
+                .peers()
+                .list_peer_keys(&req.node_id, Some(KeyUse::Encryption), true)?
+                .into_iter()
+                .next()
+                .map(|k| k.kid);
+
+            if let Some(ref peer) = existing_peer {
+                if peer.status != PeerStatus::Active {
+                    return Err(NodeError::Unauthorized(format!(
+                        "peer '{}' is revoked or inactive and cannot re-pair",
+                        req.node_id
+                    )));
+                }
+                if peer.admitted_by_human_id.as_deref() != Some(authority.human_id.as_str()) {
+                    return Err(NodeError::PeerKeyMismatch(format!(
+                        "peer '{}' is already registered under a different authority or grant",
+                        req.node_id
+                    )));
+                }
+            }
+            if !existing_sign_keys.is_empty() {
+                let all_match = existing_sign_keys.iter().all(|k| {
+                    k.kid == sign_kid
+                        && serde_json::from_str::<CryptoOkpJwk>(&k.jwk_json)
+                            .ok()
+                            .and_then(|j| j.to_ed25519().ok())
+                            == Some(device_sign_pk)
+                });
+                if !all_match {
+                    return Err(NodeError::PeerKeyMismatch(format!(
+                        "peer '{}' is already registered with a different Ed25519 signing key",
+                        req.node_id
+                    )));
+                }
+            }
+
+            // Enforce `max_devices` cap (idempotent re-pair of same `node_id` counts as 0 new devices).
+            let other_active = db
+                .peers()
+                .count_active_peers_admitted_by_human(&authority.human_id, Some(&req.node_id))?;
+            if other_active >= policy.max_devices {
+                return Err(NodeError::Store(StoreError::QuotaExceeded(format!(
+                    "human '{}' reached delegated maxDevices limit ({})",
+                    authority.human_id, policy.max_devices
+                ))));
+            }
+
+            db.human().put_node_cert(&HumanNodeCertInput {
+                node_id: req.node_id.clone(),
+                human_kid: cert.human_kid.clone(),
+                auth_epoch: cert.auth_epoch,
+                signed_json: signed_cert_json,
+                issued_at: cert_issued_ms,
+                expires_at: cert_expires_ms,
+            })?;
+
+            db.peers().upsert_peer_with_admission(
+                &PeerInput {
+                    peer_id: req.node_id.clone(),
+                    endpoint: None,
+                    profile: hyp_store::PeerProfile::Local,
+                    trust_tier: TrustTier::Org,
+                    status: PeerStatus::Active,
+                    scopes: granted_scopes.clone(),
+                    auth_credential_ref: None,
+                },
+                Some(&authority.human_id),
+                Some(cert.auth_epoch),
+                now,
+            )?;
+
+            db.peers().rotate_peer_key(
+                &PeerKeyInput {
+                    peer_id: req.node_id.clone(),
+                    kid: sign_kid.clone(),
+                    key_use: KeyUse::Signing,
+                    jwk_json: sign_jwk_json,
+                    status: KeyStatus::Active,
+                    expires_at: None,
+                },
+                now,
+            )?;
+            db.peers().rotate_peer_key(
+                &PeerKeyInput {
+                    peer_id: req.node_id.clone(),
+                    kid: enc_kid.clone(),
+                    key_use: KeyUse::Encryption,
+                    jwk_json: enc_jwk_json,
+                    status: KeyStatus::Active,
+                    expires_at: None,
+                },
+                now,
+            )?;
+
+            existing_sign_keys.iter().any(|k| k.kid != sign_kid)
+                || prev_enc_kid.is_some_and(|k| k != enc_kid)
+        };
+
+        if keys_rotated {
+            self.clear_peer_auth_credential(&req.node_id);
+        }
+
+        // Invalidate stale bearer tokens and issue a fresh bearer credential.
+        let _ = self.invalidate_peer_bearer_tokens(&req.node_id)?;
+        let auth_credential =
+            self.issue_peer_bearer_token(&req.node_id, None, Some(&sign_kid))?;
+
+        let caller = AuthenticatedPeer {
+            peer_id: req.node_id.clone(),
+            scopes: ScopeSet::from_strings(&granted_scopes),
+            trust_tier: TrustTier::Org,
+        };
+        let (signed_manifest, _, _) = self.build_signed_manifest(Some(&caller))?;
+
+        Ok(DelegatedPairReply {
+            ok: true,
+            node_id: self.config.node_id.to_string(),
+            peer_id: req.node_id.clone(),
+            human_id: authority.human_id,
+            auth_epoch: cert.auth_epoch,
+            scopes: granted_scopes,
+            auth_credential,
+            signed_manifest,
+        })
+    }
+
+    /// Cascade-revokes a `HumanAuthority` (a specific `kid` or all active keys for `human_id`),
+    /// disables its delegation policy, marks every peer with `admitted_by_human_id == human_id` as
+    /// `PeerStatus::Revoked`, invalidates all their bearer tokens, disconnects outbound links, and
+    /// immediately wakes & drops all live inbound SSE `/v1/inbox` streams.
+    ///
+    /// Returns `(effective_min_auth_epoch, revoked_peer_ids)`.
+    pub async fn revoke_human_authority_cascade(
+        &self,
+        human_id: &str,
+        kid: Option<&str>,
+        bump_epoch: bool,
+        revocation_json: &str,
+    ) -> Result<(u64, Vec<String>), NodeError> {
+        let now = now_ms();
+        let (effective_min, revoked_peers) = {
+            let db = self.db();
+            let current_min = db.human().min_auth_epoch()?;
+            let target_min = if bump_epoch {
+                current_min.saturating_add(1)
+            } else {
+                current_min
+            };
+
+            let target_kids: Vec<String> = if let Some(k) = kid {
+                vec![k.to_string()]
+            } else {
+                let auths = db.human().list_authorities_for_human(human_id, true)?;
+                if auths.is_empty() {
+                    return Err(NodeError::NotFound(format!(
+                        "human authority '{human_id}' not found"
+                    )));
+                }
+                auths.into_iter().map(|a| a.kid).collect()
+            };
+
+            let mut eff_min = current_min;
+            for target_kid in &target_kids {
+                eff_min = db.human().revoke_authority_monotonic(
+                    human_id,
+                    target_kid,
+                    target_min,
+                    revocation_json,
+                    now,
+                )?;
+            }
+
+            let _ = db.human().set_delegation_enabled(human_id, false, now)?;
+            let peers = db.peers().revoke_peers_admitted_by_human(human_id, now)?;
+            (eff_min, peers)
+        };
+
+        for pid in &revoked_peers {
+            let _ = self.invalidate_peer_bearer_tokens(pid);
+            self.clear_peer_auth_credential(pid);
+            let _ = self.disconnect_peer(pid).await;
+            self.notify_peer_inbox(pid);
+        }
+        if !revoked_peers.is_empty() {
+            self.notify_all_inbox_subscribers();
+        }
+
+        Ok((effective_min, revoked_peers))
+    }
+
+    /// Client-side helper calling `POST <hub_endpoint>/v1/auth/claim`.
+    pub async fn claim_human_invite_on_hub(
+        &self,
+        hub_endpoint: &str,
+        req: &AuthClaimRequest,
+    ) -> Result<AuthClaimReply, NodeError> {
+        let url = format!("{}/v1/auth/claim", hub_endpoint.trim_end_matches('/'));
+        let http_req = Request::builder()
+            .method(Method::POST)
+            .uri(&url)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(full_body(serde_json::to_vec(req)?))
+            .map_err(|e| NodeError::Http(e.to_string()))?;
+        let resp = self.http_client.request(http_req).await?;
+        let (status, _headers, body) = HttpClient::collect(resp, MAX_JSON_RESPONSE_BYTES).await?;
+        if !status.is_success() {
+            return Err(HttpClient::decode_error_response(status, &body));
+        }
+        Ok(serde_json::from_slice(&body)?)
+    }
+
+    /// Client-side delegated pairing: signs a live `DelegatedPairProofV1` bound to `hcert1`, calls
+    /// `POST <hub_endpoint>/v1/pair/delegated`, verifies & caches the hub's signed manifest, pins
+    /// its keys, stores `authCredential` in `SecretStore`, and activates the live `PeerLink` + SSE!
+    pub async fn pair_delegated_with_hub(
+        self: &Arc<Self>,
+        hub_endpoint: &str,
+        hub_node_id: &str,
+        hcert1: &str,
+        expected_hub_fingerprint: Option<&str>,
+    ) -> Result<(DelegatedPairReply, PeerLinkInfo), NodeError> {
+        let ts = format_rfc3339_millis(now_ms());
+        let ed_jwk = self.identity.signing_jwk();
+        let x_jwk = self.identity.encryption_jwk();
+        let proof = DelegatedPairProofV1 {
+            hub_node_id: hub_node_id.to_string(),
+            node_id: self.config.node_id.to_string(),
+            ed25519_jwk: ed_jwk.clone(),
+            x25519_jwk: x_jwk.clone(),
+            node_cert_sha256: node_cert_sha256(hcert1),
+            timestamp: ts.clone(),
+        };
+        let proof_sig = sign_delegated_pair_proof(&proof, &self.identity.signing)?;
+        let req = DelegatedPairRequest {
+            node_id: self.config.node_id.to_string(),
+            ed25519_jwk: ed_jwk,
+            x25519_jwk: x_jwk,
+            node_cert: hcert1.trim().to_string(),
+            timestamp: ts,
+            proof_sig,
+        };
+
+        let base = hub_endpoint.trim_end_matches('/');
+        let url = format!("{base}/v1/pair/delegated");
+        let http_req = Request::builder()
+            .method(Method::POST)
+            .uri(&url)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(full_body(serde_json::to_vec(&req)?))
+            .map_err(|e| NodeError::Http(e.to_string()))?;
+        let resp = self.http_client.request(http_req).await?;
+        let (status, _headers, body) = HttpClient::collect(resp, MAX_JSON_RESPONSE_BYTES).await?;
+        if !status.is_success() {
+            return Err(HttpClient::decode_error_response(status, &body));
+        }
+        let reply: DelegatedPairReply = serde_json::from_slice(&body)?;
+        if reply.node_id != hub_node_id {
+            return Err(NodeError::Unauthorized(format!(
+                "hub returned unexpected nodeId '{}' (expected '{hub_node_id}')",
+                reply.node_id
+            )));
+        }
+
+        // Verify signed manifest BEFORE persisting credentials or peer state.
+        let payload = reply.signed_manifest.decode_payload()?;
+        if payload.node_id.as_str() != hub_node_id {
+            return Err(NodeError::Unauthorized(format!(
+                "hub manifest nodeId '{}' does not match expected '{hub_node_id}'",
+                payload.node_id
+            )));
+        }
+        let hub_pk = proto_jwk_to_crypto(&payload.identity.signing_jwk).to_ed25519()?;
+        hub_pk.verify_domain_b64(
+            "manifest",
+            reply.signed_manifest.payload.as_bytes(),
+            &reply.signed_manifest.sig,
+        )?;
+        if let Some(expected_fp) = expected_hub_fingerprint {
+            let actual_fp = hub_pk.fingerprint();
+            if !expected_fp.eq_ignore_ascii_case(&actual_fp) {
+                return Err(NodeError::Unauthorized(format!(
+                    "hub signing key fingerprint '{actual_fp}' does not match pinned '{expected_fp}'"
+                )));
+            }
+        }
+
+        let cred_ref = self.save_peer_auth_credential(&reply.node_id, &reply.auth_credential)?;
+        let now = now_ms();
+        {
+            let db = self.db();
+            db.peers().upsert_peer(
+                &PeerInput {
+                    peer_id: reply.node_id.clone(),
+                    endpoint: Some(base.to_string()),
+                    profile: hyp_store::PeerProfile::Router,
+                    trust_tier: TrustTier::Org,
+                    status: PeerStatus::Active,
+                    scopes: reply.scopes.clone(),
+                    auth_credential_ref: Some(cred_ref),
+                },
+                now,
+            )?;
+        }
+
+        let etag = compute_etag(&serde_json::to_vec(&reply.signed_manifest)?);
+        let negotiated = self.verify_and_cache_peer_manifest(
+            &reply.node_id,
+            &reply.signed_manifest,
+            Some(etag),
+            false,
+        )?;
+
+        self.activate_peer_link(&reply.node_id, base, negotiated.clone())
+            .await?;
+
+        let info = PeerLinkInfo {
+            peer_id: reply.node_id.clone(),
+            endpoint: base.to_string(),
+            negotiated,
+        };
+        Ok((reply, info))
     }
 
     /// Client-side Org Admin-CA (`am2_`) onboarding: decodes `am2_`, proves possession over

@@ -66,13 +66,13 @@ use crate::engine::http_util::{
 };
 use crate::engine::node::{AuthenticatedPeer, UnifiedNode};
 use crate::engine::peer_link::{
-    ChannelEpochResponse, ChannelJoinRequest, ChannelJoinResponse, ChannelLeaveRequest,
-    ChannelPostRequest, ChannelsResponse, GuestPairRequest, HandlesResponse, InboxAckRequest,
-    InboxAckResponse, KvDeleteBody, KvEpochResponse, KvListResponse, KvSetBody, PairRequestV2,
-    PeerKeysResponse, PostMessageRequest, PostMessageResponse, PublishEventRequest,
-    PutChannelEpochRequest, PutHandlesRequest, PutKeyRequest, PutKvEpochRequest,
-    PutSubscriptionsRequest, PutSubscriptionsResponse, SubscriptionsResponse,
-    TransferUploadResponse,
+    AuthClaimRequest, ChannelEpochResponse, ChannelJoinRequest, ChannelJoinResponse,
+    ChannelLeaveRequest, ChannelPostRequest, ChannelsResponse, DelegatedPairRequest,
+    GuestPairRequest, HandlesResponse, InboxAckRequest, InboxAckResponse, KvDeleteBody,
+    KvEpochResponse, KvListResponse, KvSetBody, PairRequestV2, PeerKeysResponse,
+    PostMessageRequest, PostMessageResponse, PublishEventRequest, PutChannelEpochRequest,
+    PutHandlesRequest, PutKeyRequest, PutKvEpochRequest, PutSubscriptionsRequest,
+    PutSubscriptionsResponse, SubscriptionsResponse, TransferUploadResponse,
 };
 
 const MAX_JSON_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -443,6 +443,18 @@ async fn route_request(
         }
         let guest_req: GuestPairRequest = serde_json::from_slice(&body_bytes)?;
         let reply = node.handle_guest_pair_request(&guest_req)?;
+        return Ok(json_response(StatusCode::OK, &reply));
+    }
+
+    if method == Method::POST && path == "/v1/auth/claim" {
+        let claim_req: AuthClaimRequest = serde_json::from_slice(&body_bytes)?;
+        let reply = node.handle_auth_claim_request(&claim_req)?;
+        return Ok(json_response(StatusCode::OK, &reply));
+    }
+
+    if method == Method::POST && path == "/v1/pair/delegated" {
+        let pair_req: DelegatedPairRequest = serde_json::from_slice(&body_bytes)?;
+        let reply = node.handle_delegated_pair_request(&pair_req)?;
         return Ok(json_response(StatusCode::OK, &reply));
     }
 
@@ -1216,7 +1228,11 @@ fn resolve_pre_read_body_limit(
     }
 
     if method == Method::POST
-        && (path == "/v1/pair" || path == "/v1/guest/pair" || path.starts_with("/v1/p2p/pair/"))
+        && (path == "/v1/pair"
+            || path == "/v1/guest/pair"
+            || path == "/v1/auth/claim"
+            || path == "/v1/pair/delegated"
+            || path.starts_with("/v1/p2p/pair/"))
     {
         if path == "/v1/guest/pair" && !node.config().guest_pairing.enabled {
             return Err(NodeError::NotFound(

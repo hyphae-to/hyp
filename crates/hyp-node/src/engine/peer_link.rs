@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
 use hyp_crypto::e2ee::SignedEpochKeyBundle;
+use hyp_crypto::human::HumanInviteClaimV1;
 use hyp_crypto::{NodeIdentityKeys, OkpJwk as CryptoOkpJwk, SignedPayload};
 use hyp_proto::address::NodeId;
 use hyp_proto::cloudevent::CloudEvent as ProtoCloudEvent;
@@ -142,6 +143,57 @@ pub struct GuestPairReply {
     pub preset: String,
     pub scopes: Vec<String>,
     pub manifest: SignedNodeManifest,
+}
+
+/// Request sent to `POST /v1/auth/claim` to claim a single-use Admin-CA `hjoin1_` human invite.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthClaimRequest {
+    pub hjoin1: String,
+    pub claim: HumanInviteClaimV1,
+    pub claim_sig: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Server reply to `POST /v1/auth/claim`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthClaimReply {
+    pub ok: bool,
+    pub hub_node_id: String,
+    pub human_id: String,
+    pub kid: String,
+    pub fingerprint: String,
+    pub node_prefix: String,
+    pub scopes: Vec<String>,
+    pub max_devices: u32,
+}
+
+/// Request sent to `POST /v1/pair/delegated` using a human-signed `hcert1_` NodeCert + live device proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegatedPairRequest {
+    pub node_id: String,
+    pub ed25519_jwk: CryptoOkpJwk,
+    pub x25519_jwk: CryptoOkpJwk,
+    pub node_cert: String,
+    pub timestamp: String,
+    pub proof_sig: String,
+}
+
+/// Server reply to `POST /v1/pair/delegated`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegatedPairReply {
+    pub ok: bool,
+    pub node_id: String,
+    pub peer_id: String,
+    pub human_id: String,
+    pub auth_epoch: u64,
+    pub scopes: Vec<String>,
+    pub auth_credential: String,
+    pub signed_manifest: SignedNodeManifest,
 }
 
 /// Entry in the `GET /v1/keys` peer key directory.

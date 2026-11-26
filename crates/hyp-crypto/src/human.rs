@@ -25,8 +25,10 @@ use crate::keys::{
     decode_raw_key_32, Ed25519KeyPair, Ed25519PublicKey, OkpJwk, X25519KeyPair, X25519PublicKey,
 };
 use crate::keystore::validate_secret_name;
-use crate::pairing::is_valid_node_id;
+use crate::pairing::{is_valid_node_id, validate_endpoint_origin};
 use crate::rfc3339::parse_rfc3339_millis;
+use hyp_proto::address::LOCAL_NODE_ID;
+use hyp_proto::scopes::{validate_delegated_human_scopes, validate_node_prefix_pattern};
 
 /// Domain separation prefix for inner `HumanClaimV1` Ed25519 signatures.
 pub const HUMAN_CLAIM_DOMAIN: &[u8] = b"hyphae/v2/human-claim\n";
@@ -36,6 +38,15 @@ pub const HUMAN_NODE_CERT_DOMAIN: &[u8] = b"hyphae/v2/human-node-cert\n";
 
 /// Domain separation prefix for `HumanRevocationV1` Ed25519 signatures.
 pub const HUMAN_REVOCATION_DOMAIN: &[u8] = b"hyphae/v2/human-revocation\n";
+
+/// Domain separation prefix for Org Admin-CA-signed `HumanInviteV1` (`hjoin1_`) envelopes.
+pub const HUMAN_INVITE_DOMAIN: &[u8] = b"hyphae/v2/human-invite\n";
+
+/// Domain separation prefix for human-signed `HumanInviteClaimV1` (`POST /v1/auth/claim`).
+pub const HUMAN_INVITE_CLAIM_DOMAIN: &[u8] = b"hyphae/v2/human-invite-claim\n";
+
+/// Domain separation prefix for device-signed `DelegatedPairProofV1` (`POST /v1/pair/delegated`).
+pub const DELEGATED_PAIR_DOMAIN: &[u8] = b"hyphae/v2/delegated-pair\n";
 
 /// Wire cipher suite identifier for sealed human drops.
 pub const HUMAN_DROP_SUITE_V1: &str = "human.drop.v1";
@@ -75,6 +86,21 @@ pub const HDROP1_PREFIX: &str = "hdrop1_";
 
 /// Armored prefix for human-signed node certificates (`hcert1_<base64url(JCS)>`).
 pub const HCERT1_PREFIX: &str = "hcert1_";
+
+/// Armored prefix for Org Admin-CA-signed human enrollment invites (`hjoin1_<base64url(JCS)>`).
+pub const HJOIN1_PREFIX: &str = "hjoin1_";
+
+/// Armored prefix for compact human public identity cards (`hpub1_<base64url(JCS)>`).
+pub const HPUB1_PREFIX: &str = "hpub1_";
+
+/// Hard upper bound on `maxDevices` in any `HumanInviteV1`.
+pub const MAX_DELEGATED_DEVICES_LIMIT: u32 = 100;
+
+/// Default device cap for delegated human admission.
+pub const DEFAULT_DELEGATED_MAX_DEVICES: u32 = 10;
+
+/// Maximum tolerated clock skew (±5 minutes) for `HumanInviteClaimV1` and `DelegatedPairProofV1`.
+pub const DELEGATED_PROOF_SKEW_MS: i64 = 5 * 60 * 1000;
 
 /// Hard upper bound on `expiresAt - issuedAt` for any `HumanClaimV1` (15 minutes).
 pub const MAX_CLAIM_TTL_MS: i64 = 900_000;
@@ -1200,4 +1226,452 @@ pub fn verify_local_ingest_event(
         sig_b64,
     )?;
     Ok(kid.to_string())
+}
+
+// ============================================================================
+// Delegated Human-Cert Admission (`hjoin1_`, `hpub1_`, `HumanInviteClaimV1`, `DelegatedPairProofV1`)
+// ============================================================================
+
+/// Org Admin-CA-signed human enrollment invite payload (`hjoin1_`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HumanInviteV1 {
+    pub v: u32,
+    pub invite_id: String,
+    pub hub_node_id: String,
+    pub hub_endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_fingerprint: Option<String>,
+    pub human_id: String,
+    pub node_prefix: String,
+    pub scopes: Vec<String>,
+    pub max_devices: u32,
+    pub issued_at: String,
+    pub expires_at: String,
+}
+
+/// Signed `HumanInviteV1` envelope (`{ payload, sig, adminJwk }`), armored as
+/// `hjoin1_<base64url_nopad(JCS)>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignedHumanInviteV1 {
+    pub payload: String,
+    pub sig: String,
+    pub admin_jwk: OkpJwk,
+}
+
+/// Compact copyable single-line public human identity card (`hpub1_<base64url_nopad(JCS)>`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HumanPubCardV1 {
+    pub v: u32,
+    pub human_id: String,
+    pub signing_jwk: OkpJwk,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enc_jwk: Option<OkpJwk>,
+}
+
+/// Human-signed claim submitted to `POST /v1/auth/claim` proving possession of the human's
+/// Ed25519 signing key (Passkey+PRF or CLI key).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HumanInviteClaimV1 {
+    pub invite_id: String,
+    pub hub_node_id: String,
+    pub human_id: String,
+    pub signing_jwk: OkpJwk,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enc_jwk: Option<OkpJwk>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prf_salt: Option<String>,
+    pub timestamp: String,
+}
+
+/// Device-signed live possession proof submitted to `POST /v1/pair/delegated`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegatedPairProofV1 {
+    pub hub_node_id: String,
+    pub node_id: String,
+    pub ed25519_jwk: OkpJwk,
+    pub x25519_jwk: OkpJwk,
+    pub node_cert_sha256: String,
+    pub timestamp: String,
+}
+
+fn is_valid_hub_fingerprint(fp: &str) -> bool {
+    fp.len() == 16 && fp.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn validate_human_invite_fields(invite: &HumanInviteV1) -> Result<(i64, i64), CryptoError> {
+    if invite.v != 1 {
+        return Err(CryptoError::InvalidEnvelope(format!(
+            "unsupported HumanInviteV1 version {} (expected 1)",
+            invite.v
+        )));
+    }
+    if !is_valid_token_id(&invite.invite_id, false) {
+        return Err(CryptoError::InvalidEnvelope(
+            "invalid HumanInviteV1 inviteId".into(),
+        ));
+    }
+    if invite.hub_node_id == LOCAL_NODE_ID || !is_valid_node_id(&invite.hub_node_id) {
+        return Err(CryptoError::InvalidEnvelope(format!(
+            "invalid HumanInviteV1 hubNodeId '{}'",
+            invite.hub_node_id
+        )));
+    }
+    validate_endpoint_origin(&invite.hub_endpoint)?;
+    if let Some(ref fp) = invite.hub_fingerprint {
+        if !is_valid_hub_fingerprint(fp) {
+            return Err(CryptoError::InvalidEnvelope(format!(
+                "invalid HumanInviteV1 hubFingerprint '{fp}' (expected 16 hex characters)"
+            )));
+        }
+    }
+    if invite.human_id == LOCAL_NODE_ID || !is_valid_human_id(&invite.human_id) {
+        return Err(CryptoError::InvalidEnvelope(format!(
+            "invalid HumanInviteV1 humanId '{}'",
+            invite.human_id
+        )));
+    }
+    validate_node_prefix_pattern(&invite.node_prefix, false)
+        .map_err(|e| CryptoError::InvalidEnvelope(format!("invalid HumanInviteV1 nodePrefix: {e}")))?;
+    validate_delegated_human_scopes(&invite.scopes)
+        .map_err(|e| CryptoError::InvalidEnvelope(format!("invalid HumanInviteV1 scopes: {e}")))?;
+    if invite.max_devices == 0 || invite.max_devices > MAX_DELEGATED_DEVICES_LIMIT {
+        return Err(CryptoError::InvalidEnvelope(format!(
+            "HumanInviteV1 maxDevices {} must be in 1..={MAX_DELEGATED_DEVICES_LIMIT}",
+            invite.max_devices
+        )));
+    }
+    let issued_ms = parse_rfc3339_millis(&invite.issued_at).map_err(|_| {
+        CryptoError::InvalidEnvelope(format!(
+            "invalid HumanInviteV1 issuedAt '{}'",
+            invite.issued_at
+        ))
+    })?;
+    let expires_ms = parse_rfc3339_millis(&invite.expires_at).map_err(|_| {
+        CryptoError::InvalidEnvelope(format!(
+            "invalid HumanInviteV1 expiresAt '{}'",
+            invite.expires_at
+        ))
+    })?;
+    if expires_ms <= issued_ms {
+        return Err(CryptoError::InvalidEnvelope(
+            "HumanInviteV1 expiresAt must be strictly after issuedAt".into(),
+        ));
+    }
+    Ok((issued_ms, expires_ms))
+}
+
+/// Validates, JCS-canonicalizes, and signs a `HumanInviteV1` under `HUMAN_INVITE_DOMAIN`
+/// using the hub's Org Admin-CA Ed25519 keypair.
+pub fn sign_human_invite(
+    invite: &HumanInviteV1,
+    admin_signer: &Ed25519KeyPair,
+) -> Result<SignedHumanInviteV1, CryptoError> {
+    let _ = validate_human_invite_fields(invite)?;
+    let payload = to_canonical_json(invite)?;
+    let sig = sign_with_domain(admin_signer, HUMAN_INVITE_DOMAIN, payload.as_bytes());
+    Ok(SignedHumanInviteV1 {
+        payload,
+        sig,
+        admin_jwk: admin_signer.to_jwk(),
+    })
+}
+
+/// Strictly verifies a `SignedHumanInviteV1` against the hub's pinned `expected_admin_pk` and `now_ms`.
+///
+/// Fails closed on Admin-CA key mismatch, bad signature, disallowed scope (`*`, `bridge:post`,
+/// `forward:via`), bare `*` `nodePrefix`, invalid `maxDevices`, clock skew, or expiry.
+pub fn verify_human_invite(
+    signed: &SignedHumanInviteV1,
+    expected_admin_pk: &Ed25519PublicKey,
+    now_ms: i64,
+) -> Result<HumanInviteV1, CryptoError> {
+    let embedded_pk = signed.admin_jwk.to_ed25519()?;
+    if embedded_pk != *expected_admin_pk {
+        return Err(CryptoError::InvalidSignature(
+            "HumanInviteV1 adminJwk does not match pinned hub Admin-CA key".into(),
+        ));
+    }
+    verify_with_domain(
+        expected_admin_pk,
+        HUMAN_INVITE_DOMAIN,
+        signed.payload.as_bytes(),
+        &signed.sig,
+    )?;
+    let invite: HumanInviteV1 = serde_json::from_str(&signed.payload)?;
+    let (issued_ms, expires_ms) = validate_human_invite_fields(&invite)?;
+    if issued_ms > now_ms.saturating_add(CLOCK_SKEW_MS) {
+        return Err(CryptoError::InvalidEnvelope(format!(
+            "HumanInviteV1 issuedAt '{}' exceeds allowed clock skew",
+            invite.issued_at
+        )));
+    }
+    if now_ms >= expires_ms {
+        return Err(CryptoError::InvalidEnvelope(format!(
+            "HumanInviteV1 expired at '{}'",
+            invite.expires_at
+        )));
+    }
+    Ok(invite)
+}
+
+/// Verifies a `SignedHumanInviteV1` against its own embedded `admin_jwk` for client-side preview
+/// before contacting the hub (the hub MUST always call [`verify_human_invite`] with its pinned key).
+pub fn verify_human_invite_embedded(
+    signed: &SignedHumanInviteV1,
+    now_ms: i64,
+) -> Result<(HumanInviteV1, Ed25519PublicKey), CryptoError> {
+    let embedded_pk = signed.admin_jwk.to_ed25519()?;
+    let invite = verify_human_invite(signed, &embedded_pk, now_ms)?;
+    Ok((invite, embedded_pk))
+}
+
+/// Encodes a `SignedHumanInviteV1` into an armored `hjoin1_<base64url_nopad(JCS)>` token.
+pub fn encode_hjoin1(signed: &SignedHumanInviteV1) -> Result<String, CryptoError> {
+    if signed.payload.is_empty() || signed.sig.is_empty() {
+        return Err(CryptoError::InvalidEnvelope(
+            "SignedHumanInviteV1 payload and sig must be non-empty".into(),
+        ));
+    }
+    let _ = signed.admin_jwk.to_ed25519()?;
+    let canon = to_canonical_json(signed)?;
+    Ok(format!(
+        "{HJOIN1_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(canon.as_bytes())
+    ))
+}
+
+/// Decodes an armored `hjoin1_<base64url_nopad(JCS)>` string into a `SignedHumanInviteV1`.
+pub fn decode_hjoin1(armored: &str) -> Result<SignedHumanInviteV1, CryptoError> {
+    let trimmed = armored.trim();
+    let encoded = trimmed
+        .strip_prefix(HJOIN1_PREFIX)
+        .ok_or_else(|| CryptoError::InvalidEnvelope("expected 'hjoin1_' prefix".into()))?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|e| CryptoError::InvalidEnvelope(format!("invalid hjoin1_ base64url: {e}")))?;
+    let signed: SignedHumanInviteV1 = serde_json::from_slice(&bytes)?;
+    if signed.payload.is_empty() || signed.sig.is_empty() {
+        return Err(CryptoError::InvalidEnvelope(
+            "decoded hjoin1_ has empty payload or sig".into(),
+        ));
+    }
+    let _ = signed.admin_jwk.to_ed25519()?;
+    Ok(signed)
+}
+
+fn validate_human_pub_card(card: &HumanPubCardV1) -> Result<(Ed25519PublicKey, Option<X25519PublicKey>), CryptoError> {
+    if card.v != 1 {
+        return Err(CryptoError::InvalidEnvelope(format!(
+            "unsupported HumanPubCardV1 version {} (expected 1)",
+            card.v
+        )));
+    }
+    if card.human_id == LOCAL_NODE_ID || !is_valid_human_id(&card.human_id) {
+        return Err(CryptoError::InvalidEnvelope(format!(
+            "invalid HumanPubCardV1 humanId '{}'",
+            card.human_id
+        )));
+    }
+    let sign_pk = card.signing_jwk.to_ed25519()?;
+    let enc_pk = match &card.enc_jwk {
+        Some(jwk) => Some(jwk.to_x25519()?),
+        None => None,
+    };
+    Ok((sign_pk, enc_pk))
+}
+
+/// Encodes a validated `HumanPubCardV1` into a compact copyable `hpub1_<base64url_nopad(JCS)>` string.
+pub fn encode_hpub1(card: &HumanPubCardV1) -> Result<String, CryptoError> {
+    let _ = validate_human_pub_card(card)?;
+    let canon = to_canonical_json(card)?;
+    Ok(format!(
+        "{HPUB1_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(canon.as_bytes())
+    ))
+}
+
+/// Decodes and validates a compact `hpub1_<base64url_nopad(JCS)>` identity card fail-closed.
+pub fn decode_hpub1(armored: &str) -> Result<HumanPubCardV1, CryptoError> {
+    let trimmed = armored.trim();
+    let encoded = trimmed
+        .strip_prefix(HPUB1_PREFIX)
+        .ok_or_else(|| CryptoError::InvalidEnvelope("expected 'hpub1_' prefix".into()))?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|e| CryptoError::InvalidEnvelope(format!("invalid hpub1_ base64url: {e}")))?;
+    let card: HumanPubCardV1 = serde_json::from_slice(&bytes)?;
+    let _ = validate_human_pub_card(&card)?;
+    Ok(card)
+}
+
+fn validate_human_invite_claim_fields(
+    claim: &HumanInviteClaimV1,
+) -> Result<(Ed25519PublicKey, Option<X25519PublicKey>, i64), CryptoError> {
+    if !is_valid_token_id(&claim.invite_id, false) {
+        return Err(CryptoError::InvalidEnvelope(
+            "invalid HumanInviteClaimV1 inviteId".into(),
+        ));
+    }
+    if claim.hub_node_id == LOCAL_NODE_ID || !is_valid_node_id(&claim.hub_node_id) {
+        return Err(CryptoError::InvalidEnvelope(format!(
+            "invalid HumanInviteClaimV1 hubNodeId '{}'",
+            claim.hub_node_id
+        )));
+    }
+    if claim.human_id == LOCAL_NODE_ID || !is_valid_human_id(&claim.human_id) {
+        return Err(CryptoError::InvalidEnvelope(format!(
+            "invalid HumanInviteClaimV1 humanId '{}'",
+            claim.human_id
+        )));
+    }
+    let sign_pk = claim.signing_jwk.to_ed25519()?;
+    let enc_pk = match &claim.enc_jwk {
+        Some(jwk) => Some(jwk.to_x25519()?),
+        None => None,
+    };
+    if let Some(ref salt) = claim.prf_salt {
+        if !is_valid_token_id(salt, false) {
+            return Err(CryptoError::InvalidEnvelope(
+                "invalid HumanInviteClaimV1 prfSalt".into(),
+            ));
+        }
+    }
+    let ts_ms = parse_rfc3339_millis(&claim.timestamp).map_err(|_| {
+        CryptoError::InvalidEnvelope(format!(
+            "invalid HumanInviteClaimV1 timestamp '{}'",
+            claim.timestamp
+        ))
+    })?;
+    Ok((sign_pk, enc_pk, ts_ms))
+}
+
+/// Validates, JCS-canonicalizes, and signs a `HumanInviteClaimV1` under
+/// `HUMAN_INVITE_CLAIM_DOMAIN`, returning the base64url Ed25519 signature.
+pub fn sign_human_invite_claim(
+    claim: &HumanInviteClaimV1,
+    human_signer: &Ed25519KeyPair,
+) -> Result<String, CryptoError> {
+    let (sign_pk, _, _) = validate_human_invite_claim_fields(claim)?;
+    if sign_pk != human_signer.public_key() {
+        return Err(CryptoError::InvalidEnvelope(
+            "HumanInviteClaimV1 signingJwk does not match human signer key".into(),
+        ));
+    }
+    let canonical = to_canonical_json(claim)?;
+    Ok(sign_with_domain(
+        human_signer,
+        HUMAN_INVITE_CLAIM_DOMAIN,
+        canonical.as_bytes(),
+    ))
+}
+
+/// Strictly verifies a `HumanInviteClaimV1` signature and ±5 minute replay timestamp window.
+pub fn verify_human_invite_claim(
+    claim: &HumanInviteClaimV1,
+    sig_b64: &str,
+    now_ms: i64,
+) -> Result<(Ed25519PublicKey, Option<X25519PublicKey>), CryptoError> {
+    let (sign_pk, enc_pk, ts_ms) = validate_human_invite_claim_fields(claim)?;
+    if (now_ms - ts_ms).abs() > DELEGATED_PROOF_SKEW_MS {
+        return Err(CryptoError::InvalidEnvelope(
+            "HumanInviteClaimV1 timestamp outside allowed ±5 minute skew window".into(),
+        ));
+    }
+    let canonical = to_canonical_json(claim)?;
+    verify_with_domain(
+        &sign_pk,
+        HUMAN_INVITE_CLAIM_DOMAIN,
+        canonical.as_bytes(),
+        sig_b64,
+    )?;
+    Ok((sign_pk, enc_pk))
+}
+
+/// Computes the canonical lowercase 64-hex SHA-256 digest of an armored `hcert1_` string for
+/// binding inside [`DelegatedPairProofV1::node_cert_sha256`].
+pub fn node_cert_sha256(armored_hcert1: &str) -> String {
+    hex::encode(Sha256::digest(armored_hcert1.trim().as_bytes()))
+}
+
+fn validate_delegated_pair_proof_fields(
+    proof: &DelegatedPairProofV1,
+) -> Result<(Ed25519PublicKey, X25519PublicKey, i64), CryptoError> {
+    if proof.hub_node_id == LOCAL_NODE_ID || !is_valid_node_id(&proof.hub_node_id) {
+        return Err(CryptoError::InvalidEnvelope(format!(
+            "invalid DelegatedPairProofV1 hubNodeId '{}'",
+            proof.hub_node_id
+        )));
+    }
+    if proof.node_id == LOCAL_NODE_ID || !is_valid_node_id(&proof.node_id) {
+        return Err(CryptoError::InvalidEnvelope(format!(
+            "invalid DelegatedPairProofV1 nodeId '{}'",
+            proof.node_id
+        )));
+    }
+    let sign_pk = proof.ed25519_jwk.to_ed25519()?;
+    let enc_pk = proof.x25519_jwk.to_x25519()?;
+    if proof.node_cert_sha256.len() != 64
+        || !proof
+            .node_cert_sha256
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(CryptoError::InvalidEnvelope(
+            "DelegatedPairProofV1 nodeCertSha256 must be 64 lowercase hex characters".into(),
+        ));
+    }
+    let ts_ms = parse_rfc3339_millis(&proof.timestamp).map_err(|_| {
+        CryptoError::InvalidEnvelope(format!(
+            "invalid DelegatedPairProofV1 timestamp '{}'",
+            proof.timestamp
+        ))
+    })?;
+    Ok((sign_pk, enc_pk, ts_ms))
+}
+
+/// Validates, JCS-canonicalizes, and signs a `DelegatedPairProofV1` under `DELEGATED_PAIR_DOMAIN`
+/// using the device's Ed25519 private key.
+pub fn sign_delegated_pair_proof(
+    proof: &DelegatedPairProofV1,
+    device_signer: &Ed25519KeyPair,
+) -> Result<String, CryptoError> {
+    let (sign_pk, _, _) = validate_delegated_pair_proof_fields(proof)?;
+    if sign_pk != device_signer.public_key() {
+        return Err(CryptoError::InvalidEnvelope(
+            "DelegatedPairProofV1 ed25519Jwk does not match device signer key".into(),
+        ));
+    }
+    let canonical = to_canonical_json(proof)?;
+    Ok(sign_with_domain(
+        device_signer,
+        DELEGATED_PAIR_DOMAIN,
+        canonical.as_bytes(),
+    ))
+}
+
+/// Strictly verifies a `DelegatedPairProofV1` signature and ±5 minute replay window fail-closed.
+pub fn verify_delegated_pair_proof(
+    proof: &DelegatedPairProofV1,
+    sig_b64: &str,
+    now_ms: i64,
+) -> Result<(Ed25519PublicKey, X25519PublicKey), CryptoError> {
+    let (sign_pk, enc_pk, ts_ms) = validate_delegated_pair_proof_fields(proof)?;
+    if (now_ms - ts_ms).abs() > DELEGATED_PROOF_SKEW_MS {
+        return Err(CryptoError::InvalidEnvelope(
+            "DelegatedPairProofV1 timestamp outside allowed ±5 minute skew window".into(),
+        ));
+    }
+    let canonical = to_canonical_json(proof)?;
+    verify_with_domain(
+        &sign_pk,
+        DELEGATED_PAIR_DOMAIN,
+        canonical.as_bytes(),
+        sig_b64,
+    )?;
+    Ok((sign_pk, enc_pk))
 }

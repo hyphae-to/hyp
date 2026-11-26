@@ -133,6 +133,10 @@ pub struct PeerSkewRow {
     pub kv: String,
     pub notes: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub admitted_by_human_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admitted_auth_epoch: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub upgrade_hint: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub missing_capabilities: Vec<String>,
@@ -500,6 +504,8 @@ fn run_status_or_doctor(
         streams: "pushdown".to_string(),
         kv: "kv.e2ee.v1".to_string(),
         notes: format!("local node ({node_id})"),
+        admitted_by_human_id: None,
+        admitted_auth_epoch: None,
         upgrade_hint: None,
         missing_capabilities: Vec::new(),
     });
@@ -1219,6 +1225,8 @@ pub fn evaluate_peer_skew(
                 "Blocked: protocol_incompatible (local {}..={}, remote {}..={})",
                 MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, proto_range.min, proto_range.max
             ),
+            admitted_by_human_id: peer.admitted_by_human_id.clone(),
+            admitted_auth_epoch: peer.admitted_auth_epoch,
             upgrade_hint: Some(format!(
                 "Upgrade '{}' or local hyp to a compatible major protocol version.",
                 peer.peer_id
@@ -1247,6 +1255,8 @@ pub fn evaluate_peer_skew(
                 "Blocked: capability_downgrade_detected (previously observed {} vanished)",
                 dropped_e2ee.join(", ")
             ),
+            admitted_by_human_id: peer.admitted_by_human_id.clone(),
+            admitted_auth_epoch: peer.admitted_auth_epoch,
             upgrade_hint: Some(format!(
                 "Verify '{}' integrity or override explicitly via `hyp peer trust --accept-downgrade {}`.",
                 peer.peer_id, peer.peer_id
@@ -1266,6 +1276,8 @@ pub fn evaluate_peer_skew(
             streams: streams_col,
             kv: kv_col,
             notes: "Blocked: requireE2ee=true but peer lacks dm.e2ee.v1".to_string(),
+            admitted_by_human_id: peer.admitted_by_human_id.clone(),
+            admitted_auth_epoch: peer.admitted_auth_epoch,
             upgrade_hint: Some(format!(
                 "Upgrade '{}' to Hyphae v2 (or run `hyp peer policy {} --e2ee prefer` if plaintext is acceptable).",
                 peer.peer_id, peer.peer_id
@@ -1304,6 +1316,8 @@ pub fn evaluate_peer_skew(
             streams: streams_col,
             kv: kv_col,
             notes: "Legacy v1 peer (plaintext DMs; will ratchet to E2EE on upgrade)".to_string(),
+            admitted_by_human_id: peer.admitted_by_human_id.clone(),
+            admitted_auth_epoch: peer.admitted_auth_epoch,
             upgrade_hint: Some(format!("Upgrade '{}' to hyp >= 2.2.0 for E2EE, pushdown, and Shared KV.", peer.peer_id)),
             missing_capabilities: missing_optional,
         };
@@ -1327,12 +1341,19 @@ pub fn evaluate_peer_skew(
                 "Missing optional capabilities: {}",
                 missing_optional.join(", ")
             ),
+            admitted_by_human_id: peer.admitted_by_human_id.clone(),
+            admitted_auth_epoch: peer.admitted_auth_epoch,
             upgrade_hint: Some(hint),
             missing_capabilities: missing_optional,
         };
     }
 
-    let notes = if is_inbound_local_v2 {
+    let notes = if let Some(ref hid) = peer.admitted_by_human_id {
+        match peer.admitted_auth_epoch {
+            Some(ep) => format!("admitted via human:{hid} (ep {ep})"),
+            None => format!("admitted via human:{hid}"),
+        }
+    } else if is_inbound_local_v2 {
         if is_guest_ro {
             "inbound v2 guest client (read-only)".to_string()
         } else {
@@ -1353,6 +1374,8 @@ pub fn evaluate_peer_skew(
         streams: streams_col,
         kv: kv_col,
         notes,
+        admitted_by_human_id: peer.admitted_by_human_id.clone(),
+        admitted_auth_epoch: peer.admitted_auth_epoch,
         upgrade_hint: None,
         missing_capabilities: Vec::new(),
     }

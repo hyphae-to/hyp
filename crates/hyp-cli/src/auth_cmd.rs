@@ -26,14 +26,16 @@ use clap::{Subcommand, ValueEnum};
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full};
 use hyp_crypto::human::{
-    HumanAudience, HumanClaimV1, HumanDropKind, HumanRevocationPayloadV1, NodeCertPayloadV1,
-    SecretDropSpec, SignedHumanRevocationV1, SignedNodeCertV1, decode_hcert1, encode_hdrop1,
-    is_reserved_secret_name, seal_human_drop, sign_human_revocation, sign_local_ingest_event,
-    verify_node_cert,
+    DEFAULT_DELEGATED_MAX_DEVICES, HumanAudience, HumanClaimV1, HumanDropKind, HumanInviteV1,
+    HumanPubCardV1, HumanRevocationPayloadV1, MAX_DELEGATED_DEVICES_LIMIT, NodeCertPayloadV1,
+    SecretDropSpec, SignedHumanRevocationV1, SignedNodeCertV1, decode_hcert1, decode_hpub1,
+    encode_hdrop1, encode_hjoin1, encode_hpub1, is_reserved_secret_name, seal_human_drop,
+    sign_human_invite, sign_human_revocation, sign_local_ingest_event, verify_node_cert,
 };
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keys::{Ed25519KeyPair, Ed25519PublicKey, OkpJwk, X25519PublicKey};
 use hyp_crypto::keystore::{SecretStore, validate_secret_name};
+use hyp_crypto::pairing::validate_endpoint_origin;
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms, parse_rfc3339_millis};
 use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync};
 use hyp_node::engine::{
@@ -45,9 +47,12 @@ use hyp_proto::address::{LOCAL_NODE_ID, NodeId, is_valid_handle, is_valid_node_i
 use hyp_proto::cloudevent::{
     CONTENT_TYPE_JSON, CloudEvent as ProtoCloudEvent, EXT_LOCAL_EVENT_SIG, TYPE_HUMAN_REVOCATION_V1,
 };
+use hyp_proto::scopes::{
+    ScopePreset, expand_delegated_human_scopes, validate_node_prefix_pattern,
+};
 use hyp_store::{
     HumanAuthorityInput, HumanAuthorityRecord, HumanAuthorityRole, HumanAuthorityStatus,
-    HumanNodeCertInput, KeyUse, NodeDb, now_ms, uuid_v4,
+    HumanDelegationPolicyInput, HumanNodeCertInput, KeyUse, NodeDb, now_ms, uuid_v4,
 };
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
@@ -70,6 +75,8 @@ const MAX_JWK_STDIN_BYTES: u64 = 16 * 1024;
 const MAX_SIGN_BODY_BYTES: u64 = 32 * 1024;
 const MAX_ENROLL_CALLBACK_BYTES: usize = 16 * 1024;
 const DEFAULT_WEB_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_JOIN_PORTAL_URL: &str = "https://hyphae.to/join";
+const MAX_INVITE_EXPIRES_HOURS: u64 = 24 * 365;
 const MAX_DROP_TTL_SECS: u64 = 900;
 const LIVE_DAEMON_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 const HUMAN_REVOCATIONS_TOPIC: &str = "human.revocations";
@@ -175,14 +182,17 @@ pub enum AuthCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Monotonically revoke a human authority key (optionally bumping minAuthEpoch)
+    /// Monotonically revoke a human authority key (optionally bumping minAuthEpoch and cascading to admitted devices)
     Revoke {
-        /// Authority RFC 7638 kid (full kid or unambiguous >=8-char prefix)
+        /// Authority humanId, full RFC 7638 kid, or unambiguous >=8-char kid prefix
         #[arg(allow_hyphen_values = true)]
         kid: String,
         /// Increment minAuthEpoch monotonically to invalidate older claims & certs
         #[arg(long)]
         bump_epoch: bool,
+        /// Revoke all peers admitted under this human authority, invalidate their bearer tokens, and reload the daemon
+        #[arg(long)]
+        cascade: bool,
         /// Revocation reason recorded in audit metadata
         #[arg(long, default_value = "revoked via hyp auth revoke")]
         reason: String,
@@ -202,6 +212,99 @@ pub enum AuthCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Mint a single-use Org Admin-CA-signed `hjoin1_` human enrollment invite & https://hyphae.to/join link
+    Invite {
+        /// Canonical human identifier to invite (e.g. philip)
+        human_id: String,
+        /// Hub canonical nodeId (defaults to local nodeId)
+        #[arg(long)]
+        hub: Option<String>,
+        /// Hub HTTPS endpoint (defaults to listen.publicUrl in node.json)
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Optional 16-hex SHA-256 prefix of the hub's Ed25519 signing key
+        #[arg(long)]
+        hub_fingerprint: Option<String>,
+        /// Allowed device nodeId glob pattern (default: <human-id>@*; bare '*' is forbidden)
+        #[arg(long)]
+        node_prefix: Option<String>,
+        /// Built-in scope preset (default: member; never grants bridge:post, forward:via, or '*')
+        #[arg(long, value_enum)]
+        preset: Option<crate::pair::CliScopePreset>,
+        /// Explicit v2 scopes to grant (repeatable or space-delimited; bridge:post, forward:via, and '*' are forbidden)
+        #[arg(long, num_args = 1..)]
+        grant: Vec<String>,
+        /// Maximum simultaneous active devices this human may admit (1..=100, default: 10)
+        #[arg(long, default_value_t = DEFAULT_DELEGATED_MAX_DEVICES)]
+        max_devices: u32,
+        /// Invite validity window in hours (1..=8760, default: 24)
+        #[arg(long, default_value_t = 24)]
+        expires_hours: u64,
+        /// Join portal base URL (default: https://hyphae.to/join)
+        #[arg(long, default_value = DEFAULT_JOIN_PORTAL_URL)]
+        portal_url: String,
+        /// Explicit state directory containing node.sqlite and secrets/
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Explicit node.json path
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Output structured JSON envelope
+        #[arg(long)]
+        json: bool,
+    },
+    /// Directly enroll a human authority and delegated admission policy on this hub (from hpub1_ or stdin JWK)
+    Admit {
+        /// Canonical human identifier to admit (e.g. philip)
+        human_id: String,
+        /// Compact public human identity card (`hpub1_...`, public keys only)
+        #[arg(long)]
+        id: Option<String>,
+        /// Read `hpub1_...` or OKP Ed25519 public JWK JSON from stdin
+        #[arg(long)]
+        stdin: bool,
+        /// Human-readable label for the enrolled authority
+        #[arg(long, default_value = "delegated-human")]
+        label: String,
+        /// Allowed device nodeId glob pattern (default: <human-id>@*; bare '*' is forbidden)
+        #[arg(long)]
+        node_prefix: Option<String>,
+        /// Built-in scope preset (default: member; never grants bridge:post, forward:via, or '*')
+        #[arg(long, value_enum)]
+        preset: Option<crate::pair::CliScopePreset>,
+        /// Explicit v2 scopes to grant (repeatable or space-delimited; bridge:post, forward:via, and '*' are forbidden)
+        #[arg(long, num_args = 1..)]
+        grant: Vec<String>,
+        /// Maximum simultaneous active devices this human may admit (1..=100, default: 10)
+        #[arg(long, default_value_t = DEFAULT_DELEGATED_MAX_DEVICES)]
+        max_devices: u32,
+        /// Explicit state directory containing node.sqlite and secrets/
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Explicit node.json path
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Output structured JSON envelope
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print this node's enrolled Human Authority compact `hpub1_` public identity card and fingerprint
+    Whoami {
+        /// Optional humanId filter when multiple local authorities are enrolled
+        #[arg(long)]
+        human_id: Option<String>,
+        /// Explicit state directory containing node.sqlite
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Explicit node.json path
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Output structured JSON envelope
+        #[arg(long)]
+        json: bool,
+    },
+    /// Join a Team Hub via Passkey+PRF delegated human admission (alias for top-level `hyp join`)
+    Join(crate::join_cmd::JoinArgs),
     /// Issue & persist a human-signed NodeCertV1 (hcert1_) for this node's Ed25519 + X25519 keys
     CertifyNode {
         /// Certificate validity duration in days (default: 365)
@@ -293,6 +396,7 @@ pub fn run_auth(command: AuthCommand) -> ExitCode {
         AuthCommand::Revoke {
             kid,
             bump_epoch,
+            cascade,
             reason,
             issuer_kid,
             broadcast,
@@ -300,8 +404,69 @@ pub fn run_auth(command: AuthCommand) -> ExitCode {
             config,
             json,
         } => run_auth_revoke(
-            kid, bump_epoch, reason, issuer_kid, broadcast, state_dir, config, json,
+            kid, bump_epoch, cascade, reason, issuer_kid, broadcast, state_dir, config, json,
         ),
+        AuthCommand::Invite {
+            human_id,
+            hub,
+            endpoint,
+            hub_fingerprint,
+            node_prefix,
+            preset,
+            grant,
+            max_devices,
+            expires_hours,
+            portal_url,
+            state_dir,
+            config,
+            json,
+        } => run_auth_invite(
+            human_id,
+            hub,
+            endpoint,
+            hub_fingerprint,
+            node_prefix,
+            preset,
+            grant,
+            max_devices,
+            expires_hours,
+            portal_url,
+            state_dir,
+            config,
+            json,
+        ),
+        AuthCommand::Admit {
+            human_id,
+            id,
+            stdin,
+            label,
+            node_prefix,
+            preset,
+            grant,
+            max_devices,
+            state_dir,
+            config,
+            json,
+        } => run_auth_admit(
+            human_id,
+            id,
+            stdin,
+            label,
+            node_prefix,
+            preset,
+            grant,
+            max_devices,
+            state_dir,
+            config,
+            json,
+        ),
+        AuthCommand::Whoami {
+            human_id,
+            state_dir,
+            config,
+            json,
+        } => run_auth_whoami(human_id, state_dir, config, json),
+        AuthCommand::Join(args) => crate::join_cmd::run_join(args),
         AuthCommand::CertifyNode {
             ttl_days,
             kid,
@@ -1896,6 +2061,7 @@ fn run_auth_list(all: bool, state_dir_arg: Option<PathBuf>, as_json: bool) -> Ex
 fn run_auth_revoke(
     kid_arg: String,
     bump_epoch: bool,
+    cascade: bool,
     reason: String,
     issuer_kid_arg: Option<String>,
     broadcast: bool,
@@ -1906,12 +2072,20 @@ fn run_auth_revoke(
     let cmd = "auth revoke";
     let query = kid_arg.trim();
     if query.is_empty() {
-        return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_KID", "kid cannot be empty", None);
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "INVALID_KID",
+            "kid or humanId cannot be empty",
+            None,
+        );
     }
     if !is_interactive_tty() {
         return emit_confirm_error(cmd, as_json, ConfirmError::NotInteractiveTty);
     }
 
+    let explicit_state = state_dir_arg.is_some() || config_arg.is_some();
     let state_dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
     let config_read =
         resolve_config_path_for_read(config_arg.as_deref(), state_dir_arg.as_deref(), None);
@@ -1938,9 +2112,22 @@ fn run_auth_revoke(
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
     };
 
-    let target = match resolve_authority_by_kid_or_prefix(&all, query) {
-        Ok(rec) => rec.clone(),
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "AUTHORITY_NOT_FOUND", e, None),
+    let targets: Vec<HumanAuthorityRecord> =
+        match resolve_authorities_for_revoke(&all, query, cascade) {
+            Ok(list) => list,
+            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "AUTHORITY_NOT_FOUND", e, None),
+        };
+    let target = targets[0].clone();
+
+    let cascade_peer_ids: Vec<String> = if cascade {
+        db.peers()
+            .list_peers_admitted_by_human(&target.human_id, true)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.peer_id)
+            .collect()
+    } else {
+        Vec::new()
     };
 
     let current_min = db.human().min_auth_epoch().unwrap_or(1);
@@ -1963,7 +2150,7 @@ fn run_auth_revoke(
             .filter(|a| {
                 a.status == HumanAuthorityStatus::Active
                     && a.role == HumanAuthorityRole::Admin
-                    && a.kid != target.kid
+                    && !targets.iter().any(|t| t.kid == a.kid)
             })
             .find_map(|a| load_local_authority_keypair(&secrets, &a.kid).ok())
             .or_else(|| {
@@ -2000,7 +2187,7 @@ fn run_auth_revoke(
     }
 
     let gate_locked = is_gate_locked(&config_read);
-    let summary = format_auth_revoke_confirm_summary(
+    let mut summary = format_auth_revoke_confirm_summary(
         &target,
         bump_epoch,
         current_min,
@@ -2009,6 +2196,12 @@ fn run_auth_revoke(
         &reason,
         gate_locked,
     );
+    if cascade {
+        summary.push(format!(
+            "  Cascade:    yes (disables delegation & revokes {} active admitted peer(s))",
+            cascade_peer_ids.len()
+        ));
+    }
     let prompt = format!(
         "Revoke human authority '{}'? [y/N]: ",
         sanitize_tty_display(&target.kid)
@@ -2017,30 +2210,72 @@ fn run_auth_revoke(
         return emit_confirm_error(cmd, as_json, err);
     }
 
-    let revocation_json = match &signed_revocation {
-        Some(sr) => serde_json::to_string(sr).unwrap_or_else(|_| "{}".to_string()),
-        None => json!({
-            "v": 1,
-            "humanId": target.human_id,
-            "revokedKid": target.kid,
-            "newMinAuthEpoch": new_min,
-            "revokedAt": revoked_at,
-            "reason": reason,
-            "localCli": true,
-        })
-        .to_string(),
-    };
+    let mut effective_min = current_min;
+    for t in &targets {
+        let rev_json = if t.kid == target.kid {
+            match &signed_revocation {
+                Some(sr) => serde_json::to_string(sr).unwrap_or_else(|_| "{}".to_string()),
+                None => json!({
+                    "v": 1,
+                    "humanId": t.human_id,
+                    "revokedKid": t.kid,
+                    "newMinAuthEpoch": new_min,
+                    "revokedAt": revoked_at,
+                    "reason": reason,
+                    "localCli": true,
+                })
+                .to_string(),
+            }
+        } else {
+            json!({
+                "v": 1,
+                "humanId": t.human_id,
+                "revokedKid": t.kid,
+                "newMinAuthEpoch": new_min,
+                "revokedAt": revoked_at,
+                "reason": reason,
+                "localCli": true,
+            })
+            .to_string()
+        };
+        match db.human().revoke_authority_monotonic(
+            &t.human_id,
+            &t.kid,
+            new_min,
+            &rev_json,
+            now,
+        ) {
+            Ok(m) => effective_min = effective_min.max(m),
+            Err(e) => {
+                return emit_error(cmd, as_json, EXIT_ERROR, "REVOKE_FAILED", e.to_string(), None);
+            }
+        }
+    }
 
-    let effective_min = match db.human().revoke_authority_monotonic(
-        &target.human_id,
-        &target.kid,
-        new_min,
-        &revocation_json,
-        now,
-    ) {
-        Ok(m) => m,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "REVOKE_FAILED", e.to_string(), None),
-    };
+    let mut revoked_peers: Vec<String> = Vec::new();
+    if cascade {
+        if let Err(e) = db
+            .human()
+            .set_delegation_enabled(&target.human_id, false, now)
+        {
+            return emit_error(cmd, as_json, EXIT_ERROR, "REVOKE_FAILED", e.to_string(), None);
+        }
+        match db
+            .peers()
+            .revoke_peers_admitted_by_human(&target.human_id, now)
+        {
+            Ok(peers) => {
+                for pid in &peers {
+                    let cred = crate::pair::credential_secret_name("peer-auth", pid);
+                    let _ = secrets.delete(&cred);
+                }
+                revoked_peers = peers;
+            }
+            Err(e) => {
+                return emit_error(cmd, as_json, EXIT_ERROR, "REVOKE_FAILED", e.to_string(), None);
+            }
+        }
+    }
 
     let gate_resigned = match sync_gate_policy_digest_if_locked(&config_write, &state_dir, &db, &secrets)
     {
@@ -2064,6 +2299,14 @@ fn run_auth_revoke(
         )
     } else {
         (false, None)
+    };
+
+    let peers_reloaded = if cascade {
+        let reload = crate::pair::try_reload_live_daemon(&state_dir, explicit_state);
+        warnings.extend(reload.warnings);
+        reload.reloaded
+    } else {
+        false
     };
 
     let broadcast_outcome = if broadcast {
@@ -2098,13 +2341,18 @@ fn run_auth_revoke(
         None
     };
 
+    let revoked_kids: Vec<&str> = targets.iter().map(|t| t.kid.as_str()).collect();
     if as_json {
         let mut data = json!({
             "humanId": target.human_id,
             "kid": target.kid,
+            "revokedKids": revoked_kids,
             "status": "revoked",
             "minAuthEpoch": effective_min,
             "epochBumped": bump_epoch,
+            "cascade": cascade,
+            "revokedPeers": revoked_peers,
+            "peersReloaded": peers_reloaded,
             "authoritiesDigest": digest,
             "gatePolicyResigned": gate_resigned,
             "gateReloaded": gate_reloaded,
@@ -2124,10 +2372,18 @@ fn run_auth_revoke(
         let envelope = JsonEnvelope {
             ok: true,
             command: cmd.to_string(),
-            summary: Some(format!(
-                "Revoked human authority '{}' kid {} (minAuthEpoch={effective_min})",
-                target.human_id, target.kid
-            )),
+            summary: Some(if cascade {
+                format!(
+                    "Revoked human authority '{}' (minAuthEpoch={effective_min}) and cascaded revocation to {} admitted peer(s)",
+                    target.human_id,
+                    revoked_peers.len()
+                )
+            } else {
+                format!(
+                    "Revoked human authority '{}' kid {} (minAuthEpoch={effective_min})",
+                    target.human_id, target.kid
+                )
+            }),
             data: Some(data),
             warnings,
             next,
@@ -2139,6 +2395,20 @@ fn run_auth_revoke(
             "OK    Revoked authority '{}' (kid={}, minAuthEpoch={effective_min})",
             target.human_id, target.kid
         );
+        if cascade {
+            println!(
+                "      Cascade:   revoked {} admitted peer(s){}",
+                revoked_peers.len(),
+                if revoked_peers.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", revoked_peers.join(", "))
+                }
+            );
+            if peers_reloaded {
+                println!("      Daemon:    live daemon reloaded — SSE streams dropped immediately");
+            }
+        }
         if gate_resigned {
             println!("      Gate Sig:  re-signed with updated human_authorities_digest");
             if gate_reloaded {
@@ -2637,6 +2907,886 @@ fn resolve_authority_by_kid_or_prefix<'a>(
         }
     }
     Err(format!("human authority kid '{query}' not found"))
+}
+
+fn resolve_authorities_for_revoke(
+    authorities: &[HumanAuthorityRecord],
+    query: &str,
+    cascade: bool,
+) -> Result<Vec<HumanAuthorityRecord>, String> {
+    if let Ok(rec) = resolve_authority_by_kid_or_prefix(authorities, query) {
+        return Ok(vec![rec.clone()]);
+    }
+    let lower = query.to_ascii_lowercase();
+    let by_human_active: Vec<HumanAuthorityRecord> = authorities
+        .iter()
+        .filter(|a| a.human_id == lower && a.status == HumanAuthorityStatus::Active)
+        .cloned()
+        .collect();
+    if !by_human_active.is_empty() {
+        if cascade || by_human_active.len() == 1 {
+            return Ok(by_human_active);
+        }
+        return Err(format!(
+            "human '{lower}' has {} active authority keys; pass a specific kid or --cascade",
+            by_human_active.len()
+        ));
+    }
+    let by_human_all: Vec<HumanAuthorityRecord> = authorities
+        .iter()
+        .filter(|a| a.human_id == lower)
+        .cloned()
+        .collect();
+    if !by_human_all.is_empty() {
+        if cascade || by_human_all.len() == 1 {
+            return Ok(by_human_all);
+        }
+        return Ok(vec![by_human_all[0].clone()]);
+    }
+    Err(format!("human authority '{query}' not found"))
+}
+
+fn resolve_delegated_scopes(
+    preset: Option<crate::pair::CliScopePreset>,
+    grant: &[String],
+) -> Result<Vec<String>, String> {
+    let mut raw: Vec<String> = Vec::new();
+    match (preset, grant.is_empty()) {
+        (Some(p), true) => raw.extend(p.to_proto().expand()),
+        (Some(p), false) => {
+            raw.extend(p.to_proto().expand());
+            raw.extend(crate::pair::tokenize_scope_args(grant));
+        }
+        (None, true) => raw.extend(ScopePreset::Member.expand()),
+        (None, false) => raw.extend(crate::pair::tokenize_scope_args(grant)),
+    }
+    expand_delegated_human_scopes(&raw).map_err(|e| e.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_auth_invite(
+    human_id_raw: String,
+    hub_arg: Option<String>,
+    endpoint_arg: Option<String>,
+    hub_fingerprint_arg: Option<String>,
+    node_prefix_arg: Option<String>,
+    preset: Option<crate::pair::CliScopePreset>,
+    grant: Vec<String>,
+    max_devices: u32,
+    expires_hours: u64,
+    portal_url_raw: String,
+    state_dir_arg: Option<PathBuf>,
+    config_arg: Option<PathBuf>,
+    as_json: bool,
+) -> ExitCode {
+    let cmd = "auth invite";
+    let human_id = human_id_raw.trim().to_ascii_lowercase();
+    if human_id == LOCAL_NODE_ID || !is_valid_node_id(&human_id) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "INVALID_HUMAN_ID",
+            format!("Invalid humanId '{human_id_raw}'"),
+            Some("Example: hyp auth invite philip --endpoint https://hub.example.com".to_string()),
+        );
+    }
+    if max_devices == 0 || max_devices > MAX_DELEGATED_DEVICES_LIMIT {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "INVALID_MAX_DEVICES",
+            format!("--max-devices must be in 1..={MAX_DELEGATED_DEVICES_LIMIT}"),
+            None,
+        );
+    }
+    if expires_hours == 0 || expires_hours > MAX_INVITE_EXPIRES_HOURS {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "INVALID_EXPIRES_HOURS",
+            format!("--expires-hours must be in 1..={MAX_INVITE_EXPIRES_HOURS}"),
+            None,
+        );
+    }
+
+    let portal_url = portal_url_raw.trim().trim_end_matches('/').to_string();
+    if let Err(e) = validate_endpoint_origin(&portal_url) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "INVALID_PORTAL_URL",
+            format!("Invalid --portal-url '{portal_url_raw}': {e}"),
+            None,
+        );
+    }
+
+    let node_prefix = node_prefix_arg
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("{human_id}@*"));
+    if let Err(e) = validate_node_prefix_pattern(&node_prefix, false) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "INVALID_NODE_PREFIX",
+            format!("Invalid --node-prefix '{node_prefix}': {e}"),
+            Some(format!("Example: --node-prefix {human_id}@*")),
+        );
+    }
+
+    let scopes = match resolve_delegated_scopes(preset, &grant) {
+        Ok(s) => s,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "INVALID_SCOPE",
+                format!("Invalid delegated scopes: {e}"),
+                Some("Use --preset member|observer|guest|full or concrete v2 scopes (never '*', bridge:post, or forward:via).".to_string()),
+            );
+        }
+    };
+
+    let explicit_state = state_dir_arg.is_some() || config_arg.is_some();
+    let state_dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
+    let config_read =
+        resolve_config_path_for_read(config_arg.as_deref(), state_dir_arg.as_deref(), None);
+    if let Err(e) = ensure_dir(&state_dir, true) {
+        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
+    }
+
+    let loaded = if config_read.exists() {
+        load_node_or_legacy_config(&config_read).ok()
+    } else {
+        None
+    };
+    let db_opt = if state_dir.join("node.sqlite").exists() {
+        NodeDb::open(state_dir.join("node.sqlite")).ok()
+    } else {
+        None
+    };
+    let local_node_id = resolve_effective_node_id(loaded.as_ref(), db_opt.as_ref());
+    let hub_node_id = hub_arg
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| local_node_id.clone());
+    if hub_node_id == LOCAL_NODE_ID || !is_valid_node_id(&hub_node_id) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "INVALID_HUB_NODE_ID",
+            format!("Invalid --hub '{hub_node_id}'"),
+            None,
+        );
+    }
+
+    let hub_endpoint = match endpoint_arg
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            loaded
+                .as_ref()
+                .and_then(|c| c.public_url.clone())
+                .map(|s| s.trim().trim_end_matches('/').to_string())
+        }) {
+        Some(ep) => {
+            if let Err(e) = validate_endpoint_origin(&ep) {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_USAGE,
+                    "INVALID_ENDPOINT",
+                    format!("Invalid --endpoint '{ep}': {e}"),
+                    Some("Use https:// (or loopback http://127.0.0.1 for local testing).".to_string()),
+                );
+            }
+            ep
+        }
+        None => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "MISSING_ENDPOINT",
+                "Hub endpoint is required (pass --endpoint https://... or configure listen.publicUrl in node.json)",
+                Some(format!("Example: hyp auth invite {human_id} --hub {hub_node_id} --endpoint https://hub.example.com")),
+            );
+        }
+    };
+
+    let secrets = open_secret_store(&state_dir, explicit_state);
+    let hub_fingerprint = match hub_fingerprint_arg
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+    {
+        Some(fp) => {
+            if fp.len() != 16 || !fp.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_USAGE,
+                    "INVALID_HUB_FINGERPRINT",
+                    "--hub-fingerprint must be exactly 16 hex characters",
+                    None,
+                );
+            }
+            Some(fp)
+        }
+        None => {
+            if hub_node_id == local_node_id {
+                secrets
+                    .load_or_create_node_keys(&hub_node_id)
+                    .ok()
+                    .map(|k| k.signing.public_key().fingerprint())
+            } else {
+                None
+            }
+        }
+    };
+
+    let admin_kp = match crate::pair::load_or_create_admin_key(&secrets, &hub_node_id) {
+        Ok(kp) => kp,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "ADMIN_KEY_ERROR",
+                format!("Failed to load hub Admin-CA key for '{hub_node_id}': {e}"),
+                None,
+            );
+        }
+    };
+
+    let now = now_unix_ms();
+    let expires_ms = now + (expires_hours as i64) * 3_600_000;
+    let invite_id = uuid_v4();
+    let issued_at = format_rfc3339_millis(now);
+    let expires_at = format_rfc3339_millis(expires_ms);
+
+    let invite = HumanInviteV1 {
+        v: 1,
+        invite_id: invite_id.clone(),
+        hub_node_id: hub_node_id.clone(),
+        hub_endpoint: hub_endpoint.clone(),
+        hub_fingerprint: hub_fingerprint.clone(),
+        human_id: human_id.clone(),
+        node_prefix: node_prefix.clone(),
+        scopes: scopes.clone(),
+        max_devices,
+        issued_at: issued_at.clone(),
+        expires_at: expires_at.clone(),
+    };
+    let signed = match sign_human_invite(&invite, &admin_kp) {
+        Ok(s) => s,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "SIGN_FAILED",
+                format!("Failed to sign HumanInviteV1: {e}"),
+                None,
+            );
+        }
+    };
+    let token = match encode_hjoin1(&signed) {
+        Ok(t) => t,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "ENCODE_FAILED",
+                format!("Failed to encode hjoin1_ token: {e}"),
+                None,
+            );
+        }
+    };
+    let join_url = format!("{portal_url}#{token}");
+    let admin_kid = admin_kp.kid();
+    let admin_fp = admin_kp.fingerprint();
+    let admin_jwk = admin_kp.to_jwk();
+    let next = vec![
+        format!("Share the join URL privately with {human_id} (opens Touch ID / Passkey portal)"),
+        "For headless CLI join: save token to a 0600 file and run `hyp join --token-file <path> --local-key`".to_string(),
+    ];
+
+    if as_json {
+        let envelope = JsonEnvelope {
+            ok: true,
+            command: cmd.to_string(),
+            summary: Some(format!(
+                "Minted single-use hjoin1_ human invite for '{human_id}' on hub '{hub_node_id}' (prefix={node_prefix}, maxDevices={max_devices})"
+            )),
+            data: Some(json!({
+                "token": token,
+                "joinUrl": join_url,
+                "inviteId": invite_id,
+                "humanId": human_id,
+                "hubNodeId": hub_node_id,
+                "hubEndpoint": hub_endpoint,
+                "hubFingerprint": hub_fingerprint,
+                "nodePrefix": node_prefix,
+                "scopes": scopes,
+                "maxDevices": max_devices,
+                "issuedAt": issued_at,
+                "expiresAt": expires_at,
+                "adminKid": admin_kid,
+                "adminFingerprint": admin_fp,
+                "adminJwk": admin_jwk,
+            })),
+            warnings: Vec::new(),
+            next,
+            error: None,
+        };
+        print_json(&envelope);
+    } else {
+        println!("OK    Minted human enrollment invite for '{human_id}'");
+        println!("      Hub:          {hub_node_id} ({hub_endpoint})");
+        if let Some(ref fp) = hub_fingerprint {
+            println!("      Hub FP:       {fp}");
+        }
+        println!("      Node Prefix:  {node_prefix} (max {max_devices} devices)");
+        println!("      Scopes:       {}", scopes.join(" "));
+        println!("      Expires:      {expires_at}");
+        println!("      Admin-CA FP:  {admin_fp}");
+        println!();
+        println!("  Shareable Join Link (single-use, open in browser with Touch ID / Passkey):");
+        println!("    {join_url}");
+        println!();
+        println!("  Headless / CLI usage: save the token to a private 0600 file and run `hyp join --token-file <path> --local-key`.");
+        print_next_steps(&next);
+    }
+    ExitCode::from(EXIT_OK)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_auth_admit(
+    human_id_raw: String,
+    id_arg: Option<String>,
+    from_stdin: bool,
+    label: String,
+    node_prefix_arg: Option<String>,
+    preset: Option<crate::pair::CliScopePreset>,
+    grant: Vec<String>,
+    max_devices: u32,
+    state_dir_arg: Option<PathBuf>,
+    config_arg: Option<PathBuf>,
+    as_json: bool,
+) -> ExitCode {
+    let cmd = "auth admit";
+    let human_id = human_id_raw.trim().to_ascii_lowercase();
+    if human_id == LOCAL_NODE_ID || !is_valid_node_id(&human_id) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "INVALID_HUMAN_ID",
+            format!("Invalid humanId '{human_id_raw}'"),
+            None,
+        );
+    }
+    let trimmed_label = label.trim();
+    if trimmed_label.is_empty() || trimmed_label.len() > 128 || trimmed_label.chars().any(char::is_control) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "INVALID_LABEL",
+            "--label must be 1..=128 printable characters",
+            None,
+        );
+    }
+    if max_devices == 0 || max_devices > MAX_DELEGATED_DEVICES_LIMIT {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "INVALID_MAX_DEVICES",
+            format!("--max-devices must be in 1..={MAX_DELEGATED_DEVICES_LIMIT}"),
+            None,
+        );
+    }
+    if id_arg.is_none() && !from_stdin {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "MISSING_IDENTITY",
+            "Provide either --id <hpub1_...> or --stdin (with hpub1_ or public OKP Ed25519 JWK JSON)",
+            Some(format!("Example: hyp auth admit {human_id} --id hpub1_...")),
+        );
+    }
+    if id_arg.is_some() && from_stdin {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "CONFLICTING_FLAGS",
+            "--id and --stdin are mutually exclusive",
+            None,
+        );
+    }
+
+    let node_prefix = node_prefix_arg
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("{human_id}@*"));
+    if let Err(e) = validate_node_prefix_pattern(&node_prefix, false) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "INVALID_NODE_PREFIX",
+            format!("Invalid --node-prefix '{node_prefix}': {e}"),
+            None,
+        );
+    }
+
+    let scopes = match resolve_delegated_scopes(preset, &grant) {
+        Ok(s) => s,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "INVALID_SCOPE",
+                format!("Invalid delegated scopes: {e}"),
+                None,
+            );
+        }
+    };
+
+    let raw_input = if let Some(id_val) = id_arg {
+        id_val
+    } else {
+        let mut buf = String::new();
+        if let Err(e) = io::stdin()
+            .lock()
+            .take(MAX_JWK_STDIN_BYTES + 1)
+            .read_to_string(&mut buf)
+        {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "STDIN_ERROR",
+                format!("Failed to read public identity from stdin: {e}"),
+                None,
+            );
+        }
+        if buf.len() as u64 > MAX_JWK_STDIN_BYTES {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "PAYLOAD_TOO_LARGE",
+                format!("Stdin payload exceeds {MAX_JWK_STDIN_BYTES} byte safety cap"),
+                None,
+            );
+        }
+        buf
+    };
+
+    let trimmed = raw_input.trim();
+    if trimmed.is_empty() {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "EMPTY_INPUT",
+            "Expected an hpub1_ identity card or OKP Ed25519 public JWK JSON",
+            None,
+        );
+    }
+
+    let (signing_jwk, enc_jwk_opt, prf_salt_opt) = if trimmed.starts_with("hpub1_") {
+        let card = match decode_hpub1(trimmed) {
+            Ok(c) => c,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_USAGE,
+                    "INVALID_HPUB1",
+                    format!("Invalid hpub1_ identity card: {e}"),
+                    None,
+                );
+            }
+        };
+        if card.human_id != human_id {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "HUMAN_ID_MISMATCH",
+                format!(
+                    "hpub1_ card humanId '{}' does not match target '{human_id}'",
+                    card.human_id
+                ),
+                None,
+            );
+        }
+        (card.signing_jwk, card.enc_jwk, None)
+    } else {
+        let parsed: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_USAGE,
+                    "INVALID_JSON",
+                    format!("Expected hpub1_ card or valid JSON JWK: {e}"),
+                    None,
+                );
+            }
+        };
+        let Some(obj) = parsed.as_object() else {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "INVALID_JWK",
+                "Expected a JSON object containing an OKP Ed25519 public JWK",
+                None,
+            );
+        };
+        let jwk_val = obj
+            .get("signingJwk")
+            .or_else(|| obj.get("jwk"))
+            .or_else(|| obj.get("publicJwk"))
+            .cloned()
+            .unwrap_or(parsed.clone());
+        let jwk: OkpJwk = match serde_json::from_value(jwk_val) {
+            Ok(j) => j,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_USAGE,
+                    "INVALID_JWK",
+                    format!("Malformed OKP Ed25519 JWK: {e}"),
+                    None,
+                );
+            }
+        };
+        let enc_jwk = match obj.get("encJwk") {
+            None | Some(Value::Null) => None,
+            Some(v) => match serde_json::from_value::<OkpJwk>(v.clone()) {
+                Ok(ej) => Some(ej),
+                Err(e) => {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_USAGE,
+                        "INVALID_ENC_JWK",
+                        format!("Malformed OKP X25519 encJwk: {e}"),
+                        None,
+                    );
+                }
+            },
+        };
+        let prf_salt = obj
+            .get("prfSalt")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        (jwk, enc_jwk, prf_salt)
+    };
+
+    let ed_pk = match signing_jwk.to_ed25519() {
+        Ok(pk) => pk,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "INVALID_JWK",
+                format!("Invalid Ed25519 public JWK: {e}"),
+                None,
+            );
+        }
+    };
+    let enc_jwk_json = match enc_jwk_opt {
+        Some(ref ej) => {
+            if let Err(e) = ej.to_x25519() {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_USAGE,
+                    "INVALID_ENC_JWK",
+                    format!("Invalid X25519 encJwk: {e}"),
+                    None,
+                );
+            }
+            match to_canonical_json(ej) {
+                Ok(s) => Some(s),
+                Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
+            }
+        }
+        None => None,
+    };
+    let kid = ed_pk.kid();
+    let fingerprint = ed_pk.fingerprint();
+    let jwk_json = match to_canonical_json(&signing_jwk) {
+        Ok(s) => s,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
+    };
+
+    let explicit_state = state_dir_arg.is_some() || config_arg.is_some();
+    let state_dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
+    let config_write =
+        resolve_config_path_for_write(config_arg.as_deref(), state_dir_arg.as_deref(), None);
+    if let Err(e) = ensure_dir(&state_dir, true) {
+        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
+    }
+
+    let db = match NodeDb::open(state_dir.join("node.sqlite")) {
+        Ok(db) => db,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+    };
+    let secrets = open_secret_store(&state_dir, explicit_state);
+    let now = now_ms();
+    let min_epoch = db.human().min_auth_epoch().unwrap_or(1);
+
+    let auth_rec = match db.human().upsert_authority(
+        &HumanAuthorityInput {
+            human_id: human_id.clone(),
+            kid: kid.clone(),
+            label: trimmed_label.to_string(),
+            role: HumanAuthorityRole::Signer,
+            jwk_json,
+            enc_jwk_json,
+            prf_salt: prf_salt_opt,
+            auth_epoch: min_epoch,
+        },
+        now,
+    ) {
+        Ok(r) => r,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+    };
+
+    let policy = match db.human().upsert_delegation_policy(
+        &HumanDelegationPolicyInput {
+            human_id: human_id.clone(),
+            node_prefix: node_prefix.clone(),
+            scopes: scopes.clone(),
+            max_devices,
+            delegation_enabled: true,
+        },
+        now,
+    ) {
+        Ok(p) => p,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+    };
+
+    let gate_resigned =
+        match sync_gate_policy_digest_if_locked(&config_write, &state_dir, &db, &secrets) {
+            Ok(b) => b,
+            Err(e) => {
+                return emit_error(cmd, as_json, EXIT_ERROR, "GATE_POLICY_SYNC_FAILED", e, None);
+            }
+        };
+    let digest = db.human().authorities_digest().ok();
+    drop(db);
+
+    let mut warnings = Vec::new();
+    let mut next = vec![format!(
+        "Device certified by '{human_id}' can now run `hyp pair join <hub-url>`"
+    )];
+    let (gate_reloaded, gate_reload_error) = if gate_resigned {
+        reload_live_gate_after_resign(
+            state_dir_arg.is_some(),
+            config_arg.is_some(),
+            &state_dir,
+            &mut warnings,
+            &mut next,
+        )
+    } else {
+        (false, None)
+    };
+
+    if as_json {
+        let mut data = json!({
+            "humanId": auth_rec.human_id,
+            "kid": auth_rec.kid,
+            "fingerprint": fingerprint,
+            "role": auth_rec.role.as_str(),
+            "label": auth_rec.label,
+            "authEpoch": auth_rec.auth_epoch,
+            "nodePrefix": policy.node_prefix,
+            "scopes": policy.scopes,
+            "maxDevices": policy.max_devices,
+            "delegationEnabled": policy.delegation_enabled,
+            "authoritiesDigest": digest,
+            "gatePolicyResigned": gate_resigned,
+            "gateReloaded": gate_reloaded,
+        });
+        if let Some(ref err) = gate_reload_error {
+            data["gateReloadError"] = json!(err);
+        }
+        let envelope = JsonEnvelope {
+            ok: true,
+            command: cmd.to_string(),
+            summary: Some(format!(
+                "Admitted delegated human authority '{}' (prefix={}, maxDevices={})",
+                auth_rec.human_id, policy.node_prefix, policy.max_devices
+            )),
+            data: Some(data),
+            warnings,
+            next,
+            error: None,
+        };
+        print_json(&envelope);
+    } else {
+        println!(
+            "OK    Admitted human authority '{}' (kid={}, fp={fingerprint})",
+            auth_rec.human_id, auth_rec.kid
+        );
+        println!(
+            "      Delegation: enabled (prefix={}, maxDevices={})",
+            policy.node_prefix, policy.max_devices
+        );
+        println!("      Scopes:     {}", policy.scopes.join(" "));
+        if gate_resigned {
+            println!("      Gate Sig:   re-signed with updated human_authorities_digest");
+        }
+        print_warnings(&warnings);
+        print_next_steps(&next);
+    }
+    ExitCode::from(EXIT_OK)
+}
+
+fn run_auth_whoami(
+    human_id_filter: Option<String>,
+    state_dir_arg: Option<PathBuf>,
+    config_arg: Option<PathBuf>,
+    as_json: bool,
+) -> ExitCode {
+    let cmd = "auth whoami";
+    let state_dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
+    let db_path = state_dir.join("node.sqlite");
+    if !db_path.exists() {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "NO_HUMAN_AUTHORITY",
+            "No human authority enrolled on this node yet",
+            Some("Run `hyp join` or `hyp auth init` to enroll a human authority.".to_string()),
+        );
+    }
+    let db = match NodeDb::open(&db_path) {
+        Ok(d) => d,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+    };
+    let active = match db.human().list_active_authorities() {
+        Ok(v) => v,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+    };
+    let filter_norm = human_id_filter
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+
+    let selected = if let Some(ref hid) = filter_norm {
+        active
+            .iter()
+            .filter(|a| a.human_id == *hid)
+            .max_by_key(|a| (a.enc_jwk_json.is_some(), a.prf_salt.is_some(), a.created_at))
+    } else {
+        active
+            .iter()
+            .max_by_key(|a| (a.enc_jwk_json.is_some(), a.prf_salt.is_some(), a.created_at))
+    };
+
+    let Some(rec) = selected else {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "NO_HUMAN_AUTHORITY",
+            match filter_norm {
+                Some(hid) => format!("No active human authority enrolled for '{hid}'"),
+                None => "No active human authority enrolled on this node".to_string(),
+            },
+            Some("Run `hyp join` or `hyp auth init` to enroll a human authority.".to_string()),
+        );
+    };
+
+    let signing_jwk: OkpJwk = match serde_json::from_str(&rec.jwk_json) {
+        Ok(j) => j,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CORRUPT_JWK", e.to_string(), None),
+    };
+    let ed_pk = match signing_jwk.to_ed25519() {
+        Ok(pk) => pk,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CORRUPT_JWK", e.to_string(), None),
+    };
+    let enc_jwk: Option<OkpJwk> = rec
+        .enc_jwk_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<OkpJwk>(raw).ok());
+    let enc_kid = enc_jwk.as_ref().and_then(|j| j.thumbprint().ok());
+    let fingerprint = ed_pk.fingerprint();
+
+    let card = HumanPubCardV1 {
+        v: 1,
+        human_id: rec.human_id.clone(),
+        signing_jwk: signing_jwk.clone(),
+        enc_jwk: enc_jwk.clone(),
+    };
+    let hpub1 = match encode_hpub1(&card) {
+        Ok(s) => s,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_FAILED", e.to_string(), None),
+    };
+
+    if as_json {
+        let envelope = JsonEnvelope {
+            ok: true,
+            command: cmd.to_string(),
+            summary: Some(format!(
+                "Human authority '{}' (fp={fingerprint})",
+                rec.human_id
+            )),
+            data: Some(json!({
+                "humanId": rec.human_id,
+                "kid": rec.kid,
+                "fingerprint": fingerprint,
+                "role": rec.role.as_str(),
+                "label": rec.label,
+                "authEpoch": rec.auth_epoch,
+                "encKid": enc_kid,
+                "hpub1": hpub1,
+                "signingJwk": signing_jwk,
+                "encJwk": enc_jwk,
+            })),
+            warnings: Vec::new(),
+            next: vec![format!(
+                "Hub admin can admit this identity directly: hyp auth admit {} --id {hpub1}",
+                rec.human_id
+            )],
+            error: None,
+        };
+        print_json(&envelope);
+    } else {
+        println!("OK    Human Authority: {} ({})", rec.human_id, rec.label);
+        println!("      Fingerprint: {fingerprint}");
+        println!("      Key ID:      {}", rec.kid);
+        if let Some(ref ek) = enc_kid {
+            println!("      Enc Key ID:  {ek}");
+        }
+        println!("      Identity:    {hpub1}");
+    }
+    ExitCode::from(EXIT_OK)
 }
 
 pub(crate) fn select_local_signing_authority(

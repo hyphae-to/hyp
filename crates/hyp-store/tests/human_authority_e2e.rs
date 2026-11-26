@@ -9,8 +9,9 @@ use std::thread;
 
 use hyp_store::{
     CURRENT_SCHEMA_VERSION, GateState, HumanAuthorityInput, HumanAuthorityRole,
-    HumanAuthorityStatus, HumanClaimKind, HumanNodeCertInput, MailboxInsert, MailboxKind,
-    MailboxPutResult, NodeDb, StoreError,
+    HumanAuthorityStatus, HumanClaimKind, HumanDelegationPolicyInput, HumanNodeCertInput,
+    MailboxInsert, MailboxKind, MailboxPutResult, NodeDb, PeerInput, PeerProfile, PeerStatus,
+    StoreError, TrustTier,
 };
 use rusqlite::{Connection, OpenFlags, params};
 use tempfile::TempDir;
@@ -19,6 +20,8 @@ const SCHEMA_V1_SQL: &str = include_str!("../migrations/0001_initial_v2.sql");
 const SCHEMA_V2_SQL: &str = include_str!("../migrations/0002_discovery_and_routes.sql");
 const SCHEMA_V3_SQL: &str = include_str!("../migrations/0003_wakeups.sql");
 const SCHEMA_V4_SQL: &str = include_str!("../migrations/0004_human_authority.sql");
+const SCHEMA_V5_SQL: &str = include_str!("../migrations/0005_human_enc_jwk.sql");
+const SCHEMA_V6_SQL: &str = include_str!("../migrations/0006_muted_sources_expires_at.sql");
 
 const T0: i64 = 1_795_554_000_000;
 
@@ -718,7 +721,7 @@ fn enc_jwk_lifecycle_preferred_lookup_and_revocation_guard() {
 
 #[test]
 fn full_v1_v2_v3_v4_to_v5_migration_parity_backups_and_zero_data_loss() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, 6);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 7);
     let dir = TempDir::new().unwrap();
 
     let v1_path = dir.path().join("from-v1").join("node.sqlite");
@@ -749,7 +752,7 @@ fn full_v1_v2_v3_v4_to_v5_migration_parity_backups_and_zero_data_loss() {
             .into_iter()
             .map(|(v, _)| v)
             .collect();
-        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7]);
 
         // Bit-for-bit structural schema parity with fresh latest
         assert_eq!(
@@ -830,11 +833,311 @@ fn full_v1_v2_v3_v4_to_v5_migration_parity_backups_and_zero_data_loss() {
         Some(sample_enc_jwk("upgraded_v4_x25519").as_str())
     );
 
-    // Verify v3 wakeup survived v3->v5 untouched
+    // Verify v3 wakeup survived v3->v7 untouched
     assert!(db_v3.wakeups().get_wakeup("wk-v3").unwrap().is_some());
-    // Verify v2 peer_route survived v2->v5 untouched
+    // Verify v2 peer_route survived v2->v7 untouched
     assert_eq!(
         db_v2.peers().get_peer_route("bob@lap").unwrap().unwrap().via_peer,
         "acme-hub"
+    );
+}
+
+#[test]
+fn v6_to_v7_migration_delegation_policy_invite_nonces_and_cascade_peer_revocation() {
+    let dir = TempDir::new().unwrap();
+    let v6_path = dir.path().join("from-v6").join("node.sqlite");
+    let fresh_path = dir.path().join("fresh-v7").join("node.sqlite");
+
+    // 1. Seed a genuine v6 SQLite database with pre-existing peer, authority, and directive nonce.
+    seed_db_at_version(&v6_path, 4);
+    {
+        let conn = Connection::open(&v6_path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(SCHEMA_V5_SQL).unwrap();
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (5, ?1)",
+            params![T0 + 4],
+        )
+        .unwrap();
+        conn.execute_batch(SCHEMA_V6_SQL).unwrap();
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (6, ?1)",
+            params![T0 + 5],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO peers (peer_id, endpoint, profile, trust_tier, status, scopes_json, created_at, updated_at)
+             VALUES ('alice@macbook', 'https://alice.example', 'local', 'org', 'active', '[\"dm:*\"]', ?1, ?1)",
+            params![T0 + 5],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO human_claim_nonces (claim_id, human_kid, kind, expires_at, consumed_at)
+             VALUES ('legacy-dir-1', 'kid_v4_legacy', 'directive', ?1, ?2)",
+            params![T0 + 600_000, T0 + 5],
+        )
+        .unwrap();
+    }
+
+    // 2. Open with NodeDb -> migrates v6 -> v7 cleanly with backup and bit-exact parity with fresh v7!
+    let db = NodeDb::open(&v6_path).unwrap();
+    let fresh = NodeDb::open(&fresh_path).unwrap();
+    assert_eq!(db.schema_version().unwrap(), 7);
+    let applied: Vec<i64> = db
+        .applied_migrations()
+        .unwrap()
+        .into_iter()
+        .map(|(v, _)| v)
+        .collect();
+    assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(
+        snapshot_tables_and_columns(db.connection()),
+        snapshot_tables_and_columns(fresh.connection())
+    );
+    assert_eq!(
+        snapshot_indexes(db.connection()),
+        snapshot_indexes(fresh.connection())
+    );
+    let backups = db.list_migration_backups().unwrap();
+    assert_eq!(backups.len(), 1);
+    assert!(
+        backups[0]
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("node.sqlite.v6-to-v7-")
+    );
+
+    // Existing v6 peer & directive nonce survive untouched!
+    let alice = db.peers().get_peer("alice@macbook").unwrap().unwrap();
+    assert_eq!(alice.admitted_by_human_id, None);
+    assert_eq!(alice.admitted_auth_epoch, None);
+    assert!(
+        !db.human()
+            .consume_claim_nonce(
+                "legacy-dir-1",
+                "kid_v4_legacy",
+                HumanClaimKind::Directive,
+                T0 + 600_000,
+                T0 + 10,
+            )
+            .unwrap(),
+        "pre-existing v6 directive nonce must survive rebuild of human_claim_nonces"
+    );
+
+    // 3. New `HumanClaimKind::HumanInvite` single-use consumption works and blocks replay.
+    assert!(
+        db.human()
+            .consume_claim_nonce(
+                "invite-uuid-1",
+                "admin_kid_1",
+                HumanClaimKind::HumanInvite,
+                T0 + 86_400_000,
+                T0 + 20,
+            )
+            .unwrap()
+    );
+    assert!(
+        !db.human()
+            .consume_claim_nonce(
+                "invite-uuid-1",
+                "admin_kid_1",
+                HumanClaimKind::HumanInvite,
+                T0 + 86_400_000,
+                T0 + 21,
+            )
+            .unwrap()
+    );
+
+    // 4. Delegation policy validation fails closed on forbidden scopes, bare `*`, or invalid max_devices.
+    for bad_policy in [
+        HumanDelegationPolicyInput {
+            human_id: "philip".to_string(),
+            node_prefix: "*".to_string(),
+            scopes: vec!["dm:send".to_string()],
+            max_devices: 5,
+            delegation_enabled: true,
+        },
+        HumanDelegationPolicyInput {
+            human_id: "philip".to_string(),
+            node_prefix: "philip@*".to_string(),
+            scopes: vec!["*".to_string()],
+            max_devices: 5,
+            delegation_enabled: true,
+        },
+        HumanDelegationPolicyInput {
+            human_id: "philip".to_string(),
+            node_prefix: "philip@*".to_string(),
+            scopes: vec!["dm:send".to_string(), "bridge:post=slack:ops".to_string()],
+            max_devices: 5,
+            delegation_enabled: true,
+        },
+        HumanDelegationPolicyInput {
+            human_id: "philip".to_string(),
+            node_prefix: "philip@*".to_string(),
+            scopes: vec!["dm:send".to_string(), "forward:via=hub".to_string()],
+            max_devices: 5,
+            delegation_enabled: true,
+        },
+        HumanDelegationPolicyInput {
+            human_id: "philip".to_string(),
+            node_prefix: "philip@*".to_string(),
+            scopes: vec!["dm:send".to_string()],
+            max_devices: 0,
+            delegation_enabled: true,
+        },
+    ] {
+        assert!(
+            db.human().upsert_delegation_policy(&bad_policy, T0 + 30).is_err(),
+            "forbidden delegation policy {bad_policy:?} MUST fail closed"
+        );
+    }
+
+    let policy = db
+        .human()
+        .upsert_delegation_policy(
+            &HumanDelegationPolicyInput {
+                human_id: "philip".to_string(),
+                node_prefix: "philip@*".to_string(),
+                scopes: vec!["dm:send".to_string(), "dm:receive".to_string(), "kv:read=*".to_string()],
+                max_devices: 2,
+                delegation_enabled: true,
+            },
+            T0 + 30,
+        )
+        .unwrap();
+    assert_eq!(policy.node_prefix, "philip@*");
+    assert_eq!(policy.max_devices, 2);
+    assert!(policy.delegation_enabled);
+    assert_eq!(
+        db.human().get_delegation_policy("philip").unwrap(),
+        Some(policy.clone())
+    );
+
+    // 5. Admitted peers provenance, counting, bearer token binding, and atomic cascade revocation!
+    let p1 = db
+        .peers()
+        .upsert_peer_with_admission(
+            &PeerInput {
+                peer_id: "philip@macbook".to_string(),
+                endpoint: None,
+                profile: PeerProfile::Local,
+                trust_tier: TrustTier::Org,
+                status: PeerStatus::Active,
+                scopes: vec!["dm:*".to_string()],
+                auth_credential_ref: None,
+            },
+            Some("philip"),
+            Some(1),
+            T0 + 40,
+        )
+        .unwrap();
+    assert_eq!(p1.admitted_by_human_id.as_deref(), Some("philip"));
+    assert_eq!(p1.admitted_auth_epoch, Some(1));
+
+    let p2 = db
+        .peers()
+        .upsert_peer_with_admission(
+            &PeerInput {
+                peer_id: "philip@devbox".to_string(),
+                endpoint: None,
+                profile: PeerProfile::Local,
+                trust_tier: TrustTier::Org,
+                status: PeerStatus::Active,
+                scopes: vec!["dm:*".to_string()],
+                auth_credential_ref: None,
+            },
+            Some("philip"),
+            Some(1),
+            T0 + 41,
+        )
+        .unwrap();
+    assert_eq!(p2.admitted_by_human_id.as_deref(), Some("philip"));
+
+    assert_eq!(
+        db.peers()
+            .count_active_peers_admitted_by_human("philip", None)
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        db.peers()
+            .count_active_peers_admitted_by_human("philip", Some("philip@macbook"))
+            .unwrap(),
+        1
+    );
+
+    // Attach bearer tokens + routes to Philip's devices and Alice's unrelated device.
+    db.local()
+        .set_metadata(
+            "auth_token:hash_philip_1",
+            r#"{"peerId":"philip@macbook","grantId":"g1","signingKid":"k1"}"#,
+        )
+        .unwrap();
+    db.local()
+        .set_metadata(
+            "auth_token:hash_philip_2",
+            r#"{"peerId":"philip@devbox","grantId":"g2","signingKid":"k2"}"#,
+        )
+        .unwrap();
+    db.local()
+        .set_metadata(
+            "auth_token:hash_alice",
+            r#"{"peerId":"alice@macbook","grantId":"ga","signingKid":"ka"}"#,
+        )
+        .unwrap();
+    db.peers()
+        .upsert_peer_route("downstream@box", "philip@macbook", T0 + 42)
+        .unwrap();
+
+    // Cascade revoke all peers admitted by `philip`.
+    let revoked = db
+        .peers()
+        .revoke_peers_admitted_by_human("philip", T0 + 100)
+        .unwrap();
+    assert_eq!(
+        revoked,
+        vec!["philip@devbox".to_string(), "philip@macbook".to_string()]
+    );
+    assert_eq!(
+        db.peers()
+            .count_active_peers_admitted_by_human("philip", None)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.peers().get_peer("philip@macbook").unwrap().unwrap().status,
+        PeerStatus::Revoked
+    );
+    assert_eq!(
+        db.peers().get_peer("philip@devbox").unwrap().unwrap().status,
+        PeerStatus::Revoked
+    );
+    assert_eq!(
+        db.local().get_metadata("auth_token:hash_philip_1").unwrap(),
+        None
+    );
+    assert_eq!(
+        db.local().get_metadata("auth_token:hash_philip_2").unwrap(),
+        None
+    );
+    assert_eq!(db.peers().get_peer_route("downstream@box").unwrap(), None);
+
+    // Unrelated peer `alice@macbook` & her bearer token MUST remain untouched!
+    assert_eq!(
+        db.peers().get_peer("alice@macbook").unwrap().unwrap().status,
+        PeerStatus::Active
+    );
+    assert!(db.local().get_metadata("auth_token:hash_alice").unwrap().is_some());
+
+    // Disabling delegation policy updates cleanly.
+    assert!(db.human().set_delegation_enabled("philip", false, T0 + 101).unwrap());
+    assert!(
+        !db.human()
+            .get_delegation_policy("philip")
+            .unwrap()
+            .unwrap()
+            .delegation_enabled
     );
 }

@@ -20,6 +20,10 @@ use http_body_util::{BodyExt, Empty, Full};
 use hyp_crypto::compat_v1::{
     PairingCodeV1, derive_pairing_key_v1, issue_grant_v1, parse_pairing_code_v1,
 };
+use hyp_crypto::human::{
+    DelegatedPairProofV1, SignedNodeCertV1, encode_hcert1, node_cert_sha256,
+    sign_delegated_pair_proof,
+};
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keys::{
     Ed25519KeyPair, Ed25519PublicKey, NodeIdentityKeys, OkpJwk as CryptoOkpJwk, SignedPayload,
@@ -36,8 +40,8 @@ use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms, parse_rfc3339_mill
 use hyp_node::engine::http_util::percent_encode;
 use hyp_node::engine::peer_link::{PairBindingV2, PairRequestV2};
 use hyp_node::engine::{
-    GuestPairReply, GuestPairRequest, P2pPairServerReply, PairServerReply,
-    guest_pair_proof_canonical, p2p_offer_secret_name,
+    DelegatedPairReply, DelegatedPairRequest, GuestPairReply, GuestPairRequest, P2pPairServerReply,
+    PairServerReply, guest_pair_proof_canonical, p2p_offer_secret_name,
 };
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
 use hyp_proto::manifest::{NodeManifestPayload, NodeProfile as ProtoNodeProfile, SignedNodeManifest};
@@ -512,7 +516,7 @@ fn run_guide(mode: Option<GuideMode>, as_json: bool) -> ExitCode {
 /// Splits CLI scope arguments supporting multiple flags, RFC 6749 whitespace separation,
 /// AND comma-separated shorthands (`"dm:*,files:send=25mb"`) without breaking commas
 /// inside `stream:subscribe=github[repo=a/b,c/d]` or `dm:send=alice,bob`.
-fn tokenize_scope_args(raw_args: &[String]) -> Vec<String> {
+pub(crate) fn tokenize_scope_args(raw_args: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for arg in raw_args {
         for piece in arg.split_ascii_whitespace() {
@@ -575,12 +579,15 @@ fn generate_offer_id() -> Result<String, String> {
     ))
 }
 
-fn admin_ca_secret_name(node_id: &str) -> String {
+pub(crate) fn admin_ca_secret_name(node_id: &str) -> String {
     let hash = hex::encode(Sha256::digest(node_id.as_bytes()));
     format!("admin-ca-{}", &hash[..12])
 }
 
-fn load_or_create_admin_key(store: &SecretStore, node_id: &str) -> Result<Ed25519KeyPair, String> {
+pub(crate) fn load_or_create_admin_key(
+    store: &SecretStore,
+    node_id: &str,
+) -> Result<Ed25519KeyPair, String> {
     let name = admin_ca_secret_name(node_id);
     match store.get(&name) {
         Ok(b64) => Ed25519KeyPair::from_pkcs8_b64(&b64)
@@ -2290,7 +2297,7 @@ fn proto_jwk_to_crypto(jwk: &hyp_proto::manifest::OkpJwk) -> CryptoOkpJwk {
     }
 }
 
-fn credential_secret_name(prefix: &str, peer_id: &str) -> String {
+pub(crate) fn credential_secret_name(prefix: &str, peer_id: &str) -> String {
     let hash = hex::encode(Sha256::digest(peer_id.as_bytes()));
     format!("{prefix}-{}", &hash[..12])
 }
@@ -2977,9 +2984,9 @@ fn load_local_public_endpoint(state_dir: &Path) -> Option<String> {
         .filter(|u| validate_endpoint_origin(u).is_ok())
 }
 
-struct DaemonReloadOutcome {
-    reloaded: bool,
-    warnings: Vec<String>,
+pub(crate) struct DaemonReloadOutcome {
+    pub(crate) reloaded: bool,
+    pub(crate) warnings: Vec<String>,
 }
 
 fn resolve_pair_daemon_socket(state_dir: &Path, explicit_state: bool) -> PathBuf {
@@ -2999,12 +3006,12 @@ fn resolve_pair_daemon_socket(state_dir: &Path, explicit_state: bool) -> PathBuf
 ///
 /// Always fail-safe: returns `reloaded: false` without error if the daemon is stopped,
 /// unreachable, or timed out so an already-committed pairing/revocation never fails.
-fn try_reload_live_daemon(state_dir: &Path, explicit_state: bool) -> DaemonReloadOutcome {
+pub(crate) fn try_reload_live_daemon(state_dir: &Path, explicit_state: bool) -> DaemonReloadOutcome {
     let socket_path = resolve_pair_daemon_socket(state_dir, explicit_state);
     try_reload_live_daemon_at_socket(&socket_path)
 }
 
-fn try_reload_live_daemon_at_socket(socket_path: &Path) -> DaemonReloadOutcome {
+pub(crate) fn try_reload_live_daemon_at_socket(socket_path: &Path) -> DaemonReloadOutcome {
     let resp = hyp_harness::sock::daemon_rpc_sync(
         socket_path,
         &json!({ "type": "peers.reload" }),
@@ -5593,6 +5600,352 @@ fn attempt_guest_self_enroll(
     })
 }
 
+pub(crate) struct DelegatedEnrollSuccess {
+    pub hub_node_id: String,
+    pub human_id: String,
+    pub auth_epoch: u64,
+    pub scopes: Vec<String>,
+    pub auth_credential: String,
+    pub manifest: SignedNodeManifest,
+    pub manifest_payload: Box<NodeManifestPayload>,
+}
+
+/// Calls `POST <base_url>/v1/pair/delegated` using a human-signed `hcert1_` NodeCert and a live
+/// device Ed25519 possession proof, verifying the returned `SignedNodeManifest` against the hub's
+/// pinned signing key (or self-signed manifest + optional `expected_hub_fingerprint`).
+pub(crate) fn attempt_delegated_pair_enroll(
+    base_url: &str,
+    hub_node_id: &str,
+    expected_hub_signing_pk: Option<&Ed25519PublicKey>,
+    expected_hub_fingerprint: Option<&str>,
+    local_node_id: &str,
+    local_keys: &NodeIdentityKeys,
+    hcert1: &str,
+) -> Result<DelegatedEnrollSuccess, (u16, &'static str, String)> {
+    let pair_url = format!("{}/v1/pair/delegated", base_url.trim_end_matches('/'));
+    let uri: http::Uri = pair_url.parse().map_err(|e| {
+        (
+            0u16,
+            "INVALID_ENDPOINT",
+            format!("Invalid delegated pairing URI '{pair_url}': {e}"),
+        )
+    })?;
+
+    let ed25519_jwk = local_keys.signing_jwk();
+    let x25519_jwk = local_keys.encryption_jwk();
+    let timestamp = format_rfc3339_millis(now_unix_ms());
+    let trimmed_cert = hcert1.trim();
+    let proof = DelegatedPairProofV1 {
+        hub_node_id: hub_node_id.to_string(),
+        node_id: local_node_id.to_string(),
+        ed25519_jwk: ed25519_jwk.clone(),
+        x25519_jwk: x25519_jwk.clone(),
+        node_cert_sha256: node_cert_sha256(trimmed_cert),
+        timestamp: timestamp.clone(),
+    };
+    let proof_sig = sign_delegated_pair_proof(&proof, &local_keys.signing).map_err(|e| {
+        (
+            0u16,
+            "SIGN_ERROR",
+            format!("Failed to sign DelegatedPairProofV1: {e}"),
+        )
+    })?;
+
+    let req_body = DelegatedPairRequest {
+        node_id: local_node_id.to_string(),
+        ed25519_jwk,
+        x25519_jwk,
+        node_cert: trimmed_cert.to_string(),
+        timestamp,
+        proof_sig,
+    };
+    let req_bytes = serde_json::to_vec(&req_body).map_err(|e| {
+        (
+            0u16,
+            "ENCODE_ERROR",
+            format!("Failed to serialize delegated-pair request: {e}"),
+        )
+    })?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            (
+                0u16,
+                "RUNTIME_ERROR",
+                format!("Failed to start async runtime: {e}"),
+            )
+        })?;
+
+    let (status, body_bytes) = rt.block_on(async {
+        let client = build_http_client::<Full<Bytes>>().map_err(|e| {
+            (
+                0u16,
+                "HTTP_ERROR",
+                format!("Failed to initialize HTTP client: {e}"),
+            )
+        })?;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(&uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json")
+            .header(
+                header::USER_AGENT,
+                format!("hyp/{}", env!("CARGO_PKG_VERSION")),
+            )
+            .body(Full::new(Bytes::from(req_bytes)))
+            .map_err(|e| {
+                (
+                    0u16,
+                    "HTTP_ERROR",
+                    format!("Failed to build delegated-pair request: {e}"),
+                )
+            })?;
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS),
+            client.request(req),
+        )
+        .await
+        .map_err(|_| {
+            (
+                0u16,
+                "DELEGATED_PAIR_FAILED",
+                format!("POST {pair_url} timed out after {MANIFEST_FETCH_TIMEOUT_SECS}s"),
+            )
+        })?
+        .map_err(|e| {
+            (
+                0u16,
+                "DELEGATED_PAIR_FAILED",
+                format!("POST {pair_url} failed: {e}"),
+            )
+        })?;
+
+        let status = resp.status().as_u16();
+        let bytes = tokio::time::timeout(Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS), async {
+            let mut body = resp.into_body();
+            let mut out = Vec::new();
+            while let Some(frame_res) = body.frame().await {
+                let frame = frame_res.map_err(|e| {
+                    (
+                        status,
+                        "DELEGATED_PAIR_FAILED",
+                        format!("Delegated pair body read error: {e}"),
+                    )
+                })?;
+                if let Some(chunk) = frame.data_ref() {
+                    if out.len() + chunk.len() > MAX_MANIFEST_RESPONSE_BYTES {
+                        return Err((
+                            status,
+                            "DELEGATED_PAIR_INVALID",
+                            format!(
+                                "Delegated pair response exceeds {MAX_MANIFEST_RESPONSE_BYTES} byte cap"
+                            ),
+                        ));
+                    }
+                    out.extend_from_slice(chunk);
+                }
+            }
+            Ok::<Vec<u8>, (u16, &'static str, String)>(out)
+        })
+        .await
+        .map_err(|_| {
+            (
+                status,
+                "DELEGATED_PAIR_FAILED",
+                "Timed out reading /v1/pair/delegated response body".to_string(),
+            )
+        })??;
+
+        Ok::<(u16, Vec<u8>), (u16, &'static str, String)>((status, bytes))
+    })?;
+
+    if status != 200 {
+        let (code, detail) =
+            if let Ok(problem) = serde_json::from_slice::<ProblemDetails>(&body_bytes) {
+                let err_code = match (status, problem.error.as_str()) {
+                    (_, "peer_key_mismatch") => "PEER_KEY_MISMATCH",
+                    (_, "human_key_mismatch") => "HUMAN_KEY_MISMATCH",
+                    (429, _) | (_, "quota_exceeded") | (_, "rate_limited") => "QUOTA_EXCEEDED",
+                    (409, _) => "DELEGATED_PAIR_CONFLICT",
+                    (401, _) | (403, _) => "DELEGATED_PAIR_REJECTED",
+                    (404, _) => "DELEGATED_PAIR_NOT_SUPPORTED",
+                    _ => "DELEGATED_PAIR_FAILED",
+                };
+                let msg = problem
+                    .detail
+                    .unwrap_or_else(|| format!("{} (HTTP {status})", problem.title));
+                (err_code, format!("POST {pair_url} rejected ({}): {msg}", problem.error))
+            } else {
+                let snippet: String = String::from_utf8_lossy(&body_bytes).chars().take(200).collect();
+                let err_code = match status {
+                    409 => "DELEGATED_PAIR_CONFLICT",
+                    429 => "QUOTA_EXCEEDED",
+                    401 | 403 => "DELEGATED_PAIR_REJECTED",
+                    404 => "DELEGATED_PAIR_NOT_SUPPORTED",
+                    _ => "DELEGATED_PAIR_FAILED",
+                };
+                (
+                    err_code,
+                    format!("POST {pair_url} returned HTTP {status}: {snippet}"),
+                )
+            };
+        return Err((status, code, detail));
+    }
+
+    let reply: DelegatedPairReply = serde_json::from_slice(&body_bytes).map_err(|e| {
+        (
+            200,
+            "DELEGATED_PAIR_INVALID",
+            format!("Invalid DelegatedPairReply JSON from {pair_url}: {e}"),
+        )
+    })?;
+    if !reply.ok || reply.auth_credential.trim().is_empty() {
+        return Err((
+            200,
+            "DELEGATED_PAIR_INVALID",
+            format!("Hub '{hub_node_id}' returned invalid delegated pair reply"),
+        ));
+    }
+    if reply.node_id != hub_node_id {
+        return Err((
+            200,
+            "NODE_ID_MISMATCH",
+            format!(
+                "Hub /v1/pair/delegated nodeId '{}' does not match expected '{hub_node_id}'",
+                reply.node_id
+            ),
+        ));
+    }
+    if reply.peer_id != local_node_id {
+        return Err((
+            200,
+            "DELEGATED_PAIR_INVALID",
+            format!(
+                "Hub /v1/pair/delegated peerId '{}' does not match local nodeId '{local_node_id}'",
+                reply.peer_id
+            ),
+        ));
+    }
+    let validated_scopes = expand_v2_scopes(&reply.scopes).map_err(|e| {
+        (
+            200,
+            "DELEGATED_PAIR_INVALID",
+            format!("Hub /v1/pair/delegated returned invalid scopes: {e}"),
+        )
+    })?;
+
+    let manifest_payload = reply.signed_manifest.decode_payload().map_err(|e| {
+        (
+            200,
+            "INVALID_MANIFEST",
+            format!("Invalid NodeManifestPayload in /v1/pair/delegated reply: {e}"),
+        )
+    })?;
+    if manifest_payload.node_id.as_str() != hub_node_id {
+        return Err((
+            200,
+            "NODE_ID_MISMATCH",
+            format!(
+                "Manifest nodeId '{}' in /v1/pair/delegated reply does not match '{hub_node_id}'",
+                manifest_payload.node_id
+            ),
+        ));
+    }
+    let canonical_manifest = manifest_payload.to_canonical_payload().map_err(|e| {
+        (
+            200,
+            "INVALID_MANIFEST",
+            format!("Failed to canonicalize delegated-pair manifest payload: {e}"),
+        )
+    })?;
+    if canonical_manifest != reply.signed_manifest.payload {
+        return Err((
+            200,
+            "NON_CANONICAL_MANIFEST",
+            "Manifest in /v1/pair/delegated reply is not canonical RFC 8785 JCS (fail-closed)"
+                .to_string(),
+        ));
+    }
+    let manifest_sign_pk = proto_jwk_to_crypto(&manifest_payload.identity.signing_jwk)
+        .to_ed25519()
+        .map_err(|e| {
+            (
+                200,
+                "INVALID_KEY",
+                format!("Invalid hub signingJwk in delegated-pair manifest: {e}"),
+            )
+        })?;
+    let verify_pk = if let Some(pinned) = expected_hub_signing_pk {
+        if *pinned != manifest_sign_pk {
+            return Err((
+                200,
+                "HUB_KEY_MISMATCH",
+                "Hub signing key in /v1/pair/delegated manifest does not match pinned manifest key"
+                    .to_string(),
+            ));
+        }
+        pinned
+    } else {
+        &manifest_sign_pk
+    };
+    if let Some(expected_fp) = expected_hub_fingerprint {
+        let actual_fp = verify_pk.fingerprint();
+        if !expected_fp.eq_ignore_ascii_case(&actual_fp) {
+            return Err((
+                200,
+                "HUB_FINGERPRINT_MISMATCH",
+                format!(
+                    "Hub signing key fingerprint '{actual_fp}' does not match pinned '{expected_fp}'"
+                ),
+            ));
+        }
+    }
+    verify_pk
+        .verify_domain_b64(
+            "manifest",
+            reply.signed_manifest.payload.as_bytes(),
+            &reply.signed_manifest.sig,
+        )
+        .map_err(|e| {
+            (
+                200,
+                "INVALID_SIGNATURE",
+                format!("Manifest signature in /v1/pair/delegated reply failed verification: {e}"),
+            )
+        })?;
+    let exp_ms = parse_rfc3339_millis(&manifest_payload.expires_at).map_err(|e| {
+        (
+            200,
+            "INVALID_MANIFEST",
+            format!("Invalid expiresAt in /v1/pair/delegated manifest: {e}"),
+        )
+    })?;
+    if now_unix_ms() > exp_ms {
+        return Err((
+            200,
+            "MANIFEST_EXPIRED",
+            format!(
+                "Hub manifest in /v1/pair/delegated expired at {}",
+                manifest_payload.expires_at
+            ),
+        ));
+    }
+
+    Ok(DelegatedEnrollSuccess {
+        hub_node_id: reply.node_id,
+        human_id: reply.human_id,
+        auth_epoch: reply.auth_epoch,
+        scopes: validated_scopes,
+        auth_credential: reply.auth_credential,
+        manifest: reply.signed_manifest,
+        manifest_payload: Box::new(manifest_payload),
+    })
+}
+
 fn run_join(
     url: String,
     state_dir_arg: Option<PathBuf>,
@@ -5769,50 +6122,124 @@ fn run_join(
         }
     };
 
-    // Attempt opt-in self-service `POST /v1/guest/pair` enrollment when online.
+    // Attempt delegated human-cert pairing (`POST /v1/pair/delegated`) FIRST when this device
+    // holds a valid stored `hcert1_` NodeCert; otherwise fall back to opt-in self-service
+    // `POST /v1/guest/pair` enrollment when online.
+    let mut join_mode = "public";
     let mut enrolled = false;
     let mut effective_preset = preset.as_str().to_string();
+    let mut effective_trust_tier = trust_tier;
     let mut effective_scopes = scopes;
+    let mut effective_auth_cred_ref: Option<String> = None;
+    let mut delegated_human_id: Option<String> = None;
+    let mut delegated_auth_epoch: Option<u64> = None;
     let mut effective_signed_manifest: Option<SignedNodeManifest> = None;
     let mut effective_manifest_payload: Option<NodeManifestPayload> = None;
 
     if let Some(ref v) = verified_live {
-        match attempt_guest_self_enroll(
-            &base_url,
-            &peer_id,
-            &v.signing_pk,
-            &local_node_id,
-            &local_keys,
-        ) {
-            Ok(GuestEnrollOutcome::Enrolled {
-                preset: granted_preset,
-                scopes: granted_scopes,
-                manifest,
-                manifest_payload,
-            }) => {
-                enrolled = true;
-                effective_preset = granted_preset;
-                effective_scopes = granted_scopes;
-                effective_signed_manifest = Some(manifest);
-                effective_manifest_payload = Some(*manifest_payload);
+        let local_hcert1: Option<String> = db
+            .human()
+            .get_latest_node_cert(&local_node_id)
+            .ok()
+            .flatten()
+            .filter(|rec| rec.expires_at > now_ms())
+            .and_then(|rec| serde_json::from_str::<SignedNodeCertV1>(&rec.signed_json).ok())
+            .and_then(|signed| encode_hcert1(&signed).ok());
+
+        let mut delegated_err: Option<(&'static str, String)> = None;
+        if let Some(ref hcert1) = local_hcert1 {
+            match attempt_delegated_pair_enroll(
+                &base_url,
+                &peer_id,
+                Some(&v.signing_pk),
+                None,
+                &local_node_id,
+                &local_keys,
+                hcert1,
+            ) {
+                Ok(del) => {
+                    let cred_name = credential_secret_name("peer-auth", &peer_id);
+                    if let Err(e) = secrets.set(&cred_name, &del.auth_credential) {
+                        return emit_error(
+                            cmd,
+                            as_json,
+                            EXIT_ERROR,
+                            "KEYSTORE_ERROR",
+                            format!("Failed to store hub authCredential in SecretStore: {e}"),
+                            None,
+                        );
+                    }
+                    join_mode = "delegated";
+                    enrolled = true;
+                    effective_preset = "delegated".to_string();
+                    effective_trust_tier = StoreTrustTier::Org;
+                    effective_scopes = del.scopes;
+                    effective_auth_cred_ref = Some(cred_name);
+                    delegated_human_id = Some(del.human_id);
+                    delegated_auth_epoch = Some(del.auth_epoch);
+                    effective_signed_manifest = Some(del.manifest);
+                    effective_manifest_payload = Some(*del.manifest_payload);
+                }
+                Err((status, code, msg)) => {
+                    // Fail closed immediately on key conflicts or device quota caps;
+                    // for 401/403/404 (e.g. joining a public guest-ro hub with a personal cert),
+                    // try guest pairing fallback and surface the delegated rejection if guest is disabled.
+                    if matches!(status, 409 | 429) {
+                        return emit_error(cmd, as_json, EXIT_ERROR, code, msg, None);
+                    }
+                    delegated_err = Some((code, msg));
+                }
             }
-            Ok(GuestEnrollOutcome::NotEnabled) => {
-                warnings.push(format!(
-                    "Node '{peer_id}' does not expose self-service guest pairing (POST /v1/guest/pair returned 404); request an am2_ invite from the hub admin to enroll."
-                ));
-            }
-            Err((code, msg)) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    code,
-                    msg,
-                    Some(
-                        "Verify the local --node-id is not already claimed by another keypair, or retry after rate-limit cooldown."
-                            .to_string(),
-                    ),
-                );
+        }
+
+        if !enrolled {
+            match attempt_guest_self_enroll(
+                &base_url,
+                &peer_id,
+                &v.signing_pk,
+                &local_node_id,
+                &local_keys,
+            ) {
+                Ok(GuestEnrollOutcome::Enrolled {
+                    preset: granted_preset,
+                    scopes: granted_scopes,
+                    manifest,
+                    manifest_payload,
+                }) => {
+                    enrolled = true;
+                    effective_preset = granted_preset;
+                    effective_scopes = granted_scopes;
+                    effective_signed_manifest = Some(manifest);
+                    effective_manifest_payload = Some(*manifest_payload);
+                }
+                Ok(GuestEnrollOutcome::NotEnabled) => {
+                    if let Some((code, msg)) = delegated_err {
+                        return emit_error(
+                            cmd,
+                            as_json,
+                            EXIT_ERROR,
+                            code,
+                            msg,
+                            Some("Verify your human authority is enrolled on this hub and your nodeId matches its allowed nodePrefix, or run `hyp join`.".to_string()),
+                        );
+                    }
+                    warnings.push(format!(
+                        "Node '{peer_id}' does not expose self-service guest pairing (POST /v1/guest/pair returned 404); request an am2_ invite or hjoin1_ human invite from the hub admin to enroll."
+                    ));
+                }
+                Err((code, msg)) => {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        code,
+                        msg,
+                        Some(
+                            "Verify the local --node-id is not already claimed by another keypair, or retry after rate-limit cooldown."
+                                .to_string(),
+                        ),
+                    );
+                }
             }
         }
     }
@@ -5825,10 +6252,10 @@ fn run_join(
             peer_id: peer_id.clone(),
             endpoint: Some(base_url.clone()),
             profile: peer_profile,
-            trust_tier,
+            trust_tier: effective_trust_tier,
             status: PeerStatus::Active,
             scopes: effective_scopes.clone(),
-            auth_credential_ref: None,
+            auth_credential_ref: effective_auth_cred_ref.clone(),
         },
         now_db,
     ) {
@@ -5965,14 +6392,16 @@ fn run_join(
     };
 
     let data = json!({
-        "mode": "public",
+        "mode": join_mode,
         "nodeId": local_node_id,
         "peerId": peer_id,
         "endpoint": base_url,
         "profile": peer_profile.as_str(),
         "preset": effective_preset,
-        "trustTier": trust_tier.as_str(),
+        "trustTier": effective_trust_tier.as_str(),
         "scopes": effective_scopes,
+        "humanId": delegated_human_id,
+        "authEpoch": delegated_auth_epoch,
         "offline": offline,
         "enrolled": enrolled,
         "manifestVerified": manifest_verified,
@@ -6029,9 +6458,15 @@ fn run_join(
         println!(
             "      Preset:      {} (tier={}, enrolled={})",
             effective_preset,
-            trust_tier.as_str(),
+            effective_trust_tier.as_str(),
             enrolled
         );
+        if let Some(ref hid) = delegated_human_id {
+            println!(
+                "      Human Cert:  human:{hid} (ep {})",
+                delegated_auth_epoch.unwrap_or(1)
+            );
+        }
         if let Some(ref k) = kid {
             println!("      JWK kid:     {k}");
         }

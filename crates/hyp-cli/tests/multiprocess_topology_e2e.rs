@@ -2796,10 +2796,15 @@ fn v1_to_v2_sqlite_upgrade_via_compiled_hyp_doctor_creates_backup() {
             .unwrap();
 
         // Roll schema strictly back to frozen v0.2.0 schema v1 (`0001_initial_v2.sql` shape),
-        // dropping v5 (`human_authorities.enc_jwk_json`), v4 (`human_*`), v3 (`wakeups`), and v2.
+        // dropping v7 (`human_delegation_policies`, `peers.admitted_*`), v5 (`human_authorities.enc_jwk_json`),
+        // v4 (`human_*`), v3 (`wakeups`), and v2.
         db.connection()
             .execute_batch(
-                "DROP INDEX IF EXISTS human_authorities_kid;
+                "DROP INDEX IF EXISTS peers_admitted_by_human;
+                 DROP TABLE IF EXISTS human_delegation_policies;
+                 ALTER TABLE peers DROP COLUMN admitted_by_human_id;
+                 ALTER TABLE peers DROP COLUMN admitted_auth_epoch;
+                 DROP INDEX IF EXISTS human_authorities_kid;
                  DROP INDEX IF EXISTS human_claim_nonces_expires;
                  DROP TABLE IF EXISTS human_authorities;
                  DROP TABLE IF EXISTS human_claim_nonces;

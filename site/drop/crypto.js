@@ -26,6 +26,9 @@ const textDecoder = new TextDecoder("utf-8", { fatal: true });
 export const HUMAN_CLAIM_DOMAIN = "hyphae/v2/human-claim\n";
 export const HUMAN_NODE_CERT_DOMAIN = "hyphae/v2/human-node-cert\n";
 export const HUMAN_REVOCATION_DOMAIN = "hyphae/v2/human-revocation\n";
+export const HUMAN_INVITE_DOMAIN = "hyphae/v2/human-invite\n";
+export const HUMAN_INVITE_CLAIM_DOMAIN = "hyphae/v2/human-invite-claim\n";
+export const DELEGATED_PAIR_DOMAIN = "hyphae/v2/delegated-pair\n";
 export const HUMAN_PRF_INPUT_PREFIX = "hyphae/v2/human-prf-input\n";
 export const HUMAN_PRF_ED25519_SALT = "hyphae/v2/human-prf-ed25519";
 export const HUMAN_PRF_X25519_SALT = "hyphae/v2/human-prf-x25519";
@@ -37,6 +40,9 @@ export const MAX_HUMAN_DRAFT_CONTEXT_CHARS = 160;
 
 export const HDROP1_PREFIX = "hdrop1_";
 export const HCERT1_PREFIX = "hcert1_";
+export const HJOIN1_PREFIX = "hjoin1_";
+export const HPUB1_PREFIX = "hpub1_";
+export const MAX_DELEGATED_DEVICES_LIMIT = 100;
 
 export const MIN_PADDING_BUCKET = 256;
 export const MAX_PADDING_BUCKET = 32 * 1024;
@@ -1958,4 +1964,337 @@ export async function openHumanDraft({ encDraft, recipientPriv32, expectedNodeId
     zeroize(padded);
     if (unpadded) zeroize(unpadded);
   }
+}
+
+// ============================================================================
+// Delegated Human-Cert Admission (`hjoin1_`, `hpub1_`, `HumanInviteClaimV1`)
+// ============================================================================
+
+const NODE_PREFIX_BASE_RE = /^[a-z0-9][a-z0-9@._-]{0,63}$/;
+const HUB_FINGERPRINT_RE = /^[0-9a-fA-F]{16}$/;
+const TOKEN_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+export function isValidNodePrefix(pattern) {
+  if (typeof pattern !== "string" || pattern.length === 0 || pattern.length > 65) {
+    return false;
+  }
+  if (pattern === "*" || pattern.includes("..") || pattern.includes("/")) {
+    return false;
+  }
+  for (let i = 0; i < pattern.length; i++) {
+    const code = pattern.charCodeAt(i);
+    if (code <= 0x20 || code >= 0x7f) return false;
+  }
+  if (pattern.endsWith("*")) {
+    const prefix = pattern.slice(0, -1);
+    if (prefix.length === 0 || prefix.includes("*") || prefix === "local") {
+      return false;
+    }
+    return NODE_PREFIX_BASE_RE.test(prefix);
+  }
+  if (pattern.includes("*") || pattern === "local") {
+    return false;
+  }
+  return isValidNodeId(pattern);
+}
+
+export function matchesNodePrefix(pattern, nodeId) {
+  if (
+    typeof nodeId !== "string" ||
+    nodeId === "local" ||
+    !isValidNodeId(nodeId) ||
+    nodeId.includes("..") ||
+    nodeId.includes("/")
+  ) {
+    return false;
+  }
+  if (!isValidNodePrefix(pattern)) {
+    return false;
+  }
+  if (pattern.endsWith("*")) {
+    return nodeId.startsWith(pattern.slice(0, -1));
+  }
+  return nodeId === pattern;
+}
+
+export function isForbiddenDelegatedScope(scope) {
+  if (typeof scope !== "string") return true;
+  const s = scope.trim();
+  return (
+    s === "*" ||
+    s === "bridge:post" ||
+    s.startsWith("bridge:post=") ||
+    s === "forward:via" ||
+    s.startsWith("forward:via=")
+  );
+}
+
+export function validateDelegatedScopes(scopes) {
+  if (!Array.isArray(scopes) || scopes.length === 0) {
+    return { ok: false, message: "Delegated invite scopes must be a non-empty array" };
+  }
+  for (const s of scopes) {
+    if (typeof s !== "string" || s.length === 0 || s !== s.trim()) {
+      return { ok: false, message: "Delegated scope token must be a non-empty trimmed string" };
+    }
+    for (let i = 0; i < s.length; i++) {
+      const code = s.charCodeAt(i);
+      if (code <= 0x20 || code >= 0x7f) {
+        return { ok: false, message: `Delegated scope '${s}' contains disallowed characters` };
+      }
+    }
+    if (isForbiddenDelegatedScope(s)) {
+      return {
+        ok: false,
+        message: `Delegated invite forbids scope '${s}' ('*', bridge:post, and forward:via are blocked)`,
+      };
+    }
+  }
+  return { ok: true };
+}
+
+export function isAllowedHubEndpoint(rawUrl) {
+  if (typeof rawUrl !== "string" || rawUrl.length === 0) return false;
+  try {
+    const u = new URL(rawUrl);
+    if (u.username || u.password) return false;
+    if (u.protocol === "https:") return true;
+    if (u.protocol === "http:" && (u.hostname === "127.0.0.1" || u.hostname === "localhost")) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+export function encodeHjoin1(signedInvite) {
+  if (
+    !signedInvite ||
+    typeof signedInvite.payload !== "string" ||
+    typeof signedInvite.sig !== "string" ||
+    !signedInvite.adminJwk
+  ) {
+    throw new Error("SignedHumanInviteV1 requires payload, sig, and adminJwk");
+  }
+  decodeOkpJwkBytes(signedInvite.adminJwk, "Ed25519");
+  return HJOIN1_PREFIX + base64urlEncode(utf8Bytes(toCanonicalJson(signedInvite)));
+}
+
+export function decodeHjoin1(token) {
+  if (typeof token !== "string") {
+    throw new Error("hjoin1_ token must be a string");
+  }
+  const trimmed = token.trim();
+  if (!trimmed.startsWith(HJOIN1_PREFIX)) {
+    throw new Error("Invalid hjoin1_ prefix");
+  }
+  const jsonBytes = base64urlDecode(trimmed.slice(HJOIN1_PREFIX.length));
+  const parsed = JSON.parse(utf8String(jsonBytes));
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    typeof parsed.payload !== "string" ||
+    parsed.payload.length === 0 ||
+    typeof parsed.sig !== "string" ||
+    parsed.sig.length === 0 ||
+    !parsed.adminJwk
+  ) {
+    throw new Error("Malformed hjoin1_ SignedHumanInviteV1 envelope");
+  }
+  decodeOkpJwkBytes(parsed.adminJwk, "Ed25519");
+  return parsed;
+}
+
+/**
+ * Decodes and strictly verifies an `hjoin1_` Org Admin-CA human enrollment invite fail-closed.
+ * Matches Rust `hyp_crypto::human::verify_human_invite` byte-for-byte.
+ */
+export async function verifyHumanInvite(
+  hjoin1OrObj,
+  expectedAdminPubOrJwk = null,
+  nowMs = Date.now()
+) {
+  try {
+    const signed = typeof hjoin1OrObj === "string" ? decodeHjoin1(hjoin1OrObj) : hjoin1OrObj;
+    if (
+      !signed ||
+      typeof signed !== "object" ||
+      typeof signed.payload !== "string" ||
+      typeof signed.sig !== "string" ||
+      !signed.adminJwk
+    ) {
+      return { ok: false, reason: "malformed_invite", message: "Malformed hjoin1_ invite" };
+    }
+
+    const embeddedAdminPub32 = decodeOkpJwkBytes(signed.adminJwk, "Ed25519");
+    let verifyPub32 = embeddedAdminPub32;
+    if (expectedAdminPubOrJwk) {
+      const expectedPub32 =
+        expectedAdminPubOrJwk instanceof Uint8Array
+          ? expectedAdminPubOrJwk
+          : decodeOkpJwkBytes(expectedAdminPubOrJwk, "Ed25519");
+      if (!constantTimeEqual(embeddedAdminPub32, expectedPub32)) {
+        return {
+          ok: false,
+          reason: "admin_key_mismatch",
+          message: "Invite adminJwk does not match expected hub Admin-CA key",
+        };
+      }
+      verifyPub32 = expectedPub32;
+    }
+
+    const sigBytes = base64urlDecode(signed.sig);
+    const sigOk = await ed25519Verify(
+      verifyPub32,
+      utf8Bytes(HUMAN_INVITE_DOMAIN + signed.payload),
+      sigBytes
+    );
+    if (!sigOk) {
+      return {
+        ok: false,
+        reason: "invalid_signature",
+        message: "Invite Admin-CA Ed25519 signature verification failed",
+      };
+    }
+
+    const invite = JSON.parse(signed.payload);
+    if (!invite || typeof invite !== "object" || invite.v !== 1) {
+      return { ok: false, reason: "unsupported_version", message: "Unsupported hjoin1_ invite version" };
+    }
+    if (typeof invite.inviteId !== "string" || !TOKEN_ID_RE.test(invite.inviteId)) {
+      return { ok: false, reason: "invalid_invite_id", message: "Invalid inviteId" };
+    }
+    if (typeof invite.hubNodeId !== "string" || invite.hubNodeId === "local" || !isValidNodeId(invite.hubNodeId)) {
+      return { ok: false, reason: "invalid_hub_node_id", message: "Invalid hubNodeId" };
+    }
+    if (!isAllowedHubEndpoint(invite.hubEndpoint)) {
+      return { ok: false, reason: "invalid_hub_endpoint", message: "Invalid hubEndpoint URL" };
+    }
+    if (
+      invite.hubFingerprint !== undefined &&
+      invite.hubFingerprint !== null &&
+      (typeof invite.hubFingerprint !== "string" || !HUB_FINGERPRINT_RE.test(invite.hubFingerprint))
+    ) {
+      return { ok: false, reason: "invalid_hub_fingerprint", message: "Invalid hubFingerprint" };
+    }
+    if (typeof invite.humanId !== "string" || invite.humanId === "local" || !isValidNodeId(invite.humanId)) {
+      return { ok: false, reason: "invalid_human_id", message: "Invalid humanId" };
+    }
+    if (!isValidNodePrefix(invite.nodePrefix)) {
+      return { ok: false, reason: "invalid_node_prefix", message: "Invalid or overly broad nodePrefix" };
+    }
+    const scopeCheck = validateDelegatedScopes(invite.scopes);
+    if (!scopeCheck.ok) {
+      return { ok: false, reason: "invalid_scopes", message: scopeCheck.message };
+    }
+    if (
+      !Number.isInteger(invite.maxDevices) ||
+      invite.maxDevices < 1 ||
+      invite.maxDevices > MAX_DELEGATED_DEVICES_LIMIT
+    ) {
+      return {
+        ok: false,
+        reason: "invalid_max_devices",
+        message: `maxDevices must be in 1..=${MAX_DELEGATED_DEVICES_LIMIT}`,
+      };
+    }
+    const issuedAtMs = Date.parse(invite.issuedAt);
+    const expiresAtMs = Date.parse(invite.expiresAt);
+    if (!Number.isFinite(issuedAtMs) || !Number.isFinite(expiresAtMs) || expiresAtMs <= issuedAtMs) {
+      return { ok: false, reason: "invalid_timestamps", message: "Invite timestamps are invalid" };
+    }
+    if (issuedAtMs > nowMs + MAX_CLOCK_SKEW_MS) {
+      return { ok: false, reason: "not_yet_valid", message: "Invite issuedAt exceeds clock skew" };
+    }
+    if (nowMs >= expiresAtMs) {
+      return { ok: false, reason: "invite_expired", message: "This invite link has expired" };
+    }
+
+    return { ok: true, invite, adminJwk: signed.adminJwk, signed, expiresAtMs };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: "verify_error",
+      message: err instanceof Error ? err.message : "Invite verification failed",
+    };
+  }
+}
+
+/**
+ * Canonicalizes and signs a `HumanInviteClaimV1` under `HUMAN_INVITE_CLAIM_DOMAIN`
+ * (`"hyphae/v2/human-invite-claim\n" || JCS(claim)`), matching Rust `sign_human_invite_claim`
+ * and `verify_human_invite_claim` bit-for-bit.
+ */
+export async function signHumanInviteClaim(claimInput, humanSeed32) {
+  if (!claimInput || typeof claimInput !== "object") {
+    throw new Error("claimInput object is required");
+  }
+  const { publicJwk, kid } = await ed25519KeypairFromSeed(humanSeed32);
+  const claim = {
+    inviteId: claimInput.inviteId,
+    hubNodeId: claimInput.hubNodeId,
+    humanId: claimInput.humanId,
+    signingJwk: claimInput.signingJwk ?? publicJwk,
+    timestamp: claimInput.timestamp ?? new Date().toISOString(),
+  };
+  const claimPub = decodeOkpJwkBytes(claim.signingJwk, "Ed25519");
+  const expectedPub = decodeOkpJwkBytes(publicJwk, "Ed25519");
+  if (!constantTimeEqual(claimPub, expectedPub)) {
+    throw new Error("claimInput.signingJwk does not match signing seed");
+  }
+  if (claimInput.encJwk) {
+    decodeOkpJwkBytes(claimInput.encJwk, "X25519");
+    claim.encJwk = { kty: "OKP", crv: "X25519", x: claimInput.encJwk.x };
+  }
+  if (typeof claimInput.prfSalt === "string" && claimInput.prfSalt.length > 0) {
+    claim.prfSalt = claimInput.prfSalt;
+  }
+  const payload = toCanonicalJson(claim);
+  const sigBytes = await ed25519Sign(humanSeed32, utf8Bytes(HUMAN_INVITE_CLAIM_DOMAIN + payload));
+  return {
+    claim,
+    payload,
+    sig: base64urlEncode(sigBytes),
+    humanKid: kid,
+  };
+}
+
+/**
+ * Encodes a compact `hpub1_<base64url(JCS)>` public human identity card.
+ */
+export function encodeHpub1(card) {
+  if (!card || card.v !== 1 || !isValidNodeId(card.humanId) || card.humanId === "local") {
+    throw new Error("Invalid HumanPubCardV1");
+  }
+  decodeOkpJwkBytes(card.signingJwk, "Ed25519");
+  const normalized = {
+    v: 1,
+    humanId: card.humanId,
+    signingJwk: { kty: "OKP", crv: "Ed25519", x: card.signingJwk.x },
+  };
+  if (card.encJwk) {
+    decodeOkpJwkBytes(card.encJwk, "X25519");
+    normalized.encJwk = { kty: "OKP", crv: "X25519", x: card.encJwk.x };
+  }
+  return HPUB1_PREFIX + base64urlEncode(utf8Bytes(toCanonicalJson(normalized)));
+}
+
+/**
+ * Decodes and validates a compact `hpub1_` public human identity card fail-closed.
+ */
+export function decodeHpub1(token) {
+  if (typeof token !== "string" || !token.trim().startsWith(HPUB1_PREFIX)) {
+    throw new Error("Invalid hpub1_ prefix");
+  }
+  const bytes = base64urlDecode(token.trim().slice(HPUB1_PREFIX.length));
+  const card = JSON.parse(utf8String(bytes));
+  if (!card || card.v !== 1 || !isValidNodeId(card.humanId) || card.humanId === "local") {
+    throw new Error("Malformed hpub1_ identity card");
+  }
+  decodeOkpJwkBytes(card.signingJwk, "Ed25519");
+  if (card.encJwk !== undefined && card.encJwk !== null) {
+    decodeOkpJwkBytes(card.encJwk, "X25519");
+  }
+  return card;
 }

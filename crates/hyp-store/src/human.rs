@@ -2,6 +2,7 @@
 //! `authorities_digest` for `gate_policy_sig` tamper binding, atomic single-use `claim_id`
 //! nonce consumption, human-signed `NodeCertV1` storage, and `mailbox.human_auth_json`.
 
+use hyp_proto::scopes::{validate_delegated_human_scopes, validate_node_prefix_pattern};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -69,10 +70,11 @@ impl HumanAuthorityStatus {
 
 /// Kind of human claim tracked in `human_claim_nonces`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum HumanClaimKind {
     Directive,
     Secret,
+    HumanInvite,
 }
 
 impl HumanClaimKind {
@@ -80,6 +82,7 @@ impl HumanClaimKind {
         match self {
             Self::Directive => "directive",
             Self::Secret => "secret",
+            Self::HumanInvite => "human_invite",
         }
     }
 
@@ -87,11 +90,35 @@ impl HumanClaimKind {
         match raw {
             "directive" => Ok(Self::Directive),
             "secret" => Ok(Self::Secret),
+            "human_invite" => Ok(Self::HumanInvite),
             other => Err(StoreError::InvalidState(format!(
                 "invalid human claim kind '{other}'"
             ))),
         }
     }
+}
+
+/// Input for configuring a human's delegated device admission policy (`human_delegation_policies`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HumanDelegationPolicyInput {
+    pub human_id: String,
+    pub node_prefix: String,
+    pub scopes: Vec<String>,
+    pub max_devices: u32,
+    pub delegation_enabled: bool,
+}
+
+/// Persisted delegated device admission policy record from `human_delegation_policies`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HumanDelegationPolicy {
+    pub human_id: String,
+    pub node_prefix: String,
+    pub scopes: Vec<String>,
+    pub max_devices: u32,
+    pub delegation_enabled: bool,
+    pub updated_at: i64,
 }
 
 /// Input for enrolling or updating an active human authority key.
@@ -645,6 +672,193 @@ impl<'a> HumanAuthorityStore<'a> {
             .optional()?;
         Ok(found.flatten())
     }
+
+    /// Lists all authorities registered for `human_id`, ordered deterministically by `kid ASC`.
+    pub fn list_authorities_for_human(
+        &self,
+        human_id: &str,
+        include_revoked: bool,
+    ) -> StoreResult<Vec<HumanAuthorityRecord>> {
+        validate_human_id(human_id)?;
+        let sql = if include_revoked {
+            "SELECT human_id, kid, label, role, jwk_json, enc_jwk_json, prf_salt, auth_epoch, status,
+                    created_at, revoked_at, revocation_json
+             FROM human_authorities
+             WHERE human_id = ?1
+             ORDER BY kid ASC"
+        } else {
+            "SELECT human_id, kid, label, role, jwk_json, enc_jwk_json, prf_salt, auth_epoch, status,
+                    created_at, revoked_at, revocation_json
+             FROM human_authorities
+             WHERE human_id = ?1 AND status = 'active'
+             ORDER BY kid ASC"
+        };
+        let mut stmt = self.db.conn().prepare(sql)?;
+        let rows = stmt
+            .query_map(params![human_id], row_to_authority)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Looks up an active human authority strictly matching BOTH `human_id` and `kid`.
+    pub fn get_active_authority_by_human_and_kid(
+        &self,
+        human_id: &str,
+        kid: &str,
+    ) -> StoreResult<Option<HumanAuthorityRecord>> {
+        if human_id.is_empty() || kid.is_empty() {
+            return Ok(None);
+        }
+        self.db
+            .conn()
+            .query_row(
+                "SELECT human_id, kid, label, role, jwk_json, enc_jwk_json, prf_salt, auth_epoch, status,
+                        created_at, revoked_at, revocation_json
+                 FROM human_authorities
+                 WHERE human_id = ?1 AND kid = ?2 AND status = 'active'
+                 LIMIT 1",
+                params![human_id, kid],
+                row_to_authority,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// Creates or updates a delegated device admission policy for `human_id` in
+    /// `human_delegation_policies` (schema v7).
+    ///
+    /// Fails closed on invalid `human_id`, invalid `node_prefix`, disallowed scopes
+    /// (`*`, `bridge:post`, `forward:via`), or `max_devices` outside `1..=100`.
+    pub fn upsert_delegation_policy(
+        &self,
+        input: &HumanDelegationPolicyInput,
+        now_ms: i64,
+    ) -> StoreResult<HumanDelegationPolicy> {
+        validate_human_id(&input.human_id)?;
+        validate_node_prefix_pattern(&input.node_prefix, false)
+            .map_err(|e| StoreError::InvalidInput(format!("invalid node_prefix: {e}")))?;
+        let validated_scopes = validate_delegated_human_scopes(&input.scopes)
+            .map_err(|e| StoreError::InvalidInput(format!("invalid delegation scopes: {e}")))?;
+        if input.max_devices == 0 || input.max_devices > 100 {
+            return Err(StoreError::InvalidInput(format!(
+                "max_devices {} must be in 1..=100",
+                input.max_devices
+            )));
+        }
+        let scopes_json = serde_json::to_string(&validated_scopes)?;
+        let enabled_int: i64 = if input.delegation_enabled { 1 } else { 0 };
+
+        let tx = self.db.immediate_tx()?;
+        tx.conn().execute(
+            "INSERT INTO human_delegation_policies
+                (human_id, node_prefix, scopes_json, max_devices, delegation_enabled, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(human_id) DO UPDATE SET
+                node_prefix = excluded.node_prefix,
+                scopes_json = excluded.scopes_json,
+                max_devices = excluded.max_devices,
+                delegation_enabled = excluded.delegation_enabled,
+                updated_at = excluded.updated_at",
+            params![
+                input.human_id,
+                input.node_prefix,
+                scopes_json,
+                i64::from(input.max_devices),
+                enabled_int,
+                now_ms,
+            ],
+        )?;
+        tx.commit()?;
+
+        Ok(HumanDelegationPolicy {
+            human_id: input.human_id.clone(),
+            node_prefix: input.node_prefix.clone(),
+            scopes: validated_scopes,
+            max_devices: input.max_devices,
+            delegation_enabled: input.delegation_enabled,
+            updated_at: now_ms,
+        })
+    }
+
+    /// Reads the delegated admission policy for `human_id`, if configured.
+    pub fn get_delegation_policy(
+        &self,
+        human_id: &str,
+    ) -> StoreResult<Option<HumanDelegationPolicy>> {
+        if human_id.is_empty() {
+            return Ok(None);
+        }
+        self.db
+            .conn()
+            .query_row(
+                "SELECT human_id, node_prefix, scopes_json, max_devices, delegation_enabled, updated_at
+                 FROM human_delegation_policies
+                 WHERE human_id = ?1",
+                params![human_id],
+                row_to_delegation_policy,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// Lists all configured delegated human admission policies ordered by `human_id ASC`.
+    pub fn list_delegation_policies(&self) -> StoreResult<Vec<HumanDelegationPolicy>> {
+        let mut stmt = self.db.conn().prepare(
+            "SELECT human_id, node_prefix, scopes_json, max_devices, delegation_enabled, updated_at
+             FROM human_delegation_policies
+             ORDER BY human_id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_delegation_policy)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().collect()
+    }
+
+    /// Toggles `delegation_enabled` on an existing `human_delegation_policies` row.
+    pub fn set_delegation_enabled(
+        &self,
+        human_id: &str,
+        enabled: bool,
+        now_ms: i64,
+    ) -> StoreResult<bool> {
+        let tx = self.db.immediate_tx()?;
+        let changed = tx.conn().execute(
+            "UPDATE human_delegation_policies
+             SET delegation_enabled = ?1, updated_at = ?2
+             WHERE human_id = ?3",
+            params![if enabled { 1i64 } else { 0i64 }, now_ms, human_id],
+        )?;
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+}
+
+fn row_to_delegation_policy(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoreResult<HumanDelegationPolicy>> {
+    let human_id: String = row.get(0)?;
+    let node_prefix: String = row.get(1)?;
+    let scopes_json: String = row.get(2)?;
+    let max_devices_i64: i64 = row.get(3)?;
+    let enabled_i64: i64 = row.get(4)?;
+    let updated_at: i64 = row.get(5)?;
+
+    Ok((|| {
+        let scopes: Vec<String> = serde_json::from_str(&scopes_json)?;
+        let max_devices = u32::try_from(max_devices_i64).map_err(|_| {
+            StoreError::InvalidState(format!(
+                "corrupt max_devices '{max_devices_i64}' for human '{human_id}'"
+            ))
+        })?;
+        Ok(HumanDelegationPolicy {
+            human_id,
+            node_prefix,
+            scopes,
+            max_devices,
+            delegation_enabled: enabled_i64 != 0,
+            updated_at,
+        })
+    })())
 }
 
 fn read_min_auth_epoch(conn: &rusqlite::Connection) -> StoreResult<u64> {

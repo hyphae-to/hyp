@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="referrer" content="no-referrer" />
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src https: http://127.0.0.1:* http://localhost:*; img-src 'self' data:; form-action http://127.0.0.1:* http://localhost:*; base-uri 'none'"
+  />
+  <title>Hyphae — Join Team Hub</title>
+  <meta name="description" content="Verify your Hyphae Team Hub invite with Touch ID / Passkey and certify your devices with zero-knowledge client-side Ed25519 cryptography." />
+  <link rel="icon" type="image/svg+xml" href="../assets/logo-hyphae.svg?v=2" />
+  <link rel="alternate icon" type="image/png" href="../assets/logo-hyphae.png?v=2" />
+  <link rel="stylesheet" href="./styles.css?v=1" />
+</head>
+<body>
+  <main class="shell">
+    <!-- Slim Single-Row Header -->
+    <header class="topbar">
+      <a class="brand" href="https://hyphae.to" rel="noreferrer">
+        <span class="brand-mark" aria-hidden="true">
+          <img class="brand-logo" src="../assets/logo-hyphae.svg?v=2" alt="" />
+        </span>
+        <span class="brand-word">hyphae</span>
+        <span class="brand-pill">join</span>
+      </a>
+      <div class="topbar-right">
+        <a class="topbar-link" href="../drop/" rel="noreferrer">drop ↗</a>
+        <span class="e2ee-pill" title="Strict CSP · Zero CDN · Client-Side WebAuthn PRF">
+          <span class="pill-dot" aria-hidden="true"></span>
+          PASSKEY
+        </span>
+      </div>
+    </header>
+
+    <!-- =================================================================== -->
+    <!-- Error / Parse Failure View                                          -->
+    <!-- =================================================================== -->
+    <section id="viewError" class="card stage-in hidden" aria-live="polite">
+      <div class="status-hero">
+        <span class="hero-icon hero-icon-danger" aria-hidden="true">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 8v4M12 16h.01" />
+          </svg>
+        </span>
+        <h1 class="hero-title">Invite link could not be opened</h1>
+      </div>
+      <div class="banner danger">
+        <strong>Invalid or Expired Invite</strong>
+        <span id="errorMessage">The enrollment invite fragment is missing, invalid, or expired.</span>
+      </div>
+      <a class="btn-link btn-secondary" href="https://hyphae.to" rel="noreferrer">Return to hyphae.to</a>
+    </section>
+
+    <!-- =================================================================== -->
+    <!-- Landing View (No URL #fragment)                                     -->
+    <!-- =================================================================== -->
+    <section id="viewLanding" class="card stage-in hidden">
+      <div class="landing-head">
+        <p class="eyebrow">Delegated Human Admission</p>
+        <h1 class="card-title">Join a Hyphae Team Hub</h1>
+        <p class="card-lead">
+          Authenticate once with Touch ID / Passkey to bind your human authority and certify any of your laptops or servers with zero shared secrets.
+        </p>
+      </div>
+
+      <div class="field">
+        <label class="field-label" for="inputManualInvite">Paste an <code>hjoin1_</code> invite token or link</label>
+        <textarea
+          id="inputManualInvite"
+          class="mono-area"
+          rows="3"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="https://hyphae.to/join#hjoin1_... or hjoin1_..."
+        ></textarea>
+      </div>
+
+      <div id="landingErrorBanner" class="banner danger hidden" aria-live="polite">
+        <strong id="landingErrorTitle">Invalid Invite</strong>
+        <span id="landingErrorBody"></span>
+      </div>
+
+      <button id="btnOpenManualInvite" class="btn-primary" type="button">Review Invite</button>
+
+      <ul class="feature-list">
+        <li>
+          <span class="feature-num">01</span>
+          <div>
+            <strong>Synced Passkey Identity</strong>
+            Derives your Ed25519 authority key strictly in browser memory via WebAuthn PRF — immediately compatible with <code>hyphae.to/drop</code>.
+          </div>
+        </li>
+        <li>
+          <span class="feature-num">02</span>
+          <div>
+            <strong>6-Digit Human Approval</strong>
+            Your CLI or coding agent starts <code>hyp join</code> locally and hands you a 6-digit code — the agent never sees your Passkey or invite.
+          </div>
+        </li>
+        <li>
+          <span class="feature-num">03</span>
+          <div>
+            <strong>Multi-Device &amp; Instant Revocation</strong>
+            Certify extra laptops anytime within your device prefix ceiling, or revoke all admitted devices in one command.
+          </div>
+        </li>
+      </ul>
+    </section>
+
+    <!-- =================================================================== -->
+    <!-- Main Join Flow (#hjoin1_... or #certify=...)                        -->
+    <!-- =================================================================== -->
+    <section id="viewJoin" class="card join-card stage-in hidden">
+      <!-- Compact Invite Context Strip -->
+      <div class="context-strip">
+        <div class="context-row-primary">
+          <div class="target-identity">
+            <span id="metaHubNodeId" class="target-node">—</span>
+            <span id="metaHumanPill" class="handle-pill">—</span>
+          </div>
+          <div class="context-badges">
+            <span id="metaModeBadge" class="kind-badge directive">INVITE</span>
+            <span id="metaExpires" class="countdown-pill">—</span>
+          </div>
+        </div>
+        <div class="context-row-meta">
+          <span id="metaHubEndpoint" class="relay-host">—</span>
+          <span id="metaPrefixBadge" class="cert-badge verified">—</span>
+        </div>
+      </div>
+
+      <!-- Progressive 3-Step Indicator -->
+      <nav class="stepper" aria-label="Join progress">
+        <span id="stepDot1" class="step-pill active">
+          <span class="step-num">1</span>
+          <span>Passkey</span>
+        </span>
+        <span class="step-sep" aria-hidden="true"></span>
+        <span id="stepDot2" class="step-pill">
+          <span class="step-num">2</span>
+          <span>Device</span>
+        </span>
+        <span class="step-sep" aria-hidden="true"></span>
+        <span id="stepDot3" class="step-pill">
+          <span class="step-num">3</span>
+          <span>Joined</span>
+        </span>
+      </nav>
+
+      <!-- ================================================================= -->
+      <!-- SCREEN 1: INVITE REVIEW & PASSKEY AUTH                            -->
+      <!-- ================================================================= -->
+      <div id="stageReview" class="stage-panel stage-in">
+        <div class="stage-head">
+          <h1 id="reviewTitle" class="card-title">Review Team Hub Invite</h1>
+          <p id="reviewSubtitle" class="card-lead">
+            Verify the hub details and scopes below, then continue with Touch ID / Passkey.
+          </p>
+        </div>
+
+        <div class="summary-grid">
+          <div class="summary-item">
+            <span class="meta-k">Human Authority</span>
+            <span id="reviewHumanId" class="summary-v accent">—</span>
+          </div>
+          <div class="summary-item">
+            <span class="meta-k">Allowed Devices</span>
+            <span id="reviewNodePrefix" class="summary-v">—</span>
+          </div>
+          <div class="summary-item">
+            <span class="meta-k">Device Limit</span>
+            <span id="reviewMaxDevices" class="summary-v">—</span>
+          </div>
+          <div class="summary-item">
+            <span class="meta-k">Hub Fingerprint</span>
+            <span id="reviewHubFingerprint" class="summary-v">—</span>
+          </div>
+        </div>
+
+        <!-- Scope Summary Chips -->
+        <div class="scope-box">
+          <div class="scope-head">
+            <span class="meta-k">Granted Scopes</span>
+            <span id="reviewScopeCount" class="meta-hint">0 scopes</span>
+          </div>
+          <div id="reviewScopeChips" class="scope-chips"></div>
+        </div>
+
+        <!-- Collapsible Cryptographic Details Drawer -->
+        <details class="security-drawer">
+          <summary class="drawer-summary">
+            <span class="drawer-summary-left">
+              <span>Cryptographic verification &amp; raw scopes</span>
+            </span>
+            <span class="drawer-summary-right">
+              <span id="reviewAdminFpPreview" class="drawer-preview">—</span>
+              <svg class="drawer-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M6 9l6 6 6-6" />
+              </svg>
+            </span>
+          </summary>
+          <div class="drawer-body">
+            <div class="drawer-kv">
+              <span class="meta-k">Hub Endpoint</span>
+              <span id="drawerHubEndpoint" class="drawer-mono">—</span>
+            </div>
+            <div class="drawer-kv">
+              <span class="meta-k">Admin-CA Signing Key</span>
+              <span id="drawerAdminFp" class="drawer-mono accent">—</span>
+            </div>
+            <div class="drawer-kv">
+              <span class="meta-k">Invite ID (Single-Use)</span>
+              <span id="drawerInviteId" class="drawer-mono muted">—</span>
+            </div>
+            <div class="drawer-divider"></div>
+            <div class="drawer-kv">
+              <span class="meta-k">Raw v2 Scope Tokens</span>
+              <span id="drawerRawScopes" class="drawer-mono muted">—</span>
+            </div>
+          </div>
+        </details>
+
+        <div id="reviewBanner" class="banner hidden" aria-live="polite">
+          <strong id="reviewBannerTitle"></strong>
+          <span id="reviewBannerBody"></span>
+        </div>
+
+        <div class="btn-stack">
+          <button id="btnContinuePasskey" class="btn-primary" type="button">
+            <span id="passkeySpinner" class="spinner spinner-dark hidden" aria-hidden="true"></span>
+            <span id="btnContinuePasskeyLabel">Continue with Touch ID / Passkey</span>
+          </button>
+          <button id="btnUseExistingPasskey" class="btn-ghost hidden" type="button">
+            Create a fresh Passkey instead
+          </button>
+        </div>
+      </div>
+
+      <!-- ================================================================= -->
+      <!-- SCREEN 2: CONNECT YOUR DEVICE                                     -->
+      <!-- ================================================================= -->
+      <div id="stageConnect" class="stage-panel stage-in hidden">
+        <!-- Slim Passkey Unlocked Strip -->
+        <div class="verified-strip verified">
+          <span class="verified-strip-left">
+            <span class="verified-icon" aria-hidden="true">✓</span>
+            <span id="passkeyStripText" class="verified-strip-text">Passkey ready</span>
+          </span>
+          <button id="btnToggleFallback" class="btn-lock-pill" type="button">Safari / Remote VPS</button>
+        </div>
+
+        <!-- 2A: Waiting for Local `hyp join` Listener (Polls 127.0.0.1:47891/health) -->
+        <div id="connectWaitingPane" class="sub-pane">
+          <div class="waiting-status">
+            <span class="pulse-dot" aria-hidden="true"></span>
+            <span id="pollStatusText">Listening for local <code>hyp join</code> on <code>127.0.0.1:47891</code>…</span>
+          </div>
+
+          <p class="option-intro">
+            Start <code>hyp join</code> on this machine using either option below. Your browser will automatically detect it and ask for the 6-digit code.
+          </p>
+
+          <!-- TWO EQUAL, COPY-FRIENDLY OPTIONS -->
+          <div class="option-cards">
+            <!-- Option 1: Tell your coding agent -->
+            <div class="option-card">
+              <div class="option-card-head">
+                <span class="option-tag agent">OPTION 1</span>
+                <h2 class="option-title">Tell your coding agent</h2>
+              </div>
+              <p class="option-desc">
+                Paste into Claude Code, Codex, Cursor, Antigravity, or OpenClaw. You stay in control with Touch ID + the 6-digit code — the agent never sees your Passkey or invite.
+              </p>
+
+              <div class="copy-block">
+                <div class="copy-block-head">
+                  <span class="meta-k">Already have Hyphae? Tell your agent:</span>
+                  <button id="btnCopyAgentExisting" class="btn-copy-sm" type="button">Copy</button>
+                </div>
+                <pre id="promptAgentExisting" class="copy-pre"></pre>
+              </div>
+
+              <div class="copy-block">
+                <div class="copy-block-head">
+                  <span class="meta-k">New to Hyphae? Tell your agent:</span>
+                  <button id="btnCopyAgentNew" class="btn-copy-sm" type="button">Copy</button>
+                </div>
+                <pre id="promptAgentNew" class="copy-pre"></pre>
+              </div>
+            </div>
+
+            <!-- Option 2: Run it yourself in Terminal -->
+            <div class="option-card">
+              <div class="option-card-head">
+                <span class="option-tag terminal">OPTION 2</span>
+                <h2 class="option-title">Or run it yourself in Terminal</h2>
+              </div>
+              <p class="option-desc">
+                Run directly in any local shell. The one-shot listener binds only to <code>127.0.0.1</code> and shuts down immediately after approval.
+              </p>
+
+              <div class="copy-block">
+                <div class="copy-block-head">
+                  <span class="meta-k">Already have Hyphae</span>
+                  <button id="btnCopyTermExisting" class="btn-copy-sm" type="button">Copy</button>
+                </div>
+                <pre id="cmdTermExisting" class="copy-pre">hyp join</pre>
+              </div>
+
+              <div class="copy-block">
+                <div class="copy-block-head">
+                  <span class="meta-k">New to Hyphae</span>
+                  <button id="btnCopyTermNew" class="btn-copy-sm" type="button">Copy</button>
+                </div>
+                <pre id="cmdTermNew" class="copy-pre">curl -fsSL https://hyphae.to/install.sh | sh &amp;&amp; hyp join</pre>
+              </div>
+            </div>
+          </div>
+
+          <details class="security-drawer">
+            <summary class="drawer-summary">
+              <span class="drawer-summary-left"><span>Custom local port</span></span>
+              <span class="drawer-summary-right">
+                <span id="customPortPreview" class="drawer-preview">47891</span>
+                <svg class="drawer-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M6 9l6 6 6-6" />
+                </svg>
+              </span>
+            </summary>
+            <div class="drawer-body">
+              <div class="port-row">
+                <input id="inputLocalPort" type="number" min="1024" max="65535" value="47891" />
+                <button id="btnApplyPort" class="btn-inline" type="button">Check Port</button>
+              </div>
+            </div>
+          </details>
+        </div>
+
+        <!-- 2B: Local `hyp join` Detected -> 6-Digit Confirmation Code Entry -->
+        <div id="connectCodePane" class="sub-pane hidden">
+          <div class="banner verified compact">
+            <strong>Local <code>hyp join</code> Connected</strong>
+            <span>Enter the 6-digit confirmation code shown in your terminal to approve this device.</span>
+          </div>
+
+          <div class="field">
+            <label class="field-label" for="inputJoinCode">6-Digit Confirmation Code</label>
+            <input
+              id="inputJoinCode"
+              class="code-input"
+              type="text"
+              inputmode="numeric"
+              maxlength="7"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="482-917"
+            />
+          </div>
+
+          <div id="devicePreviewCard" class="summary-grid hidden">
+            <div class="summary-item">
+              <span class="meta-k">Device Node ID</span>
+              <span id="previewDeviceNodeId" class="summary-v accent">—</span>
+            </div>
+            <div class="summary-item">
+              <span class="meta-k">Prefix Check</span>
+              <span id="previewPrefixMatch" class="summary-v">—</span>
+            </div>
+            <div class="summary-item span-2">
+              <span class="meta-k">Device Ed25519 SAS</span>
+              <span id="previewDeviceSas" class="summary-v">—</span>
+            </div>
+          </div>
+
+          <div id="codeActionBanner" class="banner hidden" aria-live="polite">
+            <strong id="codeActionTitle"></strong>
+            <span id="codeActionBody"></span>
+          </div>
+
+          <div class="btn-stack">
+            <button id="btnVerifyAndApprove" class="btn-primary" type="button">
+              <span id="approveSpinner" class="spinner spinner-dark hidden" aria-hidden="true"></span>
+              <span id="btnVerifyAndApproveLabel">Verify Code &amp; Approve Device</span>
+            </button>
+            <button id="btnBackToWait" class="btn-ghost" type="button">Back to instructions</button>
+          </div>
+        </div>
+
+        <!-- 2C: Safari / Manual / Remote VPS Handoff Fallback -->
+        <div id="connectFallbackPane" class="sub-pane hidden">
+          <div id="fallbackNoticeBanner" class="banner warn compact">
+            <strong>Safari / Manual / Remote VPS Mode</strong>
+            <span>Sign any remote or Safari-blocked device without your Passkey ever leaving this browser.</span>
+          </div>
+
+          <div class="copy-block">
+            <div class="copy-block-head">
+              <span class="meta-k">Step 1 · Run on target device (or ask your agent)</span>
+              <button id="btnCopyRemoteCmd" class="btn-copy-sm" type="button">Copy</button>
+            </div>
+            <pre id="cmdRemoteCard" class="copy-pre">hyp join --remote</pre>
+          </div>
+
+          <div class="field">
+            <label class="field-label" for="inputRemoteDeviceCard">Step 2 · Paste the public device card JSON</label>
+            <textarea
+              id="inputRemoteDeviceCard"
+              class="mono-area"
+              rows="4"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder='{"v":1,"nodeId":"philip@vps","ed25519Jwk":{...},"x25519Jwk":{...}}'
+            ></textarea>
+          </div>
+
+          <div id="fallbackErrorBanner" class="banner danger hidden" aria-live="polite">
+            <strong id="fallbackErrorTitle"></strong>
+            <span id="fallbackErrorBody"></span>
+          </div>
+
+          <button id="btnSignRemoteBundle" class="btn-primary" type="button">
+            <span id="remoteSignSpinner" class="spinner spinner-dark hidden" aria-hidden="true"></span>
+            <span id="btnSignRemoteBundleLabel">Sign Device Certificate with Passkey</span>
+          </button>
+
+          <div id="remoteSignedResult" class="sub-pane hidden">
+            <div class="banner verified compact">
+              <strong>Signed Handoff Bundle Ready</strong>
+              <span>Paste this bundle into <code>hyp join --remote</code> (or pipe into <code>hyp join --stdin</code>).</span>
+            </div>
+
+            <div class="copy-block">
+              <div class="copy-block-head">
+                <span class="meta-k">Signed Handoff Bundle (Safe — public keys &amp; signatures only)</span>
+                <button id="btnCopySignedBundle" class="btn-copy-sm" type="button">Copy Bundle</button>
+              </div>
+              <pre id="outputSignedBundle" class="copy-pre bundle-pre"></pre>
+            </div>
+
+            <div class="copy-block">
+              <div class="copy-block-head">
+                <span class="meta-k">Or tell your agent to finish joining</span>
+                <button id="btnCopyFinishPrompt" class="btn-copy-sm" type="button">Copy Prompt</button>
+              </div>
+              <pre id="promptFinishRemote" class="copy-pre"></pre>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ================================================================= -->
+      <!-- SCREEN 3: JOINED SUCCESS                                          -->
+      <!-- ================================================================= -->
+      <div id="stageDone" class="stage-panel stage-in hidden" aria-live="polite">
+        <div class="status-hero">
+          <span class="hero-icon hero-icon-verified" aria-hidden="true">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M20 6L9 17l-5-5" />
+            </svg>
+          </span>
+          <h1 id="doneTitle" class="hero-title">Device Approved &amp; Joined</h1>
+          <p id="doneSubtitle" class="hero-subtitle">
+            Your device is now certified and connected. Your synced Passkey is also ready for Verified Human Drops on <code>hyphae.to/drop</code>.
+          </p>
+        </div>
+
+        <div class="summary-grid">
+          <div class="summary-item">
+            <span class="meta-k">Device</span>
+            <span id="doneNodeId" class="summary-v accent">—</span>
+          </div>
+          <div class="summary-item">
+            <span class="meta-k">Team Hub</span>
+            <span id="doneHubNodeId" class="summary-v">—</span>
+          </div>
+          <div class="summary-item">
+            <span class="meta-k">Human Authority</span>
+            <span id="doneHumanId" class="summary-v">—</span>
+          </div>
+          <div class="summary-item">
+            <span class="meta-k">Passkey Drops</span>
+            <span class="summary-v">Ready (hyphae.to/drop)</span>
+          </div>
+        </div>
+
+        <details class="security-drawer">
+          <summary class="drawer-summary">
+            <span class="drawer-summary-left"><span>Your Human Identity Card (<code>hpub1_</code>)</span></span>
+            <span class="drawer-summary-right">
+              <span id="doneHumanFpPreview" class="drawer-preview">—</span>
+              <svg class="drawer-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M6 9l6 6 6-6" />
+              </svg>
+            </span>
+          </summary>
+          <div class="drawer-body">
+            <div class="copy-block">
+              <div class="copy-block-head">
+                <span class="meta-k">Compact Public Card</span>
+                <button id="btnCopyHpub1" class="btn-copy-sm" type="button">Copy</button>
+              </div>
+              <pre id="doneHpub1Box" class="copy-pre"></pre>
+            </div>
+          </div>
+        </details>
+
+        <a class="btn-link btn-secondary" href="../drop/" rel="noreferrer">Open hyphae.to/drop</a>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <span>Zero-knowledge WebAuthn PRF · Fragment scrubbed on load · Ephemeral keys wiped in RAM</span>
+      <a href="https://hyphae.to" rel="noreferrer">hyphae.to</a>
+    </footer>
+  </main>
+
+  <script type="module" src="./join.js?v=1"></script>
+</body>
+</html>

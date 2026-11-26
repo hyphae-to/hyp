@@ -42,6 +42,12 @@ pub struct PeerRecord {
     pub manifest_etag: Option<String>,
     pub manifest_fetched_at: Option<i64>,
     pub observed_e2ee_caps: Vec<String>,
+    /// Delegated human authority ID that admitted this peer via `POST /v1/pair/delegated`, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_by_human_id: Option<String>,
+    /// Monotonic human `auth_epoch` pinned when this peer was admitted via delegated human cert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_auth_epoch: Option<u64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -218,6 +224,168 @@ impl<'a> PeerStore<'a> {
         )??;
         tx.commit()?;
         Ok(record)
+    }
+
+    /// Registers or updates a paired peer record while explicitly setting delegated human
+    /// admission provenance (`admitted_by_human_id`, `admitted_auth_epoch`).
+    pub fn upsert_peer_with_admission(
+        &self,
+        input: &PeerInput,
+        admitted_by_human_id: Option<&str>,
+        admitted_auth_epoch: Option<u64>,
+        now_ms: i64,
+    ) -> StoreResult<PeerRecord> {
+        if !is_node_id(&input.peer_id) || input.peer_id == "local" {
+            return Err(StoreError::InvalidInput(format!(
+                "invalid peer_id '{}' ('local' is reserved)",
+                input.peer_id
+            )));
+        }
+        if let Some(hid) = admitted_by_human_id {
+            if !is_node_id(hid) || hid == "local" {
+                return Err(StoreError::InvalidInput(format!(
+                    "invalid admitted_by_human_id '{hid}'"
+                )));
+            }
+        }
+        let epoch_i64 = match admitted_auth_epoch {
+            Some(0) => {
+                return Err(StoreError::InvalidInput(
+                    "admitted_auth_epoch must be >= 1".to_string(),
+                ));
+            }
+            Some(ep) => Some(i64::try_from(ep).map_err(|_| {
+                StoreError::InvalidInput("admitted_auth_epoch exceeds SQLite i64 range".to_string())
+            })?),
+            None => None,
+        };
+        let scopes_json = serde_json::to_string(&input.scopes)?;
+        let tx = self.db.immediate_tx()?;
+        tx.conn().execute(
+            "INSERT INTO peers
+             (peer_id, endpoint, profile, trust_tier, status, scopes_json, auth_credential_ref,
+              admitted_by_human_id, admitted_auth_epoch, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+             ON CONFLICT(peer_id) DO UPDATE SET
+               endpoint = excluded.endpoint,
+               profile = excluded.profile,
+               trust_tier = excluded.trust_tier,
+               status = excluded.status,
+               scopes_json = excluded.scopes_json,
+               auth_credential_ref = excluded.auth_credential_ref,
+               admitted_by_human_id = excluded.admitted_by_human_id,
+               admitted_auth_epoch = excluded.admitted_auth_epoch,
+               updated_at = excluded.updated_at",
+            params![
+                &input.peer_id,
+                input.endpoint.as_deref(),
+                input.profile.as_str(),
+                input.trust_tier.as_str(),
+                input.status.as_str(),
+                &scopes_json,
+                input.auth_credential_ref.as_deref(),
+                admitted_by_human_id,
+                epoch_i64,
+                now_ms
+            ],
+        )?;
+        if input.status == PeerStatus::Revoked {
+            tx.conn().execute(
+                "DELETE FROM peer_routes WHERE via_peer = ?1",
+                params![&input.peer_id],
+            )?;
+            let _ = delete_peer_bearer_tokens_in_conn(tx.conn(), &input.peer_id)?;
+        }
+        let record = tx.conn().query_row(
+            "SELECT * FROM peers WHERE peer_id = ?1",
+            params![&input.peer_id],
+            decode_peer_row,
+        )??;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    /// Counts active peers admitted under `human_id`, optionally excluding `exclude_peer_id`
+    /// (so idempotent re-pairing of the same device counts as 0 new devices against `max_devices`).
+    pub fn count_active_peers_admitted_by_human(
+        &self,
+        human_id: &str,
+        exclude_peer_id: Option<&str>,
+    ) -> StoreResult<u32> {
+        let count: i64 = if let Some(excl) = exclude_peer_id {
+            self.db.conn().query_row(
+                "SELECT COUNT(*) FROM peers
+                 WHERE admitted_by_human_id = ?1 AND status = 'active' AND peer_id != ?2",
+                params![human_id, excl],
+                |row| row.get(0),
+            )?
+        } else {
+            self.db.conn().query_row(
+                "SELECT COUNT(*) FROM peers
+                 WHERE admitted_by_human_id = ?1 AND status = 'active'",
+                params![human_id],
+                |row| row.get(0),
+            )?
+        };
+        Ok(u32::try_from(count.max(0)).unwrap_or(u32::MAX))
+    }
+
+    /// Lists peers admitted under `human_id` ordered by `peer_id ASC`.
+    pub fn list_peers_admitted_by_human(
+        &self,
+        human_id: &str,
+        active_only: bool,
+    ) -> StoreResult<Vec<PeerRecord>> {
+        let sql = if active_only {
+            "SELECT * FROM peers WHERE admitted_by_human_id = ?1 AND status = 'active' ORDER BY peer_id ASC"
+        } else {
+            "SELECT * FROM peers WHERE admitted_by_human_id = ?1 ORDER BY peer_id ASC"
+        };
+        let mut stmt = self.db.conn().prepare(sql)?;
+        let rows = stmt
+            .query_map(params![human_id], decode_peer_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().collect()
+    }
+
+    /// Atomically revokes ALL non-revoked peers admitted under `human_id`, deletes their
+    /// `peer_routes` and stored `auth_token:*` bearer tokens inside a single `BEGIN IMMEDIATE`
+    /// transaction, and returns the sorted list of revoked `peer_id`s.
+    pub fn revoke_peers_admitted_by_human(
+        &self,
+        human_id: &str,
+        now_ms: i64,
+    ) -> StoreResult<Vec<String>> {
+        let tx = self.db.immediate_tx()?;
+        let revoked_ids: Vec<String> = {
+            let mut stmt = tx.conn().prepare(
+                "SELECT peer_id FROM peers
+                 WHERE admitted_by_human_id = ?1 AND status != 'revoked'
+                 ORDER BY peer_id ASC",
+            )?;
+            let mut rows = Vec::new();
+            for row in stmt.query_map(params![human_id], |row| row.get::<_, String>(0))? {
+                rows.push(row?);
+            }
+            rows
+        };
+        if !revoked_ids.is_empty() {
+            tx.conn().execute(
+                "UPDATE peers
+                 SET status = 'revoked', updated_at = ?2
+                 WHERE admitted_by_human_id = ?1 AND status != 'revoked'",
+                params![human_id, now_ms],
+            )?;
+            for pid in &revoked_ids {
+                tx.conn().execute(
+                    "DELETE FROM peer_routes WHERE via_peer = ?1",
+                    params![pid],
+                )?;
+                let _ = delete_peer_bearer_tokens_in_conn(tx.conn(), pid)?;
+            }
+        }
+        tx.commit()?;
+        Ok(revoked_ids)
     }
 
     pub fn get_peer(&self, peer_id: &str) -> StoreResult<Option<PeerRecord>> {
@@ -1187,6 +1355,8 @@ fn decode_peer_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Peer
     let manifest_etag: Option<String> = row.get("manifest_etag")?;
     let manifest_fetched_at: Option<i64> = row.get("manifest_fetched_at")?;
     let observed_e2ee_caps_json: String = row.get("observed_e2ee_caps_json")?;
+    let admitted_by_human_id: Option<String> = row.get("admitted_by_human_id")?;
+    let admitted_auth_epoch_i64: Option<i64> = row.get("admitted_auth_epoch")?;
     let created_at: i64 = row.get("created_at")?;
     let updated_at: i64 = row.get("updated_at")?;
 
@@ -1196,6 +1366,14 @@ fn decode_peer_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Peer
         let status = PeerStatus::parse(&status_str)?;
         let scopes: Vec<String> = serde_json::from_str(&scopes_json)?;
         let observed_e2ee_caps: Vec<String> = serde_json::from_str(&observed_e2ee_caps_json)?;
+        let admitted_auth_epoch = match admitted_auth_epoch_i64 {
+            Some(ep) => Some(u64::try_from(ep).map_err(|_| {
+                StoreError::InvalidState(format!(
+                    "corrupt admitted_auth_epoch '{ep}' for peer '{peer_id}'"
+                ))
+            })?),
+            None => None,
+        };
         Ok(PeerRecord {
             peer_id,
             endpoint,
@@ -1209,6 +1387,8 @@ fn decode_peer_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Peer
             manifest_etag,
             manifest_fetched_at,
             observed_e2ee_caps,
+            admitted_by_human_id,
+            admitted_auth_epoch,
             created_at,
             updated_at,
         })

@@ -34,8 +34,8 @@ pub use events::{
 };
 pub use human::{
     HUMAN_MIN_AUTH_EPOCH_META_KEY, HumanAuthorityInput, HumanAuthorityRecord, HumanAuthorityRole,
-    HumanAuthorityStatus, HumanAuthorityStore, HumanClaimKind, HumanNodeCertInput,
-    HumanNodeCertRecord,
+    HumanAuthorityStatus, HumanAuthorityStore, HumanClaimKind, HumanDelegationPolicy,
+    HumanDelegationPolicyInput, HumanNodeCertInput, HumanNodeCertRecord,
 };
 pub use kv::{
     KvDeleteInput, KvDeleteResult, KvEntry, KvEpoch, KvEpochInput, KvSetInput, KvSetResult,

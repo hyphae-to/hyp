@@ -14,6 +14,7 @@ mod exec_cmd;
 mod gate_cmd;
 mod herdr_mod;
 mod inspect_cmd;
+mod join_cmd;
 mod kv_cmd;
 mod node_cmd;
 mod pair;
@@ -182,6 +183,8 @@ enum Commands {
         #[command(subcommand)]
         command: auth_cmd::AuthCommand,
     },
+    /// Join a Hyphae Team Hub via Passkey+PRF delegated human admission (one-shot loopback, --stdin, --token-file, or --remote)
+    Join(join_cmd::JoinArgs),
     /// Verified Human Drops (`create`, `wait`, `ingest` — zero-leak secret & directive drops)
     Drop {
         #[command(subcommand)]
@@ -495,6 +498,7 @@ fn main() -> ExitCode {
         Commands::Kv { command } => kv_cmd::run_kv(command),
         Commands::Emit(args) => emit_cmd::run_emit(args),
         Commands::Auth { command } => auth_cmd::run_auth(command),
+        Commands::Join(args) => join_cmd::run_join(args),
         Commands::Drop { command } => drop_cmd::run_drop(command),
         Commands::Relay { command } => drop_cmd::run_relay(command),
         Commands::Update(args) => update::run_update(args),

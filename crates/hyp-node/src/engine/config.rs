@@ -833,6 +833,9 @@ pub enum NodeError {
     #[error("peer key mismatch: {0}")]
     PeerKeyMismatch(String),
 
+    #[error("human key mismatch: {0}")]
+    HumanKeyMismatch(String),
+
     #[error("rate limited: {detail}")]
     RateLimited {
         detail: String,
@@ -923,6 +926,14 @@ impl NodeError {
                 msg.clone(),
             )
             .with_extension("code", serde_json::json!("peer_key_mismatch")),
+            Self::HumanKeyMismatch(msg) => ProblemDetails::new(
+                "human_key_mismatch",
+                "human-key-mismatch",
+                "Human Key Mismatch",
+                409,
+                msg.clone(),
+            )
+            .with_extension("code", serde_json::json!("human_key_mismatch")),
             Self::RateLimited { detail, .. } => ProblemDetails::new(
                 "rate_limited",
                 "rate-limited",
