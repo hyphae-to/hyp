@@ -1,0 +1,335 @@
+name: Black-Box Integration Tests
+
+on:
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "crates/**"
+      - "plugins/**"
+      - "itest/**"
+      - ".github/workflows/blackbox-itest.yml"
+  push:
+    branches: ["main"]
+    paths:
+      - "itest/Dockerfile"
+      - "itest/versions.lock.json"
+  schedule:
+    # Nightly Tier 2 full matrix (runs 1 hour before nightly-rust.yml at 03:00 UTC)
+    - cron: "0 2 * * *"
+    # Every-3-days non-blocking upstream harness canary before bumping versions.lock.json
+    - cron: "0 5 */3 * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Execution mode (tier1 = PR gate, tier2 = full matrix, canary = upstream latest, build-image = GHCR image)"
+        type: choice
+        default: tier1
+        options:
+          - tier1
+          - tier2
+          - canary
+          - build-image
+
+permissions:
+  contents: read
+
+concurrency:
+  group: blackbox-itest-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  HYPHAE_SECRET_BACKEND: file
+  HYPHAE_NO_SERVICE: "1"
+  HYPHAE_NO_OPEN: "1"
+  HYPHAE_WIZARD_NO_ANIM: "1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Pre-Baked GHCR CI Image (`ghcr.io/hyphae-to/hyp-itest:latest`)
+  # ---------------------------------------------------------------------------
+  build-itest-image:
+    name: Build & Publish GHCR itest Image
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'build-image')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push ghcr.io/hyphae-to/hyp-itest
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: itest/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/hyp-itest:latest
+            ghcr.io/${{ github.repository_owner }}/hyp-itest:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  # 2. Build Compiled `hyp` Binary Once Per Target OS (Reused Across Test Jobs)
+  # ---------------------------------------------------------------------------
+  build-hyp:
+    name: Build hyp Binary (${{ matrix.os }})
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode != 'build-image')
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: >-
+          ${{
+            (
+              (
+                (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *') ||
+                (github.event_name == 'workflow_dispatch' && inputs.mode == 'tier2')
+              ) && fromJson('["ubuntu-latest","macos-latest"]')
+            ) || fromJson('["ubuntu-latest"]')
+          }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.87.0
+        uses: dtolnay/rust-toolchain@1.87.0
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-workspace
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build hyp binary
+        run: cargo build --locked --bin hyp
+
+      - name: Smoke-check compiled binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/debug/hyp version --json
+
+      - name: Upload compiled hyp binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hyp-bin-${{ matrix.os }}
+          path: target/debug/hyp
+          retention-days: 1
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 3. Tier 1 Core Black-Box PR Gate (Zero Docker, ~2-3 min Warm)
+  # ---------------------------------------------------------------------------
+  tier1-pr-gate:
+    name: Tier 1 Black-Box Gate (ubuntu-latest)
+    needs: build-hyp
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'tier1')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Download compiled hyp binary
+        uses: actions/download-artifact@v4
+        with:
+          name: hyp-bin-ubuntu-latest
+          path: target/debug
+
+      - name: Mark hyp executable
+        run: chmod 0755 target/debug/hyp
+
+      - name: Cache version-pinned harness toolchains
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/hyphae-itest
+          key: itest-toolchains-${{ runner.os }}-${{ hashFiles('itest/versions.lock.json') }}
+
+      - name: Provision Tier 1 pinned npm harnesses
+        run: node itest/scripts/provision.mjs --tools openclaw,claude,codex
+
+      - name: Run Tier 1 black-box suites (including Blind Spot B5 poisoned parent env check)
+        shell: bash
+        env:
+          HYP_BIN: ${{ github.workspace }}/target/debug/hyp
+          # Deliberately poison parent harness env vars to prove hermetic Sandbox scrubbing (Blind Spot B5)!
+          CLAUDECODE: "1"
+          HYPHAE_SESSION_ID: "claude:ambient-poisoned-parent"
+          HC_TERMINAL_ID: "t99"
+          CLAUDE_ENV_FILE: "/tmp/hyphae-ambient-poison-env"
+          OPENCLAW_STATE_DIR: "/tmp/hyphae-ambient-poison-openclaw"
+        run: |
+          set -euo pipefail
+          npm --prefix itest run itest:core
+
+      - name: Upload failure forensics bundle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: itest-forensics-tier1-ubuntu
+          path: |
+            itest-forensics/**
+            itest/artifacts/**
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # 4. Tier 2 Full Nightly Matrix (`ubuntu-latest` + `macos-latest`)
+  # ---------------------------------------------------------------------------
+  tier2-nightly-full:
+    name: Tier 2 Full Black-Box Matrix (${{ matrix.os }})
+    needs: build-hyp
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *') ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'tier2')
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Download compiled hyp binary
+        uses: actions/download-artifact@v4
+        with:
+          name: hyp-bin-${{ matrix.os }}
+          path: target/debug
+
+      - name: Mark hyp executable
+        run: chmod 0755 target/debug/hyp
+
+      - name: Cache version-pinned harness toolchains
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/hyphae-itest
+          key: itest-toolchains-${{ runner.os }}-${{ hashFiles('itest/versions.lock.json') }}
+
+      - name: Provision all pinned npm harnesses
+        run: node itest/scripts/provision.mjs --tools openclaw,claude,codex,gemini
+
+      - name: Run full Tier 2 black-box integration matrix
+        shell: bash
+        env:
+          HYP_BIN: ${{ github.workspace }}/target/debug/hyp
+        run: |
+          set -euo pipefail
+          npm --prefix itest run itest:all
+
+      - name: Upload failure forensics bundle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: itest-forensics-tier2-${{ matrix.os }}
+          path: |
+            itest-forensics/**
+            itest/artifacts/**
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # 5. Every-3-Days Non-Blocking Upstream Harness Canary (`0 5 */3 * *`)
+  # ---------------------------------------------------------------------------
+  upstream-canary:
+    name: Upstream Harness Canary (@latest)
+    needs: build-hyp
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '0 5 */3 * *') ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'canary')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Download compiled hyp binary
+        uses: actions/download-artifact@v4
+        with:
+          name: hyp-bin-ubuntu-latest
+          path: target/debug
+
+      - name: Mark hyp executable
+        run: chmod 0755 target/debug/hyp
+
+      - name: Install latest upstream harnesses into isolated canary prefix
+        shell: bash
+        run: |
+          set -euo pipefail
+          CANARY_DIR="${RUNNER_TEMP}/hyphae-canary"
+          mkdir -p "${CANARY_DIR}/openclaw" "${CANARY_DIR}/claude" "${CANARY_DIR}/codex" "${CANARY_DIR}/gemini"
+          npm install --prefix "${CANARY_DIR}/openclaw" --no-audit --no-fund --loglevel=error openclaw@latest
+          npm install --prefix "${CANARY_DIR}/claude" --no-audit --no-fund --loglevel=error @anthropic-ai/claude-code@latest
+          npm install --prefix "${CANARY_DIR}/codex" --no-audit --no-fund --loglevel=error @openai/codex@latest
+          npm install --prefix "${CANARY_DIR}/gemini" --no-audit --no-fund --loglevel=error @google/gemini-cli@latest
+          echo "OPENCLAW_BIN=${CANARY_DIR}/openclaw/node_modules/.bin/openclaw" >> "$GITHUB_ENV"
+          echo "CLAUDE_BIN=${CANARY_DIR}/claude/node_modules/.bin/claude" >> "$GITHUB_ENV"
+          echo "CODEX_BIN=${CANARY_DIR}/codex/node_modules/.bin/codex" >> "$GITHUB_ENV"
+          echo "GEMINI_BIN=${CANARY_DIR}/gemini/node_modules/.bin/gemini" >> "$GITHUB_ENV"
+
+      - name: Print canary upstream versions
+        shell: bash
+        run: |
+          echo "openclaw: $("$OPENCLAW_BIN" --version 2>&1 | head -n 1 || true)"
+          echo "claude:   $("$CLAUDE_BIN" --version 2>&1 | head -n 1 || true)"
+          echo "codex:    $("$CODEX_BIN" --version 2>&1 | head -n 1 || true)"
+          echo "gemini:   $("$GEMINI_BIN" --version 2>&1 | head -n 1 || true)"
+
+      - name: Run canary suites against latest upstream harnesses
+        shell: bash
+        env:
+          HYP_BIN: ${{ github.workspace }}/target/debug/hyp
+        run: |
+          set -euo pipefail
+          npm --prefix itest run itest:core
+          npm --prefix itest run itest:gemini
+
+      - name: Upload canary failure forensics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: itest-forensics-canary
+          path: |
+            itest-forensics/**
+            itest/artifacts/**
+          retention-days: 14
+          if-no-files-found: ignore

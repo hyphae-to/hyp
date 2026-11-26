@@ -87,6 +87,11 @@ const DEFAULT_HOST_CANARY_RELPATHS = [
   ".config/herdr-core/config.toml",
   ".config/herdr-app/keys.json",
   ".gemini/settings.json",
+  ".gemini/antigravity-cli/settings.json",
+  ".gemini/config/plugins/hyphae/plugin.json",
+  ".cursor/mcp.json",
+  ".cursor/hooks.json",
+  ".t3/userdata/statev2.sqlite",
 ];
 
 /** Exact safe system environment keys allowed through the allowlist scrubber. */

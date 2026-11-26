@@ -1,21 +1,22 @@
 # Hyphae (`hyp`) Black-Box Integration Test Suite (`itest/`)
 
-Strict black-box end-to-end tests driving the compiled `hyp` binary alongside **real installed coding harnesses** (OpenClaw, Claude Code, Codex, Herdr, OpenCode, Gemini CLI) while shimming **only** external LLM Model APIs (`FakeBrain` / `llm-shim`) on loopback `127.0.0.1:0`.
+Strict black-box end-to-end tests driving the compiled `hyp` binary alongside **real installed coding harnesses & orchestrators** (OpenClaw, Claude Code, Codex, Herdr, OpenCode, Gemini CLI, T3 Code, plus wire-exact Cursor & Antigravity IDE lifecycle replay) while shimming **only** external LLM Model APIs (`FakeBrain` / `llm-shim`) and third-party SaaS endpoints on loopback `127.0.0.1:0`.
 
 ## Architectural Invariants
 
 1. **Strict Black-Box Boundary:** `itest/` sits outside the Cargo workspace and invokes `hyp` strictly as a compiled binary (`HYP_BIN`), never importing internal Rust structs.
 2. **Hermetic Isolation:** Every test runs inside an isolated temporary directory with a strict allowlist-only scrubbed environment (`HYPHAE_SECRET_BACKEND=file`, `HYPHAE_TAILSCALE_BIN=none`, `HYPHAE_NO_OPEN=1`, `HYPHAE_NO_SERVICE=1`, loopback egress blackhole).
-3. **Zero Host Pollution:** `HostCanary` snapshots host `~/.config/hyphae`, `~/.openclaw`, `~/.claude`, `~/.codex`, `~/.config/opencode`, `~/.config/herdr-core`, `~/.config/herdr-app`, and `~/.gemini` before & after every test and fails immediately if any host file is touched.
-4. **Zero Zombie Processes:** `ProcessReaper` spawns daemons, gateways, isolated `hc` servers, PTY sessions, and harnesses in isolated POSIX process groups (`detached: true`) and kills `-pgid` (`SIGTERM` -> `SIGKILL`) on exit/failure.
+3. **Zero Host Pollution:** `HostCanary` snapshots host `~/.config/hyphae`, `~/.openclaw`, `~/.claude`, `~/.codex`, `~/.config/opencode`, `~/.config/herdr-core`, `~/.config/herdr-app`, `~/.gemini` (including Antigravity CLI/plugin files), `~/.cursor`, and `~/.t3` before & after every test and fails immediately if any host file is touched.
+4. **Zero Zombie Processes:** `ProcessReaper` spawns daemons, gateways, isolated `hc` servers, `t3 serve` instances, PTY sessions, and harnesses in isolated POSIX process groups (`detached: true`) and kills `-pgid` (`SIGTERM` -> `SIGKILL`) on exit/failure.
 5. **Five Always-On `llm-shim` Auditors:** Every model request across Anthropic Messages, OpenAI Responses, OpenAI Chat Completions, and Google Gemini (`generateContent` / `streamGenerateContent`) passes through Zero Secret Leak, Untrusted Provenance Wrapper, Metadata-Only Wake Nudge, Duplicate-Delivery & Session-Coherence, and MCP Tool Schema Footprint auditors.
 
 ## Prerequisites
 
-- **Node.js 24+** (native TypeScript type-stripping + `node:test`, zero build step).
-- **Python 3** (stdlib `pty` module used by `itest/lib/pty.ts` for zero-dependency interactive PTY sessions and human-CLI confirmations).
+- **Node.js 24+** (native TypeScript type-stripping, `node:test`, and `node:sqlite` — zero build step).
+- **Python 3** (stdlib `pty` module used for zero-dependency interactive PTY sessions and human-CLI confirmations).
 - Compiled `hyp` binary (`cargo build --bin hyp`, or set `HYP_BIN=/path/to/hyp`).
-- Installed real harnesses (either via isolated cache or already installed on host).
+- Installed real harnesses (either via isolated `~/.cache/hyphae-itest/` cache or host binaries via `HYPHAE_ITEST_USE_HOST_BINS=1`).
+- **Zero Docker required** for all default Tier 1 and local Tier 2 runs.
 
 ## Provisioning / Discovering Harnesses
 
@@ -24,89 +25,68 @@ Strict black-box end-to-end tests driving the compiled `hyp` binary alongside **
 node itest/scripts/provision.mjs --use-host-bins --json
 
 # Or populate isolated version-pinned npm prefixes under ~/.cache/hyphae-itest/ (never `npm -g`):
-node itest/scripts/provision.mjs --tools gemini
 node itest/scripts/provision.mjs --tools openclaw,claude,codex,gemini
 ```
 
 ## Running Tests
 
+Use the root [`Justfile`](../Justfile) recipes or `npm --prefix itest run ...`:
+
 ```bash
-# Run all Phase 1 + Phase 2 + Phase 3 suites:
-HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 npm --prefix itest run itest:all
+# Tier 1 Core PR Gate (zero Docker):
+just itest-core
+# or: HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 npm --prefix itest run itest:core
 
-# Run Phase 1 only (llm-shim + OpenClaw + Claude Code):
-HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 npm --prefix itest run itest:phase1
+# Tier 2 Full Matrix (all 15 suites across Phases 1-4):
+just itest-full
+# or: HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 npm --prefix itest run itest:all
 
-# Run Phase 2 only (Gemini llm-shim + Codex + Herdr + OpenCode + Gemini + P1–P8 Parity Matrix):
-HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 npm --prefix itest run itest:phase2
+# Run by Phase:
+just itest-phase1   # llm-shim + OpenClaw + Claude Code
+just itest-phase2   # Codex + Herdr + OpenCode + Gemini + P1-P8 Differential Parity Matrix
+just itest-phase3   # Chat Bridges + Compiled-In/SaaS Sources + Onboarding Trees
+just itest-phase4   # T3 Code + Cursor/Antigravity Replay + Multi-Node E2EE Topology + Schema Compat
 
-# Run Phase 3 only (Chat Bridges E2E + Compiled-In & SaaS Sources E2E + Plugin/Onboarding Verification):
-HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 npm --prefix itest run itest:phase3
-
-# Run individual suites:
-node --test itest/suites/llm-shim.test.ts
-HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 node --test itest/suites/openclaw.test.ts
-HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 node --test itest/suites/claude.test.ts
-HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 node --test itest/suites/codex.test.ts
-HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 node --test itest/suites/herdr-orchestrator.test.ts
-HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 node --test itest/suites/opencode.test.ts
-HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 node --test itest/suites/gemini.test.ts
-HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 node --test itest/suites/parity-matrix.test.ts
-HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 node --test itest/suites/bridges-e2e.test.ts
-HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 node --test itest/suites/saas-sources-e2e.test.ts
-HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 node --test itest/suites/onboarding-trees.test.ts
+# Run individual Phase 4 suites:
+HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 node --test itest/suites/t3-orchestrator.test.ts
+HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 node --test itest/suites/replay-ide-harnesses.test.ts
+HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 node --test itest/suites/topology-multinode.test.ts
+HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 node --test itest/suites/schema-compat.test.ts
 ```
 
-## Phase 3: Chat Bridges, Sources & SaaS Plugins (Zero-Dependency Loopback Wire-Mocks)
+## Suite Overview (Phases 1–4)
 
-All external platform APIs and WebSockets are mocked in-process on `127.0.0.1:0` using zero-dependency Node 24+ TypeScript/ESM (`itest/lib/mocks/`, including a pure `node:http`+`node:crypto` RFC 6455 WebSocket server):
+### Phase 1 & 2: Real Coding Harnesses & Cross-Harness Differential Parity (P1–P8)
+- `openclaw.test.ts`, `claude.test.ts`, `codex.test.ts`, `herdr-orchestrator.test.ts`, `opencode.test.ts`, `gemini.test.ts`
+- `parity-matrix.test.ts`: drives identical **P1–P8** scenarios across every available real headless harness via `RealHarnessAdapter` (`itest/lib/harnesses/types.ts`) and compares normalized `ObservableTrace` outputs differentially.
 
-- **Bridges (`itest/suites/bridges-e2e.test.ts`):**
-  - `telegram.ts`: Bot API (`getMe`, `getUpdates` offset persistence & `0600` file mode, `sendMessage`, `setMessageReaction`, `429 retry_after`, >4096 char chunking, non-allowlisted drop, `exposeTopic: false` manifest check).
-  - `slack-socket.ts`: Web API (`auth.test`, `apps.connections.open`, `chat.postMessage`, `reactions.add/remove`) + RFC 6455 Socket Mode (`hello`, `events_api` with `envelope_id` ack verification, `disconnect` frame reconnect, fail-closed allowlists).
-  - `whatsapp.ts`: Meta Cloud Graph API + `hub.mode=subscribe` verify challenge (`200` / `403`) + `X-Hub-Signature-256` valid & 1-bit flip (`401`) + allowlist filtering.
-  - **Blind Spot B2:** Post-`hello` plugin self-crash -> `CrashLoopBackOff` in `node.status.json` / `hyp doctor --json` + `0600` log permissions + zero secret leaks (`[REDACTED]`).
-- **Compiled-In & SaaS Sources (`itest/suites/saas-sources-e2e.test.ts`):**
-  - `github.ts`: `github-public` (`200 -> 304 -> 429 Retry-After -> 200`, multi-org `repoTokens` isolation) & `github-webhook` (`X-Hub-Signature-256`, 1-bit flip `401`, org filter, raw-body SHA-256 replay dedup).
-  - `webhook-prom.ts`: Rust vs Node differential parity for `prometheus-webhook` vs `plugins/prometheus` (incl. Blind Spot B1 detection) and bidirectional `webhook-stream` vs `plugins/webhook`, plus `localIngest` (`ingest.sock` / `hyp emit` + `--sign` Ed25519 + >64 KiB rejection).
-  - **6 SaaS Source Wire-Mocks (`agentmail.ts`, `google.ts`, `sentry.ts`, `vercel.ts`, `notion.ts`):** Always execute protocol & fault-injection unit tests on `main` (B3 inclusive cursor + interleaved WS/REST, Notion 2nd `verification_token` hijack `401`, Google OAuth PKCE + metadata-only Gmail + Calendar `410 Gone`, Sentry raw-hex HMAC-SHA256, Vercel HMAC-SHA1). Automatically run full black-box E2E tests (including fake `TAILSCALE_BIN` Funnel) whenever the 6 plugins exist in `plugins/` or via `HYPHAE_ITEST_SAAS_PLUGINS_DIR`.
-- **Plugin Verification & Onboarding Trees (`itest/suites/onboarding-trees.test.ts`):**
-  - `hyp plugin install <name> --from-dir --json` + `hyp plugin verify --json` + 1-byte tamper fail-closed + `--force` recovery.
-  - Schema, reachability, privacy audience gate, and config merge safety validator for every `hyphae.onboarding/v1` `onboarding.json` tree.
+### Phase 3: Chat Bridges, Sources & SaaS Plugins (Zero-Dependency Loopback Wire-Mocks)
+- `bridges-e2e.test.ts`: full mock -> real plugin subprocess -> compiled `hyp` -> real Claude Code -> outbound reply (`telegram`, `slack`, `whatsapp`) + Blind Spot **B2** (`CrashLoopBackOff` + `0600` redacted logs).
+- `saas-sources-e2e.test.ts`: `github-public`/`github-webhook`, Rust vs Node `prometheus` & `webhook` differential parity (incl. **B1**), `localIngest` (`ingest.sock` / `hyp emit`), and all 6 SaaS source mocks (**B3** inclusive cursors & WS/REST races).
+- `onboarding-trees.test.ts`: `hyp plugin install` / `verify` / tamper detection + `hyphae.onboarding/v1` tree validator.
 
-## Cross-Harness Differential Parity Matrix (P1–P8)
-
-`itest/suites/parity-matrix.test.ts` drives the same declarative P1–P8 scenario matrix across every available real headless harness (`OpenClaw`, `Claude Code`, `Codex`, `Herdr+Claude`, `Gemini CLI`, and tracks `OpenCode`) via the unified `RealHarnessAdapter` interface (`itest/lib/harnesses/types.ts`) and compares normalized `ObservableTrace` outputs differentially:
-
-- **P1**: Idle DM Wake & Reply (exact single delivery, zero secret leaks)
-- **P2**: Mid-Turn Queue Hold -> TurnEnd Flush (deterministic `pauseMidStream` latch)
-- **P3**: Mid-Turn Interrupt (`hc interrupt` mid-stream preemption on Herdr; earliest `PostToolUse`/`AfterTool` on hook harnesses)
-- **P4**: Focus Mode & Notify Digest (buffered non-urgent, VIP bypass, Focus exit drain)
-- **P5**: Burst Protection & Coalescing (10 rapid DMs -> `<= 2` wake turns)
-- **P6**: Security Gate Quarantine + Interactive PTY `hyp inbox approve` (0 bytes leaked before approve, metadata-only `hyp gate review --json`, non-TTY fail-closed check, `gate_audit` verified)
-- **P7**: Multi-Session Isolation (2 concurrent sessions on 1 `hyp daemon`, zero cross-bleed)
-- **P8**: Daemon Restart Survival (`SIGTERM` + restart `hyp daemon` with unread mailbox -> 0 loss, single delivery)
+### Phase 4: T3 Code, IDE Replay, Multi-Node E2EE Topology, Schema Compat & CI Infrastructure
+- **`t3-orchestrator.test.ts` (`lib/harnesses/t3.ts`):** Boots real isolated `t3 serve --mode desktop --host 127.0.0.1 --port <P> --base-dir $TMP/t3 --no-browser` (`t3 project add` + `t3 auth session issue`), verifies `hyp setup --harness t3`, read-only `statev2.sqlite` provider-session auto-attach, `/api/auth/session` + `/api/auth/websocket-ticket` + Effect WS RPC `orchestration.getThreadProjection` & `orchestration.dispatchCommand` metadata-only `<hyphae-wake>` nudges, bad auth token `401` fail-closed/detach, archived/deleted thread fail-closed guards, arbitrary `tokenSecret` exfiltration rejection, and active-run dispatch modes (`queue_after_active`, `steer_active`, `restart_active`) via schema-pinned contract fallback.
+- **`replay-ide-harnesses.test.ts` (`lib/harnesses/replay-cursor-agy.ts`):** Wire-exact compiled-binary lifecycle replay for **Cursor** (`hyp setup --harness cursor`, preservation, `call_id` binding, spoof rejection, `UNTRUSTED_PROVENANCE`, mid-turn `afterMCPExecution` vs `stop` drain, `hyp wait`) and **Antigravity** (`hyp setup --harness antigravity --statusline`, stacked custom statusLine preservation/execution/restore, sidecar `--if-not-running` dedup, direct + lazy `call_mcp_tool` `_meshCall` unwrapping & single-use replay rejection, `PreInvocation` `injectSteps`, `Stop` anti-loop, `hyp wait`), plus opt-in Tier 3 live smoke hooks (`HYPHAE_ITEST_LIVE_CURSOR=1`, `HYPHAE_ITEST_LIVE_AGY=1`).
+- **`topology-multinode.test.ts`:** 3-node compiled `hyp` topology on `127.0.0.1:0` — blind Router Hub (`acme-hub`) + real Claude Code (`alice@node-a`) <-> real Codex CLI (`bob@node-b`) via live `am2_` Admin-CA pairing — verifying bidirectional E2EE DM, E2EE `#ops` channel, Shared E2EE KV + CAS conflict/update, Verified Human Drops (`hyp auth init` + PTY `hyp auth sign` + `hyp drop ingest` secret & directive + non-TTY guard + replay rejection), cryptographic zero-knowledge Hub SQLite/WAL audit, and Blind Spot **B6 (`#25`)** private topic ACL checks.
+- **`schema-compat.test.ts` (Blind Spot B4):** Deterministic `node:sqlite` forward migration tests (`v5 -> v7` & `v6 -> v7` with automatic `0600` pre-migration backups & zero data loss), future schema fail-closed guard (`v99 -> v7` asserting `SCHEMA_TOO_NEW` across `status`, `doctor`, and `daemon` with zero DB corruption), plus optional real `HYP_PREV_BIN` (`N-1` vs `N`) cross-binary skew check.
+- **CI, GHCR Image & Tier 2 Emulators:**
+  - `.github/workflows/blackbox-itest.yml`: Tier 1 PR gate (with Blind Spot **B5** poisoned parent env), nightly Tier 2 full matrix (`0 2 * * *` on `ubuntu-latest` + `macos-latest`), every-3-days non-blocking upstream harness canary (`0 5 */3 * *`), and automatic `ghcr.io/hyphae-to/hyp-itest:latest` image builds.
+  - `itest/Dockerfile`: Pre-baked CI image with Node 24, Python 3, `alertmanager`, `mosquitto`, and pinned npm harnesses under `/opt/hyphae-itest` (non-root `itest` user).
+  - `itest/docker-compose.mocks.yml`: Optional loopback-only Tier 2 vendor emulators (`alertmanager`, `tg-mock`, `mock-oauth2-server`, `mosquitto`, plus `stripe-mock`, `prism`, `svix-server` profiles).
 
 ## Environment Variables
 
 | Variable | Purpose |
 | --- | --- |
 | `HYP_BIN` | Explicit path to compiled `hyp` binary (defaults to `<repo>/target/debug/hyp` then `<repo>/target/release/hyp`). |
-| `OPENCLAW_BIN` | Explicit path to `openclaw` binary (auto-discovers `PATH` and `~/Workspace/openclaw-hyphae-sandbox/runtime/node_modules/.bin/openclaw`). |
-| `CLAUDE_BIN` | Explicit path to `claude` binary (auto-discovers `PATH` and `~/.local/bin/claude`). |
-| `CODEX_BIN` | Explicit path to `codex` binary (auto-discovers `PATH` and `~/.local/bin/codex`). |
-| `HC_BIN` | Explicit path to Herdr `hc` binary (auto-discovers `PATH` and `~/.local/bin/hc`). |
-| `OPENCODE_BIN` | Explicit path to `opencode` binary (auto-discovers `PATH` and `~/.opencode/bin/opencode`). |
-| `GEMINI_BIN` | Explicit path to `gemini` binary (auto-discovers `~/.cache/hyphae-itest/` and `PATH`). |
-| `HYPHAE_ITEST_USE_HOST_BINS=1` | Prefer host binaries over `~/.cache/hyphae-itest/` (falling back to cache for tools like `gemini`). |
-| `HYPHAE_ITEST_SAAS_PLUGINS_DIR` | Optional read-only directory containing the 6 SaaS source plugins (`agentmail`, `gmail`, `google-calendar`, `sentry`, `vercel`, `notion`) to run their full black-box E2E & onboarding tests before merge. |
+| `HYP_PREV_BIN` | Optional path to previous release `hyp` (`N-1`) binary for live cross-binary schema skew tests in `schema-compat.test.ts`. |
+| `OPENCLAW_BIN`, `CLAUDE_BIN`, `CODEX_BIN`, `HC_BIN`, `OPENCODE_BIN`, `GEMINI_BIN`, `T3_BIN` | Explicit binary overrides for individual harnesses/orchestrators. |
+| `HYPHAE_ITEST_USE_HOST_BINS=1` | Prefer host binaries over `~/.cache/hyphae-itest/` (falling back to cache when absent on host). |
+| `HYPHAE_ITEST_SAAS_PLUGINS_DIR` | Optional read-only directory containing the 6 SaaS source plugins (`agentmail`, `gmail`, `google-calendar`, `sentry`, `vercel`, `notion`). |
+| `HYPHAE_ITEST_LIVE_CURSOR=1` / `HYPHAE_ITEST_LIVE_AGY=1` | Opt-in Tier 3 live cloud smoke tests against authenticated `cursor-agent` / `agy` (always skipped by default). |
 | `HYPHAE_ITEST_KEEP_LOGS=1` | Always dump forensics bundles to `itest-forensics/<test-name>/` even on pass. |
 
 ## Failure Forensics
 
-When any test fails (or when `HYPHAE_ITEST_KEEP_LOGS=1`), `Sandbox` writes a diagnostic bundle under `itest-forensics/<test-name>/` containing:
-- `llm-shim-requests.json` (captured canonical + raw model requests & auditor findings)
-- `daemon.log` (`hyp daemon` stdout/stderr)
-- `gateway.log` (when running OpenClaw Gateway)
-- `harness-stdout.log` (harness process logs)
-- `hyp-inspect.json` (`hyp inspect --all --json` snapshot before teardown)
+When any test fails (or when `HYPHAE_ITEST_KEEP_LOGS=1`), `Sandbox` writes a diagnostic bundle under `itest-forensics/<test-name>/` containing `summary.json`, `llm-shim-requests.json`, `daemon.log`, `gateway.log`, `harness-stdout.log`, and `hyp-inspect.json`.
