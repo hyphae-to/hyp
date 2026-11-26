@@ -614,38 +614,30 @@ fn classify_item_provenance(
     if entry.source == "hyphae" {
         return ("self".to_string(), false, None);
     }
-    let tier = match entry.kind {
-        MailboxKind::Plugin => "bridge".to_string(),
-        MailboxKind::Event => {
-            if entry.source.starts_with("local.") || entry.origin_node == "local" {
-                "external-webhook".to_string()
-            } else if let Ok(Some(peer)) = db.peers().get_peer(&entry.origin_node) {
-                match peer.trust_tier {
-                    hyp_store::TrustTier::SelfNode => "external-webhook".to_string(),
-                    hyp_store::TrustTier::Org => "org".to_string(),
-                    hyp_store::TrustTier::Peer => "peer".to_string(),
-                    hyp_store::TrustTier::Guest => "guest".to_string(),
-                }
-            } else {
-                "external-webhook".to_string()
-            }
-        }
-        MailboxKind::Message | MailboxKind::Transfer | MailboxKind::Kv => {
-            if entry.origin_node == "local" {
-                "self".to_string()
-            } else if let Ok(Some(peer)) = db.peers().get_peer(&entry.origin_node) {
-                match peer.trust_tier {
-                    hyp_store::TrustTier::SelfNode => "self".to_string(),
-                    hyp_store::TrustTier::Org => "org".to_string(),
-                    hyp_store::TrustTier::Peer => "peer".to_string(),
-                    hyp_store::TrustTier::Guest => "guest".to_string(),
-                }
-            } else {
-                "peer".to_string()
-            }
+    // Events from this node are webhook/plugin ingests; everything else from this node is `self`.
+    let is_event = entry.kind == MailboxKind::Event;
+    let own = if is_event { "external-webhook" } else { "self" };
+    let tier = if entry.kind == MailboxKind::Plugin {
+        "bridge"
+    } else if entry.origin_node == "local" || (is_event && entry.source.starts_with("local.")) {
+        own
+    } else {
+        match db.peers().get_peer(&entry.origin_node) {
+            Ok(Some(peer)) => match peer.trust_tier {
+                hyp_store::TrustTier::SelfNode => own,
+                hyp_store::TrustTier::Org => "org",
+                hyp_store::TrustTier::Peer => "peer",
+                hyp_store::TrustTier::Guest => "guest",
+            },
+            _ if is_event => "external-webhook",
+            _ => "peer",
         }
     };
-    (tier, true, Some(UNTRUSTED_INBOX_PROVENANCE.to_string()))
+    (
+        tier.to_string(),
+        true,
+        Some(UNTRUSTED_INBOX_PROVENANCE.to_string()),
+    )
 }
 
 fn read_human_verified_meta(db: &NodeDb, receipt: &str) -> (bool, Option<String>, Option<String>) {

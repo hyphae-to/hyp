@@ -1399,8 +1399,9 @@ impl LocalDaemon {
             .await
     }
 
-    /// Advances the daemon's monotonic clock offset by `delta_ms` milliseconds for deterministic
-    /// testing of time-bounded features (e.g. RFC 0004 long-turn `PostToolUse` queue reminders).
+    /// Test hook: advances the daemon clock by `delta_ms` so time-bounded behaviour (e.g. the
+    /// RFC 0004 long-turn queue reminder) can be tested without sleeping. Every timestamp the
+    /// daemon takes after startup goes through this clock; `UnifiedNode` keeps real wall time.
     pub fn advance_clock_ms(&self, delta_ms: i64) {
         self.inner
             .clock_offset_ms
@@ -1715,7 +1716,7 @@ fn spawn_maintenance_task(
                 break;
             }
 
-            let now = now_ms();
+            let now = inner.current_time_ms();
             let next_mute_sleep = {
                 let db = inner.node.db();
                 db.local().next_mute_expiry_ms().ok().flatten()
@@ -1750,7 +1751,7 @@ fn spawn_maintenance_task(
                 break;
             }
 
-            inner.sweep_expired_mutes_and_policies(now_ms());
+            inner.sweep_expired_mutes_and_policies(inner.current_time_ms());
             if tokio::time::Instant::now() >= next_prune_at {
                 let _ = inner.prune_stale_sessions_now();
                 next_prune_at = tokio::time::Instant::now() + prune_interval;
@@ -2222,7 +2223,7 @@ impl LocalDaemonInner {
         let delay_ms = retry_after_ms
             .saturating_add(GATE_HOLD_RETRY_MARGIN_MS)
             .clamp(GATE_HOLD_RETRY_MIN_MS, GATE_HOLD_RETRY_MAX_MS);
-        let now = now_ms();
+        let now = self.current_time_ms();
         let fire_at_ms = now.saturating_add(delay_ms as i64);
 
         let generation = {
@@ -2475,9 +2476,11 @@ impl LocalDaemonInner {
         if target_meta.is_object() {
             let db = self.node.db();
             if db.local().get_session(session_id).ok().flatten().is_some() {
-                let _ = db
-                    .local()
-                    .merge_session_backend(session_id, &target_meta, now_ms());
+                let _ = db.local().merge_session_backend(
+                    session_id,
+                    &target_meta,
+                    self.current_time_ms(),
+                );
             }
         }
         self.bump_ui_rev();
@@ -2552,7 +2555,7 @@ impl LocalDaemonInner {
         if max_age_ms <= 0 {
             return Vec::new();
         }
-        let now = now_ms();
+        let now = self.current_time_ms();
         let cutoff = now.saturating_sub(max_age_ms);
         let active = self.active_session_ids();
         let pruned = {
@@ -2828,7 +2831,7 @@ impl LocalDaemonInner {
         item_id: String,
         text: String,
     ) {
-        let now = now_ms();
+        let now = self.current_time_ms();
         let stored_receipt = {
             let db = self.node.db();
             if db.local().get_session(session_id).ok().flatten().is_none() {
@@ -2885,7 +2888,7 @@ impl LocalDaemonInner {
         slept_for: Duration,
         was_interrupted_active: bool,
     ) -> bool {
-        let now = now_ms();
+        let now = self.current_time_ms();
         let db = self.node.db();
         if db.local().get_session(session_id).ok().flatten().is_none() {
             return false;
@@ -3342,12 +3345,15 @@ impl LocalDaemonInner {
         self.node.get_channel_policy(ch).mode == ChannelMode::Announcement
     }
 
-    fn lookup_subscription_urgency(
+    /// Finds the session subscription matching a mailbox entry's `origin_node` + `source`
+    /// (`<origin>.<topic>`, or `local.<topic>` for this node) and projects it through `pick`.
+    fn lookup_subscription<T>(
         &self,
         session_id: &str,
         origin_node: &str,
         source: &str,
-    ) -> Option<DeliveryUrgency> {
+        pick: impl FnOnce(&SubscriptionRecordMeta) -> Option<T>,
+    ) -> Option<T> {
         let guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
         let list = guard.get(session_id)?;
         let src_low = source.to_ascii_lowercase();
@@ -3364,7 +3370,16 @@ impl LocalDaemonInner {
                         && (origin_low == "local" || origin_low == my_id_low)
                         && src_low == format!("local.{s_topic}"))
             })
-            .map(|s| s.urgency)
+            .and_then(pick)
+    }
+
+    fn lookup_subscription_urgency(
+        &self,
+        session_id: &str,
+        origin_node: &str,
+        source: &str,
+    ) -> Option<DeliveryUrgency> {
+        self.lookup_subscription(session_id, origin_node, source, |s| Some(s.urgency))
     }
 
     fn lookup_subscription_key(
@@ -3373,25 +3388,9 @@ impl LocalDaemonInner {
         origin_node: &str,
         source: &str,
     ) -> Option<String> {
-        let src_low = source.to_ascii_lowercase();
-        let origin_low = origin_node.to_ascii_lowercase();
-        let my_id_low = self.node.node_id().as_str().to_ascii_lowercase();
-        let guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
-        let list = guard.get(session_id)?;
-        list.iter()
-            .find(|s| {
-                let s_orig = s.origin_node.to_ascii_lowercase();
-                let s_topic = s.topic.to_ascii_lowercase();
-                let expected = format!("{s_orig}.{s_topic}");
-                src_low == expected
-                    || (origin_low == s_orig && src_low.ends_with(&format!(".{s_topic}")))
-                    || ((s_orig == "local" || s_orig == my_id_low)
-                        && (origin_low == "local" || origin_low == my_id_low)
-                        && src_low == format!("local.{s_topic}"))
-            })
-            .and_then(|s| s.key.as_ref())
-            .filter(|k| !k.trim().is_empty())
-            .cloned()
+        self.lookup_subscription(session_id, origin_node, source, |s| {
+            s.key.clone().filter(|k| !k.trim().is_empty())
+        })
     }
 
     fn record_item_meta(&self, session_id: &str, receipt: String, meta: ClassifiedItemMeta) {
@@ -3417,7 +3416,7 @@ impl LocalDaemonInner {
     /// Returns `true` if at least one non-muted gate-cleared item is eligible for delivery/digest wake.
     async fn reconcile_session_inbox(self: &Arc<Self>, session_id: &str) -> bool {
         let _reconcile_guard = self.reconcile_lock_for(session_id).lock_owned().await;
-        self.sweep_expired_mutes_and_policies(now_ms());
+        self.sweep_expired_mutes_and_policies(self.current_time_ms());
 
         let mut wake_needed = false;
         let mut held_in_this_call: HashSet<String> = HashSet::new();
@@ -3434,7 +3433,7 @@ impl LocalDaemonInner {
                 break;
             }
 
-            let now = now_ms();
+            let now = self.current_time_ms();
             let mut processed_any = false;
 
             for entry in pending {
@@ -4212,7 +4211,7 @@ impl LocalDaemonInner {
         let _ = self.node.db().local().merge_session_backend(
             session_id,
             &Value::Object(patch),
-            now_ms(),
+            self.current_time_ms(),
         );
     }
 
@@ -4953,7 +4952,7 @@ impl LocalDaemonInner {
                     "type": "wait.items",
                     "items": [{
                         "router": self.node.node_id().as_str(),
-                        "received": now_ms() / 1000,
+                        "received": self.current_time_ms() / 1000,
                         "text": batch.rendered,
                         "notifyOnly": batch.notify_only,
                         "mutedCount": batch.muted_count,
@@ -4984,7 +4983,7 @@ impl LocalDaemonInner {
                     "type": "wait.items",
                     "items": [{
                         "router": self.node.node_id().as_str(),
-                        "received": now_ms() / 1000,
+                        "received": self.current_time_ms() / 1000,
                         "text": batch.rendered,
                         "notifyOnly": batch.notify_only,
                         "mutedCount": batch.muted_count,
@@ -5084,7 +5083,7 @@ impl LocalDaemonInner {
         let name = normalize_mesh_tool_name(raw_name).unwrap_or(raw_name);
         {
             let db = self.node.db();
-            let now = now_ms();
+            let now = self.current_time_ms();
             if db.local().get_session(session_id).ok().flatten().is_none() {
                 let _ = db.local().register_session(session_id, "{}", now);
             } else {
@@ -5288,7 +5287,7 @@ impl LocalDaemonInner {
             }
         };
 
-        let now = now_ms();
+        let now = self.current_time_ms();
         let node_id = self.node.node_id().as_str();
         let enc_jwk = self.node.identity().encryption_jwk();
         let enc_kid = self.node.identity().encryption.kid();
@@ -5523,7 +5522,7 @@ impl LocalDaemonInner {
                                             DropSubscriberAuth::SubCap(&sub_cap_bg),
                                             item.seq,
                                             true,
-                                            now_ms(),
+                                            task_daemon.current_time_ms(),
                                         );
                                         task_daemon.bump_ui_rev();
                                         break;
@@ -5825,7 +5824,7 @@ impl LocalDaemonInner {
     }
 
     async fn tool_leave(&self, session_id: &str) -> Result<Value, (String, String)> {
-        let now = now_ms();
+        let now = self.current_time_ms();
         let left = {
             let db = self.node.db();
             let prev = db
@@ -5955,7 +5954,7 @@ impl LocalDaemonInner {
                 }
             };
 
-        let now = now_ms();
+        let now = self.current_time_ms();
         let (policy, unread, muted) = {
             let db = self.node.db();
             let _ = db.local().set_delivery_mode(session_id, store_mode, now);
@@ -6035,7 +6034,7 @@ impl LocalDaemonInner {
                 }
             },
         };
-        let now = now_ms();
+        let now = self.current_time_ms();
         let expires_at =
             ttl_seconds.map(|secs| now.saturating_add((secs as i64).saturating_mul(1_000)));
 
@@ -6061,7 +6060,7 @@ impl LocalDaemonInner {
                     }
                 }
                 if !*shutdown_rx.borrow() {
-                    timer_daemon.sweep_expired_mutes_and_policies(now_ms());
+                    timer_daemon.sweep_expired_mutes_and_policies(timer_daemon.current_time_ms());
                 }
             });
         }
@@ -6121,7 +6120,7 @@ impl LocalDaemonInner {
     }
 
     async fn tool_mutes(&self, session_id: &str) -> Result<Value, (String, String)> {
-        let now = now_ms();
+        let now = self.current_time_ms();
         self.sweep_expired_mutes_and_policies(now);
         let rules = {
             let db = self.node.db();
@@ -6391,7 +6390,7 @@ impl LocalDaemonInner {
         let allow_vips_opt = args.get("focusAllowInterruptVips").and_then(Value::as_bool);
 
         if !rules.is_empty() || focus_mode_opt.is_some() || allow_vips_opt.is_some() {
-            let now = now_ms();
+            let now = self.current_time_ms();
             let policy = {
                 let db = self.node.db();
                 let p = self
@@ -7235,7 +7234,7 @@ impl LocalDaemonInner {
         let (plugin, target) = parse_bridge_plugin_target(args)?;
         self.ensure_bridge_target_configured(&plugin, &target)?;
         let read_only = args.get("readOnly").and_then(Value::as_bool) == Some(true);
-        let now = now_ms();
+        let now = self.current_time_ms();
         let link = BridgeLink {
             plugin: plugin.clone(),
             target: target.clone(),
@@ -7353,7 +7352,7 @@ impl LocalDaemonInner {
     ) -> Result<Value, (String, String)> {
         let (plugin, target) = parse_bridge_plugin_target(args)?;
         self.ensure_bridge_target_configured(&plugin, &target)?;
-        let now = now_ms();
+        let now = self.current_time_ms();
 
         let (target_session, previous_session) = {
             let db = self.node.db();
@@ -7573,7 +7572,7 @@ impl LocalDaemonInner {
                     traceparent: None,
                     payload: payload.to_string(),
                 },
-                now_ms(),
+                self.current_time_ms(),
             )
             .map_err(|e| ("gate_error".into(), e.to_string()))?;
         match eval.decision {
@@ -7856,7 +7855,7 @@ async fn handle_connection<R, W>(
                         let resp = match ttl_res {
                             Err(msg) => json!({ "ok": false, "error": msg }),
                             Ok(ttl_seconds) => {
-                                let now = now_ms();
+                                let now = daemon.current_time_ms();
                                 let expires_at = ttl_seconds.map(|secs| {
                                     now.saturating_add((secs as i64).saturating_mul(1_000))
                                 });
@@ -7878,8 +7877,9 @@ async fn handle_connection<R, W>(
                                                     }
                                                 }
                                                 if !*shutdown_rx.borrow() {
-                                                    timer_daemon
-                                                        .sweep_expired_mutes_and_policies(now_ms());
+                                                    timer_daemon.sweep_expired_mutes_and_policies(
+                                                        timer_daemon.current_time_ms(),
+                                                    );
                                                 }
                                             });
                                         }
@@ -7911,7 +7911,7 @@ async fn handle_connection<R, W>(
                         break;
                     }
                     "mute.list" => {
-                        let now = now_ms();
+                        let now = daemon.current_time_ms();
                         daemon.sweep_expired_mutes_and_policies(now);
                         let mutes = daemon
                             .node
@@ -8030,7 +8030,7 @@ async fn handle_connection<R, W>(
                             .node
                             .db()
                             .local()
-                            .touch_session(&session_id, now_ms());
+                            .touch_session(&session_id, daemon.current_time_ms());
                         daemon.bump_ui_rev();
 
                         let mode_str = match mode {
@@ -8160,7 +8160,7 @@ async fn handle_connection<R, W>(
                                     let _ = daemon.merge_session_backend_and_index(
                                         &sid,
                                         &patch,
-                                        now_ms(),
+                                        daemon.current_time_ms(),
                                     );
                                     ctx.channel_session_id = Some(sid.clone());
                                     bind_channel(&daemon, conn_id, &sid, &chan_tx);
@@ -8362,7 +8362,11 @@ async fn resolve_tool_caller(
                         m.insert("kind".into(), json!(harness.as_str()));
                         m
                     });
-                let _ = daemon.merge_session_backend_and_index(&session_id, &patch, now_ms());
+                let _ = daemon.merge_session_backend_and_index(
+                    &session_id,
+                    &patch,
+                    daemon.current_time_ms(),
+                );
                 daemon.bump_ui_rev();
                 if let Some(ctx) = mcp_ctx.as_deref_mut() {
                     if ctx.channel && harness == HarnessKind::Claude {
@@ -8418,7 +8422,11 @@ async fn resolve_tool_caller(
             let harness = ctx.backend.unwrap_or(HarnessKind::Claude);
             let session_id = format!("{}:{cid}", harness.as_str());
             let patch = ctx.hints.backend_patch(Some(harness));
-            let _ = daemon.merge_session_backend_and_index(&session_id, &patch, now_ms());
+            let _ = daemon.merge_session_backend_and_index(
+                &session_id,
+                &patch,
+                daemon.current_time_ms(),
+            );
             daemon.bump_ui_rev();
             if ctx.channel && harness == HarnessKind::Claude {
                 ctx.channel_session_id = Some(session_id.clone());
@@ -8441,7 +8449,7 @@ async fn resolve_tool_caller(
         let sid = format!("ephemeral:{}", uuid_v4());
         let mut patch = Map::new();
         patch.insert("kind".into(), json!("claude"));
-        let _ = daemon.merge_session_backend_and_index(&sid, &patch, now_ms());
+        let _ = daemon.merge_session_backend_and_index(&sid, &patch, daemon.current_time_ms());
         daemon.bump_ui_rev();
         return Ok(sid);
     }
@@ -8769,7 +8777,7 @@ async fn handle_session_start(
     if env_file_exported {
         patch.insert("envFileExported".into(), json!(true));
     }
-    let now = now_ms();
+    let now = daemon.current_time_ms();
     if patch.is_empty() {
         let db = daemon.node.db();
         if db.local().get_session(session_id).ok().flatten().is_none() {
@@ -8848,7 +8856,7 @@ async fn handle_session_register(
     }
 
     let patch = hints.backend_patch(harness);
-    let now = now_ms();
+    let now = daemon.current_time_ms();
     if patch.is_empty() {
         let db = daemon.node.db();
         if db.local().get_session(session_id).ok().flatten().is_none() {
@@ -8889,7 +8897,8 @@ fn handle_session_hint(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Valu
     let hints = TransportHints::from_packet(packet, harness);
     let patch = hints.backend_patch(harness);
     if !patch.is_empty() {
-        let _ = daemon.merge_session_backend_and_index(session_id, &patch, now_ms());
+        let _ =
+            daemon.merge_session_backend_and_index(session_id, &patch, daemon.current_time_ms());
         daemon.bump_ui_rev();
     }
     daemon.clear_lazy_hydrate_cooldown(session_id);
@@ -9039,7 +9048,7 @@ fn maybe_spawn_transport_probe(
                             let _ = daemon_arc.merge_session_backend_and_index(
                                 &sid,
                                 &herdr_patch,
-                                now_ms(),
+                                daemon_arc.current_time_ms(),
                             );
                             if daemon_arc.attach_transport_if_higher_priority(
                                 &sid,
@@ -9301,7 +9310,9 @@ fn handle_call_start(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> 
     let patch = hints.backend_patch(Some(harness));
     let backend_json = serde_json::to_string(&Value::Object(patch.clone()))
         .unwrap_or_else(|_| format!("{{\"kind\":\"{}\"}}", harness.as_str()));
-    if let Err(e) = daemon.merge_session_backend_and_index(session_id, &patch, now_ms()) {
+    if let Err(e) =
+        daemon.merge_session_backend_and_index(session_id, &patch, daemon.current_time_ms())
+    {
         return json!({ "ok": false, "error": e.to_string() });
     }
     daemon.clear_openclaw_session_missing(session_id);
@@ -9323,7 +9334,7 @@ fn handle_call_start(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> 
             backend_json: Some(backend_json),
             ttl_ms: None,
         },
-        now_ms(),
+        daemon.current_time_ms(),
     ) {
         Ok(reg) => {
             let mut result = Map::new();
@@ -10470,7 +10481,7 @@ async fn fanout_approved_local_ingest(
     let mut sessions_to_wake: HashSet<String> = HashSet::new();
 
     for entry in approved_entries {
-        let now = now_ms();
+        let now = daemon.current_time_ms();
         let event_type = {
             let db = daemon.node.db();
             db.local()
@@ -11299,7 +11310,7 @@ impl LocalDaemonInner {
         let herdr_created_ms = self.session_herdr_created_ms(sess);
         let transport_kind = self.active_transport_kind(&sess.id);
 
-        let now = now_ms();
+        let now = self.current_time_ms();
         self.sweep_expired_mutes_and_policies(now);
         let gate_active = self.current_gate().is_some();
         let (
@@ -11622,7 +11633,7 @@ impl LocalDaemonInner {
         detail: SummaryDetail,
     ) -> Value {
         let rev = self.current_ui_rev();
-        let updated_at = now_ms();
+        let updated_at = self.current_time_ms();
         let daemon_block = self.build_daemon_summary_json();
         let session_val = match self.resolve_session(sel) {
             Some(sess) => self.build_session_summary_obj(&sess, detail),
@@ -11647,7 +11658,7 @@ impl LocalDaemonInner {
         online: bool,
     ) -> Value {
         let rev = self.current_ui_rev();
-        let updated_at = now_ms();
+        let updated_at = self.current_time_ms();
         let daemon_block = self.build_daemon_summary_json_with_online(online);
         let sessions = {
             let db = self.node.db();
@@ -12170,7 +12181,7 @@ async fn handle_session_focus(
         }
     };
 
-    let now = now_ms();
+    let now = daemon.current_time_ms();
     let store_mode = if enabled {
         DeliveryMode::Notify
     } else {
@@ -12291,7 +12302,7 @@ fn handle_session_mute(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Valu
         resolved.as_ref().map(|s| s.id.as_str()).unwrap_or("*")
     };
     let actor = resolved.as_ref().map(|s| s.id.as_str()).unwrap_or("cli");
-    let now = now_ms();
+    let now = daemon.current_time_ms();
     let expires_at =
         ttl_seconds.map(|secs| now.saturating_add((secs as i64).saturating_mul(1_000)));
 
@@ -12335,7 +12346,7 @@ fn handle_session_mute(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Valu
             if *shutdown_rx.borrow() {
                 return;
             }
-            timer_daemon.sweep_expired_mutes_and_policies(now_ms());
+            timer_daemon.sweep_expired_mutes_and_policies(timer_daemon.current_time_ms());
         });
     }
 
@@ -12474,7 +12485,7 @@ fn handle_session_rule(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -
 
     let is_remove = remove_flag || raw_delivery.is_some_and(|d| d.eq_ignore_ascii_case("remove"));
 
-    let now = now_ms();
+    let now = daemon.current_time_ms();
     if is_remove {
         let (removed, rules) = {
             let db = daemon.node.db();
