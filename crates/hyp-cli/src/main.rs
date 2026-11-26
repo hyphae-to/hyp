@@ -496,10 +496,10 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Commands::Node { command } => node_cmd::run_node(command),
-        Commands::Daemon(args) => node_cmd::run_node_start(args),
+        Commands::Node { command } => finish_command(node_cmd::run_node(command)),
+        Commands::Daemon(args) => finish_command(node_cmd::run_node_start(args)),
         Commands::Connect(args) => finish_command(connect_cmd::run_connect(args)),
-        Commands::Service { command } => service::run_service(command),
+        Commands::Service { command } => finish_command(service::run_service(command)),
         Commands::Setup(args) => setup::run_setup(args),
         Commands::Onboard(args) => setup::run_onboard(args),
         Commands::Status(args) => finish_command(status_doctor::run_status(args)),
@@ -514,9 +514,9 @@ fn main() -> ExitCode {
         Commands::Join(args) => finish_command(join_cmd::run_join(args)),
         Commands::Drop { command } => finish_command(drop_cmd::run_drop(command)),
         Commands::Relay { command } => finish_command(drop_cmd::run_relay(command)),
-        Commands::Update(args) => update::run_update(args),
+        Commands::Update(args) => finish_command(update::run_update(args)),
         Commands::Uninstall(args) => finish_command(uninstall_cmd::run_uninstall(args)),
-        Commands::Deploy { command } => deploy::run_deploy(command),
+        Commands::Deploy { command } => finish_command(deploy::run_deploy(command)),
         Commands::Pair { command } => finish_command(pair::run_pair(command)),
         Commands::Plugin { command } => finish_command(plugin_cmd::run_plugin(command)),
         Commands::Statusline(args) => statusline_cmd::run_statusline(&args),
