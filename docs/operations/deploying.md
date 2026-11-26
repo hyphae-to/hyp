@@ -10,7 +10,7 @@ Run `hyp deploy providers` (or `--json`) to inspect all seven supported kits and
 
 | Provider | TLS Termination | NAT / Firewall Requirement | Best For | Generator Command |
 | --- | --- | --- | --- | --- |
-| **`tailscale`** | Tailscale Serve MagicDNS HTTPS (+ optional path-scoped Funnel) | Zero open ports; works behind CGNAT | Private meshes & Direct P2P laptops | `hyp deploy init tailscale` |
+| **`tailscale`** | Tailscale Serve MagicDNS HTTPS (plus optional dedicated webhook Funnel port) | Zero open ports; works behind CGNAT | Private meshes & Direct P2P laptops | `hyp deploy init tailscale` |
 | **`vps`** | Caddy automatic Let's Encrypt HTTPS (`flush_interval -1`) | Public IP with inbound TCP 80/443; Hyphae on `127.0.0.1:8790` | Production hubs on Hetzner / DO / AWS / Linode | `hyp deploy init vps` |
 | **`docker`** | Caddy sidecar auto-TLS on isolated bridge network | Only Caddy publishes 80/443; `hyphae-node` stays internal | Container-first teams & CI/CD rollouts | `hyp deploy init docker` |
 | **`cloudflare`** | Cloudflare Edge TLS over outbound `cloudflared` tunnel | Zero open inbound ports; works behind CGNAT/homelabs | Homelabs and NAT'd devboxes | `hyp deploy init cloudflare` |
@@ -38,7 +38,7 @@ bash ./deploy-tailscale/tailscale-serve.sh
 hyp deploy check --url https://hyphae.your-tailnet.ts.net --config ./deploy-tailscale/node.json
 ```
 
-> **Webhook Funnel rule:** If exposing external GitHub webhooks, Funnel **only** the webhook subpath (`tailscale funnel --bg --https=443 --set-path=/webhooks http://127.0.0.1:8790/webhooks`) — never the full peer/admin surface.
+For public plugin webhooks, run [webhook routing setup](#public-webhook-routing) with the plugin’s dedicated loopback receiver. Funnel and Serve share the visibility of an HTTPS port. Keep the private peer server on a different port.
 
 ### 2.2 Linux VPS (Caddy Auto-TLS + Hardened `systemd`)
 
@@ -183,6 +183,22 @@ hyp pair ssh ops@solace --preset member
 - Optional query parameters `?stateDir=/path` and `?bin=/path/to/hyp` are strictly validated against shell/option injection.
 
 ---
+
+### Public webhook routing
+
+Run the setup on the machine that runs the signed receiver. For example, Sentry uses `http://127.0.0.1:8796/sentry`.
+
+```sh
+hyp deploy webhook --local-target http://127.0.0.1:8796/sentry --json
+```
+
+- **Tailscale Funnel**. Choose `--provider tailscale`. Hyphae checks node login, HTTPS certificates, Funnel policy, available HTTPS ports, and the running loopback receiver. It enables an unused port or reuses the exact isolated route and prints its public callback URL. When the provider only issues a signing secret after it gets a callback URL, use `--plan` first. After the receiver starts, use `--funnel-port <planned-port>` with the activation command to keep the URL stable.
+- **Configured Cloudflare Tunnel**. Pass `--provider cloudflare --url https://hooks.example.com/sentry` to check that the callback's ingress rule points to the receiver. Add `--cloudflare-config <file>` if the running tunnel uses a non-default local configuration. Start the operator-managed tunnel if it is offline.
+- **Existing HTTPS callback**. Pass `--provider existing --url https://hooks.example.com/callbacks/alerts`. Configure your proxy to forward that URL to the exact loopback target. A path rewrite can map the public path to the local receiver path. Preserve the method, headers, and raw body.
+
+After the receiver starts, send a signed test delivery from the event provider and confirm the resulting event landed in the expected topic.
+
+The SDK's signed Node.js webhook receiver answers `OPTIONS` at its exact path with HTTP `204` and `X-Hyphae-Webhook-Receiver: signed`. A Python or native plugin can implement the same readiness response on a dedicated, loopback-only listener whose `POST` handler verifies signatures before publishing.
 
 ## 3. Production Hardening Checklist
 
