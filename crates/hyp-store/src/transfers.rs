@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::{NodeDb, ensure_dir_0700, ensure_file_0600};
 use crate::error::{StoreError, StoreResult};
+use crate::query::{query_opt, query_vec};
 use crate::types::string_enum;
 use crate::types::{AckOutcome, is_node_id, is_safe_transfer_id, sha256_hex, uuid_v4};
 
@@ -389,15 +390,12 @@ impl<'a> TransferStore<'a> {
 
     /// Looks up transfer metadata by ID.
     pub fn get(&self, id: &str) -> StoreResult<Option<TransferRecord>> {
-        self.db
-            .conn()
-            .query_row(
-                "SELECT * FROM transfers WHERE id = ?1",
-                params![id],
-                decode_transfer_row,
-            )
-            .optional()?
-            .transpose()
+        query_opt(
+            self.db.conn(),
+            "SELECT * FROM transfers WHERE id = ?1",
+            params![id],
+            decode_transfer_row,
+        )
     }
 
     /// Returns the oldest due pending transfer for `recipient_node`, unless any pending transfer
@@ -411,16 +409,16 @@ impl<'a> TransferStore<'a> {
     where
         F: Fn(&str) -> bool,
     {
-        let mut stmt = self.db.conn().prepare(
+        let rows = query_vec(
+            self.db.conn(),
             "SELECT * FROM transfers
              WHERE to_node = ?1 AND state = 'pending'
              ORDER BY sent_at ASC, id ASC",
-        )?;
-        let rows = stmt
-            .query_map(params![recipient_node], decode_transfer_row)?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .collect::<StoreResult<Vec<_>>>()?;
+            params![recipient_node],
+            decode_transfer_row,
+        )?
+        .into_iter()
+        .collect::<StoreResult<Vec<_>>>()?;
         let Some(first) = rows.first() else {
             return Ok(None);
         };
@@ -443,15 +441,12 @@ impl<'a> TransferStore<'a> {
         now_ms: i64,
     ) -> StoreResult<bool> {
         let tx = self.db.immediate_tx()?;
-        let rec: Option<TransferRecord> = tx
-            .conn()
-            .query_row(
-                "SELECT * FROM transfers WHERE id = ?1 AND state = 'pending'",
-                params![id],
-                decode_transfer_row,
-            )
-            .optional()?
-            .transpose()?;
+        let rec: Option<TransferRecord> = query_opt(
+            tx.conn(),
+            "SELECT * FROM transfers WHERE id = ?1 AND state = 'pending'",
+            params![id],
+            decode_transfer_row,
+        )?;
         let Some(rec) = rec else {
             return Ok(false);
         };
@@ -498,14 +493,13 @@ impl<'a> TransferStore<'a> {
     /// their blobs from disk.
     pub fn remove_node(&self, node_id: &str, now_ms: i64) -> StoreResult<usize> {
         let tx = self.db.immediate_tx()?;
-        let mut stmt = tx.conn().prepare(
+        let ids: Vec<String> = query_vec(
+            tx.conn(),
             "SELECT id FROM transfers
              WHERE state = 'pending' AND (to_node = ?1 OR from_node = ?1)",
+            params![node_id],
+            |row| row.get(0),
         )?;
-        let ids: Vec<String> = stmt
-            .query_map(params![node_id], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(stmt);
 
         for id in &ids {
             tx.conn().execute(
@@ -523,13 +517,12 @@ impl<'a> TransferStore<'a> {
     /// Expires pending transfers whose `expires_at <= now_ms` and deletes their blobs from disk.
     pub fn tick(&self, now_ms: i64) -> StoreResult<TransferTickReport> {
         let tx = self.db.immediate_tx()?;
-        let mut stmt = tx
-            .conn()
-            .prepare("SELECT id FROM transfers WHERE state = 'pending' AND expires_at <= ?1")?;
-        let expired_ids: Vec<String> = stmt
-            .query_map(params![now_ms], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(stmt);
+        let expired_ids: Vec<String> = query_vec(
+            tx.conn(),
+            "SELECT id FROM transfers WHERE state = 'pending' AND expires_at <= ?1",
+            params![now_ms],
+            |row| row.get(0),
+        )?;
 
         if expired_ids.is_empty() {
             return Ok(TransferTickReport::default());

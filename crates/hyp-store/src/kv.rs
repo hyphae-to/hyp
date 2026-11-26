@@ -3,13 +3,14 @@
 //! listing, E2EE epoch metadata, and **atomic CloudEvent emission** (`to.hyphae.kv.set` /
 //! `to.hyphae.kv.deleted`) inside the exact same `BEGIN IMMEDIATE` SQLite transaction.
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::db::NodeDb;
 use crate::error::{StoreError, StoreResult};
 use crate::events::{IngestResult, ingest_in_tx};
+use crate::query::{query_opt, query_vec};
 use crate::types::{
     CloudEvent, WriteModel, epoch_ms_to_rfc3339, is_kv_key, is_kv_namespace, is_node_id,
     sha256_hex, uuid_v4,
@@ -180,15 +181,12 @@ impl<'a> KvStore<'a> {
 
         let tx = self.db.immediate_tx()?;
 
-        let existing: Option<KvEntry> = tx
-            .conn()
-            .query_row(
-                "SELECT * FROM kv_entries WHERE host_node = ?1 AND namespace = ?2 AND key = ?3",
-                params![&input.host_node, &input.namespace, &input.key],
-                decode_kv_row,
-            )
-            .optional()?
-            .transpose()?;
+        let existing: Option<KvEntry> = query_opt(
+            tx.conn(),
+            "SELECT * FROM kv_entries WHERE host_node = ?1 AND namespace = ?2 AND key = ?3",
+            params![&input.host_node, &input.namespace, &input.key],
+            decode_kv_row,
+        )?;
 
         // Treat expired entries as absent so TTL expiry is consistent across get/set/delete.
         let live_existing = existing.filter(|e| e.expires_at.is_none_or(|exp| exp > now_ms));
@@ -378,15 +376,12 @@ impl<'a> KvStore<'a> {
         }
 
         let tx = self.db.immediate_tx()?;
-        let existing: Option<KvEntry> = tx
-            .conn()
-            .query_row(
-                "SELECT * FROM kv_entries WHERE host_node = ?1 AND namespace = ?2 AND key = ?3",
-                params![&input.host_node, &input.namespace, &input.key],
-                decode_kv_row,
-            )
-            .optional()?
-            .transpose()?;
+        let existing: Option<KvEntry> = query_opt(
+            tx.conn(),
+            "SELECT * FROM kv_entries WHERE host_node = ?1 AND namespace = ?2 AND key = ?3",
+            params![&input.host_node, &input.namespace, &input.key],
+            decode_kv_row,
+        )?;
 
         let live = existing.filter(|e| e.expires_at.is_none_or(|exp| exp > now_ms));
         let Some(prev) = live else {
@@ -489,18 +484,14 @@ impl<'a> KvStore<'a> {
         key: &str,
         now_ms: i64,
     ) -> StoreResult<Option<KvEntry>> {
-        let entry: Option<KvEntry> = self
-            .db
-            .conn()
-            .query_row(
-                "SELECT * FROM kv_entries
+        let entry: Option<KvEntry> = query_opt(
+            self.db.conn(),
+            "SELECT * FROM kv_entries
                  WHERE host_node = ?1 AND namespace = ?2 AND key = ?3
                    AND (expires_at IS NULL OR expires_at > ?4)",
-                params![host_node, namespace, key, now_ms],
-                decode_kv_row,
-            )
-            .optional()?
-            .transpose()?;
+            params![host_node, namespace, key, now_ms],
+            decode_kv_row,
+        )?;
         Ok(entry)
     }
 
@@ -513,17 +504,17 @@ impl<'a> KvStore<'a> {
         prefix: Option<&str>,
         now_ms: i64,
     ) -> StoreResult<Vec<KvEntry>> {
-        let mut stmt = self.db.conn().prepare(
+        let rows = query_vec(
+            self.db.conn(),
             "SELECT * FROM kv_entries
              WHERE host_node = ?1 AND namespace = ?2
                AND (expires_at IS NULL OR expires_at > ?3)
              ORDER BY key ASC",
-        )?;
-        let rows = stmt
-            .query_map(params![host_node, namespace, now_ms], decode_kv_row)?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .collect::<StoreResult<Vec<_>>>()?;
+            params![host_node, namespace, now_ms],
+            decode_kv_row,
+        )?
+        .into_iter()
+        .collect::<StoreResult<Vec<_>>>()?;
 
         Ok(match prefix {
             Some(p) if !p.is_empty() => rows.into_iter().filter(|e| e.key.starts_with(p)).collect(),
@@ -572,15 +563,14 @@ impl<'a> KvStore<'a> {
 
     /// Lists namespaces with at least one live KV entry on `host_node`.
     pub fn list_namespaces(&self, host_node: &str, now_ms: i64) -> StoreResult<Vec<String>> {
-        let mut stmt = self.db.conn().prepare(
+        query_vec(
+            self.db.conn(),
             "SELECT DISTINCT namespace FROM kv_entries
              WHERE host_node = ?1 AND (expires_at IS NULL OR expires_at > ?2)
              ORDER BY namespace ASC",
-        )?;
-        let rows = stmt
-            .query_map(params![host_node, now_ms], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+            params![host_node, now_ms],
+            |row| row.get::<_, String>(0),
+        )
     }
 
     /// Deletes expired KV entries (`expires_at <= now_ms`). Returns count removed.
@@ -647,15 +637,12 @@ impl<'a> KvStore<'a> {
         let members_json = serde_json::to_string(&sorted_members)?;
 
         let tx = self.db.immediate_tx()?;
-        let existing: Option<KvEpoch> = tx
-            .conn()
-            .query_row(
-                "SELECT * FROM kv_epochs WHERE host_node = ?1 AND namespace = ?2 AND epoch = ?3",
-                params![&input.host_node, &input.namespace, input.epoch as i64],
-                decode_kv_epoch_row,
-            )
-            .optional()?
-            .transpose()?;
+        let existing: Option<KvEpoch> = query_opt(
+            tx.conn(),
+            "SELECT * FROM kv_epochs WHERE host_node = ?1 AND namespace = ?2 AND epoch = ?3",
+            params![&input.host_node, &input.namespace, input.epoch as i64],
+            decode_kv_epoch_row,
+        )?;
         if let Some(prev) = existing {
             if prev.creator_node_id == input.creator_node_id
                 && prev.key_envelope_json == input.key_envelope_json
@@ -721,17 +708,14 @@ impl<'a> KvStore<'a> {
 
     /// Returns the latest E2EE epoch for `(host_node, namespace)`.
     pub fn latest_epoch(&self, host_node: &str, namespace: &str) -> StoreResult<Option<KvEpoch>> {
-        self.db
-            .conn()
-            .query_row(
-                "SELECT * FROM kv_epochs
+        query_opt(
+            self.db.conn(),
+            "SELECT * FROM kv_epochs
                  WHERE host_node = ?1 AND namespace = ?2
                  ORDER BY epoch DESC LIMIT 1",
-                params![host_node, namespace],
-                decode_kv_epoch_row,
-            )
-            .optional()?
-            .transpose()
+            params![host_node, namespace],
+            decode_kv_epoch_row,
+        )
     }
 
     /// Returns a specific E2EE epoch for `(host_node, namespace)`.
@@ -741,28 +725,25 @@ impl<'a> KvStore<'a> {
         namespace: &str,
         epoch: u64,
     ) -> StoreResult<Option<KvEpoch>> {
-        self.db
-            .conn()
-            .query_row(
-                "SELECT * FROM kv_epochs
+        query_opt(
+            self.db.conn(),
+            "SELECT * FROM kv_epochs
                  WHERE host_node = ?1 AND namespace = ?2 AND epoch = ?3",
-                params![host_node, namespace, epoch as i64],
-                decode_kv_epoch_row,
-            )
-            .optional()?
-            .transpose()
+            params![host_node, namespace, epoch as i64],
+            decode_kv_epoch_row,
+        )
     }
 
     /// Lists all E2EE epochs for `(host_node, namespace)` ordered ascending.
     pub fn list_epochs(&self, host_node: &str, namespace: &str) -> StoreResult<Vec<KvEpoch>> {
-        let mut stmt = self.db.conn().prepare(
+        let rows = query_vec(
+            self.db.conn(),
             "SELECT * FROM kv_epochs
              WHERE host_node = ?1 AND namespace = ?2
              ORDER BY epoch ASC",
+            params![host_node, namespace],
+            decode_kv_epoch_row,
         )?;
-        let rows = stmt
-            .query_map(params![host_node, namespace], decode_kv_epoch_row)?
-            .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter().collect()
     }
 }

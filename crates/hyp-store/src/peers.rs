@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::NodeDb;
 use crate::error::{StoreError, StoreResult};
+use crate::query::{query_opt, query_vec};
 use crate::types::{
     GrantDirection, KeyStatus, KeyUse, PeerProfile, PeerStatus, TrustTier, is_node_id,
 };
@@ -320,10 +321,7 @@ impl<'a> PeerStore<'a> {
         } else {
             "SELECT * FROM peers WHERE admitted_by_human_id = ?1 ORDER BY peer_id ASC"
         };
-        let mut stmt = self.db.conn().prepare(sql)?;
-        let rows = stmt
-            .query_map(params![human_id], decode_peer_row)?
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = query_vec(self.db.conn(), sql, params![human_id], decode_peer_row)?;
         rows.into_iter().collect()
     }
 
@@ -366,35 +364,30 @@ impl<'a> PeerStore<'a> {
     }
 
     pub fn get_peer(&self, peer_id: &str) -> StoreResult<Option<PeerRecord>> {
-        self.db
-            .conn()
-            .query_row(
-                "SELECT * FROM peers WHERE peer_id = ?1",
-                params![peer_id],
-                decode_peer_row,
-            )
-            .optional()?
-            .transpose()
+        query_opt(
+            self.db.conn(),
+            "SELECT * FROM peers WHERE peer_id = ?1",
+            params![peer_id],
+            decode_peer_row,
+        )
     }
 
     pub fn list_peers(&self, status: Option<PeerStatus>) -> StoreResult<Vec<PeerRecord>> {
         if let Some(st) = status {
-            let mut stmt = self
-                .db
-                .conn()
-                .prepare("SELECT * FROM peers WHERE status = ?1 ORDER BY peer_id ASC")?;
-            let rows = stmt
-                .query_map(params![st.as_str()], decode_peer_row)?
-                .collect::<Result<Vec<_>, _>>()?;
+            let rows = query_vec(
+                self.db.conn(),
+                "SELECT * FROM peers WHERE status = ?1 ORDER BY peer_id ASC",
+                params![st.as_str()],
+                decode_peer_row,
+            )?;
             rows.into_iter().collect()
         } else {
-            let mut stmt = self
-                .db
-                .conn()
-                .prepare("SELECT * FROM peers ORDER BY peer_id ASC")?;
-            let rows = stmt
-                .query_map([], decode_peer_row)?
-                .collect::<Result<Vec<_>, _>>()?;
+            let rows = query_vec(
+                self.db.conn(),
+                "SELECT * FROM peers ORDER BY peer_id ASC",
+                [],
+                decode_peer_row,
+            )?;
             rows.into_iter().collect()
         }
     }
@@ -468,16 +461,13 @@ impl<'a> PeerStore<'a> {
         }
 
         let tx = self.db.immediate_tx()?;
-        let current: PeerRecord = tx
-            .conn()
-            .query_row(
-                "SELECT * FROM peers WHERE peer_id = ?1",
-                params![peer_id],
-                decode_peer_row,
-            )
-            .optional()?
-            .transpose()?
-            .ok_or_else(|| StoreError::NotFound(format!("peer '{peer_id}' not found")))?;
+        let current: PeerRecord = query_opt(
+            tx.conn(),
+            "SELECT * FROM peers WHERE peer_id = ?1",
+            params![peer_id],
+            decode_peer_row,
+        )?
+        .ok_or_else(|| StoreError::NotFound(format!("peer '{peer_id}' not found")))?;
 
         // 1. Monotonic anti-rollback & same-version equivocation guard.
         if update.manifest_version < current.manifest_version {
@@ -570,15 +560,12 @@ impl<'a> PeerStore<'a> {
         let scopes_json = serde_json::to_string(&input.scopes)?;
 
         let tx = self.db.immediate_tx()?;
-        let existing: Option<GrantRecord> = tx
-            .conn()
-            .query_row(
-                "SELECT * FROM grants WHERE id = ?1",
-                params![&input.id],
-                decode_grant_row,
-            )
-            .optional()?
-            .transpose()?;
+        let existing: Option<GrantRecord> = query_opt(
+            tx.conn(),
+            "SELECT * FROM grants WHERE id = ?1",
+            params![&input.id],
+            decode_grant_row,
+        )?;
         if let Some(prev) = existing {
             if prev.signed_json == input.signed_json {
                 tx.commit()?;
@@ -625,34 +612,30 @@ impl<'a> PeerStore<'a> {
     }
 
     pub fn get_grant(&self, id: &str) -> StoreResult<Option<GrantRecord>> {
-        self.db
-            .conn()
-            .query_row(
-                "SELECT * FROM grants WHERE id = ?1",
-                params![id],
-                decode_grant_row,
-            )
-            .optional()?
-            .transpose()
+        query_opt(
+            self.db.conn(),
+            "SELECT * FROM grants WHERE id = ?1",
+            params![id],
+            decode_grant_row,
+        )
     }
 
     pub fn list_grants(&self, peer_id: Option<&str>) -> StoreResult<Vec<GrantRecord>> {
         if let Some(pid) = peer_id {
-            let mut stmt = self.db.conn().prepare(
+            let rows = query_vec(
+                self.db.conn(),
                 "SELECT * FROM grants WHERE peer_id = ?1 ORDER BY issued_at ASC, id ASC",
+                params![pid],
+                decode_grant_row,
             )?;
-            let rows = stmt
-                .query_map(params![pid], decode_grant_row)?
-                .collect::<Result<Vec<_>, _>>()?;
             rows.into_iter().collect()
         } else {
-            let mut stmt = self
-                .db
-                .conn()
-                .prepare("SELECT * FROM grants ORDER BY issued_at ASC, id ASC")?;
-            let rows = stmt
-                .query_map([], decode_grant_row)?
-                .collect::<Result<Vec<_>, _>>()?;
+            let rows = query_vec(
+                self.db.conn(),
+                "SELECT * FROM grants ORDER BY issued_at ASC, id ASC",
+                [],
+                decode_grant_row,
+            )?;
             rows.into_iter().collect()
         }
     }
@@ -661,16 +644,13 @@ impl<'a> PeerStore<'a> {
     /// pairing attempts racing for the same grant cannot both succeed.
     pub fn claim_grant(&self, id: &str, entry_json: &str, now_ms: i64) -> StoreResult<GrantRecord> {
         let tx = self.db.immediate_tx()?;
-        let grant: GrantRecord = tx
-            .conn()
-            .query_row(
-                "SELECT * FROM grants WHERE id = ?1",
-                params![id],
-                decode_grant_row,
-            )
-            .optional()?
-            .transpose()?
-            .ok_or_else(|| StoreError::NotFound(format!("grant '{id}' not found")))?;
+        let grant: GrantRecord = query_opt(
+            tx.conn(),
+            "SELECT * FROM grants WHERE id = ?1",
+            params![id],
+            decode_grant_row,
+        )?
+        .ok_or_else(|| StoreError::NotFound(format!("grant '{id}' not found")))?;
 
         if grant.entry_json.is_some() {
             return Err(StoreError::AlreadyPaired(format!(
@@ -747,15 +727,12 @@ impl<'a> PeerStore<'a> {
             )));
         }
 
-        let existing: Option<GrantRecord> = tx
-            .conn()
-            .query_row(
-                "SELECT * FROM grants WHERE id = ?1",
-                params![&input.id],
-                decode_grant_row,
-            )
-            .optional()?
-            .transpose()?;
+        let existing: Option<GrantRecord> = query_opt(
+            tx.conn(),
+            "SELECT * FROM grants WHERE id = ?1",
+            params![&input.id],
+            decode_grant_row,
+        )?;
 
         if let Some(prev) = existing {
             if prev.entry_json.is_some() {
@@ -885,23 +862,21 @@ impl<'a> PeerStore<'a> {
 
     pub fn list_revocations(&self, peer_id: Option<&str>) -> StoreResult<Vec<RevocationRecord>> {
         if let Some(pid) = peer_id {
-            let mut stmt = self.db.conn().prepare(
+            query_vec(
+                self.db.conn(),
                 "SELECT grant_id, peer_id, signed_json, revoked_at FROM revocations
                  WHERE peer_id = ?1 ORDER BY revoked_at ASC, grant_id ASC",
-            )?;
-            let rows = stmt
-                .query_map(params![pid], decode_revocation_row)?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
+                params![pid],
+                decode_revocation_row,
+            )
         } else {
-            let mut stmt = self.db.conn().prepare(
+            query_vec(
+                self.db.conn(),
                 "SELECT grant_id, peer_id, signed_json, revoked_at FROM revocations
                  ORDER BY revoked_at ASC, grant_id ASC",
-            )?;
-            let rows = stmt
-                .query_map([], decode_revocation_row)?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
+                [],
+                decode_revocation_row,
+            )
         }
     }
 
@@ -922,15 +897,12 @@ impl<'a> PeerStore<'a> {
             ));
         }
         let tx = self.db.immediate_tx()?;
-        let existing_same: Option<PeerKeyRecord> = tx
-            .conn()
-            .query_row(
-                "SELECT * FROM peer_keys WHERE peer_id = ?1 AND kid = ?2",
-                params![&input.peer_id, &input.kid],
-                decode_peer_key_row,
-            )
-            .optional()?
-            .transpose()?;
+        let existing_same: Option<PeerKeyRecord> = query_opt(
+            tx.conn(),
+            "SELECT * FROM peer_keys WHERE peer_id = ?1 AND kid = ?2",
+            params![&input.peer_id, &input.kid],
+            decode_peer_key_row,
+        )?;
         if let Some(prev) = existing_same {
             if prev.jwk_json != input.jwk_json {
                 return Err(StoreError::IdConflict(format!(
@@ -1012,15 +984,12 @@ impl<'a> PeerStore<'a> {
             ));
         }
         let tx = self.db.immediate_tx()?;
-        let existing_same: Option<PeerKeyRecord> = tx
-            .conn()
-            .query_row(
-                "SELECT * FROM peer_keys WHERE peer_id = ?1 AND kid = ?2",
-                params![&input.peer_id, &input.kid],
-                decode_peer_key_row,
-            )
-            .optional()?
-            .transpose()?;
+        let existing_same: Option<PeerKeyRecord> = query_opt(
+            tx.conn(),
+            "SELECT * FROM peer_keys WHERE peer_id = ?1 AND kid = ?2",
+            params![&input.peer_id, &input.kid],
+            decode_peer_key_row,
+        )?;
         if let Some(prev) = existing_same {
             if prev.jwk_json != input.jwk_json {
                 return Err(StoreError::IdConflict(format!(
@@ -1077,15 +1046,12 @@ impl<'a> PeerStore<'a> {
     }
 
     pub fn get_peer_key(&self, peer_id: &str, kid: &str) -> StoreResult<Option<PeerKeyRecord>> {
-        self.db
-            .conn()
-            .query_row(
-                "SELECT * FROM peer_keys WHERE peer_id = ?1 AND kid = ?2",
-                params![peer_id, kid],
-                decode_peer_key_row,
-            )
-            .optional()?
-            .transpose()
+        query_opt(
+            self.db.conn(),
+            "SELECT * FROM peer_keys WHERE peer_id = ?1 AND kid = ?2",
+            params![peer_id, kid],
+            decode_peer_key_row,
+        )
     }
 
     pub fn list_peer_keys(
@@ -1094,14 +1060,14 @@ impl<'a> PeerStore<'a> {
         key_use: Option<KeyUse>,
         active_only: bool,
     ) -> StoreResult<Vec<PeerKeyRecord>> {
-        let mut stmt = self.db.conn().prepare(
+        let all = query_vec(
+            self.db.conn(),
             "SELECT * FROM peer_keys WHERE peer_id = ?1 ORDER BY registered_at ASC, kid ASC",
-        )?;
-        let all = stmt
-            .query_map(params![peer_id], decode_peer_key_row)?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .collect::<StoreResult<Vec<_>>>()?;
+            params![peer_id],
+            decode_peer_key_row,
+        )?
+        .into_iter()
+        .collect::<StoreResult<Vec<_>>>()?;
         Ok(all
             .into_iter()
             .filter(|k| key_use.is_none_or(|u| k.key_use == u))
@@ -1181,13 +1147,12 @@ impl<'a> PeerStore<'a> {
 
     /// Lists all persisted multi-hub peer routes ordered by `target_node ASC`.
     pub fn list_peer_routes(&self) -> StoreResult<Vec<PeerRoute>> {
-        let mut stmt = self.db.conn().prepare(
+        query_vec(
+            self.db.conn(),
             "SELECT target_node, via_peer, updated_at FROM peer_routes ORDER BY target_node ASC",
-        )?;
-        let rows = stmt
-            .query_map([], decode_peer_route_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+            [],
+            decode_peer_route_row,
+        )
     }
 
     /// Deletes all routes forwarded through `via_peer`. Returns the count of deleted routes.

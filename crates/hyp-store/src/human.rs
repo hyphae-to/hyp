@@ -9,6 +9,7 @@ use serde_json::json;
 
 use crate::db::NodeDb;
 use crate::error::{StoreError, StoreResult};
+use crate::query::{query_opt, query_vec};
 use crate::types::string_enum;
 use crate::types::{canonical_json, is_node_id, sha256_hex};
 
@@ -331,11 +332,7 @@ impl<'a> HumanAuthorityStore<'a> {
              WHERE status = 'active'
              ORDER BY human_id ASC, kid ASC"
         };
-        let mut stmt = self.db.conn().prepare(sql)?;
-        let rows = stmt
-            .query_map([], row_to_authority)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        query_vec(self.db.conn(), sql, [], row_to_authority)
     }
 
     /// Upgrades an active human authority key with its companion X25519 encryption JWK.
@@ -473,13 +470,13 @@ impl<'a> HumanAuthorityStore<'a> {
     /// verified mesh revocations (`to.hyphae.human.revocation.v1`) to take effect without
     /// bricking a locked Security Gate.
     pub fn authorities_digest(&self) -> StoreResult<String> {
-        let mut stmt = self.db.conn().prepare(
+        let entries = query_vec(
+            self.db.conn(),
             "SELECT human_id, kid, role, jwk_json, enc_jwk_json, auth_epoch
              FROM human_authorities
              ORDER BY human_id ASC, kid ASC",
-        )?;
-        let entries = stmt
-            .query_map([], |row| {
+            [],
+            |row| {
                 let human_id: String = row.get(0)?;
                 let kid: String = row.get(1)?;
                 let role: String = row.get(2)?;
@@ -494,8 +491,8 @@ impl<'a> HumanAuthorityStore<'a> {
                     "encJwkJson": enc_jwk_json,
                     "authEpoch": auth_epoch,
                 }))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+            },
+        )?;
 
         let payload = json!({
             "authorities": entries,
@@ -691,11 +688,7 @@ impl<'a> HumanAuthorityStore<'a> {
              WHERE human_id = ?1 AND status = 'active'
              ORDER BY kid ASC"
         };
-        let mut stmt = self.db.conn().prepare(sql)?;
-        let rows = stmt
-            .query_map(params![human_id], row_to_authority)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        query_vec(self.db.conn(), sql, params![human_id], row_to_authority)
     }
 
     /// Looks up an active human authority strictly matching BOTH `human_id` and `kid`.
@@ -786,29 +779,26 @@ impl<'a> HumanAuthorityStore<'a> {
         if human_id.is_empty() {
             return Ok(None);
         }
-        self.db
-            .conn()
-            .query_row(
-                "SELECT human_id, node_prefix, scopes_json, max_devices, delegation_enabled, updated_at
+        query_opt(
+            self.db.conn(),
+            "SELECT human_id, node_prefix, scopes_json, max_devices, delegation_enabled, updated_at
                  FROM human_delegation_policies
                  WHERE human_id = ?1",
-                params![human_id],
-                row_to_delegation_policy,
-            )
-            .optional()?
-            .transpose()
+            params![human_id],
+            row_to_delegation_policy,
+        )
     }
 
     /// Lists all configured delegated human admission policies ordered by `human_id ASC`.
     pub fn list_delegation_policies(&self) -> StoreResult<Vec<HumanDelegationPolicy>> {
-        let mut stmt = self.db.conn().prepare(
+        let rows = query_vec(
+            self.db.conn(),
             "SELECT human_id, node_prefix, scopes_json, max_devices, delegation_enabled, updated_at
              FROM human_delegation_policies
              ORDER BY human_id ASC",
+            [],
+            row_to_delegation_policy,
         )?;
-        let rows = stmt
-            .query_map([], row_to_delegation_policy)?
-            .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter().collect()
     }
 
@@ -949,13 +939,13 @@ impl<'a> HumanAuthorityStore<'a> {
             }
         }
 
-        let mut stmt = self.db.conn().prepare(
+        let mut rows: Vec<(String, String, String, String, Option<String>, i64)> = query_vec(
+            self.db.conn(),
             "SELECT human_id, kid, role, jwk_json, enc_jwk_json, auth_epoch
              FROM human_authorities
              ORDER BY human_id ASC, kid ASC",
-        )?;
-        let mut rows: Vec<(String, String, String, String, Option<String>, i64)> = stmt
-            .query_map([], |row| {
+            [],
+            |row| {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -964,8 +954,8 @@ impl<'a> HumanAuthorityStore<'a> {
                     row.get(4)?,
                     row.get(5)?,
                 ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+            },
+        )?;
 
         let new_tuple = (
             input.human_id.clone(),
