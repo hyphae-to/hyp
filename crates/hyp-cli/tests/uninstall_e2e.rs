@@ -885,7 +885,7 @@ fast_mode = true
             h.join(".config/hyphae/antigravity-statusline-chain.json")
                 .exists()
         );
-        assert!(h.join(".claude/commands/hyphae.md").exists());
+        assert!(h.join(".claude/commands/hyp.md").exists());
         assert!(h.join(".gemini/config/plugins/hyphae/hooks.json").exists());
         assert!(h.join(".config/opencode/plugins/hyphae.ts").exists());
         assert!(!h.join(".config/herdr/hyphae.json").exists());
