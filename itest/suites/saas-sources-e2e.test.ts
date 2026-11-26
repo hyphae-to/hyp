@@ -6,13 +6,14 @@
  *    wired end-to-end into a REAL Claude Code harness (`claude -p`) via `llm-shim`.
  *  - Section B: All 6 SaaS source plugin wire-mock protocol & fault-injection self-tests
  *    (always run on `main`) + full black-box E2E tests (including B1, B3, Notion handshake
- *    hijack, fake `TAILSCALE_BIN` Funnel) auto-enabled whenever the 6 SaaS plugins exist in
+ *    hijack, isolated Tailscale LocalAPI Funnel) auto-enabled whenever the 6 SaaS plugins exist in
  *    `./plugins` or `HYPHAE_ITEST_SAAS_PLUGINS_DIR`.
  */
 
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
 import net from "node:net";
 import path from "node:path";
 import test from "node:test";
@@ -1707,14 +1708,46 @@ test("SaaS Sources Full Black-Box E2E (B1, B3 AgentMail WS+REST race, Notion han
     amMock.addStoredMessage(mkAm("m1", t1, "AM_B3_CAUGHT_UP_M1"));
     amMock.armInterleaveOnNextRestCatchup(mkAm("m2", t2, "AM_B3_INTERLEAVED_M2"), 80);
 
-    // 2. Fake `TAILSCALE_BIN` to prove Sentry Funnel exact args + `"/"` path acceptance!
-    const tsCallsLog = path.join(sandbox.paths.tmpDir, "fake-tailscale-calls.log");
-    const fakeTsBin = path.join(sandbox.paths.binDir, "fake-tailscale");
-    fs.writeFileSync(
-      fakeTsBin,
-      `#!/bin/sh\necho "$@" >> "${tsCallsLog}"\nif [ "$1" = "status" ]; then echo '{"Self":{"DNSName":"itest-hub.tail9999.ts.net."}}'; fi\n`,
-      { mode: 0o755 },
-    );
+    // 2. Isolated tailscaled LocalAPI. Exercise the real hyp binary and its conditional
+    //    Serve write without touching the host’s tunnel.
+    const tailscaleSocket = path.join(sandbox.paths.tmpDir, "ts.sock");
+    const privateServe = {
+      TCP: { "443": { HTTPS: true } },
+      Web: { "itest-hub.tail9999.ts.net:443": { Handlers: { "/": { Proxy: "http://127.0.0.1:8790" } } } },
+    };
+    let tsConfig: unknown = privateServe;
+    const tsWrites: Array<{ version: string | undefined; config: unknown }> = [];
+    const tsServer = http.createServer(async (req, res) => {
+      const respond = (status: number, body: unknown, headers: Record<string, string> = {}) =>
+        res.writeHead(status, { "content-type": "application/json", ...headers }).end(JSON.stringify(body));
+      if (req.method === "GET" && req.url === "/localapi/v0/status?peers=false") {
+        return respond(200, {
+          BackendState: "Running",
+          Self: {
+            DNSName: "itest-hub.tail9999.ts.net.",
+            CapMap: { https: [], funnel: [], "https://tailscale.com/cap/funnel-ports?ports=443,8443,10000": [] },
+          },
+        });
+      }
+      if (req.url === "/localapi/v0/serve-config") {
+        const etag = `itest-${tsWrites.length}`;
+        if (req.method === "GET") return respond(200, tsConfig, { etag });
+        if (req.method === "POST") {
+          const version = typeof req.headers["if-match"] === "string" ? req.headers["if-match"] : undefined;
+          if (version !== etag) return respond(412, { error: "stale" });
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) chunks.push(Buffer.from(chunk));
+          tsConfig = JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+          tsWrites.push({ version, config: tsConfig });
+          return respond(200, {});
+        }
+      }
+      return respond(404, { error: "unknown request" });
+    });
+    await new Promise<void>((resolve, reject) => tsServer.once("error", reject).listen(tailscaleSocket, resolve));
+    sandbox.onTeardown(() => new Promise<void>((resolve, reject) =>
+      tsServer.close((error) => error ? reject(error) : resolve()),
+    ));
 
     // 3. Google OAuth + Gmail + Calendar mocks!
     const googleOAuth = await GoogleOAuthMockServer.start({
@@ -1807,7 +1840,8 @@ test("SaaS Sources Full Black-Box E2E (B1, B3 AgentMail WS+REST race, Notion han
             SENTRY_WEBHOOK_PORT: String(sentryPort),
             SENTRY_WEBHOOK_PATH: "/sentry",
             SENTRY_WEBHOOK_FUNNEL: "8443",
-            TAILSCALE_BIN: fakeTsBin,
+            HYPHAE_BIN: hyp.bin,
+            TAILSCALE_SOCKET: tailscaleSocket,
           },
         },
         {
@@ -1879,13 +1913,20 @@ test("SaaS Sources Full Black-Box E2E (B1, B3 AgentMail WS+REST race, Notion han
       }
     }, "AgentMail B3 cursor advanced to t2", 15_000);
 
-    // 2. Verify Sentry Funnel fake `TAILSCALE_BIN` invocation & `"/"` path acceptance + 1-bit flip `401`!
-    await waitUntil(() => fs.existsSync(tsCallsLog) && fs.readFileSync(tsCallsLog, "utf8").includes("status --json"), "Sentry Tailscale Funnel invocation", 15_000);
-    const tsLines = fs.readFileSync(tsCallsLog, "utf8").trim().split("\n");
-    assert.deepEqual(tsLines, [
-      `funnel --bg --https=8443 --set-path=/sentry http://127.0.0.1:${sentryPort}`,
-      "status --json",
-    ]);
+    // 2. The Sentry plugin delegates activation to the host. Only the dedicated
+    //    port becomes public, and the exact signed receiver path is retained.
+    await waitUntil(() => tsWrites.length > 0, "Sentry Tailscale Funnel conditional write", 15_000);
+    assert.deepEqual(tsWrites, [{
+      version: "itest-0",
+      config: {
+        TCP: { ...privateServe.TCP, "8443": { HTTPS: true } },
+        Web: {
+          ...privateServe.Web,
+          "itest-hub.tail9999.ts.net:8443": { Handlers: { "/sentry": { Proxy: `http://127.0.0.1:${sentryPort}/sentry` } } },
+        },
+        AllowFunnel: { "itest-hub.tail9999.ts.net:8443": true },
+      },
+    }]);
 
     const sentryPayload = {
       action: "created",
@@ -1901,7 +1942,7 @@ test("SaaS Sources Full Black-Box E2E (B1, B3 AgentMail WS+REST race, Notion han
     };
     assert.equal(
       (
-        await sendSentryWebhook(`http://127.0.0.1:${sentryPort}/`, {
+        await sendSentryWebhook(`http://127.0.0.1:${sentryPort}/sentry`, {
           resource: "issue",
           payload: sentryPayload,
           clientSecret: sentrySecret,
@@ -1912,14 +1953,23 @@ test("SaaS Sources Full Black-Box E2E (B1, B3 AgentMail WS+REST race, Notion han
     );
     assert.equal(
       (
-        await sendSentryWebhook(`http://127.0.0.1:${sentryPort}/`, {
+        await sendSentryWebhook(`http://127.0.0.1:${sentryPort}/sentry`, {
           resource: "issue",
           payload: sentryPayload,
           clientSecret: sentrySecret,
         })
       ).status,
       202,
-      "Sentry Funnel root '/' path must accept validly signed webhook",
+      "The configured receiver must accept a validly signed webhook",
+    );
+
+    assert.equal(
+      (await sendSentryWebhook(`http://127.0.0.1:${sentryPort}/`, {
+        resource: "issue",
+        payload: sentryPayload,
+        clientSecret: sentrySecret,
+      })).status,
+      404,
     );
 
     // 3. Verify Vercel HMAC-SHA1: 1-bit flip & wrong SHA-256 -> 401; valid SHA-1 -> 202!
