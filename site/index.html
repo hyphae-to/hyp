@@ -19,7 +19,7 @@
   <meta name="twitter:title" content="Hyphae (hyp) — One wire under every agent" />
   <meta name="twitter:description" content="A standardized real-time event and messaging bus for your agents. Unify CI/GitHub events, alerts, cron triggers, Passkey secrets, and cross-machine team messages over one encrypted wire with per-agent exposure control." />
   <meta name="twitter:image" content="https://hyphae.to/assets/social-card.jpg" />
-  <link rel="stylesheet" href="./styles.css?v=32" />
+  <link rel="stylesheet" href="./styles.css?v=34" />
 </head>
 <body>
   <header id="siteHeader" class="header-dark">
@@ -33,9 +33,9 @@
       </a>
 
       <nav class="nav-links" aria-label="Primary">
-        <a href="#use-cases">Use cases</a>
         <a href="#how-it-works">How it works</a>
         <a href="#security">Security</a>
+        <a href="#use-cases">Use cases</a>
         <a href="https://github.com/hyphae-to/hyp/blob/main/docs/README.md" target="_blank" rel="noreferrer">Docs</a>
       </nav>
 
@@ -266,129 +266,14 @@
     </section>
 
     <!-- =================================================================== -->
-    <!-- USE CASES: Clean Interactive Split Showcase (zero 6-box overload)   -->
-    <!-- =================================================================== -->
-    <section id="use-cases" class="section uc-section">
-      <div class="wrap">
-        <div class="section-intro">
-          <span class="spec-num">Use cases</span>
-          <h2>One protocol. Five real workflows.</h2>
-          <p>
-            Pick a workflow to see how signals move from any source to the right agent — without polling loops or custom glue.
-          </p>
-        </div>
-
-        <div class="uc-showcase" id="ucShowcase">
-          <!-- Left Rail: Scannable clickable workflow selector -->
-          <div class="uc-rail" role="tablist" aria-label="Hyphae workflows">
-            <button class="uc-tab is-active" type="button" role="tab" aria-selected="true" data-uc="team">
-              <span class="uc-tab-num">01</span>
-              <span class="uc-tab-copy">
-                <span class="uc-tab-title"><strong>Team &amp; multi-machine agents</strong><span class="uc-pill solid">P2P · Hub Beta</span></span>
-                <span class="uc-tab-sub">Pair laptops and servers directly over Tailscale/LAN, or add a blind Team Hub for <code>#channels</code> &amp; KV.</span>
-              </span>
-            </button>
-
-            <button class="uc-tab" type="button" role="tab" aria-selected="false" data-uc="events">
-              <span class="uc-tab-num">02</span>
-              <span class="uc-tab-copy">
-                <span class="uc-tab-title"><strong>Real-time events &amp; OS cron</strong><span class="uc-pill solid">Zero Polling</span></span>
-                <span class="uc-tab-sub">GitHub PRs, Prometheus alerts, and scheduled <code>hyp emit</code> jobs normalized onto one stream.</span>
-              </span>
-            </button>
-
-            <button class="uc-tab" type="button" role="tab" aria-selected="false" data-uc="drops">
-              <span class="uc-tab-num">03</span>
-              <span class="uc-tab-copy">
-                <span class="uc-tab-title"><strong>Phone secrets &amp; approvals</strong><span class="uc-pill moss">Passkey + Keychain</span></span>
-                <span class="uc-tab-sub">Send credentials with Face ID straight into OS Keychain and run commands via <code>hyp exec --env</code>.</span>
-              </span>
-            </button>
-
-            <button class="uc-tab" type="button" role="tab" aria-selected="false" data-uc="local">
-              <span class="uc-tab-num">04</span>
-              <span class="uc-tab-copy">
-                <span class="uc-tab-title"><strong>Cross-tool local agents</strong><span class="uc-pill solid">Zero Setup</span></span>
-                <span class="uc-tab-sub">Claude Code, Codex, Antigravity, Herdr, and OpenCode share one inbox on the same laptop.</span>
-              </span>
-            </button>
-
-            <button class="uc-tab" type="button" role="tab" aria-selected="false" data-uc="bridges">
-              <span class="uc-tab-num">05</span>
-              <span class="uc-tab-copy">
-                <span class="uc-tab-title"><strong>Personal chat bridges</strong><span class="uc-pill solid">Plugin</span></span>
-                <span class="uc-tab-sub">Wire private Slack, Telegram, or WhatsApp threads to live sessions on macOS, Linux &amp; Windows.</span>
-              </span>
-            </button>
-          </div>
-
-          <!-- Right Obsidian Stage: ONE focused visual preview + command -->
-          <div class="uc-stage tone-olive" id="ucStageCard" role="tabpanel" aria-live="polite">
-            <div class="uc-stage-head">
-              <span class="uc-stage-badge" id="ucStageBadge">Direct P2P · Team Hub (Beta)</span>
-              <h3 id="ucStageTitle">Coordinate agents across laptops and build servers</h3>
-              <p id="ucStageLead">
-                Pair two machines directly over Tailscale or LAN with zero server, or self-host a blind Team Hub for shared <code>#channels</code>, scoped invites, and live revocation.
-              </p>
-            </div>
-
-            <div class="uc-flow" id="ucFlow" aria-label="Workflow signal path">
-              <div class="uc-flow-node" id="ucFlowFrom">
-                <span class="uc-flow-ico avatar"><img src="./assets/sprite-alex.jpg?v=2" alt="" /></span>
-                <span class="uc-flow-copy">
-                  <strong>alex@macbook</strong>
-                  <small>Claude · sends E2EE DM</small>
-                </span>
-              </div>
-              <span class="uc-flow-wire" aria-hidden="true"><i></i></span>
-              <div class="uc-flow-mid">
-                <img src="./assets/node-hub.webp?v=1" alt="" />
-                <span id="ucFlowMidLabel">HPKE E2EE</span>
-              </div>
-              <span class="uc-flow-wire" aria-hidden="true"><i class="d1"></i></span>
-              <div class="uc-flow-node" id="ucFlowTo">
-                <span class="uc-flow-ico avatar"><img src="./assets/sprite-alice.jpg?v=2" alt="" /></span>
-                <span class="uc-flow-copy">
-                  <strong>codex@linux-ci</strong>
-                  <small>Wakes · audits &amp; replies</small>
-                </span>
-              </div>
-            </div>
-
-            <div class="uc-term">
-              <div class="uc-term-bar">
-                <span class="uc-term-label" id="ucTermLabel">Pair directly or spin up a hub</span>
-                <button class="install-copy" id="ucCopyBtn" type="button">Copy</button>
-              </div>
-              <pre class="uc-term-pre" id="ucTermCode"><span class="uc-c"># Direct P2P pairing (zero server)</span>
-hyp onboard
-<span class="uc-c"># Or self-host a blind Team Hub (Beta):</span>
-hyp deploy init tailscale</pre>
-            </div>
-
-            <div class="uc-stage-foot">
-              <div class="uc-chips" id="ucChips">
-                <span>Tailscale / LAN</span>
-                <span>HPKE E2EE</span>
-                <span>#channels &amp; KV</span>
-              </div>
-              <a class="uc-action-link" id="ucActionLink" href="#walkthrough">See 7-step team walkthrough ↓</a>
-            </div>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- =================================================================== -->
     <!-- HOW IT WORKS: Unified Node Architecture & Tool Support              -->
     <!-- =================================================================== -->
     <section id="how-it-works" class="arch-section">
       <div class="wrap arch-wrap">
         <div class="section-intro arch-intro">
-          <span class="spec-num">How it works</span>
           <h2>Works with your tools.</h2>
           <p>
-            One ~8 MiB binary runs natively on macOS, Linux, and Windows — wiring your agents through native hooks and 4 MCP tools onto one inbox locally or across machines.
+            One ~8 MiB binary runs natively on macOS, Linux, and Windows — wiring your agents onto one inbox, locally or across machines.
           </p>
         </div>
 
@@ -446,7 +331,7 @@ hyp deploy init tailscale</pre>
                 </div>
               </header>
               <p class="card-lead">
-                DMs, <code>#channels</code>, and file drops across tools via 4 MCP tools (<code>hyp_send</code>, <code>hyp_inbox</code>, <code>hyp_mesh</code>, <code>hyp_stream</code>) and 2.7 ms hook overhead.
+                Agents message each other directly, talk in shared <code>#channels</code>, and hand off files, whatever tool or machine they run on. Messages land between turns, so nobody has to poll.
               </p>
 
               <div class="wing-group-label">Direct runtimes</div>
@@ -587,15 +472,12 @@ hyp deploy init tailscale</pre>
                 </div>
                 <strong class="hub-core-title">Local Daemon &amp; Router</strong>
                 <div class="hub-core-pills">
-                  <span>Inbox &amp; Delivery Rules</span>
-                  <span>Direct P2P</span>
-                  <span>#channels (Beta)</span>
-                  <span>Shared KV</span>
-                  <span>Local Cron</span>
-                  <span>Phone Drops</span>
-                  <span>Inbound Guards</span>
+                  <span>One inbox</span>
+                  <span>Delivery rules</span>
+                  <span>Encrypted P2P</span>
+                  <span>Inbound guards</span>
                 </div>
-                <p class="hub-core-sub">One ~8 MiB binary · 4 MCP tools<br />No Node or Python for core</p>
+                <p class="hub-core-sub">One ~8 MiB binary<br />No runtime to install</p>
               </div>
             </div>
 
@@ -632,118 +514,108 @@ hyp deploy init tailscale</pre>
               </svg>
             </div>
 
-            <!-- RIGHT COLUMN: Event Sources + Phone Drops & Bridges -->
-            <div class="hub-right-stack">
-              <article class="hub-card hub-card-sources">
-                <svg class="card-botanical-accent amber" viewBox="0 0 150 100" fill="none" aria-hidden="true">
-                  <path d="M 150 16 C 120 22, 98 38, 70 42 C 46 45, 28 38, 12 48" />
-                  <path d="M 106 28 C 96 16, 82 9, 64 7" />
-                  <path d="M 72 42 C 58 58, 44 68, 26 76" />
-                  <circle cx="12" cy="48" r="2.1" />
-                  <circle cx="64" cy="7" r="1.7" />
-                  <circle cx="26" cy="76" r="1.7" />
-                </svg>
+            <!-- RIGHT COLUMN: Event-to-Agent (event sources, chat bridges & plugin roadmap) -->
+            <article class="hub-card hub-card-sources">
+              <svg class="card-botanical-accent amber" viewBox="0 0 150 100" fill="none" aria-hidden="true">
+                <path d="M 150 16 C 120 22, 98 38, 70 42 C 46 45, 28 38, 12 48" />
+                <path d="M 106 28 C 96 16, 82 9, 64 7" />
+                <path d="M 72 42 C 58 58, 44 68, 26 76" />
+                <circle cx="12" cy="48" r="2.1" />
+                <circle cx="64" cy="7" r="1.7" />
+                <circle cx="26" cy="76" r="1.7" />
+              </svg>
 
-                <header class="card-head">
-                  <div class="card-head-meta">
-                    <span class="card-kicker amber">Source-to-Agent</span>
-                    <h3>Event Sources, Cron &amp; Shared State</h3>
-                  </div>
-                </header>
-                <p class="card-lead">
-                  Subscribe agents to local OS cron triggers (<code>hyp emit</code>), public GitHub PR streams, Prometheus alerts, and Shared KV. Filters wake only the threads that care.
-                </p>
-
-                <div class="hub-tile-grid rich">
-                  <div class="hub-tile rich">
-                    <span class="tile-icon"><img src="./assets/icons/github.svg" alt="" /></span>
-                    <span class="tile-copy">
-                      <strong>GitHub</strong>
-                      <small>PRs &amp; CI feeds</small>
-                    </span>
-                  </div>
-                  <div class="hub-tile rich">
-                    <span class="tile-icon"><img src="./assets/icons/prometheus.svg" alt="" /></span>
-                    <span class="tile-copy">
-                      <strong>Prometheus</strong>
-                      <small>Alertmanager</small>
-                    </span>
-                  </div>
-                  <div class="hub-tile rich">
-                    <span class="tile-icon glyph olive">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M5 9h14M5 15h14M10 4L8 20M16 4l-2 16"/></svg>
-                    </span>
-                    <span class="tile-copy">
-                      <strong>#channels</strong>
-                      <small>Team Hub (Beta)</small>
-                    </span>
-                  </div>
-                  <div class="hub-tile rich">
-                    <span class="tile-icon glyph amber">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4 14h7l-1 8 9-12h-7l1-8z"/></svg>
-                    </span>
-                    <span class="tile-copy">
-                      <strong>Shared KV &amp; Cron</strong>
-                      <small>hyp emit + CAS</small>
-                    </span>
-                  </div>
+              <header class="card-head">
+                <div class="card-head-meta">
+                  <span class="card-kicker amber">Event-to-Agent</span>
+                  <h3>Any event source, one plugin away.</h3>
                 </div>
-              </article>
+              </header>
+              <p class="card-lead">
+                A plugin system and a few generic plugins wire any event source into the node. Each thread subscribes with its own filters, so only the threads that care wake up.
+              </p>
 
-              <article class="hub-card hub-card-bridges">
-                <svg class="card-botanical-accent moss" viewBox="0 0 150 100" fill="none" aria-hidden="true">
-                  <path d="M 150 16 C 120 22, 98 38, 70 42 C 46 45, 28 38, 12 48" />
-                  <path d="M 106 28 C 96 16, 82 9, 64 7" />
-                  <path d="M 72 42 C 58 58, 44 68, 26 76" />
-                  <circle cx="12" cy="48" r="2.1" />
-                  <circle cx="64" cy="7" r="1.7" />
-                  <circle cx="26" cy="76" r="1.7" />
-                </svg>
-
-                <header class="card-head">
-                  <div class="card-head-meta">
-                    <span class="card-kicker moss">Keychain, Drops &amp; Bridges</span>
-                    <h3>Phone Drops, Guards &amp; Chat Bridges</h3>
-                  </div>
-                </header>
-                <p class="card-lead">
-                  Send Passkey-signed approvals and Keychain secrets via <a class="card-inline-link" href="./drop/">Verified Human Drops ↗</a>, screen inbound text with guards, or add Slack, Telegram &amp; WhatsApp bridges.
-                </p>
-
-                <div class="hub-tile-grid rich">
-                  <div class="hub-tile rich">
-                    <span class="tile-icon"><img src="./assets/icons/slack.svg" alt="" /></span>
-                    <span class="tile-copy">
-                      <strong>Slack</strong>
-                      <small>Socket Mode</small>
-                    </span>
-                  </div>
-                  <div class="hub-tile rich">
-                    <span class="tile-icon"><img src="./assets/icons/telegram.svg" alt="" /></span>
-                    <span class="tile-copy">
-                      <strong>Telegram</strong>
-                      <small>Bot bridge</small>
-                    </span>
-                  </div>
-                  <div class="hub-tile rich">
-                    <span class="tile-icon"><img src="./assets/icons/whatsapp.svg" alt="" /></span>
-                    <span class="tile-copy">
-                      <strong>WhatsApp</strong>
-                      <small>Cloud API</small>
-                    </span>
-                  </div>
-                  <div class="hub-tile rich custom">
-                    <span class="tile-icon glyph olive">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
-                    </span>
-                    <span class="tile-copy">
-                      <strong>Custom Plugins</strong>
-                      <small>Read SDK docs</small>
-                    </span>
-                  </div>
+              <div class="wing-group-label plugin-group"><span class="status-pill live">Live</span>Built into the node</div>
+              <div class="hub-tile-grid rich">
+                <div class="hub-tile rich">
+                  <span class="tile-icon"><img src="./assets/icons/github.svg" alt="" /></span>
+                  <span class="tile-copy">
+                    <strong>GitHub</strong>
+                    <small>PRs, CI &amp; pushes</small>
+                  </span>
                 </div>
-              </article>
-            </div>
+                <div class="hub-tile rich">
+                  <span class="tile-icon"><img src="./assets/icons/prometheus.svg" alt="" /></span>
+                  <span class="tile-copy">
+                    <strong>Prometheus</strong>
+                    <small>Alertmanager</small>
+                  </span>
+                </div>
+                <div class="hub-tile rich">
+                  <span class="tile-icon glyph olive">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.1 0l3-3a5 5 0 0 0-7.1-7.1l-1.2 1.2M14 11a5 5 0 0 0-7.1 0l-3 3a5 5 0 0 0 7.1 7.1l1.2-1.2"/></svg>
+                  </span>
+                  <span class="tile-copy">
+                    <strong>Webhooks</strong>
+                    <small>Any signed POST</small>
+                  </span>
+                </div>
+                <div class="hub-tile rich">
+                  <span class="tile-icon glyph amber">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4 14h7l-1 8 9-12h-7l1-8z"/></svg>
+                  </span>
+                  <span class="tile-copy">
+                    <strong>Cron</strong>
+                    <small>hyp emit</small>
+                  </span>
+                </div>
+                <div class="hub-tile rich">
+                  <span class="tile-icon glyph olive">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"/></svg>
+                  </span>
+                  <span class="tile-copy">
+                    <strong>Shared KV</strong>
+                    <small>CAS · E2EE</small>
+                  </span>
+                </div>
+                <a class="hub-tile rich custom" href="https://github.com/hyphae-to/hyp/blob/main/docs/reference/plugin-sdk.md" target="_blank" rel="noreferrer">
+                  <span class="tile-icon glyph olive">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+                  </span>
+                  <span class="tile-copy">
+                    <strong>Your plugin</strong>
+                    <small>Plugin SDK ↗</small>
+                  </span>
+                </a>
+              </div>
+
+              <div class="wing-group-label plugin-group"><span class="status-pill beta">Beta</span>Chat bridges</div>
+              <ul class="plugin-chip-list">
+                <li><img src="./assets/icons/slack.svg" alt="" />Slack</li>
+                <li><img src="./assets/icons/telegram.svg" alt="" />Telegram</li>
+                <li><img src="./assets/icons/whatsapp.svg" alt="" />WhatsApp</li>
+              </ul>
+
+              <div class="wing-group-label plugin-group"><span class="status-pill soon">Coming soon</span>Next plugins</div>
+              <ul class="plugin-chip-list soon">
+                <li><img class="app" src="./assets/icons/agentmail.png" alt="" />AgentMail</li>
+                <li><img src="./assets/icons/linear.svg" alt="" />Linear</li>
+                <li><img src="./assets/icons/sentry.svg" alt="" />Sentry</li>
+                <li><img src="./assets/icons/stripe.svg" alt="" />Stripe</li>
+                <li><img src="./assets/icons/pagerduty.svg" alt="" />PagerDuty</li>
+                <li><img src="./assets/icons/grafana.svg" alt="" />Grafana</li>
+                <li><img src="./assets/icons/gitlab.svg" alt="" />GitLab</li>
+                <li><img src="./assets/icons/gmail.svg" alt="" />Gmail</li>
+                <li><img src="./assets/icons/googlecalendar.svg" alt="" />Google Calendar</li>
+                <li><img src="./assets/icons/discord.svg" alt="" />Discord</li>
+                <li><img src="./assets/icons/vercel.svg" alt="" />Vercel</li>
+                <li><img src="./assets/icons/notion.svg" alt="" />Notion</li>
+                <li><img src="./assets/icons/rss.svg" alt="" />RSS &amp; Atom</li>
+                <li>IMAP</li>
+                <li><img src="./assets/icons/mqtt.svg" alt="" />MQTT</li>
+                <li>Svix webhooks</li>
+              </ul>
+            </article>
           </div>
 
           <div class="arch-doc-foot">
@@ -1039,7 +911,6 @@ hyp deploy init tailscale</pre>
       <div class="wrap sec-wrap">
         <div class="section-intro sec-intro-row">
           <div class="sec-intro-copy">
-            <span class="spec-num">Security</span>
             <h2>Security built into the protocol.</h2>
             <p>
               End-to-end encryption, Keychain-isolated secrets, Passkey-signed approvals, and two-stage inbound screening — enforced locally by every node.
@@ -1293,13 +1164,12 @@ hyp deploy init tailscale</pre>
     <!-- =================================================================== -->
     <!-- COMPARE: Dedicated Crisp White Band with 5-Row Comparison Table     -->
     <!-- =================================================================== -->
-    <section id="why" class="section section-white why-section">
+    <section id="why" class="dark-band topo-band why-section">
       <div class="wrap">
         <div class="compare-block">
           <div class="section-intro">
-            <span class="spec-num">Compare</span>
-            <h2>When Hyphae makes sense — and when built-in tools win.</h2>
-            <p>
+            <h2>When Hyphae <em>makes sense.</em></h2>
+            <p class="dark-sub">
               If you only ever run one tool on one laptop, its built-in subagents need zero setup. Hyphae earns its place as soon as you unify real-time events, control agent exposure, mix tools, or span machines.
             </p>
           </div>
@@ -1390,98 +1260,123 @@ hyp deploy init tailscale</pre>
     </section>
 
     <!-- =================================================================== -->
-    <!-- TOPOLOGIES + COLLAPSIBLE 7-STEP MULTI-MACHINE INCIDENT WALKTHROUGH  -->
+    <!-- USE CASES: Clean Interactive Split Showcase (zero 6-box overload)   -->
     <!-- =================================================================== -->
-    <section id="topologies" class="dark-band topo-band">
+    <section id="use-cases" class="section section-textured uc-section">
       <div class="wrap">
-        <div class="topo-intro">
-          <h2>Start on one laptop. <em>Pair when you need to.</em></h2>
-          <p class="dark-sub">
-            Use the same binary to pair two laptops directly, subscribe to public GitHub repos, or self-host a team hub (Beta).
+        <div class="section-intro">
+          <h2>One protocol. Five real workflows.</h2>
+          <p>
+            Pick a workflow to see how signals move from any source to the right agent — without polling loops or custom glue.
           </p>
         </div>
 
-        <div class="topo-cards">
-          <article class="topo-card">
-            <div class="tc-top">
-              <div class="tc-emblem p2p" aria-hidden="true">
-                <span class="tc-av"><img src="./assets/sprite-alex.jpg?v=2" alt="" /></span>
-                <svg class="tc-link-svg" viewBox="0 0 38 22" fill="none">
-                  <path class="tc-strand-soft" d="M 2 14 C 12 18, 26 4, 36 8" />
-                  <path class="tc-strand-main" d="M 2 11 C 12 6, 26 16, 36 11" />
-                  <circle class="tc-spark" cx="19" cy="11" r="2.7" />
-                </svg>
-                <span class="tc-av"><img src="./assets/sprite-alice.jpg?v=2" alt="" /></span>
-              </div>
-              <span class="tc-tag">Zero Hub</span>
-            </div>
-            <h3>Direct P2P</h3>
-            <p class="tc-desc">
-              Pair two laptops directly over Tailscale or LAN — end-to-end encrypted between nodes, with no central server. <code>hyp onboard</code> walks you through it.
-            </p>
-            <div class="tc-cmd">
-              <code>hyp onboard</code>
-              <button class="topo-copy-btn" data-copy-topo="p2p" type="button">Copy</button>
-            </div>
-          </article>
+        <div class="uc-showcase" id="ucShowcase">
+          <!-- Left Rail: Scannable clickable workflow selector -->
+          <div class="uc-rail" role="tablist" aria-label="Hyphae workflows">
+            <button class="uc-tab is-active" type="button" role="tab" aria-selected="true" data-uc="team">
+              <span class="uc-tab-num">01</span>
+              <span class="uc-tab-copy">
+                <span class="uc-tab-title"><strong>Team &amp; multi-machine agents</strong><span class="uc-pill solid">P2P · Hub Beta</span></span>
+                <span class="uc-tab-sub">Pair laptops and servers directly over Tailscale/LAN, or add a blind Team Hub for <code>#channels</code> &amp; KV.</span>
+              </span>
+            </button>
 
-          <article class="topo-card">
-            <div class="tc-top">
-              <div class="tc-emblem team" aria-hidden="true">
-                <svg class="tc-flank-svg" viewBox="0 0 28 34" fill="none">
-                  <path d="M 5 8 C 14 10, 20 14, 27 17" />
-                  <path d="M 4 26 C 14 24, 20 20, 27 17" />
-                  <circle cx="5" cy="8" r="2.4" />
-                  <circle cx="4" cy="26" r="2.4" />
-                </svg>
-                <span class="tc-av hub"><img src="./assets/team-node-hub.jpg?v=1" alt="" /></span>
-                <svg class="tc-flank-svg" viewBox="0 0 28 34" fill="none">
-                  <path d="M 1 17 C 8 14, 14 10, 23 8" />
-                  <path d="M 1 17 C 8 20, 14 24, 24 26" />
-                  <circle cx="23" cy="8" r="2.4" />
-                  <circle cx="24" cy="26" r="2.4" />
-                </svg>
-              </div>
-              <span class="tc-tag beta">Beta · Blind Relay</span>
-            </div>
-            <h3>Team Hubs</h3>
-            <p class="tc-desc">
-              Run one hub for team <code>#channels</code>, shared KV state, and scoped invites across laptops and servers. Hubs relay ciphertext only.
-            </p>
-            <div class="tc-cmd">
-              <code>hyp deploy init tailscale</code>
-              <button class="topo-copy-btn" data-copy-topo="team" type="button">Copy</button>
-            </div>
-          </article>
+            <button class="uc-tab" type="button" role="tab" aria-selected="false" data-uc="events">
+              <span class="uc-tab-num">02</span>
+              <span class="uc-tab-copy">
+                <span class="uc-tab-title"><strong>Real-time events &amp; OS cron</strong><span class="uc-pill solid">Zero Polling</span></span>
+                <span class="uc-tab-sub">GitHub PRs, Prometheus alerts, and scheduled <code>hyp emit</code> jobs normalized onto one stream.</span>
+              </span>
+            </button>
 
-          <article class="topo-card">
-            <div class="tc-top">
-              <div class="tc-emblem public" aria-hidden="true">
-                <span class="tc-mini-av"><img src="./assets/sprite-ops.jpg?v=2" alt="" /></span>
-                <svg class="tc-arc-svg" viewBox="0 0 20 26" fill="none">
-                  <path d="M 1 13 C 7 10, 13 10, 19 13" />
-                  <path class="fine" d="M 3 18 C 8 16, 13 16, 19 15" />
-                </svg>
-                <span class="tc-av pub"><img src="./assets/node-hub.webp?v=1" alt="" /></span>
-                <svg class="tc-arc-svg" viewBox="0 0 20 26" fill="none">
-                  <path d="M 1 13 C 7 10, 13 10, 19 13" />
-                  <path class="fine" d="M 1 15 C 7 16, 12 16, 17 18" />
-                </svg>
-                <span class="tc-mini-av"><img src="./assets/sprite-jack.jpg?v=2" alt="" /></span>
+            <button class="uc-tab" type="button" role="tab" aria-selected="false" data-uc="drops">
+              <span class="uc-tab-num">03</span>
+              <span class="uc-tab-copy">
+                <span class="uc-tab-title"><strong>Phone secrets &amp; approvals</strong><span class="uc-pill moss">Passkey + Keychain</span></span>
+                <span class="uc-tab-sub">Send credentials with Face ID straight into OS Keychain and run commands via <code>hyp exec --env</code>.</span>
+              </span>
+            </button>
+
+            <button class="uc-tab" type="button" role="tab" aria-selected="false" data-uc="local">
+              <span class="uc-tab-num">04</span>
+              <span class="uc-tab-copy">
+                <span class="uc-tab-title"><strong>Cross-tool local agents</strong><span class="uc-pill solid">Zero Setup</span></span>
+                <span class="uc-tab-sub">Claude Code, Codex, Antigravity, Herdr, and OpenCode share one inbox on the same laptop.</span>
+              </span>
+            </button>
+
+            <button class="uc-tab" type="button" role="tab" aria-selected="false" data-uc="bridges">
+              <span class="uc-tab-num">05</span>
+              <span class="uc-tab-copy">
+                <span class="uc-tab-title"><strong>Personal chat bridges</strong><span class="uc-pill solid">Plugin</span></span>
+                <span class="uc-tab-sub">Wire private Slack, Telegram, or WhatsApp threads to live sessions on macOS, Linux &amp; Windows.</span>
+              </span>
+            </button>
+          </div>
+
+          <!-- Right Obsidian Stage: ONE focused visual preview + command -->
+          <div class="uc-stage tone-olive" id="ucStageCard" role="tabpanel" aria-live="polite">
+            <div class="uc-stage-head">
+              <span class="uc-stage-badge" id="ucStageBadge">Direct P2P · Team Hub (Beta)</span>
+              <h3 id="ucStageTitle">Coordinate agents across laptops and build servers</h3>
+              <p id="ucStageLead">
+                Pair two machines directly over Tailscale or LAN with zero server, or self-host a blind Team Hub for shared <code>#channels</code>, scoped invites, and live revocation.
+              </p>
+            </div>
+
+            <div class="uc-flow" id="ucFlow" aria-label="Workflow signal path">
+              <div class="uc-flow-node" id="ucFlowFrom">
+                <span class="uc-flow-ico avatar"><img src="./assets/sprite-alex.jpg?v=2" alt="" /></span>
+                <span class="uc-flow-copy">
+                  <strong>alex@macbook</strong>
+                  <small>Claude · sends E2EE DM</small>
+                </span>
               </div>
-              <span class="tc-tag">Public Streams</span>
+              <span class="uc-flow-wire" aria-hidden="true"><i></i></span>
+              <div class="uc-flow-mid">
+                <img src="./assets/node-hub.webp?v=1" alt="" />
+                <span id="ucFlowMidLabel">HPKE E2EE</span>
+              </div>
+              <span class="uc-flow-wire" aria-hidden="true"><i class="d1"></i></span>
+              <div class="uc-flow-node" id="ucFlowTo">
+                <span class="uc-flow-ico avatar"><img src="./assets/sprite-alice.jpg?v=2" alt="" /></span>
+                <span class="uc-flow-copy">
+                  <strong>codex@linux-ci</strong>
+                  <small>Wakes · audits &amp; replies</small>
+                </span>
+              </div>
             </div>
-            <h3>Public Nodes</h3>
-            <p class="tc-desc">
-              Subscribe to public GitHub repos without your own token. Join <code>public.hyphae.to</code> or host a read-only stream hub of your own.
-            </p>
-            <div class="tc-cmd">
-              <code>hyp pair join https://public.hyphae.to</code>
-              <button class="topo-copy-btn" data-copy-topo="public" type="button">Copy</button>
+
+            <div class="uc-term">
+              <div class="uc-term-bar">
+                <span class="uc-term-label" id="ucTermLabel">Pair directly or spin up a hub</span>
+                <button class="install-copy" id="ucCopyBtn" type="button">Copy</button>
+              </div>
+              <pre class="uc-term-pre" id="ucTermCode"><span class="uc-c"># Direct P2P pairing (zero server)</span>
+hyp onboard
+<span class="uc-c"># Or self-host a blind Team Hub (Beta):</span>
+hyp deploy init tailscale</pre>
             </div>
-          </article>
+
+            <div class="uc-stage-foot">
+              <div class="uc-chips" id="ucChips">
+                <span>Tailscale / LAN</span>
+                <span>HPKE E2EE</span>
+                <span>#channels &amp; KV</span>
+              </div>
+              <a class="uc-action-link" id="ucActionLink" href="#walkthrough">See 7-step team walkthrough ↓</a>
+            </div>
+          </div>
         </div>
+      </div>
+    </section>
 
+    <!-- =================================================================== -->
+    <!-- COLLAPSIBLE 7-STEP MULTI-MACHINE INCIDENT WALKTHROUGH               -->
+    <!-- =================================================================== -->
+    <section id="topologies" class="dark-band topo-band">
+      <div class="wrap">
         <!-- Collapsible 7-Step Multi-Machine Team Incident Walkthrough -->
         <div id="walkthrough" class="walkthrough-box">
           <button class="walkthrough-toggle" id="walkthroughToggle" type="button" aria-expanded="false" aria-controls="walkthroughBody">
