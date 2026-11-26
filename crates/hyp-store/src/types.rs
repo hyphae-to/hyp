@@ -649,380 +649,172 @@ pub enum AckOutcome {
     },
 }
 
-/// Session & subscription delivery mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DeliveryMode {
-    Full,
-    Notify,
+/// Defines a store enum whose SQLite and JSON string representations are identical.
+macro_rules! string_enum {
+    (
+        $(#[$attr:meta])* pub enum $name:ident { $($variant:ident => $token:literal),+ $(,)? }
+        $error:ident: $label:literal;
+    ) => {
+        $(#[$attr])*
+        pub enum $name {
+            $(#[serde(rename = $token)] $variant),+
+        }
+
+        impl $name {
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $token),+
+                }
+            }
+
+            pub fn parse(raw: &str) -> $crate::error::StoreResult<Self> {
+                match raw {
+                    $($token => Ok(Self::$variant),)+
+                    other => Err($crate::error::StoreError::$error(format!(
+                        concat!("invalid ", $label, " '{}'"), other
+                    ))),
+                }
+            }
+        }
+    };
+}
+pub(crate) use string_enum;
+
+string_enum! {
+    /// Session & subscription delivery mode.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum DeliveryMode {
+        Full => "full",
+        Notify => "notify",
+    }
+    InvalidInput: "delivery mode";
 }
 
-impl DeliveryMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Full => "full",
-            Self::Notify => "notify",
-        }
+string_enum! {
+    /// Local Security Gate state for a mailbox entry.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum GateState {
+        Pending => "pending",
+        Delivered => "delivered",
+        Quarantined => "quarantined",
+        Rejected => "rejected",
     }
-
-    pub fn parse(s: &str) -> StoreResult<Self> {
-        match s {
-            "full" => Ok(Self::Full),
-            "notify" => Ok(Self::Notify),
-            other => Err(StoreError::InvalidInput(format!(
-                "invalid delivery mode '{other}'"
-            ))),
-        }
-    }
+    InvalidInput: "gate state";
 }
 
-/// Local Security Gate state for a mailbox entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum GateState {
-    Pending,
-    Delivered,
-    Quarantined,
-    Rejected,
+string_enum! {
+    /// Security Gate decision recorded in the immutable `gate_audit` log.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum GateDecision {
+        Allow => "allow",
+        Quarantine => "quarantine",
+        Block => "block",
+        Error => "error",
+    }
+    InvalidInput: "gate decision";
 }
 
-impl GateState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Delivered => "delivered",
-            Self::Quarantined => "quarantined",
-            Self::Rejected => "rejected",
-        }
+string_enum! {
+    /// Direction of a Security Gate audit event.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum GateDirection {
+        Inbound => "inbound",
+        Outbound => "outbound",
+        Review => "review",
     }
-
-    pub fn parse(s: &str) -> StoreResult<Self> {
-        match s {
-            "pending" => Ok(Self::Pending),
-            "delivered" => Ok(Self::Delivered),
-            "quarantined" => Ok(Self::Quarantined),
-            "rejected" => Ok(Self::Rejected),
-            other => Err(StoreError::InvalidInput(format!(
-                "invalid gate state '{other}'"
-            ))),
-        }
-    }
+    InvalidInput: "gate direction";
 }
 
-/// Security Gate decision recorded in the immutable `gate_audit` log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum GateDecision {
-    Allow,
-    Quarantine,
-    Block,
-    Error,
+string_enum! {
+    /// Kind of item parked in a local session mailbox.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum MailboxKind {
+        Message => "message",
+        Event => "event",
+        Plugin => "plugin",
+        Transfer => "transfer",
+        Kv => "kv",
+    }
+    InvalidInput: "mailbox kind";
 }
 
-impl GateDecision {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Allow => "allow",
-            Self::Quarantine => "quarantine",
-            Self::Block => "block",
-            Self::Error => "error",
-        }
+string_enum! {
+    /// Shared KV write concurrency/authorization model.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum WriteModel {
+        Owner => "owner",
+        Shared => "shared",
+        Allowlist => "allowlist",
     }
-
-    pub fn parse(s: &str) -> StoreResult<Self> {
-        match s {
-            "allow" => Ok(Self::Allow),
-            "quarantine" => Ok(Self::Quarantine),
-            "block" => Ok(Self::Block),
-            "error" => Ok(Self::Error),
-            other => Err(StoreError::InvalidInput(format!(
-                "invalid gate decision '{other}'"
-            ))),
-        }
-    }
+    InvalidInput: "kv write model";
 }
 
-/// Direction of a Security Gate audit event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum GateDirection {
-    Inbound,
-    Outbound,
-    Review,
+string_enum! {
+    /// Node configuration profile for a paired peer.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum PeerProfile {
+        Local => "local",
+        Router => "router",
+        P2p => "p2p",
+    }
+    InvalidInput: "peer profile";
 }
 
-impl GateDirection {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Inbound => "inbound",
-            Self::Outbound => "outbound",
-            Self::Review => "review",
-        }
+string_enum! {
+    /// Peer trust tier used for pairing scopes and Security Gate defaults.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum TrustTier {
+        SelfNode => "self",
+        Org => "org",
+        Peer => "peer",
+        Guest => "guest",
     }
-
-    pub fn parse(s: &str) -> StoreResult<Self> {
-        match s {
-            "inbound" => Ok(Self::Inbound),
-            "outbound" => Ok(Self::Outbound),
-            "review" => Ok(Self::Review),
-            other => Err(StoreError::InvalidInput(format!(
-                "invalid gate direction '{other}'"
-            ))),
-        }
-    }
+    InvalidInput: "trust tier";
 }
 
-/// Kind of item parked in a local session mailbox.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MailboxKind {
-    Message,
-    Event,
-    Plugin,
-    Transfer,
-    Kv,
+string_enum! {
+    /// Lifecycle state of a paired peer.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum PeerStatus {
+        Pending => "pending",
+        Active => "active",
+        Paused => "paused",
+        Revoked => "revoked",
+    }
+    InvalidInput: "peer status";
 }
 
-impl MailboxKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Message => "message",
-            Self::Event => "event",
-            Self::Plugin => "plugin",
-            Self::Transfer => "transfer",
-            Self::Kv => "kv",
-        }
+string_enum! {
+    /// Direction of a stored grant relative to this node.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum GrantDirection {
+        Inbound => "inbound",
+        Outbound => "outbound",
     }
-
-    pub fn parse(s: &str) -> StoreResult<Self> {
-        match s {
-            "message" => Ok(Self::Message),
-            "event" => Ok(Self::Event),
-            "plugin" => Ok(Self::Plugin),
-            "transfer" => Ok(Self::Transfer),
-            "kv" => Ok(Self::Kv),
-            other => Err(StoreError::InvalidInput(format!(
-                "invalid mailbox kind '{other}'"
-            ))),
-        }
-    }
+    InvalidInput: "grant direction";
 }
 
-/// Shared KV write concurrency/authorization model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum WriteModel {
-    Owner,
-    Shared,
-    Allowlist,
+string_enum! {
+    /// Key purpose in `peer_keys`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum KeyUse {
+        Signing => "signing",
+        Encryption => "encryption",
+        Prekey => "prekey",
+        Admin => "admin",
+    }
+    InvalidInput: "key use";
 }
 
-impl WriteModel {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Owner => "owner",
-            Self::Shared => "shared",
-            Self::Allowlist => "allowlist",
-        }
+string_enum! {
+    /// Lifecycle state of a peer JWK in `peer_keys`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum KeyStatus {
+        Active => "active",
+        Retired => "retired",
+        Revoked => "revoked",
     }
-
-    pub fn parse(s: &str) -> StoreResult<Self> {
-        match s {
-            "owner" => Ok(Self::Owner),
-            "shared" => Ok(Self::Shared),
-            "allowlist" => Ok(Self::Allowlist),
-            other => Err(StoreError::InvalidInput(format!(
-                "invalid kv write model '{other}'"
-            ))),
-        }
-    }
-}
-
-/// Node configuration profile for a paired peer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PeerProfile {
-    Local,
-    Router,
-    P2p,
-}
-
-impl PeerProfile {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Local => "local",
-            Self::Router => "router",
-            Self::P2p => "p2p",
-        }
-    }
-
-    pub fn parse(s: &str) -> StoreResult<Self> {
-        match s {
-            "local" => Ok(Self::Local),
-            "router" => Ok(Self::Router),
-            "p2p" => Ok(Self::P2p),
-            other => Err(StoreError::InvalidInput(format!(
-                "invalid peer profile '{other}'"
-            ))),
-        }
-    }
-}
-
-/// Peer trust tier used for pairing scopes and Security Gate defaults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TrustTier {
-    #[serde(rename = "self")]
-    SelfNode,
-    Org,
-    Peer,
-    Guest,
-}
-
-impl TrustTier {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::SelfNode => "self",
-            Self::Org => "org",
-            Self::Peer => "peer",
-            Self::Guest => "guest",
-        }
-    }
-
-    pub fn parse(s: &str) -> StoreResult<Self> {
-        match s {
-            "self" => Ok(Self::SelfNode),
-            "org" => Ok(Self::Org),
-            "peer" => Ok(Self::Peer),
-            "guest" => Ok(Self::Guest),
-            other => Err(StoreError::InvalidInput(format!(
-                "invalid trust tier '{other}'"
-            ))),
-        }
-    }
-}
-
-/// Lifecycle state of a paired peer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PeerStatus {
-    Pending,
-    Active,
-    Paused,
-    Revoked,
-}
-
-impl PeerStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Active => "active",
-            Self::Paused => "paused",
-            Self::Revoked => "revoked",
-        }
-    }
-
-    pub fn parse(s: &str) -> StoreResult<Self> {
-        match s {
-            "pending" => Ok(Self::Pending),
-            "active" => Ok(Self::Active),
-            "paused" => Ok(Self::Paused),
-            "revoked" => Ok(Self::Revoked),
-            other => Err(StoreError::InvalidInput(format!(
-                "invalid peer status '{other}'"
-            ))),
-        }
-    }
-}
-
-/// Direction of a stored grant relative to this node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum GrantDirection {
-    Inbound,
-    Outbound,
-}
-
-impl GrantDirection {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Inbound => "inbound",
-            Self::Outbound => "outbound",
-        }
-    }
-
-    pub fn parse(s: &str) -> StoreResult<Self> {
-        match s {
-            "inbound" => Ok(Self::Inbound),
-            "outbound" => Ok(Self::Outbound),
-            other => Err(StoreError::InvalidInput(format!(
-                "invalid grant direction '{other}'"
-            ))),
-        }
-    }
-}
-
-/// Key purpose in `peer_keys`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum KeyUse {
-    Signing,
-    Encryption,
-    Prekey,
-    Admin,
-}
-
-impl KeyUse {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Signing => "signing",
-            Self::Encryption => "encryption",
-            Self::Prekey => "prekey",
-            Self::Admin => "admin",
-        }
-    }
-
-    pub fn parse(s: &str) -> StoreResult<Self> {
-        match s {
-            "signing" => Ok(Self::Signing),
-            "encryption" => Ok(Self::Encryption),
-            "prekey" => Ok(Self::Prekey),
-            "admin" => Ok(Self::Admin),
-            other => Err(StoreError::InvalidInput(format!(
-                "invalid key use '{other}'"
-            ))),
-        }
-    }
-}
-
-/// Lifecycle state of a peer JWK in `peer_keys`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum KeyStatus {
-    Active,
-    Retired,
-    Revoked,
-}
-
-impl KeyStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Retired => "retired",
-            Self::Revoked => "revoked",
-        }
-    }
-
-    pub fn parse(s: &str) -> StoreResult<Self> {
-        match s {
-            "active" => Ok(Self::Active),
-            "retired" => Ok(Self::Retired),
-            "revoked" => Ok(Self::Revoked),
-            other => Err(StoreError::InvalidInput(format!(
-                "invalid key status '{other}'"
-            ))),
-        }
-    }
+    InvalidInput: "key status";
 }
 
 #[cfg(test)]

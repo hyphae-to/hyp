@@ -9,96 +9,42 @@ use serde_json::json;
 
 use crate::db::NodeDb;
 use crate::error::{StoreError, StoreResult};
+use crate::types::string_enum;
 use crate::types::{canonical_json, is_node_id, sha256_hex};
 
 /// Metadata key storing the strictly monotonic minimum accepted human `auth_epoch`.
 pub const HUMAN_MIN_AUTH_EPOCH_META_KEY: &str = "human.min_auth_epoch";
 
-/// Role assigned to an enrolled human signing key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum HumanAuthorityRole {
-    Admin,
-    Signer,
+string_enum! {
+    /// Role assigned to an enrolled human signing key.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    pub enum HumanAuthorityRole {
+        Admin => "admin",
+        Signer => "signer",
+    }
+    InvalidState: "human authority role";
 }
 
-impl HumanAuthorityRole {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Admin => "admin",
-            Self::Signer => "signer",
-        }
+string_enum! {
+    /// Lifecycle status of an enrolled human signing key.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    pub enum HumanAuthorityStatus {
+        Active => "active",
+        Revoked => "revoked",
     }
-
-    pub fn parse(raw: &str) -> StoreResult<Self> {
-        match raw {
-            "admin" => Ok(Self::Admin),
-            "signer" => Ok(Self::Signer),
-            other => Err(StoreError::InvalidState(format!(
-                "invalid human authority role '{other}'"
-            ))),
-        }
-    }
+    InvalidState: "human authority status";
 }
 
-/// Lifecycle status of an enrolled human signing key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum HumanAuthorityStatus {
-    Active,
-    Revoked,
-}
-
-impl HumanAuthorityStatus {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Revoked => "revoked",
-        }
+string_enum! {
+    /// Kind of human claim tracked in `human_claim_nonces`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    pub enum HumanClaimKind {
+        Directive => "directive",
+        Secret => "secret",
+        HumanInvite => "human_invite",
+        Approval => "approval",
     }
-
-    pub fn parse(raw: &str) -> StoreResult<Self> {
-        match raw {
-            "active" => Ok(Self::Active),
-            "revoked" => Ok(Self::Revoked),
-            other => Err(StoreError::InvalidState(format!(
-                "invalid human authority status '{other}'"
-            ))),
-        }
-    }
-}
-
-/// Kind of human claim tracked in `human_claim_nonces`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HumanClaimKind {
-    Directive,
-    Secret,
-    HumanInvite,
-    Approval,
-}
-
-impl HumanClaimKind {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Directive => "directive",
-            Self::Secret => "secret",
-            Self::HumanInvite => "human_invite",
-            Self::Approval => "approval",
-        }
-    }
-
-    pub fn parse(raw: &str) -> StoreResult<Self> {
-        match raw {
-            "directive" => Ok(Self::Directive),
-            "secret" => Ok(Self::Secret),
-            "human_invite" => Ok(Self::HumanInvite),
-            "approval" => Ok(Self::Approval),
-            other => Err(StoreError::InvalidState(format!(
-                "invalid human claim kind '{other}'"
-            ))),
-        }
-    }
+    InvalidState: "human claim kind";
 }
 
 /// The single Passkey-signed Security Gate lock seal row (`gate_lock_seal`, `id = 1`).
