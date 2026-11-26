@@ -389,7 +389,7 @@ fn differential_schema_and_data_parity_v1_migrated_equals_fresh_v2() {
     let applied_migrated = migrated.applied_migrations().unwrap();
     assert_eq!(
         applied_migrated.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        (1..=CURRENT_SCHEMA_VERSION).collect::<Vec<_>>()
     );
     assert_eq!(applied_migrated[0].1, T0);
     assert!(applied_migrated[1].1 >= T0);
