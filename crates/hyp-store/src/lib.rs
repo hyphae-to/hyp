@@ -42,8 +42,8 @@ pub use kv::{
 pub use local::{
     BridgeLink, DaemonNoticeKind, GateAuditEntry, GateAuditInput, GateAuditQuery, LocalStateStore,
     MailboxEntry, MailboxEntryEx, MailboxInsert, MailboxItemMeta, MailboxPutOptions,
-    MailboxPutResult, MuteRule, MuteRuleInput, PluginTargetHandoff, PruneReport, Session,
-    UnreadDigest,
+    MailboxPutResult, MailboxVisibility, MuteRule, MuteRuleInput, PluginTargetHandoff, PruneReport,
+    Session, UnreadDigest,
 };
 pub use messages::{
     ChannelDeliveryFailure, ChannelEpoch, ChannelEpochInput, ChannelInfo, ChannelMembership,

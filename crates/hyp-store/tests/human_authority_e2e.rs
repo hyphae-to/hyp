@@ -22,7 +22,7 @@ const SCHEMA_V3_SQL: &str = include_str!("../migrations/0003_wakeups.sql");
 const SCHEMA_V4_SQL: &str = include_str!("../migrations/0004_human_authority.sql");
 const SCHEMA_V5_SQL: &str = include_str!("../migrations/0005_human_enc_jwk.sql");
 const SCHEMA_V6_SQL: &str = include_str!("../migrations/0006_muted_sources_expires_at.sql");
-const SCHEMA_V7_SQL: &str = include_str!("../migrations/0007_delegated_human_admission.sql");
+const SCHEMA_V7_SQL: &str = include_str!("fixtures/schema_v7.sql");
 
 const T0: i64 = 1_795_554_000_000;
 

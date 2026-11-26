@@ -2349,10 +2349,35 @@ fn g3_coalesce_update_resets_reviewed_at_human_auth_and_gate_reason() {
     );
     assert!(
         db.local()
-            .peek_inbox_gate_cleared("claude:s1", 10)
+            .peek_inbox_with_visibility("claude:s1", 10, hyp_store::MailboxVisibility::GateCleared)
             .unwrap()
             .is_empty(),
         "G3: coalesced row must NOT appear in gate-cleared inbox until re-screened"
+    );
+    let local = db.local();
+    let gated = hyp_store::MailboxVisibility::GateCleared;
+    assert_eq!(local.pending_count("claude:s1").unwrap(), 1);
+    assert_eq!(
+        local
+            .pending_count_with_visibility("claude:s1", gated)
+            .unwrap(),
+        0
+    );
+    assert_eq!(local.unread_digest("claude:s1").unwrap().unread, 1);
+    let digest = local
+        .unread_digest_with_visibility("claude:s1", gated)
+        .unwrap();
+    assert_eq!(digest.unread, 0);
+    assert!(digest.sources.is_empty());
+    assert_eq!(
+        local.list_pending_metadata("claude:s1", 10).unwrap().len(),
+        1
+    );
+    assert!(
+        local
+            .list_pending_metadata_with_visibility("claude:s1", 10, gated)
+            .unwrap()
+            .is_empty()
     );
 }
 

@@ -358,7 +358,11 @@ async fn g2_local_webhook_events_and_plugins_never_bypass_stage2_as_selfhost() {
             && !rendered.contains("Direct plugin row"),
         "RFC 0004: digest must NEVER leak raw payloads (and webhook/bridge events must be quarantined): {rendered}"
     );
-    let cleared = node.db().local().peek_inbox_gate_cleared(sid, 10).unwrap();
+    let cleared = node
+        .db()
+        .local()
+        .peek_inbox_with_visibility(sid, 10, hyp_store::MailboxVisibility::GateCleared)
+        .unwrap();
     assert_eq!(cleared.len(), 1);
     assert!(cleared[0].text.contains("Same-node DM"));
 
@@ -791,7 +795,11 @@ async fn g4_rate_limit_hold_retains_audits_and_auto_retries_delivery() {
         m2_held.reviewed_at.is_none(),
         "held row must remain unscreened (`reviewed_at == None`) until gate clears it"
     );
-    let cleared_mid = node.db().local().peek_inbox_gate_cleared(sid, 50).unwrap();
+    let cleared_mid = node
+        .db()
+        .local()
+        .peek_inbox_with_visibility(sid, 50, hyp_store::MailboxVisibility::GateCleared)
+        .unwrap();
     assert_eq!(cleared_mid.len(), 1);
     assert_eq!(cleared_mid[0].receipt, receipt_m1);
     assert!(
@@ -839,7 +847,7 @@ async fn g4_rate_limit_hold_retains_audits_and_auto_retries_delivery() {
     assert!(
         node.db()
             .local()
-            .peek_inbox_gate_cleared(sid, 50)
+            .peek_inbox_with_visibility(sid, 50, hyp_store::MailboxVisibility::GateCleared)
             .unwrap()
             .iter()
             .any(|e| e.text.contains("HOLD_RAW_SECOND_RETRY_ME")),
@@ -896,7 +904,7 @@ async fn g4_rate_limit_hold_retains_audits_and_auto_retries_delivery() {
     assert!(
         node.db()
             .local()
-            .peek_inbox_gate_cleared(sid, 50)
+            .peek_inbox_with_visibility(sid, 50, hyp_store::MailboxVisibility::GateCleared)
             .unwrap()
             .iter()
             .any(|e| e.text.contains("BRIDGE_SECOND_HELD_THEN_DELIVERED")),
@@ -1157,7 +1165,11 @@ async fn hub_relayed_org_event_and_webhook_origin_capped_to_external_webhook_and
     assert!(!rendered.contains("Legitimate Org DM"));
     assert!(!rendered.contains("github:webhook"));
     assert!(!rendered.contains("via message envelope"));
-    let cleared = node.db().local().peek_inbox_gate_cleared(sid, 10).unwrap();
+    let cleared = node
+        .db()
+        .local()
+        .peek_inbox_with_visibility(sid, 10, hyp_store::MailboxVisibility::GateCleared)
+        .unwrap();
     assert_eq!(cleared.len(), 1);
     assert!(cleared[0].text.contains("Legitimate Org DM"));
 
