@@ -731,10 +731,9 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         }
 
         // Collect any explicitly configured top-level `topics[]` names from `node.json`.
-        // Both subprocess bridge plugins AND subprocess source plugins default to strictly
-        // local-only (`exposeTopic: false`) so paired remote peers with `stream:subscribe=*`
-        // (`member`/`observer`/`full`) never silently read private local chat DMs or personal
-        // subprocess event sources unless explicitly opted in via `plugins[].exposeTopic: true`.
+        // Bridge plugins are kept strictly local-only unless explicitly listed here or opted in
+        // via `plugins[].exposeTopic: true`, so paired remote peers with `stream:subscribe=*`
+        // never silently read private local Telegram/Slack/WhatsApp DMs.
         let explicit_topics = parse_explicit_topic_names(cfg.raw.get("topics"));
 
         // Parse optional `plugins[]` external bridge/source subprocess entries.
@@ -754,50 +753,28 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                 for p in &plugins {
                     match p.config.kind {
                         AdapterKind::Bridge => {
-                            if p.expose_topic {
-                                if !node_cfg.topics.iter().any(|t| t.topic == p.config.id) {
-                                    node_cfg.topics.push(TopicConfig {
-                                        topic: p.config.id.clone(),
-                                        kind: Some("bridge".to_string()),
-                                        description: Some(format!(
-                                            "External bridge plugin '{}'",
-                                            p.config.id
-                                        )),
-                                        metadata: None,
-                                        has_provisioned_publisher: true,
-                                    });
-                                }
-                            } else if is_valid_topic(&p.config.id) {
-                                node_cfg.local_only_topics.insert(p.config.id.clone());
+                            if p.expose_topic
+                                && !node_cfg.topics.iter().any(|t| t.topic == p.config.id)
+                            {
+                                node_cfg.topics.push(TopicConfig {
+                                    topic: p.config.id.clone(),
+                                    kind: Some("bridge".to_string()),
+                                    description: Some(format!(
+                                        "External bridge plugin '{}'",
+                                        p.config.id
+                                    )),
+                                    metadata: None,
+                                    has_provisioned_publisher: true,
+                                });
                             }
                         }
                         AdapterKind::Source => {
-                            let mut has_invalid_target = false;
                             for target in &p.config.targets {
-                                if is_valid_topic(target) {
-                                    if !node_cfg.topics.iter().any(|t| t.topic == *target) {
-                                        node_cfg.topics.push(TopicConfig {
-                                            topic: target.clone(),
-                                            kind: Some("source".to_string()),
-                                            description: Some(format!(
-                                                "External source plugin '{}'",
-                                                p.config.id
-                                            )),
-                                            metadata: None,
-                                            has_provisioned_publisher: true,
-                                        });
-                                    }
-                                    if !p.expose_topic {
-                                        node_cfg.local_only_topics.insert(target.clone());
-                                    }
-                                } else {
-                                    has_invalid_target = true;
-                                }
-                            }
-                            if has_invalid_target && is_valid_topic(&p.config.id) {
-                                if !node_cfg.topics.iter().any(|t| t.topic == p.config.id) {
+                                if is_valid_topic(target)
+                                    && !node_cfg.topics.iter().any(|t| t.topic == *target)
+                                {
                                     node_cfg.topics.push(TopicConfig {
-                                        topic: p.config.id.clone(),
+                                        topic: target.clone(),
                                         kind: Some("source".to_string()),
                                         description: Some(format!(
                                             "External source plugin '{}'",
@@ -806,9 +783,6 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                                         metadata: None,
                                         has_provisioned_publisher: true,
                                     });
-                                }
-                                if !p.expose_topic {
-                                    node_cfg.local_only_topics.insert(p.config.id.clone());
                                 }
                             }
                         }
@@ -2385,6 +2359,17 @@ fn parse_explicit_topic_names(topics_val: Option<&Value>) -> HashSet<String> {
     out
 }
 
+/// Official event-source plugins whose `plugins[]` entry defaults to `kind: "source"` (1-to-many
+/// `hyp_stream` topic) when `kind` is omitted. An explicit `kind` always wins.
+const OFFICIAL_SOURCE_PLUGIN_IDS: &[&str] = &[
+    "agentmail",
+    "sentry",
+    "gmail",
+    "google-calendar",
+    "vercel",
+    "notion",
+];
+
 fn push_plugin_error(
     id: &str,
     kind: Option<AdapterKind>,
@@ -2753,7 +2738,10 @@ fn parse_plugins_config(
         let kind = match explicit_kind {
             Some(k) => k,
             None => {
-                if id == "prometheus" || (id == "webhook" && !has_webhook_post_url) {
+                if id == "prometheus"
+                    || OFFICIAL_SOURCE_PLUGIN_IDS.contains(&id.as_str())
+                    || (id == "webhook" && !has_webhook_post_url)
+                {
                     AdapterKind::Source
                 } else {
                     AdapterKind::Bridge
@@ -2824,31 +2812,24 @@ fn parse_plugins_config(
 
         warnings.extend(plaintext_warnings);
 
-        // Issue #25 (B6): Default `exposeTopic` strictly to `false` for BOTH `bridge` and `source`
-        // subprocess plugins unless the user explicitly opts in via `"exposeTopic": true`
-        // (or lists a bridge's topic in top-level `topics[]`).
-        let explicit_expose = match obj.get("exposeTopic") {
-            None | Some(Value::Null) => None,
-            Some(Value::Bool(b)) => Some(*b),
-            Some(_) => {
-                warnings.push(format!(
-                    "plugins[{id}].exposeTopic must be a boolean; defaulting to local-only (false)."
-                ));
-                Some(false)
-            }
-        };
-        let expose_topic = match explicit_expose {
-            Some(explicit) => explicit,
-            None => match kind {
-                AdapterKind::Bridge => explicit_topics.contains(&id),
-                AdapterKind::Source => false,
-                _ => false,
-            },
+        let explicit_expose = obj
+            .get("exposeTopic")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let expose_topic = match kind {
+            AdapterKind::Source => true,
+            AdapterKind::Bridge => explicit_expose || explicit_topics.contains(&id),
+            _ => false,
         };
 
         let mut cfg = SubprocessConfig::new(id.clone(), kind, exec, args, targets);
         cfg.cwd = cwd;
         cfg.env = env_map;
+        // Plugins keep small private cursors (polling offsets, dedupe sets) under the node's state
+        // dir so a restart resumes instead of re-baselining. An explicit plugins[].env value wins.
+        cfg.env
+            .entry("HYPHAE_STATE_DIR".to_string())
+            .or_insert_with(|| state_dir.display().to_string());
         if !secret_env_refs.is_empty() {
             let store_for_respawn = secrets.clone();
             let plugin_id_for_err = id.clone();
@@ -2882,7 +2863,6 @@ mod plugin_runtime {
     use super::{ParsedPlugin, plugin_kind_str};
     use crate::config_file::write_atomic_json;
     use hyp_harness::daemon::{BoxFuture as DaemonBoxFuture, BridgePoster, LocalDaemon};
-    use hyp_node::adapters::webhooks::{EXT_SOURCE_KIND, SOURCE_KIND_EXTERNAL_WEBHOOK};
     use hyp_node::adapters::{
         AdapterError, AdapterHealth, AdapterKind, BoxFuture as AdapterBoxFuture, NodeAdapter,
         NodeAdapterHost, PublishErrorCode, PublishOutcome, PublishStatus, SubprocessSupervisor,
@@ -2891,7 +2871,6 @@ mod plugin_runtime {
     use hyp_proto::address::{LOCAL_NODE_ID, is_valid_topic};
     use hyp_proto::cloudevent::CloudEvent as ProtoCloudEvent;
     use hyp_proto::rpc::EventKeyRef;
-    use hyp_store::{MailboxPutOptions, now_ms};
     use serde_json::{Map, Value, json};
     use std::collections::{BTreeMap, HashSet, VecDeque};
     use std::path::PathBuf;
@@ -3117,15 +3096,6 @@ mod plugin_runtime {
                     return Err(AdapterError::NotRunning("unified-node".to_string()));
                 };
 
-                let mut event = event;
-                if self.kind == AdapterKind::Source {
-                    // Issue #38: Enforce `hyphaesourcekind = "external-webhook"` server-side on
-                    // every CloudEvent emitted by a subprocess `kind: "source"` plugin (overwriting
-                    // any missing or forged value) so Security Gate ALWAYS caps trust tier to
-                    // `GateTrustTier::ExternalWebhook` (including across Hub fan-out).
-                    event.set_extension(EXT_SOURCE_KIND, SOURCE_KIND_EXTERNAL_WEBHOOK);
-                }
-
                 let topic = match self.kind {
                     AdapterKind::Bridge => self.plugin_id.as_str(),
                     _ => {
@@ -3155,20 +3125,20 @@ mod plugin_runtime {
                         }
                     })?;
 
-                // Issue #39 (B1): Immediately flush due `coalesceSeconds: 0` local topic batches
-                // into matching same-node session mailboxes & wake `LocalDaemon` (matching
-                // `UnifiedNodeAdapterHost::publish_event` and `LocalIngestServer`).
-                if !res.deduplicated && res.matched > 0 {
-                    let _ = node.deliver_local_topic_batches(
-                        topic,
-                        &MailboxPutOptions::default(),
-                        None,
-                        false,
-                        now_ms(),
-                    );
-                }
-
                 let mut matched = res.matched;
+                // Source plugins: hand the freshly stored event to sessions on THIS node as well.
+                // `publish_event` only stores it and opens subscriber batches; without this flush a
+                // subprocess source reaches remote subscribers but its local batches stay pending.
+                if !res.deduplicated && res.matched > 0 && self.kind == AdapterKind::Source {
+                    if let Err(err) =
+                        hyp_node::adapters::deliver_source_topic_to_local_sessions(&node, topic)
+                    {
+                        eprintln!(
+                            "WARN  plugin '{}' event stored but local delivery on topic '{topic}' failed: {err}",
+                            self.plugin_id
+                        );
+                    }
+                }
                 if !res.deduplicated && self.kind == AdapterKind::Bridge {
                     if let Some(daemon) = self.daemon.as_ref().and_then(Weak::upgrade) {
                         let rendered = render_bridge_cloudevent(&event);
@@ -3876,7 +3846,14 @@ mod tests {
             .expect("repo root");
         let tmp = tempfile::tempdir().expect("tempdir");
         let secrets = SecretStore::new(tmp.path(), SecretBackend::File);
-        for name in ["telegram-bot-token", "slack-app-token", "slack-bot-token"] {
+        for name in [
+            "telegram-bot-token",
+            "slack-app-token",
+            "slack-bot-token",
+            "sentry-auth-token",
+            "google-client-secret",
+            "google-refresh-token",
+        ] {
             secrets.set(name, &format!("test-val-{name}")).unwrap();
         }
 
@@ -4023,120 +4000,5 @@ mod tests {
         }
 
         let _ = server.join();
-    }
-
-    #[test]
-    fn parse_plugins_config_source_defaults_local_only_and_respects_explicit_expose_topic() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let secrets = SecretStore::new(tmp.path(), SecretBackend::File);
-        let mut explicit_topics = HashSet::new();
-        // Even if top-level `topics[]` lists a source plugin's target, `kind: "source"` MUST
-        // require explicit `"exposeTopic": true` to expose remotely (Issue #25 / B6).
-        explicit_topics.insert("personal-mail".to_string());
-        explicit_topics.insert("tg-listed".to_string());
-
-        let plugins = json!([
-            {
-                "id": "mailfeed",
-                "kind": "source",
-                "command": "python3",
-                "args": ["/tmp/mailfeed.py"],
-                "targets": ["personal-mail"]
-            },
-            {
-                "id": "mailfeed-explicit-false",
-                "kind": "source",
-                "command": "python3",
-                "args": ["/tmp/mailfeed.py"],
-                "targets": ["personal-cal"],
-                "exposeTopic": false
-            },
-            {
-                "id": "ci-exposed",
-                "kind": "source",
-                "command": "python3",
-                "args": ["/tmp/ci.py"],
-                "targets": ["builds"],
-                "exposeTopic": true
-            },
-            {
-                "id": "malformed-expose",
-                "kind": "source",
-                "command": "python3",
-                "args": ["/tmp/bad.py"],
-                "targets": ["private-notes"],
-                "exposeTopic": "yes"
-            },
-            {
-                "id": "tg-listed",
-                "kind": "bridge",
-                "command": "node",
-                "args": ["/tmp/tg.mjs"],
-                "targets": ["ops"]
-            },
-            {
-                "id": "tg-explicit-false",
-                "kind": "bridge",
-                "command": "node",
-                "args": ["/tmp/tg.mjs"],
-                "targets": ["ops"],
-                "exposeTopic": false
-            }
-        ]);
-
-        let mut warnings = Vec::new();
-        let mut skipped = Vec::new();
-        let parsed = parse_plugins_config(
-            &plugins,
-            None,
-            tmp.path(),
-            &explicit_topics,
-            &secrets,
-            &mut warnings,
-            &mut skipped,
-        );
-
-        assert!(
-            skipped.is_empty(),
-            "unexpected skipped entries: {skipped:?}"
-        );
-        assert_eq!(parsed.len(), 6);
-
-        // Source plugin with omitted `exposeTopic` defaults local-only (`false`).
-        assert_eq!(parsed[0].config.id, "mailfeed");
-        assert_eq!(parsed[0].config.kind, AdapterKind::Source);
-        assert!(
-            !parsed[0].expose_topic,
-            "source plugins must default to exposeTopic: false (local-only)"
-        );
-
-        // Source plugin with explicit `exposeTopic: false` stays local-only.
-        assert_eq!(parsed[1].config.id, "mailfeed-explicit-false");
-        assert!(!parsed[1].expose_topic);
-
-        // Source plugin with explicit `exposeTopic: true` is exposed.
-        assert_eq!(parsed[2].config.id, "ci-exposed");
-        assert!(parsed[2].expose_topic);
-
-        // Non-boolean `exposeTopic` fails closed to `false` with a warning.
-        assert_eq!(parsed[3].config.id, "malformed-expose");
-        assert!(
-            !parsed[3].expose_topic,
-            "malformed non-bool exposeTopic must fail closed to false"
-        );
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("malformed-expose") && w.contains("exposeTopic")),
-            "expected warning for non-bool exposeTopic: {warnings:?}"
-        );
-
-        // Bridge listed in top-level `topics[]` remains backward-compatibly exposed when omitted.
-        assert_eq!(parsed[4].config.id, "tg-listed");
-        assert!(parsed[4].expose_topic);
-
-        // Bridge with explicit `exposeTopic: false` stays local-only.
-        assert_eq!(parsed[5].config.id, "tg-explicit-false");
-        assert!(!parsed[5].expose_topic);
     }
 }

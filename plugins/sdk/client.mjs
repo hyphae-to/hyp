@@ -73,6 +73,21 @@ export class MeshPluginClient {
     this.#onPost = onPost;
     this.#onError = onError;
 
+    // Once the channel is open, a pending read on it keeps a crashed Node process alive: the
+    // error is printed but the process never exits, so the supervisor keeps reporting a dead
+    // plugin as running. Fatal errors therefore log one line (message only, never a stack that
+    // could carry request details) and hard-stop the process, which hands control back to the
+    // supervisor's restart backoff and crash-loop breaker.
+    const fatal = (error) => {
+      try {
+        console.error(`${this.plugin} plugin fatal: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        process.kill(process.pid, "SIGKILL");
+      }
+    };
+    process.on("uncaughtException", fatal);
+    process.on("unhandledRejection", fatal);
+
     const pluginAddr = fd === undefined ? process.env.HYPHAE_PLUGIN_ADDR?.trim() : "";
     let input;
     let channelSock = null;

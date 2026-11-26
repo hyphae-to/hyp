@@ -24,3 +24,38 @@ pub use webhooks::{
     compute_hmac_sha256_header, normalize_generic_webhook, normalize_github_webhook,
     normalize_prometheus_webhook, verify_hmac_sha256_header,
 };
+
+/// Flushes due batches for local-session subscribers of the source topic `topic` into their
+/// mailboxes and wakes them, returning how many sessions were reached.
+///
+/// Compiled-in adapters get this from the node's own adapter host after every stored publish.
+/// Hosts that publish on behalf of external subprocess `source` plugins must call it too:
+/// `UnifiedNode::publish_event` only stores the event and opens batches, so without this flush a
+/// plugin's events reach paired remote subscribers but never a session on the same node.
+///
+/// One pass of the node's flush hands over only the oldest pending batch per subscription. A
+/// backlog (events stored while a flush failed or the node was restarting) would then drain one
+/// batch per new event and the newest would always lag by one, so this drains until a pass
+/// delivers nothing. Per-subscription wake caps and holds still apply: a capped subscription
+/// simply stops contributing, which ends the loop.
+pub fn deliver_source_topic_to_local_sessions(
+    node: &crate::engine::UnifiedNode,
+    topic: &str,
+) -> Result<usize, crate::engine::NodeError> {
+    const MAX_PASSES: usize = 64;
+    let mut delivered = 0;
+    for _ in 0..MAX_PASSES {
+        let pass = node.deliver_local_topic_batches(
+            topic,
+            &hyp_store::MailboxPutOptions::default(),
+            None,
+            false,
+            hyp_store::now_ms(),
+        )?;
+        if pass == 0 {
+            break;
+        }
+        delivered += pass;
+    }
+    Ok(delivered)
+}

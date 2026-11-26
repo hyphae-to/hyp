@@ -65,6 +65,7 @@ jobs:
             node --check "$file"
           done < <(find plugins -type f \( -name '*.mjs' -o -name '*.js' \) | sort)
           node plugins/herdr-mod/test/mod.test.mjs
+          node --test plugins/test/sources.test.mjs
 
           while IFS= read -r file; do
             python3 -m py_compile "$file"

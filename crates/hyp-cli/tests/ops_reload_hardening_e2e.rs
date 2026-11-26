@@ -1042,7 +1042,13 @@ fn r4_plugin_remove_cleans_node_json_and_strips_source_location_query_string() {
 
     // 4. Verify `sourceLocation` strips `?sv=...&sig=...` query strings from CDN redirects!
     let archive_path = tmp.path().join("test-plugins.tar.gz");
-    let entries: Vec<TarInputEntry> = ["sdk/client.mjs", "sdk/client.py", "telegram/index.mjs"]
+    let entries: Vec<TarInputEntry> = [
+        "sdk/client.mjs",
+        "sdk/client.py",
+        "sdk/google-oauth.mjs",
+        "sdk/source-kit.mjs",
+        "telegram/index.mjs",
+    ]
         .into_iter()
         .map(|rel| TarInputEntry {
             archive_path: rel.to_string(),

@@ -40,7 +40,12 @@ const PLUGIN_SPECS: &[BuildPluginSpec] = &[
     BuildPluginSpec {
         id: "sdk",
         kind: SpecKind::Bridge,
-        files: &[("sdk/client.mjs", false), ("sdk/client.py", false)],
+        files: &[
+            ("sdk/client.mjs", false),
+            ("sdk/client.py", false),
+            ("sdk/google-oauth.mjs", false),
+            ("sdk/source-kit.mjs", false),
+        ],
     },
     BuildPluginSpec {
         id: "telegram",
@@ -66,6 +71,36 @@ const PLUGIN_SPECS: &[BuildPluginSpec] = &[
         id: "prometheus",
         kind: SpecKind::Bridge,
         files: &[("prometheus/index.mjs", false)],
+    },
+    BuildPluginSpec {
+        id: "agentmail",
+        kind: SpecKind::Bridge,
+        files: &[("agentmail/index.mjs", false), ("agentmail/onboarding.json", false)],
+    },
+    BuildPluginSpec {
+        id: "sentry",
+        kind: SpecKind::Bridge,
+        files: &[("sentry/index.mjs", false), ("sentry/onboarding.json", false)],
+    },
+    BuildPluginSpec {
+        id: "gmail",
+        kind: SpecKind::Bridge,
+        files: &[("gmail/index.mjs", false), ("gmail/onboarding.json", false)],
+    },
+    BuildPluginSpec {
+        id: "google-calendar",
+        kind: SpecKind::Bridge,
+        files: &[("google-calendar/index.mjs", false), ("google-calendar/onboarding.json", false)],
+    },
+    BuildPluginSpec {
+        id: "vercel",
+        kind: SpecKind::Bridge,
+        files: &[("vercel/index.mjs", false), ("vercel/onboarding.json", false)],
+    },
+    BuildPluginSpec {
+        id: "notion",
+        kind: SpecKind::Bridge,
+        files: &[("notion/index.mjs", false), ("notion/onboarding.json", false)],
     },
     BuildPluginSpec {
         id: "claude-panel",
