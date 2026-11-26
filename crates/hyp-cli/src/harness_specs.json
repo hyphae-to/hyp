@@ -1,0 +1,104 @@
+[
+  {
+    "id": "antigravity",
+    "label": "Antigravity",
+    "setupLocation": "~/.gemini/config/plugins/hyphae",
+    "cli": "agy",
+    "aliases": ["agy"],
+    "detection": [".gemini/antigravity-cli", ".gemini/config"],
+    "fallbackDetection": { "directory": ".gemini", "without": ".gemini/settings.json" },
+    "setupSkillRoot": ".gemini/config/skills",
+    "runtimeSkillRoot": ".gemini/config/plugins/hyphae/skills",
+    "diagnostic": { "path": "hooks.json", "test": "exists" },
+    "legacySkillRoots": []
+  },
+  {
+    "id": "claude",
+    "label": "Claude Code",
+    "setupLocation": "~/.claude",
+    "cli": "claude",
+    "aliases": ["claude-code"],
+    "detection": [],
+    "setupSkillRoot": ".claude/skills",
+    "runtimeSkillRoot": ".claude/skills",
+    "legacySkillRoots": []
+  },
+  {
+    "id": "codex",
+    "label": "Codex",
+    "setupLocation": "~/.codex",
+    "cli": "codex",
+    "aliases": [],
+    "detection": [".codex"],
+    "setupSkillRoot": ".agents/skills",
+    "runtimeSkillRoot": ".agents/skills",
+    "diagnostic": { "path": "hooks.json", "test": "hooks" },
+    "legacySkillRoots": [".codex/skills"]
+  },
+  {
+    "id": "cursor",
+    "label": "Cursor Agent",
+    "setupLocation": "~/.cursor",
+    "setupLabel": "Cursor",
+    "cli": "cursor-agent",
+    "aliases": ["cursor-agent"],
+    "detection": [".cursor"],
+    "setupSkillRoot": ".cursor/skills",
+    "runtimeSkillRoot": ".cursor/skills",
+    "diagnostic": { "path": "hooks.json", "test": "hooks" },
+    "legacySkillRoots": []
+  },
+  {
+    "id": "opencode",
+    "label": "OpenCode",
+    "setupLocation": "~/.config/opencode",
+    "cli": "opencode",
+    "aliases": [],
+    "detection": [".config/opencode"],
+    "setupSkillRoot": ".config/opencode/skills",
+    "runtimeSkillRoot": ".config/opencode/skills",
+    "diagnostic": { "path": "plugins/hyphae.ts", "test": "exists" },
+    "legacySkillRoots": []
+  },
+  {
+    "id": "gemini",
+    "label": "Gemini CLI",
+    "setupLocation": "~/.gemini/settings.json",
+    "cli": "gemini",
+    "aliases": ["gemini-cli"],
+    "detection": [".gemini/settings.json"],
+    "setupSkillRoot": ".gemini/skills",
+    "runtimeSkillRoot": ".gemini/skills",
+    "diagnostic": { "path": "", "test": "hooks" },
+    "legacySkillRoots": []
+  },
+  {
+    "id": "openclaw",
+    "label": "OpenClaw",
+    "setupLocation": "~/.openclaw",
+    "aliases": [],
+    "detection": [".openclaw"],
+    "setupSkillRoot": ".openclaw/skills",
+    "runtimeSkillRoot": ".openclaw/skills",
+    "legacySkillRoots": []
+  },
+  {
+    "id": "herdr",
+    "label": "Herdr",
+    "setupLocation": "~/.config/herdr",
+    "aliases": [],
+    "detection": [".config/herdr", ".config/herdr-core", ".herdr"],
+    "runtimeSkillRoot": ".config/herdr/skills",
+    "legacySkillRoots": []
+  },
+  {
+    "id": "t3",
+    "label": "T3 Code",
+    "setupLocation": "~/.t3",
+    "aliases": ["t3-code", "t3code"],
+    "detection": [".t3"],
+    "setupSkillRoot": ".agents/skills",
+    "runtimeSkillRoot": ".agents/skills",
+    "legacySkillRoots": [".t3/skills"]
+  }
+]

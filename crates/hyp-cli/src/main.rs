@@ -14,6 +14,7 @@ mod drop_cmd;
 mod emit_cmd;
 mod exec_cmd;
 mod gate_cmd;
+mod harness_spec;
 mod herdr_mod;
 mod inspect_cmd;
 mod join_cmd;

@@ -1515,23 +1515,24 @@ EOF
   # Deduplicate canonical parent dirs so symlinked roots (e.g. $CLAUDE_CONFIG_DIR/skills -> ~/.claude/skills)
   # are never unlinked themselves and each hyphae* subdirectory is targeted once.
   _seen_skill_roots=""
-  _skill_roots="$HOME/.claude/skills"
-  if [ -n "$CLAUDE_PROFILE_DIR" ]; then
-    _skill_roots="${_skill_roots}
-${CLAUDE_PROFILE_DIR}/skills"
-  fi
-  _skill_roots="${_skill_roots}
-$HOME/.codex/skills
+  # BEGIN GENERATED HARNESS SKILL ROOTS
+  _skill_roots="$HOME/.gemini/config/skills
+$HOME/.claude/skills
 $HOME/.agents/skills
-$HOME/.gemini/config/skills
-$HOME/.gemini/skills
+$HOME/.codex/skills
+$HOME/.cursor/skills
 $CONFIG_HOME/opencode/skills
 $HOME/.config/opencode/skills
-$HOME/.cursor/skills
+$HOME/.gemini/skills
 $HOME/.openclaw/skills
 $CONFIG_HOME/herdr/skills
 $HOME/.config/herdr/skills
 $HOME/.t3/skills"
+  # END GENERATED HARNESS SKILL ROOTS
+  if [ -n "$CLAUDE_PROFILE_DIR" ]; then
+    _skill_roots="${_skill_roots}
+${CLAUDE_PROFILE_DIR}/skills"
+  fi
   while IFS= read -r _skill_root; do
     [ -n "$_skill_root" ] || continue
     [ -d "$_skill_root" ] || continue

@@ -121,43 +121,21 @@ impl LaunchableHarness {
         self.kind().as_str()
     }
 
-    pub const fn display_name(self) -> &'static str {
-        match self {
-            Self::Claude => "Claude Code",
-            Self::Codex => "Codex",
-            Self::Antigravity => "Antigravity",
-            Self::Opencode => "OpenCode",
-            Self::Cursor => "Cursor Agent",
-            Self::Gemini => "Gemini CLI",
-        }
+    pub fn display_name(self) -> &'static str {
+        &crate::harness_spec::spec(self.kind()).label
     }
 
-    pub const fn binary_name(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::Antigravity => "agy",
-            Self::Opencode => "opencode",
-            Self::Cursor => "cursor-agent",
-            Self::Gemini => "gemini",
-        }
+    pub fn binary_name(self) -> &'static str {
+        crate::harness_spec::spec(self.kind())
+            .cli
+            .as_deref()
+            .expect("launchable CLI")
     }
 
     pub fn parse_alias(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "claude" | "claude-code" => Some(Self::Claude),
-            "codex" => Some(Self::Codex),
-            "antigravity" | "agy" => Some(Self::Antigravity),
-            "opencode" => Some(Self::Opencode),
-            "cursor" | "cursor-agent" => Some(Self::Cursor),
-            "gemini" | "gemini-cli" => Some(Self::Gemini),
-            _ => None,
-        }
-    }
-
-    /// Primary global skill file path for `hyp-setup/SKILL.md`.
-    pub fn primary_skill_path(self, home: &Path) -> PathBuf {
-        self.primary_skill_path_for(home, true, None)
+        Self::ALL
+            .into_iter()
+            .find(|harness| crate::harness_spec::spec(harness.kind()).matches_alias(raw.trim()))
     }
 
     /// Profile-aware primary skill path for `hyp-setup/SKILL.md` (honors `$CLAUDE_CONFIG_DIR`
@@ -168,41 +146,17 @@ impl LaunchableHarness {
         explicit_home: bool,
         claude_config_dir: Option<&Path>,
     ) -> PathBuf {
-        match self {
-            Self::Claude => resolve_claude_profiles(home, explicit_home, claude_config_dir)
+        if self == Self::Claude {
+            if let Some(profile) = resolve_claude_profiles(home, explicit_home, claude_config_dir)
                 .into_iter()
                 .next()
-                .map(|p| p.setup_skill_path())
-                .unwrap_or_else(|| {
-                    home.join(".claude")
-                        .join("skills")
-                        .join("hyp-setup")
-                        .join("SKILL.md")
-                }),
-            Self::Codex => shared_setup_skill_path(home),
-            Self::Antigravity => home
-                .join(".gemini")
-                .join("config")
-                .join("skills")
-                .join("hyp-setup")
-                .join("SKILL.md"),
-            Self::Opencode => home
-                .join(".config")
-                .join("opencode")
-                .join("skills")
-                .join("hyp-setup")
-                .join("SKILL.md"),
-            Self::Cursor => home
-                .join(".cursor")
-                .join("skills")
-                .join("hyp-setup")
-                .join("SKILL.md"),
-            Self::Gemini => home
-                .join(".gemini")
-                .join("skills")
-                .join("hyp-setup")
-                .join("SKILL.md"),
+            {
+                return profile.setup_skill_path();
+            }
         }
+        crate::harness_spec::spec(self.kind())
+            .setup_skill(home)
+            .expect("launchable setup skill")
     }
 
     /// Additional cross-tool skill paths to populate alongside `primary_skill_path`.
@@ -291,7 +245,7 @@ impl ManualGuideHarness {
         }
     }
 
-    pub const fn display_name(self) -> &'static str {
+    pub fn display_name(self) -> &'static str {
         match self {
             Self::ClaudeDesktop => "Claude Desktop",
             Self::CodexDesktop => "Codex Desktop",
@@ -326,25 +280,16 @@ impl ManualGuideHarness {
         explicit_home: bool,
         claude_config_dir: Option<&Path>,
     ) -> PathBuf {
-        match self {
-            Self::ClaudeDesktop => LaunchableHarness::Claude.primary_skill_path_for(
+        if self.kind() == HarnessKind::Claude {
+            return LaunchableHarness::Claude.primary_skill_path_for(
                 home,
                 explicit_home,
                 claude_config_dir,
-            ),
-            Self::CodexDesktop => LaunchableHarness::Codex.primary_skill_path(home),
-            Self::OpenCodeDesktop => LaunchableHarness::Opencode.primary_skill_path(home),
-            Self::CursorIde => LaunchableHarness::Cursor.primary_skill_path(home),
-            Self::Openclaw => home
-                .join(".openclaw")
-                .join("skills")
-                .join("hyp-setup")
-                .join("SKILL.md"),
-            Self::T3 => shared_setup_skill_path(home),
-            Self::ConfigOnlyCli(lh) => {
-                lh.primary_skill_path_for(home, explicit_home, claude_config_dir)
-            }
+            );
         }
+        crate::harness_spec::spec(self.kind())
+            .setup_skill(home)
+            .expect("manual guide setup skill")
     }
 
     #[allow(dead_code)]
@@ -3923,28 +3868,12 @@ fn is_skill_harness_detected(
     explicit_home: bool,
     claude_config_dir: Option<&Path>,
 ) -> bool {
-    let dir_detected = match kind {
-        HarnessKind::Antigravity => {
-            let gemini_dir = home.join(".gemini");
-            gemini_dir.join("antigravity-cli").exists()
-                || gemini_dir.join("config").exists()
-                || (gemini_dir.is_dir() && !gemini_dir.join("settings.json").exists())
-        }
-        HarnessKind::Claude => resolve_claude_profiles(home, explicit_home, claude_config_dir)
-            .iter()
-            .any(|p| p.config_dir.exists() || p.mcp_file.exists()),
-        HarnessKind::Codex => home.join(".codex").exists(),
-        HarnessKind::Cursor => home.join(".cursor").exists(),
-        HarnessKind::Opencode => home.join(".config").join("opencode").exists(),
-        HarnessKind::Gemini => home.join(".gemini").join("settings.json").exists(),
-        HarnessKind::Openclaw => home.join(".openclaw").exists(),
-        HarnessKind::Herdr => {
-            home.join(".config").join("herdr").exists()
-                || home.join(".config").join("herdr-core").exists()
-                || home.join(".herdr").exists()
-        }
-        HarnessKind::T3 => home.join(".t3").exists(),
+    let profiles = if kind == HarnessKind::Claude {
+        resolve_claude_profiles(home, explicit_home, claude_config_dir)
+    } else {
+        Vec::new()
     };
+    let dir_detected = crate::harness_spec::spec(kind).detected(home, &profiles);
     if dir_detected {
         return true;
     }
@@ -4116,7 +4045,9 @@ pub fn install_setup_skill_for_harnesses_with_claude(
 }
 
 fn shared_setup_skill_path(home: &Path) -> PathBuf {
-    home.join(".agents/skills/hyp-setup/SKILL.md")
+    crate::harness_spec::spec(HarnessKind::Codex)
+        .setup_skill(home)
+        .expect("shared setup skill")
 }
 
 fn is_stock_legacy_setup_skill(text: &str) -> bool {
@@ -4140,7 +4071,11 @@ fn is_stock_legacy_setup_skill(text: &str) -> bool {
 fn legacy_setup_skills(home: &Path, path: &Path) -> Vec<PathBuf> {
     let local = crate::skill_render::legacy_skill_path(path, "hyphae-setup");
     if path == shared_setup_skill_path(home) {
-        vec![local, home.join(".codex/skills/hyphae-setup/SKILL.md")]
+        let mut paths = vec![local];
+        paths.extend(
+            crate::harness_spec::spec(HarnessKind::Codex).legacy_skills(home, "hyphae-setup"),
+        );
+        paths
     } else {
         vec![local]
     }
@@ -5283,17 +5218,16 @@ enum WizardScreen {
     },
 }
 
-#[cfg(unix)]
-enum TuiResolution {
+enum WizardAction {
     Cancel,
-    #[allow(dead_code)]
-    RunLocalCliSetup,
     RunLocalCliSetupWithSelection(SetupSelection),
     LaunchCli(LaunchableHarness),
     LaunchHerdr {
         hc_bin: PathBuf,
         template: HerdrTemplate,
     },
+    ManualGuide(ManualGuideHarness),
+    #[cfg(unix)]
     ManualGuideDone {
         harness: ManualGuideHarness,
         primary_skill: PathBuf,
@@ -5302,6 +5236,7 @@ enum TuiResolution {
         mcp_status: DesktopMcpStatus,
         deeplink: Option<String>,
     },
+    #[cfg(unix)]
     Error(String),
 }
 
@@ -5855,6 +5790,11 @@ fn display_compact_path(path: &Path, home: &Path) -> String {
     path.display().to_string()
 }
 
+const DESKTOP_MCP_CHOICES: [(&str, &str); 2] = [
+    ("Apply MCP config & continue", "merge safely"),
+    ("Skip config write (I'll edit manually)", "show snippet"),
+];
+
 /// Pure, cross-platform Desktop MCP confirmation screen composer (Claude Desktop & Codex Desktop).
 #[cfg_attr(not(unix), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
@@ -5952,10 +5892,7 @@ pub fn render_desktop_mcp_confirm(
         lines.push(String::new());
     }
 
-    let options = [
-        ("Apply MCP config & continue", "merge safely"),
-        ("Skip config write (I'll edit manually)", "show snippet"),
-    ];
+    let options = DESKTOP_MCP_CHOICES;
     let opt_label_w = options
         .iter()
         .map(|(l, _)| l.chars().count())
@@ -6522,7 +6459,16 @@ impl SetupToggleState {
             return preview;
         }
 
-        for kind in &sel.harnesses {
+        for &kind in &sel.harnesses {
+            let skill = || {
+                format!(
+                    "  + skill: {}",
+                    display_compact_path(
+                        &crate::harness_spec::spec(kind).runtime_skill(home),
+                        home,
+                    )
+                )
+            };
             match kind {
                 HarnessKind::Antigravity => {
                     preview.push(
@@ -6530,10 +6476,7 @@ impl SetupToggleState {
                             .to_string(),
                     );
                     if sel.install_skills {
-                        preview.push(
-                            "  + skill: ~/.gemini/config/plugins/hyphae/skills/hyp-mesh/SKILL.md"
-                                .to_string(),
-                        );
+                        preview.push(skill());
                     }
                     if sel.install_statusline {
                         preview.push(
@@ -6558,19 +6501,19 @@ impl SetupToggleState {
                         );
                     }
                     if sel.install_skills {
-                        preview.push("  + skill: ~/.claude/skills/hyp-mesh/SKILL.md".to_string());
+                        preview.push(skill());
                     }
                 }
                 HarnessKind::Codex => {
                     preview.push("codex: ~/.codex/{config.toml,hooks.json}".to_string());
                     if sel.install_skills {
-                        preview.push("  + skill: ~/.agents/skills/hyp-mesh/SKILL.md".to_string());
+                        preview.push(skill());
                     }
                 }
                 HarnessKind::Cursor => {
                     preview.push("cursor: ~/.cursor/{mcp.json,hooks.json}".to_string());
                     if sel.install_skills {
-                        preview.push("  + skill: ~/.cursor/skills/hyp-mesh/SKILL.md".to_string());
+                        preview.push(skill());
                     }
                 }
                 HarnessKind::Opencode => {
@@ -6579,15 +6522,13 @@ impl SetupToggleState {
                             .to_string(),
                     );
                     if sel.install_skills {
-                        preview.push(
-                            "  + skill: ~/.config/opencode/skills/hyp-mesh/SKILL.md".to_string(),
-                        );
+                        preview.push(skill());
                     }
                 }
                 HarnessKind::Gemini => {
                     preview.push("gemini: ~/.gemini/settings.json (MCP + hooks)".to_string());
                     if sel.install_skills {
-                        preview.push("  + skill: ~/.gemini/skills/hyp-mesh/SKILL.md".to_string());
+                        preview.push(skill());
                     }
                 }
                 HarnessKind::Openclaw => {
@@ -6601,7 +6542,7 @@ impl SetupToggleState {
                         if sel.openclaw_prompt_injection { "on" } else { "off" }
                     ));
                     if sel.install_skills {
-                        preview.push("  + skill: ~/.openclaw/skills/hyp-mesh/SKILL.md".to_string());
+                        preview.push(skill());
                     }
                 }
                 HarnessKind::Herdr => {
@@ -6610,9 +6551,7 @@ impl SetupToggleState {
                             .to_string(),
                     );
                     if sel.install_skills {
-                        preview.push(
-                            "  + skill: ~/.config/herdr/skills/hyp-mesh/SKILL.md".to_string(),
-                        );
+                        preview.push(skill());
                     }
                     if sel.install_herdr_mod {
                         preview.push(
@@ -6624,7 +6563,7 @@ impl SetupToggleState {
                 HarnessKind::T3 => {
                     preview.push("t3: ~/.config/hyphae/node.json (\"t3\" block)".to_string());
                     if sel.install_skills {
-                        preview.push("  + skill: ~/.agents/skills/hyp-mesh/SKILL.md".to_string());
+                        preview.push(skill());
                     }
                 }
             }
@@ -6901,6 +6840,8 @@ pub fn apply_openclaw_config_text_input(
     }
 }
 
+const OPENCLAW_CONFIG_TITLE: &str = "OpenClaw · Delivery Mode & Prompt Injection";
+
 #[cfg_attr(not(unix), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 pub fn render_openclaw_config_screen(
@@ -6929,7 +6870,7 @@ pub fn render_openclaw_config_screen(
             color_mode,
             RGB_PULSE_IVORY,
             true,
-            &truncate_chars("OpenClaw · Delivery Mode & Prompt Injection", content_w)
+            &truncate_chars(OPENCLAW_CONFIG_TITLE, content_w)
         )
     ));
     let sub = format!(
@@ -6958,11 +6899,8 @@ pub fn render_openclaw_config_screen(
     };
 
     lines.push(format!("{left_pad}{border_fg}╭{horiz}╮{reset}"));
-    let delivery_summary = match state.delivery {
-        OpenClawDeliveryMode::Gateway => "Delivery: Native plugin wake / /hooks/wake + hyp_inbox",
-        OpenClawDeliveryMode::Inbox => "Delivery: Turn-start / hyp_inbox only (no live wakeups)",
-    };
-    for wrapped in wrap_words(delivery_summary, inner_card_w) {
+    let delivery_summary = format!("Delivery: {}", state.delivery.display_label());
+    for wrapped in wrap_words(&delivery_summary, inner_card_w) {
         lines.push(card_row(&wrapped, RGB_PULSE_IVORY, true));
     }
     let pi_summary = if state.prompt_injection {
@@ -6993,10 +6931,7 @@ pub fn render_openclaw_config_screen(
         lines.push(String::new());
     }
 
-    let delivery_tag = match state.delivery {
-        OpenClawDeliveryMode::Gateway => "gateway",
-        OpenClawDeliveryMode::Inbox => "inbox",
-    };
+    let delivery_tag = state.delivery.as_str();
     let delivery_desc = match state.delivery {
         OpenClawDeliveryMode::Gateway => "wakes exact OpenClaw session (plugin / /hooks/wake)",
         OpenClawDeliveryMode::Inbox => "turn-start / hyp_inbox only",
@@ -7086,7 +7021,7 @@ fn run_plain_tty_openclaw_config(
 ) -> Result<OpenClawConfigAction, String> {
     loop {
         println!();
-        println!("OpenClaw · Delivery Mode & Prompt Injection");
+        println!("{OPENCLAW_CONFIG_TITLE}");
         println!("  [1] Delivery mode: {}", state.delivery.display_label());
         println!(
             "  [2] Prompt injection (before_prompt_build): [{}] {}",
@@ -7118,20 +7053,6 @@ fn run_plain_tty_openclaw_config(
             Ok(action) => return Ok(action),
             Err(msg) => println!("{msg}"),
         }
-    }
-}
-
-fn harness_toggle_display(kind: HarnessKind) -> (&'static str, &'static str) {
-    match kind {
-        HarnessKind::Antigravity => ("Antigravity", "~/.gemini/config/plugins/hyphae"),
-        HarnessKind::Claude => ("Claude Code", "~/.claude"),
-        HarnessKind::Codex => ("Codex", "~/.codex"),
-        HarnessKind::Cursor => ("Cursor", "~/.cursor"),
-        HarnessKind::Opencode => ("OpenCode", "~/.config/opencode"),
-        HarnessKind::Gemini => ("Gemini CLI", "~/.gemini/settings.json"),
-        HarnessKind::Openclaw => ("OpenClaw", "~/.openclaw"),
-        HarnessKind::Herdr => ("Herdr", "~/.config/herdr"),
-        HarnessKind::T3 => ("T3 Code", "~/.t3"),
     }
 }
 
@@ -7344,12 +7265,55 @@ fn format_toggle_row(
     }
 }
 
-#[cfg_attr(not(unix), allow(dead_code))]
-enum ToggleDisplayRow {
-    SectionHeader(&'static str),
+struct ChecklistItem {
+    index: usize,
+    label: &'static str,
+    checked: bool,
+    badge: Option<&'static str>,
+    detail: &'static str,
+    component: bool,
+}
+
+enum ChecklistRow {
+    Section(&'static str),
     Spacer,
-    Harness(usize),
-    Component(usize),
+    Item(ChecklistItem),
+}
+
+fn setup_checklist(state: &SetupToggleState) -> Vec<ChecklistRow> {
+    let mut rows = vec![ChecklistRow::Section("Harnesses")];
+    for (index, kind) in HarnessKind::ALL.into_iter().enumerate() {
+        let spec = crate::harness_spec::spec(kind);
+        rows.push(ChecklistRow::Item(ChecklistItem {
+            index,
+            label: spec.setup_label(),
+            checked: state.selected_harnesses[index],
+            badge: state.is_harness_detected(kind).then_some("(detected)"),
+            detail: &spec.setup_location,
+            component: false,
+        }));
+    }
+    rows.push(ChecklistRow::Spacer);
+    rows.push(ChecklistRow::Section("Components & UI Plugins"));
+    let checked = [
+        state.install_skills,
+        state.install_statusline,
+        state.install_claude_commands,
+        state.install_herdr_mod,
+    ];
+    for (component_index, checked) in checked.into_iter().enumerate() {
+        let index = SetupToggleState::HARNESS_COUNT + component_index;
+        let (label, detail) = component_toggle_display(index);
+        rows.push(ChecklistRow::Item(ChecklistItem {
+            index,
+            label,
+            checked,
+            badge: None,
+            detail,
+            component: true,
+        }));
+    }
+    rows
 }
 
 /// Pure, cross-platform renderer for the interactive harness & component toggle checklist.
@@ -7426,22 +7390,11 @@ pub fn render_setup_toggle_screen(
         lines.push(String::new());
     }
 
-    let mut display_rows = Vec::with_capacity(16);
-    display_rows.push(ToggleDisplayRow::SectionHeader("Harnesses"));
-    for idx in 0..SetupToggleState::HARNESS_COUNT {
-        display_rows.push(ToggleDisplayRow::Harness(idx));
-    }
-    display_rows.push(ToggleDisplayRow::Spacer);
-    display_rows.push(ToggleDisplayRow::SectionHeader("Components & UI Plugins"));
-    for idx in SetupToggleState::HARNESS_COUNT..SetupToggleState::TOTAL_ITEMS {
-        display_rows.push(ToggleDisplayRow::Component(idx));
-    }
-
-    let selected_display_row = if state.cursor < SetupToggleState::HARNESS_COUNT {
-        1 + state.cursor
-    } else {
-        12 + (state.cursor - SetupToggleState::HARNESS_COUNT)
-    };
+    let display_rows = setup_checklist(state);
+    let selected_display_row = display_rows
+        .iter()
+        .position(|row| matches!(row, ChecklistRow::Item(item) if item.index == state.cursor))
+        .unwrap_or(0);
 
     let footer_rows = if term_rows >= 10 { 2usize } else { 1usize };
     let body_budget = term_rows.saturating_sub(lines.len() + footer_rows).max(1);
@@ -7480,7 +7433,7 @@ pub fn render_setup_toggle_screen(
     let badge_w = 10usize; // "(detected)"
     for row in display_rows.iter().take(win.end).skip(win.start) {
         match row {
-            ToggleDisplayRow::SectionHeader(hdr) => {
+            ChecklistRow::Section(hdr) => {
                 lines.push(format!(
                     "{left_pad}{}",
                     paint_styled_text(
@@ -7491,43 +7444,23 @@ pub fn render_setup_toggle_screen(
                     )
                 ));
             }
-            ToggleDisplayRow::Spacer => {
+            ChecklistRow::Spacer => {
                 lines.push(String::new());
             }
-            ToggleDisplayRow::Harness(idx) => {
-                let kind = HarnessKind::ALL[*idx];
-                let (name, path_hint) = harness_toggle_display(kind);
-                let detected = state.is_harness_detected(kind);
-                let badge = if detected { Some("(detected)") } else { None };
-                lines.push(format_toggle_row(
-                    state.cursor == *idx,
-                    state.selected_harnesses[*idx],
-                    name,
-                    badge,
-                    path_hint,
-                    harness_label_w,
-                    badge_w,
-                    content_w,
-                    &left_pad,
-                    color_mode,
-                ));
-            }
-            ToggleDisplayRow::Component(idx) => {
-                let (name, desc) = component_toggle_display(*idx);
-                let checked = match *idx {
-                    9 => state.install_skills,
-                    10 => state.install_statusline,
-                    11 => state.install_claude_commands,
-                    _ => state.install_herdr_mod,
+            ChecklistRow::Item(item) => {
+                let (label_width, badge_width) = if item.component {
+                    (item.label.chars().count(), 0)
+                } else {
+                    (harness_label_w, badge_w)
                 };
                 lines.push(format_toggle_row(
-                    state.cursor == *idx,
-                    checked,
-                    name,
-                    None,
-                    desc,
-                    name.chars().count(),
-                    0,
+                    state.cursor == item.index,
+                    item.checked,
+                    item.label,
+                    item.badge,
+                    item.detail,
+                    label_width,
+                    badge_width,
                     content_w,
                     &left_pad,
                     color_mode,
@@ -7669,33 +7602,21 @@ fn run_plain_tty_setup_toggle(
             println!("hyp setup --interactive · Choose Harnesses & Components");
         }
         println!();
-        println!("Harnesses:");
-        for (idx, &kind) in HarnessKind::ALL.iter().enumerate() {
-            let (name, _) = harness_toggle_display(kind);
-            let mark = if state.selected_harnesses[idx] {
-                "x"
-            } else {
-                " "
-            };
-            let badge = if state.is_harness_detected(kind) {
-                " (detected)"
-            } else {
-                ""
-            };
-            println!("  [{:>2}] [{mark}] {name}{badge}", idx + 1);
-        }
-        println!();
-        println!("Components & UI Plugins:");
-        for idx in SetupToggleState::HARNESS_COUNT..SetupToggleState::TOTAL_ITEMS {
-            let (name, desc) = component_toggle_display(idx);
-            let checked = match idx {
-                9 => state.install_skills,
-                10 => state.install_statusline,
-                11 => state.install_claude_commands,
-                _ => state.install_herdr_mod,
-            };
-            let mark = if checked { "x" } else { " " };
-            println!("  [{:>2}] [{mark}] {name} {desc}", idx + 1);
+        for row in setup_checklist(state) {
+            match row {
+                ChecklistRow::Section(title) => println!("{title}:"),
+                ChecklistRow::Spacer => println!(),
+                ChecklistRow::Item(item) => {
+                    let mark = if item.checked { "x" } else { " " };
+                    let extra = if item.component {
+                        Some(item.detail)
+                    } else {
+                        item.badge
+                    }
+                    .map_or_else(String::new, |detail| format!(" {detail}"));
+                    println!("  [{:>2}] [{mark}] {}{extra}", item.index + 1, item.label);
+                }
+            }
         }
         if state.show_dry_run_preview {
             println!();
@@ -7948,7 +7869,7 @@ fn run_fullscreen_tui_loop(
     cli_bin: &str,
     play_intro: bool,
     animate_banner: bool,
-) -> Option<TuiResolution> {
+) -> Option<WizardAction> {
     let color_mode = detect_color_mode();
     let (mut term_rows, mut term_cols) = detect_terminal_size();
 
@@ -7964,7 +7885,7 @@ fn run_fullscreen_tui_loop(
     {
         raw.restore();
         alt.leave();
-        return Some(TuiResolution::Cancel);
+        return Some(WizardAction::Cancel);
     }
 
     if raw.set_mode(false).is_err() {
@@ -8103,12 +8024,12 @@ fn run_fullscreen_tui_loop(
                     anim_tick = anim_tick.wrapping_add(1);
                     continue;
                 }
-                Err(e) => break TuiResolution::Error(format!("Failed reading TTY input: {e}")),
+                Err(e) => break WizardAction::Error(format!("Failed reading TTY input: {e}")),
             }
         } else {
             match raw.read_key() {
                 Ok(k) => k,
-                Err(e) => break TuiResolution::Error(format!("Failed reading TTY input: {e}")),
+                Err(e) => break WizardAction::Error(format!("Failed reading TTY input: {e}")),
             }
         };
 
@@ -8127,12 +8048,12 @@ fn run_fullscreen_tui_loop(
                         }
                     }
                     KeyEvent::Back | KeyEvent::Cancel => {
-                        break TuiResolution::Cancel;
+                        break WizardAction::Cancel;
                     }
                     KeyEvent::Enter => {
                         let idx = *selected;
                         let Some(item) = main_items.get(idx) else {
-                            break TuiResolution::Cancel;
+                            break WizardAction::Cancel;
                         };
                         match &item.action {
                             MainMenuAction::HerdrTemplates { hc_bin, templates } => {
@@ -8145,13 +8066,13 @@ fn run_fullscreen_tui_loop(
                                 };
                             }
                             MainMenuAction::LaunchHerdrTemplate { hc_bin, template } => {
-                                break TuiResolution::LaunchHerdr {
+                                break WizardAction::LaunchHerdr {
                                     hc_bin: hc_bin.clone(),
                                     template: template.clone(),
                                 };
                             }
                             MainMenuAction::LaunchCli(lh) => {
-                                break TuiResolution::LaunchCli(*lh);
+                                break WizardAction::LaunchCli(*lh);
                             }
                             MainMenuAction::ManualGuide(mh) => {
                                 match install_manual_guide_skills(
@@ -8173,7 +8094,7 @@ fn run_fullscreen_tui_loop(
                                             true,
                                         );
                                     }
-                                    Err(e) => break TuiResolution::Error(e),
+                                    Err(e) => break WizardAction::Error(e),
                                 }
                             }
                             MainMenuAction::QuickLocalSetup => {
@@ -8211,7 +8132,7 @@ fn run_fullscreen_tui_loop(
                             main_selected: saved_main,
                         };
                     } else {
-                        break TuiResolution::RunLocalCliSetupWithSelection(selection);
+                        break WizardAction::RunLocalCliSetupWithSelection(selection);
                     }
                 }
                 SetupToggleAction::Back => {
@@ -8219,7 +8140,7 @@ fn run_fullscreen_tui_loop(
                     screen = WizardScreen::Main { selected: prev };
                 }
                 SetupToggleAction::Cancel => {
-                    break TuiResolution::Cancel;
+                    break WizardAction::Cancel;
                 }
             },
             WizardScreen::OpenClawLocalSetup {
@@ -8235,7 +8156,7 @@ fn run_fullscreen_tui_loop(
                     let mut next_toggle = toggle_state.clone();
                     next_toggle.openclaw_delivery = delivery;
                     next_toggle.openclaw_prompt_injection = prompt_injection;
-                    break TuiResolution::RunLocalCliSetupWithSelection(next_toggle.to_selection());
+                    break WizardAction::RunLocalCliSetupWithSelection(next_toggle.to_selection());
                 }
                 OpenClawConfigAction::Back => {
                     let mut prev_toggle = toggle_state.clone();
@@ -8248,7 +8169,7 @@ fn run_fullscreen_tui_loop(
                     };
                 }
                 OpenClawConfigAction::Cancel => {
-                    break TuiResolution::Cancel;
+                    break WizardAction::Cancel;
                 }
             },
             WizardScreen::OpenClawAssistConfig {
@@ -8308,7 +8229,7 @@ fn run_fullscreen_tui_loop(
                     screen = WizardScreen::Main { selected: prev };
                 }
                 OpenClawConfigAction::Cancel => {
-                    break TuiResolution::Cancel;
+                    break WizardAction::Cancel;
                 }
             },
             WizardScreen::HerdrTemplates {
@@ -8335,15 +8256,15 @@ fn run_fullscreen_tui_loop(
                             let prev = *main_selected;
                             screen = WizardScreen::Main { selected: prev };
                         } else {
-                            break TuiResolution::Cancel;
+                            break WizardAction::Cancel;
                         }
                     }
                     KeyEvent::Cancel => {
-                        break TuiResolution::Cancel;
+                        break WizardAction::Cancel;
                     }
                     KeyEvent::Enter => {
                         if let Some(tmpl) = templates.get(*selected).cloned() {
-                            break TuiResolution::LaunchHerdr {
+                            break WizardAction::LaunchHerdr {
                                 hc_bin: hc_bin.clone(),
                                 template: tmpl,
                             };
@@ -8351,7 +8272,7 @@ fn run_fullscreen_tui_loop(
                             let prev = *main_selected;
                             screen = WizardScreen::Main { selected: prev };
                         } else {
-                            break TuiResolution::Cancel;
+                            break WizardAction::Cancel;
                         }
                     }
                     _ => {}
@@ -8377,11 +8298,11 @@ fn run_fullscreen_tui_loop(
                         let prev = *main_selected;
                         screen = WizardScreen::Main { selected: prev };
                     } else {
-                        break TuiResolution::Cancel;
+                        break WizardAction::Cancel;
                     }
                 }
                 KeyEvent::Cancel => {
-                    break TuiResolution::Cancel;
+                    break WizardAction::Cancel;
                 }
                 KeyEvent::Enter => {
                     if *selected_option == 0 {
@@ -8482,7 +8403,7 @@ fn run_fullscreen_tui_loop(
                             let prev = *main_selected;
                             screen = WizardScreen::Main { selected: prev };
                         } else {
-                            break TuiResolution::ManualGuideDone {
+                            break WizardAction::ManualGuideDone {
                                 harness: *harness,
                                 primary_skill: primary_skill.clone(),
                                 installed: installed.clone(),
@@ -8493,7 +8414,7 @@ fn run_fullscreen_tui_loop(
                         }
                     }
                     KeyEvent::Cancel => {
-                        break TuiResolution::ManualGuideDone {
+                        break WizardAction::ManualGuideDone {
                             harness: *harness,
                             primary_skill: primary_skill.clone(),
                             installed: installed.clone(),
@@ -8516,7 +8437,7 @@ fn run_fullscreen_tui_loop(
                             let prev = *main_selected;
                             screen = WizardScreen::Main { selected: prev };
                         } else if *selected_action == done_idx {
-                            break TuiResolution::ManualGuideDone {
+                            break WizardAction::ManualGuideDone {
                                 harness: *harness,
                                 primary_skill: primary_skill.clone(),
                                 installed: installed.clone(),
@@ -8538,73 +8459,113 @@ fn run_fullscreen_tui_loop(
     Some(resolution)
 }
 
-#[cfg(unix)]
-fn execute_tui_resolution(
-    resolution: TuiResolution,
-    home: &Path,
+#[derive(Clone, Copy)]
+struct WizardDispatch<'a> {
+    home: &'a Path,
     explicit_home: bool,
-    claude_config_dir: Option<&Path>,
-    existing_node: Option<&ExistingNodeInfo>,
-    cli_bin: &str,
-) -> WizardOutcome {
-    match resolution {
-        TuiResolution::Cancel => WizardOutcome::Finished(ExitCode::from(EXIT_OK)),
-        TuiResolution::RunLocalCliSetup => WizardOutcome::RunLocalCliSetup,
-        TuiResolution::RunLocalCliSetupWithSelection(selection) => {
-            WizardOutcome::RunLocalCliSetupWithSelection(selection)
+    claude_config_dir: Option<&'a Path>,
+    existing_node: Option<&'a ExistingNodeInfo>,
+    cli_bin: &'a str,
+    json: bool,
+}
+
+impl<'a> WizardDispatch<'a> {
+    fn new(
+        args: &'a OnboardArgs,
+        home: &'a Path,
+        node: Option<&'a ExistingNodeInfo>,
+        cli_bin: &'a str,
+    ) -> Self {
+        Self {
+            home,
+            explicit_home: args.home.is_some(),
+            claude_config_dir: args.claude_config_dir.as_deref(),
+            existing_node: node,
+            cli_bin,
+            json: args.json,
         }
-        TuiResolution::LaunchCli(lh) => {
-            let code = install_and_handoff_cli(
-                lh,
-                home,
-                explicit_home,
-                claude_config_dir,
-                existing_node,
-                cli_bin,
-                false,
-            );
-            WizardOutcome::Finished(code)
-        }
-        TuiResolution::LaunchHerdr { hc_bin, template } => {
-            let code = install_and_handoff_herdr(
-                &hc_bin,
-                &template,
-                home,
-                explicit_home,
-                claude_config_dir,
-                existing_node,
-                false,
-            );
-            WizardOutcome::Finished(code)
-        }
-        TuiResolution::ManualGuideDone {
-            harness,
-            primary_skill,
-            installed,
-            prompt,
-            mcp_status,
-            deeplink,
-        } => {
-            print_manual_guide_plain(
+    }
+
+    fn dispatch(self, action: WizardAction) -> WizardOutcome {
+        let Self {
+            home,
+            explicit_home,
+            claude_config_dir,
+            existing_node,
+            cli_bin,
+            json,
+        } = self;
+        match action {
+            WizardAction::Cancel => WizardOutcome::Finished(ExitCode::from(EXIT_OK)),
+            WizardAction::RunLocalCliSetupWithSelection(selection) => {
+                WizardOutcome::RunLocalCliSetupWithSelection(selection)
+            }
+            WizardAction::LaunchCli(lh) => {
+                let code = install_and_handoff_cli(
+                    lh,
+                    home,
+                    explicit_home,
+                    claude_config_dir,
+                    existing_node,
+                    cli_bin,
+                    json,
+                );
+                WizardOutcome::Finished(code)
+            }
+            WizardAction::LaunchHerdr { hc_bin, template } => {
+                let code = install_and_handoff_herdr(
+                    &hc_bin,
+                    &template,
+                    home,
+                    explicit_home,
+                    claude_config_dir,
+                    existing_node,
+                    json,
+                );
+                WizardOutcome::Finished(code)
+            }
+            WizardAction::ManualGuide(harness) => {
+                WizardOutcome::Finished(install_and_emit_manual_guide(
+                    harness,
+                    home,
+                    explicit_home,
+                    claude_config_dir,
+                    existing_node,
+                    cli_bin,
+                    json,
+                ))
+            }
+            #[cfg(unix)]
+            WizardAction::ManualGuideDone {
                 harness,
-                home,
-                cli_bin,
-                &primary_skill,
-                &installed,
-                &prompt,
-                &mcp_status,
-                deeplink.as_deref(),
-            );
-            WizardOutcome::Finished(ExitCode::from(EXIT_OK))
+                primary_skill,
+                installed,
+                prompt,
+                mcp_status,
+                deeplink,
+            } => {
+                print_manual_guide_plain(
+                    harness,
+                    home,
+                    cli_bin,
+                    &primary_skill,
+                    &installed,
+                    &prompt,
+                    &mcp_status,
+                    deeplink.as_deref(),
+                );
+                WizardOutcome::Finished(ExitCode::from(EXIT_OK))
+            }
+            #[cfg(unix)]
+            WizardAction::Error(msg) => WizardOutcome::Finished(emit_error(
+                "onboard",
+                false,
+                EXIT_ERROR,
+                "WIZARD_ERROR",
+                msg,
+                Some("Re-run with `hyp onboard --yes` for local CLI setup.".to_string()),
+            )),
         }
-        TuiResolution::Error(msg) => WizardOutcome::Finished(emit_error(
-            "onboard",
-            false,
-            EXIT_ERROR,
-            "WIZARD_ERROR",
-            msg,
-            Some("Re-run with `hyp onboard --yes` for local CLI setup.".to_string()),
-        )),
     }
 }
 
@@ -8640,10 +8601,7 @@ pub(crate) fn read_tty_line(prompt: &str) -> io::Result<Option<String>> {
 fn run_numbered_herdr_fallback(
     hc_bin: &Path,
     templates: &[HerdrTemplate],
-    home: &Path,
-    explicit_home: bool,
-    claude_config_dir: Option<&Path>,
-    existing_node: Option<&ExistingNodeInfo>,
+    dispatch: WizardDispatch<'_>,
 ) -> Option<WizardOutcome> {
     println!();
     println!("Herdr · Pick a Launch Template:");
@@ -8666,16 +8624,10 @@ fn run_numbered_herdr_fallback(
             Err(_) => return None,
         };
         if reply.is_empty() {
-            let code = install_and_handoff_herdr(
-                hc_bin,
-                &templates[0],
-                home,
-                explicit_home,
-                claude_config_dir,
-                existing_node,
-                false,
-            );
-            return Some(WizardOutcome::Finished(code));
+            return Some(dispatch.dispatch(WizardAction::LaunchHerdr {
+                hc_bin: hc_bin.to_owned(),
+                template: templates[0].clone(),
+            }));
         }
         if matches!(reply.as_str(), "b" | "back") {
             return None;
@@ -8688,16 +8640,10 @@ fn run_numbered_herdr_fallback(
             .ok()
             .filter(|n| (1..=templates.len()).contains(n))
         {
-            let code = install_and_handoff_herdr(
-                hc_bin,
-                &templates[n - 1],
-                home,
-                explicit_home,
-                claude_config_dir,
-                existing_node,
-                false,
-            );
-            return Some(WizardOutcome::Finished(code));
+            return Some(dispatch.dispatch(WizardAction::LaunchHerdr {
+                hc_bin: hc_bin.to_owned(),
+                template: templates[n - 1].clone(),
+            }));
         }
         println!(
             "Invalid choice '{reply}'. Enter 1-{}, 'b' to go back, or 'q' to quit.",
@@ -8736,8 +8682,9 @@ fn run_plain_tty_desktop_mcp_confirm(
         println!("    {line}");
     }
     println!();
-    println!("  [1] Apply MCP config & continue");
-    println!("  [2] Skip config write (I'll edit manually)");
+    for (index, (label, _)) in DESKTOP_MCP_CHOICES.iter().enumerate() {
+        println!("  [{}] {label}", index + 1);
+    }
     if allow_back {
         println!("  [b] Back");
     }
@@ -8885,6 +8832,7 @@ fn run_numbered_fallback_wizard(
     in_herdr_env: Option<&str>,
     cli_bin: &str,
 ) -> WizardOutcome {
+    let dispatch = WizardDispatch::new(args, home, existing_node, cli_bin);
     play_mycelium_animation(args.no_anim);
 
     let version = env!("CARGO_PKG_VERSION");
@@ -8948,7 +8896,7 @@ fn run_numbered_fallback_wizard(
 
         if matches!(reply.as_str(), "q" | "quit") {
             println!("Cancelled.");
-            return WizardOutcome::Finished(ExitCode::from(EXIT_OK));
+            return dispatch.dispatch(WizardAction::Cancel);
         }
 
         let picked_idx = if reply.is_empty() {
@@ -8971,40 +8919,18 @@ fn run_numbered_fallback_wizard(
 
         match &main_items[idx].action {
             MainMenuAction::HerdrTemplates { hc_bin, templates } => {
-                if let Some(outcome) = run_numbered_herdr_fallback(
-                    hc_bin,
-                    templates,
-                    home,
-                    args.home.is_some(),
-                    args.claude_config_dir.as_deref(),
-                    existing_node,
-                ) {
+                if let Some(outcome) = run_numbered_herdr_fallback(hc_bin, templates, dispatch) {
                     return outcome;
                 }
             }
             MainMenuAction::LaunchHerdrTemplate { hc_bin, template } => {
-                let code = install_and_handoff_herdr(
-                    hc_bin,
-                    template,
-                    home,
-                    args.home.is_some(),
-                    args.claude_config_dir.as_deref(),
-                    existing_node,
-                    false,
-                );
-                return WizardOutcome::Finished(code);
+                return dispatch.dispatch(WizardAction::LaunchHerdr {
+                    hc_bin: hc_bin.clone(),
+                    template: template.clone(),
+                });
             }
-            MainMenuAction::LaunchCli(lh) => {
-                let code = install_and_handoff_cli(
-                    *lh,
-                    home,
-                    args.home.is_some(),
-                    args.claude_config_dir.as_deref(),
-                    existing_node,
-                    cli_bin,
-                    false,
-                );
-                return WizardOutcome::Finished(code);
+            MainMenuAction::LaunchCli(harness) => {
+                return dispatch.dispatch(WizardAction::LaunchCli(*harness));
             }
             MainMenuAction::ManualGuide(mh) => {
                 if let Some(outcome) = run_plain_tty_manual_guide(
@@ -9040,8 +8966,8 @@ fn run_numbered_fallback_wizard(
                                     }) => {
                                         selection.openclaw_delivery = delivery;
                                         selection.openclaw_prompt_injection = prompt_injection;
-                                        return WizardOutcome::RunLocalCliSetupWithSelection(
-                                            selection,
+                                        return dispatch.dispatch(
+                                            WizardAction::RunLocalCliSetupWithSelection(selection),
                                         );
                                     }
                                     Ok(OpenClawConfigAction::Back) => {
@@ -9055,7 +8981,7 @@ fn run_numbered_fallback_wizard(
                                         | OpenClawConfigAction::Continue,
                                     ) => {
                                         println!("Cancelled.");
-                                        return WizardOutcome::Finished(ExitCode::from(EXIT_OK));
+                                        return dispatch.dispatch(WizardAction::Cancel);
                                     }
                                     Err(e) => {
                                         return WizardOutcome::Finished(emit_error(
@@ -9072,12 +8998,13 @@ fn run_numbered_fallback_wizard(
                                     }
                                 }
                             }
-                            return WizardOutcome::RunLocalCliSetupWithSelection(selection);
+                            return dispatch
+                                .dispatch(WizardAction::RunLocalCliSetupWithSelection(selection));
                         }
                         Ok(SetupToggleAction::Back) => break,
                         Ok(SetupToggleAction::Cancel) | Ok(SetupToggleAction::Continue) => {
                             println!("Cancelled.");
-                            return WizardOutcome::Finished(ExitCode::from(EXIT_OK));
+                            return dispatch.dispatch(WizardAction::Cancel);
                         }
                         Err(e) => {
                             return WizardOutcome::Finished(emit_error(
@@ -9174,14 +9101,8 @@ pub fn run_interactive_wizard(args: &OnboardArgs, home: &Path) -> WizardOutcome 
             animate,
             animate,
         ) {
-            return execute_tui_resolution(
-                resolution,
-                home,
-                args.home.is_some(),
-                args.claude_config_dir.as_deref(),
-                existing_node.as_ref(),
-                &cli_bin,
-            );
+            return WizardDispatch::new(args, home, existing_node.as_ref(), &cli_bin)
+                .dispatch(resolution);
         }
     }
 
@@ -9206,16 +9127,8 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
         let launchables = detect_launchable_harnesses_on_path();
         if let Some(&(chosen, _)) = launchables.first() {
             let existing_node = detect_existing_node(args, home);
-            let code = install_and_handoff_cli(
-                chosen,
-                home,
-                args.home.is_some(),
-                args.claude_config_dir.as_deref(),
-                existing_node.as_ref(),
-                &cli_bin,
-                args.json,
-            );
-            return WizardOutcome::Finished(code);
+            return WizardDispatch::new(args, home, existing_node.as_ref(), &cli_bin)
+                .dispatch(WizardAction::LaunchCli(chosen));
         }
         // Check detected non-launchable harnesses (OpenClaw / T3) before failing.
         let existing_node = detect_existing_node(args, home);
@@ -9230,16 +9143,8 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
                 .iter()
                 .any(|d| d.harness == guide.id() && (d.detected || d.configured))
             {
-                let code = install_and_emit_manual_guide(
-                    guide,
-                    home,
-                    args.home.is_some(),
-                    args.claude_config_dir.as_deref(),
-                    existing_node.as_ref(),
-                    &cli_bin,
-                    args.json,
-                );
-                return WizardOutcome::Finished(code);
+                return WizardDispatch::new(args, home, existing_node.as_ref(), &cli_bin)
+                    .dispatch(WizardAction::ManualGuide(guide));
             }
         }
         return WizardOutcome::Finished(emit_error(
@@ -9307,24 +9212,15 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
                     animate,
                     animate,
                 ) {
-                    return execute_tui_resolution(
-                        resolution,
-                        home,
-                        args.home.is_some(),
-                        args.claude_config_dir.as_deref(),
-                        existing_node.as_ref(),
-                        &cli_bin,
-                    );
+                    return WizardDispatch::new(args, home, existing_node.as_ref(), &cli_bin)
+                        .dispatch(resolution);
                 }
             }
             if io::stdout().is_terminal() && !args.json {
                 if let Some(outcome) = run_numbered_herdr_fallback(
                     &hc_bin,
                     &discovered,
-                    home,
-                    args.home.is_some(),
-                    args.claude_config_dir.as_deref(),
-                    existing_node.as_ref(),
+                    WizardDispatch::new(args, home, existing_node.as_ref(), &cli_bin),
                 ) {
                     return outcome;
                 }
@@ -9365,16 +9261,8 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
         if !args.json {
             play_mycelium_animation(args.no_anim);
         }
-        let code = install_and_handoff_herdr(
-            &hc_bin,
-            &template,
-            home,
-            args.home.is_some(),
-            args.claude_config_dir.as_deref(),
-            existing_node.as_ref(),
-            args.json,
-        );
-        return WizardOutcome::Finished(code);
+        return WizardDispatch::new(args, home, existing_node.as_ref(), &cli_bin)
+            .dispatch(WizardAction::LaunchHerdr { hc_bin, template });
     }
 
     // 2. Non-launchable manual guide harnesses:
@@ -9415,14 +9303,8 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
                         animate,
                         animate,
                     ) {
-                        return execute_tui_resolution(
-                            resolution,
-                            home,
-                            args.home.is_some(),
-                            args.claude_config_dir.as_deref(),
-                            existing_node.as_ref(),
-                            &cli_bin,
-                        );
+                        return WizardDispatch::new(args, home, existing_node.as_ref(), &cli_bin)
+                            .dispatch(resolution);
                     }
                 }
                 Err(e) => {
@@ -9453,16 +9335,8 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
             return WizardOutcome::Finished(ExitCode::from(EXIT_OK));
         }
 
-        let code = install_and_emit_manual_guide(
-            guide_harness,
-            home,
-            args.home.is_some(),
-            args.claude_config_dir.as_deref(),
-            existing_node.as_ref(),
-            &cli_bin,
-            args.json,
-        );
-        return WizardOutcome::Finished(code);
+        return WizardDispatch::new(args, home, existing_node.as_ref(), &cli_bin)
+            .dispatch(WizardAction::ManualGuide(guide_harness));
     }
 
     // 3. Verified interactive CLI harnesses.
@@ -9483,16 +9357,8 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
         play_mycelium_animation(args.no_anim);
     }
     let existing_node = detect_existing_node(args, home);
-    let code = install_and_handoff_cli(
-        chosen,
-        home,
-        args.home.is_some(),
-        args.claude_config_dir.as_deref(),
-        existing_node.as_ref(),
-        &cli_bin,
-        args.json,
-    );
-    WizardOutcome::Finished(code)
+    WizardDispatch::new(args, home, existing_node.as_ref(), &cli_bin)
+        .dispatch(WizardAction::LaunchCli(chosen))
 }
 
 // ============================================================================

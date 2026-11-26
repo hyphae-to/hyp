@@ -1371,25 +1371,27 @@ if (-not $KeepHarnesses) {
     # Installed Hyphae skill subdirectories across harness roots
     $skillRoots = New-Object System.Collections.Generic.List[string]
     $skillRootSeen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-    Add-UniquePath -List $skillRoots -Seen $skillRootSeen -Path (Join-Path $UserHome ".claude\skills")
-    if (-not [string]::IsNullOrWhiteSpace($ClaudeProfileDir)) {
-        Add-UniquePath -List $skillRoots -Seen $skillRootSeen -Path (Join-Path $ClaudeProfileDir "skills")
-    }
+    # BEGIN GENERATED HARNESS SKILL ROOTS
     foreach ($sr in @(
-        (Join-Path $UserHome ".codex\skills"),
-        (Join-Path $UserHome ".agents\skills"),
         (Join-Path $UserHome ".gemini\config\skills"),
-        (Join-Path $UserHome ".gemini\skills"),
-        (Join-Path $ConfigHome "opencode\skills"),
-        (Join-Path $UserHome ".config\opencode\skills"),
-        (Join-Path $AppData "opencode\skills"),
+        (Join-Path $UserHome ".claude\skills"),
+        (Join-Path $UserHome ".agents\skills"),
+        (Join-Path $UserHome ".codex\skills"),
         (Join-Path $UserHome ".cursor\skills"),
+        (Join-Path $ConfigHome "opencode\skills"),
+        (Join-Path $AppData "opencode\skills"),
+        (Join-Path $UserHome ".config\opencode\skills"),
+        (Join-Path $UserHome ".gemini\skills"),
         (Join-Path $UserHome ".openclaw\skills"),
         (Join-Path $ConfigHome "herdr\skills"),
         (Join-Path $UserHome ".config\herdr\skills"),
         (Join-Path $UserHome ".t3\skills")
     )) {
         Add-UniquePath -List $skillRoots -Seen $skillRootSeen -Path $sr
+    }
+    # END GENERATED HARNESS SKILL ROOTS
+    if (-not [string]::IsNullOrWhiteSpace($ClaudeProfileDir)) {
+        Add-UniquePath -List $skillRoots -Seen $skillRootSeen -Path (Join-Path $ClaudeProfileDir "skills")
     }
 
     $skillSeen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)

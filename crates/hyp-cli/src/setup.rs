@@ -11,6 +11,7 @@ use crate::config_file::{
     resolve_config_path_for_write, resolve_home_dir, resolve_state_dir, write_atomic_file,
     write_atomic_json,
 };
+use crate::harness_spec::{HarnessSpec, spec};
 use crate::node_cmd::CliNodeProfile;
 use crate::pair::{
     LiveHandshakeError, OnboardJoinResult, live_join_url_for_onboard, live_pair_am2_for_onboard,
@@ -774,23 +775,26 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
         openclaw_prompt_injection: openclaw_prompt_injection_override,
     };
 
-    for kind in targets {
-        let step_res = if args.restore_statusline {
-            restore_harness_statusline_only(kind, &home, &claude_profiles, &state_dir, args.dry_run)
-        } else if args.refresh_skills {
-            refresh_harness_skill_only(kind, &home, &claude_profiles, &skill_ctx, args.dry_run)
-        } else {
-            configure_harness(
-                kind,
-                &home,
-                &bin_path,
-                &config_path,
-                setup_opts,
-                &skill_ctx,
-                &mut warnings,
-                &mut extra_next,
-            )
-        };
+    let mode = if args.restore_statusline {
+        HarnessConfigureMode::RestoreStatusline
+    } else if args.refresh_skills {
+        HarnessConfigureMode::RefreshSkills
+    } else {
+        HarnessConfigureMode::Full
+    };
+    let request = HarnessConfigureRequest {
+        home: &home,
+        bin: &bin_path,
+        config_path: &config_path,
+        options: setup_opts,
+        skills: &skill_ctx,
+        mode,
+    };
+    for step in configure_harnesses(targets, request) {
+        let kind = step.kind;
+        warnings.extend(step.warnings);
+        extra_next.extend(step.next);
+        let step_res = step.result;
         match step_res {
             Ok(mut outcome) => {
                 if kind == HarnessKind::Herdr
@@ -1396,17 +1400,19 @@ fn run_onboard_deterministic(
     let mut configured_harnesses = Vec::new();
     let mut herdr_mod_outcome: Option<crate::herdr_mod::HerdrModInstallOutcome> = None;
     let mut extra_next: Vec<String> = Vec::new();
-    for kind in targets {
-        match configure_harness(
-            kind,
-            &home,
-            &bin_path,
-            &config_path,
-            onboard_setup_opts,
-            &skill_ctx,
-            &mut warnings,
-            &mut extra_next,
-        ) {
+    let request = HarnessConfigureRequest {
+        home: &home,
+        bin: &bin_path,
+        config_path: &config_path,
+        options: onboard_setup_opts,
+        skills: &skill_ctx,
+        mode: HarnessConfigureMode::Full,
+    };
+    for step in configure_harnesses(targets, request) {
+        let kind = step.kind;
+        warnings.extend(step.warnings);
+        extra_next.extend(step.next);
+        match step.result {
             Ok(mut outcome) => {
                 if kind == HarnessKind::Herdr && opt_install_mod {
                     let mod_opts = crate::herdr_mod::HerdrModInstallOptions {
@@ -2074,21 +2080,23 @@ pub(crate) fn configure_detected_harnesses_for_join(
         openclaw_delivery: None,
         openclaw_prompt_injection: None,
     };
-    let mut extra_next = Vec::new();
+    let request = HarnessConfigureRequest {
+        home,
+        bin: &bin_str,
+        config_path,
+        options: opts,
+        skills: &skill_ctx,
+        mode: HarnessConfigureMode::Full,
+    };
     let mut configured = Vec::new();
-    for kind in targets {
-        match configure_harness(
-            kind,
-            home,
-            &bin_str,
-            config_path,
-            opts,
-            &skill_ctx,
-            warnings,
-            &mut extra_next,
-        ) {
-            Ok(_) => configured.push(kind.as_str().to_string()),
-            Err(e) => warnings.push(format!("Skipped harness '{}' setup: {e}", kind.as_str())),
+    for step in configure_harnesses(targets, request) {
+        warnings.extend(step.warnings);
+        match step.result {
+            Ok(_) => configured.push(step.kind.as_str().to_string()),
+            Err(e) => warnings.push(format!(
+                "Skipped harness '{}' setup: {e}",
+                step.kind.as_str()
+            )),
         }
     }
     configured
@@ -2099,24 +2107,7 @@ fn is_harness_detected(
     home: &Path,
     claude_profiles: &[ClaudeConfigProfile],
 ) -> bool {
-    match kind {
-        HarnessKind::Antigravity => {
-            home.join(".gemini").join("antigravity-cli").exists()
-                || home.join(".gemini").join("config").exists()
-        }
-        HarnessKind::Claude => claude_profiles
-            .iter()
-            .any(|p| p.config_dir.exists() || p.mcp_file.exists()),
-        HarnessKind::Codex => home.join(".codex").exists(),
-        HarnessKind::Cursor => home.join(".cursor").exists(),
-        HarnessKind::Opencode => home.join(".config").join("opencode").exists(),
-        HarnessKind::Gemini => home.join(".gemini").join("settings.json").exists(),
-        HarnessKind::Openclaw => home.join(".openclaw").exists(),
-        HarnessKind::Herdr => {
-            home.join(".config").join("herdr").exists() || home.join(".herdr").exists()
-        }
-        HarnessKind::T3 => home.join(".t3").exists(),
-    }
+    spec(kind).detected(home, claude_profiles)
 }
 
 fn claude_mcp_file_has_hyphae(mcp_file: &Path) -> bool {
@@ -2218,51 +2209,19 @@ pub fn detect_harness_statuses(
                 };
             }
 
-            let (configured, location) = match kind {
-                HarnessKind::Antigravity => {
-                    let p = home
-                        .join(".gemini")
-                        .join("config")
-                        .join("plugins")
-                        .join("hyphae")
-                        .join("hooks.json");
-                    (p.exists(), p.display().to_string())
-                }
-                HarnessKind::Claude => unreachable!(),
-                HarnessKind::Codex => {
-                    let p = home.join(".codex").join("hooks.json");
-                    let ok = p.exists()
-                        && fs::read_to_string(&p)
-                            .map(|s| contains_hyphae_hook(&s))
-                            .unwrap_or(false);
-                    (ok, p.display().to_string())
-                }
-                HarnessKind::Cursor => {
-                    let p = home.join(".cursor").join("hooks.json");
-                    let ok = p.exists()
-                        && fs::read_to_string(&p)
-                            .map(|s| contains_hyphae_hook(&s))
-                            .unwrap_or(false);
-                    (ok, p.display().to_string())
-                }
-                HarnessKind::Opencode => {
-                    let p = home
-                        .join(".config")
-                        .join("opencode")
-                        .join("plugins")
-                        .join("hyphae.ts");
-                    (p.exists(), p.display().to_string())
-                }
-                HarnessKind::Gemini => {
-                    let p = home.join(".gemini").join("settings.json");
-                    let ok = p.exists()
-                        && fs::read_to_string(&p)
-                            .map(|s| contains_hyphae_hook(&s))
-                            .unwrap_or(false);
-                    (ok, p.display().to_string())
-                }
+            let spec = spec(kind);
+            let (configured, location) = if let Some(diagnostic) = &spec.diagnostic {
+                let path = spec.diagnostic_path(home, diagnostic);
+                let configured = match diagnostic.test {
+                    crate::harness_spec::DiagnosticTest::Exists => path.exists(),
+                    crate::harness_spec::DiagnosticTest::Hooks => fs::read_to_string(&path)
+                        .is_ok_and(|contents| contains_hyphae_hook(&contents)),
+                };
+                (configured, path.display().to_string())
+            } else {
+                match kind {
                 HarnessKind::Openclaw => {
-                    let p = home.join(".openclaw").join("openclaw.json");
+                    let p = spec.config_location(home).join("openclaw.json");
                     let plugin_manifest = home
                         .join(".openclaw")
                         .join("extensions")
@@ -2297,9 +2256,8 @@ pub fn detect_harness_statuses(
                     (has_cfg, loc)
                 }
                 HarnessKind::Herdr => {
-                    let skill_root = home.join(".config").join("herdr").join("skills");
-                    let skill = skill_root.join("hyp-mesh/SKILL.md");
-                    let legacy_skill = skill_root.join("hyphae/SKILL.md");
+                    let skill = spec.runtime_skill(home);
+                    let legacy_skill = legacy_skill_path(&skill, "hyphae");
                     let mod_pane = home
                         .join(".config")
                         .join("herdr-app")
@@ -2318,7 +2276,7 @@ pub fn detect_harness_statuses(
                     }
                 }
                 HarnessKind::T3 => {
-                    let t3_skill = home.join(".agents/skills/hyp-mesh/SKILL.md");
+                    let t3_skill = spec.runtime_skill(home);
                     let legacy_skill = home.join(".t3/skills/hyphae/SKILL.md");
                     let t3_profile_installed = fs::read_to_string(&t3_skill).is_ok_and(|text| {
                         text.lines()
@@ -2346,6 +2304,8 @@ pub fn detect_harness_statuses(
                             || legacy.exists(),
                         loc,
                     )
+                }
+                    _ => unreachable!("harness without a diagnostic strategy"),
                 }
             };
 
@@ -2447,7 +2407,9 @@ fn merge_hook_groups(existing: Option<&Value>, new_entry: Value) -> Value {
 }
 
 pub(crate) fn codex_mcp_config_path(home: &Path) -> PathBuf {
-    home.join(".codex").join("config.toml")
+    spec(HarnessKind::Codex)
+        .config_location(home)
+        .join("config.toml")
 }
 
 pub(crate) struct CodexMcpConfig {
@@ -2680,11 +2642,10 @@ fn legacy_runtime_skills(kind: HarnessKind, home: &Path, installed: &Path) -> Ve
     let local = legacy_skill_path(installed, "hyphae");
     if matches!(kind, HarnessKind::Codex | HarnessKind::T3) {
         // Prefer the Codex profile when the host has both old harness copies.
-        vec![
-            home.join(".codex/skills/hyphae/SKILL.md"),
-            local,
-            home.join(".t3/skills/hyphae/SKILL.md"),
-        ]
+        let mut paths = spec(HarnessKind::Codex).legacy_skills(home, "hyphae");
+        paths.push(local);
+        paths.extend(spec(HarnessKind::T3).legacy_skills(home, "hyphae"));
+        paths
     } else {
         vec![local]
     }
@@ -3352,27 +3313,95 @@ fn inspect_statusline_path(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn configure_harness(
+#[derive(Clone, Copy)]
+enum HarnessConfigureMode {
+    Full,
+    RefreshSkills,
+    RestoreStatusline,
+}
+
+struct HarnessConfigureRequest<'a> {
+    home: &'a Path,
+    bin: &'a str,
+    config_path: &'a Path,
+    options: SetupOptions<'a>,
+    skills: &'a SetupSkillContext,
+    mode: HarnessConfigureMode,
+}
+
+struct HarnessConfigureStep {
     kind: HarnessKind,
-    home: &Path,
-    bin: &str,
-    config_path: &Path,
-    opts: SetupOptions<'_>,
-    skill_ctx: &SetupSkillContext,
-    warnings: &mut Vec<String>,
-    extra_next: &mut Vec<String>,
-) -> Result<HarnessSetupOutcome, String> {
-    match kind {
-        HarnessKind::Antigravity => setup_antigravity(home, bin, opts, skill_ctx),
-        HarnessKind::Claude => setup_claude(home, bin, opts, skill_ctx, warnings, extra_next),
-        HarnessKind::Codex => setup_codex(home, bin, opts, skill_ctx),
-        HarnessKind::Cursor => setup_cursor(home, bin, opts, skill_ctx),
-        HarnessKind::Opencode => setup_opencode(home, bin, opts, skill_ctx),
-        HarnessKind::Gemini => setup_gemini(home, bin, opts, skill_ctx),
-        HarnessKind::Openclaw => setup_openclaw(home, bin, config_path, opts, skill_ctx),
-        HarnessKind::Herdr => setup_herdr(home, bin, opts, skill_ctx),
-        HarnessKind::T3 => setup_t3(home, bin, config_path, opts, skill_ctx),
+    result: Result<HarnessSetupOutcome, String>,
+    warnings: Vec<String>,
+    next: Vec<String>,
+}
+
+fn configure_harnesses(
+    targets: Vec<HarnessKind>,
+    request: HarnessConfigureRequest<'_>,
+) -> impl Iterator<Item = HarnessConfigureStep> + '_ {
+    targets.into_iter().map(move |kind| {
+        let mut warnings = Vec::new();
+        let mut next = Vec::new();
+        let HarnessConfigureRequest {
+            home,
+            options,
+            skills,
+            mode,
+            ..
+        } = request;
+        let result = match mode {
+            HarnessConfigureMode::RestoreStatusline => restore_harness_statusline_only(
+                kind,
+                home,
+                options.claude_profiles,
+                options.state_dir,
+                options.dry_run,
+            ),
+            HarnessConfigureMode::RefreshSkills => refresh_harness_skill_only(
+                kind,
+                home,
+                options.claude_profiles,
+                skills,
+                options.dry_run,
+            ),
+            HarnessConfigureMode::Full => spec(kind).configure(&request, &mut warnings, &mut next),
+        };
+        HarnessConfigureStep {
+            kind,
+            result,
+            warnings,
+            next,
+        }
+    })
+}
+
+impl HarnessSpec {
+    fn configure(
+        &self,
+        request: &HarnessConfigureRequest<'_>,
+        warnings: &mut Vec<String>,
+        next: &mut Vec<String>,
+    ) -> Result<HarnessSetupOutcome, String> {
+        let HarnessConfigureRequest {
+            home,
+            bin,
+            config_path,
+            options,
+            skills,
+            ..
+        } = *request;
+        match self.kind {
+            HarnessKind::Antigravity => setup_antigravity(home, bin, options, skills),
+            HarnessKind::Claude => setup_claude(home, bin, options, skills, warnings, next),
+            HarnessKind::Codex => setup_codex(home, bin, options, skills),
+            HarnessKind::Cursor => setup_cursor(home, bin, options, skills),
+            HarnessKind::Opencode => setup_opencode(home, bin, options, skills),
+            HarnessKind::Gemini => setup_gemini(home, bin, options, skills),
+            HarnessKind::Openclaw => setup_openclaw(home, bin, config_path, options, skills),
+            HarnessKind::Herdr => setup_herdr(home, bin, options, skills),
+            HarnessKind::T3 => setup_t3(home, bin, config_path, options, skills),
+        }
     }
 }
 
@@ -3384,11 +3413,7 @@ fn setup_antigravity(
 ) -> Result<HarnessSetupOutcome, String> {
     let socket = opts.socket;
     let dry_run = opts.dry_run;
-    let plugin_dir = home
-        .join(".gemini")
-        .join("config")
-        .join("plugins")
-        .join("hyphae");
+    let plugin_dir = spec(HarnessKind::Antigravity).config_location(home);
 
     let plugin_json = plugin_dir.join("plugin.json");
     maybe_write_json(
@@ -3890,7 +3915,7 @@ fn setup_cursor(
 ) -> Result<HarnessSetupOutcome, String> {
     let socket = opts.socket;
     let dry_run = opts.dry_run;
-    let base_dir = home.join(".cursor");
+    let base_dir = spec(HarnessKind::Cursor).config_location(home);
     let mcp_file = base_dir.join("mcp.json");
     let hooks_file = base_dir.join("hooks.json");
 
@@ -3999,7 +4024,7 @@ fn setup_opencode(
 
     let socket = opts.socket;
     let dry_run = opts.dry_run;
-    let config_root = home.join(".config").join("opencode");
+    let config_root = spec(HarnessKind::Opencode).config_location(home);
     let config_file = config_root.join("opencode.json");
     let plugin_file = config_root.join("plugins").join("hyphae.ts");
     let commands_dir = config_root.join("commands");
@@ -4096,7 +4121,7 @@ fn setup_gemini(
 ) -> Result<HarnessSetupOutcome, String> {
     let socket = opts.socket;
     let dry_run = opts.dry_run;
-    let settings_file = home.join(".gemini").join("settings.json");
+    let settings_file = spec(HarnessKind::Gemini).config_location(home);
     let mut settings = read_json_object_or_empty(&settings_file)?;
 
     let mut servers = settings
@@ -4215,7 +4240,9 @@ fn setup_gemini(
 /// `~/.openclaw/openclaw.json` (used as defaults when re-running `hyp setup` or opening the
 /// interactive OpenClaw onboarding step).
 pub fn read_openclaw_hyphae_preferences(home: &Path) -> (OpenClawDeliveryMode, bool) {
-    let config_file = home.join(".openclaw").join("openclaw.json");
+    let config_file = spec(HarnessKind::Openclaw)
+        .config_location(home)
+        .join("openclaw.json");
     let Ok(doc) = read_json_object_or_empty(&config_file) else {
         return (OpenClawDeliveryMode::Gateway, false);
     };
@@ -4270,7 +4297,7 @@ pub fn apply_openclaw_config(
         include_str!("../../../plugins/openclaw/openclaw.plugin.json");
     const OPENCLAW_PLUGIN_INDEX_JS: &str = include_str!("../../../plugins/openclaw/index.js");
 
-    let base_dir = home.join(".openclaw");
+    let base_dir = spec(HarnessKind::Openclaw).config_location(home);
     let config_file = base_dir.join("openclaw.json");
     let plugin_dir = base_dir.join("extensions").join("hyphae");
     let manifest_file = plugin_dir.join("openclaw.plugin.json");
@@ -4528,7 +4555,7 @@ fn setup_t3(
     skill_ctx: &SetupSkillContext,
 ) -> Result<HarnessSetupOutcome, String> {
     let dry_run = opts.dry_run;
-    let t3_base_dir = home.join(".t3");
+    let t3_base_dir = spec(HarnessKind::T3).config_location(home);
     let mut files = Vec::new();
     let mut notes = vec![
         "T3 Code configured via node.json 't3' block (secret ref 't3-session-token', never plaintext) and tailored runtime skill (no inert ~/.t3/hyphae.json written)."
