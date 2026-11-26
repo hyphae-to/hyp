@@ -5,7 +5,7 @@
 //!    - `session.summary` RPC (`full` and `compact`),
 //!    - `sessions.summary` batch RPC, and
 //!    - Debounced atomic `<state_dir>/ui/state.json` on disk (`0700` dir / `0600` file on Unix),
-//!      while proving ZERO untrusted body / wakeup note / quarantined payload leakage!
+//!      while proving ZERO untrusted body / quarantined payload leakage!
 //! 2. Backend merge regression (`session.hint` -> bare `register_session` / `call.start`) +
 //!    daemon restart hydration of `herdr_terminal_index` from SQLite.
 //! 3. Herdr anti-recycle guard (`herdrCreatedMs` mismatch fails closed) + sequential session ranking.
@@ -32,10 +32,7 @@ use hyp_node::engine::{NodeConfig, SubscribeRequest, TopicConfig, UnifiedNode};
 use hyp_node::gates::TrustTier as GateTrustTier;
 use hyp_proto::address::NodeId;
 use hyp_proto::filter::Filter as ProtoFilter;
-use hyp_store::{
-    CronTimezone, DeliveryMode, GateState, MailboxInsert, MailboxKind, WakeupInsert, WakeupLimits,
-    WakeupTriggerKind, WakeupUrgency, now_ms,
-};
+use hyp_store::{DeliveryMode, GateState, MailboxInsert, MailboxKind, now_ms};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::io::BufReader;
@@ -106,7 +103,6 @@ struct RefSessionModel {
     session_mutes: BTreeSet<String>,
     rules: BTreeMap<String, String>, // target -> delivery
     channels: BTreeSet<String>,
-    wakeups: BTreeMap<String, (String, String, String, String)>, // id -> (label, triggerKind, urgency, state)
 }
 
 #[derive(Debug, Default)]
@@ -162,7 +158,8 @@ impl RefWorldModel {
         assert_eq!(counts["mutedRules"], expected_muted_rules);
         assert_eq!(counts["mutedArchived"], m.muted_archived);
         assert_eq!(counts["channels"], m.channels.len());
-        assert_eq!(counts["wakeups"], m.wakeups.len());
+        assert!(counts.get("wakeups").is_none());
+        assert!(actual["details"].get("wakeups").is_none());
 
         let ub = &actual["unreadBreakdown"];
         let count_kind = |k: &str| m.pending_items.iter().filter(|(kind, _)| kind == k).count();
@@ -255,22 +252,6 @@ impl RefWorldModel {
             expected_mutes.insert(("connector".to_string(), p.clone()));
         }
         assert_eq!(actual_mutes, expected_mutes);
-
-        let actual_wks = details["wakeups"].as_array().unwrap();
-        assert_eq!(actual_wks.len(), m.wakeups.len());
-        for wk in actual_wks {
-            let obj = wk.as_object().unwrap();
-            assert!(
-                !obj.contains_key("note"),
-                "wakeup summary MUST NOT contain note"
-            );
-            let id = obj["id"].as_str().unwrap();
-            let (label, trig, urg, state) = m.wakeups.get(id).expect("expected wakeup id");
-            assert_eq!(obj["label"], *label);
-            assert_eq!(obj["triggerKind"], *trig);
-            assert_eq!(obj["urgency"], *urg);
-            assert_eq!(obj["state"], *state);
-        }
     }
 }
 
@@ -402,7 +383,6 @@ async fn mckeeman_reference_model_differential_parity_and_zero_body_leakage() {
         "SENTINEL_BRIDGE_BODY_7733",
         "SENTINEL_QUARANTINED_TEXT_6644",
         "SENTINEL_QUARANTINED_SOURCE_5555",
-        "SENTINEL_WAKEUP_NOTE_4466",
     ];
 
     let mut model = RefWorldModel::new("alice@macbook");
@@ -497,44 +477,6 @@ async fn mckeeman_reference_model_differential_parity_and_zero_body_leakage() {
         ("github".into(), "alice@macbook".into(), "queue".into(), 15),
     );
 
-    // Step 4: Create a durable wakeup with a secret note (must NEVER leak!).
-    let now = now_ms();
-    node.db()
-        .wakeups()
-        .create_wakeup(
-            &WakeupInsert {
-                id: Some("wk-deploy".into()),
-                owner_session_id: Some(s1.into()),
-                target_session_id: Some(s1.into()),
-                target_handle: None,
-                target_topic: None,
-                label: "check-deploy".into(),
-                note: "SENTINEL_WAKEUP_NOTE_4466".into(),
-                trigger_kind: WakeupTriggerKind::Timer,
-                cron_expr: None,
-                timezone: CronTimezone::Utc,
-                exact_timing: false,
-                urgency: WakeupUrgency::Queue,
-                ttl_ms: 60_000,
-                coalesce: true,
-                fire_at: Some(now + 120_000),
-                max_iterations: None,
-                cold_revival_template: None,
-            },
-            &WakeupLimits::default(),
-            now,
-        )
-        .unwrap();
-    model.sessions.get_mut(s1).unwrap().wakeups.insert(
-        "wk-deploy".into(),
-        (
-            "check-deploy".into(),
-            "timer".into(),
-            "queue".into(),
-            "active".into(),
-        ),
-    );
-
     // Step 5: Ingest unread items of multiple kinds + one quarantined item with secret sentinels!
     daemon
         .ingest_inbound(InboundItem {
@@ -586,7 +528,7 @@ async fn mckeeman_reference_model_differential_parity_and_zero_body_leakage() {
                 gate_reason: Some("prompt_injection".into()),
                 traceparent: None,
             },
-            now,
+            now_ms(),
         )
         .unwrap();
     {

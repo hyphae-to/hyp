@@ -7,7 +7,6 @@
 //! anti-rollback & anti-downgrade, and exact `next_deadline_ms()` scheduling.
 
 pub use hyp_proto::PROTOCOL_VERSION;
-pub use hyp_proto::cron::{CronError, CronExpr, CronTimezone, apply_cron_jitter};
 
 pub mod db;
 pub mod error;
@@ -20,7 +19,6 @@ pub mod peers;
 pub mod scheduler;
 pub mod transfers;
 pub mod types;
-pub mod wakeups;
 
 pub use db::{
     CURRENT_SCHEMA_VERSION, MAX_MIGRATION_BACKUPS, MIGRATIONS, Migration, MigrationKind, NodeDb,
@@ -69,8 +67,4 @@ pub use types::{
     canonical_json, check_filters, epoch_ms_to_rfc3339, format_address, is_channel_name, is_handle,
     is_kv_key, is_kv_namespace, is_node_id, is_safe_transfer_id, is_topic, matches_filter,
     matches_filters, now_ms, parse_address, parse_and_check_filters, sha256_hex, uuid_v4,
-};
-pub use wakeups::{
-    DEFAULT_WAKEUP_TTL_MS, FiredWakeup, WakeupInsert, WakeupLimits, WakeupRecord, WakeupState,
-    WakeupStore, WakeupTriggerKind, WakeupUrgency,
 };

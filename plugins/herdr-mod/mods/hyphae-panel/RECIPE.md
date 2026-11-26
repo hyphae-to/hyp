@@ -1,6 +1,6 @@
 # Hyphae Inspector (`hyphae-pane` + `hyphae-panel`)
 
-Live per-pane Hyphae mesh status pills in every Herdr terminal header paired with an expandable thread inspector for subscriptions, metadata-only inbox queues, focus/mute delivery rules, channels, and active wakeups across local and remote SSH spaces.
+Live per-pane Hyphae mesh status pills in every Herdr terminal header paired with an expandable thread inspector for subscriptions, metadata-only inbox queues, focus/mute delivery rules and channels across local and remote SSH spaces.
 
 ## What you see
 
@@ -18,7 +18,7 @@ Live per-pane Hyphae mesh status pills in every Herdr terminal header paired wit
     - `Subs (N)`: topic, origin node, urgency badge, coalesce seconds, filter summary, and `[×]` Unsubscribe button.
     - `Queue (N)`: kind breakdown pills (`DMs`, `Events`, `Plugins`, `Transfers`, `KV`) and metadata-only queued rows (source, kind, urgency, age, unnotified dot, `[Mute]`). Zero message bodies are ever read or rendered.
     - `Rules (N)`: delivery mode summary, active mutes with `[Unmute]`, per-source rules with click-to-cycle urgency (`interrupt → queue → notify → mute`), and an inline mute input at the bottom.
-    - `Mesh`: local/remote node card (`nodeId`, version, profile, peers online), joined `#channels` with `[Leave]`, and active scheduled wakeups (`label`, trigger kind, next fire countdown, urgency).
+    - `Mesh`: local/remote node card (`nodeId`, version, profile, peers online), and joined `#channels` with `[Leave]`.
 
 ## How it behaves
 

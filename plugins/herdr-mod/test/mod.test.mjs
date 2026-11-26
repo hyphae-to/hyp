@@ -15,7 +15,6 @@ import {
   buildSessionControlArgs,
   createHyphaeClient,
   findLayoutNode,
-  formatNextFire,
   formatPillMetrics,
   formatRelativeAge,
   getEffectiveQuarantinedCount,
@@ -242,7 +241,7 @@ test("formatPillMetrics hides plain shells and formats enrolled, queued, focus, 
   assert.equal(multiBridged.wideLabel, "telegram:personal +1 · 1 sub");
 });
 
-test("anti-body-leakage invariant: parseSnapshotJson strips body/text/note/payload/secret keys", () => {
+test("anti-body-leakage invariant: parseSnapshotJson strips body/text/payload/secret keys", () => {
   const dirty = JSON.stringify({
     ok: true,
     command: "inspect",
@@ -273,14 +272,6 @@ test("anti-body-leakage invariant: parseSnapshotJson strips body/text/note/paylo
                 payload: { leak: true },
               },
             ],
-            wakeups: [
-              {
-                id: "wk_1",
-                label: "deploy-check",
-                triggerKind: "timer",
-                note: "SECRET_WAKEUP_NOTE",
-              },
-            ],
           },
         },
       ],
@@ -296,12 +287,10 @@ test("anti-body-leakage invariant: parseSnapshotJson strips body/text/note/paylo
     "hp2p1_never_leak",
     "SECRET_MESSAGE_BODY",
     "SECRET_TEXT",
-    "SECRET_WAKEUP_NOTE",
   ]) {
     assert.ok(!serialized.includes(sentinel), `Leaked sentinel: ${sentinel}`);
   }
   assert.equal(snap.sessions[0].details.queuedItems[0].source, "bob/rev");
-  assert.equal(snap.sessions[0].details.wakeups[0].label, "deploy-check");
 });
 
 test("sanitizeUiText, stripControlChars, and qualifyChannelTarget preserve long control values without truncation (U2 & U9)", () => {
@@ -353,13 +342,11 @@ test("buildSessionControlArgs generates exact hyp session CLI argv", () => {
   );
 });
 
-test("relative age and next fire formatting", () => {
+test("relative age formatting", () => {
   const now = 1_700_000_000_000;
   assert.equal(formatRelativeAge(now - 2000, now), "now");
   assert.equal(formatRelativeAge(now - 15_000, now), "15s");
   assert.equal(formatRelativeAge(now - 180_000, now), "3m");
-  assert.equal(formatNextFire(now + 45_000, now), "in 45s");
-  assert.equal(formatNextFire(now - 1000, now), "due");
 });
 
 test("createHyphaeClient cancels watchFolder cleanly on dispose and deduplicates remote fetches", async () => {

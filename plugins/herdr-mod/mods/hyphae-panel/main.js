@@ -6,7 +6,7 @@
 //   3. Split or tab mod pane (`pane.split { mod: "hyphae-panel" }`)
 //
 // Security invariant: strictly metadata-only (zero message bodies, zero CloudEvent
-// payloads, zero wakeup notes, zero quarantined content; quarantine directs human
+// payloads, zero quarantined content; quarantine directs human
 // to `hyp gate review` in terminal).
 
 import { View, div, svg, image } from "gpui-kit";
@@ -32,7 +32,6 @@ import {
   createHyphaeClient,
   executeSessionControl,
   findLayoutNode,
-  formatNextFire,
   formatRelativeAge,
   getEffectiveQuarantinedCount,
   qualifyChannelTarget,
@@ -1178,7 +1177,6 @@ export default class HyphaePanel extends View {
   renderMeshTab(t, target) {
     const entry = target.entry;
     const daemon = target.snapshot?.daemon;
-    const nowMs = Date.now();
     const rows = [];
 
     const sage = t.done || t.ansi2 || t.accent;
@@ -1313,70 +1311,6 @@ export default class HyphaePanel extends View {
                   this.runAction("leave", { channel: leaveTarget }, `Left ${displayChannel}`, clickCx)
                 )
                 .child("Leave")
-            )
-        );
-      }
-    }
-
-    const wakeups = Array.isArray(entry?.details?.wakeups) ? entry.details.wakeups : [];
-    rows.push(
-      div()
-        .flex_none()
-        .pt(6)
-        .pr(10)
-        .text_size(10.5)
-        .font_semibold()
-        .text_color(t.dim)
-        .child(`Active Wakeups (${wakeups.length})`)
-    );
-
-    if (wakeups.length === 0) {
-      rows.push(
-        div()
-          .flex_none()
-          .px(4)
-          .py(4)
-          .text_size(11)
-          .text_color(t.dim)
-          .child("No active scheduled wakeups.")
-      );
-    } else {
-      for (let i = 0; i < wakeups.length; i++) {
-        const w = wakeups[i];
-        const label = sanitizeUiText(w.label || w.id || "wakeup", 48);
-        const trigger = sanitizeUiText(w.triggerKind || "timer", 16);
-        const nextDue = formatNextFire(Number(w.nextFireAt), nowMs);
-        const uColor = urgencyColor(t, w.urgency);
-        rows.push(
-          h_flex()
-            .id(`hyphae-wk-${w.id || i}`)
-            .flex_none()
-            .p(7)
-            .pr(10)
-            .gap(6)
-            .items_center()
-            .rounded(6)
-            .border_1()
-            .border_color(t.border)
-            .bg(t.surface || t.background)
-            .child(
-              v_flex()
-                .flex_1()
-                .min_w(0)
-                .gap(2)
-                .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.foreground).child(label))
-                .child(div().text_size(10).text_color(t.dim).child(`${trigger} · ${nextDue}`))
-            )
-            .child(
-              div()
-                .flex_none()
-                .px(5)
-                .py(1)
-                .rounded(4)
-                .bg(withAlpha(uColor, "20"))
-                .text_size(10)
-                .text_color(uColor)
-                .child(sanitizeUiText(w.urgency || "queue", 14))
             )
         );
       }

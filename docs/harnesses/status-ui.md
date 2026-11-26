@@ -1,6 +1,6 @@
 # Status UI, Panels, Herdr Mods & Terminal Inspector
 
-Hyphae gives you live visibility and quick session controls directly inside your coding harness — **strictly metadata-only** (zero message bodies, CloudEvent `data`, wakeup notes, quarantined payloads, `sessionToken`s, or secrets ever appear in `ui/state.json` or UI components).
+Hyphae gives you live visibility and quick session controls directly inside your coding harness — **strictly metadata-only** (zero message bodies, CloudEvent `data`, quarantined payloads, `sessionToken`s, or secrets ever appear in `ui/state.json` or UI components).
 
 ## Overview
 
@@ -99,6 +99,6 @@ hyp session leave 'local/#ops' --json
 
 ## Security & Metadata Boundary
 
-1. **Zero body or token leakage:** `ui/state.json`, `hyp statusline`, `hyp inspect`, `hyp ui`, and harness UI mods never include message bodies, CloudEvent `data`, wakeup notes, quarantined payloads, `sessionToken`s, or secrets.
+1. **Zero body or token leakage:** `ui/state.json`, `hyp statusline`, `hyp inspect`, `hyp ui`, and harness UI mods never include message bodies, CloudEvent `data`, quarantined payloads, `sessionToken`s, or secrets.
 2. **Terminal injection defense:** Untrusted labels (`handle`, `topic`, `source`, `channel`, `label`) are stripped of ANSI CSI/OSC escapes and C0/C1 control characters before rendering.
 3. **Quarantine boundary:** UI surfaces show quarantined counts only and direct review to `hyp gate review` in a terminal.
