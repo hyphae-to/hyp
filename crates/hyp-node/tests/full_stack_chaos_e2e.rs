@@ -1,6 +1,6 @@
 //! Massive Pure-Rust Full-Stack & Chaos Integration Suite for `hyp-node`
 //! (`engine::UnifiedNode` + `adapters::{GitHubPublicAdapter, GitHubWebhookAdapter,
-//! PrometheusWebhookAdapter, SubprocessSupervisor}` + `gates::SecurityGatePipeline`).
+//! SubprocessSupervisor}` + `gates::SecurityGatePipeline`).
 //!
 //! 100% pure Rust (ZERO Node.js prerequisite), 100% cross-platform (`SecretBackend::File`
 //! in ephemeral `TempDir`, loopback `127.0.0.1:0` only — zero live Keychain or cloud calls!).
@@ -39,7 +39,6 @@ use tokio::net::TcpListener;
 use tokio::sync::{Barrier, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use zeroize::Zeroizing;
 
 use hyp_crypto::e2ee::{EpochScope, SignedEpochKeyBundle, open_epoch_bundle};
 use hyp_crypto::rfc3339::format_rfc3339_millis;
@@ -50,8 +49,7 @@ use hyp_crypto::{Ed25519KeyPair, SecretBackend, SecretStore};
 use hyp_node::adapters::{
     AdapterError, AdapterHealth, BoxFuture, CompiledSubscription, GitHubPublicAdapter,
     GitHubPublicConfig, GitHubWebhookAdapter, GitHubWebhookConfig, NodeAdapter, NodeAdapterHost,
-    PrometheusWebhookAdapter, PrometheusWebhookConfig, PublishErrorCode, PublishOutcome,
-    PublishStatus, compute_hmac_sha256_header,
+    PublishErrorCode, PublishOutcome, PublishStatus, compute_hmac_sha256_header,
 };
 use hyp_node::delivery::DeliveryUrgency;
 use hyp_node::engine::http_util::{HttpClient, empty_body, full_body};
@@ -208,7 +206,7 @@ async fn wait_for_events_by_id(
 }
 
 /// Real bridge wiring any `NodeAdapter` (`GitHubPublicAdapter`, `GitHubWebhookAdapter`,
-/// `PrometheusWebhookAdapter`, `SubprocessSupervisor`) directly into a live `UnifiedNode`!
+/// `SubprocessSupervisor`) directly into a live `UnifiedNode`!
 struct UnifiedNodeAdapterHost {
     node: Arc<UnifiedNode>,
     published_ids: AsyncMutex<Vec<(String, String)>>,
@@ -2902,7 +2900,7 @@ async fn chaos_webhook_transfer_and_subprocess_adapter_to_gated_node_e2e() {
         .await
         .unwrap();
 
-    // 1. Wire `GitHubWebhookAdapter` + `PrometheusWebhookAdapter` into `ops-hub` via `UnifiedNodeAdapterHost`!
+    // 1. Wire `GitHubWebhookAdapter` into `ops-hub` via `UnifiedNodeAdapterHost`!
     let hub_host = UnifiedNodeAdapterHost::new(Arc::clone(&hub));
 
     let gh_secret = "ops-gh-wh-secret";
@@ -2910,11 +2908,6 @@ async fn chaos_webhook_transfer_and_subprocess_adapter_to_gated_node_e2e() {
     gh_cfg.allowed_repos = vec!["acme/prod".to_string()];
     let gh_wh = GitHubWebhookAdapter::new(gh_cfg);
     gh_wh.start(hub_host.clone()).await.unwrap();
-
-    let mut prom_cfg = PrometheusWebhookConfig::new("ops-prom", "ops");
-    prom_cfg.webhook_secret = Some(Zeroizing::new("ops-prom-secret".to_string()));
-    let prom_wh = PrometheusWebhookAdapter::new(prom_cfg);
-    prom_wh.start(hub_host.clone()).await.unwrap();
 
     // Ingest valid GitHub webhook -> routed to Alice over SSE!
     let gh_body = serde_json::to_vec(&json!({
@@ -2941,33 +2934,22 @@ async fn chaos_webhook_transfer_and_subprocess_adapter_to_gated_node_e2e() {
     gh_hdrs.insert("x-github-delivery", HeaderValue::from_static("ops-gh-88"));
     gh_wh.ingest_webhook(&gh_hdrs, &gh_body).await.unwrap();
 
-    // Ingest valid Prometheus Alertmanager v4 webhook -> routed to Alice over SSE!
-    let prom_body = serde_json::to_vec(&json!({
-        "version": "4",
-        "receiver": "ops",
-        "status": "firing",
-        "alerts": [{
-            "status": "firing",
-            "fingerprint": "prom-fp-999",
-            "labels": {
-                "alertname": "CheckoutErrorBudget",
-                "severity": "critical",
-                "service": "checkout"
-            },
-            "annotations": { "summary": "5xx budget burning fast" },
-            "startsAt": "2026-11-24T12:00:00Z",
-            "endsAt": "0001-01-01T00:00:00Z"
-        }]
+    let second_body = serde_json::to_vec(&json!({
+        "action": "opened",
+        "repository": { "full_name": "acme/prod" },
+        "sender": { "login": "oncall" },
+        "issue": { "number": 2, "title": "CheckoutErrorBudget" }
     }))
     .unwrap();
-    let prom_sig = compute_hmac_sha256_header(b"ops-prom-secret", &prom_body);
-    let mut prom_hdrs = HeaderMap::new();
-    prom_hdrs.insert(
-        "x-webhook-signature-256",
-        HeaderValue::from_str(&prom_sig).unwrap(),
+    let second_signature = compute_hmac_sha256_header(gh_secret.as_bytes(), &second_body);
+    let mut second_headers = HeaderMap::new();
+    second_headers.insert("x-github-event", HeaderValue::from_static("issues"));
+    second_headers.insert(
+        "x-hub-signature-256",
+        HeaderValue::from_str(&second_signature).unwrap(),
     );
-    prom_wh
-        .ingest_webhook(&prom_hdrs, &prom_body)
+    gh_wh
+        .ingest_webhook(&second_headers, &second_body)
         .await
         .unwrap();
 
@@ -3010,7 +2992,7 @@ async fn chaos_webhook_transfer_and_subprocess_adapter_to_gated_node_e2e() {
         let now = tokio::time::Instant::now();
         assert!(
             now < wh_deadline,
-            "timed out waiting for GitHub + Prometheus webhooks; arrived={arrived_wh_events:?}"
+            "timed out waiting for GitHub webhooks; arrived={arrived_wh_events:?}"
         );
         let _ = timeout(Duration::from_millis(50), rx_wh.recv()).await;
     }
@@ -3191,7 +3173,6 @@ while True:
     }
 
     gh_wh.stop().await.unwrap();
-    prom_wh.stop().await.unwrap();
     alice.shutdown();
     hub.shutdown();
 }

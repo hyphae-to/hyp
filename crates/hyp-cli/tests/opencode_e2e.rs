@@ -7,6 +7,9 @@
 //! with isolated `HOME`, `XDG_CONFIG_HOME`, `--home`, `--state-dir`, and
 //! `HYPHAE_SECRET_BACKEND=file` — zero live user config or Keychain mutations.
 
+#[path = "../../test-support/node_runtime.rs"]
+mod node_runtime;
+
 mod common;
 
 use common::{ManagedProcess, hyp_bin, isolated_cmd, parse_json_stdout};
@@ -37,14 +40,7 @@ fn opencode_plugin_dir() -> PathBuf {
     repo_root().join("plugins").join("opencode")
 }
 
-fn node_available() -> bool {
-    Command::new("node")
-        .arg("-v")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
+use node_runtime::node_available;
 
 // ============================================================================
 // 1. `hyp setup --harness opencode`: Verified MCP, Lifecycle Plugin, /hyp, Idempotency

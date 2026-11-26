@@ -18,10 +18,8 @@ pub use trait_def::{
     NodeAdapterHost, PublishErrorCode, PublishOutcome, PublishStatus,
 };
 pub use webhooks::{
-    GenericWebhookAdapter, GenericWebhookConfig, GitHubNormalizeOutcome, GitHubWebhookAdapter,
-    GitHubWebhookConfig, PrometheusWebhookAdapter, PrometheusWebhookConfig, WebhookIngestOutcome,
-    compute_hmac_sha256_header, normalize_generic_webhook, normalize_github_webhook,
-    normalize_prometheus_webhook, verify_hmac_sha256_header,
+    GitHubNormalizeOutcome, GitHubWebhookAdapter, GitHubWebhookConfig, WebhookIngestOutcome,
+    compute_hmac_sha256_header, normalize_github_webhook, verify_hmac_sha256_header,
 };
 
 /// Flushes due batches for local-session subscribers of the source topic `topic` into their

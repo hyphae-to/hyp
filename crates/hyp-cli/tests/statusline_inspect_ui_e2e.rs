@@ -15,10 +15,7 @@ use hyp_node::engine::{NodeConfig, SubscribeRequest, TopicConfig, UnifiedNode};
 use hyp_node::gates::TrustTier as GateTrustTier;
 use hyp_proto::address::NodeId;
 use hyp_proto::filter::Filter as ProtoFilter;
-use hyp_store::{
-    CronTimezone, DeliveryMode, GateState, MailboxInsert, MailboxKind, WakeupInsert, WakeupLimits,
-    WakeupTriggerKind, WakeupUrgency, now_ms,
-};
+use hyp_store::{DeliveryMode, GateState, MailboxInsert, MailboxKind, now_ms};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -594,7 +591,7 @@ async fn statusline_security_fuzzing_and_ansi_injection_stripping() {
                     "mutedRules": 0,
                     "mutedArchived": 0,
                     "channels": 0,
-                    "wakeups": 0
+
                 },
                 "details": {
                     "subscriptions": [],
@@ -603,7 +600,7 @@ async fn statusline_security_fuzzing_and_ansi_injection_stripping() {
                     "rules": [],
                     "channels": [],
                     "channelEntries": [],
-                    "wakeups": []
+
                 }
             }
         }
@@ -703,9 +700,8 @@ async fn inspect_and_session_controls_e2e_and_watch_stream() {
     .await
     .unwrap();
 
-    // Seed secret untrusted body + wakeup note that MUST NEVER appear in inspect/session output!
+    // Seed secret untrusted body that MUST NEVER appear in inspect/session output!
     let secret_dm = "SENTINEL_DM_BODY_DO_NOT_LEAK_991";
-    let secret_note = "SENTINEL_WAKEUP_NOTE_DO_NOT_LEAK_882";
     daemon
         .ingest_inbound(InboundItem {
             session_id: sid.into(),
@@ -718,33 +714,6 @@ async fn inspect_and_session_controls_e2e_and_watch_stream() {
         })
         .await
         .unwrap();
-    node.db()
-        .wakeups()
-        .create_wakeup(
-            &WakeupInsert {
-                id: Some("wk-1".into()),
-                owner_session_id: Some(sid.into()),
-                target_session_id: Some(sid.into()),
-                target_handle: None,
-                target_topic: None,
-                label: "deploy-check".into(),
-                note: secret_note.into(),
-                trigger_kind: WakeupTriggerKind::Timer,
-                cron_expr: None,
-                timezone: CronTimezone::Utc,
-                exact_timing: false,
-                urgency: WakeupUrgency::Queue,
-                ttl_ms: 60_000,
-                coalesce: true,
-                fire_at: Some(now_ms() + 120_000),
-                max_iterations: None,
-                cold_revival_template: None,
-            },
-            &WakeupLimits::default(),
-            now_ms(),
-        )
-        .unwrap();
-
     // 1. Focus ON (--allow-vips false) using $HYPHAE_SESSION_ID env fallback!
     let focus_on = run_hyp_with_stdin(
         dir.path(),
@@ -818,7 +787,7 @@ async fn inspect_and_session_controls_e2e_and_watch_stream() {
     assert_eq!(rule_env["data"]["target"], "bob/rev");
     assert_eq!(rule_env["data"]["delivery"], "interrupt");
 
-    // 4. `hyp inspect --json` MUST reflect EVERY mutation identically and leak ZERO bodies/notes!
+    // 4. `hyp inspect --json` MUST reflect EVERY mutation identically and leak ZERO bodies!
     let inspect_json = run_hyp_with_stdin(
         dir.path(),
         &["inspect", "--socket", &sock_str, "--json"],
@@ -829,7 +798,6 @@ async fn inspect_and_session_controls_e2e_and_watch_stream() {
     assert_eq!(inspect_json.status.code(), Some(0));
     let raw_inspect = String::from_utf8_lossy(&inspect_json.stdout);
     assert!(!raw_inspect.contains(secret_dm));
-    assert!(!raw_inspect.contains(secret_note));
 
     let env = parse_json_stdout(&inspect_json);
     assert_eq!(env["ok"], true);
@@ -842,6 +810,8 @@ async fn inspect_and_session_controls_e2e_and_watch_stream() {
     assert_eq!(sess["counts"]["subscriptions"], 1);
     assert_eq!(sess["counts"]["queued"], 1);
     assert_eq!(sess["counts"]["channels"], 2);
+    assert!(sess["counts"].get("wakeups").is_none());
+    assert!(sess["details"].get("wakeups").is_none());
     assert!(
         sess["details"]["mutes"]
             .as_array()
@@ -875,9 +845,7 @@ async fn inspect_and_session_controls_e2e_and_watch_stream() {
     assert!(txt.contains("bob/rev"));
     assert!(txt.contains("#ops"));
     assert!(txt.contains("#release"));
-    assert!(txt.contains("deploy-check"));
     assert!(!txt.contains(secret_dm));
-    assert!(!txt.contains(secret_note));
 
     // 6. Live `hyp inspect --watch --json` streaming test (zero polling!)
     let mut watch_cmd = isolated_cmd(dir.path());

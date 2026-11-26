@@ -433,18 +433,21 @@ async fn route_request(
     let method = req.method().clone();
     let uri = req.uri().clone();
     let path = uri.path().to_string();
-    // Keep the retired App URL from falling through to the generic webhook alias.
-    if path == "/v1/webhooks/github-app" {
-        return Err(NodeError::NotFound(
-            "GitHub App webhook route retired".into(),
-        ));
-    }
     let path_and_query = uri
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| path.clone());
     let query = parse_query(uri.query());
     let headers = req.headers().clone();
+
+    if let Some(receiver) = path.strip_prefix("/v1/webhooks/") {
+        let github = receiver == "github" || receiver.starts_with("github/");
+        if !github {
+            return Err(NodeError::NotFound(
+                "Webhook receiver is not configured on this node".into(),
+            ));
+        }
+    }
 
     // Streaming SSE endpoint must NOT read a request body before upgrading.
     if method == Method::GET && path == "/v1/inbox" {
@@ -581,61 +584,6 @@ async fn route_request(
                 let Some(adapter) = node.github_webhook_adapter(Some(&id)) else {
                     return Err(NodeError::NotFound(format!(
                         "github webhook '{id}' is not configured on this node"
-                    )));
-                };
-                let outcome = adapter.ingest_webhook(&headers, &body_bytes).await;
-                return webhook_outcome_response(outcome);
-            }
-        }
-    }
-
-    if method == Method::POST && path == "/v1/webhooks/prometheus" {
-        let Some(adapter) = node.prometheus_webhook_adapter(None) else {
-            return Err(NodeError::NotFound(
-                "prometheus webhook endpoint is disabled on this node".into(),
-            ));
-        };
-        let outcome = adapter.ingest_webhook(&headers, &body_bytes).await;
-        return webhook_outcome_response(outcome);
-    }
-
-    if method == Method::POST {
-        if let Some(raw_id) = path.strip_prefix("/v1/webhooks/prometheus/") {
-            if !raw_id.is_empty() && !raw_id.contains('/') {
-                let id = percent_decode(raw_id);
-                let Some(adapter) = node.prometheus_webhook_adapter(Some(&id)) else {
-                    return Err(NodeError::NotFound(format!(
-                        "prometheus webhook '{id}' is not configured on this node"
-                    )));
-                };
-                let outcome = adapter.ingest_webhook(&headers, &body_bytes).await;
-                return webhook_outcome_response(outcome);
-            }
-        }
-    }
-
-    if method == Method::POST {
-        if let Some(raw_id) = path.strip_prefix("/v1/webhooks/stream/") {
-            if !raw_id.is_empty() && !raw_id.contains('/') {
-                let id = percent_decode(raw_id);
-                let Some(adapter) = node.generic_webhook_adapter(&id) else {
-                    return Err(NodeError::NotFound(format!(
-                        "webhook stream '{id}' is not configured on this node"
-                    )));
-                };
-                let outcome = adapter.ingest_webhook(&headers, &body_bytes).await;
-                return webhook_outcome_response(outcome);
-            }
-        }
-    }
-
-    if method == Method::POST {
-        if let Some(raw_id) = path.strip_prefix("/v1/webhooks/") {
-            if !raw_id.is_empty() && !raw_id.contains('/') {
-                let id = percent_decode(raw_id);
-                let Some(adapter) = node.generic_webhook_adapter(&id) else {
-                    return Err(NodeError::NotFound(format!(
-                        "webhook '{id}' is not configured on this node"
                     )));
                 };
                 let outcome = adapter.ingest_webhook(&headers, &body_bytes).await;
@@ -1226,17 +1174,6 @@ fn webhook_outcome_response(
             "publishStatus": outcome.status,
             "matched": outcome.matched,
         }),
-        WebhookIngestOutcome::PublishedMany {
-            event_ids,
-            stored,
-            duplicates,
-        } => json!({
-            "ok": true,
-            "status": "published_many",
-            "eventIds": event_ids,
-            "stored": stored,
-            "duplicates": duplicates,
-        }),
         WebhookIngestOutcome::Ignored { reason } => json!({
             "ok": true,
             "status": "ignored",
@@ -1283,13 +1220,6 @@ fn drop_relay_error_response(
         relay.apply_cors_headers(request_origin(req_headers), resp.headers_mut());
     }
     resp
-}
-
-fn has_any_auth_header(headers: &HeaderMap) -> bool {
-    headers.contains_key(AUTHORIZATION)
-        || headers.contains_key("x-hyphae-sig")
-        || headers.contains_key("x-hyphae-timestamp")
-        || headers.contains_key("x-hyphae-nonce")
 }
 
 fn check_content_length(headers: &HeaderMap, max_bytes: usize) -> Result<(), NodeError> {
@@ -1369,59 +1299,8 @@ fn resolve_pre_read_body_limit(
         }
     }
 
-    if method == Method::POST && path == "/v1/webhooks/prometheus" {
-        let Some(adapter) = node.prometheus_webhook_adapter(None) else {
-            return Err(NodeError::NotFound(
-                "prometheus webhook endpoint is disabled on this node".into(),
-            ));
-        };
-        return Ok(adapter.config().max_body_bytes);
-    }
-
-    if method == Method::POST {
-        if let Some(raw_id) = path.strip_prefix("/v1/webhooks/prometheus/") {
-            if !raw_id.is_empty() && !raw_id.contains('/') {
-                let id = percent_decode(raw_id);
-                let Some(adapter) = node.prometheus_webhook_adapter(Some(&id)) else {
-                    return Err(NodeError::NotFound(format!(
-                        "prometheus webhook '{id}' is not configured on this node"
-                    )));
-                };
-                return Ok(adapter.config().max_body_bytes);
-            }
-        }
-    }
-
-    if method == Method::POST {
-        if let Some(raw_id) = path.strip_prefix("/v1/webhooks/stream/") {
-            if !raw_id.is_empty() && !raw_id.contains('/') {
-                let id = percent_decode(raw_id);
-                let Some(adapter) = node.generic_webhook_adapter(&id) else {
-                    return Err(NodeError::NotFound(format!(
-                        "webhook stream '{id}' is not configured on this node"
-                    )));
-                };
-                return Ok(adapter.config().max_body_bytes);
-            }
-        }
-    }
-
-    if method == Method::POST {
-        if let Some(raw_id) = path.strip_prefix("/v1/webhooks/") {
-            if !raw_id.is_empty() && !raw_id.contains('/') {
-                let id = percent_decode(raw_id);
-                let Some(adapter) = node.generic_webhook_adapter(&id) else {
-                    return Err(NodeError::NotFound(format!(
-                        "webhook '{id}' is not configured on this node"
-                    )));
-                };
-                return Ok(adapter.config().max_body_bytes);
-            }
-        }
-    }
-
     if method == Method::PUT && path.starts_with("/v1/transfers/") {
-        if !has_any_auth_header(headers) {
+        if !headers.contains_key(AUTHORIZATION) {
             return Err(NodeError::Unauthorized(
                 "missing Authorization header".into(),
             ));

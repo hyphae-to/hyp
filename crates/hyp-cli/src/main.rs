@@ -32,6 +32,7 @@ mod ui;
 mod ui_tui;
 mod uninstall_cmd;
 mod update;
+mod webhook_deploy;
 mod wizard;
 
 use clap::{Parser, Subcommand};

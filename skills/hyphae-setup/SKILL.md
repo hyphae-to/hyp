@@ -470,7 +470,7 @@ hyp deploy check --url https://<hostname> --json
    hyp secret list --json
    ```
 3. **Compiled-in pure-Rust event sources** (`sources[]` in `~/.config/hyphae/node.json` — zero Node/Python needed):
-   - `github-public` (deduplicated ETag poller with multi-owner `repoTokens`), plus compiled-in pure-Rust `github-webhook`, `prometheus-webhook`, and `webhook-stream` wired directly into `hyp node start`. (Optional standalone Node `webhook` / `prometheus` scripts remain available via `hyp plugin install` when needed.)
+   - `github-public` (deduplicated ETag poller with multi-owner `repoTokens`), and compiled-in signed `github-webhook` run directly in `hyp node start`. Install `webhook` or `prometheus` for generic and Alertmanager receivers and add it to `plugins[]`.
    - Reference secrets strictly as `{ "secret": "<name>" }`.
 4. **Optional external chat bridges & harness UI mods (`telegram`, `slack`, `whatsapp`, `webhook`, `prometheus`, `claude-panel`, `claude-code`, `herdr-mod`) — ALWAYS manage via `hyp plugin`**:
    - **NEVER** point `node.json` `plugins[]` at a local git checkout (e.g., `plugins/telegram/index.mjs` inside a workspace repository — checkouts move, get deleted, and are not SHA-256 verified against the installed `hyp` binary).

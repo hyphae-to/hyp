@@ -4,6 +4,9 @@
 //! compatibility, three-way selective updates, offline `hyp setup` fallback, tarball cache,
 //! `hyp doctor` drift checks, and `SKILL.md` / `docs/plugins.md` contracts).
 
+#[path = "../../test-support/node_runtime.rs"]
+mod node_runtime;
+
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keys::Ed25519KeyPair;
 use hyp_crypto::transfer::{
@@ -195,7 +198,7 @@ fn packed_plugins_tarball_unpacks_and_matches_all_pinned_digests() {
 #[test]
 fn pack_plugins_mjs_matches_build_rs_digests_and_detects_changes() {
     // Only skip if node is unavailable on a bare runner (never skipped on Linux/macOS CI).
-    if Command::new("node").arg("--version").output().is_err() {
+    if !node_runtime::node_available() {
         return;
     }
 

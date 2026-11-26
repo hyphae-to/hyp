@@ -9,17 +9,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
 use http::{Method, Request, StatusCode};
-use hyp_crypto::rfc3339::now_unix_ms;
 use hyp_crypto::transfer::TarInputEntry;
 use hyp_crypto::{Ed25519KeyPair, SecretBackend};
-use hyp_node::adapters::{
-    GenericWebhookAdapter, GenericWebhookConfig, GitHubWebhookAdapter, GitHubWebhookConfig,
-    PrometheusWebhookAdapter, PrometheusWebhookConfig, compute_hmac_sha256_header,
-};
+use hyp_node::adapters::{GitHubWebhookAdapter, GitHubWebhookConfig, compute_hmac_sha256_header};
 use hyp_node::engine::config::{ForwardingMode, ForwardingPolicy, ForwardingRule};
 use hyp_node::engine::http_util::{HttpClient, full_body};
 use hyp_node::engine::node::SubscribeRequest;
@@ -39,7 +33,6 @@ use hyp_store::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use zeroize::Zeroizing;
 
 fn admin_proto_jwk(key: &Ed25519KeyPair) -> hyp_proto::manifest::OkpJwk {
     serde_json::from_value(serde_json::to_value(key.to_jwk()).expect("jwk value"))
@@ -161,37 +154,13 @@ async fn wave3d_5b_compiled_in_webhooks_fail_closed_and_publish_cloudevents() {
         .await
         .unwrap();
 
-    let prom_bearer = "prom-bearer-token-123";
-    let mut prom_cfg = PrometheusWebhookConfig::new("prometheus", "alerts");
-    prom_cfg.bearer_token = Some(Zeroizing::new(prom_bearer.to_string()));
-    hub.attach_prometheus_webhook(Arc::new(PrometheusWebhookAdapter::new(prom_cfg)))
-        .await
-        .unwrap();
-
-    let mut prom_basic_cfg = PrometheusWebhookConfig::new("prom-basic", "alerts-basic");
-    prom_basic_cfg.basic_auth = Some((
-        "alertmanager".to_string(),
-        Zeroizing::new("basic-pass-456".to_string()),
-    ));
-    hub.attach_prometheus_webhook(Arc::new(PrometheusWebhookAdapter::new(prom_basic_cfg)))
-        .await
-        .unwrap();
-
-    let gen_secret = "generic-ci-hmac-secret";
-    let mut gen_cfg = GenericWebhookConfig::new("ci-hook", "ci");
-    gen_cfg.secret = Some(Zeroizing::new(gen_secret.to_string()));
-    gen_cfg.signature_header = "x-ci-sig-256".to_string();
-    hub.attach_generic_webhook(Arc::new(GenericWebhookAdapter::new(gen_cfg)))
-        .await
-        .unwrap();
-
     let (addr, server_task) = Arc::clone(&hub)
         .serve("127.0.0.1:0".parse::<SocketAddr>().unwrap())
         .await
         .unwrap();
     let base = format!("http://{addr}");
 
-    // Subscribe a local session to `local.github`, `local.alerts`, and `local.ci`.
+    // Subscribe a local session to the native GitHub source.
     register_session_with_handle(&hub, "local-watcher", "ops").await;
     hub.subscribe_local_or_remote(SubscribeRequest {
         id: Some("sub-gh".to_string()),
@@ -207,31 +176,6 @@ async fn wave3d_5b_compiled_in_webhooks_fail_closed_and_publish_cloudevents() {
     })
     .await
     .unwrap();
-    hub.subscribe_local_or_remote(SubscribeRequest {
-        id: Some("sub-alerts".to_string()),
-        subscriber_session: "local-watcher".to_string(),
-        qualified_topic: "local.alerts".to_string(),
-        filters: vec![Filter::Exact(
-            [("severity".to_string(), "critical".to_string())]
-                .into_iter()
-                .collect(),
-        )],
-        coalesce_seconds: 0,
-        mode: DeliveryMode::Full,
-    })
-    .await
-    .unwrap();
-    hub.subscribe_local_or_remote(SubscribeRequest {
-        id: Some("sub-ci".to_string()),
-        subscriber_session: "local-watcher".to_string(),
-        qualified_topic: "local.ci".to_string(),
-        filters: vec![],
-        coalesce_seconds: 0,
-        mode: DeliveryMode::Full,
-    })
-    .await
-    .unwrap();
-
     // Also pair a remote reader subscribed to `webhook-hub.github` over SSE.
     let reader = UnifiedNode::open(make_node_cfg(
         "reader@laptop",
@@ -380,212 +324,6 @@ async fn wave3d_5b_compiled_in_webhooks_fail_closed_and_publish_cloudevents() {
     assert_eq!(st, StatusCode::OK, "named github webhook failed: {val}");
     assert_eq!(val["status"], "published");
 
-    // 2. Prometheus webhook: Bearer & Basic auth fail closed on bad/missing auth, succeed when valid.
-    let prom_body = serde_json::to_vec(&json!({
-        "receiver": "hyphae",
-        "alerts": [
-            {
-                "status": "firing",
-                "fingerprint": "fp-crit-1",
-                "startsAt": "2026-11-25T12:00:00Z",
-                "labels": { "alertname": "DiskFull", "severity": "critical", "service": "db" },
-                "annotations": { "summary": "Disk at 99%" }
-            },
-            {
-                "status": "firing",
-                "fingerprint": "fp-info-2",
-                "startsAt": "2026-11-25T12:00:00Z",
-                "labels": { "alertname": "LowNoise", "severity": "info", "service": "db" }
-            }
-        ]
-    }))
-    .unwrap();
-    let (st, _) = send_raw_http(
-        &client,
-        Method::POST,
-        &format!("{base}/v1/webhooks/prometheus"),
-        &[("authorization", "Bearer wrong-token".to_string())],
-        Bytes::from(prom_body.clone()),
-    )
-    .await;
-    assert_eq!(st, StatusCode::UNAUTHORIZED);
-
-    let (st, val) = send_raw_http(
-        &client,
-        Method::POST,
-        &format!("{base}/v1/webhooks/prometheus"),
-        &[("authorization", format!("Bearer {prom_bearer}"))],
-        Bytes::from(prom_body.clone()),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "prometheus bearer failed: {val}");
-    assert_eq!(val["stored"], 2);
-
-    // Basic auth named route `/v1/webhooks/prometheus/prom-basic`.
-    let bad_basic = format!("Basic {}", BASE64_STANDARD.encode("alertmanager:wrong"));
-    let (st, _) = send_raw_http(
-        &client,
-        Method::POST,
-        &format!("{base}/v1/webhooks/prometheus/prom-basic"),
-        &[("authorization", bad_basic)],
-        Bytes::from(prom_body.clone()),
-    )
-    .await;
-    assert_eq!(st, StatusCode::UNAUTHORIZED);
-
-    let good_basic = format!(
-        "Basic {}",
-        BASE64_STANDARD.encode("alertmanager:basic-pass-456")
-    );
-    let (st, val) = send_raw_http(
-        &client,
-        Method::POST,
-        &format!("{base}/v1/webhooks/prometheus/prom-basic"),
-        &[("authorization", good_basic)],
-        Bytes::from(prom_body),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "prometheus basic failed: {val}");
-    assert_eq!(val["stored"], 2);
-
-    // 3. Generic webhook stream: HMAC + X-Webhook-Timestamp binding + deterministic body dedup (B8).
-    let gen_body =
-        br#"{"type":"ci.build.finished","source":"ci/runner","data":{"status":"green"}}"#;
-    let now_ts = (now_unix_ms() / 1_000).to_string();
-    let stale_ts = ((now_unix_ms() / 1_000) - 900).to_string();
-
-    // Stale timestamp rejected (401).
-    let mut stale_signed = format!("{stale_ts}.").into_bytes();
-    stale_signed.extend_from_slice(gen_body);
-    let stale_sig = compute_hmac_sha256_header(gen_secret.as_bytes(), &stale_signed);
-    let (st, _) = send_raw_http(
-        &client,
-        Method::POST,
-        &format!("{base}/v1/webhooks/stream/ci-hook"),
-        &[
-            ("x-webhook-timestamp", stale_ts),
-            ("x-ci-sig-256", stale_sig),
-        ],
-        Bytes::from_static(gen_body),
-    )
-    .await;
-    assert_eq!(st, StatusCode::UNAUTHORIZED);
-
-    // Body-only HMAC rejected when X-Webhook-Timestamp is present (prevents timestamp grafting).
-    let body_only_sig = compute_hmac_sha256_header(gen_secret.as_bytes(), gen_body);
-    let (st, _) = send_raw_http(
-        &client,
-        Method::POST,
-        &format!("{base}/v1/webhooks/stream/ci-hook"),
-        &[
-            ("x-webhook-timestamp", now_ts.clone()),
-            ("x-ci-sig-256", body_only_sig),
-        ],
-        Bytes::from_static(gen_body),
-    )
-    .await;
-    assert_eq!(st, StatusCode::UNAUTHORIZED);
-
-    // Properly timestamp-bound HMAC succeeds on first delivery and deduplicates on identical replay.
-    let mut bound_payload = format!("{now_ts}.").into_bytes();
-    bound_payload.extend_from_slice(gen_body);
-    let bound_sig = compute_hmac_sha256_header(gen_secret.as_bytes(), &bound_payload);
-    let (st, val1) = send_raw_http(
-        &client,
-        Method::POST,
-        &format!("{base}/v1/webhooks/stream/ci-hook"),
-        &[
-            ("x-webhook-timestamp", now_ts.clone()),
-            ("x-ci-sig-256", bound_sig.clone()),
-        ],
-        Bytes::from_static(gen_body),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "generic webhook failed: {val1}");
-    assert_eq!(val1["publishStatus"], "stored");
-
-    let (st, val2) = send_raw_http(
-        &client,
-        Method::POST,
-        &format!("{base}/v1/webhooks/ci-hook"),
-        &[
-            ("x-webhook-timestamp", now_ts),
-            ("x-ci-sig-256", bound_sig),
-            (
-                "x-delivery-id",
-                "spoofed-unsigned-x-delivery-id".to_string(),
-            ),
-        ],
-        Bytes::from_static(gen_body),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK);
-    assert_eq!(val2["publishStatus"], "duplicate");
-    assert_eq!(val1["eventId"], val2["eventId"]);
-
-    // Pre-auth Content-Length guard rejects oversized declared Content-Length immediately with 413!
-    let (st, _) = send_raw_http(
-        &client,
-        Method::POST,
-        &format!("{base}/v1/pair"),
-        &[("content-length", (1024 * 1024).to_string())],
-        Bytes::new(),
-    )
-    .await;
-    assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
-
-    // Dual-auth Prometheus webhook (BOTH bearer_token AND basic_auth configured) accepts EITHER!
-    let mut prom_dual_cfg = PrometheusWebhookConfig::new("prom-dual", "alerts-dual");
-    prom_dual_cfg.bearer_token = Some(Zeroizing::new("dual-bearer-tok".to_string()));
-    prom_dual_cfg.basic_auth = Some((
-        "alertmanager".to_string(),
-        Zeroizing::new("dual-basic-pass".to_string()),
-    ));
-    hub.attach_prometheus_webhook(Arc::new(PrometheusWebhookAdapter::new(prom_dual_cfg)))
-        .await
-        .unwrap();
-    let dual_body = serde_json::to_vec(&json!({
-        "receiver": "dual",
-        "alerts": [{
-            "status": "firing",
-            "fingerprint": "fp-dual-1",
-            "startsAt": "2026-11-25T12:00:00Z",
-            "labels": { "alertname": "DualAuthAlert", "severity": "warning", "service": "api" }
-        }]
-    }))
-    .unwrap();
-    let (st, _) = send_raw_http(
-        &client,
-        Method::POST,
-        &format!("{base}/v1/webhooks/prometheus/prom-dual"),
-        &[("authorization", "Bearer wrong-dual".to_string())],
-        Bytes::from(dual_body.clone()),
-    )
-    .await;
-    assert_eq!(st, StatusCode::UNAUTHORIZED);
-    let (st, dual_b) = send_raw_http(
-        &client,
-        Method::POST,
-        &format!("{base}/v1/webhooks/prometheus/prom-dual"),
-        &[("authorization", "Bearer dual-bearer-tok".to_string())],
-        Bytes::from(dual_body.clone()),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "dual-auth bearer failed: {dual_b}");
-    let dual_basic = format!(
-        "Basic {}",
-        BASE64_STANDARD.encode("alertmanager:dual-basic-pass")
-    );
-    let (st, dual_ba) = send_raw_http(
-        &client,
-        Method::POST,
-        &format!("{base}/v1/webhooks/prometheus/prom-dual"),
-        &[("authorization", dual_basic)],
-        Bytes::from(dual_body),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "dual-auth basic failed: {dual_ba}");
-
     // Adapter-owned topic protection: remote peer holding `stream:publish=*` MUST be rejected
     // with 403 `not_granted` when attempting `POST /v1/events` onto an adapter-owned webhook topic!
     let pub_peer_dir = TempDir::new().unwrap();
@@ -597,7 +335,7 @@ async fn wave3d_5b_compiled_in_webhooks_fail_closed_and_publish_cloudevents() {
     .unwrap();
     pair_admin_peer(&hub, &admin_key, &pub_peer, &["stream:publish=*"]).await;
     let pub_link = pub_peer.peer_link("webhook-hub").await.unwrap();
-    for owned_topic in ["github", "alerts", "ci"] {
+    for owned_topic in ["github", "sec-github"] {
         let spoof_ev = CloudEvent::new(
             format!("spoof-{owned_topic}"),
             "spoofer@laptop/src",
@@ -629,16 +367,9 @@ async fn wave3d_5b_compiled_in_webhooks_fail_closed_and_publish_cloudevents() {
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 
-    // Local watcher receives all 3 filtered streams (github PR, ONLY critical Prometheus alert, CI event),
-    // and EVERY emitted webhook CloudEvent is stamped with `hyphaesourcekind = "external-webhook"`!
-    let local_items = wait_for_mailbox_count(&hub, "local-watcher", 3).await;
-    assert_eq!(local_items.len(), 3, "expected 3 local webhook batches");
-    assert!(
-        local_items
-            .iter()
-            .any(|m| m.text.contains("DiskFull") && !m.text.contains("LowNoise")),
-        "filter pushdown should deliver critical DiskFull and exclude info LowNoise"
-    );
+    // Every native GitHub event carries the externally sourced marker.
+    let local_items = wait_for_mailbox_count(&hub, "local-watcher", 1).await;
+    assert_eq!(local_items.len(), 1, "expected one matching GitHub batch");
     for item in &local_items {
         let parsed: Value = serde_json::from_str(&item.text).unwrap();
         let events = parsed["events"].as_array().expect("events array");
@@ -1008,9 +739,7 @@ async fn wave4a_cut_remote_node_update_and_bridges_post_return_404_and_no_capabi
             &[
                 ("content-type", "application/json".to_string()),
                 ("x-hyphae-node", "admin@laptop".to_string()),
-                ("x-hyphae-timestamp", ts.to_string()),
-                ("x-hyphae-nonce", nonce),
-                ("x-hyphae-sig", sig),
+                ("authorization", format!(r#"Hyphae-Ed25519 node="admin@laptop",ts="{ts}",nonce="{nonce}",sig="{sig}""#)),
             ],
             Bytes::copy_from_slice(body),
         )

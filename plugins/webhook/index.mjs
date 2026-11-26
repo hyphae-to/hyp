@@ -12,12 +12,16 @@
  *   WEBHOOK_ALLOW_UNSIGNED  - Set to "1" to explicitly allow unsigned loopback-only webhooks (NEVER permitted on non-loopback binds)
  *   WEBHOOK_SOURCE          - CloudEvent source attribute (default webhook/local)
  *   WEBHOOK_EVENT_TYPE      - CloudEvent type attribute (default com.webhook.received)
+ *   WEBHOOK_MAX_BODY_BYTES  - Maximum request body size (default 65536)
+ *   WEBHOOK_SIGNATURE_HEADER - Signature header name (default X-Webhook-Signature-256)
+ *   WEBHOOK_LEGACY_NATIVE  - Use the retired Rust source’s payload and event ID contract when set to 1
  *   WEBHOOK_POST_URL        - Optional outbound callback URL for hyp_plugin_post replies
  */
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { MeshPluginClient, PluginRpcError, RPC_UNAVAILABLE } from "../sdk/client.mjs";
+import { answerWebhookReadiness, envInt, readWebhookBody } from "../sdk/source-kit.mjs";
 
 const REPLAY_WINDOW_MS = 5 * 60 * 1000;
 
@@ -40,7 +44,7 @@ function parseWebhookTimestampMs(raw) {
 }
 
 const host = process.env.WEBHOOK_HOST?.trim() || "127.0.0.1";
-const port = Number(process.env.WEBHOOK_PORT ?? "8795");
+const port = envInt("WEBHOOK_PORT", 8795, { max: 65_535 });
 const expectedPath = process.env.WEBHOOK_PATH ?? "/webhook";
 const secret =
   process.env.WEBHOOK_SECRET?.trim() ||
@@ -49,6 +53,10 @@ const allowUnsigned = process.env.WEBHOOK_ALLOW_UNSIGNED === "1";
 const defaultSource = process.env.WEBHOOK_SOURCE ?? "webhook/local";
 const defaultType = process.env.WEBHOOK_EVENT_TYPE ?? "com.webhook.received";
 const postUrl = process.env.WEBHOOK_POST_URL?.trim() || null;
+const maxBodyBytes = envInt("WEBHOOK_MAX_BODY_BYTES", 65_536, { min: 1 });
+const signatureHeader = process.env.WEBHOOK_SIGNATURE_HEADER?.trim().toLowerCase() || "x-webhook-signature-256";
+if (!/^[a-z0-9!#$%&'*+.^_`|~-]+$/.test(signatureHeader)) throw new Error("Invalid WEBHOOK_SIGNATURE_HEADER");
+const nativeCompat = process.env.WEBHOOK_LEGACY_NATIVE === "1";
 
 if (!secret) {
   if (!isLoopbackHost(host)) {
@@ -101,27 +109,23 @@ if (!target || !hello.targets.includes(target)) {
   throw new Error(`Target '${target}' not in configured targets: ${hello.targets.join(", ")}`);
 }
 
-const server = createServer(async (req, res) => {
+async function handleRequest(req, res) {
+  if (answerWebhookReadiness(req, res, expectedPath, secret && isLoopbackHost(host))) return;
   if (req.method !== "POST" || (req.url ?? "").split("?")[0] !== expectedPath) {
     res.writeHead(404).end();
     return;
   }
-  const chunks = [];
-  let bytes = 0;
-  for await (const chunk of req) {
-    bytes += chunk.length;
-    if (bytes > 65_536) {
-      res.writeHead(413).end('{"error":"too_large"}');
-      return;
-    }
-    chunks.push(chunk);
+  const raw = await readWebhookBody(req, maxBodyBytes);
+  if (raw === undefined) return;
+  if (raw === null) {
+    res.writeHead(413, { connection: "close" }).end('{"error":"too_large"}');
+    return;
   }
-  const raw = Buffer.concat(chunks);
   const rawTsHeader =
     typeof req.headers["x-webhook-timestamp"] === "string"
       ? req.headers["x-webhook-timestamp"].trim()
       : "";
-  if (rawTsHeader) {
+  if (req.headers["x-webhook-timestamp"] !== undefined) {
     const tsMs = parseWebhookTimestampMs(rawTsHeader);
     if (tsMs === null || Math.abs(Date.now() - tsMs) > REPLAY_WINDOW_MS) {
       res.writeHead(401, { "content-type": "application/json" }).end('{"error":"timestamp_out_of_window"}');
@@ -129,14 +133,14 @@ const server = createServer(async (req, res) => {
     }
   }
   if (secret) {
-    const header = String(req.headers["x-webhook-signature-256"] ?? "").trim().toLowerCase();
+    const header = String(req.headers[signatureHeader] ?? "").trim().toLowerCase();
     const hmac = createHmac("sha256", secret);
     if (rawTsHeader) {
       hmac.update(`${rawTsHeader}.`);
     }
     hmac.update(raw);
     const expected = "sha256=" + hmac.digest("hex");
-    if (header.length !== expected.length || !timingSafeEqual(Buffer.from(header), Buffer.from(expected))) {
+    if (Buffer.byteLength(header) !== expected.length || !timingSafeEqual(Buffer.from(header), Buffer.from(expected))) {
       res.writeHead(401, { "content-type": "application/json" }).end('{"error":"bad_signature"}');
       return;
     }
@@ -144,7 +148,7 @@ const server = createServer(async (req, res) => {
   let parsed;
   try { parsed = JSON.parse(raw.toString("utf8")); } catch { parsed = { raw: raw.toString("utf8").slice(0, 4000) }; }
   const obj = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed : { value: parsed };
-  if (!rawTsHeader) {
+  if (!rawTsHeader && !nativeCompat) {
     const payloadTsRaw = obj.timestamp ?? obj.time;
     if (payloadTsRaw !== undefined && payloadTsRaw !== null && String(payloadTsRaw).trim() !== "") {
       const payloadTsMs = parseWebhookTimestampMs(payloadTsRaw);
@@ -154,10 +158,11 @@ const server = createServer(async (req, res) => {
       }
     }
   }
-  const eventType = typeof obj.type === "string" && obj.type.length > 0 && obj.type.length <= 128 ? obj.type : defaultType;
-  const eventSource = typeof obj.source === "string" && obj.source.length > 0 && obj.source.length <= 256 ? obj.source : defaultSource;
-  const eventSubject = typeof obj.subject === "string" && obj.subject.length > 0 && obj.subject.length <= 256 ? obj.subject : undefined;
-  const data = typeof obj.data === "object" && obj.data !== null ? obj.data : obj;
+  const eventType = typeof obj.type === "string" && obj.type.length > 0 && Buffer.byteLength(obj.type) <= 128 ? obj.type : defaultType;
+  const eventSource = typeof obj.source === "string" && obj.source.length > 0 && Buffer.byteLength(obj.source) <= 256 ? obj.source : defaultSource;
+  const eventSubject = typeof obj.subject === "string" && obj.subject.length > 0 && Buffer.byteLength(obj.subject) <= 256 ? obj.subject : undefined;
+  const data = typeof obj.data === "object" && obj.data !== null &&
+    (!nativeCompat || !Array.isArray(obj.data)) ? obj.data : obj;
   // Derive deterministic event ID from SHA-256 of (optional signed timestamp + raw body)
   // rather than trusting unsigned headers like x-delivery-id or x-request-id.
   const idHash = createHash("sha256");
@@ -165,17 +170,22 @@ const server = createServer(async (req, res) => {
     idHash.update(`${rawTsHeader}.`);
   }
   idHash.update(raw);
-  const id = `sha256:${idHash.digest("hex")}`;
-  const event = {
-    specversion: "1.0",
-    id,
-    source: eventSource,
-    type: eventType,
-    ...(eventSubject ? { subject: eventSubject } : {}),
-    time: new Date().toISOString(),
-    datacontenttype: "application/json",
-    data,
-  };
+  const id = (nativeCompat ? "wh-" : "sha256:") + idHash.digest("hex");
+  const isCloudEvent = obj.specversion === "1.0" && ["id", "source", "type"].every(
+    (key) => typeof obj[key] === "string" && obj[key].length > 0,
+  );
+  const event = nativeCompat && isCloudEvent
+    ? { time: new Date().toISOString(), ...obj, id, hyphaesourcekind: "external-webhook" }
+    : {
+        specversion: "1.0",
+        id,
+        source: eventSource,
+        type: eventType,
+        ...(eventSubject ? { subject: eventSubject } : {}),
+        time: new Date().toISOString(),
+        datacontenttype: "application/json",
+        data,
+      };
   try {
     const reply = await mesh.send(target, event);
     res.writeHead(202, { "content-type": "application/json" }).end(JSON.stringify({ status: reply.status, id }));
@@ -183,8 +193,18 @@ const server = createServer(async (req, res) => {
     const status = error instanceof PluginRpcError && error.code !== RPC_UNAVAILABLE ? 400 : 503;
     res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify({ error: error.message, ...(error instanceof PluginRpcError ? { code: error.code } : {}) }));
   }
+}
+
+const server = createServer((req, res) => {
+  handleRequest(req, res).catch(() => {
+    if (res.destroyed || res.writableEnded) return;
+    if (res.headersSent) res.destroy();
+    else res.writeHead(400, { "content-type": "application/json" }).end('{"error":"invalid_request"}');
+  });
 });
 
 server.listen(port, host, () => {
-  console.error(`webhook plugin listening on http://${host}:${port}${expectedPath} -> target ${target}`);
+  const bound = server.address();
+  const actualPort = typeof bound === "object" && bound ? bound.port : port;
+  console.error(`webhook plugin listening on http://${host}:${actualPort}${expectedPath} -> target ${target}`);
 });

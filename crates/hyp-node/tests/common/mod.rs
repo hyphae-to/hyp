@@ -224,11 +224,11 @@ impl Drop for MockHttpServer {
 }
 
 // ============================================================================
-// Ed25519AuthBuilder (signed Hyphae v2 Authorization + X-Hyphae-Timestamp + X-Hyphae-Nonce)
+// Ed25519AuthBuilder (signed Hyphae v2 Authorization)
 // ============================================================================
 
-/// Builds signed Hyphae v2 `Authorization: Hyphae-Ed25519 ...`, `X-Hyphae-Timestamp`,
-/// `X-Hyphae-Nonce`, and `X-Hyphae-Node` headers with explicit timestamp/nonce overrides
+/// Builds signed Hyphae v2 `Authorization: Hyphae-Ed25519 ...` and
+/// `X-Hyphae-Node` headers with explicit timestamp/nonce overrides
 /// for boundary clock-skew and replay testing.
 pub struct Ed25519AuthBuilder<'a> {
     node_id: String,
@@ -273,8 +273,7 @@ impl<'a> Ed25519AuthBuilder<'a> {
         (ts, nonce)
     }
 
-    /// Computes the signed `Authorization`, `X-Hyphae-Timestamp`, `X-Hyphae-Nonce`, and
-    /// `X-Hyphae-Node` headers for `(method, path_and_query, body)`.
+    /// Computes the signed `Authorization` and `X-Hyphae-Node` headers for `(method, path_and_query, body)`.
     pub fn build_headers(&self, method: &str, path_and_query: &str, body: &[u8]) -> HeaderMap {
         let (ts, nonce) = self.resolve_ts_and_nonce();
         let body_sha = hex::encode(Sha256::digest(body));
@@ -295,14 +294,6 @@ impl<'a> Ed25519AuthBuilder<'a> {
         headers.insert(
             HeaderName::from_static("x-hyphae-node"),
             HeaderValue::from_str(&self.node_id).expect("valid X-Hyphae-Node header"),
-        );
-        headers.insert(
-            HeaderName::from_static("x-hyphae-timestamp"),
-            HeaderValue::from_str(&ts.to_string()).expect("valid X-Hyphae-Timestamp header"),
-        );
-        headers.insert(
-            HeaderName::from_static("x-hyphae-nonce"),
-            HeaderValue::from_str(&nonce).expect("valid X-Hyphae-Nonce header"),
         );
         headers
     }

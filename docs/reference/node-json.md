@@ -59,8 +59,8 @@ Default workstation path: `~/.config/hyphae/node.json` (`0600`). Server path: `/
 ### Compiled-In Event Sources (`sources[]`)
 - **`kind: "github-public"`**: `topic` (`"github"`), `allowPrivateWithToken` (bool), `minPollIntervalSeconds` (`60`), `graceWindowSeconds` (`300`), `maxActivePollers` (`100`), `repoTokens` (`{ "owner/*": { "secret": "..." }, "owner/repo": { "secret": "..." } }`).
 - **`kind: "github-webhook"`**: `topic` (recommend `"github-webhooks"` on hubs with guest pairing), `secret: { "secret": "..." }`, optional `allowedRepos`, `allowedOrgs`, `maxBodyBytes`. See [repository webhook setup](../plugins.md#repository-webhook-setup).
-- **`kind: "prometheus-webhook"`**: `topic` (`"alerts"`), `bearerToken: { "secret": "..." }`, `basicAuth: { "username": "...", "password": { "secret": "..." } }`, and/or `webhookSecret: { "secret": "..." }`.
-- **`kind: "webhook-stream"`**: `topic`, `secret: { "secret": "..." }`, optional `maxBodyBytes`.
+
+Configure generic HTTP and Alertmanager receivers in `plugins[]`. See [webhook plugin migration](../plugins.md#webhook-plugin-migration) for the former native source settings.
 
 ### Local Ingest (`localIngest`)
 Enabled by default even when omitted (`defaultTopic: "schedule"`, accepting `to.hyphae.scheduled.v1` and `to.hyphae.local.v1` on `["schedule", "local"]`). Each route in `localIngest.routes[]` supports:

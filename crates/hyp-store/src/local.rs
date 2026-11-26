@@ -608,11 +608,6 @@ impl<'a> LocalStateStore<'a> {
                 "DELETE FROM plugin_targets WHERE session_id = ?1",
                 params![id],
             )?;
-            tx.conn().execute(
-                "UPDATE wakeups SET state = 'cancelled', updated_at = ?1
-                 WHERE owner_session_id = ?2 AND state IN ('active', 'paused')",
-                params![cutoff_ms, id],
-            )?;
             tx.conn()
                 .execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
         }

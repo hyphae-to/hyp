@@ -10,6 +10,9 @@
 //! 4. `legacy_v1_connector_json_and_v1_keystore_upgrade_preserves_identity`
 //! 5. `hyp_secret_and_hyp_kv_forgotten_inputs_and_adversarial_matrix`
 
+#[path = "../../test-support/node_runtime.rs"]
+mod node_runtime;
+
 mod common;
 
 use common::{
@@ -2316,6 +2319,10 @@ fn two_hub_agent_descriptions_and_auto_routing_without_hub_prefix() {
 #[cfg(unix)]
 #[test]
 fn node_json_plugins_boot_wiring_secret_resolution_and_bridge_roundtrip() {
+    assert!(
+        node_runtime::node_available(),
+        "requires Node >= 24; node not found"
+    );
     struct CapturedCallback {
         body: String,
         signature: Option<String>,

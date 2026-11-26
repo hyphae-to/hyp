@@ -1,7 +1,6 @@
 import type { Register } from 'claude-code';
 import {
   buildSessionControlArgs,
-  formatNextFire,
   formatPersistentStatusLine,
   formatRelativeAge,
   getQuarantinedCount,
@@ -651,7 +650,7 @@ export const register: Register = (on) => {
         );
       }
 
-      // 'mesh' tab: Channels, Wakeups (metadata-only), and peer count
+      // 'mesh' tab: Channels and peer count
       const fallbackRawNodeId = daemon?.rawNodeId || nodeId;
       const chanRows =
         active.details.channelEntries.length > 0
@@ -663,7 +662,6 @@ export const register: Register = (on) => {
               rawChannel: active.details.rawChannels?.[idx] ?? ch,
               mode: 'open',
             }));
-      const wakeups = active.details.wakeups.slice(0, 6);
 
       return (
         <Box flexDirection="column" gap={1}>
@@ -709,16 +707,6 @@ export const register: Register = (on) => {
               );
             })
           )}
-          {wakeups.length > 0 ? (
-            <Box flexDirection="column" gap={0}>
-              <Text bold>{`Wakeups (${wakeups.length})`}</Text>
-              {wakeups.map((w, idx) => (
-                <Text key={`wk-row-${idx}`} dimColor>
-                  {`${w.label} · ${w.triggerKind} · ${w.urgency} · ${formatNextFire(w.nextFireAt, nowMs)}`}
-                </Text>
-              ))}
-            </Box>
-          ) : null}
         </Box>
       );
     };

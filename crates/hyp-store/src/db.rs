@@ -22,10 +22,9 @@ use crate::messages::{ChannelStore, MessageLimits, MessageStore};
 use crate::peers::PeerStore;
 use crate::transfers::{TransferLimits, TransferStore};
 use crate::types::now_ms;
-use crate::wakeups::{WakeupLimits, WakeupStore};
 
 /// Current unified schema version stored in `schema_version`.
-pub const CURRENT_SCHEMA_VERSION: i64 = 10;
+pub const CURRENT_SCHEMA_VERSION: i64 = 11;
 /// Maximum number of pre-migration `node.sqlite.v*.bak` backups retained per database directory.
 pub const MAX_MIGRATION_BACKUPS: usize = 3;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -116,6 +115,14 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0010_drop_delivery_history",
         disable_foreign_keys: false,
         kind: MigrationKind::Sql(include_str!("../migrations/0010_drop_delivery_history.sql")),
+    },
+    Migration {
+        version: 11,
+        name: "0011_drop_scheduled_wakeups",
+        disable_foreign_keys: false,
+        kind: MigrationKind::Sql(include_str!(
+            "../migrations/0011_drop_scheduled_wakeups.sql"
+        )),
     },
 ];
 
@@ -228,7 +235,6 @@ pub struct StoreConfig {
     pub event_limits: EventLimits,
     pub message_limits: MessageLimits,
     pub transfer_limits: TransferLimits,
-    pub wakeup_limits: WakeupLimits,
     pub mailbox_max_pending_per_session: usize,
     /// Optional explicit directory for encrypted transfer blobs.
     /// Defaults to `<db_parent>/transfers` for file-backed DBs and an isolated temporary directory
@@ -242,7 +248,6 @@ impl Default for StoreConfig {
             event_limits: EventLimits::default(),
             message_limits: MessageLimits::default(),
             transfer_limits: TransferLimits::default(),
-            wakeup_limits: WakeupLimits::default(),
             mailbox_max_pending_per_session: 100,
             transfers_dir: None,
         }
@@ -594,10 +599,6 @@ impl NodeDb {
 
     pub fn peers(&self) -> PeerStore<'_> {
         PeerStore::new(self)
-    }
-
-    pub fn wakeups(&self) -> WakeupStore<'_> {
-        WakeupStore::new(self)
     }
 
     pub fn human(&self) -> HumanAuthorityStore<'_> {

@@ -6,7 +6,6 @@
 
 pub mod address;
 pub mod cloudevent;
-pub mod cron;
 pub mod filter;
 pub mod jcs;
 pub mod manifest;

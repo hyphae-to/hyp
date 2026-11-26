@@ -31,7 +31,6 @@ export interface SessionCounts {
   mutedRules: number;
   mutedArchived: number;
   channels: number;
-  wakeups: number;
 }
 
 export interface BridgeLinkSummary {
@@ -93,15 +92,6 @@ export interface ChannelEntrySummary {
   mode: string;
 }
 
-export interface WakeupSummary {
-  id: string;
-  label: string;
-  triggerKind: string;
-  nextFireAt: number;
-  urgency: string;
-  state: string;
-}
-
 export interface SessionDetails {
   bridges: BridgeLinkSummary[];
   subscriptions: SubscriptionSummary[];
@@ -111,7 +101,6 @@ export interface SessionDetails {
   channels: string[];
   rawChannels?: string[];
   channelEntries: ChannelEntrySummary[];
-  wakeups: WakeupSummary[];
 }
 
 export interface SessionSummary {
@@ -459,24 +448,6 @@ function parseSessionSummary(raw: unknown): SessionSummary | null {
     });
   }
 
-  const rawWakeups = Array.isArray(detailsObj?.wakeups) ? detailsObj.wakeups : [];
-  const wakeups: WakeupSummary[] = [];
-  for (const item of rawWakeups) {
-    const w = asRecord(item);
-    if (!w) continue;
-    const id = sanitizeUiText(w.id, 64);
-    const label = sanitizeUiText(w.label, 96);
-    if (!id && !label) continue;
-    wakeups.push({
-      id: id || label,
-      label: label || id,
-      triggerKind: sanitizeUiText(w.triggerKind, 24) || 'once',
-      nextFireAt: asNum(w.nextFireAt, 0),
-      urgency: sanitizeUiText(w.urgency, 24) || 'notify',
-      state: sanitizeUiText(w.state, 24) || 'armed',
-    });
-  }
-
   const rawSources = Array.isArray(unreadObj?.sources) ? unreadObj.sources : [];
   const sources = rawSources.map((s) => sanitizeUiText(s, 80)).filter((s) => s.length > 0);
 
@@ -510,7 +481,6 @@ function parseSessionSummary(raw: unknown): SessionSummary | null {
       mutedRules: asCount(countsObj?.mutedRules ?? mutes.length),
       mutedArchived: asCount(countsObj?.mutedArchived ?? 0),
       channels: asCount(countsObj?.channels ?? (channelEntries.length || channels.length)),
-      wakeups: asCount(countsObj?.wakeups ?? wakeups.length),
     },
     unreadBreakdown: {
       messages: asCount(unreadObj?.messages ?? 0),
@@ -529,7 +499,6 @@ function parseSessionSummary(raw: unknown): SessionSummary | null {
       channels,
       rawChannels,
       channelEntries,
-      wakeups,
     },
   };
 }
@@ -665,21 +634,6 @@ export function formatRelativeAge(tsMs: number, nowMs: number): string {
   const hrs = Math.floor(mins / 60);
   if (hrs < 48) return `${hrs}h`;
   return `${Math.floor(hrs / 24)}d`;
-}
-
-/**
- * Formats a future epoch millisecond timestamp (`in 45s`, `in 12m`, `due`).
- */
-export function formatNextFire(tsMs: number, nowMs: number): string {
-  if (!Number.isFinite(tsMs) || tsMs <= 0) return '—';
-  const deltaSec = Math.floor((tsMs - nowMs) / 1000);
-  if (deltaSec <= 0) return 'due';
-  if (deltaSec < 60) return `in ${deltaSec}s`;
-  const mins = Math.floor(deltaSec / 60);
-  if (mins < 60) return `in ${mins}m`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 48) return `in ${hrs}h`;
-  return `in ${Math.floor(hrs / 24)}d`;
 }
 
 function assertSafeArgValue(raw: string, label: string): string {

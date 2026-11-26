@@ -11,7 +11,7 @@ flowchart LR
   subgraph LocalNode["Local Node (profile: local)"]
     direction TB
     Harnesses["Harnesses (MCP + ~2.7ms hooks via connector.sock / connector.addr)"]
-    Sources["Compiled-In Sources (localIngest ingest.sock, github-public, github-webhook, prometheus-webhook, webhook-stream)"]
+    Sources["Compiled-In Sources (localIngest ingest.sock, github-public, github-webhook)"]
     Bridges["Optional External Bridges (SubprocessSupervisor · fd-3 / loopback TCP)"]
 
     subgraph Core["UnifiedNode + node.sqlite (WAL, schema v5)"]
@@ -47,7 +47,7 @@ flowchart LR
    - **Human Authority:** `human_authorities` (with schema v5 `enc_jwk_json`), `human_nonces`, `human_node_certs`
 3. **Composable Adapters (`NodeAdapter` in `crates/hyp-node` & `crates/hyp-harness`):**
    - **Harnesses & LocalDaemon:** Private `0600` Unix socket (`connector.sock`) or Windows loopback TCP + bearer token (`connector.addr`), `CallRegistry` + per-session HMAC `sessionToken`, zero-Tokio ~2.7 ms `hyp hook` fast path, ~2.8 MB RSS stateless `hyp mcp` multiplexer, and live hot-reload IPC RPCs (`peers.reload`, `gate.reload`, `inbox.wake`).
-   - **Compiled-in Event Sources & Local Ingest:** Pure-Rust `github-public`, `github-webhook`, `prometheus-webhook`, `webhook-stream`, and default socket-only `localIngest` (`ingest.sock` / `ingest.addr`).
+   - **Compiled-in Event Sources & Local Ingest:** Pure-Rust `github-public`, `github-webhook`, and default socket-only `localIngest` (`ingest.sock` / `ingest.addr`).
    - **External Subprocess Bridges:** Cross-platform `SubprocessSupervisor` over duplex Unix fd 3 (macOS/Linux) or authenticated loopback TCP with per-spawn 256-bit CSPRNG token (Windows), speaking JSON-RPC 2.0 v2 only, with scrubbed env, `CrashLoopBackOff` circuit breaker, `0600` redacted logs, and local-only bridge topics by default.
    - **Symmetric `PeerLink`s:** Bidirectional `hyper 1` HTTPS (or optional zero-port `ssh://` via `hyp connect` -> `0600` `peer.sock`) + WHATWG SSE links with RFC 9457 Problem Details, ETag caching, and aggregated filter pushdown (sharding merged CloudEvents filter ASTs when exceeding 4 KiB / depth 8).
 4. **Configuration Profiles:** `local` (workstation, no listener by default), `p2p` (workstation + peer listener), and `router` (Team Hub or Public Node).

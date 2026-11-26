@@ -128,7 +128,6 @@ function makeRichSnapshotJson(overrides?: {
           mutedRules: 1,
           mutedArchived: 0,
           channels: 1,
-          wakeups: 1,
         },
         unreadBreakdown: {
           messages: 1,
@@ -210,17 +209,6 @@ function makeRichSnapshotJson(overrides?: {
               mode: 'open',
             },
           ],
-          wakeups: [
-            {
-              id: 'wk-1',
-              label: adv ? `${escRed}daily-check${bidiTrap}${escReset}` : 'daily-check',
-              triggerKind: 'cron',
-              nextFireAt: 1_700_000_600_000,
-              urgency: 'notify',
-              state: 'armed',
-              ...(adv ? { note: 'WAKEUP_SECRET_NOTE' } : {}),
-            },
-          ],
           ...(adv
             ? {
                 quarantinedText: 'QUARANTINE_TEXT_LEAK',
@@ -250,7 +238,6 @@ function makeRichSnapshotJson(overrides?: {
           mutedRules: 0,
           mutedArchived: 0,
           channels: 0,
-          wakeups: 0,
         },
         unreadBreakdown: {
           messages: 0,
@@ -267,7 +254,6 @@ function makeRichSnapshotJson(overrides?: {
           rules: [],
           channels: [],
           channelEntries: [],
-          wakeups: [],
         },
       },
     ],
@@ -309,7 +295,6 @@ describe('hyphae pure state & security helpers', () => {
       'SECRET_MAILBOX_TEXT',
       'SECRET_PAYLOAD_LEAK',
       'CLOUDEVENT_DATA_LEAK',
-      'WAKEUP_SECRET_NOTE',
       'RAW_SECRET_TOKEN',
       'DAEMON_SECRET_LEAK',
       'QUARANTINE_TEXT_LEAK',
@@ -532,7 +517,6 @@ describe('hyphae native Claude Code side-panel mod', () => {
         'SECRET_MAILBOX_TEXT',
         'SECRET_PAYLOAD_LEAK',
         'CLOUDEVENT_DATA_LEAK',
-        'WAKEUP_SECRET_NOTE',
         'RAW_SECRET_TOKEN',
         'DAEMON_SECRET_LEAK',
         'QUARANTINE_TEXT_LEAK',
@@ -600,8 +584,6 @@ describe('hyphae native Claude Code side-panel mod', () => {
     await mounted.redraw(PANE_PROPS);
     const meshText = checkInvariants(await mounted.drawn());
     expect(meshText).toContain('#ops');
-    expect(meshText).toContain('daily-check');
-    expect(meshText).toContain('in 10m');
 
     await mounted.unmount();
   });

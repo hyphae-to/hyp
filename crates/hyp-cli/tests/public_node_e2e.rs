@@ -24,10 +24,7 @@ use http_body_util::{BodyExt, Empty, Full};
 use hyp_crypto::keys::NodeIdentityKeys;
 use hyp_crypto::keystore::{SecretBackend, SecretStore};
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
-use hyp_node::adapters::{
-    GenericWebhookAdapter, GenericWebhookConfig, GitHubPublicAdapter, GitHubPublicConfig,
-    compute_hmac_sha256_header,
-};
+use hyp_node::adapters::{GitHubPublicAdapter, GitHubPublicConfig};
 use hyp_node::engine::http_util::SseParser;
 use hyp_node::engine::{
     GuestPairRequest, GuestPairingConfig, NodeConfig, UnifiedNode, guest_pair_proof_canonical,
@@ -1242,31 +1239,22 @@ async fn guest_pair_disabled_rate_limit_cumulative_repo_cap_and_retired_app_rout
     assert_eq!(s3, StatusCode::FORBIDDEN, "expected 403 on 3rd repo: {b3}");
     assert_eq!(b3["error"], "not_granted");
 
-    let secret = "fixture-generic-secret";
-    let mut generic = GenericWebhookConfig::new("github-app", "private-hooks");
-    generic.secret = Some(secret.to_owned().into());
-    pub_node
-        .attach_generic_webhook(Arc::new(GenericWebhookAdapter::new(generic)))
-        .await
-        .unwrap();
-    let payload = json!({ "message": "operator-owned webhook" });
-    let signature =
-        compute_hmac_sha256_header(secret.as_bytes(), &serde_json::to_vec(&payload).unwrap());
-    for (path, expected) in [
-        ("/v1/webhooks/github-app", StatusCode::NOT_FOUND),
-        ("/v1/webhooks/stream/github-app", StatusCode::OK),
+    for path in [
+        "/v1/webhooks/github-app",
+        "/v1/webhooks/prometheus",
+        "/v1/webhooks/stream/ci",
     ] {
         let (status, _, body) = send_json_request(
             &client,
             &pub_url,
             Method::POST,
             path,
-            Some(payload.clone()),
+            Some(json!({})),
             None,
-            &[("x-webhook-signature-256", &signature)],
+            &[],
         )
         .await;
-        assert_eq!(status, expected, "{path}: {body}");
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
     }
 
     pub_node.shutdown_adapters().await;

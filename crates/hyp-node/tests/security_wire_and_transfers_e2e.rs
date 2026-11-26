@@ -167,18 +167,61 @@ async fn ed25519_nonce_replay_and_clock_skew_boundary_matrix() {
         .with_timestamp_ms(replay_ts)
         .with_nonce("fixed-replay-nonce-001");
     let headers_first = replay_builder.build_headers("GET", "/v1/channels", b"");
-    assert_eq!(
-        headers_first
-            .get("x-hyphae-timestamp")
-            .and_then(|v| v.to_str().ok()),
-        Some(replay_ts.to_string().as_str())
-    );
-    assert_eq!(
-        headers_first
-            .get("x-hyphae-nonce")
-            .and_then(|v| v.to_str().ok()),
-        Some("fixed-replay-nonce-001")
-    );
+    let signed_auth = headers_first.get(AUTHORIZATION).unwrap().to_str().unwrap();
+    assert!(signed_auth.contains(&format!("ts=\"{replay_ts}\"")));
+    assert!(signed_auth.contains("nonce=\"fixed-replay-nonce-001\""));
+
+    // A valid split tuple is no longer a credential and must not consume its nonce.
+    // Supplying it alongside invalid Authorization cannot rescue that credential either.
+    let mut split = headers_first.clone();
+    split.remove(AUTHORIZATION);
+    split.insert("x-hyphae-timestamp", replay_ts.to_string().parse().unwrap());
+    split.insert("x-hyphae-nonce", "fixed-replay-nonce-001".parse().unwrap());
+    let signature = signed_auth
+        .split("sig=\"")
+        .nth(1)
+        .unwrap()
+        .trim_end_matches('"');
+    split.insert("x-hyphae-sig", signature.parse().unwrap());
+    for authorization in [
+        None,
+        Some("Bearer unknown-test-credential"),
+        Some("invalid"),
+    ] {
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri(format!("{hub_url}/v1/channels"))
+            .body(full_body(Bytes::new()))
+            .unwrap();
+        *request.headers_mut() = split.clone();
+        if let Some(value) = authorization {
+            request
+                .headers_mut()
+                .insert(AUTHORIZATION, value.parse().unwrap());
+        }
+        assert_eq!(
+            client.request(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    // Bearer remains sufficient on its own; retired split fields are not a second factor.
+    let bearer = "isolated-split-retirement-test-credential";
+    hub.db()
+        .local()
+        .set_metadata(
+            &format!("auth_token:{}", sha256_hex(bearer.as_bytes())),
+            &json!({"peerId":"alice@macbook"}).to_string(),
+        )
+        .unwrap();
+    let mut bearer_headers = split.clone();
+    bearer_headers.insert(AUTHORIZATION, format!("Bearer {bearer}").parse().unwrap());
+    bearer_headers.insert("x-hyphae-sig", "retired-and-invalid".parse().unwrap());
+    let authenticated = hub
+        .authenticate_request(&bearer_headers, "GET", "/v1/channels", &sha256_hex(b""))
+        .unwrap()
+        .unwrap();
+    assert_eq!(authenticated.peer_id, "alice@macbook");
 
     let req1 = replay_builder.sign_request(Method::GET, &hub_url, "/v1/channels", None, None);
     let resp1 = client.request(req1).await.unwrap();

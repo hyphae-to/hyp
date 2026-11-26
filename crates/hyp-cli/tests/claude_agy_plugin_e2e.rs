@@ -26,6 +26,75 @@ fn claude_plugin_dir() -> PathBuf {
     repo_root().join("plugins").join("claude-code")
 }
 
+/// Probe optional flags independently from actual package validation. Old CLI versions still
+/// validate normally; a failed supported validator is never treated as an unsupported capability.
+fn validate_with_claude(
+    executable: &Path,
+    plugin_dir: &Path,
+) -> Option<(bool, std::process::Output)> {
+    let home = tempfile::tempdir().expect("isolated Claude validation home");
+    let command = || {
+        let mut command = Command::new(executable);
+        command
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("CLAUDE_CONFIG_DIR", home.path().join(".claude"))
+            .env("DISABLE_AUTOUPDATER", "1")
+            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+        command
+    };
+    let help = match command().args(["plugin", "validate", "--help"]).output() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => panic!("could not inspect Claude validation capabilities: {error}"),
+        Ok(help) => help,
+    };
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&help.stdout),
+        String::from_utf8_lossy(&help.stderr)
+    );
+    if !help.status.success() {
+        let message = text.to_ascii_lowercase();
+        assert!(
+            [
+                "unknown command",
+                "unknown subcommand",
+                "unrecognized command"
+            ]
+            .iter()
+            .any(|marker| message.contains(marker)),
+            "Claude capability probe failed unexpectedly: {}",
+            text.trim()
+        );
+        eprintln!("SKIP external Claude validation: installed CLI has no plugin validate command");
+        return None;
+    }
+    let strict = text.contains("--strict");
+    // Preserve the existing detailed strict report when supported. Older ordinary validators
+    // need only their normal exit-status contract; static schema/command checks run above too.
+    let json_report = strict && text.contains("--json");
+    let mut validate = command();
+    validate.args(["plugin", "validate"]);
+    if strict {
+        validate.arg("--strict");
+    }
+    if json_report {
+        validate.arg("--json");
+    }
+    let output = validate
+        .arg(plugin_dir)
+        .output()
+        .expect("run supported Claude validation");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Claude plugin validation failed (code={:?}):\nstdout={stdout}\nstderr={stderr}",
+        output.status.code()
+    );
+    Some((json_report, output))
+}
+
 // ============================================================================
 // 1. Claude Code Plugin Bundle Schema, Security Invariants & `claude plugin validate`
 // ============================================================================
@@ -140,21 +209,11 @@ fn claude_code_plugin_bundle_conforms_to_schema_and_security_invariants() {
     assert!(skill.starts_with("---\nname: hyphae\n"));
     assert!(skill.to_ascii_lowercase().contains("untrusted"));
 
-    // 5. Run `claude plugin validate --strict` if `claude` binary is present on PATH.
-    if let Ok(output) = Command::new("claude")
-        .args(["plugin", "validate", "--strict", "--json"])
-        .arg(&plugin_dir)
-        .output()
-    {
+    if let Some((true, output)) = validate_with_claude(Path::new("claude"), &plugin_dir) {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.success(),
-            "claude plugin validate --strict failed (code={:?}):\nstdout={stdout}\nstderr={stderr}",
-            output.status.code()
-        );
-        let report: Value = serde_json::from_str(&stdout)
-            .unwrap_or_else(|e| panic!("invalid JSON from claude plugin validate ({e}): {stdout}"));
+        let report: Value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
+            panic!("invalid JSON from Claude validation ({error}): {stdout}")
+        });
         assert_eq!(report["success"], true);
         let cmds = report["provides"]["commands"]
             .as_array()
@@ -171,6 +230,76 @@ fn claude_code_plugin_bundle_conforms_to_schema_and_security_invariants() {
             );
         }
     }
+}
+
+#[test]
+fn ordinary_claude_validation_runs_and_its_failure_is_not_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    let executable = tmp.path().join("claude");
+    #[cfg(windows)]
+    let executable = tmp.path().join("claude.cmd");
+    let mut marker = executable.as_os_str().to_os_string();
+    marker.push(".called");
+    let marker = PathBuf::from(marker);
+    for valid in [true, false] {
+        let exit_code = if valid { 0 } else { 17 };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::write(
+                &executable,
+                format!(
+                    r#"#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = --help ]; then printf '%s\n' 'Usage: plugin validate PATH'; exit 0; fi
+done
+printf '%s\n' called > "$0.called"
+for arg in "$@"; do if [ "$arg" = --strict ]; then exit 2; fi; done
+exit {exit_code}
+"#
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        #[cfg(windows)]
+        fs::write(&executable, format!("@echo off\r\necho %*|findstr /C:\"--help\" >nul\r\nif not errorlevel 1 (\r\necho Usage: plugin validate PATH\r\nexit /b 0\r\n)\r\necho called >\"%~f0.called\"\r\necho %*|findstr /C:\"--strict\" >nul\r\nif not errorlevel 1 exit /b 2\r\nexit /b {exit_code}\r\n")).unwrap();
+        let result = std::panic::catch_unwind(|| validate_with_claude(&executable, tmp.path()));
+        assert!(
+            marker.is_file(),
+            "ordinary validation must run after its help probe"
+        );
+        if valid {
+            let (json_report, _) = result.unwrap().expect("validator exists");
+            assert!(!json_report);
+        } else {
+            let failure = result.expect_err("invalid package status must fail the test");
+            let message = failure.downcast_ref::<String>().unwrap();
+            assert!(
+                message.contains("Claude plugin validation failed"),
+                "{message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn installed_claude_validator_rejects_an_invalid_plugin_when_available() {
+    if validate_with_claude(Path::new("claude"), &claude_plugin_dir()).is_none() {
+        return;
+    }
+    let invalid = tempfile::tempdir().unwrap();
+    fs::create_dir(invalid.path().join(".claude-plugin")).unwrap();
+    fs::write(invalid.path().join(".claude-plugin/plugin.json"), "{").unwrap();
+    let failure =
+        std::panic::catch_unwind(|| validate_with_claude(Path::new("claude"), invalid.path()))
+            .expect_err("installed validator must reject invalid plugin JSON");
+    let message = failure.downcast_ref::<String>().unwrap();
+    assert!(
+        message.contains("Claude plugin validation failed"),
+        "{message}"
+    );
 }
 
 // ============================================================================
