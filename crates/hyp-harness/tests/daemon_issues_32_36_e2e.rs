@@ -103,8 +103,26 @@ impl PushTransport for RecordingNudgeTransport {
         true
     }
 
-    fn deliver<'a>(&'a self, _text: &'a str, _mode: PushMode) -> TransportFuture<'a, PushOutcome> {
-        Box::pin(async { PushOutcome::delivered() })
+    fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
+        let extract_attr = |attr: &str| -> Option<String> {
+            let needle = format!("{attr}=\"");
+            let rest = text.split_once(&needle)?.1;
+            Some(rest.split_once('"')?.0.to_string())
+        };
+        let count = extract_attr("unread")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1);
+        let handle = extract_attr("handle");
+        let rec = RecordedNudge {
+            count,
+            handle,
+            mode,
+        };
+        Box::pin(async move {
+            self.nudges.lock().unwrap().push(rec);
+            self.notify.notify_waiters();
+            PushOutcome::delivered()
+        })
     }
 
     fn deliver_nudge<'a>(
@@ -452,8 +470,8 @@ async fn issue32_focus_vip_bypass_isolates_buffered_notify_and_flushes_on_focus_
     assert_eq!(hc_n1[0].count, 1);
     assert_eq!(hc_n1[0].mode, PushMode::Interrupt);
 
-    // Simulate inner Claude `UserPromptSubmit` (`PreInvocation` / `PreTurn`) draining the VIP turn:
-    // VIP is delivered inline & acked; Focus-buffered item stays unread (footer only, body never leaked!).
+    // Simulate inner Claude `UserPromptSubmit` (`PreInvocation` / `PreTurn`) during the VIP turn:
+    // RFC 0004: Zero body text (neither `hc_vip` nor `hc_buf`) EVER appears in hooks!
     let pre_turn = run_hook(
         &sock,
         HarnessKind::Claude,
@@ -461,17 +479,30 @@ async fn issue32_focus_vip_bypass_isolates_buffered_notify_and_flushes_on_focus_
         json!({ "session_id": hc_raw }),
     )
     .await;
-    let pre_ctx = pre_turn["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .expect("PreInvocation should inject VIP");
     assert!(
-        pre_ctx.contains(hc_vip),
-        "missing VIP in PreInvocation: {pre_ctx}"
+        !pre_turn.to_string().contains(hc_buf),
+        "Focus-buffered body must NEVER leak into VIP PreInvocation: {pre_turn}"
     );
     assert!(
-        !pre_ctx.contains(hc_buf),
-        "Focus-buffered body must NEVER leak into VIP PreInvocation: {pre_ctx}"
+        !pre_turn.to_string().contains(hc_vip),
+        "RFC 0004: raw VIP body must NEVER leak into PreInvocation hook: {pre_turn}"
     );
+    // Simulate the woken agent reading & acknowledging ONLY the VIP item via `hyp_inbox` (while
+    // `hc_buf` remains isolated & unread in SQLite during Focus Mode!).
+    {
+        let db = node.db();
+        let vip_rcpt = db
+            .local()
+            .peek_inbox(&hc_sid, 10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.item_id == "hc-p4-vip")
+            .expect("vip row")
+            .receipt;
+        db.local()
+            .acknowledge_inbox(&hc_sid, &[vip_rcpt.as_str()], now_ms())
+            .unwrap();
+    }
     // Simulate turn completing (`Stop` -> mark idle) so activity lease clears cleanly.
     let _ = run_hook(
         &sock,
@@ -682,25 +713,31 @@ esac
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         assert_eq!(
-            spawned_log.lines().count(),
+            spawned_log.matches("run ci-triage ").count(),
             1,
             "expected 1 cold spawn:\n{spawned_log}"
         );
         assert!(
-            spawned_log.contains("run ci-triage <hyphae-wake")
+            spawned_log.contains("run ci-triage <hyphae-inbox")
                 && spawned_log.contains("handle=\"triage-bot\""),
             "unexpected hc run invocation:\n{spawned_log}"
         );
         assert!(
             !spawned_log.contains(secret_dm),
-            "Tier 4 cold spawn MUST use metadata-only nudge, never raw untrusted DM body:\n{spawned_log}"
+            "Tier 4 cold spawn MUST use metadata-only XML digest, never raw untrusted DM body:\n{spawned_log}"
         );
         // Unread DM stays preserved in SQLite for the newly spawned agent (`notified = 1`).
         assert_eq!(session_status(&sock, cold_sid).await["pending"], 1);
         // Repeated flush MUST NOT spawn a second cold agent!
         daemon.flush_pending_sessions().await;
         tokio::time::sleep(Duration::from_millis(60)).await;
-        assert_eq!(fs::read_to_string(&run_log).unwrap().lines().count(), 1);
+        assert_eq!(
+            fs::read_to_string(&run_log)
+                .unwrap()
+                .matches("run ci-triage ")
+                .count(),
+            1
+        );
 
         // 2. Dead Herdr transport (`herdr_target_unavailable`) with allowlisted template detaches
         //    and falls through to cold spawn cleanly!
@@ -741,7 +778,7 @@ esac
         let deadline2 = Instant::now() + Duration::from_secs(4);
         loop {
             let count = fs::read_to_string(&run_log)
-                .map(|s| s.lines().count())
+                .map(|s| s.matches("run ci-triage ").count())
                 .unwrap_or(0);
             if count >= 2 {
                 break;
@@ -840,7 +877,10 @@ esac
             .unwrap();
         tokio::time::sleep(Duration::from_millis(120)).await;
         assert_eq!(
-            fs::read_to_string(&run_log).unwrap().lines().count(),
+            fs::read_to_string(&run_log)
+                .unwrap()
+                .matches("run ci-triage ")
+                .count(),
             2,
             "non-allowlisted, muted, and Focus-buffered items must NEVER cold-spawn"
         );
@@ -1077,10 +1117,10 @@ exit 0
         let deadline = Instant::now() + Duration::from_secs(4);
         loop {
             let hc_ok = fs::read_to_string(&hc_send_log)
-                .map(|s| s.contains("t9") && s.contains("<hyphae-wake"))
+                .map(|s| s.contains("t9") && s.contains("<hyphae-inbox"))
                 .unwrap_or(false);
             let cx_ok = fs::read_to_string(&cx_queue_log)
-                .map(|s| s.contains(cx_uuid) && s.contains("<hyphae-wake"))
+                .map(|s| s.contains(cx_uuid) && s.contains("<hyphae-inbox"))
                 .unwrap_or(false);
             if hc_ok && cx_ok {
                 break;

@@ -783,7 +783,10 @@ export const HyphaePlugin = async (ctx: OpenCodePluginContext = {}) => {
         return;
       }
 
-      if (!res.followupMessage.startsWith("Incoming hyphae message(s):")) {
+      if (
+        !res.followupMessage.startsWith("Incoming hyphae message(s):") &&
+        !res.followupMessage.startsWith("<hyphae-inbox")
+      ) {
         idleReminderSent.add(sessionID);
       }
 
@@ -1052,7 +1055,10 @@ const HyphaeV2Plugin = {
             return;
           }
 
-          if (!res.followupMessage.startsWith("Incoming hyphae message(s):")) {
+          if (
+            !res.followupMessage.startsWith("Incoming hyphae message(s):") &&
+            !res.followupMessage.startsWith("<hyphae-inbox")
+          ) {
             idleReminderSent.add(sessionID);
           }
 

@@ -118,19 +118,24 @@ test("Real Claude Code: verified PreToolUse enrollment, tool-boundary pauseUntil
           pauseUntil(gateBeforeRead1, callTool(req, "Read", { file_path: sampleFile })),
       },
       // Turn 2: `PostToolUse` just ran after `Read` #1!
-      //         `queuePayload` MUST be HELD (NOT injected mid-turn!).
+      //         `queuePayload` MUST be HELD (zero `<hyphae-inbox>`, zero body!).
       //         Now PAUSE on `gateBeforeRead2` so test configures VIP `interrupt` rule + sends `interruptPayload`,
       //         then release to issue `Read(note.txt)` #2 -> triggers `PostToolUse`!
       {
         name: "assert-queue-held-then-pause-read-2",
         once: true,
         when: (req) =>
-          Boolean(req.lastToolResult("Read")) && !req.anyMessageContains(interruptPayload),
+          Boolean(req.lastToolResult("Read")) && !req.anyMessageContains('urgency="interrupt"'),
         assert: (req) => {
           assert.equal(
             req.rawBody.includes(queuePayload),
             false,
             `PostToolUse MUST HOLD queue DM '${queuePayload}' mid-turn instead of injecting it!`,
+          );
+          assert.equal(
+            req.anyMessageContains("<hyphae-inbox "),
+            false,
+            `PostToolUse #1 MUST NOT emit a digest for a fresh queue DM before long-turn interval!`,
           );
           sawRead1ResultWithoutQueue = true;
         },
@@ -138,17 +143,21 @@ test("Real Claude Code: verified PreToolUse enrollment, tool-boundary pauseUntil
           pauseUntil(gateBeforeRead2, callTool(req, "Read", { file_path: sampleFile })),
       },
       // Turn 3: `PostToolUse` just ran after `Read` #2!
-      //         `interruptPayload` MUST be injected IMMEDIATELY with Hyphae framing,
-      //         while `queuePayload` MUST STILL be held until `Stop`!
-      //         Emit plain text to trigger the `Stop` hook!
+      //         RFC 0004: `PostToolUse` injects a metadata-only `<hyphae-inbox ... urgency="interrupt">`
+      //         digest for `@vip` (ZERO `interruptPayload`, ZERO `queuePayload`!), while `@bob`'s
+      //         `queue` DM stays held until `Stop`! Read ONLY `@vip` via `hyp_inbox` (default ack: true).
       {
-        name: "assert-interrupt-injected-and-end-turn",
+        name: "assert-interrupt-digest-and-read-vip",
         once: true,
-        when: (req) => req.anyMessageContains(interruptPayload) && !req.anyMessageContains(queuePayload),
+        when: (req) =>
+          req.anyMessageContains('urgency="interrupt"') &&
+          req.anyMessageContains('from="claude-itest@local/vip"') &&
+          !req.anyMessageContains(interruptPayload),
         assert: (req) => {
-          assert.ok(
-            req.rawBody.includes(UNTRUSTED_PROVENANCE_HEADER),
-            `Interrupt PostToolUse injection MUST include explicit '${UNTRUSTED_PROVENANCE_HEADER}'`,
+          assert.equal(
+            req.rawBody.includes(interruptPayload),
+            false,
+            `RFC 0004: PostToolUse digest MUST NEVER leak raw interrupt body '${interruptPayload}'!`,
           );
           assert.equal(
             req.rawBody.includes(queuePayload),
@@ -157,20 +166,55 @@ test("Real Claude Code: verified PreToolUse enrollment, tool-boundary pauseUntil
           );
           sawInterruptInPostToolUse = true;
         },
+        do: (req) =>
+          callTool(req, "hyp_inbox", {
+            filter: { from: "claude-itest@local/vip" },
+          }),
+      },
+      // Turn 4: `hyp_inbox` returned `@vip`'s `interruptPayload` with structured provenance and acked it!
+      //         Emit plain text to trigger the `Stop` hook for `@bob`'s held `queue` DM!
+      {
+        name: "after-vip-inbox-end-turn",
+        once: true,
+        when: (req) =>
+          req.lastToolResult("hyp_inbox")?.text.includes(interruptPayload) === true &&
+          !req.anyMessageContains(queuePayload),
+        assert: (req) => {
+          const inboxJson = req.lastToolResult("hyp_inbox")?.json;
+          assert.equal(inboxJson?.acked, 1, "hyp_inbox must ack by default (RFC 0004 Decision #3)");
+          assert.equal(inboxJson?.items?.[0]?.untrusted, true);
+          assert.equal(inboxJson?.items?.[0]?.provenance, UNTRUSTED_PROVENANCE_HEADER);
+        },
         do: () => emitText("MID_TURN_DONE_TRIGGERING_STOP"),
       },
-      // Turn 4: `Stop` hook blocked TurnEnd and flushed the held `queuePayload`!
-      //         Verify framing and send confirmation DM to `@sink` via `hyp_send`!
+      // Turn 5: `Stop` hook blocked TurnEnd with a metadata-only `<hyphae-inbox ... urgency="queue">`
+      //         digest for `@bob` (ZERO `queuePayload` body!). Call `hyp_inbox()` (default ack: true)!
+      {
+        name: "stop-digest-read-queue-inbox",
+        once: true,
+        when: (req) =>
+          req.anyMessageContains('urgency="queue"') &&
+          req.anyMessageContains('from="claude-itest@local/bob"') &&
+          !req.anyMessageContains(queuePayload),
+        assert: (req) => {
+          assert.equal(
+            req.rawBody.includes(queuePayload),
+            false,
+            `RFC 0004: Stop continuation digest MUST NEVER leak raw queue body '${queuePayload}'!`,
+          );
+          sawQueueInStopContinuation = true;
+        },
+        do: (req) => callTool(req, "hyp_inbox", {}),
+      },
+      // Turn 6: `hyp_inbox` returned `queuePayload` -> send confirmation DM to `@sink` via `hyp_send`!
       {
         name: "stop-flushed-queue-send-ack",
         once: true,
-        when: (req) => req.anyMessageContains(queuePayload),
+        when: (req) => req.lastToolResult("hyp_inbox")?.text.includes(queuePayload) === true,
         assert: (req) => {
-          assert.ok(
-            req.rawBody.includes(UNTRUSTED_PROVENANCE_HEADER),
-            `Stop continuation MUST include explicit '${UNTRUSTED_PROVENANCE_HEADER}'`,
-          );
-          sawQueueInStopContinuation = true;
+          const inboxJson = req.lastToolResult("hyp_inbox")?.json;
+          assert.equal(inboxJson?.acked, 1, "hyp_inbox must ack by default");
+          assert.equal(inboxJson?.unread, 0);
         },
         do: (req) =>
           callTool(req, "hyp_send", {
@@ -196,7 +240,7 @@ test("Real Claude Code: verified PreToolUse enrollment, tool-boundary pauseUntil
     const sessionUuid = crypto.randomUUID();
     const run = claude.spawnPrint("START_LATCH_TEST", {
       sessionId: sessionUuid,
-      maxTurns: 10,
+      maxTurns: 14,
       timeoutMs: 60_000,
     });
 
@@ -316,6 +360,16 @@ test("Real Claude Code: multi-session isolation (Session A vs Session B sharing 
         do: () => emitText("A_ENROLLED"),
       },
       {
+        name: "a-resume-read-inbox",
+        once: true,
+        when: (req) => req.anyMessageContains("<hyphae-inbox ") && !req.anyMessageContains(msgForA),
+        assert: (req) => {
+          assert.equal(req.rawBody.includes(msgForA), false, "RFC 0004: UserPromptSubmit digest MUST NOT leak body");
+          assert.equal(req.rawBody.includes(msgForB), false, "Session A MUST NEVER see Session B's DM");
+        },
+        do: (req) => callTool(req, "hyp_inbox", {}),
+      },
+      {
         name: "a-resume-reply",
         when: (req) => req.anyMessageContains(msgForA),
         assert: (req) => {
@@ -346,6 +400,16 @@ test("Real Claude Code: multi-session isolation (Session A vs Session B sharing 
         once: true,
         when: (req) => req.lastToolResult("hyp_mesh")?.json?.handle === "claude-b",
         do: () => emitText("B_ENROLLED"),
+      },
+      {
+        name: "b-resume-read-inbox",
+        once: true,
+        when: (req) => req.anyMessageContains("<hyphae-inbox ") && !req.anyMessageContains(msgForB),
+        assert: (req) => {
+          assert.equal(req.rawBody.includes(msgForB), false, "RFC 0004: UserPromptSubmit digest MUST NOT leak body");
+          assert.equal(req.rawBody.includes(msgForA), false, "Session B MUST NEVER see Session A's DM");
+        },
+        do: (req) => callTool(req, "hyp_inbox", {}),
       },
       {
         name: "b-resume-reply",
@@ -380,10 +444,10 @@ test("Real Claude Code: multi-session isolation (Session A vs Session B sharing 
     await dispatcher.send("claude-a", msgForA);
     await dispatcher.send("claude-b", msgForB);
 
-    // Resume both sessions concurrently -> `UserPromptSubmit` hook injects ONLY each session's own DM!
+    // Resume both sessions concurrently -> `UserPromptSubmit` hook injects ONLY each session's own `<hyphae-inbox>` digest!
     const [resA2, resB2] = await Promise.all([
-      claudeA.runPrint("CHECK_A", { sessionId: uuidA, resume: true, maxTurns: 4 }),
-      claudeB.runPrint("CHECK_B", { sessionId: uuidB, resume: true, maxTurns: 4 }),
+      claudeA.runPrint("CHECK_A", { sessionId: uuidA, resume: true, maxTurns: 6 }),
+      claudeB.runPrint("CHECK_B", { sessionId: uuidB, resume: true, maxTurns: 6 }),
     ]);
     assert.equal(resA2.exitCode, 0, `Session A resume failed: ${resA2.stderr}`);
     assert.equal(resB2.exitCode, 0, `Session B resume failed: ${resB2.stderr}`);

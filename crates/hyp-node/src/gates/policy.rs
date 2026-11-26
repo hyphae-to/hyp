@@ -130,12 +130,20 @@ impl From<hyp_store::TrustTier> for TrustTier {
     }
 }
 
+fn is_false_gate(b: &bool) -> bool {
+    !*b
+}
+
 /// Terminal or backpressure verdict returned by the Local Security Gate pipeline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum GateDecision {
-    /// Deliver to the target session inbox (optionally downgraded to `notify` digest mode).
-    Allow { downgraded_to_notify: bool },
+    /// Deliver to the target session inbox (optionally capped to `queue` or downgraded to `notify`).
+    Allow {
+        downgraded_to_notify: bool,
+        #[serde(default, skip_serializing_if = "is_false_gate")]
+        capped_to_queue: bool,
+    },
     /// Park in the human-reviewed quarantine mailbox (`gate_state = "quarantined"`).
     /// `notice` is strictly metadata-only and NEVER contains unscreened body text.
     Quarantine { reason: String, notice: String },
@@ -149,6 +157,30 @@ pub enum GateDecision {
 impl GateDecision {
     pub const fn is_allow(&self) -> bool {
         matches!(self, Self::Allow { .. })
+    }
+
+    pub const fn is_capped_to_queue(&self) -> bool {
+        matches!(
+            self,
+            Self::Allow {
+                capped_to_queue: true,
+                ..
+            }
+        )
+    }
+
+    pub const fn gate_reason_tag(&self) -> Option<&'static str> {
+        match self {
+            Self::Allow {
+                downgraded_to_notify: true,
+                ..
+            } => Some("downgraded_to_notify"),
+            Self::Allow {
+                capped_to_queue: true,
+                ..
+            } => Some("capped_to_queue"),
+            _ => None,
+        }
     }
 
     pub const fn is_quarantine(&self) -> bool {
@@ -256,9 +288,12 @@ impl TokenBucket {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TierDeliveryAction {
-    /// Deliver with the session's configured delivery mode (`full` or `notify`).
+    /// Deliver with the session's configured delivery urgency (`interrupt`, `queue`, `notify`, `mute`).
     Allow,
-    /// Automatically downgrade to `notify` digest mode (never auto-interrupts live agents).
+    /// Cap delivery urgency at `queue` (steps `interrupt` down to `queue`, preserving `queue`/`notify`/`mute`).
+    /// Default for `Guest` and `ExternalWebhook` under RFC 0004 (metadata-only XML digests make thread wakes safe).
+    CapToQueue,
+    /// Automatically downgrade to `notify` digest mode (never wakes idle agents).
     DowngradeToNotify,
     /// Park directly in human-reviewed quarantine mailbox.
     Quarantine,
@@ -392,7 +427,7 @@ impl Stage1Config {
                     refill_per_min: 5,
                 },
                 max_payload_bytes: 4 * 1024,
-                default_action: TierDeliveryAction::DowngradeToNotify,
+                default_action: TierDeliveryAction::CapToQueue,
             },
         );
         map.insert(
@@ -403,7 +438,7 @@ impl Stage1Config {
                     refill_per_min: 30,
                 },
                 max_payload_bytes: 16 * 1024,
-                default_action: TierDeliveryAction::DowngradeToNotify,
+                default_action: TierDeliveryAction::CapToQueue,
             },
         );
         map.insert(

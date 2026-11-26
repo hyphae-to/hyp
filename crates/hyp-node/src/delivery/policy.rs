@@ -24,6 +24,17 @@ pub const DEFAULT_BURST_MAX_EVENTS_PER_WINDOW: usize = 10;
 pub const DEFAULT_BURST_NOISY_COOLDOWN_SECS: u64 = 300;
 /// Default minimum interval (seconds) between deliveries/digests for a noisy source.
 pub const DEFAULT_BURST_MIN_DELIVERY_INTERVAL_SECS: u64 = 30;
+/// Default interval (seconds) between mid-turn `PostToolUse` `queue` digest reminders (30 min; `0` = disabled).
+pub const DEFAULT_MIDTURN_QUEUE_DIGEST_SECONDS: u64 = 1_800;
+
+/// Maps a persisted mailbox `gate_reason` (written by Stage 1) to its effective [`DeliveryUrgency`] ceiling.
+pub fn gate_reason_urgency_cap(gate_reason: Option<&str>) -> Option<DeliveryUrgency> {
+    match gate_reason {
+        Some("downgraded_to_notify") => Some(DeliveryUrgency::Notify),
+        Some("capped_to_queue") => Some(DeliveryUrgency::Queue),
+        _ => None,
+    }
+}
 
 /// Errors returned by the Delivery Engine, policy validation, or filtered inbox queries.
 #[derive(Debug, Error)]
@@ -390,6 +401,10 @@ pub struct SessionDeliveryPolicy {
     /// Adaptive per-source burst protection ("Noisy Mode") settings.
     #[serde(default)]
     pub burst: BurstProtectionConfig,
+    /// Optional per-session override for periodic mid-turn `PostToolUse` `queue` digest reminders
+    /// (seconds; `0` disables). When `None`, falls back to the daemon's configured default (`1800`s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub midturn_queue_digest_seconds: Option<u64>,
 }
 
 impl Default for SessionDeliveryPolicy {
@@ -403,6 +418,7 @@ impl Default for SessionDeliveryPolicy {
             max_inline_items: DEFAULT_MAX_INLINE_ITEMS,
             max_single_item_share: DEFAULT_MAX_SINGLE_ITEM_SHARE,
             burst: BurstProtectionConfig::default(),
+            midturn_queue_digest_seconds: None,
         }
     }
 }
@@ -477,6 +493,23 @@ impl SessionDeliveryPolicy {
         subscription_mode: Option<DeliveryUrgency>,
         gate_downgraded_to_notify: bool,
     ) -> DeliveryUrgency {
+        self.resolve_urgency_with_cap(
+            ctx,
+            subscription_mode,
+            gate_downgraded_to_notify.then_some(DeliveryUrgency::Notify),
+        )
+    }
+
+    /// Resolves effective `DeliveryUrgency` with an optional Stage 1 urgency ceiling
+    /// (`Some(DeliveryUrgency::Queue)` for RFC 0004 `CapToQueue`, `Some(DeliveryUrgency::Notify)`
+    /// for `DowngradeToNotify`). Only steps urgency down (higher rank); never promotes `Mute`
+    /// or `Notify` upward.
+    pub fn resolve_urgency_with_cap(
+        &self,
+        ctx: &DeliveryTargetContext<'_>,
+        subscription_mode: Option<DeliveryUrgency>,
+        gate_max_urgency: Option<DeliveryUrgency>,
+    ) -> DeliveryUrgency {
         let mut best_specific: Option<((u8, usize), DeliveryUrgency)> = None;
         let mut wildcard_urgency: Option<DeliveryUrgency> = None;
 
@@ -524,16 +557,12 @@ impl SessionDeliveryPolicy {
             self.default_mode
         };
 
-        if gate_downgraded_to_notify
-            && matches!(
-                resolved,
-                DeliveryUrgency::Interrupt | DeliveryUrgency::Queue
-            )
-        {
-            DeliveryUrgency::Notify
-        } else {
-            resolved
+        if let Some(cap) = gate_max_urgency {
+            if resolved.rank() < cap.rank() {
+                return cap;
+            }
         }
+        resolved
     }
 
     /// Clamps and returns the effective single-item token ceiling.

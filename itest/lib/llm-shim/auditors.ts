@@ -28,7 +28,11 @@ const PAIRING_PREFIX_PATTERNS: Array<{ name: string; re: RegExp }> = [
   { name: "pem:private-key", re: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/ },
 ];
 
-const WAKE_TAG_RE = /<hyphae-wake\b[^>]*>[\s\S]*?<\/hyphae-wake>/g;
+const WAKE_TAG_RE = /(?:<|&lt;)hyphae-wake\b[\s\S]*?(?:<|&lt;)\/hyphae-wake(?:>|&gt;)/g;
+const INBOX_DIGEST_TAG_RE =
+  /(?:<|&lt;)hyphae-inbox\s[\s\S]*?(?:\/(?:>|&gt;)|(?:<|&lt;)\/hyphae-inbox(?:>|&gt;))/g;
+const INBOX_DIGEST_START_RE = /(?:<|&lt;)hyphae-inbox\s/;
+const WAKE_TAG_START_RE = /(?:<|&lt;)hyphae-wake\b/;
 
 /** Normalizes any harness-prefixed Hyphae MCP tool name to its canonical `hyp_*` name. */
 export function extractCanonicalHyphaeToolName(rawName: string): string | undefined {
@@ -259,52 +263,78 @@ export class AuditEngine {
     }
   }
 
-  // 3. Metadata-Only Wake Nudge Auditor
+  // 3. Metadata-Only Digest & Wake Nudge Auditor (RFC 0004)
   private auditMetadataOnlyWake(req: CanonicalLlmRequest, out: AuditViolation[]): void {
     const raw = req.rawBody;
-    if (!raw.includes("<hyphae-wake")) return;
+    const hasInboxTag = INBOX_DIGEST_START_RE.test(raw);
+    const hasWakeTag = WAKE_TAG_START_RE.test(raw);
+    const isNudgeOnlyRole = Boolean(this.config.nudgeOnlyRoles?.includes(req.role));
+    if (!hasInboxTag && !hasWakeTag && !isNudgeOnlyRole) return;
 
-    // (a) Every `<hyphae-wake ...>...</hyphae-wake>` element MUST be strictly metadata-only.
-    WAKE_TAG_RE.lastIndex = 0;
-    let match: RegExpExecArray | null;
-    while ((match = WAKE_TAG_RE.exec(raw)) !== null) {
-      const tag = match[0];
-      for (const { msgId, marker } of this.untrustedPayloads.values()) {
-        if (tag.includes(marker)) {
-          this.record(
-            out,
-            req,
-            "metadata-only-wake",
-            `Wake nudge <hyphae-wake> leaked raw untrusted payload '${msgId}'`,
-            { msgId, tag },
-          );
+    // (a) Every `<hyphae-inbox ...>` and `<hyphae-wake ...>` element MUST be strictly metadata-only.
+    for (const [label, re] of [
+      ["<hyphae-inbox>", INBOX_DIGEST_TAG_RE],
+      ["<hyphae-wake>", WAKE_TAG_RE],
+    ] as const) {
+      re.lastIndex = 0;
+      let match: RegExpExecArray | null;
+      while ((match = re.exec(raw)) !== null) {
+        const tag = match[0];
+        for (const { msgId, marker } of this.untrustedPayloads.values()) {
+          if (tag.includes(marker)) {
+            this.record(
+              out,
+              req,
+              "metadata-only-wake",
+              `Digest/wake tag ${label} leaked raw untrusted payload '${msgId}'`,
+              { msgId, tag },
+            );
+          }
         }
       }
     }
 
-    // (b) On roles configured as nudge-only (e.g., promptInjection: false, Herdr, Codex, T3),
-    //     zero untrusted payload bytes may appear in the newest wake turn's inbound prompt prior to `hyp_inbox`.
-    const isNudgeOnlyRole = Boolean(this.config.nudgeOnlyRoles?.includes(req.role));
-    if (!isNudgeOnlyRole) return;
-
-    // Inspect strictly the newest trailing non-assistant messages (the wake turn itself, not historical assistant turns).
+    // (b) RFC 0004 invariant: On ANY turn where the newest trailing inbound messages contain a
+    //     hook/wake `<hyphae-inbox ...>` or `<hyphae-wake>` digest (or on any `nudgeOnlyRoles` turn)
+    //     WITHOUT a `hyp_inbox` tool result, zero untrusted payload bytes may appear in hooks,
+    //     system/developer instructions, or user wake prompts prior to calling `hyp_inbox`!
     const trailingInbound: typeof req.messages = [];
     for (let i = req.messages.length - 1; i >= 0; i -= 1) {
       if (req.messages[i].role === "assistant") break;
       trailingInbound.unshift(req.messages[i]);
     }
-    const wakeTurnHasInboxResult = trailingInbound.some((m) =>
+    const turnHasInboxResult = trailingInbound.some((m) =>
       (m.toolResults || []).some((tr) => tr.canonicalToolName === "hyp_inbox"),
     );
-    if (!wakeTurnHasInboxResult) {
-      const wakeTurnText = trailingInbound.map((m) => m.text).join("\n");
+    const trailingHasDigest = trailingInbound.some(
+      (m) =>
+        Boolean(
+          m.text && (INBOX_DIGEST_START_RE.test(m.text) || WAKE_TAG_START_RE.test(m.text)),
+        ) ||
+        (m.toolResults || []).some(
+          (tr) =>
+            tr.canonicalToolName !== "hyp_inbox" &&
+            (INBOX_DIGEST_START_RE.test(tr.text) || WAKE_TAG_START_RE.test(tr.text)),
+        ),
+    );
+
+    if (!turnHasInboxResult && (trailingHasDigest || isNudgeOnlyRole)) {
+      const nonInboxSurfaceText = [
+        req.systemPrompt,
+        ...trailingInbound.map((m) => m.text || ""),
+        ...trailingInbound.flatMap((m) =>
+          (m.toolResults || [])
+            .filter((tr) => tr.canonicalToolName !== "hyp_inbox" && tr.canonicalToolName !== "hyp_send")
+            .map((tr) => tr.text || ""),
+        ),
+      ].join("\n");
       for (const { msgId, marker } of this.untrustedPayloads.values()) {
-        if (wakeTurnText.includes(marker)) {
+        if (nonInboxSurfaceText.includes(marker)) {
           this.record(
             out,
             req,
             "metadata-only-wake",
-            `Nudge-only wake turn for '${req.role}' contained raw untrusted payload '${msgId}' before hyp_inbox was called`,
+            `RFC 0004 metadata-only violation: hook/wake turn for '${req.role}' contained raw untrusted payload '${msgId}' before hyp_inbox was called`,
             { msgId, role: req.role },
           );
         }

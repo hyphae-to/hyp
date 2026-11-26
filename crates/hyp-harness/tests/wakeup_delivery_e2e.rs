@@ -421,9 +421,12 @@ async fn test2_tier3_bounded_hold_retry_queue_and_hook_cancellation() {
     );
     let delivered = transport_retry.delivered_texts();
     assert_eq!(delivered.len(), 1);
-    assert!(delivered[0].contains(UNTRUSTED_PROVENANCE));
-    assert!(delivered[0].contains("Auto-deliver after transient busy Hold"));
-    assert_eq!(node.db().local().pending_count(sid_retry).unwrap(), 0);
+    assert!(delivered[0].starts_with("<hyphae-inbox "));
+    assert!(delivered[0].contains("unread=\"1\""));
+    assert!(delivered[0].contains("<stream topic=\"local.schedule\" count=\"1\"/>"));
+    assert!(!delivered[0].contains("Auto-deliver after transient busy Hold"));
+    assert_eq!(node.db().local().pending_count(sid_retry).unwrap(), 1);
+    assert_eq!(node.db().local().unnotified_count(sid_retry).unwrap(), 0);
 
     // ---- 2b: PostToolUse `mailbox.drain` cancels pending Tier 3 retry immediately (0 extra calls!) ----
     let dir2 = TempDir::new().unwrap();
@@ -485,9 +488,12 @@ async fn test2_tier3_bounded_hold_retry_queue_and_hook_cancellation() {
     .unwrap();
     let injected = hook_out["reason"]
         .as_str()
-        .expect("Stop TurnEnd hook must inject queued event");
-    assert!(injected.contains("Drained by PostToolUse before retry timer fires"));
-    assert_eq!(node2.db().local().pending_count(sid_cancel).unwrap(), 0);
+        .expect("Stop TurnEnd hook must inject metadata-only XML digest");
+    assert!(injected.starts_with("<hyphae-inbox "));
+    assert!(injected.contains("<stream topic=\"local.schedule\" count=\"1\"/>"));
+    assert!(!injected.contains("Drained by PostToolUse before retry timer fires"));
+    assert_eq!(node2.db().local().pending_count(sid_cancel).unwrap(), 1);
+    assert_eq!(node2.db().local().unnotified_count(sid_cancel).unwrap(), 0);
 
     // Wait well past the 200 ms backoff window and assert ZERO additional transport calls!
     tokio::time::sleep(Duration::from_millis(350)).await;
@@ -665,11 +671,28 @@ async fn test3_local_ingest_socket_wakes_hyp_stream_subscriber_end_to_end() {
     let first_entries = morning_transport.delivered_entries();
     assert_eq!(first_entries.len(), 1);
     assert!(
-        first_entries[0]
+        first_entries[0].0.starts_with("<hyphae-inbox ")
+            && first_entries[0]
+                .0
+                .contains("<stream topic=\"local.schedule\" count=\"1\"/>"),
+        "woken payload missing metadata-only XML digest: {}",
+        first_entries[0].0
+    );
+    assert!(
+        !first_entries[0]
             .0
             .contains("Check canary dashboards and open PRs"),
-        "woken payload missing note: {}",
+        "RFC 0004: woken digest must NEVER contain raw event note: {}",
         first_entries[0].0
+    );
+    assert!(
+        node.db()
+            .local()
+            .peek_inbox(morning_sid, 10)
+            .unwrap()
+            .iter()
+            .any(|m| m.text.contains("Check canary dashboards and open PRs")),
+        "full unsigned event note must remain stored in mailbox for hyp_inbox"
     );
     assert_eq!(
         first_entries[0].1,
@@ -741,11 +764,28 @@ async fn test3_local_ingest_socket_wakes_hyp_stream_subscriber_end_to_end() {
     let entries = morning_transport.delivered_entries();
     assert_eq!(entries.len(), 2);
     assert!(
-        entries[1]
+        entries[1].0.starts_with("<hyphae-inbox ")
+            && entries[1]
+                .0
+                .contains("<stream topic=\"local.schedule\" count=\"1\" verified=\"true\"/>"),
+        "second woken payload missing verified metadata-only XML digest: {}",
+        entries[1].0
+    );
+    assert!(
+        !entries[1]
             .0
             .contains("Human-signed canary release verification"),
-        "second woken payload missing signed note: {}",
+        "RFC 0004: second woken digest must NEVER contain raw signed note: {}",
         entries[1].0
+    );
+    assert!(
+        node.db()
+            .local()
+            .peek_inbox(morning_sid, 10)
+            .unwrap()
+            .iter()
+            .any(|m| m.text.contains("Human-signed canary release verification")),
+        "full signed event note must remain stored in mailbox for hyp_inbox"
     );
     assert_eq!(entries[1].1, PushMode::Interrupt);
 
@@ -1900,17 +1940,35 @@ async fn test7_unified_hook_state_machine_interrupt_queue_notify_and_activity_le
         json!({ "session_id": "fsm-1", "tool_name": "Bash", "tool_use_id": "t1" }),
     )
     .await;
+    let post_int_ctx = post_int["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("PostToolUse must emit metadata-only Interrupt XML digest");
     assert!(
-        post_int.to_string().contains("URGENT_VIA_POST_TOOL"),
-        "PostToolUse must drain Interrupt mid-turn: {post_int}"
+        post_int_ctx
+            .starts_with("<hyphae-inbox handle=\"worker\" unread=\"1\" urgency=\"interrupt\">")
     );
+    assert!(post_int_ctx.contains("<dm from=\"peer@net/vip\" count=\"1\"/>"));
+    assert!(!post_int_ctx.contains("URGENT_VIA_POST_TOOL"));
     tokio::time::sleep(Duration::from_millis(130)).await;
     assert!(
         nudge_xport.take().is_empty(),
         "PostToolUse drain must cancel Interrupt grace fallback (0 nudges)"
     );
+    // Simulate agent calling `hyp_inbox` (acks unread item).
+    {
+        let db = node.db();
+        let ids: Vec<String> = db
+            .local()
+            .peek_inbox(sid, 20)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.receipt)
+            .collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        db.local().acknowledge_inbox(sid, &refs, now_ms()).unwrap();
+    }
 
-    // 2. ACTIVE + INTERRUPT with NO PostToolUse -> grace expires (90ms) -> falls back to XML Interrupt nudge!
+    // 2. ACTIVE + INTERRUPT with NO PostToolUse -> grace expires (90ms) -> falls back to XML Interrupt digest!
     let _ = run_h(
         HarnessKind::Claude,
         HookEvent::PreInvocation,
@@ -1941,22 +1999,42 @@ async fn test7_unified_hook_state_machine_interrupt_queue_notify_and_activity_le
     assert!(
         int_nudges[0]
             .1
-            .starts_with("<hyphae-wake count=\"1\" handle=\"worker\" urgency=\"interrupt\">")
+            .starts_with("<hyphae-inbox handle=\"worker\" unread=\"1\" urgency=\"interrupt\">")
+    );
+    assert!(
+        int_nudges[0]
+            .1
+            .contains("<dm from=\"peer@net/vip\" count=\"1\"/>")
     );
     assert!(!int_nudges[0].1.contains("URGENT_FALLBACK_BODY"));
 
-    // TurnStart (`UserPromptSubmit`) drains the `NudgePending` Interrupt cleanly -> 0 unread!
+    // RFC 0004 zero-spam watermark: L2 push already announced `<hyphae-inbox>` and marked
+    // `notified = 1`, so TurnStart (`UserPromptSubmit`) MUST NOT emit a duplicate digest!
     let pre_nudge = run_h(
         HarnessKind::Claude,
         HookEvent::PreInvocation,
         json!({ "session_id": "fsm-1" }),
     )
     .await;
-    assert!(
-        pre_nudge.to_string().contains("URGENT_FALLBACK_BODY"),
-        "TurnStart must drain NudgePending item: {pre_nudge}"
+    assert_eq!(
+        pre_nudge,
+        json!({}),
+        "TurnStart must not duplicate already-pushed <hyphae-inbox> digest: {pre_nudge}"
     );
-    assert_eq!(node.db().local().pending_count(sid).unwrap(), 0);
+    assert_eq!(node.db().local().pending_count(sid).unwrap(), 1);
+    assert_eq!(node.db().local().unnotified_count(sid).unwrap(), 0);
+    {
+        let db = node.db();
+        let ids: Vec<String> = db
+            .local()
+            .peek_inbox(sid, 20)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.receipt)
+            .collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        db.local().acknowledge_inbox(sid, &refs, now_ms()).unwrap();
+    }
 
     // 3. ACTIVE + QUEUE held across PostToolUse -> drained cleanly by TurnEnd (`Stop`) with 0 nudges!
     daemon
@@ -1988,18 +2066,35 @@ async fn test7_unified_hook_state_machine_interrupt_queue_notify_and_activity_le
         json!({ "session_id": "fsm-1" }),
     )
     .await;
+    let stop_reason = stop_q["reason"]
+        .as_str()
+        .expect("Stop TurnEnd must emit Queue XML digest");
     assert!(
-        stop_q.to_string().contains("QUEUED_FOR_TURN_END"),
-        "Stop TurnEnd must drain held Queue DM: {stop_q}"
+        stop_reason.starts_with("<hyphae-inbox handle=\"worker\" unread=\"1\" urgency=\"queue\">")
     );
-    assert_eq!(node.db().local().pending_count(sid).unwrap(), 0);
+    assert!(stop_reason.contains("<dm from=\"peer@net/dev\" count=\"1\"/>"));
+    assert!(!stop_reason.contains("QUEUED_FOR_TURN_END"));
+    assert_eq!(node.db().local().pending_count(sid).unwrap(), 1);
+    assert_eq!(node.db().local().unnotified_count(sid).unwrap(), 0);
     tokio::time::sleep(Duration::from_millis(220)).await;
     assert!(
         nudge_xport.take().is_empty(),
         "Stop drain must leave 0 nudges"
     );
+    {
+        let db = node.db();
+        let ids: Vec<String> = db
+            .local()
+            .peek_inbox(sid, 20)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.receipt)
+            .collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        db.local().acknowledge_inbox(sid, &refs, now_ms()).unwrap();
+    }
 
-    // 4. ACTIVE + QUEUE with missed Stop -> activity lease expires (180ms) -> fires XML Queue nudge!
+    // 4. ACTIVE + QUEUE with missed Stop -> activity lease expires (180ms) -> fires XML Queue digest!
     let _ = run_h(
         HarnessKind::Claude,
         HookEvent::PreInvocation,
@@ -2024,22 +2119,35 @@ async fn test7_unified_hook_state_machine_interrupt_queue_notify_and_activity_le
     assert_eq!(
         q_nudges.len(),
         1,
-        "Activity lease expiry must fire Queue fallback nudge"
+        "Activity lease expiry must fire Queue fallback digest"
     );
     assert_eq!(q_nudges[0].0, PushMode::Queue);
     assert!(
         q_nudges[0]
             .1
-            .starts_with("<hyphae-wake count=\"1\" handle=\"worker\" urgency=\"queue\">")
+            .starts_with("<hyphae-inbox handle=\"worker\" unread=\"1\" urgency=\"queue\">")
     );
-    // Drain it via TurnStart so inbox is clean for Notify test.
+    assert!(!q_nudges[0].1.contains("QUEUED_LEASE_FALLBACK"));
+    // TurnStart does NOT duplicate already-announced digest; ack inbox cleanly for Notify test.
     let pre_q = run_h(
         HarnessKind::Claude,
         HookEvent::PreInvocation,
         json!({ "session_id": "fsm-1" }),
     )
     .await;
-    assert!(pre_q.to_string().contains("QUEUED_LEASE_FALLBACK"));
+    assert_eq!(pre_q, json!({}));
+    {
+        let db = node.db();
+        let ids: Vec<String> = db
+            .local()
+            .peek_inbox(sid, 20)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.receipt)
+            .collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        db.local().acknowledge_inbox(sid, &refs, now_ms()).unwrap();
+    }
     // End turn cleanly -> Idle.
     assert_eq!(
         run_h(
@@ -2052,7 +2160,7 @@ async fn test7_unified_hook_state_machine_interrupt_queue_notify_and_activity_le
     );
 
     // 5. NOTIFY -> NEVER fires L2 nudge (even while Idle!), NEVER drains on PostToolUse,
-    //    NEVER blocks Stop, surfaces 1-line digest on TurnStart (`UserPromptSubmit`)!
+    //    NEVER blocks Stop, surfaces XML Notify digest on TurnStart (`UserPromptSubmit`)!
     daemon
         .ingest_inbound(InboundItem {
             session_id: sid.into(),
@@ -2098,8 +2206,11 @@ async fn test7_unified_hook_state_machine_interrupt_queue_notify_and_activity_le
     .await;
     let notify_ctx = pre_notify["hookSpecificOutput"]["additionalContext"]
         .as_str()
-        .expect("TurnStart must emit 1-line Notify digest");
-    assert!(notify_ctx.contains("hyphae notify · 1 unread"));
+        .expect("TurnStart must emit metadata-only Notify XML digest");
+    assert!(
+        notify_ctx.starts_with("<hyphae-inbox handle=\"worker\" unread=\"1\" urgency=\"notify\">")
+    );
+    assert!(notify_ctx.contains("<dm from=\"peer@net/fyi\" count=\"1\"/>"));
     assert!(!notify_ctx.contains("FYI_LOW_PRIORITY_SECRET_BODY"));
 
     // 6. OpenClaw observational `agent_end` flips Active -> Idle immediately and flushes held Queue nudge!
@@ -2161,8 +2272,9 @@ async fn test7_unified_hook_state_machine_interrupt_queue_notify_and_activity_le
     assert!(
         oc_nudges[0]
             .1
-            .starts_with("<hyphae-wake count=\"1\" handle=\"claw\" urgency=\"queue\">")
+            .starts_with("<hyphae-inbox handle=\"claw\" unread=\"1\" urgency=\"queue\">")
     );
+    assert!(!oc_nudges[0].1.contains("OPENCLAW_HELD_UNTIL_AGENT_END"));
 
     daemon.stop().await;
     node.shutdown();

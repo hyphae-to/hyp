@@ -190,9 +190,9 @@ test("Real Herdr (hc) + Claude: identity pinning, bare-shell fail-closed, mid-st
     // Confirm bare `/bin/sh` screen NEVER received pasted text!
     const bareScreen = await herdr.read(bareAddr);
     assert.equal(
-      bareScreen.includes("<hyphae-wake"),
+      bareScreen.includes("<hyphae-inbox"),
       false,
-      `Bare shell screen MUST NEVER receive <hyphae-wake> paste! Screen:\n${bareScreen}`,
+      `Bare shell screen MUST NEVER receive <hyphae-inbox> paste! Screen:\n${bareScreen}`,
     );
     await sandbox.reaper.kill(bareMcpProc, 1_500);
     await herdr.kill(bareAddr, { allowFailure: true });
@@ -272,18 +272,23 @@ test("Real Herdr (hc) + Claude: identity pinning, bare-shell fail-closed, mid-st
         do: (req) =>
           callTool(req, "hyp_send", { to: "sink", text: `HC_INTERRUPT_ACK:${interruptPayload}` }),
       },
-      // Fallback wake handler if `<hyphae-wake>` arrived without hook drain (e.g. non-hook inner agent)
-      {
-        name: "wake-read-inbox",
-        when: (req) =>
-          req.lastUserText.includes("<hyphae-wake") && req.lastToolResults.length === 0,
-        do: (req) => callTool(req, "hyp_inbox", { ack: true }),
-      },
       {
         name: "reply-done",
         when: (req) =>
           Boolean(req.lastToolResult("hyp_send")?.json) && !req.lastToolResult("hyp_send")?.isError,
         do: () => emitText("WORKER_1_ACKED"),
+      },
+      // RFC 0004: Read inbox whenever `<hyphae-inbox ...>` digest arrives via push wake or hook!
+      {
+        name: "wake-read-inbox",
+        when: (req) =>
+          !req.lastToolResult("hyp_inbox") &&
+          !req.lastToolResult("hyp_send") &&
+          (req.lastUserText.includes("<hyphae-inbox ") ||
+            req.lastToolResults.some(
+              (tr) => tr.canonicalToolName !== "hyp_inbox" && tr.text.includes("<hyphae-inbox "),
+            )),
+        do: (req) => callTool(req, "hyp_inbox", {}),
       },
     ]);
 
@@ -330,11 +335,11 @@ test("Real Herdr (hc) + Claude: identity pinning, bare-shell fail-closed, mid-st
       15_000,
     );
     await herdr.waitForAgentState(launched.terminalAddress, ["idle", "done"], 15_000);
-    // Verify the PTY paste itself was strictly metadata-only (`<hyphae-wake` present, raw payload NEVER pasted!)
+    // Verify the PTY paste itself was strictly metadata-only (`<hyphae-inbox` present, raw payload NEVER pasted!)
     const screenAfterIdle = await herdr.read(launched.terminalAddress);
     assert.ok(
-      screenAfterIdle.includes("<hyphae-wake"),
-      `Expected metadata-only <hyphae-wake> pasted to Herdr PTY screen`,
+      screenAfterIdle.includes("<hyphae-inbox"),
+      `Expected metadata-only <hyphae-inbox> pasted to Herdr PTY screen`,
     );
     assert.equal(
       screenAfterIdle.includes(idleWakePayload),
@@ -455,9 +460,9 @@ test("Real Herdr (hc) + Claude: identity pinning, bare-shell fail-closed, mid-st
       `Recycled terminal MUST NOT receive payload: ${recycledScreen}`,
     );
     assert.equal(
-      recycledScreen.includes("<hyphae-wake"),
+      recycledScreen.includes("<hyphae-inbox"),
       false,
-      `Recycled terminal MUST NOT receive <hyphae-wake>: ${recycledScreen}`,
+      `Recycled terminal MUST NOT receive <hyphae-inbox>: ${recycledScreen}`,
     );
     assert.equal(shim.getTurns("herdr-worker").length, turnsBeforeRecycle);
 
@@ -642,21 +647,23 @@ test("Real Herdr (hc): Tier 4 herdrSpawnAllowlist config & GPUI --mod symlink/la
     );
     await new Promise((r) => setTimeout(r, 400));
 
-    const spawnLines = fs.readFileSync(hcRunLog, "utf8").trim().split(/\r?\n/);
+    const spawnRaw = fs.readFileSync(hcRunLog, "utf8").trim();
+    const spawnCalls = spawnRaw.split(/\r?\n/).filter((l) => l.startsWith("run "));
     assert.equal(
-      spawnLines.length,
+      spawnCalls.length,
       1,
-      `Expected strictly 1 allowlisted cold spawn (and 0 for unlisted template), got: ${JSON.stringify(spawnLines)}`,
+      `Expected strictly 1 allowlisted cold spawn (and 0 for unlisted template), got: ${JSON.stringify(spawnRaw)}`,
     );
     assert.ok(
-      spawnLines[0].startsWith("run triage-worker <hyphae-wake") &&
-        spawnLines[0].includes('handle="cold-triage"'),
-      `Expected metadata-only <hyphae-wake> nudge to allowlisted triage-worker, got: ${spawnLines[0]}`,
+      spawnCalls[0].startsWith("run triage-worker <hyphae-inbox ") &&
+        spawnRaw.includes('handle="cold-triage"') &&
+        spawnRaw.includes('<dm from="herdr-mod@local/cold-ops" count="1"/>'),
+      `Expected metadata-only <hyphae-inbox> digest to allowlisted triage-worker, got: ${spawnRaw}`,
     );
     assert.equal(
-      spawnLines[0].includes(coldSecretBody),
+      spawnRaw.includes(coldSecretBody),
       false,
-      `Tier 4 cold spawn argv MUST NEVER leak raw untrusted DM body: ${spawnLines[0]}`,
+      `Tier 4 cold spawn argv MUST NEVER leak raw untrusted DM body: ${spawnRaw}`,
     );
     assert.equal(
       fs.existsSync(blockedMarkerFile),

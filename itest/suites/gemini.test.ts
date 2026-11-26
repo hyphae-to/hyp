@@ -100,9 +100,12 @@ test("Compiled hyp: `hyp setup --harness gemini` + BeforeTool _meshCall + AfterT
       input: JSON.stringify({ session_id: sid }),
     });
     assert.equal(afterAgentRes.json?.decision, "deny");
+    const afterAgentReason = String(afterAgentRes.json?.reason ?? "");
     assert.ok(
-      String(afterAgentRes.json?.reason ?? "").includes("GEM_CONTRACT_QUEUE_111"),
-      `AfterAgent must flush held queue DM: ${afterAgentRes.stdout}`,
+      afterAgentReason.includes('<hyphae-inbox handle="gem-hook-ok" unread="1" urgency="queue">') &&
+        afterAgentReason.includes('<dm from="gem-contract@local/bob" count="1"/>') &&
+        !afterAgentReason.includes("GEM_CONTRACT_QUEUE_111"),
+      `AfterAgent must emit metadata-only XML digest for held queue DM (RFC 0004): ${afterAgentRes.stdout}`,
     );
 
     await mcp.close();
@@ -189,12 +192,18 @@ test("Real Gemini CLI: BeforeTool enrollment, AfterTool/AfterAgent pauseUntil(ga
         name: "gem-assert-queue-held-pause-read-2",
         once: true,
         when: (req) =>
-          Boolean(req.lastToolResult("read_file")) && !req.anyMessageContains(interruptPayload),
+          Boolean(req.lastToolResult("read_file")) &&
+          !req.anyMessageContains(/urgency=\\?"interrupt\\?"/),
         assert: (req) => {
           assert.equal(
             req.rawBody.includes(queuePayload),
             false,
             `Gemini AfterTool MUST hold queue DM '${queuePayload}' mid-turn!`,
+          );
+          assert.equal(
+            req.anyMessageContains(/(?:<|&lt;)hyphae-inbox\s/),
+            false,
+            `Gemini AfterTool #1 MUST NOT emit a digest for fresh queue DM!`,
           );
           sawRead1WithoutQueue = true;
         },
@@ -202,14 +211,17 @@ test("Real Gemini CLI: BeforeTool enrollment, AfterTool/AfterAgent pauseUntil(ga
           pauseUntil(gateBeforeRead2, callTool(req, "read_file", { file_path: "gem-note.txt" })),
       },
       {
-        name: "gem-assert-interrupt-end-turn",
+        name: "gem-assert-interrupt-digest-and-read-vip",
         once: true,
         when: (req) =>
-          req.anyMessageContains(interruptPayload) && !req.anyMessageContains(queuePayload),
+          req.anyMessageContains(/urgency=\\?"interrupt\\?"/) &&
+          req.anyMessageContains(/from=\\?"gem-live@local\/vip\\?"/) &&
+          !req.anyMessageContains(interruptPayload),
         assert: (req) => {
-          assert.ok(
-            req.rawBody.includes(UNTRUSTED_PROVENANCE_HEADER),
-            `Gemini interrupt AfterTool injection must include explicit '${UNTRUSTED_PROVENANCE_HEADER}'`,
+          assert.equal(
+            req.rawBody.includes(interruptPayload),
+            false,
+            `RFC 0004: Gemini AfterTool digest MUST NEVER leak raw interrupt body '${interruptPayload}'`,
           );
           assert.equal(
             req.rawBody.includes(queuePayload),
@@ -218,19 +230,56 @@ test("Real Gemini CLI: BeforeTool enrollment, AfterTool/AfterAgent pauseUntil(ga
           );
           sawInterruptInAfterTool = true;
         },
+        do: (req) =>
+          callTool(req, "hyp_inbox", {
+            filter: { from: "gem-live@local/vip" },
+          }),
+      },
+      {
+        name: "gem-after-vip-inbox-end-turn",
+        once: true,
+        when: (req) =>
+          req.lastToolResult("hyp_inbox")?.text.includes(interruptPayload) === true &&
+          !req.anyMessageContains(queuePayload),
+        assert: (req) => {
+          const inboxJson = req.lastToolResult("hyp_inbox")?.json;
+          assert.equal(inboxJson?.acked, 1, "hyp_inbox must ack by default");
+          assert.equal(inboxJson?.items?.[0]?.provenance, UNTRUSTED_PROVENANCE_HEADER);
+        },
         do: () => emitText("GEMINI_END_TURN_FOR_AFTER_AGENT"),
       },
       {
-        name: "gem-after-agent-queue-send-ack",
+        name: "gem-after-agent-queue-digest-read-inbox",
         once: true,
-        when: (req) => req.anyMessageContains(queuePayload),
+        when: (req) =>
+          req.anyMessageContains('urgency="queue"') &&
+          req.anyMessageContains('from="gem-live@local/bob"') &&
+          !req.anyMessageContains(queuePayload),
         assert: (req) => {
+          assert.equal(
+            req.rawBody.includes(queuePayload),
+            false,
+            `RFC 0004: Gemini AfterAgent digest MUST NEVER leak raw queue body '${queuePayload}'`,
+          );
           assert.equal(
             req.rawBody.includes(peerOnlyPayload),
             false,
             "Session A must NEVER see Session B's DM",
           );
           sawQueueInAfterAgent = true;
+        },
+        do: (req) => callTool(req, "hyp_inbox", {}),
+      },
+      {
+        name: "gem-after-agent-queue-send-ack",
+        once: true,
+        when: (req) => req.lastToolResult("hyp_inbox")?.text.includes(queuePayload) === true,
+        assert: (req) => {
+          assert.equal(
+            req.rawBody.includes(peerOnlyPayload),
+            false,
+            "Session A must NEVER see Session B's DM",
+          );
         },
         do: (req) =>
           callTool(req, "hyp_send", {
@@ -266,6 +315,19 @@ test("Real Gemini CLI: BeforeTool enrollment, AfterTool/AfterAgent pauseUntil(ga
         once: true,
         when: (req) => req.lastToolResult("hyp_mesh")?.json?.handle === "gem-peer",
         do: () => emitText("GEM_B_ENROLLED"),
+      },
+      {
+        name: "peer-read-digest",
+        once: true,
+        when: (req) =>
+          req.anyMessageContains(/(?:<|&lt;)hyphae-inbox\s/) &&
+          !req.anyMessageContains(peerOnlyPayload),
+        assert: (req) => {
+          assert.equal(req.rawBody.includes(peerOnlyPayload), false, "RFC 0004: hook must not leak raw body");
+          assert.equal(req.rawBody.includes(queuePayload), false, "Session B must NEVER see Session A's DM");
+          assert.equal(req.rawBody.includes(interruptPayload), false, "Session B must NEVER see Session A's DM");
+        },
+        do: (req) => callTool(req, "hyp_inbox", {}),
       },
       {
         name: "peer-receive-own",

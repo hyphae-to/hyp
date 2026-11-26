@@ -560,11 +560,28 @@ fn three_process_hub_alice_bob_e2ee_dm_and_channel_with_zero_hub_plaintext() {
     assert_eq!(dm_wait_status.code(), Some(0));
     assert_eq!(dm_wait_json["ok"], true);
     let dm_items = dm_wait_json["data"]["items"].as_array().unwrap();
+    let dm_wait_txt = dm_items[0]["text"].as_str().unwrap_or_default();
     assert!(
-        dm_items
-            .iter()
-            .any(|i| i["text"].as_str().unwrap_or_default().contains(dm_secret)),
-        "Bob's live hyp wait must receive decrypted DM plaintext: {dm_wait_json}"
+        dm_wait_txt.contains("<hyphae-inbox ")
+            && dm_wait_txt.contains("<dm from=\"alice@macbook/alice\" count=\"1\"/>"),
+        "Bob's live hyp wait must receive metadata-only XML digest: {dm_wait_json}"
+    );
+    assert!(
+        !dm_wait_txt.contains(dm_secret),
+        "RFC 0004: live hyp wait must NEVER expose raw E2EE DM plaintext: {dm_wait_json}"
+    );
+    let (bob_dm_inbox, bob_dm_err) = bob_mcp.call_verified_claude(
+        &bob_home,
+        &bob_sock,
+        "bob-s1",
+        "hyp_inbox",
+        json!({}),
+        RPC_TIMEOUT,
+    );
+    assert!(!bob_dm_err, "bob hyp_inbox failed: {bob_dm_inbox}");
+    assert!(
+        bob_dm_inbox.contains(dm_secret),
+        "Bob's hyp_inbox must return decrypted DM plaintext: {bob_dm_inbox}"
     );
 
     // --- Part B: Cross-Process E2EE `#eng` Channel (Alice -> acme-team -> Bob's live `hyp wait`) ---
@@ -619,11 +636,28 @@ fn three_process_hub_alice_bob_e2ee_dm_and_channel_with_zero_hub_plaintext() {
     assert_eq!(ch_wait_status.code(), Some(0));
     assert_eq!(ch_wait_json["ok"], true);
     let ch_items = ch_wait_json["data"]["items"].as_array().unwrap();
+    let ch_wait_txt = ch_items[0]["text"].as_str().unwrap_or_default();
     assert!(
-        ch_items
-            .iter()
-            .any(|i| i["text"].as_str().unwrap_or_default().contains(chan_secret)),
-        "Bob's live hyp wait must receive decrypted #eng channel message: {ch_wait_json}"
+        ch_wait_txt.contains("<hyphae-inbox ")
+            && ch_wait_txt.contains("<channel name=\"#eng\" count=\"1\"/>"),
+        "Bob's live hyp wait must receive metadata-only #eng XML digest: {ch_wait_json}"
+    );
+    assert!(
+        !ch_wait_txt.contains(chan_secret),
+        "RFC 0004: live hyp wait must NEVER expose raw #eng plaintext: {ch_wait_json}"
+    );
+    let (bob_ch_inbox, bob_ch_err) = bob_mcp.call_verified_claude(
+        &bob_home,
+        &bob_sock,
+        "bob-s1",
+        "hyp_inbox",
+        json!({}),
+        RPC_TIMEOUT,
+    );
+    assert!(!bob_ch_err, "bob #eng hyp_inbox failed: {bob_ch_inbox}");
+    assert!(
+        bob_ch_inbox.contains(chan_secret),
+        "Bob's hyp_inbox must return decrypted #eng channel message: {bob_ch_inbox}"
     );
 
     // --- Part C: Cryptographic Zero-Knowledge Hub Verification ---
@@ -848,12 +882,20 @@ fn two_process_public_node_onboarding_to_live_hyp_wait_github_stream() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        joined_text.contains("public.hyphae.to.github"),
-        "woken wait digest missing public.hyphae.to.github topic: {wait_json}"
+        joined_text.contains("<hyphae-inbox ")
+            && joined_text.contains("public.hyphae.to.github")
+            && joined_text.contains("urgency=\"queue\""),
+        "woken wait digest missing public.hyphae.to.github queue XML digest: {wait_json}"
     );
+    assert!(
+        !joined_text.contains("Multi-process live public.hyphae.to stream wakeup"),
+        "RFC 0004: wait digest must NEVER contain raw event text: {wait_json}"
+    );
+    // RFC 0004: Guest trust tier enforces Stage 1 CapToQueue (wakes threads with a metadata-only
+    // `<hyphae-inbox ... urgency="queue">` digest without injecting untrusted payload text!).
     assert_eq!(
-        items[0]["notifyOnly"], true,
-        "Guest trust tier stream should be Stage-1 downgraded to notifyOnly digest: {wait_json}"
+        items[0]["notifyOnly"], false,
+        "Guest trust tier stream should be Stage-1 capped to queue XML digest: {wait_json}"
     );
 
     // Drain the full durable GitHub PR CloudEvent via `hyp_inbox`!
@@ -1359,13 +1401,26 @@ fn live_tampered_gate_policy_daemon_lockdown_and_human_approve_wakeup() {
     assert_eq!(aw_status.code(), Some(0));
     assert_eq!(aw_json["ok"], true);
     let delivered_items = aw_json["data"]["items"].as_array().unwrap();
+    let aw_txt = delivered_items[0]["text"].as_str().unwrap_or_default();
     assert!(
-        delivered_items.iter().any(|i| {
-            let txt = i["text"].as_str().unwrap_or_default();
-            txt.contains(head_marker) && txt.contains(tail_secret)
-        }),
-        "approved message must deliver cleanly in full: {aw_json}"
+        aw_txt.contains("<hyphae-inbox ")
+            && aw_txt.contains("<dm from=\"ext@peer/outsider\" count=\"1\"/>"),
+        "approved message must wake with metadata-only XML digest: {aw_json}"
     );
+    assert!(
+        !aw_txt.contains(head_marker) && !aw_txt.contains(tail_secret),
+        "RFC 0004: live hyp wait must NEVER include raw approved body: {aw_json}"
+    );
+    {
+        let db = hyp_store::NodeDb::open(state_dir.join("node.sqlite")).unwrap();
+        let inbox = db.local().peek_inbox("claude:sec-s1", 20).unwrap();
+        assert!(
+            inbox
+                .iter()
+                .any(|m| m.text.contains(head_marker) && m.text.contains(tail_secret)),
+            "approved message must remain intact in full inside mailbox for hyp_inbox: {inbox:?}"
+        );
+    }
 
     let _ = clean_daemon.shutdown_gracefully();
     let _ = hub_proc.shutdown_gracefully();
@@ -2199,11 +2254,28 @@ fn two_hub_agent_descriptions_and_auto_routing_without_hub_prefix() {
     assert_eq!(wait_status.code(), Some(0));
     assert_eq!(wait_json["ok"], true);
     let items = wait_json["data"]["items"].as_array().unwrap();
+    let wait_txt = items[0]["text"].as_str().unwrap_or_default();
     assert!(
-        items
-            .iter()
-            .any(|i| i["text"].as_str().unwrap_or_default().contains(dm_secret)),
-        "Bob's live hyp wait must receive decrypted E2EE DM: {wait_json}"
+        wait_txt.contains("<hyphae-inbox ")
+            && wait_txt.contains("<dm from=\"alice@macbook/alice\" count=\"1\"/>"),
+        "Bob's live hyp wait must receive metadata-only XML digest: {wait_json}"
+    );
+    assert!(
+        !wait_txt.contains(dm_secret),
+        "RFC 0004: live hyp wait must NEVER include raw E2EE DM plaintext: {wait_json}"
+    );
+    let (bob_inbox_txt, bob_inbox_err) = bob_mcp.call_verified_claude(
+        &bob_home,
+        &bob_sock,
+        "bob-s1",
+        "hyp_inbox",
+        json!({}),
+        RPC_TIMEOUT,
+    );
+    assert!(!bob_inbox_err, "bob hyp_inbox failed: {bob_inbox_txt}");
+    assert!(
+        bob_inbox_txt.contains(dm_secret),
+        "Bob's hyp_inbox must return decrypted E2EE DM: {bob_inbox_txt}"
     );
 
     // Zero-knowledge verification on BOTH hubs (live + post-shutdown)!
@@ -2633,20 +2705,36 @@ fn node_json_plugins_boot_wiring_secret_resolution_and_bridge_roundtrip() {
         assert_eq!(good_resp.status(), StatusCode::ACCEPTED);
     });
 
-    // BOTH `primary` and `reader` live `hyp wait` processes MUST wake with the inbound event!
+    // BOTH `primary` and `reader` live `hyp wait` processes MUST wake with the metadata-only XML digest!
     for (label, mut waiter) in [("primary", wait_primary), ("reader", wait_reader)] {
         let (st, out) = waiter.wait_json_output(Duration::from_secs(12));
         assert_eq!(st.code(), Some(0), "{label} wait status: {out}");
         assert_eq!(out["ok"], true);
         let items = out["data"]["items"].as_array().unwrap();
+        let wait_txt = items[0]["text"].as_str().unwrap_or_default();
         assert!(
-            items.iter().any(|i| i["text"]
-                .as_str()
-                .unwrap_or_default()
-                .contains(inbound_marker)),
-            "{label} must receive inbound webhook event: {out}"
+            wait_txt.contains("<hyphae-inbox ")
+                && wait_txt.contains("<bridge target=\"webhook:ops\" count=\"1\"/>"),
+            "{label} must receive metadata-only bridge XML digest: {out}"
+        );
+        assert!(
+            !wait_txt.contains(inbound_marker),
+            "RFC 0004: {label} wait must NEVER include raw webhook payload: {out}"
         );
     }
+    let (wh_inbox_txt, wh_inbox_err) = mcp.call_verified_claude(
+        &home,
+        &sock,
+        "wh-primary",
+        "hyp_inbox",
+        json!({}),
+        RPC_TIMEOUT,
+    );
+    assert!(!wh_inbox_err, "primary hyp_inbox failed: {wh_inbox_txt}");
+    assert!(
+        wh_inbox_txt.contains(inbound_marker),
+        "primary hyp_inbox must return full inbound webhook payload: {wh_inbox_txt}"
+    );
 
     // Outbound: `reader` MUST be rejected `not_target_holder`!
     let (r_txt, r_err) = mcp.call_verified_claude(
@@ -3230,8 +3318,19 @@ fn zero_flag_default_home_onboard_daemon_mcp_hook_wait_roundtrip() {
         .as_str()
         .unwrap_or_default();
     assert!(
-        drained_ctx.contains(dm1),
-        "zero-flag user-prompt-submit must drain DM #1 from default daemon socket: {pre_turn_out}"
+        drained_ctx.contains("<hyphae-inbox ")
+            && drained_ctx.contains(&format!("<dm from=\"{node_id}/alpha\" count=\"1\"/>")),
+        "zero-flag user-prompt-submit must emit metadata-only XML digest for DM #1: {pre_turn_out}"
+    );
+    assert!(
+        !drained_ctx.contains(dm1),
+        "RFC 0004: user-prompt-submit must NEVER expose raw DM #1 body: {pre_turn_out}"
+    );
+    let (inbox1_txt, inbox1_err) = call_verified("zero-b", "hyp_inbox", json!({}));
+    assert!(!inbox1_err, "zero-flag hyp_inbox #1 failed: {inbox1_txt}");
+    assert!(
+        inbox1_txt.contains(dm1),
+        "zero-flag hyp_inbox #1 must return and ack DM #1: {inbox1_txt}"
     );
 
     // 6. Spawn `hyp wait` with ZERO `--socket` flag and wake it via DM #2!
@@ -3264,11 +3363,21 @@ fn zero_flag_default_home_onboard_daemon_mcp_hook_wait_roundtrip() {
         "zero-flag hyp wait JSON: {wait_json}"
     );
     let wait_items = wait_json["data"]["items"].as_array().unwrap();
+    let wait_txt = wait_items[0]["text"].as_str().unwrap_or_default();
     assert!(
-        wait_items
-            .iter()
-            .any(|i| i["text"].as_str().unwrap_or_default().contains(dm2)),
-        "zero-flag hyp wait must receive DM #2 from default daemon socket: {wait_json}"
+        wait_txt.contains("<hyphae-inbox ")
+            && wait_txt.contains(&format!("<dm from=\"{node_id}/alpha\" count=\"1\"/>")),
+        "zero-flag hyp wait must emit metadata-only XML digest for DM #2: {wait_json}"
+    );
+    assert!(
+        !wait_txt.contains(dm2),
+        "RFC 0004: zero-flag hyp wait must NEVER expose raw DM #2 body: {wait_json}"
+    );
+    let (inbox2_txt, inbox2_err) = call_verified("zero-b", "hyp_inbox", json!({}));
+    assert!(!inbox2_err, "zero-flag hyp_inbox #2 failed: {inbox2_txt}");
+    assert!(
+        inbox2_txt.contains(dm2),
+        "zero-flag hyp_inbox #2 must return and ack DM #2: {inbox2_txt}"
     );
 
     drop(mcp_stdin);

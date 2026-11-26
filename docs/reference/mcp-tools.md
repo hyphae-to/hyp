@@ -36,7 +36,7 @@ Send E2EE DMs (`<node>/<handle>` or `<handle>`), post to `#channels`, reply/reac
 | `chatId` | `string` | Optional bridge chat ID override |
 
 ### 3. `hyp_inbox`
-Query/ack filtered cursor-paginated inbox items, toggle Focus Mode, manage per-source delivery rules, or mute/unmute sources. **Never poll in a loop.** Refuses `quarantined` and `rejected` states fail-closed.
+Read and acknowledge filtered cursor-paginated inbox items (call when a `<hyphae-inbox ...>` XML digest arrives), toggle Focus Mode, manage per-source delivery rules, or mute/unmute sources. **Never poll in a loop.** Refuses `quarantined` and `rejected` states fail-closed. Returned items include `trustTier` (plus `humanVerified: true` when cryptographically verified, or `untrusted: true` + `provenance` note for untrusted payloads).
 
 | Parameter | Type | Description |
 | --- | --- | --- |
@@ -45,8 +45,8 @@ Query/ack filtered cursor-paginated inbox items, toggle Focus Mode, manage per-s
 | `cursor` | `string` | Opaque base64url pagination cursor |
 | `limit` | `integer` (`1..=50`) | Page size (default `20`) |
 | `summary` | `boolean` | Return compact metadata summaries |
-| `ack` | `boolean` | Mark returned items as delivered |
-| `ids` | `string[]` | Fetch specific receipt IDs (for example truncated oversized payloads) |
+| `ack` | `boolean` | Mark returned unread items as delivered (defaults to `true` for `unread` queries; pass `false` to peek) |
+| `ids` | `string[]` | Fetch specific receipt IDs |
 | `mode` | `"queue" \| "notify"` | Set session delivery mode (`"notify"` = Focus Mode) |
 | `rules` | `Array<{ target, delivery }>` | Per-source overrides (`delivery`: `"interrupt" \| "queue" \| "notify" \| "mute"`) |
 | `mute` / `unmute` | `string` | Mute or unmute a source pattern |

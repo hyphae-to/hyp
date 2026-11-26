@@ -216,20 +216,40 @@ async fn restart_flushes_persisted_mailbox_strictly_at_most_once() {
         let got_inline = t_inline.wait_for_count(1, Duration::from_secs(3)).await;
         assert_eq!(got_inline.len(), 1);
         assert!(
-            got_inline[0].0.contains("hello-after-restart-inline"),
-            "unexpected inline payload: {:?}",
+            got_inline[0]
+                .0
+                .starts_with("<hyphae-inbox handle=\"alice\" unread=\"1\" urgency=\"queue\">")
+                && got_inline[0]
+                    .0
+                    .contains("<dm from=\"flush-node/ops\" count=\"1\"/>"),
+            "unexpected XML digest payload: {:?}",
+            got_inline
+        );
+        assert!(
+            !got_inline[0].0.contains("hello-after-restart-inline"),
+            "RFC 0004: push digest must NEVER contain raw body: {:?}",
             got_inline
         );
 
         let got_nudge = t_nudge.wait_for_count(1, Duration::from_secs(3)).await;
         assert_eq!(got_nudge.len(), 1);
         assert!(
-            got_nudge[0].0.contains("nudge:count=1:handle=bob"),
-            "unexpected nudge payload: {:?}",
+            got_nudge[0]
+                .0
+                .starts_with("<hyphae-inbox handle=\"bob\" unread=\"1\" urgency=\"queue\">")
+                && got_nudge[0]
+                    .0
+                    .contains("<dm from=\"flush-node/ops\" count=\"1\"/>"),
+            "unexpected nudge XML digest payload: {:?}",
+            got_nudge
+        );
+        assert!(
+            !got_nudge[0].0.contains("hello-after-restart-nudge"),
+            "RFC 0004: nudge digest must NEVER contain raw body: {:?}",
             got_nudge
         );
 
-        // Repeated explicit startup flushes MUST NOT duplicate either inline or nudge delivery!
+        // Repeated explicit startup flushes MUST NOT duplicate either delivery!
         daemon.flush_pending_sessions().await;
         daemon.flush_pending_sessions().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -237,7 +257,7 @@ async fn restart_flushes_persisted_mailbox_strictly_at_most_once() {
         assert_eq!(
             t_inline.snapshot().len(),
             1,
-            "inline delivery must be strictly at-most-once"
+            "digest delivery must be strictly at-most-once"
         );
         assert_eq!(
             t_nudge.snapshot().len(),
@@ -245,11 +265,12 @@ async fn restart_flushes_persisted_mailbox_strictly_at_most_once() {
             "nudge delivery must be strictly at-most-once"
         );
 
-        // Inline item is now acknowledged (`pending_count == 0`); nudge-only item remains unread
-        // in SQLite (`pending_count == 1`) with `notified == 1` (`unnotified_count == 0`).
+        // RFC 0004: Both items remain unread in SQLite (`pending_count == 1`) until read via
+        // `hyp_inbox`, with `notified == 1` (`unnotified_count == 0`) preventing duplicate wakes.
         {
             let db = node.db();
-            assert_eq!(db.local().pending_count(sid_inline).unwrap(), 0);
+            assert_eq!(db.local().pending_count(sid_inline).unwrap(), 1);
+            assert_eq!(db.local().unnotified_count(sid_inline).unwrap(), 0);
             assert_eq!(db.local().pending_count(sid_nudge).unwrap(), 1);
             assert_eq!(db.local().unnotified_count(sid_nudge).unwrap(), 0);
         }
@@ -393,13 +414,21 @@ esac
         if let Ok(content) = fs::read_to_string(&calls_file) {
             if !content.trim().is_empty() {
                 assert_eq!(
-                    content.lines().count(),
+                    content.matches("send --json --if idle t7 ").count(),
                     1,
-                    "expected strictly one Herdr wake nudge on startup, got:\n{content}"
+                    "expected strictly one Herdr wake digest on startup, got:\n{content}"
                 );
                 assert!(
-                    content.contains("t7") && content.contains("<hyphae-wake"),
+                    content.contains("t7")
+                        && content.contains(
+                            "<hyphae-inbox handle=\"dev\" unread=\"1\" urgency=\"queue\">"
+                        )
+                        && content.contains("<dm from=\"herdr-flush-node/lead\" count=\"1\"/>"),
                     "unexpected hc send invocation: {content}"
+                );
+                assert!(
+                    !content.contains("ping while daemon was stopped"),
+                    "RFC 0004: Herdr wake must NEVER contain raw DM body: {content}"
                 );
                 break;
             }
@@ -416,7 +445,7 @@ esac
     tokio::time::sleep(Duration::from_millis(50)).await;
     let final_log = fs::read_to_string(&calls_file).unwrap();
     assert_eq!(
-        final_log.lines().count(),
+        final_log.matches("send --json --if idle t7 ").count(),
         1,
         "startup flush must not re-nudge Herdr terminal: {final_log}"
     );
@@ -537,6 +566,7 @@ async fn startup_flush_respects_security_gate_and_mute_rules() {
                     FilterOutcome {
                         decision: GateDecision::Allow {
                             downgraded_to_notify: false,
+                            capped_to_queue: false,
                         },
                         confidence: Some(0.01),
                         categories: Vec::new(),
@@ -591,8 +621,13 @@ async fn startup_flush_respects_security_gate_and_mute_rules() {
     assert_eq!(delivered.len(), 1, "expected exactly 1 delivered batch");
     let body = &delivered[0].0;
     assert!(
-        body.contains("clean-allowed-message"),
-        "allowed DM must be delivered: {body}"
+        body.starts_with("<hyphae-inbox unread=\"1\" urgency=\"queue\">")
+            && body.contains("<dm from=\"gate-node/trusted-peer\" count=\"1\"/>"),
+        "allowed DM must be surfaced in metadata-only XML digest: {body}"
+    );
+    assert!(
+        !body.contains("clean-allowed-message"),
+        "RFC 0004: push digest must NEVER contain raw allowed body: {body}"
     );
     assert!(
         !body.contains("noisy muted chatter"),
@@ -603,10 +638,11 @@ async fn startup_flush_respects_security_gate_and_mute_rules() {
         "quarantined prompt-injection payload must NEVER be delivered: {body}"
     );
 
-    // Verify SQLite state: 0 pending, >=1 quarantined!
+    // Verify SQLite state: 1 unread (notified=1) pending allowed DM, 1 quarantined!
     {
         let db = node.db();
-        assert_eq!(db.local().pending_count(sid).unwrap(), 0);
+        assert_eq!(db.local().pending_count(sid).unwrap(), 1);
+        assert_eq!(db.local().unnotified_count(sid).unwrap(), 0);
         assert_eq!(
             db.local().quarantined_count(Some(sid)).unwrap(),
             1,
@@ -722,11 +758,17 @@ async fn restart_flushes_pending_local_topic_batches_into_subscribed_session_inb
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            combined.contains("offline-batch-1") && combined.contains("offline-batch-2"),
-            "both persisted local topic batches must flush after restart: {combined}"
+            combined.starts_with("<hyphae-inbox unread=\"2\" urgency=\"queue\">")
+                && combined.contains("<stream topic=\"local.alerts\" count=\"2\"/>"),
+            "both persisted local topic batches must flush as metadata-only XML digest after restart: {combined}"
+        );
+        assert!(
+            !combined.contains("offline-batch-1") && !combined.contains("offline-batch-2"),
+            "RFC 0004: push digest must NEVER expose raw event payloads: {combined}"
         );
 
-        // Verify zero remaining pending batches in `EventStore` and zero duplicates on re-flush.
+        // Verify zero remaining pending batches in `EventStore`, full payloads preserved unread
+        // in SQLite mailbox (`pending_count == 2`, `unnotified_count == 0`), and zero duplicates.
         {
             let db = node.db();
             let remaining = db.events().claim_due_batches(sid, now_ms()).unwrap();
@@ -734,7 +776,11 @@ async fn restart_flushes_pending_local_topic_batches_into_subscribed_session_inb
                 remaining.is_empty(),
                 "all local topic batches should be acked delivered: {remaining:?}"
             );
-            assert_eq!(db.local().pending_count(sid).unwrap(), 0);
+            assert_eq!(db.local().pending_count(sid).unwrap(), 2);
+            assert_eq!(db.local().unnotified_count(sid).unwrap(), 0);
+            let rows = db.local().peek_inbox(sid, 10).unwrap();
+            assert!(rows.iter().any(|r| r.text.contains("offline-batch-1")));
+            assert!(rows.iter().any(|r| r.text.contains("offline-batch-2")));
         }
 
         daemon.flush_pending_sessions().await;

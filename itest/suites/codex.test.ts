@@ -132,12 +132,17 @@ test("Real Codex CLI: hyp setup, rollout JSONL verification, codex exec no auto-
           once: true,
           when: (req) =>
             Boolean(req.lastToolResult("exec_command")?.text.includes("STEP_ONE")) &&
-            !req.anyMessageContains(interruptPayload),
+            !req.anyMessageContains('urgency="interrupt"'),
           assert: (req) => {
             assert.equal(
               req.rawBody.includes(queuePayload),
               false,
               `Codex PostToolUse MUST hold queue DM '${queuePayload}' mid-turn!`,
+            );
+            assert.equal(
+              req.anyMessageContains("<hyphae-inbox "),
+              false,
+              `Codex PostToolUse #1 MUST NOT emit a digest for a fresh queue DM!`,
             );
             sawCmd1WithoutQueue = true;
           },
@@ -145,14 +150,17 @@ test("Real Codex CLI: hyp setup, rollout JSONL verification, codex exec no auto-
             pauseUntil(gateBeforeCmd2, callTool(req, "exec_command", { cmd: "echo STEP_TWO" })),
         },
         {
-          name: "assert-interrupt-and-end-turn",
+          name: "assert-interrupt-digest-and-read-vip",
           once: true,
           when: (req) =>
-            req.anyMessageContains(interruptPayload) && !req.anyMessageContains(queuePayload),
+            req.anyMessageContains('urgency="interrupt"') &&
+            req.anyMessageContains('from="codex-itest@local/vip"') &&
+            !req.anyMessageContains(interruptPayload),
           assert: (req) => {
-            assert.ok(
-              req.rawBody.includes(UNTRUSTED_PROVENANCE_HEADER),
-              `Codex interrupt PostToolUse injection MUST include explicit '${UNTRUSTED_PROVENANCE_HEADER}' (#23)`,
+            assert.equal(
+              req.rawBody.includes(interruptPayload),
+              false,
+              `RFC 0004: Codex PostToolUse digest MUST NEVER leak raw interrupt body '${interruptPayload}'!`,
             );
             assert.equal(
               req.rawBody.includes(queuePayload),
@@ -161,19 +169,45 @@ test("Real Codex CLI: hyp setup, rollout JSONL verification, codex exec no auto-
             );
             sawInterruptInPostToolUse = true;
           },
+          do: (req) =>
+            callTool(req, "hyp_inbox", {
+              filter: { from: "codex-itest@local/vip" },
+            }),
+        },
+        {
+          name: "after-vip-inbox-end-turn",
+          once: true,
+          when: (req) =>
+            req.lastToolResult("hyp_inbox")?.text.includes(interruptPayload) === true &&
+            !req.anyMessageContains(queuePayload),
+          assert: (req) => {
+            const inboxJson = req.lastToolResult("hyp_inbox")?.json;
+            assert.equal(inboxJson?.acked, 1, "hyp_inbox must ack by default");
+            assert.equal(inboxJson?.items?.[0]?.provenance, UNTRUSTED_PROVENANCE_HEADER);
+          },
           do: () => emitText("CODEX_END_TURN_TO_TRIGGER_STOP"),
+        },
+        {
+          name: "stop-digest-read-queue-inbox",
+          once: true,
+          when: (req) =>
+            req.anyMessageContains('urgency="queue"') &&
+            req.anyMessageContains('from="codex-itest@local/bob"') &&
+            !req.anyMessageContains(queuePayload),
+          assert: (req) => {
+            assert.equal(
+              req.rawBody.includes(queuePayload),
+              false,
+              `RFC 0004: Codex Stop digest MUST NEVER leak raw queue body '${queuePayload}'!`,
+            );
+            sawQueueInStopContinuation = true;
+          },
+          do: (req) => callTool(req, "hyp_inbox", {}),
         },
         {
           name: "stop-flushed-queue-send-ack",
           once: true,
-          when: (req) => req.anyMessageContains(queuePayload),
-          assert: (req) => {
-            assert.ok(
-              req.rawBody.includes(UNTRUSTED_PROVENANCE_HEADER),
-              `Codex Stop continuation MUST include explicit '${UNTRUSTED_PROVENANCE_HEADER}' (#23)`,
-            );
-            sawQueueInStopContinuation = true;
-          },
+          when: (req) => req.lastToolResult("hyp_inbox")?.text.includes(queuePayload) === true,
           do: (req) =>
             callTool(req, "hyp_send", {
               to: "sink",
@@ -371,20 +405,20 @@ test("Real Codex CLI: live interactive PTY `codex queue --thread` wakeup + Tier 
         {
           name: "pty-wake-read-inbox",
           when: (req) =>
-            req.lastUserText.includes("<hyphae-wake") && req.lastToolResults.length === 0,
+            req.lastUserText.includes("<hyphae-inbox") && req.lastToolResults.length === 0,
           assert: (req) => {
             assert.equal(
               req.lastUserText.includes(liveDmPayload),
               false,
-              "codex queue wake nudge MUST be strictly metadata-only prior to hyp_inbox",
+              "codex queue wake digest MUST be strictly metadata-only prior to hyp_inbox",
             );
             assert.equal(
               req.lastUserText.includes(postRestartDmPayload),
               false,
-              "post-restart codex queue wake nudge MUST be strictly metadata-only prior to hyp_inbox",
+              "post-restart codex queue wake digest MUST be strictly metadata-only prior to hyp_inbox",
             );
           },
-          do: (req) => callTool(req, "hyp_inbox", { ack: true }),
+          do: (req) => callTool(req, "hyp_inbox", {}),
         },
         {
           name: "pty-reply-done",
@@ -487,7 +521,7 @@ test("Real Codex CLI: live interactive PTY `codex queue --thread` wakeup + Tier 
         recorderWrapper,
         [
           "#!/bin/sh",
-          `printf '%s\\n' "$*" >> ${JSON.stringify(argvLog)}`,
+          `${JSON.stringify(process.execPath)} -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)) + "\\n")' -- "$@" >> ${JSON.stringify(argvLog)}`,
           `exec ${JSON.stringify(codexBin)} "$@"`,
         ].join("\n") + "\n",
         { mode: 0o700 },
@@ -520,7 +554,7 @@ test("Real Codex CLI: live interactive PTY `codex queue --thread` wakeup + Tier 
       }
 
       // Send another DM (and/or observe startup flush of `coldStoppedPayload`) -> verify daemon passes
-      // `--resume` to real `codex queue --thread <uuid>` with strictly metadata-only nudge!
+      // `--resume` to real `codex queue --thread <uuid>` with strictly metadata-only XML digest!
       const sender2 = await hyp.openPeer("alice-resume");
       await sender2.send("cx-live-pty", optInResumePayload);
       await waitForCondition(
@@ -531,21 +565,25 @@ test("Real Codex CLI: live interactive PTY `codex queue --thread` wakeup + Tier 
         "hyp daemon invoking `codex queue ... --resume` when deliveryRetry.codexResume=true",
       );
 
-      const recordedCalls = fs
+      const recordedCalls: string[][] = fs
         .readFileSync(argvLog, "utf8")
         .trim()
         .split(/\r?\n/)
-        .filter((l) => l.startsWith("queue --thread"));
+        .filter(Boolean)
+        .map((l) => JSON.parse(l) as string[])
+        .filter((args) => args[0] === "queue" && args[1] === "--thread");
       assert.ok(
-        recordedCalls.some(
-          (line) =>
-            line.includes(enrolledSess.sessionId.slice("codex:".length)) &&
-            line.includes("--resume") &&
-            line.includes("<hyphae-wake") &&
-            !line.includes(coldStoppedPayload) &&
-            !line.includes(optInResumePayload),
-        ),
-        `Expected real codex queue invocation with --resume and metadata-only wake nudge, got: ${JSON.stringify(recordedCalls)}`,
+        recordedCalls.some((args) => {
+          const joined = args.join(" ");
+          return (
+            joined.includes(enrolledSess.sessionId.slice("codex:".length)) &&
+            args.includes("--resume") &&
+            joined.includes("<hyphae-inbox ") &&
+            !joined.includes(coldStoppedPayload) &&
+            !joined.includes(optInResumePayload)
+          );
+        }),
+        `Expected real codex queue invocation with --resume and metadata-only <hyphae-inbox> digest, got: ${JSON.stringify(recordedCalls)}`,
       );
 
       shim.assertAllClean();

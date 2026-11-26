@@ -382,6 +382,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
     let mut webhook_sources = ParsedWebhookSources::default();
     let mut delivery_retry_cfg = DeliveryRetryConfig::default();
     let mut wake_recovery_cfg = WakeRecoveryConfig::default();
+    let mut midturn_queue_digest_seconds = hyp_node::delivery::DEFAULT_MIDTURN_QUEUE_DIGEST_SECONDS;
     let mut parsed_plugins: Vec<ParsedPlugin> = Vec::new();
     let mut skipped_plugin_statuses: Vec<Value> = Vec::new();
 
@@ -489,6 +490,21 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                     EXIT_ERROR,
                     "CONFIG_ERROR",
                     format!("Invalid wakeRecovery config in {}: {e}", cfg.path.display()),
+                    None,
+                );
+            }
+        }
+
+        // Parse optional RFC 0004 `delivery.midturnQueueDigestSeconds` (or top-level key).
+        match parse_midturn_queue_digest_seconds(&cfg.raw) {
+            Ok(secs) => midturn_queue_digest_seconds = secs,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "CONFIG_ERROR",
+                    format!("Invalid delivery config in {}: {e}", cfg.path.display()),
                     None,
                 );
             }
@@ -997,6 +1013,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                 auto_detect_transports: true,
                 delivery_retry: delivery_retry_cfg,
                 wake_recovery: wake_recovery_cfg.clone(),
+                midturn_queue_digest_seconds,
                 ..Default::default()
             };
             match LocalDaemon::start(Arc::clone(&node), gate_pipeline.clone(), local_cfg).await {
@@ -2603,6 +2620,35 @@ fn parse_wake_recovery_config(raw: &Value) -> Result<WakeRecoveryConfig, String>
             .ok_or_else(|| "wakeRecovery.notifyAllEnrolled must be a boolean".to_string())?;
     }
     Ok(cfg)
+}
+
+fn parse_midturn_queue_digest_seconds(raw: &Value) -> Result<u64, String> {
+    let mut secs = hyp_node::delivery::DEFAULT_MIDTURN_QUEUE_DIGEST_SECONDS;
+    let Some(root) = raw.as_object() else {
+        return Ok(secs);
+    };
+    if let Some(val) = root
+        .get("midturnQueueDigestSeconds")
+        .or_else(|| root.get("midturn_queue_digest_seconds"))
+    {
+        secs = val.as_u64().ok_or_else(|| {
+            "midturnQueueDigestSeconds must be a non-negative integer".to_string()
+        })?;
+    }
+    if let Some(delivery_val) = root.get("delivery") {
+        let obj = delivery_val
+            .as_object()
+            .ok_or_else(|| "delivery must be a JSON object".to_string())?;
+        if let Some(val) = obj
+            .get("midturnQueueDigestSeconds")
+            .or_else(|| obj.get("midturn_queue_digest_seconds"))
+        {
+            secs = val.as_u64().ok_or_else(|| {
+                "delivery.midturnQueueDigestSeconds must be a non-negative integer".to_string()
+            })?;
+        }
+    }
+    Ok(secs)
 }
 
 const fn plugin_kind_str(kind: AdapterKind) -> &'static str {
@@ -4564,5 +4610,48 @@ mod tests {
         // Bridge with explicit `exposeTopic: false` stays local-only.
         assert_eq!(parsed[5].config.id, "tg-explicit-false");
         assert!(!parsed[5].expose_topic);
+    }
+
+    #[test]
+    fn parse_midturn_queue_digest_seconds_supports_nested_top_level_zero_and_rejects_bad_types() {
+        assert_eq!(
+            parse_midturn_queue_digest_seconds(&json!({})).unwrap(),
+            hyp_node::delivery::DEFAULT_MIDTURN_QUEUE_DIGEST_SECONDS
+        );
+        assert_eq!(
+            parse_midturn_queue_digest_seconds(&json!({
+                "delivery": { "midturnQueueDigestSeconds": 600 }
+            }))
+            .unwrap(),
+            600
+        );
+        assert_eq!(
+            parse_midturn_queue_digest_seconds(&json!({
+                "midturnQueueDigestSeconds": 0
+            }))
+            .unwrap(),
+            0
+        );
+        // Nested `delivery.midturnQueueDigestSeconds` takes precedence over top-level fallback.
+        assert_eq!(
+            parse_midturn_queue_digest_seconds(&json!({
+                "midturnQueueDigestSeconds": 900,
+                "delivery": { "midturnQueueDigestSeconds": 120 }
+            }))
+            .unwrap(),
+            120
+        );
+        assert!(
+            parse_midturn_queue_digest_seconds(&json!({
+                "delivery": { "midturnQueueDigestSeconds": -5 }
+            }))
+            .is_err()
+        );
+        assert!(
+            parse_midturn_queue_digest_seconds(&json!({
+                "delivery": { "midturnQueueDigestSeconds": "30m" }
+            }))
+            .is_err()
+        );
     }
 }

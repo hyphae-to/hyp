@@ -1230,7 +1230,7 @@ async fn t3_deliver_nudge_is_strictly_metadata_only_and_sanitizes_handle() {
     assert_eq!(out_q, PushOutcome::Delivered);
     assert_eq!(
         server.commands().last().unwrap()["text"],
-        "<hyphae-wake count=\"2\" handle=\"t3-agent\" urgency=\"queue\">2 Hyphae message(s) queued for @t3-agent. Review any injected Hyphae context or call hyp_inbox({ ack: true }) to read them.</hyphae-wake>"
+        "<hyphae-inbox handle=\"t3-agent\" unread=\"2\" urgency=\"queue\"/>"
     );
 
     let out_i = transport
@@ -1248,7 +1248,7 @@ async fn t3_deliver_nudge_is_strictly_metadata_only_and_sanitizes_handle() {
         .to_string();
     assert_eq!(
         dispatched,
-        "<hyphae-wake count=\"1\" urgency=\"interrupt\">1 urgent Hyphae message(s) queued. Review any injected Hyphae context or call hyp_inbox({ ack: true }) to read them.</hyphae-wake>"
+        "<hyphae-inbox unread=\"1\" urgency=\"interrupt\"/>"
     );
     assert!(!dispatched.contains("run rm"));
     assert!(!dispatched.contains("human-verified"));

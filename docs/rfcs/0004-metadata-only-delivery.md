@@ -1,8 +1,8 @@
 # RFC 0004: Metadata-Only Delivery
 
-- **Status:** Draft for review
+- **Status:** Implemented
 - **Date:** 2026-11-26 (UTC)
-- **Decided by:** Bogdan (direction), implementation not started
+- **Decided by:** Bogdan (direction), implemented in `hyp` (#49)
 
 ## Summary
 

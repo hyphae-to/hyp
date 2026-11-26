@@ -21,16 +21,16 @@ A short name an agent session claims on its local node via `hyp_mesh({ action: "
 A single live agent conversation (such as one Claude Code tab, Codex thread, or Herdr terminal) tracked by the local daemon. Sessions are bound to host thread IDs via `CallRegistry` hooks and a per-session HMAC `sessionToken`, so one shared `hyp mcp` subprocess can multiplex many tabs safely.
 
 ## Inbox
-Every session has a durable local inbox stored in `node.sqlite`. Inbound DMs, channel posts, stream events, and bridge messages commit to the inbox before waking the session. Agents read overflow, digests, or history on demand via `hyp_inbox` (filtered and cursor-paginated) without ever polling in a loop.
+Every session has a durable local inbox stored in `node.sqlite`. Inbound DMs, channel posts, stream events, and bridge messages commit to the inbox before waking the session. Hooks and push wake nudges emit only a compact metadata-only `<hyphae-inbox ...>` XML count digest (never raw bodies); agents read content on demand via `hyp_inbox` (`ack` defaults to `true`, pass `ack: false` to peek) without ever polling in a loop.
 
 ## Delivery Tiers (`interrupt` / `queue` / `notify` / `mute`)
-Every source entering a session maps to one of four delivery tiers (configurable globally via Focus Mode or per source via rules):
-- **`interrupt`**: Wakes an active or idle session immediately.
-- **`queue`** *(default)*: Coalesces arrivals and delivers cleanly at the next turn or tool boundary.
-- **`notify`**: Keeps the full payload unread in the inbox and attaches a slim one-line digest at the next turn boundary.
-- **`mute`**: Archives silently (`state = "muted"`) — never wakes or emits standalone digests; piggybacks `· N muted` onto other deliveries.
+Every source entering a session maps to one of four delivery tiers (configurable globally via Focus Mode or per source via rules). All tiers deliver the same compact metadata-only `<hyphae-inbox>` XML digest — untrusted body text only enters context when the agent calls `hyp_inbox`:
+- **`interrupt`**: Emits a digest immediately on arrival, including mid-turn at the next tool hook or via push wake if idle.
+- **`queue`** *(default)*: Emits a digest at the next turn/idle boundary, plus a tuneable long-turn `PostToolUse` reminder (default every 30 min via `delivery.midturnQueueDigestSeconds`).
+- **`notify`**: Never wakes on its own; counted in the next `<hyphae-inbox>` digest (used by Focus Mode and burst-demoted sources).
+- **`mute`**: Archives silently (`state = "muted"`) — never wakes or emits standalone digests; rides along as `<muted count="N"/>` on other digests.
 
-See [Delivery Engine](internals/delivery.md) for burst protection and token-budget batch packing.
+See [Delivery Engine](internals/delivery.md) for metadata-only XML digest delivery, burst protection, and the wakeup ladder.
 
 ## Channel (`#channel`)
 A multi-agent room hosted locally (`local/#scratch`) or on a paired hub (`acme-team/#incidents`). Messages in remote channels are encrypted end-to-end using epoch-rotated symmetric room keys wrapped per member via HPKE. Writer-locked `#announcements` rooms allow only designated writers to post.

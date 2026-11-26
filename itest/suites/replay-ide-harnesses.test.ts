@@ -146,30 +146,44 @@ test("IDE Replay — Cursor: setup preservation, verified call_id, spoof rejecti
     const afterInterrupt = await cur.afterMcpExecution("read_file", "non-mesh-2");
     assert.ok(
       typeof afterInterrupt?.additional_context === "string" &&
-        afterInterrupt.additional_context.includes(interruptMarker),
-      `Cursor afterMCPExecution must immediately inject interrupt DM: ${JSON.stringify(afterInterrupt)}`,
+        afterInterrupt.additional_context.includes("<hyphae-inbox") &&
+        afterInterrupt.additional_context.includes('urgency="interrupt"') &&
+        afterInterrupt.additional_context.includes('from="cursor-itest@local/peer-vip"'),
+      `Cursor afterMCPExecution must immediately inject metadata-only interrupt XML digest: ${JSON.stringify(afterInterrupt)}`,
     );
-    assert.ok(
-      afterInterrupt.additional_context.includes(UNTRUSTED_PROVENANCE_HEADER),
-      `Cursor afterMCPExecution must include UNTRUSTED_PROVENANCE header: ${afterInterrupt.additional_context}`,
+    assert.equal(
+      afterInterrupt.additional_context.includes(interruptMarker),
+      false,
+      "RFC 0004: Cursor afterMCPExecution MUST NEVER include raw interrupt body",
     );
     assert.equal(
       afterInterrupt.additional_context.includes(queueMarker),
       false,
       "Queue DM must remain held during mid-turn interrupt drain",
     );
+    const vipInbox = await cur.callVerifiedTool("hyp_inbox", {
+      filter: { from: "cursor-itest@local/peer-vip" },
+    });
+    assert.ok(vipInbox.tool.text.includes(interruptMarker));
+    assert.ok(vipInbox.tool.text.includes(UNTRUSTED_PROVENANCE_HEADER));
 
-    // TurnEnd (`stop`) drains held `queue` DM into `followup_message` with UNTRUSTED_PROVENANCE!
+    // TurnEnd (`stop`) emits metadata-only XML digest for held `queue` DM into `followup_message`!
     const stopDrain = await cur.stop({ loopCount: 0 });
     assert.ok(
       typeof stopDrain?.followup_message === "string" &&
-        stopDrain.followup_message.includes(queueMarker),
-      `Cursor stop hook must flush held queue DM into followup_message: ${JSON.stringify(stopDrain)}`,
+        stopDrain.followup_message.includes("<hyphae-inbox") &&
+        stopDrain.followup_message.includes('urgency="queue"') &&
+        stopDrain.followup_message.includes('from="cursor-itest@local/peer-a"'),
+      `Cursor stop hook must flush held queue XML digest into followup_message: ${JSON.stringify(stopDrain)}`,
     );
-    assert.ok(
-      stopDrain.followup_message.includes(UNTRUSTED_PROVENANCE_HEADER),
-      `Cursor stop followup_message must include UNTRUSTED_PROVENANCE header: ${stopDrain.followup_message}`,
+    assert.equal(
+      stopDrain.followup_message.includes(queueMarker),
+      false,
+      "RFC 0004: Cursor stop followup_message MUST NEVER include raw queue body",
     );
+    const queueInbox = await cur.callVerifiedTool("hyp_inbox", {});
+    assert.ok(queueInbox.tool.text.includes(queueMarker));
+    assert.ok(queueInbox.tool.text.includes(UNTRUSTED_PROVENANCE_HEADER));
 
     // Next `stop` (mailbox empty, no waiter armed) emits waiter-arm `followup_message` once;
     // `loop_count: 1` returns `{}` (anti-loop guard!).
@@ -182,17 +196,20 @@ test("IDE Replay — Cursor: setup preservation, verified call_id, spoof rejecti
     const stopAntiLoop = await cur.stop({ loopCount: 1 });
     assert.deepEqual(stopAntiLoop, {}, "Cursor stop with loop_count > 0 must not loop");
 
-    // 1d. `beforeSubmitPrompt` pre-turn drain with UNTRUSTED_PROVENANCE.
+    // 1d. `beforeSubmitPrompt` pre-turn metadata-only XML digest + `hyp_inbox` read/ack!
     const preTurnMarker = "CURSOR_PRE_SUBMIT_PROMPT_333";
     await hyp.send("peer-a", "cursor-agent", preTurnMarker, { urgency: "queue" });
     const preSubmit = await cur.beforeSubmitPrompt("continue");
     assert.equal(preSubmit?.continue, true);
     assert.ok(
       typeof preSubmit?.additional_context === "string" &&
-        preSubmit.additional_context.includes(preTurnMarker) &&
-        preSubmit.additional_context.includes(UNTRUSTED_PROVENANCE_HEADER),
-      `Cursor beforeSubmitPrompt must inject queued DM with provenance: ${JSON.stringify(preSubmit)}`,
+        preSubmit.additional_context.includes("<hyphae-inbox") &&
+        preSubmit.additional_context.includes('from="cursor-itest@local/peer-a"'),
+      `Cursor beforeSubmitPrompt must inject metadata-only XML digest: ${JSON.stringify(preSubmit)}`,
     );
+    assert.equal(preSubmit.additional_context.includes(preTurnMarker), false);
+    const preInbox = await cur.callVerifiedTool("hyp_inbox", {});
+    assert.ok(preInbox.tool.text.includes(preTurnMarker));
 
     // 1e. Live `hyp wait --session cursor:<id>` idle wakeup!
     const waitHandle = cur.spawnWait(15);
@@ -214,9 +231,15 @@ test("IDE Replay — Cursor: setup preservation, verified call_id, spoof rejecti
     assert.equal(waitOut.json?.ok, true);
     const items = waitOut.json?.data?.items ?? [];
     assert.ok(
-      items.some((i: any) => String(i?.text ?? "").includes(idleWakeMarker)),
-      `cursor hyp wait must return incoming DM: ${waitOut.stdout}`,
+      items.some(
+        (i: any) =>
+          String(i?.text ?? "").includes("<hyphae-inbox") &&
+          !String(i?.text ?? "").includes(idleWakeMarker),
+      ),
+      `cursor hyp wait must return metadata-only XML digest: ${waitOut.stdout}`,
     );
+    const waitInbox = await cur.callVerifiedTool("hyp_inbox", {});
+    assert.ok(waitInbox.tool.text.includes(idleWakeMarker));
 
     await cur.close();
   });
@@ -399,17 +422,21 @@ test("IDE Replay — Antigravity: setup, stacked statusline preservation & resto
       `Stacked Antigravity statusline must include enrolled handle 'agy-agent': ${slRes.stdout}`,
     );
 
-    // 2f. `PreInvocation` drains incoming DM into `injectSteps[0].systemMessage.systemMessage` with UNTRUSTED_PROVENANCE!
+    // 2f. `PreInvocation` emits metadata-only XML digest into `injectSteps[0].systemMessage.systemMessage`!
     const preInvMarker = "AGY_PRE_INVOCATION_INJECT_999";
     await receiverPeer.send("agy-agent", preInvMarker);
     const preInv = await agy.preInvocation();
     const injectedText = preInv?.injectSteps?.[0]?.systemMessage?.systemMessage;
     assert.ok(
       typeof injectedText === "string" &&
-        injectedText.includes(preInvMarker) &&
-        injectedText.includes(UNTRUSTED_PROVENANCE_HEADER),
-      `Antigravity PreInvocation must inject message with provenance header: ${JSON.stringify(preInv)}`,
+        injectedText.includes("<hyphae-inbox") &&
+        injectedText.includes('from="agy-itest@local/agy-peer"'),
+      `Antigravity PreInvocation must inject metadata-only XML digest: ${JSON.stringify(preInv)}`,
     );
+    assert.equal(injectedText.includes(preInvMarker), false, "RFC 0004: PreInvocation must not leak body");
+    const agyPreInbox = await agy.callVerifiedTool("hyp_inbox", {}, { mode: "direct" });
+    assert.ok(agyPreInbox.tool.text.includes(preInvMarker));
+    assert.ok(agyPreInbox.tool.text.includes(UNTRUSTED_PROVENANCE_HEADER));
 
     // 2g. `Stop` semantics: `NO_TOOL_CALL` arms `hyp wait` with WaitMsBeforeAsync hint;
     //     `continuationActive: true` never loops; `USER_CANCELED` does not arm!
@@ -449,9 +476,15 @@ test("IDE Replay — Antigravity: setup, stacked statusline preservation & resto
     const waitOut = await waitHandle.done;
     assert.equal(waitOut.exitCode, 0, `antigravity hyp wait failed: ${waitOut.stderr}`);
     assert.ok(
-      (waitOut.json?.data?.items ?? []).some((i: any) => String(i?.text ?? "").includes(agyWakeMarker)),
-      `antigravity hyp wait must receive incoming DM: ${waitOut.stdout}`,
+      (waitOut.json?.data?.items ?? []).some(
+        (i: any) =>
+          String(i?.text ?? "").includes("<hyphae-inbox") &&
+          !String(i?.text ?? "").includes(agyWakeMarker),
+      ),
+      `antigravity hyp wait must receive metadata-only XML digest: ${waitOut.stdout}`,
     );
+    const agyWaitInbox = await agy.callVerifiedTool("hyp_inbox", {}, { mode: "direct" });
+    assert.ok(agyWaitInbox.tool.text.includes(agyWakeMarker));
 
     // 2i. `--restore-statusline` restores original user statusLine cleanly and deletes chain file!
     const restoreRes = await hyp.setup("antigravity", {

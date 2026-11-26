@@ -138,9 +138,22 @@ test("Real OpenCode v2.3.2 CLI: hyp setup wiring, zero LoadError, 4-tool MCP dis
         do: () => emitText("OPENCODE_RUN_DONE"),
       },
       {
+        name: "oc-read-live-dm-digest",
+        once: true,
+        when: (req) => req.anyMessageContains("<hyphae-inbox ") && !req.anyMessageContains(liveInboundPayload),
+        assert: (req) => {
+          assert.equal(
+            req.rawBody.includes(liveInboundPayload),
+            false,
+            "RFC 0004: OpenCode prompt hook MUST emit metadata-only XML digest, never raw DM body",
+          );
+        },
+        do: (req) => callTool(req, "hyp_inbox", {}),
+      },
+      {
         name: "oc-ack-live-dm",
         once: true,
-        when: (req) => req.anyMessageContains(liveInboundPayload),
+        when: (req) => req.lastToolResult("hyp_inbox")?.text.includes(liveInboundPayload) === true,
         do: (req) =>
           callTool(req, "hyp_send", {
             to: "sink",
@@ -353,10 +366,19 @@ test("Real installed OpenCode plugin (plugins/hyphae.ts) + compiled hyp: tool.ex
     );
     assert.equal(typeof afterStrOut.output, "string");
     assert.ok(
-      String(afterStrOut.output).startsWith("bash stdout\n\n"),
-      `String output must preserve original tool result + append context: ${afterStrOut.output}`,
+      String(afterStrOut.output).startsWith("bash stdout\n\n<hyphae-inbox "),
+      `String output must preserve original tool result + append metadata-only XML digest: ${afterStrOut.output}`,
     );
-    assert.ok(String(afterStrOut.output).includes(intMsg1), "Interrupt DM must inject into string output");
+    assert.ok(
+      String(afterStrOut.output).includes('urgency="interrupt"') &&
+        String(afterStrOut.output).includes('from="oc-plugin@local/vip"'),
+      `Interrupt XML digest missing expected attributes: ${afterStrOut.output}`,
+    );
+    assert.equal(
+      String(afterStrOut.output).includes(intMsg1),
+      false,
+      "RFC 0004: tool.execute.after MUST NEVER leak raw interrupt body",
+    );
     assert.equal(
       String(afterStrOut.output).includes(queueMsg),
       false,
@@ -379,18 +401,28 @@ test("Real installed OpenCode plugin (plugins/hyphae.ts) + compiled hyp: tool.ex
       structuredPayload,
       "Structured non-string output MUST remain intact!",
     );
+    const structCtx = String(afterStructOut.metadata.hyphaeAdditionalContext ?? "");
     assert.ok(
-      String(afterStructOut.metadata.hyphaeAdditionalContext ?? "").includes(intMsg2),
-      `Structured output must receive interrupt context via metadata.hyphaeAdditionalContext: ${JSON.stringify(afterStructOut)}`,
+      structCtx.startsWith("<hyphae-inbox ") &&
+        structCtx.includes('urgency="interrupt"') &&
+        structCtx.includes('from="oc-plugin@local/vip"'),
+      `Structured output must receive metadata-only XML digest via metadata.hyphaeAdditionalContext: ${JSON.stringify(afterStructOut)}`,
     );
+    assert.equal(structCtx.includes(intMsg2), false, "RFC 0004: structured metadata must not leak raw body");
 
-    // 4. `event` (`session.idle`): flushes held `queueMsg` via `client.session.prompt`!
+    // 4. `event` (`session.idle`): flushes held `queueMsg` metadata-only XML digest via `client.session.prompt`!
     await hooks.event({ event: { type: "session.idle", properties: { sessionID: sessionId } } });
-    assert.equal(idlePrompts.length, 1, `Expected 1 idle prompt flushing held queue DM, got: ${JSON.stringify(idlePrompts)}`);
+    assert.equal(idlePrompts.length, 1, `Expected 1 idle prompt flushing held queue XML digest, got: ${JSON.stringify(idlePrompts)}`);
     assert.equal(idlePrompts[0].sessionId, sessionId);
     assert.ok(
+      idlePrompts[0].text.startsWith("<hyphae-inbox ") &&
+        idlePrompts[0].text.includes('from="oc-plugin@local/bob"'),
+      `Idle prompt must deliver metadata-only XML digest for held queue DM: ${idlePrompts[0].text}`,
+    );
+    assert.equal(
       idlePrompts[0].text.includes(queueMsg),
-      `Idle prompt must deliver held queue DM: ${idlePrompts[0].text}`,
+      false,
+      "RFC 0004: idle prompt MUST NEVER leak raw queue DM body",
     );
 
     // 5. `idleReminderSent` anti-loop guard:

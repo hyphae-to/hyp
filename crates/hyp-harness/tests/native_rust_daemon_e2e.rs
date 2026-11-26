@@ -552,10 +552,27 @@ async fn two_native_rust_daemons_over_rust_hub_hooks_mcp_delivery_wait_watch_kv_
         .unwrap()
         .unwrap();
     assert_eq!(wake_code, 0);
-    assert!(wake_out.contains("URGENT: ship native rust daemon!"));
     assert!(
-        wake_out.contains("· 3 muted"),
-        "expected piggybacked '· 3 muted' footer, got: {wake_out}"
+        wake_out.contains("<hyphae-inbox ")
+            && wake_out.contains("<dm from=\"alice@macbook/claude\" count=\"1\"/>"),
+        "expected metadata-only XML digest in hyp wait, got: {wake_out}"
+    );
+    assert!(
+        !wake_out.contains("URGENT: ship native rust daemon!"),
+        "RFC 0004: hyp wait must NEVER expose raw DM body: {wake_out}"
+    );
+    assert!(
+        wake_out.contains("<muted count=\"3\"/>"),
+        "expected piggybacked '<muted count=\"3\"/>' element, got: {wake_out}"
+    );
+    // Bob reads & acks the urgent DM via `hyp_inbox` (default `ack: true`)!
+    let (bob_dm_txt, bob_dm_err) = bob_mcp
+        .call_verified_claude(&bob_sock, "bob-sess-1", "hyp_inbox", json!({}))
+        .await;
+    assert!(!bob_dm_err, "bob hyp_inbox failed: {bob_dm_txt}");
+    assert!(
+        bob_dm_txt.contains("URGENT: ship native rust daemon!"),
+        "bob hyp_inbox must return decrypted urgent DM: {bob_dm_txt}"
     );
 
     // 8. Focus Mode (`mode: "notify"`) + `hyp_stream` (`acme-team.github`, `mode: "notify"`)
@@ -625,13 +642,20 @@ async fn two_native_rust_daemons_over_rust_hub_hooks_mcp_delivery_wait_watch_kv_
     }
     let ctx = post_out["hookSpecificOutput"]["additionalContext"]
         .as_str()
-        .expect("TurnStart hook should inject 1-line notify digest");
+        .expect("TurnStart hook should inject metadata-only notify XML digest");
     assert!(
-        ctx.contains("hyphae notify · 1 unread"),
-        "expected slim notify digest, got: {ctx}"
+        ctx.starts_with("<hyphae-inbox ")
+            && ctx.contains("unread=\"1\" urgency=\"notify\"")
+            && ctx.contains("subscription=\"gh:hyp\"")
+            && ctx.contains("topic=\"acme-team.github\""),
+        "expected slim notify XML digest with subscription key, got: {ctx}"
     );
     assert!(
-        ctx.contains("· 3 muted"),
+        !ctx.contains("Wave 3-A native daemon"),
+        "RFC 0004: notify digest must NEVER include raw event payload: {ctx}"
+    );
+    assert!(
+        ctx.contains("<muted count=\"3\"/>"),
         "expected piggybacked muted count: {ctx}"
     );
 
@@ -706,12 +730,21 @@ async fn two_native_rust_daemons_over_rust_hub_hooks_mcp_delivery_wait_watch_kv_
         .unwrap();
     assert_eq!(w_code, 0);
     let first_watch: Value = serde_json::from_str(w_out.lines().next().unwrap()).unwrap();
+    let watch_txt = first_watch["text"].as_str().unwrap();
     assert!(
-        first_watch["text"]
-            .as_str()
-            .unwrap()
-            .contains("watch-stream-ping")
+        watch_txt.starts_with("<hyphae-inbox ")
+            && watch_txt.contains("<dm from=\"alice@macbook/claude\" count=\"1\"/>"),
+        "expected metadata-only XML digest in hyp watch, got: {watch_txt}"
     );
+    assert!(
+        !watch_txt.contains("watch-stream-ping"),
+        "RFC 0004: hyp watch must NEVER expose raw DM body: {watch_txt}"
+    );
+    let (w_inbox_txt, w_inbox_err) = bob_mcp
+        .call_verified_claude(&bob_sock, "bob-sess-1", "hyp_inbox", json!({}))
+        .await;
+    assert!(!w_inbox_err, "watch hyp_inbox failed: {w_inbox_txt}");
+    assert!(w_inbox_txt.contains("watch-stream-ping"));
 
     // 10. `hyp_kv`: Alice writes Shared KV on `acme-team`, Bob reads & lists it!
     let (kv_set_txt, kv_set_err) = alice_mcp
@@ -822,12 +855,22 @@ async fn two_native_rust_daemons_over_rust_hub_hooks_mcp_delivery_wait_watch_kv_
 
     let push_notif = chan_mcp.next_message().await;
     assert_eq!(push_notif["method"], "notifications/claude/channel");
+    let push_content = push_notif["params"]["content"].as_str().unwrap();
     assert!(
-        push_notif["params"]["content"]
-            .as_str()
-            .unwrap()
-            .contains("native-rust-claude-channel-push!")
+        push_content
+            .starts_with("<hyphae-inbox handle=\"chan-bob\" unread=\"1\" urgency=\"queue\">")
+            && push_content.contains("<dm from=\"alice@macbook/")
+            && !push_content.contains("native-rust-claude-channel-push!"),
+        "--claude-channel must push metadata-only XML digest (RFC 0004): {push_content}"
     );
+    let (ch_inbox_txt, ch_inbox_err) = chan_mcp.call_tool("hyp_inbox", json!({}), None).await;
+    assert!(!ch_inbox_err, "chan hyp_inbox failed: {ch_inbox_txt}");
+    let ch_inbox: Value = serde_json::from_str(&ch_inbox_txt).unwrap();
+    assert_eq!(
+        ch_inbox["items"][0]["text"],
+        "native-rust-claude-channel-push!"
+    );
+    assert_eq!(ch_inbox["acked"], 1);
 
     // 12. Verify `daemon.status` RPC returns nodeId, version, profile, sessions, peers, mutedCount, quarantinedCount!
     let status = daemon_rpc_async(
@@ -1182,10 +1225,22 @@ async fn peers_reload_hot_reconciles_new_and_revoked_peers_idempotently_with_ui_
         .await;
         if drained.ok {
             if let Some(res) = drained.result {
-                if Value::Object(res)
-                    .to_string()
-                    .contains("hello-over-hot-reloaded-link")
-                {
+                let s = Value::Object(res).to_string();
+                if s.contains("<hyphae-inbox") && s.contains("alice@macbook/sender") {
+                    assert!(
+                        !s.contains("hello-over-hot-reloaded-link"),
+                        "RFC 0004: mailbox.drain must not expose raw DM body: {s}"
+                    );
+                    assert!(
+                        bob_node
+                            .db()
+                            .local()
+                            .peek_inbox("claude:bob-1", 10)
+                            .unwrap()
+                            .iter()
+                            .any(|m| m.text.contains("hello-over-hot-reloaded-link")),
+                        "decrypted DM must be persisted in Bob's mailbox"
+                    );
                     delivered = true;
                     break;
                 }

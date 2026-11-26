@@ -383,7 +383,7 @@ async fn x3_unauthenticated_t3_never_attaches_and_t3_auth_missing_detaches_clean
     assert_eq!(st["hasLiveTransport"], false);
     assert_eq!(st["pending"], 1);
 
-    // Fallback TurnEnd (Stop) hook now delivers the preserved Queue message cleanly!
+    // Fallback TurnEnd (Stop) hook now emits metadata-only XML digest for the preserved Queue message!
     let post = run_hook(
         &sock,
         HarnessKind::Claude,
@@ -391,9 +391,17 @@ async fn x3_unauthenticated_t3_never_attaches_and_t3_auth_missing_detaches_clean
         json!({ "session_id": "sess-t3-missing-tok" }),
     )
     .await;
+    let post_reason = post["reason"]
+        .as_str()
+        .expect("fallback Stop hook must emit XML digest after T3 detach");
     assert!(
-        post.to_string().contains("WAKEUP_AFTER_T3_DETACH"),
-        "fallback hook must deliver preserved message after T3 detach: {post}"
+        post_reason.starts_with("<hyphae-inbox unread=\"1\" urgency=\"queue\">")
+            && post_reason.contains("<dm from=\"peer@box/dev\" count=\"1\"/>"),
+        "fallback hook must emit metadata-only XML digest after T3 detach: {post}"
+    );
+    assert!(
+        !post_reason.contains("WAKEUP_AFTER_T3_DETACH"),
+        "RFC 0004: fallback Stop hook must NEVER include raw DM body: {post}"
     );
 
     mcp.close().await;
@@ -470,7 +478,7 @@ async fn x4_terminal_transport_errors_detach_and_immediately_refresh_ui_state() 
         );
         assert!(sess_entry["transportKind"].is_null());
 
-        // Fallback TurnEnd (Stop) hook resumes and delivers preserved Queue message!
+        // Fallback TurnEnd (Stop) hook resumes and emits metadata-only XML digest for preserved Queue message!
         let raw_sid = sid.strip_prefix("claude:").unwrap();
         let hook_out = run_hook(
             &sock,
@@ -479,9 +487,17 @@ async fn x4_terminal_transport_errors_detach_and_immediately_refresh_ui_state() 
             json!({ "session_id": raw_sid }),
         )
         .await;
+        let reason = hook_out["reason"]
+            .as_str()
+            .expect("fallback Stop hook must emit XML digest after detach");
         assert!(
-            hook_out.to_string().contains(msg_text),
-            "fallback hook must deliver message after {kind} detach: {hook_out}"
+            reason.starts_with("<hyphae-inbox unread=\"1\" urgency=\"queue\">")
+                && reason.contains("<dm from=\"bob@lap/dev\" count=\"1\"/>"),
+            "fallback hook must emit metadata-only XML digest after {kind} detach: {hook_out}"
+        );
+        assert!(
+            !reason.contains(msg_text),
+            "RFC 0004: fallback hook must NEVER include raw body after {kind} detach: {hook_out}"
         );
     }
 
@@ -1006,20 +1022,30 @@ async fn h6_drop_watcher_reconnects_with_last_event_id_and_surfaces_unrecoverabl
     )
     .await;
 
-    // Wait for reconnect + ingest + live delivery to `claude:h6-sess`!
+    // Wait for reconnect + ingest + live metadata-only XML digest delivery to `claude:h6-sess`!
     let delivered = transport
         .wait_for_delivered(1, Duration::from_secs(5))
         .await;
     assert!(
-        delivered[0].contains("H6_RECONNECTED_DIRECTIVE_PAYLOAD_77"),
-        "expected reconnected human directive delivery, got: {:?}",
+        delivered[0].starts_with("<hyphae-inbox handle=\"dev\" unread=\"1\" urgency=\"queue\">")
+            && delivered[0].contains("human:bogdan:")
+            && delivered[0].contains("verified=\"true\""),
+        "H9/RFC 0004: reconnected human directive must deliver verified XML digest: {:?}",
         delivered
     );
-    // H9 check in packed context header too!
     assert!(
-        delivered[0].contains("human-verified") && delivered[0].contains("bogdan"),
-        "H9: packed context header must expose human-verified provenance: {}",
+        !delivered[0].contains("H6_RECONNECTED_DIRECTIVE_PAYLOAD_77"),
+        "RFC 0004: push digest must NEVER include raw directive text: {}",
         delivered[0]
+    );
+    assert!(
+        node.db()
+            .local()
+            .peek_inbox("claude:h6-sess", 10)
+            .unwrap()
+            .iter()
+            .any(|m| m.text.contains("H6_RECONNECTED_DIRECTIVE_PAYLOAD_77")),
+        "full reconnected human directive must remain stored in mailbox for hyp_inbox"
     );
 
     // Wait briefly for POST /ack
@@ -1109,10 +1135,19 @@ async fn h6_drop_watcher_reconnects_with_last_event_id_and_surfaces_unrecoverabl
         .wait_for_delivered(2, Duration::from_secs(5))
         .await;
     assert!(
-        delivered_after_gone[1].contains("drop-gone-410")
-            && delivered_after_gone[1].contains("410"),
-        "H6: unrecoverable relay 410 must deliver safe metadata-only notice: {:?}",
+        delivered_after_gone[1].starts_with("<hyphae-inbox handle=\"dev\" ")
+            && delivered_after_gone[1].contains("<system from=\"hyphae:system\" count=\"1\"/>"),
+        "H6/RFC 0004: unrecoverable relay 410 must deliver safe metadata-only system XML digest: {:?}",
         delivered_after_gone[1]
+    );
+    assert!(
+        node.db()
+            .local()
+            .peek_inbox("claude:h6-sess", 10)
+            .unwrap()
+            .iter()
+            .any(|m| m.text.contains("drop-gone-410") && m.text.contains("410")),
+        "H6: full unrecoverable relay 410 notice must be stored in mailbox for hyp_inbox"
     );
 
     mcp.close().await;
@@ -1248,11 +1283,16 @@ async fn h9_human_verified_metadata_exposed_in_hyp_inbox_and_packed_headers() {
         .to_string();
     let kid8: String = human_kp.kid().chars().take(8).collect();
     assert!(
-        rendered.contains("human-verified")
-            && rendered.contains("alice-admin")
-            && rendered.contains(&kid8)
-            && rendered.contains("APPROVE_PROD_RELEASE_H9"),
-        "H9: packed context header must show human-verified + humanId + kid8: {rendered}"
+        rendered.starts_with("<hyphae-inbox handle=\"worker\" unread=\"2\" urgency=\"queue\">")
+            && rendered.contains(&format!(
+                "<dm from=\"human:alice-admin:{kid8}\" count=\"1\" verified=\"true\"/>"
+            ))
+            && rendered.contains("<dm from=\"ext@peer/guest\" count=\"1\"/>"),
+        "H9/RFC 0004: XML digest must distinguish verified human authority (verified=\"true\" + humanId + kid8) from unverified peer: {rendered}"
+    );
+    assert!(
+        !rendered.contains("APPROVE_PROD_RELEASE_H9"),
+        "RFC 0004: digest must NEVER include raw body text: {rendered}"
     );
 
     mcp.close().await;
@@ -1370,14 +1410,31 @@ async fn g8_approving_quarantined_local_ingest_fans_out_to_subscribed_sessions()
         "G8: inbox.wake must fan out approved local-ingest event and wake subscriber: {wake_res:?}"
     );
 
-    // 3. Subscribed session's live transport MUST receive the approved local-ingest event without re-quarantine!
+    // 3. Subscribed session's live transport MUST receive metadata-only XML digest without re-quarantine!
     let delivered = transport
         .wait_for_delivered(1, Duration::from_secs(3))
         .await;
     assert!(
-        delivered[0].contains("HOLD_FOR_APPROVAL nightly backup summary #42"),
-        "subscribed session must receive approved local-ingest payload: {:?}",
+        delivered[0].starts_with("<hyphae-inbox handle=\"sched\" unread=\"1\" urgency=\"queue\">")
+            && delivered[0].contains("<stream topic=\"local.schedule\" count=\"1\"/>"),
+        "subscribed session must receive metadata-only XML digest for approved local-ingest event: {:?}",
         delivered
+    );
+    assert!(
+        !delivered[0].contains("HOLD_FOR_APPROVAL nightly backup summary #42"),
+        "RFC 0004: push digest must NEVER include raw event payload: {:?}",
+        delivered
+    );
+    assert!(
+        node.db()
+            .local()
+            .peek_inbox("claude:g8-sub", 10)
+            .unwrap()
+            .iter()
+            .any(|m| m
+                .text
+                .contains("HOLD_FOR_APPROVAL nightly backup summary #42")),
+        "approved local-ingest payload must be readable in subscriber mailbox"
     );
     assert_eq!(
         node.db().local().quarantined_count(None).unwrap(),
@@ -1502,11 +1559,15 @@ async fn g10_reconcile_quarantine_surfaces_coalesced_metadata_only_notice() {
         .as_str()
         .unwrap()
         .to_string();
-    assert!(rendered1.contains("BENIGN_MSG_1"));
+    assert!(
+        rendered1.starts_with("<hyphae-inbox handle=\"agent\" unread=\"1\" urgency=\"queue\">")
+    );
+    assert!(rendered1.contains("<dm from=\"g10-notice@box/self\" count=\"1\"/>"));
+    assert!(!rendered1.contains("BENIGN_MSG_1"));
     assert!(rendered1.contains(&q_rcpt));
     assert!(rendered1.contains("evil@ext/bot"));
     assert!(
-        rendered1.contains("ask the human to review via `hyp gate review` / `hyp inbox approve`"),
+        rendered1.contains("ask the human to review via hyp gate review / hyp inbox approve"),
         "G10: quarantine notice must direct agent to ask the human, not run gate review itself: {rendered1}"
     );
     assert!(!rendered1.contains("SECRET_EXFIL_BODY_G10"));
@@ -1533,7 +1594,11 @@ async fn g10_reconcile_quarantine_surfaces_coalesced_metadata_only_notice() {
         .as_str()
         .unwrap()
         .to_string();
-    assert!(rendered2.contains("BENIGN_MSG_2"));
+    assert!(
+        rendered2.starts_with("<hyphae-inbox handle=\"agent\" unread=\"2\" urgency=\"queue\">")
+    );
+    assert!(rendered2.contains("<dm from=\"g10-notice@box/self\" count=\"2\"/>"));
+    assert!(!rendered2.contains("BENIGN_MSG_2"));
     assert!(
         !rendered2.contains(&q_rcpt),
         "quarantine notice must be coalesced and never spam subsequent batches: {rendered2}"
@@ -2162,13 +2227,22 @@ async fn h18_drop_watcher_ignores_junk_envelope_and_delivers_subsequent_valid_dr
         .wait_for_delivered(1, Duration::from_secs(5))
         .await;
     assert!(
-        delivered[0].contains("REAL_HUMAN_DROP_AFTER_JUNK_H18"),
-        "H18: drop watcher must survive junk envelope and deliver valid drop: {delivered:?}"
+        delivered[0].starts_with("<hyphae-inbox handle=\"dev\" unread=\"1\" urgency=\"queue\">")
+            && delivered[0].contains("human:bogdan:")
+            && delivered[0].contains("verified=\"true\""),
+        "H18: drop watcher must survive junk envelope and deliver valid verified XML digest: {delivered:?}"
     );
     assert!(
-        !delivered[0].contains("FORGED_JUNK_DROP_H18"),
-        "junk drop must never be delivered"
+        !delivered[0].contains("REAL_HUMAN_DROP_AFTER_JUNK_H18")
+            && !delivered[0].contains("FORGED_JUNK_DROP_H18"),
+        "RFC 0004: push digest must NEVER include raw drop body (and junk drop must never be stored)"
     );
+    let rows = node.db().local().peek_inbox("claude:h18-sess", 10).unwrap();
+    assert!(
+        rows.iter()
+            .any(|m| m.text.contains("REAL_HUMAN_DROP_AFTER_JUNK_H18"))
+    );
+    assert!(!rows.iter().any(|m| m.text.contains("FORGED_JUNK_DROP_H18")));
 
     mcp.close().await;
     daemon.stop().await;
@@ -2280,12 +2354,28 @@ async fn g8_approval_never_blanket_approves_unrelated_batches_and_sweeps_on_star
         .await;
     let combined = delivered.join("\n");
     assert!(
-        combined.contains("explicitly human approved"),
-        "approved event must be delivered: {combined}"
+        combined.starts_with("<hyphae-inbox handle=\"worker\" unread=\"1\" urgency=\"queue\">")
+            && combined.contains("<stream topic=\"local.schedule\" count=\"1\"/>"),
+        "approved event must surface in metadata-only XML digest: {combined}"
     );
     assert!(
-        !combined.contains("sneaky payload"),
-        "G8 VIOLATION: unrelated due batch on same topic was blanket-approved! {combined}"
+        !combined.contains("explicitly human approved") && !combined.contains("sneaky payload"),
+        "RFC 0004 / G8: digest must NEVER expose raw event bodies: {combined}"
+    );
+    let cleared = node
+        .db()
+        .local()
+        .peek_inbox_gate_cleared("claude:g8-strict-sub", 10)
+        .unwrap();
+    assert!(
+        cleared
+            .iter()
+            .any(|m| m.text.contains("explicitly human approved")),
+        "approved event must be in gate-cleared mailbox: {cleared:?}"
+    );
+    assert!(
+        !cleared.iter().any(|m| m.text.contains("sneaky payload")),
+        "G8 VIOLATION: unrelated due batch on same topic was blanket-approved! {cleared:?}"
     );
     assert_eq!(
         node.db()
@@ -2346,8 +2436,18 @@ async fn g8_approval_never_blanket_approves_unrelated_batches_and_sweeps_on_star
     assert!(drain2.ok);
     let rendered2 = serde_json::to_string(&drain2.result).unwrap();
     assert!(
-        rendered2.contains("OFFLINE_APPROVED_STARTUP_SWEEP_G8"),
-        "G8 startup sweep must fan out offline-approved local-ingest row: {rendered2}"
+        rendered2.contains("<hyphae-inbox") && rendered2.contains("local.schedule"),
+        "G8 startup sweep must emit metadata-only XML digest for offline-approved local-ingest row: {rendered2}"
+    );
+    assert!(!rendered2.contains("OFFLINE_APPROVED_STARTUP_SWEEP_G8"));
+    assert!(
+        node.db()
+            .local()
+            .peek_inbox_gate_cleared("claude:g8-strict-sub", 20)
+            .unwrap()
+            .iter()
+            .any(|m| m.text.contains("OFFLINE_APPROVED_STARTUP_SWEEP_G8")),
+        "G8 startup sweep must fan out offline-approved local-ingest row into subscriber mailbox"
     );
 
     daemon2.stop().await;

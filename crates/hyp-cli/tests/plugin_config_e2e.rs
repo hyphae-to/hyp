@@ -1202,19 +1202,24 @@ srv.shutdown()
             !wait_items.is_empty(),
             "Issue #39 (B1): hyp wait must deliver wake item immediately: {wait_out}"
         );
-        // Issue #38: ExternalWebhook trust tier defaults to `DowngradeToNotify`, so `hyp wait`
-        // wakes immediately with a `notifyOnly: true` digest for `local.personal-mail` while
-        // storing the full CloudEvent (stamped `hyphaesourcekind = "external-webhook"`) in mailbox!
+        // RFC 0004 / Issue #38: ExternalWebhook trust tier defaults to Stage 1 `CapToQueue`
+        // (`notifyOnly: false`, `urgency="queue"`), so `hyp wait` wakes immediately with a
+        // metadata-only `<hyphae-inbox ...>` XML digest (zero raw payload!) for `local.personal-mail`
+        // while storing the full CloudEvent (stamped `hyphaesourcekind = "external-webhook"`) in mailbox!
         assert_eq!(
-            wait_items[0]["notifyOnly"], true,
-            "Issue #38: subprocess source event must enforce ExternalWebhook DowngradeToNotify: {wait_out}"
+            wait_items[0]["notifyOnly"], false,
+            "RFC 0004 / Issue #38: subprocess source event must enforce ExternalWebhook CapToQueue: {wait_out}"
+        );
+        let wait_text = wait_items[0]["text"].as_str().unwrap_or("");
+        assert!(
+            wait_text.contains("<hyphae-inbox ")
+                && wait_text.contains("urgency=\"queue\"")
+                && wait_text.contains("local.personal-mail"),
+            "hyp wait wake digest missing queue XML for local.personal-mail: {wait_out}"
         );
         assert!(
-            wait_items[0]["text"]
-                .as_str()
-                .unwrap_or("")
-                .contains("local.personal-mail"),
-            "hyp wait wake notice missing topic local.personal-mail: {wait_out}"
+            !wait_text.contains("INSTANT_B1_PAYLOAD_1"),
+            "RFC 0004: hyp wait wake digest must NEVER include raw CloudEvent payload: {wait_out}"
         );
         {
             let db = hyp_store::NodeDb::open(state_dir.join("node.sqlite")).unwrap();

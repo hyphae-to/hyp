@@ -294,8 +294,15 @@ fn strip_provenance_lines(text: &str) -> String {
     kept.join("\n")
 }
 
-/// Formats drained untrusted inbox items with a single leading `UNTRUSTED_PROVENANCE` header,
-/// deduplicating any repeated provenance lines across single- and multi-item hook drains.
+fn is_inbox_digest_text(text: &str) -> bool {
+    text.trim_start().starts_with("<hyphae-inbox")
+}
+
+/// Formats drained inbox items for hook injection.
+///
+/// Under RFC 0004, drained batches are compact metadata-only `<hyphae-inbox ...>` XML digests
+/// containing zero untrusted body text and are returned directly without a redundant prose
+/// provenance header. Any legacy non-digest payload retains a single leading `UNTRUSTED_PROVENANCE`.
 pub fn format_drained_messages(items: &[Value]) -> String {
     let texts: Vec<&str> = items
         .iter()
@@ -304,6 +311,9 @@ pub fn format_drained_messages(items: &[Value]) -> String {
         .collect();
     if texts.is_empty() {
         return String::new();
+    }
+    if texts.iter().all(|t| is_inbox_digest_text(t)) {
+        return texts.join("\n");
     }
     let stripped: Vec<String> = texts
         .into_iter()
@@ -795,7 +805,11 @@ where
             if text.is_empty() {
                 return json!({});
             }
-            let ctx = format!("Incoming hyphae message(s):\n\n{text}");
+            let ctx = if is_inbox_digest_text(&text) {
+                text
+            } else {
+                format!("Incoming hyphae message(s):\n\n{text}")
+            };
             match options.harness {
                 HarnessKind::Opencode => json!({ "additionalContext": ctx }),
                 HarnessKind::Cursor => json!({ "additional_context": ctx }),
@@ -819,7 +833,6 @@ where
             drain_pkt.insert("sessionId".into(), json!(session_id));
             drain_pkt.insert("harness".into(), json!(options.harness.as_str()));
             drain_pkt.insert("scope".into(), json!("pre_turn"));
-            drain_pkt.insert("includeNudged".into(), json!(true));
             drain_pkt.insert("limit".into(), json!(5));
             if options.harness == HarnessKind::Openclaw {
                 attach_openclaw_session_hints(&mut drain_pkt, payload);
@@ -848,7 +861,11 @@ where
                     _ => json!({}),
                 };
             }
-            let ctx = format!("Incoming hyphae message(s):\n\n{text}");
+            let ctx = if is_inbox_digest_text(&text) {
+                text
+            } else {
+                format!("Incoming hyphae message(s):\n\n{text}")
+            };
             match options.harness {
                 HarnessKind::Antigravity => json!({
                     "injectSteps": [
@@ -916,10 +933,12 @@ where
             if !items.is_empty() {
                 let text = format_drained_messages(&items);
                 if !text.is_empty() {
-                    return format_stop_continuation(
-                        options.harness,
-                        format!("Incoming hyphae message(s):\n\n{text}"),
-                    );
+                    let reason = if is_inbox_digest_text(&text) {
+                        text
+                    } else {
+                        format!("Incoming hyphae message(s):\n\n{text}")
+                    };
+                    return format_stop_continuation(options.harness, reason);
                 }
             }
 
@@ -1709,7 +1728,7 @@ mod tests {
                 DaemonRpcResult::ok(
                     json!({
                         "items": [{
-                            "text": format!("hyphae from bob/dev\n{UNTRUSTED_PROVENANCE}\n\"deploy ready\"")
+                            "text": "<hyphae-inbox handle=\"claw\" unread=\"1\" urgency=\"queue\">\n  <dm from=\"bob/dev\" count=\"1\"/>\n</hyphae-inbox>"
                         }]
                     })
                     .as_object()
@@ -1726,7 +1745,7 @@ mod tests {
             "openclaw:agent:main:explicit:oc-sess-1"
         );
         assert_eq!(pkts[0]["harness"], "openclaw");
-        assert_eq!(pkts[0]["includeNudged"], true);
+        assert!(pkts[0].get("includeNudged").is_none());
         assert_eq!(pkts[0]["sessionKey"], "agent:main:explicit:oc-sess-1");
         assert_eq!(
             pkts[0]["openclawSessionKey"],
@@ -1738,9 +1757,9 @@ mod tests {
         let ctx = res["prependContext"]
             .as_str()
             .expect("prependContext string");
-        assert!(ctx.starts_with("Incoming hyphae message(s):\n\n"));
-        assert!(ctx.contains("deploy ready"));
-        assert!(ctx.contains(UNTRUSTED_PROVENANCE));
+        assert!(ctx.starts_with("<hyphae-inbox "));
+        assert!(ctx.contains("<dm from=\"bob/dev\" count=\"1\"/>"));
+        assert!(!ctx.contains("Incoming hyphae message(s):"));
 
         // Empty drain -> `{}`
         let empty = handle_hook_payload_with(
@@ -1792,9 +1811,9 @@ mod tests {
         let item_rpc = |_sock: &Path, pkt: &Value| {
             assert_eq!(pkt["type"], "mailbox.drain");
             assert_eq!(pkt["scope"], "pre_turn");
-            assert_eq!(pkt["includeNudged"], true);
+            assert!(pkt.get("includeNudged").is_none());
             DaemonRpcResult::ok(
-                json!({"items": [{"text": "queued hello"}]})
+                json!({"items": [{"text": "<hyphae-inbox unread=\"1\" urgency=\"queue\">\n  <dm from=\"bob/dev\" count=\"1\"/>\n</hyphae-inbox>"}]})
                     .as_object()
                     .unwrap()
                     .clone(),
@@ -1814,7 +1833,7 @@ mod tests {
             claude["hookSpecificOutput"]["additionalContext"]
                 .as_str()
                 .unwrap()
-                .contains("queued hello")
+                .starts_with("<hyphae-inbox ")
         );
 
         let codex = handle_hook_payload_with(
@@ -1844,7 +1863,7 @@ mod tests {
             cursor["additional_context"]
                 .as_str()
                 .unwrap()
-                .contains("queued hello")
+                .starts_with("<hyphae-inbox ")
         );
 
         let cursor_empty = handle_hook_payload_with(

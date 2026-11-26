@@ -218,6 +218,7 @@ impl FilterPlugin for InspectingStage2Filter {
                 FilterOutcome {
                     decision: GateDecision::Allow {
                         downgraded_to_notify: false,
+                        capped_to_queue: false,
                     },
                     confidence: Some(0.98),
                     categories: vec!["clean".to_string()],
@@ -345,15 +346,20 @@ async fn g2_local_webhook_events_and_plugins_never_bypass_stage2_as_selfhost() {
     assert_eq!(items.len(), 1, "only same-node DM should be delivered");
     let rendered = items[0]["text"].as_str().unwrap();
     assert!(
-        rendered.contains("Same-node DM"),
-        "genuine same-node DM must deliver cleanly: {rendered}"
+        rendered.starts_with("<hyphae-inbox unread=\"1\" urgency=\"queue\">")
+            && rendered.contains("<dm from=\"alice@macbook/dev\" count=\"1\"/>"),
+        "genuine same-node DM must surface in metadata-only XML digest: {rendered}"
     );
     assert!(
-        !rendered.contains("GitHub PR comment")
+        !rendered.contains("Same-node DM")
+            && !rendered.contains("GitHub PR comment")
             && !rendered.contains("Telegram mirror")
             && !rendered.contains("Direct plugin row"),
-        "webhook/bridge events & plugins MUST NEVER bypass Stage 2: {rendered}"
+        "RFC 0004: digest must NEVER leak raw payloads (and webhook/bridge events must be quarantined): {rendered}"
     );
+    let cleared = node.db().local().peek_inbox_gate_cleared(sid, 10).unwrap();
+    assert_eq!(cleared.len(), 1);
+    assert!(cleared[0].text.contains("Same-node DM"));
 
     // Verify exact trust tiers observed by Stage 2 classifier!
     let seen = filter.seen_snapshot();
@@ -739,21 +745,35 @@ async fn g4_rate_limit_hold_retains_audits_and_auto_retries_delivery() {
     assert!(wake_res.ok, "inbox.wake failed: {wake_res:?}");
 
     let first_deliveries = transport.wait_for_count(1, Duration::from_secs(2)).await;
-    assert!(first_deliveries[0].0.contains("HOLD_RAW_FIRST"));
     assert!(
-        !first_deliveries[0].0.contains("HOLD_RAW_SECOND_RETRY_ME"),
-        "held item MUST NOT be delivered before rate-limit window clears!"
+        first_deliveries[0]
+            .0
+            .starts_with("<hyphae-inbox unread=\"1\" urgency=\"queue\">")
+            && first_deliveries[0]
+                .0
+                .contains("<dm from=\"bob@laptop/dev\" count=\"1\"/>"),
+        "first delivery must emit metadata-only XML digest for raw-1: {:?}",
+        first_deliveries[0]
+    );
+    assert!(
+        !first_deliveries[0].0.contains("HOLD_RAW_FIRST")
+            && !first_deliveries[0].0.contains("HOLD_RAW_SECOND_RETRY_ME"),
+        "RFC 0004: push digest must NEVER expose raw bodies: {:?}",
+        first_deliveries[0]
     );
 
-    // Immediately verify raw-2 is STILL retained unscreened (`Pending`, `reviewed_at == None`)
-    // AND invisible to `hyp_inbox`, AND recorded in immutable `gate_audit`!
+    // Immediately verify raw-1 was promoted (`reviewed_at.is_some()`, `notified == true`, still
+    // `Pending` until read via `hyp_inbox`) while raw-2 is STILL retained unscreened (`Pending`,
+    // `reviewed_at == None`) AND invisible to `peek_inbox_gate_cleared`, AND recorded in `gate_audit`!
     let m1_after = node
         .db()
         .local()
         .get_mailbox_entry(&receipt_m1)
         .unwrap()
         .unwrap();
-    assert_eq!(m1_after.gate_state, GateState::Delivered);
+    assert_eq!(m1_after.gate_state, GateState::Pending);
+    assert!(m1_after.reviewed_at.is_some());
+    assert!(m1_after.notified);
 
     let m2_held = node
         .db()
@@ -770,12 +790,11 @@ async fn g4_rate_limit_hold_retains_audits_and_auto_retries_delivery() {
         m2_held.reviewed_at.is_none(),
         "held row must remain unscreened (`reviewed_at == None`) until gate clears it"
     );
+    let cleared_mid = node.db().local().peek_inbox_gate_cleared(sid, 50).unwrap();
+    assert_eq!(cleared_mid.len(), 1);
+    assert_eq!(cleared_mid[0].receipt, receipt_m1);
     assert!(
-        node.db()
-            .local()
-            .peek_inbox_gate_cleared(sid, 50)
-            .unwrap()
-            .is_empty(),
+        !cleared_mid.iter().any(|e| e.receipt == receipt_m2),
         "held row must NOT appear in gate-cleared inbox"
     );
 
@@ -806,11 +825,24 @@ async fn g4_rate_limit_hold_retains_audits_and_auto_retries_delivery() {
         "G4 VIOLATION: Hold verdict must write immutable gate_audit row: {audit_rows:?}"
     );
 
-    // Wait for automatic bounded delayed retry (~525ms) -> raw-2 MUST be delivered automatically!
+    // Wait for automatic bounded delayed retry (~525ms) -> raw-2 MUST clear gate & wake automatically!
     let after_retry = transport.wait_for_count(2, Duration::from_secs(3)).await;
     assert!(
-        after_retry[1].0.contains("HOLD_RAW_SECOND_RETRY_ME"),
-        "held item must be auto-delivered once rate-limit window clears: {after_retry:?}"
+        after_retry[1].0.starts_with("<hyphae-inbox ")
+            && after_retry[1]
+                .0
+                .contains("<dm from=\"bob@laptop/dev\" count=\"2\"/>"),
+        "held item must auto-deliver metadata-only digest once rate-limit window clears: {after_retry:?}"
+    );
+    assert!(!after_retry[1].0.contains("HOLD_RAW_SECOND_RETRY_ME"));
+    assert!(
+        node.db()
+            .local()
+            .peek_inbox_gate_cleared(sid, 50)
+            .unwrap()
+            .iter()
+            .any(|e| e.text.contains("HOLD_RAW_SECOND_RETRY_ME")),
+        "held item must be promoted in gate-cleared mailbox for hyp_inbox"
     );
 
     // ---- Path B: Bridge `ingest_inbound` Hold retains & auto-retries too! ----
@@ -849,10 +881,25 @@ async fn g4_rate_limit_hold_retains_audits_and_auto_retries_delivery() {
     // Wait for automatic retry to deliver the held bridge message!
     let after_bridge_retry = transport.wait_for_count(4, Duration::from_secs(3)).await;
     assert!(
-        after_bridge_retry[3]
+        after_bridge_retry[3].0.starts_with("<hyphae-inbox ")
+            && after_bridge_retry[3]
+                .0
+                .contains("<bridge target=\"telegram:room-1\" count=\"2\"/>"),
+        "held bridge message must NOT be lost and must auto-deliver XML digest after window clears: {after_bridge_retry:?}"
+    );
+    assert!(
+        !after_bridge_retry[3]
             .0
-            .contains("BRIDGE_SECOND_HELD_THEN_DELIVERED"),
-        "held bridge message must NOT be lost and must auto-deliver after window clears: {after_bridge_retry:?}"
+            .contains("BRIDGE_SECOND_HELD_THEN_DELIVERED")
+    );
+    assert!(
+        node.db()
+            .local()
+            .peek_inbox_gate_cleared(sid, 50)
+            .unwrap()
+            .iter()
+            .any(|e| e.text.contains("BRIDGE_SECOND_HELD_THEN_DELIVERED")),
+        "held bridge item must be promoted in gate-cleared mailbox for hyp_inbox"
     );
 
     daemon.stop().await;
@@ -901,23 +948,15 @@ async fn b2_g11_bridge_message_cannot_strip_header_or_forge_sibling_block_e2e() 
 
     let delivered = transport.wait_for_count(1, Duration::from_secs(2)).await;
     let prompt = &delivered[0].0;
-    let lines: Vec<&str> = prompt.lines().collect();
-
+    // RFC 0004: Zero untrusted bridge body text EVER appears in hook/wake prompts!
     assert_eq!(
-        lines[0], "[hyphae · telegram:ops-chat]",
-        "bridge message starting with 'hyphae ' MUST keep its [hyphae · telegram:ops-chat] header: {prompt}"
+        prompt,
+        "<hyphae-inbox unread=\"1\" urgency=\"queue\">\n  <bridge target=\"telegram:ops-chat\" count=\"1\"/>\n</hyphae-inbox>",
+        "bridge delivery must be strictly metadata-only XML digest: {prompt}"
     );
-    for (idx, line) in lines.iter().enumerate().skip(1) {
-        let trimmed = line.trim_start();
-        assert!(
-            !trimmed.starts_with("---"),
-            "bridge body must not emit raw '---' separator at line {idx}: {prompt}"
-        );
-        assert!(
-            !trimmed.to_ascii_lowercase().starts_with("[hyphae"),
-            "bridge body must not forge sibling [hyphae] header at line {idx}: {prompt}"
-        );
-    }
+    assert!(!prompt.contains("hyphae fake trusted notice"));
+    assert!(!prompt.contains("[hyphae"));
+    assert!(!prompt.contains("---"));
 
     daemon.stop().await;
 }
@@ -1109,9 +1148,17 @@ async fn hub_relayed_org_event_and_webhook_origin_capped_to_external_webhook_and
     let items = drain.result.unwrap()["items"].as_array().unwrap().clone();
     assert_eq!(items.len(), 1, "only normal Org DM should deliver");
     let rendered = items[0]["text"].as_str().unwrap();
-    assert!(rendered.contains("Legitimate Org DM"));
+    assert!(
+        rendered.starts_with("<hyphae-inbox unread=\"1\" urgency=\"queue\">")
+            && rendered.contains("<dm from=\"team-hub@acme/ops\" count=\"1\"/>"),
+        "only normal Org DM should surface in metadata-only XML digest: {rendered}"
+    );
+    assert!(!rendered.contains("Legitimate Org DM"));
     assert!(!rendered.contains("github:webhook"));
     assert!(!rendered.contains("via message envelope"));
+    let cleared = node.db().local().peek_inbox_gate_cleared(sid, 10).unwrap();
+    assert_eq!(cleared.len(), 1);
+    assert!(cleared[0].text.contains("Legitimate Org DM"));
 
     let seen = filter.seen_snapshot();
     assert_eq!(

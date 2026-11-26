@@ -118,6 +118,9 @@ pub struct LocalIngestOutcome {
     /// `true` if the Security Gate downgraded delivery urgency to `notify`.
     #[serde(default)]
     pub downgraded_to_notify: bool,
+    /// `true` if the Security Gate capped delivery urgency at `queue` (RFC 0004 Stage 1 default).
+    #[serde(default)]
+    pub capped_to_queue: bool,
     /// Monotonic `gate_audit` sequence number, if an audit row was written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_seq: Option<i64>,
@@ -505,6 +508,7 @@ impl LocalIngestState {
         // 6. Security Gate verification (`if route.gate` and `gate` is `Some(g)`).
         let mut audit_seq: Option<i64> = None;
         let mut downgraded_to_notify = false;
+        let mut capped_to_queue = false;
         let qualified_topic = format!("local.{topic}");
 
         if route.gate {
@@ -540,8 +544,10 @@ impl LocalIngestState {
                 match eval.decision {
                     GateDecision::Allow {
                         downgraded_to_notify: downgraded,
+                        capped_to_queue: capped,
                     } => {
                         downgraded_to_notify = downgraded;
+                        capped_to_queue = capped;
                     }
                     GateDecision::Block { reason } => {
                         return Err(LocalIngestError::GateBlocked {
@@ -646,11 +652,18 @@ impl LocalIngestState {
             coalesce_key: effective_coalesce_key.clone(),
             expires_at,
         };
-        let delivered_sessions = self.node.deliver_local_topic_batches(
+        let gate_reason = if downgraded_to_notify {
+            Some("downgraded_to_notify")
+        } else if capped_to_queue {
+            Some("capped_to_queue")
+        } else {
+            None
+        };
+        let delivered_sessions = self.node.deliver_local_topic_batches_with_gate_reason(
             &topic,
             &put_opts,
             verified_claim.as_ref(),
-            downgraded_to_notify,
+            gate_reason,
             now_ms,
         )?;
 
@@ -668,6 +681,7 @@ impl LocalIngestState {
             coalesced,
             coalesce_key: effective_coalesce_key,
             downgraded_to_notify,
+            capped_to_queue,
             audit_seq,
             deduplicated: ingest_res.deduplicated,
         })

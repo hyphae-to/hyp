@@ -37,6 +37,9 @@ fn make_packable(
         created_at_ms,
         burst_demoted,
         is_system_notice: false,
+        topic: None,
+        subscription_key: None,
+        human_verified: false,
     }
 }
 
@@ -157,7 +160,8 @@ fn muted_items_never_wake_alone_and_piggyback_on_next_delivery() {
     let policy = SessionDeliveryPolicy::default();
     assert!(pack_delivery_batch(&[], 12, &policy).is_none());
 
-    // Even if a Notify-only item arrives in Focus Mode, digest fires AND piggybacks `· 12 muted`.
+    // Even if a Notify-only item arrives in Focus Mode, digest fires AND piggybacks `<muted count="12"/>`
+    // without EVER leaking the untrusted body text (RFC 0004).
     let notify_item = make_packable(
         "r-notify",
         DeliveryUrgency::Notify,
@@ -171,13 +175,19 @@ fn muted_items_never_wake_alone_and_piggyback_on_next_delivery() {
     );
     let notify_batch =
         pack_delivery_batch(&[notify_item], 12, &SessionDeliveryPolicy::focus_mode())
-            .expect("notify item must still emit 1-line digest");
+            .expect("notify item must still emit XML digest");
     assert!(notify_batch.notify_only);
-    assert!(notify_batch.rendered.contains("hyphae notify · 1 unread"));
-    assert!(notify_batch.rendered.contains("· 12 muted"));
-    assert!(notify_batch.rendered.contains("hyp_inbox("));
+    assert!(notify_batch.rendered.contains("unread=\"1\""));
+    assert!(notify_batch.rendered.contains("urgency=\"notify\""));
+    assert!(
+        notify_batch
+            .rendered
+            .contains("<dm from=\"bob@laptop/codex\" count=\"1\"/>")
+    );
+    assert!(notify_batch.rendered.contains("<muted count=\"12\"/>"));
+    assert!(!notify_batch.rendered.contains("PR #42 ready"));
 
-    // When a regular Queue DM arrives, inline batch fires AND piggybacks `· 12 muted`!
+    // When a regular Queue DM arrives, metadata-only XML digest fires AND piggybacks `<muted count="12"/>`!
     let dm = make_packable(
         "r-dm",
         DeliveryUrgency::Queue,
@@ -191,9 +201,16 @@ fn muted_items_never_wake_alone_and_piggyback_on_next_delivery() {
     );
     let dm_batch = pack_delivery_batch(&[dm], 12, &policy).expect("DM batch must emit");
     assert!(!dm_batch.notify_only);
-    assert_eq!(dm_batch.inline_ids, vec!["r-dm"]);
-    assert!(dm_batch.rendered.contains("Can you review checkout PR?"));
-    assert!(dm_batch.rendered.contains("· 12 muted"));
+    assert!(dm_batch.inline_ids.is_empty());
+    assert_eq!(dm_batch.spilled_ids, vec!["r-dm"]);
+    assert!(dm_batch.rendered.contains("urgency=\"queue\""));
+    assert!(
+        dm_batch
+            .rendered
+            .contains("<dm from=\"alice@macbook/claude\" count=\"1\"/>")
+    );
+    assert!(dm_batch.rendered.contains("<muted count=\"12\"/>"));
+    assert!(!dm_batch.rendered.contains("Can you review checkout PR?"));
     assert_eq!(dm_batch.muted_count, 12);
 }
 
@@ -306,23 +323,31 @@ fn token_budget_hybrid_packer_prioritizes_critical_dm_and_spills_twenty_noisy_ev
 
     let batch = pack_delivery_batch(&items, 4, &policy).expect("batch must emit");
 
-    // Critical DM MUST be inline verbatim at the top!
+    // RFC 0004: Strictly metadata-only XML digest! Zero body text ever appears; all 21 receipts
+    // remain unread (`spilled_ids`) until `hyp_inbox` reads them, with `urgency="interrupt"`
+    // hoisted from the critical DM.
+    assert!(batch.inline_ids.is_empty());
+    assert!(batch.truncated_ids.is_empty());
+    assert_eq!(batch.spilled_ids.len(), 21);
+    assert!(batch.spilled_ids.contains(&"dm-critical".to_string()));
+    assert!(!batch.rendered.contains(critical_body));
+    assert!(!batch.rendered.contains("CI build #"));
     assert!(
-        batch.inline_ids.contains(&"dm-critical".to_string()),
-        "critical DM must be packed inline verbatim: {batch:?}"
+        batch
+            .rendered
+            .contains("unread=\"21\" urgency=\"interrupt\"")
     );
-    assert!(batch.rendered.contains(critical_body));
-
-    // Majority of the 20 noisy events must spill into the compact 1-line digest footer.
     assert!(
-        batch.spilled_ids.len() >= 15,
-        "expected most noisy events spilled, got spilled={}",
-        batch.spilled_ids.len()
+        batch
+            .rendered
+            .contains("<dm from=\"ops@prod/oncall\" count=\"1\"/>")
     );
-    assert!(batch.rendered.contains("more unread:"));
-    assert!(batch.rendered.contains("acme-team.ci"));
-    assert!(batch.rendered.contains("· 4 muted"));
-    assert!(batch.rendered.contains("hyp_inbox("));
+    assert!(
+        batch
+            .rendered
+            .contains("<stream topic=\"acme-team.ci\" count=\"20\"/>")
+    );
+    assert!(batch.rendered.contains("<muted count=\"4\"/>"));
 
     // Strict token budget ceiling!
     assert!(
@@ -381,18 +406,25 @@ fn single_giant_payload_truncates_with_preview_and_inbox_ids_hint() {
         false,
     );
 
-    let batch = pack_delivery_batch(&[item], 0, &policy).expect("giant item preview must emit");
+    let batch = pack_delivery_batch(&[item], 0, &policy).expect("giant item XML digest must emit");
     assert!(batch.inline_ids.is_empty());
-    assert_eq!(batch.truncated_ids, vec!["rcpt-giant-42"]);
-    assert!(batch.rendered.contains("HEADER-START:"));
+    assert!(batch.truncated_ids.is_empty());
+    assert_eq!(batch.spilled_ids, vec!["rcpt-giant-42"]);
+    assert!(!batch.rendered.contains("HEADER-START:"));
+    assert!(!batch.rendered.contains("AAAA"));
     assert!(
         batch
             .rendered
-            .contains("full body in hyp_inbox(ids:[\"rcpt-giant-42\"])")
+            .contains("unread=\"1\" urgency=\"interrupt\"")
+    );
+    assert!(
+        batch
+            .rendered
+            .contains("<dm from=\"alice@macbook/claude\" count=\"1\"/>")
     );
     assert!(
         batch.estimated_tokens <= policy.max_batch_tokens,
-        "giant truncated batch must stay <= max_batch_tokens ({} <= {})",
+        "giant item XML digest must stay <= max_batch_tokens ({} <= {})",
         batch.estimated_tokens,
         policy.max_batch_tokens
     );

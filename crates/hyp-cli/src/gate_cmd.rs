@@ -361,6 +361,7 @@ fn error_action_str(action: Stage2ErrorAction) -> &'static str {
 fn tier_action_str(action: TierDeliveryAction) -> &'static str {
     match action {
         TierDeliveryAction::Allow => "allow",
+        TierDeliveryAction::CapToQueue => "cap_to_queue",
         TierDeliveryAction::DowngradeToNotify => "downgrade_to_notify",
         TierDeliveryAction::Quarantine => "quarantine",
     }
@@ -369,8 +370,9 @@ fn tier_action_str(action: TierDeliveryAction) -> &'static str {
 fn tier_action_strictness(action: TierDeliveryAction) -> u8 {
     match action {
         TierDeliveryAction::Allow => 0,
-        TierDeliveryAction::DowngradeToNotify => 1,
-        TierDeliveryAction::Quarantine => 2,
+        TierDeliveryAction::CapToQueue => 1,
+        TierDeliveryAction::DowngradeToNotify => 2,
+        TierDeliveryAction::Quarantine => 3,
     }
 }
 

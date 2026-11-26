@@ -372,11 +372,15 @@ fn cli_subprocesses_mcp_hook_and_wait_interop() {
     assert_eq!(wait_json["command"], "wait");
     let items = wait_json["data"]["items"].as_array().unwrap();
     assert!(!items.is_empty(), "expected woken wait items: {wait_json}");
+    let wait_txt = items[0]["text"].as_str().unwrap_or_default();
     assert!(
-        items
-            .iter()
-            .any(|i| i["text"].as_str().unwrap_or_default().contains(dm_text)),
-        "wait output missing DM text: {wait_json}"
+        wait_txt.contains("<hyphae-inbox ")
+            && wait_txt.contains("<dm from=\"cli@local/bob\" count=\"1\"/>"),
+        "wait output missing metadata-only XML digest: {wait_json}"
+    );
+    assert!(
+        !wait_txt.contains(dm_text),
+        "RFC 0004: wait output must NEVER include raw DM plaintext: {wait_json}"
     );
 
     // 5. Bob sends a second DM; Alice drains it through `hyp_inbox`!

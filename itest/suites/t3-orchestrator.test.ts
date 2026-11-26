@@ -177,12 +177,12 @@ test("T3 Orchestrator — real t3 serve: setup, statev2.sqlite auto-attach, /api
     // and verify the persisted message in `statev2.sqlite`!
     const dispatched = await t3.waitForDispatchedMessage(
       threadId,
-      (m) => m.text.includes("<hyphae-wake"),
+      (m) => m.text.includes("<hyphae-inbox"),
       15_000,
     );
     assert.ok(
-      dispatched.text.includes("<hyphae-wake") && dispatched.text.includes("hyp_inbox"),
-      `Dispatched T3 wake message must be a <hyphae-wake> nudge: ${dispatched.text}`,
+      dispatched.text.includes("<hyphae-inbox") && dispatched.text.includes('unread="1"'),
+      `Dispatched T3 wake message must be a <hyphae-inbox> digest: ${dispatched.text}`,
     );
     assert.equal(
       dispatched.text.includes(rawDmSecret),
@@ -312,7 +312,7 @@ test("T3 Orchestrator — unverified MCP spoof rejected, primary t3-auth-token s
 
     const dispatched = await t3.waitForDispatchedMessage(
       threadId,
-      (m) => m.text.includes("<hyphae-wake"),
+      (m) => m.text.includes("<hyphae-inbox"),
       15_000,
     );
     assert.equal(dispatched.text.includes(dmBody), false, "T3 wake must stay metadata-only");

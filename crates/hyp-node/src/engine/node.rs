@@ -8516,7 +8516,7 @@ impl UnifiedNode {
                 &topic,
                 &default_opts,
                 None,
-                false,
+                None,
                 now,
                 false,
             ) {
@@ -8542,6 +8542,25 @@ impl UnifiedNode {
         gate_downgraded: bool,
         now_ms: i64,
     ) -> Result<usize, NodeError> {
+        self.deliver_local_topic_batches_with_gate_reason(
+            topic,
+            put_opts,
+            human_auth,
+            gate_downgraded.then_some("downgraded_to_notify"),
+            now_ms,
+        )
+    }
+
+    /// Like [`Self::deliver_local_topic_batches`], recording an explicit Stage 1 `gate_reason`
+    /// (e.g. `"capped_to_queue"` or `"downgraded_to_notify"`).
+    pub fn deliver_local_topic_batches_with_gate_reason(
+        &self,
+        topic: &str,
+        put_opts: &MailboxPutOptions,
+        human_auth: Option<&VerifiedHumanClaim>,
+        gate_reason: Option<&str>,
+        now_ms: i64,
+    ) -> Result<usize, NodeError> {
         let bare_topic = topic
             .strip_prefix(&format!("{LOCAL_NODE_ID}."))
             .unwrap_or(topic);
@@ -8549,7 +8568,7 @@ impl UnifiedNode {
             bare_topic,
             put_opts,
             human_auth,
-            gate_downgraded,
+            gate_reason,
             now_ms,
             true,
         )?;
@@ -8561,7 +8580,7 @@ impl UnifiedNode {
         topic: &str,
         put_opts: &MailboxPutOptions,
         human_auth: Option<&VerifiedHumanClaim>,
-        gate_downgraded: bool,
+        gate_reason: Option<&str>,
         now_ms: i64,
         wake_scheduler: bool,
     ) -> Result<(usize, usize), NodeError> {
@@ -8634,8 +8653,7 @@ impl UnifiedNode {
                                 kind,
                                 source: format!("local.{}", local_batch.topic),
                                 gate_state: GateState::Pending,
-                                gate_reason: gate_downgraded
-                                    .then(|| "downgraded_to_notify".to_string()),
+                                gate_reason: gate_reason.map(str::to_string),
                                 traceparent,
                             },
                             put_opts,
@@ -9417,6 +9435,7 @@ impl UnifiedNode {
                     match eval.decision {
                         GateDecision::Allow {
                             downgraded_to_notify,
+                            ..
                         } => {
                             self.notify_local_session(&target_session);
                             self.notify_scheduler();

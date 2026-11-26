@@ -120,6 +120,7 @@ impl FilterPlugin for KeywordQuarantinePlugin {
                     plugin_id: Some(plugin_id),
                     decision: GateDecision::Allow {
                         downgraded_to_notify: false,
+                        capped_to_queue: false,
                     },
                     confidence: Some(0.98),
                     categories: Vec::new(),

@@ -180,12 +180,12 @@ test("Real OpenClaw Gateway: plugin load, dual-session exact enrollment, live hy
         do: () => emitText("SENT_DM1_OK"),
       },
 
-      // Beta wakes via native `hyphae-wake` metadata-only nudge -> calls `hyp_inbox` -> replies to `@oc-alpha`!
+      // Beta wakes via native `hyphae-wake` metadata-only `<hyphae-inbox>` digest -> calls `hyp_inbox()` -> replies to `@oc-alpha`!
       {
         name: "beta-wake-read-inbox",
         when: (req) =>
           req.anyMessageContains("BETA_SESSION_TAG") &&
-          req.lastUserText.includes("<hyphae-wake") &&
+          req.lastUserText.includes("<hyphae-inbox") &&
           req.lastToolResults.length === 0,
         assert: (req) => {
           // Verify wake turn occurred IN-PLACE on `agent:main:beta` (NEVER ALPHA!)
@@ -197,15 +197,15 @@ test("Real OpenClaw Gateway: plugin load, dual-session exact enrollment, live hy
           assert.equal(
             req.lastUserText.includes(dmPayload1),
             false,
-            `Wake nudge MUST be strictly metadata-only before hyp_inbox`,
+            `Wake digest MUST be strictly metadata-only before hyp_inbox`,
           );
           assert.equal(
             req.lastUserText.includes(dmPayloadAfterRestart),
             false,
-            `Post-restart wake nudge MUST be strictly metadata-only before hyp_inbox`,
+            `Post-restart wake digest MUST be strictly metadata-only before hyp_inbox`,
           );
         },
-        do: (req) => callTool(req, "hyp_inbox", { ack: true }),
+        do: (req) => callTool(req, "hyp_inbox", {}),
       },
       {
         name: "beta-reply-dm1",
@@ -238,12 +238,12 @@ test("Real OpenClaw Gateway: plugin load, dual-session exact enrollment, live hy
         do: () => emitText("BETA_ACKED_OK"),
       },
 
-      // Alpha wakes in-place to receive Beta's reply -> reads `hyp_inbox` -> completes cleanly (zero ping-pong)!
+      // Alpha wakes in-place to receive Beta's reply -> reads `hyp_inbox()` -> completes cleanly (zero ping-pong)!
       {
         name: "alpha-wake-read-inbox",
         when: (req) =>
           req.anyMessageContains("ALPHA_SESSION_TAG") &&
-          req.lastUserText.includes("<hyphae-wake") &&
+          req.lastUserText.includes("<hyphae-inbox") &&
           req.lastToolResults.length === 0,
         assert: (req) => {
           assert.equal(
@@ -254,10 +254,10 @@ test("Real OpenClaw Gateway: plugin load, dual-session exact enrollment, live hy
           assert.equal(
             req.lastUserText.includes(betaReply1),
             false,
-            `Alpha wake nudge MUST be metadata-only before hyp_inbox`,
+            `Alpha wake digest MUST be metadata-only before hyp_inbox`,
           );
         },
-        do: (req) => callTool(req, "hyp_inbox", { ack: true }),
+        do: (req) => callTool(req, "hyp_inbox", {}),
       },
       {
         name: "alpha-wake-done",
@@ -342,7 +342,7 @@ test("Real OpenClaw Gateway: plugin load, dual-session exact enrollment, live hy
       .getTurns("openclaw")
       .filter(
         (turn) =>
-          turn.request.lastUserText.includes("<hyphae-wake") &&
+          turn.request.lastUserText.includes("<hyphae-inbox") &&
           turn.request.rawBody.includes("ALPHA_SESSION_TAG") &&
           turn.request.rawBody.includes('handle="oc-beta"'),
       );

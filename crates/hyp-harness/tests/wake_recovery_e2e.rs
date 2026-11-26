@@ -47,6 +47,20 @@ fn open_local_node(node_id: &str, dir: &Path) -> Arc<UnifiedNode> {
     UnifiedNode::open(cfg).expect("open UnifiedNode")
 }
 
+/// RFC 0004: pushes carry only the `<hyphae-inbox>` digest; bodies stay unread in the mailbox
+/// until the agent reads them via `hyp_inbox`.
+fn unread_texts(node: &UnifiedNode, sid: &str) -> String {
+    let texts: Vec<String> = node
+        .db()
+        .local()
+        .peek_inbox(sid, 50)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.text)
+        .collect();
+    texts.join("\n")
+}
+
 struct RecordingTransport {
     delivered: Mutex<Vec<(String, PushMode)>>,
     notify: Notify,
@@ -340,14 +354,19 @@ async fn wake_recovery_flushes_interrupted_active_and_held_idle_without_spamming
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        combined_a.contains("queued-dm-for-session-a"),
-        "Session A must receive its queued DM on wake: {combined_a:?}"
+        combined_a.contains("<system from=\"hyphae:system\" count=\"1\"/>")
+            && combined_a.contains("<dm from=")
+            && !combined_a.contains("queued-dm-for-session-a")
+            && !combined_a.contains("Host woke"),
+        "Session A must receive a metadata-only digest counting its DM + wake notice: {combined_a:?}"
     );
+    let unread_a = unread_texts(&node, sid_a);
     assert!(
-        combined_a.contains(
-            "[hyphae notice] Host woke from sleep after 10m; your previous turn may have been interrupted. Peer links reconnected."
-        ),
-        "Session A must receive concise wake notice: {combined_a:?}"
+        unread_a.contains("queued-dm-for-session-a")
+            && unread_a.contains(
+                "[hyphae notice] Host woke from sleep after 10m; your previous turn may have been interrupted. Peer links reconnected."
+            ),
+        "Session A must hold its queued DM + concise wake notice unread: {unread_a:?}"
     );
 
     // 2. Session C: transient `hold_retries` cleared -> pending DM flushed immediately!
@@ -357,7 +376,8 @@ async fn wake_recovery_flushes_interrupted_active_and_held_idle_without_spamming
         1,
         "Session C must flush immediately on wake: {got_c:?}"
     );
-    assert!(got_c[0].0.contains("held-dm-for-session-c"));
+    assert!(got_c[0].0.starts_with("<hyphae-inbox ") && got_c[0].0.contains("<dm from="));
+    assert!(unread_texts(&node, sid_c).contains("held-dm-for-session-c"));
 
     // Wait past the 80ms follow-up flush timer + invoke an extra manual flush to prove at-most-once!
     tokio::time::sleep(Duration::from_millis(180)).await;
@@ -573,7 +593,8 @@ async fn system_wake_ipc_rpc_triggers_recovery_hooks_and_fails_closed_on_bad_arg
     assert_eq!(*hook_slept.lock().unwrap(), vec![120_000]);
 
     let got = transport.wait_for_count(1, Duration::from_secs(2)).await;
-    assert!(got[0].0.contains("Host woke from sleep after 2m"));
+    assert!(got[0].0.contains("<system from=\"hyphae:system\" count=\"1\"/>"));
+    assert!(unread_texts(&node, sid).contains("Host woke from sleep after 2m"));
 
     daemon.stop().await;
     node.shutdown();
@@ -830,9 +851,8 @@ async fn external_drop_watcher_recycles_stalled_sse_immediately_on_wake() {
         "external drop watcher wake recycle took {elapsed:?}"
     );
     assert!(
-        got[0]
-            .0
-            .contains("directive-delivered-after-wake-reconnect"),
+        got[0].0.contains("verified=\"true\"")
+            && unread_texts(&node, sid).contains("directive-delivered-after-wake-reconnect"),
         "expected verified human directive after wake reconnect: {got:?}"
     );
     assert!(stream_conns.load(Ordering::SeqCst) >= 2);
@@ -888,9 +908,9 @@ async fn notify_all_enrolled_opt_in_notifies_quiet_idle_enrolled_sessions_only()
     assert_eq!(report.notified_sessions, vec![sid_enrolled.to_string()]);
 
     let got = t_enrolled.wait_for_count(1, Duration::from_secs(2)).await;
+    assert!(got[0].0.contains("<system from=\"hyphae:system\" count=\"1\"/>"));
     assert!(
-        got[0]
-            .0
+        unread_texts(&node, sid_enrolled)
             .contains("[hyphae notice] Host woke from sleep after 5m. Peer links reconnected.")
     );
     assert!(

@@ -391,7 +391,7 @@ async fn x2_openclaw_transport_delivers_metadata_nudge_enforces_auth_and_detache
         let parsed: Value = serde_json::from_str(&req.body).unwrap();
         assert_eq!(
             parsed["message"],
-            "<hyphae-wake count=\"1\" handle=\"claw\" urgency=\"queue\">1 Hyphae message(s) queued for @claw. Review any injected Hyphae context or call hyp_inbox({ ack: true }) to read them.</hyphae-wake>"
+            "<hyphae-inbox handle=\"claw\" unread=\"1\" urgency=\"queue\"/>"
         );
         assert_eq!(parsed["name"], "Hyphae");
         assert_eq!(parsed["agentId"], "coder-main");
@@ -423,7 +423,7 @@ async fn x2_openclaw_transport_delivers_metadata_nudge_enforces_auth_and_detache
         let parsed: Value = serde_json::from_str(&req.body).unwrap();
         assert_eq!(
             parsed["text"],
-            "<hyphae-wake count=\"3\" handle=\"claw\" urgency=\"queue\">3 Hyphae message(s) queued for @claw. Review any injected Hyphae context or call hyp_inbox({ ack: true }) to read them.</hyphae-wake>"
+            "<hyphae-inbox handle=\"claw\" unread=\"3\" urgency=\"queue\"/>"
         );
         assert_eq!(parsed["mode"], "now");
     }
@@ -606,7 +606,7 @@ async fn x2_openclaw_transport_delivers_metadata_nudge_enforces_auth_and_detache
         let body_json: Value = serde_json::from_str(&reqs[0].body).unwrap();
         assert_eq!(
             body_json["message"],
-            "<hyphae-wake count=\"1\" handle=\"claw\" urgency=\"queue\">1 Hyphae message(s) queued for @claw. Review any injected Hyphae context or call hyp_inbox({ ack: true }) to read them.</hyphae-wake>"
+            "<hyphae-inbox handle=\"claw\" unread=\"1\" urgency=\"queue\">\n  <dm from=\"peer@box/dev\" count=\"1\"/>\n</hyphae-inbox>"
         );
         assert_eq!(body_json["agentId"], "gw-main");
     }
@@ -914,9 +914,9 @@ async fn x8_codex_uuid_session_auto_attaches_queue_transport_when_rollout_exists
     }
     assert!(
         logged.contains(&format!(
-            "queue --thread {live_uuid} --message <hyphae-wake count=\"1\" handle=\"live-cx\" urgency=\"queue\">1 Hyphae message(s) queued for @live-cx. Review any injected Hyphae context or call hyp_inbox({{ ack: true }}) to read them.</hyphae-wake>"
-        )),
-        "expected fake-codex queue metadata-only nudge, got:\n{logged}"
+            "queue --thread {live_uuid} --message <hyphae-inbox handle=\"live-cx\" unread=\"1\" urgency=\"queue\">"
+        )) && logged.contains("<dm from=\"peer@box/dev\" count=\"1\"/>"),
+        "expected fake-codex queue metadata-only XML digest, got:\n{logged}"
     );
     assert!(
         !logged.contains("AUTO_WIRED_CODEX_QUEUE_WAKEUP") && !logged.contains("human-verified"),
@@ -1605,13 +1605,17 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
     .await
     .expect("wait with persisted HMAC sessionToken must succeed after daemon restart");
     assert_eq!(ok_wait, 0);
+    let victim_out = String::from_utf8(victim_buf).unwrap();
     assert!(
-        String::from_utf8(victim_buf)
-            .unwrap()
-            .contains("TOP_SECRET_VICTIM_DM_X5")
+        victim_out.contains("<hyphae-inbox") && victim_out.contains("boss@mac/lead"),
+        "expected metadata-only XML digest in wait output: {victim_out}"
+    );
+    assert!(
+        !victim_out.contains("TOP_SECRET_VICTIM_DM_X5"),
+        "RFC 0004: wait output must NEVER include raw DM body: {victim_out}"
     );
 
-    // Real Claude Code `UserPromptSubmit` (PreInvocation) hook OMITTING `sessionToken` drains Queue DM cleanly too!
+    // Real Claude Code `UserPromptSubmit` (PreInvocation) hook OMITTING `sessionToken` emits XML digest cleanly too!
     let _ = daemon2
         .ingest_inbound(InboundItem {
             session_id: victim_sid.into(),
@@ -1642,9 +1646,16 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
     })
     .await
     .unwrap();
+    let hook_ctx = post_no_tok["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("Claude UserPromptSubmit hook omitting sessionToken MUST emit XML digest");
     assert!(
-        post_no_tok.to_string().contains("SECOND_VICTIM_DM_X5"),
-        "Claude UserPromptSubmit hook omitting sessionToken MUST drain cleanly: {post_no_tok}"
+        hook_ctx.starts_with("<hyphae-inbox ") && hook_ctx.contains("boss@mac/lead"),
+        "expected metadata-only XML digest on hook: {post_no_tok}"
+    );
+    assert!(
+        !hook_ctx.contains("SECOND_VICTIM_DM_X5"),
+        "RFC 0004: hook must NEVER include raw DM body: {post_no_tok}"
     );
 
     // ---- Part B (X6): `--ephemeral` MUST NEVER bypass an invalid/replayed `_meshCall` token,
@@ -1952,8 +1963,9 @@ async fn openclaw_nudge_then_drain_focus_mode_restart_and_fail_closed_session_is
         "unrelated OpenClaw sessionKey must NEVER drain another session's mailbox"
     );
 
-    // 2b. Exact OpenClaw `before-prompt-build` hook (matching `sessionKey`) drains the nudge-pending
-    //     item cleanly AND transitions it pending -> delivered!
+    // 2b. RFC 0004: OpenClaw wake nudge ALREADY delivered `<hyphae-inbox>` and marked `notified = 1`,
+    //     so `before-prompt-build` MUST stay silent (zero duplicate digest!), while `hyp_inbox`
+    //     reads & acks ONLY this session's unread item (never leaking Claude's private item!).
     let hook_out = run_hook(
         &sock,
         HarnessKind::Openclaw,
@@ -1965,18 +1977,46 @@ async fn openclaw_nudge_then_drain_focus_mode_restart_and_fail_closed_session_is
         }),
     )
     .await;
-    let prep = hook_out["prependContext"]
-        .as_str()
-        .expect("expected prependContext after wake nudge");
-    assert!(prep.contains("NUDGE_THEN_DRAIN_PAYLOAD_101"), "prep={prep}");
+    assert_eq!(
+        hook_out,
+        json!({}),
+        "RFC 0004 zero-spam: before-prompt-build must not duplicate already-pushed <hyphae-inbox> digest: {hook_out}"
+    );
+    assert_eq!(
+        session_status(&sock, &oc_sid).await["pending"],
+        1,
+        "item must stay unread until hyp_inbox reads it"
+    );
+    let read_pre = run_hook(
+        &sock,
+        HarnessKind::Openclaw,
+        HookEvent::PreToolUse,
+        json!({
+            "sessionKey": oc_session_key,
+            "agentId": "main",
+            "toolName": "hyphae__hyp_inbox",
+            "toolCallId": "tc-nudge-read-1",
+            "params": {}
+        }),
+    )
+    .await;
+    let read_tok = read_pre["callToken"].as_str().expect("read callToken");
+    let (read_txt, read_err) = oc_mcp
+        .call_tool("hyp_inbox", json!({ "_meshCall": read_tok }), None)
+        .await;
+    assert!(!read_err, "hyp_inbox read failed: {read_txt}");
     assert!(
-        !prep.contains("CLAUDE_PRIVATE_MUST_NEVER_LEAK_TO_OPENCLAW"),
-        "OpenClaw drain leaked non-OpenClaw session!"
+        read_txt.contains("NUDGE_THEN_DRAIN_PAYLOAD_101"),
+        "read_txt={read_txt}"
+    );
+    assert!(
+        !read_txt.contains("CLAUDE_PRIVATE_MUST_NEVER_LEAK_TO_OPENCLAW"),
+        "OpenClaw hyp_inbox leaked non-OpenClaw session!"
     );
     assert_eq!(
         session_status(&sock, &oc_sid).await["pending"],
         0,
-        "inline drained item must transition pending -> delivered"
+        "hyp_inbox default ack:true must transition pending -> delivered"
     );
 
     // Second turn on the same session MUST return `{}` (zero duplicates!).
@@ -2100,12 +2140,27 @@ async fn openclaw_nudge_then_drain_focus_mode_restart_and_fail_closed_session_is
         json!({ "sessionKey": oc_session_key, "agentId": "main" }),
     )
     .await;
+    // RFC 0004: Unread item survives daemon restart and `before-prompt-build` surfaces a strictly
+    // metadata-only `<hyphae-inbox>` XML digest (zero raw body!) while full text stays in SQLite!
     let restart_prep = after_restart["prependContext"]
         .as_str()
-        .expect("nudge-pending item must survive daemon restart");
+        .expect("unread item must surface XML digest after daemon restart");
     assert!(
-        restart_prep.contains("SURVIVES_DAEMON_RESTART_NUDGE_202"),
+        restart_prep.starts_with("<hyphae-inbox handle=\"claw\" unread=\"1\" urgency=\"queue\">")
+            && restart_prep.contains("<dm from=\"peer@box/dev\" count=\"1\"/>"),
         "restart_prep={restart_prep}"
+    );
+    assert!(!restart_prep.contains("SURVIVES_DAEMON_RESTART_NUDGE_202"));
+    assert_eq!(session_status(&sock2, &oc_sid).await["pending"], 1);
+    assert!(
+        node2
+            .db()
+            .local()
+            .peek_inbox(&oc_sid, 10)
+            .unwrap()
+            .iter()
+            .any(|m| m.text.contains("SURVIVES_DAEMON_RESTART_NUDGE_202")),
+        "unread item must survive daemon restart durably in SQLite"
     );
 
     // 5. Fail-closed ambiguity: with 2 distinct OpenClaw sessions enrolled and an unrecognized
@@ -2144,7 +2199,7 @@ async fn openclaw_nudge_then_drain_focus_mode_restart_and_fail_closed_session_is
         json!({}),
         "ambiguous multi-session OpenClaw hook drain must fail closed"
     );
-    // Exact sessionId match still succeeds!
+    // Exact sessionId match still succeeds with a metadata-only XML digest (zero raw body)!
     let exact = run_hook(
         &sock2,
         HarnessKind::Openclaw,
@@ -2153,10 +2208,12 @@ async fn openclaw_nudge_then_drain_focus_mode_restart_and_fail_closed_session_is
     )
     .await;
     assert!(
-        exact["prependContext"]
-            .as_str()
-            .is_some_and(|s| s.contains("MUST_NOT_LEAK_WHEN_AMBIGUOUS")),
-        "exact sessionId match must succeed: {exact}"
+        exact["prependContext"].as_str().is_some_and(|s| {
+            s.contains("<hyphae-inbox")
+                && s.contains("<dm from=\"peer@box/dev\" count=\"1\"/>")
+                && !s.contains("MUST_NOT_LEAK_WHEN_AMBIGUOUS")
+        }),
+        "exact sessionId match must succeed with metadata-only digest: {exact}"
     );
 
     daemon2.stop().await;
@@ -2461,29 +2518,21 @@ async fn openclaw_exact_multi_session_isolation_wake_default_and_native_plugin_s
         assert_eq!(wake_b["mode"], "now");
     }
 
-    // 4. Strict multi-session isolation on `before-prompt-build`:
-    //    - Session B drains ONLY B's secret (never A's)
-    //    - Unrelated Session C drains NOTHING
-    //    - Session A drains ONLY A's secret (never B's)
-    let drain_b = run_hook(
-        &sock,
-        HarnessKind::Openclaw,
-        HookEvent::PreInvocation,
-        json!({ "sessionKey": sk_b, "agentId": "ops" }),
-    )
-    .await;
-    let prep_b = drain_b["prependContext"]
-        .as_str()
-        .expect("prependContext for B");
-    assert!(
-        prep_b.contains("CONFIDENTIAL_FOR_B_ONLY"),
-        "prep_b={prep_b}"
+    // 4. Strict multi-session isolation (RFC 0004):
+    //    - Both sessions already received their metadata-only `<hyphae-inbox>` wake nudges, so
+    //      `before-prompt-build` stays silent (zero duplicate digests) across A, B, and C.
+    //    - Session B `hyp_inbox` reads & acks ONLY B's secret (never A's)
+    //    - Session A `hyp_inbox` reads & acks ONLY A's secret (never B's)
+    assert_eq!(
+        run_hook(
+            &sock,
+            HarnessKind::Openclaw,
+            HookEvent::PreInvocation,
+            json!({ "sessionKey": sk_b, "agentId": "ops" }),
+        )
+        .await,
+        json!({})
     );
-    assert!(
-        !prep_b.contains("CONFIDENTIAL_FOR_A_ONLY"),
-        "cross-session leak into B!"
-    );
-
     let drain_c = run_hook(
         &sock,
         HarnessKind::Openclaw,
@@ -2492,23 +2541,54 @@ async fn openclaw_exact_multi_session_isolation_wake_default_and_native_plugin_s
     )
     .await;
     assert_eq!(drain_c, json!({}), "unrelated session C must never drain A");
+    assert_eq!(
+        run_hook(
+            &sock,
+            HarnessKind::Openclaw,
+            HookEvent::PreInvocation,
+            json!({ "sessionKey": sk_a, "agentId": "main" }),
+        )
+        .await,
+        json!({})
+    );
 
-    let drain_a = run_hook(
+    let (inbox_b_txt, inbox_b_err) = call_oc(
+        &mut shared_mcp,
         &sock,
-        HarnessKind::Openclaw,
-        HookEvent::PreInvocation,
-        json!({ "sessionKey": sk_a, "agentId": "main" }),
+        sk_b,
+        "ops",
+        "hyp_inbox",
+        json!({}),
+        "tc-b-inbox",
     )
     .await;
-    let prep_a = drain_a["prependContext"]
-        .as_str()
-        .expect("prependContext for A");
+    assert!(!inbox_b_err, "session B hyp_inbox failed: {inbox_b_txt}");
     assert!(
-        prep_a.contains("CONFIDENTIAL_FOR_A_ONLY"),
-        "prep_a={prep_a}"
+        inbox_b_txt.contains("CONFIDENTIAL_FOR_B_ONLY"),
+        "inbox_b={inbox_b_txt}"
     );
     assert!(
-        !prep_a.contains("CONFIDENTIAL_FOR_B_ONLY"),
+        !inbox_b_txt.contains("CONFIDENTIAL_FOR_A_ONLY"),
+        "cross-session leak into B!"
+    );
+
+    let (inbox_a_txt, inbox_a_err) = call_oc(
+        &mut shared_mcp,
+        &sock,
+        sk_a,
+        "main",
+        "hyp_inbox",
+        json!({}),
+        "tc-a-inbox",
+    )
+    .await;
+    assert!(!inbox_a_err, "session A hyp_inbox failed: {inbox_a_txt}");
+    assert!(
+        inbox_a_txt.contains("CONFIDENTIAL_FOR_A_ONLY"),
+        "inbox_a={inbox_a_txt}"
+    );
+    assert!(
+        !inbox_a_txt.contains("CONFIDENTIAL_FOR_B_ONLY"),
         "cross-session leak into A!"
     );
 
@@ -2670,10 +2750,23 @@ async fn openclaw_exact_multi_session_isolation_wake_default_and_native_plugin_s
         json!({ "sessionKey": sk_b, "agentId": "ops" }),
     )
     .await;
+    let drain_b2_ctx = drain_b2["prependContext"]
+        .as_str()
+        .expect("re-activating Session B must surface preserved XML digest");
     assert!(
-        drain_b2["prependContext"]
-            .as_str()
-            .is_some_and(|s| s.contains("NATIVE_SERVICE_MISSING_B"))
+        drain_b2_ctx.starts_with("<hyphae-inbox handle=\"claw-b\" unread=\"1\" urgency=\"queue\">")
+            && drain_b2_ctx.contains("<dm from=\"peer@box/dev\" count=\"1\"/>"),
+        "drain_b2_ctx={drain_b2_ctx}"
+    );
+    assert!(!drain_b2_ctx.contains("NATIVE_SERVICE_MISSING_B"));
+    assert!(
+        node.db()
+            .local()
+            .peek_inbox(&sid_b, 10)
+            .unwrap()
+            .iter()
+            .any(|m| m.text.contains("NATIVE_SERVICE_MISSING_B")),
+        "preserved B payload must remain intact in SQLite for hyp_inbox"
     );
     assert_eq!(
         daemon.session_transport_kind(&sid_b),

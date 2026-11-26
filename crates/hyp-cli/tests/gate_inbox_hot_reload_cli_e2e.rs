@@ -289,12 +289,20 @@ fn cli_gate_lock_and_inbox_approve_live_hot_reload_without_restart() {
     assert_eq!(app_json["data"]["daemonWoken"], true);
     assert_eq!(app_json["data"]["quarantinedRemaining"], 1);
 
-    // Live `hyp wait` subprocess MUST immediately receive the approved message and exit 0!
+    // Live `hyp wait` subprocess MUST immediately receive the metadata-only XML digest (zero body!)
+    // for the approved message and exit 0!
     let wait_json = wait_proc.read_json_line(Duration::from_secs(5));
-    let wait_text = wait_json.to_string();
+    let wait_text = wait_json["data"]["items"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
     assert!(
-        wait_text.contains("Approved live wakeup payload #77"),
-        "expected approved message in live hyp wait output: {wait_json}"
+        wait_text.contains("<hyphae-inbox ")
+            && wait_text.contains("<dm from=\"ext@peer/reviewer\" count=\"1\"/>"),
+        "expected metadata-only XML digest in live hyp wait output: {wait_json}"
+    );
+    assert!(
+        !wait_text.contains("Approved live wakeup payload #77"),
+        "RFC 0004: live hyp wait must NEVER include raw message body: {wait_json}"
     );
     let wait_status = wait_proc
         .wait_timeout(Duration::from_secs(5))

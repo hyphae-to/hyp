@@ -26,7 +26,7 @@ use hyp_crypto::{Ed25519KeyPair, SecretBackend};
 use hyp_harness::daemon::{BoxFuture, BridgePoster, InboundItem, LocalDaemon, LocalDaemonConfig};
 use hyp_harness::hooks::HookEvent;
 use hyp_harness::mcp::McpOptions;
-use hyp_harness::protocol::{HarnessKind, UNTRUSTED_PROVENANCE};
+use hyp_harness::protocol::HarnessKind;
 use hyp_harness::sock::{
     MAX_SOCKET_LINE_BYTES, connect_daemon_async, daemon_rpc_async, read_bounded_line_async,
     write_ndjson_line_async,
@@ -299,15 +299,26 @@ async fn suite_1_all_nine_harnesses_live_differential_parity() {
         let drained_text = extract_pre_turn_drain_text(*harness, &drain_out);
         assert!(
             drained_text.starts_with(&format!(
-                "Incoming hyphae message(s):\n\n{UNTRUSTED_PROVENANCE}\n\n"
-            )),
-            "PreInvocation drain for {raw_id} must start with UNTRUSTED_PROVENANCE: {drained_text:?}"
+                "<hyphae-inbox handle=\"{handle}\" unread=\"1\" urgency=\"queue\">"
+            )) && drained_text.contains("<dm from=\"parity@box/sender\" count=\"1\"/>"),
+            "RFC 0004: PreInvocation drain for {raw_id} must emit metadata-only XML digest: {drained_text:?}"
         );
-        assert_eq!(
-            drained_text.matches(UNTRUSTED_PROVENANCE).count(),
-            1,
-            "PreInvocation drain for {raw_id} must emit UNTRUSTED_PROVENANCE exactly once: {drained_text:?}"
+        assert!(
+            !drained_text.contains(&msg1),
+            "RFC 0004: PreInvocation drain for {raw_id} must NEVER expose raw DM body: {drained_text:?}"
         );
+
+        // Agent calls `hyp_inbox({})` (default `ack: true`) to read & ack DM #1!
+        let (in1_txt, in1_err) = if *lazy_ag {
+            worker_mcp
+                .call_verified_antigravity_lazy(&sock, raw_id, "hyp_inbox", json!({}))
+                .await
+        } else {
+            worker_mcp
+                .call_verified_for_harness(&sock, *harness, raw_id, "hyp_inbox", json!({}))
+                .await
+        };
+        assert!(!in1_err, "hyp_inbox #1 failed for {raw_id}: {in1_txt}");
 
         let st_after_drain = session_status(&sock, &session_id).await;
 
@@ -329,7 +340,7 @@ async fn suite_1_all_nine_harnesses_live_differential_parity() {
         let deliv_val: Value = serde_json::from_str(&deliv_txt).unwrap();
         let deliv_items = deliv_val["items"].as_array().unwrap();
 
-        // 4. Send DM #2 -> verify Stop hook drains into harness-specific continuation envelope!
+        // 4. Send DM #2 -> verify Stop hook emits metadata-only XML digest in harness-specific continuation envelope!
         let msg2 = format!("parity-msg-2-{raw_id}");
         let (_, dm2_err) = sender_mcp
             .call_verified_claude(
@@ -360,15 +371,25 @@ async fn suite_1_all_nine_harnesses_live_differential_parity() {
         };
         assert!(
             stop_reason.starts_with(&format!(
-                "Incoming hyphae message(s):\n\n{UNTRUSTED_PROVENANCE}\n\n"
-            )),
-            "Stop/turn-boundary drain for {raw_id} must start with UNTRUSTED_PROVENANCE: {stop_reason:?}"
+                "<hyphae-inbox handle=\"{handle}\" unread=\"1\" urgency=\"queue\">"
+            )) && stop_reason.contains("<dm from=\"parity@box/sender\" count=\"1\"/>"),
+            "RFC 0004: Stop/turn-boundary drain for {raw_id} must emit metadata-only XML digest: {stop_reason:?}"
         );
-        assert_eq!(
-            stop_reason.matches(UNTRUSTED_PROVENANCE).count(),
-            1,
-            "Stop/turn-boundary drain for {raw_id} must emit UNTRUSTED_PROVENANCE exactly once: {stop_reason:?}"
+        assert!(
+            !stop_reason.contains(&msg2),
+            "RFC 0004: Stop/turn-boundary drain for {raw_id} must NEVER expose raw DM body: {stop_reason:?}"
         );
+
+        let (in2_txt, in2_err) = if *lazy_ag {
+            worker_mcp
+                .call_verified_antigravity_lazy(&sock, raw_id, "hyp_inbox", json!({}))
+                .await
+        } else {
+            worker_mcp
+                .call_verified_for_harness(&sock, *harness, raw_id, "hyp_inbox", json!({}))
+                .await
+        };
+        assert!(!in2_err, "hyp_inbox #2 failed for {raw_id}: {in2_txt}");
 
         // 5. Idle Stop hook (no unread, no live transport):
         //    - Herdr, T3, and OpenClaw rely on native push/ephemeral turn orchestration and
@@ -439,8 +460,8 @@ async fn suite_1_all_nine_harnesses_live_differential_parity() {
             enrolled_after_join: st_after_join["enrolled"].as_bool() == Some(true),
             pending_after_drain: st_after_drain["pending"].as_u64().unwrap_or(99),
             delivered_count_after_drain: deliv_items.len(),
-            drain_contained_msg1: drained_text.contains(&msg1),
-            stop_contained_msg2: stop_reason.contains(&msg2),
+            drain_contained_msg1: in1_txt.contains(&msg1),
+            stop_contained_msg2: in2_txt.contains(&msg2),
             reply_sent_ok: !rep_err,
         });
     }
@@ -896,10 +917,11 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
     .await;
     let burst_ctx = burst_drain["hookSpecificOutput"]["additionalContext"]
         .as_str()
-        .expect("burst-demoted arrivals must emit 1-line notify digest");
+        .expect("burst-demoted arrivals must emit metadata-only notify XML digest");
     assert!(
-        burst_ctx.contains("hyphae notify · 2 unread"),
-        "expected burst 1-line digest, got: {burst_ctx}"
+        burst_ctx.starts_with("<hyphae-inbox handle=\"recv\" unread=\"2\" urgency=\"notify\">")
+            && burst_ctx.contains("<dm from=\"delivery@box/noisy\" count=\"2\"/>"),
+        "expected burst notify XML digest, got: {burst_ctx}"
     );
     assert!(
         !burst_ctx.contains("tripped-burst-10"),
@@ -911,7 +933,7 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
             .is_source_noisy("claude:recv-1", "delivery@box/noisy", now_ms())
     );
 
-    // Independent peer `calm` is NOT in Noisy Mode -> delivers verbatim inline at TurnStart/TurnEnd!
+    // Independent peer `calm` is NOT in Noisy Mode -> triggers Queue-urgency XML digest!
     let (_, calm_err) = mcp
         .call_verified_claude(
             &sock,
@@ -932,22 +954,23 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
     .await;
     let calm_ctx = calm_drain["hookSpecificOutput"]["additionalContext"]
         .as_str()
-        .expect("calm peer message must deliver inline");
-    assert!(calm_ctx.contains("CALM_PEER_DELIVERS_NORMALLY"));
-    assert!(calm_ctx.contains("+2 more unread"));
+        .expect("calm peer message must emit queue XML digest");
+    assert!(
+        calm_ctx.starts_with("<hyphae-inbox handle=\"recv\" unread=\"3\" urgency=\"queue\">")
+            && calm_ctx.contains("<dm from=\"delivery@box/calm\" count=\"1\"/>")
+            && calm_ctx.contains("<dm from=\"delivery@box/noisy\" count=\"2\"/>"),
+        "expected combined XML digest with queue urgency, got: {calm_ctx}"
+    );
+    assert!(!calm_ctx.contains("CALM_PEER_DELIVERS_NORMALLY"));
 
-    // Clean out the 2 unread burst messages before hybrid packer test.
-    let (_, ack_b_err) = mcp
-        .call_verified_claude(
-            &sock,
-            "recv-1",
-            "hyp_inbox",
-            json!({ "state": "unread", "ack": true }),
-        )
+    // Clean out all 3 unread messages via `hyp_inbox` (default `ack: true`) before next test.
+    let (ack_b_txt, ack_b_err) = mcp
+        .call_verified_claude(&sock, "recv-1", "hyp_inbox", json!({ "state": "unread" }))
         .await;
     assert!(!ack_b_err);
+    assert!(ack_b_txt.contains("CALM_PEER_DELIVERS_NORMALLY"));
 
-    // ---- 3.2 Token-Budget Hybrid Batch Packer (1 VIP `interrupt` + 15 noisy -> VIP inline, 15 spilled, 0 duplicate) ----
+    // ---- 3.2 Metadata-Only Digest Aggregation (1 VIP `interrupt` + 15 noisy -> urgency="interrupt", 0 bodies, 0 duplicate) ----
     let (_, vip_rule_err) = mcp
         .call_verified_claude(
             &sock,
@@ -958,7 +981,7 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
         .await;
     assert!(!vip_rule_err);
 
-    // `noisy` is already in Noisy Mode (burst-demoted) -> all 15 spill to digest!
+    // `noisy` is already in Noisy Mode (burst-demoted) -> grouped in `<hyphae-inbox>` digest!
     for i in 0..15 {
         let (_, err) = mcp
             .call_verified_claude(
@@ -990,21 +1013,20 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
     .await;
     let hybrid_ctx = hybrid_drain["hookSpecificOutput"]["additionalContext"]
         .as_str()
-        .expect("hybrid batch must deliver");
+        .expect("hybrid digest must emit on PostToolUse because of VIP interrupt");
     assert!(
-        hybrid_ctx.contains("VIP_HYBRID_INLINE_URGENT"),
-        "VIP interrupt must pack verbatim inline: {hybrid_ctx}"
+        hybrid_ctx
+            .starts_with("<hyphae-inbox handle=\"recv\" unread=\"16\" urgency=\"interrupt\">")
+            && hybrid_ctx.contains("<dm from=\"delivery@box/vip\" count=\"1\"/>")
+            && hybrid_ctx.contains("<dm from=\"delivery@box/noisy\" count=\"15\"/>"),
+        "expected grouped interrupt XML digest for 1 VIP + 15 noisy: {hybrid_ctx}"
     );
     assert!(
-        hybrid_ctx.contains("+15 more unread"),
-        "15 noisy messages must spill to digest footer: {hybrid_ctx}"
-    );
-    assert!(
-        !hybrid_ctx.contains("hybrid-noisy-00"),
-        "spilled noisy messages must not be inlined: {hybrid_ctx}"
+        !hybrid_ctx.contains("VIP_HYBRID_INLINE_URGENT") && !hybrid_ctx.contains("hybrid-noisy-00"),
+        "RFC 0004: PostToolUse digest must NEVER leak any body text: {hybrid_ctx}"
     );
 
-    // Subsequent PostToolUse MUST NOT duplicate the 15 already-notified spilled items!
+    // Subsequent PostToolUse MUST NOT duplicate the 16 already-notified items!
     let no_dup_drain = run_hook(
         &sock,
         HarnessKind::Claude,
@@ -1015,14 +1037,14 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
     assert_eq!(
         no_dup_drain,
         json!({}),
-        "already-notified spilled items must NOT re-emit on subsequent PostToolUse"
+        "already-notified digest items must NOT re-emit on subsequent PostToolUse"
     );
 
-    // Read all 15 spilled messages cleanly via cursor-paginated `hyp_inbox` (5 + 5 + 5)!
+    // Read all 16 unread messages cleanly via cursor-paginated `hyp_inbox(ack: false)` peek (5 + 5 + 5 + 1)!
     let mut collected_texts = Vec::new();
     let mut cursor: Option<String> = None;
-    for page_idx in 0..3 {
-        let mut args = json!({ "state": "unread", "limit": 5 });
+    for page_idx in 0..4 {
+        let mut args = json!({ "state": "unread", "limit": 5, "ack": false });
         if let Some(ref c) = cursor {
             args["cursor"] = json!(c);
         }
@@ -1032,11 +1054,16 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
         assert!(!p_err, "page {page_idx} failed: {p_txt}");
         let p_val: Value = serde_json::from_str(&p_txt).unwrap();
         let items = p_val["items"].as_array().unwrap();
-        assert_eq!(items.len(), 5, "page {page_idx} must have 5 items");
+        let expected_len = if page_idx < 3 { 5 } else { 1 };
+        assert_eq!(
+            items.len(),
+            expected_len,
+            "page {page_idx} item count mismatch"
+        );
         for it in items {
             collected_texts.push(it["text"].as_str().unwrap().to_string());
         }
-        if page_idx < 2 {
+        if page_idx < 3 {
             assert_eq!(p_val["hasMore"], true);
             cursor = p_val["nextCursor"].as_str().map(ToString::to_string);
             assert!(cursor.is_some());
@@ -1044,7 +1071,12 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
             assert_eq!(p_val["hasMore"], false);
         }
     }
-    assert_eq!(collected_texts.len(), 15);
+    assert_eq!(collected_texts.len(), 16);
+    assert!(
+        collected_texts
+            .iter()
+            .any(|t| t.contains("VIP_HYBRID_INLINE_URGENT"))
+    );
     assert!(
         collected_texts
             .iter()
@@ -1056,18 +1088,18 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
             .any(|t| t.contains("hybrid-noisy-14"))
     );
 
-    // Ack all 15 noisy unread items.
-    let (_, ack_15_err) = mcp
+    // Ack all 16 unread items via `hyp_inbox` default `ack: true`.
+    let (_, ack_16_err) = mcp
         .call_verified_claude(
             &sock,
             "recv-1",
             "hyp_inbox",
-            json!({ "state": "unread", "limit": 20, "ack": true }),
+            json!({ "state": "unread", "limit": 20 }),
         )
         .await;
-    assert!(!ack_15_err);
+    assert!(!ack_16_err);
 
-    // ---- 3.3 Single Giant Payload Truncation + Full Retrieval via `hyp_inbox(ids:[...])` ----
+    // ---- 3.3 Single Giant Payload: Zero Body in Hook Digest + Full Retrieval via `hyp_inbox` ----
     let giant_body = format!(
         "GIANT_HEADER_BEGIN {} GIANT_TAIL_SENTINEL",
         "X".repeat(4_800)
@@ -1092,15 +1124,16 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
     .await;
     let giant_ctx = giant_drain["hookSpecificOutput"]["additionalContext"]
         .as_str()
-        .expect("giant payload must emit truncated preview");
-    assert!(giant_ctx.contains("GIANT_HEADER_BEGIN"));
-    assert!(!giant_ctx.contains("GIANT_TAIL_SENTINEL"));
+        .expect("giant payload must emit metadata-only XML digest");
     assert!(
-        giant_ctx.contains("full body in hyp_inbox(ids:[\""),
-        "expected hyp_inbox(ids:[...]) hint, got: {giant_ctx}"
+        giant_ctx.starts_with("<hyphae-inbox handle=\"recv\" unread=\"1\" urgency=\"queue\">")
+            && giant_ctx.contains("<dm from=\"delivery@box/calm\" count=\"1\"/>"),
+        "expected metadata-only XML digest for giant DM, got: {giant_ctx}"
     );
+    assert!(!giant_ctx.contains("GIANT_HEADER_BEGIN"));
+    assert!(!giant_ctx.contains("GIANT_TAIL_SENTINEL"));
 
-    // Second TurnStart must NOT re-emit the truncated giant preview!
+    // Second TurnStart must NOT re-emit the already-notified giant digest!
     let giant_nodup = run_hook(
         &sock,
         HarnessKind::Claude,
@@ -1110,21 +1143,11 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
     .await;
     assert_eq!(giant_nodup, json!({}));
 
-    // Parse receipt ID from the hint and fetch the complete intact body via `hyp_inbox(ids:[...])`!
-    let marker = "full body in hyp_inbox(ids:[\"";
-    let start = giant_ctx.find(marker).unwrap() + marker.len();
-    let end = giant_ctx[start..].find("\"])").unwrap() + start;
-    let giant_receipt = &giant_ctx[start..end];
-
+    // Fetch the complete intact giant body via `hyp_inbox` (default `ack: true`)!
     let (full_txt, full_err) = mcp
-        .call_verified_claude(
-            &sock,
-            "recv-1",
-            "hyp_inbox",
-            json!({ "ids": [giant_receipt], "ack": true }),
-        )
+        .call_verified_claude(&sock, "recv-1", "hyp_inbox", json!({}))
         .await;
-    assert!(!full_err, "hyp_inbox(ids:[...]) failed: {full_txt}");
+    assert!(!full_err, "hyp_inbox giant read failed: {full_txt}");
     let full_val: Value = serde_json::from_str(&full_txt).unwrap();
     let full_items = full_val["items"].as_array().unwrap();
     assert_eq!(full_items.len(), 1);
@@ -1171,8 +1194,12 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
     .await;
     let strict_ctx = strict_drain["hookSpecificOutput"]["additionalContext"]
         .as_str()
-        .expect("strict focus mode should still emit slim 1-line digest");
-    assert!(strict_ctx.contains("hyphae notify · 1 unread"));
+        .expect("strict focus mode should still emit metadata-only notify XML digest");
+    assert!(
+        strict_ctx.starts_with("<hyphae-inbox handle=\"recv\" unread=\"1\" urgency=\"notify\">")
+            && strict_ctx.contains("<dm from=\"delivery@box/vip\" count=\"1\"/>"),
+        "expected notify-urgency XML digest in strict focus mode: {strict_ctx}"
+    );
     assert!(
         !strict_ctx.contains("STRICT_FOCUS_HELD_VIP"),
         "strict focus mode must hold even VIP interrupts in inbox: {strict_ctx}"
@@ -1226,9 +1253,22 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
     let vip_ctx = vip_drain["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .expect("VIP must break through focus mode");
-    assert!(vip_ctx.contains("VIP_BREAKS_THROUGH_FOCUS"));
+    // Issue #32 + RFC 0004: VIP breakthrough emits metadata-only XML digest for ONLY the VIP item
+    // (never leaking Focus-buffered `CALM_HELD_IN_FOCUS` or raw VIP body text!).
+    assert!(
+        vip_ctx.starts_with("<hyphae-inbox handle=\"recv\" unread=\"1\" urgency=\"interrupt\">")
+            && vip_ctx.contains("<dm from=\"delivery@box/vip\" count=\"1\"/>"),
+        "expected isolated VIP interrupt XML digest: {vip_ctx}"
+    );
+    assert!(!vip_ctx.contains("VIP_BREAKS_THROUGH_FOCUS"));
     assert!(!vip_ctx.contains("CALM_HELD_IN_FOCUS"));
-    assert!(vip_ctx.contains("+1 more unread"));
+    // Agent reads & acks ONLY the VIP item via unfiltered `hyp_inbox({})` (Focus Mode VIP isolation #32)!
+    let (vip_read_txt, vip_read_err) = mcp
+        .call_verified_claude(&sock, "recv-1", "hyp_inbox", json!({}))
+        .await;
+    assert!(!vip_read_err, "VIP hyp_inbox failed: {vip_read_txt}");
+    assert!(vip_read_txt.contains("VIP_BREAKS_THROUGH_FOCUS"));
+    assert!(!vip_read_txt.contains("CALM_HELD_IN_FOCUS"));
 
     // ---- 3.5 Filtered `hyp_inbox` (`from`, `node`, `channel`, `summary`, `delivered`, corrupt cursor, quarantined receipt) ----
     // Ingest a `#ops` channel post from remote node `acme-team` (held unread due to Focus Mode)
@@ -1248,13 +1288,13 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
     assert!(ch_u.is_some());
     wait_for_pending_count(&sock, "claude:recv-1", 2).await;
 
-    // Filter by `from`
+    // Filter by `from` (`ack: false` peeks without consuming unread set!)
     let (from_txt, from_err) = mcp
         .call_verified_claude(
             &sock,
             "recv-1",
             "hyp_inbox",
-            json!({ "state": "unread", "filter": { "from": "delivery@box/calm" } }),
+            json!({ "state": "unread", "ack": false, "filter": { "from": "delivery@box/calm" } }),
         )
         .await;
     assert!(!from_err, "from filter failed: {from_txt}");
@@ -1274,7 +1314,7 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
             &sock,
             "recv-1",
             "hyp_inbox",
-            json!({ "state": "unread", "filter": { "node": "delivery@box" } }),
+            json!({ "state": "unread", "ack": false, "filter": { "node": "delivery@box" } }),
         )
         .await;
     assert!(!node_local_err);
@@ -1290,7 +1330,7 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
             &sock,
             "recv-1",
             "hyp_inbox",
-            json!({ "state": "unread", "filter": { "node": "acme-team" } }),
+            json!({ "state": "unread", "ack": false, "filter": { "node": "acme-team" } }),
         )
         .await;
     assert!(!node_remote_err);
@@ -1306,7 +1346,7 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
             &sock,
             "recv-1",
             "hyp_inbox",
-            json!({ "state": "unread", "filter": { "node": "other@missing" } }),
+            json!({ "state": "unread", "ack": false, "filter": { "node": "other@missing" } }),
         )
         .await;
     assert!(!node_miss_err);
@@ -1324,7 +1364,7 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
             &sock,
             "recv-1",
             "hyp_inbox",
-            json!({ "state": "unread", "filter": { "channel": "#ops" } }),
+            json!({ "state": "unread", "ack": false, "filter": { "channel": "#ops" } }),
         )
         .await;
     assert!(!ch_flt_err, "channel filter failed: {ch_flt_txt}");
@@ -1346,7 +1386,7 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
             &sock,
             "recv-1",
             "hyp_inbox",
-            json!({ "state": "unread", "summary": true }),
+            json!({ "state": "unread", "ack": false, "summary": true }),
         )
         .await;
     assert!(!sum_err);
@@ -1662,7 +1702,8 @@ async fn suite_4_claude_channel_failure_nack_disconnect_and_timeout_fallback_mat
             .unwrap()
             .unwrap();
 
-        // Message MUST NOT be lost/acked; TurnStart (`UserPromptSubmit`) hook drains it intact!
+        // Message MUST NOT be lost/acked; TurnStart (`UserPromptSubmit`) hook emits metadata-only
+        // XML digest while full payload remains preserved in mailbox!
         let drain = run_hook(
             &sock,
             HarnessKind::Claude,
@@ -1672,8 +1713,18 @@ async fn suite_4_claude_channel_failure_nack_disconnect_and_timeout_fallback_mat
         .await;
         let ctx = drain["hookSpecificOutput"]["additionalContext"]
             .as_str()
-            .expect("nacked channel message must drain via TurnStart hook");
-        assert!(ctx.contains("NACK_PRESERVED_PAYLOAD"));
+            .expect("nacked channel message must emit XML digest via TurnStart hook");
+        assert!(ctx.starts_with("<hyphae-inbox unread=\"1\" urgency=\"queue\">"));
+        assert!(ctx.contains("<dm from=\"peer@net/bot\" count=\"1\"/>"));
+        assert!(!ctx.contains("NACK_PRESERVED_PAYLOAD"));
+        assert!(
+            node.db()
+                .local()
+                .peek_inbox("claude:nack-sess", 10)
+                .unwrap()
+                .iter()
+                .any(|m| m.text.contains("NACK_PRESERVED_PAYLOAD"))
+        );
     }
 
     // ---- Case 4.2: Channel disconnects mid-delivery -> preserved & delivered via `hyp wait` ----
@@ -1749,8 +1800,20 @@ async fn suite_4_claude_channel_failure_nack_disconnect_and_timeout_fallback_mat
         assert_eq!(code, 0);
         let wait_text = String::from_utf8(buf).unwrap();
         assert!(
-            wait_text.contains("DISCONNECT_FALLBACK_WAIT_PAYLOAD"),
-            "expected preserved message via hyp wait, got: {wait_text:?}"
+            wait_text.contains("<hyphae-inbox") && wait_text.contains("peer@net/bot"),
+            "expected preserved message XML digest via hyp wait, got: {wait_text:?}"
+        );
+        assert!(
+            !wait_text.contains("DISCONNECT_FALLBACK_WAIT_PAYLOAD"),
+            "RFC 0004: hyp wait must NEVER include raw DM body: {wait_text:?}"
+        );
+        assert!(
+            node.db()
+                .local()
+                .peek_inbox("claude:drop-sess", 10)
+                .unwrap()
+                .iter()
+                .any(|m| m.text.contains("DISCONNECT_FALLBACK_WAIT_PAYLOAD"))
         );
     }
 
@@ -2519,6 +2582,14 @@ async fn run_transport_parity_scenario(sock: &Path) -> TransportParitySnapshot {
         .await
         .unwrap()
         .unwrap();
+    assert!(
+        wait_out.contains("<hyphae-inbox") && !wait_out.contains("CROSS_OS_WAIT_MSG_1"),
+        "RFC 0004: wait must emit metadata-only XML digest without raw body: {wait_out}"
+    );
+    let (in1_txt, in1_err) = mcp
+        .call_verified_claude(sock, "xport-b", "hyp_inbox", json!({}))
+        .await;
+    assert!(!in1_err);
 
     // 2. Send msg2 and drain via synchronous `handle_hook_payload` (`PreInvocation` TurnStart) over `sock`!
     let (_, s2_err) = mcp
@@ -2543,6 +2614,14 @@ async fn run_transport_parity_scenario(sock: &Path) -> TransportParitySnapshot {
         .as_str()
         .unwrap_or_default()
         .to_string();
+    assert!(
+        post_ctx.starts_with("<hyphae-inbox") && !post_ctx.contains("CROSS_OS_HOOK_MSG_2"),
+        "RFC 0004: hook must emit metadata-only XML digest without raw body: {post_ctx}"
+    );
+    let (in2_txt, in2_err) = mcp
+        .call_verified_claude(sock, "xport-b", "hyp_inbox", json!({}))
+        .await;
+    assert!(!in2_err);
 
     // 3. Query `hyp_inbox(state:"delivered")` and `daemon.status`!
     let (del_txt, del_err) = mcp
@@ -2573,8 +2652,8 @@ async fn run_transport_parity_scenario(sock: &Path) -> TransportParitySnapshot {
     TransportParitySnapshot {
         tools,
         joined_address,
-        wait_contains_msg1: wait_out.contains("CROSS_OS_WAIT_MSG_1"),
-        post_hook_contains_msg2: post_ctx.contains("CROSS_OS_HOOK_MSG_2"),
+        wait_contains_msg1: in1_txt.contains("CROSS_OS_WAIT_MSG_1"),
+        post_hook_contains_msg2: in2_txt.contains("CROSS_OS_HOOK_MSG_2"),
         delivered_count,
         daemon_node_id: st_res["nodeId"].as_str().unwrap().to_string(),
         daemon_profile: st_res["profile"].as_str().unwrap().to_string(),
@@ -2814,9 +2893,25 @@ async fn suite_7_direct_p2p_security_gate_lockdown_and_human_approve_without_req
         json!({ "session_id": "bob-p2p-gate" }),
     )
     .await;
+    let approved_ctx = post_approved["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("human-approved receipt must emit XML digest without re-quarantine");
     assert!(
-        post_approved.to_string().contains("P2P_SECRET_PAYLOAD_42"),
-        "human-approved receipt MUST deliver immediately without being re-quarantined: {post_approved}"
+        approved_ctx.starts_with("<hyphae-inbox handle=\"bob\" unread=\"1\" urgency=\"queue\">")
+            && approved_ctx.contains("<dm from=\"alice@macbook/alice\" count=\"1\"/>"),
+        "human-approved receipt MUST emit metadata-only XML digest without being re-quarantined: {post_approved}"
+    );
+    assert!(
+        !approved_ctx.contains("P2P_SECRET_PAYLOAD_42"),
+        "RFC 0004: hook digest must NEVER include raw approved body: {post_approved}"
+    );
+    let (bob_in_txt, bob_in_err) = bob_mcp
+        .call_verified_claude(&bob_sock, "bob-p2p-gate", "hyp_inbox", json!({}))
+        .await;
+    assert!(!bob_in_err, "bob hyp_inbox failed: {bob_in_txt}");
+    assert!(
+        bob_in_txt.contains("P2P_SECRET_PAYLOAD_42"),
+        "approved receipt payload must be readable via hyp_inbox: {bob_in_txt}"
     );
 
     bob_mcp.close().await;
@@ -3101,8 +3196,24 @@ async fn suite_8_handle_descriptions_multihub_peers_and_configured_bridge_target
         .unwrap()
         .unwrap();
     assert!(
-        wait_out.contains("Please deploy v0.3.0"),
-        "live wait must wake with inbound bridge text: {wait_out}"
+        wait_out.contains("<hyphae-inbox handle=\"alice\" unread=\"1\" urgency=\"queue\">")
+            && wait_out.contains("<bridge target=\"telegram:123456789\" count=\"1\"/>"),
+        "live wait must wake with metadata-only bridge XML digest: {wait_out}"
+    );
+    assert!(
+        !wait_out.contains("Please deploy v0.3.0"),
+        "RFC 0004: live wait must NEVER expose raw bridge body: {wait_out}"
+    );
+    let (alice_in_txt, alice_in_err) = alice_mcp
+        .call_verified_claude(&alice_sock, "alice-s8", "hyp_inbox", json!({}))
+        .await;
+    assert!(
+        !alice_in_err,
+        "alice bridge hyp_inbox failed: {alice_in_txt}"
+    );
+    assert!(
+        alice_in_txt.contains("Please deploy v0.3.0"),
+        "hyp_inbox must return inbound bridge text: {alice_in_txt}"
     );
 
     // Also verify Security Gate rejects oversized (>16 KiB) Bridge inbound payload fail-closed!
@@ -3277,7 +3388,22 @@ async fn suite_9_push_transport_queue_interrupt_stop_silencing_and_hold_fallback
     let batch1 = mock_transport.take_delivered();
     assert_eq!(batch1.len(), 1);
     assert_eq!(batch1[0].0, PushMode::Queue);
-    assert!(batch1[0].1.contains("hello-via-queue-push"));
+    assert!(
+        batch1[0]
+            .1
+            .starts_with("<hyphae-inbox handle=\"codex\" unread=\"1\" urgency=\"queue\">")
+            && batch1[0]
+                .1
+                .contains("<dm from=\"push@box/sender\" count=\"1\"/>"),
+        "expected metadata-only XML digest on queue push: {:?}",
+        batch1[0]
+    );
+    assert!(!batch1[0].1.contains("hello-via-queue-push"));
+    assert_eq!(session_status(&sock, "codex:thr-p9").await["pending"], 1);
+    let (in1_txt, in1_err) = codex_mcp
+        .call_verified_for_harness(&sock, HarnessKind::Codex, "thr-p9", "hyp_inbox", json!({}))
+        .await;
+    assert!(!in1_err && in1_txt.contains("hello-via-queue-push"));
     assert_eq!(session_status(&sock, "codex:thr-p9").await["pending"], 0);
 
     // 2. VIP interrupt rule -> pushed in Interrupt mode!
@@ -3319,10 +3445,29 @@ async fn suite_9_push_transport_queue_interrupt_stop_silencing_and_hold_fallback
     let batch2 = mock_transport.take_delivered();
     assert_eq!(batch2.len(), 1);
     assert_eq!(batch2[0].0, PushMode::Interrupt);
-    assert!(batch2[0].1.contains("urgent-interrupt-msg"));
+    assert!(
+        batch2[0]
+            .1
+            .starts_with("<hyphae-inbox handle=\"codex\" unread=\"1\" urgency=\"interrupt\">")
+            && batch2[0]
+                .1
+                .contains("<dm from=\"push@box/sender\" count=\"1\"/>")
+    );
+    assert!(!batch2[0].1.contains("urgent-interrupt-msg"));
+    let (in2_txt, in2_err) = codex_mcp
+        .call_verified_for_harness(&sock, HarnessKind::Codex, "thr-p9", "hyp_inbox", json!({}))
+        .await;
+    assert!(!in2_err && in2_txt.contains("urgent-interrupt-msg"));
+    let _ = run_hook(
+        &sock,
+        HarnessKind::Codex,
+        HookEvent::Stop,
+        json!({ "thread_id": "thr-p9" }),
+    )
+    .await;
 
     // 3. Transport returns Hold("herdr_working") -> message preserved unread in durable SQLite
-    //    and drained cleanly via PostToolUse hook!
+    //    and surfaced cleanly via PostToolUse hook XML digest!
     mock_transport.set_outcome(PushOutcome::hold("herdr_working"));
     let (_, dm3_err) = sender_mcp
         .call_verified_claude(
@@ -3356,9 +3501,17 @@ async fn suite_9_push_transport_queue_interrupt_stop_silencing_and_hold_fallback
     .await;
     let drained_txt = extract_drain_text(HarnessKind::Codex, &post_drain);
     assert!(
-        drained_txt.contains("preserve-on-hold-fallback"),
-        "PostToolUse fallback must deliver held message: {drained_txt}"
+        drained_txt
+            .starts_with("<hyphae-inbox handle=\"codex\" unread=\"1\" urgency=\"interrupt\">")
+            && drained_txt.contains("<dm from=\"push@box/sender\" count=\"1\"/>"),
+        "PostToolUse fallback must emit XML digest for held message: {drained_txt}"
     );
+    assert!(!drained_txt.contains("preserve-on-hold-fallback"));
+    assert_eq!(session_status(&sock, "codex:thr-p9").await["pending"], 1);
+    let (in3_txt, in3_err) = codex_mcp
+        .call_verified_for_harness(&sock, HarnessKind::Codex, "thr-p9", "hyp_inbox", json!({}))
+        .await;
+    assert!(!in3_err && in3_txt.contains("preserve-on-hold-fallback"));
     assert_eq!(session_status(&sock, "codex:thr-p9").await["pending"], 0);
 
     codex_mcp.close().await;
@@ -3490,8 +3643,11 @@ esac
     }
     assert!(
         log_contents.contains("send --json --if idle t9h")
-            && log_contents.contains("<hyphae-wake count=\"1\" handle=\"codex-in-herdr\" urgency=\"queue\">1 Hyphae message(s) queued for @codex-in-herdr. Review any injected Hyphae context or call hyp_inbox({ ack: true }) to read them.</hyphae-wake>"),
-        "expected fake-hc to receive guarded metadata-only wake nudge, got:\n{log_contents}"
+            && log_contents.contains(
+                "<hyphae-inbox handle=\"codex-in-herdr\" unread=\"1\" urgency=\"queue\">"
+            )
+            && log_contents.contains("<dm from=\"herdr-auto@box/sender\" count=\"1\"/>"),
+        "expected fake-hc to receive guarded metadata-only XML digest, got:\n{log_contents}"
     );
     assert!(
         !log_contents.contains("wake-up-codex-via-herdr"),

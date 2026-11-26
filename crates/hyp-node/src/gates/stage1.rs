@@ -49,14 +49,17 @@ pub struct Stage1Outcome {
 }
 
 impl Stage1Outcome {
-    fn allow(downgraded_to_notify: bool) -> Self {
+    fn allow(downgraded_to_notify: bool, capped_to_queue: bool) -> Self {
         let mut categories = Vec::new();
         if downgraded_to_notify {
             categories.push("downgraded_to_notify".to_string());
+        } else if capped_to_queue {
+            categories.push("capped_to_queue".to_string());
         }
         Self {
             decision: GateDecision::Allow {
                 downgraded_to_notify,
+                capped_to_queue,
             },
             categories,
         }
@@ -295,10 +298,11 @@ impl Stage1Engine {
             }
         }
 
-        // 8. Automatic trust-tier delivery downgrade (never auto-interrupt live agents from untrusted tiers).
+        // 8. Automatic trust-tier delivery ceiling (never auto-interrupt live agents from untrusted tiers).
         match tier_policy.default_action {
-            TierDeliveryAction::Allow => Stage1Outcome::allow(false),
-            TierDeliveryAction::DowngradeToNotify => Stage1Outcome::allow(true),
+            TierDeliveryAction::Allow => Stage1Outcome::allow(false, false),
+            TierDeliveryAction::CapToQueue => Stage1Outcome::allow(false, true),
+            TierDeliveryAction::DowngradeToNotify => Stage1Outcome::allow(true, false),
             TierDeliveryAction::Quarantine => Stage1Outcome::quarantine(
                 format!("trust_tier_quarantine:{}", ctx.trust_tier.as_str()),
                 "trust_tier_quarantine",
@@ -312,7 +316,7 @@ impl Stage1Engine {
     /// and categories contain ONLY redacted category labels — NEVER any characters of the secret.
     pub fn evaluate_outbound(&self, ctx: &OutboundContext) -> Stage1Outcome {
         if !self.config.outbound_dlp_enabled {
-            return Stage1Outcome::allow(false);
+            return Stage1Outcome::allow(false, false);
         }
 
         let mut matched_categories: BTreeSet<String> = BTreeSet::new();
@@ -323,7 +327,7 @@ impl Stage1Engine {
         }
 
         if matched_categories.is_empty() {
-            Stage1Outcome::allow(false)
+            Stage1Outcome::allow(false, false)
         } else {
             let cats: Vec<String> = matched_categories.into_iter().collect();
             let reason = format!("outbound_dlp_blocked:{}", cats.join(","));

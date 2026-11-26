@@ -3133,7 +3133,8 @@ async fn chaos_webhook_transfer_and_subprocess_adapter_to_gated_node_e2e() {
         assert_eq!(
             res.decision,
             GateDecision::Allow {
-                downgraded_to_notify: true
+                downgraded_to_notify: false,
+                capped_to_queue: true,
             }
         );
     }

@@ -493,6 +493,7 @@ impl LakeraGuardPlugin {
             FilterOutcome {
                 decision: GateDecision::Allow {
                     downgraded_to_notify: false,
+                    capped_to_queue: false,
                 },
                 confidence: Some(1.0),
                 categories: vec!["lakera_clean".to_string()],
@@ -677,6 +678,7 @@ impl HttpClassifierPlugin {
             FilterOutcome {
                 decision: GateDecision::Allow {
                     downgraded_to_notify: false,
+                    capped_to_queue: false,
                 },
                 confidence: Some(score),
                 categories,

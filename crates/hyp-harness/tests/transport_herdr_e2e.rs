@@ -888,11 +888,11 @@ esac
                 "--if",
                 "idle",
                 "t3",
-                "<hyphae-wake count=\"2\" handle=\"concierge\" urgency=\"queue\">2 Hyphae message(s) queued for @concierge. Review any injected Hyphae context or call hyp_inbox({ ack: true }) to read them.</hyphae-wake>",
+                "<hyphae-inbox handle=\"concierge\" unread=\"2\" urgency=\"queue\"/>",
             ]
         );
 
-        // Interrupt nudge with prompt-injected handle falls back safely to handle-less urgent nudge
+        // Interrupt nudge with prompt-injected handle falls back safely to handle-less urgent digest
         assert_eq!(
             transport
                 .deliver_nudge(
@@ -914,7 +914,7 @@ esac
                 "--if",
                 "idle",
                 "t3",
-                "<hyphae-wake count=\"1\" urgency=\"interrupt\">1 urgent Hyphae message(s) queued. Review any injected Hyphae context or call hyp_inbox({ ack: true }) to read them.</hyphae-wake>",
+                "<hyphae-inbox unread=\"1\" urgency=\"interrupt\"/>",
             ]
         );
     }

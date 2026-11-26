@@ -871,14 +871,34 @@ impl<'a> LocalStateStore<'a> {
         downgraded_to_notify: bool,
         now_ms: i64,
     ) -> StoreResult<bool> {
+        self.mark_mailbox_gate_approved_with_reason(
+            session_id,
+            receipt,
+            downgraded_to_notify.then_some("downgraded_to_notify"),
+            now_ms,
+        )
+    }
+
+    /// Atomically marks a `pending` mailbox row as gate-screened & approved (`reviewed_at = now_ms`),
+    /// optionally recording a specific Stage 1 `gate_reason` (e.g. `"capped_to_queue"` or
+    /// `"downgraded_to_notify"`).
+    ///
+    /// Returns `true` if the row existed in `pending` state and was promoted.
+    pub fn mark_mailbox_gate_approved_with_reason(
+        &self,
+        session_id: &str,
+        receipt: &str,
+        gate_reason: Option<&str>,
+        now_ms: i64,
+    ) -> StoreResult<bool> {
         let tx = self.db.immediate_tx()?;
-        let changed = if downgraded_to_notify {
+        let changed = if let Some(reason) = gate_reason {
             tx.conn().execute(
                 "UPDATE mailbox
                  SET reviewed_at = COALESCE(reviewed_at, ?1),
-                     gate_reason = 'downgraded_to_notify'
-                 WHERE session_id = ?2 AND receipt = ?3 AND gate_state = 'pending'",
-                params![now_ms, session_id, receipt],
+                     gate_reason = ?2
+                 WHERE session_id = ?3 AND receipt = ?4 AND gate_state = 'pending'",
+                params![now_ms, reason, session_id, receipt],
             )?
         } else {
             tx.conn().execute(

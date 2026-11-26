@@ -235,6 +235,44 @@ async function runParityMatrixForAdapter(adapter: RealHarnessAdapter): Promise<O
 
     let p3InterruptSawMidTurnTool = false;
 
+    const INBOX_DIGEST_RE = /(?:<|&lt;)hyphae-inbox\s/;
+    const URGENCY_INTERRUPT_RE = /urgency=(?:\\?"|&quot;)interrupt(?:\\?"|&quot;)/;
+    const URGENCY_ACTIONABLE_RE = /urgency=(?:\\?"|&quot;)(?:interrupt|queue)(?:\\?"|&quot;)/;
+    const trailingInboundMessages = (req: CanonicalLlmRequest) => {
+      const out: CanonicalLlmRequest["messages"] = [];
+      for (let i = req.messages.length - 1; i >= 0; i -= 1) {
+        if (req.messages[i].role === "assistant") break;
+        out.unshift(req.messages[i]);
+      }
+      return out;
+    };
+    // Only auto-pull `hyp_inbox` on actionable (`interrupt`/`queue`) digests — passive
+    // `urgency="notify"` digests (e.g. Focus Mode buffered FYI badges) stay untouched until focus off!
+    const hasFreshInboxDigest = (req: CanonicalLlmRequest): boolean =>
+      trailingInboundMessages(req).some(
+        (m) =>
+          Boolean(m.text && INBOX_DIGEST_RE.test(m.text) && URGENCY_ACTIONABLE_RE.test(m.text)) ||
+          (m.toolResults || []).some(
+            (tr) =>
+              tr.canonicalToolName !== "hyp_inbox" &&
+              INBOX_DIGEST_RE.test(tr.text) &&
+              URGENCY_ACTIONABLE_RE.test(tr.text),
+          ),
+      );
+    const hasFreshInterruptDigest = (req: CanonicalLlmRequest): boolean =>
+      trailingInboundMessages(req).some(
+        (m) =>
+          Boolean(
+            m.text && INBOX_DIGEST_RE.test(m.text) && URGENCY_INTERRUPT_RE.test(m.text),
+          ) ||
+          (m.toolResults || []).some(
+            (tr) =>
+              tr.canonicalToolName !== "hyp_inbox" &&
+              INBOX_DIGEST_RE.test(tr.text) &&
+              URGENCY_INTERRUPT_RE.test(tr.text),
+          ),
+      );
+
     const alphaRules: ScriptRule[] = [
       // Ignore utility title-generation turns (e.g. Codex `thread_title` with `tools: []`)
       {
@@ -322,13 +360,18 @@ async function runParityMatrixForAdapter(adapter: RealHarnessAdapter): Promise<O
           !adapter.capabilities.midStreamInterrupt &&
           sawProbeToolResult(adapter.id, req),
         assert: (req) => {
-          if (req.anyMessageContains(p3Msg)) {
+          if (hasFreshInterruptDigest(req) || req.anyMessageContains(p3Msg)) {
             p3InterruptSawMidTurnTool = true;
           }
+          assert.equal(
+            req.rawBody.includes(p3Msg),
+            false,
+            "RFC 0004: PostToolUse interrupt digest MUST NOT leak raw payload body",
+          );
         },
         do: (req) =>
-          req.anyMessageContains(p3Msg)
-            ? callTool(req, "hyp_send", { to: "sink", text: `P3_ACK:${p3Msg}` })
+          hasFreshInterruptDigest(req)
+            ? callTool(req, "hyp_inbox", {})
             : emitText("P3_NO_INTERRUPT"),
       },
 
@@ -382,14 +425,15 @@ async function runParityMatrixForAdapter(adapter: RealHarnessAdapter): Promise<O
         do: (req) => callTool(req, "hyp_send", { to: "sink", text: `P8_ACK:${p8PersistMsg}` }),
       },
 
-      // Generic `<hyphae-wake>` metadata-only nudge -> `hyp_inbox(ack: true)`!
+      // RFC 0004: Read inbox whenever a fresh `<hyphae-inbox ...>` digest arrives via hook or push wake!
       {
         name: "alpha-wake-read-inbox",
         when: (req) =>
           matchSession(req, alphaTag) &&
-          req.lastUserText.includes("<hyphae-wake") &&
-          req.lastToolResults.length === 0,
-        do: (req) => callTool(req, "hyp_inbox", { ack: true }),
+          !req.lastToolResult("hyp_inbox") &&
+          !req.lastToolResult("hyp_send") &&
+          hasFreshInboxDigest(req),
+        do: (req) => callTool(req, "hyp_inbox", {}),
       },
       // When turn-driven Focus exit / restart / burst check asks to check inbox explicitly & nothing was hook-injected
       {
@@ -417,7 +461,8 @@ async function runParityMatrixForAdapter(adapter: RealHarnessAdapter): Promise<O
       {
         name: "alpha-waiter-ack",
         when: (req) =>
-          matchSession(req, alphaTag) && req.anyMessageContains("no background waiter is running yet"),
+          matchSession(req, alphaTag) &&
+          req.lastUserText.includes("no background waiter is running yet"),
         do: () => emitText("ALPHA_STANDING_BY"),
       },
     ];
@@ -457,9 +502,9 @@ async function runParityMatrixForAdapter(adapter: RealHarnessAdapter): Promise<O
         name: "beta-wake-read-inbox",
         when: (req) =>
           matchSession(req, betaTag) &&
-          req.lastUserText.includes("<hyphae-wake") &&
-          req.lastToolResults.length === 0,
-        do: (req) => callTool(req, "hyp_inbox", { ack: true }),
+          !req.lastToolResult("hyp_inbox") &&
+          hasFreshInboxDigest(req),
+        do: (req) => callTool(req, "hyp_inbox", {}),
       },
       {
         name: "beta-reply-p7",
@@ -470,7 +515,8 @@ async function runParityMatrixForAdapter(adapter: RealHarnessAdapter): Promise<O
       {
         name: "beta-waiter-ack",
         when: (req) =>
-          matchSession(req, betaTag) && req.anyMessageContains("no background waiter is running yet"),
+          matchSession(req, betaTag) &&
+          req.lastUserText.includes("no background waiter is running yet"),
         do: () => emitText("BETA_STANDING_BY"),
       },
     ];

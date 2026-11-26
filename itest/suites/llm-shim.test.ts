@@ -535,7 +535,26 @@ test("llm-shim all 5 invariant auditors catch mutated negative violations", asyn
     );
     shim.auditors.resetViolations();
 
-    // (E) Mutated negative case 3: Wake nudge leaks raw untrusted payload!
+    // (E) Mutated negative case 3: <hyphae-inbox> digest & legacy <hyphae-wake> leak raw untrusted payload!
+    await fetch(`${shim.roleBaseUrl("nudge-only")}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-5",
+        messages: [
+          {
+            role: "user",
+            content: `<hyphae-inbox handle="bob" unread="1" urgency="queue">\n  <dm from="alice" count="1"/>\n  UNTRUSTED_PAYLOAD_MARKER_77\n</hyphae-inbox>`,
+          },
+        ],
+      }),
+    });
+    assert.ok(
+      shim.auditors.getViolations().some((v) => v.auditor === "metadata-only-wake"),
+      "must flag raw payload inside <hyphae-inbox> digest",
+    );
+    shim.auditors.resetViolations();
+
     await fetch(`${shim.roleBaseUrl("nudge-only")}/v1/messages`, {
       method: "POST",
       headers: { "content-type": "application/json" },

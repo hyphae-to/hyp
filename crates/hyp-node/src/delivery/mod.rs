@@ -19,13 +19,17 @@ pub use inbox_query::{
     archive_muted_entry, load_session_policy, move_pending_to_muted, muted_count, query_inbox,
     record_delivered_receipts, save_session_policy,
 };
-pub use packer::{PackableItem, PackedDeliveryBatch, estimate_tokens, pack_delivery_batch};
+pub use packer::{
+    PackableItem, PackedDeliveryBatch, QuarantineDigestNotice, estimate_tokens,
+    pack_delivery_batch, pack_inbox_digest, xml_escape_attr,
+};
 pub use policy::{
     BurstProtectionConfig, DEFAULT_BURST_MAX_EVENTS_PER_WINDOW,
     DEFAULT_BURST_MIN_DELIVERY_INTERVAL_SECS, DEFAULT_BURST_NOISY_COOLDOWN_SECS,
     DEFAULT_BURST_WINDOW_SECS, DEFAULT_MAX_BATCH_TOKENS, DEFAULT_MAX_INLINE_ITEMS,
-    DEFAULT_MAX_SINGLE_ITEM_SHARE, DeliveryError, DeliveryRule, DeliveryTargetContext,
-    DeliveryUrgency, ParsedMailboxSource, SessionDeliveryPolicy,
+    DEFAULT_MAX_SINGLE_ITEM_SHARE, DEFAULT_MIDTURN_QUEUE_DIGEST_SECONDS, DeliveryError,
+    DeliveryRule, DeliveryTargetContext, DeliveryUrgency, ParsedMailboxSource,
+    SessionDeliveryPolicy, gate_reason_urgency_cap,
 };
 
 /// Result of classifying a single inbound item through [`DeliveryEngine`].
@@ -116,12 +120,34 @@ impl DeliveryEngine {
         gate_downgraded_to_notify: bool,
         now_ms: i64,
     ) -> Result<DeliveryClassification, DeliveryError> {
+        self.classify_entry_with_cap(
+            db,
+            session_id,
+            entry,
+            subscription_mode,
+            gate_downgraded_to_notify.then_some(DeliveryUrgency::Notify),
+            now_ms,
+        )
+    }
+
+    /// Classifies an inbound mailbox entry with an explicit optional Stage 1 urgency ceiling
+    /// (`Some(DeliveryUrgency::Queue)` for `CapToQueue` or `Some(DeliveryUrgency::Notify)` for
+    /// `DowngradeToNotify`).
+    pub fn classify_entry_with_cap(
+        &self,
+        db: &NodeDb,
+        session_id: &str,
+        entry: &MailboxEntry,
+        subscription_mode: Option<DeliveryUrgency>,
+        gate_max_urgency: Option<DeliveryUrgency>,
+        now_ms: i64,
+    ) -> Result<DeliveryClassification, DeliveryError> {
         let policy = self.policy(db, session_id)?;
         let parsed = ParsedMailboxSource::from_entry(entry);
-        let policy_urgency = policy.resolve_urgency(
+        let policy_urgency = policy.resolve_urgency_with_cap(
             &parsed.as_context(),
             subscription_mode,
-            gate_downgraded_to_notify,
+            gate_max_urgency,
         );
         let burst_key = parsed.burst_source_key();
         let burst = {

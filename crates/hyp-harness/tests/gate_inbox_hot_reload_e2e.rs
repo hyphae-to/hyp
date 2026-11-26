@@ -245,7 +245,21 @@ async fn gate_reload_swaps_live_pipeline_without_restart_and_blocks_new_rule() {
         "expected message to be allowed before reload"
     );
     let deliveries = transport.wait_for_count(1, Duration::from_secs(2)).await;
-    assert!(deliveries[0].0.contains("FORBIDDEN_SECRET_RULE"));
+    assert!(deliveries[0].0.starts_with("<hyphae-inbox "));
+    assert!(
+        deliveries[0]
+            .0
+            .contains("<dm from=\"bob@laptop/dev\" count=\"1\"/>")
+    );
+    assert!(!deliveries[0].0.contains("FORBIDDEN_SECRET_RULE"));
+    assert!(
+        node.db()
+            .local()
+            .peek_inbox("claude:live-gate", 10)
+            .unwrap()
+            .iter()
+            .any(|m| m.text.contains("FORBIDDEN_SECRET_RULE"))
+    );
 
     // 2. Write a NEW signed policy adding a Stage 1 block rule + 1 enabled filter plugin.
     let mut updated_cfg = SecurityGateConfig::default();
@@ -358,7 +372,23 @@ async fn gate_reload_swaps_live_pipeline_without_restart_and_blocks_new_rule() {
         .unwrap();
     assert!(res3.is_some());
     let deliveries = transport.wait_for_count(2, Duration::from_secs(2)).await;
-    assert!(deliveries[1].0.contains("benign engineering update"));
+    assert!(
+        deliveries[1].0.starts_with("<hyphae-inbox ")
+            && deliveries[1]
+                .0
+                .contains("<dm from=\"bob@laptop/dev\" count=\"2\"/>"),
+        "expected metadata-only XML digest on benign message after reload: {:?}",
+        deliveries[1]
+    );
+    assert!(!deliveries[1].0.contains("benign engineering update"));
+    assert!(
+        node.db()
+            .local()
+            .peek_inbox("claude:live-gate", 10)
+            .unwrap()
+            .iter()
+            .any(|m| m.text.contains("benign engineering update"))
+    );
 
     ingest_srv.stop().await;
     daemon.stop().await;
@@ -650,14 +680,32 @@ async fn inbox_wake_immediately_delivers_approved_item_and_clears_quarantine_bad
     assert_eq!(wr["quarantinedGlobal"], 1);
     let wake_rev = wr["rev"].as_u64().unwrap();
 
-    // Attached PushTransport MUST have received the approved message immediately (NO restart!).
+    // Attached PushTransport MUST have received the metadata-only XML digest immediately (NO restart!).
     let deliveries = transport.wait_for_count(1, Duration::from_secs(2)).await;
     assert!(
         deliveries[0]
             .0
-            .contains("SUSPICIOUS_HOLD please review PR #42"),
-        "expected approved body in delivery, got: {}",
+            .starts_with("<hyphae-inbox unread=\"1\" urgency=\"queue\">")
+            && deliveries[0]
+                .0
+                .contains("<dm from=\"ext@peer/sender\" count=\"1\"/>"),
+        "expected approved item XML digest in delivery, got: {}",
         deliveries[0].0
+    );
+    assert!(
+        !deliveries[0]
+            .0
+            .contains("SUSPICIOUS_HOLD please review PR #42"),
+        "RFC 0004: push digest must NEVER contain raw approved body: {}",
+        deliveries[0].0
+    );
+    assert!(
+        node.db()
+            .local()
+            .peek_inbox("claude:idle-1", 10)
+            .unwrap()
+            .iter()
+            .any(|m| m.text.contains("SUSPICIOUS_HOLD please review PR #42"))
     );
 
     // `session.summary` AND `ui/state.json` must immediately reflect quarantined=1.
@@ -819,7 +867,25 @@ async fn cross_os_tcp_loopback_parity_for_gate_reload_and_inbox_wake() {
     assert_eq!(wr["quarantinedRemaining"], 0);
 
     let deliveries = transport.wait_for_count(1, Duration::from_secs(2)).await;
-    assert!(deliveries[0].0.contains("TCP_HOLD_TOKEN"));
+    assert!(
+        deliveries[0]
+            .0
+            .starts_with("<hyphae-inbox unread=\"1\" urgency=\"queue\">")
+    );
+    assert!(
+        deliveries[0]
+            .0
+            .contains("<dm from=\"ext@peer/bot\" count=\"1\"/>")
+    );
+    assert!(!deliveries[0].0.contains("TCP_HOLD_TOKEN"));
+    assert!(
+        node.db()
+            .local()
+            .peek_inbox("claude:tcp-1", 10)
+            .unwrap()
+            .iter()
+            .any(|m| m.text.contains("TCP_HOLD_TOKEN"))
+    );
 
     daemon.stop().await;
 }

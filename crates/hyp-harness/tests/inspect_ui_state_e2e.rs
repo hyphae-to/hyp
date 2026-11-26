@@ -757,6 +757,26 @@ async fn mckeeman_reference_model_differential_parity_and_zero_body_leakage() {
     }
     let drain_res = rpc(sock, json!({ "type": "mailbox.drain", "sessionId": s1 })).await;
     assert!(drain_res.ok);
+    // RFC 0004: `mailbox.drain` emits a metadata-only `<hyphae-inbox>` XML digest and marks rows
+    // `notified = 1` WITHOUT acknowledging them as delivered — all 3 items stay unread (`queued`)
+    // until explicitly read/acked via `hyp_inbox`!
+    assert_all_four_oracles_agree(&model, &daemon, &[s1, s2], &sentinels).await;
+
+    // Now acknowledge the 3 unread items (matching `hyp_inbox` default `ack: true`) and confirm
+    // all four oracles drop to 0 queued!
+    {
+        let db = node.db();
+        let ids: Vec<String> = db
+            .local()
+            .peek_inbox(s1, 20)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.receipt)
+            .collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        db.local().acknowledge_inbox(s1, &refs, now_ms()).unwrap();
+    }
+    let _ = rpc(sock, json!({ "type": "inbox.wake", "sessionId": s1 })).await;
     model.sessions.get_mut(s1).unwrap().pending_items.clear();
 
     assert_all_four_oracles_agree(&model, &daemon, &[s1, s2], &sentinels).await;
@@ -1252,12 +1272,10 @@ async fn wait_subscribe_resolves_herdr_terminal_id_and_tcp_loopback_parity() {
     .unwrap();
     let items: Value = serde_json::from_str(&items_line).unwrap();
     assert_eq!(items["type"], "wait.items");
-    assert!(
-        items["items"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("hello over tcp")
-    );
+    let wait_txt = items["items"][0]["text"].as_str().unwrap();
+    assert!(wait_txt.starts_with("<hyphae-inbox "));
+    assert!(wait_txt.contains("<dm from=\"bob@lap/dev\" count=\"1\"/>"));
+    assert!(!wait_txt.contains("hello over tcp"));
 
     // Verify `session.summary` & debounced `ui/state.json` over loopback TCP match.
     let sum = rpc(

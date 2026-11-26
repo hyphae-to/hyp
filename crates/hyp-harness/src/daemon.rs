@@ -15,7 +15,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -34,10 +34,11 @@ use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keystore::validate_secret_name;
 use hyp_crypto::rfc3339::format_rfc3339_millis;
 use hyp_node::delivery::{
-    DeliveryEngine, DeliveryError, DeliveryRule, DeliveryUrgency, InboxFilter, InboxItemState,
-    InboxItemView, InboxQuery, InboxQueryResult, InboxStateFilter, PackableItem,
-    PackedDeliveryBatch, archive_muted_entry, move_pending_to_muted, muted_count,
-    pack_delivery_batch, query_inbox, record_delivered_receipts,
+    DEFAULT_MIDTURN_QUEUE_DIGEST_SECONDS, DeliveryEngine, DeliveryError, DeliveryRule,
+    DeliveryUrgency, InboxFilter, InboxItemState, InboxItemView, InboxQuery, InboxQueryResult,
+    InboxStateFilter, PackableItem, PackedDeliveryBatch, QuarantineDigestNotice,
+    archive_muted_entry, gate_reason_urgency_cap, move_pending_to_muted, muted_count,
+    pack_inbox_digest, query_inbox, record_delivered_receipts,
 };
 pub use hyp_node::engine::WakeRecoveryConfig;
 use hyp_node::engine::http_util::{HttpClient, SseParser, empty_body, full_body};
@@ -97,7 +98,7 @@ use crate::transport::t3::{
     normalize_t3_server_url_with_remote, probe_t3_server_with_remote,
     resolve_t3_thread_by_provider_session, t3_state_db_path, verify_t3_thread_exists,
 };
-use crate::transport::{PushMode, PushOutcome, PushTransport, format_push_wake_nudge};
+use crate::transport::{PushMode, PushOutcome, PushTransport};
 
 /// Reserved `SecretStore` key name holding the daemon's 32-byte deterministic HMAC-SHA256
 /// key used to derive per-session `sessionToken` values that survive daemon restarts & resume.
@@ -304,6 +305,9 @@ pub struct LocalDaemonConfig {
     pub wake_check_interval: Duration,
     /// Delay for the single `shutdown_rx`-cancellable post-wake follow-up flush (default: 2s).
     pub wake_followup_flush_delay: Duration,
+    /// Interval (seconds) between periodic mid-turn `PostToolUse` `<hyphae-inbox urgency="queue">`
+    /// digest reminders during long turns (RFC 0004 Decision #4). Default `1800` (30 min); `0` = disabled.
+    pub midturn_queue_digest_seconds: u64,
 }
 
 impl Default for LocalDaemonConfig {
@@ -328,6 +332,7 @@ impl Default for LocalDaemonConfig {
             wake_recovery: WakeRecoveryConfig::default(),
             wake_check_interval: Duration::from_secs(DEFAULT_WAKE_CHECK_INTERVAL_SECS),
             wake_followup_flush_delay: DEFAULT_WAKE_FOLLOWUP_FLUSH_DELAY,
+            midturn_queue_digest_seconds: DEFAULT_MIDTURN_QUEUE_DIGEST_SECONDS,
         }
     }
 }
@@ -605,6 +610,33 @@ struct QuarantineNoticeMeta {
     surfaced_in_batch: bool,
 }
 
+/// Result of building a metadata-only XML digest batch for a session & drain scope.
+struct BuiltDigestBatch {
+    batch: PackedDeliveryBatch,
+    /// True when produced by RFC 0004 Decision #4 periodic long-turn `PostToolUse` `Queue` reminder
+    /// (updates `last_midturn_digest_at_ms` without prematurely stamping `Queue` items `notified = 1`).
+    is_midturn_queue_reminder: bool,
+}
+
+fn strictest_urgency_cap(
+    a: Option<DeliveryUrgency>,
+    b: Option<DeliveryUrgency>,
+) -> Option<DeliveryUrgency> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(if x.rank() >= y.rank() { x } else { y }),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
+const fn urgency_cap_gate_reason(cap: Option<DeliveryUrgency>) -> Option<&'static str> {
+    match cap {
+        Some(DeliveryUrgency::Notify) => Some("downgraded_to_notify"),
+        Some(DeliveryUrgency::Queue) => Some("capped_to_queue"),
+        _ => None,
+    }
+}
+
 /// Delivery drain scope requested by `mailbox.drain`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrainScope {
@@ -730,6 +762,11 @@ struct LocalDaemonInner {
     gate_hold_retries: Mutex<HashMap<String, (u32, u64, i64)>>,
     /// Tier 4 per-wakeup concurrency guard (`maxConcurrentSpawns: 1`) for allowlisted Herdr cold spawns.
     active_cold_spawns: Mutex<HashSet<String>>,
+    /// Per-session timestamp (ms) of the last mid-turn (`PostToolUse`) digest injected during the
+    /// current turn, used to rate-limit periodic long-turn `Queue` digest reminders (RFC 0004 Decision #4).
+    last_midturn_digest_at_ms: Mutex<HashMap<String, i64>>,
+    /// Optional monotonic test clock offset (ms) added to `now_ms()` for deterministic timing tests.
+    clock_offset_ms: AtomicI64,
     /// Monotonic UI projection revision counter bumped on every session/sub/mailbox/policy/channel change.
     ui_rev: AtomicU64,
     /// Watch broadcaster notifying `inspect.watch` clients and the debounced `ui/state.json` projector.
@@ -1387,6 +1424,14 @@ impl LocalDaemon {
             .await
     }
 
+    /// Advances the daemon's monotonic clock offset by `delta_ms` milliseconds for deterministic
+    /// testing of time-bounded features (e.g. RFC 0004 long-turn `PostToolUse` queue reminders).
+    pub fn advance_clock_ms(&self, delta_ms: i64) {
+        self.inner
+            .clock_offset_ms
+            .fetch_add(delta_ms, Ordering::Relaxed);
+    }
+
     /// Directly ingests an inbound item through `SecurityGatePipeline` (if configured) ->
     /// `DeliveryEngine` -> `NodeDb` mailbox, waking live transports ONLY for non-`Mute` items.
     pub async fn ingest_inbound(
@@ -1402,8 +1447,8 @@ impl LocalDaemon {
             kind,
             trust_tier,
         } = item;
-        let now = now_ms();
-        let mut gate_downgraded = false;
+        let now = self.inner.current_time_ms();
+        let mut gate_cap: Option<DeliveryUrgency> = None;
         let effective_trust_tier = if kind == MailboxKind::Plugin
             || origin_node.starts_with("bridge:")
         {
@@ -1454,8 +1499,16 @@ impl LocalDaemon {
             match eval.decision {
                 GateDecision::Allow {
                     downgraded_to_notify,
+                    capped_to_queue,
                 } => {
-                    gate_downgraded = downgraded_to_notify;
+                    gate_cap = if downgraded_to_notify {
+                        Some(DeliveryUrgency::Notify)
+                    } else if capped_to_queue {
+                        Some(DeliveryUrgency::Queue)
+                    } else {
+                        None
+                    };
+                    let gate_reason = urgency_cap_gate_reason(gate_cap);
                     gate_approved = true;
                     if let Some(receipt) = eval.receipt {
                         // Pipeline already inserted into DB if sharing same DB; check if present in node DB.
@@ -1468,10 +1521,10 @@ impl LocalDaemon {
                                 .flatten()
                                 .is_some();
                             if found {
-                                let _ = db.local().mark_mailbox_gate_approved(
+                                let _ = db.local().mark_mailbox_gate_approved_with_reason(
                                     &session_id,
                                     &receipt,
-                                    gate_downgraded,
+                                    gate_reason,
                                     now,
                                 );
                             }
@@ -1483,7 +1536,7 @@ impl LocalDaemon {
                                 .classify_and_route_pending_entry(
                                     &session_id,
                                     &receipt,
-                                    gate_downgraded,
+                                    gate_cap,
                                     now,
                                 )
                                 .await;
@@ -1545,7 +1598,7 @@ impl LocalDaemon {
             kind,
             source: source.clone(),
             gate_state: GateState::Pending,
-            gate_reason: None,
+            gate_reason: urgency_cap_gate_reason(gate_cap).map(str::to_string),
             traceparent: None,
         };
 
@@ -1560,7 +1613,7 @@ impl LocalDaemon {
             source: source.clone(),
             notified: false,
             gate_state: GateState::Pending,
-            gate_reason: None,
+            gate_reason: urgency_cap_gate_reason(gate_cap).map(str::to_string),
             traceparent: None,
             payload_sha256: None,
             reviewed_at: None,
@@ -1573,14 +1626,7 @@ impl LocalDaemon {
             let db = self.inner.node.db();
             self.inner
                 .delivery
-                .classify_entry(
-                    &db,
-                    &session_id,
-                    &temp_entry,
-                    sub_mode,
-                    gate_downgraded,
-                    now,
-                )
+                .classify_entry_with_cap(&db, &session_id, &temp_entry, sub_mode, gate_cap, now)
                 .map_err(|e| e.to_string())?
         };
 
@@ -1600,10 +1646,10 @@ impl LocalDaemon {
             {
                 MailboxPutResult::Stored { receipt } => {
                     if gate_approved {
-                        let _ = db.local().mark_mailbox_gate_approved(
+                        let _ = db.local().mark_mailbox_gate_approved_with_reason(
                             &session_id,
                             &receipt,
-                            gate_downgraded,
+                            urgency_cap_gate_reason(gate_cap),
                             now,
                         );
                     }
@@ -1865,6 +1911,8 @@ impl LocalDaemonInner {
             reconcile_locks: Mutex::new(HashMap::new()),
             gate_hold_retries: Mutex::new(HashMap::new()),
             active_cold_spawns: Mutex::new(HashSet::new()),
+            last_midturn_digest_at_ms: Mutex::new(HashMap::new()),
+            clock_offset_ms: AtomicI64::new(0),
             ui_rev: AtomicU64::new(1),
             ui_rev_tx,
             shutdown_rx,
@@ -2060,6 +2108,25 @@ impl LocalDaemonInner {
             );
     }
 
+    /// Returns the daemon's current wall-clock time (ms) plus any deterministic test clock offset.
+    fn current_time_ms(&self) -> i64 {
+        now_ms().saturating_add(self.clock_offset_ms.load(Ordering::Relaxed))
+    }
+
+    fn reset_midturn_digest_timer(&self, session_id: &str) {
+        self.last_midturn_digest_at_ms
+            .lock()
+            .expect("last_midturn_digest_at_ms lock poisoned")
+            .remove(session_id);
+    }
+
+    fn record_midturn_digest_timestamp(&self, session_id: &str, ts_ms: i64) {
+        self.last_midturn_digest_at_ms
+            .lock()
+            .expect("last_midturn_digest_at_ms lock poisoned")
+            .insert(session_id.to_string(), ts_ms);
+    }
+
     /// Immediately transitions `session_id` to `Idle` and cancels any pending activity grace timer.
     fn mark_session_idle(&self, session_id: &str) {
         self.session_activity
@@ -2067,6 +2134,7 @@ impl LocalDaemonInner {
             .expect("session_activity lock poisoned")
             .remove(session_id);
         self.cancel_activity_grace(session_id);
+        self.reset_midturn_digest_timer(session_id);
     }
 
     /// Returns the active hook activity lease for `session_id`, pruning it if already expired.
@@ -2732,14 +2800,14 @@ impl LocalDaemonInner {
         live
     }
 
-    /// Formats unsurfaced metadata-only quarantine notices for piggybacking onto an
-    /// already-scheduled normal delivery batch (`G10`).
+    /// Returns unsurfaced metadata-only quarantine notices for piggybacking inside an
+    /// already-scheduled `<hyphae-inbox>` XML digest (`G10`).
     ///
-    /// Read-only with respect to `surfaced_in_batch`: notices are marked surfaced only in
-    /// [`Self::commit_delivered_batch`] once the batch is actually delivered or drained, so
-    /// speculative flushes with no live transport never drop a notice before delivery.
-    /// Never leaks message body text and never emits duplicate notices for the same receipt.
-    fn peek_unsurfaced_quarantine_footer(&self, session_id: &str) -> Option<String> {
+    /// Read-only with respect to `surfaced_in_batch`: notices are marked surfaced only once
+    /// the rendered digest actually commits, so speculative flushes with no live transport
+    /// never drop a notice before delivery. Never leaks message body text and never emits
+    /// duplicate notices for the same receipt.
+    fn peek_unsurfaced_quarantine_notices(&self, session_id: &str) -> Vec<QuarantineDigestNotice> {
         let still_quarantined: HashSet<String> = {
             let db = self.node.db();
             db.local()
@@ -2749,7 +2817,7 @@ impl LocalDaemonInner {
                 .map(|e| e.receipt)
                 .collect()
         };
-        let mut lines = Vec::new();
+        let mut out = Vec::new();
         {
             let mut guard = self
                 .quarantine_notices
@@ -2759,10 +2827,12 @@ impl LocalDaemonInner {
                 list.retain(|n| still_quarantined.contains(&n.receipt));
                 for n in list.iter() {
                     if !n.surfaced_in_batch {
-                        lines.push(format!(
-                            "[hyphae gate · receipt={} source={} tier={} reason={} — Quarantined by Security Gate — ask the human to review via `hyp gate review` / `hyp inbox approve`]",
-                            n.receipt, n.source, n.trust_tier, n.reason
-                        ));
+                        out.push(QuarantineDigestNotice {
+                            receipt: n.receipt.clone(),
+                            source: n.source.clone(),
+                            trust_tier: n.trust_tier.clone(),
+                            reason: n.reason.clone(),
+                        });
                     }
                 }
                 if list.is_empty() {
@@ -2770,10 +2840,20 @@ impl LocalDaemonInner {
                 }
             }
         }
-        if lines.is_empty() {
-            None
-        } else {
-            Some(lines.join("\n"))
+        out
+    }
+
+    fn mark_surfaced_quarantine_notices(&self, session_id: &str, rendered: &str) {
+        let mut guard = self
+            .quarantine_notices
+            .lock()
+            .expect("quarantine_notices lock poisoned");
+        if let Some(list) = guard.get_mut(session_id) {
+            for n in list.iter_mut() {
+                if !n.surfaced_in_batch && rendered.contains(&n.receipt) {
+                    n.surfaced_in_batch = true;
+                }
+            }
         }
     }
 
@@ -3309,18 +3389,46 @@ impl LocalDaemonInner {
         let list = guard.get(session_id)?;
         let src_low = source.to_ascii_lowercase();
         let origin_low = origin_node.to_ascii_lowercase();
+        let my_id_low = self.node.node_id().as_str().to_ascii_lowercase();
         list.iter()
             .find(|s| {
-                let expected = format!(
-                    "{}.{}",
-                    s.origin_node.to_ascii_lowercase(),
-                    s.topic.to_ascii_lowercase()
-                );
+                let s_orig = s.origin_node.to_ascii_lowercase();
+                let s_topic = s.topic.to_ascii_lowercase();
+                let expected = format!("{s_orig}.{s_topic}");
                 src_low == expected
-                    || (origin_low == s.origin_node.to_ascii_lowercase()
-                        && src_low.ends_with(&format!(".{}", s.topic.to_ascii_lowercase())))
+                    || (origin_low == s_orig && src_low.ends_with(&format!(".{s_topic}")))
+                    || ((s_orig == "local" || s_orig == my_id_low)
+                        && (origin_low == "local" || origin_low == my_id_low)
+                        && src_low == format!("local.{s_topic}"))
             })
             .map(|s| s.urgency)
+    }
+
+    fn lookup_subscription_key(
+        &self,
+        session_id: &str,
+        origin_node: &str,
+        source: &str,
+    ) -> Option<String> {
+        let src_low = source.to_ascii_lowercase();
+        let origin_low = origin_node.to_ascii_lowercase();
+        let my_id_low = self.node.node_id().as_str().to_ascii_lowercase();
+        let guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
+        let list = guard.get(session_id)?;
+        list.iter()
+            .find(|s| {
+                let s_orig = s.origin_node.to_ascii_lowercase();
+                let s_topic = s.topic.to_ascii_lowercase();
+                let expected = format!("{s_orig}.{s_topic}");
+                src_low == expected
+                    || (origin_low == s_orig && src_low.ends_with(&format!(".{s_topic}")))
+                    || ((s_orig == "local" || s_orig == my_id_low)
+                        && (origin_low == "local" || origin_low == my_id_low)
+                        && src_low == format!("local.{s_topic}"))
+            })
+            .and_then(|s| s.key.as_ref())
+            .filter(|k| !k.trim().is_empty())
+            .cloned()
     }
 
     fn record_item_meta(&self, session_id: &str, receipt: String, meta: ClassifiedItemMeta) {
@@ -3445,8 +3553,7 @@ impl LocalDaemonInner {
                 }
 
                 processed_any = true;
-                let mut gate_downgraded =
-                    entry.gate_reason.as_deref() == Some("downgraded_to_notify");
+                let mut gate_cap = gate_reason_urgency_cap(entry.gate_reason.as_deref());
 
                 if needs_gate {
                     if let Some(pipeline) = active_gate {
@@ -3489,15 +3596,24 @@ impl LocalDaemonInner {
                             Ok(eval) => match eval.decision {
                                 GateDecision::Allow {
                                     downgraded_to_notify,
+                                    capped_to_queue,
                                 } => {
-                                    gate_downgraded = gate_downgraded || downgraded_to_notify;
+                                    let eval_cap = if downgraded_to_notify {
+                                        Some(DeliveryUrgency::Notify)
+                                    } else if capped_to_queue {
+                                        Some(DeliveryUrgency::Queue)
+                                    } else {
+                                        None
+                                    };
+                                    gate_cap = strictest_urgency_cap(gate_cap, eval_cap);
+                                    let reason_str = urgency_cap_gate_reason(gate_cap);
                                     // Ensure `self.node.db()` records gate approval even if the
                                     // pipeline uses a separate `NodeDb` handle.
                                     let db = self.node.db();
-                                    let _ = db.local().mark_mailbox_gate_approved(
+                                    let _ = db.local().mark_mailbox_gate_approved_with_reason(
                                         session_id,
                                         &entry.receipt,
-                                        gate_downgraded,
+                                        reason_str,
                                         now,
                                     );
                                 }
@@ -3585,12 +3701,7 @@ impl LocalDaemonInner {
                 }
 
                 if let Some(u) = self
-                    .classify_and_route_pending_entry(
-                        session_id,
-                        &entry.receipt,
-                        gate_downgraded,
-                        now,
-                    )
+                    .classify_and_route_pending_entry(session_id, &entry.receipt, gate_cap, now)
                     .await
                 {
                     if u.triggers_delivery_or_digest() {
@@ -3617,7 +3728,7 @@ impl LocalDaemonInner {
         &self,
         session_id: &str,
         receipt: &str,
-        gate_downgraded: bool,
+        gate_cap: Option<DeliveryUrgency>,
         now: i64,
     ) -> Option<DeliveryUrgency> {
         let entry = {
@@ -3632,7 +3743,7 @@ impl LocalDaemonInner {
         let classification = {
             let db = self.node.db();
             self.delivery
-                .classify_entry(&db, session_id, &entry, sub_mode, gate_downgraded, now)
+                .classify_entry_with_cap(&db, session_id, &entry, sub_mode, gate_cap, now)
                 .ok()?
         };
 
@@ -3790,10 +3901,10 @@ impl LocalDaemonInner {
         GateTrustTier::Peer
     }
 
-    /// Builds a token-budgeted [`PackedDeliveryBatch`] for `session_id` from pending unread items.
+    /// Builds a unified RFC 0004 metadata-only XML [`PackedDeliveryBatch`] for `session_id`
+    /// from pending unread items.
     ///
-    /// - Excludes already-notified items (including nudge-pending items) so push transports and
-    ///   Focus Mode digests NEVER re-emit in a loop.
+    /// - Excludes already-notified items so push transports and hooks NEVER re-emit in a loop.
     /// - Strictly returns `None` when zero eligible unread items exist (even if `muted_count > 0`!).
     /// - **Security invariant (G3/G4):** When a `SecurityGatePipeline` is active, ONLY gate-cleared
     ///   rows (`reviewed_at IS NOT NULL OR human_auth_json IS NOT NULL`) are ever packed or delivered.
@@ -3803,33 +3914,43 @@ impl LocalDaemonInner {
     ) -> Option<PackedDeliveryBatch> {
         self.build_batch_for_session_scoped(session_id, false, DrainScope::PushFlush)
             .await
+            .map(|built| built.batch)
     }
 
-    /// Builds a token-budgeted [`PackedDeliveryBatch`] for `session_id` filtered by `scope`,
-    /// optionally including `nudge_pending` items that were previously announced via a
-    /// metadata-only wake nudge (`include_nudged == true`).
+    /// Builds a unified RFC 0004 metadata-only XML [`PackedDeliveryBatch`] for `session_id`
+    /// filtered by `scope`.
     ///
     /// Scope semantics:
-    /// - `DrainScope::MidTurn` (`PostToolUse`): ONLY packs deliverable `Interrupt` items inline
-    ///   (holding `Queue` and `Notify` untouched in SQLite until TurnEnd / TurnStart).
-    /// - `DrainScope::TurnBoundary` (`Stop`): packs `Interrupt` + `Queue` (plus piggybacked
-    ///   footers); returns `None` if `batch.notify_only` so TurnEnd never forces an extra turn
-    ///   just for a `Notify` FYI digest.
-    /// - `DrainScope::PreTurn` / `DrainScope::All`: packs `Interrupt` + `Queue` + slim 1-line
-    ///   `Notify` digests. Genuine Focus Mode `Notify` digests (`notified && !nudge_pending`)
-    ///   never re-dump even when `include_nudged == true`.
+    /// - `DrainScope::MidTurn` (`PostToolUse`):
+    ///   1. If any unnotified `Interrupt` exists -> returns `<hyphae-inbox ... urgency="interrupt">`
+    ///      immediately (`is_midturn_queue_reminder == false`).
+    ///   2. Otherwise, if `midturn_queue_digest_seconds > 0` AND unread `Queue` items exist AND
+    ///      `now - max(last_midturn_digest_at_ms, oldest_unread_queue_received_at_ms) >= interval_ms`
+    ///      -> returns ONE `<hyphae-inbox ... urgency="queue">` reminder (`is_midturn_queue_reminder == true`).
+    /// - `DrainScope::TurnBoundary` (`Stop`): packs unnotified `Interrupt` + `Queue` digests; returns
+    ///   `None` if `batch.notify_only` so TurnEnd never forces an extra turn for an FYI.
+    /// - `DrainScope::PreTurn` / `DrainScope::All`: packs unnotified `Interrupt` + `Queue` + `Notify`
+    ///   digests. Already-notified items never re-dump unless a new unnotified item arrives.
+    /// - `DrainScope::PushFlush`: excludes Focus-buffered `Notify` items during VIP wakes (#32).
     async fn build_batch_for_session_scoped(
         self: &Arc<Self>,
         session_id: &str,
         include_nudged: bool,
         scope: DrainScope,
-    ) -> Option<PackedDeliveryBatch> {
+    ) -> Option<BuiltDigestBatch> {
         self.reconcile_session_inbox(session_id).await;
 
+        let now = self.current_time_ms();
         let gate_active = self.current_gate().is_some();
-        let (policy, pending, muted, human_auth_by_receipt) = {
+        let (policy, session_handle, pending, muted, human_auth_by_receipt) = {
             let db = self.node.db();
             let policy = self.delivery.policy(&db, session_id).ok()?;
+            let session_handle = db
+                .local()
+                .get_session(session_id)
+                .ok()
+                .flatten()
+                .and_then(|s| s.handle);
             let pending = if gate_active {
                 db.local().peek_inbox_gate_cleared(session_id, 500).ok()?
             } else {
@@ -3844,7 +3965,7 @@ impl LocalDaemonInner {
                     }
                 }
             }
-            (policy, pending, muted, auth_map)
+            (policy, session_handle, pending, muted, auth_map)
         };
 
         if pending.is_empty() {
@@ -3860,6 +3981,8 @@ impl LocalDaemonInner {
             .unwrap_or_default();
 
         let mut packable: Vec<PackableItem> = Vec::with_capacity(pending.len());
+        let mut midturn_queue_reminder_items: Vec<PackableItem> = Vec::new();
+        let mut oldest_unread_queue_ms: Option<i64> = None;
         let mut any_deliverable = false;
         let mut any_deliverable_interrupt = false;
         let mut any_deliverable_non_notify = false;
@@ -3881,11 +4004,63 @@ impl LocalDaemonInner {
                 DeliveryUrgency::Notify
             };
 
+            let parsed = hyp_node::delivery::ParsedMailboxSource::from_entry(&entry);
+            let channel = meta.and_then(|m| m.channel.clone()).or(parsed.channel);
+            let is_announcement = meta
+                .map(|m| m.is_announcement)
+                .unwrap_or_else(|| self.is_announcement_channel(channel.as_deref()));
+            let human_verified = human_auth_by_receipt.contains_key(&entry.receipt);
+            let is_system_notice = entry.source == "hyphae" || entry.source.starts_with("hyphae:");
+            let (topic, subscription_key) =
+                if matches!(entry.kind, MailboxKind::Event | MailboxKind::Kv) {
+                    let qualified_topic = if entry.source.contains('.') {
+                        Some(entry.source.clone())
+                    } else {
+                        parsed
+                            .topic
+                            .as_deref()
+                            .map(|t| format!("{}.{t}", entry.origin_node))
+                            .or_else(|| Some(entry.source.clone()))
+                    };
+                    let sub_key =
+                        self.lookup_subscription_key(session_id, &entry.origin_node, &entry.source);
+                    (qualified_topic, sub_key)
+                } else {
+                    (None, None)
+                };
+
+            let item = PackableItem {
+                id: entry.receipt,
+                urgency: effective_urgency,
+                kind: entry.kind,
+                source: entry.source,
+                channel,
+                is_announcement,
+                text: entry.text,
+                created_at_ms: entry.received_at,
+                burst_demoted,
+                is_system_notice,
+                topic,
+                subscription_key,
+                human_verified,
+            };
+
             if scope == DrainScope::MidTurn {
-                // Mid-turn tool hooks drain ONLY deliverable Interrupt items inline, holding Queue
-                // items untouched in SQLite until TurnEnd (`Stop`). Low-priority `Notify` items
-                // may still piggyback cleanly onto an Interrupt batch's unread footer (`+N more unread`)
-                // because `MidTurn` returns `None` whenever zero deliverable Interrupt items exist.
+                // Track unread `Queue` items for RFC 0004 Decision #4 periodic long-turn reminders.
+                if urgency == DeliveryUrgency::Queue && !burst_demoted {
+                    oldest_unread_queue_ms = Some(
+                        oldest_unread_queue_ms
+                            .map_or(item.created_at_ms, |prev| prev.min(item.created_at_ms)),
+                    );
+                    let mut reminder_item = item.clone();
+                    reminder_item.urgency = DeliveryUrgency::Queue;
+                    midturn_queue_reminder_items.push(reminder_item);
+                } else if !policy.focus_mode && item.is_notify_tier() {
+                    midturn_queue_reminder_items.push(item.clone());
+                }
+
+                // Normal mid-turn path drains ONLY deliverable `Interrupt` items (plus non-Focus
+                // `Notify` ride-along); `Queue` items stay held until TurnEnd or long-turn interval.
                 if effective_urgency == DeliveryUrgency::Queue {
                     continue;
                 }
@@ -3893,83 +4068,109 @@ impl LocalDaemonInner {
 
             if treat_as_deliverable {
                 any_deliverable = true;
-                if effective_urgency == DeliveryUrgency::Interrupt {
+                if effective_urgency == DeliveryUrgency::Interrupt && !burst_demoted {
                     any_deliverable_interrupt = true;
                 }
-                if effective_urgency != DeliveryUrgency::Notify {
+                if effective_urgency != DeliveryUrgency::Notify && !burst_demoted {
                     any_deliverable_non_notify = true;
                 }
             }
 
-            let parsed = hyp_node::delivery::ParsedMailboxSource::from_entry(&entry);
-            let channel = meta.and_then(|m| m.channel.clone()).or(parsed.channel);
-            let is_announcement = meta
-                .map(|m| m.is_announcement)
-                .unwrap_or_else(|| self.is_announcement_channel(channel.as_deref()));
+            packable.push(item);
+        }
 
-            let is_wake_notice = meta
-                .map(|m| m.is_wake_notice)
-                .unwrap_or_else(|| self.is_trusted_wake_notice_entry(&entry));
+        let q_notices = self.peek_unsurfaced_quarantine_notices(session_id);
 
-            let display_source = match human_auth_by_receipt.get(&entry.receipt) {
-                Some((hid_opt, kid_opt)) => format_human_verified_source(
-                    &entry.source,
-                    hid_opt.as_deref(),
-                    kid_opt.as_deref(),
-                ),
-                None => entry.source,
-            };
+        if scope == DrainScope::MidTurn {
+            if any_deliverable_interrupt {
+                if policy.focus_mode {
+                    packable.retain(|item| !item.is_notify_tier());
+                }
+                let batch = pack_inbox_digest(
+                    session_handle.as_deref(),
+                    &packable,
+                    muted,
+                    &q_notices,
+                    &policy,
+                )?;
+                return Some(BuiltDigestBatch {
+                    batch,
+                    is_midturn_queue_reminder: false,
+                });
+            }
 
-            packable.push(PackableItem {
-                id: entry.receipt,
-                urgency: effective_urgency,
-                kind: entry.kind,
-                source: display_source,
-                channel,
-                is_announcement,
-                text: entry.text,
-                created_at_ms: entry.received_at,
-                burst_demoted,
-                is_system_notice: is_wake_notice,
-            });
+            // RFC 0004 Decision #4: Tuneable periodic long-turn `PostToolUse` `Queue` reminder.
+            let interval_secs = policy
+                .midturn_queue_digest_seconds
+                .unwrap_or(self.config.midturn_queue_digest_seconds);
+            if interval_secs > 0 {
+                if let Some(oldest_queue_ms) = oldest_unread_queue_ms {
+                    let interval_ms = (interval_secs as i64).saturating_mul(1_000);
+                    let last_reminded = self
+                        .last_midturn_digest_at_ms
+                        .lock()
+                        .expect("last_midturn_digest_at_ms lock poisoned")
+                        .get(session_id)
+                        .copied()
+                        .unwrap_or(0);
+                    let anchor_ms = last_reminded.max(oldest_queue_ms);
+                    if now.saturating_sub(anchor_ms) >= interval_ms {
+                        let batch = pack_inbox_digest(
+                            session_handle.as_deref(),
+                            &midturn_queue_reminder_items,
+                            muted,
+                            &q_notices,
+                            &policy,
+                        )?;
+                        return Some(BuiltDigestBatch {
+                            batch,
+                            is_midturn_queue_reminder: true,
+                        });
+                    }
+                }
+            }
+            return None;
         }
 
         if packable.is_empty() || !any_deliverable {
             return None;
         }
-        if scope == DrainScope::MidTurn && !any_deliverable_interrupt {
-            return None;
-        }
         if scope == DrainScope::TurnBoundary && !any_deliverable_non_notify {
             return None;
         }
-        // Issue #32: When Focus Mode is ON and a VIP (`Interrupt`) triggers an out-of-band push
-        // wake (`DrainScope::PushFlush`), strictly exclude Focus-buffered `Notify` items from the
-        // VIP wake batch so they are NEVER folded into `<hyphae-wake count="...">` or stamped
-        // `notified = true` in SQLite / `item_meta`.
-        if scope == DrainScope::PushFlush && policy.focus_mode && any_deliverable_non_notify {
+        // Issue #32: When Focus Mode is ON and a VIP (`Interrupt`/`Queue`) triggers a wake or
+        // turn drain, strictly exclude Focus-buffered `Notify` items so they are NEVER folded into
+        // the VIP digest count or stamped `notified = true` in SQLite / `item_meta`.
+        if policy.focus_mode && any_deliverable_non_notify {
             packable.retain(|item| !item.is_notify_tier());
             if packable.is_empty() {
                 return None;
             }
         }
 
-        let mut batch = pack_delivery_batch(&packable, muted, &policy)?;
+        let batch = pack_inbox_digest(
+            session_handle.as_deref(),
+            &packable,
+            muted,
+            &q_notices,
+            &policy,
+        )?;
         if scope == DrainScope::TurnBoundary && batch.notify_only {
             return None;
         }
-        if let Some(q_footer) = self.peek_unsurfaced_quarantine_footer(session_id) {
-            batch.rendered.push_str("\n\n");
-            batch.rendered.push_str(&q_footer);
-        }
-        Some(batch)
+        Some(BuiltDigestBatch {
+            batch,
+            is_midturn_queue_reminder: false,
+        })
     }
 
     /// Commits a delivered [`PackedDeliveryBatch`]:
-    /// - Inline full items -> transitioned `pending -> delivered` + recorded in delivered archive.
-    /// - Spilled & truncated items -> kept `unread` (`Pending`) in `NodeDb` and marked `notified = 1`.
+    /// - Under RFC 0004, `inline_ids` & `truncated_ids` are always empty; all counted digest
+    ///   receipts are in `spilled_ids`, kept `unread` (`Pending`) in `NodeDb`, and marked
+    ///   `notified = 1` (`nudge_pending = false`) so neither hooks nor push transports duplicate
+    ///   the same digest until a new item arrives or the agent reads them via `hyp_inbox`.
     fn commit_delivered_batch(&self, session_id: &str, batch: &PackedDeliveryBatch) {
-        let now = now_ms();
+        let now = self.current_time_ms();
         {
             let db = self.node.db();
             if !batch.inline_ids.is_empty() {
@@ -3988,20 +4189,8 @@ impl LocalDaemonInner {
             }
         }
 
-        // G10: Mark quarantine notices as surfaced only once their rendered batch actually commits.
-        {
-            let mut guard = self
-                .quarantine_notices
-                .lock()
-                .expect("quarantine_notices lock poisoned");
-            if let Some(list) = guard.get_mut(session_id) {
-                for n in list.iter_mut() {
-                    if !n.surfaced_in_batch && batch.rendered.contains(&n.receipt) {
-                        n.surfaced_in_batch = true;
-                    }
-                }
-            }
-        }
+        // G10: Mark quarantine notices as surfaced only once their rendered digest actually commits.
+        self.mark_surfaced_quarantine_notices(session_id, &batch.rendered);
 
         let mut sources_delivered: HashSet<String> = HashSet::new();
         let any_nudge_left = {
@@ -4059,6 +4248,7 @@ impl LocalDaemonInner {
     /// never re-nudges in a loop (and NEVER stamps unrelated Focus-buffered `Notify` rows!),
     /// while preserving all items as `unread` in SQLite so the woken agent either drains them via
     /// `before_prompt_build` (`includeNudged: true`) or reads and acknowledges them via `hyp_inbox`.
+    #[allow(dead_code)]
     fn mark_batch_notified(&self, session_id: &str, batch: &PackedDeliveryBatch) {
         let now = now_ms();
         let batch_ids: Vec<&str> = batch
@@ -4140,9 +4330,9 @@ impl LocalDaemonInner {
                 let parsed = hyp_node::delivery::ParsedMailboxSource::from_entry(&entry);
                 let sub_mode =
                     self.lookup_subscription_urgency(session_id, &entry.origin_node, &entry.source);
-                let gate_downgraded = entry.gate_reason.as_deref() == Some("downgraded_to_notify");
+                let gate_cap = gate_reason_urgency_cap(entry.gate_reason.as_deref());
                 let restored_urgency =
-                    policy.resolve_urgency(&parsed.as_context(), sub_mode, gate_downgraded);
+                    policy.resolve_urgency_with_cap(&parsed.as_context(), sub_mode, gate_cap);
                 if matches!(
                     restored_urgency,
                     DeliveryUrgency::Interrupt | DeliveryUrgency::Queue
@@ -4724,27 +4914,8 @@ impl LocalDaemonInner {
                         }
                     }
 
-                    let push_mode = if batch.max_urgency == DeliveryUrgency::Interrupt {
-                        PushMode::Interrupt
-                    } else {
-                        PushMode::Queue
-                    };
-                    let msg_count = batch
-                        .inline_ids
-                        .len()
-                        .saturating_add(batch.spilled_ids.len())
-                        .saturating_add(batch.truncated_ids.len())
-                        .max(1);
-                    let handle = {
-                        let db = self.node.db();
-                        db.local()
-                            .get_session(session_id)
-                            .ok()
-                            .flatten()
-                            .and_then(|s| s.handle)
-                    };
                     let batch_id = compute_batch_idempotency_id(session_id, &batch);
-                    let nudge = format_push_wake_nudge(msg_count, handle.as_deref(), push_mode);
+                    let digest_xml = batch.rendered.clone();
                     let delivery_id = self.next_seq();
                     let (ack_tx, ack_rx) = oneshot::channel();
                     let sent = tx
@@ -4754,7 +4925,7 @@ impl LocalDaemonInner {
                             session_key,
                             agent_id,
                             batch_id,
-                            text: nudge,
+                            text: digest_xml,
                             ack_tx,
                         })
                         .is_ok();
@@ -4771,8 +4942,7 @@ impl LocalDaemonInner {
                             reason: Some(REASON_OPENCLAW_GATEWAY_UNAVAILABLE.to_string()),
                         });
                         if ack.ok {
-                            self.mark_batch_notified(session_id, &batch);
-                            self.cancel_activity_grace(session_id);
+                            self.commit_delivered_batch(session_id, &batch);
                             delivered_any = true;
                             continue;
                         }
@@ -4865,37 +5035,13 @@ impl LocalDaemonInner {
                     } else {
                         PushMode::Queue
                     };
-                    let is_nudge_only = transport.is_nudge_only();
-                    let outcome = if is_nudge_only {
-                        let msg_count = batch
-                            .inline_ids
-                            .len()
-                            .saturating_add(batch.spilled_ids.len())
-                            .saturating_add(batch.truncated_ids.len())
-                            .max(1);
-                        let handle = {
-                            let db = self.node.db();
-                            db.local()
-                                .get_session(session_id)
-                                .ok()
-                                .flatten()
-                                .and_then(|s| s.handle)
-                        };
-                        let batch_id = compute_batch_idempotency_id(session_id, &batch);
-                        transport
-                            .deliver_nudge(msg_count, handle.as_deref(), &batch_id, push_mode)
-                            .await
-                    } else {
-                        transport.deliver(&batch.rendered, push_mode).await
-                    };
+                    let batch_id = compute_batch_idempotency_id(session_id, &batch);
+                    let outcome = transport
+                        .deliver_digest(&batch.rendered, &batch_id, push_mode)
+                        .await;
                     match outcome {
                         PushOutcome::Delivered => {
-                            if is_nudge_only {
-                                self.mark_batch_notified(session_id, &batch);
-                            } else {
-                                self.commit_delivered_batch(session_id, &batch);
-                            }
-                            self.cancel_activity_grace(session_id);
+                            self.commit_delivered_batch(session_id, &batch);
                             delivered_any = true;
                             continue;
                         }
@@ -5032,14 +5178,10 @@ impl LocalDaemonInner {
             let has_non_wake_deliverable = {
                 let guard = self.item_meta.lock().expect("item_meta lock poisoned");
                 let map = guard.get(session_id);
-                batch
-                    .inline_ids
-                    .iter()
-                    .chain(batch.truncated_ids.iter())
-                    .any(|receipt| {
-                        !map.and_then(|m| m.get(receipt))
-                            .is_some_and(|meta| meta.is_wake_notice)
-                    })
+                batch.spilled_ids.iter().any(|receipt| {
+                    !map.and_then(|m| m.get(receipt))
+                        .is_some_and(|meta| meta.is_wake_notice)
+                })
             };
             if !batch.notify_only
                 && has_non_wake_deliverable
@@ -5047,16 +5189,17 @@ impl LocalDaemonInner {
                 && !self.config.delivery_retry.herdr_spawn_allowlist.is_empty()
                 && !self.has_live_transport(session_id)
             {
-                let (herdr_template, handle) = {
+                let herdr_template = {
                     let db = self.node.db();
-                    let sess = db.local().get_session(session_id).ok().flatten();
-                    let tpl = sess.as_ref().and_then(|s| {
-                        extract_backend_str(&s.backend_json, "herdrTemplate")
-                            .or_else(|| extract_backend_str(&s.backend_json, "herdr_template"))
-                            .filter(|t| is_valid_herdr_template(t))
-                    });
-                    let handle = sess.and_then(|s| s.handle);
-                    (tpl, handle)
+                    db.local()
+                        .get_session(session_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| {
+                            extract_backend_str(&s.backend_json, "herdrTemplate")
+                                .or_else(|| extract_backend_str(&s.backend_json, "herdr_template"))
+                                .filter(|t| is_valid_herdr_template(t))
+                        })
                 };
                 if let Some(template) = herdr_template {
                     if self
@@ -5066,26 +5209,13 @@ impl LocalDaemonInner {
                         .iter()
                         .any(|allowed| allowed == &template)
                     {
-                        let push_mode = if batch.max_urgency == DeliveryUrgency::Interrupt {
-                            PushMode::Interrupt
-                        } else {
-                            PushMode::Queue
-                        };
-                        let msg_count = batch
-                            .inline_ids
-                            .len()
-                            .saturating_add(batch.spilled_ids.len())
-                            .saturating_add(batch.truncated_ids.len())
-                            .max(1);
-                        let nudge = format_push_wake_nudge(msg_count, handle.as_deref(), push_mode);
                         let spawn_key = format!("herdr-cold:{session_id}:{template}");
                         if self
-                            .try_herdr_cold_spawn(&spawn_key, &template, &nudge)
+                            .try_herdr_cold_spawn(&spawn_key, &template, &batch.rendered)
                             .await
                             .is_delivered()
                         {
-                            self.mark_batch_notified(session_id, &batch);
-                            self.cancel_activity_grace(session_id);
+                            self.commit_delivered_batch(session_id, &batch);
                             delivered_any = true;
                             terminal_error = None;
                             continue;
@@ -6427,8 +6557,16 @@ impl LocalDaemonInner {
         let rules = parse_rules_arg(args)?;
         let focus_mode_opt = args.get("focusMode").and_then(Value::as_bool);
         let allow_vips_opt = args.get("focusAllowInterruptVips").and_then(Value::as_bool);
+        let midturn_secs_opt = args
+            .get("midturnQueueDigestSeconds")
+            .or_else(|| args.get("midturn_queue_digest_seconds"))
+            .and_then(Value::as_u64);
 
-        if !rules.is_empty() || focus_mode_opt.is_some() || allow_vips_opt.is_some() {
+        if !rules.is_empty()
+            || focus_mode_opt.is_some()
+            || allow_vips_opt.is_some()
+            || midturn_secs_opt.is_some()
+        {
             let now = now_ms();
             let policy = {
                 let db = self.node.db();
@@ -6445,6 +6583,9 @@ impl LocalDaemonInner {
                         }
                         if let Some(v) = allow_vips_opt {
                             pol.focus_allow_interrupt_vips = v;
+                        }
+                        if let Some(secs) = midturn_secs_opt {
+                            pol.midturn_queue_digest_seconds = Some(secs);
                         }
                         for r in &rules {
                             pol.upsert_rule(r.clone());
@@ -6521,11 +6662,13 @@ impl LocalDaemonInner {
             .or_else(|| args.get("summary"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        // RFC 0004 Decision #3: `hyp_inbox` acknowledges returned `unread` items by default
+        // (`ack: false` peeks without acknowledging).
         let ack = args
             .get("acknowledgeAll")
             .or_else(|| args.get("ack"))
             .and_then(Value::as_bool)
-            .unwrap_or(false);
+            .unwrap_or(state == InboxStateFilter::Unread);
         let ids: Vec<String> = args
             .get("acknowledge")
             .or_else(|| args.get("ids"))
@@ -6608,9 +6751,9 @@ impl LocalDaemonInner {
             }
         }
 
-        let (result, policy) = {
+        let (mut result, policy) = {
             let db = self.node.db();
-            let now = now_ms();
+            let now = self.current_time_ms();
             let res = if gate_active {
                 query_inbox_gate_cleared(&db, session_id, &query, now)
                     .map_err(delivery_err_tuple)?
@@ -6621,22 +6764,43 @@ impl LocalDaemonInner {
             (res, pol)
         };
 
-        // Clean up in-memory item_meta for acknowledged receipts, and cancel any pending
-        // Tier 3 Hold retries if the session's pending inbox is now empty.
+        let my_node_id = self.node.node_id().as_str();
+        for item in &mut result.items {
+            if !item.human_verified
+                && item.source != "hyphae"
+                && item.origin_node == my_node_id
+                && matches!(
+                    item.kind,
+                    MailboxKind::Message | MailboxKind::Transfer | MailboxKind::Kv
+                )
+            {
+                item.trust_tier = Some("self".to_string());
+            }
+        }
+
+        // Clean up in-memory item_meta for acknowledged receipts, reset the mid-turn queue
+        // reminder timer when unread queue traffic clears, and cancel any pending Tier 3 Hold retries.
         if result.acked_count > 0 {
-            let any_nudge_left = {
+            let (any_nudge_left, any_queue_left) = {
                 let mut guard = self.item_meta.lock().expect("item_meta lock poisoned");
                 if let Some(map) = guard.get_mut(session_id) {
                     for item in &result.items {
                         map.remove(&item.receipt);
                     }
-                    map.values().any(|m| m.nudge_pending)
+                    (
+                        map.values().any(|m| m.nudge_pending),
+                        map.values()
+                            .any(|m| m.urgency == DeliveryUrgency::Queue && !m.burst_demoted),
+                    )
                 } else {
-                    false
+                    (false, false)
                 }
             };
             if result.unread_count == 0 || !any_nudge_left {
-                self.set_session_nudge_pending_flag(session_id, false, now_ms());
+                self.set_session_nudge_pending_flag(session_id, false, self.current_time_ms());
+            }
+            if result.unread_count == 0 || !any_queue_left {
+                self.reset_midturn_digest_timer(session_id);
             }
             if result.unread_count == 0 {
                 self.cancel_hold_retry(session_id);
@@ -9538,13 +9702,31 @@ async fn handle_mailbox_drain(
             if scope != DrainScope::MidTurn {
                 daemon.cancel_hold_retry(&target_session_id);
             }
+            if scope == DrainScope::TurnBoundary {
+                daemon.reset_midturn_digest_timer(&target_session_id);
+            }
             if mark_idle_if_empty {
                 daemon.mark_session_idle(&target_session_id);
             }
             json!({ "ok": true, "result": { "items": [] } })
         }
-        Some(batch) => {
-            daemon.commit_delivered_batch(&target_session_id, &batch);
+        Some(built) => {
+            let batch = built.batch;
+            if built.is_midturn_queue_reminder {
+                daemon
+                    .record_midturn_digest_timestamp(&target_session_id, daemon.current_time_ms());
+                daemon.mark_surfaced_quarantine_notices(&target_session_id, &batch.rendered);
+            } else {
+                daemon.commit_delivered_batch(&target_session_id, &batch);
+                if scope == DrainScope::MidTurn {
+                    daemon.record_midturn_digest_timestamp(
+                        &target_session_id,
+                        daemon.current_time_ms(),
+                    );
+                } else if scope == DrainScope::TurnBoundary {
+                    daemon.reset_midturn_digest_timer(&target_session_id);
+                }
+            }
             if scope == DrainScope::TurnBoundary {
                 if let Some(h) = inferred_harness {
                     daemon.mark_session_active(&target_session_id, h);
@@ -10081,28 +10263,6 @@ fn parse_human_auth_meta(raw: &str) -> Option<(Option<String>, Option<String>)> 
         .filter(|s| !s.is_empty())
         .map(ToString::to_string);
     Some((human_id, kid))
-}
-
-fn format_human_verified_source(source: &str, human_id: Option<&str>, kid: Option<&str>) -> String {
-    let kid8 = kid.map(|k| k.chars().take(8).collect::<String>());
-    match (human_id, kid8) {
-        (Some(hid), Some(k8)) => {
-            if source.starts_with("human:") || source.is_empty() {
-                format!("human-verified · {hid} (kid:{k8})")
-            } else {
-                format!("human-verified · {hid} (kid:{k8}) · {source}")
-            }
-        }
-        (Some(hid), None) => {
-            if source.starts_with("human:") || source.is_empty() {
-                format!("human-verified · {hid}")
-            } else {
-                format!("human-verified · {hid} · {source}")
-            }
-        }
-        (None, Some(k8)) => format!("human-verified · kid:{k8} · {source}"),
-        (None, None) => format!("human-verified · {source}"),
-    }
 }
 
 async fn notify_drop_secret_conflict(

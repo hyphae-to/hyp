@@ -297,7 +297,7 @@ async fn stage1_guest_rate_limit_4kib_cap_and_notify_downgrade() {
     let pipeline = SecurityGatePipeline::new(cfg, Arc::clone(&db), None).unwrap();
     let t0 = 1_700_000_000_000i64;
 
-    // Guest default: 5 msg/min burst, 4 KiB max payload, auto-downgraded to `notify`.
+    // Guest default (RFC 0004): 5 msg/min burst, 4 KiB max payload, capped at `queue`.
     for i in 0..5 {
         let ctx = make_inbound_dm(
             &format!("guest-msg-{i}"),
@@ -310,9 +310,10 @@ async fn stage1_guest_rate_limit_4kib_cap_and_notify_downgrade() {
         assert_eq!(
             eval.decision,
             GateDecision::Allow {
-                downgraded_to_notify: true
+                downgraded_to_notify: false,
+                capped_to_queue: true,
             },
-            "guest msg #{i} must be allowed but downgraded to notify"
+            "guest msg #{i} must be allowed and capped to queue"
         );
         assert!(eval.receipt.is_some());
     }
@@ -356,7 +357,8 @@ async fn stage1_guest_rate_limit_4kib_cap_and_notify_downgrade() {
     assert_eq!(
         eval_refill.decision,
         GateDecision::Allow {
-            downgraded_to_notify: true
+            downgraded_to_notify: false,
+            capped_to_queue: true,
         }
     );
 
@@ -396,7 +398,7 @@ async fn stage1_guest_rate_limit_4kib_cap_and_notify_downgrade() {
         GateDecision::Block { ref reason } if reason == "e2ee_required_downgrade_rejected"
     ));
 
-    // ExternalWebhook also defaults to downgraded_to_notify (never auto-interrupts live shell agent).
+    // ExternalWebhook also defaults to capped_to_queue under RFC 0004 (can wake threads with digest, never interrupts mid-turn).
     let mut wh = make_inbound_dm(
         "wh-1",
         "local",
@@ -410,7 +412,8 @@ async fn stage1_guest_rate_limit_4kib_cap_and_notify_downgrade() {
     assert_eq!(
         eval_wh.decision,
         GateDecision::Allow {
-            downgraded_to_notify: true
+            downgraded_to_notify: false,
+            capped_to_queue: true,
         }
     );
 
@@ -542,7 +545,8 @@ async fn stage1_mute_drop_cloudevents_filter_acl_and_regex_denylist() {
     assert_eq!(
         eval_clean.decision,
         GateDecision::Allow {
-            downgraded_to_notify: false
+            downgraded_to_notify: false,
+            capped_to_queue: false,
         }
     );
 }
@@ -851,7 +855,7 @@ async fn stage2_allow_high_conf_low_conf_downgrade_and_block_with_audit_rows() {
     let p_allow =
         SecurityGatePipeline::new(cfg_allow, Arc::clone(&db), Some(Arc::clone(&secrets))).unwrap();
 
-    // Guest allowed by Stage 2 MUST keep Stage 1's `downgraded_to_notify: true`!
+    // Guest allowed by Stage 2 MUST keep Stage 1's `capped_to_queue: true`!
     let guest_ok = make_inbound_dm(
         "s2-allow-1",
         "guest@ext",
@@ -863,7 +867,8 @@ async fn stage2_allow_high_conf_low_conf_downgrade_and_block_with_audit_rows() {
     assert_eq!(
         eval_allow.decision,
         GateDecision::Allow {
-            downgraded_to_notify: true
+            downgraded_to_notify: false,
+            capped_to_queue: true,
         }
     );
     assert_eq!(eval_allow.stage, "stage2");
