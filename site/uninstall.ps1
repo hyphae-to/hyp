@@ -1333,7 +1333,7 @@ if (-not $KeepHarnesses) {
     }
     foreach ($cmdDir in $claudeCmdDirs) {
         if (Test-Path -LiteralPath $cmdDir -PathType Container) {
-            foreach ($cmdName in @("hyphae.md", "hyphae-subs.md", "hyphae-focus.md", "hyphae-mute.md")) {
+            foreach ($cmdName in @("hyp.md", "hyp-subs.md", "hyp-focus.md", "hyp-mute.md", "hyphae.md", "hyphae-subs.md", "hyphae-focus.md", "hyphae-mute.md")) {
                 $p = Join-Path $cmdDir $cmdName
                 if (Test-Path -LiteralPath $p) {
                     Add-UniquePath -List $StandaloneHarnessPaths -Seen $standaloneSeen -Path $p
@@ -1345,8 +1345,14 @@ if (-not $KeepHarnesses) {
     # Standalone harness plugins, manifests & Herdr mods
     foreach ($p in @(
         (Join-Path $UserHome ".gemini\config\plugins\hyphae"),
+        (Join-Path $ConfigHome "opencode\commands\hyp.md"),
+        (Join-Path $ConfigHome "opencode\commands\hyphae.md"),
         (Join-Path $ConfigHome "opencode\plugins\hyphae.ts"),
+        (Join-Path $UserHome ".config\opencode\commands\hyp.md"),
+        (Join-Path $UserHome ".config\opencode\commands\hyphae.md"),
         (Join-Path $UserHome ".config\opencode\plugins\hyphae.ts"),
+        (Join-Path $AppData "opencode\commands\hyp.md"),
+        (Join-Path $AppData "opencode\commands\hyphae.md"),
         (Join-Path $AppData "opencode\plugins\hyphae.ts"),
         (Join-Path $UserHome ".openclaw\extensions\hyphae"),
         (Join-Path $ConfigHome "herdr\hyphae.json"),
@@ -1389,7 +1395,7 @@ if (-not $KeepHarnesses) {
     $skillSeen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($rootDir in $skillRoots) {
         if (Test-Path -LiteralPath $rootDir -PathType Container) {
-            foreach ($skillName in @("hyphae", "hyphae-setup", "hyphae-schedule", "hyphae-panel")) {
+            foreach ($skillName in @("hyphae", "hyphae-setup", "hyphae-schedule", "hyphae-panel", "hyp-panel")) {
                 $s = Join-Path $rootDir $skillName
                 if ((Test-Path -LiteralPath $s) -and (Test-SafeRemovalPath $s)) {
                     Add-UniquePath -List $SkillDirsToRemove -Seen $skillSeen -Path $s

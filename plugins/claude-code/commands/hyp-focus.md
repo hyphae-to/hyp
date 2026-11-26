@@ -21,7 +21,7 @@ User arguments: `$ARGUMENTS`
    - If `$ARGUMENTS` is empty:
      1. Run `hyp inspect --json` to read `session.focusMode`.
      2. If `focusMode` is `true`, run `hyp session focus off --json`; otherwise run `hyp session focus on --json`.
-   - If `$ARGUMENTS` is anything else: explain usage (`/hyphae-focus`, `/hyphae-focus on`, `/hyphae-focus off`).
+   - If `$ARGUMENTS` is anything else: explain usage (`/hyp-focus`, `/hyp-focus on`, `/hyp-focus off`).
 
 3. Report the updated Focus Mode state concisely:
    - **Focus Mode ON (`notify`)**: Non-VIP traffic is buffered into slim 1-line digests; VIP `interrupt` rules still wake immediately.

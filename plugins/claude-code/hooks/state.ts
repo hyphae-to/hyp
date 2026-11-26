@@ -883,7 +883,7 @@ export function formatPersistentStatusLine(
 }
 
 /**
- * Parses optional `/hyphae-panel` command arguments.
+ * Parses optional `/hyp-panel` command arguments.
  */
 export function parsePanelCommandArgs(
   rawArgs: string,

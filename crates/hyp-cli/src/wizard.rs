@@ -6522,7 +6522,7 @@ impl SetupToggleState {
                     ));
                     if sel.install_claude_commands {
                         preview.push(
-                            "  + commands: ~/.claude/commands/hyphae{,-subs,-focus,-mute}.md"
+                            "  + commands: ~/.claude/commands/hyp{,-subs,-focus,-mute}.md"
                                 .to_string(),
                         );
                     }
@@ -7118,7 +7118,7 @@ fn component_toggle_display(idx: usize) -> (&'static str, &'static str) {
         ),
         11 => (
             "Claude slash commands",
-            "(/hyphae, /hyphae-subs, /hyphae-focus, /hyphae-mute)",
+            "(/hyphae, /hyp-subs, /hyp-focus, /hyp-mute)",
         ),
         _ => (
             "Native Herdr mod",

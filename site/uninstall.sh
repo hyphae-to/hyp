@@ -1478,7 +1478,8 @@ ${CLAUDE_PROFILE_DIR}/commands"
       continue
     fi
     _seen_cmd_dirs="$(list_append_unique "$_seen_cmd_dirs" "$_cmd_real")"
-    for _cmd_name in hyphae.md hyphae-subs.md hyphae-focus.md hyphae-mute.md; do
+    for _cmd_name in hyp.md hyp-subs.md hyp-focus.md hyp-mute.md \
+      hyphae.md hyphae-subs.md hyphae-focus.md hyphae-mute.md; do
       _p="${_cmd_dir}/${_cmd_name}"
       if [ -e "$_p" ] || [ -L "$_p" ]; then
         STANDALONE_HARNESS_PATHS="$(list_append_unique "$STANDALONE_HARNESS_PATHS" "$_p")"
@@ -1490,7 +1491,11 @@ EOF
 
   for _p in \
     "$HOME/.gemini/config/plugins/hyphae" \
+    "$CONFIG_HOME/opencode/commands/hyp.md" \
+    "$CONFIG_HOME/opencode/commands/hyphae.md" \
     "$CONFIG_HOME/opencode/plugins/hyphae.ts" \
+    "$HOME/.config/opencode/commands/hyp.md" \
+    "$HOME/.config/opencode/commands/hyphae.md" \
     "$HOME/.config/opencode/plugins/hyphae.ts" \
     "$HOME/.openclaw/extensions/hyphae" \
     "$CONFIG_HOME/herdr/hyphae.json" \
@@ -1535,7 +1540,7 @@ $HOME/.t3/skills"
       continue
     fi
     _seen_skill_roots="$(list_append_unique "$_seen_skill_roots" "$_root_real")"
-    for _skill_name in hyphae hyphae-setup hyphae-schedule hyphae-panel; do
+    for _skill_name in hyphae hyphae-setup hyphae-schedule hyphae-panel hyp-panel; do
       _s="${_skill_root}/${_skill_name}"
       if [ -e "$_s" ] || [ -L "$_s" ]; then
         SKILL_DIRS_TO_REMOVE="$(list_append_unique "$SKILL_DIRS_TO_REMOVE" "$_s")"

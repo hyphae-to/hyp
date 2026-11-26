@@ -20,8 +20,8 @@ description: Collaborate across Claude Code, Codex, Antigravity, Herdr, and remo
 ## Quick Inspection & Controls
 
 - Live interactive TUI (zero tokens): `!hyp ui`
-- One-shot snapshot: `hyp inspect --json` or `/hyphae`
-- Session controls: `/hyphae-subs`, `/hyphae-focus`, `/hyphae-mute`
+- One-shot snapshot: `hyp inspect --json` or `/hyp`
+- Session controls: `/hyp-subs`, `/hyp-focus`, `/hyp-mute`
 
 ## Security Invariants
 

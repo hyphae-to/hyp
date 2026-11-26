@@ -75,12 +75,7 @@ fn setup_claude_no_skills_and_no_commands_writes_only_mcp_and_hooks() {
         !home.join(".claude/skills/hyphae/SKILL.md").exists(),
         "runtime skill must be skipped when --no-skills is passed"
     );
-    for cmd_file in [
-        "hyphae.md",
-        "hyphae-subs.md",
-        "hyphae-focus.md",
-        "hyphae-mute.md",
-    ] {
+    for cmd_file in ["hyp.md", "hyp-subs.md", "hyp-focus.md", "hyp-mute.md"] {
         assert!(
             !home.join(".claude/commands").join(cmd_file).exists(),
             "slash command {cmd_file} must be skipped when --no-commands is passed"
@@ -88,7 +83,7 @@ fn setup_claude_no_skills_and_no_commands_writes_only_mcp_and_hooks() {
     }
 
     assert!(
-        !home.join(".claude/skills/hyphae-panel").exists(),
+        !home.join(".claude/skills/hyp-panel").exists(),
         "native side-panel mod must be skipped when --no-commands is passed"
     );
 
@@ -168,7 +163,7 @@ fn setup_claude_and_antigravity_statusline_without_skills() {
     assert!(claude_sl_cmd.contains("--chain-file"));
     assert!(state_dir.join("claude-statusline-chain.json").is_file());
     assert!(
-        home.join(".claude/commands/hyphae.md").is_file(),
+        home.join(".claude/commands/hyp.md").is_file(),
         "Claude slash commands should still install when --no-commands is not passed"
     );
     assert!(
@@ -330,7 +325,7 @@ fn onboard_yes_selected_harnesses_with_statusline_mod_and_no_skills() {
             .as_str()
             .is_some_and(|c| c.contains("statusline --harness claude"))
     );
-    assert!(home.join(".claude/commands/hyphae.md").is_file());
+    assert!(home.join(".claude/commands/hyp.md").is_file());
     assert!(!home.join(".claude/skills/hyphae/SKILL.md").exists());
 
     // Native Herdr mod installed safely, runtime skills skipped, no dead ~/.config/herdr/hyphae.json written (X9).
@@ -384,7 +379,7 @@ fn onboard_yes_no_commands_skips_claude_slash_commands_and_default_yes_preserves
         .unwrap();
     assert_eq!(out1.status.code(), Some(0));
     assert!(home1.join(".claude/skills/hyphae/SKILL.md").is_file());
-    assert!(!home1.join(".claude/commands/hyphae.md").exists());
+    assert!(!home1.join(".claude/commands/hyp.md").exists());
 
     // 2. Default `hyp onboard --yes` (no new flags): skills enabled, statusLine off, Herdr mod off.
     let tmp2 = tempfile::tempdir().unwrap();
@@ -415,7 +410,7 @@ fn onboard_yes_no_commands_skips_claude_slash_commands_and_default_yes_preserves
     assert_eq!(payload2["ok"], true);
     assert!(payload2["data"].get("herdrMod").is_none());
     assert!(home2.join(".claude/skills/hyphae/SKILL.md").is_file());
-    assert!(home2.join(".claude/commands/hyphae.md").is_file());
+    assert!(home2.join(".claude/commands/hyp.md").is_file());
     let claude_settings2: Value =
         serde_json::from_str(&fs::read_to_string(home2.join(".claude/settings.json")).unwrap())
             .unwrap();

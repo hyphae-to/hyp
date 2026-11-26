@@ -1,8 +1,8 @@
 # Hyphae Plugin & Optional TUI Widget for OpenCode
 
-Real lifecycle hooks, `/hyphae` slash command, and an optional zero-polling, metadata-only TUI status widget for [OpenCode](https://opencode.ai).
+Real lifecycle hooks, `/hyp` slash command, and an optional zero-polling, metadata-only TUI status widget for [OpenCode](https://opencode.ai).
 
-## Automatic Setup (Lifecycle Hooks + `/hyphae` Command)
+## Automatic Setup (Lifecycle Hooks + `/hyp` Command)
 
 Run the static `hyp` binary configurator:
 
@@ -18,7 +18,7 @@ This configures OpenCode idempotently while preserving all existing settings:
   - `api.tool.hook("execute.after")` / v1 `tool.execute.after`: scrubs consumed `_meshCall`, avoids losing Interrupt messages inside inner Code Mode calls, and appends drained `additionalContext` cleanly to `ev.result.content` / tool output without breaking non-string outputs.
   - `api.session.hook("prompt")`: invokes `hyp hook opencode pre-invocation` to inject queued messages at the start of a turn.
   - `api.event.subscribe` (`session.execution.succeeded` / `session.idle`) / v1 `event` (`session.idle`): invokes `hyp hook opencode stop` and delivers any returned `followupMessage` via `api.session.prompt({ sessionID, text })` / `client.session.prompt` (guarded against infinite continuation loops and missing APIs).
-- **`~/.config/opencode/commands/hyphae.md`** — installs the `/hyphae` snapshot slash command (skip with `--no-commands`).
+- **`~/.config/opencode/commands/hyp.md`** — installs the `/hyp` snapshot slash command (skip with `--no-commands`).
 - **`~/.config/opencode/skills/hyphae/SKILL.md`** — installs the OpenCode runtime skill (skip with `--no-skills`).
 
 ## Optional Zero-Polling TUI Status Widget (`tui.json`)
@@ -49,7 +49,7 @@ Reads `<state_dir>/ui/state.json` (honoring `HYPHAE_STATE_DIR`, `stateDir` in `~
 - **Strict `execFile` argv arrays** — `hyphae.ts` never invokes a shell or interpolates strings into commands, enforces a 5 s timeout, and fails safe (`{}`) when the daemon is offline.
 - **Metadata-only boundary** — `tui.mjs` recursively strips forbidden body/payload/note/secret/token keys (`body`, `text`, `note`, `payload`, `data`, `content`, `message`, `raw`, `ciphertext`, `plaintext`, `secret`, `token`, `quarantinedText`, `quarantinedItems`) before parsing.
 - **Terminal injection stripping** — `sanitizeUiText` strips ANSI escapes (OSC/CSI/DCS/ESC), C0/C1 controls, zero-width marks, and Unicode BiDi overrides/isolates from all untrusted external metadata strings.
-- **Quarantine isolation** — neither `/hyphae` nor `tui.mjs` ever displays quarantined payloads or auto-approves quarantined items; humans review directly via `hyp gate review`.
+- **Quarantine isolation** — neither `/hyp` nor `tui.mjs` ever displays quarantined payloads or auto-approves quarantined items; humans review directly via `hyp gate review`.
 
 ## Verification
 
