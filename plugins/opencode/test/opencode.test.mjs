@@ -538,11 +538,18 @@ process.stdout.write(JSON.stringify(reply ?? {}) + "\\n");
     const modUrl = `${pathToFileURL(path.join(PLUGIN_DIR, "hyphae.ts")).href}?t=${Date.now()}`;
     const mod = await import(modUrl);
 
-    // Ensure ONLY HyphaePlugin / default are exported (no helper functions OpenCode might invoke!).
+    // Ensure ONLY `HyphaePlugin` function and OpenCode v2 `default` definition `{ id, setup }`
+    // are exported (no helper functions that v1 OpenCode might invoke!).
     const exportedFns = Object.entries(mod).filter(([, v]) => typeof v === "function");
-    assert.equal(exportedFns.length, 2);
-    assert.equal(mod.default, mod.HyphaePlugin);
+    assert.equal(exportedFns.length, 1);
+    assert.equal(exportedFns[0][0], "HyphaePlugin");
+    assert.equal(typeof mod.default, "object");
+    assert.equal(mod.default.id, "hyphae");
+    assert.equal(typeof mod.default.setup, "function");
 
+    // ------------------------------------------------------------------------
+    // Part A: OpenCode v1 `HyphaePlugin` factory compatibility
+    // ------------------------------------------------------------------------
     const promptCalls = [];
     const sessionObj = {
       tag: "bound-session",
@@ -553,7 +560,7 @@ process.stdout.write(JSON.stringify(reply ?? {}) + "\\n");
         return Promise.resolve({ ok: true });
       },
     };
-    const hooks = await mod.default({
+    const hooks = await mod.HyphaePlugin({
       directory: "/workspace/demo",
       client: { session: sessionObj },
     });
@@ -568,7 +575,7 @@ process.stdout.write(JSON.stringify(reply ?? {}) + "\\n");
     assert.equal(bashOut.args._meshCall, undefined);
     assert.equal(readCalls().length, 0);
 
-    // 4b. Hyphae MCP tool invokes `hyp hook opencode pre-tool-use --socket ...` and injects `_meshCall`.
+    // 4b. Hyphae MCP tool strips any untrusted `_meshCall`, invokes `hyp hook opencode pre-tool-use --socket ...`, and injects verified `_meshCall`.
     setMode({
       "pre-tool-use": {
         callToken: "tok_verified_1",
@@ -579,7 +586,9 @@ process.stdout.write(JSON.stringify(reply ?? {}) + "\\n");
         },
       },
     });
-    const meshOut = { args: { action: "join", handle: "opencode-worker" } };
+    const meshOut = {
+      args: { action: "join", handle: "opencode-worker", _meshCall: "ct_spoofed" },
+    };
     await hooks["tool.execute.before"](
       { sessionID: "ses-1", tool: "hyphae_hyp_mesh", callID: "c-1" },
       meshOut,
@@ -688,9 +697,9 @@ process.stdout.write(JSON.stringify(reply ?? {}) + "\\n");
     assert.equal(readCalls().at(-1).payload.continuationActive, true);
     assert.equal(promptCalls.length, 1);
 
-    // 4f. Fail-safe on hook failure, corrupt JSON, or missing client.session.prompt.
+    // 4f. Fail-safe on hook failure, corrupt JSON, forged `_meshCall`, or missing client.session.prompt.
     setMode({ "pre-tool-use": "__FAIL__", "post-tool-use": "__CORRUPT__", stop: "__FAIL__" });
-    const failOut = { args: { action: "status" } };
+    const failOut = { args: { action: "status", _meshCall: "ct_forged_must_be_stripped" } };
     await hooks["tool.execute.before"](
       { sessionID: "ses-1", tool: "hyp_mesh", callID: "c-fail" },
       failOut,
@@ -700,11 +709,253 @@ process.stdout.write(JSON.stringify(reply ?? {}) + "\\n");
       { sessionID: "ses-1", tool: "bash", callID: "c-corrupt" },
       { output: "ok" },
     );
-    const noClientHooks = await mod.default({});
+    const noClientHooks = await mod.HyphaePlugin({});
     setMode({ stop: { followupMessage: "ignored without client" } });
     await noClientHooks.event({
       event: { type: "session.idle", properties: { sessionID: "ses-2" } },
     });
+
+    // ------------------------------------------------------------------------
+    // Part B: OpenCode v2 (`default.setup(api)`) with Code Mode & Async Event Stream
+    // ------------------------------------------------------------------------
+    const v2ToolHooks = new Map();
+    const v2SessionHooks = new Map();
+    const v2Prompts = [];
+    let v2DisposedCount = 0;
+    let v2SubscribedTypes = null;
+    let v2EventResolve = null;
+    const v2EventQueue = [];
+    let v2EventClosed = false;
+
+    const pushV2Event = (ev) => {
+      if (v2EventResolve) {
+        const r = v2EventResolve;
+        v2EventResolve = null;
+        r({ value: ev, done: false });
+      } else {
+        v2EventQueue.push(ev);
+      }
+    };
+
+    const v2Api = {
+      location: { directory: "/workspace/v2-demo" },
+      tool: {
+        async transform(cb) {
+          cb({
+            list: () => [
+              { id: "hyphae_hyp_mesh", name: "hyp_mesh", options: { codemode: true, namespace: "hyphae" } },
+              { id: "hyphae_hyp_inbox", name: "hyp_inbox", options: { codemode: true, namespace: "hyphae" } },
+              { id: "opencode_models", name: "models", options: { codemode: true, namespace: "opencode" } },
+              { id: "shell", name: "shell", options: {} },
+            ],
+          });
+          return { dispose: () => { v2DisposedCount++; } };
+        },
+        async hook(name, fn) {
+          v2ToolHooks.set(name, fn);
+          return () => { v2DisposedCount++; };
+        },
+      },
+      session: {
+        tag: "v2-session-api",
+        async hook(name, fn) {
+          v2SessionHooks.set(name, fn);
+          return { dispose: () => { v2DisposedCount++; } };
+        },
+        async prompt(req) {
+          assert.equal(this.tag, "v2-session-api");
+          v2Prompts.push(req);
+          // Mirror real OpenCode v2: `api.session.prompt` invokes `session.hook("prompt")` synchronously!
+          const promptHook = v2SessionHooks.get("prompt");
+          if (promptHook) {
+            await promptHook({
+              sessionID: req.sessionID,
+              prompt: { text: req.text, files: [] },
+              delivery: "steer",
+            });
+          }
+          return { id: "msg_plugin_1" };
+        },
+      },
+      event: {
+        subscribe(opts) {
+          v2SubscribedTypes = opts?.types ?? null;
+          return {
+            [Symbol.asyncIterator]() {
+              return {
+                next() {
+                  if (v2EventClosed) return Promise.resolve({ value: undefined, done: true });
+                  if (v2EventQueue.length > 0) {
+                    return Promise.resolve({ value: v2EventQueue.shift(), done: false });
+                  }
+                  return new Promise((resolve) => {
+                    v2EventResolve = resolve;
+                  });
+                },
+                return() {
+                  v2EventClosed = true;
+                  if (v2EventResolve) {
+                    const r = v2EventResolve;
+                    v2EventResolve = null;
+                    r({ value: undefined, done: true });
+                  }
+                  return Promise.resolve({ value: undefined, done: true });
+                },
+              };
+            },
+          };
+        },
+      },
+    };
+
+    const disposeV2Plugin = await mod.default.setup(v2Api);
+    assert.equal(typeof disposeV2Plugin, "function");
+    assert.ok(v2ToolHooks.has("execute.before"));
+    assert.ok(v2ToolHooks.has("execute.after"));
+    assert.ok(v2SessionHooks.has("prompt"));
+    assert.ok(Array.isArray(v2SubscribedTypes) && v2SubscribedTypes.includes("session.execution.succeeded"));
+
+    // 4g. v2 `session.hook("prompt")` drains `pre-invocation` into `ev.prompt.text`.
+    setMode({
+      "pre-invocation": {
+        additionalContext: "Incoming hyphae message(s):\n\nqueued before turn",
+      },
+    });
+    const promptEv = {
+      sessionID: "ses-v2-1",
+      prompt: { text: "Check status", files: [] },
+    };
+    await v2SessionHooks.get("prompt")(promptEv);
+    assert.equal(
+      promptEv.prompt.text,
+      "Check status\n\nIncoming hyphae message(s):\n\nqueued before turn",
+    );
+
+    // 4h. v2 Code Mode `execute` + inner `hyphae_hyp_mesh` + parallel direct `shell`:
+    //     - `execute.before` injects `_meshCall` on `hyphae_hyp_mesh` and strips forged `_meshCall`.
+    //     - `execute.after` skips draining on inner Code Mode `hyphae_hyp_mesh` (scrubbing `_meshCall`),
+    //       drains on parallel direct `shell`, AND drains on outer `execute` into `ev.result.content`!
+    const callsBeforeV2Exec = readCalls().length;
+    setMode({
+      "pre-tool-use": { callToken: "tok_v2_codemode_1" },
+      "post-tool-use": { additionalContext: "Incoming hyphae message(s):\n\ninterrupt ping" },
+    });
+
+    const execBeforeEv = {
+      tool: "execute",
+      sessionID: "ses-v2-1",
+      id: "call_exec_1",
+      input: { code: "return await tools.hyphae.hyp_mesh({ action: 'join', handle: 'v2' });" },
+    };
+    await v2ToolHooks.get("execute.before")(execBeforeEv);
+    assert.equal(readCalls().length, callsBeforeV2Exec, "outer execute must not call pre-tool-use");
+
+    const innerMeshEv = {
+      tool: "hyphae_hyp_mesh",
+      sessionID: "ses-v2-1",
+      id: "call_inner_mesh_1",
+      input: { action: "join", handle: "v2", _meshCall: "ct_forged_inner" },
+    };
+    await v2ToolHooks.get("execute.before")(innerMeshEv);
+    assert.equal(innerMeshEv.input._meshCall, "tok_v2_codemode_1");
+    assert.equal(readCalls().at(-1).payload.tool_input._meshCall, undefined);
+    assert.equal(readCalls().at(-1).payload.cwd, "/workspace/v2-demo");
+
+    // Inner Code Mode `execute.after` MUST NOT drain (Code Mode drops inner content!) and MUST scrub `_meshCall`.
+    const callsBeforeInnerAfter = readCalls().length;
+    const innerAfterEv = {
+      tool: "hyphae_hyp_mesh",
+      sessionID: "ses-v2-1",
+      id: "call_inner_mesh_1",
+      input: innerMeshEv.input,
+      status: "completed",
+      result: { output: { ok: true }, content: [{ type: "text", text: "{\"ok\":true}" }] },
+    };
+    await v2ToolHooks.get("execute.after")(innerAfterEv);
+    assert.equal(innerAfterEv.input._meshCall, undefined, "consumed _meshCall should be scrubbed");
+    assert.equal(readCalls().length, callsBeforeInnerAfter, "inner Code Mode tool must not drain mailbox");
+    assert.equal(innerAfterEv.result.content.length, 1);
+
+    // Parallel direct `shell` finishing while `execute` is still active MUST STILL drain!
+    const shellAfterEv = {
+      tool: "shell",
+      sessionID: "ses-v2-1",
+      id: "call_sh_1",
+      status: "completed",
+      result: { output: "ok", content: [{ type: "text", text: "ok" }] },
+    };
+    await v2ToolHooks.get("execute.after")(shellAfterEv);
+    assert.equal(shellAfterEv.result.content.length, 2);
+    assert.ok(shellAfterEv.result.content[1].text.includes("interrupt ping"));
+
+    // Outer `execute` finishing drains into `ev.result.content`!
+    const execAfterEv = {
+      tool: "execute",
+      sessionID: "ses-v2-1",
+      id: "call_exec_1",
+      status: "completed",
+      result: { output: { output: "{\"ok\":true}" }, content: [{ type: "text", text: "{\"ok\":true}" }] },
+    };
+    await v2ToolHooks.get("execute.after")(execAfterEv);
+    assert.equal(execAfterEv.result.content.length, 2);
+    assert.ok(execAfterEv.result.content[1].text.includes("interrupt ping"));
+
+    // Zero-arg `hyphae_hyp_inbox` when daemon fails MUST strip any forged `_meshCall` and fail closed!
+    setMode({ "pre-tool-use": "__FAIL__" });
+    const forgedZeroEv = {
+      tool: "hyphae_hyp_inbox",
+      sessionID: "ses-v2-1",
+      id: "call_inbox_fail",
+      input: { _meshCall: "ct_forged_v2" },
+    };
+    await v2ToolHooks.get("execute.before")(forgedZeroEv);
+    assert.equal(forgedZeroEv.input._meshCall, undefined);
+
+    // 4i. v2 `event.subscribe` (`session.execution.succeeded`) triggers `stop`, sends waiter reminder
+    //     via `api.session.prompt({ sessionID, text })`, preserves `idleReminderSent` across the
+    //     resulting `session.hook("prompt")`, and suppresses consecutive reminder loop!
+    setMode({
+      stop: {
+        followupMessage:
+          "hyphae: Enrolled, but no background waiter is running yet. Run `hyp wait --session opencode:ses-v2-1` in background, then end turn.",
+      },
+      "pre-invocation": {
+        additionalContext: "SHOULD_NOT_BE_CALLED_FOR_PLUGIN_PROMPT",
+      },
+    });
+    pushV2Event({
+      type: "session.execution.succeeded",
+      data: { sessionID: "ses-v2-1" },
+    });
+    const waitDeadline = Date.now() + 2_000;
+    while (Date.now() < waitDeadline && v2Prompts.length < 1) {
+      await new Promise((r) => setTimeout(r, 15));
+    }
+    assert.equal(v2Prompts.length, 1);
+    assert.equal(v2Prompts[0].sessionID, "ses-v2-1");
+    assert.ok(v2Prompts[0].text.includes("hyp wait --session opencode:ses-v2-1"));
+    assert.equal(readCalls().at(-1).argv[2], "stop", "plugin prompt must not trigger pre-invocation");
+    assert.equal(readCalls().at(-1).payload.continuationActive, false);
+
+    // Second consecutive `session.execution.succeeded` must pass `continuationActive: true`!
+    const callsBeforeIdle2 = readCalls().length;
+    setMode({ stop: {} });
+    pushV2Event({
+      type: "session.execution.succeeded",
+      data: { sessionID: "ses-v2-1" },
+    });
+    const waitDeadline2 = Date.now() + 2_000;
+    while (Date.now() < waitDeadline2 && readCalls().length <= callsBeforeIdle2) {
+      await new Promise((r) => setTimeout(r, 15));
+    }
+    assert.equal(readCalls().at(-1).argv[2], "stop");
+    assert.equal(readCalls().at(-1).payload.continuationActive, true);
+    assert.equal(v2Prompts.length, 1);
+
+    // Dispose cleans up all hooks and event iterator.
+    disposeV2Plugin();
+    assert.equal(v2EventClosed, true);
+    assert.equal(v2DisposedCount, 4);
   } finally {
     if (prevBin === undefined) delete process.env.HYPHAE_BIN;
     else process.env.HYPHAE_BIN = prevBin;

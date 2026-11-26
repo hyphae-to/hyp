@@ -13,10 +13,11 @@ hyp setup --harness opencode
 This configures OpenCode idempotently while preserving all existing settings:
 
 - **`~/.config/opencode/opencode.json`** — registers the local `hyphae` MCP server (`hyp mcp --backend opencode`, with verified per-session identity — no `--ephemeral`!).
-- **`~/.config/opencode/plugins/hyphae.ts`** — installs the real OpenCode lifecycle hook plugin:
-  - `tool.execute.before`: invokes `hyp hook opencode pre-tool-use` for Hyphae MCP tools (`hyp_mesh`, `hyp_send`, `hyp_inbox`, `hyp_stream`, `hyp_bridge`, `hyp_kv`, `hyphae_*`, `mcp__hyphae__*`) and injects the verified `_meshCall` token into `output.args` so `CallRegistry` verifies `opencode:<sessionID>`.
-  - `tool.execute.after`: invokes `hyp hook opencode post-tool-use` to clean up `callID` and append any drained `additionalContext` cleanly without breaking non-string tool outputs.
-  - `event` (`session.idle`): invokes `hyp hook opencode stop` and delivers any returned `followupMessage` via `client.session.prompt` (guarded against infinite continuation loops and missing APIs).
+- **`~/.config/opencode/plugins/hyphae.ts`** — installs the real OpenCode lifecycle hook plugin supporting BOTH OpenCode v2 (`export default { id: "hyphae", setup(api) }`, including Code Mode `execute` + `tools.hyphae.hyp_*`) and OpenCode v1 (`export const HyphaePlugin`):
+  - `api.tool.hook("execute.before")` / v1 `tool.execute.before`: strips any untrusted `_meshCall`, invokes `hyp hook opencode pre-tool-use` for Hyphae MCP tools (`hyp_mesh`, `hyp_send`, `hyp_inbox`, `hyp_stream`, `hyp_bridge`, `hyp_kv`, `hyphae_*`, `mcp__hyphae__*`), and injects the verified single-use `_meshCall` token into tool arguments so `CallRegistry` verifies `opencode:<sessionID>`.
+  - `api.tool.hook("execute.after")` / v1 `tool.execute.after`: scrubs consumed `_meshCall`, avoids losing Interrupt messages inside inner Code Mode calls, and appends drained `additionalContext` cleanly to `ev.result.content` / tool output without breaking non-string outputs.
+  - `api.session.hook("prompt")`: invokes `hyp hook opencode pre-invocation` to inject queued messages at the start of a turn.
+  - `api.event.subscribe` (`session.execution.succeeded` / `session.idle`) / v1 `event` (`session.idle`): invokes `hyp hook opencode stop` and delivers any returned `followupMessage` via `api.session.prompt({ sessionID, text })` / `client.session.prompt` (guarded against infinite continuation loops and missing APIs).
 - **`~/.config/opencode/commands/hyphae.md`** — installs the `/hyphae` snapshot slash command (skip with `--no-commands`).
 - **`~/.config/opencode/skills/hyphae/SKILL.md`** — installs the OpenCode runtime skill (skip with `--no-skills`).
 

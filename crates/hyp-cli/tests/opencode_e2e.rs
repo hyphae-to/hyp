@@ -162,21 +162,28 @@ fn setup_opencode_writes_real_hooks_command_skill_and_is_idempotent() {
         existing_tui
     );
 
-    // Inspect generated plugins/hyphae.ts invariants.
+    // Inspect generated plugins/hyphae.ts invariants (OpenCode v2 default + v1 HyphaePlugin).
     let plugin_src = fs::read_to_string(&plugin_path).unwrap();
     assert!(plugin_src.contains(&format!("const HYP_BIN: string = \"{fake_bin}\";")));
     assert!(plugin_src.contains(&format!(
         "const HYP_SOCKET: string = {};",
         serde_json::to_string(fake_sock_str).unwrap()
     )));
+    assert!(plugin_src.contains("id: \"hyphae\""));
+    assert!(plugin_src.contains("async setup(api:"));
+    assert!(plugin_src.contains("\"execute.before\""));
+    assert!(plugin_src.contains("\"execute.after\""));
+    assert!(plugin_src.contains("session.execution.succeeded"));
     assert!(plugin_src.contains("\"tool.execute.before\""));
     assert!(plugin_src.contains("\"tool.execute.after\""));
     assert!(plugin_src.contains("session.idle"));
     assert!(plugin_src.contains("pre-tool-use"));
     assert!(plugin_src.contains("post-tool-use"));
+    assert!(plugin_src.contains("pre-invocation"));
     assert!(plugin_src.contains("execFile"));
     assert!(plugin_src.contains("_meshCall"));
-    assert!(plugin_src.contains("export default HyphaePlugin"));
+    assert!(plugin_src.contains("export const HyphaePlugin"));
+    assert!(plugin_src.contains("export default HyphaeV2Plugin"));
     assert!(!plugin_src.contains("shell: true"));
 
     // Inspect installed /hyphae slash command.
@@ -390,7 +397,8 @@ async fn opencode_real_plugin_verifies_caller_drains_messages_and_feeds_tui_agai
         let script = format!(
             "import {{ pathToFileURL }} from 'node:url';\n\
              const mod = await import(pathToFileURL({plugin}).href);\n\
-             const HyphaePlugin = mod.default;\n\
+             const HyphaePlugin = mod.HyphaePlugin;\n\
+             const HyphaeV2Plugin = mod.default;\n\
              {script_body}\n",
             plugin = serde_json::to_string(generated_plugin.to_str().unwrap()).unwrap(),
         );
@@ -719,6 +727,304 @@ async fn opencode_real_plugin_verifies_caller_drains_messages_and_feeds_tui_agai
             .unwrap()
             .contains("@opencode-agent"),
         "unexpected TUI statusLine: {tui_json}"
+    );
+
+    // Step 9: OpenCode v2 (`default.setup(api)`) live Code Mode E2E against the SAME live daemon!
+    // Verifies `api.tool.hook("execute.before")` -> real `hyp mcp --backend opencode` join,
+    // inner Code Mode skip -> outer `execute` Interrupt drain, `api.session.hook("prompt")`
+    // pre-turn drain, and `api.event.subscribe` (`session.execution.succeeded`) -> `api.session.prompt`
+    // drain + single-shot waiter arm + anti-loop!
+    let v2_join_step = run_plugin_step(
+        r#"
+        const toolHooks = new Map();
+        const dispose = await HyphaeV2Plugin.setup({
+          location: { directory: "/tmp/opencode-v2-repo" },
+          tool: {
+            async transform(cb) {
+              cb({
+                list: () => [
+                  { id: "hyphae_hyp_mesh", name: "hyp_mesh", options: { codemode: true } },
+                ],
+              });
+            },
+            async hook(name, fn) { toolHooks.set(name, fn); },
+          },
+        });
+        await toolHooks.get("execute.before")({
+          tool: "execute",
+          sessionID: "ses-v2-live-1",
+          id: "call_exec_v2_1",
+          input: { code: "return await tools.hyphae.hyp_mesh({ action: 'join', handle: 'opencode-v2' });" },
+        });
+        const innerEv = {
+          tool: "hyphae_hyp_mesh",
+          sessionID: "ses-v2-live-1",
+          id: "call_inner_v2_1",
+          input: { action: "join", handle: "opencode-v2", _meshCall: "ct_forged_must_be_replaced" },
+        };
+        await toolHooks.get("execute.before")(innerEv);
+        dispose();
+        process.stdout.write(JSON.stringify({ input: innerEv.input }));
+        "#,
+    );
+    let v2_join_token = v2_join_step["input"]["_meshCall"]
+        .as_str()
+        .expect("v2 execute.before must inject verified _meshCall token")
+        .to_string();
+    assert_ne!(v2_join_token, "ct_forged_must_be_replaced");
+
+    let v2_join_resp = send_mcp(
+        &mut mcp_stdin,
+        &mcp_proc,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "hyp_mesh",
+                "arguments": {
+                    "action": "join",
+                    "handle": "opencode-v2",
+                    "_meshCall": v2_join_token
+                }
+            }
+        }),
+    );
+    assert!(
+        v2_join_resp["result"]["isError"].as_bool() != Some(true),
+        "verified opencode v2 join must succeed: {v2_join_resp}"
+    );
+    let v2_join_payload: Value = serde_json::from_str(
+        v2_join_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(v2_join_payload["address"], "alice@macbook/opencode-v2");
+
+    // Configure `@reviewer` as `interrupt` for `opencode:ses-v2-live-1` and enqueue Interrupt DM.
+    let v2_rule_step = run_plugin_step(
+        r#"
+        const toolHooks = new Map();
+        const dispose = await HyphaeV2Plugin.setup({
+          location: { directory: "/tmp/opencode-v2-repo" },
+          tool: { async hook(name, fn) { toolHooks.set(name, fn); } },
+        });
+        const ev = {
+          tool: "hyphae_hyp_inbox",
+          sessionID: "ses-v2-live-1",
+          id: "call_v2_rule_1",
+          input: { rules: [{ target: "bob@laptop/reviewer", delivery: "interrupt" }] },
+        };
+        await toolHooks.get("execute.before")(ev);
+        dispose();
+        process.stdout.write(JSON.stringify({ input: ev.input }));
+        "#,
+    );
+    let v2_rule_token = v2_rule_step["input"]["_meshCall"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let v2_rule_resp = send_mcp(
+        &mut mcp_stdin,
+        &mcp_proc,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "hyp_inbox",
+                "arguments": {
+                    "rules": [{ "target": "bob@laptop/reviewer", "delivery": "interrupt" }],
+                    "_meshCall": v2_rule_token
+                }
+            }
+        }),
+    );
+    assert!(
+        v2_rule_resp["result"]["isError"].as_bool() != Some(true),
+        "v2 rule setup failed: {v2_rule_resp}"
+    );
+
+    daemon
+        .ingest_inbound(InboundItem {
+            session_id: "opencode:ses-v2-live-1".into(),
+            origin_node: "bob@laptop".into(),
+            item_id: "dm-opencode-v2-int".into(),
+            source: "bob@laptop/reviewer".into(),
+            text: "v2 codemode interrupt dm".into(),
+            kind: MailboxKind::Message,
+            trust_tier: GateTrustTier::Peer,
+        })
+        .await
+        .expect("ingest v2 Interrupt DM");
+
+    // Inner `hyphae_hyp_mesh` `execute.after` must NOT consume the Interrupt DM; outer `execute` MUST!
+    let v2_after_step = run_plugin_step(
+        r#"
+        const toolHooks = new Map();
+        const dispose = await HyphaeV2Plugin.setup({
+          location: { directory: "/tmp/opencode-v2-repo" },
+          tool: {
+            async transform(cb) {
+              cb({
+                list: () => [
+                  { id: "hyphae_hyp_mesh", name: "hyp_mesh", options: { codemode: true } },
+                ],
+              });
+            },
+            async hook(name, fn) { toolHooks.set(name, fn); },
+          },
+        });
+        await toolHooks.get("execute.before")({
+          tool: "execute",
+          sessionID: "ses-v2-live-1",
+          id: "call_exec_v2_2",
+          input: { code: "return await tools.hyphae.hyp_mesh({ action: 'status' });" },
+        });
+        const innerAfter = {
+          tool: "hyphae_hyp_mesh",
+          sessionID: "ses-v2-live-1",
+          id: "call_inner_v2_2",
+          input: { action: "status", _meshCall: "ct_used" },
+          result: { output: { ok: true }, content: [{ type: "text", text: "{\"ok\":true}" }] },
+        };
+        await toolHooks.get("execute.after")(innerAfter);
+        const outerAfter = {
+          tool: "execute",
+          sessionID: "ses-v2-live-1",
+          id: "call_exec_v2_2",
+          result: { output: { output: "{\"ok\":true}" }, content: [{ type: "text", text: "{\"ok\":true}" }] },
+        };
+        await toolHooks.get("execute.after")(outerAfter);
+        dispose();
+        process.stdout.write(JSON.stringify({
+          innerContentLen: innerAfter.result.content.length,
+          innerScrubbed: innerAfter.input._meshCall === undefined,
+          outerContent: outerAfter.result.content,
+        }));
+        "#,
+    );
+    assert_eq!(v2_after_step["innerContentLen"], 1);
+    assert_eq!(v2_after_step["innerScrubbed"], true);
+    let outer_content = v2_after_step["outerContent"].as_array().unwrap();
+    assert_eq!(outer_content.len(), 2);
+    assert!(
+        outer_content[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("v2 codemode interrupt dm")
+    );
+
+    // Enqueue a pre-turn Queue DM and verify v2 `session.hook("prompt")` drains it!
+    daemon
+        .ingest_inbound(InboundItem {
+            session_id: "opencode:ses-v2-live-1".into(),
+            origin_node: "bob@laptop".into(),
+            item_id: "dm-opencode-v2-preturn".into(),
+            source: "bob@laptop/colleague".into(),
+            text: "v2 pre-turn queued dm".into(),
+            kind: MailboxKind::Message,
+            trust_tier: GateTrustTier::Peer,
+        })
+        .await
+        .expect("ingest v2 pre-turn DM");
+
+    let v2_prompt_step = run_plugin_step(
+        r#"
+        const sessionHooks = new Map();
+        const dispose = await HyphaeV2Plugin.setup({
+          location: { directory: "/tmp/opencode-v2-repo" },
+          session: { async hook(name, fn) { sessionHooks.set(name, fn); } },
+        });
+        const ev = { sessionID: "ses-v2-live-1", prompt: { text: "Continue work", files: [] } };
+        await sessionHooks.get("prompt")(ev);
+        dispose();
+        process.stdout.write(JSON.stringify({ text: ev.prompt.text }));
+        "#,
+    );
+    let pre_turn_text = v2_prompt_step["text"].as_str().unwrap();
+    assert!(pre_turn_text.starts_with("Continue work\n\nIncoming hyphae message(s):"));
+    assert!(pre_turn_text.contains("v2 pre-turn queued dm"));
+
+    // Enqueue another Queue DM and verify v2 `event.subscribe` (`session.execution.succeeded`)
+    // flushes it via `api.session.prompt({ sessionID, text })`, then sends single-shot waiter arm,
+    // and suppresses the third consecutive idle (zero loop!).
+    daemon
+        .ingest_inbound(InboundItem {
+            session_id: "opencode:ses-v2-live-1".into(),
+            origin_node: "bob@laptop".into(),
+            item_id: "dm-opencode-v2-idle".into(),
+            source: "bob@laptop/colleague".into(),
+            text: "v2 idle flush dm".into(),
+            kind: MailboxKind::Message,
+            trust_tier: GateTrustTier::Peer,
+        })
+        .await
+        .expect("ingest v2 idle DM");
+
+    let v2_idle_step = run_plugin_step(
+        r#"
+        const prompts = [];
+        const sessionHooks = new Map();
+        const events = [
+          { type: "session.execution.succeeded", data: { sessionID: "ses-v2-live-1" } },
+          { type: "session.execution.succeeded", data: { sessionID: "ses-v2-live-1" } },
+          { type: "session.execution.succeeded", data: { sessionID: "ses-v2-live-1" } },
+        ];
+        let doneResolve;
+        const donePromise = new Promise((r) => { doneResolve = r; });
+        const dispose = await HyphaeV2Plugin.setup({
+          location: { directory: "/tmp/opencode-v2-repo" },
+          session: {
+            async hook(name, fn) { sessionHooks.set(name, fn); },
+            async prompt(req) {
+              prompts.push(req);
+              const h = sessionHooks.get("prompt");
+              if (h) await h({ sessionID: req.sessionID, prompt: { text: req.text, files: [] } });
+            },
+          },
+          event: {
+            subscribe() {
+              let idx = 0;
+              return {
+                [Symbol.asyncIterator]() {
+                  return {
+                    async next() {
+                      if (idx < events.length) return { value: events[idx++], done: false };
+                      doneResolve();
+                      return { value: undefined, done: true };
+                    },
+                  };
+                },
+              };
+            },
+          },
+        });
+        await donePromise;
+        dispose();
+        process.stdout.write(JSON.stringify({ prompts }));
+        "#,
+    );
+    let v2_prompts = v2_idle_step["prompts"].as_array().unwrap();
+    assert_eq!(
+        v2_prompts.len(),
+        2,
+        "expected exactly 2 v2 idle prompts (DM flush + single-shot waiter arm): {v2_prompts:?}"
+    );
+    assert_eq!(v2_prompts[0]["sessionID"], "ses-v2-live-1");
+    assert!(
+        v2_prompts[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("v2 idle flush dm")
+    );
+    assert_eq!(v2_prompts[1]["sessionID"], "ses-v2-live-1");
+    assert!(
+        v2_prompts[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("wait --session opencode:ses-v2-live-1")
     );
 
     drop(mcp_stdin);
