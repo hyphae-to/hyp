@@ -55,8 +55,9 @@ use hyp_proto::cloudevent::{CONTENT_TYPE_JSON, CloudEvent as ProtoCloudEvent, EX
 use hyp_proto::filter::Filter as ProtoFilter;
 use hyp_store::{
     AckOutcome, BridgeLink, DaemonNoticeKind, DeliveryMode, GateAuditQuery, GateState,
-    MailboxEntry, MailboxInsert, MailboxKind, MailboxPutResult, PluginTargetHandoff,
-    SubscriptionMeta, WriteModel, format_address, now_ms, parse_address, sha256_hex, uuid_v4,
+    MailboxEntry, MailboxInsert, MailboxKind, MailboxPutResult, MailboxVisibility,
+    PluginTargetHandoff, SubscriptionMeta, WriteModel, format_address, now_ms, parse_address,
+    sha256_hex, uuid_v4,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -2304,13 +2305,12 @@ impl LocalDaemonInner {
     }
 
     fn effective_pending_count(&self, db: &hyp_store::NodeDb, session_id: &str) -> usize {
-        if self.current_gate().is_some() {
-            db.local()
-                .pending_count_gate_cleared(session_id)
-                .unwrap_or(0)
-        } else {
-            db.local().pending_count(session_id).unwrap_or(0)
-        }
+        db.local()
+            .pending_count_with_visibility(
+                session_id,
+                MailboxVisibility::for_gate(self.current_gate().is_some()),
+            )
+            .unwrap_or(0)
     }
 
     /// Schedules a single bounded Tier 3 retry task for a transient `Hold` outcome
@@ -3870,11 +3870,14 @@ impl LocalDaemonInner {
                 .ok()
                 .flatten()
                 .and_then(|s| s.handle);
-            let pending = if gate_active {
-                db.local().peek_inbox_gate_cleared(session_id, 500).ok()?
-            } else {
-                db.local().peek_inbox(session_id, 500).ok()?
-            };
+            let pending = db
+                .local()
+                .peek_inbox_with_visibility(
+                    session_id,
+                    500,
+                    MailboxVisibility::for_gate(gate_active),
+                )
+                .ok()?;
             let muted = muted_count(&db, session_id).unwrap_or(0);
             let mut auth_map: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
             for entry in &pending {
@@ -4128,13 +4131,14 @@ impl LocalDaemonInner {
             if policy.focus_mode {
                 return 0;
             }
-            let pending = if gate_active {
-                db.local()
-                    .peek_inbox_gate_cleared(session_id, 500)
-                    .unwrap_or_default()
-            } else {
-                db.local().peek_inbox(session_id, 500).unwrap_or_default()
-            };
+            let pending = db
+                .local()
+                .peek_inbox_with_visibility(
+                    session_id,
+                    500,
+                    MailboxVisibility::for_gate(gate_active),
+                )
+                .unwrap_or_default();
             let mut receipts = Vec::new();
             for entry in pending {
                 if let Some(meta) = meta_snapshot.get(&entry.receipt) {
@@ -6518,13 +6522,13 @@ impl LocalDaemonInner {
             if focus_on {
                 let pending = {
                     let db = self.node.db();
-                    if gate_active {
-                        db.local()
-                            .peek_inbox_gate_cleared(session_id, 500)
-                            .unwrap_or_default()
-                    } else {
-                        db.local().peek_inbox(session_id, 500).unwrap_or_default()
-                    }
+                    db.local()
+                        .peek_inbox_with_visibility(
+                            session_id,
+                            500,
+                            MailboxVisibility::for_gate(gate_active),
+                        )
+                        .unwrap_or_default()
                 };
                 let meta_map = self
                     .item_meta
@@ -10580,7 +10584,7 @@ async fn fanout_approved_local_ingest(
             }
         } else {
             db.local()
-                .peek_inbox_gate_cleared(staging_sid, 100)
+                .peek_inbox_with_visibility(staging_sid, 100, MailboxVisibility::GateCleared)
                 .unwrap_or_default()
         }
     };
@@ -11425,7 +11429,7 @@ impl LocalDaemonInner {
 
         let now = self.current_time_ms();
         self.sweep_expired_mutes_and_policies(now);
-        let gate_active = self.current_gate().is_some();
+        let visibility = MailboxVisibility::for_gate(self.current_gate().is_some());
         let (
             policy,
             digest,
@@ -11439,13 +11443,10 @@ impl LocalDaemonInner {
         ) = {
             let db = self.node.db();
             let policy = self.delivery.policy(&db, &sess.id).unwrap_or_default();
-            let digest = if gate_active {
-                db.local()
-                    .unread_digest_gate_cleared(&sess.id)
-                    .unwrap_or_default()
-            } else {
-                db.local().unread_digest(&sess.id).unwrap_or_default()
-            };
+            let digest = db
+                .local()
+                .unread_digest_with_visibility(&sess.id, visibility)
+                .unwrap_or_default();
             let muted_archived = muted_count(&db, &sess.id).unwrap_or(0);
             let mutes = db
                 .local()
@@ -11482,15 +11483,13 @@ impl LocalDaemonInner {
                 .list_active_wakeups_for_session(&sess.id, sess.handle.as_deref())
                 .unwrap_or_default();
             let queued_meta = if detail == SummaryDetail::Full {
-                if gate_active {
-                    db.local()
-                        .list_pending_metadata_gate_cleared(&sess.id, MAX_SUMMARY_QUEUED_ITEMS)
-                        .unwrap_or_default()
-                } else {
-                    db.local()
-                        .list_pending_metadata(&sess.id, MAX_SUMMARY_QUEUED_ITEMS)
-                        .unwrap_or_default()
-                }
+                db.local()
+                    .list_pending_metadata_with_visibility(
+                        &sess.id,
+                        MAX_SUMMARY_QUEUED_ITEMS,
+                        visibility,
+                    )
+                    .unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -11872,7 +11871,9 @@ fn query_inbox_gate_cleared(
                 next_cursor: None,
                 has_more: false,
                 total_matched: 0,
-                unread_count: db.local().pending_count_gate_cleared(session_id)?,
+                unread_count: db
+                    .local()
+                    .pending_count_with_visibility(session_id, MailboxVisibility::GateCleared)?,
                 muted_count: muted_count(db, session_id)?,
                 acked_count: 0,
             });
@@ -11882,7 +11883,9 @@ fn query_inbox_gate_cleared(
             ..query.clone()
         };
         let mut res = query_inbox_for_node(db, local_node_id, session_id, &filtered_query, now_ms)?;
-        res.unread_count = db.local().pending_count_gate_cleared(session_id)?;
+        res.unread_count = db
+            .local()
+            .pending_count_with_visibility(session_id, MailboxVisibility::GateCleared)?;
         return Ok(res);
     }
 
@@ -11977,7 +11980,9 @@ fn query_inbox_gate_cleared(
         }
     }
 
-    let unread_count = db.local().pending_count_gate_cleared(session_id)?;
+    let unread_count = db
+        .local()
+        .pending_count_with_visibility(session_id, MailboxVisibility::GateCleared)?;
     let muted_total = muted_count(db, session_id)?;
 
     Ok(InboxQueryResult {

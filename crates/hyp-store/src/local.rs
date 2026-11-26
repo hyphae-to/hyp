@@ -253,6 +253,28 @@ pub struct PruneReport {
     pub pruned_sessions: Vec<String>,
 }
 
+/// Selects which pending mailbox rows may be shown by a read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MailboxVisibility {
+    /// All pending rows. Quarantined and rejected rows remain excluded.
+    All,
+    /// Only pending rows reviewed by the Security Gate or verified human authority.
+    GateCleared,
+}
+
+impl MailboxVisibility {
+    pub const fn for_gate(active: bool) -> Self {
+        if active { Self::GateCleared } else { Self::All }
+    }
+
+    const fn predicate(self) -> &'static str {
+        match self {
+            Self::All => "",
+            Self::GateCleared => " AND (reviewed_at IS NOT NULL OR human_auth_json IS NOT NULL)",
+        }
+    }
+}
+
 /// Local runtime state & Security Gate store view borrowed from [`NodeDb`].
 pub struct LocalStateStore<'a> {
     db: &'a NodeDb,
@@ -856,41 +878,27 @@ impl<'a> LocalStateStore<'a> {
         Ok(next)
     }
 
-    /// Peeks up to `limit` **pending** (gate-allowed) mailbox items for `session_id`.
-    ///
-    /// **Security invariant:** Quarantined and rejected items are NEVER returned.
+    /// Peeks pending rows for an ungated caller.
     pub fn peek_inbox(&self, session_id: &str, limit: usize) -> StoreResult<Vec<MailboxEntry>> {
-        let mut stmt = self.db.conn().prepare(
-            "SELECT * FROM mailbox
-             WHERE session_id = ?1 AND gate_state = 'pending'
-             ORDER BY received_at ASC, receipt ASC
-             LIMIT ?2",
-        )?;
-        let rows = stmt
-            .query_map(params![session_id, limit as i64], decode_mailbox_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows.into_iter().collect()
+        self.peek_inbox_with_visibility(session_id, limit, MailboxVisibility::All)
     }
 
-    /// Peeks up to `limit` **pending AND gate-cleared** mailbox items for `session_id`
-    /// (`reviewed_at IS NOT NULL OR human_auth_json IS NOT NULL`).
-    ///
-    /// **Security invariant (G3/G4):** Unscreened raw arrivals (`reviewed_at IS NULL` and
-    /// `human_auth_json IS NULL`) and `Hold`-retained rows are NEVER returned before
-    /// `SecurityGatePipeline` or human approval promotes them.
-    pub fn peek_inbox_gate_cleared(
+    /// Peeks up to `limit` pending rows. Gate-cleared reads also exclude unscreened and
+    /// held arrivals until the gate or a verified human clears them.
+    pub fn peek_inbox_with_visibility(
         &self,
         session_id: &str,
         limit: usize,
+        visibility: MailboxVisibility,
     ) -> StoreResult<Vec<MailboxEntry>> {
-        let mut stmt = self.db.conn().prepare(
+        let sql = format!(
             "SELECT * FROM mailbox
-             WHERE session_id = ?1
-               AND gate_state = 'pending'
-               AND (reviewed_at IS NOT NULL OR human_auth_json IS NOT NULL)
+             WHERE session_id = ?1 AND gate_state = 'pending'{}
              ORDER BY received_at ASC, receipt ASC
              LIMIT ?2",
-        )?;
+            visibility.predicate()
+        );
+        let mut stmt = self.db.conn().prepare(&sql)?;
         let rows = stmt
             .query_map(params![session_id, limit as i64], decode_mailbox_row)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1046,13 +1054,25 @@ impl<'a> LocalStateStore<'a> {
         Ok(acked)
     }
 
-    /// Count of `pending` (gate-allowed, undelivered) mailbox entries for `session_id`.
+    /// Counts pending rows for an ungated caller.
     pub fn pending_count(&self, session_id: &str) -> StoreResult<usize> {
-        let n: i64 = self.db.conn().query_row(
-            "SELECT COUNT(*) FROM mailbox WHERE session_id = ?1 AND gate_state = 'pending'",
-            params![session_id],
-            |row| row.get(0),
-        )?;
+        self.pending_count_with_visibility(session_id, MailboxVisibility::All)
+    }
+
+    /// Counts only the pending rows visible to this caller.
+    pub fn pending_count_with_visibility(
+        &self,
+        session_id: &str,
+        visibility: MailboxVisibility,
+    ) -> StoreResult<usize> {
+        let sql = format!(
+            "SELECT COUNT(*) FROM mailbox WHERE session_id = ?1 AND gate_state = 'pending'{}",
+            visibility.predicate()
+        );
+        let n: i64 = self
+            .db
+            .conn()
+            .query_row(&sql, params![session_id], |row| row.get(0))?;
         Ok(n.max(0) as usize)
     }
 
@@ -1068,20 +1088,6 @@ impl<'a> LocalStateStore<'a> {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
-    }
-
-    /// Count of `pending` AND gate-cleared mailbox entries for `session_id`
-    /// (`reviewed_at IS NOT NULL OR human_auth_json IS NOT NULL`).
-    pub fn pending_count_gate_cleared(&self, session_id: &str) -> StoreResult<usize> {
-        let n: i64 = self.db.conn().query_row(
-            "SELECT COUNT(*) FROM mailbox
-             WHERE session_id = ?1
-               AND gate_state = 'pending'
-               AND (reviewed_at IS NOT NULL OR human_auth_json IS NOT NULL)",
-            params![session_id],
-            |row| row.get(0),
-        )?;
-        Ok(n.max(0) as usize)
     }
 
     /// Count of unnotified `pending` mailbox entries for `session_id`.
@@ -1105,36 +1111,25 @@ impl<'a> LocalStateStore<'a> {
         Ok(changed)
     }
 
-    /// Builds a metadata-only unread digest for `session_id`.
-    /// Reports quarantined count separately without exposing quarantined body text or sources.
+    /// Builds a metadata-only digest for an ungated caller.
     pub fn unread_digest(&self, session_id: &str) -> StoreResult<UnreadDigest> {
-        self.unread_digest_inner(session_id, false)
+        self.unread_digest_with_visibility(session_id, MailboxVisibility::All)
     }
 
-    /// Builds a metadata-only unread digest for `session_id` counting ONLY gate-cleared pending
-    /// entries (`reviewed_at IS NOT NULL OR human_auth_json IS NOT NULL`).
-    pub fn unread_digest_gate_cleared(&self, session_id: &str) -> StoreResult<UnreadDigest> {
-        self.unread_digest_inner(session_id, true)
-    }
-
-    fn unread_digest_inner(
+    /// Counts visible unread rows and reports the held count separately.
+    pub fn unread_digest_with_visibility(
         &self,
         session_id: &str,
-        gate_cleared_only: bool,
+        visibility: MailboxVisibility,
     ) -> StoreResult<UnreadDigest> {
         let mut digest = UnreadDigest::default();
-        let sql = if gate_cleared_only {
+        let sql = format!(
             "SELECT kind, source, notified FROM mailbox
-             WHERE session_id = ?1
-               AND gate_state = 'pending'
-               AND (reviewed_at IS NOT NULL OR human_auth_json IS NOT NULL)
-             ORDER BY received_at DESC"
-        } else {
-            "SELECT kind, source, notified FROM mailbox
-             WHERE session_id = ?1 AND gate_state = 'pending'
-             ORDER BY received_at DESC"
-        };
-        let mut stmt = self.db.conn().prepare(sql)?;
+             WHERE session_id = ?1 AND gate_state = 'pending'{}
+             ORDER BY received_at DESC",
+            visibility.predicate()
+        );
+        let mut stmt = self.db.conn().prepare(&sql)?;
         let rows: Vec<(String, String, i64)> = stmt
             .query_map(params![session_id], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -1186,44 +1181,32 @@ impl<'a> LocalStateStore<'a> {
         Ok(n.max(0) as usize)
     }
 
-    /// Lists up to `limit` **pending** (gate-allowed) mailbox item metadata rows for `session_id`,
-    /// ordered newest-first (`received_at DESC, receipt ASC`).
-    ///
-    /// **Security invariant:** Never selects `text`, `gate_reason`, or quarantined rows.
+    /// Lists pending metadata for an ungated caller.
     pub fn list_pending_metadata(
         &self,
         session_id: &str,
         limit: usize,
     ) -> StoreResult<Vec<MailboxItemMeta>> {
-        let mut stmt = self.db.conn().prepare(
-            "SELECT receipt, session_id, origin_node, item_id, received_at, kind, source, notified
-             FROM mailbox
-             WHERE session_id = ?1 AND gate_state = 'pending'
-             ORDER BY received_at DESC, receipt ASC
-             LIMIT ?2",
-        )?;
-        let rows = stmt
-            .query_map(params![session_id, limit as i64], decode_mailbox_meta_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows.into_iter().collect()
+        self.list_pending_metadata_with_visibility(session_id, limit, MailboxVisibility::All)
     }
 
-    /// Lists up to `limit` **pending AND gate-cleared** mailbox item metadata rows for
-    /// `session_id` (`reviewed_at IS NOT NULL OR human_auth_json IS NOT NULL`).
-    pub fn list_pending_metadata_gate_cleared(
+    /// Lists up to `limit` visible pending rows, newest first. The projection excludes body text
+    /// and gate reasons independently of visibility.
+    pub fn list_pending_metadata_with_visibility(
         &self,
         session_id: &str,
         limit: usize,
+        visibility: MailboxVisibility,
     ) -> StoreResult<Vec<MailboxItemMeta>> {
-        let mut stmt = self.db.conn().prepare(
+        let sql = format!(
             "SELECT receipt, session_id, origin_node, item_id, received_at, kind, source, notified
              FROM mailbox
-             WHERE session_id = ?1
-               AND gate_state = 'pending'
-               AND (reviewed_at IS NOT NULL OR human_auth_json IS NOT NULL)
+             WHERE session_id = ?1 AND gate_state = 'pending'{}
              ORDER BY received_at DESC, receipt ASC
              LIMIT ?2",
-        )?;
+            visibility.predicate()
+        );
+        let mut stmt = self.db.conn().prepare(&sql)?;
         let rows = stmt
             .query_map(params![session_id, limit as i64], decode_mailbox_meta_row)?
             .collect::<Result<Vec<_>, _>>()?;

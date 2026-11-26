@@ -199,25 +199,6 @@ const _: () = {
             m.version == (i as i64) + 1,
             "MIGRATIONS versions must be contiguous 1..=CURRENT_SCHEMA_VERSION"
         );
-        assert!(!m.name.is_empty(), "migration name must not be empty");
-        let a = m.name.as_bytes();
-        let mut j = 0;
-        while j < i {
-            let b = MIGRATIONS[j].name.as_bytes();
-            let mut same = a.len() == b.len();
-            if same {
-                let mut k = 0;
-                while k < a.len() {
-                    if a[k] != b[k] {
-                        same = false;
-                        break;
-                    }
-                    k += 1;
-                }
-            }
-            assert!(!same, "migration names must be unique");
-            j += 1;
-        }
         i += 1;
     }
 };

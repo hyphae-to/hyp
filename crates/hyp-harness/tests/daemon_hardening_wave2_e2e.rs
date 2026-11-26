@@ -2382,7 +2382,11 @@ async fn g8_approval_never_blanket_approves_unrelated_batches_and_sweeps_on_star
     let cleared = node
         .db()
         .local()
-        .peek_inbox_gate_cleared("claude:g8-strict-sub", 10)
+        .peek_inbox_with_visibility(
+            "claude:g8-strict-sub",
+            10,
+            hyp_store::MailboxVisibility::GateCleared,
+        )
         .unwrap();
     assert!(
         cleared
@@ -2460,7 +2464,11 @@ async fn g8_approval_never_blanket_approves_unrelated_batches_and_sweeps_on_star
     assert!(
         node.db()
             .local()
-            .peek_inbox_gate_cleared("claude:g8-strict-sub", 20)
+            .peek_inbox_with_visibility(
+                "claude:g8-strict-sub",
+                20,
+                hyp_store::MailboxVisibility::GateCleared
+            )
             .unwrap()
             .iter()
             .any(|m| m.text.contains("OFFLINE_APPROVED_STARTUP_SWEEP_G8")),
