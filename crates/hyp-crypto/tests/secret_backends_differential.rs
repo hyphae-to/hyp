@@ -27,9 +27,27 @@ fn write_executable_script(path: &Path, body: &str) {
 #[cfg(windows)]
 fn write_windows_ps_shim(cmd_path: &Path, ps1_body: &str) {
     let ps1_path = cmd_path.with_extension("ps1");
-    fs::write(&ps1_path, ps1_body).expect("write ps1 shim");
+    // Windows PowerShell parses a bare "-" as an invalid parameter to -File.
+    // Pass the fixture's native arguments through numbered environment entries instead.
+    let ps1_args = r#"$args = @(for ($i = 0; $i -lt [int]$env:HYP_TEST_FAKE_ARG_COUNT; $i++) {
+  [Environment]::GetEnvironmentVariable("HYP_TEST_FAKE_ARG_$i")
+})
+"#;
+    fs::write(&ps1_path, format!("{ps1_args}{ps1_body}")).expect("write ps1 shim");
     let cmd_body = format!(
-        "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\" %*\r\n",
+        concat!(
+            "@echo off\r\n",
+            "setlocal DisableDelayedExpansion\r\n",
+            "set HYP_TEST_FAKE_ARG_COUNT=0\r\n",
+            ":collect\r\n",
+            "if \"%~1\"==\"\" goto run\r\n",
+            "set \"HYP_TEST_FAKE_ARG_%HYP_TEST_FAKE_ARG_COUNT%=%~1\"\r\n",
+            "set /a HYP_TEST_FAKE_ARG_COUNT+=1 >nul\r\n",
+            "shift /1\r\n",
+            "goto collect\r\n",
+            ":run\r\n",
+            "powershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"\r\n",
+        ),
         ps1_path.display()
     );
     fs::write(cmd_path, cmd_body).expect("write cmd shim");

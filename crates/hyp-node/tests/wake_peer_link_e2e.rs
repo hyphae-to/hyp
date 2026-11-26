@@ -488,15 +488,17 @@ impl NodeAdapterHost for RecordingHost {
 
 #[tokio::test]
 async fn subprocess_supervisor_sends_system_wake_notification_to_plugins() {
-    let sdk_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../plugins/sdk/client.mjs")
-        .canonicalize()
-        .expect("plugins/sdk/client.mjs");
-    let sdk_url = format!("file://{}", sdk_path.display());
+    let sdk_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/sdk/client.mjs");
+    assert!(sdk_path.is_file(), "missing SDK at {}", sdk_path.display());
+    let sdk_path = sdk_path
+        .into_os_string()
+        .into_string()
+        .expect("UTF-8 SDK path");
 
     // 1. Plugin WITH `onWake` handler receives `{ sleptMs: 90000 }` and emits confirmation event.
     let wake_script = r#"
-        const { MeshPluginClient } = await import(process.env.SDK_URL);
+        import { pathToFileURL } from "node:url";
+        const { MeshPluginClient } = await import(pathToFileURL(process.env.SDK_MJS_PATH).href);
         const mesh = new MeshPluginClient({
           onWake: async ({ sleptMs }) => {
             await mesh.send("ops", {
@@ -524,7 +526,7 @@ async fn subprocess_supervisor_sends_system_wake_notification_to_plugins() {
         vec!["ops".to_string()],
     );
     cfg.hello_mode = HelloMode::LegacyV1;
-    cfg.env = BTreeMap::from([("SDK_URL".to_string(), sdk_url.clone())]);
+    cfg.env = BTreeMap::from([("SDK_MJS_PATH".to_string(), sdk_path.clone())]);
 
     let host = RecordingHost::new();
     let sup = SubprocessSupervisor::new(cfg);
@@ -557,7 +559,8 @@ async fn subprocess_supervisor_sends_system_wake_notification_to_plugins() {
 
     // 2. Older plugin WITHOUT `onWake` safely ignores `system.wake` and keeps running!
     let legacy_script = r#"
-        const { MeshPluginClient } = await import(process.env.SDK_URL);
+        import { pathToFileURL } from "node:url";
+        const { MeshPluginClient } = await import(pathToFileURL(process.env.SDK_MJS_PATH).href);
         const mesh = new MeshPluginClient();
         await mesh.ready;
         setTimeout(async () => {
@@ -583,7 +586,7 @@ async fn subprocess_supervisor_sends_system_wake_notification_to_plugins() {
         vec!["ops".to_string()],
     );
     legacy_cfg.hello_mode = HelloMode::LegacyV1;
-    legacy_cfg.env = BTreeMap::from([("SDK_URL".to_string(), sdk_url)]);
+    legacy_cfg.env = BTreeMap::from([("SDK_MJS_PATH".to_string(), sdk_path)]);
 
     let legacy_host = RecordingHost::new();
     let legacy_sup = SubprocessSupervisor::new(legacy_cfg);
