@@ -503,8 +503,8 @@ fn main() -> ExitCode {
         Commands::Service { command } => service::run_service(command),
         Commands::Setup(args) => setup::run_setup(args),
         Commands::Onboard(args) => setup::run_onboard(args),
-        Commands::Status(args) => status_doctor::run_status(args),
-        Commands::Doctor(args) => status_doctor::run_doctor(args),
+        Commands::Status(args) => finish_command(status_doctor::run_status(args)),
+        Commands::Doctor(args) => finish_command(status_doctor::run_doctor(args)),
         Commands::Secret { command } => finish_command(secret_cmd::run_secret(command)),
         Commands::Exec(args) => exec_cmd::run_exec(args),
         Commands::Gate { command } => finish_command(gate_cmd::run_gate(command)),
@@ -519,11 +519,11 @@ fn main() -> ExitCode {
         Commands::Uninstall(args) => finish_command(uninstall_cmd::run_uninstall(args)),
         Commands::Deploy { command } => deploy::run_deploy(command),
         Commands::Pair { command } => finish_command(pair::run_pair(command)),
-        Commands::Plugin { command } => plugin_cmd::run_plugin(command),
+        Commands::Plugin { command } => finish_command(plugin_cmd::run_plugin(command)),
         Commands::Statusline(args) => statusline_cmd::run_statusline(&args),
-        Commands::Inspect(args) => inspect_cmd::run_inspect(&args),
-        Commands::Session(args) => session_cmd::run_session(&args),
-        Commands::Ui(args) => ui_tui::run_ui(&args),
+        Commands::Inspect(args) => finish_command(inspect_cmd::run_inspect(&args)),
+        Commands::Session(args) => finish_command(session_cmd::run_session(&args)),
+        Commands::Ui(args) => finish_command(ui_tui::run_ui(&args)),
         Commands::Version { json: as_json } => {
             let version = env!("CARGO_PKG_VERSION");
             if as_json {

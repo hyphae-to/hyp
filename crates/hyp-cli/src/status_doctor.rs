@@ -12,8 +12,8 @@ use crate::setup::{
     HarnessDiagnostic, StatusLineDiagnostic, detect_harness_statuses, detect_statusline_statuses,
 };
 use crate::ui::{
-    CheckStatus, CliCheck, CliError, EXIT_ERROR, EXIT_OK, JsonEnvelope, emit_error, print_checks,
-    print_json, print_next_steps, print_warnings,
+    CheckStatus, CliCheck, CliError, CommandResult, EXIT_ERROR, EXIT_OK, JsonEnvelope,
+    print_checks, print_json, print_next_steps, print_warnings,
 };
 use crate::update::read_cached_update_status;
 use clap::Args;
@@ -209,25 +209,33 @@ const ENV_TAILSCALE_STATUS_JSON: &str = "HYPHAE_TAILSCALE_STATUS_JSON";
 const ENV_TAILSCALE_SERVE_STATUS_JSON: &str = "HYPHAE_TAILSCALE_SERVE_STATUS_JSON";
 const ENV_TAILSCALE_BIN: &str = "HYPHAE_TAILSCALE_BIN";
 
-pub fn run_status(args: StatusArgs) -> ExitCode {
-    run_status_or_doctor(
-        args.state_dir,
-        args.config,
-        args.home,
-        args.claude_config_dir,
+pub fn run_status(args: StatusArgs) -> CommandResult {
+    CommandResult::new(
+        "status",
         args.json,
-        false,
+        run_status_or_doctor(
+            args.state_dir,
+            args.config,
+            args.home,
+            args.claude_config_dir,
+            args.json,
+            false,
+        ),
     )
 }
 
-pub fn run_doctor(args: DoctorArgs) -> ExitCode {
-    run_status_or_doctor(
-        args.state_dir,
-        args.config,
-        args.home,
-        args.claude_config_dir,
+pub fn run_doctor(args: DoctorArgs) -> CommandResult {
+    CommandResult::new(
+        "doctor",
         args.json,
-        true,
+        run_status_or_doctor(
+            args.state_dir,
+            args.config,
+            args.home,
+            args.claude_config_dir,
+            args.json,
+            true,
+        ),
     )
 }
 
@@ -238,7 +246,7 @@ fn run_status_or_doctor(
     claude_config_dir_arg: Option<PathBuf>,
     as_json: bool,
     is_doctor: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = if is_doctor { "doctor" } else { "status" };
     let state_dir = resolve_state_dir(
         state_dir_arg.as_deref(),
@@ -356,18 +364,15 @@ fn run_status_or_doctor(
                 };
                 checks.push(CliCheck::fail("store.sqlite", detail.clone(), fix.clone()));
                 if !is_doctor {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
+                    return Err(CliError::error(
                         if is_downgrade {
                             "SCHEMA_TOO_NEW"
                         } else {
                             "DB_ERROR"
                         },
                         detail,
-                        fix,
-                    );
+                    )
+                    .with_optional_fix(fix));
                 }
                 let report = StorageStatusReport {
                     path: db_path.display().to_string(),
@@ -1035,15 +1040,10 @@ fn run_status_or_doctor(
                 .with_optional_fix(next.first().cloned()),
             )
         };
-        let envelope = JsonEnvelope {
-            ok,
-            command: cmd.to_string(),
-            summary: Some(summary),
-            data: Some(data),
-            warnings,
-            next,
-            error,
-        };
+        let envelope = JsonEnvelope::ok(cmd, summary, data)
+            .warnings(warnings)
+            .next(next)
+            .error(error);
         print_json(&envelope);
     } else {
         println!(
@@ -1236,9 +1236,9 @@ fn run_status_or_doctor(
     }
 
     if ok {
-        ExitCode::from(EXIT_OK)
+        Ok(ExitCode::from(EXIT_OK))
     } else {
-        ExitCode::from(EXIT_ERROR)
+        Ok(ExitCode::from(EXIT_ERROR))
     }
 }
 
