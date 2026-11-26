@@ -15,7 +15,7 @@ use clap::Subcommand;
 use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync, default_socket_path};
 use serde::Serialize;
 use serde_json::json;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
@@ -523,6 +523,12 @@ pub struct ServiceSpec {
     /// background services use the exact same secret store as interactive CLI invocations.
     #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
     pub secret_backend: Option<String>,
+    /// Additional non-secret backend configuration environment variables pinned into the service
+    /// definition (e.g. `HYPHAE_1PASSWORD_VAULT`, `HYPHAE_LASTPASS_PREFIX`, `HYPHAE_PASS_PREFIX`,
+    /// `PASSWORD_STORE_DIR`, `GNUPGHOME`, `HYPHAE_OP_BIN`, `HYPHAE_LPASS_BIN`, `HYPHAE_PASS_BIN`).
+    /// Never contains secrets or tokens (e.g. never `OP_SERVICE_ACCOUNT_TOKEN`).
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+    pub extra_env: BTreeMap<String, String>,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub user_id: Option<String>,
 }
@@ -735,6 +741,70 @@ pub fn build_daemon_argv(spec: &ServiceSpec) -> Vec<String> {
     argv
 }
 
+fn is_safe_service_env_value(val: &str) -> bool {
+    !val.trim().is_empty() && !val.chars().any(char::is_control)
+}
+
+/// Collects ONLY safe, non-secret configuration env vars relevant to `backend` so installed
+/// background services (`LaunchAgent` / `systemd --user`) target the exact same vault/prefix/store.
+/// Never collects secret credentials or session tokens (e.g. never `OP_SERVICE_ACCOUNT_TOKEN`).
+pub fn collect_secret_backend_service_env<F>(
+    backend: hyp_crypto::keystore::SecretBackend,
+    get_env: F,
+) -> BTreeMap<String, String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mut env = BTreeMap::new();
+    match backend {
+        hyp_crypto::keystore::SecretBackend::OnePassword => {
+            if let Some(vault) = get_env("HYPHAE_1PASSWORD_VAULT") {
+                if hyp_crypto::keystore::validate_onepassword_vault(&vault).is_ok() {
+                    env.insert("HYPHAE_1PASSWORD_VAULT".to_string(), vault);
+                }
+            }
+            if let Some(bin) = get_env("HYPHAE_OP_BIN") {
+                let trimmed = bin.trim();
+                if is_safe_service_env_value(trimmed) {
+                    env.insert("HYPHAE_OP_BIN".to_string(), trimmed.to_string());
+                }
+            }
+        }
+        hyp_crypto::keystore::SecretBackend::LastPass => {
+            if let Some(prefix) = get_env("HYPHAE_LASTPASS_PREFIX") {
+                if hyp_crypto::keystore::validate_lastpass_prefix(&prefix).is_ok() {
+                    env.insert("HYPHAE_LASTPASS_PREFIX".to_string(), prefix);
+                }
+            }
+            if let Some(bin) = get_env("HYPHAE_LPASS_BIN") {
+                let trimmed = bin.trim();
+                if is_safe_service_env_value(trimmed) {
+                    env.insert("HYPHAE_LPASS_BIN".to_string(), trimmed.to_string());
+                }
+            }
+        }
+        hyp_crypto::keystore::SecretBackend::Pass => {
+            if let Some(prefix) = get_env("HYPHAE_PASS_PREFIX") {
+                if hyp_crypto::keystore::validate_pass_prefix(&prefix).is_ok() {
+                    env.insert("HYPHAE_PASS_PREFIX".to_string(), prefix);
+                }
+            }
+            for key in ["PASSWORD_STORE_DIR", "GNUPGHOME", "HYPHAE_PASS_BIN"] {
+                if let Some(val) = get_env(key) {
+                    let trimmed = val.trim();
+                    if is_safe_service_env_value(trimmed) {
+                        env.insert(key.to_string(), trimmed.to_string());
+                    }
+                }
+            }
+        }
+        hyp_crypto::keystore::SecretBackend::File
+        | hyp_crypto::keystore::SecretBackend::Keychain
+        | hyp_crypto::keystore::SecretBackend::SecretService => {}
+    }
+    env
+}
+
 /// Renders the macOS LaunchAgent XML property list (`to.hyphae.daemon.plist`).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn render_macos_plist(spec: &ServiceSpec) -> String {
@@ -748,18 +818,31 @@ pub fn render_macos_plist(spec: &ServiceSpec) -> String {
     let out_log = xml_escape(&spec.logs_dir.join("daemon.out.log").display().to_string());
     let err_log = xml_escape(&spec.logs_dir.join("daemon.err.log").display().to_string());
     let path_xml = xml_escape(&spec.path_env);
-    let secret_backend_xml = match spec
+    let mut extra_env_xml = String::new();
+    if let Some(backend) = spec
         .secret_backend
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        Some(backend) => format!(
+        extra_env_xml.push_str(&format!(
             "    <key>HYPHAE_SECRET_BACKEND</key>\n    <string>{}</string>\n",
             xml_escape(backend)
-        ),
-        None => String::new(),
-    };
+        ));
+    }
+    for (k, v) in &spec.extra_env {
+        if matches!(k.as_str(), "PATH" | "HYPHAE_SECRET_BACKEND")
+            || !is_safe_service_env_value(k)
+            || !is_safe_service_env_value(v)
+        {
+            continue;
+        }
+        extra_env_xml.push_str(&format!(
+            "    <key>{}</key>\n    <string>{}</string>\n",
+            xml_escape(k),
+            xml_escape(v)
+        ));
+    }
 
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -784,7 +867,7 @@ pub fn render_macos_plist(spec: &ServiceSpec) -> String {
          \x20\x20<dict>\n\
          \x20\x20\x20\x20<key>PATH</key>\n\
          \x20\x20\x20\x20<string>{path_xml}</string>\n\
-         {secret_backend_xml}\
+         {extra_env_xml}\
          \x20\x20</dict>\n\
          </dict>\n\
          </plist>\n"
@@ -799,26 +882,37 @@ pub fn render_linux_systemd_unit(spec: &ServiceSpec) -> String {
         .map(|arg| systemd_escape_arg(arg))
         .collect::<Vec<_>>()
         .join(" ");
-    let env_path = spec
-        .path_env
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('%', "%%");
-    let secret_backend_line = match spec
+    let escape_systemd_env = |raw: &str| {
+        raw.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%")
+    };
+    let env_path = escape_systemd_env(&spec.path_env);
+    let mut extra_env_lines = String::new();
+    if let Some(backend) = spec
         .secret_backend
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        Some(backend) => {
-            let escaped = backend
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"")
-                .replace('%', "%%");
-            format!("Environment=\"HYPHAE_SECRET_BACKEND={escaped}\"\n")
+        extra_env_lines.push_str(&format!(
+            "Environment=\"HYPHAE_SECRET_BACKEND={}\"\n",
+            escape_systemd_env(backend)
+        ));
+    }
+    for (k, v) in &spec.extra_env {
+        if matches!(k.as_str(), "PATH" | "HYPHAE_SECRET_BACKEND")
+            || !is_safe_service_env_value(k)
+            || !is_safe_service_env_value(v)
+        {
+            continue;
         }
-        None => String::new(),
-    };
+        extra_env_lines.push_str(&format!(
+            "Environment=\"{}={}\"\n",
+            escape_systemd_env(k),
+            escape_systemd_env(v)
+        ));
+    }
 
     format!(
         "[Unit]\n\
@@ -831,7 +925,7 @@ pub fn render_linux_systemd_unit(spec: &ServiceSpec) -> String {
          Restart=on-failure\n\
          RestartSec=3\n\
          Environment=\"PATH={env_path}\"\n\
-         {secret_backend_line}\
+         {extra_env_lines}\
          \n\
          [Install]\n\
          WantedBy=default.target\n"
@@ -1281,8 +1375,8 @@ fn build_spec(
     let path_env = build_service_path_env(current_path.as_deref(), bin_path.parent());
     let explicit_backend_env = std::env::var("HYPHAE_SECRET_BACKEND")
         .ok()
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| matches!(s.as_str(), "file" | "keychain" | "secret-service"));
+        .and_then(|s| hyp_crypto::keystore::parse_backend(&s))
+        .map(|b| b.as_str().to_string());
     let active_backend =
         hyp_crypto::keystore::detect_backend_with(&state_dir, explicit_backend_env.as_deref());
     let secret_backend = if let Some(explicit) = explicit_backend_env {
@@ -1292,6 +1386,7 @@ fn build_spec(
     } else {
         None
     };
+    let extra_env = collect_secret_backend_service_env(active_backend, |k| std::env::var(k).ok());
     #[cfg(target_os = "windows")]
     let user_id = {
         let domain = std::env::var("USERDOMAIN").ok();
@@ -1309,6 +1404,7 @@ fn build_spec(
         logs_dir,
         path_env,
         secret_backend,
+        extra_env,
         user_id,
     })
 }
@@ -2862,6 +2958,7 @@ mod tests {
                 Some(Path::new("/Users/alice/.local/bin")),
             ),
             secret_backend: None,
+            extra_env: BTreeMap::new(),
             user_id: None,
         }
     }
@@ -2942,6 +3039,7 @@ mod tests {
             logs_dir: PathBuf::from(r"C:\Users\O'Malley & Co\.config\hyphae\logs"),
             path_env: String::new(),
             secret_backend: None,
+            extra_env: BTreeMap::new(),
             user_id: Some(r"CORP\o'malley & co".to_string()),
         };
 
@@ -3152,6 +3250,84 @@ mod tests {
         assert_eq!(parse_loginctl_linger("Linger=yes\n"), Some(true));
         assert_eq!(parse_loginctl_linger("Linger=no\n"), Some(false));
         assert_eq!(parse_loginctl_linger("Other=1\n"), None);
+    }
+
+    #[test]
+    fn service_env_pins_1password_lastpass_pass_non_secret_config_never_tokens() {
+        use hyp_crypto::keystore::SecretBackend;
+
+        // 1Password: pins vault & op bin, NEVER OP_SERVICE_ACCOUNT_TOKEN!
+        let op_env = collect_secret_backend_service_env(SecretBackend::OnePassword, |k| match k {
+            "HYPHAE_1PASSWORD_VAULT" => Some("Team Vault".to_string()),
+            "HYPHAE_OP_BIN" => Some("/opt/homebrew/bin/op".to_string()),
+            "OP_SERVICE_ACCOUNT_TOKEN" => Some("ops_NEVER_PIN_SECRET_TOKEN".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            op_env.get("HYPHAE_1PASSWORD_VAULT").map(String::as_str),
+            Some("Team Vault")
+        );
+        assert_eq!(
+            op_env.get("HYPHAE_OP_BIN").map(String::as_str),
+            Some("/opt/homebrew/bin/op")
+        );
+        assert!(!op_env.contains_key("OP_SERVICE_ACCOUNT_TOKEN"));
+
+        let mut spec = sample_spec();
+        spec.secret_backend = Some("1password".to_string());
+        spec.extra_env = op_env;
+        let plist = render_macos_plist(&spec);
+        assert!(plist.contains("<key>HYPHAE_SECRET_BACKEND</key>\n    <string>1password</string>"));
+        assert!(
+            plist.contains("<key>HYPHAE_1PASSWORD_VAULT</key>\n    <string>Team Vault</string>")
+        );
+        assert!(!plist.contains("OP_SERVICE_ACCOUNT_TOKEN"));
+        let unit = render_linux_systemd_unit(&spec);
+        assert!(unit.contains("Environment=\"HYPHAE_SECRET_BACKEND=1password\""));
+        assert!(unit.contains("Environment=\"HYPHAE_1PASSWORD_VAULT=Team Vault\""));
+        assert!(!unit.contains("OP_SERVICE_ACCOUNT_TOKEN"));
+
+        // LastPass: pins valid prefix, rejects traversal prefix
+        let lp_env = collect_secret_backend_service_env(SecretBackend::LastPass, |k| match k {
+            "HYPHAE_LASTPASS_PREFIX" => Some("work/hyphae".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            lp_env.get("HYPHAE_LASTPASS_PREFIX").map(String::as_str),
+            Some("work/hyphae")
+        );
+        let lp_bad = collect_secret_backend_service_env(SecretBackend::LastPass, |k| match k {
+            "HYPHAE_LASTPASS_PREFIX" => Some("../escape".to_string()),
+            _ => None,
+        });
+        assert!(!lp_bad.contains_key("HYPHAE_LASTPASS_PREFIX"));
+
+        // Pass: pins prefix, PASSWORD_STORE_DIR, GNUPGHOME; rejects traversal prefix
+        let pass_env = collect_secret_backend_service_env(SecretBackend::Pass, |k| match k {
+            "HYPHAE_PASS_PREFIX" => Some("infra/hyphae".to_string()),
+            "PASSWORD_STORE_DIR" => Some("/srv/pass-store".to_string()),
+            "GNUPGHOME" => Some("/srv/gnupg".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            pass_env.get("HYPHAE_PASS_PREFIX").map(String::as_str),
+            Some("infra/hyphae")
+        );
+        assert_eq!(
+            pass_env.get("PASSWORD_STORE_DIR").map(String::as_str),
+            Some("/srv/pass-store")
+        );
+        assert_eq!(
+            pass_env.get("GNUPGHOME").map(String::as_str),
+            Some("/srv/gnupg")
+        );
+        spec.secret_backend = Some("pass".to_string());
+        spec.extra_env = pass_env;
+        let pass_unit = render_linux_systemd_unit(&spec);
+        assert!(pass_unit.contains("Environment=\"HYPHAE_SECRET_BACKEND=pass\""));
+        assert!(pass_unit.contains("Environment=\"HYPHAE_PASS_PREFIX=infra/hyphae\""));
+        assert!(pass_unit.contains("Environment=\"PASSWORD_STORE_DIR=/srv/pass-store\""));
+        assert!(pass_unit.contains("Environment=\"GNUPGHOME=/srv/gnupg\""));
     }
 
     fn zero_sleep_policy() -> LaunchdRetryPolicy {

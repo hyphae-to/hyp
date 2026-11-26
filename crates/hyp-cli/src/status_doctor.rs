@@ -17,6 +17,7 @@ use crate::ui::{
 };
 use crate::update::read_cached_update_status;
 use clap::Args;
+use hyp_crypto::keystore::{SecretBackend, SecretStore};
 use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync};
 use hyp_node::engine::{DEFAULT_HYPHAE_VERSION, DropRelayConfig, LocalIngestConfig, NodeProfile};
 use hyp_node::gates::policy::{FilterAdapterConfig, LlmProvider, SecurityGateConfig};
@@ -159,6 +160,23 @@ pub struct TailscaleServeStatus {
     pub detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix_command: Option<String>,
+}
+
+/// Non-invasive secret backend readiness diagnostic reported under `data.secretBackend`.
+/// Never reads, unlocks, or exposes secret values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretBackendDiagnostic {
+    pub backend: String,
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_bin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_bin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Smart operational Tailscale probe result reported under `data.tailscale`.
@@ -415,10 +433,20 @@ fn run_status_or_doctor(
         .unwrap_or(NodeProfile::Local);
     let require_e2ee = loaded_cfg.as_ref().map(|c| c.require_e2ee).unwrap_or(true);
 
-    // Load identity keys if already present (do not silently create brand new keys on status/doctor if dir missing).
+    // Load identity keys if already present (do not silently create brand new keys on status/doctor
+    // if dir missing, and NEVER touch external CLI password managers like 1Password/LastPass/pass
+    // during read-only `status`/`doctor` checks).
     let explicit_state = state_dir_arg.is_some();
     let secrets = open_secret_store(&state_dir, explicit_state);
-    let (kid, fingerprint) = if state_dir.join("secrets").exists() || !explicit_state {
+    let (secret_backend_status, secret_backend_check) = inspect_secret_backend(&secrets, is_doctor);
+    checks.push(secret_backend_check);
+    let is_external_cli_secret_backend = matches!(
+        secrets.backend(),
+        SecretBackend::OnePassword | SecretBackend::LastPass | SecretBackend::Pass
+    );
+    let (kid, fingerprint) = if !is_external_cli_secret_backend
+        && (state_dir.join("secrets").exists() || !explicit_state)
+    {
         match secrets.load_or_create_node_keys(&node_id) {
             Ok(keys) => (Some(keys.kid()), Some(keys.fingerprint())),
             Err(_) => (None, None),
@@ -960,10 +988,12 @@ fn run_status_or_doctor(
             "socketPath": socket_path,
             "stateDir": state_dir.display().to_string(),
             "configPath": config_path.display().to_string(),
+            "secretBackend": secrets.backend().as_str(),
             "sessions": sessions_count,
             "subscriptions": subs_count,
             "kvNamespaces": kv_namespaces,
         },
+        "secretBackend": secret_backend_status,
         "storage": storage_status,
         "peers": skew_rows,
         "gate": gate_status,
@@ -1024,6 +1054,20 @@ fn run_status_or_doctor(
                 fingerprint.as_deref().unwrap_or("-")
             );
         }
+        println!(
+            "  Secrets:  {}{}{}",
+            secret_backend_status.backend,
+            secret_backend_status
+                .namespace
+                .as_deref()
+                .map(|ns| format!(" ({ns})"))
+                .unwrap_or_default(),
+            if secret_backend_status.available {
+                ""
+            } else {
+                " [UNAVAILABLE]"
+            }
+        );
         if let Some(ref sock) = socket_path {
             println!("  Local IPC: {sock}");
         }
@@ -2500,6 +2544,379 @@ pub(crate) fn build_tailscale_checks(
     out
 }
 
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path)
+            .map(|m| (m.permissions().mode() & 0o111) != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn find_executable_in_dir(dir: &Path, name: &Path) -> Option<PathBuf> {
+    let direct = dir.join(name);
+    if is_executable_file(&direct) {
+        return Some(direct);
+    }
+    #[cfg(windows)]
+    {
+        if name.extension().is_none() {
+            for ext in ["exe", "cmd", "bat"] {
+                let with_ext = direct.with_extension(ext);
+                if is_executable_file(&with_ext) {
+                    return Some(with_ext);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Pure filesystem/PATH executable lookup — never spawns the target CLI or touches secrets.
+pub(crate) fn find_executable_path(bin: &Path) -> Option<PathBuf> {
+    let raw = bin.to_string_lossy();
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let has_path_sep = raw.contains('/') || raw.contains('\\') || bin.components().count() > 1;
+    if has_path_sep {
+        if is_executable_file(bin) {
+            return Some(bin.to_path_buf());
+        }
+        #[cfg(windows)]
+        {
+            if bin.extension().is_none() {
+                for ext in ["exe", "cmd", "bat"] {
+                    let with_ext = bin.with_extension(ext);
+                    if is_executable_file(&with_ext) {
+                        return Some(with_ext);
+                    }
+                }
+            }
+        }
+        return None;
+    }
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        if let Some(found) = find_executable_in_dir(&dir, bin) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Checks secret backend configuration and CLI binary availability cleanly without touching secrets.
+pub(crate) fn inspect_secret_backend(
+    store: &SecretStore,
+    is_doctor: bool,
+) -> (SecretBackendDiagnostic, CliCheck) {
+    let backend_name = store.backend().as_str().to_string();
+    let fail_or_warn = |detail: String, fix: String| {
+        if is_doctor {
+            CliCheck::fail("secrets.backend", detail, Some(fix))
+        } else {
+            CliCheck::warn("secrets.backend", detail, Some(fix))
+        }
+    };
+
+    match store.backend() {
+        SecretBackend::File => {
+            let detail = format!("file (0600 store at {})", store.secrets_dir().display());
+            (
+                SecretBackendDiagnostic {
+                    backend: backend_name,
+                    available: true,
+                    cli_bin: None,
+                    resolved_bin: None,
+                    namespace: None,
+                    error: None,
+                },
+                CliCheck::ok("secrets.backend", detail),
+            )
+        }
+        SecretBackend::Keychain => {
+            let sec_bin = Path::new("/usr/bin/security");
+            let available = cfg!(target_os = "macos") && is_executable_file(sec_bin);
+            let check = if available {
+                CliCheck::ok("secrets.backend", "keychain (/usr/bin/security)")
+            } else {
+                CliCheck::warn(
+                    "secrets.backend",
+                    "macOS Keychain CLI (/usr/bin/security) is unavailable on this platform",
+                    Some(
+                        "Set HYPHAE_SECRET_BACKEND=file (or secret-service on Linux).".to_string(),
+                    ),
+                )
+            };
+            (
+                SecretBackendDiagnostic {
+                    backend: backend_name,
+                    available,
+                    cli_bin: Some("/usr/bin/security".to_string()),
+                    resolved_bin: available.then(|| "/usr/bin/security".to_string()),
+                    namespace: None,
+                    error: (!available).then(|| "macOS Keychain binary unavailable".to_string()),
+                },
+                check,
+            )
+        }
+        SecretBackend::SecretService => {
+            let resolved = find_executable_path(Path::new("secret-tool"));
+            let available = cfg!(target_os = "linux") && resolved.is_some();
+            let check = if available {
+                CliCheck::ok(
+                    "secrets.backend",
+                    format!(
+                        "secret-service ({})",
+                        resolved
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "secret-tool".to_string())
+                    ),
+                )
+            } else {
+                CliCheck::warn(
+                    "secrets.backend",
+                    "Linux Secret Service CLI (`secret-tool`) not found or unsupported platform",
+                    Some(
+                        "Install `libsecret-tools` or set HYPHAE_SECRET_BACKEND=file.".to_string(),
+                    ),
+                )
+            };
+            (
+                SecretBackendDiagnostic {
+                    backend: backend_name,
+                    available,
+                    cli_bin: Some("secret-tool".to_string()),
+                    resolved_bin: resolved.map(|p| p.display().to_string()),
+                    namespace: None,
+                    error: (!available).then(|| "secret-tool CLI unavailable".to_string()),
+                },
+                check,
+            )
+        }
+        SecretBackend::OnePassword => {
+            let vault = match store.resolved_op_vault() {
+                Ok(v) => v,
+                Err(e) => {
+                    let msg = e.to_string();
+                    let fix = "Set a valid HYPHAE_1PASSWORD_VAULT (no control chars or leading '-') or switch to HYPHAE_SECRET_BACKEND=file.".to_string();
+                    return (
+                        SecretBackendDiagnostic {
+                            backend: backend_name,
+                            available: false,
+                            cli_bin: None,
+                            resolved_bin: None,
+                            namespace: None,
+                            error: Some(msg.clone()),
+                        },
+                        fail_or_warn(format!("1password config invalid: {msg}"), fix),
+                    );
+                }
+            };
+            let bin = match store.resolved_op_bin() {
+                Ok(b) => b,
+                Err(e) => {
+                    let msg = e.to_string();
+                    let fix =
+                        "Set a valid HYPHAE_OP_BIN path or switch to HYPHAE_SECRET_BACKEND=file."
+                            .to_string();
+                    return (
+                        SecretBackendDiagnostic {
+                            backend: backend_name,
+                            available: false,
+                            cli_bin: None,
+                            resolved_bin: None,
+                            namespace: Some(vault),
+                            error: Some(msg.clone()),
+                        },
+                        fail_or_warn(format!("1password CLI path invalid: {msg}"), fix),
+                    );
+                }
+            };
+            let bin_str = bin.display().to_string();
+            if let Some(resolved) = find_executable_path(&bin) {
+                let resolved_str = resolved.display().to_string();
+                let detail = format!("1password (bin={resolved_str}, vault={vault})");
+                (
+                    SecretBackendDiagnostic {
+                        backend: backend_name,
+                        available: true,
+                        cli_bin: Some(bin_str),
+                        resolved_bin: Some(resolved_str),
+                        namespace: Some(vault),
+                        error: None,
+                    },
+                    CliCheck::ok("secrets.backend", detail),
+                )
+            } else {
+                let err = format!("1Password CLI '{bin_str}' not found (vault={vault})");
+                let fix = "Install 1Password CLI (`op`), set HYPHAE_OP_BIN, or switch to HYPHAE_SECRET_BACKEND=file.".to_string();
+                (
+                    SecretBackendDiagnostic {
+                        backend: backend_name,
+                        available: false,
+                        cli_bin: Some(bin_str),
+                        resolved_bin: None,
+                        namespace: Some(vault),
+                        error: Some(err.clone()),
+                    },
+                    fail_or_warn(err, fix),
+                )
+            }
+        }
+        SecretBackend::LastPass => {
+            let prefix = match store.resolved_lpass_prefix() {
+                Ok(p) => p,
+                Err(e) => {
+                    let msg = e.to_string();
+                    let fix = "Set a valid HYPHAE_LASTPASS_PREFIX (no '..', control chars, or leading '-') or switch to HYPHAE_SECRET_BACKEND=file.".to_string();
+                    return (
+                        SecretBackendDiagnostic {
+                            backend: backend_name,
+                            available: false,
+                            cli_bin: None,
+                            resolved_bin: None,
+                            namespace: None,
+                            error: Some(msg.clone()),
+                        },
+                        fail_or_warn(format!("lastpass config invalid: {msg}"), fix),
+                    );
+                }
+            };
+            let bin = match store.resolved_lpass_bin() {
+                Ok(b) => b,
+                Err(e) => {
+                    let msg = e.to_string();
+                    let fix = "Set a valid HYPHAE_LPASS_BIN path or switch to HYPHAE_SECRET_BACKEND=file.".to_string();
+                    return (
+                        SecretBackendDiagnostic {
+                            backend: backend_name,
+                            available: false,
+                            cli_bin: None,
+                            resolved_bin: None,
+                            namespace: Some(prefix),
+                            error: Some(msg.clone()),
+                        },
+                        fail_or_warn(format!("lastpass CLI path invalid: {msg}"), fix),
+                    );
+                }
+            };
+            let bin_str = bin.display().to_string();
+            if let Some(resolved) = find_executable_path(&bin) {
+                let resolved_str = resolved.display().to_string();
+                let detail = format!("lastpass (bin={resolved_str}, prefix={prefix})");
+                (
+                    SecretBackendDiagnostic {
+                        backend: backend_name,
+                        available: true,
+                        cli_bin: Some(bin_str),
+                        resolved_bin: Some(resolved_str),
+                        namespace: Some(prefix),
+                        error: None,
+                    },
+                    CliCheck::ok("secrets.backend", detail),
+                )
+            } else {
+                let err = format!("LastPass CLI '{bin_str}' not found (prefix={prefix})");
+                let fix = "Install LastPass CLI (`lpass`), set HYPHAE_LPASS_BIN, or switch to HYPHAE_SECRET_BACKEND=file.".to_string();
+                (
+                    SecretBackendDiagnostic {
+                        backend: backend_name,
+                        available: false,
+                        cli_bin: Some(bin_str),
+                        resolved_bin: None,
+                        namespace: Some(prefix),
+                        error: Some(err.clone()),
+                    },
+                    fail_or_warn(err, fix),
+                )
+            }
+        }
+        SecretBackend::Pass => {
+            let prefix = match store.resolved_pass_prefix() {
+                Ok(p) => p,
+                Err(e) => {
+                    let msg = e.to_string();
+                    let fix = "Set a valid HYPHAE_PASS_PREFIX (alphanumeric path segments, no '..' or leading '/') or switch to HYPHAE_SECRET_BACKEND=file.".to_string();
+                    return (
+                        SecretBackendDiagnostic {
+                            backend: backend_name,
+                            available: false,
+                            cli_bin: None,
+                            resolved_bin: None,
+                            namespace: None,
+                            error: Some(msg.clone()),
+                        },
+                        fail_or_warn(format!("pass config invalid: {msg}"), fix),
+                    );
+                }
+            };
+            let bin = match store.resolved_pass_bin() {
+                Ok(b) => b,
+                Err(e) => {
+                    let msg = e.to_string();
+                    let fix =
+                        "Set a valid HYPHAE_PASS_BIN path or switch to HYPHAE_SECRET_BACKEND=file."
+                            .to_string();
+                    return (
+                        SecretBackendDiagnostic {
+                            backend: backend_name,
+                            available: false,
+                            cli_bin: None,
+                            resolved_bin: None,
+                            namespace: Some(prefix),
+                            error: Some(msg.clone()),
+                        },
+                        fail_or_warn(format!("pass CLI path invalid: {msg}"), fix),
+                    );
+                }
+            };
+            let bin_str = bin.display().to_string();
+            if let Some(resolved) = find_executable_path(&bin) {
+                let resolved_str = resolved.display().to_string();
+                let detail = format!("pass (bin={resolved_str}, prefix={prefix})");
+                (
+                    SecretBackendDiagnostic {
+                        backend: backend_name,
+                        available: true,
+                        cli_bin: Some(bin_str),
+                        resolved_bin: Some(resolved_str),
+                        namespace: Some(prefix),
+                        error: None,
+                    },
+                    CliCheck::ok("secrets.backend", detail),
+                )
+            } else {
+                let err = format!("pass CLI '{bin_str}' not found (prefix={prefix})");
+                let fix = "Install `pass` (password-store), set HYPHAE_PASS_BIN, or switch to HYPHAE_SECRET_BACKEND=file.".to_string();
+                (
+                    SecretBackendDiagnostic {
+                        backend: backend_name,
+                        available: false,
+                        cli_bin: Some(bin_str),
+                        resolved_bin: None,
+                        namespace: Some(prefix),
+                        error: Some(err.clone()),
+                    },
+                    fail_or_warn(err, fix),
+                )
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2655,5 +3072,45 @@ mod tests {
             parse_https_port_from_url("https://alice.ts.net:8443/path"),
             Some(8443)
         );
+    }
+
+    #[test]
+    fn inspect_secret_backend_checks_cli_availability_without_touching_secrets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_bin = tmp.path().join("mock-cli");
+        fs::write(&fake_bin, "#!/bin/sh\nexit 99\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fake_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // 1Password available -> OK
+        let op_ok = SecretStore::new(tmp.path(), SecretBackend::OnePassword)
+            .with_op_bin(&fake_bin)
+            .with_op_vault("TeamVault");
+        let (diag, check) = inspect_secret_backend(&op_ok, true);
+        assert!(diag.available);
+        assert_eq!(diag.backend, "1password");
+        assert_eq!(diag.namespace.as_deref(), Some("TeamVault"));
+        assert_eq!(check.status, CheckStatus::Ok);
+
+        // LastPass missing -> Fail in doctor, Warn in status
+        let lp_missing = SecretStore::new(tmp.path(), SecretBackend::LastPass)
+            .with_lpass_bin("/nonexistent/mock-lpass")
+            .with_lpass_prefix("hyphae");
+        let (diag_doc, check_doc) = inspect_secret_backend(&lp_missing, true);
+        assert!(!diag_doc.available);
+        assert_eq!(check_doc.status, CheckStatus::Fail);
+        let (_, check_status) = inspect_secret_backend(&lp_missing, false);
+        assert_eq!(check_status.status, CheckStatus::Warn);
+
+        // Pass path-traversal prefix -> Fail closed
+        let pass_bad = SecretStore::new(tmp.path(), SecretBackend::Pass)
+            .with_pass_bin(&fake_bin)
+            .with_pass_prefix("../etc");
+        let (diag_bad, check_bad) = inspect_secret_backend(&pass_bad, true);
+        assert!(!diag_bad.available);
+        assert_eq!(check_bad.status, CheckStatus::Fail);
     }
 }

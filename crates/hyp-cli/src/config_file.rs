@@ -154,11 +154,26 @@ pub fn resolve_config_path_for_write(
 }
 
 /// Opens a `SecretStore` pinned to `state_dir`. When `explicit_dir` is `true` and
-/// `HYPHAE_SECRET_BACKEND` is unset, defaults to `SecretBackend::File` so isolated tests
-/// and explicit `--state-dir` calls never mutate live OS Keychain entries.
+/// `HYPHAE_SECRET_BACKEND` is unset (or unrecognized), defaults to `SecretBackend::File` so
+/// isolated tests and explicit `--state-dir` calls never mutate live OS Keychain entries.
 pub fn open_secret_store(state_dir: &Path, explicit_dir: bool) -> SecretStore {
-    if std::env::var_os("HYPHAE_SECRET_BACKEND").is_some() {
-        SecretStore::from_env(state_dir)
+    let override_val = std::env::var("HYPHAE_SECRET_BACKEND").ok();
+    open_secret_store_with(state_dir, explicit_dir, override_val.as_deref())
+}
+
+/// Pure testable helper for [`open_secret_store`] supporting all `HYPHAE_SECRET_BACKEND` values
+/// (`file`, `keychain`, `secret-service`, `1password`, `lastpass`, `pass`).
+pub(crate) fn open_secret_store_with(
+    state_dir: &Path,
+    explicit_dir: bool,
+    explicit_backend_override: Option<&str>,
+) -> SecretStore {
+    if let Some(backend) = explicit_backend_override.and_then(hyp_crypto::keystore::parse_backend) {
+        let mut store = SecretStore::from_env(state_dir);
+        if store.backend() != backend {
+            store = SecretStore::new(state_dir, backend);
+        }
+        store
     } else if explicit_dir {
         SecretStore::new(state_dir, SecretBackend::File)
     } else {
@@ -672,6 +687,31 @@ mod tests {
                 .unwrap()
                 .file_type()
                 .is_symlink()
+        );
+    }
+
+    #[test]
+    fn open_secret_store_with_supports_1password_lastpass_pass_and_preserves_explicit_dir_safety() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            open_secret_store_with(tmp.path(), true, None).backend(),
+            SecretBackend::File
+        );
+        assert_eq!(
+            open_secret_store_with(tmp.path(), true, Some("unknown")).backend(),
+            SecretBackend::File
+        );
+        assert_eq!(
+            open_secret_store_with(tmp.path(), true, Some("1password")).backend(),
+            SecretBackend::OnePassword
+        );
+        assert_eq!(
+            open_secret_store_with(tmp.path(), true, Some("lastpass")).backend(),
+            SecretBackend::LastPass
+        );
+        assert_eq!(
+            open_secret_store_with(tmp.path(), true, Some("pass")).backend(),
+            SecretBackend::Pass
         );
     }
 }

@@ -41,7 +41,7 @@ const DEFAULT_WEB_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Subcommand)]
 pub enum SecretCommand {
-    /// Save a secret into OS Keychain / Secret Service / 0600 file store (reads stdin or --web, NEVER argv!)
+    /// Save a secret into OS Keychain / Secret Service / 1Password / LastPass / pass / 0600 file store (reads stdin or --web, NEVER argv!)
     Set {
         /// Secret name matching /^[a-z0-9][a-z0-9._-]{0,63}$/
         #[arg(value_name = "NAME")]
@@ -673,6 +673,9 @@ fn friendly_backend_label(raw: &str) -> String {
     match raw {
         "keychain" => "macOS Keychain".to_string(),
         "secret-service" => "Linux Secret Service".to_string(),
+        "1password" => "1Password CLI (op)".to_string(),
+        "lastpass" => "LastPass CLI (lpass)".to_string(),
+        "pass" => "Linux pass (password-store)".to_string(),
         "file" => "0600 Private Secret File".to_string(),
         other => escape_html(other),
     }
@@ -1324,7 +1327,23 @@ async fn handle_web_capture_request(
 
 #[cfg(test)]
 mod tests {
-    use super::render_web_capture_form_html;
+    use super::{friendly_backend_label, render_web_capture_form_html};
+
+    #[test]
+    fn friendly_backend_labels_cover_all_six_backends() {
+        assert_eq!(friendly_backend_label("1password"), "1Password CLI (op)");
+        assert_eq!(friendly_backend_label("lastpass"), "LastPass CLI (lpass)");
+        assert_eq!(
+            friendly_backend_label("pass"),
+            "Linux pass (password-store)"
+        );
+        assert_eq!(friendly_backend_label("keychain"), "macOS Keychain");
+        assert_eq!(
+            friendly_backend_label("secret-service"),
+            "Linux Secret Service"
+        );
+        assert_eq!(friendly_backend_label("file"), "0600 Private Secret File");
+    }
 
     #[test]
     fn web_capture_form_disables_password_manager_autofill_prompts() {

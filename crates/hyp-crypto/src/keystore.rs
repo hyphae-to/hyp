@@ -2,6 +2,9 @@
 //! - Private user-only file backend (`HYPHAE_SECRET_BACKEND=file`, `0700` dir, atomic `0600` temp-file + rename)
 //! - macOS Keychain (`/usr/bin/security -i` over stdin `-X <hex>`, zero secrets in argv, lossless `hyphae-b64v1:`)
 //! - Linux Freedesktop Secret Service (`secret-tool` over stdin, zero secrets in argv)
+//! - 1Password CLI (`HYPHAE_SECRET_BACKEND=1password`, `op` JSON over stdin, zero secrets in argv, lossless `hyphae-b64v1:`)
+//! - LastPass CLI (`HYPHAE_SECRET_BACKEND=lastpass`, `lpass` over stdin with `LPASS_DISABLE_PINENTRY=1`, zero secrets in argv)
+//! - Linux `pass` (`HYPHAE_SECRET_BACKEND=pass`, `pass insert -m -f` over stdin with non-interactive GPG opts, zero secrets in argv)
 //!
 //! Mirrors `src/secrets.ts` and `src/identity.ts` naming & safety invariants, including
 //! automatic `File` backend selection for ephemeral temp directories so tests NEVER touch live OS keyrings.
@@ -10,7 +13,6 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,6 +28,12 @@ use crate::keys::{Ed25519KeyPair, NodeIdentityKeys, X25519KeyPair};
 #[cfg(target_os = "macos")]
 const MACOS_SECURITY_BIN: &str = "/usr/bin/security";
 const KEYCHAIN_B64_PREFIX: &str = "hyphae-b64v1:";
+const DEFAULT_OP_BIN: &str = "op";
+const DEFAULT_OP_VAULT: &str = "Hyphae";
+const DEFAULT_LPASS_BIN: &str = "lpass";
+const DEFAULT_LPASS_PREFIX: &str = "hyphae";
+const DEFAULT_PASS_BIN: &str = "pass";
+const DEFAULT_PASS_PREFIX: &str = "hyphae";
 
 /// Active secret storage backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +41,12 @@ const KEYCHAIN_B64_PREFIX: &str = "hyphae-b64v1:";
 pub enum SecretBackend {
     Keychain,
     SecretService,
+    #[serde(rename = "1password")]
+    OnePassword,
+    #[serde(rename = "lastpass")]
+    LastPass,
+    #[serde(rename = "pass")]
+    Pass,
     File,
 }
 
@@ -41,6 +55,9 @@ impl SecretBackend {
         match self {
             SecretBackend::Keychain => "keychain",
             SecretBackend::SecretService => "secret-service",
+            SecretBackend::OnePassword => "1password",
+            SecretBackend::LastPass => "lastpass",
+            SecretBackend::Pass => "pass",
             SecretBackend::File => "file",
         }
     }
@@ -159,14 +176,168 @@ fn is_inside_temp_dir(config_dir: &Path) -> bool {
         .any(|base| abs.starts_with(base) || config_dir.starts_with(base))
 }
 
+/// Parses a `HYPHAE_SECRET_BACKEND` name into a [`SecretBackend`].
+pub fn parse_backend(raw: &str) -> Option<SecretBackend> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "keychain" => Some(SecretBackend::Keychain),
+        "secret-service" => Some(SecretBackend::SecretService),
+        "1password" => Some(SecretBackend::OnePassword),
+        "lastpass" => Some(SecretBackend::LastPass),
+        "pass" => Some(SecretBackend::Pass),
+        "file" => Some(SecretBackend::File),
+        _ => None,
+    }
+}
+
+/// Validates a 1Password vault name (`HYPHAE_1PASSWORD_VAULT`): non-empty, <= 128 bytes,
+/// no control chars/newlines, and no leading `-` (prevents CLI flag injection).
+pub fn validate_onepassword_vault(vault: &str) -> Result<(), CryptoError> {
+    if vault.is_empty() || vault.trim().is_empty() {
+        return Err(CryptoError::Keystore(
+            "invalid 1Password vault name: cannot be empty".into(),
+        ));
+    }
+    if vault.len() > 128 {
+        return Err(CryptoError::Keystore(
+            "invalid 1Password vault name: exceeds 128 bytes".into(),
+        ));
+    }
+    if vault.starts_with('-') {
+        return Err(CryptoError::Keystore(
+            "invalid 1Password vault name: must not start with '-'".into(),
+        ));
+    }
+    if vault.chars().any(char::is_control) {
+        return Err(CryptoError::Keystore(
+            "invalid 1Password vault name: contains disallowed control characters".into(),
+        ));
+    }
+    if vault.trim() != vault {
+        return Err(CryptoError::Keystore(
+            "invalid 1Password vault name: must not have leading or trailing whitespace".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a LastPass entry prefix (`HYPHAE_LASTPASS_PREFIX`): non-empty, <= 128 bytes,
+/// path-traversal-proof (rejects `..`, `.` segments, leading/trailing `/`, `//`, `\`,
+/// control chars, and leading `-`).
+pub fn validate_lastpass_prefix(prefix: &str) -> Result<(), CryptoError> {
+    if prefix.is_empty() || prefix.trim().is_empty() {
+        return Err(CryptoError::Keystore(
+            "invalid LastPass prefix: cannot be empty".into(),
+        ));
+    }
+    if prefix.len() > 128 {
+        return Err(CryptoError::Keystore(
+            "invalid LastPass prefix: exceeds 128 bytes".into(),
+        ));
+    }
+    if prefix.trim() != prefix {
+        return Err(CryptoError::Keystore(
+            "invalid LastPass prefix: must not have leading or trailing whitespace".into(),
+        ));
+    }
+    if prefix.starts_with('-') {
+        return Err(CryptoError::Keystore(
+            "invalid LastPass prefix: must not start with '-'".into(),
+        ));
+    }
+    if prefix.starts_with('/') || prefix.ends_with('/') {
+        return Err(CryptoError::Keystore(
+            "invalid LastPass prefix: must not start or end with '/'".into(),
+        ));
+    }
+    if prefix.contains('\\') || prefix.contains("..") {
+        return Err(CryptoError::Keystore(
+            "invalid LastPass prefix: path traversal characters ('..', '\\\\') are disallowed"
+                .into(),
+        ));
+    }
+    if prefix.chars().any(char::is_control) {
+        return Err(CryptoError::Keystore(
+            "invalid LastPass prefix: contains disallowed control characters".into(),
+        ));
+    }
+    for seg in prefix.split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." || seg.starts_with('.') {
+            return Err(CryptoError::Keystore(
+                "invalid LastPass prefix: contains invalid path segment".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validates a Linux `pass` store prefix (`HYPHAE_PASS_PREFIX`): strictly path-traversal-proof
+/// (`[A-Za-z0-9][A-Za-z0-9._-]*` segments separated by `/`, rejecting `..`, leading/trailing `/`,
+/// hidden `.`-prefixed segments like `.git`/`.gpg-id`, backslashes, control chars, and leading `-`).
+pub fn validate_pass_prefix(prefix: &str) -> Result<(), CryptoError> {
+    if prefix.is_empty() || prefix.len() > 128 {
+        return Err(CryptoError::Keystore(
+            "invalid pass prefix: must be 1..=128 bytes".into(),
+        ));
+    }
+    if prefix.starts_with('-') {
+        return Err(CryptoError::Keystore(
+            "invalid pass prefix: must not start with '-'".into(),
+        ));
+    }
+    if prefix.starts_with('/') || prefix.ends_with('/') {
+        return Err(CryptoError::Keystore(
+            "invalid pass prefix: must not start or end with '/'".into(),
+        ));
+    }
+    if prefix.contains('\\') || prefix.contains("..") {
+        return Err(CryptoError::Keystore(
+            "invalid pass prefix: path traversal characters ('..', '\\\\') are disallowed".into(),
+        ));
+    }
+    if prefix.chars().any(char::is_control) {
+        return Err(CryptoError::Keystore(
+            "invalid pass prefix: contains disallowed control characters".into(),
+        ));
+    }
+    for seg in prefix.split('/') {
+        let b = seg.as_bytes();
+        if b.is_empty() || !(b[0].is_ascii_alphanumeric()) {
+            return Err(CryptoError::Keystore(
+                "invalid pass prefix: each path segment must start with [A-Za-z0-9]".into(),
+            ));
+        }
+        if !b
+            .iter()
+            .all(|&c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+        {
+            return Err(CryptoError::Keystore(
+                "invalid pass prefix: contains disallowed characters".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_cli_bin_path(bin: &Path, label: &str) -> Result<(), CryptoError> {
+    let raw = bin.to_string_lossy();
+    if raw.trim().is_empty() {
+        return Err(CryptoError::Keystore(format!(
+            "invalid {label} CLI path: cannot be empty"
+        )));
+    }
+    if raw.chars().any(char::is_control) {
+        return Err(CryptoError::Keystore(format!(
+            "invalid {label} CLI path: contains disallowed control characters"
+        )));
+    }
+    Ok(())
+}
+
 /// Pure backend resolution helper matching `detectSecretBackend` in `src/secrets.ts`.
 pub fn detect_backend_with(config_dir: &Path, explicit_override: Option<&str>) -> SecretBackend {
     if let Some(raw) = explicit_override {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "keychain" => return SecretBackend::Keychain,
-            "secret-service" => return SecretBackend::SecretService,
-            "file" => return SecretBackend::File,
-            _ => {}
+        if let Some(backend) = parse_backend(raw) {
+            return backend;
         }
     }
     if is_inside_temp_dir(config_dir) {
@@ -187,15 +358,21 @@ pub fn detect_backend_with(config_dir: &Path, explicit_override: Option<&str>) -
     SecretBackend::File
 }
 
+/// Always encodes a secret payload losslessly with the `hyphae-b64v1:` prefix so arbitrary
+/// multiline, binary-safe UTF-8, quotes, and special characters survive external password managers.
+pub fn encode_lossless_payload(value: &str) -> Zeroizing<String> {
+    Zeroizing::new(format!(
+        "{KEYCHAIN_B64_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(value.as_bytes())
+    ))
+}
+
 /// Lossless ASCII encoding for macOS Keychain `-X` matching `src/secrets.ts:138-147`.
 pub fn encode_keychain_payload(value: &str) -> Zeroizing<String> {
     let needs_b64 = value.starts_with(KEYCHAIN_B64_PREFIX)
         || value.bytes().any(|b| !(0x20..=0x7e).contains(&b));
     if needs_b64 {
-        Zeroizing::new(format!(
-            "{KEYCHAIN_B64_PREFIX}{}",
-            URL_SAFE_NO_PAD.encode(value.as_bytes())
-        ))
+        encode_lossless_payload(value)
     } else {
         Zeroizing::new(value.to_string())
     }
@@ -359,12 +536,21 @@ fn atomic_write_private_file(dir: &Path, dest: &Path, contents: &[u8]) -> Result
     write_res
 }
 
-/// Hyphae v2 `SecretStore` managing private keys & API secrets across OS keyrings and `0600` local files.
+/// Hyphae v2 `SecretStore` managing private keys & API secrets across OS keyrings,
+/// external password managers (`1password`, `lastpass`, `pass`), and `0600` local files.
 #[derive(Debug, Clone)]
 pub struct SecretStore {
     config_dir: PathBuf,
     backend: SecretBackend,
     service: String,
+    op_bin: Option<PathBuf>,
+    op_vault: Option<String>,
+    lpass_bin: Option<PathBuf>,
+    lpass_prefix: Option<String>,
+    pass_bin: Option<PathBuf>,
+    pass_prefix: Option<String>,
+    password_store_dir: Option<PathBuf>,
+    gnupg_home: Option<PathBuf>,
 }
 
 impl SecretStore {
@@ -374,6 +560,14 @@ impl SecretStore {
             config_dir: config_dir.into(),
             backend,
             service: "hyphae".to_string(),
+            op_bin: None,
+            op_vault: None,
+            lpass_bin: None,
+            lpass_prefix: None,
+            pass_bin: None,
+            pass_prefix: None,
+            password_store_dir: None,
+            gnupg_home: None,
         }
     }
 
@@ -393,11 +587,175 @@ impl SecretStore {
             .map(|s| s.trim().to_string())
             .filter(|s| is_valid_service_name(s))
             .unwrap_or_else(|| "hyphae".to_string());
+        let non_empty_env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
         Self {
             config_dir,
             backend,
             service,
+            op_bin: non_empty_env("HYPHAE_OP_BIN").map(PathBuf::from),
+            op_vault: non_empty_env("HYPHAE_1PASSWORD_VAULT"),
+            lpass_bin: non_empty_env("HYPHAE_LPASS_BIN").map(PathBuf::from),
+            lpass_prefix: non_empty_env("HYPHAE_LASTPASS_PREFIX"),
+            pass_bin: non_empty_env("HYPHAE_PASS_BIN").map(PathBuf::from),
+            pass_prefix: non_empty_env("HYPHAE_PASS_PREFIX"),
+            password_store_dir: non_empty_env("PASSWORD_STORE_DIR").map(PathBuf::from),
+            gnupg_home: non_empty_env("GNUPGHOME").map(PathBuf::from),
         }
+    }
+
+    /// Overrides the 1Password CLI binary path (alternative to `HYPHAE_OP_BIN`, ideal for isolated tests).
+    pub fn with_op_bin(mut self, bin: impl Into<PathBuf>) -> Self {
+        self.op_bin = Some(bin.into());
+        self
+    }
+
+    /// Overrides the 1Password vault name (alternative to `HYPHAE_1PASSWORD_VAULT`).
+    pub fn with_op_vault(mut self, vault: impl Into<String>) -> Self {
+        self.op_vault = Some(vault.into());
+        self
+    }
+
+    /// Overrides the LastPass CLI binary path (alternative to `HYPHAE_LPASS_BIN`, ideal for isolated tests).
+    pub fn with_lpass_bin(mut self, bin: impl Into<PathBuf>) -> Self {
+        self.lpass_bin = Some(bin.into());
+        self
+    }
+
+    /// Overrides the LastPass entry prefix (alternative to `HYPHAE_LASTPASS_PREFIX`).
+    pub fn with_lpass_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.lpass_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Overrides the `pass` CLI binary path (alternative to `HYPHAE_PASS_BIN`, ideal for isolated tests).
+    pub fn with_pass_bin(mut self, bin: impl Into<PathBuf>) -> Self {
+        self.pass_bin = Some(bin.into());
+        self
+    }
+
+    /// Overrides the `pass` entry prefix (alternative to `HYPHAE_PASS_PREFIX`).
+    pub fn with_pass_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.pass_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Overrides `PASSWORD_STORE_DIR` for the `pass` backend.
+    pub fn with_password_store_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.password_store_dir = Some(dir.into());
+        self
+    }
+
+    /// Overrides `GNUPGHOME` for the `pass` backend.
+    pub fn with_gnupg_home(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.gnupg_home = Some(dir.into());
+        self
+    }
+
+    /// Resolves and validates the 1Password CLI executable path (`HYPHAE_OP_BIN` or `"op"`).
+    pub fn resolved_op_bin(&self) -> Result<PathBuf, CryptoError> {
+        let bin = match self.op_bin {
+            Some(ref p) => p.clone(),
+            None => std::env::var("HYPHAE_OP_BIN")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_OP_BIN)),
+        };
+        validate_cli_bin_path(&bin, "1Password")?;
+        Ok(bin)
+    }
+
+    /// Resolves and validates the 1Password vault name (`HYPHAE_1PASSWORD_VAULT` or `"Hyphae"`).
+    pub fn resolved_op_vault(&self) -> Result<String, CryptoError> {
+        let vault = match self.op_vault {
+            Some(ref v) => v.clone(),
+            None => std::env::var("HYPHAE_1PASSWORD_VAULT")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| DEFAULT_OP_VAULT.to_string()),
+        };
+        validate_onepassword_vault(&vault)?;
+        Ok(vault)
+    }
+
+    /// Resolves and validates the LastPass CLI executable path (`HYPHAE_LPASS_BIN` or `"lpass"`).
+    pub fn resolved_lpass_bin(&self) -> Result<PathBuf, CryptoError> {
+        let bin = match self.lpass_bin {
+            Some(ref p) => p.clone(),
+            None => std::env::var("HYPHAE_LPASS_BIN")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_LPASS_BIN)),
+        };
+        validate_cli_bin_path(&bin, "LastPass")?;
+        Ok(bin)
+    }
+
+    /// Resolves and validates the LastPass entry prefix (`HYPHAE_LASTPASS_PREFIX` or `"hyphae"`).
+    pub fn resolved_lpass_prefix(&self) -> Result<String, CryptoError> {
+        let prefix = match self.lpass_prefix {
+            Some(ref p) => p.clone(),
+            None => std::env::var("HYPHAE_LASTPASS_PREFIX")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| DEFAULT_LPASS_PREFIX.to_string()),
+        };
+        validate_lastpass_prefix(&prefix)?;
+        Ok(prefix)
+    }
+
+    /// Resolves and validates the `pass` CLI executable path (`HYPHAE_PASS_BIN` or `"pass"`).
+    pub fn resolved_pass_bin(&self) -> Result<PathBuf, CryptoError> {
+        let bin = match self.pass_bin {
+            Some(ref p) => p.clone(),
+            None => std::env::var("HYPHAE_PASS_BIN")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_PASS_BIN)),
+        };
+        validate_cli_bin_path(&bin, "pass")?;
+        Ok(bin)
+    }
+
+    /// Resolves and validates the `pass` prefix (`HYPHAE_PASS_PREFIX` or `"hyphae"`).
+    pub fn resolved_pass_prefix(&self) -> Result<String, CryptoError> {
+        let prefix = match self.pass_prefix {
+            Some(ref p) => p.clone(),
+            None => std::env::var("HYPHAE_PASS_PREFIX")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| DEFAULT_PASS_PREFIX.to_string()),
+        };
+        validate_pass_prefix(&prefix)?;
+        Ok(prefix)
+    }
+
+    /// Resolves `PASSWORD_STORE_DIR` (or `~/.password-store`) for metadata-only `pass` listing.
+    pub fn resolved_password_store_dir(&self) -> Option<PathBuf> {
+        if let Some(ref dir) = self.password_store_dir {
+            return Some(dir.clone());
+        }
+        if let Ok(env_dir) = std::env::var("PASSWORD_STORE_DIR") {
+            let trimmed = env_dir.trim();
+            if !trimmed.is_empty() {
+                return Some(PathBuf::from(trimmed));
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let trimmed = home.trim();
+            if !trimmed.is_empty() {
+                return Some(PathBuf::from(trimmed).join(".password-store"));
+            }
+        }
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            let trimmed = profile.trim();
+            if !trimmed.is_empty() {
+                return Some(PathBuf::from(trimmed).join(".password-store"));
+            }
+        }
+        None
     }
 
     pub fn backend(&self) -> SecretBackend {
@@ -447,7 +805,8 @@ impl SecretStore {
     }
 
     /// Stores a secret value in the configured backend (atomic `0600` file, macOS Keychain via stdin,
-    /// or Linux Secret Service via stdin).
+    /// Linux Secret Service via stdin, 1Password `op` via stdin JSON, LastPass `lpass` via stdin,
+    /// or Linux `pass` via stdin).
     pub fn set(&self, name: &str, value: &str) -> Result<SavedSecret, CryptoError> {
         validate_secret_name(name)?;
         let trimmed = value.trim();
@@ -457,17 +816,35 @@ impl SecretStore {
             )));
         }
 
-        let location = match self.backend {
-            SecretBackend::File => self.write_file_secret(name, trimmed)?,
+        let (location, recorded_service) = match self.backend {
+            SecretBackend::File => (self.write_file_secret(name, trimmed)?, None),
             SecretBackend::Keychain => {
                 let loc = self.write_mac_keychain(name, trimmed)?;
                 let _ = fs::remove_file(self.secret_file_path(name)?);
-                loc
+                (loc, Some(self.service.clone()))
             }
             SecretBackend::SecretService => {
                 let loc = self.write_linux_secret_service(name, trimmed)?;
                 let _ = fs::remove_file(self.secret_file_path(name)?);
-                loc
+                (loc, Some(self.service.clone()))
+            }
+            SecretBackend::OnePassword => {
+                let vault = self.resolved_op_vault()?;
+                let loc = self.write_onepassword(name, trimmed, &vault)?;
+                let _ = fs::remove_file(self.secret_file_path(name)?);
+                (loc, Some(vault))
+            }
+            SecretBackend::LastPass => {
+                let prefix = self.resolved_lpass_prefix()?;
+                let loc = self.write_lastpass(name, trimmed, &prefix)?;
+                let _ = fs::remove_file(self.secret_file_path(name)?);
+                (loc, Some(prefix))
+            }
+            SecretBackend::Pass => {
+                let prefix = self.resolved_pass_prefix()?;
+                let loc = self.write_pass(name, trimmed, &prefix)?;
+                let _ = fs::remove_file(self.secret_file_path(name)?);
+                (loc, Some(prefix))
             }
         };
 
@@ -481,7 +858,7 @@ impl SecretStore {
             SecretIndexEntry {
                 backend: self.backend,
                 updated_at: now_ms,
-                service: (self.backend != SecretBackend::File).then(|| self.service.clone()),
+                service: recorded_service,
             },
         );
         self.write_index(&index)?;
@@ -511,6 +888,39 @@ impl SecretStore {
             SecretBackend::SecretService => self
                 .read_linux_secret_service(name, service)?
                 .ok_or_else(|| CryptoError::SecretNotFound(name.to_string())),
+            SecretBackend::OnePassword => {
+                let vault = match entry.and_then(|e| e.service.as_deref()) {
+                    Some(v) => {
+                        validate_onepassword_vault(v)?;
+                        v.to_string()
+                    }
+                    None => self.resolved_op_vault()?,
+                };
+                self.read_onepassword(name, &vault)?
+                    .ok_or_else(|| CryptoError::SecretNotFound(name.to_string()))
+            }
+            SecretBackend::LastPass => {
+                let prefix = match entry.and_then(|e| e.service.as_deref()) {
+                    Some(p) => {
+                        validate_lastpass_prefix(p)?;
+                        p.to_string()
+                    }
+                    None => self.resolved_lpass_prefix()?,
+                };
+                self.read_lastpass(name, &prefix)?
+                    .ok_or_else(|| CryptoError::SecretNotFound(name.to_string()))
+            }
+            SecretBackend::Pass => {
+                let prefix = match entry.and_then(|e| e.service.as_deref()) {
+                    Some(p) => {
+                        validate_pass_prefix(p)?;
+                        p.to_string()
+                    }
+                    None => self.resolved_pass_prefix()?,
+                };
+                self.read_pass(name, &prefix)?
+                    .ok_or_else(|| CryptoError::SecretNotFound(name.to_string()))
+            }
         }
     }
 
@@ -518,7 +928,7 @@ impl SecretStore {
     pub fn delete(&self, name: &str) -> Result<bool, CryptoError> {
         validate_secret_name(name)?;
         let mut index = self.read_index();
-        let entry = index.secrets.remove(name);
+        let entry = index.secrets.get(name).cloned();
         let service = entry
             .as_ref()
             .and_then(|e| e.service.as_deref())
@@ -533,6 +943,36 @@ impl SecretStore {
                 SecretBackend::SecretService => {
                     removed |= self.delete_linux_secret_service(name, service);
                 }
+                SecretBackend::OnePassword => {
+                    let vault = match e.service.as_deref() {
+                        Some(v) => {
+                            validate_onepassword_vault(v)?;
+                            v.to_string()
+                        }
+                        None => self.resolved_op_vault()?,
+                    };
+                    removed |= self.delete_onepassword(name, &vault)?;
+                }
+                SecretBackend::LastPass => {
+                    let prefix = match e.service.as_deref() {
+                        Some(p) => {
+                            validate_lastpass_prefix(p)?;
+                            p.to_string()
+                        }
+                        None => self.resolved_lpass_prefix()?,
+                    };
+                    removed |= self.delete_lastpass(name, &prefix)?;
+                }
+                SecretBackend::Pass => {
+                    let prefix = match e.service.as_deref() {
+                        Some(p) => {
+                            validate_pass_prefix(p)?;
+                            p.to_string()
+                        }
+                        None => self.resolved_pass_prefix()?,
+                    };
+                    removed |= self.delete_pass(name, &prefix)?;
+                }
                 SecretBackend::File => {}
             }
         }
@@ -544,6 +984,7 @@ impl SecretStore {
         }
 
         if entry.is_some() {
+            index.secrets.remove(name);
             self.write_index(&index)?;
             removed = true;
         } else if !removed {
@@ -551,6 +992,18 @@ impl SecretStore {
                 SecretBackend::Keychain => removed = self.delete_mac_keychain(name, service),
                 SecretBackend::SecretService => {
                     removed = self.delete_linux_secret_service(name, service);
+                }
+                SecretBackend::OnePassword => {
+                    let vault = self.resolved_op_vault()?;
+                    removed = self.delete_onepassword(name, &vault)?;
+                }
+                SecretBackend::LastPass => {
+                    let prefix = self.resolved_lpass_prefix()?;
+                    removed = self.delete_lastpass(name, &prefix)?;
+                }
+                SecretBackend::Pass => {
+                    let prefix = self.resolved_pass_prefix()?;
+                    removed = self.delete_pass(name, &prefix)?;
                 }
                 SecretBackend::File => {}
             }
@@ -575,6 +1028,45 @@ impl SecretStore {
                             name: name.clone(),
                             backend: entry.backend,
                             location: format!("{}:{service}/{name}", entry.backend.as_str()),
+                            mode_ok: true,
+                            bytes: None,
+                        },
+                    );
+                }
+                SecretBackend::OnePassword => {
+                    let vault = entry.service.as_deref().unwrap_or(DEFAULT_OP_VAULT);
+                    by_name.insert(
+                        name.clone(),
+                        SecretMetadata {
+                            name: name.clone(),
+                            backend: SecretBackend::OnePassword,
+                            location: format!("1password:{vault}/hyphae/{name}"),
+                            mode_ok: true,
+                            bytes: None,
+                        },
+                    );
+                }
+                SecretBackend::LastPass => {
+                    let prefix = entry.service.as_deref().unwrap_or(DEFAULT_LPASS_PREFIX);
+                    by_name.insert(
+                        name.clone(),
+                        SecretMetadata {
+                            name: name.clone(),
+                            backend: SecretBackend::LastPass,
+                            location: format!("lastpass:{prefix}/{name}"),
+                            mode_ok: true,
+                            bytes: None,
+                        },
+                    );
+                }
+                SecretBackend::Pass => {
+                    let prefix = entry.service.as_deref().unwrap_or(DEFAULT_PASS_PREFIX);
+                    by_name.insert(
+                        name.clone(),
+                        SecretMetadata {
+                            name: name.clone(),
+                            backend: SecretBackend::Pass,
+                            location: format!("pass:{prefix}/{name}"),
                             mode_ok: true,
                             bytes: None,
                         },
@@ -630,6 +1122,52 @@ impl SecretStore {
                     },
                 );
             }
+        }
+
+        match self.backend {
+            SecretBackend::OnePassword => {
+                let vault = self.resolved_op_vault()?;
+                for name in self.list_onepassword(&vault)? {
+                    by_name
+                        .entry(name.clone())
+                        .or_insert_with(|| SecretMetadata {
+                            name: name.clone(),
+                            backend: SecretBackend::OnePassword,
+                            location: format!("1password:{vault}/hyphae/{name}"),
+                            mode_ok: true,
+                            bytes: None,
+                        });
+                }
+            }
+            SecretBackend::LastPass => {
+                let prefix = self.resolved_lpass_prefix()?;
+                for name in self.list_lastpass(&prefix)? {
+                    by_name
+                        .entry(name.clone())
+                        .or_insert_with(|| SecretMetadata {
+                            name: name.clone(),
+                            backend: SecretBackend::LastPass,
+                            location: format!("lastpass:{prefix}/{name}"),
+                            mode_ok: true,
+                            bytes: None,
+                        });
+                }
+            }
+            SecretBackend::Pass => {
+                let prefix = self.resolved_pass_prefix()?;
+                for name in self.list_pass_metadata(&prefix)? {
+                    by_name
+                        .entry(name.clone())
+                        .or_insert_with(|| SecretMetadata {
+                            name: name.clone(),
+                            backend: SecretBackend::Pass,
+                            location: format!("pass:{prefix}/{name}"),
+                            mode_ok: true,
+                            bytes: None,
+                        });
+                }
+            }
+            SecretBackend::File | SecretBackend::Keychain | SecretBackend::SecretService => {}
         }
 
         Ok(by_name.into_values().collect())
@@ -935,6 +1473,494 @@ impl SecretStore {
     fn delete_linux_secret_service(&self, _name: &str, _service: &str) -> bool {
         false
     }
+
+    // ---- 1Password CLI backend (`op`, stdin JSON template, zero secrets in argv) ----
+
+    fn write_onepassword(
+        &self,
+        name: &str,
+        value: &str,
+        vault: &str,
+    ) -> Result<String, CryptoError> {
+        validate_secret_name(name)?;
+        validate_onepassword_vault(vault)?;
+        let bin = self.resolved_op_bin()?;
+        let title = format!("hyphae/{name}");
+        let encoded = encode_lossless_payload(value);
+
+        // Check whether the item already exists (zero secrets in argv, closed stdin).
+        let probe = Command::new(&bin)
+            .args(["item", "get", &title, "--vault", vault, "--format", "json"])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| map_cli_spawn_error("1Password", &bin, "op", e))?;
+
+        let probe_stderr = String::from_utf8_lossy(&probe.stderr);
+        if probe.status.success() {
+            let (target_ref, edit_json) =
+                build_onepassword_edit_json(&probe.stdout, &title, &encoded);
+            let mut child = Command::new(&bin)
+                .args([
+                    "item",
+                    "edit",
+                    &target_ref,
+                    "--vault",
+                    vault,
+                    "--format",
+                    "json",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| map_cli_spawn_error("1Password", &bin, "op", e))?;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(edit_json.as_bytes())?;
+            }
+            let output = child.wait_with_output()?;
+            if !output.status.success() {
+                let raw_err = String::from_utf8_lossy(&output.stderr);
+                let safe_err = redact_backend_stderr(&raw_err, value, &encoded);
+                return Err(CryptoError::Keystore(format_onepassword_error(
+                    "write",
+                    name,
+                    output.status.code(),
+                    &safe_err,
+                )));
+            }
+        } else {
+            let probe_lower = probe_stderr.to_ascii_lowercase();
+            if !is_onepassword_item_not_found(&probe_lower) {
+                let safe_err = redact_backend_stderr(&probe_stderr, value, &encoded);
+                return Err(CryptoError::Keystore(format_onepassword_error(
+                    "write",
+                    name,
+                    probe.status.code(),
+                    &safe_err,
+                )));
+            }
+            let create_json = build_onepassword_create_json(&title, &encoded);
+            let mut child = Command::new(&bin)
+                .args(["item", "create", "--vault", vault, "--format", "json", "-"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| map_cli_spawn_error("1Password", &bin, "op", e))?;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(create_json.as_bytes())?;
+            }
+            let output = child.wait_with_output()?;
+            if !output.status.success() {
+                let raw_err = String::from_utf8_lossy(&output.stderr);
+                let safe_err = redact_backend_stderr(&raw_err, value, &encoded);
+                return Err(CryptoError::Keystore(format_onepassword_error(
+                    "write",
+                    name,
+                    output.status.code(),
+                    &safe_err,
+                )));
+            }
+        }
+
+        Ok(format!("1password:{vault}/{title}"))
+    }
+
+    fn read_onepassword(
+        &self,
+        name: &str,
+        vault: &str,
+    ) -> Result<Option<Zeroizing<String>>, CryptoError> {
+        validate_secret_name(name)?;
+        validate_onepassword_vault(vault)?;
+        let bin = self.resolved_op_bin()?;
+        let title = format!("hyphae/{name}");
+        let output = Command::new(&bin)
+            .args([
+                "item", "get", &title, "--vault", vault, "--format", "json", "--reveal",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| map_cli_spawn_error("1Password", &bin, "op", e))?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        classify_onepassword_get_output(name, output.status.code(), &output.stdout, &stderr)
+    }
+
+    fn delete_onepassword(&self, name: &str, vault: &str) -> Result<bool, CryptoError> {
+        validate_secret_name(name)?;
+        validate_onepassword_vault(vault)?;
+        let bin = self.resolved_op_bin()?;
+        let title = format!("hyphae/{name}");
+        let output = Command::new(&bin)
+            .args(["item", "delete", &title, "--vault", vault])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| map_cli_spawn_error("1Password", &bin, "op", e))?;
+        if output.status.success() {
+            return Ok(true);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let lower = stderr.to_ascii_lowercase();
+        if is_onepassword_item_not_found(&lower) {
+            return Ok(false);
+        }
+        Err(CryptoError::Keystore(format_onepassword_error(
+            "delete",
+            name,
+            output.status.code(),
+            stderr.trim(),
+        )))
+    }
+
+    fn list_onepassword(&self, vault: &str) -> Result<Vec<String>, CryptoError> {
+        validate_onepassword_vault(vault)?;
+        let bin = self.resolved_op_bin()?;
+        let output = Command::new(&bin)
+            .args(["item", "list", "--vault", vault, "--format", "json"])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| map_cli_spawn_error("1Password", &bin, "op", e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(CryptoError::Keystore(format_onepassword_error(
+                "list",
+                vault,
+                output.status.code(),
+                stderr.trim(),
+            )));
+        }
+        parse_onepassword_list_json(&output.stdout)
+    }
+
+    // ---- LastPass CLI backend (`lpass`, stdin notes, LPASS_DISABLE_PINENTRY=1, zero secrets in argv) ----
+
+    fn ensure_lastpass_authenticated(&self, bin: &Path) -> Result<(), CryptoError> {
+        let output = Command::new(bin)
+            .args(["status", "-q"])
+            .env("LPASS_DISABLE_PINENTRY", "1")
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| map_cli_spawn_error("LastPass", bin, "lpass", e))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(CryptoError::Keystore(if stderr.is_empty() {
+            format!(
+                "LastPass CLI is locked or unauthenticated (exit {:?}); run `lpass login <email>` or set HYPHAE_SECRET_BACKEND=file",
+                output.status.code()
+            )
+        } else {
+            format!(
+                "LastPass CLI is locked or unauthenticated (exit {:?}): {stderr}; run `lpass login <email>` or set HYPHAE_SECRET_BACKEND=file",
+                output.status.code()
+            )
+        }))
+    }
+
+    fn write_lastpass(&self, name: &str, value: &str, prefix: &str) -> Result<String, CryptoError> {
+        validate_secret_name(name)?;
+        validate_lastpass_prefix(prefix)?;
+        let bin = self.resolved_lpass_bin()?;
+        self.ensure_lastpass_authenticated(&bin)?;
+
+        let entry = format!("{prefix}/{name}");
+        let encoded = encode_lossless_payload(value);
+        let stdin_payload = Zeroizing::new(format!("{}\n", &*encoded));
+
+        // Try in-place edit first so overwrites never create duplicate LastPass entries.
+        let mut edit_child = Command::new(&bin)
+            .args(["edit", "--non-interactive", "--notes", &entry])
+            .env("LPASS_DISABLE_PINENTRY", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| map_cli_spawn_error("LastPass", &bin, "lpass", e))?;
+        if let Some(mut stdin) = edit_child.stdin.take() {
+            stdin.write_all(stdin_payload.as_bytes())?;
+        }
+        let edit_out = edit_child.wait_with_output()?;
+        if !edit_out.status.success() {
+            let edit_err = String::from_utf8_lossy(&edit_out.stderr);
+            if !is_lastpass_not_found(&edit_err.to_ascii_lowercase()) {
+                let safe_err = redact_backend_stderr(&edit_err, value, &encoded);
+                return Err(CryptoError::Keystore(format_lastpass_error(
+                    "write",
+                    name,
+                    edit_out.status.code(),
+                    &safe_err,
+                )));
+            }
+
+            let mut add_child = Command::new(&bin)
+                .args(["add", "--non-interactive", "--notes", &entry])
+                .env("LPASS_DISABLE_PINENTRY", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| map_cli_spawn_error("LastPass", &bin, "lpass", e))?;
+            if let Some(mut stdin) = add_child.stdin.take() {
+                stdin.write_all(stdin_payload.as_bytes())?;
+            }
+            let add_out = add_child.wait_with_output()?;
+            if !add_out.status.success() {
+                let add_err = String::from_utf8_lossy(&add_out.stderr);
+                let safe_err = redact_backend_stderr(&add_err, value, &encoded);
+                return Err(CryptoError::Keystore(format_lastpass_error(
+                    "write",
+                    name,
+                    add_out.status.code(),
+                    &safe_err,
+                )));
+            }
+        }
+
+        Ok(format!("lastpass:{entry}"))
+    }
+
+    fn read_lastpass(
+        &self,
+        name: &str,
+        prefix: &str,
+    ) -> Result<Option<Zeroizing<String>>, CryptoError> {
+        validate_secret_name(name)?;
+        validate_lastpass_prefix(prefix)?;
+        let bin = self.resolved_lpass_bin()?;
+        self.ensure_lastpass_authenticated(&bin)?;
+
+        let entry = format!("{prefix}/{name}");
+        let output = Command::new(&bin)
+            .args(["show", "--notes", &entry])
+            .env("LPASS_DISABLE_PINENTRY", "1")
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| map_cli_spawn_error("LastPass", &bin, "lpass", e))?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        classify_lastpass_show_output(name, output.status.code(), &output.stdout, &stderr)
+    }
+
+    fn delete_lastpass(&self, name: &str, prefix: &str) -> Result<bool, CryptoError> {
+        validate_secret_name(name)?;
+        validate_lastpass_prefix(prefix)?;
+        let bin = self.resolved_lpass_bin()?;
+        self.ensure_lastpass_authenticated(&bin)?;
+
+        let entry = format!("{prefix}/{name}");
+        let output = Command::new(&bin)
+            .args(["rm", &entry])
+            .env("LPASS_DISABLE_PINENTRY", "1")
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| map_cli_spawn_error("LastPass", &bin, "lpass", e))?;
+        if output.status.success() {
+            return Ok(true);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_lastpass_not_found(&stderr.to_ascii_lowercase()) {
+            return Ok(false);
+        }
+        Err(CryptoError::Keystore(format_lastpass_error(
+            "delete",
+            name,
+            output.status.code(),
+            stderr.trim(),
+        )))
+    }
+
+    fn list_lastpass(&self, prefix: &str) -> Result<Vec<String>, CryptoError> {
+        validate_lastpass_prefix(prefix)?;
+        let bin = self.resolved_lpass_bin()?;
+        self.ensure_lastpass_authenticated(&bin)?;
+
+        let output = Command::new(&bin)
+            .args(["ls", prefix])
+            .env("LPASS_DISABLE_PINENTRY", "1")
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| map_cli_spawn_error("LastPass", &bin, "lpass", e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let lower = stderr.to_ascii_lowercase();
+            let stdout_empty = output.stdout.iter().all(|b| b.is_ascii_whitespace());
+            if stdout_empty && (is_lastpass_not_found(&lower) || stderr.trim().is_empty()) {
+                return Ok(Vec::new());
+            }
+            return Err(CryptoError::Keystore(format_lastpass_error(
+                "list",
+                prefix,
+                output.status.code(),
+                stderr.trim(),
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(parse_lastpass_ls_output(prefix, &stdout))
+    }
+
+    // ---- Linux `pass` backend (`password-store`, stdin insert, non-interactive GPG, zero secrets in argv) ----
+
+    fn configure_pass_command(&self, cmd: &mut Command) {
+        if let Some(ref dir) = self.password_store_dir {
+            cmd.env("PASSWORD_STORE_DIR", dir);
+        }
+        if let Some(ref gnupg) = self.gnupg_home {
+            cmd.env("GNUPGHOME", gnupg);
+        }
+        // Fail closed cleanly if gpg-agent is locked instead of hanging a headless daemon on pinentry.
+        let existing_opts = std::env::var("PASSWORD_STORE_GPG_OPTS").unwrap_or_default();
+        let mut opts = existing_opts.trim().to_string();
+        for required in ["--batch", "--no-tty"] {
+            if !opts.split_whitespace().any(|tok| tok == required) {
+                if !opts.is_empty() {
+                    opts.push(' ');
+                }
+                opts.push_str(required);
+            }
+        }
+        cmd.env("PASSWORD_STORE_GPG_OPTS", opts);
+        if std::env::var_os("PINENTRY_USER_DATA").is_none() {
+            cmd.env("PINENTRY_USER_DATA", "hyphae-noninteractive");
+        }
+        cmd.env_remove("GPG_TTY");
+    }
+
+    fn write_pass(&self, name: &str, value: &str, prefix: &str) -> Result<String, CryptoError> {
+        validate_secret_name(name)?;
+        validate_pass_prefix(prefix)?;
+        let bin = self.resolved_pass_bin()?;
+        let entry = format!("{prefix}/{name}");
+        let encoded = encode_lossless_payload(value);
+        let stdin_payload = Zeroizing::new(format!("{}\n", &*encoded));
+
+        let mut cmd = Command::new(&bin);
+        cmd.args(["insert", "-m", "-f", &entry])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        self.configure_pass_command(&mut cmd);
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| map_cli_spawn_error("pass", &bin, "pass", e))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(stdin_payload.as_bytes())?;
+        }
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            let raw_err = String::from_utf8_lossy(&output.stderr);
+            let safe_err = redact_backend_stderr(&raw_err, value, &encoded);
+            return Err(CryptoError::Keystore(format_pass_error(
+                "write",
+                name,
+                output.status.code(),
+                &safe_err,
+            )));
+        }
+
+        Ok(format!("pass:{entry}"))
+    }
+
+    fn read_pass(
+        &self,
+        name: &str,
+        prefix: &str,
+    ) -> Result<Option<Zeroizing<String>>, CryptoError> {
+        validate_secret_name(name)?;
+        validate_pass_prefix(prefix)?;
+        let bin = self.resolved_pass_bin()?;
+        let entry = format!("{prefix}/{name}");
+
+        let mut cmd = Command::new(&bin);
+        cmd.args(["show", &entry]).stdin(Stdio::null());
+        self.configure_pass_command(&mut cmd);
+
+        let output = cmd
+            .output()
+            .map_err(|e| map_cli_spawn_error("pass", &bin, "pass", e))?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        classify_pass_show_output(name, output.status.code(), &output.stdout, &stderr)
+    }
+
+    fn delete_pass(&self, name: &str, prefix: &str) -> Result<bool, CryptoError> {
+        validate_secret_name(name)?;
+        validate_pass_prefix(prefix)?;
+        let bin = self.resolved_pass_bin()?;
+        let entry = format!("{prefix}/{name}");
+
+        let mut cmd = Command::new(&bin);
+        cmd.args(["rm", "-f", &entry]).stdin(Stdio::null());
+        self.configure_pass_command(&mut cmd);
+
+        let output = cmd
+            .output()
+            .map_err(|e| map_cli_spawn_error("pass", &bin, "pass", e))?;
+        if output.status.success() {
+            return Ok(true);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_pass_not_found(&stderr.to_ascii_lowercase()) {
+            return Ok(false);
+        }
+        Err(CryptoError::Keystore(format_pass_error(
+            "delete",
+            name,
+            output.status.code(),
+            stderr.trim(),
+        )))
+    }
+
+    /// Scans `<PASSWORD_STORE_DIR>/<prefix>/*.gpg` metadata on disk without invoking `pass show` or GPG.
+    fn list_pass_metadata(&self, prefix: &str) -> Result<Vec<String>, CryptoError> {
+        validate_pass_prefix(prefix)?;
+        let Some(store_dir) = self.resolved_password_store_dir() else {
+            return Ok(Vec::new());
+        };
+        if !store_dir.is_dir() {
+            return Ok(Vec::new());
+        }
+        let target_dir = store_dir.join(prefix);
+        if !target_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let st = fs::symlink_metadata(&target_dir)?;
+        if st.file_type().is_symlink() || !st.is_dir() {
+            return Err(CryptoError::Keystore(format!(
+                "refusing non-directory or symlink pass prefix path at {}",
+                target_dir.display()
+            )));
+        }
+        let canon_store = fs::canonicalize(&store_dir)?;
+        let canon_target = fs::canonicalize(&target_dir)?;
+        if !canon_target.starts_with(&canon_store) {
+            return Err(CryptoError::Keystore(
+                "pass prefix path escapes PASSWORD_STORE_DIR".into(),
+            ));
+        }
+
+        let mut names = Vec::new();
+        for ent in fs::read_dir(&canon_target)? {
+            let ent = ent?;
+            let path = ent.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                continue;
+            }
+            let fname = ent.file_name();
+            let Some(s) = fname.to_str() else { continue };
+            let Some(name) = s.strip_suffix(".gpg") else {
+                continue;
+            };
+            if validate_secret_name(name).is_ok() {
+                names.push(name.to_string());
+            }
+        }
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
 }
 
 /// Classifies the exit status, stdout, and stderr of macOS `/usr/bin/security find-generic-password`.
@@ -1055,6 +2081,496 @@ pub fn classify_linux_secret_service_output(
     let trimmed = raw.trim().to_string();
     if trimmed.is_empty() {
         Ok(None)
+    } else {
+        Ok(Some(Zeroizing::new(trimmed)))
+    }
+}
+
+fn map_cli_spawn_error(
+    label: &str,
+    bin: &Path,
+    default_cmd: &str,
+    err: std::io::Error,
+) -> CryptoError {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        CryptoError::Keystore(format!(
+            "{label} CLI ('{}') not found; install `{default_cmd}`, set the binary override env var, or switch to HYPHAE_SECRET_BACKEND=file",
+            bin.display()
+        ))
+    } else {
+        CryptoError::Keystore(format!(
+            "failed to spawn {label} CLI ('{}'): {err}",
+            bin.display()
+        ))
+    }
+}
+
+/// Scrubs secret bytes (both lossless `hyphae-b64v1:` encoding and raw value) from child stderr
+/// before returning an error message, preventing accidental secret leaks.
+fn redact_backend_stderr(stderr: &str, raw_value: &str, encoded_value: &str) -> String {
+    let mut out = stderr.trim().to_string();
+    if !encoded_value.is_empty() && out.contains(encoded_value) {
+        out = out.replace(encoded_value, "[REDACTED]");
+    }
+    if raw_value.len() >= 4 && out.contains(raw_value) {
+        out = out.replace(raw_value, "[REDACTED]");
+    }
+    if out.len() > 512 {
+        let mut end = 512;
+        while end > 0 && !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+        out.push_str("...");
+    }
+    out
+}
+
+fn build_onepassword_create_json(title: &str, encoded_payload: &str) -> Zeroizing<String> {
+    let doc = serde_json::json!({
+        "title": title,
+        "category": "SECURE_NOTE",
+        "tags": ["hyphae"],
+        "fields": [
+            {
+                "id": "notesPlain",
+                "type": "STRING",
+                "purpose": "NOTES",
+                "label": "notesPlain",
+                "value": encoded_payload,
+            }
+        ]
+    });
+    Zeroizing::new(doc.to_string())
+}
+
+fn build_onepassword_edit_json(
+    existing_stdout: &[u8],
+    title: &str,
+    encoded_payload: &str,
+) -> (String, Zeroizing<String>) {
+    let mut target_ref = title.to_string();
+    if let Ok(mut doc) = serde_json::from_slice::<serde_json::Value>(existing_stdout) {
+        if let Some(obj) = doc.as_object_mut() {
+            if let Some(id) = obj
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| {
+                    !s.is_empty() && !s.starts_with('-') && !s.chars().any(char::is_control)
+                })
+            {
+                target_ref = id.to_string();
+            }
+            obj.insert(
+                "title".to_string(),
+                serde_json::Value::String(title.to_string()),
+            );
+            let fields = obj
+                .entry("fields".to_string())
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            if let Some(arr) = fields.as_array_mut() {
+                let mut updated = false;
+                for field in arr.iter_mut() {
+                    let is_notes = field.get("id").and_then(serde_json::Value::as_str)
+                        == Some("notesPlain")
+                        || field.get("label").and_then(serde_json::Value::as_str)
+                            == Some("notesPlain")
+                        || field.get("purpose").and_then(serde_json::Value::as_str)
+                            == Some("NOTES");
+                    if is_notes {
+                        if let Some(fobj) = field.as_object_mut() {
+                            fobj.insert(
+                                "value".to_string(),
+                                serde_json::Value::String(encoded_payload.to_string()),
+                            );
+                            updated = true;
+                            break;
+                        }
+                    }
+                }
+                if !updated {
+                    arr.push(serde_json::json!({
+                        "id": "notesPlain",
+                        "type": "STRING",
+                        "purpose": "NOTES",
+                        "label": "notesPlain",
+                        "value": encoded_payload,
+                    }));
+                }
+                return (target_ref, Zeroizing::new(doc.to_string()));
+            }
+        }
+    }
+    (
+        target_ref,
+        build_onepassword_create_json(title, encoded_payload),
+    )
+}
+
+fn is_onepassword_auth_or_vault_error(stderr_lower: &str) -> bool {
+    stderr_lower.contains("not currently signed in")
+        || stderr_lower.contains("not signed in")
+        || stderr_lower.contains("signin")
+        || stderr_lower.contains("sign in")
+        || stderr_lower.contains("session expired")
+        || stderr_lower.contains("session")
+        || stderr_lower.contains("unauthorized")
+        || stderr_lower.contains("authentication")
+        || stderr_lower.contains("auth failed")
+        || stderr_lower.contains("locked")
+        || stderr_lower.contains("unlock")
+        || stderr_lower.contains("biometric")
+        || stderr_lower.contains("service account")
+        || stderr_lower.contains("op_service_account_token")
+        || stderr_lower.contains("permission")
+        || stderr_lower.contains("denied")
+        || stderr_lower.contains("forbidden")
+        || stderr_lower.contains("isn't a vault")
+        || stderr_lower.contains("vault not found")
+        || stderr_lower.contains("no vault")
+        || stderr_lower.contains("more than one item")
+        || stderr_lower.contains("multiple items")
+        || stderr_lower.contains("connect")
+        || stderr_lower.contains("timeout")
+        || stderr_lower.contains("timed out")
+}
+
+fn is_onepassword_item_not_found(stderr_lower: &str) -> bool {
+    !is_onepassword_auth_or_vault_error(stderr_lower)
+        && (stderr_lower.contains("isn't an item")
+            || stderr_lower.contains("no item found")
+            || stderr_lower.contains("item not found")
+            || (stderr_lower.contains("not found") && !stderr_lower.contains("vault")))
+}
+
+fn format_onepassword_error(
+    op_action: &str,
+    target: &str,
+    exit_code: Option<i32>,
+    stderr: &str,
+) -> String {
+    let hint = "sign in with `op signin` or configure OP_SERVICE_ACCOUNT_TOKEN (or set HYPHAE_SECRET_BACKEND=file)";
+    if stderr.is_empty() {
+        format!("1Password {op_action} failed for '{target}' (exit {exit_code:?}); {hint}")
+    } else {
+        format!(
+            "1Password {op_action} failed for '{target}' (exit {exit_code:?}): {stderr}; {hint}"
+        )
+    }
+}
+
+/// Classifies the exit status, stdout, and stderr of `op item get`.
+///
+/// Only genuine item-not-found (without auth/lock/vault/session errors) maps to `Ok(None)`.
+/// Accepts full `op` item JSON (`fields[].value`), single-field JSON (`{"value": ...}`),
+/// or raw field text, and decodes `hyphae-b64v1:` payloads losslessly.
+pub fn classify_onepassword_get_output(
+    name: &str,
+    exit_code: Option<i32>,
+    stdout: &[u8],
+    stderr: &str,
+) -> Result<Option<Zeroizing<String>>, CryptoError> {
+    if exit_code != Some(0) {
+        let stderr_trimmed = stderr.trim();
+        let lower = stderr_trimmed.to_ascii_lowercase();
+        let stdout_empty = stdout.iter().all(|b| b.is_ascii_whitespace());
+        if stdout_empty && is_onepassword_item_not_found(&lower) {
+            return Ok(None);
+        }
+        return Err(CryptoError::Keystore(format_onepassword_error(
+            "read",
+            name,
+            exit_code,
+            stderr_trimmed,
+        )));
+    }
+
+    let raw_text = Zeroizing::new(
+        String::from_utf8(stdout.to_vec())
+            .map_err(|e| CryptoError::Keystore(format!("non-UTF8 1Password output: {e}")))?,
+    );
+    let trimmed_outer = raw_text.trim();
+    if trimmed_outer.is_empty() {
+        return Err(CryptoError::Keystore(format!(
+            "1Password secret '{name}' is empty"
+        )));
+    }
+
+    let extracted: Zeroizing<String> = if trimmed_outer.starts_with('{') {
+        let parsed: serde_json::Value = serde_json::from_str(trimmed_outer).map_err(|e| {
+            CryptoError::Keystore(format!("invalid 1Password JSON for '{name}': {e}"))
+        })?;
+        let val = parsed
+            .get("fields")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|fields| {
+                fields.iter().find_map(|f| {
+                    let is_notes = f.get("id").and_then(serde_json::Value::as_str)
+                        == Some("notesPlain")
+                        || f.get("label").and_then(serde_json::Value::as_str) == Some("notesPlain")
+                        || f.get("purpose").and_then(serde_json::Value::as_str) == Some("NOTES");
+                    if is_notes {
+                        f.get("value").and_then(serde_json::Value::as_str)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .or_else(|| parsed.get("value").and_then(serde_json::Value::as_str))
+            .ok_or_else(|| {
+                CryptoError::Keystore(format!(
+                    "1Password item for '{name}' is missing notesPlain value"
+                ))
+            })?;
+        Zeroizing::new(val.to_string())
+    } else {
+        Zeroizing::new(raw_text.trim_end_matches(['\r', '\n']).to_string())
+    };
+
+    if extracted.is_empty() {
+        return Err(CryptoError::Keystore(format!(
+            "1Password secret '{name}' is empty"
+        )));
+    }
+    let decoded = decode_keychain_payload(&extracted)?;
+    let final_val = decoded.trim().to_string();
+    if final_val.is_empty() {
+        Err(CryptoError::Keystore(format!(
+            "1Password secret '{name}' is empty"
+        )))
+    } else {
+        Ok(Some(Zeroizing::new(final_val)))
+    }
+}
+
+/// Parses `op item list --vault <vault> --format json` metadata into Hyphae secret names
+/// (`hyphae/<name>` -> `<name>`), never inspecting or returning secret values.
+pub fn parse_onepassword_list_json(raw: &[u8]) -> Result<Vec<String>, CryptoError> {
+    let trimmed = std::str::from_utf8(raw)
+        .map_err(|e| CryptoError::Keystore(format!("non-UTF8 1Password list output: {e}")))?
+        .trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let items: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|e| CryptoError::Keystore(format!("invalid 1Password item list JSON: {e}")))?;
+    let Some(arr) = items.as_array() else {
+        return Err(CryptoError::Keystore(
+            "unexpected 1Password item list JSON (expected array)".into(),
+        ));
+    };
+    let mut names = Vec::new();
+    for item in arr {
+        let Some(title) = item.get("title").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(name) = title.strip_prefix("hyphae/") else {
+            continue;
+        };
+        if validate_secret_name(name).is_ok() {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+fn is_lastpass_auth_or_backend_error(stderr_lower: &str) -> bool {
+    stderr_lower.contains("not logged in")
+        || stderr_lower.contains("logged out")
+        || stderr_lower.contains("login")
+        || stderr_lower.contains("pinentry")
+        || stderr_lower.contains("locked")
+        || stderr_lower.contains("unlock")
+        || stderr_lower.contains("decryption")
+        || stderr_lower.contains("decrypt")
+        || stderr_lower.contains("permission")
+        || stderr_lower.contains("denied")
+        || stderr_lower.contains("unauthorized")
+        || stderr_lower.contains("authentication")
+        || stderr_lower.contains("network")
+        || stderr_lower.contains("could not connect")
+        || stderr_lower.contains("curl")
+        || stderr_lower.contains("timeout")
+        || stderr_lower.contains("multiple matches")
+}
+
+fn is_lastpass_not_found(stderr_lower: &str) -> bool {
+    !is_lastpass_auth_or_backend_error(stderr_lower)
+        && (stderr_lower.contains("could not find")
+            || stderr_lower.contains("not found")
+            || stderr_lower.contains("no such")
+            || stderr_lower.contains("unable to find"))
+}
+
+fn format_lastpass_error(
+    op_action: &str,
+    target: &str,
+    exit_code: Option<i32>,
+    stderr: &str,
+) -> String {
+    let hint = "run `lpass login <email>` (or set HYPHAE_SECRET_BACKEND=file)";
+    if stderr.is_empty() {
+        format!("LastPass {op_action} failed for '{target}' (exit {exit_code:?}); {hint}")
+    } else {
+        format!("LastPass {op_action} failed for '{target}' (exit {exit_code:?}): {stderr}; {hint}")
+    }
+}
+
+/// Classifies the exit status, stdout, and stderr of `lpass show --notes`.
+pub fn classify_lastpass_show_output(
+    name: &str,
+    exit_code: Option<i32>,
+    stdout: &[u8],
+    stderr: &str,
+) -> Result<Option<Zeroizing<String>>, CryptoError> {
+    if exit_code != Some(0) {
+        let stderr_trimmed = stderr.trim();
+        let lower = stderr_trimmed.to_ascii_lowercase();
+        let stdout_empty = stdout.iter().all(|b| b.is_ascii_whitespace());
+        if stdout_empty && is_lastpass_not_found(&lower) {
+            return Ok(None);
+        }
+        return Err(CryptoError::Keystore(format_lastpass_error(
+            "read",
+            name,
+            exit_code,
+            stderr_trimmed,
+        )));
+    }
+
+    let raw = Zeroizing::new(
+        String::from_utf8(stdout.to_vec())
+            .map_err(|e| CryptoError::Keystore(format!("non-UTF8 LastPass output: {e}")))?,
+    );
+    let stripped = raw.trim_end_matches(['\r', '\n']);
+    if stripped.is_empty() {
+        return Err(CryptoError::Keystore(format!(
+            "LastPass secret '{name}' is empty"
+        )));
+    }
+    let decoded = decode_keychain_payload(stripped)?;
+    let trimmed = decoded.trim().to_string();
+    if trimmed.is_empty() {
+        Err(CryptoError::Keystore(format!(
+            "LastPass secret '{name}' is empty"
+        )))
+    } else {
+        Ok(Some(Zeroizing::new(trimmed)))
+    }
+}
+
+/// Parses `lpass ls <prefix>` metadata lines into validated Hyphae secret names without reading values.
+pub fn parse_lastpass_ls_output(prefix: &str, stdout: &str) -> Vec<String> {
+    let needle = format!("{prefix}/");
+    let mut names = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let without_id = trimmed
+            .rsplit_once(" [id:")
+            .map(|(head, _)| head.trim())
+            .unwrap_or(trimmed);
+        let candidate = if let Some(rest) = without_id.strip_prefix(&needle) {
+            rest
+        } else if let Some((_, rest)) = without_id.split_once(&format!(" {needle}")) {
+            rest
+        } else {
+            continue;
+        };
+        let clean = candidate.trim();
+        if validate_secret_name(clean).is_ok() {
+            names.push(clean.to_string());
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn is_pass_gpg_or_backend_error(stderr_lower: &str) -> bool {
+    stderr_lower.contains("gpg:")
+        || stderr_lower.contains("gpg2:")
+        || stderr_lower.contains("decryption")
+        || stderr_lower.contains("decrypt")
+        || stderr_lower.contains("no secret key")
+        || stderr_lower.contains("secret key not available")
+        || stderr_lower.contains("pinentry")
+        || stderr_lower.contains("passphrase")
+        || stderr_lower.contains("gpg-agent")
+        || stderr_lower.contains("agent")
+        || stderr_lower.contains("locked")
+        || stderr_lower.contains("operation cancelled")
+        || stderr_lower.contains("inappropriate ioctl")
+        || stderr_lower.contains("permission denied")
+        || stderr_lower.contains("denied")
+        || stderr_lower.contains("pass init")
+        || stderr_lower.contains("password store is empty")
+}
+
+fn is_pass_not_found(stderr_lower: &str) -> bool {
+    !is_pass_gpg_or_backend_error(stderr_lower)
+        && (stderr_lower.contains("is not in the password store")
+            || stderr_lower.contains("not found"))
+}
+
+fn format_pass_error(
+    op_action: &str,
+    target: &str,
+    exit_code: Option<i32>,
+    stderr: &str,
+) -> String {
+    let hint =
+        "unlock gpg-agent and ensure `pass init` has been run (or set HYPHAE_SECRET_BACKEND=file)";
+    if stderr.is_empty() {
+        format!("pass {op_action} failed for '{target}' (exit {exit_code:?}); {hint}")
+    } else {
+        format!("pass {op_action} failed for '{target}' (exit {exit_code:?}): {stderr}; {hint}")
+    }
+}
+
+/// Classifies the exit status, stdout, and stderr of `pass show`.
+pub fn classify_pass_show_output(
+    name: &str,
+    exit_code: Option<i32>,
+    stdout: &[u8],
+    stderr: &str,
+) -> Result<Option<Zeroizing<String>>, CryptoError> {
+    if exit_code != Some(0) {
+        let stderr_trimmed = stderr.trim();
+        let lower = stderr_trimmed.to_ascii_lowercase();
+        let stdout_empty = stdout.iter().all(|b| b.is_ascii_whitespace());
+        if stdout_empty && is_pass_not_found(&lower) {
+            return Ok(None);
+        }
+        return Err(CryptoError::Keystore(format_pass_error(
+            "read",
+            name,
+            exit_code,
+            stderr_trimmed,
+        )));
+    }
+
+    let raw = Zeroizing::new(
+        String::from_utf8(stdout.to_vec())
+            .map_err(|e| CryptoError::Keystore(format!("non-UTF8 pass output: {e}")))?,
+    );
+    let stripped = raw.trim_end_matches(['\r', '\n']);
+    if stripped.is_empty() {
+        return Err(CryptoError::Keystore(format!(
+            "pass secret '{name}' is empty"
+        )));
+    }
+    let decoded = decode_keychain_payload(stripped)?;
+    let trimmed = decoded.trim().to_string();
+    if trimmed.is_empty() {
+        Err(CryptoError::Keystore(format!(
+            "pass secret '{name}' is empty"
+        )))
     } else {
         Ok(Some(Zeroizing::new(trimmed)))
     }
