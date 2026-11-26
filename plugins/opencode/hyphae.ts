@@ -26,7 +26,9 @@
 //   - Strips pre-existing/forged `_meshCall` before `pre-tool-use` and guards against prototype
 //     pollution (`__proto__`, `constructor`, `prototype`).
 
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 
 const HYP_BIN: string = process.env.HYPHAE_BIN || "hyp";
 const HYP_SOCKET: string = process.env.HYPHAE_SOCKET || "";
@@ -35,6 +37,24 @@ const HOOK_TIMEOUT_MS = 5_000;
 const MAX_BUFFER_BYTES = 256_000;
 const HYPHAE_TOOL_RE = /^(?:(?:mcp__?)?hyphae(?:__|[_./:])[a-z0-9_]+|hyp_[a-z_]+)$/;
 const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const OPENCODE_VALUE_FLAGS = new Set([
+  "--log-level",
+  "--server",
+  "--model",
+  "-m",
+  "--session",
+  "-s",
+  "--agent",
+  "--format",
+  "--file",
+  "-f",
+  "--title",
+  "--prompt",
+  "--completions",
+  "--hostname",
+  "--port",
+  "--cors",
+]);
 
 interface ToolHookInput {
   tool?: string;
@@ -502,6 +522,168 @@ function invokeDisposer(handle: unknown): void {
   }
 }
 
+interface ParsedOpencodeArgs {
+  subcommand: string | null;
+  hasStandalone: boolean;
+  hasStdio: boolean;
+  hasServer: boolean;
+}
+
+function stripRuntimePrefix(argv: readonly string[]): string[] {
+  if (argv.length <= 1) return [];
+  const exeBase = path.basename(argv[0] || "").toLowerCase();
+  const rest = argv.slice(1);
+  if (
+    (exeBase === "bun" ||
+      exeBase === "bun.exe" ||
+      exeBase === "node" ||
+      exeBase === "node.exe") &&
+    rest.length > 0 &&
+    !rest[0].startsWith("-")
+  ) {
+    return rest.slice(1);
+  }
+  return rest;
+}
+
+function parseOpencodeCliArgs(argv: readonly string[]): ParsedOpencodeArgs {
+  const tokens = stripRuntimePrefix(argv);
+  let subcommand: string | null = null;
+  let hasStandalone = false;
+  let hasStdio = false;
+  let hasServer = false;
+
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (!tok) continue;
+    if (tok === "--") break;
+    if (tok === "--standalone") {
+      hasStandalone = true;
+      continue;
+    }
+    if (tok === "--stdio") {
+      hasStdio = true;
+      continue;
+    }
+    if (tok === "--server") {
+      hasServer = true;
+      i += 1;
+      continue;
+    }
+    if (tok.startsWith("--server=")) {
+      hasServer = true;
+      continue;
+    }
+    if (OPENCODE_VALUE_FLAGS.has(tok)) {
+      i += 1;
+      continue;
+    }
+    if (tok.startsWith("-")) {
+      continue;
+    }
+    if (subcommand === null) {
+      subcommand = tok;
+    } else {
+      // First positional argument after the subcommand (e.g. prompt text): stop scanning flags.
+      break;
+    }
+  }
+
+  return { subcommand, hasStandalone, hasStdio, hasServer };
+}
+
+function readParentProcessArgv(): string[] | null {
+  const ppid = process.ppid;
+  if (!Number.isInteger(ppid) || ppid <= 1) return null;
+
+  if (process.platform === "linux") {
+    try {
+      const raw = fs.readFileSync(`/proc/${ppid}/cmdline`, "utf8");
+      if (raw) {
+        const parts = raw.split("\0").filter((s) => s.length > 0);
+        if (parts.length > 0) return parts;
+      }
+    } catch {
+      // Fall through to `ps`.
+    }
+  }
+
+  if (process.platform === "win32") {
+    return null;
+  }
+
+  try {
+    const argsOut = execFileSync("ps", ["-ww", "-o", "args=", "-p", String(ppid)], {
+      encoding: "utf8",
+      timeout: 1_000,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (!argsOut) return null;
+
+    let commOut = "";
+    try {
+      commOut = execFileSync("ps", ["-o", "comm=", "-p", String(ppid)], {
+        encoding: "utf8",
+        timeout: 1_000,
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+    } catch {
+      // Ignore optional comm lookup error.
+    }
+
+    if (commOut && (argsOut === commOut || argsOut.startsWith(`${commOut} `))) {
+      const remainder = argsOut.slice(commOut.length).trim();
+      const tail = remainder ? remainder.split(/\s+/) : [];
+      return [commOut, ...tail];
+    }
+    return argsOut.split(/\s+/);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Detects ephemeral one-shot `opencode run --standalone` invocations (#43).
+ *
+ * OpenCode v2.3+ executes `opencode run --standalone` by spawning a private
+ * `opencode serve --stdio --port 0` child server and exiting immediately with code 0 on
+ * `step_finish`. If this plugin ran `hyp hook opencode stop` asynchronously on
+ * `session.execution.succeeded`, it would drain held `queue` DMs out of Hyphae's SQLite
+ * and hand them to `api.session.prompt()` right before the ephemeral server shuts down,
+ * stranding them without executing the follow-up LLM turn.
+ *
+ * Returning `true` skips TurnEnd `stop` draining in standalone one-shot runs so queued DMs
+ * remain safely persisted in Hyphae's SQLite and drain cleanly via `api.session.hook("prompt")`
+ * (`pre-invocation`) on the next resumed turn. Persistent `opencode serve`, `opencode service`,
+ * `opencode run --server`, and interactive `opencode --standalone` TUI sessions return `false`.
+ */
+function isStandaloneOneShotRun(): boolean {
+  const override = process.env.HYPHAE_OPENCODE_STANDALONE?.trim().toLowerCase();
+  if (override === "1" || override === "true") return true;
+  if (override === "0" || override === "false") return false;
+
+  const selfParsed = parseOpencodeCliArgs(process.argv);
+  if (
+    selfParsed.subcommand === "run" &&
+    selfParsed.hasStandalone &&
+    !selfParsed.hasServer
+  ) {
+    return true;
+  }
+
+  if (selfParsed.subcommand === "serve" && selfParsed.hasStdio) {
+    const parentArgv = readParentProcessArgv();
+    if (parentArgv) {
+      const parentParsed = parseOpencodeCliArgs(parentArgv);
+      if (parentParsed.subcommand === "run" && !parentParsed.hasServer) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 // ============================================================================
 // OpenCode v1 Factory Export (preserved for v1 harnesses & backward compatibility)
 // ============================================================================
@@ -514,6 +696,7 @@ export const HyphaePlugin = async (ctx: OpenCodePluginContext = {}) => {
         ? ctx.worktree
         : undefined;
   const idleReminderSent = new Set<string>();
+  const standaloneOneShot = isStandaloneOneShotRun();
 
   return {
     "tool.execute.before": async (
@@ -574,6 +757,9 @@ export const HyphaePlugin = async (ctx: OpenCodePluginContext = {}) => {
     event: async (arg: { event?: OpenCodeEvent }) => {
       const sessionID = extractIdleSessionId(arg?.event);
       if (!sessionID) return;
+      // #43: In one-shot `opencode run --standalone`, skip TurnEnd `stop` drain so held
+      // `queue` DMs remain safely in Hyphae SQLite for the next turn's prompt hook.
+      if (standaloneOneShot) return;
 
       const payload: Record<string, unknown> = {
         session_id: sessionID,
@@ -635,6 +821,7 @@ const HyphaeV2Plugin = {
     const activeExecuteCalls = new Map<string, ExecuteTracker>();
     const pendingPluginPrompts = new Map<string, PendingPluginPrompt[]>();
     const disposers: unknown[] = [];
+    const standaloneOneShot = isStandaloneOneShotRun();
     let disposed = false;
 
     const registerDisposer = (handle: unknown) => {
@@ -835,6 +1022,11 @@ const HyphaeV2Plugin = {
         }
 
         activeExecuteCalls.delete(sessionID);
+        // #43: Ephemeral `opencode run --standalone` exits immediately on `step_finish` before
+        // any async TurnEnd `api.session.prompt()` can run. Skip draining Hyphae's SQLite inbox
+        // here so held `queue` DMs stay persisted and drain via `session.hook("prompt")` on the
+        // next resumed turn.
+        if (standaloneOneShot) return;
         if (inFlightIdle.has(sessionID)) return;
         inFlightIdle.add(sessionID);
         try {

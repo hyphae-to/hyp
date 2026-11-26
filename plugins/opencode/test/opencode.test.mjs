@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFile } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import tuiPlugin, {
@@ -961,6 +962,296 @@ process.stdout.write(JSON.stringify(reply ?? {}) + "\\n");
     else process.env.HYPHAE_BIN = prevBin;
     if (prevSock === undefined) delete process.env.HYPHAE_SOCKET;
     else process.env.HYPHAE_SOCKET = prevSock;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("plugins/opencode/hyphae.ts skips TurnEnd stop drain in one-shot `opencode run --standalone` (#43) while preserving persistent serve & TUI", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "hyp-opencode-standalone-"));
+  const logFile = path.join(tmp, "calls.ndjson");
+  const fakeHyp = path.join(tmp, "fake-hyp.mjs");
+
+  fs.writeFileSync(
+    fakeHyp,
+    `#!${process.execPath}
+import fs from "node:fs";
+const chunks = [];
+for await (const chunk of process.stdin) chunks.push(chunk);
+const payload = Buffer.concat(chunks).toString("utf8").trim();
+const argv = process.argv.slice(2);
+const event = argv[2];
+fs.appendFileSync(${JSON.stringify(logFile)}, JSON.stringify({ event, payload: payload ? JSON.parse(payload) : {} }) + "\\n");
+if (event === "stop") {
+  process.stdout.write(JSON.stringify({ followupMessage: "Incoming hyphae message(s):\\n\\nheld queue dm" }) + "\\n");
+} else if (event === "pre-invocation") {
+  process.stdout.write(JSON.stringify({ additionalContext: "Incoming hyphae message(s):\\n\\nheld queue dm" }) + "\\n");
+} else {
+  process.stdout.write("{}\\n");
+}
+`,
+    { mode: 0o755 },
+  );
+
+  const readCalls = () =>
+    fs.existsSync(logFile)
+      ? fs
+          .readFileSync(logFile, "utf8")
+          .trim()
+          .split("\n")
+          .filter(Boolean)
+          .map((l) => JSON.parse(l))
+      : [];
+  const clearCalls = () => {
+    if (fs.existsSync(logFile)) fs.unlinkSync(logFile);
+  };
+
+  const prevBin = process.env.HYPHAE_BIN;
+  const prevSock = process.env.HYPHAE_SOCKET;
+  const prevStandaloneEnv = process.env.HYPHAE_OPENCODE_STANDALONE;
+  const origArgv = [...process.argv];
+  process.env.HYPHAE_BIN = fakeHyp;
+  process.env.HYPHAE_SOCKET = "/tmp/test-opencode-43.sock";
+  delete process.env.HYPHAE_OPENCODE_STANDALONE;
+
+  const pluginHref = `${pathToFileURL(path.join(PLUGIN_DIR, "hyphae.ts")).href}?standalone=${Date.now()}`;
+
+  const runV2Scenario = async (argvOverride, envOverride = undefined) => {
+    clearCalls();
+    process.argv = [...argvOverride];
+    if (envOverride === undefined) delete process.env.HYPHAE_OPENCODE_STANDALONE;
+    else process.env.HYPHAE_OPENCODE_STANDALONE = envOverride;
+
+    const mod = await import(pluginHref);
+    const prompts = [];
+    const sessionHooks = new Map();
+    let streamDoneResolve;
+    const streamDone = new Promise((r) => {
+      streamDoneResolve = r;
+    });
+    const events = [
+      { type: "session.execution.succeeded", data: { sessionID: "ses-43" } },
+    ];
+    const dispose = await mod.default.setup({
+      location: { directory: "/workspace/demo-43" },
+      session: {
+        async hook(name, fn) {
+          sessionHooks.set(name, fn);
+        },
+        async prompt(req) {
+          prompts.push(req);
+        },
+      },
+      event: {
+        subscribe() {
+          let idx = 0;
+          return {
+            [Symbol.asyncIterator]() {
+              return {
+                async next() {
+                  if (idx < events.length) return { value: events[idx++], done: false };
+                  streamDoneResolve();
+                  return { value: undefined, done: true };
+                },
+              };
+            },
+          };
+        },
+      },
+    });
+    await streamDone;
+    // Allow microtasks/handleEvent to finish before inspecting calls.
+    await new Promise((r) => setTimeout(r, 80));
+    const stopCalls = readCalls().filter((c) => c.event === "stop");
+
+    // Verify `session.hook("prompt")` (`pre-invocation`) STILL drains queued DMs in EVERY mode!
+    const nextPromptEv = {
+      sessionID: "ses-43",
+      prompt: { text: "Resume session", files: [] },
+    };
+    await sessionHooks.get("prompt")(nextPromptEv);
+    dispose();
+    return { stopCalls, prompts, nextPromptText: nextPromptEv.prompt.text };
+  };
+
+  try {
+    // 1. Persistent `opencode serve --hostname 127.0.0.1 --port 4096`: TurnEnd `stop` drains & prompts!
+    const serveRes = await runV2Scenario([
+      "bun",
+      "/$bunfs/root/opencode",
+      "serve",
+      "--hostname",
+      "127.0.0.1",
+      "--port",
+      "4096",
+    ]);
+    assert.equal(serveRes.stopCalls.length, 1, "persistent serve must call stop on TurnEnd");
+    assert.equal(serveRes.prompts.length, 1, "persistent serve must dispatch followup prompt");
+    assert.ok(serveRes.prompts[0].text.includes("held queue dm"));
+
+    // 2. `opencode run --server http://127.0.0.1:4096`: persistent server attached -> drains & prompts!
+    const serverRunRes = await runV2Scenario([
+      "/usr/local/bin/opencode",
+      "run",
+      "--server",
+      "http://127.0.0.1:4096",
+      "--auto",
+      "hello",
+    ]);
+    assert.equal(serverRunRes.stopCalls.length, 1);
+    assert.equal(serverRunRes.prompts.length, 1);
+
+    // 3. Interactive TUI `opencode --standalone` (no `run` subcommand): stays alive -> drains & prompts!
+    const tuiStandaloneRes = await runV2Scenario([
+      "/usr/local/bin/opencode",
+      "--standalone",
+      "/workspace/demo-43",
+    ]);
+    assert.equal(tuiStandaloneRes.stopCalls.length, 1);
+    assert.equal(tuiStandaloneRes.prompts.length, 1);
+
+    // 4. Direct one-shot `opencode run --standalone`: MUST skip TurnEnd `stop` & `api.session.prompt`,
+    //    while `session.hook("prompt")` (`pre-invocation`) still drains cleanly on next turn!
+    const directStandaloneRes = await runV2Scenario([
+      "/usr/local/bin/opencode",
+      "run",
+      "--standalone",
+      "--auto",
+      "--format",
+      "json",
+      "do work",
+    ]);
+    assert.equal(
+      directStandaloneRes.stopCalls.length,
+      0,
+      "one-shot `opencode run --standalone` must NOT drain via stop on TurnEnd",
+    );
+    assert.equal(directStandaloneRes.prompts.length, 0);
+    assert.ok(
+      directStandaloneRes.nextPromptText.includes("held queue dm"),
+      "subsequent turn prompt hook must still drain held queue DM",
+    );
+
+    // 5. Global flag before subcommand (`opencode --standalone run "hi"`) also skips TurnEnd drain!
+    const preFlagStandaloneRes = await runV2Scenario([
+      "/usr/local/bin/opencode",
+      "--standalone",
+      "run",
+      "do work",
+    ]);
+    assert.equal(preFlagStandaloneRes.stopCalls.length, 0);
+    assert.equal(preFlagStandaloneRes.prompts.length, 0);
+
+    // 6. Prompt text mentioning `--standalone` in non-standalone `opencode run` must NOT false-positive!
+    const promptMentionsFlag = await runV2Scenario([
+      "/usr/local/bin/opencode",
+      "run",
+      "explain --standalone flag",
+    ]);
+    assert.equal(promptMentionsFlag.stopCalls.length, 1);
+    assert.equal(promptMentionsFlag.prompts.length, 1);
+
+    // 7. Explicit env override `HYPHAE_OPENCODE_STANDALONE=1` / `=0` works deterministically.
+    const envForceOn = await runV2Scenario(
+      ["bun", "/$bunfs/root/opencode", "serve", "--port", "4096"],
+      "1",
+    );
+    assert.equal(envForceOn.stopCalls.length, 0);
+    assert.equal(envForceOn.prompts.length, 0);
+
+    const envForceOff = await runV2Scenario(
+      ["/usr/local/bin/opencode", "run", "--standalone", "do work"],
+      "0",
+    );
+    assert.equal(envForceOff.stopCalls.length, 1);
+    assert.equal(envForceOff.prompts.length, 1);
+
+    // 8. Real OpenCode v2.3+ process tree (Unix): parent `... run --standalone` spawning child
+    //    `serve --stdio --port 0` skips TurnEnd `stop`; parent `... --standalone` (TUI) keeps it!
+    if (process.platform !== "win32") {
+      const childRunner = path.join(tmp, "child-stdio-serve.mjs");
+      const parentRunner = path.join(tmp, "parent-launcher.mjs");
+      const pluginPathUrl = pathToFileURL(path.join(PLUGIN_DIR, "hyphae.ts")).href;
+
+      fs.writeFileSync(
+        childRunner,
+        `import { pathToFileURL } from "node:url";
+process.argv = ["bun", "/$bunfs/root/opencode", "serve", "--stdio", "--port", "0"];
+const mod = await import(${JSON.stringify(pluginPathUrl)});
+const prompts = [];
+let doneResolve;
+const done = new Promise((r) => { doneResolve = r; });
+const dispose = await mod.default.setup({
+  location: { directory: "/workspace/tree-test" },
+  session: {
+    async prompt(req) { prompts.push(req); },
+  },
+  event: {
+    subscribe() {
+      let sent = false;
+      return {
+        [Symbol.asyncIterator]() {
+          return {
+            async next() {
+              if (!sent) {
+                sent = true;
+                return { value: { type: "session.execution.succeeded", data: { sessionID: "ses-tree" } }, done: false };
+              }
+              doneResolve();
+              return { value: undefined, done: true };
+            },
+          };
+        },
+      };
+    },
+  },
+});
+await done;
+await new Promise((r) => setTimeout(r, 80));
+dispose();
+process.stdout.write(JSON.stringify({ prompts }) + "\\n");
+`,
+        "utf8",
+      );
+
+      fs.writeFileSync(
+        parentRunner,
+        `import { execFileSync } from "node:child_process";
+const out = execFileSync(process.execPath, [${JSON.stringify(childRunner)}], {
+  encoding: "utf8",
+  env: process.env,
+});
+process.stdout.write(out);
+`,
+        "utf8",
+      );
+
+      const execTree = (parentArgs) =>
+        new Promise((resolve, reject) => {
+          clearCalls();
+          const env = { ...process.env };
+          delete env.HYPHAE_OPENCODE_STANDALONE;
+          execFile(process.execPath, [parentRunner, ...parentArgs], { env }, (err, stdout, stderr) => {
+            if (err) reject(new Error(`parent tree failed: ${err.message}\nstderr=${stderr}`));
+            else resolve(JSON.parse(stdout.trim()));
+          });
+        });
+
+      const runChild = await execTree(["run", "--standalone", "--auto", "--format", "json", "hi"]);
+      assert.equal(runChild.prompts.length, 0, "serve --stdio under `run --standalone` must skip stop drain");
+      assert.equal(readCalls().filter((c) => c.event === "stop").length, 0);
+
+      const tuiChild = await execTree(["--standalone", "/workspace/tree-test"]);
+      assert.equal(tuiChild.prompts.length, 1, "serve --stdio under TUI `--standalone` must keep stop drain");
+      assert.equal(readCalls().filter((c) => c.event === "stop").length, 1);
+    }
+  } finally {
+    process.argv = origArgv;
+    if (prevBin === undefined) delete process.env.HYPHAE_BIN;
+    else process.env.HYPHAE_BIN = prevBin;
+    if (prevSock === undefined) delete process.env.HYPHAE_SOCKET;
+    else process.env.HYPHAE_SOCKET = prevSock;
+    if (prevStandaloneEnv === undefined) delete process.env.HYPHAE_OPENCODE_STANDALONE;
+    else process.env.HYPHAE_OPENCODE_STANDALONE = prevStandaloneEnv;
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });

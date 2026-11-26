@@ -1027,6 +1027,78 @@ async fn opencode_real_plugin_verifies_caller_drains_messages_and_feeds_tui_agai
             .contains("wait --session opencode:ses-v2-live-1")
     );
 
+    // Step 10 (#43): In one-shot `opencode run --standalone`, TurnEnd `session.execution.succeeded`
+    // MUST NOT drain a held `queue` DM out of Hyphae's SQLite before process exit; instead, the DM
+    // remains persisted and drains cleanly via `api.session.hook("prompt")` on the next resumed turn!
+    daemon
+        .ingest_inbound(InboundItem {
+            session_id: "opencode:ses-v2-live-1".into(),
+            origin_node: "bob@laptop".into(),
+            item_id: "dm-opencode-v2-standalone-43".into(),
+            source: "bob@laptop/colleague".into(),
+            text: "standalone queued dm must survive turn end".into(),
+            kind: MailboxKind::Message,
+            trust_tier: GateTrustTier::Peer,
+        })
+        .await
+        .expect("ingest standalone DM");
+
+    let v2_standalone_step = run_plugin_step(
+        r#"
+        process.argv = ["/usr/local/bin/opencode", "run", "--standalone", "--auto", "--format", "json", "turn 1"];
+        const prompts = [];
+        const sessionHooks = new Map();
+        const events = [
+          { type: "session.execution.succeeded", data: { sessionID: "ses-v2-live-1" } },
+        ];
+        let doneResolve;
+        const donePromise = new Promise((r) => { doneResolve = r; });
+        const dispose = await HyphaeV2Plugin.setup({
+          location: { directory: "/tmp/opencode-v2-repo" },
+          session: {
+            async hook(name, fn) { sessionHooks.set(name, fn); },
+            async prompt(req) { prompts.push(req); },
+          },
+          event: {
+            subscribe() {
+              let idx = 0;
+              return {
+                [Symbol.asyncIterator]() {
+                  return {
+                    async next() {
+                      if (idx < events.length) return { value: events[idx++], done: false };
+                      doneResolve();
+                      return { value: undefined, done: true };
+                    },
+                  };
+                },
+              };
+            },
+          },
+        });
+        await donePromise;
+        await new Promise((r) => setTimeout(r, 80));
+        // Now simulate the next resumed `opencode run --standalone --session ses-v2-live-1` turn!
+        const nextEv = { sessionID: "ses-v2-live-1", prompt: { text: "turn 2", files: [] } };
+        await sessionHooks.get("prompt")(nextEv);
+        dispose();
+        process.stdout.write(JSON.stringify({ turnEndPrompts: prompts, nextTurnText: nextEv.prompt.text }));
+        "#,
+    );
+    assert_eq!(
+        v2_standalone_step["turnEndPrompts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "standalone mode must NOT drain DM at TurnEnd: {v2_standalone_step}"
+    );
+    let next_turn_text = v2_standalone_step["nextTurnText"].as_str().unwrap();
+    assert!(
+        next_turn_text.contains("standalone queued dm must survive turn end"),
+        "held DM must drain via pre-invocation prompt hook on next turn: {next_turn_text}"
+    );
+
     drop(mcp_stdin);
     let _ = mcp_proc.wait_timeout(Duration::from_secs(2));
     daemon.shutdown();
