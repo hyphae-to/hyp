@@ -2,6 +2,19 @@
 
 All notable changes to Hyphae (`hyp`) are documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Six event-source plugins (Beta)**: `agentmail`, `sentry`, `gmail`, `google-calendar`, `vercel` and `notion`, installed with `hyp plugin install <name>` and wired as `kind: "source"` so each thread subscribes with its own `hyp_stream` filter. All are outbound-only by default (WebSocket or polling) and run on a laptop or a hub; Sentry, Vercel and Notion also accept signed webhooks (`*_MODE=webhook`). Events carry routing metadata and short previews only, never message or page bodies.
+- **Tailscale Funnel for plugin webhooks (`<PREFIX>_WEBHOOK_FUNNEL`)**: Sentry, Vercel and Notion webhook modes can publish their own loopback path through Funnel and log the public URL, with no reverse proxy to configure; their onboarding trees offer it as the recommended route on a tailnet.
+- **AgentMail catch-up**: mail received while the WebSocket was down (reconnects, restarts, sleep) is listed over REST on connect and delivered, deduplicated by message ID.
+- **Google sign-in helper (`plugins/sdk/google-oauth.mjs auth`)**: One-time PKCE + loopback consent for the user's own Google OAuth client. The refresh token goes from Google straight into the node's secret store; a fixed `--port` (ssh tunnel) or `--stdout` (pipe over ssh, refused on a terminal) covers hubs.
+- **Onboarding trees (`hyphae.onboarding/v1`)**: A structured, agent-walkable setup format ([docs/reference/onboarding-tree.md](docs/reference/onboarding-tree.md)). Each event-source plugin ships a pinned `onboarding.json`, `hyp plugin list/install --json` report it as `onboardingPath`, and the `hyphae-setup` skill carries the first-time onboarding flow as a root tree in the same format.
+- **`HYPHAE_STATE_DIR` for plugins**: The node now passes its state directory to every `plugins[]` subprocess so polling cursors survive restarts without per-plugin path config (an explicit `plugins[].env` value wins).
+
+### Security & Hardening
+- **Plugins that crash after connecting now stop**: `plugins/sdk/client.mjs` logs one line (message only) and hard-stops the process on an uncaught error or unhandled rejection. Previously the open channel kept a crashed Node bridge (Telegram, Slack, WhatsApp, webhook, Prometheus or a custom plugin) alive, so the node reported it as running and the restart backoff and `CrashLoopBackOff` breaker never engaged.
+
 ## [0.7.0] - 2026-11-25
 
 ### Added

@@ -38,6 +38,8 @@ export const PLUGIN_SPECS = [
     files: [
       { relPath: "sdk/client.mjs", isBinary: false },
       { relPath: "sdk/client.py", isBinary: false },
+      { relPath: "sdk/google-oauth.mjs", isBinary: false },
+      { relPath: "sdk/source-kit.mjs", isBinary: false },
     ],
   },
   {
@@ -64,6 +66,54 @@ export const PLUGIN_SPECS = [
     id: "prometheus",
     kind: "bridge",
     files: [{ relPath: "prometheus/index.mjs", isBinary: false }],
+  },
+  {
+    id: "agentmail",
+    kind: "bridge",
+    files: [
+      { relPath: "agentmail/index.mjs", isBinary: false },
+      { relPath: "agentmail/onboarding.json", isBinary: false },
+    ],
+  },
+  {
+    id: "sentry",
+    kind: "bridge",
+    files: [
+      { relPath: "sentry/index.mjs", isBinary: false },
+      { relPath: "sentry/onboarding.json", isBinary: false },
+    ],
+  },
+  {
+    id: "gmail",
+    kind: "bridge",
+    files: [
+      { relPath: "gmail/index.mjs", isBinary: false },
+      { relPath: "gmail/onboarding.json", isBinary: false },
+    ],
+  },
+  {
+    id: "google-calendar",
+    kind: "bridge",
+    files: [
+      { relPath: "google-calendar/index.mjs", isBinary: false },
+      { relPath: "google-calendar/onboarding.json", isBinary: false },
+    ],
+  },
+  {
+    id: "vercel",
+    kind: "bridge",
+    files: [
+      { relPath: "vercel/index.mjs", isBinary: false },
+      { relPath: "vercel/onboarding.json", isBinary: false },
+    ],
+  },
+  {
+    id: "notion",
+    kind: "bridge",
+    files: [
+      { relPath: "notion/index.mjs", isBinary: false },
+      { relPath: "notion/onboarding.json", isBinary: false },
+    ],
   },
   {
     id: "claude-panel",

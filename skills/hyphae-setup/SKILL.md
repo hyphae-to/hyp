@@ -6,7 +6,8 @@ description: >-
   Codex Queue, `--claude-channel`, T3 Code, OpenClaw), default socket-only Local Ingest Route
   (`ingest.sock` / `hyp emit`) & OS cron triggers, Verified Human Drops (with HPKE-encrypted
   directive prefills) & Blind Drop Relay, Direct P2P (`hp2p1_`), Team Hubs (`am2_`),
-  Public Nodes, GitHub/Prometheus/webhook streams, Slack/Telegram bridges, and Local Security Gates.
+  Public Nodes, GitHub/Prometheus/webhook streams, event-source plugins with structured onboarding trees
+  (AgentMail, Gmail, Google Calendar, Sentry, Vercel, Notion), Slack/Telegram bridges, and Local Security Gates.
 ---
 
 # Hyphae (`hyp`) — Setup & Configuration Concierge
@@ -55,6 +56,54 @@ Use the results to pick the right mode automatically:
    - During **Mode 1 (First-Time Onboarding)**, **NEVER stop after bootstrapping the local node & harnesses** and dump Event Streams, Chat Bridges, Verified Human Drops, or Local Security Gates into a passive *"Later you can add..."* list unless the user explicitly answers *"none / skip optional integrations"*.
    - Keep each turn focused (**2–3 crisp choices**; use native multi-choice / interactive question tools if the harness provides them, or short numbered A/B/C options).
    - **NEVER dump a passive *"Three things need your input"* bullet wall at the end** — turn every machine-specific decision (Herdr symlinked/custom layout, T3 session token, `CLAUDE_CONFIG_DIR` profiles) into a crisp direct question right when it arises!
+
+---
+
+## Onboarding Trees (Structured Flow for Any Agent)
+
+Hyphae describes setup flows as small JSON **onboarding trees** (`hyphae.onboarding/v1`): named steps that say what to ask, what the human must do, what to run and how to verify it. The format, step types and the generic plugin skeleton are in [docs/reference/onboarding-tree.md](https://github.com/hyphae-to/hyp/blob/main/docs/reference/onboarding-tree.md). Rules for walking any tree:
+
+- Walk from `start` to a `done` step. Put each `ask` / `input` to the user **as written, one at a time**; a `default` is a pre-selected choice, not a decision made for them.
+- `secret` steps always end with the human running `hyp secret set <name> --web` (stdin on a headless host). Never ask for the value (Guardrail #1).
+- `human` steps are for the human; show `how[]` and wait. `run` steps you execute, except TTY-confirmed commands (Guardrail #6).
+- `"on": "host"` means the machine picked in the tree's placement step. If that is a hub, run the step there (ssh, or hand the user the exact command).
+- A failed `verify` stops the walk until the user decides.
+
+### Root tree (Mode 1)
+
+This is Mode 1 below in tree form; `ref` names the section with the full recipe for that step.
+
+```json
+{"schema": "hyphae.onboarding/v1", "id": "hyphae-node", "title": "Hyphae node", "summary": "First-time setup of a Hyphae node, its harnesses, topology and optional capabilities.", "kind": "node", "status": "live", "privacy": "private", "start": "inspect", "steps": {
+  "inspect": {"type": "run", "command": "hyp version --json && hyp status --json && hyp doctor --json", "capture": "probe", "why": "Decide between first-time onboarding and a configuration change before asking anything.", "ref": "Section 0", "next": "harnesses"},
+  "harnesses": {"type": "ask", "var": "harnesses", "multi": true, "question": "Which detected coding harnesses and optional UI components should Hyphae wire?", "ref": "Turn 1, question 1", "options": [{"value": "auto", "label": "Everything detected"}, {"value": "subset", "label": "Let me pick", "description": "Offer the detected harnesses and the UI extras from Turn 1 one by one."}], "next": "topology"},
+  "topology": {"type": "ask", "var": "topology", "question": "How should this node connect to others?", "ref": "Turn 1, question 2", "options": [{"value": "local", "label": "Local only"}, {"value": "p2p", "label": "Direct P2P with another machine"}, {"value": "team", "label": "Team Hub"}, {"value": "public", "label": "Public read-only node"}], "next": "bootstrap"},
+  "bootstrap": {"type": "run", "command": "hyp onboard --yes --profile <profile> --node-id <user@host> --harness <harnesses> --json", "capture": "onboard", "ref": "Step 2.1", "next": "followups"},
+  "followups": {"type": "human", "text": "Turn each machine-specific item in the onboard output (Herdr layout, T3 token, extra Claude profiles) into a direct question.", "ref": "Step 2.2", "next": {"switch": "topology", "cases": {"local": "capabilities", "p2p": "connect", "team": "connect", "public": "connect"}}},
+  "connect": {"type": "human", "text": "Pair with the chosen peer, hub or public node. Tokens go through stdin or a 0600 file, never argv or chat.", "ref": "Connect Chosen Topology", "next": "capabilities"},
+  "capabilities": {"type": "ask", "var": "capabilities", "multi": true, "question": "Which optional capabilities do you want to set up now?", "ref": "Step 2.3", "options": [{"value": "streams", "label": "Built-in event streams", "description": "GitHub and Prometheus, compiled into the node. Recipe: Mode 2, section F."}, {"value": "plugins", "label": "Event-source plugins", "description": "AgentMail, Gmail, Google Calendar, Sentry, Vercel, Notion. Each has its own onboarding tree."}, {"value": "bridges", "label": "Chat bridges", "description": "Telegram, Slack, WhatsApp. Recipe: Mode 2, section F."}, {"value": "drops", "label": "Verified Human Drops", "description": "Phone passkey and Blind Drop Relay. Recipe: Mode 2, section E."}, {"value": "gate", "label": "Local Security Gate", "description": "Inbound prompt-injection screening. Recipe: Mode 2, section G."}, {"value": "none", "label": "None for now"}], "next": "plugins"},
+  "plugins": {"type": "ask", "var": "plugins", "multi": true, "when": "capabilities includes plugins", "question": "Which event sources should agents be able to subscribe to?", "why": "Each one is a small verified plugin. Nothing reaches a thread until that thread subscribes with its own filter.", "options": [{"value": "agentmail", "label": "AgentMail", "description": "New mail in AgentMail inboxes (sender, subject, short preview)."}, {"value": "gmail", "label": "Gmail", "description": "New Gmail inbox mail (sender, subject, snippet). Uses the user's own Google OAuth client."}, {"value": "google-calendar", "label": "Google Calendar", "description": "Calendar changes and a heads-up before events start. Uses the user's own Google OAuth client."}, {"value": "sentry", "label": "Sentry", "description": "New issues; with webhooks also errors, alert rules and comments."}, {"value": "vercel", "label": "Vercel", "description": "Deployments created, succeeded, failed or canceled."}, {"value": "notion", "label": "Notion", "description": "Pages created or edited (titles and links only)."}], "next": "plugin_each"},
+  "plugin_each": {"type": "subtree", "forEach": "plugins", "prepare": "hyp plugin install {{item}} --json", "from": "{{prepare.data.plugins[0].onboardingPath}}", "note": "Installing only verifies and unpacks the plugin so its tree can be read; nothing runs until the tree's wire step. If the user places the plugin on a hub, the tree's on:host steps install it there and the local copy can be removed with hyp plugin remove.", "next": "finish"},
+  "finish": {"type": "run", "command": "hyp service install --json", "ref": "Finish", "next": "verify"},
+  "verify": {"type": "verify", "command": "hyp doctor --json", "expect": "No FAIL checks; every wired harness, peer and plugin is reported healthy.", "onFail": "Fix the first FAIL check using its `next` command, then verify again.", "next": "done"},
+  "done": {"type": "done", "text": "Run the Wrap-Up Checklist and remind the user to restart any open desktop app once."}
+}}
+```
+
+### Plugin trees
+
+Every official event-source plugin ships its own tree. `hyp plugin install <name> --json` returns it as `data.plugins[0].onboardingPath` (also in `hyp plugin list --json`). **Always walk the plugin's tree instead of improvising its setup**: it covers where the plugin runs (this machine or the user's hub), polling versus webhook, the exact credential to create and its minimum permissions, who can read the events, the `node.json` entry and a first `hyp_stream` subscription.
+
+| Plugin | What agents can subscribe to | Topic |
+| --- | --- | --- |
+| `agentmail` | New mail in AgentMail inboxes (sender, subject, short preview). | `local.agentmail` or `<hub>.agentmail` |
+| `gmail` | New Gmail inbox mail (sender, subject, snippet). Uses the user's own Google OAuth client. | `local.gmail` or `<hub>.gmail` |
+| `google-calendar` | Calendar changes and a heads-up before events start. Uses the user's own Google OAuth client. | `local.google-calendar` or `<hub>.google-calendar` |
+| `sentry` | New issues; with webhooks also errors, alert rules and comments. | `local.sentry` or `<hub>.sentry` |
+| `vercel` | Deployments created, succeeded, failed or canceled. | `local.vercel` or `<hub>.vercel` |
+| `notion` | Pages created or edited (titles and links only). | `local.notion` or `<hub>.notion` |
+
+*(Mail, calendar and Notion events are personal data. Their trees include a mandatory check of who is paired with the host node, because the `member`, `observer` and `full` presets carry `stream:subscribe=*`.)*
 
 ---
 
@@ -134,7 +183,8 @@ In Turn 2 (right after bootstrapping the core node/harnesses and connecting any 
 
 > **"Which optional capabilities do you want to set up now?"**
 > 1. **Event Streams** — GitHub (always explain **Local Polling vs. Webhook** first — even on a Local node — before asking for any PAT) or Prometheus Alertmanager
-> 2. **Chat Bridges** — Telegram (`@BotFather`), Slack (Socket Mode), WhatsApp, or generic Webhook *(always install via `hyp plugin install <name> --json` into `~/.config/hyphae/plugins/` and wire `data.nodePath` + `data.plugins[0].scriptPath` — NEVER point `node.json` at a local git checkout)*
+> 2. **Event-Source Plugins** — AgentMail, Gmail, Google Calendar, Sentry, Vercel, Notion *(install with `hyp plugin install <name> --json`, then walk the returned `onboardingPath` tree step by step)*
+> 2b. **Chat Bridges** — Telegram (`@BotFather`), Slack (Socket Mode), WhatsApp, or generic Webhook *(always install via `hyp plugin install <name> --json` into `~/.config/hyphae/plugins/` and wire `data.nodePath` + `data.plugins[0].scriptPath` — NEVER point `node.json` at a local git checkout)*
 > 3. **Verified Human Drops** — Phone WebAuthn Passkey (`https://hyphae.to/drop`, QR + URL) + `https://spore.hyphae.to` Blind Drop Relay for zero-leak secret handoffs & signed directives
 > 4. **Local Security Gate** — Prompt-injection filter (`anthropic` [supports `--base-url` + `--auth-header bearer|x-api-key`], `openai-compat`, `google`, `lakera-guard`, `http-classifier`) + `hyp gate lock`
 > 5. **None for now** — skip straight to final `hyp doctor` check
@@ -449,7 +499,8 @@ hyp deploy check --url https://<hostname> --json
      ```
      *(Replace `"my_assistant_bot"` with `data.plugins[0].defaultTarget` — your bot's Telegram username without `@`, or `"personal"` as fallback.)*
    - Supervised natively by `hyp daemon` (Unix fd 3 on macOS/Linux, authenticated loopback TCP on Windows); bridge topics stay local-only by default (`"exposeTopic": true` opt-in). Always configure explicit allowlists (`SLACK_ALLOWED_USERS` / `SLACK_ALLOWED_CHANNELS`, `TELEGRAM_ALLOWED_USERS` / `TELEGRAM_ALLOWED_CHATS`, etc.) and reference tokens via `{ "secret": "<name>" }`. Use `hyp plugin remove <name> --json` when retiring a bridge (automatically removes matching `plugins[]` entries from `node.json`; pass `--keep-config` to preserve them).
-5. Restart the background daemon after editing `node.json` (`hyp service restart --json`), then verify with `hyp doctor --json`.
+5. **Event-source plugins (`agentmail`, `gmail`, `google-calendar`, `sentry`, `vercel`, `notion`)**: run `hyp plugin install <name> --json` and walk the tree at `data.plugins[0].onboardingPath` (see *Onboarding Trees* above). Their `plugins[]` entries default to `kind: "source"`, so threads subscribe with `hyp_stream` and their own filters; secrets are `agentmail-api-key`, `sentry-auth-token` / `sentry-client-secret`, `vercel-token` / `vercel-webhook-secret`, `notion-token`, and `google-refresh-token` / `google-client-secret` for Gmail and Calendar (created by the consent helper `plugins/sdk/google-oauth.mjs auth`, never typed into chat).
+6. Restart the background daemon after editing `node.json` (`hyp service restart --json`), then verify with `hyp doctor --json`.
 
 ### G. Propose & Lock a Local Security Gate
 1. Store the classifier API key out-of-band (skip for local Ollama `openai-compat` or local `subprocess` plugins) and tell the user where to get it:

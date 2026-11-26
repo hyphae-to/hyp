@@ -384,7 +384,87 @@ hyp setup --refresh-skills
 
 ---
 
-## 5. Writing a Custom Subprocess Plugin (JSON-RPC 2.0 v2 or v1 SDK)
+## 5. Event-Source Plugins (Beta): AgentMail, Gmail, Google Calendar, Sentry, Vercel, Notion
+
+These are `kind: "source"` plugins: each publishes onto its own topic (`local.<id>` on the node that runs it, `<node-id>.<id>` from a paired node) and every thread subscribes with its own `hyp_stream` filter, delivery mode and mute rules. Install with `hyp plugin install <name> --json` and follow the plugin's [onboarding tree](reference/onboarding-tree.md) (`data.plugins[0].onboardingPath`) rather than wiring by hand.
+
+| Plugin | Transport | Event types | Secrets |
+| --- | --- | --- | --- |
+| [agentmail](../plugins/agentmail/index.mjs) | Outbound WebSocket | `to.agentmail.message.received` (and any AgentMail event type you list) | `agentmail-api-key` |
+| [gmail](../plugins/gmail/index.mjs) | Polls the Gmail history API | `com.google.gmail.message.received` | `google-refresh-token`, `google-client-secret` |
+| [google-calendar](../plugins/google-calendar/index.mjs) | Polls the Calendar API | `com.google.calendar.event.created` / `.updated` / `.cancelled` / `.starting` | `google-refresh-token`, `google-client-secret` |
+| [sentry](../plugins/sentry/index.mjs) | Poll (default) or signed webhook | `io.sentry.issue.created`; webhook: `io.sentry.<resource>.<action>` | `sentry-auth-token` or `sentry-client-secret` |
+| [vercel](../plugins/vercel/index.mjs) | Poll (default) or signed webhook | `com.vercel.deployment.created` / `.succeeded` / `.error` / `.canceled`; webhook: `com.vercel.<type>` | `vercel-token` or `vercel-webhook-secret` |
+| [notion](../plugins/notion/index.mjs) | Poll (default) or signed webhook | `so.notion.page.created` / `.updated` / `.deleted`; webhook: `so.notion.<type>` | `notion-token` (poll) |
+
+- **What an event contains**: routing fields under `data` (sender, subject, project, branch, URLs) and a clipped preview. Mail bodies and page content are never fetched or forwarded. Everything in `data` is untrusted external text.
+- **First run never replays history**: each plugin starts from "now" and keeps a small cursor in `$HYPHAE_STATE_DIR/<id>-state.json` (`0600`).
+- **Laptop or hub**: every plugin works outbound-only, so it runs behind NAT. On a hub, the credential and cursor live on the hub and your machines subscribe to `<hub-node-id>.<id>`. Webhook modes listen on loopback only (`*_WEBHOOK_HOST`/`PORT`/`PATH`) behind your reverse proxy or tunnel, and have no unsigned mode.
+- **Webhooks over Tailscale Funnel**: set `SENTRY_WEBHOOK_FUNNEL` / `VERCEL_WEBHOOK_FUNNEL` / `NOTION_WEBHOOK_FUNNEL` to `8443` (or `443`, `10000`) and the plugin runs `tailscale funnel --bg --https=<port> --set-path=<path> http://127.0.0.1:<local port>` for its own path only, then logs the public URL to give the provider (`https://<node>.<tailnet>.ts.net:8443/sentry`). Funnel must be allowed for the node in your tailnet policy. If it cannot be enabled the plugin says so and keeps running local-only. Remove the mapping with `tailscale funnel --https=8443 --set-path=/sentry off`. Use webhook mode for Sentry when you need more than new issues: regressions and other status changes, errors, alert rules and comments.
+- **AgentMail reconnects**: on every connect the plugin lists mail received since its per-inbox cursor and publishes what was missed, so a dropped socket, a restart or a sleeping laptop does not lose mail (`AGENTMAIL_CATCH_UP=0` turns this off).
+- **Who can read a source topic**: any paired peer with a matching `stream:subscribe` scope. The `member`, `observer` and `full` presets include `stream:subscribe=*`, so run mail and calendar plugins on a node that only your own devices are paired with, or pair other peers with topic-scoped grants.
+
+```json
+{
+  "plugins": [
+    {
+      "id": "sentry",
+      "command": "/opt/homebrew/bin/node",
+      "args": ["/Users/you/.config/hyphae/plugins/sentry/index.mjs"],
+      "targets": ["sentry"],
+      "env": {
+        "SENTRY_AUTH_TOKEN": { "secret": "sentry-auth-token" },
+        "SENTRY_ORG": "acme",
+        "SENTRY_PROJECTS": "api,web"
+      }
+    },
+    {
+      "id": "gmail",
+      "command": "/opt/homebrew/bin/node",
+      "args": ["/Users/you/.config/hyphae/plugins/gmail/index.mjs"],
+      "targets": ["gmail"],
+      "env": {
+        "GOOGLE_CLIENT_ID": "1234-abc.apps.googleusercontent.com",
+        "GOOGLE_CLIENT_SECRET": { "secret": "google-client-secret" },
+        "GOOGLE_REFRESH_TOKEN": { "secret": "google-refresh-token" }
+      }
+    }
+  ]
+}
+```
+
+```json
+hyp_stream({
+  "action": "subscribe",
+  "key": "sentry:api-errors",
+  "topic": "local.sentry",
+  "filters": [{ "exact": { "data.project": "api", "data.level": "error" } }],
+  "mode": "queue"
+})
+```
+
+### Google sign-in (Gmail and Calendar)
+
+Gmail and Calendar use **your own** Google OAuth client of type *Desktop app*. The consent runs in your browser against a loopback port on the machine running the helper, with PKCE, and the refresh token is written straight into that node's secret store. No Hyphae service takes part, so nobody but you can read the data.
+
+```sh
+# On the machine that runs the plugin:
+node ~/.config/hyphae/plugins/sdk/google-oauth.mjs auth --client-file ~/Downloads/client_secret.json --scopes gmail,calendar
+
+# Plugin on a headless hub, option 1: sign in through an ssh tunnel (token is created and stored on the hub)
+ssh -L 8765:127.0.0.1:8765 hub
+node ~/.config/hyphae/plugins/sdk/google-oauth.mjs auth --client-file client_secret.json --scopes gmail --port 8765
+
+# Option 2: sign in locally and pipe the token to the hub (never printed to a terminal)
+node ~/.config/hyphae/plugins/sdk/google-oauth.mjs auth --client-file client_secret.json --scopes gmail --stdout \
+  | ssh hub hyp secret set google-refresh-token
+```
+
+Scopes requested: `gmail.readonly` and `calendar.events.readonly`. Google's device-code flow does not allow either, which is why a headless host needs one of the two routes above.
+
+---
+
+## 6. Writing a Custom Subprocess Plugin (JSON-RPC 2.0 v2 or v1 SDK)
 
 Any language that can read/write newline-delimited JSON (≤ 64 KiB/line) over Unix fd 3 (or authenticated loopback TCP via `HYPHAE_PLUGIN_ADDR` + `HYPHAE_PLUGIN_TOKEN` on Windows) works directly.
 

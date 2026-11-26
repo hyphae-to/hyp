@@ -68,19 +68,25 @@ fn compute_tree_sha256(entries: &[(&str, &str)]) -> String {
 #[test]
 fn build_rs_pinned_digests_and_tree_hashes_match_sha2_crate_and_crlf_invariance() {
     let expected_plugins = [
-        ("sdk", PluginKind::Bridge, 2usize),
+        ("sdk", PluginKind::Bridge, 4usize),
         ("telegram", PluginKind::Bridge, 1),
         ("slack", PluginKind::Bridge, 1),
         ("whatsapp", PluginKind::Bridge, 1),
         ("webhook", PluginKind::Bridge, 1),
         ("prometheus", PluginKind::Bridge, 1),
+        ("agentmail", PluginKind::Bridge, 2),
+        ("sentry", PluginKind::Bridge, 2),
+        ("gmail", PluginKind::Bridge, 2),
+        ("google-calendar", PluginKind::Bridge, 2),
+        ("vercel", PluginKind::Bridge, 2),
+        ("notion", PluginKind::Bridge, 2),
         ("claude-panel", PluginKind::Harness, 2),
         ("claude-code", PluginKind::Harness, 12),
         ("herdr-mod", PluginKind::Harness, 9),
     ];
 
     assert_eq!(PINNED_PLUGINS.len(), expected_plugins.len());
-    assert_eq!(PINNED_PLUGIN_FILES.len(), 28);
+    assert_eq!(PINNED_PLUGIN_FILES.len(), 42);
     let plugins_dir = repo_root().join("plugins");
 
     for (spec, (exp_id, exp_kind, exp_count)) in PINNED_PLUGINS.iter().zip(expected_plugins.iter())
@@ -580,8 +586,33 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
     assert_eq!(list_json["ok"], true);
     assert_eq!(
         list_json["data"]["plugins"].as_array().map(Vec::len),
-        Some(9)
+        Some(15)
     );
+    // Event-source plugins advertise their structured onboarding tree; bridges without one do not.
+    let listed = list_json["data"]["plugins"].as_array().unwrap();
+    let onboarding_of = |name: &str| {
+        listed
+            .iter()
+            .find(|p| p["name"] == name)
+            .map(|p| p["onboardingPath"].clone())
+            .unwrap_or(Value::Null)
+    };
+    for name in [
+        "agentmail",
+        "sentry",
+        "gmail",
+        "google-calendar",
+        "vercel",
+        "notion",
+    ] {
+        let path = onboarding_of(name);
+        assert!(
+            path.as_str()
+                .is_some_and(|p| p.ends_with(&format!("{name}/onboarding.json"))),
+            "{name} must report onboardingPath, got {path}"
+        );
+    }
+    assert_eq!(onboarding_of("telegram"), Value::Null);
 
     // 2. Install telegram, claude-panel, and herdr-mod via --from-dir.
     for name in ["telegram", "claude-panel", "herdr-mod"] {

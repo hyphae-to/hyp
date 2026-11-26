@@ -43,6 +43,6 @@ Pick the path that matches what you are doing.
 
 ## Reference & Internals
 
-- **Reference:** [CLI Reference](reference/cli.md) · [`node.json` Schema](reference/node-json.md) · [MCP Tools](reference/mcp-tools.md) · [Scopes & Presets](reference/scopes.md) · [Plugin SDK](reference/plugin-sdk.md) · [Quick Plugin & Bridge Config](plugins.md)
+- **Reference:** [CLI Reference](reference/cli.md) · [`node.json` Schema](reference/node-json.md) · [MCP Tools](reference/mcp-tools.md) · [Scopes & Presets](reference/scopes.md) · [Plugin SDK](reference/plugin-sdk.md) · [Onboarding Trees](reference/onboarding-tree.md) · [Quick Plugin & Bridge Config](plugins.md)
 - **Internals:** [Architecture](internals/architecture.md) · [Delivery Engine](internals/delivery.md) · [Testing Strategy](internals/testing.md)
 - **Historical RFCs:** [docs/rfcs/](rfcs/README.md)

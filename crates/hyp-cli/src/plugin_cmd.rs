@@ -4,7 +4,8 @@
 //! - `hyp` stays a pure-Rust static binary (zero embedded JS/TS/TSX/SVG/PNG assets); `build.rs`
 //!   pins ONLY per-file SHA-256 digests (LF-normalized for text, raw bytes for binary `.png`)
 //!   and per-plugin deterministic `tree_sha256` digests for every official non-Rust plugin & mod:
-//!   - Bridges (`kind = "bridge"`): `sdk`, `telegram`, `slack`, `whatsapp`, `webhook`, `prometheus`
+//!   - Bridges (`kind = "bridge"`): `sdk`, `telegram`, `slack`, `whatsapp`, `webhook`, `prometheus`,
+//!     and the event sources `agentmail`, `sentry`, `gmail`, `google-calendar`, `vercel`, `notion`
 //!   - Harness mods (`kind = "harness"`): `claude-panel`, `claude-code`, `herdr-mod`
 //! - Source precedence (ALL verified in constant time via `ct_eq` BEFORE writing a single byte):
 //!   1. `--archive <path>` / `HYPHAE_PLUGINS_ARCHIVE`
@@ -84,7 +85,23 @@ const CLAUDE_PANEL_ID: &str = "claude-panel";
 const CLAUDE_CODE_ID: &str = "claude-code";
 const HERDR_MOD_ID: &str = "herdr-mod";
 
-const BRIDGE_CONSUMER_IDS: &[&str] = &["telegram", "slack", "whatsapp", "webhook", "prometheus"];
+const BRIDGE_CONSUMER_IDS: &[&str] = &[
+    "telegram",
+    "slack",
+    "whatsapp",
+    "webhook",
+    "prometheus",
+    "agentmail",
+    "sentry",
+    "gmail",
+    "google-calendar",
+    "vercel",
+    "notion",
+];
+
+/// File name of the structured onboarding tree (`hyphae.onboarding/v1`) an official plugin may ship
+/// next to its script. Surfaced as `onboardingPath` so setup agents can walk it without guessing paths.
+const ONBOARDING_TREE_FILE: &str = "onboarding.json";
 
 const CLAUDE_PANEL_MANIFEST_JSON: &str = concat!(
     "{\n  \"name\": \"hyphae-panel\",\n  \"version\": \"",
@@ -115,7 +132,7 @@ pub enum PluginCommand {
     },
     /// Download, SHA-256 verify, and atomically install an official plugin or harness mod (or `all`)
     Install {
-        /// Plugin name: sdk, telegram, slack, whatsapp, webhook, prometheus, claude-panel, claude-code, herdr-mod, or all
+        /// Plugin name: sdk, telegram, slack, whatsapp, webhook, prometheus, agentmail, sentry, gmail, google-calendar, vercel, notion, claude-panel, claude-code, herdr-mod, or all
         #[arg(value_name = "PLUGIN")]
         plugin: String,
         /// Explicit Hyphae state directory (defaults to ~/.config/hyphae)
@@ -187,7 +204,7 @@ pub enum PluginCommand {
     },
     /// Remove an installed official plugin or harness mod (or `all`)
     Remove {
-        /// Plugin name: sdk, telegram, slack, whatsapp, webhook, prometheus, claude-panel, claude-code, herdr-mod, or all
+        /// Plugin name: sdk, telegram, slack, whatsapp, webhook, prometheus, agentmail, sentry, gmail, google-calendar, vercel, notion, claude-panel, claude-code, herdr-mod, or all
         #[arg(value_name = "PLUGIN")]
         plugin: String,
         /// Keep matching `plugins[]` entries in node.json instead of removing them
@@ -382,6 +399,8 @@ struct PluginListEntry {
     installed: bool,
     verified: bool,
     script_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    onboarding_path: Option<String>,
     target_paths: Vec<String>,
     pinned_sha256: String,
     tree_sha256: String,
@@ -401,6 +420,8 @@ struct InstalledPluginRecord {
     name: String,
     kind: String,
     script_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    onboarding_path: Option<String>,
     target_paths: Vec<String>,
     sha256: String,
     tree_sha256: String,
@@ -707,7 +728,7 @@ pub fn pinned_spec_for(plugin_id: &str) -> Option<&'static PinnedPluginSpec> {
     PINNED_PLUGINS.iter().find(|p| p.id == plugin_id)
 }
 
-/// Resolves a user plugin selector (`sdk|telegram|slack|whatsapp|webhook|prometheus|claude-panel|claude-code|herdr-mod|all`).
+/// Resolves a user plugin selector (`sdk|telegram|slack|whatsapp|webhook|prometheus|agentmail|sentry|gmail|google-calendar|vercel|notion|claude-panel|claude-code|herdr-mod|all`).
 pub fn resolve_plugin_targets(selector: &str) -> Result<Vec<&'static PinnedPluginSpec>, String> {
     let normalized = selector.trim().to_ascii_lowercase();
     if normalized == "all" {
@@ -860,6 +881,15 @@ fn primary_script_display(plugin_id: &str, target_roots: &[PathBuf]) -> String {
         CLAUDE_CODE_ID | HERDR_MOD_ID => first.display().to_string(),
         _ => first.join("index.mjs").display().to_string(),
     }
+}
+
+/// Absolute display path of the plugin's onboarding tree, when its pinned spec ships one.
+fn onboarding_tree_display(spec: &PinnedPluginSpec, target_roots: &[PathBuf]) -> Option<String> {
+    let first = target_roots.first()?;
+    spec.files
+        .iter()
+        .any(|f| f.rel_path.rsplit('/').next() == Some(ONBOARDING_TREE_FILE))
+        .then(|| first.join(ONBOARDING_TREE_FILE).display().to_string())
 }
 
 fn is_private_plugin_target(plugin_id: &str) -> bool {
@@ -2783,6 +2813,7 @@ fn run_plugin_list(
             installed,
             verified,
             script_path: primary_script_display(spec.id, &insp.target_paths),
+            onboarding_path: onboarding_tree_display(spec, &insp.target_paths),
             target_paths: insp
                 .target_paths
                 .iter()
@@ -3090,6 +3121,7 @@ fn run_plugin_install(
             name: spec.id.to_string(),
             kind: spec.kind.as_str().to_string(),
             script_path: primary_script_display(spec.id, roots),
+            onboarding_path: onboarding_tree_display(spec, roots),
             target_paths: roots.iter().map(|p| p.display().to_string()).collect(),
             sha256: primary_sha.to_string(),
             tree_sha256: spec.tree_sha256.to_string(),
@@ -4162,8 +4194,8 @@ mod tests {
 
     #[test]
     fn differential_build_rs_sha256_and_tree_digests_match_sha2_crate_for_all_plugins() {
-        assert_eq!(PINNED_PLUGINS.len(), 9);
-        assert_eq!(PINNED_PLUGIN_FILES.len(), 28);
+        assert_eq!(PINNED_PLUGINS.len(), 15);
+        assert_eq!(PINNED_PLUGIN_FILES.len(), 42);
         let root = repo_plugins_dir();
 
         for entry in PINNED_PLUGIN_FILES {

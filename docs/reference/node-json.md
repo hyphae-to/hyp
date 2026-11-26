@@ -69,7 +69,9 @@ Enabled by default even when omitted (`defaultTopic: "schedule"`, accepting `to.
 - `id`: Unique plugin identifier (also determines `<state_dir>/logs/plugin-<id>.log`).
 - `command` *(alias `exec`)* and `args`: Absolute binary and verified script path returned by `hyp plugin install <name> --json`.
 - `targets`: List of target identifiers (e.g. `["my_assistant_bot"]`; for `id: "telegram"`, omitting `targets` auto-resolves the bot's Telegram username via `getMe` with `"personal"` as fallback).
-- `exposeTopic`: Boolean (default **`false`**). Bridge topics stay local-only unless explicitly set to `true`.
+- `kind`: `"bridge"` (thread-linked chat bridge) or `"source"` (1-to-many `hyp_stream` topic named after each target). Omitted, it defaults to `source` for `prometheus`, `agentmail`, `sentry`, `gmail`, `google-calendar`, `vercel`, `notion` and for `webhook` without `WEBHOOK_POST_URL`; otherwise `bridge`.
+- `exposeTopic`: Boolean (default **`false`**). Bridge topics stay local-only unless explicitly set to `true`. Source topics are always subscribable by paired peers holding a matching `stream:subscribe` scope.
+- The node adds `HYPHAE_STATE_DIR` (its state directory) to every plugin's environment unless `env` sets it.
 - `env`: Map of string values or `{ "secret": "<name>" }` references.
 
 ### Security Gate (`gate`)

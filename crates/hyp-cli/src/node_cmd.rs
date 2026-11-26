@@ -2385,6 +2385,17 @@ fn parse_explicit_topic_names(topics_val: Option<&Value>) -> HashSet<String> {
     out
 }
 
+/// Official event-source plugins whose `plugins[]` entry defaults to `kind: "source"` (1-to-many
+/// `hyp_stream` topic) when `kind` is omitted. An explicit `kind` always wins.
+const OFFICIAL_SOURCE_PLUGIN_IDS: &[&str] = &[
+    "agentmail",
+    "sentry",
+    "gmail",
+    "google-calendar",
+    "vercel",
+    "notion",
+];
+
 fn push_plugin_error(
     id: &str,
     kind: Option<AdapterKind>,
@@ -2753,7 +2764,10 @@ fn parse_plugins_config(
         let kind = match explicit_kind {
             Some(k) => k,
             None => {
-                if id == "prometheus" || (id == "webhook" && !has_webhook_post_url) {
+                if id == "prometheus"
+                    || OFFICIAL_SOURCE_PLUGIN_IDS.contains(&id.as_str())
+                    || (id == "webhook" && !has_webhook_post_url)
+                {
                     AdapterKind::Source
                 } else {
                     AdapterKind::Bridge
@@ -2849,6 +2863,11 @@ fn parse_plugins_config(
         let mut cfg = SubprocessConfig::new(id.clone(), kind, exec, args, targets);
         cfg.cwd = cwd;
         cfg.env = env_map;
+        // Plugins keep small private cursors (polling offsets, dedupe sets) under the node's state
+        // dir so a restart resumes instead of re-baselining. An explicit plugins[].env value wins.
+        cfg.env
+            .entry("HYPHAE_STATE_DIR".to_string())
+            .or_insert_with(|| state_dir.display().to_string());
         if !secret_env_refs.is_empty() {
             let store_for_respawn = secrets.clone();
             let plugin_id_for_err = id.clone();
@@ -2891,7 +2910,6 @@ mod plugin_runtime {
     use hyp_proto::address::{LOCAL_NODE_ID, is_valid_topic};
     use hyp_proto::cloudevent::CloudEvent as ProtoCloudEvent;
     use hyp_proto::rpc::EventKeyRef;
-    use hyp_store::{MailboxPutOptions, now_ms};
     use serde_json::{Map, Value, json};
     use std::collections::{BTreeMap, HashSet, VecDeque};
     use std::path::PathBuf;
@@ -3155,20 +3173,20 @@ mod plugin_runtime {
                         }
                     })?;
 
-                // Issue #39 (B1): Immediately flush due `coalesceSeconds: 0` local topic batches
-                // into matching same-node session mailboxes & wake `LocalDaemon` (matching
-                // `UnifiedNodeAdapterHost::publish_event` and `LocalIngestServer`).
-                if !res.deduplicated && res.matched > 0 {
-                    let _ = node.deliver_local_topic_batches(
-                        topic,
-                        &MailboxPutOptions::default(),
-                        None,
-                        false,
-                        now_ms(),
-                    );
-                }
-
                 let mut matched = res.matched;
+                // Issue #39 (B1): Hand freshly stored subprocess source events to matching
+                // same-node session mailboxes immediately (`coalesceSeconds: 0` + backlog drain),
+                // matching compiled-in adapters and `LocalIngestServer`.
+                if !res.deduplicated && res.matched > 0 && self.kind == AdapterKind::Source {
+                    if let Err(err) =
+                        hyp_node::adapters::deliver_source_topic_to_local_sessions(&node, topic)
+                    {
+                        eprintln!(
+                            "WARN  plugin '{}' event stored but local delivery on topic '{topic}' failed: {err}",
+                            self.plugin_id
+                        );
+                    }
+                }
                 if !res.deduplicated && self.kind == AdapterKind::Bridge {
                     if let Some(daemon) = self.daemon.as_ref().and_then(Weak::upgrade) {
                         let rendered = render_bridge_cloudevent(&event);
@@ -3876,7 +3894,14 @@ mod tests {
             .expect("repo root");
         let tmp = tempfile::tempdir().expect("tempdir");
         let secrets = SecretStore::new(tmp.path(), SecretBackend::File);
-        for name in ["telegram-bot-token", "slack-app-token", "slack-bot-token"] {
+        for name in [
+            "telegram-bot-token",
+            "slack-app-token",
+            "slack-bot-token",
+            "sentry-auth-token",
+            "google-client-secret",
+            "google-refresh-token",
+        ] {
             secrets.set(name, &format!("test-val-{name}")).unwrap();
         }
 
