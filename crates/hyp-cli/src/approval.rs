@@ -18,8 +18,7 @@ use crate::auth_cmd::{
     random_b64url, should_skip_browser_open, try_open_browser,
 };
 use crate::config_file::{
-    ensure_dir, load_node_or_legacy_config, read_json_object_or_empty, resolve_effective_node_id,
-    write_atomic_file,
+    ensure_dir, load_node_or_legacy_config, resolve_effective_node_id, write_atomic_file,
 };
 use crate::drop_cmd::{
     collect_bounded_body, create_relay_drop_slot, decode_drop_envelope, validate_relay_url,
@@ -48,6 +47,7 @@ use hyp_node::engine::{
 use hyp_node::gates::policy::{
     SecurityGateConfig, is_passkey_backed_admin, verify_gate_policy_for_node,
 };
+use hyp_node::node_file::NodeFile;
 use hyp_store::{
     GateLockSealRecord, HumanAuthorityRecord, HumanClaimKind, NodeDb, StoreError, now_ms,
 };
@@ -273,7 +273,7 @@ pub(crate) fn inspect_policy_integrity(
     secrets: &SecretStore,
 ) -> PolicyIntegrityState {
     let verify = || -> Result<bool, String> {
-        let gate_cfg = match read_json_object_or_empty(config_path)
+        let gate_cfg = match NodeFile::read_document_or_empty(config_path)
             .map_err(|e| format!("failed to read node.json: {e}"))?
             .get("gate")
         {
@@ -414,7 +414,7 @@ pub(crate) fn execute_approved_operation<T>(
             }
         }
         let result = operation().and_then(|value| {
-            let raw = read_json_object_or_empty(config_write)?;
+            let raw = NodeFile::read_document_or_empty(config_write)?;
             let loaded = load_node_or_legacy_config(config_write).map_err(|e| e.to_string())?;
             if resolve_effective_node_id(Some(&loaded), Some(db)) != verified.action.node_id {
                 return Err("resulting node identity differs from the signed approval".into());

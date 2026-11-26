@@ -135,9 +135,9 @@ pub fn run_emit(args: EmitArgs) -> ExitCode {
     };
 
     let local_ingest_cfg: LocalIngestConfig =
-        match loaded.as_ref().and_then(|c| c.raw.get("localIngest")) {
-            Some(val) => match serde_json::from_value(val.clone()) {
-                Ok(cfg) => cfg,
+        match loaded.as_ref().and_then(|c| c.file.local_ingest.as_ref()) {
+            Some(val) => match val {
+                Ok(cfg) => cfg.clone(),
                 Err(e) => {
                     return emit_error(
                         cmd,

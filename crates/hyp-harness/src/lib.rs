@@ -11,6 +11,8 @@ pub mod daemon;
 pub mod hooks;
 pub mod local_kv;
 pub mod mcp;
+pub mod node_config;
+pub mod plugin_runtime;
 pub mod protocol;
 pub mod sock;
 pub mod transport;

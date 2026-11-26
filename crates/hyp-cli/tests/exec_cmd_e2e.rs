@@ -6,7 +6,7 @@
 //! independent whole-buffer reference oracle, fail-closed validation/denylist checks,
 //! clap CLI `debug_assert()`, and real child subprocess execution & signal propagation.
 
-#[allow(dead_code)]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/config_file.rs"]
 mod config_file;
 #[path = "../src/exec_cmd.rs"]

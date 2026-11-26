@@ -7,15 +7,8 @@ use hyp_crypto::keystore::{SecretBackend, SecretStore};
 use hyp_node::engine::NodeProfile;
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
 use hyp_store::NodeDb;
-use hyper_rustls::HttpsConnectorBuilder;
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioExecutor;
-use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{Map, Value, json};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::net::SocketAddr;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Returns the default Hyphae config directory, honoring `--home`, `HYPHAE_CONFIG_DIR`,
@@ -73,16 +66,9 @@ pub fn resolve_state_dir(
         }
     }
     if let Some(cfg) = config_path {
-        if let Ok(loaded) = read_json_value(cfg) {
-            if let Some(sd) = loaded.get("stateDir").and_then(Value::as_str) {
-                let p = PathBuf::from(sd);
-                if p.is_absolute() {
-                    return p;
-                }
-                if let Some(parent) = cfg.parent() {
-                    return parent.join(p);
-                }
-                return p;
+        if let Ok((file, _)) = hyp_node::node_file::NodeFile::read(cfg) {
+            if let Some(dir) = file.state_dir(cfg) {
+                return dir;
             }
         }
         if let Some(parent) = cfg.parent() {
@@ -217,22 +203,6 @@ fn sanitize_id_segment(raw: &str, fallback: &str) -> String {
     }
 }
 
-/// Parsed fields normalized from either v2 `node.json` or legacy v1 `connector.json`.
-#[derive(Debug, Clone)]
-pub struct LoadedNodeFile {
-    pub path: PathBuf,
-    pub is_legacy_v1: bool,
-    pub node_id: Option<String>,
-    pub profile: Option<NodeProfile>,
-    pub bind_addr: Option<SocketAddr>,
-    pub public_url: Option<String>,
-    pub state_dir: Option<PathBuf>,
-    pub require_e2ee: bool,
-    pub require_pairing: bool,
-    pub update_channel: Option<String>,
-    pub raw: Value,
-}
-
 /// Reads a JSON file into `serde_json::Value`.
 pub fn read_json_value(path: &Path) -> Result<Value, String> {
     let raw =
@@ -254,126 +224,9 @@ pub fn read_json_object_or_empty(path: &Path) -> Result<Map<String, Value>, Stri
     }
 }
 
-/// Reads the explicit agent-facing KV tool setting. Missing values use capability discovery.
-pub fn kv_tool_override(kv: Option<&Value>) -> Result<Option<bool>, &'static str> {
-    match kv {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Bool(enabled)) => Ok(Some(*enabled)),
-        Some(Value::Object(kv)) => match kv.get("enabled") {
-            None => Ok(None),
-            Some(Value::Bool(enabled)) => Ok(Some(*enabled)),
-            _ => Err("kv.enabled must be a boolean"),
-        },
-        _ => Err("kv must be a boolean or an object with an enabled boolean"),
-    }
-}
+pub use hyp_node::node_file::kv_tool_override;
 
-/// Loads either v2 `node.json` or legacy v1 `connector.json` transparently.
-pub fn load_node_or_legacy_config(path: &Path) -> Result<LoadedNodeFile, String> {
-    let raw = read_json_value(path)?;
-    let obj = raw
-        .as_object()
-        .ok_or_else(|| format!("expected top-level JSON object in {}", path.display()))?;
-
-    let is_legacy_v1 = obj.contains_key("connectorId") && !obj.contains_key("nodeId");
-
-    let node_id = obj
-        .get("nodeId")
-        .or_else(|| obj.get("connectorId"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-
-    let profile = match obj.get("profile").and_then(Value::as_str) {
-        Some("local") => Some(NodeProfile::Local),
-        Some("router") => Some(NodeProfile::Router),
-        Some("p2p") => Some(NodeProfile::P2p),
-        Some(other) => {
-            return Err(format!(
-                "invalid profile '{other}' in {} (expected local, router, or p2p)",
-                path.display()
-            ));
-        }
-        None => {
-            if is_legacy_v1 {
-                Some(NodeProfile::Local)
-            } else {
-                None
-            }
-        }
-    };
-
-    let bind_str = obj
-        .get("listen")
-        .and_then(|l| l.get("bind"))
-        .and_then(Value::as_str)
-        .or_else(|| obj.get("bind").and_then(Value::as_str))
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            // Legacy v1 `localRouter: { host, port }`
-            let lr = obj.get("localRouter")?;
-            let host = lr
-                .get("host")
-                .and_then(Value::as_str)
-                .unwrap_or("127.0.0.1");
-            let port = lr.get("port").and_then(Value::as_u64)?;
-            Some(format!("{host}:{port}"))
-        });
-
-    let bind_addr = match bind_str {
-        Some(ref s) => Some(
-            s.parse::<SocketAddr>()
-                .map_err(|e| format!("invalid listen.bind '{s}' in {}: {e}", path.display()))?,
-        ),
-        None => None,
-    };
-
-    let public_url = obj
-        .get("listen")
-        .and_then(|l| l.get("publicUrl"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-
-    let state_dir = obj.get("stateDir").and_then(Value::as_str).map(|s| {
-        let p = PathBuf::from(s);
-        if p.is_absolute() {
-            p
-        } else if let Some(parent) = path.parent() {
-            parent.join(p)
-        } else {
-            p
-        }
-    });
-
-    let policy = obj.get("policy");
-    let require_e2ee = policy
-        .and_then(|p| p.get("requireE2ee"))
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let require_pairing = policy
-        .and_then(|p| p.get("requirePairing"))
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-
-    let update_channel = obj
-        .get("update")
-        .and_then(|u| u.get("channel"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-
-    Ok(LoadedNodeFile {
-        path: path.to_path_buf(),
-        is_legacy_v1,
-        node_id,
-        profile,
-        bind_addr,
-        public_url,
-        state_dir,
-        require_e2ee,
-        require_pairing,
-        update_channel,
-        raw,
-    })
-}
+pub use hyp_node::node_file::{LoadedNodeFile, load_node_or_legacy_config};
 
 /// Resolves the canonical node ID from config, `node.sqlite` metadata, or fallback default.
 pub fn resolve_effective_node_id(loaded: Option<&LoadedNodeFile>, db: Option<&NodeDb>) -> String {
@@ -394,137 +247,7 @@ pub fn resolve_effective_node_id(loaded: Option<&LoadedNodeFile>, db: Option<&No
     default_node_id()
 }
 
-/// Ensures directory exists with `0700` permissions on Unix when `private == true`.
-pub fn ensure_dir(dir: &Path, private: bool) -> Result<(), String> {
-    fs::create_dir_all(dir)
-        .map_err(|e| format!("failed to create directory {}: {e}", dir.display()))?;
-    #[cfg(unix)]
-    if private {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
-            .map_err(|e| format!("failed to chmod 0700 {}: {e}", dir.display()))?;
-    }
-    #[cfg(not(unix))]
-    let _ = private;
-    Ok(())
-}
-
-/// Resolves the final filesystem write target for `dest` so atomic renames through an existing
-/// symlink update the symlink's target in place instead of clobbering the symlink itself.
-///
-/// Fails closed on symlink loops or multi-hop broken chains: only resolves either an existing
-/// target via `fs::canonicalize` or a single-hop dangling relative/absolute symlink whose direct
-/// target does not yet exist.
-fn resolve_symlink_write_target(dest: &Path) -> Result<PathBuf, String> {
-    let Ok(meta) = fs::symlink_metadata(dest) else {
-        return Ok(dest.to_path_buf());
-    };
-    if !meta.file_type().is_symlink() {
-        return Ok(dest.to_path_buf());
-    }
-
-    match fs::canonicalize(dest) {
-        Ok(resolved) => Ok(resolved),
-        Err(canon_err) => {
-            let raw_target = fs::read_link(dest)
-                .map_err(|e| format!("failed to read symlink {}: {e}", dest.display()))?;
-            let candidate = if raw_target.is_absolute() {
-                raw_target
-            } else {
-                dest.parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or_else(|| Path::new("."))
-                    .join(raw_target)
-            };
-            // Only allow a single-hop dangling link whose direct target does not exist yet.
-            // If `symlink_metadata(&candidate)` succeeds (e.g. symlink loop / multi-hop broken
-            // chain) or errors with anything other than NotFound (e.g. ELOOP / EACCES), fail closed.
-            match fs::symlink_metadata(&candidate) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    if candidate.file_name().is_none() {
-                        return Err(format!(
-                            "refusing to write through invalid symlink target {} (from {})",
-                            candidate.display(),
-                            dest.display()
-                        ));
-                    }
-                    Ok(candidate)
-                }
-                _ => Err(format!(
-                    "failed to resolve symlink {} (possible symlink loop or broken chain): {canon_err}",
-                    dest.display()
-                )),
-            }
-        }
-    }
-}
-
-/// Atomically writes bytes to `dest` via sibling temporary file + `sync_all` + `rename`.
-/// Enforces `0600` permissions on Unix when `private == true`.
-///
-/// If `dest` is an existing symlink, writes into the target's parent directory and atomically
-/// renames over the resolved target path so the symlink at `dest` remains intact.
-pub fn write_atomic_file(dest: &Path, bytes: &[u8], private: bool) -> Result<(), String> {
-    let target = resolve_symlink_write_target(dest)?;
-    let parent = target
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    ensure_dir(parent, private)?;
-
-    let rng = SystemRandom::new();
-    let mut suffix = [0u8; 8];
-    rng.fill(&mut suffix)
-        .map_err(|_| "OS CSPRNG failure".to_string())?;
-    let tmp_path = parent.join(format!(".tmp-hyp-{}", hex::encode(suffix)));
-
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(if private { 0o600 } else { 0o644 });
-    }
-
-    let res: Result<(), String> = (|| {
-        let mut f = opts
-            .open(&tmp_path)
-            .map_err(|e| format!("failed to create temp file {}: {e}", tmp_path.display()))?;
-        f.write_all(bytes)
-            .map_err(|e| format!("failed to write {}: {e}", tmp_path.display()))?;
-        f.sync_all()
-            .map_err(|e| format!("failed to sync {}: {e}", tmp_path.display()))?;
-        drop(f);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = if private { 0o600 } else { 0o644 };
-            fs::set_permissions(&tmp_path, fs::Permissions::from_mode(mode))
-                .map_err(|e| format!("failed to set permissions on {}: {e}", tmp_path.display()))?;
-        }
-        fs::rename(&tmp_path, &target).map_err(|e| {
-            format!(
-                "failed to atomically rename {} -> {}: {e}",
-                tmp_path.display(),
-                target.display()
-            )
-        })?;
-        Ok(())
-    })();
-
-    if res.is_err() {
-        let _ = fs::remove_file(&tmp_path);
-    }
-    res
-}
-
-/// Atomically writes pretty-printed JSON with a trailing newline.
-pub fn write_atomic_json(dest: &Path, value: &Value, private: bool) -> Result<(), String> {
-    let mut text = serde_json::to_string_pretty(value)
-        .map_err(|e| format!("failed to serialize JSON for {}: {e}", dest.display()))?;
-    text.push('\n');
-    write_atomic_file(dest, text.as_bytes(), private)
-}
+pub use hyp_node::atomic_file::{ensure_dir, write_atomic_file, write_atomic_json};
 
 /// Ensures a baseline v2 `node.json` object has required top-level fields without clobbering
 /// existing user configuration.
@@ -582,125 +305,73 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     std::hint::black_box(diff) == 0
 }
 
-/// Builds a shared `hyper 1` + `hyper-rustls` client (ring + webpki-roots, HTTPS + loopback HTTP).
-pub fn build_http_client<B>()
--> Result<Client<hyper_rustls::HttpsConnector<HttpConnector>, B>, String>
-where
-    B: hyper::body::Body + Send + 'static + Unpin,
-    B::Data: Send,
-    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let connector = HttpsConnectorBuilder::new()
-        .with_provider_and_webpki_roots(rustls::crypto::ring::default_provider())
-        .map_err(|e| format!("TLS connector initialization failed: {e}"))?
-        .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .build();
-    Ok(Client::builder(TokioExecutor::new()).build(connector))
-}
+pub use hyp_node::engine::http_util::build_http_client;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn write_atomic_file_creates_and_updates_regular_file() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let dest = tmp.path().join("nested").join("config.json");
-        write_atomic_file(&dest, b"{\"v\":1}\n", true).expect("initial write");
-        assert_eq!(fs::read_to_string(&dest).unwrap(), "{\"v\":1}\n");
+    fn node_file_compatibility_preserves_precedence_defaults_and_extensions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("node.json");
+        let legacy = json!({
+            "connectorId": "legacy@host",
+            "localRouter": {"port": 9071},
+            "stateDir": "home/state",
+            "extension": {"anything": [true, null]}
+        });
+        fs::write(&path, legacy.to_string()).unwrap();
+        let loaded = load_node_or_legacy_config(&path).unwrap();
+        assert!(loaded.is_legacy_v1);
+        assert_eq!(loaded.node_id.as_deref(), Some("legacy@host"));
+        assert_eq!(loaded.profile, Some(NodeProfile::Local));
+        assert_eq!(loaded.bind_addr, Some("127.0.0.1:9071".parse().unwrap()));
+        assert_eq!(loaded.state_dir, Some(tmp.path().join("home/state")));
+        assert!(loaded.require_e2ee);
+        assert!(loaded.require_pairing);
+        assert_eq!(loaded.raw, legacy);
+        assert_eq!(loaded.file.extra["extension"], legacy["extension"]);
+        let mut original = hyp_node::node_file::NodeFile::read_document_or_empty(&path).unwrap();
+        original.insert("update".into(), json!({"channel": "beta"}));
+        hyp_node::node_file::NodeFile::write_document(&path, original).unwrap();
+        let saved = load_node_or_legacy_config(&path).unwrap();
+        assert_eq!(saved.raw["extension"], legacy["extension"]);
+        assert_eq!(saved.update_channel.as_deref(), Some("beta"));
 
-        write_atomic_file(&dest, b"{\"v\":2}\n", false).expect("overwrite");
-        assert_eq!(fs::read_to_string(&dest).unwrap(), "{\"v\":2}\n");
-    }
+        let v2 = json!({
+            "nodeId": null,
+            "connectorId": "legacy@host",
+            "profile": "p2p",
+            "listen": {"bind": "[::1]:9081", "publicUrl": "https://node.example"},
+            "bind": "127.0.0.1:9082",
+            "localRouter": {"port": 9083},
+            "policy": {"requireE2ee": false, "requirePairing": "false"},
+            "update": {"channel": "beta"}
+        });
+        fs::write(&path, v2.to_string()).unwrap();
+        let loaded = load_node_or_legacy_config(&path).unwrap();
+        assert!(!loaded.is_legacy_v1);
+        assert_eq!(loaded.node_id, None);
+        assert_eq!(loaded.profile, Some(NodeProfile::P2p));
+        assert_eq!(loaded.bind_addr, Some("[::1]:9081".parse().unwrap()));
+        assert_eq!(loaded.public_url.as_deref(), Some("https://node.example"));
+        assert!(!loaded.require_e2ee);
+        assert!(loaded.require_pairing);
+        assert_eq!(loaded.update_channel.as_deref(), Some("beta"));
 
-    #[cfg(unix)]
-    #[test]
-    fn write_atomic_file_preserves_symlink_and_updates_target() {
-        use std::os::unix::fs::symlink;
+        let mut fallback = v2;
+        fallback["listen"]["bind"] = json!(123);
+        fs::write(&path, fallback.to_string()).unwrap();
+        let loaded = load_node_or_legacy_config(&path).unwrap();
+        assert_eq!(loaded.bind_addr, Some("127.0.0.1:9082".parse().unwrap()));
 
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let real_dir = tmp.path().join("real");
-        let profile_dir = tmp.path().join("profile");
-        fs::create_dir_all(&real_dir).unwrap();
-        fs::create_dir_all(&profile_dir).unwrap();
-
-        let target = real_dir.join("settings.json");
-        fs::write(&target, "{\"v\":1}\n").unwrap();
-        let link = profile_dir.join("settings.json");
-        symlink(&target, &link).unwrap();
-
-        write_atomic_file(&link, b"{\"v\":2}\n", false).expect("atomic write through symlink");
-
+        fallback["profile"] = json!("invalid");
+        fs::write(&path, fallback.to_string()).unwrap();
         assert!(
-            fs::symlink_metadata(&link)
-                .unwrap()
-                .file_type()
-                .is_symlink(),
-            "symlink at dest must remain a symlink after write_atomic_file"
-        );
-        assert_eq!(fs::read_to_string(&target).unwrap(), "{\"v\":2}\n");
-        assert_eq!(fs::read_to_string(&link).unwrap(), "{\"v\":2}\n");
-
-        // Relative symlink in a sibling directory also stays intact.
-        let rel_link = profile_dir.join("rel-settings.json");
-        symlink(Path::new("../real/settings.json"), &rel_link).unwrap();
-        write_atomic_file(&rel_link, b"{\"v\":3}\n", false).expect("atomic write via rel symlink");
-        assert!(
-            fs::symlink_metadata(&rel_link)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(fs::read_to_string(&target).unwrap(), "{\"v\":3}\n");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn write_atomic_file_handles_dangling_symlink_and_rejects_loops() {
-        use std::os::unix::fs::symlink;
-
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let real_dir = tmp.path().join("real");
-        let profile_dir = tmp.path().join("profile");
-        fs::create_dir_all(&profile_dir).unwrap();
-
-        // Single-hop dangling symlink pointing to a non-existent target file.
-        let dangling_target = real_dir.join("future.json");
-        let dangling_link = profile_dir.join("future.json");
-        symlink(&dangling_target, &dangling_link).unwrap();
-
-        write_atomic_file(&dangling_link, b"{\"created\":true}\n", false)
-            .expect("single-hop dangling symlink should write target and stay symlink");
-        assert!(
-            fs::symlink_metadata(&dangling_link)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(
-            fs::read_to_string(&dangling_target).unwrap(),
-            "{\"created\":true}\n"
-        );
-
-        // Symlink loop must fail closed and leave symlinks untouched.
-        let loop_a = profile_dir.join("loop-a.json");
-        let loop_b = profile_dir.join("loop-b.json");
-        symlink(&loop_b, &loop_a).unwrap();
-        symlink(&loop_a, &loop_b).unwrap();
-
-        let err = write_atomic_file(&loop_a, b"oops", false).unwrap_err();
-        assert!(
-            err.contains("symlink"),
-            "expected symlink resolution error, got: {err}"
-        );
-        assert!(
-            fs::symlink_metadata(&loop_a)
-                .unwrap()
-                .file_type()
-                .is_symlink()
+            load_node_or_legacy_config(&path)
+                .unwrap_err()
+                .contains("invalid profile")
         );
     }
 

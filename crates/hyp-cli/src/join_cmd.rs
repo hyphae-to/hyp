@@ -20,9 +20,8 @@ use crate::approval::inspect_policy_integrity;
 use crate::auth_cmd::admin_secret_name_for_kid;
 use crate::config_file::{
     build_http_client, ct_eq, default_node_id, ensure_dir, ensure_v2_node_json_defaults,
-    load_node_or_legacy_config, open_secret_store, read_json_object_or_empty,
-    resolve_config_path_for_read, resolve_config_path_for_write, resolve_effective_node_id,
-    resolve_home_dir, resolve_state_dir, write_atomic_json,
+    load_node_or_legacy_config, open_secret_store, resolve_config_path_for_read,
+    resolve_config_path_for_write, resolve_effective_node_id, resolve_home_dir, resolve_state_dir,
 };
 use crate::pair::{attempt_delegated_pair_enroll, credential_secret_name, try_reload_live_daemon};
 use crate::setup::configure_detected_harnesses_for_join;
@@ -44,6 +43,7 @@ use hyp_crypto::keystore::SecretStore;
 use hyp_crypto::pairing::validate_endpoint_origin;
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms, parse_rfc3339_millis};
 use hyp_node::engine::{AuthClaimReply, AuthClaimRequest};
+use hyp_node::node_file::NodeFile;
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
 use hyp_proto::manifest::{NodeProfile, OkpCurve as ProtoOkpCurve, OkpJwk as ProtoOkpJwk};
 use hyp_proto::problem::ProblemDetails;
@@ -1459,7 +1459,7 @@ fn finalize_join(
     // 1. Streamlined auto-onboarding when `node.json` does not exist yet.
     let mut configured_harnesses: Vec<String> = Vec::new();
     if !validated.already_onboarded {
-        let mut cfg_map = read_json_object_or_empty(config_write).unwrap_or_default();
+        let mut cfg_map = NodeFile::read_document_or_empty(config_write).unwrap_or_default();
         cfg_map.insert("v".to_string(), json!(2));
         cfg_map.insert("nodeId".to_string(), json!(validated.node_id));
         cfg_map.insert("profile".to_string(), json!("local"));
@@ -1473,7 +1473,7 @@ fn finalize_join(
             NodeProfile::Local,
             state_dir,
         );
-        if let Err(e) = write_atomic_json(config_write, &Value::Object(cfg_map), true) {
+        if let Err(e) = NodeFile::write_document(config_write, cfg_map) {
             return emit_error(
                 cmd,
                 as_json,

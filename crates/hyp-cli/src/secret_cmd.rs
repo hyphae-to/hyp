@@ -8,7 +8,7 @@
 //! - Secret values are NEVER printed to stdout, stderr, or `--json` output.
 
 use crate::config_file::{
-    ct_eq, open_secret_store, read_json_value, resolve_config_path_for_read, resolve_state_dir,
+    ct_eq, open_secret_store, resolve_config_path_for_read, resolve_state_dir,
 };
 use crate::ui::{
     EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
@@ -20,6 +20,7 @@ use clap::Subcommand;
 use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full};
 use hyp_crypto::keystore::{SecretMetadata, SecretStore, validate_secret_name};
+use hyp_node::node_file::NodeFile;
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -197,7 +198,7 @@ fn find_secret_references_in_node_json(
         },
         None,
     );
-    let Ok(root) = read_json_value(&cfg_path) else {
+    let Ok(root) = NodeFile::read_document(&cfg_path) else {
         return Vec::new();
     };
     let mut refs = Vec::new();

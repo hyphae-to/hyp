@@ -16,6 +16,7 @@
 use crate::config_file::{read_json_value, write_atomic_file};
 use crate::setup::{ClaudeConfigProfile, canonical_dedup_key};
 use hyp_harness::protocol::HarnessKind;
+use hyp_node::node_file::NodeFile;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
@@ -758,7 +759,7 @@ pub fn detect_capabilities_from_config_path(config_path: &Path) -> SkillCapabili
     if !config_path.exists() {
         return SkillCapabilities::default();
     }
-    match read_json_value(config_path) {
+    match NodeFile::read_document(config_path) {
         Ok(val) => detect_capabilities_from_node_json(&val),
         Err(_) => SkillCapabilities::default(),
     }
