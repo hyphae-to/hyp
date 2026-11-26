@@ -510,9 +510,7 @@ pub fn run_auth(command: AuthCommand) -> CommandResult {
             json,
             run_auth_whoami(human_id, state_dir, config, json),
         ),
-        AuthCommand::Join(args) => {
-            CommandResult::new("join", args.json, Ok(crate::join_cmd::run_join(args)))
-        }
+        AuthCommand::Join(args) => crate::join_cmd::run_join(args),
         AuthCommand::CertifyNode {
             ttl_days,
             kid,
