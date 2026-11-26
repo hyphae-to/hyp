@@ -42,9 +42,10 @@ pub use kv::{
     KvStore, MAX_KV_VALUE_BYTES,
 };
 pub use local::{
-    BridgeLink, GateAuditEntry, GateAuditInput, GateAuditQuery, LocalStateStore, MailboxEntry,
-    MailboxEntryEx, MailboxInsert, MailboxItemMeta, MailboxPutOptions, MailboxPutResult, MuteRule,
-    MuteRuleInput, PluginTargetHandoff, PruneReport, Session, UnreadDigest,
+    BridgeLink, DaemonNoticeKind, GateAuditEntry, GateAuditInput, GateAuditQuery, LocalStateStore,
+    MailboxEntry, MailboxEntryEx, MailboxInsert, MailboxItemMeta, MailboxPutOptions,
+    MailboxPutResult, MuteRule, MuteRuleInput, PluginTargetHandoff, PruneReport, Session,
+    UnreadDigest,
 };
 pub use messages::{
     ChannelDeliveryFailure, ChannelEpoch, ChannelEpochInput, ChannelInfo, ChannelMembership,
