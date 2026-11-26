@@ -357,7 +357,7 @@ impl PushTransport for HerdrTransport {
 ///
 /// Returns `None` when unset, blank, or not a safe terminal address.
 pub fn detect_env_terminal_id() -> Option<String> {
-    parse_env_terminal_id(std::env::var("HC_TERMINAL_ID").ok().as_deref())
+    parse_env_terminal_id(crate::ambient_env_var("HC_TERMINAL_ID").as_deref())
 }
 
 fn parse_env_terminal_id(raw: Option<&str>) -> Option<String> {

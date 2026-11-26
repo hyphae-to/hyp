@@ -13,10 +13,12 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 
 pub fn loopback_zero() -> SocketAddr {
+    hyp_harness::enable_test_env_isolation();
     "127.0.0.1:0".parse().expect("valid loopback address")
 }
 
 pub fn hook_opts(harness: HarnessKind, event: HookEvent, sock: &Path) -> HandleHookOptions {
+    hyp_harness::enable_test_env_isolation();
     HandleHookOptions {
         harness,
         event,
@@ -123,6 +125,7 @@ pub struct TestMcpClient {
 
 impl TestMcpClient {
     pub fn spawn(options: McpOptions) -> Self {
+        hyp_harness::enable_test_env_isolation();
         let (client_w, server_r) = tokio::io::duplex(65_536);
         let (server_w, client_r) = tokio::io::duplex(65_536);
         let task = tokio::spawn(async move {

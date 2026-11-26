@@ -40,10 +40,12 @@ use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 
 fn loopback_zero() -> SocketAddr {
+    hyp_harness::enable_test_env_isolation();
     "127.0.0.1:0".parse().expect("valid loopback")
 }
 
 fn hook_opts(harness: HarnessKind, event: HookEvent, sock: &Path) -> HandleHookOptions {
+    hyp_harness::enable_test_env_isolation();
     HandleHookOptions {
         harness,
         event,

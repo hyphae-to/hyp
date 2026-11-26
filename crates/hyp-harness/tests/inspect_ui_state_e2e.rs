@@ -41,6 +41,7 @@ use tempfile::TempDir;
 use tokio::io::BufReader;
 
 fn make_local_node(node_id: &str, dir: &TempDir) -> Arc<UnifiedNode> {
+    hyp_harness::enable_test_env_isolation();
     let mut cfg = NodeConfig::local(NodeId::new(node_id).unwrap(), dir.path());
     cfg.secret_backend = Some(SecretBackend::File);
     cfg.topics.push(TopicConfig {

@@ -70,7 +70,8 @@ All `hyp` CLI commands follow an **agent-first, consistent output contract** (`c
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
-HYPHAE_SECRET_BACKEND=file cargo test --workspace
+# Clean-env form ensures zero ambient harness/session variables leak when run inside a live agent session:
+env -i HOME="$HOME" PATH="$PATH" USER="$USER" TMPDIR="${TMPDIR:-/tmp}" HYPHAE_SECRET_BACKEND=file cargo test --workspace
 cargo build --release -p hyp-cli
 bash scripts/test-installer.sh
 ```

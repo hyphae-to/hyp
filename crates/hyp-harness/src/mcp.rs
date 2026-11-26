@@ -577,7 +577,7 @@ fn build_mcp_hello(options: &McpOptions, ephemeral_client_id: Option<&str>) -> V
             pkt.insert("resume".into(), json!(true));
         }
         if options.backend == Some(HarnessKind::Codex) {
-            if let Ok(env_tid) = std::env::var("CODEX_THREAD_ID") {
+            if let Some(env_tid) = crate::ambient_env_var("CODEX_THREAD_ID") {
                 let trimmed = env_tid.trim();
                 if !trimmed.is_empty() {
                     pkt.insert("codexThreadId".into(), json!(trimmed));
@@ -588,13 +588,13 @@ fn build_mcp_hello(options: &McpOptions, ephemeral_client_id: Option<&str>) -> V
     if let Some(sess_tok) = crate::hooks::infer_session_token_from_env() {
         pkt.insert("sessionToken".into(), json!(sess_tok));
     }
-    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
+    if let Some(codex_home) = crate::ambient_env_var("CODEX_HOME") {
         if !codex_home.is_empty() {
             pkt.insert("codexHome".into(), json!(codex_home));
         }
     }
     if !pkt.contains_key("remote") {
-        if let Ok(remote) = std::env::var("CODEX_REMOTE") {
+        if let Some(remote) = crate::ambient_env_var("CODEX_REMOTE") {
             let trimmed = remote.trim();
             if !trimmed.is_empty() {
                 pkt.insert("remote".into(), json!(trimmed));
@@ -607,9 +607,8 @@ fn build_mcp_hello(options: &McpOptions, ephemeral_client_id: Option<&str>) -> V
         }
     }
     let t3_url = options.t3_url.clone().or_else(|| {
-        std::env::var("T3CODE_URL")
-            .ok()
-            .or_else(|| std::env::var("T3_URL").ok())
+        crate::ambient_env_var("T3CODE_URL")
+            .or_else(|| crate::ambient_env_var("T3_URL"))
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     });
@@ -617,8 +616,7 @@ fn build_mcp_hello(options: &McpOptions, ephemeral_client_id: Option<&str>) -> V
         pkt.insert("t3Url".into(), json!(url));
     }
     let t3_dir = options.t3_base_dir.clone().or_else(|| {
-        std::env::var("T3CODE_HOME")
-            .ok()
+        crate::ambient_env_var("T3CODE_HOME")
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     });
@@ -650,9 +648,7 @@ fn tool_call_result(id: Value, value: Value, is_error: bool) -> Value {
 }
 
 fn env_non_empty(key: &str) -> bool {
-    std::env::var(key)
-        .ok()
-        .is_some_and(|v| !v.trim().is_empty())
+    crate::ambient_env_var(key).is_some_and(|v| !v.trim().is_empty())
 }
 
 fn detect_env_herdr_active() -> bool {

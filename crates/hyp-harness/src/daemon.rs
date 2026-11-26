@@ -8242,7 +8242,7 @@ fn read_node_json_for_state_dir(state_dir: &Path) -> Option<Value> {
         state_dir.join("node.json"),
         state_dir.join("connector.json"),
     ];
-    if let Ok(env_cfg) = std::env::var("HYPHAE_CONFIG") {
+    if let Some(env_cfg) = crate::ambient_env_var("HYPHAE_CONFIG") {
         let trimmed = env_cfg.trim();
         if !trimmed.is_empty() {
             candidates.push(PathBuf::from(trimmed));

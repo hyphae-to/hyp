@@ -97,7 +97,7 @@ pub enum WaitError {
 /// 3. `CLAUDE_SESSION_ID` (`claude:<id>`)
 /// 4. `CODEX_THREAD_ID` (`codex:<id>`)
 pub fn infer_session_id_from_env() -> Option<String> {
-    infer_session_id_with(|k| std::env::var(k).ok())
+    infer_session_id_with(crate::ambient_env_var)
 }
 
 /// Resolves a validated Herdr terminal ID from `HC_TERMINAL_ID`, if present.

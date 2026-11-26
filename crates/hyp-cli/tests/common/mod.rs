@@ -29,10 +29,40 @@ pub fn repo_plugins_dir() -> PathBuf {
         .join("plugins")
 }
 
+/// Scrubs all ambient Hyphae and coding-harness environment variables from `cmd` so running
+/// `cargo test` inside an active Claude Code / Herdr / Codex / OpenClaw / OpenCode / T3 /
+/// Gemini session can NEVER leak live session IDs, tokens, or host config paths into child
+/// processes (Blind Spot B5).
+pub fn scrub_ambient_harness_env(cmd: &mut Command) {
+    const PREFIXES: &[&str] = &[
+        "HYPHAE_",
+        "AGENTS_MESH_",
+        "T3_MESH_",
+        "HC_",
+        "CLAUDE",
+        "CODEX_",
+        "OPENCLAW_",
+        "OPENCODE_",
+        "T3CODE_",
+        "T3_",
+        "GEMINI_",
+        "ANTIGRAVITY_",
+    ];
+    for (key, _) in std::env::vars_os() {
+        if let Some(s) = key.to_str() {
+            if PREFIXES.iter().any(|p| s.starts_with(p)) {
+                cmd.env_remove(&key);
+            }
+        }
+    }
+    cmd.env_remove("PASSWORD_STORE_DIR").env_remove("GNUPGHOME");
+}
+
 /// Applies complete hermetic environment isolation to `cmd` so live user config, sockets,
 /// Keychain, host OS service managers (`HYPHAE_NO_SERVICE=1`, `HYPHAE_NO_SERVICE_RESTART=1`),
 /// ambient `HYPHAE_*` variables, and parent live-harness identity variables can NEVER leak into tests.
-fn apply_isolated_env(cmd: &mut Command, home: &Path) {
+pub fn apply_isolated_env(cmd: &mut Command, home: &Path) {
+    scrub_ambient_harness_env(cmd);
     cmd.env("HOME", home)
         .env("USERPROFILE", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
@@ -41,43 +71,7 @@ fn apply_isolated_env(cmd: &mut Command, home: &Path) {
         .env("HYPHAE_NO_SERVICE", "1")
         .env("HYPHAE_NO_SERVICE_RESTART", "1")
         .env("HYPHAE_PLUGINS_DIR", repo_plugins_dir())
-        .env("HYPHAE_TAILSCALE_BIN", "none")
-        .env_remove("HYPHAE_TAILSCALE_STATUS_JSON")
-        .env_remove("HYPHAE_TAILSCALE_SERVE_STATUS_JSON")
-        .env_remove("HYPHAE_SSH_BIN")
-        .env_remove("HYPHAE_OP_BIN")
-        .env_remove("HYPHAE_1PASSWORD_VAULT")
-        .env_remove("HYPHAE_LPASS_BIN")
-        .env_remove("HYPHAE_LASTPASS_PREFIX")
-        .env_remove("HYPHAE_PASS_BIN")
-        .env_remove("HYPHAE_PASS_PREFIX")
-        .env_remove("PASSWORD_STORE_DIR")
-        .env_remove("GNUPGHOME")
-        .env_remove("HYPHAE_PLUGINS_ARCHIVE")
-        .env_remove("HYPHAE_PLUGINS_URL")
-        .env_remove("HYPHAE_CONFIG")
-        .env_remove("HYPHAE_STATE_DIR")
-        .env_remove("HYPHAE_CONFIG_DIR")
-        .env_remove("HYPHAE_SOCKET")
-        .env_remove("AGENTS_MESH_SOCKET")
-        .env_remove("HYPHAE_RELEASE_PUBKEY")
-        .env_remove("HYPHAE_DISABLE_AUTO_UPDATE")
-        .env_remove("HYPHAE_DROP_PORTAL_URL")
-        // Scrub ambient live-harness env vars so running `cargo test` inside Claude Code / Herdr /
-        // Codex / OpenClaw / OpenCode / T3 never leaks parent harness identity into tests (B5).
-        .env_remove("HC_TERMINAL_ID")
-        .env_remove("HC_TERMINAL_SOCKET")
-        .env_remove("HYPHAE_SESSION_ID")
-        .env_remove("HYPHAE_SESSION_TOKEN")
-        .env_remove("CLAUDECODE")
-        .env_remove("CLAUDE_ENV_FILE")
-        .env_remove("CLAUDE_CONFIG_DIR")
-        .env_remove("CODEX_HOME")
-        .env_remove("OPENCLAW_STATE_DIR")
-        .env_remove("OPENCLAW_CONFIG_PATH")
-        .env_remove("OPENCLAW_HOME")
-        .env_remove("OPENCODE_CONFIG")
-        .env_remove("T3CODE_HOME");
+        .env("HYPHAE_TAILSCALE_BIN", "none");
 }
 
 /// Constructs a `Command` for the compiled `hyp` binary with complete environment

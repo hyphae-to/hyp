@@ -80,13 +80,36 @@ while True:
 
     fn isolated_cmd(home: &Path) -> Command {
         let mut cmd = Command::new(hyp_bin());
+        for (key, _) in std::env::vars_os() {
+            if let Some(s) = key.to_str() {
+                if [
+                    "HYPHAE_",
+                    "AGENTS_MESH_",
+                    "T3_MESH_",
+                    "HC_",
+                    "CLAUDE",
+                    "CODEX_",
+                    "OPENCLAW_",
+                    "OPENCODE_",
+                    "T3CODE_",
+                    "T3_",
+                    "GEMINI_",
+                    "ANTIGRAVITY_",
+                ]
+                .iter()
+                .any(|p| s.starts_with(p))
+                {
+                    cmd.env_remove(&key);
+                }
+            }
+        }
         cmd.env("HOME", home)
             .env("USERPROFILE", home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("HYPHAE_SECRET_BACKEND", "file")
-            .env_remove("HYPHAE_CONFIG")
-            .env_remove("HYPHAE_STATE_DIR")
-            .env_remove("HYPHAE_SOCKET");
+            .env("HYPHAE_NO_OPEN", "1")
+            .env("HYPHAE_NO_SERVICE", "1")
+            .env("HYPHAE_NO_SERVICE_RESTART", "1");
         cmd
     }
 
@@ -223,7 +246,14 @@ while True:
                 fs::create_dir_all(&state_dir).unwrap();
 
                 let secrets = SecretStore::new(&state_dir, SecretBackend::File);
-                for secret_name in ["telegram-bot-token", "slack-app-token", "slack-bot-token"] {
+                for secret_name in [
+                    "telegram-bot-token",
+                    "slack-app-token",
+                    "slack-bot-token",
+                    "sentry-auth-token",
+                    "google-client-secret",
+                    "google-refresh-token",
+                ] {
                     secrets
                         .set(secret_name, &format!("doc-test-secret-{secret_name}"))
                         .unwrap();

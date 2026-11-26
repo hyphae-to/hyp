@@ -402,10 +402,13 @@ async fn opencode_real_plugin_verifies_caller_drains_messages_and_feeds_tui_agai
              {script_body}\n",
             plugin = serde_json::to_string(generated_plugin.to_str().unwrap()).unwrap(),
         );
-        let out = Command::new("node")
+        let mut cmd = Command::new("node");
+        common::scrub_ambient_harness_env(&mut cmd);
+        let out = cmd
             .args(["--input-type=module", "-e", &script])
             .env("HOME", &home)
             .env("HYPHAE_SECRET_BACKEND", "file")
+            .env("HYPHAE_NO_SERVICE", "1")
             .output()
             .expect("run node plugin driver");
         assert!(
@@ -709,7 +712,9 @@ async fn opencode_real_plugin_verifies_caller_drains_messages_and_feeds_tui_agai
         tui = serde_json::to_string(tui_path.to_str().unwrap()).unwrap(),
         state = serde_json::to_string(ui_state_path.to_str().unwrap()).unwrap(),
     );
-    let tui_out = Command::new("node")
+    let mut tui_cmd = Command::new("node");
+    common::scrub_ambient_harness_env(&mut tui_cmd);
+    let tui_out = tui_cmd
         .args(["--input-type=module", "-e", &tui_script])
         .output()
         .expect("run node tui check");

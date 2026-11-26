@@ -26,6 +26,7 @@ use tempfile::TempDir;
 use tokio::sync::Notify;
 
 fn open_local_node(node_id: &str, dir: &Path) -> Arc<UnifiedNode> {
+    hyp_harness::enable_test_env_isolation();
     let mut cfg = NodeConfig::local(NodeId::new(node_id).unwrap(), dir);
     cfg.secret_backend = Some(SecretBackend::File);
     UnifiedNode::open(cfg).expect("open UnifiedNode")

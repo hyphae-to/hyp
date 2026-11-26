@@ -92,8 +92,7 @@ impl HookTransportHints {
     /// Captures transport environment variables from the current hook process.
     pub fn from_env() -> Self {
         let non_empty = |key: &str| {
-            std::env::var(key)
-                .ok()
+            crate::ambient_env_var(key)
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
         };
@@ -459,7 +458,7 @@ pub fn is_valid_session_token(raw: &str) -> bool {
 
 /// Reads and validates `HYPHAE_SESSION_TOKEN` from the current process environment.
 pub fn infer_session_token_from_env() -> Option<String> {
-    let raw = std::env::var("HYPHAE_SESSION_TOKEN").ok()?;
+    let raw = crate::ambient_env_var("HYPHAE_SESSION_TOKEN")?;
     let trimmed = raw.trim();
     if is_valid_session_token(trimmed) {
         Some(trimmed.to_string())
@@ -626,7 +625,7 @@ where
 
     if options.event == HookEvent::SessionStart {
         let claude_env_file = if options.harness == HarnessKind::Claude {
-            std::env::var_os("CLAUDE_ENV_FILE").filter(|v| !v.is_empty())
+            crate::ambient_env_var_os("CLAUDE_ENV_FILE").filter(|v| !v.is_empty())
         } else {
             None
         };
