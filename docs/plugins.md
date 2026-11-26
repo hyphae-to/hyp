@@ -12,7 +12,7 @@ Hyphae unifies event sources and chat bridges onto the single Rust `Node` CloudE
 
 | Layer | Implementation | Routing Model | Secrets Location | Best For |
 | --- | --- | --- | --- | --- |
-| **Compiled-In Rust Event Sources & Local Ingest** (`crates/hyp-node/src/adapters/`, `engine/local_ingest.rs`) | Pure Rust wired directly into `hyp node start` (`github-public`, `github-webhook`, `prometheus-webhook`, `webhook-stream`, plus default-enabled socket-only `localIngest` on `ingest.sock` / `ingest.addr`) — zero Node/Python needed | **1-to-many Pub/Sub** via standard `hyp_stream` with server-side CloudEvents filter pushdown (including `local.schedule` / `local.<topic>` triggered via `hyp emit` or raw NDJSON) | Node's `SecretStore` (`{ "secret": "<name>" }` in `node.json`) | Public or org **GitHub** streams (`github-public` ETag poller + `github-webhook`), **Prometheus Alertmanager v4**, signed **HTTP webhooks**, and OS-scheduled **Local Ingest & Cron triggers** |
+| **Compiled-In Rust Event Sources & Local Ingest** (`crates/hyp-node/src/adapters/`, `engine/local_ingest.rs`) | Pure Rust wired directly into `hyp node start` (`github-public`, `github-webhook`, plus default-enabled socket-only `localIngest` on `ingest.sock` / `ingest.addr`) — zero Node/Python needed | **1-to-many Pub/Sub** via standard `hyp_stream` with server-side CloudEvents filter pushdown (including `local.schedule` / `local.<topic>` triggered via `hyp emit` or raw NDJSON) | Node's `SecretStore` (`{ "secret": "<name>" }` in `node.json`) | Public or org **GitHub** streams (`github-public` ETag poller + `github-webhook`) and OS-scheduled **Local Ingest & Cron triggers** |
 | **External Subprocess Bridges & Custom Sources** (`plugins/`) | Optional self-contained scripts (`plugins/slack`, `plugins/telegram`, `plugins/whatsapp`, `plugins/webhook`, `plugins/prometheus`, or custom executables) supervised by `SubprocessSupervisor` (Unix fd 3 / Windows loopback TCP) | **Thread-owned + multi-thread fan-in + outbound replies** via `hyp_bridge` and `hyp_send({ to: "<plugin>:<target>", text })`; bridge topics stay **local-only by default** (`exposeTopic: true` opt-in) | Local machine's `SecretStore` — scrubbed subprocess env, never sent to remote hubs | Personal **Slack / Telegram / WhatsApp** bridges, local callbacks, and custom scripts in any language |
 
 ---
@@ -100,34 +100,9 @@ hyp secret set github-acme-token --web
 - **1 poller per distinct `owner/repo` + bounded rate-limit hardening**: Regardless of subscriber count, conditional `If-None-Match` polls returning `304 Not Modified` consume **0** GitHub API quota, adaptively back off on idle repos, enforce bounded backoff on HTTP `403`/`429` (`Retry-After` and `X-RateLimit-Remaining: 0` + `X-RateLimit-Reset`), cap concurrent active pollers at `maxActivePollers` (default `100`), and tear down after `graceWindowSeconds` when active subscribers drop to `0`.
 - **Private repo access**: On non-`publicReadOnly` local/private nodes, setting `"allowPrivateWithToken": true` permits watching a private repo **only** when `token_for_repo(repo)` resolves a matching token (unmatched orgs/private repos still fail closed!).
 
-### B. Compiled-In Pure-Rust Webhooks: `github-webhook`, `prometheus-webhook` & `webhook-stream` (`crates/hyp-node/src/adapters/webhooks.rs`)
+### B. GitHub repository webhooks
 
-All three webhook adapters are compiled in pure Rust and wired directly into `hyp node start` via `sources[]` in `node.json` — **zero Node.js or Python subprocess required**. Every adapter verifies signatures/auth in constant time (`ring::hmac`), enforces raw-body SHA-256 deduplication, and caps hub-relayed webhook deliveries at the `ExternalWebhook` trust tier:
-
-- **GitHub (`kind: "github-webhook"`, `com.github.*`)**: Requires `"secret": { "secret": "<name>" }` (`X-Hub-Signature-256`), supports optional `"allowedRepos"` / `"allowedOrgs"` allowlists, and emits `repo` (`"owner/repo"`), `source` (`"github.com/owner/repo"`), `type` (`"com.github.pull_request.opened"`, etc.), `action`, `actor`, and `subject` (`"pull/<n>"`, `"issues/<n>"`, `"actions/runs/<id>"`, `"refs/heads/<branch>"`).
-  - **Hub isolation recommendation:** On hubs that also enable self-service guest pairing (`guest-ro`, which grants `stream:subscribe=github[...]`), set **`"topic": "github-webhooks"`** on your private `github-webhook` source so internal/private repo webhook events stay strictly isolated from the public `"github"` topic!
-- **Prometheus Alertmanager v4 (`kind: "prometheus-webhook"`)**: Requires `"bearerToken"`, `"basicAuth"` (`{ "username": "...", "password": { "secret": "<name>" } }`), and/or `"webhookSecret"` via `{ "secret": "<name>" }`. Emits one CloudEvent per alert (`io.prometheus.alert.firing` / `io.prometheus.alert.resolved`) with `alertname`, `severity`, `service`, and `subject: "severity=<severity>/<alertname>"`.
-- **Generic Webhook (`kind: "webhook-stream"`)**: Constant-time HMAC-SHA256 verification via `{ "secret": "<name>" }` and CloudEvents v1.0 pass-through/wrapping.
-
-```json
-{
-  "sources": [
-    {
-      "id": "org-github",
-      "kind": "github-webhook",
-      "topic": "github-webhooks",
-      "secret": { "secret": "github-webhook-secret" },
-      "allowedOrgs": ["acme"]
-    },
-    {
-      "id": "prom-alerts",
-      "kind": "prometheus-webhook",
-      "topic": "alerts",
-      "bearerToken": { "secret": "prometheus-bearer-token" }
-    }
-  ]
-}
-```
+The `github-webhook` source runs inside `hyp` and verifies `X-Hub-Signature-256` with the configured SecretStore reference. It also supports `allowedRepos` and `allowedOrgs`. Normalized events carry `repo`, `source`, `type`, `action`, `actor`, and `subject`.
 
 #### Repository webhook setup
 
@@ -135,6 +110,52 @@ All three webhook adapters are compiled in pure Rust and wired directly into `hy
 2. Store a unique shared secret with `hyp secret set github-webhook-secret --web` on the node that runs the receiver. Reference it as `"secret": { "secret": "github-webhook-secret" }` and restart the node.
 3. Expose `POST /v1/webhooks/github/<id>` through your public HTTPS proxy or tunnel. Route only the webhook endpoint if the node also serves private peer or admin routes.
 4. In the repository's **Settings → Webhooks → Add webhook**, enter the public payload URL, for example `https://hooks.example.com/v1/webhooks/github/org-github`. Choose **application/json**, enter the same secret, and select the events to deliver. Check **Recent Deliveries** to verify GitHub reached the receiver.
+
+#### Webhook plugin migration
+
+`webhook` and `prometheus` handle generic signed webhooks and Alertmanager v4. On the receiver host, install the release-matched plugins with `hyp plugin install webhook --json` or `hyp plugin install prometheus --json`. The output supplies `data.nodePath` and `data.plugins[0].scriptPath` for `command` and `args`.
+
+```json
+{
+  "plugins": [
+    {
+      "id": "ci-events",
+      "kind": "source",
+      "command": "<nodePath>",
+      "args": ["<webhook scriptPath>"],
+      "targets": ["ci"],
+      "env": {
+        "WEBHOOK_SECRET": { "secret": "ci-webhook-secret" },
+        "WEBHOOK_LEGACY_NATIVE": "1"
+      }
+    },
+    {
+      "id": "prom-alerts",
+      "kind": "source",
+      "command": "<nodePath>",
+      "args": ["<prometheus scriptPath>"],
+      "targets": ["alerts"],
+      "env": {
+        "PROMETHEUS_BEARER_TOKEN": { "secret": "prometheus-bearer-token" },
+        "PROMETHEUS_LEGACY_NATIVE": "1"
+      }
+    }
+  ]
+}
+```
+
+Use the old source topic as the plugin target to keep subscriptions. Remove the retired `webhook-stream` or `prometheus-webhook` entry from `sources[]`. The node skips old entries and reports a migration warning at startup. Keep plugin topics local by default. On a team hub, set `exposeTopic: true` only when the intended peers already have or need grants for that private topic.
+
+| Former native setting | Plugin environment |
+| --- | --- |
+| Generic `secret`, `signatureHeader`, `maxBodyBytes` | `WEBHOOK_SECRET`, `WEBHOOK_SIGNATURE_HEADER`, `WEBHOOK_MAX_BODY_BYTES` |
+| Generic `defaultSource`, `defaultType` | `WEBHOOK_SOURCE`, `WEBHOOK_EVENT_TYPE` |
+| Alertmanager `bearerToken`, `webhookSecret`, `maxBodyBytes` | `PROMETHEUS_BEARER_TOKEN`, `PROMETHEUS_WEBHOOK_SECRET`, `PROMETHEUS_MAX_BODY_BYTES` |
+| Alertmanager `basicAuth` | `PROMETHEUS_BASIC_AUTH` references a SecretStore entry whose value is `username:password` |
+
+Use the migration flags shown above for existing sources. They preserve native event IDs and the generic native CloudEvents pass-through contract. New plugin entries can omit them. Retain signature and timestamp headers when forwarding.
+
+The default loopback targets are `http://127.0.0.1:8795/webhook` and `http://127.0.0.1:8793/alerts`. Set `WEBHOOK_PORT` / `WEBHOOK_PATH` or `PROMETHEUS_PORT` / `PROMETHEUS_PATH` when running multiple receivers. Update the sender or proxy to reach the new listener. For public callbacks, use [webhook routing setup](operations/deploying.md#public-webhook-routing) to preserve the existing HTTPS path or choose a new one. Send an authenticated test delivery and verify the event reaches the existing topic.
 
 ### C. `localIngest` — Default Socket-Only Local Event Ingest Route (`ingest.sock` & `hyp emit`)
 
@@ -340,7 +361,7 @@ All included `.mjs` scripts have zero external npm dependencies (**requires Node
 | [plugins/telegram/index.mjs](../plugins/telegram/index.mjs) | `bridge` | Telegram Bot API long polling + `sendMessage` | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS` / `TELEGRAM_ALLOWED_CHATS` *(numeric IDs)* |
 | [plugins/whatsapp/index.mjs](../plugins/whatsapp/index.mjs) | `bridge` | Meta WhatsApp Business Cloud API webhook (`X-Hub-Signature-256`) + Graph API | `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_ALLOWED_NUMBERS` |
 | [plugins/webhook/index.mjs](../plugins/webhook/index.mjs) | `source` *(or `bridge` when `WEBHOOK_POST_URL` is set)* | Local HTTP webhook receiver (`X-Webhook-Signature-256`) + optional `WEBHOOK_POST_URL` | `WEBHOOK_PORT`, `WEBHOOK_SECRET` (or `WEBHOOK_SECRET_FILE`); fails closed without auth unless `WEBHOOK_ALLOW_UNSIGNED=1` on **loopback only** |
-| [plugins/prometheus/index.mjs](../plugins/prometheus/index.mjs) | `source` | Standalone Alertmanager v4 webhook script (when not using compiled-in Rust `prometheus-webhook`) | `PROMETHEUS_PORT`, `PROMETHEUS_BEARER_TOKEN`, `PROMETHEUS_BASIC_AUTH`, and/or `PROMETHEUS_WEBHOOK_SECRET`; fails closed without auth unless `PROMETHEUS_ALLOW_UNSIGNED=1` on **loopback only** |
+| [plugins/prometheus/index.mjs](../plugins/prometheus/index.mjs) | `source` | Alertmanager v4 webhook receiver | `PROMETHEUS_PORT`, `PROMETHEUS_BEARER_TOKEN`, `PROMETHEUS_BASIC_AUTH`, and/or `PROMETHEUS_WEBHOOK_SECRET`; fails closed without auth unless `PROMETHEUS_ALLOW_UNSIGNED=1` on **loopback only** |
 
 > **Fail-closed auth & loopback-only unsigned opt-in:** Both `plugins/webhook/index.mjs` and `plugins/prometheus/index.mjs` refuse to boot without configured auth credentials. Setting **`WEBHOOK_ALLOW_UNSIGNED=1`** or **`PROMETHEUS_ALLOW_UNSIGNED=1`** permits unsigned local development traffic **strictly on loopback binds (`127.0.0.1` / `::1`)** — both plugins still fail closed and refuse to start unsigned on any non-loopback bind (such as `0.0.0.0`).
 

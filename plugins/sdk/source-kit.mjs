@@ -19,6 +19,13 @@ export function isLoopbackHost(host) {
   return LOOPBACK_HOSTS.has(String(host ?? "").trim().toLowerCase());
 }
 
+/** Advertise only an authenticated receiver, at its exact listener path. */
+export function answerWebhookReadiness(req, res, path, hasAuth) {
+  if (!hasAuth || req.method !== "OPTIONS" || (req.url ?? "").split("?")[0] !== path) return false;
+  res.writeHead(204, { "x-hyphae-webhook-receiver": "signed" }).end();
+  return true;
+}
+
 /** Reads `<NAME>_FILE` (trimmed file content) or `<NAME>`; returns "" when neither is set. */
 export function readSecretEnv(name) {
   const file = process.env[`${name}_FILE`]?.trim();
@@ -275,7 +282,7 @@ export function startWebhookServer({ prefix, name, defaultPort, defaultPath, max
     try {
       const requestPath = (req.url ?? "").split("?")[0];
       if (requestPath !== path) return reply(res, 404, { error: "not_found" });
-      if (req.method === "OPTIONS") return res.writeHead(204, { "x-hyphae-webhook-receiver": "signed" }).end();
+      if (answerWebhookReadiness(req, res, path, true)) return;
       if (req.method !== "POST") return reply(res, 404, { error: "not_found" });
       const chunks = [];
       let bytes = 0;
@@ -324,4 +331,25 @@ export function startWebhookServer({ prefix, name, defaultPort, defaultPath, max
       resolve({ server, port: bound.port, path });
     });
   });
+}
+
+// A null body exceeds the limit. An undefined body was interrupted.
+export async function readWebhookBody(req, maxBytes) {
+  const contentLength = Number(req.headers["content-length"]);
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    return null;
+  }
+  const chunks = [];
+  let bytes = 0;
+  try {
+    for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+      bytes += chunk.length;
+      if (bytes > maxBytes) return null;
+      chunks.push(chunk);
+    }
+  } catch {
+    // The sender disconnected before delivering the complete request.
+    return undefined;
+  }
+  return Buffer.concat(chunks);
 }

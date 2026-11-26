@@ -24,9 +24,8 @@ use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync};
 use hyp_node::adapters::github_public::normalize_repo_token_pattern;
 use hyp_node::adapters::supervisor::is_secret_like_env_key;
 use hyp_node::adapters::{
-    AdapterKind, GenericWebhookAdapter, GenericWebhookConfig, GitHubPublicAdapter,
-    GitHubPublicConfig, GitHubWebhookAdapter, GitHubWebhookConfig, PrometheusWebhookAdapter,
-    PrometheusWebhookConfig, SubprocessConfig,
+    AdapterKind, GitHubPublicAdapter, GitHubPublicConfig, GitHubWebhookAdapter,
+    GitHubWebhookConfig, SubprocessConfig,
 };
 use hyp_node::engine::config::{ForwardingPolicy, validate_trusted_proxy_cidr};
 use hyp_node::engine::{
@@ -690,7 +689,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             }
         }
 
-        // Parse `sources` entries (`github-public`, `github-webhook`, `prometheus-webhook`, `webhook-stream`).
+        // Parse GitHub polling and repository webhook sources.
         if let Some(sources_val) = cfg.raw.get("sources") {
             let public_read_only = cfg
                 .raw
@@ -734,7 +733,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                 }
             }
 
-            match parse_webhook_sources(sources_val, &secrets) {
+            match parse_webhook_sources(sources_val, &secrets, &mut startup_warnings) {
                 Ok(mut parsed) => {
                     filter_colliding_webhook_sources(
                         &mut parsed,
@@ -753,33 +752,6 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                             });
                         }
                     }
-                    for prom in &parsed.prometheus {
-                        if !node_cfg.topics.iter().any(|t| t.topic == prom.topic) {
-                            node_cfg.topics.push(TopicConfig {
-                                topic: prom.topic.clone(),
-                                kind: Some("prometheus-webhook".to_string()),
-                                description: Some(
-                                    "Prometheus Alertmanager webhook CloudEvents stream"
-                                        .to_string(),
-                                ),
-                                metadata: None,
-                                has_provisioned_publisher: true,
-                            });
-                        }
-                    }
-                    for gen_wh in &parsed.generic {
-                        if !node_cfg.topics.iter().any(|t| t.topic == gen_wh.topic) {
-                            node_cfg.topics.push(TopicConfig {
-                                topic: gen_wh.topic.clone(),
-                                kind: Some("webhook-stream".to_string()),
-                                description: Some(
-                                    "Generic signed webhook CloudEvents stream".to_string(),
-                                ),
-                                metadata: None,
-                                has_provisioned_publisher: true,
-                            });
-                        }
-                    }
                     webhook_sources = parsed;
                 }
                 Err(e) => {
@@ -789,10 +761,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                         EXIT_ERROR,
                         "CONFIG_ERROR",
                         format!("Invalid webhook source in {}: {e}", cfg.path.display()),
-                        Some(
-                            "Verify webhook sources[] in node.json use { \"secret\": \"<name>\" } references stored via `hyp secret set <name>`, never plaintext secrets."
-                                .to_string(),
-                        ),
+                        Some("Use SecretStore references for GitHub webhook sources.".to_string()),
                     );
                 }
             }
@@ -972,18 +941,6 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             node.attach_github_webhook(adapter)
                 .await
                 .map_err(|e| format!("Failed to attach github-webhook adapter: {e}"))?;
-        }
-        for prom_cfg in webhook_sources.prometheus {
-            let adapter = Arc::new(PrometheusWebhookAdapter::new(prom_cfg));
-            node.attach_prometheus_webhook(adapter)
-                .await
-                .map_err(|e| format!("Failed to attach prometheus-webhook adapter: {e}"))?;
-        }
-        for gen_cfg in webhook_sources.generic {
-            let adapter = Arc::new(GenericWebhookAdapter::new(gen_cfg));
-            node.attach_generic_webhook(adapter)
-                .await
-                .map_err(|e| format!("Failed to attach webhook-stream adapter: {e}"))?;
         }
 
         let guest_pairing_enabled = node.config().guest_pairing.enabled;
@@ -1730,8 +1687,6 @@ fn parse_secret_ref_name(val: &Value, field_name: &str) -> Result<Option<String>
 #[derive(Default)]
 struct ParsedWebhookSources {
     github: Vec<GitHubWebhookConfig>,
-    prometheus: Vec<PrometheusWebhookConfig>,
-    generic: Vec<GenericWebhookConfig>,
 }
 
 /// Guest topic collision guard: refuses (with a clear startup warning + skip) wiring any webhook
@@ -1759,28 +1714,6 @@ fn filter_colliding_webhook_sources(
         if let Some(reason) = collision_reason(&cfg.topic) {
             warnings.push(format!(
                 "Skipping github-webhook source '{}' on topic '{}': {reason}; configure a distinct private topic.",
-                cfg.id, cfg.topic
-            ));
-            false
-        } else {
-            true
-        }
-    });
-    parsed.prometheus.retain(|cfg| {
-        if let Some(reason) = collision_reason(&cfg.topic) {
-            warnings.push(format!(
-                "Skipping prometheus-webhook source '{}' on topic '{}': {reason}; configure a distinct private topic.",
-                cfg.id, cfg.topic
-            ));
-            false
-        } else {
-            true
-        }
-    });
-    parsed.generic.retain(|cfg| {
-        if let Some(reason) = collision_reason(&cfg.topic) {
-            warnings.push(format!(
-                "Skipping webhook-stream source '{}' on topic '{}': {reason}; configure a distinct private topic.",
                 cfg.id, cfg.topic
             ));
             false
@@ -2049,6 +1982,7 @@ fn parse_optional_string_vec(
 fn parse_webhook_sources(
     sources_val: &Value,
     secrets: &hyp_crypto::SecretStore,
+    warnings: &mut Vec<String>,
 ) -> Result<ParsedWebhookSources, String> {
     let arr = sources_val
         .as_array()
@@ -2056,8 +1990,6 @@ fn parse_webhook_sources(
 
     let mut out = ParsedWebhookSources::default();
     let mut gh_ids: HashSet<String> = HashSet::new();
-    let mut prom_ids: HashSet<String> = HashSet::new();
-    let mut gen_ids: HashSet<String> = HashSet::new();
 
     for entry in arr {
         let Some(obj) = entry.as_object() else {
@@ -2135,215 +2067,15 @@ fn parse_webhook_sources(
                 }
                 out.github.push(cfg);
             }
-            "prometheus-webhook" => {
-                let raw_id = obj
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("prometheus");
-                let id = validate_webhook_source_id(raw_id, "sources[prometheus-webhook].id")?;
-                if !prom_ids.insert(id.clone()) {
-                    return Err(format!("duplicate prometheus-webhook source id '{id}'"));
-                }
-                let topic = obj
-                    .get("topic")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("alerts")
-                    .to_string();
-                if !is_valid_topic(&topic) {
-                    return Err(format!(
-                        "invalid topic '{topic}' in prometheus-webhook source '{id}'"
-                    ));
-                }
-                let mut cfg = PrometheusWebhookConfig::new(id.clone(), topic);
-
-                if let Some(tok_val) = obj.get("bearerToken").or_else(|| obj.get("token")) {
-                    if let Some(secret_name) = parse_secret_ref_name(
-                        tok_val,
-                        &format!("sources[prometheus-webhook:'{id}'].bearerToken"),
-                    )? {
-                        let val = secrets.get(&secret_name).map_err(|e| {
-                            format!(
-                                "failed to load bearerToken secret '{secret_name}' for prometheus-webhook '{id}': {e}"
-                            )
-                        })?;
-                        if val.is_empty() {
-                            return Err(format!(
-                                "bearerToken secret '{secret_name}' for prometheus-webhook '{id}' must not be empty"
-                            ));
-                        }
-                        cfg.bearer_token = Some(val);
-                    }
-                }
-
-                if let Some(sec_val) = obj.get("secret").or_else(|| obj.get("webhookSecret")) {
-                    if let Some(secret_name) = parse_secret_ref_name(
-                        sec_val,
-                        &format!("sources[prometheus-webhook:'{id}'].webhookSecret"),
-                    )? {
-                        let val = secrets.get(&secret_name).map_err(|e| {
-                            format!(
-                                "failed to load webhookSecret '{secret_name}' for prometheus-webhook '{id}': {e}"
-                            )
-                        })?;
-                        if val.is_empty() {
-                            return Err(format!(
-                                "webhookSecret '{secret_name}' for prometheus-webhook '{id}' must not be empty"
-                            ));
-                        }
-                        cfg.webhook_secret = Some(val);
-                    }
-                }
-
-                if let Some(basic_val) = obj.get("basicAuth") {
-                    if !basic_val.is_null() {
-                        let b_obj = basic_val.as_object().ok_or_else(|| {
-                            format!(
-                                "sources[prometheus-webhook:'{id}'].basicAuth must be an object with 'username' and 'password': {{ \"secret\": \"<name>\" }}"
-                            )
-                        })?;
-                        let username = b_obj
-                            .get("username")
-                            .or_else(|| b_obj.get("user"))
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .ok_or_else(|| {
-                                format!(
-                                    "sources[prometheus-webhook:'{id}'].basicAuth requires non-empty 'username'"
-                                )
-                            })?;
-                        let pass_val = b_obj
-                            .get("password")
-                            .or_else(|| b_obj.get("pass"))
-                            .ok_or_else(|| {
-                                format!(
-                                    "sources[prometheus-webhook:'{id}'].basicAuth requires 'password': {{ \"secret\": \"<name>\" }}"
-                                )
-                            })?;
-                        let pass_name = parse_secret_ref_name(
-                            pass_val,
-                            &format!("sources[prometheus-webhook:'{id}'].basicAuth.password"),
-                        )?
-                        .ok_or_else(|| {
-                            format!(
-                                "sources[prometheus-webhook:'{id}'].basicAuth.password must be {{ \"secret\": \"<name>\" }}"
-                            )
-                        })?;
-                        let pass = secrets.get(&pass_name).map_err(|e| {
-                            format!(
-                                "failed to load basicAuth password secret '{pass_name}' for prometheus-webhook '{id}': {e}"
-                            )
-                        })?;
-                        if pass.is_empty() {
-                            return Err(format!(
-                                "basicAuth password secret '{pass_name}' for prometheus-webhook '{id}' must not be empty"
-                            ));
-                        }
-                        cfg.basic_auth = Some((username.to_string(), pass));
-                    }
-                }
-
-                if !cfg.has_auth_configured() {
-                    return Err(format!(
-                        "sources[prometheus-webhook:'{id}'] requires bearerToken, basicAuth, or webhookSecret via {{ \"secret\": \"<name>\" }}"
-                    ));
-                }
-
-                if let Some(max_b) = obj.get("maxBodyBytes").and_then(Value::as_u64) {
-                    if max_b == 0 {
-                        return Err(format!(
-                            "sources[prometheus-webhook:'{id}'].maxBodyBytes must be >= 1"
-                        ));
-                    }
-                    cfg.max_body_bytes = usize::try_from(max_b).unwrap_or(usize::MAX);
-                }
-                out.prometheus.push(cfg);
-            }
-            "webhook-stream" => {
-                let fallback_id = obj
-                    .get("topic")
-                    .and_then(Value::as_str)
-                    .unwrap_or("webhook");
-                let raw_id = obj.get("id").and_then(Value::as_str).unwrap_or(fallback_id);
-                let id = validate_webhook_source_id(raw_id, "sources[webhook-stream].id")?;
-                if !gen_ids.insert(id.clone()) {
-                    return Err(format!("duplicate webhook-stream source id '{id}'"));
-                }
-                let topic = obj
-                    .get("topic")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(id.as_str())
-                    .to_string();
-                if !is_valid_topic(&topic) {
-                    return Err(format!(
-                        "invalid topic '{topic}' in webhook-stream source '{id}'"
-                    ));
-                }
-                let secret_val = obj
-                    .get("secret")
-                    .or_else(|| obj.get("webhookSecret"))
-                    .ok_or_else(|| {
-                        format!(
-                            "sources[webhook-stream:'{id}'] requires 'secret': {{ \"secret\": \"<name>\" }}"
-                        )
-                    })?;
-                let secret_name = parse_secret_ref_name(
-                    secret_val,
-                    &format!("sources[webhook-stream:'{id}'].secret"),
-                )?
-                .ok_or_else(|| {
-                    format!(
-                        "sources[webhook-stream:'{id}'] requires non-null 'secret': {{ \"secret\": \"<name>\" }}"
-                    )
-                })?;
-                let secret = secrets.get(&secret_name).map_err(|e| {
-                    format!("failed to load secret '{secret_name}' for webhook-stream '{id}': {e}")
-                })?;
-                if secret.is_empty() {
-                    return Err(format!(
-                        "secret '{secret_name}' for webhook-stream '{id}' must not be empty"
-                    ));
-                }
-                let mut cfg = GenericWebhookConfig::new(id.clone(), topic);
-                cfg.secret = Some(secret);
-                if let Some(hdr) = obj
-                    .get("signatureHeader")
-                    .or_else(|| obj.get("header"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    cfg.signature_header = hdr.to_ascii_lowercase();
-                }
-                if let Some(src) = obj
-                    .get("defaultSource")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    cfg.default_source = src.to_string();
-                }
-                if let Some(ty) = obj
-                    .get("defaultType")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    cfg.default_type = ty.to_string();
-                }
-                if let Some(max_b) = obj.get("maxBodyBytes").and_then(Value::as_u64) {
-                    if max_b == 0 {
-                        return Err(format!(
-                            "sources[webhook-stream:'{id}'].maxBodyBytes must be >= 1"
-                        ));
-                    }
-                    cfg.max_body_bytes = usize::try_from(max_b).unwrap_or(usize::MAX);
-                }
-                out.generic.push(cfg);
+            "prometheus-webhook" | "webhook-stream" => {
+                let plugin = if kind == "prometheus-webhook" {
+                    "prometheus"
+                } else {
+                    "webhook"
+                };
+                warnings.push(format!(
+                    "Skipping retired source kind '{kind}'. Run `hyp plugin install {plugin} --json` and migrate this source to plugins[]. See https://github.com/hyphae-to/hyp/blob/main/docs/plugins.md#webhook-plugin-migration."
+                ));
             }
             _ => {}
         }
@@ -3752,8 +3484,6 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let secrets = SecretStore::new(tmp.path(), SecretBackend::File);
         secrets.set("gh-hook-sec", "gh-secret-value").unwrap();
-        secrets.set("prom-pass", "prom-basic-pass").unwrap();
-        secrets.set("ci-hook-sec", "ci-hmac-secret").unwrap();
 
         let sources = json!([
             {
@@ -3762,33 +3492,14 @@ mod tests {
                 "topic": "github",
                 "secret": { "secret": "gh-hook-sec" },
                 "allowedRepos": ["acme/app"]
-            },
-            {
-                "kind": "prometheus-webhook",
-                "id": "prom-ops",
-                "topic": "alerts",
-                "basicAuth": {
-                    "username": "alertmanager",
-                    "password": { "secret": "prom-pass" }
-                }
-            },
-            {
-                "kind": "webhook-stream",
-                "id": "ci-events",
-                "topic": "ci",
-                "secret": { "secret": "ci-hook-sec" },
-                "signatureHeader": "X-CI-Sig-256"
             }
         ]);
-        let parsed = parse_webhook_sources(&sources, &secrets).expect("valid webhook sources");
+        let mut warnings = Vec::new();
+        let parsed = parse_webhook_sources(&sources, &secrets, &mut warnings)
+            .expect("valid webhook sources");
         assert_eq!(parsed.github.len(), 1);
         assert_eq!(parsed.github[0].id, "gh-main");
         assert_eq!(parsed.github[0].allowed_repos, vec!["acme/app"]);
-        assert_eq!(parsed.prometheus.len(), 1);
-        assert!(parsed.prometheus[0].has_auth_configured());
-        assert_eq!(parsed.generic.len(), 1);
-        assert_eq!(parsed.generic[0].signature_header, "x-ci-sig-256");
-
         // Plaintext secret MUST fail closed.
         let plaintext = json!([
             {
@@ -3798,17 +3509,27 @@ mod tests {
                 "secret": "hardcoded-plaintext-secret"
             }
         ]);
-        assert!(parse_webhook_sources(&plaintext, &secrets).is_err());
+        assert!(parse_webhook_sources(&plaintext, &secrets, &mut warnings).is_err());
 
-        // Unauthenticated Prometheus webhook MUST fail closed.
-        let unauth_prom = json!([
-            {
-                "kind": "prometheus-webhook",
-                "id": "prom-bad",
-                "topic": "alerts"
-            }
-        ]);
-        assert!(parse_webhook_sources(&unauth_prom, &secrets).is_err());
+        for (kind, plugin) in [
+            ("prometheus-webhook", "prometheus"),
+            ("webhook-stream", "webhook"),
+        ] {
+            let enabled = json!([{ "kind": kind, "id": "configured" }]);
+            warnings.clear();
+            assert!(
+                parse_webhook_sources(&enabled, &secrets, &mut warnings)
+                    .unwrap()
+                    .github
+                    .is_empty()
+            );
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains(&format!("hyp plugin install {plugin} --json")));
+            let disabled = json!([{ "kind": kind, "id": "configured", "enabled": false }]);
+            warnings.clear();
+            assert!(parse_webhook_sources(&disabled, &secrets, &mut warnings).is_ok());
+            assert!(warnings.is_empty());
+        }
     }
 
     #[test]
@@ -3909,16 +3630,12 @@ mod tests {
                 GitHubWebhookConfig::new("gh-public-collide", "github", "sec1"),
                 GitHubWebhookConfig::new("gh-private", "github-private", "sec2"),
             ],
-            prometheus: vec![PrometheusWebhookConfig::new("prom-collide", "github")],
-            generic: vec![GenericWebhookConfig::new("gen-ok", "ci")],
         };
         let mut warnings = Vec::new();
         filter_colliding_webhook_sources(&mut parsed, true, Some("github"), &mut warnings);
         assert_eq!(parsed.github.len(), 1);
         assert_eq!(parsed.github[0].id, "gh-private");
-        assert!(parsed.prometheus.is_empty());
-        assert_eq!(parsed.generic.len(), 1);
-        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings.len(), 1);
     }
 
     #[test]
@@ -4323,6 +4040,8 @@ mod tests {
             "slack-app-token",
             "slack-bot-token",
             "sentry-auth-token",
+            "ci-webhook-secret",
+            "prometheus-bearer-token",
             "google-client-secret",
             "google-refresh-token",
         ] {

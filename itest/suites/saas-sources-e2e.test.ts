@@ -1,8 +1,7 @@
 /**
  * Phase 3 Black-Box End-to-End Integration Suite:
- *  - Section A: Compiled-in Rust event sources (`github-public`, `github-webhook`,
- *    `prometheus-webhook` vs `plugins/prometheus` differential parity,
- *    `webhook-stream` vs `plugins/webhook` bidirectional parity, `localIngest` / `hyp emit`)
+ *  - Section A: GitHub polling and repository webhooks, the Alertmanager and generic
+ *    webhook plugins, and localIngest / hyp emit
  *    wired end-to-end into a REAL Claude Code harness (`claude -p`) via `llm-shim`.
  *  - Section B: All 6 SaaS source plugin wire-mock protocol & fault-injection self-tests
  *    (always run on `main`) + full black-box E2E tests (including B1, B3, Notion handshake
@@ -625,14 +624,14 @@ test("Sources E2E — github-webhook: valid HMAC -> Claude, 1-bit flip 401, non-
   });
 });
 
-test("Sources E2E — prometheus-webhook (Rust) vs plugins/prometheus (Node) differential parity + 401/413 + Blind Spot B1 probe", async (t) => {
+test("Sources E2E — Prometheus plugin: signed delivery, bearer or basic auth, body cap, and local wakes", async (t) => {
   const claudeBin = resolveClaudeBin();
   if (!claudeBin) {
     t.skip("claude binary not found (set CLAUDE_BIN)");
     return;
   }
 
-  await withSandbox("source-prom-differential-e2e", async (sandbox) => {
+  await withSandbox("source-prom-e2e", async (sandbox) => {
     const hyp = new HypCli(sandbox);
     await hyp.onboard({ nodeId: "prom-itest@local", noSkills: true, noCommands: true });
 
@@ -641,28 +640,17 @@ test("Sources E2E — prometheus-webhook (Rust) vs plugins/prometheus (Node) dif
     const promBasicPass = "prom-basic-pass-222";
     const promHmac = "prom-hmac-secret-333";
     await hyp.secretSet("prom-bearer", promBearer);
-    await hyp.secretSet("prom-basic-pass", promBasicPass);
+    await hyp.secretSet("prom-basic-auth", `prom:${promBasicPass}`);
     await hyp.secretSet("prom-hmac", promHmac);
 
-    const bindPort = await getFreePort();
     const nodePromPort = await getFreePort();
 
     writeNodeJson(hyp, {
       v: 2,
       nodeId: "prom-itest@local",
       profile: "p2p",
-      bind: `127.0.0.1:${bindPort}`,
+      bind: "127.0.0.1:0",
       stateDir: sandbox.paths.hyphaeStateDir,
-      sources: [
-        {
-          kind: "prometheus-webhook",
-          id: "prom-rust",
-          topic: "alerts-rust",
-          bearerToken: { secret: "prom-bearer" },
-          basicAuth: { username: "prom", password: { secret: "prom-basic-pass" } },
-          webhookSecret: { secret: "prom-hmac" },
-        },
-      ],
       plugins: [
         {
           id: "prometheus",
@@ -675,9 +663,9 @@ test("Sources E2E — prometheus-webhook (Rust) vs plugins/prometheus (Node) dif
             PROMETHEUS_PORT: String(nodePromPort),
             PROMETHEUS_PATH: "/alerts",
             PROMETHEUS_TOPIC: "alerts-node",
-            // ISSUE #42: plugins/prometheus requires both Bearer AND Basic if both are set;
-            // configure Bearer + HMAC here until Bearer-OR-Basic parity lands.
             PROMETHEUS_BEARER_TOKEN: { secret: "prom-bearer" },
+            PROMETHEUS_BASIC_AUTH: { secret: "prom-basic-auth" },
+            PROMETHEUS_LEGACY_NATIVE: "1",
             PROMETHEUS_WEBHOOK_SECRET: { secret: "prom-hmac" },
           },
         },
@@ -685,7 +673,6 @@ test("Sources E2E — prometheus-webhook (Rust) vs plugins/prometheus (Node) dif
     });
 
     await hyp.startDaemon();
-    const rustUrl = `http://127.0.0.1:${bindPort}/v1/webhooks/prometheus/prom-rust`;
     const nodeUrl = `http://127.0.0.1:${nodePromPort}/alerts`;
 
     await waitUntil(async () => {
@@ -697,10 +684,6 @@ test("Sources E2E — prometheus-webhook (Rust) vs plugins/prometheus (Node) dif
       }
     }, "node prometheus plugin /health", 15_000);
 
-    // Subscribe two peers to `local.alerts-node`:
-    //  - `nodeSubPeer` with default `coalesceSeconds: 0` (probes Blind Spot B1 directly)
-    //  - `nodeCoalescePeer` with `coalesceSeconds: 1` (receives Node CloudEvents on 1s batch close
-    //    so we can differentially compare Rust vs Node CloudEvent structure even if B1 affects `0`!)
     const nodeSubPeer = await hyp.openPeer("prom-node-sub");
     const subNodeRes = await nodeSubPeer.client.callTool("hyp_stream", {
       action: "subscribe",
@@ -735,9 +718,9 @@ test("Sources E2E — prometheus-webhook (Rust) vs plugins/prometheus (Node) dif
     shim.auditors.registerUntrustedPayload("prom-fire", "fp-prom-diff-1:firing:");
     shim.auditors.registerUntrustedPayload("prom-res", "fp-prom-diff-2:resolved:");
 
-    let subRustOk = false;
+    let subOk = false;
     let sawFiringAndResolved = false;
-    let rustInboxJson: any = null;
+    let claudeInbox: unknown = null;
 
     shim.script("prom-claude", [
       coreToolSearchRule(false),
@@ -748,13 +731,13 @@ test("Sources E2E — prometheus-webhook (Rust) vs plugins/prometheus (Node) dif
         do: (req) => callTool(req, "hyp_mesh", { action: "join", handle: "prom-agent" }),
       },
       {
-        name: "sub-rust-alerts",
+        name: "sub-alerts",
         once: true,
         when: (req) => req.lastToolResult("hyp_mesh")?.json?.handle === "prom-agent",
         do: (req) =>
           callTool(req, "hyp_stream", {
             action: "subscribe",
-            topic: "local.alerts-rust",
+            topic: "local.alerts-node",
             mode: "queue",
           }),
       },
@@ -763,7 +746,7 @@ test("Sources E2E — prometheus-webhook (Rust) vs plugins/prometheus (Node) dif
         once: true,
         when: (req) => {
           const r = req.lastToolResult("hyp_stream");
-          if (r && !r.isError) subRustOk = true;
+          if (r && !r.isError) subOk = true;
           return Boolean(r && !r.isError);
         },
         do: () => emitText("PROM_SUBSCRIBED"),
@@ -774,12 +757,12 @@ test("Sources E2E — prometheus-webhook (Rust) vs plugins/prometheus (Node) dif
         when: (req) =>
           req.anyMessageContains(alertSummary) && req.anyMessageContains(resolvedSummary),
         do: (req) => {
-          rustInboxJson = req.lastToolResult("hyp_inbox")?.json ?? req.lastToolResult("hyp_inbox")?.text;
+          claudeInbox = req.lastToolResult("hyp_inbox")?.json ?? req.lastToolResult("hyp_inbox")?.text;
           sawFiringAndResolved = true;
           return emitText("PROM_ALERTS_RECEIVED");
         },
       },
-      pullInboxOnNotifyRule("pull-prom-inbox", "local.alerts-rust"),
+      pullInboxOnNotifyRule("pull-prom-inbox", "local.alerts-node"),
       {
         name: "ack-waiter-prompt",
         when: (req) => req.lastUserText.includes("no background waiter is running yet"),
@@ -798,7 +781,7 @@ test("Sources E2E — prometheus-webhook (Rust) vs plugins/prometheus (Node) dif
     const sessionUuid = crypto.randomUUID();
     const r1 = await claude.runPrint("ENROLL_PROM", { sessionId: sessionUuid, maxTurns: 8 });
     assert.equal(r1.exitCode, 0);
-    assert.equal(subRustOk, true);
+    assert.equal(subOk, true);
 
     const alertPayload = buildAlertmanagerPayload([
       {
@@ -819,11 +802,10 @@ test("Sources E2E — prometheus-webhook (Rust) vs plugins/prometheus (Node) dif
       },
     ]);
 
-    // 1. Differential negative security checks on BOTH Rust adapter and Node plugin:
-    for (const [label, targetUrl] of [
-      ["rust prometheus-webhook", rustUrl],
-      ["node plugins/prometheus", nodeUrl],
-    ] as const) {
+    // Reject invalid signatures and oversized bodies.
+    {
+      const label = "Prometheus plugin";
+      const targetUrl = nodeUrl;
       const wrongBearer = await sendAlertmanagerWebhook(targetUrl, {
         payload: alertPayload,
         bearerToken: "wrong-token",
@@ -847,21 +829,21 @@ test("Sources E2E — prometheus-webhook (Rust) vs plugins/prometheus (Node) dif
       assert.equal(oversized.status, 413, `${label}: >1 MiB body must return 413`);
     }
 
-    // Also test wrong Basic auth -> 401 on Rust adapter!
-    const wrongBasic = await sendAlertmanagerWebhook(rustUrl, {
+    // Also test wrong Basic auth also fails.
+    const wrongBasic = await sendAlertmanagerWebhook(nodeUrl, {
       payload: alertPayload,
       basicAuth: { user: "prom", pass: "wrong-pass" },
       hmacSecret: promHmac,
     });
-    assert.equal(wrongBasic.status, 401, "rust prometheus-webhook wrong Basic auth must return 401");
+    assert.equal(wrongBasic.status, 401, "Prometheus plugin wrong Basic auth must return 401");
 
-    // 2. Send IDENTICAL firing + resolved Alertmanager v4 payload to BOTH Rust and Node!
-    const rustOk = await sendAlertmanagerWebhook(rustUrl, {
+    // Both configured authorization schemes accept the same signed alert batch.
+    const basicOk = await sendAlertmanagerWebhook(nodeUrl, {
       payload: alertPayload,
       basicAuth: { user: "prom", pass: promBasicPass },
       hmacSecret: promHmac,
     });
-    assert.ok(rustOk.status === 200 || rustOk.status === 202, `rust prom failed: ${rustOk.status} ${rustOk.text}`);
+    assert.equal(basicOk.status, 200, basicOk.text);
 
     const nodeOk = await sendAlertmanagerWebhook(nodeUrl, {
       payload: alertPayload,
@@ -871,7 +853,7 @@ test("Sources E2E — prometheus-webhook (Rust) vs plugins/prometheus (Node) dif
     assert.equal(nodeOk.status, 200, `node prom failed: ${nodeOk.status} ${nodeOk.text}`);
     assert.equal(nodeOk.json?.alerts, 2, "node prometheus plugin must ack both alerts");
 
-    // 3. Verify real Claude receives firing + resolved alerts from Rust adapter.
+    // 3. Verify real Claude receives firing + resolved alerts from the plugin.
     const r2 = await claude.runPrint("CHECK_PROM_ALERTS", {
       sessionId: sessionUuid,
       resume: true,
@@ -880,56 +862,18 @@ test("Sources E2E — prometheus-webhook (Rust) vs plugins/prometheus (Node) dif
     assert.equal(r2.exitCode, 0);
     assert.equal(sawFiringAndResolved, true, "Claude must receive both firing and resolved Alertmanager alerts");
 
-    // 4. Probe local session inbox for `plugins/prometheus` (`kind: "source"`):
-    //    - `nodeSubPeer` (`coalesceSeconds: 0`) checks Blind Spot B1 directly!
-    //    - `nodeCoalescePeer` (`coalesceSeconds: 1`) receives the CloudEvents after 1s batch close
-    //      so we can differentially compare Rust vs Node CloudEvent payloads!
-    await new Promise((r) => setTimeout(r, 300));
-    const nodeInbox = await nodeSubPeer.inbox({ ack: true });
-    const nodeInboxText = JSON.stringify(nodeInbox);
-    const b1Observed = !nodeInboxText.includes(alertSummary);
-    if (!b1Observed) {
-      assert.ok(nodeInboxText.includes(resolvedSummary), "node prometheus must deliver resolved alert too");
+    // Immediate and coalesced subscribers both receive complete externally sourced events.
+    for (const peer of [nodeSubPeer, nodeCoalescePeer]) {
+      const inbox = await waitUntil(async () => {
+        const box = await peer.inbox({ ack: false });
+        const text = JSON.stringify(box);
+        return text.includes(alertSummary) && text.includes(resolvedSummary) ? text : false;
+      }, "Prometheus plugin local delivery", 5_000, 150);
+      assert.ok(inbox.includes("HighP99Latency"));
+      assert.ok(inbox.includes("io.prometheus.alert.firing"));
+      assert.ok(inbox.includes("external-webhook"));
     }
-
-    // Wait for `coalesceSeconds: 1` batch window to close & flush for `nodeCoalescePeer`, then
-    // verify differential CloudEvent content parity between Rust `prometheus-webhook` and Node `plugins/prometheus`!
-    const nodeCoalescedText = await waitUntil(async () => {
-      const box = await nodeCoalescePeer.inbox({ ack: true });
-      const text = JSON.stringify(box);
-      return text.includes(alertSummary) ? text : false;
-    }, "node plugins/prometheus coalesced delivery", 5_000, 150);
-
-    assert.ok(nodeCoalescedText.includes(alertSummary), "node prometheus must carry firing summary");
-    assert.ok(nodeCoalescedText.includes(resolvedSummary), "node prometheus must carry resolved summary");
-    assert.ok(nodeCoalescedText.includes("HighP99Latency"), "node prometheus must carry alertname");
-    assert.ok(JSON.stringify(rustInboxJson).includes("HighP99Latency"), "rust prometheus must carry alertname");
-
-    // Differential CloudEvent field inspection: Rust `prometheus-webhook` stamps top-level
-    // `alertname`, `severity`, `service`, and `hyphaesourcekind: "external-webhook"` extensions.
-    const rustInboxStr = JSON.stringify(rustInboxJson);
-    assert.ok(
-      rustInboxStr.includes("external-webhook"),
-      "Rust prometheus-webhook CloudEvent must carry hyphaesourcekind=external-webhook",
-    );
-    // ISSUE #41 & ISSUE #38: Differential parity + Security Gate provenance gaps on `main`:
-    //  - ISSUE #41: `plugins/prometheus/index.mjs:272-281` omits top-level `alertname`, `severity`,
-    //    `service` CloudEvent extensions (breaking `hyp_stream` filter ASTs on those fields vs Rust).
-    //  - ISSUE #38: `crates/hyp-cli/src/node_cmd.rs:3090-3107` (`NodePluginHost::publish_event`) omits
-    //    `hyphaesourcekind = "external-webhook"` on subprocess `kind: "source"` CloudEvents, so
-    //    `value_indicates_external_webhook` does not cap their trust tier to `ExternalWebhook`.
-    if (nodeCoalescedText.includes("external-webhook")) {
-      assert.ok(nodeCoalescedText.includes("io.prometheus.alert.firing"));
-    }
-
-    if (b1Observed) {
-      // ISSUE #39: Blind Spot B1 reproduced live on `main` (`crates/hyp-cli/src/node_cmd.rs:3090-3128`):
-      // `NodePluginHost::publish_event` calls `node.publish_event(&qualified, event)` for `kind: "source"`
-      // plugins WITHOUT calling `node.deliver_local_topic_batches(topic, ...)`, so `nodeSubPeer`
-      // (`coalesceSeconds: 0` default) received 0 items while `nodeCoalescePeer` (`coalesceSeconds: 1`)
-      // received both alerts on the next `db.tick()` batch close!
-      assert.equal(b1Observed, true);
-    }
+    assert.ok(JSON.stringify(claudeInbox).includes("HighP99Latency"));
 
     await nodeCoalescePeer.close();
     await nodeSubPeer.close();
@@ -937,14 +881,14 @@ test("Sources E2E — prometheus-webhook (Rust) vs plugins/prometheus (Node) dif
   });
 });
 
-test("Sources E2E — webhook-stream (Rust) vs plugins/webhook (Node) bidirectional differential parity + 401/expired-ts/413 + outbound HMAC callback", async (t) => {
+test("Sources E2E — webhook plugin: signed source events, expiry and body caps, and outbound bridge callbacks", async (t) => {
   const claudeBin = resolveClaudeBin();
   if (!claudeBin) {
     t.skip("claude binary not found (set CLAUDE_BIN)");
     return;
   }
 
-  await withSandbox("source-webhook-differential-e2e", async (sandbox) => {
+  await withSandbox("source-webhook-e2e", async (sandbox) => {
     const hyp = new HypCli(sandbox);
     await hyp.onboard({ nodeId: "whdiff-itest@local", noSkills: true, noCommands: true });
 
@@ -955,24 +899,30 @@ test("Sources E2E — webhook-stream (Rust) vs plugins/webhook (Node) bidirectio
     const callbackServer = await WebhookCallbackServer.start({ secret: whSecret });
     sandbox.onTeardown(() => callbackServer.close());
 
-    const bindPort = await getFreePort();
+    const sourcePort = await getFreePort();
     const nodeWhPort = await getFreePort();
 
     writeNodeJson(hyp, {
       v: 2,
       nodeId: "whdiff-itest@local",
       profile: "p2p",
-      bind: `127.0.0.1:${bindPort}`,
+      bind: "127.0.0.1:0",
       stateDir: sandbox.paths.hyphaeStateDir,
-      sources: [
-        {
-          kind: "webhook-stream",
-          id: "wh-rust",
-          topic: "wh-rust",
-          secret: { secret: "wh-diff-secret" },
-        },
-      ],
       plugins: [
+        {
+          id: "webhook-source",
+          kind: "source",
+          command: nodePath,
+          args: [scriptPath],
+          targets: ["wh-source"],
+          env: {
+            WEBHOOK_PORT: String(sourcePort),
+            WEBHOOK_PATH: "/webhook-source",
+            WEBHOOK_TARGET: "wh-source",
+            WEBHOOK_SECRET: { secret: "wh-diff-secret" },
+            WEBHOOK_LEGACY_NATIVE: "1",
+          },
+        },
         {
           id: "webhook",
           kind: "bridge",
@@ -992,14 +942,14 @@ test("Sources E2E — webhook-stream (Rust) vs plugins/webhook (Node) bidirectio
     });
 
     await hyp.startDaemon();
-    const rustUrl = `http://127.0.0.1:${bindPort}/v1/webhooks/stream/wh-rust`;
+    const sourceUrl = `http://127.0.0.1:${sourcePort}/webhook-source`;
     const nodeUrl = `http://127.0.0.1:${nodeWhPort}/webhook`;
 
     // Wait for node webhook HTTP server to listen (404 on GET /webhook proves server is up).
     await waitUntil(async () => {
       try {
-        const r = await fetch(nodeUrl);
-        return r.status === 404;
+        const ready = await Promise.all([fetch(nodeUrl), fetch(sourceUrl)]);
+        return ready.every((response) => response.status === 404);
       } catch {
         return false;
       }
@@ -1014,9 +964,9 @@ test("Sources E2E — webhook-stream (Rust) vs plugins/webhook (Node) bidirectio
       },
     });
 
-    const rustMarker = "WH_RUST_PAYLOAD_601";
+    const sourceMarker = "WH_SOURCE_PAYLOAD_601";
     const nodeMarker = "WH_NODE_PAYLOAD_602";
-    shim.auditors.registerUntrustedPayload("wh-rust-ev", rustMarker);
+    shim.auditors.registerUntrustedPayload("wh-source-ev", sourceMarker);
     shim.auditors.registerUntrustedPayload("wh-node-ev", nodeMarker);
 
     let subOk = false;
@@ -1032,13 +982,13 @@ test("Sources E2E — webhook-stream (Rust) vs plugins/webhook (Node) bidirectio
         do: (req) => callTool(req, "hyp_mesh", { action: "join", handle: "whdiff-agent" }),
       },
       {
-        name: "sub-rust",
+        name: "sub-source",
         once: true,
         when: (req) => req.lastToolResult("hyp_mesh")?.json?.handle === "whdiff-agent",
         do: (req) =>
           callTool(req, "hyp_stream", {
             action: "subscribe",
-            topic: "local.wh-rust",
+            topic: "local.wh-source",
             mode: "queue",
           }),
       },
@@ -1066,11 +1016,11 @@ test("Sources E2E — webhook-stream (Rust) vs plugins/webhook (Node) bidirectio
       {
         name: "reply-via-webhook-bridge",
         once: true,
-        when: (req) => req.anyMessageContains(rustMarker) && req.anyMessageContains(nodeMarker),
+        when: (req) => req.anyMessageContains(sourceMarker) && req.anyMessageContains(nodeMarker),
         do: (req) =>
           callTool(req, "hyp_send", {
             to: "webhook:ops",
-            text: `WH_CALLBACK_ACK:${rustMarker}+${nodeMarker}`,
+            text: `WH_CALLBACK_ACK:${sourceMarker}+${nodeMarker}`,
           }),
       },
       pullInboxOnNotifyRule("pull-wh-both-inbox"),
@@ -1105,10 +1055,10 @@ test("Sources E2E — webhook-stream (Rust) vs plugins/webhook (Node) bidirectio
     assert.equal(subOk, true);
     assert.equal(linkOk, true);
 
-    // 1. Differential security guards on BOTH Rust `webhook-stream` and Node `plugins/webhook`:
+    // 1. Security guards on both plugin receiver modes:
     for (const [label, targetUrl] of [
-      ["rust webhook-stream", rustUrl],
-      ["node plugins/webhook", nodeUrl],
+      ["source webhook plugin", sourceUrl],
+      ["bridge webhook plugin", nodeUrl],
     ] as const) {
       const badHmac = await sendGenericWebhook(targetUrl, {
         payload: { text: "bad-sig" },
@@ -1134,12 +1084,22 @@ test("Sources E2E — webhook-stream (Rust) vs plugins/webhook (Node) bidirectio
     }
 
     // 2. Send valid signed webhooks with fresh timestamp to BOTH!
-    const rustOk = await sendGenericWebhook(rustUrl, {
-      payload: { type: "ci.deploy", source: "ci/rust", text: rustMarker },
+    const sourceOk = await sendGenericWebhook(sourceUrl, {
+      payload: {
+        specversion: "1.0",
+        id: "discard-sender-id",
+        type: "ci.deploy",
+        source: "ci/source",
+        subject: "service/ci",
+        time: "2026-11-24T14:00:00Z",
+        data: { text: sourceMarker },
+      },
       secret: whSecret,
       timestamp: "now",
     });
-    assert.ok(rustOk.status === 200 || rustOk.status === 202, `rust webhook failed: ${rustOk.status} ${rustOk.text}`);
+    assert.equal(sourceOk.status, 202, sourceOk.text);
+    assert.match(sourceOk.json?.id, /^wh-[a-f0-9]{64}$/);
+    assert.notEqual(sourceOk.json?.id, "discard-sender-id");
 
     const nodeOk = await sendGenericWebhook(nodeUrl, {
       payload: { type: "ci.deploy", source: "ci/node", text: nodeMarker },
@@ -1159,7 +1119,7 @@ test("Sources E2E — webhook-stream (Rust) vs plugins/webhook (Node) bidirectio
 
     // 4. Verify outbound callback reached `WEBHOOK_POST_URL` with valid HMAC-SHA256!
     const cb = await callbackServer.waitForCallback(
-      (c) => c.json?.text === `WH_CALLBACK_ACK:${rustMarker}+${nodeMarker}`,
+      (c) => c.json?.text === `WH_CALLBACK_ACK:${sourceMarker}+${nodeMarker}`,
       10_000,
     );
     assert.equal(cb.signatureValid, true, "outbound webhook callback MUST carry valid X-Webhook-Signature-256");

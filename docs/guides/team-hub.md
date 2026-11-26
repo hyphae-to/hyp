@@ -1,6 +1,6 @@
 # Team Hub *(Beta)*
 
-Run an organization hub (`profile: "router"`) so teammates pair once with offline-signed `am2_` grants, share E2EE `#channels`, Shared KV, and org event streams (`github-webhook`, `prometheus-webhook`), and relay E2EE DMs across laptops behind NAT.
+Run an organization hub (`profile: "router"`) so teammates pair once with offline-signed `am2_` grants, share E2EE `#channels`, Shared KV, and GitHub and Alertmanager streams, and relay E2EE DMs across laptops behind NAT.
 
 > **Status & Trust Model:** Team Hubs are **Beta**. Hubs relay encrypted ciphertext only (DMs, `#channels`, KV, and streaming file transfers are end-to-end encrypted between member nodes). Peer directory keys served by a hub currently use **pin-on-first-use** (signed anti-rollback directory checkpoints `directory.checkpoint.v1` are planned).
 
@@ -60,7 +60,7 @@ hyp pair accept <<< "$HYPHAE_TOKEN"
 
 ## 4. Hub-Side Org Streams & Transit Scope Rules
 
-- **Webhooks:** Configure pure-Rust `github-webhook` and `prometheus-webhook` in the hub's `node.json` `sources[]` (see [Events & OS Cron](events-and-cron.md)). If your hub also enables guest pairing, isolate private webhooks on `"topic": "github-webhooks"`.
+- **Webhooks:** Configure `github-webhook` in `sources[]` and the Alertmanager receiver in `plugins[]` (see [Events & OS Cron](events-and-cron.md)). If your hub also enables guest pairing, isolate private webhooks on `"topic": "github-webhooks"`.
 - **Forwarding & scopes:** Hubs default to `forwarding.mode: "deny"`. When relaying between members, the hub actively enforces `forwarding` allowlist rules alongside explicit `forward:via` and `dm:receive` scopes (`*` and `full` never grant `forward:via` or `bridge:post`).
 
 ---

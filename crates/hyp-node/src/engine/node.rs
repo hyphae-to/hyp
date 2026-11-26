@@ -101,9 +101,9 @@ use hyp_store::{
 
 use crate::adapters::github_public::canonicalize_repo;
 use crate::adapters::{
-    AdapterError, AdapterHealth, BoxFuture, CompiledSubscription, GenericWebhookAdapter,
-    GitHubPublicAdapter, GitHubWebhookAdapter, NodeAdapter, NodeAdapterHost,
-    PrometheusWebhookAdapter, PublishErrorCode, PublishOutcome, PublishStatus,
+    AdapterError, AdapterHealth, BoxFuture, CompiledSubscription, GitHubPublicAdapter,
+    GitHubWebhookAdapter, NodeAdapter, NodeAdapterHost, PublishErrorCode, PublishOutcome,
+    PublishStatus,
 };
 use crate::delivery::DeliveryUrgency;
 use crate::engine::config::{
@@ -331,8 +331,6 @@ pub struct UnifiedNode {
     guest_join_timestamps: Mutex<VecDeque<i64>>,
     github_public: Mutex<Option<Arc<GitHubPublicAdapter>>>,
     github_webhooks: Mutex<BTreeMap<String, Arc<GitHubWebhookAdapter>>>,
-    prometheus_webhooks: Mutex<BTreeMap<String, Arc<PrometheusWebhookAdapter>>>,
-    generic_webhooks: Mutex<BTreeMap<String, Arc<GenericWebhookAdapter>>>,
     security_gate: Mutex<Arc<std::sync::RwLock<Option<Arc<SecurityGatePipeline>>>>>,
     peer_links: RwLock<HashMap<String, Arc<PeerLink>>>,
     sse_tasks: Mutex<HashMap<String, JoinHandle<()>>>,
@@ -469,8 +467,6 @@ impl UnifiedNode {
             guest_join_timestamps: Mutex::new(VecDeque::new()),
             github_public: Mutex::new(None),
             github_webhooks: Mutex::new(BTreeMap::new()),
-            prometheus_webhooks: Mutex::new(BTreeMap::new()),
-            generic_webhooks: Mutex::new(BTreeMap::new()),
             security_gate: Mutex::new(Arc::new(std::sync::RwLock::new(None))),
             peer_links: RwLock::new(HashMap::new()),
             sse_tasks: Mutex::new(HashMap::new()),
@@ -606,42 +602,6 @@ impl UnifiedNode {
         Ok(())
     }
 
-    /// Attaches and starts a compiled-in pure-Rust [`PrometheusWebhookAdapter`].
-    pub async fn attach_prometheus_webhook(
-        self: &Arc<Self>,
-        adapter: Arc<PrometheusWebhookAdapter>,
-    ) -> Result<(), NodeError> {
-        let host: Arc<dyn NodeAdapterHost> = Arc::new(UnifiedNodeAdapterHost {
-            node: Arc::downgrade(self),
-        });
-        adapter.start(host).await.map_err(|e| {
-            NodeError::BadRequest(format!("failed to start prometheus-webhook adapter: {e}"))
-        })?;
-        self.prometheus_webhooks
-            .lock()
-            .expect("prometheus_webhooks lock poisoned")
-            .insert(adapter.id().to_string(), adapter);
-        Ok(())
-    }
-
-    /// Attaches and starts a compiled-in pure-Rust [`GenericWebhookAdapter`].
-    pub async fn attach_generic_webhook(
-        self: &Arc<Self>,
-        adapter: Arc<GenericWebhookAdapter>,
-    ) -> Result<(), NodeError> {
-        let host: Arc<dyn NodeAdapterHost> = Arc::new(UnifiedNodeAdapterHost {
-            node: Arc::downgrade(self),
-        });
-        adapter.start(host).await.map_err(|e| {
-            NodeError::BadRequest(format!("failed to start webhook-stream adapter: {e}"))
-        })?;
-        self.generic_webhooks
-            .lock()
-            .expect("generic_webhooks lock poisoned")
-            .insert(adapter.id().to_string(), adapter);
-        Ok(())
-    }
-
     /// Looks up a registered [`GitHubWebhookAdapter`] by optional ID.
     pub fn github_webhook_adapter(&self, id: Option<&str>) -> Option<Arc<GitHubWebhookAdapter>> {
         let map = self
@@ -660,38 +620,6 @@ impl UnifiedNode {
                 }
             }
         }
-    }
-
-    /// Looks up a registered [`PrometheusWebhookAdapter`] by optional ID.
-    pub fn prometheus_webhook_adapter(
-        &self,
-        id: Option<&str>,
-    ) -> Option<Arc<PrometheusWebhookAdapter>> {
-        let map = self
-            .prometheus_webhooks
-            .lock()
-            .expect("prometheus_webhooks lock poisoned");
-        match id {
-            Some(k) => map.get(k).cloned(),
-            None => {
-                if map.len() == 1 {
-                    map.values().next().cloned()
-                } else {
-                    map.get("prometheus")
-                        .or_else(|| map.get("prometheus-webhook"))
-                        .cloned()
-                }
-            }
-        }
-    }
-
-    /// Looks up a registered [`GenericWebhookAdapter`] by ID.
-    pub fn generic_webhook_adapter(&self, id: &str) -> Option<Arc<GenericWebhookAdapter>> {
-        self.generic_webhooks
-            .lock()
-            .expect("generic_webhooks lock poisoned")
-            .get(id)
-            .cloned()
     }
 
     /// Attaches a standalone [`SecurityGatePipeline`] to this `UnifiedNode` (used for outbound
@@ -747,26 +675,6 @@ impl UnifiedNode {
         for a in gh_webhooks {
             let _ = a.stop().await;
         }
-        let prom_webhooks: Vec<Arc<PrometheusWebhookAdapter>> = {
-            let mut map = self
-                .prometheus_webhooks
-                .lock()
-                .expect("prometheus_webhooks lock poisoned");
-            std::mem::take(&mut *map).into_values().collect()
-        };
-        for a in prom_webhooks {
-            let _ = a.stop().await;
-        }
-        let gen_webhooks: Vec<Arc<GenericWebhookAdapter>> = {
-            let mut map = self
-                .generic_webhooks
-                .lock()
-                .expect("generic_webhooks lock poisoned");
-            std::mem::take(&mut *map).into_values().collect()
-        };
-        for a in gen_webhooks {
-            let _ = a.stop().await;
-        }
     }
 
     /// Gracefully stops the scheduler, attached source adapters, and all background SSE peer links.
@@ -786,37 +694,13 @@ impl UnifiedNode {
                 .expect("github_webhooks lock poisoned");
             std::mem::take(&mut *map).into_values().collect()
         };
-        let prom_webhooks: Vec<Arc<PrometheusWebhookAdapter>> = {
-            let mut map = self
-                .prometheus_webhooks
-                .lock()
-                .expect("prometheus_webhooks lock poisoned");
-            std::mem::take(&mut *map).into_values().collect()
-        };
-        let gen_webhooks: Vec<Arc<GenericWebhookAdapter>> = {
-            let mut map = self
-                .generic_webhooks
-                .lock()
-                .expect("generic_webhooks lock poisoned");
-            std::mem::take(&mut *map).into_values().collect()
-        };
-        if gh_opt.is_some()
-            || !gh_webhooks.is_empty()
-            || !prom_webhooks.is_empty()
-            || !gen_webhooks.is_empty()
-        {
+        if gh_opt.is_some() || !gh_webhooks.is_empty() {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
                     if let Some(gh) = gh_opt {
                         let _ = gh.stop().await;
                     }
                     for a in gh_webhooks {
-                        let _ = a.stop().await;
-                    }
-                    for a in prom_webhooks {
-                        let _ = a.stop().await;
-                    }
-                    for a in gen_webhooks {
                         let _ = a.stop().await;
                     }
                 });
@@ -1460,47 +1344,6 @@ impl UnifiedNode {
                                 topic: wh_topic.to_string(),
                                 kind: Some("github-webhook".to_string()),
                                 description: Some("GitHub webhook CloudEvents stream".to_string()),
-                            });
-                        }
-                    }
-                }
-                {
-                    let map = self
-                        .prometheus_webhooks
-                        .lock()
-                        .expect("prometheus_webhooks lock poisoned");
-                    for adapter in map.values() {
-                        let wh_topic = adapter.topic();
-                        if !topics.iter().any(|t| t.topic == wh_topic)
-                            && peer_may_see_topic(&peer.scopes, wh_topic)
-                        {
-                            topics.push(AdvertisedTopic {
-                                topic: wh_topic.to_string(),
-                                kind: Some("prometheus-webhook".to_string()),
-                                description: Some(
-                                    "Prometheus Alertmanager webhook CloudEvents stream"
-                                        .to_string(),
-                                ),
-                            });
-                        }
-                    }
-                }
-                {
-                    let map = self
-                        .generic_webhooks
-                        .lock()
-                        .expect("generic_webhooks lock poisoned");
-                    for adapter in map.values() {
-                        let wh_topic = adapter.topic();
-                        if !topics.iter().any(|t| t.topic == wh_topic)
-                            && peer_may_see_topic(&peer.scopes, wh_topic)
-                        {
-                            topics.push(AdvertisedTopic {
-                                topic: wh_topic.to_string(),
-                                kind: Some("webhook-stream".to_string()),
-                                description: Some(
-                                    "Generic signed webhook CloudEvents stream".to_string(),
-                                ),
                             });
                         }
                     }
@@ -8228,24 +8071,6 @@ impl UnifiedNode {
             .github_webhooks
             .lock()
             .expect("github_webhooks lock poisoned")
-            .values()
-            .any(|a| a.topic() == topic)
-        {
-            return true;
-        }
-        if self
-            .prometheus_webhooks
-            .lock()
-            .expect("prometheus_webhooks lock poisoned")
-            .values()
-            .any(|a| a.topic() == topic)
-        {
-            return true;
-        }
-        if self
-            .generic_webhooks
-            .lock()
-            .expect("generic_webhooks lock poisoned")
             .values()
             .any(|a| a.topic() == topic)
         {

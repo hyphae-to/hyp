@@ -247,6 +247,8 @@ while True:
 
                 let secrets = SecretStore::new(&state_dir, SecretBackend::File);
                 for secret_name in [
+                    "ci-webhook-secret",
+                    "prometheus-bearer-token",
                     "telegram-bot-token",
                     "slack-app-token",
                     "slack-bot-token",
