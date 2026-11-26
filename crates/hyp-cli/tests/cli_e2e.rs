@@ -1063,6 +1063,7 @@ async fn kv_cli_authenticates_over_loopback_tcp() {
         json!({ "action": "get", "key": "guarded" }),
         json!({ "action": "list" }),
         json!({ "action": "inspect" }),
+        json!({ "action": "keys" }),
         json!({ "action": "preview", "key": "guarded" }),
         json!({ "action": "set", "key": "guarded", "writeModel": "owner", "writer": "owner@local", "value": 2 }),
         json!({ "action": "delete", "key": "guarded", "writer": "owner@local" }),
@@ -1146,6 +1147,39 @@ async fn kv_cli_authenticates_over_loopback_tcp() {
     let preview = cli(&["preview", "--ns", "sealed", "--key", "note"]);
     assert_eq!(preview["data"]["text"], "🔐".repeat(1024));
     assert_eq!(preview["data"]["truncated"], true);
+    let keys = cli(&["keys", "--ns", "sealed"]);
+    assert_eq!(keys["data"]["entries"][0]["key"], "note");
+    assert!(!keys.to_string().contains("🔐"));
+
+    cli(&[
+        "set",
+        "--ns",
+        "test",
+        "--key",
+        "ansi",
+        "--value",
+        r#""alert\u001b[31m\u202e""#,
+    ]);
+    let terminal_preview = isolated_cmd(home.path())
+        .args([
+            "kv",
+            "preview",
+            "--ns",
+            "test",
+            "--key",
+            "ansi",
+            "--state-dir",
+            state.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(terminal_preview.status.success());
+    assert_eq!(
+        std::str::from_utf8(&terminal_preview.stdout)
+            .unwrap()
+            .trim(),
+        "alert"
+    );
 
     // The database's separate members list is not an authorization source.
     let other = X25519KeyPair::generate().unwrap().public_key();
@@ -1247,7 +1281,7 @@ async fn kv_cli_authenticates_over_loopback_tcp() {
     assert_eq!(sealed["entryCount"], 1);
     assert_eq!(sealed["entries"][0]["key"], "note");
     assert!(
-        node.preview_local_kv("sealed", "hidden")
+        node.preview_kv("local", "sealed", "hidden")
             .await
             .unwrap()
             .is_none()

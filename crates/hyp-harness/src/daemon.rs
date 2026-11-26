@@ -9453,6 +9453,11 @@ async fn handle_local_kv(daemon: &LocalDaemonInner, request: Option<&Value>) -> 
             .await
             .map(LocalKvResponse::Inspect)
             .map_err(|err| LocalKvError::Other(err.to_string())),
+        LocalKvAction::Keys { after } => node
+            .inspect_kv_keys(&request.host_node, &request.namespace, after.as_deref())
+            .await
+            .map(LocalKvResponse::Keys)
+            .map_err(|err| LocalKvError::Other(err.to_string())),
         LocalKvAction::Preview { key } => node
             .preview_kv(&request.host_node, &request.namespace, key)
             .await

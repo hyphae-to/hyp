@@ -1289,6 +1289,37 @@ async fn kv_e2ee_auto_wraps_for_authorized_hub_members_excludes_blind_router_and
             .namespaces
             .is_empty()
     );
+    for index in 0..65 {
+        hub.kv_set(KvWriteRequest {
+            host_node: "local".into(),
+            namespace: "limited".into(),
+            key: format!("visible/rows/{index:02}"),
+            value: json!("page fixture"),
+            write_model: WriteModel::Owner,
+            owner_id: None,
+            allowlist: None,
+            expected_version: None,
+            ttl_ms: None,
+            encrypt: false,
+            e2ee_members: None,
+        })
+        .await
+        .unwrap();
+    }
+    let first = bob
+        .inspect_kv_keys("acme-kv-hub", "limited", Some("visible/notes"))
+        .await
+        .unwrap();
+    assert_eq!(first.entries.len(), 64);
+    assert_eq!(first.entries[0].key, "visible/rows/00");
+    assert_eq!(first.next_after.as_deref(), Some("visible/rows/63"));
+    let last = bob
+        .inspect_kv_keys("acme-kv-hub", "limited", first.next_after.as_deref())
+        .await
+        .unwrap();
+    assert_eq!(last.entries.len(), 1);
+    assert_eq!(last.entries[0].key, "visible/rows/64");
+    assert!(last.next_after.is_none());
 
     // Bob MUST immediately decrypt it via `kv_get`!
     let bob_v1 = bob

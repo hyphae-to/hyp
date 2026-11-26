@@ -1009,6 +1009,14 @@ async fn route_request(
                 StatusCode::OK,
                 &node.inspect_hosted_kv_for_peer(&caller, now_ms())?,
             )),
+            (Some(namespace), None) => Ok(json_response(
+                StatusCode::OK,
+                &node.inspect_hosted_kv_keys_for_peer(
+                    &caller,
+                    namespace,
+                    query.get("after").map(String::as_str),
+                )?,
+            )),
             (Some(namespace), Some(key)) => Ok(json_response(
                 StatusCode::OK,
                 &node.read_hosted_kv_for_peer(&caller, namespace, key)?,

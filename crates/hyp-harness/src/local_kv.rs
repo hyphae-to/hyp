@@ -1,6 +1,6 @@
 //! Local CLI KV operations shared by the daemon and offline SQLite access.
 
-use hyp_node::engine::node::{KvInspection, KvValuePreview};
+use hyp_node::engine::node::{KvInspection, KvKeyPage, KvValuePreview};
 use hyp_proto::address::LOCAL_NODE_ID;
 use hyp_store::{KvDeleteInput, KvEntry, KvSetInput, NodeDb, StoreError, WriteModel, now_ms};
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,9 @@ pub struct LocalKvRequest {
 )]
 pub enum LocalKvAction {
     Inspect,
+    Keys {
+        after: Option<String>,
+    },
     Preview {
         key: String,
     },
@@ -54,6 +57,7 @@ pub enum LocalKvAction {
 #[serde(rename_all = "camelCase")]
 pub enum LocalKvResponse {
     Inspect(KvInspection),
+    Keys(KvKeyPage),
     Preview(Option<KvValuePreview>),
     Get(Option<KvEntry>),
     Set(KvEntry),
@@ -101,7 +105,7 @@ impl LocalKvRequest {
         let kv = db.kv();
         let now = now_ms();
         Ok(match self.action {
-            LocalKvAction::Inspect | LocalKvAction::Preview { .. } => {
+            LocalKvAction::Inspect | LocalKvAction::Keys { .. } | LocalKvAction::Preview { .. } => {
                 return Err(LocalKvError::Other(
                     "KV inspection requires the local daemon.".into(),
                 ));

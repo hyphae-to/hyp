@@ -557,10 +557,10 @@ pub fn render_inspect_text(payload: &Value, is_all: bool) -> String {
         );
     }
     if let Some(namespaces) = payload.pointer("/kv/namespaces").and_then(Value::as_array) {
-        let entries: u64 = namespaces
+        let entries = namespaces
             .iter()
             .filter_map(|ns| ns["entryCount"].as_u64())
-            .sum();
+            .fold(0u64, u64::saturating_add);
         let _ = writeln!(
             out,
             "KV  {} namespaces  {entries} live entries",
