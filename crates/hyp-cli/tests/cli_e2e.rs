@@ -956,8 +956,8 @@ fn kv_cli_and_mcp_wake_two_subscribers_under_the_real_node_id() {
         json!(["legacy", "shared"])
     );
 
-    // A connection confirmed a daemon is present, but a lost reply leaves the
-    // write outcome unknown. The CLI must not retry a mutation in SQLite.
+    // A bogus TCP endpoint must receive only the nonce, and the CLI must
+    // surface the failed exchange without retrying the mutation in SQLite.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr_file = daemon.state_dir.join("connector.addr");
     fs::write(&addr_file, listener.local_addr().unwrap().to_string()).unwrap();
@@ -980,7 +980,10 @@ fn kv_cli_and_mcp_wake_two_subscribers_under_the_real_node_id() {
         stream.set_read_timeout(Some(RPC_TIMEOUT)).unwrap();
         let mut request = String::new();
         BufReader::new(stream).read_line(&mut request).unwrap();
-        assert!(request.contains("ambiguous-key"));
+        let packet: Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(packet["type"], "kv.local.challenge");
+        assert!(packet.get("request").is_none());
+        assert!(!request.contains("ambiguous-key"));
     });
     let (status, error) = kv(&["set", "--key", "ambiguous-key", "--value", "1"]);
     assert_eq!(status, Some(1), "{error}");
@@ -990,4 +993,136 @@ fn kv_cli_and_mcp_wake_two_subscribers_under_the_real_node_id() {
     let (status, missing) = kv(&["get", "--key", "ambiguous-key"]);
     assert_eq!(status, Some(1), "{missing}");
     assert_eq!(missing["error"]["code"], "NOT_FOUND");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kv_cli_authenticates_over_loopback_tcp() {
+    use hyp_crypto::keystore::SecretBackend;
+    use hyp_harness::daemon::{LocalDaemon, LocalDaemonConfig};
+    use hyp_harness::sock::daemon_rpc_async;
+    use hyp_node::engine::{NodeConfig, UnifiedNode};
+    use hyp_proto::address::NodeId;
+    use std::sync::Arc;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let state = home.path().join("state");
+    let socket = state.join("connector.addr");
+    let mut config = NodeConfig::local(NodeId::new("owner@local").unwrap(), &state);
+    config.secret_backend = Some(SecretBackend::File);
+    let node = UnifiedNode::open(config).unwrap();
+    let daemon = LocalDaemon::start_tcp(
+        Arc::clone(&node),
+        None,
+        LocalDaemonConfig::default(),
+        socket.clone(),
+    )
+    .await
+    .unwrap();
+
+    let cli = |args: &[&str]| {
+        let out = isolated_cmd(home.path())
+            .args(["kv"])
+            .args(args)
+            .args(["--state-dir", state.to_str().unwrap(), "--json"])
+            .output()
+            .unwrap();
+        let envelope: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(out.status.code(), Some(0), "{envelope}");
+        envelope
+    };
+    cli(&[
+        "set",
+        "--ns",
+        "test",
+        "--key",
+        "guarded",
+        "--value",
+        "1",
+        "--writer",
+        "owner@local",
+    ]);
+
+    for request in [
+        json!({ "action": "get", "key": "guarded" }),
+        json!({ "action": "list" }),
+        json!({ "action": "set", "key": "guarded", "writeModel": "owner", "writer": "owner@local", "value": 2 }),
+        json!({ "action": "delete", "key": "guarded", "writer": "owner@local" }),
+    ] {
+        let mut request = request.as_object().unwrap().clone();
+        request.insert("hostNode".into(), json!("local"));
+        request.insert("namespace".into(), json!("test"));
+        let result = daemon_rpc_async(
+            &socket,
+            &json!({ "type": "kv.local", "request": request }),
+            RPC_TIMEOUT,
+        )
+        .await;
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Local KV authentication failed.")
+        );
+    }
+    let read = cli(&["get", "--ns", "test", "--key", "guarded"]);
+    assert_eq!(read["data"]["value"], 1, "{read}");
+    let deleted = cli(&["delete", "--ns", "test", "--key", "guarded"]);
+    assert_eq!(deleted["data"]["deleted"], true, "{deleted}");
+
+    daemon.stop().await;
+    node.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn kv_cli_does_not_retry_a_mutation_when_daemon_reply_is_lost() {
+    use hyp_store::NodeDb;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixListener;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let state = home.path().join("state");
+    fs::create_dir(&state).unwrap();
+    let db_path = state.join("node.sqlite");
+    let db = NodeDb::open(&db_path).unwrap();
+    let listener = UnixListener::bind(state.join("connector.sock")).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(RPC_TIMEOUT)).unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        let packet: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(packet["type"], "kv.local");
+        let request: hyp_harness::local_kv::LocalKvRequest =
+            serde_json::from_value(packet["request"].clone()).unwrap();
+        request.execute(&db, "owner@local").unwrap();
+    });
+
+    let out = isolated_cmd(home.path())
+        .args([
+            "kv",
+            "set",
+            "--ns",
+            "test",
+            "--key",
+            "guarded",
+            "--value",
+            "1",
+            "--node",
+            "owner@local",
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    let envelope: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{envelope}");
+    assert_eq!(envelope["error"]["code"], "DAEMON_ERROR");
+    let entry = NodeDb::open(&db_path)
+        .unwrap()
+        .kv()
+        .get("owner@local", "test", "guarded", hyp_store::now_ms())
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.version, 1);
 }

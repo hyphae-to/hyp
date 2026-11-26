@@ -4,13 +4,13 @@
 //! optimistic CAS with clean exit `1` conflict reporting, and `allowlist`).
 
 use crate::config_file::{
-    load_node_or_legacy_config, resolve_config_path_for_read, resolve_effective_node_id,
-    resolve_state_dir,
+    load_node_or_legacy_config, open_secret_store, resolve_config_path_for_read,
+    resolve_effective_node_id, resolve_state_dir,
 };
 use crate::ui::{CliError, EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json};
 use clap::{Subcommand, ValueEnum};
 use hyp_harness::local_kv::{LocalKvAction, LocalKvError, LocalKvRequest, LocalKvResponse};
-use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync_checked, default_socket_path};
+use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_local_kv_rpc, default_socket_path};
 use hyp_store::{NodeDb, WriteModel};
 use serde_json::{Value, json};
 use std::io::ErrorKind;
@@ -232,44 +232,45 @@ fn execute_kv(
         namespace: namespace.to_owned(),
         action,
     };
-    let packet = json!({ "type": "kv.local", "request": request });
-    let daemon_node = match daemon_rpc_sync_checked(&socket, &packet, Duration::from_secs(10)) {
-        Ok(rpc) => {
-            let response = rpc
-                .result
-                .and_then(|mut result| result.remove("response"))
-                .ok_or_else(|| {
-                    KvCommandError::Daemon(
-                        rpc.error
-                            .unwrap_or_else(|| "The daemon did not return a KV result.".into()),
-                    )
-                })?;
-            let response =
-                serde_json::from_value::<Result<LocalKvResponse, LocalKvError>>(response)
-                    .map_err(|err| KvCommandError::Daemon(err.to_string()))?;
-            // Large lists can exceed the RPC frame limit. This response permits a
-            // read-only fall back to the specific daemon's database, including custom sockets.
-            match (&request.action, response) {
-                (
-                    LocalKvAction::List { .. },
-                    Err(LocalKvError::ListTooLarge { state_dir, node_id }),
-                ) => {
-                    dir = state_dir;
-                    Some(node_id)
+    let keystore = open_secret_store(&dir, state_dir_arg.is_some());
+    let daemon_node =
+        match daemon_local_kv_rpc(&socket, &json!(request), &keystore, Duration::from_secs(10)) {
+            Ok(rpc) => {
+                let response = rpc
+                    .result
+                    .and_then(|mut result| result.remove("response"))
+                    .ok_or_else(|| {
+                        KvCommandError::Daemon(
+                            rpc.error
+                                .unwrap_or_else(|| "The daemon did not return a KV result.".into()),
+                        )
+                    })?;
+                let response =
+                    serde_json::from_value::<Result<LocalKvResponse, LocalKvError>>(response)
+                        .map_err(|err| KvCommandError::Daemon(err.to_string()))?;
+                // Large lists can exceed the RPC frame limit. This response permits a
+                // read-only fall back to the specific daemon's database, including custom sockets.
+                match (&request.action, response) {
+                    (
+                        LocalKvAction::List { .. },
+                        Err(LocalKvError::ListTooLarge { state_dir, node_id }),
+                    ) => {
+                        dir = state_dir;
+                        Some(node_id)
+                    }
+                    (_, response) => return response.map_err(KvCommandError::Operation),
                 }
-                (_, response) => return response.map_err(KvCommandError::Operation),
             }
-        }
-        Err(err)
-            if matches!(
-                err.kind(),
-                ErrorKind::NotFound | ErrorKind::ConnectionRefused
-            ) =>
-        {
-            None
-        }
-        Err(err) => return Err(KvCommandError::Daemon(err.to_string())),
-    };
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::NotFound | ErrorKind::ConnectionRefused
+                ) =>
+            {
+                None
+            }
+            Err(err) => return Err(KvCommandError::Daemon(err.to_string())),
+        };
 
     let db_path = dir.join("node.sqlite");
     let db = NodeDb::open(&db_path).map_err(|err| {
