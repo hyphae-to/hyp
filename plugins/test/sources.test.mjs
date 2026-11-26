@@ -415,8 +415,10 @@ test("gmail: an expired history cursor re-baselines instead of replaying or cras
     return null;
   });
   const plugin = startPlugin("gmail", { ...googleEnv(tokens), GMAIL_API_BASE: gmail.base, GMAIL_STATE_FILE: stateFile });
-  await until(() => JSON.parse(readFileSync(stateFile, "utf8")).historyId === "9000", "gmail re-baseline");
-  assert.match(plugin.stderr(), /history cursor expired/);
+  await until(
+    () => JSON.parse(readFileSync(stateFile, "utf8")).historyId === "9000" && /history cursor expired/.test(plugin.stderr()),
+    "gmail re-baseline and expiration warning",
+  );
   assert.equal(plugin.events.length, 0);
 });
 
