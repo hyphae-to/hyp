@@ -493,3 +493,272 @@ fn daemon_socket_and_no_local_socket_flags() {
     assert!(!headless.state_dir.join("connector.sock").exists());
     assert!(!headless.state_dir.join("connector.addr").exists());
 }
+
+#[test]
+fn node_start_parses_kv_namespaces_advertises_manifest_and_mcp_hyp_kv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hub_home = tmp.path().join("hub-home");
+    let hub_state = tmp.path().join("hub-state");
+    let peer_home = tmp.path().join("peer-home");
+    let peer_state = tmp.path().join("peer-state");
+    fs::create_dir_all(&hub_home).unwrap();
+    fs::create_dir_all(&hub_state).unwrap();
+    fs::create_dir_all(&peer_home).unwrap();
+    fs::create_dir_all(&peer_state).unwrap();
+
+    // 1. Write `node.json` containing both simple string and structured object `kvNamespaces`
+    //    (plus a duplicate entry to verify deduplication).
+    let config_path = hub_home.join("node.json");
+    let node_json = json!({
+        "nodeId": "kv-hub",
+        "profile": "p2p",
+        "kvNamespaces": [
+            "shared",
+            { "namespace": "deploy-state", "mode": "plaintext", "writeModel": "owner" },
+            { "namespace": "ops", "mode": "e2ee", "writeModel": "cas" },
+            "shared"
+        ]
+    });
+    fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&node_json).unwrap(),
+    )
+    .unwrap();
+
+    // 2. Start compiled `hyp node start --config node.json --bind 127.0.0.1:0`
+    let mut hub_cmd = isolated_cmd(&hub_home);
+    hub_cmd
+        .args([
+            "node",
+            "start",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--bind",
+            "127.0.0.1:0",
+            "--state-dir",
+            hub_state.to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::null());
+    let mut hub_proc = ManagedProcess::spawn("kv-hub", &mut hub_cmd);
+    let hub_startup = hub_proc.read_json_line(Duration::from_secs(10));
+    assert_eq!(hub_startup["ok"], true, "hub startup failed: {hub_startup}");
+    let hub_socket = PathBuf::from(
+        hub_startup["data"]["socketPath"]
+            .as_str()
+            .expect("p2p node must expose socketPath"),
+    );
+    let hub_endpoint = hub_startup["data"]["endpoint"]
+        .as_str()
+        .expect("p2p node must expose HTTP endpoint")
+        .to_string();
+
+    // 3. Verify `hyp mcp <socket>` `tools/list` on the node directly advertises `hyp_kv`!
+    let mut mcp = McpSubprocess::spawn(&hub_home, &hub_socket);
+    let init = mcp.initialize(RPC_TIMEOUT);
+    assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+    let list = mcp.rpc(
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+        RPC_TIMEOUT,
+    );
+    let names: Vec<&str> = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["hyp_send", "hyp_inbox", "hyp_mesh", "hyp_stream", "hyp_kv"],
+        "node.json kvNamespaces must advertise hyp_kv in MCP tools/list: {list}"
+    );
+    assert_eq!(mcp.close(Duration::from_secs(5)), Some(0));
+
+    // 4. Pair a real remote peer (`alice@laptop`) via `hyp pair invite --mode p2p` + live
+    //    online `hyp pair accept` and verify the authenticated `/v1/manifest` advertises all 3
+    //    parsed KV namespaces!
+    let inv_out = isolated_cmd(&hub_home)
+        .args([
+            "pair",
+            "invite",
+            "--mode",
+            "p2p",
+            "--node-id",
+            "kv-hub",
+            "--endpoint",
+            &hub_endpoint,
+            "--peer",
+            "alice@laptop",
+            "--preset",
+            "full",
+            "--state-dir",
+            hub_state.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run hyp pair invite");
+    assert_eq!(
+        inv_out.status.code(),
+        Some(0),
+        "pair invite failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&inv_out.stdout),
+        String::from_utf8_lossy(&inv_out.stderr)
+    );
+    let inv_json: Value = serde_json::from_slice(&inv_out.stdout).expect("invite JSON");
+    let pair_token = inv_json["data"]["token"].as_str().expect("pair token");
+
+    let mut acc_child = isolated_cmd(&peer_home)
+        .args([
+            "pair",
+            "accept",
+            "--node-id",
+            "alice@laptop",
+            "--state-dir",
+            peer_state.to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hyp pair accept");
+    acc_child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{pair_token}\n").as_bytes())
+        .unwrap();
+    let acc_out = acc_child.wait_with_output().unwrap();
+    assert_eq!(
+        acc_out.status.code(),
+        Some(0),
+        "pair accept failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&acc_out.stdout),
+        String::from_utf8_lossy(&acc_out.stderr)
+    );
+
+    // Inspect cached signed manifest stored on `alice@laptop` after authenticated pairing!
+    let peer_db = hyp_store::NodeDb::open(peer_state.join("node.sqlite")).unwrap();
+    let hub_peer = peer_db
+        .peers()
+        .get_peer("kv-hub")
+        .unwrap()
+        .expect("kv-hub peer persisted");
+    let manifest_raw = hub_peer
+        .manifest_json
+        .expect("authenticated manifest fetched during pairing");
+    let signed: hyp_proto::manifest::SignedNodeManifest =
+        serde_json::from_str(&manifest_raw).expect("valid signed manifest");
+    let payload = signed.decode_payload().expect("valid manifest payload");
+    let adv_kv: Vec<(
+        &str,
+        hyp_proto::manifest::KvMode,
+        hyp_proto::manifest::KvWriteModel,
+    )> = payload
+        .advertised
+        .kv_namespaces
+        .iter()
+        .map(|ns| (ns.name.as_str(), ns.mode, ns.write_model))
+        .collect();
+    assert_eq!(
+        adv_kv,
+        vec![
+            (
+                "shared",
+                hyp_proto::manifest::KvMode::E2ee,
+                hyp_proto::manifest::KvWriteModel::Shared,
+            ),
+            (
+                "deploy-state",
+                hyp_proto::manifest::KvMode::Plaintext,
+                hyp_proto::manifest::KvWriteModel::Owner,
+            ),
+            (
+                "ops",
+                hyp_proto::manifest::KvMode::E2ee,
+                hyp_proto::manifest::KvWriteModel::Shared,
+            ),
+        ],
+        "/v1/manifest advertised.kvNamespaces must match parsed node.json entries"
+    );
+
+    // 5. Start a local daemon for `alice@laptop` (no local kvNamespaces!) and prove that the
+    //    Hub's advertised manifest automatically causes `alice@laptop`'s `hyp mcp` `tools/list`
+    //    to advertise `hyp_kv` as well!
+    let mut peer_cmd = isolated_cmd(&peer_home);
+    peer_cmd
+        .args([
+            "node",
+            "start",
+            "--profile",
+            "local",
+            "--node-id",
+            "alice@laptop",
+            "--state-dir",
+            peer_state.to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::null());
+    let mut peer_proc = ManagedProcess::spawn("alice-local", &mut peer_cmd);
+    let peer_startup = peer_proc.read_json_line(Duration::from_secs(10));
+    assert_eq!(peer_startup["ok"], true, "peer startup: {peer_startup}");
+    let peer_socket = PathBuf::from(peer_startup["data"]["socketPath"].as_str().unwrap());
+
+    let mut peer_mcp = McpSubprocess::spawn(&peer_home, &peer_socket);
+    peer_mcp.initialize(RPC_TIMEOUT);
+    let peer_list = peer_mcp.rpc(
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}}),
+        RPC_TIMEOUT,
+    );
+    let peer_names: Vec<&str> = peer_list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        peer_names,
+        vec!["hyp_send", "hyp_inbox", "hyp_mesh", "hyp_stream", "hyp_kv"],
+        "paired peer must inherit hyp_kv tool advertisement from Hub /v1/manifest: {peer_list}"
+    );
+    assert_eq!(peer_mcp.close(Duration::from_secs(5)), Some(0));
+
+    // 6. Verify invalid `kvNamespaces` entry fails closed with CONFIG_ERROR on `hyp node start`.
+    let bad_cfg_path = tmp.path().join("bad-node.json");
+    let bad_state = tmp.path().join("bad-state");
+    fs::create_dir_all(&bad_state).unwrap();
+    fs::write(
+        &bad_cfg_path,
+        serde_json::to_string(&json!({
+            "nodeId": "bad-kv",
+            "profile": "local",
+            "kvNamespaces": ["INVALID/NAMESPACE"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let bad_out = isolated_cmd(tmp.path())
+        .args([
+            "node",
+            "start",
+            "--config",
+            bad_cfg_path.to_str().unwrap(),
+            "--state-dir",
+            bad_state.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(bad_out.status.code(), Some(1));
+    let bad_env: Value = serde_json::from_slice(&bad_out.stdout).expect("bad error JSON");
+    assert_eq!(bad_env["ok"], false);
+    assert_eq!(bad_env["error"]["code"], "CONFIG_ERROR");
+
+    #[cfg(unix)]
+    {
+        let _ = peer_proc.shutdown_gracefully();
+        let _ = hub_proc.shutdown_gracefully();
+    }
+    drop(peer_proc);
+    drop(hub_proc);
+}

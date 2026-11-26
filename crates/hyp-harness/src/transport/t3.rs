@@ -1720,14 +1720,19 @@ impl T3Transport {
             .unwrap_or(&empty_obj);
 
         if let Some(thread) = projection.get("thread").and_then(Value::as_object) {
-            if let Some(deleted_at) = thread.get("deletedAt") {
-                if !deleted_at.is_null() {
-                    return T3DeliveryDetail {
-                        outcome: PushOutcome::reject("t3_thread_deleted"),
-                        interrupted: false,
-                        dispatch_mode: None,
-                    };
-                }
+            if thread.get("deletedAt").is_some_and(is_timestamp_field_set) {
+                return T3DeliveryDetail {
+                    outcome: PushOutcome::reject("t3_thread_deleted"),
+                    interrupted: false,
+                    dispatch_mode: None,
+                };
+            }
+            if thread.get("archivedAt").is_some_and(is_timestamp_field_set) {
+                return T3DeliveryDetail {
+                    outcome: PushOutcome::reject("t3_thread_archived"),
+                    interrupted: false,
+                    dispatch_mode: None,
+                };
             }
         }
 
@@ -1782,6 +1787,15 @@ impl T3Transport {
             interrupted: false,
             dispatch_mode: Some(dispatch_mode),
         }
+    }
+}
+
+fn is_timestamp_field_set(val: &Value) -> bool {
+    match val {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::String(s) => !s.trim().is_empty(),
+        _ => true,
     }
 }
 

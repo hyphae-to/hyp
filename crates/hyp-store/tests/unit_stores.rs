@@ -2413,3 +2413,207 @@ fn g3_coalesce_update_resets_reviewed_at_human_auth_and_gate_reason() {
         "G3: coalesced row must NOT appear in gate-cleared inbox until re-screened"
     );
 }
+
+#[test]
+fn subscription_meta_persists_across_reopen_and_cleans_up_atomically() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("node.sqlite");
+    let t0 = 1_700_000_000_000i64;
+
+    {
+        let db = NodeDb::open(&db_path).unwrap();
+        db.events()
+            .upsert_subscription(
+                &SubscriptionSpec {
+                    id: "sub-1".into(),
+                    origin_node: "alice@macbook".into(),
+                    topic: "agentmail".into(),
+                    subscriber: "claude:s1".into(),
+                    filters: vec![],
+                    coalesce_seconds: 0,
+                    max_batch_age_ms: None,
+                    max_wakes_per_hour: None,
+                    mode: DeliveryMode::Full,
+                },
+                t0,
+            )
+            .unwrap();
+        db.events()
+            .set_subscription_meta(
+                "sub-1",
+                &hyp_store::SubscriptionMeta {
+                    key: Some("gmail:bowd".into()),
+                    urgency: Some("interrupt".into()),
+                },
+            )
+            .unwrap();
+
+        db.events()
+            .upsert_subscription(
+                &SubscriptionSpec {
+                    id: "sub-2".into(),
+                    origin_node: "alice@macbook".into(),
+                    topic: "github".into(),
+                    subscriber: "claude:s2".into(),
+                    filters: vec![],
+                    coalesce_seconds: 0,
+                    max_batch_age_ms: None,
+                    max_wakes_per_hour: None,
+                    mode: DeliveryMode::Notify,
+                },
+                t0 + 1,
+            )
+            .unwrap();
+        db.events()
+            .set_subscription_meta(
+                "sub-2",
+                &hyp_store::SubscriptionMeta {
+                    key: Some("gh:org".into()),
+                    urgency: Some("notify".into()),
+                },
+            )
+            .unwrap();
+    }
+
+    // Reopen fresh NodeDb from disk and verify metadata & lookup by key survive intact.
+    let db = NodeDb::open(&db_path).unwrap();
+    let meta1 = db
+        .events()
+        .get_subscription_meta("sub-1")
+        .unwrap()
+        .expect("persisted meta for sub-1");
+    assert_eq!(meta1.key.as_deref(), Some("gmail:bowd"));
+    assert_eq!(meta1.urgency.as_deref(), Some("interrupt"));
+
+    let found = db
+        .events()
+        .find_subscription_by_key("claude:s1", "gmail:bowd")
+        .unwrap()
+        .expect("find_subscription_by_key must locate persisted key");
+    assert_eq!(found.id, "sub-1");
+    assert!(
+        db.events()
+            .find_subscription_by_key("claude:s2", "gmail:bowd")
+            .unwrap()
+            .is_none(),
+        "key lookup must be scoped per subscriber"
+    );
+
+    // Wrong subscriber delete fails closed and preserves metadata!
+    assert!(
+        !db.events()
+            .delete_subscription_for_subscriber("sub-1", "claude:s2")
+            .unwrap()
+    );
+    assert!(
+        db.events()
+            .get_subscription_meta("sub-1")
+            .unwrap()
+            .is_some()
+    );
+
+    // Owner delete removes both subscription and persisted metadata atomically.
+    assert!(
+        db.events()
+            .delete_subscription_for_subscriber("sub-1", "claude:s1")
+            .unwrap()
+    );
+    assert!(
+        db.events()
+            .get_subscription_meta("sub-1")
+            .unwrap()
+            .is_none()
+    );
+
+    // `remove_subscriber` cleans up metadata atomically too.
+    assert_eq!(db.events().remove_subscriber("claude:s2").unwrap(), 1);
+    assert!(
+        db.events()
+            .get_subscription_meta("sub-2")
+            .unwrap()
+            .is_none()
+    );
+    assert!(db.events().list_subscription_meta().unwrap().is_empty());
+}
+
+#[test]
+fn topic_event_stats_normalizes_bare_and_local_prefixed_topics_and_extracts_repos() {
+    let db = NodeDb::open_in_memory().unwrap();
+    let t0 = 1_700_000_000_000i64;
+
+    let make_ev = |id: &str, source: &str| CloudEvent {
+        specversion: "1.0".into(),
+        id: id.into(),
+        source: source.into(),
+        event_type: "com.example.test".into(),
+        subject: None,
+        time: None,
+        datacontenttype: "application/json".into(),
+        dataschema: None,
+        data: json!({ "ok": true }),
+        extensions: Default::default(),
+    };
+
+    // Bare topic under node_id + local-prefixed topic under "local" fold into one "agentmail" bucket.
+    db.events()
+        .ingest(
+            "alice@macbook",
+            "agentmail",
+            "pub-1",
+            &make_ev("ev-1", "agentmail://inbox/a"),
+            t0,
+        )
+        .unwrap();
+    db.events()
+        .ingest(
+            "local",
+            "local.agentmail",
+            "pub-1",
+            &make_ev("ev-2", "agentmail://inbox/b"),
+            t0 + 50,
+        )
+        .unwrap();
+
+    // GitHub event ingested with 0 subscribers (so `body` is cleared to NULL on ingest)
+    // still extracts `owner/repo` from `source = "github.com/acme/checkout"`.
+    db.events()
+        .ingest(
+            "alice@macbook",
+            "github",
+            "gh-adapter",
+            &make_ev("gh-1", "github.com/acme/checkout"),
+            t0 + 100,
+        )
+        .unwrap();
+
+    // Remote peer event on a different origin_node MUST NOT be counted in local stats.
+    db.events()
+        .ingest(
+            "remote-hub",
+            "agentmail",
+            "remote-pub",
+            &make_ev("remote-1", "agentmail://remote"),
+            t0 + 200,
+        )
+        .unwrap();
+
+    let stats = db
+        .events()
+        .topic_event_stats(&["alice@macbook", "local"])
+        .unwrap();
+
+    let am = stats.get("agentmail").expect("agentmail stats");
+    assert_eq!(am.event_count, 2);
+    assert_eq!(am.last_received_at, Some(t0 + 50));
+    assert_eq!(
+        am.sources,
+        vec![
+            "agentmail://inbox/a".to_string(),
+            "agentmail://inbox/b".to_string()
+        ]
+    );
+
+    let gh = stats.get("github").expect("github stats");
+    assert_eq!(gh.event_count, 1);
+    assert_eq!(gh.repos, vec!["acme/checkout".to_string()]);
+}

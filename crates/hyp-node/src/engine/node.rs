@@ -7871,49 +7871,94 @@ impl UnifiedNode {
 
     /// Builds the local `TopicCatalogEntry` snapshot for `diagnose_subscription`.
     pub fn local_topic_catalog(&self) -> Vec<TopicCatalogEntry> {
+        let mut observed_by_topic: BTreeMap<String, ObservedTopicStats> = {
+            let db = self.db();
+            db.events()
+                .topic_event_stats(&[self.config.node_id.as_str(), LOCAL_NODE_ID])
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(topic, st)| {
+                    (
+                        topic,
+                        ObservedTopicStats {
+                            event_count: st.event_count,
+                            last_event_at: st.last_received_at.map(format_rfc3339_millis),
+                            sources: st.sources,
+                            repos: st.repos,
+                        },
+                    )
+                })
+                .collect()
+        };
+
         let mut catalog: Vec<TopicCatalogEntry> = self
             .config
             .topics
             .iter()
-            .map(|t| TopicCatalogEntry {
-                topic: t.topic.clone(),
-                has_provisioned_publisher: t.has_provisioned_publisher,
-                metadata: t.metadata.clone(),
-                observed: ObservedTopicStats::default(),
+            .map(|t| {
+                let bare = t.topic.strip_prefix("local.").unwrap_or(t.topic.as_str());
+                let observed = observed_by_topic.remove(bare).unwrap_or_default();
+                TopicCatalogEntry {
+                    topic: t.topic.clone(),
+                    has_provisioned_publisher: t.has_provisioned_publisher,
+                    metadata: t.metadata.clone(),
+                    observed,
+                }
             })
             .collect();
 
         if let Some(gh) = self.github_public_adapter() {
             let gh_topic = gh.topic();
             if !catalog.iter().any(|c| c.topic == gh_topic) {
+                let bare = gh_topic.strip_prefix("local.").unwrap_or(gh_topic);
+                let observed = observed_by_topic.remove(bare).unwrap_or_default();
                 catalog.push(TopicCatalogEntry {
                     topic: gh_topic.to_string(),
                     has_provisioned_publisher: true,
                     metadata: None,
-                    observed: ObservedTopicStats::default(),
+                    observed,
                 });
             }
         }
         if !catalog.iter().any(|c| c.topic == "kv") {
+            let observed = observed_by_topic.remove("kv").unwrap_or_default();
             catalog.push(TopicCatalogEntry {
                 topic: "kv".to_string(),
                 has_provisioned_publisher: true,
                 metadata: None,
-                observed: ObservedTopicStats::default(),
+                observed,
             });
         }
         if self.config.local_ingest.enabled {
             for ingest_topic in self.config.local_ingest.advertised_topics() {
                 if !catalog.iter().any(|c| c.topic == ingest_topic) {
+                    let bare = ingest_topic
+                        .strip_prefix("local.")
+                        .unwrap_or(ingest_topic.as_str());
+                    let observed = observed_by_topic.remove(bare).unwrap_or_default();
                     catalog.push(TopicCatalogEntry {
                         topic: ingest_topic,
                         has_provisioned_publisher: true,
                         metadata: None,
-                        observed: ObservedTopicStats::default(),
+                        observed,
                     });
                 }
             }
         }
+
+        // Include any local topics that already have stored events in SQLite even if not
+        // statically declared in `config.topics` so diagnostics report accurate counts.
+        for (topic, observed) in observed_by_topic {
+            if observed.event_count > 0 && !catalog.iter().any(|c| c.topic == topic) {
+                catalog.push(TopicCatalogEntry {
+                    topic,
+                    has_provisioned_publisher: true,
+                    metadata: None,
+                    observed,
+                });
+            }
+        }
+
         catalog
     }
 

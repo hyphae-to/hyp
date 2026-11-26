@@ -166,6 +166,32 @@ impl MockT3Config {
                 "providerSessions": []
             }),
         );
+        projections.insert(
+            "thr-archived".to_string(),
+            json!({
+                "thread": {
+                    "id": "thr-archived",
+                    "deletedAt": null,
+                    "archivedAt": "2026-11-26T00:00:00Z"
+                },
+                "runs": [],
+                "providerThreads": [],
+                "providerSessions": []
+            }),
+        );
+        projections.insert(
+            "thr-archived-empty".to_string(),
+            json!({
+                "thread": {
+                    "id": "thr-archived-empty",
+                    "deletedAt": null,
+                    "archivedAt": ""
+                },
+                "runs": [],
+                "providerThreads": [],
+                "providerSessions": []
+            }),
+        );
         Self {
             expected_token: expected_token.to_string(),
             issued_ticket: "ws-ticket+ok/123=".to_string(),
@@ -1047,6 +1073,33 @@ async fn error_mapping_covers_auth_failed_missing_secret_unreachable_and_effect_
         PushOutcome::reject("t3_thread_deleted")
     );
 
+    // 4b. Archived thread in projection (`deletedAt: null, archivedAt != null`) ->
+    //     Reject("t3_thread_archived") and NEVER dispatch a message into the archived thread!
+    let cmds_before_archived = server.commands().len();
+    let mut archived_thr_target = T3Target::new("thr-archived", &server.url);
+    archived_thr_target.token_override = Some("good-t3-token".into());
+    assert_eq!(
+        T3Transport::new(archived_thr_target)
+            .deliver("must not wake archived thread", PushMode::Queue)
+            .await,
+        PushOutcome::reject("t3_thread_archived")
+    );
+    assert_eq!(
+        server.commands().len(),
+        cmds_before_archived,
+        "archived thread MUST fail closed before orchestration.dispatchCommand"
+    );
+
+    // 4c. Empty string `archivedAt: ""` is treated as unset (unarchived) and delivers normally.
+    let mut archived_empty_target = T3Target::new("thr-archived-empty", &server.url);
+    archived_empty_target.token_override = Some("good-t3-token".into());
+    assert_eq!(
+        T3Transport::new(archived_empty_target)
+            .deliver("hello unarchived", PushMode::Queue)
+            .await,
+        PushOutcome::Delivered
+    );
+
     // 5. Insecure non-loopback HTTP URL -> Reject("t3_invalid_server_url")
     let mut bad_url_target = T3Target::new("thr-idle", "http://10.0.0.1:3773");
     bad_url_target.token_override = Some("good-t3-token".into());
@@ -1200,5 +1253,125 @@ async fn t3_deliver_nudge_is_strictly_metadata_only_and_sanitizes_handle() {
     assert!(!dispatched.contains("run rm"));
     assert!(!dispatched.contains("human-verified"));
 
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn archived_t3_thread_mid_session_rejects_and_detaches_daemon_transport() {
+    hyp_harness::enable_test_env_isolation();
+    let dir = TempDir::new().unwrap();
+    let state_dir = dir.path().join("state");
+
+    let server = MockT3Server::start(MockT3Config::standard("detach-t3-tok")).await;
+
+    let mut cfg = hyp_node::engine::NodeConfig::local(
+        hyp_proto::address::NodeId::new("t3@local").unwrap(),
+        &state_dir,
+    );
+    cfg.secret_backend = Some(SecretBackend::File);
+    let node = hyp_node::engine::UnifiedNode::open(cfg).unwrap();
+    let daemon = hyp_harness::daemon::LocalDaemon::start(
+        Arc::clone(&node),
+        None,
+        hyp_harness::daemon::LocalDaemonConfig::default(),
+    )
+    .await
+    .unwrap();
+    let sock_path = daemon.socket_path().to_path_buf();
+
+    // Register session + enroll handle + attach T3Transport pointing to an archived thread
+    // (simulating a T3 thread that was archived mid-session after enrollment).
+    let session_id = "claude:t3-archived-sess";
+    let now = hyp_store::now_ms();
+    {
+        let db = node.db();
+        db.local()
+            .register_session(session_id, r#"{"kind":"claude"}"#, now)
+            .unwrap();
+        db.local()
+            .set_session_handle(session_id, Some("worker"), now)
+            .unwrap();
+    }
+
+    let mut target = T3Target::new("thr-archived", &server.url);
+    target.token_override = Some("detach-t3-tok".into());
+    daemon.register_session_transport(session_id, Arc::new(T3Transport::new(target)));
+
+    // Confirm transport is attached before delivery attempt.
+    let status_before = hyp_harness::sock::daemon_rpc_async(
+        &sock_path,
+        &json!({ "type": "daemon.status" }),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(status_before.ok, "daemon.status failed: {status_before:?}");
+    let sessions_before = status_before.result.as_ref().unwrap()["sessions"]
+        .as_array()
+        .unwrap();
+    let sess_before = sessions_before
+        .iter()
+        .find(|s| s["id"] == session_id)
+        .expect("session in daemon.status");
+    assert_eq!(sess_before["hasLiveTransport"], true);
+    assert_eq!(sess_before["transportKind"], "t3");
+
+    // Queue an inbound DM into the session mailbox and trigger flush.
+    {
+        let db = node.db();
+        db.local()
+            .put_in_mailbox(
+                &hyp_store::MailboxInsert {
+                    session_id: session_id.to_string(),
+                    origin_node: "t3@local".to_string(),
+                    item_id: "dm-archived-1".to_string(),
+                    text: "[hyphae · DM from @alice] please check build".to_string(),
+                    kind: hyp_store::MailboxKind::Message,
+                    source: "t3@local/alice".to_string(),
+                    gate_state: hyp_store::GateState::Pending,
+                    gate_reason: None,
+                    traceparent: None,
+                },
+                now + 10,
+            )
+            .unwrap();
+    }
+    daemon.flush_pending_sessions().await;
+
+    // 1. ZERO `message.dispatch` commands were sent into the archived T3 thread!
+    assert!(
+        server.commands().is_empty(),
+        "archived thread must never receive <hyphae-wake> dispatchCommand: {:?}",
+        server.commands()
+    );
+
+    // 2. LocalDaemon MUST detach the archived T3 transport cleanly (matching `t3_thread_deleted`).
+    let status_after = hyp_harness::sock::daemon_rpc_async(
+        &sock_path,
+        &json!({ "type": "daemon.status" }),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(status_after.ok, "daemon.status failed: {status_after:?}");
+    let sessions_after = status_after.result.as_ref().unwrap()["sessions"]
+        .as_array()
+        .unwrap();
+    let sess_after = sessions_after
+        .iter()
+        .find(|s| s["id"] == session_id)
+        .expect("session in daemon.status");
+    assert_eq!(
+        sess_after["hasLiveTransport"], false,
+        "LocalDaemon must detach archived T3 transport cleanly: {sess_after}"
+    );
+    assert!(
+        sess_after["transportKind"].is_null(),
+        "LocalDaemon must clear archived T3 transportKind cleanly: {sess_after}"
+    );
+
+    // 3. Unread DM remains safely queued in SQLite mailbox (zero message loss).
+    assert_eq!(node.db().local().pending_count(session_id).unwrap(), 1);
+
+    daemon.shutdown();
+    node.shutdown();
     server.shutdown().await;
 }

@@ -53,8 +53,8 @@ use hyp_proto::cloudevent::{CONTENT_TYPE_JSON, CloudEvent as ProtoCloudEvent, EX
 use hyp_proto::filter::Filter as ProtoFilter;
 use hyp_store::{
     AckOutcome, BridgeLink, DeliveryMode, GateAuditQuery, GateState, MailboxEntry, MailboxInsert,
-    MailboxKind, MailboxPutResult, PluginTargetHandoff, WriteModel, format_address, now_ms,
-    parse_address, sha256_hex, uuid_v4,
+    MailboxKind, MailboxPutResult, PluginTargetHandoff, SubscriptionMeta, WriteModel,
+    format_address, now_ms, parse_address, sha256_hex, uuid_v4,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -1783,6 +1783,7 @@ impl LocalDaemonInner {
         let mut hydrated_herdr_index: HashMap<String, Vec<String>> = HashMap::new();
         let mut hydrated_env_exported: HashSet<String> = HashSet::new();
         let mut hydrated_openclaw_targets: HashMap<String, (String, String)> = HashMap::new();
+        let mut hydrated_sub_meta: HashMap<String, Vec<SubscriptionRecordMeta>> = HashMap::new();
         {
             let db = node.db();
             if let Ok(sessions) = db.local().list_sessions() {
@@ -1802,6 +1803,26 @@ impl LocalDaemonInner {
                     if backend_json_flag_true(&s.backend_json, "envFileExported") {
                         hydrated_env_exported.insert(s.id);
                     }
+                }
+            }
+            if let Ok(subs) = db.events().list_subscriptions(None) {
+                let stored_meta = db.events().list_subscription_meta().unwrap_or_default();
+                for sub in subs {
+                    let meta = stored_meta.get(&sub.id);
+                    let key = meta.and_then(|m| m.key.clone());
+                    let urgency = meta
+                        .and_then(|m| m.urgency.as_deref())
+                        .and_then(|raw| DeliveryUrgency::parse(raw).ok())
+                        .unwrap_or_else(|| DeliveryUrgency::from_store_mode(sub.mode));
+                    hydrated_sub_meta.entry(sub.subscriber).or_default().push(
+                        SubscriptionRecordMeta {
+                            id: sub.id,
+                            key,
+                            origin_node: sub.origin_node,
+                            topic: sub.topic,
+                            urgency,
+                        },
+                    );
                 }
             }
         }
@@ -1830,7 +1851,7 @@ impl LocalDaemonInner {
             lazy_hydrate_cooldowns: Mutex::new(HashMap::new()),
             flushing: Mutex::new(HashSet::new()),
             item_meta: Mutex::new(HashMap::new()),
-            sub_meta: Mutex::new(HashMap::new()),
+            sub_meta: Mutex::new(hydrated_sub_meta),
             dismissed_receipts: Mutex::new(HashSet::new()),
             quarantine_notices: Mutex::new(HashMap::new()),
             bridge_posters: Mutex::new(HashMap::new()),
@@ -4910,6 +4931,7 @@ impl LocalDaemonInner {
                                 reason.as_str(),
                                 "herdr_target_unavailable"
                                     | "t3_thread_deleted"
+                                    | "t3_thread_archived"
                                     | "t3_thread_not_found"
                                     | "t3_auth_missing"
                                     | "t3_auth_failed"
@@ -6755,16 +6777,27 @@ impl LocalDaemonInner {
         let key = args
             .get("key")
             .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
             .map(ToString::to_string);
 
-        // Reuse existing subscription ID if caller supplied matching `key`.
+        // Reuse existing subscription ID if caller supplied matching `key` (in-memory or persisted).
         let existing_id = key.as_deref().and_then(|k| {
-            let guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
-            guard
-                .get(session_id)?
-                .iter()
-                .find(|s| s.key.as_deref() == Some(k))
-                .map(|s| s.id.clone())
+            let cached = {
+                let guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
+                guard
+                    .get(session_id)
+                    .and_then(|list| list.iter().find(|s| s.key.as_deref() == Some(k)))
+                    .map(|s| s.id.clone())
+            };
+            cached.or_else(|| {
+                let db = self.node.db();
+                db.events()
+                    .find_subscription_by_key(session_id, k)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.id)
+            })
         });
 
         let res = self
@@ -6798,6 +6831,19 @@ impl LocalDaemonInner {
                 .events()
                 .delete_subscription(&res.subscription.id);
             return Err(("unreachable_subscription".into(), msg));
+        }
+
+        {
+            let db = self.node.db();
+            db.events()
+                .set_subscription_meta(
+                    &res.subscription.id,
+                    &SubscriptionMeta {
+                        key: key.clone(),
+                        urgency: Some(urgency.as_str().to_string()),
+                    },
+                )
+                .map_err(store_err_tuple)?;
         }
 
         {
@@ -6843,13 +6889,22 @@ impl LocalDaemonInner {
         let target_id = if let Some(id) = id_arg {
             Some(id.to_string())
         } else if let Some(key) = key_arg {
-            let guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
-            guard
-                .get(session_id)
-                .and_then(|list| {
+            let cached = {
+                let guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
+                guard.get(session_id).and_then(|list| {
                     list.iter()
                         .find(|s| s.key.as_deref() == Some(key) || s.id == key)
                         .map(|s| s.id.clone())
+                })
+            };
+            cached
+                .or_else(|| {
+                    let db = self.node.db();
+                    db.events()
+                        .find_subscription_by_key(session_id, key)
+                        .ok()
+                        .flatten()
+                        .map(|s| s.id)
                 })
                 .or_else(|| Some(key.to_string()))
         } else {
@@ -6879,11 +6934,14 @@ impl LocalDaemonInner {
     }
 
     async fn tool_subscriptions(&self, session_id: &str) -> Result<Value, (String, String)> {
-        let subs = {
+        let (subs, stored_meta) = {
             let db = self.node.db();
-            db.events()
+            let subs = db
+                .events()
                 .list_subscriptions(Some(session_id))
-                .map_err(store_err_tuple)?
+                .map_err(store_err_tuple)?;
+            let stored_meta = db.events().list_subscription_meta().unwrap_or_default();
+            (subs, stored_meta)
         };
         let meta_map: HashMap<String, SubscriptionRecordMeta> = self
             .sub_meta
@@ -6897,12 +6955,17 @@ impl LocalDaemonInner {
             .into_iter()
             .map(|s| {
                 let meta = meta_map.get(&s.id);
+                let persisted = stored_meta.get(&s.id);
+                let key = meta
+                    .and_then(|m| m.key.clone())
+                    .or_else(|| persisted.and_then(|m| m.key.clone()));
                 let mode_str = meta
-                    .map(|m| m.urgency.as_str())
-                    .unwrap_or_else(|| s.mode.as_str());
+                    .map(|m| m.urgency.as_str().to_string())
+                    .or_else(|| persisted.and_then(|m| m.urgency.clone()))
+                    .unwrap_or_else(|| s.mode.as_str().to_string());
                 json!({
                     "id": s.id,
-                    "key": meta.and_then(|m| m.key.clone()),
+                    "key": key,
                     "originNode": s.origin_node,
                     "topic": s.topic,
                     "filters": s.filters,
@@ -11417,6 +11480,10 @@ impl LocalDaemonInner {
         );
 
         if detail == SummaryDetail::Full {
+            let stored_meta = {
+                let db = self.node.db();
+                db.events().list_subscription_meta().unwrap_or_default()
+            };
             let sub_meta_map: HashMap<String, SubscriptionRecordMeta> = self
                 .sub_meta
                 .lock()
@@ -11429,13 +11496,22 @@ impl LocalDaemonInner {
                 .into_iter()
                 .map(|s| {
                     let meta = sub_meta_map.get(&s.id);
+                    let persisted = stored_meta.get(&s.id);
+                    let key = meta
+                        .and_then(|m| m.key.clone())
+                        .or_else(|| persisted.and_then(|m| m.key.clone()));
                     let mode_str = meta
-                        .map(|m| m.urgency.as_str())
-                        .unwrap_or_else(|| DeliveryUrgency::from_store_mode(s.mode).as_str());
+                        .map(|m| m.urgency.as_str().to_string())
+                        .or_else(|| persisted.and_then(|m| m.urgency.clone()))
+                        .unwrap_or_else(|| {
+                            DeliveryUrgency::from_store_mode(s.mode)
+                                .as_str()
+                                .to_string()
+                        });
                     let filter_summary = summarize_filters(&s.filters);
                     json!({
                         "id": s.id,
-                        "key": meta.and_then(|m| m.key.clone()),
+                        "key": key,
                         "originNode": s.origin_node,
                         "topic": s.topic,
                         "mode": mode_str,
@@ -12542,13 +12618,22 @@ fn handle_session_unsubscribe(daemon: &LocalDaemonInner, packet: &Map<String, Va
     let sub_id = if let Some(id) = explicit_id {
         id.to_string()
     } else if let Some(key) = key_arg {
-        let guard = daemon.sub_meta.lock().expect("sub_meta lock poisoned");
-        guard
-            .get(&sess.id)
-            .and_then(|list| {
+        let cached = {
+            let guard = daemon.sub_meta.lock().expect("sub_meta lock poisoned");
+            guard.get(&sess.id).and_then(|list| {
                 list.iter()
                     .find(|m| m.key.as_deref() == Some(key) || m.id == key)
                     .map(|m| m.id.clone())
+            })
+        };
+        cached
+            .or_else(|| {
+                let db = daemon.node.db();
+                db.events()
+                    .find_subscription_by_key(&sess.id, key)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.id)
             })
             .unwrap_or_else(|| key.to_string())
     } else {

@@ -29,8 +29,8 @@ pub use db::{
 pub use error::{StoreError, StoreResult};
 pub use events::{
     BatchRecord, BatchState, DueBatch, EventCacheStats, EventLimits, EventStore, EventTickReport,
-    IngestResult, Publisher, Subscription, SubscriptionSpec, UpstreamPushdown,
-    UpstreamPushdownInput,
+    IngestResult, Publisher, SUBSCRIPTION_META_PREFIX, StoredTopicStats, Subscription,
+    SubscriptionMeta, SubscriptionSpec, UpstreamPushdown, UpstreamPushdownInput,
 };
 pub use human::{
     HUMAN_MIN_AUTH_EPOCH_META_KEY, HumanAuthorityInput, HumanAuthorityRecord, HumanAuthorityRole,

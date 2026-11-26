@@ -31,15 +31,15 @@ use hyp_node::adapters::{
 use hyp_node::engine::config::{ForwardingPolicy, validate_trusted_proxy_cidr};
 use hyp_node::engine::{
     DEFAULT_PEER_SOCKET_FILENAME, DEFAULT_WAKE_CHECK_INTERVAL_SECS, DropRelayConfig, E2eePolicy,
-    EscalationConfig, GuestPairingConfig, LocalIngestConfig, LocalIngestServer, NodeConfig,
-    NodeProfile, PeerReconcileReport, TopicConfig, UnifiedNode, normalize_drop_portal_url,
-    spawn_wake_watcher,
+    EscalationConfig, GuestPairingConfig, KvNamespaceConfig, LocalIngestConfig, LocalIngestServer,
+    NodeConfig, NodeProfile, PeerReconcileReport, TopicConfig, UnifiedNode,
+    normalize_drop_portal_url, spawn_wake_watcher,
 };
 use hyp_node::gates::{SecurityGateConfig, SecurityGatePipeline};
 use hyp_proto::address::{
-    LOCAL_NODE_ID, NodeId, is_valid_handle, is_valid_node_id, is_valid_topic,
+    LOCAL_NODE_ID, NodeId, is_valid_handle, is_valid_kv_namespace, is_valid_node_id, is_valid_topic,
 };
-use hyp_proto::manifest::{OkpCurve as ProtoOkpCurve, OkpJwk as ProtoOkpJwk};
+use hyp_proto::manifest::{KvMode, KvWriteModel, OkpCurve as ProtoOkpCurve, OkpJwk as ProtoOkpJwk};
 use hyp_proto::scopes::ScopePreset;
 use hyp_store::NodeDb;
 use serde_json::{Value, json};
@@ -402,6 +402,26 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                 format!("Invalid runtime policy in {}: {e}", cfg.path.display()),
                 None,
             );
+        }
+
+        // Parse optional `kvNamespaces[]` (simple strings or structured objects) into
+        // `NodeConfig.kv_namespaces` so `/v1/manifest` and `LocalDaemon::has_kv_capability()`
+        // advertise `hyp_kv` accurately.
+        match parse_kv_namespaces(&cfg.raw, &mut startup_warnings) {
+            Ok(namespaces) => node_cfg.kv_namespaces = namespaces,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "CONFIG_ERROR",
+                    format!("Invalid kvNamespaces config in {}: {e}", cfg.path.display()),
+                    Some(
+                        "Use strings like [\"shared\"] or objects like { \"namespace\": \"shared\", \"mode\": \"e2ee\", \"writeModel\": \"shared\" }."
+                            .to_string(),
+                    ),
+                );
+            }
         }
 
         // Parse optional `localIngest` policy (default enabled: true!).
@@ -1813,6 +1833,143 @@ fn parse_node_runtime_policies(raw: &Value, node_cfg: &mut NodeConfig) -> Result
     }
 
     Ok(())
+}
+
+/// Parses `"kvNamespaces"` from `node.json` into [`KvNamespaceConfig`] entries.
+///
+/// Accepts both simple string entries (e.g. `["shared", "deploy-state"]`) and structured objects
+/// (e.g. `{ "namespace": "shared", "mode": "e2ee", "writeModel": "shared" }` or `"name"`).
+/// Validates every namespace name fail-closed with [`is_valid_kv_namespace`] and deduplicates
+/// duplicate namespace names while emitting a startup warning.
+fn parse_kv_namespaces(
+    raw: &Value,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<KvNamespaceConfig>, String> {
+    let Some(val) = raw.get("kvNamespaces") else {
+        return Ok(Vec::new());
+    };
+    if val.is_null() {
+        return Ok(Vec::new());
+    }
+    let arr = val
+        .as_array()
+        .ok_or_else(|| "kvNamespaces must be an array".to_string())?;
+
+    let mut out = Vec::with_capacity(arr.len());
+    let mut seen = HashSet::new();
+
+    for (idx, item) in arr.iter().enumerate() {
+        let cfg = match item {
+            Value::String(s) => {
+                let name = s.trim();
+                if !is_valid_kv_namespace(name) {
+                    return Err(format!(
+                        "kvNamespaces[{idx}] invalid namespace name '{name}': must match /^[a-z0-9][a-z0-9._-]{{0,63}}$/"
+                    ));
+                }
+                KvNamespaceConfig {
+                    name: name.to_string(),
+                    mode: KvMode::E2ee,
+                    write_model: KvWriteModel::Shared,
+                }
+            }
+            Value::Object(obj) => {
+                let name_field = match obj.get("name") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(s)) => Some(s.trim()),
+                    Some(_) => {
+                        return Err(format!("kvNamespaces[{idx}].name must be a string"));
+                    }
+                };
+                let ns_field = match obj.get("namespace") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(s)) => Some(s.trim()),
+                    Some(_) => {
+                        return Err(format!("kvNamespaces[{idx}].namespace must be a string"));
+                    }
+                };
+                let name = match (name_field, ns_field) {
+                    (Some(a), Some(b)) if a != b => {
+                        return Err(format!(
+                            "kvNamespaces[{idx}] specifies conflicting 'name' ('{a}') and 'namespace' ('{b}')"
+                        ));
+                    }
+                    (Some(a), _) => a,
+                    (None, Some(b)) => b,
+                    (None, None) => {
+                        return Err(format!(
+                            "kvNamespaces[{idx}] object must specify 'namespace' (or 'name')"
+                        ));
+                    }
+                };
+                if !is_valid_kv_namespace(name) {
+                    return Err(format!(
+                        "kvNamespaces[{idx}] invalid namespace name '{name}': must match /^[a-z0-9][a-z0-9._-]{{0,63}}$/"
+                    ));
+                }
+
+                let mode = match obj.get("mode") {
+                    None | Some(Value::Null) => KvMode::E2ee,
+                    Some(Value::String(raw_mode)) => {
+                        match raw_mode.trim().to_ascii_lowercase().as_str() {
+                            "e2ee" => KvMode::E2ee,
+                            "plaintext" => KvMode::Plaintext,
+                            other => {
+                                return Err(format!(
+                                    "kvNamespaces[{idx}].mode invalid value '{other}': expected 'e2ee' or 'plaintext'"
+                                ));
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        return Err(format!("kvNamespaces[{idx}].mode must be a string"));
+                    }
+                };
+
+                let write_model_val = obj.get("writeModel").or_else(|| obj.get("write_model"));
+                let write_model = match write_model_val {
+                    None | Some(Value::Null) => KvWriteModel::Shared,
+                    Some(Value::String(raw_wm)) => {
+                        match raw_wm.trim().to_ascii_lowercase().as_str() {
+                            "shared" | "cas" => KvWriteModel::Shared,
+                            "owner" => KvWriteModel::Owner,
+                            "allowlist" => KvWriteModel::Allowlist,
+                            other => {
+                                return Err(format!(
+                                    "kvNamespaces[{idx}].writeModel invalid value '{other}': expected 'shared', 'owner', 'allowlist', or 'cas'"
+                                ));
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        return Err(format!("kvNamespaces[{idx}].writeModel must be a string"));
+                    }
+                };
+
+                KvNamespaceConfig {
+                    name: name.to_string(),
+                    mode,
+                    write_model,
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "kvNamespaces[{idx}] must be a namespace string or object"
+                ));
+            }
+        };
+
+        if !seen.insert(cfg.name.clone()) {
+            warnings.push(format!(
+                "Duplicate kvNamespaces entry '{}' ignored (keeping first definition).",
+                cfg.name
+            ));
+            continue;
+        }
+        out.push(cfg);
+    }
+
+    Ok(out)
 }
 
 fn validate_webhook_source_id(id: &str, field: &str) -> Result<String, String> {
@@ -3739,6 +3896,88 @@ mod tests {
         assert!(parsed.prometheus.is_empty());
         assert_eq!(parsed.generic.len(), 1);
         assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn parse_kv_namespaces_supports_strings_objects_dedup_and_fail_closed_validation() {
+        // 1. Absent / null -> empty vec, zero warnings.
+        let mut warnings = Vec::new();
+        assert!(
+            parse_kv_namespaces(&json!({}), &mut warnings)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            parse_kv_namespaces(&json!({ "kvNamespaces": null }), &mut warnings)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(warnings.is_empty());
+
+        // 2. Simple string entries + structured objects (`namespace` and `name`, `cas` alias) + dedup!
+        let mixed = json!({
+            "kvNamespaces": [
+                "shared",
+                "deploy-state",
+                { "namespace": "ops", "mode": "e2ee", "writeModel": "cas" },
+                { "name": "public-meta", "mode": "plaintext", "writeModel": "owner" },
+                { "namespace": "restricted", "writeModel": "allowlist" },
+                "shared"
+            ]
+        });
+        let parsed = parse_kv_namespaces(&mixed, &mut warnings).expect("valid kvNamespaces");
+        assert_eq!(
+            parsed,
+            vec![
+                KvNamespaceConfig {
+                    name: "shared".to_string(),
+                    mode: KvMode::E2ee,
+                    write_model: KvWriteModel::Shared,
+                },
+                KvNamespaceConfig {
+                    name: "deploy-state".to_string(),
+                    mode: KvMode::E2ee,
+                    write_model: KvWriteModel::Shared,
+                },
+                KvNamespaceConfig {
+                    name: "ops".to_string(),
+                    mode: KvMode::E2ee,
+                    write_model: KvWriteModel::Shared,
+                },
+                KvNamespaceConfig {
+                    name: "public-meta".to_string(),
+                    mode: KvMode::Plaintext,
+                    write_model: KvWriteModel::Owner,
+                },
+                KvNamespaceConfig {
+                    name: "restricted".to_string(),
+                    mode: KvMode::E2ee,
+                    write_model: KvWriteModel::Allowlist,
+                },
+            ]
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("shared"));
+
+        // 3. Fail-closed on invalid shapes, invalid names, conflicting keys, and unknown enums.
+        for bad in [
+            json!({ "kvNamespaces": "shared" }),
+            json!({ "kvNamespaces": [""] }),
+            json!({ "kvNamespaces": ["UPPERCASE"] }),
+            json!({ "kvNamespaces": ["../escape"] }),
+            json!({ "kvNamespaces": ["bad/slash"] }),
+            json!({ "kvNamespaces": [42] }),
+            json!({ "kvNamespaces": [{}] }),
+            json!({ "kvNamespaces": [{ "name": "a", "namespace": "b" }] }),
+            json!({ "kvNamespaces": [{ "namespace": "shared", "mode": "rot13" }] }),
+            json!({ "kvNamespaces": [{ "namespace": "shared", "writeModel": "bogus" }] }),
+        ] {
+            let mut w = Vec::new();
+            assert!(
+                parse_kv_namespaces(&bad, &mut w).is_err(),
+                "must fail closed for invalid kvNamespaces: {bad}"
+            );
+        }
     }
 
     #[test]

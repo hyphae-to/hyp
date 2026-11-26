@@ -909,7 +909,16 @@ pub fn diagnose_subscription(
     filters: &[Filter],
     catalog: &[TopicCatalogEntry],
 ) -> Vec<SubscriptionDiagnostic> {
-    let Some(info) = catalog.iter().find(|entry| entry.topic == topic) else {
+    let bare_topic = topic.strip_prefix("local.").unwrap_or(topic);
+    let Some(info) = catalog
+        .iter()
+        .find(|entry| entry.topic == topic)
+        .or_else(|| {
+            catalog.iter().find(|entry| {
+                entry.topic.strip_prefix("local.").unwrap_or(&entry.topic) == bare_topic
+            })
+        })
+    else {
         let mut available: Vec<&str> = catalog.iter().map(|e| e.topic.as_str()).collect();
         available.sort_unstable();
         let avail_str = if available.is_empty() {

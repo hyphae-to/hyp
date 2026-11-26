@@ -79,6 +79,30 @@ pub struct SubscriptionSpec {
     pub mode: DeliveryMode,
 }
 
+/// Prefix used in the `metadata` table to persist local subscription metadata (`key`, `urgency`)
+/// without requiring a SQLite schema version bump.
+pub const SUBSCRIPTION_META_PREFIX: &str = "sub_meta:";
+
+/// Optional persisted local metadata attached to a subscription row (`metadata` table).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub urgency: Option<String>,
+}
+
+/// Aggregated per-topic observation stats queried from the SQLite `events` table.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredTopicStats {
+    pub topic: String,
+    pub event_count: u64,
+    pub last_received_at: Option<i64>,
+    pub sources: Vec<String>,
+    pub repos: Vec<String>,
+}
+
 /// Persisted subscription record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Subscription {
@@ -583,6 +607,9 @@ impl<'a> EventStore<'a> {
                 )?;
                 tx.conn()
                     .execute("DELETE FROM subscriptions WHERE id = ?1", params![&prev.id])?;
+                let meta_key = format!("{SUBSCRIPTION_META_PREFIX}{}", prev.id);
+                tx.conn()
+                    .execute("DELETE FROM metadata WHERE key = ?1", params![&meta_key])?;
             }
         }
 
@@ -667,6 +694,9 @@ impl<'a> EventStore<'a> {
         let changed = tx
             .conn()
             .execute("DELETE FROM subscriptions WHERE id = ?1", params![id])?;
+        let meta_key = format!("{SUBSCRIPTION_META_PREFIX}{id}");
+        tx.conn()
+            .execute("DELETE FROM metadata WHERE key = ?1", params![&meta_key])?;
         tx.commit()?;
         if changed > 0 {
             self.invalidate_cache();
@@ -693,6 +723,9 @@ impl<'a> EventStore<'a> {
                 "DELETE FROM batches WHERE subscription_id = ?1",
                 params![id],
             )?;
+            let meta_key = format!("{SUBSCRIPTION_META_PREFIX}{id}");
+            tx.conn()
+                .execute("DELETE FROM metadata WHERE key = ?1", params![&meta_key])?;
         }
         tx.commit()?;
         if changed > 0 {
@@ -708,6 +741,10 @@ impl<'a> EventStore<'a> {
             "DELETE FROM batches WHERE subscription_id IN (SELECT id FROM subscriptions WHERE subscriber = ?1)",
             params![subscriber],
         )?;
+        tx.conn().execute(
+            "DELETE FROM metadata WHERE key IN (SELECT ?1 || id FROM subscriptions WHERE subscriber = ?2)",
+            params![SUBSCRIPTION_META_PREFIX, subscriber],
+        )?;
         let changed = tx.conn().execute(
             "DELETE FROM subscriptions WHERE subscriber = ?1",
             params![subscriber],
@@ -717,6 +754,246 @@ impl<'a> EventStore<'a> {
             self.invalidate_cache();
         }
         Ok(changed)
+    }
+
+    /// Persists optional local metadata (`key`, `urgency`) for `subscription_id` in the
+    /// `metadata` table under `sub_meta:<subscription_id>`.
+    pub fn set_subscription_meta(
+        &self,
+        subscription_id: &str,
+        meta: &SubscriptionMeta,
+    ) -> StoreResult<()> {
+        if subscription_id.is_empty() {
+            return Err(StoreError::InvalidInput(
+                "subscription_id must be non-empty".to_string(),
+            ));
+        }
+        let meta_key = format!("{SUBSCRIPTION_META_PREFIX}{subscription_id}");
+        if meta.key.is_none() && meta.urgency.is_none() {
+            self.db
+                .conn()
+                .execute("DELETE FROM metadata WHERE key = ?1", params![&meta_key])?;
+            return Ok(());
+        }
+        let encoded = serde_json::to_string(meta)?;
+        self.db.conn().execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![&meta_key, &encoded],
+        )?;
+        Ok(())
+    }
+
+    /// Loads persisted local metadata for `subscription_id`, if present.
+    pub fn get_subscription_meta(
+        &self,
+        subscription_id: &str,
+    ) -> StoreResult<Option<SubscriptionMeta>> {
+        let meta_key = format!("{SUBSCRIPTION_META_PREFIX}{subscription_id}");
+        let raw: Option<String> = self
+            .db
+            .conn()
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                params![&meta_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(raw.and_then(|s| serde_json::from_str::<SubscriptionMeta>(&s).ok()))
+    }
+
+    /// Lists all persisted subscription metadata records keyed by `subscription_id`.
+    pub fn list_subscription_meta(&self) -> StoreResult<BTreeMap<String, SubscriptionMeta>> {
+        let prefix_like = format!("{SUBSCRIPTION_META_PREFIX}%");
+        let mut stmt = self
+            .db
+            .conn()
+            .prepare("SELECT key, value FROM metadata WHERE key LIKE ?1")?;
+        let rows = stmt
+            .query_map(params![&prefix_like], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut out = BTreeMap::new();
+        for (raw_key, raw_val) in rows {
+            if let Some(sub_id) = raw_key.strip_prefix(SUBSCRIPTION_META_PREFIX) {
+                if let Ok(meta) = serde_json::from_str::<SubscriptionMeta>(&raw_val) {
+                    out.insert(sub_id.to_string(), meta);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Finds an existing subscription owned by `subscriber` whose persisted metadata `key`
+    /// equals `sub_key` (returning the oldest match deterministically if multiple exist).
+    pub fn find_subscription_by_key(
+        &self,
+        subscriber: &str,
+        sub_key: &str,
+    ) -> StoreResult<Option<Subscription>> {
+        if subscriber.is_empty() || sub_key.is_empty() {
+            return Ok(None);
+        }
+        let subs = load_subscriptions_of(self.db.conn(), subscriber)?;
+        for sub in subs {
+            if let Some(meta) = self.get_subscription_meta(&sub.id)? {
+                if meta.key.as_deref() == Some(sub_key) {
+                    return Ok(Some(sub));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Queries stored event counts, last-received timestamps, distinct sources, and observed
+    /// GitHub repos from the `events` table for any of `origin_nodes`, normalizing topic names
+    /// by stripping any leading `"local."` prefix so bare `<topic>` and `local.<topic>` fold
+    /// together consistently.
+    pub fn topic_event_stats(
+        &self,
+        origin_nodes: &[&str],
+    ) -> StoreResult<BTreeMap<String, StoredTopicStats>> {
+        const MAX_OBSERVED_VALUES: usize = 50;
+        const MAX_RECENT_BODIES: i64 = 256;
+
+        let mut origins: Vec<&str> = Vec::new();
+        for &origin in origin_nodes {
+            if !origin.is_empty() && !origins.contains(&origin) {
+                origins.push(origin);
+            }
+        }
+        if origins.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        let placeholders = (1..=origins.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let origin_params = rusqlite::params_from_iter(origins.iter().copied());
+
+        // 1. Aggregate event counts & latest `received_at` per raw topic.
+        let count_sql = format!(
+            "SELECT topic, COUNT(*), MAX(received_at)
+             FROM events
+             WHERE origin_node IN ({placeholders})
+             GROUP BY topic"
+        );
+        let mut count_stmt = self.db.conn().prepare(&count_sql)?;
+        let count_rows = count_stmt
+            .query_map(origin_params, |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if count_rows.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        let mut stats: BTreeMap<String, StoredTopicStats> = BTreeMap::new();
+        for (raw_topic, count, last_ts) in count_rows {
+            let norm_topic = raw_topic
+                .strip_prefix("local.")
+                .unwrap_or(raw_topic.as_str())
+                .to_string();
+            let entry = stats
+                .entry(norm_topic.clone())
+                .or_insert_with(|| StoredTopicStats {
+                    topic: norm_topic,
+                    ..StoredTopicStats::default()
+                });
+            entry.event_count = entry.event_count.saturating_add(count.max(0) as u64);
+            if let Some(ts) = last_ts {
+                entry.last_received_at = Some(match entry.last_received_at {
+                    Some(prev) => prev.max(ts),
+                    None => ts,
+                });
+            }
+        }
+
+        // 2. Collect distinct sources (and infer `owner/repo` from `github.com/<owner>/<repo>`
+        //    sources even when `events.body` was cleared for unmatched events).
+        let source_sql = format!(
+            "SELECT DISTINCT topic, source
+             FROM events
+             WHERE origin_node IN ({placeholders})
+             ORDER BY topic ASC, source ASC"
+        );
+        let mut source_stmt = self.db.conn().prepare(&source_sql)?;
+        let source_rows = source_stmt
+            .query_map(rusqlite::params_from_iter(origins.iter().copied()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (raw_topic, source) in source_rows {
+            let norm_topic = raw_topic
+                .strip_prefix("local.")
+                .unwrap_or(raw_topic.as_str());
+            let Some(entry) = stats.get_mut(norm_topic) else {
+                continue;
+            };
+            let trimmed_src = source.trim();
+            if !trimmed_src.is_empty()
+                && entry.sources.len() < MAX_OBSERVED_VALUES
+                && !entry.sources.iter().any(|s| s == trimmed_src)
+            {
+                entry.sources.push(trimmed_src.to_string());
+            }
+            if let Some(repo) = extract_github_repo_from_source(trimmed_src) {
+                if entry.repos.len() < MAX_OBSERVED_VALUES
+                    && !entry.repos.iter().any(|r| r.eq_ignore_ascii_case(&repo))
+                {
+                    entry.repos.push(repo);
+                }
+            }
+        }
+
+        // 3. Extract observed `repo` extension attributes from recent non-null event bodies.
+        let body_sql = format!(
+            "SELECT topic, body
+             FROM events
+             WHERE origin_node IN ({placeholders}) AND body IS NOT NULL
+             ORDER BY seq DESC
+             LIMIT {MAX_RECENT_BODIES}"
+        );
+        let mut body_stmt = self.db.conn().prepare(&body_sql)?;
+        let body_rows = body_stmt
+            .query_map(rusqlite::params_from_iter(origins.iter().copied()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (raw_topic, body) in body_rows {
+            let norm_topic = raw_topic
+                .strip_prefix("local.")
+                .unwrap_or(raw_topic.as_str());
+            let Some(entry) = stats.get_mut(norm_topic) else {
+                continue;
+            };
+            if entry.repos.len() >= MAX_OBSERVED_VALUES {
+                continue;
+            }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&body) {
+                if let Some(repo) = val
+                    .get("repo")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    if !entry.repos.iter().any(|r| r.eq_ignore_ascii_case(repo)) {
+                        entry.repos.push(repo.to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(stats)
     }
 
     /// Lists subscriptions, optionally filtered by `subscriber`.
@@ -1714,6 +1991,26 @@ fn decode_batch_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Bat
         reason,
         settled_at,
     }))
+}
+
+fn extract_github_repo_from_source(source: &str) -> Option<String> {
+    let lower = source.to_ascii_lowercase();
+    let rest = if lower.starts_with("https://github.com/") {
+        &source["https://github.com/".len()..]
+    } else if lower.starts_with("http://github.com/") {
+        &source["http://github.com/".len()..]
+    } else if lower.starts_with("github.com/") {
+        &source["github.com/".len()..]
+    } else {
+        return None;
+    };
+    let mut parts = rest.trim_matches('/').split('/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
 }
 
 fn decode_pushdown_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UpstreamPushdown> {
