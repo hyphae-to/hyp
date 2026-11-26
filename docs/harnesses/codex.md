@@ -11,7 +11,7 @@ What this configures:
 - Hooks (`SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`) in `~/.codex/hooks.json`.
 - Tailored skill in `~/.codex/skills/hyphae/SKILL.md` and `~/.agents/skills/hyphae/SKILL.md`.
 
-For Codex Desktop, run `hyp onboard --assist codex-desktop` to preview and merge `~/.codex/config.toml`, then **restart Codex Desktop**.
+For Codex Desktop, run `hyp onboard --assist codex-desktop` to preview and merge `~/.codex/config.toml`, then **restart Codex Desktop**. Both setup paths use the same MCP entry and keep any socket set by `hyp setup --harness codex --socket <path>`.
 
 ## Caller Identity & Wakeups
 

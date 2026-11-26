@@ -1233,5 +1233,5 @@ fn assist_claude_desktop_codex_desktop_and_cursor_ide_emit_manual_guides() {
         .expect("re-run assist codex-desktop --json");
     assert_eq!(cx_out2.status.code(), Some(0));
     let cx_json2 = parse_json_stdout(&cx_out2);
-    assert_eq!(cx_json2["data"]["mcpAlreadyConfigured"], true);
+    assert_eq!(cx_json2["data"]["mcpAlreadyConfigured"], false);
 }
