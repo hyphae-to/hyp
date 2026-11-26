@@ -6,7 +6,7 @@
 //! - Alternate screen (`\x1b[?1049h` / `\x1b[?1049l`) + synchronized redraw (`\x1b[?2026h`/`l`)
 //! - Live zero-polling updates pushed over a background `inspect.watch` NDJSON stream
 //! - Instant quick-control actions (`f` focus, `m` mute, `u`/`x` unsubscribe/unmute/leave,
-//!   `s` switch session, `r` refresh, `1`–`4` / `Tab` / `←` / `→` tabs, `↑`/`↓`/`j`/`k` nav)
+//!   `s` switch session, `r` refresh, `1`–`5` / `Tab` / `←` / `→` tabs, `↑`/`↓`/`j`/`k` nav)
 //! - Clean non-TTY / Windows interactive fallback printing `hyp inspect` output without hanging
 //! - Pure deterministic frame renderer (`render_ui_frame`) verified across `24×80` and `18×40`
 //!   viewports with strict column/row bounds and zero untrusted body leakage.
@@ -52,6 +52,9 @@ use std::sync::mpsc;
 #[cfg(unix)]
 use std::thread;
 use std::time::Duration;
+
+mod kv;
+use kv::KvBrowser;
 
 /// Bounded reconnect backoff schedule for `inspect.watch`: 500ms -> 1s -> 2s -> 5s.
 pub const WATCH_BACKOFF_SCHEDULE_MS: [u64; 4] = [500, 1_000, 2_000, 5_000];
@@ -100,14 +103,16 @@ pub enum UiTab {
     Queue,
     RulesAndMutes,
     MeshAndChannels,
+    Kv,
 }
 
 impl UiTab {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Subscriptions,
         Self::Queue,
         Self::RulesAndMutes,
         Self::MeshAndChannels,
+        Self::Kv,
     ];
 
     pub const fn title(self) -> &'static str {
@@ -116,6 +121,7 @@ impl UiTab {
             Self::Queue => "Queue",
             Self::RulesAndMutes => "Rules & Mutes",
             Self::MeshAndChannels => "Mesh & Channels",
+            Self::Kv => "KV",
         }
     }
 
@@ -125,6 +131,7 @@ impl UiTab {
             Self::Queue => "Queue",
             Self::RulesAndMutes => "Rules",
             Self::MeshAndChannels => "Mesh",
+            Self::Kv => "KV",
         }
     }
 
@@ -134,6 +141,7 @@ impl UiTab {
             Self::Queue => 2,
             Self::RulesAndMutes => 3,
             Self::MeshAndChannels => 4,
+            Self::Kv => 5,
         }
     }
 
@@ -142,13 +150,15 @@ impl UiTab {
             Self::Subscriptions => Self::Queue,
             Self::Queue => Self::RulesAndMutes,
             Self::RulesAndMutes => Self::MeshAndChannels,
-            Self::MeshAndChannels => Self::Subscriptions,
+            Self::MeshAndChannels => Self::Kv,
+            Self::Kv => Self::Subscriptions,
         }
     }
 
     pub const fn prev(self) -> Self {
         match self {
-            Self::Subscriptions => Self::MeshAndChannels,
+            Self::Subscriptions => Self::Kv,
+            Self::Kv => Self::MeshAndChannels,
             Self::Queue => Self::Subscriptions,
             Self::RulesAndMutes => Self::Queue,
             Self::MeshAndChannels => Self::RulesAndMutes,
@@ -239,6 +249,7 @@ pub struct SessionView {
 #[derive(Debug, Clone)]
 pub struct UiState {
     pub daemon: DaemonView,
+    kv: KvBrowser,
     pub sessions: Vec<SessionView>,
     pub active_session_idx: usize,
     pub active_tab: UiTab,
@@ -255,6 +266,7 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             daemon: DaemonView::default(),
+            kv: KvBrowser::default(),
             sessions: Vec::new(),
             active_session_idx: 0,
             active_tab: UiTab::Subscriptions,
@@ -531,6 +543,10 @@ impl UiState {
             }
         }
 
+        if let Some(kv) = snap.get("kv") {
+            self.kv.apply_local_snapshot(kv, &self.daemon.node_id);
+        }
+
         let mut parsed_sessions = Vec::new();
         if let Some(arr) = snap.get("sessions").and_then(Value::as_array) {
             for item in arr {
@@ -584,6 +600,9 @@ impl UiState {
     }
 
     pub fn current_row_count(&self) -> usize {
+        if self.active_tab == UiTab::Kv {
+            return self.kv.row_count();
+        }
         let Some(sess) = self.active_session() else {
             return 0;
         };
@@ -592,6 +611,7 @@ impl UiState {
             UiTab::Queue => sess.queued_items.len(),
             UiTab::RulesAndMutes => sess.rules_and_mutes.len(),
             UiTab::MeshAndChannels => sess.channels.len(),
+            UiTab::Kv => self.kv.row_count(),
         }
     }
 
@@ -607,6 +627,9 @@ impl UiState {
 
     pub fn select_tab(&mut self, tab: UiTab) {
         if self.active_tab != tab {
+            if self.active_tab == UiTab::Kv {
+                self.kv.close();
+            }
             self.active_tab = tab;
             self.selected_row = 0;
             self.scroll_offset = 0;
@@ -862,12 +885,18 @@ fn render_header_line(state: &UiState, cols: usize, use_color: bool) -> String {
 }
 
 fn render_tab_bar(state: &UiState, cols: usize, use_color: bool) -> String {
-    let compact = cols < 64;
+    let compact = cols < 80;
     let mut built_plain = String::new();
     let mut built_styled = String::new();
 
     for (idx, tab) in UiTab::ALL.iter().enumerate() {
-        let sep = if idx == 0 { "" } else { "  " };
+        let sep = if idx == 0 {
+            ""
+        } else if compact {
+            " "
+        } else {
+            "  "
+        };
         let label = if compact {
             format!("[{}]{}", tab.number(), tab.short_title())
         } else {
@@ -908,6 +937,15 @@ fn render_active_tab_body(
     if budget == 0 {
         return Vec::new();
     }
+    if state.active_tab == UiTab::Kv {
+        return state.kv.render(
+            state.selected_row,
+            state.updated_at,
+            budget,
+            cols,
+            use_color,
+        );
+    }
     let Some(sess) = state.active_session() else {
         let msg = if state.daemon.online {
             "No sessions registered yet. Start an agent session or press `r` to refresh."
@@ -946,6 +984,13 @@ fn render_active_tab_body(
             &state.daemon,
             sess,
             state.selected_row,
+            budget,
+            cols,
+            use_color,
+        ),
+        UiTab::Kv => state.kv.render(
+            state.selected_row,
+            state.updated_at,
             budget,
             cols,
             use_color,
@@ -1360,30 +1405,37 @@ fn render_footer_line(tab: UiTab, cols: usize, use_color: bool) -> String {
     let text = match tab {
         UiTab::Subscriptions => {
             if cols < 56 {
-                "1-4 tab · ↑↓ · f focus · m mute · u unsub · s sess · q"
+                "1-5 tab · ↑↓ · f focus · m mute · u unsub · s sess · q"
             } else {
-                "1-4/Tab tabs · ↑↓ nav · f focus · m mute · u unsub · s sess · r refresh · q quit"
+                "1-5/Tab tabs · ↑↓ nav · f focus · m mute · u unsub · s sess · r refresh · q quit"
             }
         }
         UiTab::Queue => {
             if cols < 56 {
-                "1-4 tab · ↑↓ · f focus · m mute src · s sess · q"
+                "1-5 tab · ↑↓ · f focus · m mute src · s sess · q"
             } else {
-                "1-4/Tab tabs · ↑↓ nav · f focus · m mute src · s sess · r refresh · q quit"
+                "1-5/Tab tabs · ↑↓ nav · f focus · m mute src · s sess · r refresh · q quit"
             }
         }
         UiTab::RulesAndMutes => {
             if cols < 56 {
-                "1-4 tab · ↑↓ · f focus · m mute · u rm · s sess · q"
+                "1-5 tab · ↑↓ · f focus · m mute · u rm · s sess · q"
             } else {
-                "1-4/Tab tabs · ↑↓ nav · f focus · m mute · u unmute/rm · s sess · r refresh · q quit"
+                "1-5/Tab tabs · ↑↓ nav · f focus · m mute · u unmute/rm · s sess · r refresh · q quit"
             }
         }
         UiTab::MeshAndChannels => {
             if cols < 56 {
-                "1-4 tab · ↑↓ · f focus · m mute · u leave · s sess · q"
+                "1-5 tab · ↑↓ · f focus · m mute · u leave · s sess · q"
             } else {
-                "1-4/Tab tabs · ↑↓ nav · f focus · m mute · u leave ch · s sess · r refresh · q quit"
+                "1-5/Tab tabs · ↑↓ nav · f focus · m mute · u leave ch · s sess · r refresh · q quit"
+            }
+        }
+        UiTab::Kv => {
+            if cols < 56 {
+                "↑↓ · Enter view · b back · n/p page · r"
+            } else {
+                "1-5 tabs · ↑↓ select · Enter view · b back · n/p page · r refresh · q quit"
             }
         }
     };
@@ -1408,6 +1460,10 @@ pub enum TuiKey {
     Remove,
     SwitchSession,
     Refresh,
+    Enter,
+    Back,
+    NextPage,
+    PreviousPage,
     Quit,
     Other,
 }
@@ -1424,6 +1480,11 @@ pub fn parse_tui_key(bytes: &[u8]) -> TuiKey {
         [b'2'] => TuiKey::TabNum(2),
         [b'3'] => TuiKey::TabNum(3),
         [b'4'] => TuiKey::TabNum(4),
+        [b'5'] => TuiKey::TabNum(5),
+        [b'\r'] | [b'\n'] => TuiKey::Enter,
+        [b'b'] | [b'B'] | [0x7f] | [0x08] => TuiKey::Back,
+        [b'n'] | [b'N'] => TuiKey::NextPage,
+        [b'p'] | [b'P'] => TuiKey::PreviousPage,
         [b'f'] | [b'F'] => TuiKey::Focus,
         [b'm'] | [b'M'] => TuiKey::Mute,
         [b'u'] | [b'U'] | [b'x'] | [b'X'] => TuiKey::Remove,
@@ -1800,6 +1861,7 @@ fn build_action_rpc_packet(
             UiTab::Queue => {
                 return Some(Err(("Use `m` to mute the selected source".into(), false)));
             }
+            UiTab::Kv => return None,
         },
         _ => return None,
     };
@@ -1862,6 +1924,16 @@ fn toggle_mute_all_packet(sess: &SessionView) -> (Value, String) {
             "Muted all (*)".to_string(),
         )
     }
+}
+
+#[cfg(unix)]
+fn refresh_kv_report(socket: &Path, state: &mut UiState) {
+    state.status_message = if state.kv.refresh(socket, &state.daemon.node_id) {
+        None
+    } else {
+        Some(("Could not refresh KV metadata from the daemon".into(), true))
+    };
+    state.clamp_selection();
 }
 
 fn fallback_to_inspect(args: &UiArgs) -> ExitCode {
@@ -1945,17 +2017,20 @@ pub fn run_ui(args: &UiArgs) -> ExitCode {
         let mut idle_ticks: u32 = 0;
 
         loop {
+            let mut refresh_kv_page = false;
             // Drain all pending pushed watch snapshots without blocking.
             while let Ok(ev) = rx.try_recv() {
                 match ev {
                     WatchEvent::Snapshot(snap) => {
                         let was_offline = state.is_offline();
+                        let previous_rev = state.rev;
                         state.apply_snapshot(
                             &snap,
                             prefer_session.as_deref(),
                             prefer_herdr.as_deref(),
                             prefer_handle.as_deref(),
                         );
+                        refresh_kv_page |= state.rev != previous_rev;
                         if was_offline && state.daemon.online {
                             state.status_message = Some(("Reconnected to daemon".into(), false));
                         }
@@ -1963,12 +2038,20 @@ pub fn run_ui(args: &UiArgs) -> ExitCode {
                     }
                     WatchEvent::Disconnected { reason, attempt } => {
                         state.daemon.online = false;
+                        state.kv.close();
                         state.watch_status = WatchStatus::Reconnecting { attempt };
                         state.status_message =
                             Some((format!("OFFLINE (reconnecting…) · {reason}"), true));
                         dirty = true;
                     }
                 }
+            }
+
+            if refresh_kv_page && state.active_tab == UiTab::Kv && state.daemon.online {
+                state
+                    .kv
+                    .refresh_open_page(&socket_path, Some(&state.daemon.node_id));
+                state.clamp_selection();
             }
 
             if dirty {
@@ -1980,12 +2063,14 @@ pub fn run_ui(args: &UiArgs) -> ExitCode {
             match tty.read_key_timeout() {
                 Ok(Some(key)) => {
                     idle_ticks = 0;
+                    let was_kv = state.active_tab == UiTab::Kv;
                     match key {
                         TuiKey::Quit => break,
                         TuiKey::TabNum(1) => state.select_tab(UiTab::Subscriptions),
                         TuiKey::TabNum(2) => state.select_tab(UiTab::Queue),
                         TuiKey::TabNum(3) => state.select_tab(UiTab::RulesAndMutes),
                         TuiKey::TabNum(4) => state.select_tab(UiTab::MeshAndChannels),
+                        TuiKey::TabNum(5) => state.select_tab(UiTab::Kv),
                         TuiKey::Tab | TuiKey::Right => state.select_tab(state.active_tab.next()),
                         TuiKey::BackTab | TuiKey::Left => state.select_tab(state.active_tab.prev()),
                         TuiKey::Up => state.move_up(),
@@ -2001,6 +2086,32 @@ pub fn run_ui(args: &UiArgs) -> ExitCode {
                                 state.status_message =
                                     Some((format!("Switched to {label}"), false));
                             }
+                        }
+                        TuiKey::Enter if was_kv => {
+                            if state.kv.open_selected(&socket_path, state.selected_row) {
+                                state.selected_row = 0;
+                                state.status_message = None;
+                            } else {
+                                state.status_message =
+                                    Some(("Could not open the selected KV record".into(), true));
+                            }
+                        }
+                        TuiKey::Back if was_kv => {
+                            state.kv.back();
+                            state.selected_row = 0;
+                            state.status_message = None;
+                        }
+                        TuiKey::NextPage | TuiKey::PreviousPage if was_kv => {
+                            if state.kv.page(&socket_path, key == TuiKey::NextPage) {
+                                state.selected_row = 0;
+                                state.status_message = None;
+                            }
+                        }
+                        TuiKey::Refresh if was_kv => {
+                            let (r, c) = detect_terminal_size();
+                            rows = r;
+                            cols = c;
+                            refresh_kv_report(&socket_path, &mut state);
                         }
                         TuiKey::Refresh => {
                             let (r, c) = detect_terminal_size();
@@ -2033,7 +2144,7 @@ pub fn run_ui(args: &UiArgs) -> ExitCode {
                                 ));
                             }
                         }
-                        TuiKey::Focus | TuiKey::Mute | TuiKey::Remove => {
+                        TuiKey::Focus | TuiKey::Mute | TuiKey::Remove if !was_kv => {
                             perform_action_rpc(&socket_path, &mut state, key);
                             // Fetch fresh state immediately in case watch stream had disconnected.
                             let res = daemon_rpc_sync(
@@ -2052,7 +2163,10 @@ pub fn run_ui(args: &UiArgs) -> ExitCode {
                                 }
                             }
                         }
-                        TuiKey::TabNum(_) | TuiKey::Other => continue,
+                        _ => continue,
+                    }
+                    if !was_kv && state.active_tab == UiTab::Kv {
+                        refresh_kv_report(&socket_path, &mut state);
                     }
                     dirty = true;
                 }
@@ -2194,7 +2308,7 @@ mod tests {
     }
 
     #[test]
-    fn render_ui_frame_fits_strictly_at_24x80_and_18x40_across_all_4_tabs() {
+    fn render_ui_frame_fits_strictly_at_24x80_and_18x40_across_all_tabs() {
         let mut state = sample_state_with_ansi_traps();
 
         for (rows, cols) in [(24usize, 80usize), (18, 40), (10, 32)] {
@@ -2243,6 +2357,10 @@ mod tests {
                                 assert!(joined.contains("#ops"));
                                 assert!(joined.contains("#release"));
                             }
+                            UiTab::Kv => {
+                                assert!(joined.contains("KV namespaces"));
+                                assert!(joined.contains("No visible KV records."));
+                            }
                         }
                     }
 
@@ -2274,6 +2392,10 @@ mod tests {
         assert_eq!(parse_tui_key(b"\t"), TuiKey::Tab);
         assert_eq!(parse_tui_key(b"1"), TuiKey::TabNum(1));
         assert_eq!(parse_tui_key(b"4"), TuiKey::TabNum(4));
+        assert_eq!(parse_tui_key(b"5"), TuiKey::TabNum(5));
+        assert_eq!(parse_tui_key(b"\r"), TuiKey::Enter);
+        assert_eq!(parse_tui_key(b"b"), TuiKey::Back);
+        assert_eq!(parse_tui_key(b"n"), TuiKey::NextPage);
         assert_eq!(parse_tui_key(b"f"), TuiKey::Focus);
         assert_eq!(parse_tui_key(b"m"), TuiKey::Mute);
         assert_eq!(parse_tui_key(b"u"), TuiKey::Remove);

@@ -1069,6 +1069,7 @@ async fn route_request(
                     };
                     match res {
                         Ok(set_res) => {
+                            node.notify_kv_metadata_change();
                             node.notify_all_inbox_subscribers();
                             node.notify_scheduler();
                             let etag = format_version_etag(set_res.entry.version);
@@ -1138,6 +1139,9 @@ async fn route_request(
                     };
                     match res {
                         Ok(del_res) => {
+                            if del_res.deleted {
+                                node.notify_kv_metadata_change();
+                            }
                             node.notify_all_inbox_subscribers();
                             Ok(json_response(StatusCode::OK, &del_res))
                         }
