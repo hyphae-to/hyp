@@ -207,7 +207,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --keep-going --locked -- -D warnings
 
       - name: Workspace Tests (unit, golden interop, chaos & CLI E2E)
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
 
       - name: Verify live Node.js & Python external plugin E2E (zero skips)
         if: runner.os == 'Linux'

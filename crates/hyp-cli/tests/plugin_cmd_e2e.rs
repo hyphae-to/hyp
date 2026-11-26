@@ -606,10 +606,11 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
         "notion",
     ] {
         let path = onboarding_of(name);
-        assert!(
-            path.as_str()
-                .is_some_and(|p| p.ends_with(&format!("{name}/onboarding.json"))),
-            "{name} must report onboardingPath, got {path}"
+        let expected = state_dir.join("plugins").join(name).join("onboarding.json");
+        assert_eq!(
+            path.as_str().map(Path::new),
+            Some(expected.as_path()),
+            "{name} must report its onboardingPath"
         );
     }
     assert_eq!(onboarding_of("telegram"), Value::Null);
