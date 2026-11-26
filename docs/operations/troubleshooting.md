@@ -50,7 +50,9 @@ hyp inbox reject <receipt> --mute
 - Verify sender allowlists (`TELEGRAM_ALLOWED_USERS`, `SLACK_ALLOWED_USERS`, `WHATSAPP_ALLOWED_NUMBERS`) are non-empty — all included bridges drop unauthorized senders fail-closed.
 - For `plugins/webhook` and `plugins/prometheus`, verify auth secrets are configured (or `*_ALLOW_UNSIGNED=1` on **loopback only**).
 
-### 8. Peer offline, `capability_downgrade_detected`, or `am2_` pairing rejected
+### 8. Peer offline, Tailscale stopped/misconfigured, `capability_downgrade_detected`, or `am2_` pairing rejected
+- **Tailscale offline or missing Serve route:** `hyp doctor` and `hyp status` probe `tailscale status --json` and `tailscale serve status --json` (non-blocking, 1.5s budget). If `*.ts.net` peers or `deploymentProvider: "tailscale"` are configured while Tailscale is stopped/logged out, run `tailscale up` (or reconnect the Tailscale app). If `tailscale.serve` warns of a missing HTTPS route, run the printed `tailscale serve --bg --https=<port> http://<bind>` command.
+- **SSH peer (`ssh://`) connection failed:** Verify non-interactive SSH works (`ssh -o BatchMode=yes <target> true`), confirm `hyp` is on remote `PATH` or `~/.local/bin/hyp` (or pass `?bin=/path/to/hyp`), and confirm the remote daemon has `<state_dir>/peer.sock` (`0600`) or loopback `listen.bind` active (`hyp connect` bridges stdio cleanly with zero banner output on stdout).
 - **`am2_` disabled on Team Hub:** Provision the public Admin-CA JWK (`hyphae-admin-pubkey`) on the hub and restart it (see [Team Hub Guide](../guides/team-hub.md)).
 - **Key mismatch / downgrade:** A previously pinned peer changed keys or dropped `dm.e2ee.v1`. Verify out-of-band before revoking (`hyp pair revoke <peer>`) and re-pairing.
 - **Behind a reverse proxy:** Confirm Caddy sets `flush_interval -1` and `listen.trustedProxies` includes the proxy's CIDR (default `["127.0.0.1/32", "::1/128"]`).

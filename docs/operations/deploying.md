@@ -166,6 +166,22 @@ hyp relay set https://drop.example.com
 hyp relay status --probe
 ```
 
+### 2.8 Zero-Port SSH-Only Node (`ssh://` + `peer.sock` + `hyp connect`)
+
+For personal servers, bastions, or private VPC machines already reachable over SSH (`~/.ssh/config` + key auth), you can run a Hyphae `router` or `p2p` node with **zero listening TCP ports**:
+
+```sh
+# On the remote server (binds only user-only 0600 <state_dir>/peer.sock):
+hyp node start --profile p2p --node-id solace --bind none
+
+# From your laptop (one-command mutual P2P pairing over ssh://ops@solace):
+hyp pair ssh ops@solace --preset member
+```
+
+- `router` and `p2p` nodes automatically bind `<state_dir>/peer.sock` (`0600`) on Unix (opt-in on `local` nodes via `--peer-socket <path>` or `listen.peerSocket: true`).
+- Remote peers tunnel HTTP/1.1 + SSE via `ssh -o BatchMode=yes -T -- <target>` invoking `hyp connect`, which bridges stdio directly to `peer.sock` (falling back to loopback `listen.bind` if `peer.sock` is absent).
+- Optional query parameters `?stateDir=/path` and `?bin=/path/to/hyp` are strictly validated against shell/option injection.
+
 ---
 
 ## 3. Production Hardening Checklist

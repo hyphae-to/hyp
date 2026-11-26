@@ -10774,8 +10774,10 @@ mod tests {
         let normalized = HYPHAE_SETUP_SKILL_MD.replace("\r\n", "\n");
         assert!(normalized.starts_with("---\nname: hyphae-setup\n"));
         assert!(!HYPHAE_SETUP_SKILL_MD.contains("hyp share"));
-        assert!(!HYPHAE_SETUP_SKILL_MD.contains("hyp connect"));
         assert!(!HYPHAE_SETUP_SKILL_MD.contains("npm install"));
+        assert!(HYPHAE_SETUP_SKILL_MD.contains("hyp pair ssh"));
+        assert!(HYPHAE_SETUP_SKILL_MD.contains("hyp connect"));
+        assert!(HYPHAE_SETUP_SKILL_MD.contains("ssh://"));
         assert!(HYPHAE_SETUP_SKILL_MD.contains("hyp secret set"));
         assert!(HYPHAE_SETUP_SKILL_MD.contains("--web"));
         assert!(HYPHAE_SETUP_SKILL_MD.contains("hyp gate propose"));

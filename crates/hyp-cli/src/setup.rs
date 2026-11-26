@@ -1447,6 +1447,8 @@ fn run_onboard_deterministic(
         })
     });
 
+    let tailscale_status = crate::status_doctor::probe_tailscale_for_onboarding();
+
     if as_json {
         let mut data_map = Map::new();
         data_map.insert("nodeId".to_string(), json!(node_id));
@@ -1471,6 +1473,7 @@ fn run_onboard_deterministic(
         data_map.insert("stagedJoin".to_string(), json!(staged_json));
         data_map.insert("daemon".to_string(), json!(daemon_json));
         data_map.insert("harnesses".to_string(), json!(configured_harnesses));
+        data_map.insert("tailscale".to_string(), json!(tailscale_status));
         if let Some(ref hm) = herdr_mod_outcome {
             data_map.insert("herdrMod".to_string(), json!(hm));
         }
@@ -1500,6 +1503,28 @@ fn run_onboard_deterministic(
         println!("      JWK kid:     {kid}");
         println!("      Fingerprint: {fingerprint}");
         println!("      Secrets:     {}", secrets.backend().as_str());
+        if tailscale_status.state == "running" {
+            let mut ts_parts = Vec::new();
+            if let Some(ref dns) = tailscale_status.dns_name {
+                ts_parts.push(dns.as_str());
+            }
+            if let Some(ip) = tailscale_status.tailnet_ips.first() {
+                ts_parts.push(ip.as_str());
+            }
+            println!(
+                "      Tailscale:   Running ({}) — ready for Tailscale Serve HTTPS or `hyp pair ssh <target>`",
+                if ts_parts.is_empty() {
+                    "connected".to_string()
+                } else {
+                    ts_parts.join(", ")
+                }
+            );
+        } else if tailscale_status.installed {
+            println!(
+                "      Tailscale:   {} (run `tailscale up` for MagicDNS HTTPS, or `hyp pair ssh <target>` for zero-port SSH)",
+                tailscale_status.state
+            );
+        }
         if let Some(ref live) = live_join_outcome {
             println!(
                 "      Paired Peer: {} ({}, endpoint={}, status=active)",
@@ -1622,23 +1647,39 @@ fn read_and_stage_join_token(
     warnings: &mut Vec<String>,
 ) -> Result<StagedJoin, (u8, &'static str, String, Option<String>)> {
     let trimmed_source = source.trim();
-    if trimmed_source.starts_with("https://") || trimmed_source.starts_with("http://") {
+    if trimmed_source.starts_with("https://")
+        || trimmed_source.starts_with("http://")
+        || trimmed_source.starts_with("ssh://")
+    {
         validate_endpoint_origin(trimmed_source).map_err(|e| {
             (
                 EXIT_USAGE,
                 "INVALID_ENDPOINT",
                 format!("Invalid --join URL '{trimmed_source}': {e}"),
                 Some(
-                    "Use an https:// URL (or loopback http://127.0.0.1 for local testing)."
+                    "Use an https:// URL, ssh://[user@]host[:port], or loopback http://127.0.0.1 for local testing."
                         .to_string(),
                 ),
             )
         })?;
-        let base_url = trimmed_source
-            .trim_end_matches('/')
-            .strip_suffix("/v1/manifest")
-            .unwrap_or(trimmed_source.trim_end_matches('/'))
-            .to_string();
+        let base_url = if trimmed_source.starts_with("ssh://") {
+            hyp_crypto::pairing::parse_ssh_endpoint(trimmed_source)
+                .map_err(|e| {
+                    (
+                        EXIT_USAGE,
+                        "INVALID_ENDPOINT",
+                        format!("Invalid --join SSH URL '{trimmed_source}': {e}"),
+                        None,
+                    )
+                })?
+                .canonical_url()
+        } else {
+            trimmed_source
+                .trim_end_matches('/')
+                .strip_suffix("/v1/manifest")
+                .unwrap_or(trimmed_source.trim_end_matches('/'))
+                .to_string()
+        };
         return Ok(StagedJoin {
             format: "url",
             peer_node_id: None,
@@ -1768,23 +1809,39 @@ fn read_and_stage_join_token(
             raw_token: token,
             source_file,
         })
-    } else if token.starts_with("https://") || token.starts_with("http://") {
+    } else if token.starts_with("https://")
+        || token.starts_with("http://")
+        || token.starts_with("ssh://")
+    {
         validate_endpoint_origin(&token).map_err(|e| {
             (
                 EXIT_USAGE,
                 "INVALID_ENDPOINT",
                 format!("Invalid join URL '{token}': {e}"),
                 Some(
-                    "Use an https:// URL (or loopback http://127.0.0.1 for local testing)."
+                    "Use an https:// URL, ssh://[user@]host[:port], or loopback http://127.0.0.1 for local testing."
                         .to_string(),
                 ),
             )
         })?;
-        let base_url = token
-            .trim_end_matches('/')
-            .strip_suffix("/v1/manifest")
-            .unwrap_or(token.trim_end_matches('/'))
-            .to_string();
+        let base_url = if token.starts_with("ssh://") {
+            hyp_crypto::pairing::parse_ssh_endpoint(&token)
+                .map_err(|e| {
+                    (
+                        EXIT_USAGE,
+                        "INVALID_ENDPOINT",
+                        format!("Invalid join SSH URL '{token}': {e}"),
+                        None,
+                    )
+                })?
+                .canonical_url()
+        } else {
+            token
+                .trim_end_matches('/')
+                .strip_suffix("/v1/manifest")
+                .unwrap_or(token.trim_end_matches('/'))
+                .to_string()
+        };
         Ok(StagedJoin {
             format: "url",
             peer_node_id: None,

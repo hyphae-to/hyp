@@ -26,11 +26,13 @@ pub use drop_relay::{
     DropRelay, DropRelayConfig, DropRelayError, DropRelayHealth, DropSubscriberAuth,
     DropSubscription, PostDropResponse,
 };
+pub use http_util::{ENV_SSH_BIN, SshEndpoint, parse_ssh_endpoint, resolve_ssh_binary};
 pub use local_ingest::{
     LOCAL_INGEST_MAX_CONCURRENT_CONNS, LOCAL_INGEST_READ_TIMEOUT, LocalIngestError,
     LocalIngestOutcome, LocalIngestServer, MAX_LOCAL_INGEST_LINE_BYTES,
     canonical_local_event_for_signing, send_local_ingest_event,
 };
+pub use server::DEFAULT_PEER_SOCKET_FILENAME;
 pub use node::{
     AuthenticatedPeer, DiscoveredPeerHandle, IngestedHumanDrop, KvWriteRequest, PeerLinkInfo,
     PeerReconcileReport, SendDmResult, SubscribeRequest, SubscribeResult, TransferSendResult,

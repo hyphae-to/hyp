@@ -84,6 +84,9 @@ const MAX_CONCURRENT_LINGERING_CLOSES: usize = 64;
 const LINGERING_CLOSE_TIMEOUT: Duration = Duration::from_millis(200);
 const LINGERING_CLOSE_MAX_DISCARD_BYTES: usize = 512 * 1024;
 
+/// Default Unix domain socket filename for local `hyp connect` / `ssh://` peer transport.
+pub const DEFAULT_PEER_SOCKET_FILENAME: &str = "peer.sock";
+
 static ACTIVE_LINGERING_CLOSES: AtomicUsize = AtomicUsize::new(0);
 
 /// RFC 9112 §9.6 lingering-close `TcpStream` wrapper.
@@ -291,6 +294,108 @@ impl UnifiedNode {
         });
 
         Ok((local_addr, handle))
+    }
+
+    /// Binds and serves this `UnifiedNode`'s full Hyphae v2 HTTP/1.1+2 + WHATWG SSE peer router
+    /// over a user-only (`0600`) Unix domain socket (typically `<state_dir>/peer.sock`), enabling
+    /// zero-open-port `hyp connect` / `ssh://` peer transport.
+    #[cfg(unix)]
+    pub async fn serve_unix(
+        self: Arc<Self>,
+        path: std::path::PathBuf,
+    ) -> Result<(std::path::PathBuf, JoinHandle<()>), NodeError> {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            if !meta.file_type().is_socket() {
+                return Err(NodeError::Io(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "refusing to bind peer.sock over non-socket path {}",
+                        path.display()
+                    ),
+                )));
+            }
+            let alive = matches!(
+                tokio::time::timeout(
+                    Duration::from_millis(200),
+                    tokio::net::UnixStream::connect(&path),
+                )
+                .await,
+                Ok(Ok(_))
+            );
+            if alive {
+                return Err(NodeError::Io(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "another live Hyphae peer server is already listening on {}",
+                        path.display()
+                    ),
+                )));
+            }
+            std::fs::remove_file(&path)?;
+        }
+
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        self.set_peer_socket_path(path.clone());
+
+        let mut shutdown_rx = self.shutdown_receiver();
+        let node = Arc::clone(&self);
+        let cleanup_path = path.clone();
+        let loopback_peer = SocketAddr::from(([127, 0, 0, 1], 0));
+        let handle = tokio::spawn(async move {
+            loop {
+                let accept = tokio::select! {
+                    res = listener.accept() => res,
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let (stream, _unix_addr) = match accept {
+                    Ok(pair) => pair,
+                    Err(_) => continue,
+                };
+                let conn_node = Arc::clone(&node);
+                let mut conn_shutdown = node.shutdown_receiver();
+                tokio::spawn(async move {
+                    if *conn_shutdown.borrow() {
+                        return;
+                    }
+                    let io = TokioIo::new(stream);
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let n = Arc::clone(&conn_node);
+                        async move {
+                            Ok::<_, Infallible>(handle_http_request(n, loopback_peer, req).await)
+                        }
+                    });
+                    let builder = AutoServerBuilder::new(TokioExecutor::new());
+                    let conn = builder.serve_connection(io, service);
+                    tokio::pin!(conn);
+                    tokio::select! {
+                        _ = conn.as_mut() => {}
+                        _ = conn_shutdown.changed() => {
+                            if *conn_shutdown.borrow() {
+                                conn.as_mut().graceful_shutdown();
+                            }
+                        }
+                    }
+                });
+            }
+            let _ = std::fs::remove_file(&cleanup_path);
+        });
+
+        Ok((path, handle))
     }
 }
 

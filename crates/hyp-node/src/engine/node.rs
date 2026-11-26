@@ -303,6 +303,7 @@ pub struct UnifiedNode {
     drop_relay: Arc<DropRelay>,
     http_client: HttpClient,
     bound_addr: Mutex<Option<SocketAddr>>,
+    peer_socket_path: Mutex<Option<PathBuf>>,
     manifest_window: Mutex<ManifestWindow>,
     room_keys: Mutex<HashMap<(String, String, String, u64), RoomEpochKey>>,
     min_epochs: Mutex<HashMap<(String, String, String), u64>>,
@@ -413,6 +414,7 @@ impl UnifiedNode {
             drop_relay,
             http_client,
             bound_addr: Mutex::new(None),
+            peer_socket_path: Mutex::new(None),
             manifest_window: Mutex::new(ManifestWindow::default()),
             room_keys: Mutex::new(HashMap::new()),
             min_epochs: Mutex::new(HashMap::new()),
@@ -717,6 +719,7 @@ impl UnifiedNode {
     /// Gracefully stops the scheduler, attached source adapters, and all background SSE peer links.
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
+        self.http_client.shutdown_ssh();
         self.scheduler_notify.notify_waiters();
         let gh_opt = self
             .github_public
@@ -810,6 +813,22 @@ impl UnifiedNode {
 
     pub(crate) fn set_bound_addr(&self, addr: SocketAddr) {
         *self.bound_addr.lock().expect("bound_addr lock poisoned") = Some(addr);
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn set_peer_socket_path(&self, path: PathBuf) {
+        *self
+            .peer_socket_path
+            .lock()
+            .expect("peer_socket_path lock poisoned") = Some(path);
+    }
+
+    /// Returns the bound Unix peer socket path (`peer.sock`) if [`UnifiedNode::serve_unix`] is active.
+    pub fn peer_socket_path(&self) -> Option<PathBuf> {
+        self.peer_socket_path
+            .lock()
+            .expect("peer_socket_path lock poisoned")
+            .clone()
     }
 
     /// Returns this node's public HTTP(S) origin (explicit `public_endpoint` or bound loopback addr).
@@ -3395,14 +3414,16 @@ impl UnifiedNode {
                 obj.insert("signedGrant".to_string(), serde_json::to_value(sg)?);
             }
         }
-        let url = format!("{}/v1/pair", invite.router.trim_end_matches('/'));
         let http_req = Request::builder()
             .method(Method::POST)
-            .uri(&url)
+            .uri("/v1/pair")
             .header(http::header::CONTENT_TYPE, "application/json")
             .body(full_body(serde_json::to_vec(&req_val)?))
             .map_err(|e| NodeError::Http(e.to_string()))?;
-        let resp = self.http_client.request(http_req).await?;
+        let resp = self
+            .http_client
+            .request_for_endpoint(&invite.router, http_req)
+            .await?;
         let (status, _headers, body) =
             HttpClient::collect(resp, MAX_JSON_RESPONSE_BYTES).await?;
         if !status.is_success() {
@@ -3901,18 +3922,20 @@ impl UnifiedNode {
             &bob_grant,
         )?;
 
-        let url = format!(
-            "{}/v1/p2p/pair/{}",
-            offer.endpoint.trim_end_matches('/'),
-            offer.offer_id
+        let path = format!(
+            "/v1/p2p/pair/{}",
+            crate::engine::http_util::percent_encode(&offer.offer_id)
         );
         let http_req = Request::builder()
             .method(Method::POST)
-            .uri(&url)
+            .uri(&path)
             .header(http::header::CONTENT_TYPE, "application/json")
             .body(full_body(serde_json::to_vec(&resp_body)?))
             .map_err(|e| NodeError::Http(e.to_string()))?;
-        let resp = self.http_client.request(http_req).await?;
+        let resp = self
+            .http_client
+            .request_for_endpoint(&offer.endpoint, http_req)
+            .await?;
         let (status, _headers, body) =
             HttpClient::collect(resp, MAX_JSON_RESPONSE_BYTES).await?;
         if !status.is_success() {

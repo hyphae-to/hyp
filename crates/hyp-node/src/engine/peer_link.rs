@@ -585,13 +585,18 @@ impl PeerLink {
         body_bytes: Option<Bytes>,
         content_type: Option<&str>,
     ) -> Result<Request<BoxedBody>, NodeError> {
-        let url = format!("{}{}", self.endpoint, path_and_query);
         let body_sha = match &body_bytes {
             Some(b) => hex::encode(Sha256::digest(b)),
             None => hex::encode(Sha256::digest(b"")),
         };
 
-        let mut builder = Request::builder().method(method.clone()).uri(&url);
+        let uri_str = if self.endpoint.starts_with("ssh://") {
+            path_and_query.to_string()
+        } else {
+            format!("{}{}", self.endpoint, path_and_query)
+        };
+
+        let mut builder = Request::builder().method(method.clone()).uri(&uri_str);
         if let Some(ct) = content_type {
             builder = builder.header(CONTENT_TYPE, ct);
         }
@@ -654,7 +659,10 @@ impl PeerLink {
             req.headers_mut().insert(name, val);
         }
 
-        let resp = self.client.request(req).await?;
+        let resp = self
+            .client
+            .request_for_endpoint(&self.endpoint, req)
+            .await?;
         let (status, _headers, bytes) =
             HttpClient::collect(resp, MAX_JSON_RESPONSE_BYTES).await?;
         if !status.is_success() {
@@ -675,7 +683,10 @@ impl PeerLink {
                 req.headers_mut().insert(IF_NONE_MATCH, val);
             }
         }
-        let resp = self.client.request(req).await?;
+        let resp = self
+            .client
+            .request_for_endpoint(&self.endpoint, req)
+            .await?;
         let (status, headers, bytes) =
             HttpClient::collect(resp, MAX_JSON_RESPONSE_BYTES).await?;
         if status == StatusCode::NOT_MODIFIED {
@@ -684,7 +695,11 @@ impl PeerLink {
         if status == StatusCode::NOT_FOUND {
             // Legacy v1 TypeScript router fallback (§3.2.1): probe GET /v1/keys.
             let keys_req = self.build_request(Method::GET, "/v1/keys", None, None)?;
-            let keys_present = match self.client.request(keys_req).await {
+            let keys_present = match self
+                .client
+                .request_for_endpoint(&self.endpoint, keys_req)
+                .await
+            {
                 Ok(r) => r.status().is_success(),
                 Err(_) => false,
             };
@@ -972,7 +987,10 @@ impl PeerLink {
             }
         }
 
-        let resp = self.client.request(req).await?;
+        let resp = self
+            .client
+            .request_for_endpoint(&self.endpoint, req)
+            .await?;
         let (status, _headers, bytes) =
             HttpClient::collect(resp, MAX_JSON_RESPONSE_BYTES).await?;
         if !status.is_success() {
@@ -984,7 +1002,10 @@ impl PeerLink {
     pub async fn download_transfer(&self, id: &str) -> Result<Bytes, NodeError> {
         let path = format!("/v1/transfers/{}", percent_encode(id));
         let req = self.build_request(Method::GET, &path, None, None)?;
-        let resp = self.client.request(req).await?;
+        let resp = self
+            .client
+            .request_for_endpoint(&self.endpoint, req)
+            .await?;
         let (status, _headers, bytes) =
             HttpClient::collect(resp, MAX_TRANSFER_DOWNLOAD_BYTES).await?;
         if !status.is_success() {
@@ -1004,6 +1025,14 @@ impl PeerLink {
         &self,
         last_event_id: Option<&str>,
     ) -> Result<Response<Incoming>, NodeError> {
+        self.open_inbox_sse_cancellable(last_event_id, None).await
+    }
+
+    pub(crate) async fn open_inbox_sse_cancellable(
+        &self,
+        last_event_id: Option<&str>,
+        cancel_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> Result<Response<Incoming>, NodeError> {
         let mut req = self.build_request(Method::GET, "/v1/inbox", None, None)?;
         req.headers_mut()
             .insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
@@ -1012,7 +1041,9 @@ impl PeerLink {
                 req.headers_mut().insert("last-event-id", val);
             }
         }
-        self.client.request(req).await
+        self.client
+            .request_stream_for_endpoint(&self.endpoint, req, cancel_rx)
+            .await
     }
 }
 
@@ -1067,8 +1098,9 @@ pub fn spawn_sse_worker(
                 break;
             }
 
+            let (_stream_cancel_tx, stream_cancel_rx) = tokio::sync::oneshot::channel::<()>();
             let connect_res = tokio::select! {
-                res = link.open_inbox_sse(last_event_id.as_deref()) => res,
+                res = link.open_inbox_sse_cancellable(last_event_id.as_deref(), Some(stream_cancel_rx)) => res,
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() { break; }
                     continue;

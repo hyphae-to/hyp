@@ -158,9 +158,9 @@ Check which orchestrators and native push transports are present on this machine
   ```sh
   hyp pair join https://public.hyphae.to --json
   ```
-- **Direct P2P (`hp2p1_`)**:
+- **Direct P2P (`hp2p1_` — HTTPS, Tailscale Serve, or Optional `ssh://`)**:
   ```sh
-  # On the inviting machine (needs a reachable HTTPS endpoint, e.g. Tailscale Serve):
+  # Option 1 — Tailscale Serve / HTTPS (auto-detects Tailscale MagicDNS when --endpoint omitted):
   hyp pair invite --mode p2p \
     --node-id alice@macbook \
     --endpoint https://alice.tailnet.ts.net \
@@ -170,7 +170,14 @@ Check which orchestrators and native push transports are present on this machine
   # On the accepting machine (inspect first, then accept via stdin or --token-file):
   hyp pair inspect --json <<< "$TOKEN"
   hyp pair accept --json <<< "$TOKEN"
+
+  # Option 2 — Zero-port SSH (`ssh://`, personal servers/bastions/VPCs via ~/.ssh/config + peer.sock):
+  # One-command mutual P2P pairing (remote node runs `hyp node start --profile p2p` or `--peer-socket`):
+  hyp pair ssh ops@solace --preset member --json
+  # Or manual/asymmetric workflow:
+  hyp pair invite --mode p2p --node-id solace --endpoint ssh://ops@solace --preset member
   ```
+  *(SSH is strictly a transport pipe via `hyp connect` -> `<state_dir>/peer.sock` `0600`; full Hyphae v2 E2EE, Ed25519 auth, and manifest verification remain 100% enforced.)*
 - **Team Hub (`am2_`)**:
   - To **deploy** a new hub, inspect options and generate a hardened kit:
     ```sh
@@ -178,7 +185,7 @@ Check which orchestrators and native push transports are present on this machine
     hyp deploy init tailscale --node-id acme-team --domain hyphae.your-tailnet.ts.net --out ./deploy-tailscale --json
     hyp deploy check --config ./deploy-tailscale/node.json --json
     ```
-    Supported providers: `tailscale`, `vps`, `docker`, `cloudflare`, `fly`, `public-node`, `drop-relay` (pass `--enable-drop-relay` to co-host a RAM-only Blind Drop Relay on any hub provider).
+    Supported providers: `tailscale`, `vps`, `docker`, `cloudflare`, `fly`, `public-node`, `drop-relay` (pass `--enable-drop-relay` to co-host a RAM-only Blind Drop Relay on any hub provider). For private SSH-only hubs with zero open TCP ports, bind `<state_dir>/peer.sock` (`--bind none`) and mint invites with `--endpoint ssh://<user@host>`.
   - To **invite** a teammate from the admin machine:
     ```sh
     hyp pair invite --mode team \
@@ -257,8 +264,13 @@ Identify what the user wants to change and execute only the targeted workflow:
   - Full clean removal/reset (stops background service, restores chained `statusLine`, cleans harness integrations, and optionally removes state/binary): use `hyp uninstall` (or the standalone `uninstall.sh` / `uninstall.ps1` script).
 
 ### B. Pair or Revoke Laptops, Servers, or Public Nodes
-- Inspect the built-in pairing guide: `hyp pair guide --json` (or `--mode p2p|team|public`).
-- Mint invites: `hyp pair invite --mode p2p|team --node-id <id> --endpoint <url> ...`
+- Inspect the built-in pairing & transport guide (Tailscale Serve HTTPS, Public HTTPS, and Optional `ssh://`): `hyp pair guide --json` (or `--mode p2p|team|public`).
+- One-command zero-port SSH mutual P2P pairing (tunnels over `ssh -o BatchMode=yes` -> remote `hyp connect` -> `peer.sock` `0600`):
+  ```sh
+  hyp pair ssh ops@solace --preset member --json
+  hyp pair ssh great-northern --dry-run --json
+  ```
+- Mint invites (`https://` or `ssh://[user@]host[:port]`): `hyp pair invite --mode p2p|team --node-id <id> --endpoint <url> ...`
 - Inspect & accept invites safely via stdin or `--token-file` (triggers live `peers.reload` on the running daemon):
   ```sh
   hyp pair inspect --token-file ~/.config/hyphae/invite.tok --json
@@ -477,8 +489,9 @@ hyp service status --json   # check LaunchAgent / systemd --user / Windows schta
 hyp service install --json  # install & start auto-restarting background daemon service
 hyp service restart --json  # cleanly restart background daemon after node.json changes
 hyp service stop --json     # stop background daemon service
-hyp doctor --json           # fail-closed checks on node.json, node.sqlite, peers, gate_policy_sig, harnesses
-hyp status --json           # node identity, peer capabilities/version skew, gate & update status
+hyp doctor --json           # fail-closed checks on node.json, node.sqlite, peers, Tailscale/Serve status, gate_policy_sig, harnesses
+hyp status --json           # node identity, peer capabilities/version skew, Tailscale & SSH transport status, gate & update status
+hyp connect                 # stdio bridge to local peer.sock / loopback TCP (invoked remotely by ssh:// peers)
 hyp exec --env VAR=<secret> -- <cmd>  # run user app command with SecretStore env injection + streaming redaction
 hyp daemon                  # run foreground daemon (used by supervisors / Docker / debugging)
 hyp update check --json     # verify signed release manifests for available updates

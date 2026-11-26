@@ -131,6 +131,8 @@ pub struct PeerSkewRow {
     pub e2ee: String,
     pub streams: String,
     pub kv: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
     pub notes: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admitted_by_human_id: Option<String>,
@@ -141,6 +143,55 @@ pub struct PeerSkewRow {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub missing_capabilities: Vec<String>,
 }
+
+/// Tailscale Serve HTTPS route verification result (`tailscale serve status --json`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TailscaleServeStatus {
+    pub checked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exposed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_https_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix_command: Option<String>,
+}
+
+/// Smart operational Tailscale probe result reported under `data.tailscale`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TailscaleOperationalStatus {
+    pub installed: bool,
+    /// `"running"` | `"stopped"` | `"needs_login"` | `"not_installed"` | `"error"`
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tailnet_ips: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub online: Option<bool>,
+    pub has_ts_net_endpoints: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ts_net_endpoints: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serve: Option<TailscaleServeStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+const TAILSCALE_PROBE_TIMEOUT: Duration = Duration::from_millis(1_500);
+const MAX_TAILSCALE_PROBE_BYTES: usize = 1024 * 1024;
+const ENV_TAILSCALE_STATUS_JSON: &str = "HYPHAE_TAILSCALE_STATUS_JSON";
+const ENV_TAILSCALE_SERVE_STATUS_JSON: &str = "HYPHAE_TAILSCALE_SERVE_STATUS_JSON";
+const ENV_TAILSCALE_BIN: &str = "HYPHAE_TAILSCALE_BIN";
 
 pub fn run_status(args: StatusArgs) -> ExitCode {
     run_status_or_doctor(
@@ -503,6 +554,7 @@ fn run_status_or_doctor(
         e2ee: "n/a".to_string(),
         streams: "pushdown".to_string(),
         kv: "kv.e2ee.v1".to_string(),
+        transport: None,
         notes: format!("local node ({node_id})"),
         admitted_by_human_id: None,
         admitted_auth_epoch: None,
@@ -842,6 +894,10 @@ fn run_status_or_doctor(
     let runtime_plugins = extract_runtime_plugin_statuses(status_doc.as_ref());
     checks.extend(build_runtime_plugin_checks(&runtime_plugins));
 
+    // 9. Smart Tailscale operational detection (non-blocking, bounded 1.5s timeout)
+    let tailscale_status = probe_tailscale_operational(loaded_cfg.as_ref(), profile, &peers);
+    checks.extend(build_tailscale_checks(&tailscale_status, is_doctor));
+
     let fail_count = checks
         .iter()
         .filter(|c| c.status == CheckStatus::Fail)
@@ -918,6 +974,7 @@ fn run_status_or_doctor(
         "herdrMod": herdr_mod_status,
         "plugins": plugins_report,
         "runtimePlugins": runtime_plugins,
+        "tailscale": tailscale_status,
         "checks": checks,
     });
 
@@ -1033,6 +1090,33 @@ fn run_status_or_doctor(
                 plugins_report.outdated_count,
                 plugins_report.modified_count,
                 plugins_report.corrupt_count
+            );
+        }
+        if tailscale_status.state == "running" {
+            let mut ts_parts = Vec::new();
+            if let Some(ref dns) = tailscale_status.dns_name {
+                ts_parts.push(sanitize_tty_display(dns));
+            }
+            if let Some(first_ip) = tailscale_status.tailnet_ips.first() {
+                ts_parts.push(sanitize_tty_display(first_ip));
+            }
+            let detail_parens = if ts_parts.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", ts_parts.join(", "))
+            };
+            let serve_note = match tailscale_status.serve.as_ref() {
+                Some(s) if s.exposed == Some(true) => " [serve: OK]".to_string(),
+                Some(s) if s.exposed == Some(false) => " [serve: WARN missing route]".to_string(),
+                _ => String::new(),
+            };
+            println!("  Tailscale: Running{detail_parens}{serve_note}");
+        } else if tailscale_status.has_ts_net_endpoints {
+            let sev = if is_doctor { "FAIL" } else { "WARN" };
+            println!(
+                "  Tailscale: {sev} ({}; required by {} *.ts.net endpoint(s))",
+                sanitize_tty_display(&tailscale_status.state),
+                tailscale_status.ts_net_endpoints.len().max(1)
             );
         }
         if !runtime_plugins.is_empty() {
@@ -1211,6 +1295,8 @@ pub fn evaluate_peer_skew(
         "missing".to_string()
     };
 
+    let transport = detect_peer_transport(peer.endpoint.as_deref());
+
     // 1. Disjoint protocol range -> FAIL
     if max_agreed < min_agreed {
         return PeerSkewRow {
@@ -1221,6 +1307,7 @@ pub fn evaluate_peer_skew(
             e2ee: e2ee_col,
             streams: streams_col,
             kv: kv_col,
+            transport,
             notes: format!(
                 "Blocked: protocol_incompatible (local {}..={}, remote {}..={})",
                 MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, proto_range.min, proto_range.max
@@ -1251,6 +1338,7 @@ pub fn evaluate_peer_skew(
             e2ee: e2ee_col,
             streams: streams_col,
             kv: kv_col,
+            transport,
             notes: format!(
                 "Blocked: capability_downgrade_detected (previously observed {} vanished)",
                 dropped_e2ee.join(", ")
@@ -1275,6 +1363,7 @@ pub fn evaluate_peer_skew(
             e2ee: e2ee_col,
             streams: streams_col,
             kv: kv_col,
+            transport,
             notes: "Blocked: requireE2ee=true but peer lacks dm.e2ee.v1".to_string(),
             admitted_by_human_id: peer.admitted_by_human_id.clone(),
             admitted_auth_epoch: peer.admitted_auth_epoch,
@@ -1315,6 +1404,7 @@ pub fn evaluate_peer_skew(
             e2ee: e2ee_col,
             streams: streams_col,
             kv: kv_col,
+            transport,
             notes: "Legacy v1 peer (plaintext DMs; will ratchet to E2EE on upgrade)".to_string(),
             admitted_by_human_id: peer.admitted_by_human_id.clone(),
             admitted_auth_epoch: peer.admitted_auth_epoch,
@@ -1337,6 +1427,7 @@ pub fn evaluate_peer_skew(
             e2ee: e2ee_col,
             streams: streams_col,
             kv: kv_col,
+            transport,
             notes: format!(
                 "Missing optional capabilities: {}",
                 missing_optional.join(", ")
@@ -1348,7 +1439,7 @@ pub fn evaluate_peer_skew(
         };
     }
 
-    let notes = if let Some(ref hid) = peer.admitted_by_human_id {
+    let base_notes = if let Some(ref hid) = peer.admitted_by_human_id {
         match peer.admitted_auth_epoch {
             Some(ep) => format!("admitted via human:{hid} (ep {ep})"),
             None => format!("admitted via human:{hid}"),
@@ -1364,6 +1455,11 @@ pub fn evaluate_peer_skew(
     } else {
         "full v2 parity".to_string()
     };
+    let notes = if transport.as_deref() == Some("ssh") {
+        format!("{base_notes} (transport=ssh)")
+    } else {
+        base_notes
+    };
 
     PeerSkewRow {
         status: CheckStatus::Ok,
@@ -1373,11 +1469,25 @@ pub fn evaluate_peer_skew(
         e2ee: e2ee_col,
         streams: streams_col,
         kv: kv_col,
+        transport,
         notes,
         admitted_by_human_id: peer.admitted_by_human_id.clone(),
         admitted_auth_epoch: peer.admitted_auth_epoch,
         upgrade_hint: None,
         missing_capabilities: Vec::new(),
+    }
+}
+
+fn detect_peer_transport(endpoint: Option<&str>) -> Option<String> {
+    let ep = endpoint?.trim();
+    if ep.starts_with("ssh://") {
+        Some("ssh".to_string())
+    } else if ep.starts_with("https://") {
+        Some("https".to_string())
+    } else if ep.starts_with("http://") {
+        Some("http".to_string())
+    } else {
+        None
     }
 }
 
@@ -1677,4 +1787,850 @@ fn collect_disabled_insecure_gate_url_warnings(raw_config: Option<&Value>) -> Ve
     }
 
     warnings
+}
+
+// ============================================================================
+// Smart Tailscale Operational Detection (`hyp status` / `hyp doctor` / `hyp onboard`)
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedTailscaleStatus {
+    state: String,
+    backend_state: Option<String>,
+    dns_name: Option<String>,
+    tailnet_ips: Vec<String>,
+    online: Option<bool>,
+}
+
+/// Returns `true` if `raw` is an HTTP(S) endpoint whose hostname falls under `*.ts.net`.
+pub(crate) fn is_ts_net_endpoint(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    let Some(rest) = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    if host_port.starts_with('[') {
+        return false;
+    }
+    let host = host_port
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    host.len() > ".ts.net".len() && host.ends_with(".ts.net")
+}
+
+/// Extracts the HTTPS port from an `https://host[:port]` URL (defaulting to `443`).
+pub(crate) fn parse_https_port_from_url(raw: &str) -> Option<u16> {
+    let trimmed = raw.trim();
+    let rest = trimmed.strip_prefix("https://")?;
+    let authority = rest.split('/').next().unwrap_or("");
+    if authority.is_empty() {
+        return None;
+    }
+    if let Some(after_open) = authority.strip_prefix('[') {
+        let (_ip, tail) = after_open.split_once(']')?;
+        if tail.is_empty() {
+            Some(443)
+        } else {
+            tail.strip_prefix(':')?.parse::<u16>().ok().filter(|&p| p > 0)
+        }
+    } else if let Some((_host, port_str)) = authority.split_once(':') {
+        port_str.parse::<u16>().ok().filter(|&p| p > 0)
+    } else {
+        Some(443)
+    }
+}
+
+fn parse_tailscale_status_json(bytes: &[u8]) -> Result<ParsedTailscaleStatus, String> {
+    let parsed: Value = serde_json::from_slice(bytes)
+        .map_err(|e| format!("invalid tailscale status JSON: {e}"))?;
+    let Some(root) = parsed.as_object() else {
+        return Err("tailscale status JSON is not an object".to_string());
+    };
+    let backend_state = root
+        .get("BackendState")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+
+    let self_obj = root.get("Self").and_then(Value::as_object);
+    let online = self_obj
+        .and_then(|s| s.get("Online"))
+        .and_then(Value::as_bool);
+    let dns_name = self_obj
+        .and_then(|s| s.get("DNSName"))
+        .and_then(Value::as_str)
+        .map(|s| s.trim().trim_end_matches('.'))
+        .filter(|s| !s.is_empty())
+        .map(|s| sanitize_tty_display(&s.to_ascii_lowercase()));
+    let tailnet_ips: Vec<String> = self_obj
+        .and_then(|s| s.get("TailscaleIPs"))
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(sanitize_tty_display)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let state = match backend_state.as_deref() {
+        Some("Running") => {
+            if online == Some(false) {
+                "stopped".to_string()
+            } else {
+                "running".to_string()
+            }
+        }
+        Some("NeedsLogin") | Some("NoState") => "needs_login".to_string(),
+        Some("Stopped") | Some("Starting") | Some("NeedsMachineAuth") => "stopped".to_string(),
+        Some(_) => "error".to_string(),
+        None => "error".to_string(),
+    };
+
+    Ok(ParsedTailscaleStatus {
+        state,
+        backend_state,
+        dns_name,
+        tailnet_ips,
+        online,
+    })
+}
+
+fn normalize_proxy_loopback_port(raw: &str) -> Option<(bool, String, u16)> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    let rest = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .unwrap_or(trimmed);
+    let authority = rest.split('/').next().unwrap_or("");
+    if authority.is_empty() {
+        return None;
+    }
+    let (host, port) = if let Some(after_open) = authority.strip_prefix('[') {
+        let (ip, tail) = after_open.split_once(']')?;
+        let p = tail.strip_prefix(':')?.parse::<u16>().ok()?;
+        (ip.to_ascii_lowercase(), p)
+    } else {
+        let (h, p_str) = authority.split_once(':')?;
+        let p = p_str.parse::<u16>().ok()?;
+        (h.to_ascii_lowercase(), p)
+    };
+    let is_loopback = matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1" | "0.0.0.0" | "::");
+    Some((is_loopback, host, port))
+}
+
+fn proxy_matches_bind(proxy: &str, expected_bind: &str) -> bool {
+    let Some((p_lo, p_host, p_port)) = normalize_proxy_loopback_port(proxy) else {
+        return false;
+    };
+    let Some((e_lo, e_host, e_port)) = normalize_proxy_loopback_port(expected_bind) else {
+        return false;
+    };
+    if p_port != e_port {
+        return false;
+    }
+    (p_lo && e_lo) || p_host == e_host
+}
+
+pub(crate) fn parse_tailscale_serve_status_json(
+    bytes: &[u8],
+    expected_port: u16,
+    expected_bind: &str,
+) -> TailscaleServeStatus {
+    let expected_target = format!("http://{expected_bind}");
+    let fix_cmd = format!("tailscale serve --bg --https={expected_port} {expected_target}");
+    let parsed: Value = match serde_json::from_slice(bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            return TailscaleServeStatus {
+                checked: false,
+                exposed: None,
+                expected_https_port: Some(expected_port),
+                expected_target: Some(expected_target),
+                matched_target: None,
+                detail: Some(format!("Could not parse tailscale serve status JSON: {e}")),
+                fix_command: None,
+            };
+        }
+    };
+
+    let port_suffix = format!(":{expected_port}");
+    if let Some(web) = parsed.get("Web").and_then(Value::as_object) {
+        for (host_port, cfg) in web {
+            if !host_port.ends_with(&port_suffix) {
+                continue;
+            }
+            if let Some(handlers) = cfg.get("Handlers").and_then(Value::as_object) {
+                if let Some(root_handler) = handlers.get("/") {
+                    if let Some(proxy) = root_handler.get("Proxy").and_then(Value::as_str) {
+                        if proxy_matches_bind(proxy, expected_bind) {
+                            return TailscaleServeStatus {
+                                checked: true,
+                                exposed: Some(true),
+                                expected_https_port: Some(expected_port),
+                                expected_target: Some(expected_target),
+                                matched_target: Some(sanitize_tty_display(proxy)),
+                                detail: Some(format!(
+                                    "Tailscale Serve HTTPS :{expected_port} -> {}",
+                                    sanitize_tty_display(proxy)
+                                )),
+                                fix_command: None,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    TailscaleServeStatus {
+        checked: true,
+        exposed: Some(false),
+        expected_https_port: Some(expected_port),
+        expected_target: Some(expected_target.clone()),
+        matched_target: None,
+        detail: Some(format!(
+            "No Tailscale Serve route found exposing HTTPS :{expected_port} -> {expected_target}"
+        )),
+        fix_command: Some(fix_cmd),
+    }
+}
+
+fn find_tailscale_binary() -> Option<String> {
+    if let Ok(explicit) = std::env::var(ENV_TAILSCALE_BIN) {
+        let trimmed = explicit.trim();
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("none")
+            || trimmed.eq_ignore_ascii_case("disabled")
+        {
+            return None;
+        }
+        return Some(trimmed.to_string());
+    }
+
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            let direct = dir.join("tailscale");
+            if direct.is_file() {
+                return Some(direct.display().to_string());
+            }
+            #[cfg(windows)]
+            {
+                let exe = dir.join("tailscale.exe");
+                if exe.is_file() {
+                    return Some(exe.display().to_string());
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mac_bin = "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
+        if Path::new(mac_bin).is_file() {
+            return Some(mac_bin.to_string());
+        }
+    }
+
+    None
+}
+
+fn run_bounded_probe_command(
+    bin: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<(bool, Vec<u8>, Vec<u8>), String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("failed to create probe runtime: {e}"))?;
+    rt.block_on(async {
+        use tokio::io::AsyncReadExt;
+        use tokio::process::Command;
+
+        let mut cmd = Command::new(bin);
+        cmd.args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("failed to spawn '{bin}': {e}"))?;
+        let mut out_pipe = child
+            .stdout
+            .take()
+            .ok_or_else(|| "probe missing stdout".to_string())?;
+        let mut err_pipe = child
+            .stderr
+            .take()
+            .ok_or_else(|| "probe missing stderr".to_string())?;
+
+        let fut = async {
+            let mut out_buf = Vec::new();
+            let mut err_buf = Vec::new();
+            let out_fut = async {
+                let mut lim = (&mut out_pipe).take((MAX_TAILSCALE_PROBE_BYTES + 1) as u64);
+                lim.read_to_end(&mut out_buf).await
+            };
+            let err_fut = async {
+                let mut lim = (&mut err_pipe).take(16 * 1024);
+                lim.read_to_end(&mut err_buf).await
+            };
+            let (out_res, _err_res) = tokio::join!(out_fut, err_fut);
+            out_res.map_err(|e| format!("failed reading probe stdout: {e}"))?;
+            if out_buf.len() > MAX_TAILSCALE_PROBE_BYTES {
+                let _ = child.kill().await;
+                return Err("tailscale probe output exceeded 1 MiB safety limit".to_string());
+            }
+            let status = child
+                .wait()
+                .await
+                .map_err(|e| format!("failed waiting on probe process: {e}"))?;
+            Ok((status.success(), out_buf, err_buf))
+        };
+
+        match tokio::time::timeout(timeout, fut).await {
+            Ok(res) => res,
+            Err(_) => {
+                let _ = child.kill().await;
+                Err(format!(
+                    "tailscale probe timed out after {}ms",
+                    timeout.as_millis()
+                ))
+            }
+        }
+    })
+}
+
+fn collect_ts_net_endpoints(
+    loaded_cfg: Option<&LoadedNodeFile>,
+    peers: &[PeerRecord],
+) -> (Vec<String>, bool) {
+    let mut set = BTreeSet::new();
+    let mut uses_tailscale_provider = false;
+
+    if let Some(cfg) = loaded_cfg {
+        if let Some(ref pub_url) = cfg.public_url {
+            if is_ts_net_endpoint(pub_url) {
+                set.insert(pub_url.trim().to_string());
+                uses_tailscale_provider = true;
+            }
+        }
+        let provider_str = cfg
+            .raw
+            .get("deploymentProvider")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                cfg.raw
+                    .get("deployment")
+                    .and_then(|d| d.get("provider"))
+                    .and_then(Value::as_str)
+            });
+        if provider_str.is_some_and(|p| p.trim().eq_ignore_ascii_case("tailscale")) {
+            uses_tailscale_provider = true;
+        }
+        if let Some(arr) = cfg.raw.get("peers").and_then(Value::as_array) {
+            for p in arr {
+                if let Some(ep) = p.get("endpoint").and_then(Value::as_str) {
+                    if is_ts_net_endpoint(ep) {
+                        set.insert(ep.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    for p in peers {
+        if let Some(ref ep) = p.endpoint {
+            if is_ts_net_endpoint(ep) {
+                set.insert(ep.trim().to_string());
+            }
+        }
+    }
+
+    (set.into_iter().collect(), uses_tailscale_provider)
+}
+
+/// Probes Tailscale operational status and (for `Router | P2p` nodes serving `*.ts.net`)
+/// verifies `tailscale serve status --json` within a strict 1.5s non-blocking budget.
+pub(crate) fn probe_tailscale_operational(
+    loaded_cfg: Option<&LoadedNodeFile>,
+    profile: NodeProfile,
+    peers: &[PeerRecord],
+) -> TailscaleOperationalStatus {
+    let (ts_net_endpoints, uses_tailscale_provider) = collect_ts_net_endpoints(loaded_cfg, peers);
+    let has_ts_net_endpoints = !ts_net_endpoints.is_empty() || uses_tailscale_provider;
+
+    let should_check_serve = matches!(profile, NodeProfile::Router | NodeProfile::P2p)
+        && (uses_tailscale_provider
+            || loaded_cfg
+                .and_then(|c| c.public_url.as_deref())
+                .is_some_and(is_ts_net_endpoint));
+    let expected_port = loaded_cfg
+        .and_then(|c| c.public_url.as_deref())
+        .and_then(parse_https_port_from_url)
+        .unwrap_or(443);
+    let expected_bind = loaded_cfg
+        .and_then(|c| c.bind_addr)
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "127.0.0.1:8790".to_string());
+
+    // Fast test override via `HYPHAE_TAILSCALE_STATUS_JSON` (zero subprocesses, 100% isolated).
+    if let Ok(raw_env) = std::env::var(ENV_TAILSCALE_STATUS_JSON) {
+        let trimmed = raw_env.trim();
+        if trimmed.eq_ignore_ascii_case("not_installed")
+            || trimmed.eq_ignore_ascii_case("none")
+            || trimmed.eq_ignore_ascii_case("disabled")
+        {
+            return TailscaleOperationalStatus {
+                installed: false,
+                state: "not_installed".to_string(),
+                backend_state: None,
+                dns_name: None,
+                tailnet_ips: Vec::new(),
+                online: None,
+                has_ts_net_endpoints,
+                ts_net_endpoints,
+                serve: None,
+                error: None,
+            };
+        }
+        return match parse_tailscale_status_json(trimmed.as_bytes()) {
+            Ok(parsed) => {
+                let serve = if parsed.state == "running" && should_check_serve {
+                    probe_tailscale_serve_from_env_or_bin(None, expected_port, &expected_bind)
+                } else {
+                    None
+                };
+                TailscaleOperationalStatus {
+                    installed: true,
+                    state: parsed.state,
+                    backend_state: parsed.backend_state,
+                    dns_name: parsed.dns_name,
+                    tailnet_ips: parsed.tailnet_ips,
+                    online: parsed.online,
+                    has_ts_net_endpoints,
+                    ts_net_endpoints,
+                    serve,
+                    error: None,
+                }
+            }
+            Err(err) => TailscaleOperationalStatus {
+                installed: true,
+                state: "error".to_string(),
+                backend_state: None,
+                dns_name: None,
+                tailnet_ips: Vec::new(),
+                online: None,
+                has_ts_net_endpoints,
+                ts_net_endpoints,
+                serve: None,
+                error: Some(err),
+            },
+        };
+    }
+
+    let Some(bin) = find_tailscale_binary() else {
+        return TailscaleOperationalStatus {
+            installed: false,
+            state: "not_installed".to_string(),
+            backend_state: None,
+            dns_name: None,
+            tailnet_ips: Vec::new(),
+            online: None,
+            has_ts_net_endpoints,
+            ts_net_endpoints,
+            serve: None,
+            error: None,
+        };
+    };
+
+    match run_bounded_probe_command(&bin, &["status", "--json"], TAILSCALE_PROBE_TIMEOUT) {
+        Ok((ok, stdout, stderr)) => {
+            // Tailscale CLI often exits non-zero when Stopped / NeedsLogin while still emitting
+            // valid JSON status on stdout — parse stdout whenever present!
+            if !stdout.is_empty() {
+                if let Ok(parsed) = parse_tailscale_status_json(&stdout) {
+                    let serve = if parsed.state == "running" && should_check_serve {
+                        probe_tailscale_serve_from_env_or_bin(
+                            Some(&bin),
+                            expected_port,
+                            &expected_bind,
+                        )
+                    } else {
+                        None
+                    };
+                    return TailscaleOperationalStatus {
+                        installed: true,
+                        state: parsed.state,
+                        backend_state: parsed.backend_state,
+                        dns_name: parsed.dns_name,
+                        tailnet_ips: parsed.tailnet_ips,
+                        online: parsed.online,
+                        has_ts_net_endpoints,
+                        ts_net_endpoints,
+                        serve,
+                        error: None,
+                    };
+                }
+            }
+            let err_text = String::from_utf8_lossy(&stderr).trim().to_string();
+            let err_lower = err_text.to_ascii_lowercase();
+            let inferred_state = if err_lower.contains("stopped") || err_lower.contains("not running") {
+                "stopped"
+            } else if err_lower.contains("logged out") || err_lower.contains("needs login") {
+                "needs_login"
+            } else {
+                "error"
+            };
+            TailscaleOperationalStatus {
+                installed: true,
+                state: inferred_state.to_string(),
+                backend_state: None,
+                dns_name: None,
+                tailnet_ips: Vec::new(),
+                online: None,
+                has_ts_net_endpoints,
+                ts_net_endpoints,
+                serve: None,
+                error: if ok {
+                    Some("tailscale status --json returned empty output".to_string())
+                } else if !err_text.is_empty() {
+                    Some(sanitize_tty_display(&err_text))
+                } else {
+                    Some("tailscale status --json exited with non-zero status".to_string())
+                },
+            }
+        }
+        Err(err) => TailscaleOperationalStatus {
+            installed: true,
+            state: "error".to_string(),
+            backend_state: None,
+            dns_name: None,
+            tailnet_ips: Vec::new(),
+            online: None,
+            has_ts_net_endpoints,
+            ts_net_endpoints,
+            serve: None,
+            error: Some(err),
+        },
+    }
+}
+
+fn probe_tailscale_serve_from_env_or_bin(
+    bin: Option<&str>,
+    expected_port: u16,
+    expected_bind: &str,
+) -> Option<TailscaleServeStatus> {
+    if let Ok(raw_env) = std::env::var(ENV_TAILSCALE_SERVE_STATUS_JSON) {
+        let trimmed = raw_env.trim();
+        if trimmed.eq_ignore_ascii_case("permission_denied") || trimmed.eq_ignore_ascii_case("error") {
+            return Some(TailscaleServeStatus {
+                checked: false,
+                exposed: None,
+                expected_https_port: Some(expected_port),
+                expected_target: Some(format!("http://{expected_bind}")),
+                matched_target: None,
+                detail: Some(
+                    "Could not inspect `tailscale serve status --json` (permission denied or unavailable)"
+                        .to_string(),
+                ),
+                fix_command: None,
+            });
+        }
+        return Some(parse_tailscale_serve_status_json(
+            trimmed.as_bytes(),
+            expected_port,
+            expected_bind,
+        ));
+    }
+
+    let bin_path = bin?;
+    match run_bounded_probe_command(bin_path, &["serve", "status", "--json"], TAILSCALE_PROBE_TIMEOUT)
+    {
+        Ok((true, stdout, _stderr)) if !stdout.is_empty() => Some(parse_tailscale_serve_status_json(
+            &stdout,
+            expected_port,
+            expected_bind,
+        )),
+        Ok((_ok, _stdout, stderr)) => {
+            let err_snippet = sanitize_tty_display(String::from_utf8_lossy(&stderr).trim());
+            Some(TailscaleServeStatus {
+                checked: false,
+                exposed: None,
+                expected_https_port: Some(expected_port),
+                expected_target: Some(format!("http://{expected_bind}")),
+                matched_target: None,
+                detail: Some(if err_snippet.is_empty() {
+                    "Could not inspect `tailscale serve status --json` (insufficient permissions or serve unavailable)".to_string()
+                } else {
+                    format!("Could not inspect `tailscale serve status --json`: {err_snippet}")
+                }),
+                fix_command: None,
+            })
+        }
+        Err(err) => Some(TailscaleServeStatus {
+            checked: false,
+            exposed: None,
+            expected_https_port: Some(expected_port),
+            expected_target: Some(format!("http://{expected_bind}")),
+            matched_target: None,
+            detail: Some(format!("Could not inspect `tailscale serve status --json`: {err}")),
+            fix_command: None,
+        }),
+    }
+}
+
+/// Lightweight Tailscale operational probe used during `hyp onboard`.
+pub(crate) fn probe_tailscale_for_onboarding() -> TailscaleOperationalStatus {
+    probe_tailscale_operational(None, NodeProfile::Local, &[])
+}
+
+pub(crate) fn build_tailscale_checks(
+    ts: &TailscaleOperationalStatus,
+    is_doctor: bool,
+) -> Vec<CliCheck> {
+    let mut out = Vec::new();
+    if ts.state == "running" {
+        let mut parts = Vec::new();
+        if let Some(ref dns) = ts.dns_name {
+            parts.push(dns.clone());
+        }
+        if let Some(first_ip) = ts.tailnet_ips.first() {
+            parts.push(first_ip.clone());
+        }
+        let detail = if parts.is_empty() {
+            "Running".to_string()
+        } else {
+            format!("Running ({})", parts.join(", "))
+        };
+        out.push(CliCheck::ok("tailscale", detail));
+
+        if let Some(ref serve) = ts.serve {
+            if serve.checked {
+                match serve.exposed {
+                    Some(true) => {
+                        out.push(CliCheck::ok(
+                            "tailscale.serve",
+                            serve
+                                .detail
+                                .clone()
+                                .unwrap_or_else(|| "Tailscale Serve HTTPS route matches listen.bind".to_string()),
+                        ));
+                    }
+                    Some(false) => {
+                        out.push(CliCheck::warn(
+                            "tailscale.serve",
+                            serve.detail.clone().unwrap_or_else(|| {
+                                "Configured *.ts.net URL is not exposed via Tailscale Serve".to_string()
+                            }),
+                            serve.fix_command.clone(),
+                        ));
+                    }
+                    None => {}
+                }
+            }
+        }
+        return out;
+    }
+
+    if ts.has_ts_net_endpoints {
+        let count = ts.ts_net_endpoints.len();
+        let endpoint_summary = if count > 0 {
+            format!("{count} *.ts.net endpoint(s) configured")
+        } else {
+            "deploymentProvider=tailscale configured".to_string()
+        };
+        let (detail, fix) = if !ts.installed {
+            (
+                format!("Tailscale is not installed, but {endpoint_summary}"),
+                "Install Tailscale and run `tailscale up` (or Open Tailscale app and connect)."
+                    .to_string(),
+            )
+        } else if ts.state == "needs_login" {
+            (
+                format!("Tailscale requires login (NeedsLogin), but {endpoint_summary}"),
+                "tailscale up  # or open the Tailscale app and connect".to_string(),
+            )
+        } else {
+            (
+                format!(
+                    "Tailscale is {} (offline), but {endpoint_summary}",
+                    ts.state
+                ),
+                "tailscale up  # or open the Tailscale app and connect".to_string(),
+            )
+        };
+        if is_doctor {
+            out.push(CliCheck::fail("tailscale", detail, Some(fix)));
+        } else {
+            out.push(CliCheck::warn("tailscale", detail, Some(fix)));
+        }
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tailscale_status_and_serve_parsers_handle_running_stopped_and_missing_routes() {
+        let running = br#"{
+            "BackendState": "Running",
+            "Self": {
+                "DNSName": "alice-mbp.tail9f3a.ts.net.",
+                "TailscaleIPs": ["100.64.0.12", "fd7a:115c:a1e0::12"],
+                "Online": true
+            }
+        }"#;
+        let parsed = parse_tailscale_status_json(running).unwrap();
+        assert_eq!(parsed.state, "running");
+        assert_eq!(parsed.dns_name.as_deref(), Some("alice-mbp.tail9f3a.ts.net"));
+        assert_eq!(parsed.tailnet_ips[0], "100.64.0.12");
+        assert_eq!(parsed.online, Some(true));
+
+        let stopped = br#"{
+            "BackendState": "Stopped",
+            "Self": {
+                "DNSName": "alice-mbp.tail9f3a.ts.net.",
+                "TailscaleIPs": ["100.64.0.12"],
+                "Online": false
+            }
+        }"#;
+        assert_eq!(parse_tailscale_status_json(stopped).unwrap().state, "stopped");
+
+        let needs_login = br#"{ "BackendState": "NeedsLogin", "Self": { "Online": false } }"#;
+        assert_eq!(
+            parse_tailscale_status_json(needs_login).unwrap().state,
+            "needs_login"
+        );
+
+        let serve_matched = br#"{
+            "TCP": { "443": { "HTTPS": true } },
+            "Web": {
+                "alice-mbp.tail9f3a.ts.net:443": {
+                    "Handlers": {
+                        "/": { "Proxy": "http://127.0.0.1:8790" }
+                    }
+                }
+            }
+        }"#;
+        let s_ok = parse_tailscale_serve_status_json(serve_matched, 443, "127.0.0.1:8790");
+        assert!(s_ok.checked);
+        assert_eq!(s_ok.exposed, Some(true));
+        assert!(s_ok.fix_command.is_none());
+
+        let serve_empty = br#"{}"#;
+        let s_miss = parse_tailscale_serve_status_json(serve_empty, 443, "127.0.0.1:8790");
+        assert!(s_miss.checked);
+        assert_eq!(s_miss.exposed, Some(false));
+        assert_eq!(
+            s_miss.fix_command.as_deref(),
+            Some("tailscale serve --bg --https=443 http://127.0.0.1:8790")
+        );
+    }
+
+    #[test]
+    fn tailscale_checks_match_operational_severity_rules() {
+        // 1. Running + serve matched -> OK
+        let ts_running = TailscaleOperationalStatus {
+            installed: true,
+            state: "running".to_string(),
+            backend_state: Some("Running".to_string()),
+            dns_name: Some("alice.tail.ts.net".to_string()),
+            tailnet_ips: vec!["100.64.0.5".to_string()],
+            online: Some(true),
+            has_ts_net_endpoints: true,
+            ts_net_endpoints: vec!["https://alice.tail.ts.net".to_string()],
+            serve: Some(TailscaleServeStatus {
+                checked: true,
+                exposed: Some(true),
+                expected_https_port: Some(443),
+                expected_target: Some("http://127.0.0.1:8790".to_string()),
+                matched_target: Some("http://127.0.0.1:8790".to_string()),
+                detail: Some("Tailscale Serve HTTPS :443 -> http://127.0.0.1:8790".to_string()),
+                fix_command: None,
+            }),
+            error: None,
+        };
+        let checks = build_tailscale_checks(&ts_running, true);
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0].status, CheckStatus::Ok);
+        assert!(checks[0].detail.contains("alice.tail.ts.net"));
+        assert!(checks[0].detail.contains("100.64.0.5"));
+        assert_eq!(checks[1].status, CheckStatus::Ok);
+
+        // 2. Stopped with *.ts.net peer -> FAIL in doctor, WARN in status, with `tailscale up` fix
+        let ts_stopped = TailscaleOperationalStatus {
+            installed: true,
+            state: "stopped".to_string(),
+            backend_state: Some("Stopped".to_string()),
+            dns_name: Some("alice.tail.ts.net".to_string()),
+            tailnet_ips: vec![],
+            online: Some(false),
+            has_ts_net_endpoints: true,
+            ts_net_endpoints: vec!["https://bob.tail.ts.net".to_string()],
+            serve: None,
+            error: None,
+        };
+        let doc_checks = build_tailscale_checks(&ts_stopped, true);
+        assert_eq!(doc_checks.len(), 1);
+        assert_eq!(doc_checks[0].status, CheckStatus::Fail);
+        assert!(
+            doc_checks[0]
+                .fix
+                .as_deref()
+                .unwrap_or("")
+                .contains("tailscale up")
+        );
+        let status_checks = build_tailscale_checks(&ts_stopped, false);
+        assert_eq!(status_checks.len(), 1);
+        assert_eq!(status_checks[0].status, CheckStatus::Warn);
+
+        // 3. Not installed without *.ts.net endpoints -> silent (0 checks)
+        let ts_none = TailscaleOperationalStatus {
+            installed: false,
+            state: "not_installed".to_string(),
+            backend_state: None,
+            dns_name: None,
+            tailnet_ips: vec![],
+            online: None,
+            has_ts_net_endpoints: false,
+            ts_net_endpoints: vec![],
+            serve: None,
+            error: None,
+        };
+        assert!(build_tailscale_checks(&ts_none, true).is_empty());
+        assert!(build_tailscale_checks(&ts_none, false).is_empty());
+    }
+
+    #[test]
+    fn is_ts_net_endpoint_and_port_parsing() {
+        assert!(is_ts_net_endpoint("https://alice.tail9f3a.ts.net"));
+        assert!(is_ts_net_endpoint("https://alice.tail9f3a.ts.net:8443/v1/manifest"));
+        assert!(!is_ts_net_endpoint("https://ts.net"));
+        assert!(!is_ts_net_endpoint("https://public.hyphae.to"));
+        assert!(!is_ts_net_endpoint("ssh://ops@alice.tail9f3a.ts.net"));
+        assert_eq!(parse_https_port_from_url("https://alice.ts.net"), Some(443));
+        assert_eq!(
+            parse_https_port_from_url("https://alice.ts.net:8443/path"),
+            Some(8443)
+        );
+    }
 }

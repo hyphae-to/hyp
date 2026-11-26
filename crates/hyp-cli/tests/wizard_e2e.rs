@@ -182,9 +182,10 @@ fn install_skill_detects_fake_harnesses_and_writes_exact_skill_files() {
     let canonical_lf = canonical.replace("\r\n", "\n");
     assert!(canonical_lf.starts_with("---\nname: hyphae-setup\n"));
     assert!(!canonical.contains("hyp share"));
-    assert!(!canonical.contains("hyp connect"));
     assert!(!canonical.contains("npm install"));
     assert!(!canonical.contains("--value"));
+    assert!(canonical.contains("hyp pair ssh"));
+    assert!(canonical.contains("hyp connect"));
 
     let expected_paths = [
         home.join(".claude/skills/hyphae-setup/SKILL.md"),

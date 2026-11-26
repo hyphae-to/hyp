@@ -8,11 +8,13 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::pin::Pin;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
 use http::header::{
-    CACHE_CONTROL, CONNECTION, CONTENT_TYPE, ETAG, IF_MATCH, IF_NONE_MATCH, RETRY_AFTER,
+    CACHE_CONTROL, CONNECTION, CONTENT_TYPE, ETAG, HOST, IF_MATCH, IF_NONE_MATCH, RETRY_AFTER,
 };
 use http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
@@ -21,15 +23,23 @@ use hyper::body::{Body, Frame, Incoming};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::{mpsc, oneshot, watch};
 
+pub use hyp_crypto::pairing::{SshEndpoint, parse_ssh_endpoint};
 use hyp_proto::problem::{CONTENT_TYPE_PROBLEM_JSON, ProblemDetails};
 
 use crate::engine::config::NodeError;
+
+/// Optional environment variable overriding the `ssh` binary path (primarily for isolated tests).
+pub const ENV_SSH_BIN: &str = "HYPHAE_SSH_BIN";
+
+const MAX_SSH_STDERR_BYTES: usize = 4096;
 
 /// Unified boxed HTTP body type used across both `hyper 1` server and client.
 pub type BoxedBody = BoxBody<Bytes, io::Error>;
@@ -477,18 +487,85 @@ fn hex_val(b: u8) -> Option<u8> {
 }
 
 // ============================================================================
-// Outbound HTTP/1.1+2 + rustls Client (`hyper 1` + `hyper-util` + `hyper-rustls`)
+// Outbound HTTP/1.1+2 + rustls + Optional `ssh://` Client
 // ============================================================================
 
-/// Shared asynchronous HTTP/HTTPS client supporting HTTP/1.1, HTTP/2, and streaming SSE.
+/// AsyncRead + AsyncWrite wrapper over a spawned `ssh` child process's `stdout`/`stdin` pipes.
+///
+/// The underlying `Child` is spawned with `kill_on_drop(true)` and shared with the connection
+/// driver task so dropping a connection or shutting down the node immediately kills and reaps
+/// the child process without leaking zombies.
+struct ChildStdioStream {
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+    _child: Arc<Mutex<Option<Child>>>,
+}
+
+impl AsyncRead for ChildStdioStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stdout).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ChildStdioStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stdin).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stdin).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stdin).poll_shutdown(cx)
+    }
+}
+
+/// Resolves the SSH executable (`HYPHAE_SSH_BIN` override when set, otherwise `ssh`).
+pub fn resolve_ssh_binary() -> String {
+    std::env::var(ENV_SSH_BIN)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "ssh".to_string())
+}
+
+fn format_ssh_stderr(buf: &Arc<Mutex<Vec<u8>>>) -> String {
+    let guard = buf.lock().expect("ssh stderr buffer lock poisoned");
+    if guard.is_empty() {
+        return String::new();
+    }
+    let clean: String = String::from_utf8_lossy(&guard)
+        .chars()
+        .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
+        .collect();
+    let trimmed = clean.trim();
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!(" (ssh stderr: {trimmed})")
+    }
+}
+
+/// Shared asynchronous HTTP/HTTPS/SSH client supporting HTTP/1.1, HTTP/2, streaming SSE,
+/// and optional `ssh://` stdio-tunnelled HTTP/1.1 + SSE peers.
 #[derive(Clone)]
 pub struct HttpClient {
     inner: Client<HttpsConnector<HttpConnector>, BoxedBody>,
+    ssh_shutdown: Arc<watch::Sender<bool>>,
 }
 
 impl HttpClient {
     /// Constructs a new `HttpClient` with `rustls` (`ring` + `webpki-roots`),
-    /// permitting both HTTPS and loopback HTTP.
+    /// permitting HTTPS, loopback HTTP, and strictly validated `ssh://` peer transports.
     pub fn new() -> Result<Self, NodeError> {
         let connector = HttpsConnectorBuilder::new()
             .with_provider_and_webpki_roots(rustls::crypto::ring::default_provider())
@@ -498,15 +575,253 @@ impl HttpClient {
             .enable_http2()
             .build();
         let inner = Client::builder(TokioExecutor::new()).build(connector);
-        Ok(Self { inner })
+        let (ssh_shutdown, _) = watch::channel(false);
+        Ok(Self {
+            inner,
+            ssh_shutdown: Arc::new(ssh_shutdown),
+        })
+    }
+
+    /// Signals all active `ssh://` transport connections created by this client (or its clones)
+    /// to terminate and reap their child processes immediately.
+    pub fn shutdown_ssh(&self) {
+        let _ = self.ssh_shutdown.send(true);
     }
 
     /// Sends an HTTP request and returns the raw streaming `hyper::Response<Incoming>`.
+    ///
+    /// Supports `https://`, loopback `http://`, and direct `ssh://[user@]host[:port]/path` URIs.
+    /// For `ssh://` endpoints carrying query parameters (`?stateDir=...&bin=...`), prefer
+    /// [`Self::request_for_endpoint`] with an origin-form request URI.
     pub async fn request(&self, req: Request<BoxedBody>) -> Result<Response<Incoming>, NodeError> {
+        if req.uri().scheme_str() == Some("ssh") {
+            let authority = req
+                .uri()
+                .authority()
+                .map(|a| a.as_str())
+                .ok_or_else(|| NodeError::Http("ssh:// request URI missing authority".into()))?;
+            let base = format!("ssh://{authority}");
+            let ssh = parse_ssh_endpoint(&base)?;
+            return self.request_ssh_inner(&ssh, req, true, None).await;
+        }
         self.inner
             .request(req)
             .await
             .map_err(|e| NodeError::Http(format!("HTTP request failed: {e}")))
+    }
+
+    /// Sends a one-shot request to `base_endpoint` (`https://`, loopback `http://`, or `ssh://`),
+    /// combining `base_endpoint` with `req`'s origin-form `path_and_query`.
+    pub async fn request_for_endpoint(
+        &self,
+        base_endpoint: &str,
+        req: Request<BoxedBody>,
+    ) -> Result<Response<Incoming>, NodeError> {
+        self.request_for_endpoint_inner(base_endpoint, req, true, None)
+            .await
+    }
+
+    /// Sends a long-lived streaming request (such as WHATWG SSE `GET /v1/inbox`) to
+    /// `base_endpoint`, keeping the `ssh://` transport open until EOF, `cancel_rx`, or
+    /// [`Self::shutdown_ssh`].
+    pub async fn request_stream_for_endpoint(
+        &self,
+        base_endpoint: &str,
+        req: Request<BoxedBody>,
+        cancel_rx: Option<oneshot::Receiver<()>>,
+    ) -> Result<Response<Incoming>, NodeError> {
+        self.request_for_endpoint_inner(base_endpoint, req, false, cancel_rx)
+            .await
+    }
+
+    async fn request_for_endpoint_inner(
+        &self,
+        base_endpoint: &str,
+        mut req: Request<BoxedBody>,
+        close_after_response: bool,
+        cancel_rx: Option<oneshot::Receiver<()>>,
+    ) -> Result<Response<Incoming>, NodeError> {
+        let trimmed = base_endpoint.trim();
+        if trimmed.starts_with("ssh://") {
+            let ssh = parse_ssh_endpoint(trimmed)?;
+            return self
+                .request_ssh_inner(&ssh, req, close_after_response, cancel_rx)
+                .await;
+        }
+
+        if req.uri().scheme().is_none() {
+            let pq = req
+                .uri()
+                .path_and_query()
+                .map(|p| p.as_str())
+                .unwrap_or("/");
+            let full = format!("{}{}", trimmed.trim_end_matches('/'), pq);
+            let parsed_uri: http::Uri = full
+                .parse()
+                .map_err(|e| NodeError::Http(format!("invalid endpoint URI '{full}': {e}")))?;
+            *req.uri_mut() = parsed_uri;
+        }
+        self.inner
+            .request(req)
+            .await
+            .map_err(|e| NodeError::Http(format!("HTTP request failed: {e}")))
+    }
+
+    async fn request_ssh_inner(
+        &self,
+        ssh: &SshEndpoint,
+        mut req: Request<BoxedBody>,
+        close_after_response: bool,
+        cancel_rx: Option<oneshot::Receiver<()>>,
+    ) -> Result<Response<Incoming>, NodeError> {
+        if *self.ssh_shutdown.borrow() {
+            return Err(NodeError::Http(
+                "SSH transport client has been shut down".into(),
+            ));
+        }
+
+        let path_and_query = req
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let origin_uri: http::Uri = path_and_query.parse().map_err(|e| {
+            NodeError::Http(format!("invalid HTTP/1.1 request target '{path_and_query}': {e}"))
+        })?;
+        *req.uri_mut() = origin_uri;
+
+        if !req.headers().contains_key(HOST) {
+            let host_val = HeaderValue::from_str(&ssh.http_host_header())
+                .map_err(|e| NodeError::Http(format!("invalid SSH Host header: {e}")))?;
+            req.headers_mut().insert(HOST, host_val);
+        }
+        if close_after_response {
+            req.headers_mut()
+                .insert(CONNECTION, HeaderValue::from_static("close"));
+        }
+
+        let ssh_bin = resolve_ssh_binary();
+        let args = ssh.build_ssh_args();
+        let mut cmd = Command::new(&ssh_bin);
+        cmd.args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = cmd.spawn().map_err(|e| {
+            NodeError::Http(format!(
+                "failed to spawn SSH transport '{ssh_bin}' for '{}': {e}",
+                ssh.target()
+            ))
+        })?;
+
+        let stdin = child.stdin.take().ok_or_else(|| {
+            NodeError::Http("SSH child process missing stdin pipe".into())
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            NodeError::Http("SSH child process missing stdout pipe".into())
+        })?;
+        let stderr_pipe = child.stderr.take();
+
+        let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        if let Some(mut err_pipe) = stderr_pipe {
+            let buf_clone = Arc::clone(&stderr_buf);
+            tokio::spawn(async move {
+                let mut tmp = [0u8; 512];
+                loop {
+                    match err_pipe.read(&mut tmp).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let mut guard =
+                                buf_clone.lock().expect("ssh stderr buffer lock poisoned");
+                            let remaining = MAX_SSH_STDERR_BYTES.saturating_sub(guard.len());
+                            if remaining > 0 {
+                                guard.extend_from_slice(&tmp[..n.min(remaining)]);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(Some(child)));
+        let stdio_stream = ChildStdioStream {
+            stdin,
+            stdout,
+            _child: Arc::clone(&child_slot),
+        };
+
+        let (mut sender, conn) =
+            match hyper::client::conn::http1::handshake(TokioIo::new(stdio_stream)).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    let child_opt = child_slot
+                        .lock()
+                        .expect("ssh child slot lock poisoned")
+                        .take();
+                    if let Some(mut c) = child_opt {
+                        let _ = c.kill().await;
+                    }
+                    tokio::task::yield_now().await;
+                    let stderr_note = format_ssh_stderr(&stderr_buf);
+                    return Err(NodeError::Http(format!(
+                        "SSH HTTP/1.1 handshake failed for '{}': {e}{stderr_note}",
+                        ssh.target()
+                    )));
+                }
+            };
+
+        let mut client_shutdown_rx = self.ssh_shutdown.subscribe();
+        let child_for_reap = Arc::clone(&child_slot);
+        tokio::spawn(async move {
+            {
+                let shutdown_fut = async {
+                    if *client_shutdown_rx.borrow() {
+                        return;
+                    }
+                    let _ = client_shutdown_rx.changed().await;
+                };
+                match cancel_rx {
+                    Some(cancel) => {
+                        tokio::select! {
+                            _ = conn => {}
+                            _ = shutdown_fut => {}
+                            _ = cancel => {}
+                        }
+                    }
+                    None => {
+                        tokio::select! {
+                            _ = conn => {}
+                            _ = shutdown_fut => {}
+                        }
+                    }
+                }
+            }
+            // `conn` (and its `ChildStdioStream` stdin/stdout pipes) has now been dropped.
+            // Kill and reap the child process deterministically so zero zombie PIDs remain.
+            let child_opt = child_for_reap
+                .lock()
+                .expect("ssh child slot lock poisoned")
+                .take();
+            if let Some(mut c) = child_opt {
+                let _ = c.kill().await;
+            }
+        });
+
+        let resp_res = sender.send_request(req).await;
+        drop(sender);
+        match resp_res {
+            Ok(resp) => Ok(resp),
+            Err(e) => {
+                tokio::task::yield_now().await;
+                let stderr_note = format_ssh_stderr(&stderr_buf);
+                Err(NodeError::Http(format!(
+                    "SSH HTTP/1.1 request failed for '{}': {e}{stderr_note}",
+                    ssh.target()
+                )))
+            }
+        }
     }
 
     /// Collects a response's status, headers, and bounded body bytes.

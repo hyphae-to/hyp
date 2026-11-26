@@ -5,7 +5,7 @@
 //! where they could leak to `ps` — always read from stdin or `--token-file`.
 
 use crate::config_file::{
-    build_http_client, ensure_dir, load_node_or_legacy_config, resolve_config_path_for_read,
+    ensure_dir, load_node_or_legacy_config, resolve_config_path_for_read,
     resolve_effective_node_id, resolve_state_dir,
 };
 use crate::ui::{
@@ -16,7 +16,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::{Subcommand, ValueEnum};
 use http::{Method, Request, header};
-use http_body_util::{BodyExt, Empty, Full};
+use http_body_util::BodyExt;
 use hyp_crypto::compat_v1::{
     PairingCodeV1, derive_pairing_key_v1, issue_grant_v1, parse_pairing_code_v1,
 };
@@ -32,12 +32,15 @@ use hyp_crypto::keys::{
 use hyp_crypto::keystore::SecretStore;
 use hyp_crypto::pairing::{
     AM2_PREFIX, AdminInviteV2, GrantV2, HP2P1_PREFIX, P2P_SECRET_BYTES, P2pOfferToken,
-    P2pPairConfirmation, P2pPairResponse, create_p2p_offer, create_p2p_response, decode_am2,
-    decode_hp2p1, encode_am2, encode_hp2p1, sign_grant_v2, validate_endpoint_origin,
+    P2pPairConfirmation, P2pPairResponse, SshEndpoint, create_p2p_offer, create_p2p_response,
+    decode_am2, decode_hp2p1, encode_am2, encode_hp2p1, parse_ssh_endpoint, sign_grant_v2,
+    validate_endpoint_origin, validate_http_endpoint_origin, validate_ssh_posix_path,
     verify_grant_v2, verify_p2p_confirmation,
 };
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms, parse_rfc3339_millis};
-use hyp_node::engine::http_util::percent_encode;
+use hyp_node::engine::http_util::{
+    HttpClient, empty_body, full_body, percent_encode, resolve_ssh_binary,
+};
 use hyp_node::engine::peer_link::{PairBindingV2, PairRequestV2};
 use hyp_node::engine::{
     DelegatedPairReply, DelegatedPairRequest, GuestPairReply, GuestPairRequest, P2pPairServerReply,
@@ -147,7 +150,7 @@ pub enum PairCommand {
         /// Inviting node's canonical nodeId (e.g. alice@macbook, acme-team)
         #[arg(long)]
         node_id: String,
-        /// Inviting node's HTTPS endpoint (auto-detected from Tailscale MagicDNS for --mode p2p if omitted)
+        /// Inviting node's endpoint (`https://...`, `ssh://[user@]host[:port]`, or loopback `http://127.0.0.1:...`; auto-detected from Tailscale MagicDNS for --mode p2p if omitted)
         #[arg(long)]
         endpoint: Option<String>,
         /// Target peer's nodeId (optional for p2p; recommended for team)
@@ -210,7 +213,7 @@ pub enum PairCommand {
     },
     /// Join a public or team Hyphae node by URL (verifies signed /v1/manifest unless --offline)
     Join {
-        /// Target node URL (https:// or loopback http://127.0.0.1 for local testing)
+        /// Target node URL (https://, ssh://[user@]host[:port], or loopback http://127.0.0.1 for local testing)
         url: String,
         /// Explicit state directory containing node.sqlite and secrets/
         #[arg(long)]
@@ -227,6 +230,41 @@ pub enum PairCommand {
         /// Skip live GET /v1/manifest verification when pre-configuring offline
         #[arg(long)]
         offline: bool,
+        /// Output structured JSON envelope
+        #[arg(long)]
+        json: bool,
+    },
+    /// One-command mutual P2P pairing over SSH (`ssh://<target>` via `hyp connect` / `peer.sock`)
+    Ssh {
+        /// SSH target (`[user@]host[:port]` or `ssh://[user@]host[:port][?stateDir=...&bin=...]`)
+        target: String,
+        /// Built-in scope preset (guest-ro, guest, observer, member, full; default: member)
+        #[arg(long, value_enum)]
+        preset: Option<CliScopePreset>,
+        /// Explicit scopes to grant to the remote peer (repeatable or space-delimited)
+        #[arg(long, num_args = 1..)]
+        grant: Vec<String>,
+        /// Explicit scopes to request from the remote peer in return (defaults to --preset / --grant)
+        #[arg(long, num_args = 1..)]
+        request: Vec<String>,
+        /// Local state directory containing node.sqlite and secrets/
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Local nodeId override (e.g. alice@macbook)
+        #[arg(long)]
+        node_id: Option<String>,
+        /// Expected remote peer nodeId override (auto-discovered from remote /v1/manifest when omitted)
+        #[arg(long)]
+        remote_node_id: Option<String>,
+        /// Optional remote Hyphae state directory passed to remote `hyp` (`--state-dir`)
+        #[arg(long)]
+        remote_state_dir: Option<String>,
+        /// Optional remote `hyp` binary path override
+        #[arg(long)]
+        remote_bin: Option<String>,
+        /// Validate target/scopes and preview planned SSH pairing without executing remote commands
+        #[arg(long)]
+        dry_run: bool,
         /// Output structured JSON envelope
         #[arg(long)]
         json: bool,
@@ -301,6 +339,31 @@ pub fn run_pair(command: PairCommand) -> ExitCode {
             offline,
             json,
         } => run_join(url, state_dir, node_id, node_name, preset, offline, json),
+        PairCommand::Ssh {
+            target,
+            preset,
+            grant,
+            request,
+            state_dir,
+            node_id,
+            remote_node_id,
+            remote_state_dir,
+            remote_bin,
+            dry_run,
+            json,
+        } => run_pair_ssh(
+            target,
+            preset,
+            grant,
+            request,
+            state_dir,
+            node_id,
+            remote_node_id,
+            remote_state_dir,
+            remote_bin,
+            dry_run,
+            json,
+        ),
         PairCommand::Revoke {
             peer_id,
             reason,
@@ -422,6 +485,46 @@ fn build_presets() -> Vec<PresetGuide> {
     .collect()
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransportGuide {
+    id: &'static str,
+    title: &'static str,
+    best_for: &'static str,
+    endpoint_format: &'static str,
+    example: &'static str,
+    notes: &'static str,
+}
+
+fn build_transports() -> Vec<TransportGuide> {
+    vec![
+        TransportGuide {
+            id: "tailscale",
+            title: "Tailscale Serve HTTPS (Recommended for Team Hubs & Tailnets)",
+            best_for: "Private team hubs, personal laptops, and zero-port-forwarding MagicDNS meshes.",
+            endpoint_format: "https://<host>.<tailnet>.ts.net",
+            example: "hyp deploy init tailscale --node-id acme-team --domain hyphae.your-tailnet.ts.net --out ./deploy-tailscale",
+            notes: "Automatic Let's Encrypt HTTPS certificates over WireGuard; verified automatically by `hyp status` and `hyp doctor`.",
+        },
+        TransportGuide {
+            id: "https",
+            title: "Public HTTPS / Reverse Proxy",
+            best_for: "Internet-facing Team Hubs, Public Nodes, VPS+Caddy, Docker Compose, Cloudflare Tunnel, or Fly.io.",
+            endpoint_format: "https://<domain>",
+            example: "hyp deploy init vps --node-id acme-team --domain mesh.example.com --out ./deploy-vps",
+            notes: "Standard HTTPS termination with `flush_interval -1` for zero-buffering SSE; laptops connect outbound-only.",
+        },
+        TransportGuide {
+            id: "ssh",
+            title: "Optional SSH (`ssh://`, Zero Open Ports)",
+            best_for: "Personal servers, bastions, air-gapped VPCs, and hosts already reachable via `~/.ssh/config`.",
+            endpoint_format: "ssh://[user@]host[:port][?stateDir=/path&bin=/path/to/hyp]",
+            example: "hyp pair ssh ops@solace   # or: hyp pair invite --mode p2p --node-id solace --endpoint ssh://ops@solace",
+            notes: "Tunnels Hyphae v2 HTTP/1.1 + SSE over `ssh -o BatchMode=yes -T -- <target> \"... hyp connect\"` to `<state_dir>/peer.sock` (0600). Full Hyphae E2EE, Ed25519 auth, and manifest verification remain 100% enforced.",
+        },
+    ]
+}
+
 fn run_guide(mode: Option<GuideMode>, as_json: bool) -> ExitCode {
     let all_topologies = build_topologies();
     let topologies: Vec<TopologyGuide> = match mode {
@@ -432,10 +535,12 @@ fn run_guide(mode: Option<GuideMode>, as_json: bool) -> ExitCode {
         None => all_topologies,
     };
     let presets = build_presets();
+    let transports = build_transports();
     let nat_tips = vec![
-        "Tailscale Serve: zero port forwarding, automatic MagicDNS HTTPS inside your tailnet (`hyp deploy init tailscale`).",
-        "Cloudflare Tunnel: zero open inbound ports behind CGNAT/homelabs (`hyp deploy init cloudflare`).",
-        "Outbound-only P2P: only ONE peer needs a reachable HTTPS endpoint; the behind-NAT peer connects outbound and carries bidirectional traffic over one SSE+HTTPS link.",
+        "Tailscale Serve HTTPS (recommended for team hubs): zero port forwarding, automatic MagicDNS HTTPS inside your tailnet (`hyp deploy init tailscale`).",
+        "Public HTTPS / Reverse Proxy: VPS+Caddy, Docker Compose, Cloudflare Tunnel (`hyp deploy init cloudflare`), or Fly.io.",
+        "Optional SSH (`ssh://`): zero open ports for personal servers, bastions, or VPC hosts using `~/.ssh/config` + `hyp connect` (`hyp pair ssh <user@host>` or `hyp pair invite --endpoint ssh://<user@host>`).",
+        "Outbound-only P2P: only ONE peer needs a reachable HTTPS or `ssh://` endpoint; the behind-NAT peer connects outbound and carries bidirectional traffic over one SSE+HTTP link.",
         "Always pass pairing tokens via stdin (`<<<`) or `--token-file` (0600) — NEVER as CLI argv flags where they leak to `ps`.",
     ];
     let escalation_guidance = json!({
@@ -445,6 +550,7 @@ fn run_guide(mode: Option<GuideMode>, as_json: bool) -> ExitCode {
     });
     let next = vec![
         "hyp pair invite --mode p2p --node-id alice@macbook --endpoint https://alice.tailnet.ts.net --preset member".to_string(),
+        "hyp pair ssh ops@solace --preset member".to_string(),
         "hyp pair inspect <<< '<token>'".to_string(),
         "hyp deploy providers".to_string(),
     ];
@@ -460,6 +566,7 @@ fn run_guide(mode: Option<GuideMode>, as_json: bool) -> ExitCode {
             data: Some(json!({
                 "mode": mode.map(GuideMode::as_str),
                 "topologies": topologies,
+                "transports": transports,
                 "presets": presets,
                 "natTips": nat_tips,
                 "escalationNotes": escalation_guidance,
@@ -483,6 +590,16 @@ fn run_guide(mode: Option<GuideMode>, as_json: bool) -> ExitCode {
         println!("  NAT:    {}", t.nat_notes);
         println!();
     }
+
+    println!("Transport Options (all enforce full Hyphae v2 E2EE, Ed25519 auth & manifest verification):");
+    for tr in &transports {
+        println!("  [{}] {}", tr.id, tr.title);
+        println!("    Best for: {}", tr.best_for);
+        println!("    Format:   {}", tr.endpoint_format);
+        println!("    Example:  {}", tr.example);
+        println!("    Notes:    {}", tr.notes);
+    }
+    println!();
 
     println!("Scope Presets (note: '*' and 'full' NEVER grant bridge:post or forward:via):");
     for p in &presets {
@@ -782,7 +899,7 @@ pub(crate) fn parse_tailscale_magicdns_endpoint(json_bytes: &[u8]) -> Option<Str
         return None;
     }
     let candidate = format!("https://{}", host_raw.to_ascii_lowercase());
-    validate_endpoint_origin(&candidate).ok()?;
+    validate_http_endpoint_origin(&candidate).ok()?;
     Some(candidate)
 }
 
@@ -839,11 +956,29 @@ fn detect_tailscale_magicdns_endpoint_with_bin(bin: &str, timeout: Duration) -> 
 }
 
 fn detect_tailscale_magicdns_endpoint() -> Option<String> {
-    let bin = std::env::var("HYPHAE_TAILSCALE_BIN").unwrap_or_else(|_| "tailscale".to_string());
-    detect_tailscale_magicdns_endpoint_with_bin(
-        &bin,
+    if let Ok(explicit) = std::env::var("HYPHAE_TAILSCALE_BIN") {
+        return detect_tailscale_magicdns_endpoint_with_bin(
+            &explicit,
+            Duration::from_secs(TAILSCALE_DETECT_TIMEOUT_SECS),
+        );
+    }
+    if let Some(ep) = detect_tailscale_magicdns_endpoint_with_bin(
+        "tailscale",
         Duration::from_secs(TAILSCALE_DETECT_TIMEOUT_SECS),
-    )
+    ) {
+        return Some(ep);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mac_bin = "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
+        if Path::new(mac_bin).is_file() {
+            return detect_tailscale_magicdns_endpoint_with_bin(
+                mac_bin,
+                Duration::from_secs(TAILSCALE_DETECT_TIMEOUT_SECS),
+            );
+        }
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -918,7 +1053,10 @@ fn run_invite(
             EXIT_USAGE,
             "INVALID_ENDPOINT",
             format!("Invalid --endpoint '{endpoint}': {e}"),
-            Some("Use https:// (or loopback http://127.0.0.1 for local testing).".to_string()),
+            Some(
+                "Use https://, ssh://[user@]host[:port], or loopback http://127.0.0.1 for local testing."
+                    .to_string(),
+            ),
         );
     }
 
@@ -2304,6 +2442,16 @@ pub(crate) fn credential_secret_name(prefix: &str, peer_id: &str) -> String {
 
 fn derive_peer_id_from_url(url: &str) -> Result<String, String> {
     let trimmed = url.trim();
+    if trimmed.starts_with("ssh://") {
+        let ep = parse_ssh_endpoint(trimmed).map_err(|e| e.to_string())?;
+        let host = ep.host.to_ascii_lowercase();
+        if host == LOCAL_NODE_ID || !is_valid_node_id(&host) {
+            return Err(format!(
+                "derived SSH host '{host}' from '{url}' is not a valid nodeId; pass --node-name <node-id>"
+            ));
+        }
+        return Ok(host);
+    }
     let rest = trimmed
         .strip_prefix("https://")
         .or_else(|| trimmed.strip_prefix("http://"))
@@ -2592,11 +2740,12 @@ fn verify_signed_manifest_strict(
     Ok((payload, signing_pk, encryption_pk))
 }
 
-fn post_json_handshake(url: &str, body_bytes: Vec<u8>) -> Result<(u16, Vec<u8>), LiveHandshakeError> {
-    let uri: http::Uri = url.parse().map_err(|e| LiveHandshakeError::Rejected {
-        code: "INVALID_ENDPOINT",
-        message: format!("Invalid pairing URI '{url}': {e}"),
-    })?;
+fn post_json_handshake(
+    base_endpoint: &str,
+    path: &str,
+    body_bytes: Vec<u8>,
+) -> Result<(u16, Vec<u8>), LiveHandshakeError> {
+    let display_url = format!("{}{path}", base_endpoint.trim_end_matches('/'));
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2606,67 +2755,71 @@ fn post_json_handshake(url: &str, body_bytes: Vec<u8>) -> Result<(u16, Vec<u8>),
         })?;
 
     rt.block_on(async {
-        let client = build_http_client::<Full<Bytes>>().map_err(|e| {
-            LiveHandshakeError::Rejected {
-                code: "HTTP_ERROR",
-                message: format!("Failed to initialize HTTP client: {e}"),
-            }
+        let client = HttpClient::new().map_err(|e| LiveHandshakeError::Rejected {
+            code: "HTTP_ERROR",
+            message: format!("Failed to initialize HTTP client: {e}"),
         })?;
         let req = Request::builder()
             .method(Method::POST)
-            .uri(&uri)
+            .uri(path)
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::ACCEPT, "application/json")
             .header(
                 header::USER_AGENT,
                 format!("hyp/{}", env!("CARGO_PKG_VERSION")),
             )
-            .body(Full::new(Bytes::from(body_bytes)))
+            .body(full_body(Bytes::from(body_bytes)))
             .map_err(|e| LiveHandshakeError::Rejected {
                 code: "HTTP_ERROR",
                 message: format!("Failed to build pairing HTTP request: {e}"),
             })?;
 
-        let resp = tokio::time::timeout(
-            Duration::from_secs(PAIR_HTTP_TIMEOUT_SECS),
-            client.request(req),
-        )
-        .await
-        .map_err(|_| {
-            LiveHandshakeError::Unreachable(format!(
-                "POST {url} timed out after {PAIR_HTTP_TIMEOUT_SECS}s"
-            ))
-        })?
-        .map_err(|e| LiveHandshakeError::Unreachable(format!("POST {url} failed: {e}")))?;
+        let outcome = async {
+            let resp = tokio::time::timeout(
+                Duration::from_secs(PAIR_HTTP_TIMEOUT_SECS),
+                client.request_for_endpoint(base_endpoint, req),
+            )
+            .await
+            .map_err(|_| {
+                LiveHandshakeError::Unreachable(format!(
+                    "POST {display_url} timed out after {PAIR_HTTP_TIMEOUT_SECS}s"
+                ))
+            })?
+            .map_err(|e| LiveHandshakeError::Unreachable(format!("POST {display_url} failed: {e}")))?;
 
-        let status = resp.status().as_u16();
-        let bytes = tokio::time::timeout(Duration::from_secs(PAIR_HTTP_TIMEOUT_SECS), async {
-            let mut body = resp.into_body();
-            let mut out = Vec::new();
-            while let Some(frame_res) = body.frame().await {
-                let frame = frame_res.map_err(|e| {
-                    LiveHandshakeError::Unreachable(format!("Pairing response body read error: {e}"))
-                })?;
-                if let Some(chunk) = frame.data_ref() {
-                    if out.len() + chunk.len() > MAX_MANIFEST_RESPONSE_BYTES {
-                        return Err(LiveHandshakeError::Rejected {
-                            code: "PAIR_HANDSHAKE_INVALID",
-                            message: format!(
-                                "Pairing response exceeds {MAX_MANIFEST_RESPONSE_BYTES} byte safety cap"
-                            ),
-                        });
+            let status = resp.status().as_u16();
+            let bytes = tokio::time::timeout(Duration::from_secs(PAIR_HTTP_TIMEOUT_SECS), async {
+                let mut body = resp.into_body();
+                let mut out = Vec::new();
+                while let Some(frame_res) = body.frame().await {
+                    let frame = frame_res.map_err(|e| {
+                        LiveHandshakeError::Unreachable(format!("Pairing response body read error: {e}"))
+                    })?;
+                    if let Some(chunk) = frame.data_ref() {
+                        if out.len() + chunk.len() > MAX_MANIFEST_RESPONSE_BYTES {
+                            return Err(LiveHandshakeError::Rejected {
+                                code: "PAIR_HANDSHAKE_INVALID",
+                                message: format!(
+                                    "Pairing response exceeds {MAX_MANIFEST_RESPONSE_BYTES} byte safety cap"
+                                ),
+                            });
+                        }
+                        out.extend_from_slice(chunk);
                     }
-                    out.extend_from_slice(chunk);
                 }
-            }
-            Ok::<Vec<u8>, LiveHandshakeError>(out)
-        })
-        .await
-        .map_err(|_| {
-            LiveHandshakeError::Unreachable("Timed out reading pairing response body".to_string())
-        })??;
+                Ok::<Vec<u8>, LiveHandshakeError>(out)
+            })
+            .await
+            .map_err(|_| {
+                LiveHandshakeError::Unreachable("Timed out reading pairing response body".to_string())
+            })??;
 
-        Ok::<(u16, Vec<u8>), LiveHandshakeError>((status, bytes))
+            Ok::<(u16, Vec<u8>), LiveHandshakeError>((status, bytes))
+        }
+        .await;
+
+        client.shutdown_ssh();
+        outcome
     })
 }
 
@@ -2756,12 +2909,9 @@ fn execute_live_p2p_handshake(
         message: format!("Failed to serialize P2P pairing response: {e}"),
     })?;
 
-    let url = format!(
-        "{}/v1/p2p/pair/{}",
-        offer.endpoint.trim_end_matches('/'),
-        percent_encode(&offer.offer_id)
-    );
-    let (status, body_bytes) = post_json_handshake(&url, req_bytes)?;
+    let path = format!("/v1/p2p/pair/{}", percent_encode(&offer.offer_id));
+    let url = format!("{}{path}", offer.endpoint.trim_end_matches('/'));
+    let (status, body_bytes) = post_json_handshake(&offer.endpoint, &path, req_bytes)?;
     if status != 200 {
         return Err(decode_handshake_http_error(
             &url,
@@ -2886,7 +3036,7 @@ fn execute_live_am2_handshake(
     })?;
 
     let url = format!("{}/v1/pair", invite.router.trim_end_matches('/'));
-    let (status, body_bytes) = post_json_handshake(&url, req_bytes)?;
+    let (status, body_bytes) = post_json_handshake(&invite.router, "/v1/pair", req_bytes)?;
     if status != 200 {
         return Err(decode_handshake_http_error(
             &url,
@@ -5010,11 +5160,21 @@ pub(crate) fn live_join_url_for_onboard(
         code: "INVALID_ENDPOINT",
         message: format!("Invalid target URL '{raw_url}': {e}"),
     })?;
-    let trimmed = raw_url.trim().trim_end_matches('/');
-    let base_url = trimmed
-        .strip_suffix("/v1/manifest")
-        .unwrap_or(trimmed)
-        .to_string();
+    let trimmed = raw_url.trim();
+    let base_url = if trimmed.starts_with("ssh://") {
+        parse_ssh_endpoint(trimmed)
+            .map_err(|e| LiveHandshakeError::Rejected {
+                code: "INVALID_ENDPOINT",
+                message: format!("Invalid target SSH URL '{raw_url}': {e}"),
+            })?
+            .canonical_url()
+    } else {
+        let no_slash = trimmed.trim_end_matches('/');
+        no_slash
+            .strip_suffix("/v1/manifest")
+            .unwrap_or(no_slash)
+            .to_string()
+    };
 
     let v = match fetch_and_verify_manifest(&base_url) {
         Ok(v) => v,
@@ -5175,12 +5335,6 @@ struct VerifiedLiveManifest {
 
 fn fetch_and_verify_manifest(base_url: &str) -> Result<VerifiedLiveManifest, (&'static str, String)> {
     let manifest_url = format!("{}/v1/manifest", base_url.trim_end_matches('/'));
-    let uri: http::Uri = manifest_url.parse().map_err(|e| {
-        (
-            "INVALID_ENDPOINT",
-            format!("Invalid manifest URI '{manifest_url}': {e}"),
-        )
-    })?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -5188,81 +5342,87 @@ fn fetch_and_verify_manifest(base_url: &str) -> Result<VerifiedLiveManifest, (&'
         .map_err(|e| ("RUNTIME_ERROR", format!("Failed to start async runtime: {e}")))?;
 
     let (body_bytes, etag) = rt.block_on(async {
-        let client = build_http_client::<Empty<Bytes>>()
+        let client = HttpClient::new()
             .map_err(|e| ("HTTP_ERROR", format!("Failed to initialize HTTP client: {e}")))?;
 
         let req = Request::builder()
             .method(Method::GET)
-            .uri(&uri)
+            .uri("/v1/manifest")
             .header(header::ACCEPT, "application/json")
             .header(
                 header::USER_AGENT,
                 format!("hyp/{}", env!("CARGO_PKG_VERSION")),
             )
-            .body(Empty::new())
+            .body(empty_body())
             .map_err(|e| ("HTTP_ERROR", format!("Failed to build request: {e}")))?;
 
-        let resp = tokio::time::timeout(
-            Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS),
-            client.request(req),
-        )
-        .await
-        .map_err(|_| {
-            (
-                "MANIFEST_FETCH_FAILED",
-                format!(
-                    "GET {manifest_url} timed out after {MANIFEST_FETCH_TIMEOUT_SECS}s"
-                ),
+        let outcome = async {
+            let resp = tokio::time::timeout(
+                Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS),
+                client.request_for_endpoint(base_url, req),
             )
-        })?
-        .map_err(|e| (
-            "MANIFEST_FETCH_FAILED",
-            format!("GET {manifest_url} failed: {e}"),
-        ))?;
-
-        let status = resp.status().as_u16();
-        if status != 200 {
-            return Err((
+            .await
+            .map_err(|_| {
+                (
+                    "MANIFEST_FETCH_FAILED",
+                    format!(
+                        "GET {manifest_url} timed out after {MANIFEST_FETCH_TIMEOUT_SECS}s"
+                    ),
+                )
+            })?
+            .map_err(|e| (
                 "MANIFEST_FETCH_FAILED",
-                format!("GET {manifest_url} returned HTTP {status} (expected 200)"),
-            ));
-        }
-        let etag = resp
-            .headers()
-            .get(header::ETAG)
-            .and_then(|v| v.to_str().ok())
-            .map(ToOwned::to_owned);
+                format!("GET {manifest_url} failed: {e}"),
+            ))?;
 
-        let bytes = tokio::time::timeout(Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS), async {
-            let mut body = resp.into_body();
-            let mut out = Vec::new();
-            while let Some(frame_res) = body.frame().await {
-                let frame = frame_res.map_err(|e| {
-                    ("MANIFEST_FETCH_FAILED", format!("Manifest body read error: {e}"))
-                })?;
-                if let Some(chunk) = frame.data_ref() {
-                    if out.len() + chunk.len() > MAX_MANIFEST_RESPONSE_BYTES {
-                        return Err((
-                            "INVALID_MANIFEST",
-                            format!(
-                                "Manifest response exceeds {MAX_MANIFEST_RESPONSE_BYTES} byte safety cap"
-                            ),
-                        ));
-                    }
-                    out.extend_from_slice(chunk);
-                }
+            let status = resp.status().as_u16();
+            if status != 200 {
+                return Err((
+                    "MANIFEST_FETCH_FAILED",
+                    format!("GET {manifest_url} returned HTTP {status} (expected 200)"),
+                ));
             }
-            Ok::<Vec<u8>, (&'static str, String)>(out)
-        })
-        .await
-        .map_err(|_| {
-            (
-                "MANIFEST_FETCH_FAILED",
-                "Timed out reading /v1/manifest response body".to_string(),
-            )
-        })??;
+            let etag = resp
+                .headers()
+                .get(header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(ToOwned::to_owned);
 
-        Ok::<(Vec<u8>, Option<String>), (&'static str, String)>((bytes, etag))
+            let bytes = tokio::time::timeout(Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS), async {
+                let mut body = resp.into_body();
+                let mut out = Vec::new();
+                while let Some(frame_res) = body.frame().await {
+                    let frame = frame_res.map_err(|e| {
+                        ("MANIFEST_FETCH_FAILED", format!("Manifest body read error: {e}"))
+                    })?;
+                    if let Some(chunk) = frame.data_ref() {
+                        if out.len() + chunk.len() > MAX_MANIFEST_RESPONSE_BYTES {
+                            return Err((
+                                "INVALID_MANIFEST",
+                                format!(
+                                    "Manifest response exceeds {MAX_MANIFEST_RESPONSE_BYTES} byte safety cap"
+                                ),
+                            ));
+                        }
+                        out.extend_from_slice(chunk);
+                    }
+                }
+                Ok::<Vec<u8>, (&'static str, String)>(out)
+            })
+            .await
+            .map_err(|_| {
+                (
+                    "MANIFEST_FETCH_FAILED",
+                    "Timed out reading /v1/manifest response body".to_string(),
+                )
+            })??;
+
+            Ok::<(Vec<u8>, Option<String>), (&'static str, String)>((bytes, etag))
+        }
+        .await;
+
+        client.shutdown_ssh();
+        outcome
     })?;
 
     let signed: SignedNodeManifest = serde_json::from_slice(&body_bytes).map_err(|e| {
@@ -5359,12 +5519,6 @@ fn attempt_guest_self_enroll(
     local_keys: &NodeIdentityKeys,
 ) -> Result<GuestEnrollOutcome, (&'static str, String)> {
     let pair_url = format!("{}/v1/guest/pair", base_url.trim_end_matches('/'));
-    let uri: http::Uri = pair_url.parse().map_err(|e| {
-        (
-            "INVALID_ENDPOINT",
-            format!("Invalid guest pairing URI '{pair_url}': {e}"),
-        )
-    })?;
 
     let ed25519_jwk = local_keys.signing_jwk();
     let x25519_jwk = local_keys.encryption_jwk();
@@ -5397,67 +5551,73 @@ fn attempt_guest_self_enroll(
         .map_err(|e| ("RUNTIME_ERROR", format!("Failed to start async runtime: {e}")))?;
 
     let (status, body_bytes) = rt.block_on(async {
-        let client = build_http_client::<Full<Bytes>>()
+        let client = HttpClient::new()
             .map_err(|e| ("HTTP_ERROR", format!("Failed to initialize HTTP client: {e}")))?;
         let req = Request::builder()
             .method(Method::POST)
-            .uri(&uri)
+            .uri("/v1/guest/pair")
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::ACCEPT, "application/json")
             .header(
                 header::USER_AGENT,
                 format!("hyp/{}", env!("CARGO_PKG_VERSION")),
             )
-            .body(Full::new(Bytes::from(req_bytes)))
+            .body(full_body(Bytes::from(req_bytes)))
             .map_err(|e| ("HTTP_ERROR", format!("Failed to build guest-pair request: {e}")))?;
 
-        let resp = tokio::time::timeout(
-            Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS),
-            client.request(req),
-        )
-        .await
-        .map_err(|_| {
-            (
-                "GUEST_PAIR_FAILED",
-                format!("POST {pair_url} timed out after {MANIFEST_FETCH_TIMEOUT_SECS}s"),
+        let outcome = async {
+            let resp = tokio::time::timeout(
+                Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS),
+                client.request_for_endpoint(base_url, req),
             )
-        })?
-        .map_err(|e| ("GUEST_PAIR_FAILED", format!("POST {pair_url} failed: {e}")))?;
+            .await
+            .map_err(|_| {
+                (
+                    "GUEST_PAIR_FAILED",
+                    format!("POST {pair_url} timed out after {MANIFEST_FETCH_TIMEOUT_SECS}s"),
+                )
+            })?
+            .map_err(|e| ("GUEST_PAIR_FAILED", format!("POST {pair_url} failed: {e}")))?;
 
-        let status = resp.status().as_u16();
-        let bytes = tokio::time::timeout(Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS), async {
-            let mut body = resp.into_body();
-            let mut out = Vec::new();
-            while let Some(frame_res) = body.frame().await {
-                let frame = frame_res.map_err(|e| {
-                    (
-                        "GUEST_PAIR_FAILED",
-                        format!("Guest pair body read error: {e}"),
-                    )
-                })?;
-                if let Some(chunk) = frame.data_ref() {
-                    if out.len() + chunk.len() > MAX_MANIFEST_RESPONSE_BYTES {
-                        return Err((
-                            "GUEST_PAIR_INVALID",
-                            format!(
-                                "Guest pair response exceeds {MAX_MANIFEST_RESPONSE_BYTES} byte cap"
-                            ),
-                        ));
+            let status = resp.status().as_u16();
+            let bytes = tokio::time::timeout(Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS), async {
+                let mut body = resp.into_body();
+                let mut out = Vec::new();
+                while let Some(frame_res) = body.frame().await {
+                    let frame = frame_res.map_err(|e| {
+                        (
+                            "GUEST_PAIR_FAILED",
+                            format!("Guest pair body read error: {e}"),
+                        )
+                    })?;
+                    if let Some(chunk) = frame.data_ref() {
+                        if out.len() + chunk.len() > MAX_MANIFEST_RESPONSE_BYTES {
+                            return Err((
+                                "GUEST_PAIR_INVALID",
+                                format!(
+                                    "Guest pair response exceeds {MAX_MANIFEST_RESPONSE_BYTES} byte cap"
+                                ),
+                            ));
+                        }
+                        out.extend_from_slice(chunk);
                     }
-                    out.extend_from_slice(chunk);
                 }
-            }
-            Ok::<Vec<u8>, (&'static str, String)>(out)
-        })
-        .await
-        .map_err(|_| {
-            (
-                "GUEST_PAIR_FAILED",
-                "Timed out reading /v1/guest/pair response body".to_string(),
-            )
-        })??;
+                Ok::<Vec<u8>, (&'static str, String)>(out)
+            })
+            .await
+            .map_err(|_| {
+                (
+                    "GUEST_PAIR_FAILED",
+                    "Timed out reading /v1/guest/pair response body".to_string(),
+                )
+            })??;
 
-        Ok::<(u16, Vec<u8>), (&'static str, String)>((status, bytes))
+            Ok::<(u16, Vec<u8>), (&'static str, String)>((status, bytes))
+        }
+        .await;
+
+        client.shutdown_ssh();
+        outcome
     })?;
 
     if status == 404 {
@@ -5623,13 +5783,13 @@ pub(crate) fn attempt_delegated_pair_enroll(
     hcert1: &str,
 ) -> Result<DelegatedEnrollSuccess, (u16, &'static str, String)> {
     let pair_url = format!("{}/v1/pair/delegated", base_url.trim_end_matches('/'));
-    let uri: http::Uri = pair_url.parse().map_err(|e| {
-        (
+    if let Err(e) = validate_endpoint_origin(base_url) {
+        return Err((
             0u16,
             "INVALID_ENDPOINT",
-            format!("Invalid delegated pairing URI '{pair_url}': {e}"),
-        )
-    })?;
+            format!("Invalid delegated pairing endpoint '{base_url}': {e}"),
+        ));
+    }
 
     let ed25519_jwk = local_keys.signing_jwk();
     let x25519_jwk = local_keys.encryption_jwk();
@@ -5679,7 +5839,7 @@ pub(crate) fn attempt_delegated_pair_enroll(
         })?;
 
     let (status, body_bytes) = rt.block_on(async {
-        let client = build_http_client::<Full<Bytes>>().map_err(|e| {
+        let client = HttpClient::new().map_err(|e| {
             (
                 0u16,
                 "HTTP_ERROR",
@@ -5688,14 +5848,14 @@ pub(crate) fn attempt_delegated_pair_enroll(
         })?;
         let req = Request::builder()
             .method(Method::POST)
-            .uri(&uri)
+            .uri("/v1/pair/delegated")
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::ACCEPT, "application/json")
             .header(
                 header::USER_AGENT,
                 format!("hyp/{}", env!("CARGO_PKG_VERSION")),
             )
-            .body(Full::new(Bytes::from(req_bytes)))
+            .body(full_body(Bytes::from(req_bytes)))
             .map_err(|e| {
                 (
                     0u16,
@@ -5704,63 +5864,69 @@ pub(crate) fn attempt_delegated_pair_enroll(
                 )
             })?;
 
-        let resp = tokio::time::timeout(
-            Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS),
-            client.request(req),
-        )
-        .await
-        .map_err(|_| {
-            (
-                0u16,
-                "DELEGATED_PAIR_FAILED",
-                format!("POST {pair_url} timed out after {MANIFEST_FETCH_TIMEOUT_SECS}s"),
+        let outcome = async {
+            let resp = tokio::time::timeout(
+                Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS),
+                client.request_for_endpoint(base_url, req),
             )
-        })?
-        .map_err(|e| {
-            (
-                0u16,
-                "DELEGATED_PAIR_FAILED",
-                format!("POST {pair_url} failed: {e}"),
-            )
-        })?;
+            .await
+            .map_err(|_| {
+                (
+                    0u16,
+                    "DELEGATED_PAIR_FAILED",
+                    format!("POST {pair_url} timed out after {MANIFEST_FETCH_TIMEOUT_SECS}s"),
+                )
+            })?
+            .map_err(|e| {
+                (
+                    0u16,
+                    "DELEGATED_PAIR_FAILED",
+                    format!("POST {pair_url} failed: {e}"),
+                )
+            })?;
 
-        let status = resp.status().as_u16();
-        let bytes = tokio::time::timeout(Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS), async {
-            let mut body = resp.into_body();
-            let mut out = Vec::new();
-            while let Some(frame_res) = body.frame().await {
-                let frame = frame_res.map_err(|e| {
-                    (
-                        status,
-                        "DELEGATED_PAIR_FAILED",
-                        format!("Delegated pair body read error: {e}"),
-                    )
-                })?;
-                if let Some(chunk) = frame.data_ref() {
-                    if out.len() + chunk.len() > MAX_MANIFEST_RESPONSE_BYTES {
-                        return Err((
+            let status = resp.status().as_u16();
+            let bytes = tokio::time::timeout(Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS), async {
+                let mut body = resp.into_body();
+                let mut out = Vec::new();
+                while let Some(frame_res) = body.frame().await {
+                    let frame = frame_res.map_err(|e| {
+                        (
                             status,
-                            "DELEGATED_PAIR_INVALID",
-                            format!(
-                                "Delegated pair response exceeds {MAX_MANIFEST_RESPONSE_BYTES} byte cap"
-                            ),
-                        ));
+                            "DELEGATED_PAIR_FAILED",
+                            format!("Delegated pair body read error: {e}"),
+                        )
+                    })?;
+                    if let Some(chunk) = frame.data_ref() {
+                        if out.len() + chunk.len() > MAX_MANIFEST_RESPONSE_BYTES {
+                            return Err((
+                                status,
+                                "DELEGATED_PAIR_INVALID",
+                                format!(
+                                    "Delegated pair response exceeds {MAX_MANIFEST_RESPONSE_BYTES} byte cap"
+                                ),
+                            ));
+                        }
+                        out.extend_from_slice(chunk);
                     }
-                    out.extend_from_slice(chunk);
                 }
-            }
-            Ok::<Vec<u8>, (u16, &'static str, String)>(out)
-        })
-        .await
-        .map_err(|_| {
-            (
-                status,
-                "DELEGATED_PAIR_FAILED",
-                "Timed out reading /v1/pair/delegated response body".to_string(),
-            )
-        })??;
+                Ok::<Vec<u8>, (u16, &'static str, String)>(out)
+            })
+            .await
+            .map_err(|_| {
+                (
+                    status,
+                    "DELEGATED_PAIR_FAILED",
+                    "Timed out reading /v1/pair/delegated response body".to_string(),
+                )
+            })??;
 
-        Ok::<(u16, Vec<u8>), (u16, &'static str, String)>((status, bytes))
+            Ok::<(u16, Vec<u8>), (u16, &'static str, String)>((status, bytes))
+        }
+        .await;
+
+        client.shutdown_ssh();
+        outcome
     })?;
 
     if status != 200 {
@@ -5968,11 +6134,28 @@ fn run_join(
         );
     }
 
-    let trimmed = url.trim().trim_end_matches('/');
-    let base_url = trimmed
-        .strip_suffix("/v1/manifest")
-        .unwrap_or(trimmed)
-        .to_string();
+    let trimmed = url.trim();
+    let base_url = if trimmed.starts_with("ssh://") {
+        match parse_ssh_endpoint(trimmed) {
+            Ok(ep) => ep.canonical_url(),
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_USAGE,
+                    "INVALID_ENDPOINT",
+                    format!("Invalid SSH target URL '{url}': {e}"),
+                    Some("Use ssh://[user@]host[:port][?stateDir=/path]".to_string()),
+                );
+            }
+        }
+    } else {
+        let no_slash = trimmed.trim_end_matches('/');
+        no_slash
+            .strip_suffix("/v1/manifest")
+            .unwrap_or(no_slash)
+            .to_string()
+    };
 
     if let Some(ref raw) = node_id_arg {
         if raw == LOCAL_NODE_ID || !is_valid_node_id(raw) {
@@ -6483,6 +6666,979 @@ fn run_join(
         print_warnings(&warnings);
         print_next_steps(&next);
     }
+    ExitCode::from(EXIT_OK)
+}
+
+// ============================================================================
+// `pair ssh <target>` — One-command zero-port mutual P2P pairing over SSH
+// ============================================================================
+
+const PAIR_SSH_REMOTE_TIMEOUT_SECS: u64 = 30;
+const MAX_PAIR_SSH_STDOUT_BYTES: usize = 256 * 1024;
+
+fn shell_single_quote_strict(raw: &str, label: &str) -> Result<String, String> {
+    if raw.is_empty()
+        || raw.contains('\'')
+        || raw.chars().any(|c| c.is_control() || c == '\n' || c == '\r')
+    {
+        return Err(format!(
+            "refusing unsafe remote SSH argument for {label}: contains single quote or control characters"
+        ));
+    }
+    Ok(format!("'{raw}'"))
+}
+
+fn build_remote_p2p_invite_cmd(
+    ssh_ep: &SshEndpoint,
+    remote_node_id: &str,
+    canonical_endpoint: &str,
+    local_node_id: &str,
+    remote_offered_scopes: &[String],
+    remote_requested_scopes: &[String],
+) -> Result<String, String> {
+    if remote_node_id == LOCAL_NODE_ID || !is_valid_node_id(remote_node_id) {
+        return Err(format!("invalid remote nodeId '{remote_node_id}'"));
+    }
+    if local_node_id == LOCAL_NODE_ID || !is_valid_node_id(local_node_id) {
+        return Err(format!("invalid local nodeId '{local_node_id}'"));
+    }
+    let _ = parse_ssh_endpoint(canonical_endpoint).map_err(|e| e.to_string())?;
+
+    let mut args: Vec<String> = vec![
+        "pair".to_string(),
+        "invite".to_string(),
+        "--mode".to_string(),
+        "p2p".to_string(),
+        "--node-id".to_string(),
+        shell_single_quote_strict(remote_node_id, "remote_node_id")?,
+        "--endpoint".to_string(),
+        shell_single_quote_strict(canonical_endpoint, "endpoint")?,
+        "--peer".to_string(),
+        shell_single_quote_strict(local_node_id, "peer")?,
+    ];
+    if let Some(ref sd) = ssh_ep.state_dir {
+        validate_ssh_posix_path(sd, "stateDir").map_err(|e| e.to_string())?;
+        args.push("--state-dir".to_string());
+        args.push(shell_single_quote_strict(sd, "stateDir")?);
+    }
+    if !remote_offered_scopes.is_empty() {
+        args.push("--grant".to_string());
+        for s in remote_offered_scopes {
+            args.push(shell_single_quote_strict(s, "remote grant scope")?);
+        }
+    }
+    if !remote_requested_scopes.is_empty() {
+        args.push("--request".to_string());
+        for s in remote_requested_scopes {
+            args.push(shell_single_quote_strict(s, "remote request scope")?);
+        }
+    }
+    args.push("--json".to_string());
+
+    let joined = args.join(" ");
+    match &ssh_ep.bin {
+        Some(bin) => {
+            validate_ssh_posix_path(bin, "bin").map_err(|e| e.to_string())?;
+            Ok(format!("exec {} {joined}", shell_single_quote_strict(bin, "bin")?))
+        }
+        None => Ok(format!(
+            "command -v hyp >/dev/null 2>&1 && exec hyp {joined} || exec \"$HOME/.local/bin/hyp\" {joined}"
+        )),
+    }
+}
+
+fn invoke_remote_ssh_invite(
+    ssh_ep: &SshEndpoint,
+    remote_cmd: &str,
+) -> Result<String, (&'static str, String)> {
+    let ssh_bin = resolve_ssh_binary();
+    let ssh_args = ssh_ep.build_ssh_args_for_remote_cmd(remote_cmd);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| ("RUNTIME_ERROR", format!("Failed to start async runtime: {e}")))?;
+
+    let (status_ok, status_code, stdout_bytes, stderr_bytes) = rt.block_on(async {
+        use tokio::io::AsyncReadExt;
+        use tokio::process::Command;
+
+        let mut cmd = Command::new(&ssh_bin);
+        cmd.args(&ssh_args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().map_err(|e| {
+            (
+                "SSH_SPAWN_FAILED",
+                format!("Failed to launch SSH client '{ssh_bin}': {e}"),
+            )
+        })?;
+
+        let mut out_pipe = child
+            .stdout
+            .take()
+            .ok_or(("SSH_EXEC_FAILED", "SSH child missing stdout pipe".to_string()))?;
+        let mut err_pipe = child
+            .stderr
+            .take()
+            .ok_or(("SSH_EXEC_FAILED", "SSH child missing stderr pipe".to_string()))?;
+
+        let fut = async {
+            let mut out_buf = Vec::new();
+            let mut err_buf = Vec::new();
+            let out_task = async {
+                let mut lim = (&mut out_pipe).take((MAX_PAIR_SSH_STDOUT_BYTES + 1) as u64);
+                lim.read_to_end(&mut out_buf).await
+            };
+            let err_task = async {
+                let mut lim = (&mut err_pipe).take(64 * 1024);
+                lim.read_to_end(&mut err_buf).await
+            };
+            let (out_res, err_res) = tokio::join!(out_task, err_task);
+            out_res.map_err(|e| ("SSH_EXEC_FAILED", format!("Failed reading SSH stdout: {e}")))?;
+            let _ = err_res;
+            if out_buf.len() > MAX_PAIR_SSH_STDOUT_BYTES {
+                let _ = child.kill().await;
+                return Err((
+                    "SSH_RESPONSE_TOO_LARGE",
+                    format!("Remote SSH invite output exceeded {MAX_PAIR_SSH_STDOUT_BYTES} bytes"),
+                ));
+            }
+            let status = child
+                .wait()
+                .await
+                .map_err(|e| ("SSH_EXEC_FAILED", format!("Failed waiting for SSH child: {e}")))?;
+            Ok((status.success(), status.code(), out_buf, err_buf))
+        };
+
+        match tokio::time::timeout(Duration::from_secs(PAIR_SSH_REMOTE_TIMEOUT_SECS), fut).await {
+            Ok(res) => res,
+            Err(_) => {
+                let _ = child.kill().await;
+                Err((
+                    "SSH_TIMEOUT",
+                    format!(
+                        "Remote SSH pairing invite timed out after {PAIR_SSH_REMOTE_TIMEOUT_SECS}s"
+                    ),
+                ))
+            }
+        }
+    })?;
+
+    if !status_ok {
+        let err_snippet: String = String::from_utf8_lossy(&stderr_bytes)
+            .trim()
+            .chars()
+            .take(300)
+            .collect();
+        let out_snippet: String = String::from_utf8_lossy(&stdout_bytes)
+            .trim()
+            .chars()
+            .take(300)
+            .collect();
+        let detail = if !err_snippet.is_empty() {
+            err_snippet
+        } else if !out_snippet.is_empty() {
+            out_snippet
+        } else {
+            format!("exit status {:?}", status_code)
+        };
+        return Err((
+            "SSH_REMOTE_INVITE_FAILED",
+            format!("Remote `hyp pair invite` over SSH failed: {detail}"),
+        ));
+    }
+
+    let parsed: Value = serde_json::from_slice(&stdout_bytes).map_err(|e| {
+        (
+            "SSH_INVALID_RESPONSE",
+            format!("Remote `hyp pair invite --json` returned invalid JSON: {e}"),
+        )
+    })?;
+    if parsed.get("ok").and_then(Value::as_bool) != Some(true) {
+        let msg = parsed
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("remote invite returned ok=false");
+        return Err(("SSH_REMOTE_INVITE_FAILED", msg.to_string()));
+    }
+    let token = parsed
+        .get("data")
+        .and_then(|d| d.get("token"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| t.starts_with(HP2P1_PREFIX))
+        .ok_or_else(|| {
+            (
+                "SSH_INVALID_RESPONSE",
+                "Remote `hyp pair invite --json` output did not contain a valid hp2p1_ token"
+                    .to_string(),
+            )
+        })?;
+    Ok(token.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_pair_ssh(
+    target: String,
+    preset: Option<CliScopePreset>,
+    grant_args: Vec<String>,
+    request_args: Vec<String>,
+    state_dir_arg: Option<PathBuf>,
+    node_id_arg: Option<String>,
+    remote_node_id_arg: Option<String>,
+    remote_state_dir: Option<String>,
+    remote_bin: Option<String>,
+    dry_run: bool,
+    as_json: bool,
+) -> ExitCode {
+    let cmd = "pair ssh";
+    let raw_target = target.trim();
+    if raw_target.is_empty() {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "INVALID_ENDPOINT",
+            "Missing SSH target (e.g. `ops@solace` or `great-northern`)",
+            Some("Example: hyp pair ssh ops@solace --preset member".to_string()),
+        );
+    }
+    if raw_target.contains("://") && !raw_target.starts_with("ssh://") {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "INVALID_ENDPOINT",
+            format!("`hyp pair ssh` expects an SSH target or ssh:// URL (got '{raw_target}')"),
+            Some("Example: hyp pair ssh ops@solace  (or use `hyp pair join` / `hyp pair accept` for https://)".to_string()),
+        );
+    }
+
+    let raw_ssh_url = if raw_target.starts_with("ssh://") {
+        raw_target.to_string()
+    } else {
+        format!("ssh://{raw_target}")
+    };
+    let mut ssh_ep = match parse_ssh_endpoint(&raw_ssh_url) {
+        Ok(ep) => ep,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "INVALID_ENDPOINT",
+                format!("Invalid SSH target '{target}': {e}"),
+                Some("Use `[user@]host[:port]` or `ssh://[user@]host[:port][?stateDir=/path]` without shell metacharacters or leading '-'.".to_string()),
+            );
+        }
+    };
+
+    if let Some(ref sd) = remote_state_dir {
+        if let Err(e) = validate_ssh_posix_path(sd, "remoteStateDir") {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "INVALID_ENDPOINT",
+                format!("Invalid --remote-state-dir '{sd}': {e}"),
+                None,
+            );
+        }
+        if let Some(ref existing_sd) = ssh_ep.state_dir {
+            if existing_sd != sd {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_USAGE,
+                    "INVALID_ENDPOINT",
+                    format!(
+                        "Conflicting remote state directories: query ?stateDir={existing_sd} vs --remote-state-dir {sd}"
+                    ),
+                    None,
+                );
+            }
+        }
+        ssh_ep.state_dir = Some(sd.clone());
+    }
+    if let Some(ref b) = remote_bin {
+        if let Err(e) = validate_ssh_posix_path(b, "remoteBin") {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "INVALID_ENDPOINT",
+                format!("Invalid --remote-bin '{b}': {e}"),
+                None,
+            );
+        }
+        if let Some(ref existing_bin) = ssh_ep.bin {
+            if existing_bin != b {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_USAGE,
+                    "INVALID_ENDPOINT",
+                    format!(
+                        "Conflicting remote binaries: query ?bin={existing_bin} vs --remote-bin {b}"
+                    ),
+                    None,
+                );
+            }
+        }
+        ssh_ep.bin = Some(b.clone());
+    }
+
+    let canonical_endpoint = ssh_ep.canonical_url();
+
+    if let Some(ref raw) = node_id_arg {
+        if raw == LOCAL_NODE_ID || !is_valid_node_id(raw) {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "INVALID_NODE_ID",
+                format!(
+                    "Invalid --node-id '{raw}': must match /^[a-z0-9][a-z0-9@._-]{{0,63}}$/ and cannot be 'local'"
+                ),
+                None,
+            );
+        }
+    }
+    if let Some(ref raw) = remote_node_id_arg {
+        if raw == LOCAL_NODE_ID || !is_valid_node_id(raw) {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "INVALID_PEER_ID",
+                format!(
+                    "Invalid --remote-node-id '{raw}': must match /^[a-z0-9][a-z0-9@._-]{{0,63}}$/ and cannot be 'local'"
+                ),
+                None,
+            );
+        }
+    }
+
+    // Resolve mutual scopes:
+    // - `local_granted_scopes`: scopes OUR local node grants to the remote peer
+    // - `remote_offered_scopes`: scopes we ask the remote peer to grant US
+    let mut warnings = Vec::new();
+    let explicit_grant = !grant_args.is_empty();
+    let mut raw_local_grants: Vec<String> = Vec::new();
+    if let Some(p) = preset {
+        raw_local_grants.extend(p.to_proto().expand());
+    }
+    raw_local_grants.extend(tokenize_scope_args(&grant_args));
+    if raw_local_grants.is_empty() {
+        raw_local_grants = ScopePreset::Member.expand();
+    }
+    let expanded_local_grants = match expand_v2_scopes(&raw_local_grants) {
+        Ok(s) => s,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "INVALID_SCOPE",
+                format!("Invalid --grant scope: {e}"),
+                Some("Run `hyp pair guide` to see valid v2 scopes.".to_string()),
+            );
+        }
+    };
+    let local_granted_scopes = if explicit_grant {
+        expanded_local_grants
+    } else {
+        strip_privileged_default_scopes(expanded_local_grants, &mut warnings)
+    };
+
+    let remote_offered_scopes = if request_args.is_empty() {
+        local_granted_scopes.clone()
+    } else {
+        let tokenized_req = tokenize_scope_args(&request_args);
+        match expand_v2_scopes(&tokenized_req) {
+            Ok(s) => s,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_USAGE,
+                    "INVALID_SCOPE",
+                    format!("Invalid --request scope: {e}"),
+                    Some("Run `hyp pair guide` to see valid v2 scopes.".to_string()),
+                );
+            }
+        }
+    };
+
+    let explicit_state = state_dir_arg.is_some();
+    let state_dir = resolve_state_dir(state_dir_arg.as_deref(), None, None);
+    let db_path = state_dir.join("node.sqlite");
+    let existing_db = if db_path.exists() {
+        match NodeDb::open(&db_path) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "DB_ERROR",
+                    format!("Failed to open {}: {e}", db_path.display()),
+                    None,
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    let local_node_id = match resolve_local_node_id(
+        node_id_arg.as_deref(),
+        &state_dir,
+        existing_db.as_ref(),
+    ) {
+        Ok(id) => id,
+        Err((exit, code, msg)) => return emit_error(cmd, as_json, exit, code, msg, None),
+    };
+
+    if dry_run {
+        let preview_remote_id = remote_node_id_arg
+            .clone()
+            .or_else(|| derive_peer_id_from_url(&canonical_endpoint).ok())
+            .unwrap_or_else(|| "remote-node".to_string());
+        let remote_invite_cmd = match build_remote_p2p_invite_cmd(
+            &ssh_ep,
+            &preview_remote_id,
+            &canonical_endpoint,
+            &local_node_id,
+            &remote_offered_scopes,
+            &local_granted_scopes,
+        ) {
+            Ok(c) => c,
+            Err(msg) => {
+                return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_ENDPOINT", msg, None);
+            }
+        };
+        let connect_args = ssh_ep.build_ssh_args();
+        let data = json!({
+            "dryRun": true,
+            "transport": "ssh",
+            "target": ssh_ep.target(),
+            "endpoint": canonical_endpoint,
+            "localNodeId": local_node_id,
+            "remoteNodeId": remote_node_id_arg,
+            "grantedScopes": local_granted_scopes,
+            "requestedScopes": remote_offered_scopes,
+            "sshConnectArgs": connect_args,
+            "remoteInviteCmd": remote_invite_cmd,
+            "manualInviteAlternative": format!(
+                "hyp pair invite --mode p2p --node-id {preview_remote_id} --endpoint {canonical_endpoint} --preset {}",
+                preset.map(CliScopePreset::as_str).unwrap_or("member")
+            ),
+        });
+        if as_json {
+            let envelope = JsonEnvelope {
+                ok: true,
+                command: cmd.to_string(),
+                summary: Some(format!(
+                    "Dry-run validated SSH mutual P2P pairing plan for {canonical_endpoint}"
+                )),
+                data: Some(data),
+                warnings,
+                next: vec![format!("hyp pair ssh {}", ssh_ep.target())],
+                error: None,
+            };
+            print_json(&envelope);
+        } else {
+            println!("OK    SSH Mutual P2P Pairing Plan (--dry-run)");
+            println!("      Local Node:   {local_node_id}");
+            println!("      SSH Target:   {}", ssh_ep.target());
+            println!("      Endpoint:     {canonical_endpoint}");
+            println!("      Grant To Peer: {}", local_granted_scopes.join(" "));
+            println!("      Request Scope: {}", remote_offered_scopes.join(" "));
+            println!("      Connect Args: ssh {}", connect_args.join(" "));
+            print_warnings(&warnings);
+        }
+        return ExitCode::from(EXIT_OK);
+    }
+
+    // Step 1: Verify the remote node is reachable over `ssh://` (`hyp connect` -> `peer.sock`)
+    // and cryptographically verify its signed `/v1/manifest`.
+    let verified_manifest = match fetch_and_verify_manifest(&canonical_endpoint) {
+        Ok(v) => v,
+        Err((code, msg)) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                code,
+                format!("Could not reach or verify remote Hyphae node via {canonical_endpoint}: {msg}"),
+                Some(format!(
+                    "Verify passwordless SSH works (`ssh -o BatchMode=yes {} true`) and the remote Hyphae node is running (`hyp node start --profile p2p` or `--peer-socket`).",
+                    ssh_ep.target()
+                )),
+            );
+        }
+    };
+
+    let remote_node_id = verified_manifest.payload.node_id.as_str().to_string();
+    if let Some(ref expected) = remote_node_id_arg {
+        if *expected != remote_node_id {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "NODE_ID_MISMATCH",
+                format!(
+                    "Remote manifest nodeId '{remote_node_id}' does not match --remote-node-id '{expected}'"
+                ),
+                None,
+            );
+        }
+    }
+    if remote_node_id == local_node_id {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "PEER_ID_CONFLICT",
+            format!("Remote nodeId '{remote_node_id}' is identical to local nodeId '{local_node_id}'"),
+            Some("Pass a distinct --node-id for this machine.".to_string()),
+        );
+    }
+
+    let manifest_sign_kid = verified_manifest.signing_pk.kid();
+    if let Some(ref db) = existing_db {
+        if let Err((code, msg)) = check_existing_signing_pin(db, &remote_node_id, &manifest_sign_kid)
+        {
+            return emit_error(cmd, as_json, EXIT_ERROR, code, msg, None);
+        }
+        if let Err((code, msg)) =
+            check_existing_peer_pin(db, &remote_node_id, PeerProfile::P2p, &canonical_endpoint)
+        {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                code,
+                msg,
+                Some(format!(
+                    "Revoke the existing peer first with `hyp pair revoke {remote_node_id}` before re-pairing to a different endpoint."
+                )),
+            );
+        }
+    }
+
+    // Step 2: Mint a single-use `hp2p1_` offer remotely over `ssh -o BatchMode=yes -- <target>`
+    // (ZERO secrets in argv — token travels back over SSH stdout JSON into RAM only!).
+    let remote_invite_cmd = match build_remote_p2p_invite_cmd(
+        &ssh_ep,
+        &remote_node_id,
+        &canonical_endpoint,
+        &local_node_id,
+        &remote_offered_scopes,
+        &local_granted_scopes,
+    ) {
+        Ok(c) => c,
+        Err(msg) => {
+            return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_ENDPOINT", msg, None);
+        }
+    };
+    let hp2p1_token = match invoke_remote_ssh_invite(&ssh_ep, &remote_invite_cmd) {
+        Ok(tok) => tok,
+        Err((code, msg)) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                code,
+                msg,
+                Some(format!(
+                    "Ensure `hyp` is installed on {} (or pass --remote-bin /path/to/hyp) and its node daemon is running.",
+                    ssh_ep.target()
+                )),
+            );
+        }
+    };
+
+    // Step 3: Decode & cross-verify the returned `hp2p1_` offer against the verified manifest.
+    let offer = match decode_hp2p1(&hp2p1_token) {
+        Ok(o) => o,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "INVALID_TOKEN",
+                format!("Remote host returned an invalid hp2p1_ offer: {e}"),
+                None,
+            );
+        }
+    };
+    if offer.node_id != remote_node_id {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "NODE_ID_MISMATCH",
+            format!(
+                "Remote hp2p1_ offer nodeId '{}' does not match verified manifest nodeId '{remote_node_id}'",
+                offer.node_id
+            ),
+            None,
+        );
+    }
+    let offer_sign_pk = match offer.signing_jwk.to_ed25519() {
+        Ok(pk) => pk,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "INVALID_KEY",
+                format!("Invalid signingJwk in remote hp2p1_ offer: {e}"),
+                None,
+            );
+        }
+    };
+    let offer_enc_pk = match offer.encryption_jwk.to_x25519() {
+        Ok(pk) => pk,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "INVALID_KEY",
+                format!("Invalid encryptionJwk in remote hp2p1_ offer: {e}"),
+                None,
+            );
+        }
+    };
+    if offer_sign_pk != verified_manifest.signing_pk
+        || offer_enc_pk != verified_manifest.encryption_pk
+    {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "KEY_PIN_MISMATCH",
+            "Remote hp2p1_ offer keys do not match the running node's verified /v1/manifest keys (fail-closed)".to_string(),
+            Some("Verify --remote-state-dir matches the running remote Hyphae daemon's state directory.".to_string()),
+        );
+    }
+    if offer.endpoint != canonical_endpoint {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "INVALID_ENDPOINT",
+            format!(
+                "Remote hp2p1_ offer endpoint '{}' does not match expected '{canonical_endpoint}'",
+                offer.endpoint
+            ),
+            None,
+        );
+    }
+
+    if let Err(e) = ensure_dir(&state_dir, true) {
+        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
+    }
+    let secrets = crate::config_file::open_secret_store(&state_dir, explicit_state);
+    let local_keys = match secrets.load_or_create_node_keys(&local_node_id) {
+        Ok(k) => k,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "KEYSTORE_ERROR",
+                format!("Failed to load/create local node keys: {e}"),
+                None,
+            );
+        }
+    };
+
+    // Step 4: Complete live mutual P2P handshake over `ssh://` (`POST /v1/p2p/pair/<offerId>`).
+    let trust_tier = StoreTrustTier::Peer;
+    let local_endpoint = load_local_public_endpoint(&state_dir);
+    let live = match execute_live_p2p_handshake(
+        &offer,
+        &offer_sign_pk,
+        &local_node_id,
+        local_endpoint.as_deref(),
+        &local_keys,
+        &local_granted_scopes,
+        trust_tier,
+    ) {
+        Ok(res) => res,
+        Err(LiveHandshakeError::Unreachable(msg)) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "PAIR_HANDSHAKE_FAILED",
+                msg,
+                Some("Verify the remote node daemon is running and reachable via `hyp connect`.".to_string()),
+            );
+        }
+        Err(LiveHandshakeError::Rejected { code, message }) => {
+            return emit_error(cmd, as_json, EXIT_ERROR, code, message, None);
+        }
+    };
+
+    // Step 5: Persist peer (`ssh://` endpoint), pin JWKs, store authCredential, grants & manifest.
+    let db = match existing_db {
+        Some(d) => d,
+        None => match NodeDb::open(&db_path) {
+            Ok(d) => d,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "DB_ERROR",
+                    format!("Failed to open {}: {e}", db_path.display()),
+                    None,
+                );
+            }
+        },
+    };
+
+    let cred_ref = credential_secret_name("peer-auth", &remote_node_id);
+    if let Err(e) = secrets.set(&cred_ref, &live.auth_credential) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "KEYSTORE_ERROR",
+            format!("Failed to store peer authCredential in SecretStore: {e}"),
+            None,
+        );
+    }
+
+    let now_db = now_ms();
+    let _ = db.local().ensure_metadata("node_id", &local_node_id);
+
+    if let Err(e) = db.peers().upsert_peer(
+        &PeerInput {
+            peer_id: remote_node_id.clone(),
+            endpoint: Some(canonical_endpoint.clone()),
+            profile: PeerProfile::P2p,
+            trust_tier,
+            status: PeerStatus::Active,
+            scopes: local_granted_scopes.clone(),
+            auth_credential_ref: Some(cred_ref.clone()),
+        },
+        now_db,
+    ) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "DB_ERROR",
+            format!("Failed to persist SSH peer '{remote_node_id}': {e}"),
+            None,
+        );
+    }
+
+    let kid = offer_sign_pk.kid();
+    let enc_kid = offer_enc_pk.kid();
+    let fingerprint = offer_sign_pk.fingerprint();
+    let sign_jwk_json = match serde_json::to_string(&offer.signing_jwk) {
+        Ok(s) => s,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+    };
+    let enc_jwk_json = match serde_json::to_string(&offer.encryption_jwk) {
+        Ok(s) => s,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+    };
+
+    if let Err(e) = db.peers().upsert_peer_key(
+        &PeerKeyInput {
+            peer_id: remote_node_id.clone(),
+            kid: kid.clone(),
+            key_use: KeyUse::Signing,
+            jwk_json: sign_jwk_json,
+            status: KeyStatus::Active,
+            expires_at: None,
+        },
+        now_db,
+    ) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "DB_ERROR",
+            format!("Failed to pin remote signing JWK: {e}"),
+            None,
+        );
+    }
+    if let Err(e) = db.peers().upsert_peer_key(
+        &PeerKeyInput {
+            peer_id: remote_node_id.clone(),
+            kid: enc_kid.clone(),
+            key_use: KeyUse::Encryption,
+            jwk_json: enc_jwk_json,
+            status: KeyStatus::Active,
+            expires_at: None,
+        },
+        now_db,
+    ) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "DB_ERROR",
+            format!("Failed to pin remote encryption JWK: {e}"),
+            None,
+        );
+    }
+
+    let alice_grant_json = match serde_json::to_string(&live.alice_grant_signed) {
+        Ok(s) => s,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+    };
+    if let Err(e) = save_grant_idempotent(
+        &db,
+        &GrantInput {
+            id: live.alice_grant_verified.id.clone(),
+            peer_id: remote_node_id.clone(),
+            direction: GrantDirection::Outbound,
+            signed_json: alice_grant_json,
+            scopes: live.alice_grant_verified.scopes.clone(),
+            trust_tier,
+            issued_at: now_db,
+            pair_by: None,
+            expires_at: None,
+        },
+        now_db,
+    ) {
+        return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None);
+    }
+
+    let bob_grant_json = match serde_json::to_string(&live.bob_grant_signed) {
+        Ok(s) => s,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+    };
+    if let Err(e) = save_grant_idempotent(
+        &db,
+        &GrantInput {
+            id: live.bob_grant_id.clone(),
+            peer_id: remote_node_id.clone(),
+            direction: GrantDirection::Inbound,
+            signed_json: bob_grant_json,
+            scopes: local_granted_scopes.clone(),
+            trust_tier,
+            issued_at: now_db,
+            pair_by: None,
+            expires_at: None,
+        },
+        now_db,
+    ) {
+        return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None);
+    }
+
+    let manifest_json = match serde_json::to_string(&live.signed_manifest) {
+        Ok(s) => s,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+    };
+    let caps: Vec<String> = live
+        .manifest_payload
+        .capabilities
+        .iter()
+        .map(|c| c.as_str().to_string())
+        .collect();
+    if let Err(e) = db.peers().cache_manifest(
+        &remote_node_id,
+        &ManifestCacheUpdate {
+            manifest_version: live.manifest_payload.manifest_version as i64,
+            manifest_json,
+            etag: Some(live.manifest_etag.clone()),
+            capabilities: caps.clone(),
+            accept_downgrade: false,
+        },
+        now_db,
+    ) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "MANIFEST_CACHE_ERROR",
+            format!("Failed to cache verified manifest: {e}"),
+            None,
+        );
+    }
+
+    drop(db);
+    let reload = try_reload_live_daemon(&state_dir, explicit_state);
+    warnings.extend(reload.warnings);
+    let daemon_reloaded = reload.reloaded;
+
+    let next = if daemon_reloaded {
+        vec![format!("hyp status --state-dir {}", state_dir.display())]
+    } else {
+        vec![
+            "hyp service restart".to_string(),
+            format!("hyp status --state-dir {}", state_dir.display()),
+        ]
+    };
+
+    let data = json!({
+        "mode": "p2p",
+        "transport": "ssh",
+        "nodeId": local_node_id,
+        "peerId": remote_node_id,
+        "target": ssh_ep.target(),
+        "endpoint": canonical_endpoint,
+        "kid": kid,
+        "encryptionKid": enc_kid,
+        "fingerprint": fingerprint,
+        "grantedScopes": local_granted_scopes,
+        "peerGrantedScopes": live.alice_grant_verified.scopes,
+        "capabilities": caps,
+        "handshakeCompleted": true,
+        "daemonReloaded": daemon_reloaded,
+        "credentialRef": cred_ref,
+        "secretBackend": secrets.backend().as_str(),
+        "stateDir": state_dir.display().to_string(),
+    });
+
+    if as_json {
+        let envelope = JsonEnvelope {
+            ok: true,
+            command: cmd.to_string(),
+            summary: Some(format!(
+                "Paired mutually over SSH with '{}' ({}, kid {})",
+                remote_node_id, canonical_endpoint, kid
+            )),
+            data: Some(data),
+            warnings,
+            next,
+            error: None,
+        };
+        print_json(&envelope);
+    } else {
+        println!("OK    Mutual P2P pairing completed over SSH (ssh://)");
+        println!("      Local Node:   {local_node_id}");
+        println!("      Remote Peer:  {remote_node_id}");
+        println!("      Endpoint:     {canonical_endpoint}");
+        println!("      Peer kid:     {kid}");
+        println!("      Fingerprint:  {fingerprint}");
+        println!("      Granted:      {}", local_granted_scopes.join(" "));
+        println!(
+            "      Peer Granted: {}",
+            live.alice_grant_verified.scopes.join(" ")
+        );
+        if daemon_reloaded {
+            println!("      Daemon:       Live daemon reloaded — SSH peer connected immediately.");
+        }
+        print_warnings(&warnings);
+        print_next_steps(&next);
+    }
+
     ExitCode::from(EXIT_OK)
 }
 

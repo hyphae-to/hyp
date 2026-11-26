@@ -42,8 +42,391 @@ pub fn is_valid_node_id(id: &str) -> bool {
     })
 }
 
-/// Validates that `endpoint` is an HTTPS origin or a loopback HTTP origin (`127.0.0.1`, `localhost`, `[::1]`).
-pub fn validate_endpoint_origin(endpoint: &str) -> Result<(), CryptoError> {
+/// Parsed and strictly validated `ssh://` peer transport endpoint.
+///
+/// Canonical format:
+/// `ssh://[user@]host[:port][?stateDir=/path&bin=/path/to/hyp]`
+///
+/// Security invariants (fail-closed):
+/// - Rejects empty host, leading `-` on `user` or `host` (prevents OpenSSH `-oProxyCommand=...`
+///   option injection), whitespace, NUL/control characters, quotes, backticks, `;`, `|`, `&`,
+///   `$`, `(`, `)`, `<`, `>`, `*`, `?`, `\`, and unknown query parameters.
+/// - Validates port strictly in `1..=65535`.
+/// - Builds discrete `ssh` argv vectors (never local `sh -c`) with `--` before target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshEndpoint {
+    pub user: Option<String>,
+    /// Canonical host (IPv6 literals stored bare without `[` `]`).
+    pub host: String,
+    pub port: Option<u16>,
+    pub state_dir: Option<String>,
+    pub bin: Option<String>,
+}
+
+impl SshEndpoint {
+    /// Returns `<user>@<host>` when `user` is present, otherwise `<host>`.
+    pub fn target(&self) -> String {
+        match &self.user {
+            Some(u) => format!("{u}@{}", self.host),
+            None => self.host.clone(),
+        }
+    }
+
+    /// Returns a valid HTTP/1.1 `Host` header value for requests tunnelled over SSH.
+    pub fn http_host_header(&self) -> String {
+        let host_part = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        match self.port {
+            Some(p) => format!("{host_part}:{p}"),
+            None => host_part,
+        }
+    }
+
+    /// Formats the canonical `ssh://` endpoint URL.
+    pub fn canonical_url(&self) -> String {
+        let mut out = String::from("ssh://");
+        if let Some(ref u) = self.user {
+            out.push_str(u);
+            out.push('@');
+        }
+        if self.host.contains(':') {
+            out.push('[');
+            out.push_str(&self.host);
+            out.push(']');
+        } else {
+            out.push_str(&self.host);
+        }
+        if let Some(p) = self.port {
+            out.push(':');
+            out.push_str(&p.to_string());
+        }
+        let mut sep = '?';
+        if let Some(ref sd) = self.state_dir {
+            out.push(sep);
+            out.push_str("stateDir=");
+            out.push_str(sd);
+            sep = '&';
+        }
+        if let Some(ref b) = self.bin {
+            out.push(sep);
+            out.push_str("bin=");
+            out.push_str(b);
+        }
+        out
+    }
+
+    /// Builds the safe remote shell invocation for `hyp connect` (resolving `hyp` on `PATH`
+    /// or `$HOME/.local/bin/hyp`, or the strictly validated `?bin=` override).
+    pub fn build_connect_remote_cmd(&self) -> String {
+        let state_flag = match &self.state_dir {
+            Some(sd) => format!(" --state-dir '{sd}'"),
+            None => String::new(),
+        };
+        match &self.bin {
+            Some(b) => format!("exec '{b}' connect{state_flag}"),
+            None => format!(
+                "command -v hyp >/dev/null 2>&1 && exec hyp connect{state_flag} || exec \"$HOME/.local/bin/hyp\" connect{state_flag}"
+            ),
+        }
+    }
+
+    /// Builds a discrete OpenSSH argv vector (NEVER invokes a local shell) ending in
+    /// `-- <target> <remote_cmd>`.
+    pub fn build_ssh_args_for_remote_cmd(&self, remote_cmd: &str) -> Vec<String> {
+        let mut args = vec![
+            "-o".to_string(),
+            "BatchMode=yes".to_string(),
+            "-o".to_string(),
+            "ServerAliveInterval=15".to_string(),
+            "-o".to_string(),
+            "ServerAliveCountMax=3".to_string(),
+            "-o".to_string(),
+            "ConnectTimeout=15".to_string(),
+            "-T".to_string(),
+        ];
+        if let Some(port) = self.port {
+            args.push("-p".to_string());
+            args.push(port.to_string());
+        }
+        args.push("--".to_string());
+        args.push(self.target());
+        args.push(remote_cmd.to_string());
+        args
+    }
+
+    /// Builds the discrete OpenSSH argv vector to bridge stdio to the remote node's `hyp connect`.
+    pub fn build_ssh_args(&self) -> Vec<String> {
+        self.build_ssh_args_for_remote_cmd(&self.build_connect_remote_cmd())
+    }
+}
+
+fn contains_forbidden_ssh_chars(s: &str) -> bool {
+    s.chars().any(|c| {
+        c.is_control()
+            || c.is_whitespace()
+            || matches!(
+                c,
+                '\'' | '"' | '`' | ';' | '|' | '$' | '(' | ')' | '<' | '>' | '*' | '\\' | '#'
+                    | '!' | '{' | '}' | '%'
+            )
+    })
+}
+
+fn validate_ssh_user(user: &str) -> Result<(), CryptoError> {
+    if user.is_empty() || user.len() > 64 {
+        return Err(CryptoError::InvalidPairing(
+            "ssh:// username must be 1..=64 characters".into(),
+        ));
+    }
+    if user.starts_with('-') {
+        return Err(CryptoError::InvalidPairing(
+            "ssh:// username must not start with '-' (option injection rejected)".into(),
+        ));
+    }
+    if !user
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err(CryptoError::InvalidPairing(format!(
+            "ssh:// username '{user}' contains disallowed characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_ssh_host(host: &str) -> Result<(), CryptoError> {
+    if host.is_empty() || host.len() > 253 {
+        return Err(CryptoError::InvalidPairing(
+            "ssh:// host must be 1..=253 characters".into(),
+        ));
+    }
+    if host.starts_with('-') || host.starts_with('.') || host.ends_with('-') {
+        return Err(CryptoError::InvalidPairing(format!(
+            "ssh:// host '{host}' must not start with '-' or '.' or end with '-'"
+        )));
+    }
+    if !host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err(CryptoError::InvalidPairing(format!(
+            "ssh:// host '{host}' contains disallowed characters"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_ssh_port(raw: &str) -> Result<u16, CryptoError> {
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(CryptoError::InvalidPairing(format!(
+            "invalid ssh:// port '{raw}'"
+        )));
+    }
+    let port: u16 = raw
+        .parse()
+        .map_err(|_| CryptoError::InvalidPairing(format!("ssh:// port out of range: '{raw}'")))?;
+    if port == 0 {
+        return Err(CryptoError::InvalidPairing(
+            "ssh:// port must be between 1 and 65535".into(),
+        ));
+    }
+    Ok(port)
+}
+
+/// Strictly validates a safe POSIX path parameter for `ssh://` (`?stateDir=...` or `?bin=...`).
+pub fn validate_ssh_posix_path(raw: &str, label: &str) -> Result<(), CryptoError> {
+    if raw.is_empty() || raw.len() > 512 {
+        return Err(CryptoError::InvalidPairing(format!(
+            "ssh:// {label} must be 1..=512 characters"
+        )));
+    }
+    if raw.starts_with('-') {
+        return Err(CryptoError::InvalidPairing(format!(
+            "ssh:// {label} must not start with '-'"
+        )));
+    }
+    if contains_forbidden_ssh_chars(raw) || raw.contains('?') || raw.contains('&') {
+        return Err(CryptoError::InvalidPairing(format!(
+            "ssh:// {label} contains disallowed shell or control characters"
+        )));
+    }
+    if raw.split('/').any(|seg| seg == "..") {
+        return Err(CryptoError::InvalidPairing(format!(
+            "ssh:// {label} must not contain '..' traversal segments"
+        )));
+    }
+    if !raw
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'+'))
+    {
+        return Err(CryptoError::InvalidPairing(format!(
+            "ssh:// {label} contains unsafe path characters (allowed: [A-Za-z0-9/_.+-])"
+        )));
+    }
+    Ok(())
+}
+
+/// Strictly parses and validates an optional `ssh://` peer transport endpoint:
+/// `ssh://[user@]host[:port][?stateDir=/path&bin=/path/to/hyp]`.
+pub fn parse_ssh_endpoint(raw: &str) -> Result<SshEndpoint, CryptoError> {
+    if raw.is_empty() || contains_forbidden_ssh_chars(raw) {
+        return Err(CryptoError::InvalidPairing(format!(
+            "invalid ssh:// endpoint '{raw}': contains forbidden whitespace, control, or shell metacharacters"
+        )));
+    }
+    let Some(rest) = raw.strip_prefix("ssh://") else {
+        return Err(CryptoError::InvalidPairing(format!(
+            "expected ssh:// scheme (got '{raw}')"
+        )));
+    };
+    if rest.is_empty() {
+        return Err(CryptoError::InvalidPairing("empty ssh:// host".into()));
+    }
+
+    let (authority_raw, query_opt) = match rest.split_once('?') {
+        Some((a, q)) => (a, Some(q)),
+        None => (rest, None),
+    };
+
+    let mut state_dir: Option<String> = None;
+    let mut bin: Option<String> = None;
+    if let Some(query) = query_opt {
+        if query.is_empty() || query.contains('?') {
+            return Err(CryptoError::InvalidPairing(format!(
+                "invalid ssh:// query string in '{raw}'"
+            )));
+        }
+        for pair in query.split('&') {
+            if pair.is_empty() {
+                return Err(CryptoError::InvalidPairing(format!(
+                    "empty query parameter in ssh:// endpoint '{raw}'"
+                )));
+            }
+            let Some((key, val)) = pair.split_once('=') else {
+                return Err(CryptoError::InvalidPairing(format!(
+                    "malformed query parameter '{pair}' in ssh:// endpoint"
+                )));
+            };
+            if val.contains('=') {
+                return Err(CryptoError::InvalidPairing(format!(
+                    "disallowed '=' in ssh:// query parameter '{key}'"
+                )));
+            }
+            match key {
+                "stateDir" => {
+                    if state_dir.is_some() {
+                        return Err(CryptoError::InvalidPairing(
+                            "duplicate stateDir query parameter in ssh:// endpoint".into(),
+                        ));
+                    }
+                    validate_ssh_posix_path(val, "stateDir")?;
+                    state_dir = Some(val.to_string());
+                }
+                "bin" => {
+                    if bin.is_some() {
+                        return Err(CryptoError::InvalidPairing(
+                            "duplicate bin query parameter in ssh:// endpoint".into(),
+                        ));
+                    }
+                    validate_ssh_posix_path(val, "bin")?;
+                    bin = Some(val.to_string());
+                }
+                other => {
+                    return Err(CryptoError::InvalidPairing(format!(
+                        "unsupported ssh:// query parameter '{other}' (allowed: stateDir, bin)"
+                    )));
+                }
+            }
+        }
+    }
+
+    if authority_raw.contains('&') || authority_raw.contains('=') || authority_raw.contains('?') {
+        return Err(CryptoError::InvalidPairing(format!(
+            "invalid characters in ssh:// authority '{authority_raw}'"
+        )));
+    }
+
+    // Permit at most one trailing '/' (e.g. `ssh://box/`), rejecting arbitrary paths.
+    let authority = authority_raw.strip_suffix('/').unwrap_or(authority_raw);
+    if authority.is_empty() || authority.contains('/') {
+        return Err(CryptoError::InvalidPairing(format!(
+            "ssh:// endpoint must not include a path segment (use ?stateDir=... or ?bin=...; got '{raw}')"
+        )));
+    }
+
+    let (user, host_port) = match authority.split_once('@') {
+        Some((u, hp)) => {
+            if hp.contains('@') {
+                return Err(CryptoError::InvalidPairing(format!(
+                    "multiple '@' in ssh:// endpoint '{raw}'"
+                )));
+            }
+            validate_ssh_user(u)?;
+            (Some(u.to_string()), hp)
+        }
+        None => (None, authority),
+    };
+
+    if host_port.is_empty() {
+        return Err(CryptoError::InvalidPairing("empty ssh:// host".into()));
+    }
+
+    let (host, port) = if let Some(after_open) = host_port.strip_prefix('[') {
+        let Some((ipv6_raw, remainder)) = after_open.split_once(']') else {
+            return Err(CryptoError::InvalidPairing(format!(
+                "unclosed IPv6 bracket in ssh:// endpoint '{raw}'"
+            )));
+        };
+        let ipv6: std::net::Ipv6Addr = ipv6_raw.parse().map_err(|_| {
+            CryptoError::InvalidPairing(format!(
+                "invalid IPv6 literal '[{ipv6_raw}]' in ssh:// endpoint"
+            ))
+        })?;
+        let port = if remainder.is_empty() {
+            None
+        } else if let Some(p_str) = remainder.strip_prefix(':') {
+            Some(parse_ssh_port(p_str)?)
+        } else {
+            return Err(CryptoError::InvalidPairing(format!(
+                "unexpected suffix '{remainder}' after IPv6 host in ssh:// endpoint"
+            )));
+        };
+        (ipv6.to_string(), port)
+    } else {
+        match host_port.split_once(':') {
+            Some((h, p_str)) => {
+                if p_str.contains(':') {
+                    return Err(CryptoError::InvalidPairing(format!(
+                        "IPv6 hosts in ssh:// endpoints must be bracketed (got '{host_port}')"
+                    )));
+                }
+                validate_ssh_host(h)?;
+                (h.to_string(), Some(parse_ssh_port(p_str)?))
+            }
+            None => {
+                validate_ssh_host(host_port)?;
+                (host_port.to_string(), None)
+            }
+        }
+    };
+
+    Ok(SshEndpoint {
+        user,
+        host,
+        port,
+        state_dir,
+        bin,
+    })
+}
+
+/// Validates that `endpoint` is strictly an HTTPS origin or a loopback HTTP origin
+/// (`127.0.0.1`, `localhost`, `[::1]`) — does NOT allow `ssh://`.
+///
+/// Use this for HTTP-only URLs such as signed binary updates or Tailscale MagicDNS origins.
+pub fn validate_http_endpoint_origin(endpoint: &str) -> Result<(), CryptoError> {
     let trimmed = endpoint.trim();
     if trimmed.contains(char::is_whitespace) || trimmed.contains('@') {
         return Err(CryptoError::InvalidPairing(format!(
@@ -71,6 +454,26 @@ pub fn validate_endpoint_origin(endpoint: &str) -> Result<(), CryptoError> {
     Err(CryptoError::InvalidPairing(format!(
         "endpoint must be https:// or loopback http:// (got {endpoint})"
     )))
+}
+
+/// Validates that `endpoint` is an HTTPS origin, a loopback HTTP origin (`127.0.0.1`,
+/// `localhost`, `[::1]`), or a strictly validated `ssh://` peer transport endpoint.
+pub fn validate_endpoint_origin(endpoint: &str) -> Result<(), CryptoError> {
+    let trimmed = endpoint.trim();
+    if trimmed.starts_with("ssh://") {
+        if trimmed != endpoint {
+            return Err(CryptoError::InvalidPairing(format!(
+                "ssh:// endpoint must not contain surrounding whitespace (got {endpoint:?})"
+            )));
+        }
+        let _ = parse_ssh_endpoint(endpoint)?;
+        return Ok(());
+    }
+    validate_http_endpoint_origin(endpoint).map_err(|_| {
+        CryptoError::InvalidPairing(format!(
+            "endpoint must be https://, ssh://, or loopback http:// (got {endpoint})"
+        ))
+    })
 }
 
 fn parse_rfc3339(ts: &str) -> Result<i64, CryptoError> {
@@ -838,5 +1241,109 @@ mod tests {
         let signed = sign_revocation_v2(&rev, &admin).unwrap();
         let verified = verify_revocation_v2(&signed, &admin.public_key()).unwrap();
         assert_eq!(verified, rev);
+    }
+
+    #[test]
+    fn parse_ssh_endpoint_valid_and_security_mutations() {
+        let ep1 = parse_ssh_endpoint("ssh://great-northern").unwrap();
+        assert_eq!(ep1.user, None);
+        assert_eq!(ep1.host, "great-northern");
+        assert_eq!(ep1.port, None);
+        assert_eq!(ep1.state_dir, None);
+        assert_eq!(ep1.bin, None);
+        assert_eq!(ep1.target(), "great-northern");
+        assert_eq!(ep1.canonical_url(), "ssh://great-northern");
+        let args1 = ep1.build_ssh_args();
+        assert!(args1.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
+        assert!(args1.contains(&"-T".to_string()));
+        let sep_idx = args1.iter().position(|a| a == "--").unwrap();
+        assert_eq!(args1[sep_idx + 1], "great-northern");
+
+        let ep2 = parse_ssh_endpoint("ssh://ops@bayfold-co-ops").unwrap();
+        assert_eq!(ep2.user.as_deref(), Some("ops"));
+        assert_eq!(ep2.host, "bayfold-co-ops");
+        assert_eq!(ep2.port, None);
+        assert_eq!(ep2.target(), "ops@bayfold-co-ops");
+
+        let ep3 = parse_ssh_endpoint("ssh://ops@solace:2222").unwrap();
+        assert_eq!(ep3.user.as_deref(), Some("ops"));
+        assert_eq!(ep3.host, "solace");
+        assert_eq!(ep3.port, Some(2222));
+        let args3 = ep3.build_ssh_args();
+        assert!(args3.windows(2).any(|w| w == ["-p", "2222"]));
+
+        let ep4 = parse_ssh_endpoint("ssh://ops@solace:2222?stateDir=/var/lib/hyphae&bin=/usr/local/bin/hyp").unwrap();
+        assert_eq!(ep4.state_dir.as_deref(), Some("/var/lib/hyphae"));
+        assert_eq!(ep4.bin.as_deref(), Some("/usr/local/bin/hyp"));
+        assert_eq!(
+            ep4.build_connect_remote_cmd(),
+            "exec '/usr/local/bin/hyp' connect --state-dir '/var/lib/hyphae'"
+        );
+
+        let ep_v6 = parse_ssh_endpoint("ssh://ops@[::1]:2222").unwrap();
+        assert_eq!(ep_v6.host, "::1");
+        assert_eq!(ep_v6.port, Some(2222));
+        assert_eq!(ep_v6.canonical_url(), "ssh://ops@[::1]:2222");
+        assert_eq!(ep_v6.http_host_header(), "[::1]:2222");
+
+        // validate_endpoint_origin accepts ssh://, https://, loopback http://
+        assert!(validate_endpoint_origin("ssh://ops@solace:2222").is_ok());
+        assert!(validate_endpoint_origin("https://alice.tailnet.ts.net").is_ok());
+        assert!(validate_endpoint_origin("http://127.0.0.1:8790").is_ok());
+        // Still rejects remote plaintext http://
+        assert!(validate_endpoint_origin("http://mesh.acme.internal").is_err());
+        // validate_http_endpoint_origin strictly rejects ssh://
+        assert!(validate_http_endpoint_origin("ssh://ops@solace").is_err());
+
+        // Security mutation vectors: option injection, shell metacharacters, bad ports, traversal
+        let bad_cases = [
+            "",
+            "ssh://",
+            "ssh:///",
+            "ssh://-oProxyCommand=id",
+            "ssh://-oProxyCommand=id@host",
+            "ssh://ops@-oProxyCommand=id",
+            "ssh://-evil@box",
+            "ssh://box;id",
+            "ssh://box|cat",
+            "ssh://box&whoami",
+            "ssh://$(id)",
+            "ssh://`id`",
+            "ssh://box'evil",
+            "ssh://box\"evil",
+            "ssh://box>out",
+            "ssh://box<in",
+            "ssh://box*",
+            "ssh://box\\evil",
+            "ssh://box with space",
+            " ssh://box",
+            "ssh://box\n",
+            "ssh://box\0evil",
+            "ssh://box:0",
+            "ssh://box:65536",
+            "ssh://box:abc",
+            "ssh://box:-22",
+            "ssh://box/extra/path",
+            "ssh://box?",
+            "ssh://box?unknown=1",
+            "ssh://box?stateDir=-evil",
+            "ssh://box?stateDir=/tmp/../etc",
+            "ssh://box?stateDir=/tmp/a;id",
+            "ssh://box?stateDir=/tmp/a$(id)",
+            "ssh://box?bin=/bin/sh;id",
+            "ssh://box?stateDir=/a&stateDir=/b",
+            "ssh://a@b@c",
+            "SSH://box",
+        ];
+        for bad in bad_cases {
+            assert!(
+                parse_ssh_endpoint(bad).is_err(),
+                "expected parse_ssh_endpoint({bad:?}) to fail closed"
+            );
+            assert!(
+                validate_endpoint_origin(bad).is_err(),
+                "expected validate_endpoint_origin({bad:?}) to fail closed"
+            );
+        }
     }
 }

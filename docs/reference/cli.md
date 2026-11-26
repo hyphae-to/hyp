@@ -14,10 +14,11 @@ hyp setup [--harness auto|all|claude,codex,...] [--interactive] [--dry-run] [--s
 ## Daemon, Background Service & Diagnostics
 
 ```sh
-hyp node start [--profile local|router|p2p] [--bind <ip:port>] [--config <path>] [--no-local-socket]   # alias: hyp daemon
-hyp service [install | uninstall | start | stop | restart | status] [--json]   # LaunchAgent / systemd --user / Windows schtasks
-hyp status [--json]                  # node identity, peer capabilities/version skew, gate & update status
-hyp doctor [--json]                  # fail-closed diagnostics across node.json, node.sqlite, peers, gate, plugins, harnesses
+hyp node start [--profile local|router|p2p] [--bind <ip:port>|none] [--peer-socket <path>] [--no-peer-socket] [--config <path>] [--no-local-socket]   # alias: hyp daemon
+hyp connect [--state-dir <dir>] [--config <path>] [--socket <path>]             # stdio <-> peer.sock (or loopback TCP) bridge for ssh:// peers
+hyp service [install | uninstall | start | stop | restart | status] [--json]    # LaunchAgent / systemd --user / Windows schtasks
+hyp status [--json]                  # node identity, peer capabilities/version skew, Tailscale & SSH transport, gate & update status
+hyp doctor [--json]                  # fail-closed diagnostics across node.json, node.sqlite, peers, Tailscale/Serve, gate, plugins, harnesses
 hyp version [--json]
 ```
 
@@ -27,10 +28,11 @@ Pairing tokens (`hp2p1_`, `am2_`, `t3mp1_`) are **never** accepted as CLI argv f
 
 ```sh
 hyp pair guide [--mode team|p2p|public] [--json]
-hyp pair invite --mode p2p|team --node-id <id> --endpoint <url> [--peer <id>] [--preset <name>] [--grant ...] [--request ...] [--json]
+hyp pair invite --mode p2p|team --node-id <id> --endpoint <https://...|ssh://...> [--peer <id>] [--preset <name>] [--grant ...] [--request ...] [--json]
+hyp pair ssh <[user@]host[:port]> [--preset <name>] [--grant ...] [--request ...] [--remote-state-dir <dir>] [--dry-run] [--json]
 hyp pair inspect [--token-file <path>] [--json]             # reads stdin if --token-file omitted
 hyp pair accept [--token-file <path>] [--json]              # triggers live `peers.reload` on running daemon
-hyp pair join <https://public-node> [--json]                # verifies manifest + triggers live `peers.reload`
+hyp pair join <https://...|ssh://...> [--json]              # verifies manifest + triggers live `peers.reload`
 hyp pair revoke <peer-id> [--reason <text>] [--json]        # marks revoked, clears credentials, triggers live `peers.reload`
 ```
 

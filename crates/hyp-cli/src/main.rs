@@ -7,6 +7,7 @@
 
 mod auth_cmd;
 mod config_file;
+mod connect_cmd;
 mod deploy;
 mod drop_cmd;
 mod emit_cmd;
@@ -141,6 +142,8 @@ enum Commands {
     },
     /// Alias for `node start` — runs the unified Hyphae v2 Node daemon
     Daemon(node_cmd::NodeStartArgs),
+    /// Bidirectional stdio bridge to local peer.sock (or loopback TCP) for `ssh://` peer transport
+    Connect(connect_cmd::ConnectArgs),
     /// Manage the Hyphae background daemon OS service (`install`, `uninstall`, `start`, `stop`, `restart`, `status`)
     Service {
         #[command(subcommand)]
@@ -486,6 +489,7 @@ fn main() -> ExitCode {
         }
         Commands::Node { command } => node_cmd::run_node(command),
         Commands::Daemon(args) => node_cmd::run_node_start(args),
+        Commands::Connect(args) => connect_cmd::run_connect(args),
         Commands::Service { command } => service::run_service(command),
         Commands::Setup(args) => setup::run_setup(args),
         Commands::Onboard(args) => setup::run_onboard(args),

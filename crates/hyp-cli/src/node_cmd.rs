@@ -30,9 +30,9 @@ use hyp_node::adapters::{
 };
 use hyp_node::engine::config::{ForwardingPolicy, validate_trusted_proxy_cidr};
 use hyp_node::engine::{
-    DropRelayConfig, E2eePolicy, EscalationConfig, GuestPairingConfig, LocalIngestConfig,
-    LocalIngestServer, NodeConfig, NodeProfile, PeerReconcileReport, TopicConfig, UnifiedNode,
-    normalize_drop_portal_url,
+    DEFAULT_PEER_SOCKET_FILENAME, DropRelayConfig, E2eePolicy, EscalationConfig,
+    GuestPairingConfig, LocalIngestConfig, LocalIngestServer, NodeConfig, NodeProfile,
+    PeerReconcileReport, TopicConfig, UnifiedNode, normalize_drop_portal_url,
 };
 use hyp_node::gates::{SecurityGateConfig, SecurityGatePipeline};
 use hyp_proto::address::{
@@ -84,9 +84,15 @@ pub struct NodeStartArgs {
     /// Node profile override (local, router, or p2p)
     #[arg(long, value_enum)]
     pub profile: Option<CliNodeProfile>,
-    /// HTTP/SSE peer listener address (e.g. 127.0.0.1:8790)
+    /// HTTP/SSE peer listener address (e.g. 127.0.0.1:8790, or 'none' for SSH-only peer.sock mode)
     #[arg(long)]
     pub bind: Option<String>,
+    /// Explicit Unix domain socket path for `hyp connect` / `ssh://` peer transport (also opts in on --profile local)
+    #[arg(long)]
+    pub peer_socket: Option<PathBuf>,
+    /// Disable automatic `<state_dir>/peer.sock` listener on router/p2p profiles
+    #[arg(long)]
+    pub no_peer_socket: bool,
     /// Canonical Hyphae nodeId override (e.g. alice@macbook, acme-team)
     #[arg(long)]
     pub node_id: Option<String>,
@@ -246,7 +252,23 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         }
     };
 
+    let explicit_ssh_only_config = loaded.as_ref().is_some_and(|c| {
+        let bind_explicitly_disabled = c
+            .raw
+            .get("listen")
+            .and_then(|l| l.get("bind"))
+            .is_some_and(|v| v.is_null() || v.as_str().is_some_and(|s| s.trim().is_empty()));
+        let ssh_public_url = c
+            .public_url
+            .as_deref()
+            .is_some_and(|u| u.trim().starts_with("ssh://"));
+        bind_explicitly_disabled || (ssh_public_url && c.bind_addr.is_none())
+    });
+
     let bind_addr: Option<SocketAddr> = match args.bind {
+        Some(ref raw) if raw.trim().eq_ignore_ascii_case("none") || raw.trim().eq_ignore_ascii_case("off") => {
+            None
+        }
         Some(ref raw) => match raw.parse::<SocketAddr>() {
             Ok(a) => Some(a),
             Err(e) => {
@@ -256,17 +278,49 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                     EXIT_USAGE,
                     "INVALID_BIND",
                     format!("Invalid --bind '{raw}': {e}"),
-                    Some("Use <ip>:<port>, e.g. 127.0.0.1:8790".to_string()),
+                    Some("Use <ip>:<port>, e.g. 127.0.0.1:8790 (or 'none' for SSH-only peer.sock)".to_string()),
                 );
             }
         },
         None => loaded.as_ref().and_then(|c| c.bind_addr).or_else(|| {
-            if matches!(profile, NodeProfile::Router | NodeProfile::P2p) {
+            if !explicit_ssh_only_config && matches!(profile, NodeProfile::Router | NodeProfile::P2p) {
                 Some("127.0.0.1:8790".parse().expect("valid default bind"))
             } else {
                 None
             }
         }),
+    };
+
+    let (peer_socket_path, peer_socket_required): (Option<PathBuf>, bool) = if args.no_peer_socket {
+        (None, false)
+    } else if let Some(ref explicit_ps) = args.peer_socket {
+        (Some(explicit_ps.clone()), true)
+    } else {
+        let cfg_ps = loaded
+            .as_ref()
+            .and_then(|c| c.raw.get("listen").and_then(|l| l.get("peerSocket")));
+        match cfg_ps {
+            Some(Value::Bool(false)) => (None, false),
+            Some(Value::Bool(true)) => (Some(state_dir.join(DEFAULT_PEER_SOCKET_FILENAME)), true),
+            Some(Value::String(s)) if !s.trim().is_empty() => {
+                let p = PathBuf::from(s.trim());
+                let resolved = if p.is_absolute() {
+                    p
+                } else if let Some(parent) = loaded.as_ref().and_then(|c| c.path.parent()) {
+                    parent.join(p)
+                } else {
+                    p
+                };
+                (Some(resolved), true)
+            }
+            _ if matches!(profile, NodeProfile::Router | NodeProfile::P2p) || explicit_ssh_only_config => {
+                (
+                    Some(state_dir.join(DEFAULT_PEER_SOCKET_FILENAME)),
+                    bind_addr.is_none(),
+                )
+            }
+            _ => (None, false),
+        }
     };
 
     let start_local_daemon = !args.no_local_socket
@@ -949,6 +1003,36 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             server_handle = Some(handle);
         }
 
+        #[cfg(unix)]
+        let mut bound_peer_socket: Option<PathBuf> = None;
+        #[cfg(not(unix))]
+        let bound_peer_socket: Option<PathBuf> = None;
+        #[cfg(unix)]
+        let mut unix_server_handle = None;
+        #[cfg(unix)]
+        if let Some(ps_path) = peer_socket_path {
+            match Arc::clone(&node).serve_unix(ps_path.clone()).await {
+                Ok((actual_sock, handle)) => {
+                    bound_peer_socket = Some(actual_sock);
+                    unix_server_handle = Some(handle);
+                }
+                Err(e) if !peer_socket_required => {
+                    startup_warnings.push(format!(
+                        "Could not bind optional peer.sock at {}: {e}",
+                        ps_path.display()
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Failed to bind peer Unix socket {}: {e}",
+                        ps_path.display()
+                    ));
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (peer_socket_path, peer_socket_required);
+
         // Auto-connect persisted active peers with a configured endpoint so restarted
         // daemons immediately restore PeerLinks and background SSE `/v1/inbox` streams.
         // Never fail startup if a remote peer is temporarily offline — record a warning instead.
@@ -971,6 +1055,9 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         let local_ingest_socket_str = local_ingest_server
             .as_ref()
             .map(|s| s.endpoint_path().display().to_string());
+        let peer_socket_str = bound_peer_socket
+            .as_ref()
+            .map(|p| p.display().to_string());
 
         write_atomic_file(&pid_path, format!("{pid}\n").as_bytes(), true)?;
         let status_doc = json!({
@@ -982,6 +1069,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             "fingerprint": fingerprint,
             "bind": bound_addr.map(|a| a.to_string()),
             "endpoint": endpoint,
+            "peerSocket": peer_socket_str,
             "socketPath": socket_path_str,
             "localIngestEnabled": local_ingest_server.is_some(),
             "localIngestSocket": local_ingest_socket_str,
@@ -1052,8 +1140,13 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             }
             if let Some(addr) = bound_addr {
                 println!("      Peer HTTP:   http://{addr} (GET /v1/manifest, GET /v1/health)");
+            } else if peer_socket_str.is_some() {
+                println!("      Peer HTTP:   disabled (SSH-only peer.sock mode)");
             } else {
                 println!("      Peer HTTP:   disabled (local profile)");
+            }
+            if let Some(ref ps) = peer_socket_str {
+                println!("      Peer Socket: {ps} (0600, hyp connect / ssh://)");
             }
             if guest_pairing_enabled {
                 println!("      Guest Pair:  enabled (POST /v1/guest/pair -> guest-ro)");
@@ -1124,6 +1217,15 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         if let Some(handle) = server_handle {
             handle.abort();
             let _ = handle.await;
+        }
+        #[cfg(unix)]
+        if let Some(handle) = unix_server_handle {
+            handle.abort();
+            let _ = handle.await;
+        }
+        #[cfg(unix)]
+        if let Some(ref ps) = bound_peer_socket {
+            let _ = fs::remove_file(ps);
         }
         let _ = fs::remove_file(&pid_path);
         let _ = fs::remove_file(&status_path);

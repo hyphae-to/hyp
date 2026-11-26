@@ -9,7 +9,7 @@ use crate::ui::{
 use clap::{Subcommand, ValueEnum};
 use http_body_util::{BodyExt, Empty};
 use hyp_crypto::keys::OkpJwk as CryptoOkpJwk;
-use hyp_crypto::pairing::validate_endpoint_origin;
+use hyp_crypto::pairing::{validate_endpoint_origin, validate_http_endpoint_origin};
 use hyp_crypto::rfc3339::{now_unix_ms, parse_rfc3339_millis};
 use hyp_node::engine::{DropRelayConfig, normalize_drop_portal_url};
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
@@ -2583,7 +2583,7 @@ async fn probe_manifest_url(
     checks: &mut Vec<CliCheck>,
 ) -> Option<ProbedManifestSummary> {
     // 1. Strictly enforce https:// or loopback http://
-    if let Err(e) = validate_endpoint_origin(base_url) {
+    if let Err(e) = validate_http_endpoint_origin(base_url) {
         checks.push(CliCheck::fail(
             "probe.origin",
             format!("Refusing unsafe URL '{base_url}': {e}"),

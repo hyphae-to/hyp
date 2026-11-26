@@ -24,7 +24,7 @@ use http::{Method, Request, header};
 use http_body_util::{BodyExt, Empty};
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keys::Ed25519PublicKey;
-use hyp_crypto::pairing::validate_endpoint_origin;
+use hyp_crypto::pairing::validate_http_endpoint_origin;
 use hyp_crypto::rfc3339::parse_rfc3339_millis;
 use hyp_crypto::transfer::{TarUnpackOptions, unpack_tar_gz};
 use hyp_node::engine::NodeProfile;
@@ -531,7 +531,7 @@ pub fn verify_release_manifest(
     }
 
     for (triple, art) in &payload.artifacts {
-        validate_endpoint_origin(&art.url).map_err(|e| {
+        validate_http_endpoint_origin(&art.url).map_err(|e| {
             (
                 "UNSAFE_ARTIFACT_URL",
                 format!("Artifact URL for '{triple}' rejected: {e}"),
@@ -1579,7 +1579,7 @@ fn resolve_redirect_url(
         ));
     };
 
-    validate_endpoint_origin(&next_url)
+    validate_http_endpoint_origin(&next_url)
         .map_err(|e| ("UNSAFE_REDIRECT", format!("Refusing unsafe redirect '{next_url}': {e}")))?;
     let next_uri: http::Uri = next_url
         .parse()
@@ -1595,7 +1595,7 @@ fn resolve_redirect_url(
 
 async fn download_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>, (&'static str, String)> {
     let mut current_url = url.trim().to_string();
-    validate_endpoint_origin(&current_url)
+    validate_http_endpoint_origin(&current_url)
         .map_err(|e| ("UNSAFE_URL", format!("Refusing unsafe URL '{current_url}': {e}")))?;
     let mut current_uri: http::Uri = current_url
         .parse()
