@@ -132,6 +132,8 @@ impl DeployProfile {
 
 #[derive(Subcommand)]
 pub enum DeployCommand {
+    /// Discover or configure public HTTPS routing for a dedicated loopback webhook receiver
+    Webhook(crate::webhook_deploy::WebhookArgs),
     /// List all 7 supported internet deployment providers with TLS, NAT, and pros/cons
     Providers {
         /// Output structured JSON envelope
@@ -213,6 +215,7 @@ struct ProviderInfo {
 
 pub fn run_deploy(command: DeployCommand) -> ExitCode {
     match command {
+        DeployCommand::Webhook(args) => crate::webhook_deploy::run(args),
         DeployCommand::Providers { json } => run_providers(json),
         DeployCommand::Init {
             provider,
@@ -254,12 +257,19 @@ const DEPLOY_TOOL_NAMES: &[&str] = &[
     "systemctl",
 ];
 
-fn find_in_path(bin: &str) -> Option<PathBuf> {
+pub(crate) fn find_in_path(bin: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(bin);
         if is_executable_file(&candidate) {
             return Some(candidate);
+        }
+        #[cfg(windows)]
+        {
+            let candidate = candidate.with_extension("exe");
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
         }
     }
     None
@@ -316,7 +326,7 @@ fn build_provider_catalog(tools: &[DetectedTool]) -> Vec<ProviderInfo> {
                 "Zero open inbound internet ports",
                 "Automatic HTTPS certificates via Tailscale Serve",
                 "Works identically on laptops, SSH devboxes, and homelabs",
-                "Optional Tailscale Funnel can expose webhook paths only",
+                "A separate Funnel port can expose a dedicated webhook listener",
             ],
             cons: &[
                 "Requires Tailscale client on participating nodes",
@@ -1396,9 +1406,8 @@ tailscale serve --bg --https=443 "http://{bind}"
 echo "Tailscale Serve active -> https://{domain}"
 echo "Verify with: hyp deploy check --url https://{domain}"
 
-# OPTIONAL: Only if you need public GitHub/Stripe webhooks on a dedicated path,
-# enable Tailscale Funnel ONLY on the webhook subpath (never on /v1/inbox or admin APIs):
-# tailscale funnel --bg --https=443 --set-path=/webhooks "http://{bind}/webhooks"
+# For public webhooks, use `hyp deploy webhook` with a dedicated loopback receiver.
+# Keep the private peer listener on its own Serve port.
 "#
     )
 }

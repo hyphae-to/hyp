@@ -754,36 +754,34 @@ test("a node that cannot store yet makes the plugin retry instead of dropping th
 
 test("webhook + Tailscale Funnel: publishes only the plugin path, logs the public URL, and stays signed", async () => {
   const dir = tempDir();
-  const calls = join(dir, "tailscale-calls.log");
-  const fake = join(dir, "tailscale");
-  // Stand-in for the Tailscale CLI: records its arguments and answers `status --json`.
-  writeFileSync(fake, `#!/bin/sh\necho "$@" >> "${calls}"\nif [ "$1" = "status" ]; then echo '{"Self":{"DNSName":"hub.tail1234.ts.net."}}'; fi\n`, { mode: 0o755 });
+  const calls = join(dir, "hyp-calls.log");
+  const fake = join(dir, "hyp");
+  writeFileSync(fake, `#!/bin/sh\necho "$@" >> "${calls}"\necho '{"ok":true,"data":{"publicUrl":"https://hub.tail1234.ts.net:8443/sentry"}}'\n`, { mode: 0o755 });
   const secret = "sentry-client-secret";
-  const plugin = startPlugin("sentry", { SENTRY_MODE: "webhook", SENTRY_CLIENT_SECRET: secret, SENTRY_WEBHOOK_PORT: "0", SENTRY_WEBHOOK_FUNNEL: "8443", TAILSCALE_BIN: fake });
+  const plugin = startPlugin("sentry", { SENTRY_MODE: "webhook", SENTRY_CLIENT_SECRET: secret, SENTRY_WEBHOOK_PORT: "0", SENTRY_WEBHOOK_FUNNEL: "8443", HYPHAE_BIN: fake });
   const url = await plugin.webhookUrl();
   await until(() => plugin.stderr().includes("public webhook URL (Tailscale Funnel): https://hub.tail1234.ts.net:8443/sentry"), "funnel URL log");
 
   const port = new URL(url).port;
   assert.deepEqual(readFileSync(calls, "utf8").trim().split("\n"), [
-    `funnel --bg --https=8443 --set-path=/sentry http://127.0.0.1:${port}`,
-    "status --json",
+    `deploy webhook --provider tailscale --local-target http://127.0.0.1:${port}/sentry --funnel-port 8443 --json`,
   ]);
 
-  // Funnel may deliver the request with or without the mount path; both are accepted, both stay signed.
+  // The host helper forwards to the exact signed listener path.
   const raw = JSON.stringify({ action: "unresolved", data: { issue: { id: "7", shortId: "WEB-7", title: "Regressed", status: "unresolved", substatus: "regressed", project: { slug: "web" } } } });
   const headers = { "sentry-hook-resource": "issue", "sentry-hook-signature": hmac("sha256", secret, raw) };
   const root = url.replace(/\/sentry$/, "/");
-  assert.equal((await post(root, raw, { ...headers, "sentry-hook-signature": flipBit(headers["sentry-hook-signature"]) })).status, 401);
+  assert.equal((await post(root, raw, headers)).status, 404);
+  assert.equal((await post(url, raw, { ...headers, "sentry-hook-signature": flipBit(headers["sentry-hook-signature"]) })).status, 401);
   assert.equal(plugin.events.length, 0);
-  assert.equal((await post(root, raw, headers)).status, 202);
   assert.equal((await post(url, raw, headers)).status, 202);
   assert.equal(plugin.events[0].event.type, "io.sentry.issue.unresolved");
   assert.equal(plugin.events[0].event.data.substatus, "regressed");
-  assert.equal(plugin.events[0].event.id, plugin.events[1].event.id, "the same delivery on either path is one event to the node");
+  assert.equal(plugin.events.length, 1);
 });
 
 test("webhook + Tailscale Funnel: a missing or failing tailscale leaves the listener local-only and running", async () => {
-  const plugin = startPlugin("vercel", { VERCEL_MODE: "webhook", VERCEL_WEBHOOK_SECRET: "s", VERCEL_WEBHOOK_PORT: "0", VERCEL_WEBHOOK_FUNNEL: "8443", TAILSCALE_BIN: "/nonexistent/tailscale" });
+  const plugin = startPlugin("vercel", { VERCEL_MODE: "webhook", VERCEL_WEBHOOK_SECRET: "s", VERCEL_WEBHOOK_PORT: "0", VERCEL_WEBHOOK_FUNNEL: "8443", HYPHAE_BIN: "/nonexistent/hyp" });
   const url = await plugin.webhookUrl();
   await until(() => plugin.stderr().includes("could not enable Tailscale Funnel (listener stays local-only)"), "funnel failure log");
   const raw = JSON.stringify({ id: "evt_2", type: "deployment.error", payload: { deployment: { id: "dpl_2", name: "web" } } });

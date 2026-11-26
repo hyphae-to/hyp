@@ -83,7 +83,7 @@ A plugin on a hub means the credential, the outbound connection and the state al
 - Steps marked `"on": "host"` happen on the hub. Run them over ssh if the agent has that access; otherwise hand the exact command to the user.
 - **Secrets on a headless host** are stored there, never relayed through chat: `hyp secret set <name>` reading stdin on the hub, or a phone drop created on the hub (`hyp drop create --kind secret --secret-name <name>`).
 - **Browser sign-ins** (Google) cannot complete on a headless host. The tree offers an ssh tunnel or a piped token; see the Gmail and Calendar trees.
-- **Webhooks** reach the plugin's loopback listener through Tailscale Funnel (the plugin enables it for its own path when `<PREFIX>_WEBHOOK_FUNNEL` is set) or through the hub's reverse proxy. The listener never binds a public interface.
+- **Webhooks** reach a dedicated signed loopback receiver. Run [webhook routing setup](../operations/deploying.md#public-webhook-routing) on the chosen host, keep its exact public callback URL for the provider, and verify with a signed delivery after the plugin starts.
 
 ## 4. Guardrails for agents walking a tree
 

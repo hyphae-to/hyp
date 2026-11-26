@@ -230,27 +230,27 @@ export async function pollForever(name, intervalMs, tick) {
 
 const FUNNEL_PORTS = new Set(["443", "8443", "10000"]);
 
-function runTailscale(args) {
-  return new Promise((resolve, reject) => {
-    execFile(envString("TAILSCALE_BIN", "tailscale"), args, { timeout: 20_000, maxBuffer: 1_048_576 }, (error, stdout, stderr) => {
-      if (error) reject(new Error(clip(String(stderr || error.message).trim().split("\n")[0], 200)));
-      else resolve(stdout);
-    });
-  });
-}
-
 /**
- * Publishes a loopback webhook listener through Tailscale Funnel on exactly one path, and
- * returns the public URL. `--bg` makes the mapping persistent in tailscaled, so it survives
- * plugin restarts and reboots; remove it with
- * `tailscale funnel --https=<port> --set-path=<path> off`.
+ * The host CLI owns provider discovery and route changes. This compatibility
+ * adapter supports existing *_WEBHOOK_FUNNEL plugin configurations.
  */
 export async function tailscaleFunnel({ funnelPort, localPort, path }) {
-  await runTailscale(["funnel", "--bg", `--https=${funnelPort}`, `--set-path=${path}`, `http://127.0.0.1:${localPort}`]);
-  const status = JSON.parse(await runTailscale(["status", "--json"]));
-  const dnsName = String(status?.Self?.DNSName ?? "").replace(/\.$/, "");
-  if (!/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(dnsName)) throw new Error("tailscale status reported no DNS name for this node");
-  return `https://${dnsName}${funnelPort === "443" ? "" : `:${funnelPort}`}${path}`;
+  const target = `http://127.0.0.1:${localPort}${path}`;
+  const args = ["deploy", "webhook", "--provider", "tailscale", "--local-target", target, "--funnel-port", funnelPort, "--json"];
+  return new Promise((resolve, reject) => {
+    execFile(envString("HYPHAE_BIN", "hyp"), args, { timeout: 70_000, maxBuffer: 262_144, windowsHide: true }, (error, stdout) => {
+      let reply;
+      try {
+        reply = JSON.parse(stdout);
+      } catch {
+        return reject(new Error("Run hyp deploy webhook on this host to inspect Funnel prerequisites."));
+      }
+      if (error || reply?.ok !== true || typeof reply.data?.publicUrl !== "string") {
+        return reject(new Error(clip(reply?.error?.message ?? "Run hyp deploy webhook to inspect Funnel prerequisites.", 200)));
+      }
+      resolve(reply.data.publicUrl);
+    });
+  });
 }
 
 /**
@@ -263,9 +263,8 @@ export async function tailscaleFunnel({ funnelPort, localPort, path }) {
  * setup handshake (Notion); returning true answers 200 without publishing.
  *
  * `<PREFIX>_WEBHOOK_FUNNEL=443|8443|10000` additionally asks the local Tailscale client to
- * expose this one path publicly through Funnel on that port and logs the resulting URL. Funnel
- * may or may not strip the mount path before proxying, so in this mode the listener also accepts
- * POSTs on "/". A failed Funnel setup is logged and leaves the listener local-only.
+ * expose this path on a dedicated HTTPS port and logs the resulting URL. The host helper
+ * preserves the receiver path. A failed Funnel setup leaves the signed listener on loopback.
  */
 export function startWebhookServer({ prefix, name, defaultPort, defaultPath, maxBodyBytes = 1_048_576, verify, handle, preVerify }) {
   const host = envString(`${prefix}_WEBHOOK_HOST`, "127.0.0.1");
@@ -275,15 +274,16 @@ export function startWebhookServer({ prefix, name, defaultPort, defaultPath, max
   const funnelPort = envString(`${prefix}_WEBHOOK_FUNNEL`);
   if (funnelPort) {
     if (!FUNNEL_PORTS.has(funnelPort)) throw new Error(`${prefix}_WEBHOOK_FUNNEL must be 443, 8443 or 10000 (got '${clip(funnelPort, 20)}')`);
-    if (!isLoopbackHost(host)) throw new Error(`${prefix}_WEBHOOK_FUNNEL requires the listener to stay on loopback (${prefix}_WEBHOOK_HOST is '${clip(host, 60)}')`);
+    if (host !== "127.0.0.1") throw new Error(`${prefix}_WEBHOOK_FUNNEL requires the listener to stay on loopback (${prefix}_WEBHOOK_HOST is '${clip(host, 60)}')`);
   }
   const reply = (res, status, body) => res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
 
   const server = createServer(async (req, res) => {
     try {
       const requestPath = (req.url ?? "").split("?")[0];
-      const pathOk = requestPath === path || (funnelPort !== "" && requestPath === "/");
-      if (req.method !== "POST" || !pathOk) return reply(res, 404, { error: "not_found" });
+      if (requestPath !== path) return reply(res, 404, { error: "not_found" });
+      if (req.method === "OPTIONS") return res.writeHead(204, { "x-hyphae-webhook-receiver": "signed" }).end();
+      if (req.method !== "POST") return reply(res, 404, { error: "not_found" });
       const chunks = [];
       let bytes = 0;
       for await (const chunk of req) {
