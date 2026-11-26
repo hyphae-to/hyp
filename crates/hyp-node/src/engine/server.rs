@@ -433,6 +433,12 @@ async fn route_request(
     let method = req.method().clone();
     let uri = req.uri().clone();
     let path = uri.path().to_string();
+    // Keep the retired App URL from falling through to the generic webhook alias.
+    if path == "/v1/webhooks/github-app" {
+        return Err(NodeError::NotFound(
+            "GitHub App webhook route retired".into(),
+        ));
+    }
     let path_and_query = uri
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
