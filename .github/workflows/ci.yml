@@ -230,20 +230,21 @@ jobs:
             exit 1
           fi
 
-      - name: Verify bidirectional JS <-> Rust Verified Human Drops interop (H19)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          node --version
-          # Workspace integration tests already built the hyp executable.
-          export HYPHAE_BIN="$PWD/target/debug/hyp"
-          test -x "$HYPHAE_BIN"
-          node --test site/drop/cross_lang_interop.test.mjs
-
       - name: Build release binary (hyp)
         if: github.event_name != 'workflow_dispatch' || !inputs.skip_release_build
         run: cargo build --release --locked -p hyp-cli
+
+      - name: Verify bidirectional JS <-> Rust Verified Human Drops interop (H19)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          HYPHAE_BIN: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_release_build && './target/debug/hyp' || './target/release/hyp' }}
+        run: |
+          set -euo pipefail
+          node --version
+          export HYPHAE_BIN="$PWD/${HYPHAE_BIN#./}"
+          test -x "$HYPHAE_BIN"
+          node --test site/drop/cross_lang_interop.test.mjs
 
       - name: Smoke-test compiled binary (Unix)
         if: runner.os != 'Windows' && (github.event_name != 'workflow_dispatch' || !inputs.skip_release_build)
