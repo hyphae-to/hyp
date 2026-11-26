@@ -16,7 +16,7 @@ Security Gates run **strictly post-decrypt on inbound traffic** (inside your loc
 
 - Cryptographic identity & E2EE anti-downgrade verification.
 - Trust-tier tagging (`self`, `human-verified`, `org`, `peer`, `guest`, `external-webhook`, `bridge`). Hub-relayed webhook events are capped at `ExternalWebhook` so they never escalate to `Org` or `Peer` trust.
-- Session/connector mute lookup, CloudEvents Filter AST allow/denylists, per-sender token-bucket rate limits, payload size ceilings, inbound regex denylists, and automatic `guest`/`external-webhook` downgrade to `notify` or `quarantine`.
+- Session/connector mute lookup, CloudEvents Filter AST allow/denylists, per-sender token-bucket rate limits, payload size ceilings, inbound regex denylists, and a per-tier urgency ceiling (`guest`/`external-webhook` default to `cap_to_queue`; `downgrade_to_notify` and `quarantine` remain configurable).
 - **Transfer Attachment Guard:** Inspects every `tar.gz` path during streaming unpack and blocks executable, script, and startup files (`.sh`, `.exe`, `.dmg`, `.pkg`, `.ps1`, `.bashrc`, `.zshrc`, `.git/hooks/*`, `.claude/*`, etc.) unless explicitly allowlisted for that peer.
 - **Outbound Secret DLP Scanner:** Blocks accidental exfiltration of AWS keys (`AKIA...`), GitHub tokens (`gh[pousr]_...`), Slack tokens (`xox...`), Anthropic/OpenAI keys, PEM private keys, and JWTs — returning redacted category names only.
 
@@ -52,7 +52,7 @@ hyp gate init --adapter anthropic --secret anthropic-api-key --lock
 
 ## 5. Quarantine Review & Disposition (No MCP Self-Approval)
 
-- Quarantined items emit a metadata-only notice (`hyphae quarantine · 1 item held (reason: ...) · review via hyp gate review`) — unscreened body text is never injected into agent context.
+- Quarantined items add only `<quarantined count="N"/>` to the next `<hyphae-inbox>` digest (never counted in `unread`); receipt, source, and reason are shown by `hyp gate review` — unscreened body text is never injected into agent context.
 - `hyp_inbox` refuses `state: "quarantined"` / `"rejected"` fail-closed.
 - `hyp gate review --json` returns **metadata only** (receipt ID, source, reason, trust tier, timestamps — never raw body previews).
 - `hyp inbox approve <receipt>` and `hyp inbox reject <receipt> [--mute]` require **interactive TTY confirmation** and send live **`inbox.wake`** to deliver approved items immediately.

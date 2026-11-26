@@ -51,7 +51,7 @@ A digest sent while a turn is active is the same digest the wake nudge would hav
 ## Security Gate changes
 
 - Remove the Stage 1 "downgrade to notify" for the `external-webhook` and `guest` tiers. Replace it with a cap: those tiers may not use `interrupt` (it becomes `queue`).
-- Quarantine and block decisions are unchanged. Quarantined items are not counted in any digest.
+- Quarantine and block decisions are unchanged. Quarantined items are not counted in any digest; a digest that fires anyway carries one `<quarantined count="N"/>` so the agent can point the human at `hyp gate review`.
 - Burst protection is unchanged: a source exceeding the per-minute threshold is still demoted to `notify`.
 
 ## What changes for users
@@ -73,4 +73,4 @@ A digest sent while a turn is active is the same digest the wake nudge would hav
 1. ~~Should `interrupt` from a trusted peer still be allowed to carry one line of content?~~ **Decided 2026-11-26 (Bogdan): digest only is absolute for now, for every source and tier. Revisit once it has been used.**
 2. ~~Does a digest list every subscription, or only those with unread items?~~ **Decided 2026-11-26 (Bogdan): only subscriptions and sources with unread items are listed.**
 3. ~~Should reading with `hyp_inbox` ack by default?~~ **Decided 2026-11-26 (Bogdan): yes. Reading acknowledges by default; passing `ack: false` peeks without acknowledging.**
-4. **Long-turn mid-turn `queue` digest reminder (Decided 2026-11-26, Bogdan):** During long active turns where `Stop` has not fired yet, inject a periodic `<hyphae-inbox>` digest on `PostToolUse` when unread `queue` items are waiting, gated by a tuneable interval (default **30 minutes** since the oldest un-reminded `queue` item arrived / last mid-turn reminder; configurable per node/session, `0` to disable). Items stay `unread` until read via `hyp_inbox` and never re-inject between intervals.
+4. **Long-turn mid-turn `queue` digest reminder (Decided 2026-11-26, Bogdan):** During long active turns where `Stop` has not fired yet, inject a periodic `<hyphae-inbox>` digest on `PostToolUse` when unread `queue` items are waiting, gated by a tuneable interval (default **30 minutes** since the oldest un-reminded `queue` item arrived / last mid-turn reminder; configurable per node via `delivery.midturnQueueDigestSeconds` in `node.json`, `0` to disable). Items stay `unread` until read via `hyp_inbox` and never re-inject between intervals.

@@ -43,7 +43,7 @@ Both hooks (`PreInvocation`/`UserPromptSubmit`, `PostToolUse`, `Stop`, etc.) and
 
 - **Zero Body Leak:** `pack_inbox_digest` never reads `item.text`. Every attribute value strips control/BiDi characters and strictly XML-escapes `&`, `<`, `>`, `"`, `'`.
 - **Unread-Only Listing:** Lists only sources/subscriptions with unread items; omits `<muted>` when 0; omits empty categories.
-- **Verified & Quarantine Isolation:** `human-verified` items carry `verified="true"` in a separate group key (unverified items can never merge into a verified count). Quarantined items are never counted in `unread="..."` and surface at most once as coalesced metadata-only `<quarantined .../>` notices.
+- **Verified & Quarantine Isolation:** `human-verified` items carry `verified="true"` in a separate group key (unverified items can never merge into a verified count). Quarantined items are never counted in `unread="..."` and surface at most once as a single `<quarantined count="N"/>` element; details stay in `hyp gate review` (and `hyp_inbox`'s `quarantinedNotices`).
 - **At-Most-Once Watermark:** Delivering a digest via a hook or push wake stamps counted receipts `notified = 1` (keeping items `unread` in SQLite until `hyp_inbox` reads them) and cancels any pending duplicate wake nudge.
 
 ---
