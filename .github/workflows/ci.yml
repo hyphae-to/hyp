@@ -206,8 +206,39 @@ jobs:
       - name: Clippy (zero warnings across workspace & all targets)
         run: cargo clippy --workspace --all-targets --keep-going --locked -- -D warnings
 
-      - name: Workspace Tests (unit, golden interop, chaos & CLI E2E)
-        run: cargo test --workspace --locked --no-fail-fast
+      - name: Prepare identical test binaries and install nextest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o nextest.tgz https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.152/cargo-nextest-0.9.152-x86_64-unknown-linux-gnu.tar.gz
+          echo 'd039b43c3e0958441b6ad0a39c8884d018b3d2e8fb9928f209074b1100b5e17a  nextest.tgz' | sha256sum -c -
+          mkdir nextest-bin
+          tar -xzf nextest.tgz -C nextest-bin
+          install "$(find nextest-bin -type f -name cargo-nextest -print -quit)" "$HOME/.cargo/bin/cargo-nextest"
+          cd "$GITHUB_WORKSPACE"
+          cargo test --workspace --locked --no-run
+          cargo nextest --version
+
+      - name: Benchmark Cargo and nextest with warm binaries
+        shell: bash
+        run: |
+          set -uo pipefail
+          bench() {
+            local label="$1" start elapsed rc
+            shift
+            start=$(date +%s)
+            "$@"
+            rc=$?
+            elapsed=$(( $(date +%s) - start ))
+            echo "$label = ${elapsed}s (exit $rc)" | tee -a "$GITHUB_STEP_SUMMARY"
+            return "$rc"
+          }
+          failed=0
+          bench Cargo cargo test --workspace --locked --lib --bins --tests --no-fail-fast || failed=1
+          bench Nextest cargo nextest run --workspace --locked --lib --bins --tests --no-fail-fast || failed=1
+          bench Doctests cargo test --workspace --locked --doc || failed=1
+          exit "$failed"
 
       - name: Verify live Node.js & Python external plugin E2E (zero skips)
         if: runner.os == 'Linux'
