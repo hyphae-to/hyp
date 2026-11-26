@@ -7,6 +7,7 @@ use crate::config_file::{
     load_node_or_legacy_config, open_secret_store, resolve_config_path_for_read,
     resolve_effective_node_id, resolve_state_dir,
 };
+use crate::statusline_cmd::sanitize_terminal_text;
 use crate::ui::{CliError, EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json};
 use clap::{Subcommand, ValueEnum};
 use hyp_harness::local_kv::{LocalKvAction, LocalKvError, LocalKvRequest, LocalKvResponse};
@@ -49,6 +50,24 @@ pub enum KvCommand {
         #[arg(long, default_value = "local")]
         node: String,
         /// Explicit state directory containing node.sqlite
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Output structured JSON envelope
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a bounded preview of a live Shared KV value
+    Preview {
+        /// KV namespace
+        #[arg(long)]
+        ns: String,
+        /// Key within namespace
+        #[arg(long)]
+        key: String,
+        /// Host node ID (defaults to this node)
+        #[arg(long, default_value = "local")]
+        node: String,
+        /// Explicit daemon state directory
         #[arg(long)]
         state_dir: Option<PathBuf>,
         /// Output structured JSON envelope
@@ -147,6 +166,13 @@ pub fn run_kv(command: KvCommand) -> ExitCode {
             state_dir,
             json,
         } => run_kv_get(ns, key, node, state_dir, json),
+        KvCommand::Preview {
+            ns,
+            key,
+            node,
+            state_dir,
+            json,
+        } => run_kv_preview(ns, key, node, state_dir, json),
         KvCommand::Set {
             ns,
             key,
@@ -272,6 +298,14 @@ fn execute_kv(
             Err(err) => return Err(KvCommandError::Daemon(err.to_string())),
         };
 
+    if matches!(
+        request.action,
+        LocalKvAction::Inspect | LocalKvAction::Preview { .. }
+    ) {
+        return Err(KvCommandError::Daemon(
+            "KV inspection requires the local daemon.".into(),
+        ));
+    }
     let db_path = dir.join("node.sqlite");
     let db = NodeDb::open(&db_path).map_err(|err| {
         KvCommandError::Db(format!("failed to open {}: {err}", db_path.display()))
@@ -411,6 +445,85 @@ fn run_kv_get(
         ),
         Err(err) => emit_kv_error(cmd, as_json, err),
         Ok(_) => unexpected_kv_response(cmd, as_json),
+    }
+}
+
+fn run_kv_preview(
+    namespace: String,
+    key: String,
+    node: String,
+    state_dir: Option<PathBuf>,
+    as_json: bool,
+) -> ExitCode {
+    let command = "kv preview";
+    let action = LocalKvAction::Preview { key };
+    match execute_kv(&node, &namespace, action, state_dir.as_deref()) {
+        Ok(LocalKvResponse::Preview(Some(preview))) => {
+            if as_json {
+                print_json(&JsonEnvelope {
+                    ok: true,
+                    command: command.to_owned(),
+                    summary: Some(format!("KV value preview (v{})", preview.version)),
+                    data: Some(json!(preview)),
+                    warnings: Vec::new(),
+                    next: Vec::new(),
+                    error: None,
+                });
+            } else {
+                for line in preview.text.lines() {
+                    println!("{}", sanitize_terminal_text(line));
+                }
+                if preview.truncated {
+                    println!("… (truncated)");
+                }
+            }
+            ExitCode::from(EXIT_OK)
+        }
+        Ok(LocalKvResponse::Preview(None)) => emit_error(
+            command,
+            as_json,
+            EXIT_ERROR,
+            "NOT_FOUND",
+            "No visible KV entry at this key.",
+            None,
+        ),
+        Err(err) => emit_kv_error(command, as_json, err),
+        Ok(_) => unexpected_kv_response(command, as_json),
+    }
+}
+
+pub(crate) fn inspect_live_kv(socket: &Path) -> Option<Value> {
+    let hinted_state = socket
+        .parent()
+        .filter(|path| path.join("node.sqlite").is_file());
+    let config_path = resolve_config_path_for_read(None, hinted_state, None);
+    let loaded = load_node_or_legacy_config(&config_path).ok();
+    let state_dir = resolve_state_dir(
+        hinted_state.or(loaded.as_ref().and_then(|cfg| cfg.state_dir.as_deref())),
+        loaded.as_ref().map(|cfg| cfg.path.as_path()),
+        None,
+    );
+    let secret_store = open_secret_store(&state_dir, hinted_state.is_some());
+    let request = LocalKvRequest {
+        host_node: "local".into(),
+        namespace: String::new(),
+        action: LocalKvAction::Inspect,
+    };
+    let response = daemon_local_kv_rpc(
+        socket,
+        &json!(request),
+        &secret_store,
+        Duration::from_secs(3),
+    )
+    .ok()?
+    .result?
+    .remove("response")?;
+    let response = serde_json::from_value::<Result<LocalKvResponse, LocalKvError>>(response)
+        .ok()?
+        .ok()?;
+    match response {
+        LocalKvResponse::Inspect(kv) => Some(json!(kv)),
+        _ => None,
     }
 }
 

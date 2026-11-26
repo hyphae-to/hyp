@@ -556,6 +556,24 @@ pub fn render_inspect_text(payload: &Value, is_all: bool) -> String {
             "WARN  Global quarantined items: {quarantined_global} — inspect with `hyp gate review`"
         );
     }
+    if let Some(namespaces) = payload.pointer("/kv/namespaces").and_then(Value::as_array) {
+        let entries: u64 = namespaces
+            .iter()
+            .filter_map(|ns| ns["entryCount"].as_u64())
+            .sum();
+        let _ = writeln!(
+            out,
+            "KV  {} namespaces  {entries} live entries",
+            namespaces.len()
+        );
+        for namespace in namespaces {
+            let name = sanitize_terminal_text(namespace["name"].as_str().unwrap_or_default());
+            let origin =
+                sanitize_terminal_text(namespace["originNode"].as_str().unwrap_or_default());
+            let count = namespace["entryCount"].as_u64().unwrap_or(0);
+            let _ = writeln!(out, "  {origin}/{name}  {count} entries");
+        }
+    }
     out.push('\n');
 
     if is_all || payload.get("sessions").is_some() {
@@ -819,7 +837,12 @@ pub fn run_inspect(args: &InspectArgs) -> ExitCode {
         );
     }
 
-    let payload = Value::Object(res.result.unwrap_or_default());
+    let mut payload = Value::Object(res.result.unwrap_or_default());
+    if target.all && payload.get("kv").is_none() {
+        if let Some(kv) = crate::kv_cmd::inspect_live_kv(&socket_path) {
+            payload["kv"] = kv;
+        }
+    }
     let (warnings, next) = collect_warnings_and_next(&payload);
 
     if args.json {

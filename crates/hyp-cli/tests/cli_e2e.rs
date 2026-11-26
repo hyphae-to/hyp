@@ -997,10 +997,12 @@ fn kv_cli_and_mcp_wake_two_subscribers_under_the_real_node_id() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn kv_cli_authenticates_over_loopback_tcp() {
+    use hyp_crypto::X25519KeyPair;
+    use hyp_crypto::e2ee::{EpochMember, EpochScope, create_epoch_bundle};
     use hyp_crypto::keystore::SecretBackend;
     use hyp_harness::daemon::{LocalDaemon, LocalDaemonConfig};
     use hyp_harness::sock::daemon_rpc_async;
-    use hyp_node::engine::{NodeConfig, UnifiedNode};
+    use hyp_node::engine::{KvWriteRequest, NodeConfig, UnifiedNode};
     use hyp_proto::address::NodeId;
     use std::sync::Arc;
 
@@ -1030,6 +1032,21 @@ async fn kv_cli_authenticates_over_loopback_tcp() {
         assert_eq!(out.status.code(), Some(0), "{envelope}");
         envelope
     };
+    let inspect = || {
+        let out = isolated_cmd(home.path())
+            .args([
+                "inspect",
+                "--all",
+                "--socket",
+                socket.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()
+    };
+    assert_eq!(inspect()["data"]["kv"]["namespaces"], json!([]));
     cli(&[
         "set",
         "--ns",
@@ -1045,6 +1062,8 @@ async fn kv_cli_authenticates_over_loopback_tcp() {
     for request in [
         json!({ "action": "get", "key": "guarded" }),
         json!({ "action": "list" }),
+        json!({ "action": "inspect" }),
+        json!({ "action": "preview", "key": "guarded" }),
         json!({ "action": "set", "key": "guarded", "writeModel": "owner", "writer": "owner@local", "value": 2 }),
         json!({ "action": "delete", "key": "guarded", "writer": "owner@local" }),
     ] {
@@ -1062,6 +1081,86 @@ async fn kv_cli_authenticates_over_loopback_tcp() {
             Some("Local KV authentication failed.")
         );
     }
+    let payload = "🔐".repeat(1200);
+    node.kv_set(KvWriteRequest {
+        host_node: "local".into(),
+        namespace: "sealed".into(),
+        key: "note".into(),
+        value: json!(payload),
+        write_model: hyp_store::WriteModel::Owner,
+        owner_id: None,
+        allowlist: None,
+        expected_version: None,
+        ttl_ms: None,
+        encrypt: true,
+        e2ee_members: None,
+    })
+    .await
+    .unwrap();
+
+    let unsecured =
+        daemon_rpc_async(&socket, &json!({ "type": "sessions.summary" }), RPC_TIMEOUT).await;
+    assert!(unsecured.ok);
+    assert!(!unsecured.result.unwrap().contains_key("kv"));
+    let inspection = inspect();
+    let namespaces = inspection["data"]["kv"]["namespaces"].as_array().unwrap();
+    assert_eq!(namespaces.len(), 2);
+    assert_eq!(namespaces[0]["name"], "sealed");
+    assert_eq!(namespaces[0]["epoch"], 1);
+    assert_eq!(namespaces[0]["memberCount"], 1);
+    assert_eq!(namespaces[0]["entryCount"], 1);
+    assert_eq!(namespaces[0]["entries"][0]["key"], "note");
+    assert_eq!(namespaces[0]["entries"][0]["version"], 1);
+    assert!(!inspection.to_string().contains("🔐"));
+
+    let preview = cli(&["preview", "--ns", "sealed", "--key", "note"]);
+    assert_eq!(preview["data"]["text"], "🔐".repeat(1024));
+    assert_eq!(preview["data"]["truncated"], true);
+
+    // The database's separate members list is not an authorization source.
+    let other = X25519KeyPair::generate().unwrap().public_key();
+    let (_, next_epoch) = create_epoch_bundle(
+        EpochScope::Kv,
+        "owner@local",
+        "sealed",
+        2,
+        "owner@local",
+        &node.identity().signing,
+        &[EpochMember {
+            node_id: "other@local",
+            enc_pk: &other,
+        }],
+    )
+    .unwrap();
+    node.db()
+        .kv()
+        .put_epoch(
+            &hyp_store::KvEpochInput {
+                host_node: "owner@local".into(),
+                namespace: "sealed".into(),
+                epoch: 2,
+                creator_node_id: "owner@local".into(),
+                key_envelope_json: serde_json::to_string(&next_epoch).unwrap(),
+                members: vec!["owner@local".into()],
+                signature: next_epoch.sig,
+            },
+            hyp_store::now_ms(),
+        )
+        .unwrap();
+    assert_eq!(
+        inspect()["data"]["kv"]["namespaces"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        node.preview_local_kv("sealed", "note")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
     let read = cli(&["get", "--ns", "test", "--key", "guarded"]);
     assert_eq!(read["data"]["value"], 1, "{read}");
     let deleted = cli(&["delete", "--ns", "test", "--key", "guarded"]);

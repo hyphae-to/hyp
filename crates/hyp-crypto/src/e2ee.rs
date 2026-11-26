@@ -472,19 +472,15 @@ pub fn rotate_epoch_bundle(
     )
 }
 
-/// Verifies creator signature, scope/resource binding, `membersHash` integrity, and anti-rollback
-/// (`epoch >= min_expected_epoch`), then unwraps this node's `RoomEpochKey` via RFC 9180 HPKE.
-#[allow(clippy::too_many_arguments)]
-pub fn open_epoch_bundle(
+/// Verifies signed epoch metadata without unwrapping a member key.
+pub fn verify_epoch_bundle(
     bundle: &SignedEpochKeyBundle,
     expected_scope: EpochScope,
     expected_host_node: &str,
     expected_resource: &str,
     creator_signing_pk: &Ed25519PublicKey,
-    my_node_id: &str,
-    my_enc_kp: &X25519KeyPair,
     min_expected_epoch: u64,
-) -> Result<(RoomEpochKey, EpochKeyBundlePayload), CryptoError> {
+) -> Result<EpochKeyBundlePayload, CryptoError> {
     // 1. Verify creator signature FIRST.
     let payload: EpochKeyBundlePayload = creator_signing_pk.verify_signed("epoch-key", bundle)?;
 
@@ -522,6 +518,31 @@ pub fn open_epoch_bundle(
             "epoch bundle membersHash mismatch".into(),
         ));
     }
+
+    Ok(payload)
+}
+
+/// Verifies creator signature, scope/resource binding, `membersHash` integrity, and anti-rollback
+/// (`epoch >= min_expected_epoch`), then unwraps this node's `RoomEpochKey` via RFC 9180 HPKE.
+#[allow(clippy::too_many_arguments)]
+pub fn open_epoch_bundle(
+    bundle: &SignedEpochKeyBundle,
+    expected_scope: EpochScope,
+    expected_host_node: &str,
+    expected_resource: &str,
+    creator_signing_pk: &Ed25519PublicKey,
+    my_node_id: &str,
+    my_enc_kp: &X25519KeyPair,
+    min_expected_epoch: u64,
+) -> Result<(RoomEpochKey, EpochKeyBundlePayload), CryptoError> {
+    let payload = verify_epoch_bundle(
+        bundle,
+        expected_scope,
+        expected_host_node,
+        expected_resource,
+        creator_signing_pk,
+        min_expected_epoch,
+    )?;
 
     // 3. Find our wrap slot and HPKE-unwrap the 32-byte room key.
     let my_kid = my_enc_kp.kid();
