@@ -1295,13 +1295,6 @@ fn drop_relay_error_response(
     resp
 }
 
-fn has_any_auth_header(headers: &HeaderMap) -> bool {
-    headers.contains_key(AUTHORIZATION)
-        || headers.contains_key("x-hyphae-sig")
-        || headers.contains_key("x-hyphae-timestamp")
-        || headers.contains_key("x-hyphae-nonce")
-}
-
 fn check_content_length(headers: &HeaderMap, max_bytes: usize) -> Result<(), NodeError> {
     let Some(raw_val) = headers.get(CONTENT_LENGTH) else {
         return Ok(());
@@ -1444,7 +1437,7 @@ fn resolve_pre_read_body_limit(
     }
 
     if method == Method::PUT && path.starts_with("/v1/transfers/") {
-        if !has_any_auth_header(headers) {
+        if !headers.contains_key(AUTHORIZATION) {
             return Err(NodeError::Unauthorized(
                 "missing Authorization header".into(),
             ));

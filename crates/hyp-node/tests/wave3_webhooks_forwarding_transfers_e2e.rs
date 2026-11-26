@@ -1008,9 +1008,7 @@ async fn wave4a_cut_remote_node_update_and_bridges_post_return_404_and_no_capabi
             &[
                 ("content-type", "application/json".to_string()),
                 ("x-hyphae-node", "admin@laptop".to_string()),
-                ("x-hyphae-timestamp", ts.to_string()),
-                ("x-hyphae-nonce", nonce),
-                ("x-hyphae-sig", sig),
+                ("authorization", format!(r#"Hyphae-Ed25519 node="admin@laptop",ts="{ts}",nonce="{nonce}",sig="{sig}""#)),
             ],
             Bytes::copy_from_slice(body),
         )
